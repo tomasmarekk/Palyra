@@ -1,8 +1,7 @@
-use std::io::Cursor;
 use std::sync::Arc;
 
 use rustls::{
-    pki_types::{CertificateDer, PrivateKeyDer},
+    pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer},
     server::WebPkiClientVerifier,
     ClientConfig, RootCertStore, ServerConfig,
 };
@@ -63,16 +62,12 @@ pub fn build_unpaired_client_config(
 }
 
 fn parse_pem_certs(pem: &str) -> IdentityResult<Vec<CertificateDer<'static>>> {
-    let mut reader = Cursor::new(pem);
-    rustls_pemfile::certs(&mut reader)
+    CertificateDer::pem_slice_iter(pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| IdentityError::CertificateParsingFailed)
 }
 
 fn parse_private_key(pem: &str) -> IdentityResult<PrivateKeyDer<'static>> {
-    let mut reader = Cursor::new(pem);
-    let key = rustls_pemfile::private_key(&mut reader)
-        .map_err(|_| IdentityError::PrivateKeyParsingFailed)?
-        .ok_or(IdentityError::PrivateKeyParsingFailed)?;
-    Ok(key)
+    PrivateKeyDer::from_pem_slice(pem.as_bytes())
+        .map_err(|_| IdentityError::PrivateKeyParsingFailed)
 }

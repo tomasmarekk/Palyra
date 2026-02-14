@@ -31,15 +31,14 @@ proptest = "1.6.0"
 rand = "0.8.5"
 reqwest = { version = "0.12.12", default-features = false, features = ["blocking", "json"] }
 rcgen = "0.13.1"
-rustls = "0.23.23"
-rustls-pemfile = "2.2.0"
+rustls = { version = "0.23.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 serde = { version = "1.0.218", features = ["derive"] }
 serde_json = "1.0.140"
 sha2 = "0.10.8"
 tempfile = "3.17.1"
 thiserror = "2.0.11"
 tokio = { version = "1.43.0", features = ["macros", "rt-multi-thread", "signal", "time"] }
-tokio-rustls = "0.26.1"
+tokio-rustls = { version = "0.26.1", default-features = false, features = ["logging", "ring", "tls12"] }
 toml = "0.8.20"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }
