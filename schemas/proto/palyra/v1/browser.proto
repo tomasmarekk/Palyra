@@ -1,0 +1,65 @@
+syntax = "proto3";
+
+package palyra.browser.v1;
+
+import "palyra/v1/common.proto";
+
+service BrowserService {
+  rpc StartProfile(StartProfileRequest) returns (StartProfileResponse);
+  rpc ExecuteAction(ExecuteActionRequest) returns (ExecuteActionResponse);
+  rpc Observe(stream ObserveRequest) returns (stream ObserveEvent);
+}
+
+message StartProfileRequest {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId profile_id = 2;
+  string user_data_path = 3;
+  uint64 max_payload_bytes = 4;
+
+  reserved 5 to 12;
+}
+
+message StartProfileResponse {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId profile_id = 2;
+  bool started = 3;
+  string websocket_url = 4;
+
+  reserved 5 to 12;
+}
+
+message ExecuteActionRequest {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId profile_id = 2;
+  string action = 3;
+  bytes input_json = 4;
+  uint64 max_payload_bytes = 5;
+
+  reserved 6 to 14;
+}
+
+message ExecuteActionResponse {
+  uint32 v = 1;
+  bool success = 2;
+  bytes output_json = 3;
+  string error = 4;
+
+  reserved 5 to 12;
+}
+
+message ObserveRequest {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId profile_id = 2;
+  repeated string topics = 3;
+
+  reserved 4 to 10;
+}
+
+message ObserveEvent {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId profile_id = 2;
+  string topic = 3;
+  bytes payload_json = 4;
+
+  reserved 5 to 12;
+}

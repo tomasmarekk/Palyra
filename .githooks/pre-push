@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "Running rustfmt check..."
+cargo fmt --all --check
+
+echo "Running clippy..."
+cargo clippy --workspace --all-targets -- -D warnings
+
+echo "Running unit and integration tests..."
+cargo test --workspace --locked
+
+echo "Running protocol schema checks..."
+bash scripts/protocol/validate-proto.sh
+bash scripts/protocol/generate-stubs.sh
+bash scripts/protocol/validate-rust-stubs.sh
+
+echo "Running high-risk pattern scan..."
+bash scripts/check-high-risk-patterns.sh

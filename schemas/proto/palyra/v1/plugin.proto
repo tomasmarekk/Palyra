@@ -1,0 +1,67 @@
+syntax = "proto3";
+
+package palyra.plugin.v1;
+
+import "palyra/v1/common.proto";
+
+service PluginHostService {
+  rpc RegisterPlugin(RegisterPluginRequest) returns (RegisterPluginResponse);
+  rpc InvokeTool(InvokeToolRequest) returns (InvokeToolResponse);
+  rpc StreamPluginEvents(stream PluginEventRequest) returns (stream PluginEventResponse);
+}
+
+message RegisterPluginRequest {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId plugin_id = 2;
+  string name = 3;
+  string version = 4;
+  repeated string declared_capabilities = 5;
+
+  reserved 6 to 16;
+}
+
+message RegisterPluginResponse {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId plugin_id = 2;
+  bool accepted = 3;
+  string reason = 4;
+
+  reserved 5 to 12;
+}
+
+message InvokeToolRequest {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId plugin_id = 2;
+  string tool_name = 3;
+  bytes input_json = 4;
+  uint64 max_payload_bytes = 5;
+
+  reserved 6 to 12;
+}
+
+message InvokeToolResponse {
+  uint32 v = 1;
+  bool success = 2;
+  bytes output_json = 3;
+  string error = 4;
+
+  reserved 5 to 12;
+}
+
+message PluginEventRequest {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId plugin_id = 2;
+  string event_name = 3;
+  bytes payload_json = 4;
+
+  reserved 5 to 12;
+}
+
+message PluginEventResponse {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId event_id = 2;
+  bool accepted = 3;
+  string reason = 4;
+
+  reserved 5 to 12;
+}

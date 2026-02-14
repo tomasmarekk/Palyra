@@ -1,0 +1,30 @@
+target/
+**/target/
+Cargo.lock.bk
+
+# IDE
+.vscode/
+.idea/
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# Local overrides
+*.local.toml
+*.local.json
+*.tmp
+.tmp-proto-validate.*
+.tmp-rust-stubs.*
+**/sbom.json
+apps/web/node_modules/
+.palyra-doctor-write-check.tmp
+fuzz/artifacts/
+fuzz/corpus/
+fuzz/coverage/
+security-artifacts/
+/roadmap/
+/oc-docs/
+TechStack_Architecture.md
+SECURITY.md
+/docs/

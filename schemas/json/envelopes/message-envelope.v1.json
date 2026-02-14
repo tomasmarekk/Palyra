@@ -1,0 +1,172 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.dev/json/envelopes/message-envelope.v1.json",
+  "title": "Message Envelope v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "v",
+    "id",
+    "ts",
+    "origin",
+    "content",
+    "security",
+    "limits"
+  ],
+  "properties": {
+    "v": {
+      "const": 1
+    },
+    "id": {
+      "$ref": "../common/canonical-id.v1.json"
+    },
+    "ts": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "origin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "channel",
+            "web",
+            "cli",
+            "node",
+            "system"
+          ]
+        },
+        "channel": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "conversation_id": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "sender": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "display": {
+              "type": "string",
+              "maxLength": 128
+            },
+            "handle": {
+              "type": "string",
+              "maxLength": 128
+            },
+            "verified": {
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    },
+    "content": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "text"
+      ],
+      "properties": {
+        "text": {
+          "type": "string",
+          "maxLength": 32768
+        },
+        "attachments": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "artifact_id"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "image",
+                  "file",
+                  "audio",
+                  "video"
+                ]
+              },
+              "artifact_id": {
+                "$ref": "../common/canonical-id.v1.json"
+              },
+              "size_bytes": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 104857600
+              }
+            }
+          }
+        }
+      }
+    },
+    "security": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "trust"
+      ],
+      "properties": {
+        "trust": {
+          "type": "string",
+          "enum": [
+            "untrusted",
+            "user-trusted",
+            "system"
+          ]
+        },
+        "labels": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "type": "string",
+            "maxLength": 64
+          }
+        },
+        "provenance": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "url": {
+              "type": "string",
+              "maxLength": 2048
+            },
+            "hash": {
+              "type": "string",
+              "maxLength": 256
+            }
+          }
+        },
+        "replay_protection": {
+          "$ref": "../common/replay-protection.v1.json"
+        }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_payload_bytes"
+      ],
+      "properties": {
+        "max_payload_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1048576
+        }
+      }
+    }
+  }
+}

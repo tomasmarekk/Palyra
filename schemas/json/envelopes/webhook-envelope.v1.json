@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.dev/json/envelopes/webhook-envelope.v1.json",
+  "title": "Webhook Envelope v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "v",
+    "id",
+    "event",
+    "source",
+    "payload",
+    "replay_protection"
+  ],
+  "properties": {
+    "v": {
+      "const": 1
+    },
+    "id": {
+      "$ref": "../common/canonical-id.v1.json"
+    },
+    "event": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "source": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "payload": {
+      "type": "object",
+      "maxProperties": 2048
+    },
+    "replay_protection": {
+      "$ref": "../common/replay-protection.v1.json"
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_payload_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1048576
+        }
+      }
+    }
+  }
+}

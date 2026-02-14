@@ -1,0 +1,9 @@
+title = "Palyra gitleaks config"
+
+[allowlist]
+description = "Global allowlist"
+paths = [
+  '''^LICENSE$''',
+  '''^roadmap/''',
+  '''^openclaw-documentation/'''
+]

@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.dev/json/common/replay-protection.v1.json",
+  "title": "Replay Protection v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "nonce",
+    "timestamp_unix_ms"
+  ],
+  "properties": {
+    "nonce": {
+      "type": "string",
+      "minLength": 16,
+      "maxLength": 128
+    },
+    "timestamp_unix_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "signature": {
+      "type": "string",
+      "maxLength": 4096
+    }
+  }
+}

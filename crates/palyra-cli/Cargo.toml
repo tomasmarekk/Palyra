@@ -1,0 +1,24 @@
+[package]
+name = "palyra-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "palyra"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+palyra-common = { version = "0.1.0", path = "../palyra-common" }
+palyra-identity = { version = "0.1.0", path = "../palyra-identity" }
+palyra-policy = { version = "0.1.0", path = "../palyra-policy" }
+reqwest.workspace = true
+serde.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+reqwest.workspace = true
+tempfile.workspace = true

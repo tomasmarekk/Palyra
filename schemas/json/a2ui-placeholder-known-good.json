@@ -1,0 +1,13 @@
+{
+  "v": 1,
+  "surface": "bootstrap",
+  "components": [
+    {
+      "id": "welcome",
+      "type": "text",
+      "props": {
+        "value": "Palyra bootstrap"
+      }
+    }
+  ]
+}

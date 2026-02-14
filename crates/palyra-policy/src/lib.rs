@@ -1,0 +1,71 @@
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyRequest {
+    pub principal: String,
+    pub action: String,
+    pub resource: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyDecision {
+    Allow,
+    DenyByDefault { reason: String },
+}
+
+#[must_use]
+pub fn evaluate(request: &PolicyRequest) -> PolicyDecision {
+    if is_sensitive_action(request) {
+        return PolicyDecision::DenyByDefault {
+            reason: "sensitive action blocked by default; explicit user approval required"
+                .to_owned(),
+        };
+    }
+
+    PolicyDecision::DenyByDefault { reason: "deny-by-default baseline policy".to_owned() }
+}
+
+fn is_sensitive_action(request: &PolicyRequest) -> bool {
+    let action = request.action.to_ascii_lowercase();
+    let resource = request.resource.to_ascii_lowercase();
+    action.contains("shell")
+        || action.contains("delete")
+        || action.contains("payment")
+        || resource.contains("secrets")
+        || resource.contains("credential")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{evaluate, PolicyDecision, PolicyRequest};
+
+    #[test]
+    fn default_policy_denies_all_requests() {
+        let request = PolicyRequest {
+            principal: "user:bootstrap".to_owned(),
+            action: "tool.execute".to_owned(),
+            resource: "tool:filesystem".to_owned(),
+        };
+
+        let decision = evaluate(&request);
+
+        assert!(matches!(decision, PolicyDecision::DenyByDefault { .. }));
+    }
+
+    #[test]
+    fn sensitive_actions_require_explicit_approval() {
+        let request = PolicyRequest {
+            principal: "user:bootstrap".to_owned(),
+            action: "tool.execute.shell".to_owned(),
+            resource: "tool:shell".to_owned(),
+        };
+
+        let decision = evaluate(&request);
+
+        assert_eq!(
+            decision,
+            PolicyDecision::DenyByDefault {
+                reason: "sensitive action blocked by default; explicit user approval required"
+                    .to_owned(),
+            }
+        );
+    }
+}

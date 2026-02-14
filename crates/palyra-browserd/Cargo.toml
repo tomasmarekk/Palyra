@@ -1,0 +1,19 @@
+[package]
+name = "palyra-browserd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "palyra-browserd"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+clap.workspace = true
+palyra-common = { version = "0.1.0", path = "../palyra-common" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

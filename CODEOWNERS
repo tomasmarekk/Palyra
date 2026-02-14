@@ -1,0 +1,20 @@
+# Global default owner for all files.
+* @palo
+
+# Security-sensitive areas.
+SECURITY.md @palo
+docs/security/ @palo
+infra/ci/ @palo
+scripts/check-high-risk-patterns.sh @palo
+scripts/generate-attestation-placeholder.sh @palo
+crates/palyra-policy/ @palo
+crates/palyra-plugins/runtime/ @palo
+.github/pull_request_template.md @palo
+.github/workflows/ @palo
+schemas/proto/ @palo
+schemas/json/ @palo
+schemas/generated/ @palo
+docs/protocols/ @palo
+Cargo.toml @palo
+Cargo.lock @palo
+deny.toml @palo

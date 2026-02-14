@@ -1,0 +1,200 @@
+syntax = "proto3";
+
+package palyra.common.v1;
+
+// Canonical ULID-based identifier encoded using Crockford Base32.
+message CanonicalId {
+  string ulid = 1;
+
+  reserved 2;
+  reserved 3;
+}
+
+// Replay protection envelope used for webhook and pairing paths.
+message ReplayProtection {
+  string nonce = 1;
+  int64 timestamp_unix_ms = 2;
+  string signature = 3;
+
+  reserved 4;
+  reserved 5;
+}
+
+message EnvelopeOrigin {
+  enum OriginType {
+    ORIGIN_TYPE_UNSPECIFIED = 0;
+    ORIGIN_TYPE_CHANNEL = 1;
+    ORIGIN_TYPE_WEB = 2;
+    ORIGIN_TYPE_CLI = 3;
+    ORIGIN_TYPE_NODE = 4;
+    ORIGIN_TYPE_SYSTEM = 5;
+  }
+
+  OriginType type = 1;
+  string channel = 2;
+  string conversation_id = 3;
+  string sender_handle = 4;
+  bool sender_verified = 5;
+
+  reserved 6 to 10;
+}
+
+message MessageAttachment {
+  enum AttachmentKind {
+    ATTACHMENT_KIND_UNSPECIFIED = 0;
+    ATTACHMENT_KIND_IMAGE = 1;
+    ATTACHMENT_KIND_FILE = 2;
+    ATTACHMENT_KIND_AUDIO = 3;
+    ATTACHMENT_KIND_VIDEO = 4;
+  }
+
+  AttachmentKind kind = 1;
+  CanonicalId artifact_id = 2;
+  uint64 size_bytes = 3;
+
+  reserved 4 to 8;
+}
+
+message MessageContent {
+  string text = 1;
+  repeated MessageAttachment attachments = 2;
+
+  reserved 3 to 8;
+}
+
+message SecurityContext {
+  enum TrustLevel {
+    TRUST_LEVEL_UNSPECIFIED = 0;
+    TRUST_LEVEL_UNTRUSTED = 1;
+    TRUST_LEVEL_USER_TRUSTED = 2;
+    TRUST_LEVEL_SYSTEM = 3;
+  }
+
+  TrustLevel trust = 1;
+  repeated string labels = 2;
+  string provenance_url = 3;
+  string provenance_hash = 4;
+  ReplayProtection replay = 5;
+
+  reserved 6 to 12;
+}
+
+message MessageEnvelope {
+  uint32 v = 1;
+  CanonicalId envelope_id = 2;
+  int64 timestamp_unix_ms = 3;
+  EnvelopeOrigin origin = 4;
+  MessageContent content = 5;
+  SecurityContext security = 6;
+  uint64 max_payload_bytes = 7;
+
+  reserved 8 to 20;
+}
+
+message JournalEvent {
+  enum EventKind {
+    EVENT_KIND_UNSPECIFIED = 0;
+    EVENT_KIND_MESSAGE_RECEIVED = 1;
+    EVENT_KIND_MODEL_TOKEN = 2;
+    EVENT_KIND_TOOL_PROPOSED = 3;
+    EVENT_KIND_TOOL_EXECUTED = 4;
+    EVENT_KIND_A2UI_UPDATED = 5;
+    EVENT_KIND_RUN_COMPLETED = 6;
+    EVENT_KIND_RUN_FAILED = 7;
+  }
+
+  enum EventActor {
+    EVENT_ACTOR_UNSPECIFIED = 0;
+    EVENT_ACTOR_USER = 1;
+    EVENT_ACTOR_AGENT = 2;
+    EVENT_ACTOR_SYSTEM = 3;
+    EVENT_ACTOR_PLUGIN = 4;
+  }
+
+  uint32 v = 1;
+  CanonicalId event_id = 2;
+  CanonicalId session_id = 3;
+  CanonicalId run_id = 4;
+  EventKind kind = 5;
+  EventActor actor = 6;
+  int64 timestamp_unix_ms = 7;
+  bytes payload_json = 8;
+  string hash = 9;
+  string prev_hash = 10;
+
+  reserved 11 to 24;
+}
+
+message ToolProposal {
+  CanonicalId proposal_id = 1;
+  string tool_name = 2;
+  bytes input_json = 3;
+  bool approval_required = 4;
+
+  reserved 5 to 10;
+}
+
+message ToolResult {
+  CanonicalId proposal_id = 1;
+  bool success = 2;
+  bytes output_json = 3;
+  string error = 4;
+
+  reserved 5 to 10;
+}
+
+message A2uiUpdate {
+  uint32 v = 1;
+  string surface = 2;
+  bytes patch_json = 3;
+
+  reserved 4 to 10;
+}
+
+message RunStreamRequest {
+  uint32 v = 1;
+  CanonicalId session_id = 2;
+  CanonicalId run_id = 3;
+  MessageEnvelope input = 4;
+  bool allow_sensitive_tools = 5;
+
+  reserved 6 to 16;
+}
+
+message ModelToken {
+  string token = 1;
+  bool is_final = 2;
+
+  reserved 3 to 8;
+}
+
+message StreamStatus {
+  enum StatusKind {
+    STATUS_KIND_UNSPECIFIED = 0;
+    STATUS_KIND_ACCEPTED = 1;
+    STATUS_KIND_IN_PROGRESS = 2;
+    STATUS_KIND_DONE = 3;
+    STATUS_KIND_FAILED = 4;
+  }
+
+  StatusKind kind = 1;
+  string message = 2;
+
+  reserved 3 to 8;
+}
+
+message RunStreamEvent {
+  uint32 v = 1;
+  CanonicalId run_id = 2;
+
+  oneof body {
+    ModelToken model_token = 3;
+    ToolProposal tool_proposal = 4;
+    ToolResult tool_result = 5;
+    A2uiUpdate a2ui_update = 6;
+    StreamStatus status = 7;
+    JournalEvent journal_event = 8;
+  }
+
+  reserved 9 to 24;
+}

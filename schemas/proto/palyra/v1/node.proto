@@ -1,0 +1,172 @@
+syntax = "proto3";
+
+package palyra.node.v1;
+
+import "palyra/v1/common.proto";
+
+service NodeService {
+  rpc BeginPairingSession(BeginPairingSessionRequest) returns (BeginPairingSessionResponse);
+  rpc CompletePairingSession(CompletePairingSessionRequest) returns (CompletePairingSessionResponse);
+  rpc RotateDeviceCertificate(RotateDeviceCertificateRequest) returns (RotateDeviceCertificateResponse);
+  rpc RevokeDevicePairing(RevokeDevicePairingRequest) returns (RevokeDevicePairingResponse);
+  rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
+  rpc StreamNodeEvents(stream NodeEventRequest) returns (stream NodeEventResponse);
+  rpc ExecuteCapability(ExecuteCapabilityRequest) returns (ExecuteCapabilityResponse);
+}
+
+message PairingMethod {
+  oneof value {
+    string pin_code = 1;
+    string qr_token = 2;
+  }
+
+  reserved 3 to 8;
+}
+
+message BeginPairingSessionRequest {
+  uint32 v = 1;
+  string client_kind = 2;
+  PairingMethod method = 3;
+  palyra.common.v1.ReplayProtection replay = 4;
+
+  reserved 5 to 16;
+}
+
+message BeginPairingSessionResponse {
+  uint32 v = 1;
+  string session_id = 2;
+  string client_kind = 3;
+  bytes gateway_ephemeral_public = 4;
+  bytes challenge = 5;
+  uint64 expires_at_unix_ms = 6;
+
+  reserved 7 to 16;
+}
+
+message CompletePairingSessionRequest {
+  uint32 v = 1;
+  string session_id = 2;
+  palyra.common.v1.CanonicalId device_id = 3;
+  string client_kind = 4;
+  string proof = 5;
+  bytes device_signing_public = 6;
+  bytes device_x25519_public = 7;
+  bytes challenge_signature = 8;
+  bytes transcript_mac = 9;
+
+  reserved 10 to 24;
+}
+
+message CompletePairingSessionResponse {
+  uint32 v = 1;
+  bool paired = 2;
+  string reason = 3;
+  string identity_fingerprint = 4;
+  string transcript_hash = 5;
+  string mtls_client_certificate_pem = 6;
+  string mtls_client_private_key_pem = 7;
+  string gateway_ca_certificate_pem = 8;
+  uint64 cert_expires_at_unix_ms = 9;
+
+  reserved 10 to 24;
+}
+
+message RotateDeviceCertificateRequest {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId device_id = 2;
+  palyra.common.v1.ReplayProtection replay = 3;
+
+  reserved 4 to 12;
+}
+
+message RotateDeviceCertificateResponse {
+  uint32 v = 1;
+  bool rotated = 2;
+  string reason = 3;
+  string mtls_client_certificate_pem = 4;
+  string mtls_client_private_key_pem = 5;
+  uint64 cert_expires_at_unix_ms = 6;
+
+  reserved 7 to 16;
+}
+
+message RevokeDevicePairingRequest {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId device_id = 2;
+  string reason = 3;
+  palyra.common.v1.ReplayProtection replay = 4;
+
+  reserved 5 to 12;
+}
+
+message RevokeDevicePairingResponse {
+  uint32 v = 1;
+  bool revoked = 2;
+  string reason = 3;
+
+  reserved 4 to 12;
+}
+
+message DeviceCapability {
+  string name = 1;
+  bool available = 2;
+
+  reserved 3 to 8;
+}
+
+message RegisterNodeRequest {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId device_id = 2;
+  string platform = 3;
+  repeated DeviceCapability capabilities = 4;
+  palyra.common.v1.ReplayProtection replay = 5;
+
+  reserved 6 to 16;
+}
+
+message RegisterNodeResponse {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId device_id = 2;
+  bool accepted = 3;
+  string reason = 4;
+
+  reserved 5 to 12;
+}
+
+message NodeEventRequest {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId device_id = 2;
+  string event_name = 3;
+  bytes payload_json = 4;
+  palyra.common.v1.ReplayProtection replay = 5;
+
+  reserved 6 to 12;
+}
+
+message NodeEventResponse {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId event_id = 2;
+  bool accepted = 3;
+  string reason = 4;
+
+  reserved 5 to 12;
+}
+
+message ExecuteCapabilityRequest {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId device_id = 2;
+  string capability = 3;
+  bytes input_json = 4;
+  uint64 max_payload_bytes = 5;
+
+  reserved 6 to 12;
+}
+
+message ExecuteCapabilityResponse {
+  uint32 v = 1;
+  bool success = 2;
+  bytes output_json = 3;
+  string error = 4;
+
+  reserved 5 to 12;
+}

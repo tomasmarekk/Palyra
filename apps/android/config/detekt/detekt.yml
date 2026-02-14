@@ -1,0 +1,22 @@
+build:
+  maxIssues: 0
+
+config:
+  validation: true
+
+style:
+  MagicNumber:
+    active: true
+  WildcardImport:
+    active: true
+  MaxLineLength:
+    active: true
+    maxLineLength: 120
+
+complexity:
+  LongMethod:
+    active: true
+    threshold: 60
+  LargeClass:
+    active: true
+    threshold: 500

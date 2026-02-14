@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.dev/json/envelopes/config-export.v1.json",
+  "title": "Config Export Envelope v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "v",
+    "id",
+    "exported_at",
+    "config"
+  ],
+  "properties": {
+    "v": {
+      "const": 1
+    },
+    "id": {
+      "$ref": "../common/canonical-id.v1.json"
+    },
+    "exported_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "config": {
+      "type": "object",
+      "maxProperties": 2048
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "git_hash": {
+          "type": "string",
+          "maxLength": 64
+        }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_payload_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1048576
+        }
+      }
+    }
+  }
+}

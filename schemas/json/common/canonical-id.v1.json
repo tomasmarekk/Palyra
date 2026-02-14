@@ -1,0 +1,8 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palyra.dev/json/common/canonical-id.v1.json",
+  "title": "Canonical ULID v1",
+  "description": "Canonical ULID using Crockford Base32 (26 chars, uppercase).",
+  "type": "string",
+  "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+}

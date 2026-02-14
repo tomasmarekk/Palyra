@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+package palyra.gateway.v1;
+
+import "palyra/v1/common.proto";
+
+service GatewayService {
+  rpc GetHealth(HealthRequest) returns (HealthResponse);
+  rpc RunStream(stream palyra.common.v1.RunStreamRequest)
+      returns (stream palyra.common.v1.RunStreamEvent);
+  rpc AppendEvent(AppendEventRequest) returns (AppendEventResponse);
+}
+
+message HealthRequest {
+  uint32 v = 1;
+
+  reserved 2 to 8;
+}
+
+message HealthResponse {
+  uint32 v = 1;
+  string service = 2;
+  string status = 3;
+  string version = 4;
+  string git_hash = 5;
+  string build_profile = 6;
+  uint64 uptime_seconds = 7;
+
+  reserved 8 to 16;
+}
+
+message AppendEventRequest {
+  uint32 v = 1;
+  palyra.common.v1.JournalEvent event = 2;
+
+  reserved 3 to 12;
+}
+
+message AppendEventResponse {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId event_id = 2;
+  bool accepted = 3;
+
+  reserved 4 to 10;
+}

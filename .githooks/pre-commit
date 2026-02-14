@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "Running rustfmt check..."
+cargo fmt --all --check
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+  echo "gitleaks is required for pre-commit checks. Install gitleaks and retry."
+  exit 1
+fi
+
+echo "Running gitleaks staged scan..."
+gitleaks protect --staged --redact
+
+echo "Running high-risk pattern scan..."
+bash scripts/check-high-risk-patterns.sh

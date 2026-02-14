@@ -1,0 +1,10 @@
+package palyra:plugins/sdk@0.1.0;
+
+interface runtime {
+  /// Returns a static plugin runtime compatibility string.
+  plugin-hello: func() -> string;
+}
+
+world palyra-plugin {
+  export runtime;
+}

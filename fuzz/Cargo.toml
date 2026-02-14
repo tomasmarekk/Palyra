@@ -1,0 +1,36 @@
+[package]
+name = "palyra-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+palyra-a2ui = { path = "../crates/palyra-a2ui" }
+palyra-common = { path = "../crates/palyra-common" }
+
+[[bin]]
+name = "config_path_parser"
+path = "fuzz_targets/config_path_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "a2ui_json_parser"
+path = "fuzz_targets/a2ui_json_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "webhook_payload_parser"
+path = "fuzz_targets/webhook_payload_parser.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
