@@ -14,6 +14,8 @@ pub enum A2uiValidationError {
     MissingField(&'static str),
     #[error("field '{0}' has an invalid type")]
     InvalidType(&'static str),
+    #[error("field '{0}' cannot be empty")]
+    EmptyField(&'static str),
     #[error("unsupported A2UI version")]
     UnsupportedVersion,
 }
@@ -64,7 +66,7 @@ fn validate_required_string(
         .ok_or(A2uiValidationError::InvalidType(key))?;
 
     if value.is_empty() {
-        return Err(A2uiValidationError::InvalidType(key));
+        return Err(A2uiValidationError::EmptyField(key));
     }
     Ok(())
 }
@@ -121,5 +123,17 @@ mod tests {
         let known_good = known_good_document().to_string();
         let result = parse_and_validate_document(known_good.as_bytes());
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn empty_required_string_returns_empty_field_error() {
+        let invalid_document = json!({
+            "v": 1,
+            "surface": "",
+            "components": [{"id": "card1"}]
+        });
+
+        let result = validate_document(&invalid_document);
+        assert_eq!(result, Err(A2uiValidationError::EmptyField("surface")));
     }
 }

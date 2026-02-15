@@ -15,12 +15,12 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           fetch-depth: 0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7
         with:
           toolchain: 1.90.0
 
@@ -58,7 +58,7 @@ jobs:
           osv-scanner scan -L Cargo.lock --format json --output security-artifacts/osv-results.json
 
       - name: Gitleaks scan
-        uses: gitleaks/gitleaks-action@v2
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -85,7 +85,7 @@ jobs:
         run: bash scripts/generate-attestation-placeholder.sh security-artifacts/attestation-placeholder.json
 
       - name: Upload security artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: security-artifacts-${{ github.run_id }}
           path: security-artifacts/

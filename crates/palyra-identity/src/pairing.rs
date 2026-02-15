@@ -118,6 +118,15 @@ pub struct RevokedDevice {
     pub revoked_at_unix_ms: u64,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PersistedIdentityState {
+    ca: StoredCertificateAuthority,
+    paired_devices: HashMap<String, PairedDevice>,
+    revoked_devices: HashMap<String, RevokedDevice>,
+    revoked_certificate_fingerprints: HashSet<String>,
+}
+
+const IDENTITY_STATE_BUNDLE_KEY: &str = "identity/state.v1.json";
 const GATEWAY_CA_STATE_KEY: &str = "identity/ca/state.json";
 const PAIRED_DEVICES_STATE_KEY: &str = "identity/pairing/paired_devices.json";
 const REVOKED_DEVICES_STATE_KEY: &str = "identity/pairing/revoked_devices.json";
@@ -138,23 +147,25 @@ pub struct IdentityManager {
 
 impl IdentityManager {
     pub fn with_store(store: Arc<dyn SecretStore>) -> IdentityResult<Self> {
-        let ca = load_or_init_gateway_ca(store.as_ref())?;
-        let paired_devices = load_paired_devices(store.as_ref())?;
-        let revoked_devices = load_revoked_devices(store.as_ref())?;
-        let revoked_certificate_fingerprints =
-            load_revoked_certificate_fingerprints(store.as_ref())?;
+        let (state, loaded_from_bundle) = load_identity_state(store.as_ref())?;
+        let ca = CertificateAuthority::from_stored(&state.ca)?;
 
-        Ok(Self {
+        let manager = Self {
             store,
             pairing_window: DEFAULT_PAIRING_WINDOW,
             certificate_validity: DEFAULT_CERT_VALIDITY,
             rotation_threshold: DEFAULT_ROTATION_THRESHOLD,
             active_sessions: HashMap::new(),
-            paired_devices,
-            revoked_devices,
-            revoked_certificate_fingerprints,
+            paired_devices: state.paired_devices,
+            revoked_devices: state.revoked_devices,
+            revoked_certificate_fingerprints: state.revoked_certificate_fingerprints,
             ca,
-        })
+        };
+        if !loaded_from_bundle {
+            manager.persist_identity_state_bundle()?;
+        }
+
+        Ok(manager)
     }
 
     pub fn with_memory_store() -> IdentityResult<Self> {
@@ -183,7 +194,7 @@ impl IdentityManager {
         common_name: &str,
     ) -> IdentityResult<IssuedCertificate> {
         let issued = self.ca.issue_server_certificate(common_name, self.certificate_validity)?;
-        self.persist_gateway_ca_state()?;
+        self.persist_identity_state_bundle()?;
         Ok(issued)
     }
 
@@ -357,7 +368,7 @@ impl IdentityManager {
             &active.public.challenge,
             &transcript_context,
         )?;
-        if expected_mac != hello.transcript_mac {
+        if !constant_time_eq(expected_mac.as_slice(), hello.transcript_mac.as_slice()) {
             self.active_sessions.remove(&hello.session_id);
             return Err(IdentityError::TranscriptVerificationFailed);
         }
@@ -370,7 +381,6 @@ impl IdentityManager {
             identity_fingerprint.as_str(),
             self.certificate_validity,
         )?;
-        self.persist_gateway_ca_state()?;
         let certificate_fingerprint = certificate_fingerprint_hex(&certificate.certificate_pem)?;
 
         let paired = PairedDevice {
@@ -384,10 +394,9 @@ impl IdentityManager {
         };
         if let Some(previous) = self.paired_devices.get(&hello.device_id).cloned() {
             self.revoke_superseded_certificates(&previous)?;
-            self.persist_revoked_certificate_fingerprints()?;
         }
         self.paired_devices.insert(hello.device_id.clone(), paired.clone());
-        self.persist_paired_devices()?;
+        self.persist_identity_state_bundle()?;
 
         Ok(PairingResult {
             device: paired,
@@ -412,7 +421,6 @@ impl IdentityManager {
             paired.identity_fingerprint.as_str(),
             self.certificate_validity,
         )?;
-        self.persist_gateway_ca_state()?;
         let rotated_fingerprint = certificate_fingerprint_hex(&rotated.certificate_pem)?;
         let previous_fingerprints = paired.certificate_fingerprints.clone();
         let mut updated = paired;
@@ -425,8 +433,7 @@ impl IdentityManager {
             self.revoked_certificate_fingerprints.insert(fingerprint);
         }
         self.paired_devices.insert(device_id.to_owned(), updated);
-        self.persist_revoked_certificate_fingerprints()?;
-        self.persist_paired_devices()?;
+        self.persist_identity_state_bundle()?;
         Ok(rotated)
     }
 
@@ -440,6 +447,9 @@ impl IdentityManager {
         }
         let paired =
             self.paired_devices.get(device_id).cloned().ok_or(IdentityError::DeviceNotPaired)?;
+        if paired.current_certificate.private_key_pem.is_empty() {
+            return self.force_rotate_device_certificate(device_id);
+        }
         if should_rotate_certificate(&paired.current_certificate, now, self.rotation_threshold)? {
             return self.force_rotate_device_certificate(device_id);
         }
@@ -461,9 +471,7 @@ impl IdentityManager {
             revoked_at_unix_ms: unix_ms(now)?,
         };
         self.revoked_devices.insert(device_id.to_owned(), revoked);
-        self.persist_paired_devices()?;
-        self.persist_revoked_devices()?;
-        self.persist_revoked_certificate_fingerprints()?;
+        self.persist_identity_state_bundle()?;
         Ok(())
     }
 
@@ -482,24 +490,14 @@ impl IdentityManager {
         self.revoked_certificate_fingerprints.clone()
     }
 
-    fn persist_gateway_ca_state(&self) -> IdentityResult<()> {
-        write_json(self.store.as_ref(), GATEWAY_CA_STATE_KEY, &self.ca.to_stored())
-    }
-
-    fn persist_paired_devices(&self) -> IdentityResult<()> {
-        write_json(self.store.as_ref(), PAIRED_DEVICES_STATE_KEY, &self.paired_devices)
-    }
-
-    fn persist_revoked_devices(&self) -> IdentityResult<()> {
-        write_json(self.store.as_ref(), REVOKED_DEVICES_STATE_KEY, &self.revoked_devices)
-    }
-
-    fn persist_revoked_certificate_fingerprints(&self) -> IdentityResult<()> {
-        write_json(
-            self.store.as_ref(),
-            REVOKED_CERTIFICATES_STATE_KEY,
-            &self.revoked_certificate_fingerprints,
-        )
+    fn persist_identity_state_bundle(&self) -> IdentityResult<()> {
+        let state = PersistedIdentityState {
+            ca: self.ca.to_stored(),
+            paired_devices: self.paired_devices.clone(),
+            revoked_devices: self.revoked_devices.clone(),
+            revoked_certificate_fingerprints: self.revoked_certificate_fingerprints.clone(),
+        };
+        write_json(self.store.as_ref(), IDENTITY_STATE_BUNDLE_KEY, &state)
     }
 
     fn revoke_superseded_certificates(&mut self, paired: &PairedDevice) -> IdentityResult<()> {
@@ -528,18 +526,40 @@ fn load_or_init_gateway_ca(store: &dyn SecretStore) -> IdentityResult<Certificat
     }
 }
 
-fn load_paired_devices(store: &dyn SecretStore) -> IdentityResult<HashMap<String, PairedDevice>> {
-    read_json_or_default(store, PAIRED_DEVICES_STATE_KEY)
+fn load_identity_state(store: &dyn SecretStore) -> IdentityResult<(PersistedIdentityState, bool)> {
+    if let Some(bundle) = load_identity_state_bundle(store)? {
+        return Ok((bundle, true));
+    }
+
+    let ca = load_or_init_gateway_ca(store)?;
+    let paired_devices = read_json_or_default(store, PAIRED_DEVICES_STATE_KEY)?;
+    let revoked_devices = read_json_or_default(store, REVOKED_DEVICES_STATE_KEY)?;
+    let revoked_certificate_fingerprints =
+        read_json_or_default(store, REVOKED_CERTIFICATES_STATE_KEY)?;
+
+    Ok((
+        PersistedIdentityState {
+            ca: ca.to_stored(),
+            paired_devices,
+            revoked_devices,
+            revoked_certificate_fingerprints,
+        },
+        false,
+    ))
 }
 
-fn load_revoked_devices(store: &dyn SecretStore) -> IdentityResult<HashMap<String, RevokedDevice>> {
-    read_json_or_default(store, REVOKED_DEVICES_STATE_KEY)
-}
-
-fn load_revoked_certificate_fingerprints(
+fn load_identity_state_bundle(
     store: &dyn SecretStore,
-) -> IdentityResult<HashSet<String>> {
-    read_json_or_default(store, REVOKED_CERTIFICATES_STATE_KEY)
+) -> IdentityResult<Option<PersistedIdentityState>> {
+    match store.read_secret(IDENTITY_STATE_BUNDLE_KEY) {
+        Ok(raw) => {
+            let state: PersistedIdentityState = serde_json::from_slice(&raw)
+                .map_err(|error| IdentityError::Internal(error.to_string()))?;
+            Ok(Some(state))
+        }
+        Err(IdentityError::SecretNotFound) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn read_json_or_default<T>(store: &dyn SecretStore, key: &str) -> IdentityResult<T>
@@ -663,11 +683,67 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+    };
 
     use super::*;
-    use crate::device::DeviceIdentity;
+    use crate::{device::DeviceIdentity, store::SecretStore};
     use proptest::prelude::*;
+
+    struct ToggleFailSecretStore {
+        state: Mutex<HashMap<String, Vec<u8>>>,
+        fail_writes: Mutex<bool>,
+    }
+
+    impl ToggleFailSecretStore {
+        fn new() -> Self {
+            Self { state: Mutex::new(HashMap::new()), fail_writes: Mutex::new(false) }
+        }
+
+        fn set_fail_writes(&self, value: bool) {
+            let mut guard =
+                self.fail_writes.lock().expect("fail_writes lock should not be poisoned");
+            *guard = value;
+        }
+    }
+
+    impl SecretStore for ToggleFailSecretStore {
+        fn write_secret(&self, key: &str, value: &[u8]) -> IdentityResult<()> {
+            let fail_writes = self.fail_writes.lock().map_err(|_| {
+                IdentityError::Internal("store fail_writes lock poisoned".to_owned())
+            })?;
+            if *fail_writes {
+                return Err(IdentityError::Internal("injected write failure".to_owned()));
+            }
+            drop(fail_writes);
+
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| IdentityError::Internal("store state lock poisoned".to_owned()))?;
+            state.insert(key.to_owned(), value.to_vec());
+            Ok(())
+        }
+
+        fn read_secret(&self, key: &str) -> IdentityResult<Vec<u8>> {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| IdentityError::Internal("store state lock poisoned".to_owned()))?;
+            state.get(key).cloned().ok_or(IdentityError::SecretNotFound)
+        }
+
+        fn delete_secret(&self, key: &str) -> IdentityResult<()> {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| IdentityError::Internal("store state lock poisoned".to_owned()))?;
+            state.remove(key);
+            Ok(())
+        }
+    }
 
     fn sample_device_id() -> &'static str {
         "01ARZ3NDEKTSV4RRFFQ69G5FAV"
@@ -969,6 +1045,80 @@ mod tests {
         assert!(
             !revoked.contains(&second_fingerprint),
             "newly paired certificate fingerprint must remain valid"
+        );
+    }
+
+    #[test]
+    fn rotate_if_due_reissues_certificate_when_private_key_is_not_persisted() {
+        let store = Arc::new(InMemorySecretStore::new());
+        let mut first =
+            IdentityManager::with_store(store.clone()).expect("manager should initialize");
+        let (_, _, hello) = start_pin_pairing(&mut first, "123456");
+        let pairing =
+            first.complete_pairing(hello, SystemTime::now()).expect("pairing should complete");
+        drop(first);
+
+        let mut second =
+            IdentityManager::with_store(store).expect("manager should reload from store");
+        let before = second
+            .paired_device(sample_device_id())
+            .expect("paired device should be available")
+            .current_certificate
+            .clone();
+        assert!(
+            before.private_key_pem.is_empty(),
+            "private key should be absent after state rehydration"
+        );
+        let before_fingerprint =
+            certificate_fingerprint_hex(&before.certificate_pem).expect("fingerprint should parse");
+
+        let rotated = second
+            .rotate_device_certificate_if_due(sample_device_id(), SystemTime::now())
+            .expect("certificate should be reissued when private key is unavailable");
+        assert!(
+            !rotated.private_key_pem.is_empty(),
+            "rotated certificate must include private key"
+        );
+        assert!(
+            rotated.sequence > pairing.device.current_certificate.sequence,
+            "reissued certificate sequence must advance"
+        );
+        assert!(
+            second.revoked_certificate_fingerprints().contains(&before_fingerprint),
+            "previous certificate should be revoked after keyless reissue"
+        );
+    }
+
+    #[test]
+    fn failed_bundle_write_does_not_persist_partial_rotation_state() {
+        let store = Arc::new(ToggleFailSecretStore::new());
+        let mut manager =
+            IdentityManager::with_store(store.clone()).expect("manager should initialize");
+        let (_, _, hello) = start_pin_pairing(&mut manager, "123456");
+        let pairing =
+            manager.complete_pairing(hello, SystemTime::now()).expect("pairing should complete");
+
+        let baseline_sequence = pairing.device.current_certificate.sequence;
+        let baseline_revoked = manager.revoked_certificate_fingerprints();
+
+        store.set_fail_writes(true);
+        let rotation = manager.force_rotate_device_certificate(sample_device_id());
+        assert!(rotation.is_err(), "rotation should fail when bundle persistence fails");
+        store.set_fail_writes(false);
+
+        let reloaded =
+            IdentityManager::with_store(store).expect("manager should reload from persisted state");
+        let restored = reloaded
+            .paired_device(sample_device_id())
+            .expect("paired device should remain persisted");
+        assert_eq!(
+            restored.current_certificate.sequence, baseline_sequence,
+            "failed write must not persist rotated certificate sequence"
+        );
+        assert_eq!(
+            reloaded.revoked_certificate_fingerprints(),
+            baseline_revoked,
+            "failed write must not persist revocation side effects"
         );
     }
 

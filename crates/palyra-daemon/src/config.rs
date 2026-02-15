@@ -27,18 +27,21 @@ pub struct IdentityConfig {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RootFileConfig {
     daemon: Option<FileDaemonConfig>,
     identity: Option<FileIdentityConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FileDaemonConfig {
     bind_addr: Option<String>,
     port: Option<u16>,
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FileIdentityConfig {
     allow_insecure_node_rpc_without_mtls: Option<bool>,
 }
@@ -146,5 +149,27 @@ mod tests {
         .expect("toml should parse");
         let identity = parsed.identity.expect("identity config should be present");
         assert_eq!(identity.allow_insecure_node_rpc_without_mtls, Some(true));
+    }
+
+    #[test]
+    fn config_rejects_unknown_top_level_key() {
+        let result: Result<RootFileConfig, _> =
+            toml::from_str("unexpected=true\n[daemon]\nport=7142\n");
+        assert!(result.is_err(), "unknown top-level keys must be rejected");
+    }
+
+    #[test]
+    fn config_rejects_unknown_daemon_key() {
+        let result: Result<RootFileConfig, _> =
+            toml::from_str("[daemon]\nport=7142\nunexpected=true\n");
+        assert!(result.is_err(), "unknown daemon keys must be rejected");
+    }
+
+    #[test]
+    fn config_rejects_unknown_identity_key() {
+        let result: Result<RootFileConfig, _> = toml::from_str(
+            "[identity]\nallow_insecure_node_rpc_without_mtls=true\nunexpected=true\n",
+        );
+        assert!(result.is_err(), "unknown identity keys must be rejected");
     }
 }

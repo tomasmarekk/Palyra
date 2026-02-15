@@ -35,10 +35,13 @@ impl MemoryRevocationIndex {
         Self { revoked_fingerprints: RwLock::new(fingerprints) }
     }
 
-    pub fn replace_all(&self, fingerprints: HashSet<String>) {
-        if let Ok(mut guard) = self.revoked_fingerprints.write() {
-            *guard = fingerprints;
-        }
+    pub fn replace_all(&self, fingerprints: HashSet<String>) -> IdentityResult<()> {
+        let mut guard = self
+            .revoked_fingerprints
+            .write()
+            .map_err(|_| IdentityError::Internal("revocation index lock poisoned".to_owned()))?;
+        *guard = fingerprints;
+        Ok(())
     }
 }
 
@@ -194,4 +197,30 @@ fn parse_private_key(pem: &str) -> IdentityResult<PrivateKeyDer<'static>> {
 
 fn certificate_fingerprint_hex(certificate: &CertificateDer<'_>) -> String {
     hex::encode(Sha256::digest(certificate.as_ref()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MemoryRevocationIndex;
+    use std::{
+        collections::HashSet,
+        panic::{self, AssertUnwindSafe},
+        sync::Arc,
+        thread,
+    };
+
+    #[test]
+    fn replace_all_returns_error_when_lock_is_poisoned() {
+        let index = Arc::new(MemoryRevocationIndex::default());
+        let poisoned = index.clone();
+        let _ = panic::catch_unwind(AssertUnwindSafe(|| {
+            let _guard =
+                poisoned.revoked_fingerprints.write().expect("write lock should be acquired");
+            panic!("intentional lock poisoning for test");
+        }));
+
+        thread::yield_now();
+        let result = index.replace_all(HashSet::from([String::from("deadbeef")]));
+        assert!(result.is_err(), "poisoned lock should return an explicit error");
+    }
 }

@@ -63,6 +63,14 @@ pub struct ReplayProtection {
     pub signature: Option<String>,
 }
 
+pub trait ReplayNonceStore {
+    fn consume_once(&self, nonce: &str, timestamp_unix_ms: u64) -> Result<(), WebhookPayloadError>;
+}
+
+pub trait WebhookSignatureVerifier {
+    fn verify(&self, payload_bytes: &[u8], signature: &str) -> Result<(), WebhookPayloadError>;
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum WebhookPayloadError {
     #[error("payload exceeds maximum size of {limit} bytes")]
@@ -131,6 +139,25 @@ pub fn parse_webhook_payload(input: &[u8]) -> Result<WebhookEnvelope, WebhookPay
     let now_unix_ms = current_unix_ms()
         .map_err(|_| WebhookPayloadError::InvalidValue("replay_protection.timestamp_unix_ms"))?;
     parse_webhook_payload_with_now(input, now_unix_ms)
+}
+
+pub fn verify_webhook_payload(
+    input: &[u8],
+    nonce_store: &dyn ReplayNonceStore,
+    verifier: &dyn WebhookSignatureVerifier,
+) -> Result<WebhookEnvelope, WebhookPayloadError> {
+    let envelope = parse_webhook_payload(input)?;
+    let signature = envelope
+        .replay_protection
+        .signature
+        .as_deref()
+        .ok_or(WebhookPayloadError::MissingField("replay_protection.signature"))?;
+    verifier.verify(input, signature)?;
+    nonce_store.consume_once(
+        &envelope.replay_protection.nonce,
+        envelope.replay_protection.timestamp_unix_ms,
+    )?;
+    Ok(envelope)
 }
 
 fn parse_webhook_payload_with_now(
@@ -311,15 +338,91 @@ fn is_valid_crockford_char(ch: char) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        collections::HashSet,
+        sync::Mutex,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
     use super::{
-        parse_config_path, parse_webhook_payload_with_now, validate_canonical_id, CanonicalIdError,
-        ConfigPathParseError, WebhookEnvelope, WebhookPayloadError,
+        parse_config_path, parse_webhook_payload_with_now, validate_canonical_id,
+        verify_webhook_payload, CanonicalIdError, ConfigPathParseError, ReplayNonceStore,
+        WebhookEnvelope, WebhookPayloadError, WebhookSignatureVerifier,
     };
 
     const REFERENCE_NOW_UNIX_MS: u64 = 1_730_000_000_000;
 
     fn parse_with_reference_now(payload: &[u8]) -> Result<WebhookEnvelope, WebhookPayloadError> {
         parse_webhook_payload_with_now(payload, REFERENCE_NOW_UNIX_MS)
+    }
+
+    #[derive(Default)]
+    struct InMemoryReplayNonceStore {
+        consumed_nonces: Mutex<HashSet<String>>,
+    }
+
+    impl ReplayNonceStore for InMemoryReplayNonceStore {
+        fn consume_once(
+            &self,
+            nonce: &str,
+            _timestamp_unix_ms: u64,
+        ) -> Result<(), WebhookPayloadError> {
+            let mut guard = self
+                .consumed_nonces
+                .lock()
+                .map_err(|_| WebhookPayloadError::InvalidValue("replay_protection.nonce"))?;
+            if !guard.insert(nonce.to_owned()) {
+                return Err(WebhookPayloadError::InvalidValue("replay_protection.nonce"));
+            }
+            Ok(())
+        }
+    }
+
+    struct PrefixSignatureVerifier;
+
+    impl WebhookSignatureVerifier for PrefixSignatureVerifier {
+        fn verify(
+            &self,
+            _payload_bytes: &[u8],
+            signature: &str,
+        ) -> Result<(), WebhookPayloadError> {
+            if signature == "sig:test-valid" {
+                Ok(())
+            } else {
+                Err(WebhookPayloadError::InvalidValue("replay_protection.signature"))
+            }
+        }
+    }
+
+    fn now_unix_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_millis() as u64
+    }
+
+    fn build_webhook_payload(
+        nonce: &str,
+        timestamp_unix_ms: u64,
+        signature: Option<&str>,
+    ) -> Vec<u8> {
+        let signature_field =
+            signature.map(|value| format!(r#","signature":"{value}""#)).unwrap_or_default();
+        format!(
+            r#"{{
+            "v": 1,
+            "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "event": "message.created",
+            "source": "slack",
+            "payload": {{"channel": "C123", "text": "hello"}},
+            "replay_protection": {{
+                "nonce": "{nonce}",
+                "timestamp_unix_ms": {timestamp_unix_ms}
+                {signature_field}
+            }}
+        }}"#
+        )
+        .into_bytes()
     }
 
     #[test]
@@ -544,6 +647,54 @@ mod tests {
             parse_with_reference_now(payload.as_slice()),
             Err(WebhookPayloadError::PayloadTooLarge { limit: 1_048_576 })
         );
+    }
+
+    #[test]
+    fn verify_webhook_payload_rejects_missing_signature() {
+        let payload = build_webhook_payload("1234567890abcdef", now_unix_ms(), None);
+        let nonce_store = InMemoryReplayNonceStore::default();
+        let verifier = PrefixSignatureVerifier;
+
+        assert_eq!(
+            verify_webhook_payload(payload.as_slice(), &nonce_store, &verifier),
+            Err(WebhookPayloadError::MissingField("replay_protection.signature"))
+        );
+    }
+
+    #[test]
+    fn verify_webhook_payload_rejects_invalid_signature() {
+        let payload = build_webhook_payload("1234567890abcdef", now_unix_ms(), Some("sig:invalid"));
+        let nonce_store = InMemoryReplayNonceStore::default();
+        let verifier = PrefixSignatureVerifier;
+
+        assert_eq!(
+            verify_webhook_payload(payload.as_slice(), &nonce_store, &verifier),
+            Err(WebhookPayloadError::InvalidValue("replay_protection.signature"))
+        );
+    }
+
+    #[test]
+    fn verify_webhook_payload_rejects_duplicate_nonce() {
+        let payload =
+            build_webhook_payload("1234567890abcdef", now_unix_ms(), Some("sig:test-valid"));
+        let nonce_store = InMemoryReplayNonceStore::default();
+        let verifier = PrefixSignatureVerifier;
+
+        let first = verify_webhook_payload(payload.as_slice(), &nonce_store, &verifier);
+        assert!(first.is_ok(), "fresh nonce should succeed");
+        let second = verify_webhook_payload(payload.as_slice(), &nonce_store, &verifier);
+        assert_eq!(second, Err(WebhookPayloadError::InvalidValue("replay_protection.nonce")));
+    }
+
+    #[test]
+    fn verify_webhook_payload_accepts_valid_signature_and_fresh_nonce() {
+        let payload =
+            build_webhook_payload("abcdef1234567890", now_unix_ms(), Some("sig:test-valid"));
+        let nonce_store = InMemoryReplayNonceStore::default();
+        let verifier = PrefixSignatureVerifier;
+
+        let result = verify_webhook_payload(payload.as_slice(), &nonce_store, &verifier);
+        assert!(result.is_ok(), "valid signature and nonce should pass verification");
     }
 
     #[test]

@@ -111,7 +111,9 @@ async fn pairing_connect_rotate_flow_requires_valid_client_cert() -> Result<()> 
     let rotated_certificate = manager
         .force_rotate_device_certificate(device_id)
         .context("failed to rotate device cert")?;
-    revocation_index.replace_all(manager.revoked_certificate_fingerprints());
+    revocation_index
+        .replace_all(manager.revoked_certificate_fingerprints())
+        .context("failed to refresh revocation index after certificate rotation")?;
     let stale_client = build_paired_device_client_mtls_config(
         &pairing_result.gateway_ca_certificate_pem,
         &pairing_result.device.current_certificate,
@@ -132,7 +134,9 @@ async fn pairing_connect_rotate_flow_requires_valid_client_cert() -> Result<()> 
     manager
         .revoke_device(device_id, "lost device", SystemTime::now())
         .context("failed to revoke device")?;
-    revocation_index.replace_all(manager.revoked_certificate_fingerprints());
+    revocation_index
+        .replace_all(manager.revoked_certificate_fingerprints())
+        .context("failed to refresh revocation index after device revocation")?;
     let revoked_client = build_paired_device_client_mtls_config(
         &pairing_result.gateway_ca_certificate_pem,
         &rotated_certificate,
@@ -209,7 +213,9 @@ async fn repairing_same_device_revokes_superseded_client_cert() -> Result<()> {
     let replacement_pairing = manager
         .complete_pairing(replacement_hello, SystemTime::now())
         .context("failed to complete replacement pairing")?;
-    revocation_index.replace_all(manager.revoked_certificate_fingerprints());
+    revocation_index
+        .replace_all(manager.revoked_certificate_fingerprints())
+        .context("failed to refresh revocation index after replacement pairing")?;
 
     let superseded_client = build_paired_device_client_mtls_config(
         &first_pairing.gateway_ca_certificate_pem,

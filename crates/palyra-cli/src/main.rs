@@ -237,6 +237,7 @@ fn run_config(command: ConfigCommand) -> Result<()> {
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ValidatedRootConfig {
     #[allow(dead_code)]
     daemon: Option<ValidatedDaemonConfig>,
@@ -245,6 +246,7 @@ struct ValidatedRootConfig {
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ValidatedDaemonConfig {
     #[allow(dead_code)]
     bind_addr: Option<String>,
@@ -253,6 +255,7 @@ struct ValidatedDaemonConfig {
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ValidatedIdentityConfig {
     #[allow(dead_code)]
     allow_insecure_node_rpc_without_mtls: Option<bool>,
