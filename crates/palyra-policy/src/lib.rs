@@ -11,6 +11,17 @@ pub enum PolicyDecision {
     DenyByDefault { reason: String },
 }
 
+const READ_ONLY_ACTION_ALLOWLIST: &[&str] = &[
+    "tool.read",
+    "tool.read.status",
+    "tool.status",
+    "tool.list",
+    "tool.health",
+    "tool.get",
+    "daemon.status",
+    "protocol.version",
+];
+
 #[must_use]
 pub fn evaluate(request: &PolicyRequest) -> PolicyDecision {
     if is_sensitive_action(request) {
@@ -39,9 +50,7 @@ fn is_sensitive_action(request: &PolicyRequest) -> bool {
 
 fn is_read_only_action(request: &PolicyRequest) -> bool {
     let action = request.action.to_ascii_lowercase();
-    action
-        .split('.')
-        .any(|segment| matches!(segment, "read" | "status" | "list" | "health" | "get"))
+    READ_ONLY_ACTION_ALLOWLIST.contains(&action.as_str())
 }
 
 #[cfg(test)]
@@ -99,6 +108,32 @@ mod tests {
             principal: "user:bootstrap".to_owned(),
             action: "tool.target.reset".to_owned(),
             resource: "tool:filesystem".to_owned(),
+        };
+
+        let decision = evaluate(&request);
+
+        assert!(matches!(decision, PolicyDecision::DenyByDefault { .. }));
+    }
+
+    #[test]
+    fn mixed_scope_mutating_action_is_denied() {
+        let request = PolicyRequest {
+            principal: "user:bootstrap".to_owned(),
+            action: "tool.read.write".to_owned(),
+            resource: "tool:filesystem".to_owned(),
+        };
+
+        let decision = evaluate(&request);
+
+        assert!(matches!(decision, PolicyDecision::DenyByDefault { .. }));
+    }
+
+    #[test]
+    fn stacked_read_only_tokens_are_denied_when_not_allowlisted() {
+        let request = PolicyRequest {
+            principal: "user:bootstrap".to_owned(),
+            action: "tool.status.health".to_owned(),
+            resource: "tool:daemon".to_owned(),
         };
 
         let decision = evaluate(&request);

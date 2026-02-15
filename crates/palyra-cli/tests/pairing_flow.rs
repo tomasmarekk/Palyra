@@ -59,3 +59,22 @@ fn pairing_pair_outputs_verifiable_identity_and_rotation() -> Result<()> {
     assert!(stdout.contains("pairing.rotation=simulated"));
     Ok(())
 }
+
+#[cfg(windows)]
+#[test]
+fn pairing_pair_works_on_windows_with_approval() -> Result<()> {
+    let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
+        .args(["pairing", "pair", "--device-id", DEVICE_ID, "--proof", "123456", "--approve"])
+        .output()
+        .context("failed to execute palyra pairing pair on windows")?;
+
+    assert!(
+        output.status.success(),
+        "pairing command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).context("stdout was not UTF-8")?;
+    assert!(stdout.contains("pairing.status=paired"));
+    assert!(stdout.contains("device_id=01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+    Ok(())
+}

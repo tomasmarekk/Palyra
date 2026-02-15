@@ -106,6 +106,24 @@ jobs:
       - name: Verify generated stubs are up to date
         run: bash scripts/protocol/check-generated-stubs.sh
 
+  web-lint:
+    name: Web lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install web dependencies
+        run: npm --prefix apps/web install --no-audit --no-fund
+
+      - name: Lint web app
+        run: npm --prefix apps/web run lint
+
   security:
     name: Security checks
     uses: ./.github/workflows/security.yml

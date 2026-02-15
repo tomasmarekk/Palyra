@@ -100,3 +100,58 @@ fn json_envelope_schemas_require_version_and_limits() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn message_envelope_json_and_proto_contracts_stay_aligned() -> Result<()> {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .canonicalize()
+        .context("failed to resolve repository root")?;
+    let json_schema =
+        repo_root.join("schemas").join("json").join("envelopes").join("message-envelope.v1.json");
+    let proto_schema =
+        repo_root.join("schemas").join("proto").join("palyra").join("v1").join("common.proto");
+
+    let json_content = fs::read_to_string(&json_schema)
+        .with_context(|| format!("failed to read {}", json_schema.display()))?;
+    let proto_content = fs::read_to_string(&proto_schema)
+        .with_context(|| format!("failed to read {}", proto_schema.display()))?;
+
+    for json_sender_field in ["\"display\"", "\"handle\"", "\"verified\""] {
+        assert!(
+            json_content.contains(json_sender_field),
+            "message envelope JSON schema must include sender.{json_sender_field}"
+        );
+    }
+    for proto_sender_field in
+        ["string sender_display = 11;", "string sender_handle = 4;", "bool sender_verified = 5;"]
+    {
+        assert!(
+            proto_content.contains(proto_sender_field),
+            "common.proto must include sender parity field: {proto_sender_field}"
+        );
+    }
+
+    assert!(json_content.contains("\"maxItems\": 32"));
+    assert!(json_content.contains("\"maximum\": 104857600"));
+    assert!(proto_content.contains("Canonical contract limit is 32 attachments."));
+    assert!(proto_content.contains("Canonical contract limit is 104857600 bytes."));
+
+    for json_trust in ["\"untrusted\"", "\"user-trusted\"", "\"system\""] {
+        assert!(
+            json_content.contains(json_trust),
+            "message envelope JSON schema must include trust value {json_trust}"
+        );
+    }
+    for proto_trust in
+        ["TRUST_LEVEL_UNTRUSTED = 0;", "TRUST_LEVEL_USER_TRUSTED = 1;", "TRUST_LEVEL_SYSTEM = 2;"]
+    {
+        assert!(
+            proto_content.contains(proto_trust),
+            "common.proto must include trust value {proto_trust}"
+        );
+    }
+
+    Ok(())
+}

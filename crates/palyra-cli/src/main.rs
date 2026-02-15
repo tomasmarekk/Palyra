@@ -1,7 +1,9 @@
 mod cli;
 
 use std::{
-    env, fs,
+    env,
+    ffi::OsString,
+    fs,
     io::Write,
     path::{Path, PathBuf},
     process::Command,
@@ -20,9 +22,13 @@ use palyra_common::{
     build_metadata, validate_canonical_id, HealthResponse, CANONICAL_JSON_ENVELOPE_VERSION,
     CANONICAL_PROTOCOL_MAJOR,
 };
+#[cfg(not(windows))]
+use palyra_identity::FilesystemSecretStore;
+#[cfg(windows)]
+use palyra_identity::InMemorySecretStore;
 use palyra_identity::{
-    default_identity_storage_path, DeviceIdentity, FilesystemSecretStore, IdentityManager,
-    PairingClientKind, PairingMethod, DEFAULT_CERT_VALIDITY,
+    DeviceIdentity, IdentityManager, PairingClientKind, PairingMethod, SecretStore,
+    DEFAULT_CERT_VALIDITY,
 };
 use palyra_policy::{evaluate, PolicyDecision, PolicyRequest};
 use reqwest::blocking::Client;
@@ -205,8 +211,12 @@ fn run_policy(command: PolicyCommand) -> Result<()> {
 fn run_config(command: ConfigCommand) -> Result<()> {
     match command {
         ConfigCommand::Validate { path } => {
+            let explicit_path = path.is_some();
             let path = path.unwrap_or_else(|| "palyra.toml".to_owned());
             if !std::path::Path::new(&path).exists() {
+                if explicit_path {
+                    anyhow::bail!("config file does not exist: {}", path);
+                }
                 println!("config=valid source=defaults");
                 return std::io::stdout().flush().context("stdout flush failed");
             }
@@ -240,9 +250,7 @@ fn run_pairing(command: PairingCommand) -> Result<()> {
 
             let now = SystemTime::now();
             let store_root = resolve_identity_store_root(store_dir)?;
-            let store = Arc::new(FilesystemSecretStore::new(&store_root).with_context(|| {
-                format!("failed to initialize secret store at {}", store_root.display())
-            })?);
+            let store = build_identity_store(&store_root)?;
             let mut manager = IdentityManager::with_store(store.clone())
                 .context("failed to initialize identity manager")?;
             let pairing_method = build_pairing_method(method, &proof);
@@ -293,8 +301,49 @@ fn resolve_identity_store_root(store_dir: Option<String>) -> Result<PathBuf> {
     if let Some(path) = store_dir {
         return Ok(PathBuf::from(path));
     }
-    let cwd = env::current_dir().context("failed to resolve current working directory")?;
-    Ok(default_identity_storage_path(cwd))
+    #[cfg(windows)]
+    {
+        default_identity_store_root_from_env(env::var_os("LOCALAPPDATA"))
+    }
+    #[cfg(not(windows))]
+    {
+        default_identity_store_root_from_env(env::var_os("XDG_STATE_HOME"), env::var_os("HOME"))
+    }
+}
+
+#[cfg(windows)]
+fn default_identity_store_root_from_env(localappdata: Option<OsString>) -> Result<PathBuf> {
+    let base = localappdata.map(PathBuf::from).context("LOCALAPPDATA is not set")?;
+    Ok(base.join("Palyra").join("identity"))
+}
+
+#[cfg(not(windows))]
+fn default_identity_store_root_from_env(
+    xdg_state_home: Option<OsString>,
+    home: Option<OsString>,
+) -> Result<PathBuf> {
+    if let Some(state_home) = xdg_state_home {
+        return Ok(PathBuf::from(state_home).join("palyra").join("identity"));
+    }
+
+    let home = home.map(PathBuf::from).context("HOME is not set")?;
+    Ok(home.join(".local").join("state").join("palyra").join("identity"))
+}
+
+fn build_identity_store(store_root: &Path) -> Result<Arc<dyn SecretStore>> {
+    #[cfg(windows)]
+    {
+        let _ = store_root;
+        // Windows persistent storage remains disabled in palyra-identity until ACL hardening lands.
+        Ok(Arc::new(InMemorySecretStore::new()))
+    }
+    #[cfg(not(windows))]
+    {
+        let store = FilesystemSecretStore::new(store_root).with_context(|| {
+            format!("failed to initialize secret store at {}", store_root.display())
+        })?;
+        Ok(Arc::new(store))
+    }
 }
 
 fn build_pairing_method(method: PairingMethodArg, proof: &str) -> PairingMethod {
@@ -357,9 +406,6 @@ fn required_directories_ok() -> bool {
         "infra/docker",
         "infra/nix",
         "infra/ci",
-        "docs/architecture",
-        "docs/security",
-        "docs/protocols",
         "fuzz/fuzz_targets",
     ]
     .iter()
@@ -409,4 +455,47 @@ struct DoctorCheck {
     key: &'static str,
     ok: bool,
     required: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_identity_store_root_from_env;
+    use anyhow::Result;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    #[cfg(not(windows))]
+    #[test]
+    fn identity_store_defaults_to_xdg_state_home_when_available() -> Result<()> {
+        let root = default_identity_store_root_from_env(
+            Some(OsString::from("/tmp/xdg-state")),
+            Some(OsString::from("/tmp/home")),
+        )?;
+        assert_eq!(root, PathBuf::from("/tmp/xdg-state").join("palyra").join("identity"));
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn identity_store_falls_back_to_home_state_directory() -> Result<()> {
+        let root = default_identity_store_root_from_env(None, Some(OsString::from("/tmp/home")))?;
+        assert_eq!(
+            root,
+            PathBuf::from("/tmp/home").join(".local").join("state").join("palyra").join("identity")
+        );
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn identity_store_uses_localappdata_on_windows() -> Result<()> {
+        let root = default_identity_store_root_from_env(Some(OsString::from(
+            r"C:\Users\Test\AppData\Local",
+        )))?;
+        assert_eq!(
+            root,
+            PathBuf::from(r"C:\Users\Test\AppData\Local").join("Palyra").join("identity")
+        );
+        Ok(())
+    }
 }

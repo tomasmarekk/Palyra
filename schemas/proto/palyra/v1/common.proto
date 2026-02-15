@@ -33,7 +33,11 @@ message EnvelopeOrigin {
   OriginType type = 1;
   string channel = 2;
   string conversation_id = 3;
+  // Canonical sender display name (JSON: origin.sender.display).
+  string sender_display = 11;
+  // Canonical sender handle (JSON: origin.sender.handle).
   string sender_handle = 4;
+  // Canonical sender verification bit (JSON: origin.sender.verified).
   bool sender_verified = 5;
 
   reserved 6 to 10;
@@ -50,6 +54,7 @@ message MessageAttachment {
 
   AttachmentKind kind = 1;
   CanonicalId artifact_id = 2;
+  // Canonical contract limit is 104857600 bytes.
   uint64 size_bytes = 3;
 
   reserved 4 to 8;
@@ -57,6 +62,7 @@ message MessageAttachment {
 
 message MessageContent {
   string text = 1;
+  // Canonical contract limit is 32 attachments.
   repeated MessageAttachment attachments = 2;
 
   reserved 3 to 8;
@@ -64,10 +70,9 @@ message MessageContent {
 
 message SecurityContext {
   enum TrustLevel {
-    TRUST_LEVEL_UNSPECIFIED = 0;
-    TRUST_LEVEL_UNTRUSTED = 1;
-    TRUST_LEVEL_USER_TRUSTED = 2;
-    TRUST_LEVEL_SYSTEM = 3;
+    TRUST_LEVEL_UNTRUSTED = 0;
+    TRUST_LEVEL_USER_TRUSTED = 1;
+    TRUST_LEVEL_SYSTEM = 2;
   }
 
   TrustLevel trust = 1;

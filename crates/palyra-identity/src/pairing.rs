@@ -319,7 +319,7 @@ impl IdentityManager {
         if hello.client_kind != active.public.client_kind {
             return Err(IdentityError::PairingClientKindMismatch);
         }
-        if hello.proof != active.public.method.proof() {
+        if !constant_time_eq(hello.proof.as_bytes(), active.public.method.proof().as_bytes()) {
             self.active_sessions.remove(&hello.session_id);
             return Err(IdentityError::InvalidPairingProof);
         }
@@ -631,6 +631,19 @@ fn derive_transcript_mac(
     Ok(output)
 }
 
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut diff = left.len() ^ right.len();
+    let max_len = left.len().max(right.len());
+
+    for index in 0..max_len {
+        let left_byte = left.get(index).copied().unwrap_or(0);
+        let right_byte = right.get(index).copied().unwrap_or(0);
+        diff |= usize::from(left_byte ^ right_byte);
+    }
+
+    diff == 0
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -730,6 +743,21 @@ mod tests {
             .expect("retry hello should build");
         let second = manager.complete_pairing(retry, SystemTime::now());
         assert!(matches!(second, Err(IdentityError::PairingSessionNotFound)));
+    }
+
+    #[test]
+    fn constant_time_eq_returns_true_for_equal_inputs() {
+        assert!(constant_time_eq(b"123456", b"123456"));
+    }
+
+    #[test]
+    fn constant_time_eq_returns_false_for_different_same_length_inputs() {
+        assert!(!constant_time_eq(b"123456", b"123457"));
+    }
+
+    #[test]
+    fn constant_time_eq_returns_false_for_different_length_inputs() {
+        assert!(!constant_time_eq(b"123456", b"1234567"));
     }
 
     #[test]
