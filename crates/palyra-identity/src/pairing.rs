@@ -1,7 +1,11 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
-    time::{Duration, SystemTime},
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, MutexGuard},
+    thread,
+    time::{Duration, Instant, SystemTime},
 };
 
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
@@ -17,7 +21,7 @@ use crate::{
     ca::{CertificateAuthority, IssuedCertificate, StoredCertificateAuthority},
     device::DeviceIdentity,
     error::{IdentityError, IdentityResult},
-    store::{InMemorySecretStore, SecretStore},
+    store::{FilesystemSecretStore, InMemorySecretStore, SecretStore},
     unix_ms, DEFAULT_CERT_VALIDITY, DEFAULT_PAIRING_WINDOW, DEFAULT_ROTATION_THRESHOLD,
     PAIRING_PROTOCOL_VERSION,
 };
@@ -120,6 +124,8 @@ pub struct RevokedDevice {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct PersistedIdentityState {
+    #[serde(default)]
+    generation: u64,
     ca: StoredCertificateAuthority,
     paired_devices: HashMap<String, PairedDevice>,
     revoked_devices: HashMap<String, RevokedDevice>,
@@ -132,6 +138,27 @@ const PAIRED_DEVICES_STATE_KEY: &str = "identity/pairing/paired_devices.json";
 const REVOKED_DEVICES_STATE_KEY: &str = "identity/pairing/revoked_devices.json";
 const REVOKED_CERTIFICATES_STATE_KEY: &str = "identity/pairing/revoked_certificates.json";
 const MAX_ACTIVE_PAIRING_SESSIONS: usize = 10_000;
+const IDENTITY_STATE_LOCK_FILENAME: &str = ".identity-state.lock";
+const IDENTITY_STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(3);
+const IDENTITY_STATE_LOCK_RETRY: Duration = Duration::from_millis(20);
+const IDENTITY_STATE_LOCK_STALE_AFTER: Duration = Duration::from_secs(30);
+
+static IDENTITY_STATE_PROCESS_LOCK: Mutex<()> = Mutex::new(());
+
+struct FilesystemStateLockGuard {
+    path: PathBuf,
+}
+
+impl Drop for FilesystemStateLockGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+struct StateMutationGuard {
+    _process: MutexGuard<'static, ()>,
+    _filesystem: Option<FilesystemStateLockGuard>,
+}
 
 pub struct IdentityManager {
     store: Arc<dyn SecretStore>,
@@ -142,6 +169,7 @@ pub struct IdentityManager {
     paired_devices: HashMap<String, PairedDevice>,
     revoked_devices: HashMap<String, RevokedDevice>,
     revoked_certificate_fingerprints: HashSet<String>,
+    state_generation: u64,
     ca: CertificateAuthority,
 }
 
@@ -150,7 +178,7 @@ impl IdentityManager {
         let (state, loaded_from_bundle) = load_identity_state(store.as_ref())?;
         let ca = CertificateAuthority::from_stored(&state.ca)?;
 
-        let manager = Self {
+        let mut manager = Self {
             store,
             pairing_window: DEFAULT_PAIRING_WINDOW,
             certificate_validity: DEFAULT_CERT_VALIDITY,
@@ -159,6 +187,7 @@ impl IdentityManager {
             paired_devices: state.paired_devices,
             revoked_devices: state.revoked_devices,
             revoked_certificate_fingerprints: state.revoked_certificate_fingerprints,
+            state_generation: state.generation,
             ca,
         };
         if !loaded_from_bundle {
@@ -189,13 +218,88 @@ impl IdentityManager {
         self.ca.certificate_pem.clone()
     }
 
+    fn mutate_persisted_state<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Self) -> IdentityResult<T>,
+    ) -> IdentityResult<T> {
+        let _guard = self.acquire_state_mutation_guard()?;
+        self.reload_persisted_state()?;
+        let result = operation(self)?;
+        self.persist_identity_state_bundle()?;
+        Ok(result)
+    }
+
+    fn acquire_state_mutation_guard(&self) -> IdentityResult<StateMutationGuard> {
+        let process = IDENTITY_STATE_PROCESS_LOCK.lock().map_err(|_| {
+            IdentityError::Internal("identity state process lock poisoned".to_owned())
+        })?;
+        let filesystem = self.acquire_filesystem_state_lock()?;
+        Ok(StateMutationGuard { _process: process, _filesystem: filesystem })
+    }
+
+    fn acquire_filesystem_state_lock(&self) -> IdentityResult<Option<FilesystemStateLockGuard>> {
+        let Some(store) = self.store.as_any().downcast_ref::<FilesystemSecretStore>() else {
+            return Ok(None);
+        };
+        let lock_path = store.root_path().join(IDENTITY_STATE_LOCK_FILENAME);
+        let start = Instant::now();
+        loop {
+            match fs::OpenOptions::new().create_new(true).write(true).open(&lock_path) {
+                Ok(mut file) => {
+                    let marker = format!(
+                        "pid={} ts_ms={}\n",
+                        std::process::id(),
+                        unix_ms(SystemTime::now())?
+                    );
+                    file.write_all(marker.as_bytes())
+                        .map_err(|error| IdentityError::Internal(error.to_string()))?;
+                    file.sync_all().map_err(|error| IdentityError::Internal(error.to_string()))?;
+                    return Ok(Some(FilesystemStateLockGuard { path: lock_path }));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if lock_file_is_stale(&lock_path)? {
+                        let _ = fs::remove_file(&lock_path);
+                        continue;
+                    }
+                    if start.elapsed() >= IDENTITY_STATE_LOCK_TIMEOUT {
+                        return Err(IdentityError::Internal(format!(
+                            "timed out waiting for identity state lock at {}",
+                            lock_path.display()
+                        )));
+                    }
+                    thread::sleep(IDENTITY_STATE_LOCK_RETRY);
+                }
+                Err(error) => return Err(IdentityError::Internal(error.to_string())),
+            }
+        }
+    }
+
+    fn reload_persisted_state(&mut self) -> IdentityResult<()> {
+        let state = if let Some(state) = load_identity_state_bundle(self.store.as_ref())? {
+            state
+        } else {
+            let (state, _) = load_identity_state(self.store.as_ref())?;
+            state
+        };
+        self.apply_persisted_state(state)
+    }
+
+    fn apply_persisted_state(&mut self, state: PersistedIdentityState) -> IdentityResult<()> {
+        self.ca = CertificateAuthority::from_stored(&state.ca)?;
+        self.paired_devices = state.paired_devices;
+        self.revoked_devices = state.revoked_devices;
+        self.revoked_certificate_fingerprints = state.revoked_certificate_fingerprints;
+        self.state_generation = state.generation;
+        Ok(())
+    }
+
     pub fn issue_gateway_server_certificate(
         &mut self,
         common_name: &str,
     ) -> IdentityResult<IssuedCertificate> {
-        let issued = self.ca.issue_server_certificate(common_name, self.certificate_validity)?;
-        self.persist_identity_state_bundle()?;
-        Ok(issued)
+        self.mutate_persisted_state(|manager| {
+            manager.ca.issue_server_certificate(common_name, manager.certificate_validity)
+        })
     }
 
     fn prune_expired_sessions(
@@ -305,6 +409,14 @@ impl IdentityManager {
         hello: DevicePairingHello,
         now: SystemTime,
     ) -> IdentityResult<PairingResult> {
+        self.mutate_persisted_state(|manager| manager.complete_pairing_inner(hello, now))
+    }
+
+    fn complete_pairing_inner(
+        &mut self,
+        hello: DevicePairingHello,
+        now: SystemTime,
+    ) -> IdentityResult<PairingResult> {
         self.prune_expired_sessions(now, Some(hello.session_id.as_str()))?;
         validate_canonical_id(&hello.device_id)
             .map_err(|error| IdentityError::InvalidCanonicalDeviceId(error.to_string()))?;
@@ -396,7 +508,6 @@ impl IdentityManager {
             self.revoke_superseded_certificates(&previous)?;
         }
         self.paired_devices.insert(hello.device_id.clone(), paired.clone());
-        self.persist_identity_state_bundle()?;
 
         Ok(PairingResult {
             device: paired,
@@ -405,6 +516,15 @@ impl IdentityManager {
     }
 
     pub fn force_rotate_device_certificate(
+        &mut self,
+        device_id: &str,
+    ) -> IdentityResult<IssuedCertificate> {
+        self.mutate_persisted_state(|manager| {
+            manager.force_rotate_device_certificate_inner(device_id)
+        })
+    }
+
+    fn force_rotate_device_certificate_inner(
         &mut self,
         device_id: &str,
     ) -> IdentityResult<IssuedCertificate> {
@@ -433,7 +553,6 @@ impl IdentityManager {
             self.revoked_certificate_fingerprints.insert(fingerprint);
         }
         self.paired_devices.insert(device_id.to_owned(), updated);
-        self.persist_identity_state_bundle()?;
         Ok(rotated)
     }
 
@@ -462,17 +581,18 @@ impl IdentityManager {
         reason: &str,
         now: SystemTime,
     ) -> IdentityResult<()> {
-        if let Some(paired) = self.paired_devices.remove(device_id) {
-            self.revoke_superseded_certificates(&paired)?;
-        }
-        let revoked = RevokedDevice {
-            device_id: device_id.to_owned(),
-            reason: reason.to_owned(),
-            revoked_at_unix_ms: unix_ms(now)?,
-        };
-        self.revoked_devices.insert(device_id.to_owned(), revoked);
-        self.persist_identity_state_bundle()?;
-        Ok(())
+        self.mutate_persisted_state(|manager| {
+            if let Some(paired) = manager.paired_devices.remove(device_id) {
+                manager.revoke_superseded_certificates(&paired)?;
+            }
+            let revoked = RevokedDevice {
+                device_id: device_id.to_owned(),
+                reason: reason.to_owned(),
+                revoked_at_unix_ms: unix_ms(now)?,
+            };
+            manager.revoked_devices.insert(device_id.to_owned(), revoked);
+            Ok(())
+        })
     }
 
     #[must_use]
@@ -490,14 +610,18 @@ impl IdentityManager {
         self.revoked_certificate_fingerprints.clone()
     }
 
-    fn persist_identity_state_bundle(&self) -> IdentityResult<()> {
+    fn persist_identity_state_bundle(&mut self) -> IdentityResult<()> {
+        let next_generation = self.state_generation.saturating_add(1);
         let state = PersistedIdentityState {
+            generation: next_generation,
             ca: self.ca.to_stored(),
             paired_devices: self.paired_devices.clone(),
             revoked_devices: self.revoked_devices.clone(),
             revoked_certificate_fingerprints: self.revoked_certificate_fingerprints.clone(),
         };
-        write_json(self.store.as_ref(), IDENTITY_STATE_BUNDLE_KEY, &state)
+        write_json(self.store.as_ref(), IDENTITY_STATE_BUNDLE_KEY, &state)?;
+        self.state_generation = next_generation;
+        Ok(())
     }
 
     fn revoke_superseded_certificates(&mut self, paired: &PairedDevice) -> IdentityResult<()> {
@@ -539,6 +663,7 @@ fn load_identity_state(store: &dyn SecretStore) -> IdentityResult<(PersistedIden
 
     Ok((
         PersistedIdentityState {
+            generation: 0,
             ca: ca.to_stored(),
             paired_devices,
             revoked_devices,
@@ -560,6 +685,21 @@ fn load_identity_state_bundle(
         Err(IdentityError::SecretNotFound) => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+fn lock_file_is_stale(path: &Path) -> IdentityResult<bool> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(IdentityError::Internal(error.to_string())),
+    };
+    let modified =
+        metadata.modified().map_err(|error| IdentityError::Internal(error.to_string()))?;
+    let age = match SystemTime::now().duration_since(modified) {
+        Ok(age) => age,
+        Err(_) => Duration::from_secs(0),
+    };
+    Ok(age >= IDENTITY_STATE_LOCK_STALE_AFTER)
 }
 
 fn read_json_or_default<T>(store: &dyn SecretStore, key: &str) -> IdentityResult<T>
@@ -743,17 +883,33 @@ mod tests {
             state.remove(key);
             Ok(())
         }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
     }
 
     fn sample_device_id() -> &'static str {
         "01ARZ3NDEKTSV4RRFFQ69G5FAV"
     }
 
+    fn sample_second_device_id() -> &'static str {
+        "01ARZ3NDEKTSV4RRFFQ69G5FAW"
+    }
+
     fn start_pin_pairing(
         manager: &mut IdentityManager,
         proof: &str,
     ) -> (DeviceIdentity, PairingSession, DevicePairingHello) {
-        let device = DeviceIdentity::generate(sample_device_id()).expect("device should generate");
+        start_pin_pairing_for_device(manager, sample_device_id(), proof)
+    }
+
+    fn start_pin_pairing_for_device(
+        manager: &mut IdentityManager,
+        device_id: &str,
+        proof: &str,
+    ) -> (DeviceIdentity, PairingSession, DevicePairingHello) {
+        let device = DeviceIdentity::generate(device_id).expect("device should generate");
         let session = manager
             .start_pairing(
                 PairingClientKind::Node,
@@ -978,6 +1134,37 @@ mod tests {
         let second = IdentityManager::with_store(store).expect("manager should reload from store");
         assert!(second.revoked_devices().contains(sample_device_id()));
         assert_eq!(second.revoked_certificate_fingerprints(), revoked_fingerprints);
+    }
+
+    #[test]
+    fn stale_manager_instance_does_not_clobber_existing_pairings() {
+        let store = Arc::new(InMemorySecretStore::new());
+        let mut first =
+            IdentityManager::with_store(store.clone()).expect("first manager should initialize");
+        let mut stale =
+            IdentityManager::with_store(store.clone()).expect("second manager should initialize");
+
+        let (_, _, first_hello) =
+            start_pin_pairing_for_device(&mut first, sample_device_id(), "123456");
+        first
+            .complete_pairing(first_hello, SystemTime::now())
+            .expect("first pairing should complete");
+
+        let (_, _, second_hello) =
+            start_pin_pairing_for_device(&mut stale, sample_second_device_id(), "123456");
+        stale
+            .complete_pairing(second_hello, SystemTime::now())
+            .expect("stale manager pairing should still preserve existing state");
+
+        let reloaded = IdentityManager::with_store(store).expect("manager should reload");
+        assert!(
+            reloaded.paired_device(sample_device_id()).is_some(),
+            "first pairing must remain present after stale manager write"
+        );
+        assert!(
+            reloaded.paired_device(sample_second_device_id()).is_some(),
+            "second pairing must be persisted"
+        );
     }
 
     #[test]

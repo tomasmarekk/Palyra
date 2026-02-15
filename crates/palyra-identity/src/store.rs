@@ -1,4 +1,5 @@
 use std::{
+    any::Any,
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
@@ -11,6 +12,7 @@ pub trait SecretStore: Send + Sync {
     fn write_secret(&self, key: &str, value: &[u8]) -> IdentityResult<()>;
     fn read_secret(&self, key: &str) -> IdentityResult<Vec<u8>>;
     fn delete_secret(&self, key: &str) -> IdentityResult<()>;
+    fn as_any(&self) -> &dyn Any;
 }
 
 #[derive(Default)]
@@ -50,6 +52,10 @@ impl SecretStore for InMemorySecretStore {
             .map_err(|_| IdentityError::Internal("store lock poisoned".to_owned()))?;
         state.remove(key);
         Ok(())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -91,6 +97,11 @@ impl FilesystemSecretStore {
         }
         Ok(self.root.join(hex::encode(key.as_bytes())))
     }
+
+    #[must_use]
+    pub fn root_path(&self) -> &Path {
+        &self.root
+    }
 }
 
 impl SecretStore for FilesystemSecretStore {
@@ -112,11 +123,12 @@ impl SecretStore for FilesystemSecretStore {
             };
 
             let path = self.key_path(key)?;
-            let tmp_path = path.with_extension("tmp");
-            if tmp_path.exists() {
-                fs::remove_file(&tmp_path)
-                    .map_err(|error| IdentityError::Internal(error.to_string()))?;
-            }
+            let tmp_path = loop {
+                let candidate = path.with_extension(format!("tmp.{}", ulid::Ulid::new()));
+                if !candidate.exists() {
+                    break candidate;
+                }
+            };
 
             let write_result: IdentityResult<()> = (|| {
                 let mut file = fs::OpenOptions::new()
@@ -166,6 +178,10 @@ impl SecretStore for FilesystemSecretStore {
         }
         Ok(())
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 pub fn default_identity_storage_path(root: impl AsRef<Path>) -> PathBuf {
@@ -178,6 +194,10 @@ mod tests {
     use super::{FilesystemSecretStore, SecretStore};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use std::sync::Arc;
+    #[cfg(unix)]
+    use std::thread;
     #[cfg(unix)]
     use tempfile::tempdir;
 
@@ -248,7 +268,11 @@ mod tests {
         let store = FilesystemSecretStore::new(temp.path()).expect("store should initialize");
         let key = "identity/pairing/paired_devices.json";
         let key_path = store.key_path(key).expect("key should map to path");
-        let tmp_path = key_path.with_extension("tmp");
+        let key_file_name = key_path
+            .file_name()
+            .expect("key path should include file name")
+            .to_string_lossy()
+            .into_owned();
 
         for sequence in 1..=5 {
             let payload = format!(r#"{{"sequence":{sequence}}}"#);
@@ -257,7 +281,55 @@ mod tests {
             let parsed: serde_json::Value =
                 serde_json::from_slice(&readback).expect("persisted secret should be valid JSON");
             assert_eq!(parsed["sequence"].as_u64(), Some(sequence));
-            assert!(!tmp_path.exists(), "temporary swap file should be cleaned up");
+            let stale_tmp_exists = std::fs::read_dir(temp.path())
+                .expect("temporary directory should be readable")
+                .filter_map(Result::ok)
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .any(|file_name| file_name.starts_with(format!("{key_file_name}.tmp.").as_str()));
+            assert!(!stale_tmp_exists, "temporary swap files should be cleaned up");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_secret_store_handles_concurrent_writes_without_tmp_collisions() {
+        let temp = tempdir().expect("temp dir should initialize");
+        let store =
+            Arc::new(FilesystemSecretStore::new(temp.path()).expect("store should initialize"));
+        let key = "identity/pairing/paired_devices.json";
+
+        let mut handles = Vec::new();
+        for worker in 0..8 {
+            let store = Arc::clone(&store);
+            let key = key.to_owned();
+            handles.push(thread::spawn(move || {
+                for sequence in 0..50 {
+                    let payload = format!(r#"{{"worker":{worker},"sequence":{sequence}}}"#);
+                    store
+                        .write_secret(&key, payload.as_bytes())
+                        .expect("concurrent secret write should succeed");
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("worker should join successfully");
+        }
+
+        let key_path = store.key_path(key).expect("key should map to path");
+        let key_file_name = key_path
+            .file_name()
+            .expect("key path should include file name")
+            .to_string_lossy()
+            .into_owned();
+        let stale_tmp_files: Vec<String> = std::fs::read_dir(temp.path())
+            .expect("temporary directory should be readable")
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|file_name| file_name.starts_with(format!("{key_file_name}.tmp.").as_str()))
+            .collect();
+        assert!(
+            stale_tmp_files.is_empty(),
+            "temporary files should not remain after concurrent writes: {stale_tmp_files:?}"
+        );
     }
 }

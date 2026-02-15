@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
 
+pub mod daemon_config_schema;
+
 pub const CANONICAL_PROTOCOL_MAJOR: u32 = 1;
 pub const CANONICAL_JSON_ENVELOPE_VERSION: u32 = 1;
 const WEBHOOK_MAX_PAYLOAD_BYTES: usize = 1_048_576;
@@ -172,7 +174,12 @@ fn parse_webhook_payload_with_now(
         serde_json::from_slice(input).map_err(|_| WebhookPayloadError::InvalidJson)?;
     let object = root.as_object().ok_or(WebhookPayloadError::NotAnObject)?;
     reject_additional_properties(object, WEBHOOK_ALLOWED_FIELDS, "envelope.additional_properties")?;
-    validate_optional_limits(object)?;
+    let declared_max_payload_bytes = validate_optional_limits(object)?;
+    if let Some(max_payload_bytes) = declared_max_payload_bytes {
+        if input.len() > max_payload_bytes as usize {
+            return Err(WebhookPayloadError::InvalidValue("limits.max_payload_bytes"));
+        }
+    }
 
     let version = read_required_u32(object, "v")?;
     if version != CANONICAL_JSON_ENVELOPE_VERSION {
@@ -254,9 +261,11 @@ fn read_replay_protection(
     Ok(ReplayProtection { nonce, timestamp_unix_ms, signature })
 }
 
-fn validate_optional_limits(object: &Map<String, Value>) -> Result<(), WebhookPayloadError> {
+fn validate_optional_limits(
+    object: &Map<String, Value>,
+) -> Result<Option<u64>, WebhookPayloadError> {
     let Some(limits_value) = object.get("limits") else {
-        return Ok(());
+        return Ok(None);
     };
     let limits = limits_value.as_object().ok_or(WebhookPayloadError::InvalidType("limits"))?;
     reject_additional_properties(
@@ -272,9 +281,10 @@ fn validate_optional_limits(object: &Map<String, Value>) -> Result<(), WebhookPa
         if max_payload_bytes == 0 || max_payload_bytes > WEBHOOK_MAX_PAYLOAD_BYTES as u64 {
             return Err(WebhookPayloadError::InvalidValue("limits.max_payload_bytes"));
         }
+        return Ok(Some(max_payload_bytes));
     }
 
-    Ok(())
+    Ok(None)
 }
 
 fn reject_additional_properties(
@@ -638,6 +648,29 @@ mod tests {
 
         let parsed = parse_with_reference_now(payload).expect("payload should parse");
         assert_eq!(parsed.v, 1);
+    }
+
+    #[test]
+    fn parse_webhook_payload_rejects_when_declared_limit_is_lower_than_payload_size() {
+        let payload = br#"{
+            "v": 1,
+            "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "event": "message.created",
+            "source": "slack",
+            "payload": { "channel": "C123", "text": "hello" },
+            "replay_protection": {
+                "nonce": "1234567890abcdef",
+                "timestamp_unix_ms": 1730000000000
+            },
+            "limits": {
+                "max_payload_bytes": 64
+            }
+        }"#;
+
+        assert_eq!(
+            parse_with_reference_now(payload),
+            Err(WebhookPayloadError::InvalidValue("limits.max_payload_bytes"))
+        );
     }
 
     #[test]

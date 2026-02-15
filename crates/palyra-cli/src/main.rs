@@ -4,7 +4,7 @@ use std::{
     env,
     ffi::OsString,
     fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
@@ -19,8 +19,8 @@ use cli::{
     PairingMethodArg, PolicyCommand, ProtocolCommand,
 };
 use palyra_common::{
-    build_metadata, validate_canonical_id, HealthResponse, CANONICAL_JSON_ENVELOPE_VERSION,
-    CANONICAL_PROTOCOL_MAJOR,
+    build_metadata, daemon_config_schema::RootFileConfig, validate_canonical_id, HealthResponse,
+    CANONICAL_JSON_ENVELOPE_VERSION, CANONICAL_PROTOCOL_MAJOR,
 };
 #[cfg(not(windows))]
 use palyra_identity::FilesystemSecretStore;
@@ -236,33 +236,8 @@ fn run_config(command: ConfigCommand) -> Result<()> {
     }
 }
 
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ValidatedRootConfig {
-    #[allow(dead_code)]
-    daemon: Option<ValidatedDaemonConfig>,
-    #[allow(dead_code)]
-    identity: Option<ValidatedIdentityConfig>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ValidatedDaemonConfig {
-    #[allow(dead_code)]
-    bind_addr: Option<String>,
-    #[allow(dead_code)]
-    port: Option<u16>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ValidatedIdentityConfig {
-    #[allow(dead_code)]
-    allow_insecure_node_rpc_without_mtls: Option<bool>,
-}
-
 fn validate_daemon_compatible_config(content: &str) -> Result<()> {
-    let _: ValidatedRootConfig = toml::from_str(content).context("invalid daemon config schema")?;
+    let _: RootFileConfig = toml::from_str(content).context("invalid daemon config schema")?;
     Ok(())
 }
 
@@ -283,6 +258,7 @@ fn run_pairing(command: PairingCommand) -> Result<()> {
             client_kind,
             method,
             proof,
+            proof_stdin,
             store_dir,
             approve,
             simulate_rotation,
@@ -298,6 +274,7 @@ fn run_pairing(command: PairingCommand) -> Result<()> {
             let store = build_identity_store(&store_root)?;
             let mut manager = IdentityManager::with_store(store.clone())
                 .context("failed to initialize identity manager")?;
+            let proof = resolve_pairing_proof(proof, proof_stdin)?;
             let pairing_method = build_pairing_method(method, &proof);
 
             let session = manager
@@ -305,7 +282,6 @@ fn run_pairing(command: PairingCommand) -> Result<()> {
                 .context("failed to start pairing session")?;
             let device = DeviceIdentity::generate(&device_id)
                 .context("failed to generate device identity")?;
-            device.store(store.as_ref()).context("failed to persist device identity")?;
 
             let hello = manager
                 .build_device_hello(&session, &device, &proof)
@@ -313,6 +289,21 @@ fn run_pairing(command: PairingCommand) -> Result<()> {
             let result = manager
                 .complete_pairing(hello, now)
                 .context("failed to complete pairing handshake")?;
+            if let Err(store_error) = device.store(store.as_ref()) {
+                let rollback = manager.revoke_device(
+                    &device_id,
+                    "device identity persistence failed after pairing",
+                    SystemTime::now(),
+                );
+                if let Err(rollback_error) = rollback {
+                    anyhow::bail!(
+                        "failed to persist device identity after pairing ({store_error}); rollback revoke failed ({rollback_error})"
+                    );
+                }
+                anyhow::bail!(
+                    "failed to persist device identity after pairing: {store_error}; pairing was rolled back"
+                );
+            }
 
             println!(
                 "pairing.status=paired device_id={} client_kind={} method={} identity_fingerprint={} signing_public_key_hex={} transcript_hash={} cert_sequence={} cert_expires_at_unix_ms={} store_root={}",
@@ -397,6 +388,22 @@ fn build_pairing_method(method: PairingMethodArg, proof: &str) -> PairingMethod 
         PairingMethodArg::Pin => PairingMethod::Pin { code: proof.to_owned() },
         PairingMethodArg::Qr => PairingMethod::Qr { token: proof.to_owned() },
     }
+}
+
+fn resolve_pairing_proof(proof: Option<String>, proof_stdin: bool) -> Result<String> {
+    if proof_stdin {
+        let mut input = String::new();
+        std::io::stdin()
+            .read_to_string(&mut input)
+            .context("failed to read pairing proof from stdin")?;
+        let proof = input.trim_end_matches(['\r', '\n']);
+        if proof.is_empty() {
+            anyhow::bail!("pairing proof from stdin is empty");
+        }
+        return Ok(proof.to_owned());
+    }
+
+    proof.context("missing pairing proof: use --proof or --proof-stdin")
 }
 
 fn to_identity_client_kind(value: PairingClientKindArg) -> PairingClientKind {
@@ -505,7 +512,7 @@ struct DoctorCheck {
 
 #[cfg(test)]
 mod tests {
-    use super::default_identity_store_root_from_env;
+    use super::{default_identity_store_root_from_env, resolve_pairing_proof};
     use anyhow::Result;
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -543,5 +550,18 @@ mod tests {
             PathBuf::from(r"C:\Users\Test\AppData\Local").join("Palyra").join("identity")
         );
         Ok(())
+    }
+
+    #[test]
+    fn resolve_pairing_proof_accepts_explicit_value() {
+        let proof =
+            resolve_pairing_proof(Some("123456".to_owned()), false).expect("proof should resolve");
+        assert_eq!(proof, "123456");
+    }
+
+    #[test]
+    fn resolve_pairing_proof_requires_value_or_stdin_flag() {
+        let result = resolve_pairing_proof(None, false);
+        assert!(result.is_err(), "proof resolution should fail without any proof source");
     }
 }

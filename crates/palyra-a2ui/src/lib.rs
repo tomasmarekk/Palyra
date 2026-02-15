@@ -82,7 +82,7 @@ fn validate_required_array(
         .ok_or(A2uiValidationError::InvalidType(key))?;
 
     if array.is_empty() {
-        return Err(A2uiValidationError::InvalidType(key));
+        return Err(A2uiValidationError::EmptyField(key));
     }
     Ok(())
 }
@@ -135,5 +135,17 @@ mod tests {
 
         let result = validate_document(&invalid_document);
         assert_eq!(result, Err(A2uiValidationError::EmptyField("surface")));
+    }
+
+    #[test]
+    fn empty_required_array_returns_empty_field_error() {
+        let invalid_document = json!({
+            "v": 1,
+            "surface": "main",
+            "components": []
+        });
+
+        let result = validate_document(&invalid_document);
+        assert_eq!(result, Err(A2uiValidationError::EmptyField("components")));
     }
 }

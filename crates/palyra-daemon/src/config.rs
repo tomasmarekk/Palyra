@@ -1,8 +1,7 @@
 use std::{env, fs, path::PathBuf};
 
 use anyhow::{Context, Result};
-use palyra_common::parse_config_path;
-use serde::Deserialize;
+use palyra_common::{daemon_config_schema::RootFileConfig, parse_config_path};
 
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 7142;
@@ -24,26 +23,6 @@ pub struct DaemonConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdentityConfig {
     pub allow_insecure_node_rpc_without_mtls: bool,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RootFileConfig {
-    daemon: Option<FileDaemonConfig>,
-    identity: Option<FileIdentityConfig>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FileDaemonConfig {
-    bind_addr: Option<String>,
-    port: Option<u16>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FileIdentityConfig {
-    allow_insecure_node_rpc_without_mtls: Option<bool>,
 }
 
 impl Default for DaemonConfig {
@@ -130,7 +109,8 @@ fn find_config_path() -> Result<Option<PathBuf>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{IdentityConfig, RootFileConfig};
+    use super::IdentityConfig;
+    use palyra_common::daemon_config_schema::RootFileConfig;
 
     #[test]
     fn identity_config_defaults_to_secure_mode() {

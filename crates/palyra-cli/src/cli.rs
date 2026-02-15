@@ -82,8 +82,10 @@ pub enum PairingCommand {
         client_kind: PairingClientKindArg,
         #[arg(long, value_enum, default_value_t = PairingMethodArg::Pin)]
         method: PairingMethodArg,
-        #[arg(long)]
-        proof: String,
+        #[arg(long, conflicts_with = "proof_stdin", required_unless_present = "proof_stdin")]
+        proof: Option<String>,
+        #[arg(long, default_value_t = false)]
+        proof_stdin: bool,
         #[arg(long)]
         store_dir: Option<String>,
         #[arg(long, default_value_t = false)]
@@ -229,7 +231,8 @@ mod tests {
                     device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
                     client_kind: PairingClientKindArg::Node,
                     method: PairingMethodArg::Pin,
-                    proof: "123456".to_owned(),
+                    proof: Some("123456".to_owned()),
+                    proof_stdin: false,
                     store_dir: None,
                     approve: true,
                     simulate_rotation: false,
@@ -264,10 +267,39 @@ mod tests {
                     device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
                     client_kind: PairingClientKindArg::Desktop,
                     method: PairingMethodArg::Qr,
-                    proof: "0123456789ABCDEF0123456789ABCDEF".to_owned(),
+                    proof: Some("0123456789ABCDEF0123456789ABCDEF".to_owned()),
+                    proof_stdin: false,
                     store_dir: Some("tmp-identity".to_owned()),
                     approve: true,
                     simulate_rotation: true,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn parse_pairing_pair_with_proof_stdin() {
+        let parsed = Cli::parse_from([
+            "palyra",
+            "pairing",
+            "pair",
+            "--device-id",
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "--proof-stdin",
+            "--approve",
+        ]);
+        assert_eq!(
+            parsed.command,
+            Command::Pairing {
+                command: PairingCommand::Pair {
+                    device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                    client_kind: PairingClientKindArg::Node,
+                    method: PairingMethodArg::Pin,
+                    proof: None,
+                    proof_stdin: true,
+                    store_dir: None,
+                    approve: true,
+                    simulate_rotation: false,
                 }
             }
         );
