@@ -228,12 +228,39 @@ fn run_config(command: ConfigCommand) -> Result<()> {
 
             let content =
                 fs::read_to_string(&path).with_context(|| format!("failed to read {}", path))?;
-            toml::from_str::<toml::Value>(&content)
+            validate_daemon_compatible_config(&content)
                 .with_context(|| format!("failed to parse {}", path))?;
             println!("config=valid source={path}");
             std::io::stdout().flush().context("stdout flush failed")
         }
     }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ValidatedRootConfig {
+    #[allow(dead_code)]
+    daemon: Option<ValidatedDaemonConfig>,
+    #[allow(dead_code)]
+    identity: Option<ValidatedIdentityConfig>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ValidatedDaemonConfig {
+    #[allow(dead_code)]
+    bind_addr: Option<String>,
+    #[allow(dead_code)]
+    port: Option<u16>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ValidatedIdentityConfig {
+    #[allow(dead_code)]
+    allow_insecure_node_rpc_without_mtls: Option<bool>,
+}
+
+fn validate_daemon_compatible_config(content: &str) -> Result<()> {
+    let _: ValidatedRootConfig = toml::from_str(content).context("invalid daemon config schema")?;
+    Ok(())
 }
 
 fn find_default_config_path() -> Option<String> {

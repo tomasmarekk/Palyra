@@ -382,6 +382,10 @@ impl IdentityManager {
             current_certificate: certificate.clone(),
             certificate_fingerprints: vec![certificate_fingerprint],
         };
+        if let Some(previous) = self.paired_devices.get(&hello.device_id).cloned() {
+            self.revoke_superseded_certificates(&previous)?;
+            self.persist_revoked_certificate_fingerprints()?;
+        }
         self.paired_devices.insert(hello.device_id.clone(), paired.clone());
         self.persist_paired_devices()?;
 
@@ -400,6 +404,8 @@ impl IdentityManager {
         }
         let paired =
             self.paired_devices.get(device_id).cloned().ok_or(IdentityError::DeviceNotPaired)?;
+        let previous_fingerprint =
+            certificate_fingerprint_hex(&paired.current_certificate.certificate_pem)?;
 
         let rotated = self.ca.issue_client_certificate(
             device_id,
@@ -408,12 +414,18 @@ impl IdentityManager {
         )?;
         self.persist_gateway_ca_state()?;
         let rotated_fingerprint = certificate_fingerprint_hex(&rotated.certificate_pem)?;
+        let previous_fingerprints = paired.certificate_fingerprints.clone();
         let mut updated = paired;
         updated.current_certificate = rotated.clone();
         if !updated.certificate_fingerprints.contains(&rotated_fingerprint) {
             updated.certificate_fingerprints.push(rotated_fingerprint);
         }
+        self.revoked_certificate_fingerprints.insert(previous_fingerprint);
+        for fingerprint in previous_fingerprints {
+            self.revoked_certificate_fingerprints.insert(fingerprint);
+        }
         self.paired_devices.insert(device_id.to_owned(), updated);
+        self.persist_revoked_certificate_fingerprints()?;
         self.persist_paired_devices()?;
         Ok(rotated)
     }
@@ -441,11 +453,7 @@ impl IdentityManager {
         now: SystemTime,
     ) -> IdentityResult<()> {
         if let Some(paired) = self.paired_devices.remove(device_id) {
-            for fingerprint in paired.certificate_fingerprints {
-                self.revoked_certificate_fingerprints.insert(fingerprint);
-            }
-            self.revoked_certificate_fingerprints
-                .insert(certificate_fingerprint_hex(&paired.current_certificate.certificate_pem)?);
+            self.revoke_superseded_certificates(&paired)?;
         }
         let revoked = RevokedDevice {
             device_id: device_id.to_owned(),
@@ -492,6 +500,15 @@ impl IdentityManager {
             REVOKED_CERTIFICATES_STATE_KEY,
             &self.revoked_certificate_fingerprints,
         )
+    }
+
+    fn revoke_superseded_certificates(&mut self, paired: &PairedDevice) -> IdentityResult<()> {
+        for fingerprint in &paired.certificate_fingerprints {
+            self.revoked_certificate_fingerprints.insert(fingerprint.clone());
+        }
+        self.revoked_certificate_fingerprints
+            .insert(certificate_fingerprint_hex(&paired.current_certificate.certificate_pem)?);
+        Ok(())
     }
 }
 
@@ -885,6 +902,74 @@ mod tests {
         let second = IdentityManager::with_store(store).expect("manager should reload from store");
         assert!(second.revoked_devices().contains(sample_device_id()));
         assert_eq!(second.revoked_certificate_fingerprints(), revoked_fingerprints);
+    }
+
+    #[test]
+    fn rotate_device_certificate_revokes_previous_fingerprint() {
+        let mut manager = IdentityManager::with_memory_store().expect("manager should initialize");
+        let (_, _, hello) = start_pin_pairing(&mut manager, "123456");
+        let paired =
+            manager.complete_pairing(hello, SystemTime::now()).expect("pairing should complete");
+        let previous_fingerprint =
+            certificate_fingerprint_hex(&paired.device.current_certificate.certificate_pem)
+                .expect("previous certificate fingerprint should parse");
+
+        let rotated = manager
+            .force_rotate_device_certificate(sample_device_id())
+            .expect("certificate rotation should succeed");
+        let rotated_fingerprint = certificate_fingerprint_hex(&rotated.certificate_pem)
+            .expect("rotated certificate fingerprint should parse");
+
+        let revoked = manager.revoked_certificate_fingerprints();
+        assert!(
+            revoked.contains(&previous_fingerprint),
+            "previous certificate fingerprint must be revoked"
+        );
+        assert!(
+            !revoked.contains(&rotated_fingerprint),
+            "active rotated certificate fingerprint must remain valid"
+        );
+    }
+
+    #[test]
+    fn repairing_same_device_revokes_superseded_certificate() {
+        let mut manager = IdentityManager::with_memory_store().expect("manager should initialize");
+        let (_, _, first_hello) = start_pin_pairing(&mut manager, "123456");
+        let first_pairing = manager
+            .complete_pairing(first_hello, SystemTime::now())
+            .expect("first pairing should complete");
+        let first_fingerprint =
+            certificate_fingerprint_hex(&first_pairing.device.current_certificate.certificate_pem)
+                .expect("first certificate fingerprint should parse");
+
+        let replacement_device = DeviceIdentity::generate(sample_device_id())
+            .expect("replacement device should generate");
+        let replacement_session = manager
+            .start_pairing(
+                PairingClientKind::Node,
+                PairingMethod::Pin { code: "123456".to_owned() },
+                SystemTime::now(),
+            )
+            .expect("replacement pairing session should start");
+        let replacement_hello = manager
+            .build_device_hello(&replacement_session, &replacement_device, "123456")
+            .expect("replacement hello should build");
+        let second_pairing = manager
+            .complete_pairing(replacement_hello, SystemTime::now())
+            .expect("replacement pairing should complete");
+        let second_fingerprint =
+            certificate_fingerprint_hex(&second_pairing.device.current_certificate.certificate_pem)
+                .expect("second certificate fingerprint should parse");
+
+        let revoked = manager.revoked_certificate_fingerprints();
+        assert!(
+            revoked.contains(&first_fingerprint),
+            "superseded certificate fingerprint must be revoked after re-pair"
+        );
+        assert!(
+            !revoked.contains(&second_fingerprint),
+            "newly paired certificate fingerprint must remain valid"
+        );
     }
 
     proptest! {

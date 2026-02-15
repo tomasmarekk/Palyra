@@ -90,3 +90,41 @@ fn config_validate_without_path_discovers_config_directory_path() -> Result<()> 
     assert!(stdout.contains("config=valid source=config/palyra.toml"));
     Ok(())
 }
+
+#[test]
+fn config_validate_with_explicit_path_rejects_non_numeric_daemon_port() -> Result<()> {
+    let workdir = TempDir::new().context("failed to create temporary workdir")?;
+    let config_path = workdir.path().join("invalid-port.toml");
+    fs::write(&config_path, "[daemon]\nport='not-a-number'\n")
+        .with_context(|| format!("failed to write {}", config_path.display()))?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
+        .current_dir(workdir.path())
+        .args(["config", "validate", "--path", "invalid-port.toml"])
+        .output()
+        .context("failed to execute palyra config validate with invalid daemon port")?;
+
+    assert!(!output.status.success(), "config with string daemon port must fail validation");
+    let stderr = String::from_utf8(output.stderr).context("stderr was not UTF-8")?;
+    assert!(stderr.contains("invalid daemon config schema"), "unexpected stderr output: {stderr}");
+    Ok(())
+}
+
+#[test]
+fn config_validate_with_explicit_path_rejects_non_boolean_identity_flag() -> Result<()> {
+    let workdir = TempDir::new().context("failed to create temporary workdir")?;
+    let config_path = workdir.path().join("invalid-identity.toml");
+    fs::write(&config_path, "[identity]\nallow_insecure_node_rpc_without_mtls='definitely'\n")
+        .with_context(|| format!("failed to write {}", config_path.display()))?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
+        .current_dir(workdir.path())
+        .args(["config", "validate", "--path", "invalid-identity.toml"])
+        .output()
+        .context("failed to execute palyra config validate with invalid identity flag")?;
+
+    assert!(!output.status.success(), "config with non-boolean identity flag must fail");
+    let stderr = String::from_utf8(output.stderr).context("stderr was not UTF-8")?;
+    assert!(stderr.contains("invalid daemon config schema"), "unexpected stderr output: {stderr}");
+    Ok(())
+}

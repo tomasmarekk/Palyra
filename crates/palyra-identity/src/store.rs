@@ -112,18 +112,39 @@ impl SecretStore for FilesystemSecretStore {
             };
 
             let path = self.key_path(key)?;
-            let mut file = fs::OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .mode(0o600)
-                .open(&path)
-                .map_err(|error| IdentityError::Internal(error.to_string()))?;
-            file.set_permissions(fs::Permissions::from_mode(0o600))
-                .map_err(|error| IdentityError::Internal(error.to_string()))?;
-            file.write_all(value).map_err(|error| IdentityError::Internal(error.to_string()))?;
-            file.sync_all().map_err(|error| IdentityError::Internal(error.to_string()))?;
-            Ok(())
+            let tmp_path = path.with_extension("tmp");
+            if tmp_path.exists() {
+                fs::remove_file(&tmp_path)
+                    .map_err(|error| IdentityError::Internal(error.to_string()))?;
+            }
+
+            let write_result: IdentityResult<()> = (|| {
+                let mut file = fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .mode(0o600)
+                    .open(&tmp_path)
+                    .map_err(|error| IdentityError::Internal(error.to_string()))?;
+                file.set_permissions(fs::Permissions::from_mode(0o600))
+                    .map_err(|error| IdentityError::Internal(error.to_string()))?;
+                file.write_all(value)
+                    .map_err(|error| IdentityError::Internal(error.to_string()))?;
+                file.sync_all().map_err(|error| IdentityError::Internal(error.to_string()))?;
+                fs::rename(&tmp_path, &path)
+                    .map_err(|error| IdentityError::Internal(error.to_string()))?;
+                if let Some(parent) = path.parent() {
+                    fs::File::open(parent)
+                        .map_err(|error| IdentityError::Internal(error.to_string()))?
+                        .sync_all()
+                        .map_err(|error| IdentityError::Internal(error.to_string()))?;
+                }
+                Ok(())
+            })();
+
+            if write_result.is_err() && tmp_path.exists() {
+                let _ = fs::remove_file(&tmp_path);
+            }
+            write_result
         }
     }
 
@@ -218,5 +239,25 @@ mod tests {
             store.read_secret(first_key),
             Err(crate::error::IdentityError::SecretNotFound)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_secret_store_overwrites_atomically_and_keeps_json_readable() {
+        let temp = tempdir().expect("temp dir should initialize");
+        let store = FilesystemSecretStore::new(temp.path()).expect("store should initialize");
+        let key = "identity/pairing/paired_devices.json";
+        let key_path = store.key_path(key).expect("key should map to path");
+        let tmp_path = key_path.with_extension("tmp");
+
+        for sequence in 1..=5 {
+            let payload = format!(r#"{{"sequence":{sequence}}}"#);
+            store.write_secret(key, payload.as_bytes()).expect("secret should persist");
+            let readback = store.read_secret(key).expect("secret should be readable");
+            let parsed: serde_json::Value =
+                serde_json::from_slice(&readback).expect("persisted secret should be valid JSON");
+            assert_eq!(parsed["sequence"].as_u64(), Some(sequence));
+            assert!(!tmp_path.exists(), "temporary swap file should be cleaned up");
+        }
     }
 }

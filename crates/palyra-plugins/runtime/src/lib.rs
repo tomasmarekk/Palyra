@@ -51,11 +51,14 @@ impl WasmRuntime {
         let mut store = Store::new(&self.engine, RuntimeStoreState { limits });
         store.limiter(|state| &mut state.limits);
         store.set_fuel(self.fuel_budget)?;
-        let instance = Instance::new(&mut store, &module, &[]).map_err(map_execution_error)?;
+        let instance = Instance::new(&mut store, &module, &[])
+            .map_err(|error| map_execution_error_with_store(error, &store))?;
         let function: TypedFunc<(), i32> = instance
             .get_typed_func(&mut store, export_name)
             .map_err(|_| RuntimeError::MissingExport(export_name.to_owned()))?;
-        let output = function.call(&mut store, ()).map_err(map_execution_error)?;
+        let output = function
+            .call(&mut store, ())
+            .map_err(|error| map_execution_error_with_store(error, &store))?;
         Ok(output)
     }
 }
@@ -64,16 +67,17 @@ struct RuntimeStoreState {
     limits: StoreLimits,
 }
 
-fn map_execution_error(error: wasmtime::Error) -> RuntimeError {
-    if error_chain_contains_any(
-        &error,
-        &[
-            "all fuel consumed",
-            "exceeds memory limits",
-            "memory minimum size",
-            "resource limit exceeded",
-        ],
-    ) {
+fn map_execution_error_with_store(
+    error: wasmtime::Error,
+    store: &Store<RuntimeStoreState>,
+) -> RuntimeError {
+    if store.get_fuel().ok() == Some(0)
+        || matches!(
+            error.downcast_ref::<wasmtime::Trap>(),
+            Some(wasmtime::Trap::OutOfFuel | wasmtime::Trap::AllocationTooLarge)
+        )
+        || error_chain_contains_any(&error, &["resource limit exceeded", "exceeds memory limits"])
+    {
         return RuntimeError::ExecutionLimitExceeded;
     }
     RuntimeError::Execution(error)

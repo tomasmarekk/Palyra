@@ -1,6 +1,7 @@
 use std::{
     path::{Component, PathBuf},
     time::Instant,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -10,6 +11,7 @@ use thiserror::Error;
 pub const CANONICAL_PROTOCOL_MAJOR: u32 = 1;
 pub const CANONICAL_JSON_ENVELOPE_VERSION: u32 = 1;
 const WEBHOOK_MAX_PAYLOAD_BYTES: usize = 1_048_576;
+const WEBHOOK_MAX_REPLAY_SKEW_MS: u64 = 5 * 60 * 1_000;
 const WEBHOOK_ALLOWED_FIELDS: &[&str] =
     &["v", "id", "event", "source", "payload", "replay_protection", "limits"];
 const WEBHOOK_REPLAY_PROTECTION_ALLOWED_FIELDS: &[&str] =
@@ -126,6 +128,15 @@ pub fn parse_config_path(raw: &str) -> Result<PathBuf, ConfigPathParseError> {
 }
 
 pub fn parse_webhook_payload(input: &[u8]) -> Result<WebhookEnvelope, WebhookPayloadError> {
+    let now_unix_ms = current_unix_ms()
+        .map_err(|_| WebhookPayloadError::InvalidValue("replay_protection.timestamp_unix_ms"))?;
+    parse_webhook_payload_with_now(input, now_unix_ms)
+}
+
+fn parse_webhook_payload_with_now(
+    input: &[u8],
+    now_unix_ms: u64,
+) -> Result<WebhookEnvelope, WebhookPayloadError> {
     if input.len() > WEBHOOK_MAX_PAYLOAD_BYTES {
         return Err(WebhookPayloadError::PayloadTooLarge { limit: WEBHOOK_MAX_PAYLOAD_BYTES });
     }
@@ -157,7 +168,7 @@ pub fn parse_webhook_payload(input: &[u8]) -> Result<WebhookEnvelope, WebhookPay
         return Err(WebhookPayloadError::InvalidValue("payload"));
     }
 
-    let replay_protection = read_replay_protection(object)?;
+    let replay_protection = read_replay_protection(object, now_unix_ms)?;
 
     Ok(WebhookEnvelope {
         v: version,
@@ -171,6 +182,7 @@ pub fn parse_webhook_payload(input: &[u8]) -> Result<WebhookEnvelope, WebhookPay
 
 fn read_replay_protection(
     object: &Map<String, Value>,
+    now_unix_ms: u64,
 ) -> Result<ReplayProtection, WebhookPayloadError> {
     let replay_protection = object
         .get("replay_protection")
@@ -193,6 +205,11 @@ fn read_replay_protection(
         .ok_or(WebhookPayloadError::MissingField("replay_protection.timestamp_unix_ms"))?
         .as_u64()
         .ok_or(WebhookPayloadError::InvalidType("replay_protection.timestamp_unix_ms"))?;
+    let minimum_allowed = now_unix_ms.saturating_sub(WEBHOOK_MAX_REPLAY_SKEW_MS);
+    let maximum_allowed = now_unix_ms.saturating_add(WEBHOOK_MAX_REPLAY_SKEW_MS);
+    if timestamp_unix_ms < minimum_allowed || timestamp_unix_ms > maximum_allowed {
+        return Err(WebhookPayloadError::InvalidValue("replay_protection.timestamp_unix_ms"));
+    }
 
     let signature = match replay_protection.get("signature") {
         Some(value) => {
@@ -244,6 +261,10 @@ fn reject_additional_properties(
     Ok(())
 }
 
+fn current_unix_ms() -> Result<u64, std::time::SystemTimeError> {
+    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64)
+}
+
 fn read_required_u32(
     object: &Map<String, Value>,
     key: &'static str,
@@ -291,9 +312,15 @@ fn is_valid_crockford_char(ch: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_config_path, parse_webhook_payload, validate_canonical_id, CanonicalIdError,
-        ConfigPathParseError, WebhookPayloadError,
+        parse_config_path, parse_webhook_payload_with_now, validate_canonical_id, CanonicalIdError,
+        ConfigPathParseError, WebhookEnvelope, WebhookPayloadError,
     };
+
+    const REFERENCE_NOW_UNIX_MS: u64 = 1_730_000_000_000;
+
+    fn parse_with_reference_now(payload: &[u8]) -> Result<WebhookEnvelope, WebhookPayloadError> {
+        parse_webhook_payload_with_now(payload, REFERENCE_NOW_UNIX_MS)
+    }
 
     #[test]
     fn parse_config_path_rejects_parent_traversal() {
@@ -323,7 +350,7 @@ mod tests {
             }
         }"#;
 
-        let parsed = parse_webhook_payload(payload).expect("payload should parse");
+        let parsed = parse_with_reference_now(payload).expect("payload should parse");
         assert_eq!(parsed.v, 1);
         assert_eq!(parsed.id, "01ARZ3NDEKTSV4RRFFQ69G5FAV");
         assert_eq!(parsed.event, "message.created");
@@ -331,6 +358,52 @@ mod tests {
         assert_eq!(parsed.replay_protection.nonce, "1234567890abcdef");
         assert_eq!(parsed.replay_protection.timestamp_unix_ms, 1_730_000_000_000);
         assert!(parsed.payload.is_object());
+    }
+
+    #[test]
+    fn parse_webhook_payload_rejects_stale_replay_timestamp() {
+        let stale_timestamp = REFERENCE_NOW_UNIX_MS - super::WEBHOOK_MAX_REPLAY_SKEW_MS - 1;
+        let payload = format!(
+            r#"{{
+            "v": 1,
+            "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "event": "message.created",
+            "source": "slack",
+            "payload": {{ "channel": "C123" }},
+            "replay_protection": {{
+                "nonce": "1234567890abcdef",
+                "timestamp_unix_ms": {stale_timestamp}
+            }}
+        }}"#
+        );
+
+        assert_eq!(
+            parse_with_reference_now(payload.as_bytes()),
+            Err(WebhookPayloadError::InvalidValue("replay_protection.timestamp_unix_ms"))
+        );
+    }
+
+    #[test]
+    fn parse_webhook_payload_rejects_future_replay_timestamp() {
+        let future_timestamp = REFERENCE_NOW_UNIX_MS + super::WEBHOOK_MAX_REPLAY_SKEW_MS + 1;
+        let payload = format!(
+            r#"{{
+            "v": 1,
+            "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "event": "message.created",
+            "source": "slack",
+            "payload": {{ "channel": "C123" }},
+            "replay_protection": {{
+                "nonce": "1234567890abcdef",
+                "timestamp_unix_ms": {future_timestamp}
+            }}
+        }}"#
+        );
+
+        assert_eq!(
+            parse_with_reference_now(payload.as_bytes()),
+            Err(WebhookPayloadError::InvalidValue("replay_protection.timestamp_unix_ms"))
+        );
     }
 
     #[test]
@@ -347,7 +420,7 @@ mod tests {
         }"#;
 
         assert_eq!(
-            parse_webhook_payload(payload),
+            parse_with_reference_now(payload),
             Err(WebhookPayloadError::MissingField("payload"))
         );
     }
@@ -365,7 +438,7 @@ mod tests {
             }
         }"#;
 
-        assert_eq!(parse_webhook_payload(payload), Err(WebhookPayloadError::MissingField("id")));
+        assert_eq!(parse_with_reference_now(payload), Err(WebhookPayloadError::MissingField("id")));
     }
 
     #[test]
@@ -379,7 +452,7 @@ mod tests {
         }"#;
 
         assert_eq!(
-            parse_webhook_payload(payload),
+            parse_with_reference_now(payload),
             Err(WebhookPayloadError::MissingField("replay_protection"))
         );
     }
@@ -398,7 +471,7 @@ mod tests {
             }
         }"#;
 
-        assert_eq!(parse_webhook_payload(payload), Err(WebhookPayloadError::InvalidValue("v")));
+        assert_eq!(parse_with_reference_now(payload), Err(WebhookPayloadError::InvalidValue("v")));
     }
 
     #[test]
@@ -417,7 +490,7 @@ mod tests {
         }"#;
 
         assert_eq!(
-            parse_webhook_payload(payload),
+            parse_with_reference_now(payload),
             Err(WebhookPayloadError::InvalidValue("envelope.additional_properties"))
         );
     }
@@ -438,7 +511,7 @@ mod tests {
         }"#;
 
         assert_eq!(
-            parse_webhook_payload(payload),
+            parse_with_reference_now(payload),
             Err(WebhookPayloadError::InvalidValue("replay_protection.additional_properties"))
         );
     }
@@ -460,7 +533,7 @@ mod tests {
             }
         }"#;
 
-        let parsed = parse_webhook_payload(payload).expect("payload should parse");
+        let parsed = parse_with_reference_now(payload).expect("payload should parse");
         assert_eq!(parsed.v, 1);
     }
 
@@ -468,7 +541,7 @@ mod tests {
     fn parse_webhook_payload_rejects_oversized_input() {
         let payload = vec![b' '; 1_048_577];
         assert_eq!(
-            parse_webhook_payload(payload.as_slice()),
+            parse_with_reference_now(payload.as_slice()),
             Err(WebhookPayloadError::PayloadTooLarge { limit: 1_048_576 })
         );
     }

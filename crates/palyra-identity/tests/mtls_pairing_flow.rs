@@ -111,6 +111,15 @@ async fn pairing_connect_rotate_flow_requires_valid_client_cert() -> Result<()> 
     let rotated_certificate = manager
         .force_rotate_device_certificate(device_id)
         .context("failed to rotate device cert")?;
+    revocation_index.replace_all(manager.revoked_certificate_fingerprints());
+    let stale_client = build_paired_device_client_mtls_config(
+        &pairing_result.gateway_ca_certificate_pem,
+        &pairing_result.device.current_certificate,
+    )
+    .context("failed to build stale client config")?;
+    let stale_client_result = send_ping(address, stale_client).await;
+    assert!(stale_client_result.is_err(), "superseded certificate unexpectedly connected");
+
     let rotated_client = build_paired_device_client_mtls_config(
         &pairing_result.gateway_ca_certificate_pem,
         &rotated_certificate,
@@ -136,6 +145,88 @@ async fn pairing_connect_rotate_flow_requires_valid_client_cert() -> Result<()> 
         matches!(revoked_rotate, Err(IdentityError::DeviceRevoked)),
         "revoked device should not be rotated"
     );
+
+    let _ = shutdown_tx.send(());
+    let _ = server_task.await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn repairing_same_device_revokes_superseded_client_cert() -> Result<()> {
+    let mut manager =
+        IdentityManager::with_memory_store().context("failed to build identity manager")?;
+    let device_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    let first_device =
+        DeviceIdentity::generate(device_id).context("failed to generate first device identity")?;
+
+    let first_session = manager
+        .start_pairing(
+            PairingClientKind::Node,
+            PairingMethod::Pin { code: "123456".to_owned() },
+            SystemTime::now(),
+        )
+        .context("failed to start first pairing session")?;
+    let first_hello = manager
+        .build_device_hello(&first_session, &first_device, "123456")
+        .context("failed to build first device hello")?;
+    let first_pairing = manager
+        .complete_pairing(first_hello, SystemTime::now())
+        .context("failed to complete first pairing")?;
+
+    let server_certificate = manager
+        .issue_gateway_server_certificate("palyrad-node-rpc")
+        .context("failed to issue server certificate")?;
+    let revocation_index = Arc::new(MemoryRevocationIndex::default());
+    let server_config = build_node_rpc_server_mtls_config(
+        &first_pairing.gateway_ca_certificate_pem,
+        &server_certificate,
+        revocation_index.clone(),
+    )
+    .context("failed to build server mTLS config")?;
+    let (address, shutdown_tx, server_task) = spawn_mtls_echo_server(server_config).await?;
+
+    let first_client = build_paired_device_client_mtls_config(
+        &first_pairing.gateway_ca_certificate_pem,
+        &first_pairing.device.current_certificate,
+    )
+    .context("failed to build first client config")?;
+    send_ping(address, first_client)
+        .await
+        .context("initially paired client should connect over mTLS")?;
+
+    let replacement_device = DeviceIdentity::generate(device_id)
+        .context("failed to generate replacement device identity")?;
+    let replacement_session = manager
+        .start_pairing(
+            PairingClientKind::Node,
+            PairingMethod::Pin { code: "123456".to_owned() },
+            SystemTime::now(),
+        )
+        .context("failed to start replacement pairing session")?;
+    let replacement_hello = manager
+        .build_device_hello(&replacement_session, &replacement_device, "123456")
+        .context("failed to build replacement hello")?;
+    let replacement_pairing = manager
+        .complete_pairing(replacement_hello, SystemTime::now())
+        .context("failed to complete replacement pairing")?;
+    revocation_index.replace_all(manager.revoked_certificate_fingerprints());
+
+    let superseded_client = build_paired_device_client_mtls_config(
+        &first_pairing.gateway_ca_certificate_pem,
+        &first_pairing.device.current_certificate,
+    )
+    .context("failed to build superseded client config")?;
+    let superseded_result = send_ping(address, superseded_client).await;
+    assert!(superseded_result.is_err(), "superseded certificate unexpectedly connected");
+
+    let replacement_client = build_paired_device_client_mtls_config(
+        &replacement_pairing.gateway_ca_certificate_pem,
+        &replacement_pairing.device.current_certificate,
+    )
+    .context("failed to build replacement client config")?;
+    send_ping(address, replacement_client)
+        .await
+        .context("replacement client should connect over mTLS")?;
 
     let _ = shutdown_tx.send(());
     let _ = server_task.await;
