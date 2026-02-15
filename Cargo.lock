@@ -1529,6 +1529,7 @@ dependencies = [
  "tokio-rustls",
  "ulid",
  "x25519-dalek",
+ "x509-parser",
 ]
 
 [[package]]

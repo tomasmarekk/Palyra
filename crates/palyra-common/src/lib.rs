@@ -10,6 +10,11 @@ use thiserror::Error;
 pub const CANONICAL_PROTOCOL_MAJOR: u32 = 1;
 pub const CANONICAL_JSON_ENVELOPE_VERSION: u32 = 1;
 const WEBHOOK_MAX_PAYLOAD_BYTES: usize = 1_048_576;
+const WEBHOOK_ALLOWED_FIELDS: &[&str] =
+    &["v", "id", "event", "source", "payload", "replay_protection", "limits"];
+const WEBHOOK_REPLAY_PROTECTION_ALLOWED_FIELDS: &[&str] =
+    &["nonce", "timestamp_unix_ms", "signature"];
+const WEBHOOK_LIMITS_ALLOWED_FIELDS: &[&str] = &["max_payload_bytes"];
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BuildMetadata {
@@ -128,6 +133,8 @@ pub fn parse_webhook_payload(input: &[u8]) -> Result<WebhookEnvelope, WebhookPay
     let root: Value =
         serde_json::from_slice(input).map_err(|_| WebhookPayloadError::InvalidJson)?;
     let object = root.as_object().ok_or(WebhookPayloadError::NotAnObject)?;
+    reject_additional_properties(object, WEBHOOK_ALLOWED_FIELDS, "envelope.additional_properties")?;
+    validate_optional_limits(object)?;
 
     let version = read_required_u32(object, "v")?;
     if version != CANONICAL_JSON_ENVELOPE_VERSION {
@@ -170,6 +177,11 @@ fn read_replay_protection(
         .ok_or(WebhookPayloadError::MissingField("replay_protection"))?
         .as_object()
         .ok_or(WebhookPayloadError::InvalidType("replay_protection"))?;
+    reject_additional_properties(
+        replay_protection,
+        WEBHOOK_REPLAY_PROTECTION_ALLOWED_FIELDS,
+        "replay_protection.additional_properties",
+    )?;
 
     let nonce = read_required_string(replay_protection, "nonce")?;
     if nonce.len() < 16 || nonce.len() > 128 {
@@ -196,6 +208,40 @@ fn read_replay_protection(
     };
 
     Ok(ReplayProtection { nonce, timestamp_unix_ms, signature })
+}
+
+fn validate_optional_limits(object: &Map<String, Value>) -> Result<(), WebhookPayloadError> {
+    let Some(limits_value) = object.get("limits") else {
+        return Ok(());
+    };
+    let limits = limits_value.as_object().ok_or(WebhookPayloadError::InvalidType("limits"))?;
+    reject_additional_properties(
+        limits,
+        WEBHOOK_LIMITS_ALLOWED_FIELDS,
+        "limits.additional_properties",
+    )?;
+
+    if let Some(max_payload_bytes) = limits.get("max_payload_bytes") {
+        let max_payload_bytes = max_payload_bytes
+            .as_u64()
+            .ok_or(WebhookPayloadError::InvalidType("limits.max_payload_bytes"))?;
+        if max_payload_bytes == 0 || max_payload_bytes > WEBHOOK_MAX_PAYLOAD_BYTES as u64 {
+            return Err(WebhookPayloadError::InvalidValue("limits.max_payload_bytes"));
+        }
+    }
+
+    Ok(())
+}
+
+fn reject_additional_properties(
+    object: &Map<String, Value>,
+    allowed_fields: &[&str],
+    field_name: &'static str,
+) -> Result<(), WebhookPayloadError> {
+    if object.keys().any(|key| !allowed_fields.contains(&key.as_str())) {
+        return Err(WebhookPayloadError::InvalidValue(field_name));
+    }
+    Ok(())
 }
 
 fn read_required_u32(
@@ -353,6 +399,69 @@ mod tests {
         }"#;
 
         assert_eq!(parse_webhook_payload(payload), Err(WebhookPayloadError::InvalidValue("v")));
+    }
+
+    #[test]
+    fn parse_webhook_payload_rejects_unknown_top_level_field() {
+        let payload = br#"{
+            "v": 1,
+            "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "event": "message.created",
+            "source": "slack",
+            "payload": { "channel": "C123" },
+            "replay_protection": {
+                "nonce": "1234567890abcdef",
+                "timestamp_unix_ms": 1730000000000
+            },
+            "unexpected": true
+        }"#;
+
+        assert_eq!(
+            parse_webhook_payload(payload),
+            Err(WebhookPayloadError::InvalidValue("envelope.additional_properties"))
+        );
+    }
+
+    #[test]
+    fn parse_webhook_payload_rejects_unknown_replay_protection_field() {
+        let payload = br#"{
+            "v": 1,
+            "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "event": "message.created",
+            "source": "slack",
+            "payload": { "channel": "C123" },
+            "replay_protection": {
+                "nonce": "1234567890abcdef",
+                "timestamp_unix_ms": 1730000000000,
+                "unexpected": true
+            }
+        }"#;
+
+        assert_eq!(
+            parse_webhook_payload(payload),
+            Err(WebhookPayloadError::InvalidValue("replay_protection.additional_properties"))
+        );
+    }
+
+    #[test]
+    fn parse_webhook_payload_accepts_limits_within_schema_range() {
+        let payload = br#"{
+            "v": 1,
+            "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "event": "message.created",
+            "source": "slack",
+            "payload": { "channel": "C123", "text": "hello" },
+            "replay_protection": {
+                "nonce": "1234567890abcdef",
+                "timestamp_unix_ms": 1730000000000
+            },
+            "limits": {
+                "max_payload_bytes": 1048576
+            }
+        }"#;
+
+        let parsed = parse_webhook_payload(payload).expect("payload should parse");
+        assert_eq!(parsed.v, 1);
     }
 
     #[test]

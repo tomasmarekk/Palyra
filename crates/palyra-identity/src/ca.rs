@@ -123,11 +123,14 @@ impl CertificateAuthority {
 
     fn issue_leaf_certificate(
         &mut self,
-        params: CertificateParams,
+        mut params: CertificateParams,
         validity: Duration,
         subject: String,
     ) -> IdentityResult<IssuedCertificate> {
         let now = SystemTime::now();
+        let expires_at_time = now + validity;
+        params.not_before = now.into();
+        params.not_after = expires_at_time.into();
         let key_pair =
             KeyPair::generate().map_err(|error| IdentityError::Cryptographic(error.to_string()))?;
         let certificate = params
@@ -138,7 +141,7 @@ impl CertificateAuthority {
 
         self.sequence = self.sequence.saturating_add(1);
         let issued_at = unix_ms(now)?;
-        let expires_at = unix_ms(now + validity)?;
+        let expires_at = unix_ms(expires_at_time)?;
 
         Ok(IssuedCertificate {
             sequence: self.sequence,
@@ -148,5 +151,50 @@ impl CertificateAuthority {
             issued_at_unix_ms: issued_at,
             expires_at_unix_ms: expires_at,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use x509_parser::{
+        pem::parse_x509_pem,
+        prelude::{FromDer, X509Certificate},
+    };
+
+    use super::CertificateAuthority;
+
+    #[test]
+    fn issued_certificate_validity_matches_requested_window() {
+        let mut ca = CertificateAuthority::new("Palyra Test CA").expect("CA should initialize");
+        let validity = Duration::from_secs(3_600);
+
+        let issued = ca
+            .issue_client_certificate(
+                "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                validity,
+            )
+            .expect("certificate issuance should succeed");
+
+        let (_, pem) = parse_x509_pem(issued.certificate_pem.as_bytes())
+            .expect("certificate PEM should parse");
+        let (_, cert) =
+            X509Certificate::from_der(&pem.contents).expect("certificate DER should parse");
+
+        let not_before = cert.validity().not_before.timestamp();
+        let not_after = cert.validity().not_after.timestamp();
+        let validity_seconds = not_after.saturating_sub(not_before);
+        assert!(
+            (3_595..=3_605).contains(&validity_seconds),
+            "expected validity around 3600s, got {validity_seconds}s"
+        );
+
+        let metadata_not_after = (issued.expires_at_unix_ms / 1_000) as i64;
+        assert!(
+            (metadata_not_after - not_after).abs() <= 2,
+            "metadata expires_at_unix_ms ({metadata_not_after}) should align with x509 not_after ({not_after})"
+        );
     }
 }

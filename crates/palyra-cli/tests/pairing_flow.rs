@@ -62,19 +62,14 @@ fn pairing_pair_outputs_verifiable_identity_and_rotation() -> Result<()> {
 
 #[cfg(windows)]
 #[test]
-fn pairing_pair_works_on_windows_with_approval() -> Result<()> {
+fn pairing_pair_refuses_windows_volatile_storage() -> Result<()> {
     let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
         .args(["pairing", "pair", "--device-id", DEVICE_ID, "--proof", "123456", "--approve"])
         .output()
         .context("failed to execute palyra pairing pair on windows")?;
 
-    assert!(
-        output.status.success(),
-        "pairing command failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8(output.stdout).context("stdout was not UTF-8")?;
-    assert!(stdout.contains("pairing.status=paired"));
-    assert!(stdout.contains("device_id=01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+    assert!(!output.status.success(), "pairing should fail on windows without durable store");
+    let stderr = String::from_utf8(output.stderr).context("stderr was not UTF-8")?;
+    assert!(stderr.contains("persistent identity storage is not available on Windows yet"));
     Ok(())
 }

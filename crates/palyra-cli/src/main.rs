@@ -24,8 +24,6 @@ use palyra_common::{
 };
 #[cfg(not(windows))]
 use palyra_identity::FilesystemSecretStore;
-#[cfg(windows)]
-use palyra_identity::InMemorySecretStore;
 use palyra_identity::{
     DeviceIdentity, IdentityManager, PairingClientKind, PairingMethod, SecretStore,
     DEFAULT_CERT_VALIDITY,
@@ -211,15 +209,22 @@ fn run_policy(command: PolicyCommand) -> Result<()> {
 fn run_config(command: ConfigCommand) -> Result<()> {
     match command {
         ConfigCommand::Validate { path } => {
-            let explicit_path = path.is_some();
-            let path = path.unwrap_or_else(|| "palyra.toml".to_owned());
-            if !std::path::Path::new(&path).exists() {
-                if explicit_path {
-                    anyhow::bail!("config file does not exist: {}", path);
+            let path = match path {
+                Some(explicit_path) => {
+                    if !Path::new(&explicit_path).exists() {
+                        anyhow::bail!("config file does not exist: {}", explicit_path);
+                    }
+                    explicit_path
                 }
-                println!("config=valid source=defaults");
-                return std::io::stdout().flush().context("stdout flush failed");
-            }
+                None => {
+                    if let Some(found) = find_default_config_path() {
+                        found
+                    } else {
+                        println!("config=valid source=defaults");
+                        return std::io::stdout().flush().context("stdout flush failed");
+                    }
+                }
+            };
 
             let content =
                 fs::read_to_string(&path).with_context(|| format!("failed to read {}", path))?;
@@ -229,6 +234,16 @@ fn run_config(command: ConfigCommand) -> Result<()> {
             std::io::stdout().flush().context("stdout flush failed")
         }
     }
+}
+
+fn find_default_config_path() -> Option<String> {
+    for candidate in ["palyra.toml", "Palyra.toml", "config/palyra.toml"] {
+        if Path::new(candidate).exists() {
+            return Some(candidate.to_owned());
+        }
+    }
+
+    None
 }
 
 fn run_pairing(command: PairingCommand) -> Result<()> {
@@ -333,9 +348,10 @@ fn default_identity_store_root_from_env(
 fn build_identity_store(store_root: &Path) -> Result<Arc<dyn SecretStore>> {
     #[cfg(windows)]
     {
-        let _ = store_root;
-        // Windows persistent storage remains disabled in palyra-identity until ACL hardening lands.
-        Ok(Arc::new(InMemorySecretStore::new()))
+        anyhow::bail!(
+            "persistent identity storage is not available on Windows yet; refusing volatile pairing state at {}",
+            store_root.display()
+        );
     }
     #[cfg(not(windows))]
     {

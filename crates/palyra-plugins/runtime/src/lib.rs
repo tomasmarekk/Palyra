@@ -7,6 +7,8 @@ use wasmtime::{
 pub enum RuntimeError {
     #[error("failed to compile wasm module: {0}")]
     Compile(#[from] wasmtime::Error),
+    #[error("wasm execution failed: {0}")]
+    Execution(wasmtime::Error),
     #[error("failed to resolve exported function '{0}'")]
     MissingExport(String),
     #[error("wasm execution exceeded runtime limits")]
@@ -74,7 +76,7 @@ fn map_execution_error(error: wasmtime::Error) -> RuntimeError {
     ) {
         return RuntimeError::ExecutionLimitExceeded;
     }
-    RuntimeError::Compile(error)
+    RuntimeError::Execution(error)
 }
 
 fn error_chain_contains_any(error: &wasmtime::Error, needles: &[&str]) -> bool {
@@ -152,6 +154,26 @@ mod tests {
         assert!(
             matches!(result, Err(RuntimeError::ExecutionLimitExceeded)),
             "expected memory limit error, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn runtime_reports_trap_as_execution_error() {
+        let module = br#"
+            (module
+                (func (export "trap") (result i32)
+                    unreachable
+                    i32.const 0
+                )
+            )
+        "#;
+        let runtime = WasmRuntime::new().expect("runtime should initialize");
+
+        let result = runtime.call_noarg_i32_export(module, "trap");
+
+        assert!(
+            matches!(result, Err(RuntimeError::Execution(_))),
+            "expected execution trap error, got: {result:?}"
         );
     }
 }
