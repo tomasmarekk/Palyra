@@ -5,7 +5,7 @@ use std::{
     path::PathBuf,
     process::{Child, ChildStdout, Command, Stdio},
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         mpsc, Arc,
     },
     thread,
@@ -26,6 +26,7 @@ const RUN_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAX";
 const RUN_ID_ALT: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAZ";
 const ENVELOPE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAY";
 const OPENAI_API_KEY: &str = "sk-openai-integration-test";
+static TEMP_JOURNAL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub mod proto {
     pub mod palyra {
@@ -978,7 +979,9 @@ fn unique_temp_journal_db_path() -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("system time should be after unix epoch")
         .as_nanos();
-    std::env::temp_dir().join(format!("palyra-gateway-grpc-{nonce}-{}.sqlite3", std::process::id()))
+    let counter = TEMP_JOURNAL_COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir()
+        .join(format!("palyra-gateway-grpc-{nonce}-{}-{counter}.sqlite3", std::process::id()))
 }
 
 fn sample_journal_event(event_id: &str, payload_json: &[u8]) -> common_v1::JournalEvent {
