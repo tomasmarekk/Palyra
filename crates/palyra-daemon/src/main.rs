@@ -236,7 +236,12 @@ async fn admin_status_handler(
         auth_error_response(error)
     })?;
     state.runtime.record_admin_status_request();
-    Ok(Json(state.runtime.status_snapshot(context, &state.auth)))
+    let snapshot = state
+        .runtime
+        .status_snapshot_async(context, state.auth.clone())
+        .await
+        .map_err(runtime_status_response)?;
+    Ok(Json(snapshot))
 }
 
 async fn admin_journal_recent_handler(
@@ -254,7 +259,9 @@ async fn admin_journal_recent_handler(
     })?;
     state.runtime.record_admin_status_request();
     let limit = query.limit.unwrap_or(20);
-    state.runtime.recent_journal_snapshot(limit).map(Json).map_err(runtime_status_response)
+    let snapshot =
+        state.runtime.recent_journal_snapshot(limit).await.map_err(runtime_status_response)?;
+    Ok(Json(snapshot))
 }
 
 fn auth_error_response(error: AuthError) -> Response {

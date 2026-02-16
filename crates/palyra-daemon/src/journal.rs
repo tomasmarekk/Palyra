@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -95,6 +95,8 @@ pub enum JournalError {
     },
     #[error("journal lock poisoned")]
     LockPoisoned,
+    #[error("journal event already exists: {event_id}")]
+    DuplicateEventId { event_id: String },
     #[error("journal sqlite operation failed: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("failed to serialize journal payload: {0}")]
@@ -215,7 +217,7 @@ impl JournalStore {
             None
         };
 
-        transaction.execute(
+        match transaction.execute(
             r#"
                 INSERT INTO journal_events (
                     event_ulid,
@@ -250,7 +252,20 @@ impl JournalStore {
                 request.channel,
                 created_at_unix_ms,
             ],
-        )?;
+        ) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(error, message))
+                if error.code == ErrorCode::ConstraintViolation
+                    && (error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                        || message
+                            .as_deref()
+                            .map(|value| value.contains("journal_events.event_ulid"))
+                            .unwrap_or(false)) =>
+            {
+                return Err(JournalError::DuplicateEventId { event_id: request.event_id.clone() });
+            }
+            Err(error) => return Err(error.into()),
+        }
         transaction.commit()?;
 
         Ok(JournalAppendOutcome { redacted, hash, prev_hash, write_duration: started_at.elapsed() })
@@ -505,7 +520,7 @@ mod tests {
 
     use rusqlite::{params, Connection};
 
-    use super::{JournalAppendRequest, JournalConfig, JournalStore};
+    use super::{JournalAppendRequest, JournalConfig, JournalError, JournalStore};
 
     fn build_request(event_id: &str, payload_json: &[u8]) -> JournalAppendRequest {
         JournalAppendRequest {
@@ -590,6 +605,25 @@ mod tests {
             records[0].payload_json.contains("non_json_payload"),
             "redacted metadata should explain why payload was transformed"
         );
+    }
+
+    #[test]
+    fn append_duplicate_event_id_returns_deterministic_duplicate_error() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(JournalConfig { db_path, hash_chain_enabled: false })
+            .expect("journal store should open");
+
+        store
+            .append(&build_request("01ARZ3NDEKTSV4RRFFQ69G5FB6", br#"{"kind":"first"}"#))
+            .expect("first append should succeed");
+        let error = store
+            .append(&build_request("01ARZ3NDEKTSV4RRFFQ69G5FB6", br#"{"kind":"duplicate"}"#))
+            .expect_err("duplicate event ids must be rejected deterministically");
+        assert!(matches!(
+            error,
+            JournalError::DuplicateEventId { ref event_id }
+                if event_id == "01ARZ3NDEKTSV4RRFFQ69G5FB6"
+        ));
     }
 
     #[test]
