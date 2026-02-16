@@ -10,7 +10,7 @@ use std::{
 use axum::http::{header::AUTHORIZATION, HeaderMap};
 use palyra_common::{build_metadata, validate_canonical_id, CANONICAL_PROTOCOL_MAJOR};
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tonic::{metadata::MetadataMap, Request, Response, Status, Streaming};
@@ -24,10 +24,10 @@ use crate::{
         OrchestratorSessionUpsertRequest, OrchestratorTapeAppendRequest, OrchestratorTapeRecord,
         OrchestratorUsageDelta,
     },
-    orchestrator::{
-        estimate_token_count, is_cancel_command, split_model_tokens, RunLifecycleState,
-        RunStateMachine, RunTransition, MAX_MODEL_TOKENS_PER_EVENT,
+    model_provider::{
+        ModelProvider, ProviderError, ProviderEvent, ProviderRequest, ProviderStatusSnapshot,
     },
+    orchestrator::{is_cancel_command, RunLifecycleState, RunStateMachine, RunTransition},
 };
 
 pub mod proto {
@@ -89,7 +89,6 @@ pub struct RequestContext {
     pub channel: Option<String>,
 }
 
-#[derive(Debug)]
 pub struct GatewayRuntimeState {
     started_at: Instant,
     build: BuildSnapshot,
@@ -98,6 +97,7 @@ pub struct GatewayRuntimeState {
     counters: RuntimeCounters,
     journal_store: JournalStore,
     revoked_certificate_count: usize,
+    model_provider: Arc<dyn ModelProvider>,
 }
 
 #[derive(Debug)]
@@ -114,6 +114,10 @@ struct RuntimeCounters {
     orchestrator_runs_cancelled: AtomicU64,
     orchestrator_cancel_requests: AtomicU64,
     orchestrator_tape_events: AtomicU64,
+    model_provider_requests: AtomicU64,
+    model_provider_failures: AtomicU64,
+    model_provider_retry_attempts: AtomicU64,
+    model_provider_circuit_open_rejections: AtomicU64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -134,6 +138,7 @@ pub struct GatewayStatusSnapshot {
     pub transport: TransportSnapshot,
     pub security: SecuritySnapshot,
     pub storage: StorageSnapshot,
+    pub model_provider: ProviderStatusSnapshot,
     pub counters: CountersSnapshot,
     pub request_context: RequestContext,
 }
@@ -179,6 +184,10 @@ pub struct CountersSnapshot {
     pub orchestrator_runs_cancelled: u64,
     pub orchestrator_cancel_requests: u64,
     pub orchestrator_tape_events: u64,
+    pub model_provider_requests: u64,
+    pub model_provider_failures: u64,
+    pub model_provider_retry_attempts: u64,
+    pub model_provider_circuit_open_rejections: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -232,16 +241,45 @@ impl RuntimeCounters {
             orchestrator_runs_cancelled: self.orchestrator_runs_cancelled.load(Ordering::Relaxed),
             orchestrator_cancel_requests: self.orchestrator_cancel_requests.load(Ordering::Relaxed),
             orchestrator_tape_events: self.orchestrator_tape_events.load(Ordering::Relaxed),
+            model_provider_requests: self.model_provider_requests.load(Ordering::Relaxed),
+            model_provider_failures: self.model_provider_failures.load(Ordering::Relaxed),
+            model_provider_retry_attempts: self
+                .model_provider_retry_attempts
+                .load(Ordering::Relaxed),
+            model_provider_circuit_open_rejections: self
+                .model_provider_circuit_open_rejections
+                .load(Ordering::Relaxed),
         }
     }
 }
 
 impl GatewayRuntimeState {
+    #[cfg(test)]
     pub fn new(
         config: GatewayRuntimeConfigSnapshot,
         journal_config: GatewayJournalConfigSnapshot,
         journal_store: JournalStore,
         revoked_certificate_count: usize,
+    ) -> Result<Arc<Self>, JournalError> {
+        let default_provider = crate::model_provider::build_model_provider(
+            &crate::model_provider::ModelProviderConfig::default(),
+        )
+        .expect("default deterministic model provider should initialize");
+        Self::new_with_provider(
+            config,
+            journal_config,
+            journal_store,
+            revoked_certificate_count,
+            default_provider,
+        )
+    }
+
+    pub fn new_with_provider(
+        config: GatewayRuntimeConfigSnapshot,
+        journal_config: GatewayJournalConfigSnapshot,
+        journal_store: JournalStore,
+        revoked_certificate_count: usize,
+        model_provider: Arc<dyn ModelProvider>,
     ) -> Result<Arc<Self>, JournalError> {
         let build = build_metadata();
         let existing_events = journal_store.total_events()? as u64;
@@ -267,9 +305,14 @@ impl GatewayRuntimeState {
                 orchestrator_runs_cancelled: AtomicU64::new(0),
                 orchestrator_cancel_requests: AtomicU64::new(0),
                 orchestrator_tape_events: AtomicU64::new(0),
+                model_provider_requests: AtomicU64::new(0),
+                model_provider_failures: AtomicU64::new(0),
+                model_provider_retry_attempts: AtomicU64::new(0),
+                model_provider_circuit_open_rejections: AtomicU64::new(0),
             },
             journal_store,
             revoked_certificate_count,
+            model_provider,
         }))
     }
 
@@ -360,6 +403,7 @@ impl GatewayRuntimeState {
                 journal_hash_chain_enabled: self.journal_config.hash_chain_enabled,
                 latest_event_hash,
             },
+            model_provider: self.model_provider.status_snapshot(),
             counters: self.counters.snapshot(),
             request_context: context,
         }
@@ -411,6 +455,38 @@ impl GatewayRuntimeState {
     #[must_use]
     pub const fn is_orchestrator_runloop_enabled(&self) -> bool {
         self.config.orchestrator_runloop_v1_enabled
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn execute_model_provider(
+        self: &Arc<Self>,
+        request: ProviderRequest,
+    ) -> Result<crate::model_provider::ProviderResponse, Status> {
+        self.counters.model_provider_requests.fetch_add(1, Ordering::Relaxed);
+        match self.model_provider.complete(request).await {
+            Ok(response) => {
+                if response.retry_count > 0 {
+                    self.counters
+                        .model_provider_retry_attempts
+                        .fetch_add(response.retry_count as u64, Ordering::Relaxed);
+                }
+                Ok(response)
+            }
+            Err(error) => {
+                self.counters.model_provider_failures.fetch_add(1, Ordering::Relaxed);
+                if error.retry_count() > 0 {
+                    self.counters
+                        .model_provider_retry_attempts
+                        .fetch_add(error.retry_count() as u64, Ordering::Relaxed);
+                }
+                if error.is_circuit_open() {
+                    self.counters
+                        .model_provider_circuit_open_rejections
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Err(map_provider_error(error))
+            }
+        }
     }
 
     #[allow(clippy::result_large_err)]
@@ -655,6 +731,34 @@ fn map_orchestrator_store_error(operation: &str, error: JournalError) -> Status 
             format!("orchestrator session identity mismatch for session: {session_id}"),
         ),
         other => Status::internal(format!("{operation} failed: {other}")),
+    }
+}
+
+fn map_provider_error(error: ProviderError) -> Status {
+    match error {
+        ProviderError::CircuitOpen { retry_after_ms } => Status::unavailable(format!(
+            "model provider circuit breaker is open; retry after {retry_after_ms}ms"
+        )),
+        ProviderError::MissingApiKey => {
+            Status::failed_precondition("model provider API key is missing")
+        }
+        ProviderError::VisionUnsupported { provider } => {
+            Status::failed_precondition(format!("provider '{provider}' does not support vision"))
+        }
+        ProviderError::RequestFailed { message, retryable, retry_count } => {
+            let status_message = format!(
+                "model provider request failed after {retry_count} retries (retryable={retryable}): {message}"
+            );
+            if retryable {
+                Status::unavailable(status_message)
+            } else {
+                Status::internal(status_message)
+            }
+        }
+        ProviderError::InvalidResponse { message, retry_count } => Status::internal(format!(
+            "model provider response invalid after {retry_count} retries: {message}"
+        )),
+        ProviderError::StatePoisoned => Status::internal("model provider state lock poisoned"),
     }
 }
 
@@ -1009,11 +1113,19 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     }
                 }
 
-                let input_text = message
-                    .input
-                    .and_then(|input| input.content)
-                    .map(|content| content.text)
-                    .unwrap_or_default();
+                let input_envelope = message.input.unwrap_or_default();
+                let input_content = input_envelope.content.unwrap_or_default();
+                let input_text = input_content.text;
+                let vision_requested = input_content.attachments.iter().any(|attachment| {
+                    attachment.kind == common_v1::message_attachment::AttachmentKind::Image as i32
+                });
+                let json_mode_requested = input_envelope
+                    .security
+                    .as_ref()
+                    .map(|security| {
+                        security.labels.iter().any(|label| label.eq_ignore_ascii_case("json_mode"))
+                    })
+                    .unwrap_or(false);
 
                 if is_cancel_command(input_text.as_str()) {
                     if let Err(error) = state_for_stream
@@ -1163,11 +1275,34 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     in_progress_emitted = true;
                 }
 
-                let prompt_tokens = estimate_token_count(input_text.as_str());
+                let provider_response = match state_for_stream
+                    .execute_model_provider(ProviderRequest {
+                        input_text: input_text.clone(),
+                        json_mode: json_mode_requested,
+                        vision_requested,
+                    })
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(error) => {
+                        finalize_run_failure(
+                            &sender,
+                            &state_for_stream,
+                            &mut run_state,
+                            active_run_id.as_deref(),
+                            &mut tape_seq,
+                            error.message(),
+                        )
+                        .await;
+                        let _ = sender.send(Err(error)).await;
+                        return;
+                    }
+                };
+
                 if let Err(error) = state_for_stream
                     .add_orchestrator_usage(OrchestratorUsageDelta {
                         run_id: run_id.clone(),
-                        prompt_tokens_delta: prompt_tokens,
+                        prompt_tokens_delta: provider_response.prompt_tokens,
                         completion_tokens_delta: 0,
                     })
                     .await
@@ -1185,14 +1320,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     return;
                 }
 
-                let mut tokens =
-                    split_model_tokens(input_text.as_str(), MAX_MODEL_TOKENS_PER_EVENT);
-                if tokens.is_empty() {
-                    tokens.push("ack".to_owned());
-                }
-                let mut completion_tokens = 0_u64;
-                let token_count = tokens.len();
-                for (index, token) in tokens.into_iter().enumerate() {
+                for provider_event in provider_response.events {
                     match state_for_stream.is_orchestrator_cancel_requested(run_id.clone()).await {
                         Ok(true) => {
                             if let Err(error) = run_state.transition(RunTransition::Cancel) {
@@ -1259,16 +1387,67 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                         }
                     }
 
-                    let is_final = index + 1 == token_count;
-                    if let Err(error) = send_model_token_with_tape(
-                        &sender,
-                        &state_for_stream,
-                        run_id.as_str(),
-                        &mut tape_seq,
-                        token.as_str(),
-                        is_final,
-                    )
-                    .await
+                    match provider_event {
+                        ProviderEvent::ModelToken { token, is_final } => {
+                            if let Err(error) = send_model_token_with_tape(
+                                &sender,
+                                &state_for_stream,
+                                run_id.as_str(),
+                                &mut tape_seq,
+                                token.as_str(),
+                                is_final,
+                            )
+                            .await
+                            {
+                                finalize_run_failure(
+                                    &sender,
+                                    &state_for_stream,
+                                    &mut run_state,
+                                    active_run_id.as_deref(),
+                                    &mut tape_seq,
+                                    error.message(),
+                                )
+                                .await;
+                                let _ = sender.send(Err(error)).await;
+                                return;
+                            }
+                        }
+                        ProviderEvent::ToolProposal { proposal_id, tool_name, input_json } => {
+                            if let Err(error) = send_tool_proposal_with_tape(
+                                &sender,
+                                &state_for_stream,
+                                run_id.as_str(),
+                                &mut tape_seq,
+                                proposal_id.as_str(),
+                                tool_name.as_str(),
+                                input_json,
+                            )
+                            .await
+                            {
+                                finalize_run_failure(
+                                    &sender,
+                                    &state_for_stream,
+                                    &mut run_state,
+                                    active_run_id.as_deref(),
+                                    &mut tape_seq,
+                                    error.message(),
+                                )
+                                .await;
+                                let _ = sender.send(Err(error)).await;
+                                return;
+                            }
+                        }
+                    }
+                }
+
+                if provider_response.completion_tokens > 0 {
+                    if let Err(error) = state_for_stream
+                        .add_orchestrator_usage(OrchestratorUsageDelta {
+                            run_id: run_id.clone(),
+                            prompt_tokens_delta: 0,
+                            completion_tokens_delta: provider_response.completion_tokens,
+                        })
+                        .await
                     {
                         finalize_run_failure(
                             &sender,
@@ -1282,27 +1461,6 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                         let _ = sender.send(Err(error)).await;
                         return;
                     }
-                    completion_tokens += 1;
-                }
-                if let Err(error) = state_for_stream
-                    .add_orchestrator_usage(OrchestratorUsageDelta {
-                        run_id: run_id.clone(),
-                        prompt_tokens_delta: 0,
-                        completion_tokens_delta: completion_tokens,
-                    })
-                    .await
-                {
-                    finalize_run_failure(
-                        &sender,
-                        &state_for_stream,
-                        &mut run_state,
-                        active_run_id.as_deref(),
-                        &mut tape_seq,
-                        error.message(),
-                    )
-                    .await;
-                    let _ = sender.send(Err(error)).await;
-                    return;
                 }
             }
 
@@ -1510,6 +1668,24 @@ fn model_token_event(
     }
 }
 
+fn tool_proposal_event(
+    run_id: String,
+    proposal_id: impl Into<String>,
+    tool_name: impl Into<String>,
+    input_json: Vec<u8>,
+) -> common_v1::RunStreamEvent {
+    common_v1::RunStreamEvent {
+        v: CANONICAL_PROTOCOL_MAJOR,
+        run_id: Some(common_v1::CanonicalId { ulid: run_id }),
+        body: Some(common_v1::run_stream_event::Body::ToolProposal(common_v1::ToolProposal {
+            proposal_id: Some(common_v1::CanonicalId { ulid: proposal_id.into() }),
+            tool_name: tool_name.into(),
+            input_json,
+            approval_required: true,
+        })),
+    }
+}
+
 #[allow(clippy::result_large_err)]
 async fn send_status_with_tape(
     sender: &mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
@@ -1562,6 +1738,38 @@ async fn send_model_token_with_tape(
     Ok(())
 }
 
+#[allow(clippy::result_large_err)]
+async fn send_tool_proposal_with_tape(
+    sender: &mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    proposal_id: &str,
+    tool_name: &str,
+    input_json: Vec<u8>,
+) -> Result<(), Status> {
+    let event = tool_proposal_event(
+        run_id.to_owned(),
+        proposal_id.to_owned(),
+        tool_name.to_owned(),
+        input_json.clone(),
+    );
+    sender
+        .send(Ok(event))
+        .await
+        .map_err(|_| Status::cancelled("run stream response channel closed"))?;
+    runtime_state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: *tape_seq,
+            event_type: "tool_proposal".to_owned(),
+            payload_json: tool_proposal_tape_payload(proposal_id, tool_name, input_json.as_slice()),
+        })
+        .await?;
+    *tape_seq += 1;
+    Ok(())
+}
+
 fn status_tape_payload(kind: common_v1::stream_status::StatusKind, message: &str) -> String {
     json!({
         "kind": status_kind_name(kind),
@@ -1574,6 +1782,18 @@ fn model_token_tape_payload(token: &str, is_final: bool) -> String {
     json!({
         "token": token,
         "is_final": is_final,
+    })
+    .to_string()
+}
+
+fn tool_proposal_tape_payload(proposal_id: &str, tool_name: &str, input_json: &[u8]) -> String {
+    let normalized_input = serde_json::from_slice::<Value>(input_json)
+        .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(input_json).to_string() }));
+    json!({
+        "proposal_id": proposal_id,
+        "tool_name": tool_name,
+        "input_json": normalized_input,
+        "approval_required": true,
     })
     .to_string()
 }

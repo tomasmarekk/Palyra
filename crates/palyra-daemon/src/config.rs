@@ -8,6 +8,8 @@ use palyra_common::{
     daemon_config_schema::RootFileConfig, default_config_search_paths, parse_config_path,
 };
 
+use crate::model_provider::{ModelProviderConfig, ModelProviderKind};
+
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 7142;
 const DEFAULT_GRPC_BIND_ADDR: &str = "127.0.0.1";
@@ -20,13 +22,13 @@ const DEFAULT_ADMIN_REQUIRE_AUTH: bool = true;
 const DEFAULT_ALLOW_INSECURE_NODE_RPC_WITHOUT_MTLS: bool = false;
 const DEFAULT_JOURNAL_DB_PATH: &str = "data/journal.sqlite3";
 const DEFAULT_JOURNAL_HASH_CHAIN_ENABLED: bool = false;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadedConfig {
     pub source: String,
     pub daemon: DaemonConfig,
     pub gateway: GatewayConfig,
     pub orchestrator: OrchestratorConfig,
+    pub model_provider: ModelProviderConfig,
     pub admin: AdminConfig,
     pub identity: IdentityConfig,
     pub storage: StorageConfig,
@@ -118,6 +120,7 @@ pub fn load_config() -> Result<LoadedConfig> {
     let mut daemon = DaemonConfig::default();
     let mut gateway = GatewayConfig::default();
     let mut orchestrator = OrchestratorConfig::default();
+    let mut model_provider = ModelProviderConfig::default();
     let mut admin = AdminConfig::default();
     let mut identity = IdentityConfig::default();
     let mut storage = StorageConfig::default();
@@ -156,6 +159,40 @@ pub fn load_config() -> Result<LoadedConfig> {
         if let Some(file_orchestrator) = parsed.orchestrator {
             if let Some(runloop_v1_enabled) = file_orchestrator.runloop_v1_enabled {
                 orchestrator.runloop_v1_enabled = runloop_v1_enabled;
+            }
+        }
+        if let Some(file_model_provider) = parsed.model_provider {
+            if let Some(kind) = file_model_provider.kind {
+                model_provider.kind = ModelProviderKind::parse(kind.as_str())
+                    .context("model_provider.kind must be deterministic or openai_compatible")?;
+            }
+            if let Some(openai_base_url) = file_model_provider.openai_base_url {
+                model_provider.openai_base_url = parse_openai_base_url(openai_base_url.as_str())?;
+            }
+            if let Some(openai_model) = file_model_provider.openai_model {
+                model_provider.openai_model = parse_openai_model(openai_model.as_str())?;
+            }
+            if let Some(request_timeout_ms) = file_model_provider.request_timeout_ms {
+                model_provider.request_timeout_ms =
+                    parse_positive_u64(request_timeout_ms, "model_provider.request_timeout_ms")?;
+            }
+            if let Some(max_retries) = file_model_provider.max_retries {
+                model_provider.max_retries =
+                    parse_retries(max_retries, "model_provider.max_retries")?;
+            }
+            if let Some(retry_backoff_ms) = file_model_provider.retry_backoff_ms {
+                model_provider.retry_backoff_ms =
+                    parse_positive_u64(retry_backoff_ms, "model_provider.retry_backoff_ms")?;
+            }
+            if let Some(failure_threshold) = file_model_provider.circuit_breaker_failure_threshold {
+                model_provider.circuit_breaker_failure_threshold = parse_positive_u32(
+                    failure_threshold,
+                    "model_provider.circuit_breaker_failure_threshold",
+                )?;
+            }
+            if let Some(cooldown_ms) = file_model_provider.circuit_breaker_cooldown_ms {
+                model_provider.circuit_breaker_cooldown_ms =
+                    parse_positive_u64(cooldown_ms, "model_provider.circuit_breaker_cooldown_ms")?;
             }
         }
         if let Some(file_admin) = parsed.admin {
@@ -229,6 +266,80 @@ pub fn load_config() -> Result<LoadedConfig> {
         source.push_str(" +env(PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED)");
     }
 
+    if let Ok(kind) = env::var("PALYRA_MODEL_PROVIDER_KIND") {
+        model_provider.kind = ModelProviderKind::parse(kind.as_str())
+            .context("PALYRA_MODEL_PROVIDER_KIND must be deterministic or openai_compatible")?;
+        source.push_str(" +env(PALYRA_MODEL_PROVIDER_KIND)");
+    }
+
+    if let Ok(openai_base_url) = env::var("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL") {
+        model_provider.openai_base_url = parse_openai_base_url(openai_base_url.as_str())?;
+        source.push_str(" +env(PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL)");
+    }
+
+    if let Ok(openai_model) = env::var("PALYRA_MODEL_PROVIDER_OPENAI_MODEL") {
+        model_provider.openai_model = parse_openai_model(openai_model.as_str())?;
+        source.push_str(" +env(PALYRA_MODEL_PROVIDER_OPENAI_MODEL)");
+    }
+
+    if let Ok(openai_api_key) = env::var("PALYRA_MODEL_PROVIDER_OPENAI_API_KEY") {
+        model_provider.openai_api_key =
+            if openai_api_key.trim().is_empty() { None } else { Some(openai_api_key) };
+        source.push_str(" +env(PALYRA_MODEL_PROVIDER_OPENAI_API_KEY)");
+    }
+
+    if let Ok(request_timeout_ms) = env::var("PALYRA_MODEL_PROVIDER_REQUEST_TIMEOUT_MS") {
+        model_provider.request_timeout_ms = parse_positive_u64(
+            request_timeout_ms
+                .parse::<u64>()
+                .context("PALYRA_MODEL_PROVIDER_REQUEST_TIMEOUT_MS must be a valid u64")?,
+            "PALYRA_MODEL_PROVIDER_REQUEST_TIMEOUT_MS",
+        )?;
+        source.push_str(" +env(PALYRA_MODEL_PROVIDER_REQUEST_TIMEOUT_MS)");
+    }
+
+    if let Ok(max_retries) = env::var("PALYRA_MODEL_PROVIDER_MAX_RETRIES") {
+        model_provider.max_retries = parse_retries(
+            max_retries
+                .parse::<u32>()
+                .context("PALYRA_MODEL_PROVIDER_MAX_RETRIES must be a valid u32")?,
+            "PALYRA_MODEL_PROVIDER_MAX_RETRIES",
+        )?;
+        source.push_str(" +env(PALYRA_MODEL_PROVIDER_MAX_RETRIES)");
+    }
+
+    if let Ok(retry_backoff_ms) = env::var("PALYRA_MODEL_PROVIDER_RETRY_BACKOFF_MS") {
+        model_provider.retry_backoff_ms = parse_positive_u64(
+            retry_backoff_ms
+                .parse::<u64>()
+                .context("PALYRA_MODEL_PROVIDER_RETRY_BACKOFF_MS must be a valid u64")?,
+            "PALYRA_MODEL_PROVIDER_RETRY_BACKOFF_MS",
+        )?;
+        source.push_str(" +env(PALYRA_MODEL_PROVIDER_RETRY_BACKOFF_MS)");
+    }
+
+    if let Ok(failure_threshold) =
+        env::var("PALYRA_MODEL_PROVIDER_CIRCUIT_BREAKER_FAILURE_THRESHOLD")
+    {
+        model_provider.circuit_breaker_failure_threshold = parse_positive_u32(
+            failure_threshold.parse::<u32>().context(
+                "PALYRA_MODEL_PROVIDER_CIRCUIT_BREAKER_FAILURE_THRESHOLD must be a valid u32",
+            )?,
+            "PALYRA_MODEL_PROVIDER_CIRCUIT_BREAKER_FAILURE_THRESHOLD",
+        )?;
+        source.push_str(" +env(PALYRA_MODEL_PROVIDER_CIRCUIT_BREAKER_FAILURE_THRESHOLD)");
+    }
+
+    if let Ok(cooldown_ms) = env::var("PALYRA_MODEL_PROVIDER_CIRCUIT_BREAKER_COOLDOWN_MS") {
+        model_provider.circuit_breaker_cooldown_ms = parse_positive_u64(
+            cooldown_ms
+                .parse::<u64>()
+                .context("PALYRA_MODEL_PROVIDER_CIRCUIT_BREAKER_COOLDOWN_MS must be a valid u64")?,
+            "PALYRA_MODEL_PROVIDER_CIRCUIT_BREAKER_COOLDOWN_MS",
+        )?;
+        source.push_str(" +env(PALYRA_MODEL_PROVIDER_CIRCUIT_BREAKER_COOLDOWN_MS)");
+    }
+
     if let Ok(require_auth) = env::var("PALYRA_ADMIN_REQUIRE_AUTH") {
         admin.require_auth = require_auth
             .parse::<bool>()
@@ -260,7 +371,16 @@ pub fn load_config() -> Result<LoadedConfig> {
         source.push_str(" +env(PALYRA_JOURNAL_HASH_CHAIN_ENABLED)");
     }
 
-    Ok(LoadedConfig { source, daemon, gateway, orchestrator, admin, identity, storage })
+    Ok(LoadedConfig {
+        source,
+        daemon,
+        gateway,
+        orchestrator,
+        model_provider,
+        admin,
+        identity,
+        storage,
+    })
 }
 
 fn find_config_path() -> Result<Option<PathBuf>> {
@@ -296,14 +416,55 @@ fn parse_journal_db_path(raw: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+fn parse_openai_base_url(raw: &str) -> Result<String> {
+    if raw.trim().is_empty() {
+        anyhow::bail!("openai base URL cannot be empty");
+    }
+    let normalized = raw.trim();
+    if !(normalized.starts_with("http://") || normalized.starts_with("https://")) {
+        anyhow::bail!("openai base URL must start with http:// or https://");
+    }
+    Ok(normalized.to_owned())
+}
+
+fn parse_openai_model(raw: &str) -> Result<String> {
+    if raw.trim().is_empty() {
+        anyhow::bail!("openai model cannot be empty");
+    }
+    Ok(raw.trim().to_owned())
+}
+
+fn parse_positive_u64(value: u64, name: &str) -> Result<u64> {
+    if value == 0 {
+        anyhow::bail!("{name} must be greater than 0");
+    }
+    Ok(value)
+}
+
+fn parse_positive_u32(value: u32, name: &str) -> Result<u32> {
+    if value == 0 {
+        anyhow::bail!("{name} must be greater than 0");
+    }
+    Ok(value)
+}
+
+fn parse_retries(value: u32, name: &str) -> Result<u32> {
+    const MAX_RETRIES: u32 = 10;
+    if value > MAX_RETRIES {
+        anyhow::bail!("{name} must be <= {MAX_RETRIES}");
+    }
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
     use super::{
-        parse_journal_db_path, AdminConfig, GatewayConfig, IdentityConfig, OrchestratorConfig,
-        StorageConfig,
+        parse_journal_db_path, parse_openai_base_url, AdminConfig, GatewayConfig, IdentityConfig,
+        ModelProviderConfig, OrchestratorConfig, StorageConfig,
     };
+    use crate::model_provider::ModelProviderKind;
     use palyra_common::daemon_config_schema::RootFileConfig;
 
     #[test]
@@ -342,6 +503,16 @@ mod tests {
             !config.runloop_v1_enabled,
             "orchestrator run loop should default disabled until explicitly enabled"
         );
+    }
+
+    #[test]
+    fn model_provider_defaults_to_deterministic_with_safe_retry_policy() {
+        let config = ModelProviderConfig::default();
+        assert_eq!(config.kind, ModelProviderKind::Deterministic);
+        assert_eq!(config.openai_base_url, "https://api.openai.com/v1");
+        assert_eq!(config.openai_model, "gpt-4o-mini");
+        assert!(config.openai_api_key.is_none(), "openai API key should default to unset");
+        assert_eq!(config.max_retries, 2);
     }
 
     #[test]
@@ -398,6 +569,13 @@ mod tests {
     }
 
     #[test]
+    fn config_rejects_unknown_model_provider_key() {
+        let result: Result<RootFileConfig, _> =
+            toml::from_str("[model_provider]\nkind='deterministic'\nunexpected=true\n");
+        assert!(result.is_err(), "unknown model_provider keys must be rejected");
+    }
+
+    #[test]
     fn config_rejects_unknown_admin_key() {
         let result: Result<RootFileConfig, _> =
             toml::from_str("[admin]\nrequire_auth=true\nunexpected=true\n");
@@ -415,5 +593,11 @@ mod tests {
     fn journal_db_path_rejects_parent_traversal() {
         let result = parse_journal_db_path("../secrets/journal.sqlite3");
         assert!(result.is_err(), "journal db path must reject parent traversal");
+    }
+
+    #[test]
+    fn openai_base_url_requires_http_scheme() {
+        let result = parse_openai_base_url("file:///tmp/openai");
+        assert!(result.is_err(), "openai base URL without http/https scheme must fail");
     }
 }

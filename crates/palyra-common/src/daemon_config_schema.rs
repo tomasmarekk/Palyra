@@ -6,6 +6,7 @@ pub struct RootFileConfig {
     pub daemon: Option<FileDaemonConfig>,
     pub gateway: Option<FileGatewayConfig>,
     pub orchestrator: Option<FileOrchestratorConfig>,
+    pub model_provider: Option<FileModelProviderConfig>,
     pub admin: Option<FileAdminConfig>,
     pub identity: Option<FileIdentityConfig>,
     pub storage: Option<FileStorageConfig>,
@@ -32,6 +33,19 @@ pub struct FileGatewayConfig {
 #[serde(deny_unknown_fields)]
 pub struct FileOrchestratorConfig {
     pub runloop_v1_enabled: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileModelProviderConfig {
+    pub kind: Option<String>,
+    pub openai_base_url: Option<String>,
+    pub openai_model: Option<String>,
+    pub request_timeout_ms: Option<u64>,
+    pub max_retries: Option<u32>,
+    pub retry_backoff_ms: Option<u64>,
+    pub circuit_breaker_failure_threshold: Option<u32>,
+    pub circuit_breaker_cooldown_ms: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]

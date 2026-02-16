@@ -1,6 +1,7 @@
 mod config;
 mod gateway;
 mod journal;
+mod model_provider;
 mod orchestrator;
 
 use std::time::Instant;
@@ -22,6 +23,7 @@ use gateway::{
 use journal::{
     JournalConfig, JournalStore, OrchestratorCancelRequest, OrchestratorRunStatusSnapshot,
 };
+use model_provider::build_model_provider;
 use palyra_common::{
     build_metadata, health_response, parse_daemon_bind_socket, validate_canonical_id,
     HealthResponse,
@@ -105,7 +107,9 @@ async fn main() -> Result<()> {
         hash_chain_enabled: loaded.storage.journal_hash_chain_enabled,
     })
     .context("failed to initialize event journal storage")?;
-    let runtime = GatewayRuntimeState::new(
+    let model_provider = build_model_provider(&loaded.model_provider)
+        .context("failed to initialize model provider runtime")?;
+    let runtime = GatewayRuntimeState::new_with_provider(
         GatewayRuntimeConfigSnapshot {
             grpc_bind_addr: loaded.gateway.grpc_bind_addr.clone(),
             grpc_port: loaded.gateway.grpc_port,
@@ -122,6 +126,7 @@ async fn main() -> Result<()> {
         },
         journal_store,
         revoked_certificates,
+        model_provider,
     )
     .context("failed to initialize gateway runtime state")?;
 
@@ -154,6 +159,10 @@ async fn main() -> Result<()> {
         quic_port = loaded.gateway.quic_port,
         quic_enabled = loaded.gateway.quic_enabled,
         orchestrator_runloop_v1_enabled = loaded.orchestrator.runloop_v1_enabled,
+        model_provider_kind = loaded.model_provider.kind.as_str(),
+        model_provider_openai_base_url = %loaded.model_provider.openai_base_url,
+        model_provider_openai_model = %loaded.model_provider.openai_model,
+        model_provider_api_key_configured = loaded.model_provider.openai_api_key.is_some(),
         admin_auth_required = loaded.admin.require_auth,
         admin_token_configured = loaded.admin.auth_token.is_some(),
         node_rpc_mtls_required = !loaded.identity.allow_insecure_node_rpc_without_mtls,

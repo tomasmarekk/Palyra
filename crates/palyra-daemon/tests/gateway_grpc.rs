@@ -1,10 +1,13 @@
 use std::{
     fs,
     io::{BufRead, BufReader, Read, Write},
-    net::{SocketAddr, TcpStream},
+    net::{SocketAddr, TcpListener, TcpStream},
     path::PathBuf,
     process::{Child, ChildStdout, Command, Stdio},
-    sync::mpsc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc, Arc,
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -22,6 +25,7 @@ const SESSION_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
 const RUN_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAX";
 const RUN_ID_ALT: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAZ";
 const ENVELOPE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAY";
+const OPENAI_API_KEY: &str = "sk-openai-integration-test";
 
 pub mod proto {
     pub mod palyra {
@@ -141,6 +145,67 @@ async fn grpc_gateway_run_stream_emits_at_most_sixteen_model_tokens() -> Result<
         model_tokens.iter().take(15).all(|token| !token.is_final),
         "only the last emitted token should be marked final"
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_run_stream_uses_openai_compatible_provider_when_configured() -> Result<()> {
+    let (openai_base_url, request_count, server_handle) = spawn_scripted_openai_server(vec![(
+        200,
+        r#"{"choices":[{"message":{"content":"provider says hello"}}]}"#.to_owned(),
+    )])?;
+    let (child, admin_port, grpc_port, _journal_db_path) =
+        spawn_palyrad_with_openai_provider(openai_base_url.as_str(), OPENAI_API_KEY)?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+
+    let mut stream_request =
+        tonic::Request::new(tokio_stream::iter(vec![sample_run_stream_request_with_text(
+            "ignored by deterministic fallback".to_owned(),
+        )]));
+    stream_request.metadata_mut().insert("authorization", format!("Bearer {ADMIN_TOKEN}").parse()?);
+    stream_request.metadata_mut().insert("x-palyra-principal", "user:ops".parse()?);
+    stream_request.metadata_mut().insert("x-palyra-device-id", DEVICE_ID.parse()?);
+    stream_request.metadata_mut().insert("x-palyra-channel", "cli".parse()?);
+
+    let mut response_stream =
+        client.run_stream(stream_request).await.context("failed to call RunStream")?.into_inner();
+    let mut model_tokens = Vec::new();
+    while let Some(event) = response_stream.next().await {
+        let event = event.context("failed to read RunStream event")?;
+        if let Some(common_v1::run_stream_event::Body::ModelToken(token)) = event.body {
+            model_tokens.push(token.token);
+        }
+    }
+    assert_eq!(model_tokens, vec!["provider", "says", "hello"]);
+    assert_eq!(
+        request_count.load(Ordering::Relaxed),
+        1,
+        "openai-compatible provider should perform one upstream call"
+    );
+
+    let status_snapshot = admin_get_json_async(admin_port, "/admin/v1/status".to_owned()).await?;
+    assert_eq!(
+        status_snapshot.pointer("/model_provider/kind").and_then(Value::as_str),
+        Some("openai_compatible")
+    );
+    assert_eq!(
+        status_snapshot.pointer("/model_provider/api_key_configured").and_then(Value::as_bool),
+        Some(true)
+    );
+    let serialized_status =
+        serde_json::to_string(&status_snapshot).context("failed to serialize status snapshot")?;
+    assert!(
+        !serialized_status.contains(OPENAI_API_KEY),
+        "admin status snapshot must not leak provider API key"
+    );
+
+    server_handle.join().expect("scripted openai server thread should exit");
     Ok(())
 }
 
@@ -649,6 +714,110 @@ fn spawn_palyrad_with_dynamic_ports_and_hash_chain(
     let stdout = child.stdout.take().context("failed to capture palyrad stdout")?;
     let (admin_port, grpc_port) = wait_for_listen_ports(stdout, &mut child)?;
     Ok((child, admin_port, grpc_port, journal_db_path))
+}
+
+fn spawn_palyrad_with_openai_provider(
+    openai_base_url: &str,
+    openai_api_key: &str,
+) -> Result<(Child, u16, u16, PathBuf)> {
+    let journal_db_path = unique_temp_journal_db_path();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_palyrad"))
+        .args([
+            "--bind",
+            "127.0.0.1",
+            "--port",
+            "0",
+            "--grpc-bind",
+            "127.0.0.1",
+            "--grpc-port",
+            "0",
+        ])
+        .env("PALYRA_ADMIN_TOKEN", ADMIN_TOKEN)
+        .env("PALYRA_JOURNAL_DB_PATH", journal_db_path.to_string_lossy().to_string())
+        .env("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED", "true")
+        .env("PALYRA_MODEL_PROVIDER_KIND", "openai_compatible")
+        .env("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", openai_base_url)
+        .env("PALYRA_MODEL_PROVIDER_OPENAI_API_KEY", openai_api_key)
+        .env("PALYRA_MODEL_PROVIDER_MAX_RETRIES", "0")
+        .env("PALYRA_MODEL_PROVIDER_RETRY_BACKOFF_MS", "1")
+        .env("PALYRA_MODEL_PROVIDER_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "1")
+        .env("PALYRA_MODEL_PROVIDER_CIRCUIT_BREAKER_COOLDOWN_MS", "30000")
+        .env("RUST_LOG", "info")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to start palyrad with openai-compatible provider")?;
+    let stdout = child.stdout.take().context("failed to capture palyrad stdout")?;
+    let (admin_port, grpc_port) = wait_for_listen_ports(stdout, &mut child)?;
+    Ok((child, admin_port, grpc_port, journal_db_path))
+}
+
+fn spawn_scripted_openai_server(
+    responses: Vec<(u16, String)>,
+) -> Result<(String, Arc<AtomicUsize>, thread::JoinHandle<()>)> {
+    let listener =
+        TcpListener::bind("127.0.0.1:0").context("failed to bind scripted openai listener")?;
+    let address = listener.local_addr().context("failed to resolve scripted listener address")?;
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let request_count_for_thread = Arc::clone(&request_count);
+    let handle = thread::spawn(move || {
+        for (status_code, body) in responses {
+            let (mut stream, _) =
+                listener.accept().expect("scripted openai listener should accept connection");
+            request_count_for_thread.fetch_add(1, Ordering::Relaxed);
+            read_http_request_for_scripted_server(&mut stream)
+                .expect("scripted openai server should read request");
+            let reason = match status_code {
+                200 => "OK",
+                429 => "Too Many Requests",
+                500 => "Internal Server Error",
+                502 => "Bad Gateway",
+                503 => "Service Unavailable",
+                504 => "Gateway Timeout",
+                _ => "Error",
+            };
+            let response = format!(
+                "HTTP/1.1 {status_code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("scripted openai server should write response");
+            let _ = stream.flush();
+        }
+    });
+    Ok((format!("http://{address}/v1"), request_count, handle))
+}
+
+fn read_http_request_for_scripted_server(stream: &mut TcpStream) -> Result<()> {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .context("failed to configure scripted server read timeout")?;
+    let mut reader = BufReader::new(stream);
+    let mut content_length = 0_usize;
+    loop {
+        let mut line = String::new();
+        let bytes_read =
+            reader.read_line(&mut line).context("failed to read scripted request line")?;
+        if bytes_read == 0 || line == "\r\n" {
+            break;
+        }
+        let line_trimmed = line.trim_end_matches(['\r', '\n']);
+        if let Some(value) = line_trimmed.strip_prefix("Content-Length:") {
+            content_length =
+                value.trim().parse::<usize>().context("invalid Content-Length in request")?;
+        }
+    }
+
+    if content_length > 0 {
+        let mut body = vec![0_u8; content_length];
+        reader.read_exact(&mut body).context("failed to read scripted request body")?;
+        if body.is_empty() {
+            anyhow::bail!("scripted openai request body should not be empty");
+        }
+    }
+
+    Ok(())
 }
 
 fn unique_temp_journal_db_path() -> PathBuf {
