@@ -29,6 +29,11 @@ use serde::Deserialize;
 
 const MAX_HEALTH_ATTEMPTS: usize = 3;
 const BASE_HEALTH_BACKOFF_MS: u64 = 100;
+const DEFAULT_GATEWAY_GRPC_BIND_ADDR: &str = "127.0.0.1";
+const DEFAULT_GATEWAY_GRPC_PORT: u16 = 7443;
+const DEFAULT_GATEWAY_QUIC_BIND_ADDR: &str = "127.0.0.1";
+const DEFAULT_GATEWAY_QUIC_PORT: u16 = 7444;
+const DEFAULT_GATEWAY_QUIC_ENABLED: bool = true;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -181,18 +186,18 @@ fn run_daemon(command: DaemonCommand) -> Result<()> {
                 .or_else(|| env::var("PALYRA_DAEMON_URL").ok())
                 .unwrap_or_else(|| "http://127.0.0.1:7142".to_owned());
             let status_url = format!("{}/admin/v1/status", base_url.trim_end_matches('/'));
-            let token = token
-                .or_else(|| env::var("PALYRA_ADMIN_TOKEN").ok())
-                .context("admin status requires --token or PALYRA_ADMIN_TOKEN")?;
+            let token = token.or_else(|| env::var("PALYRA_ADMIN_TOKEN").ok());
             let client = Client::builder()
                 .timeout(std::time::Duration::from_secs(2))
                 .build()
                 .context("failed to build HTTP client")?;
             let mut request = client
                 .get(status_url)
-                .header("Authorization", format!("Bearer {token}"))
                 .header("x-palyra-principal", principal)
                 .header("x-palyra-device-id", device_id);
+            if let Some(token) = token {
+                request = request.header("Authorization", format!("Bearer {token}"));
+            }
             if let Some(channel) = channel {
                 request = request.header("x-palyra-channel", channel);
             }
@@ -284,6 +289,40 @@ fn validate_daemon_compatible_config(content: &str) -> Result<()> {
     let port = parsed.daemon.as_ref().and_then(|daemon| daemon.port).unwrap_or(7142);
     let _ =
         parse_daemon_bind_socket(bind_addr, port).context("invalid daemon bind address or port")?;
+
+    let grpc_bind_addr = parsed
+        .gateway
+        .as_ref()
+        .and_then(|gateway| gateway.grpc_bind_addr.as_deref())
+        .unwrap_or(DEFAULT_GATEWAY_GRPC_BIND_ADDR);
+    let grpc_port = parsed
+        .gateway
+        .as_ref()
+        .and_then(|gateway| gateway.grpc_port)
+        .unwrap_or(DEFAULT_GATEWAY_GRPC_PORT);
+    let _ = parse_daemon_bind_socket(grpc_bind_addr, grpc_port)
+        .context("invalid gateway gRPC bind address or port")?;
+
+    let quic_enabled = parsed
+        .gateway
+        .as_ref()
+        .and_then(|gateway| gateway.quic_enabled)
+        .unwrap_or(DEFAULT_GATEWAY_QUIC_ENABLED);
+    if quic_enabled {
+        let quic_bind_addr = parsed
+            .gateway
+            .as_ref()
+            .and_then(|gateway| gateway.quic_bind_addr.as_deref())
+            .unwrap_or(DEFAULT_GATEWAY_QUIC_BIND_ADDR);
+        let quic_port = parsed
+            .gateway
+            .as_ref()
+            .and_then(|gateway| gateway.quic_port)
+            .unwrap_or(DEFAULT_GATEWAY_QUIC_PORT);
+        let _ = parse_daemon_bind_socket(quic_bind_addr, quic_port)
+            .context("invalid gateway QUIC bind address or port")?;
+    }
+
     Ok(())
 }
 

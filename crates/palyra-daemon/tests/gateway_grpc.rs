@@ -94,7 +94,55 @@ async fn grpc_gateway_enforces_auth_and_streams_status() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_gateway_run_stream_emits_at_most_sixteen_model_tokens() -> Result<()> {
+    let (child, admin_port, grpc_port) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+
+    let long_input = (0..64).map(|index| format!("token{index}")).collect::<Vec<_>>().join(" ");
+    let mut stream_request =
+        tonic::Request::new(tokio_stream::iter(vec![sample_run_stream_request_with_text(
+            long_input,
+        )]));
+    stream_request.metadata_mut().insert("authorization", format!("Bearer {ADMIN_TOKEN}").parse()?);
+    stream_request.metadata_mut().insert("x-palyra-principal", "user:ops".parse()?);
+    stream_request.metadata_mut().insert("x-palyra-device-id", DEVICE_ID.parse()?);
+    stream_request.metadata_mut().insert("x-palyra-channel", "cli".parse()?);
+
+    let mut response_stream =
+        client.run_stream(stream_request).await.context("failed to call RunStream")?.into_inner();
+
+    let mut model_tokens = Vec::new();
+    while let Some(event) = response_stream.next().await {
+        let event = event.context("failed to read RunStream event")?;
+        if let Some(common_v1::run_stream_event::Body::ModelToken(token)) = event.body {
+            model_tokens.push(token);
+        }
+    }
+
+    assert_eq!(model_tokens.len(), 16, "run stream should emit at most 16 model tokens");
+    assert!(
+        model_tokens.last().map(|token| token.is_final).unwrap_or(false),
+        "last emitted token should be final"
+    );
+    assert!(
+        model_tokens.iter().take(15).all(|token| !token.is_final),
+        "only the last emitted token should be marked final"
+    );
+    Ok(())
+}
+
 fn sample_run_stream_request() -> common_v1::RunStreamRequest {
+    sample_run_stream_request_with_text("hello from grpc integration".to_owned())
+}
+
+fn sample_run_stream_request_with_text(text: String) -> common_v1::RunStreamRequest {
     common_v1::RunStreamRequest {
         v: 1,
         session_id: Some(common_v1::CanonicalId { ulid: SESSION_ID.to_owned() }),
@@ -102,10 +150,7 @@ fn sample_run_stream_request() -> common_v1::RunStreamRequest {
         input: Some(common_v1::MessageEnvelope {
             v: 1,
             envelope_id: Some(common_v1::CanonicalId { ulid: ENVELOPE_ID.to_owned() }),
-            content: Some(common_v1::MessageContent {
-                text: "hello from grpc integration".to_owned(),
-                attachments: Vec::new(),
-            }),
+            content: Some(common_v1::MessageContent { text, attachments: Vec::new() }),
             ..Default::default()
         }),
         allow_sensitive_tools: false,

@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -36,6 +37,8 @@ use proto::palyra::{common::v1 as common_v1, gateway::v1 as gateway_v1};
 pub const HEADER_PRINCIPAL: &str = "x-palyra-principal";
 pub const HEADER_DEVICE_ID: &str = "x-palyra-device-id";
 pub const HEADER_CHANNEL: &str = "x-palyra-channel";
+const MAX_JOURNAL_EVENTS: usize = 10_000;
+const MAX_MODEL_TOKENS_PER_EVENT: usize = 16;
 
 #[derive(Debug, Clone)]
 pub struct GatewayRuntimeConfigSnapshot {
@@ -68,7 +71,7 @@ pub struct GatewayRuntimeState {
     build: BuildSnapshot,
     config: GatewayRuntimeConfigSnapshot,
     counters: RuntimeCounters,
-    journal: Mutex<Vec<String>>,
+    journal: Mutex<VecDeque<String>>,
     revoked_certificate_count: usize,
 }
 
@@ -176,7 +179,7 @@ impl GatewayRuntimeState {
                 admin_status_requests: AtomicU64::new(0),
                 denied_requests: AtomicU64::new(0),
             },
-            journal: Mutex::new(Vec::new()),
+            journal: Mutex::new(VecDeque::new()),
             revoked_certificate_count,
         })
     }
@@ -187,6 +190,17 @@ impl GatewayRuntimeState {
 
     pub fn record_admin_status_request(&self) {
         self.counters.admin_status_requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn record_journal_event(&self, event_id: String) -> Result<(), Status> {
+        let mut journal =
+            self.journal.lock().map_err(|_| Status::internal("gateway journal lock poisoned"))?;
+        journal.push_back(event_id);
+        if journal.len() > MAX_JOURNAL_EVENTS {
+            let _ = journal.pop_front();
+        }
+        Ok(())
     }
 
     pub fn status_snapshot(
@@ -287,9 +301,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
             Ulid::new().to_string()
         };
 
-        if let Ok(mut journal) = self.state.journal.lock() {
-            journal.push(event_id.clone());
-        }
+        self.state.record_journal_event(event_id.clone())?;
 
         info!(
             method = "AppendEvent",
@@ -402,14 +414,14 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     .and_then(|input| input.content)
                     .and_then(|content| non_empty(content.text))
                 {
-                    let tokens: Vec<_> = text.split_whitespace().collect();
-                    if tokens.is_empty() {
+                    let mut tokens =
+                        text.split_whitespace().take(MAX_MODEL_TOKENS_PER_EVENT).peekable();
+                    if tokens.peek().is_none() {
                         let _ =
                             sender.send(Ok(model_token_event(run_id.clone(), "ack", true))).await;
                     } else {
-                        let take_count = tokens.len().min(16);
-                        for (index, token) in tokens.into_iter().take(take_count).enumerate() {
-                            let is_final = index + 1 == take_count;
+                        while let Some(token) = tokens.next() {
+                            let is_final = tokens.peek().is_none();
                             if sender
                                 .send(Ok(model_token_event(run_id.clone(), token, is_final)))
                                 .await
@@ -601,7 +613,8 @@ mod tests {
 
     use super::{
         authorize_headers, request_context_from_headers, AuthError, GatewayAuthConfig,
-        RequestContext, HEADER_CHANNEL, HEADER_DEVICE_ID, HEADER_PRINCIPAL,
+        GatewayRuntimeConfigSnapshot, GatewayRuntimeState, RequestContext, HEADER_CHANNEL,
+        HEADER_DEVICE_ID, HEADER_PRINCIPAL, MAX_JOURNAL_EVENTS,
     };
 
     #[test]
@@ -644,6 +657,41 @@ mod tests {
                 device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
                 channel: Some("cli".to_owned()),
             }
+        );
+    }
+
+    #[test]
+    fn journal_retention_is_bounded_and_status_reports_capped_size() {
+        let state = GatewayRuntimeState::new(
+            GatewayRuntimeConfigSnapshot {
+                grpc_bind_addr: "127.0.0.1".to_owned(),
+                grpc_port: 7443,
+                quic_bind_addr: "127.0.0.1".to_owned(),
+                quic_port: 7444,
+                quic_enabled: true,
+                node_rpc_mtls_required: true,
+                admin_auth_required: true,
+            },
+            0,
+        );
+
+        for index in 0..(MAX_JOURNAL_EVENTS + 32) {
+            state
+                .record_journal_event(format!("event-{index}"))
+                .expect("journal record should succeed");
+        }
+
+        let status = state.status_snapshot(
+            RequestContext {
+                principal: "user:ops".to_owned(),
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                channel: Some("cli".to_owned()),
+            },
+            &GatewayAuthConfig { require_auth: true, admin_token: Some("token".to_owned()) },
+        );
+        assert_eq!(
+            status.counters.journal_events, MAX_JOURNAL_EVENTS,
+            "journal retention should cap stored event count"
         );
     }
 }

@@ -135,6 +135,81 @@ fn config_validate_with_explicit_path_rejects_invalid_bind_address() -> Result<(
 }
 
 #[test]
+fn config_validate_with_explicit_path_rejects_invalid_gateway_grpc_bind_address() -> Result<()> {
+    let workdir = TempDir::new().context("failed to create temporary workdir")?;
+    let config_path = workdir.path().join("invalid-gateway-grpc-bind.toml");
+    fs::write(&config_path, "[gateway]\ngrpc_bind_addr='bad host value'\ngrpc_port=7443\n")
+        .with_context(|| format!("failed to write {}", config_path.display()))?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
+        .current_dir(workdir.path())
+        .args(["config", "validate", "--path", "invalid-gateway-grpc-bind.toml"])
+        .output()
+        .context("failed to execute palyra config validate with invalid gateway gRPC bind")?;
+
+    assert!(!output.status.success(), "config with invalid gateway gRPC bind must fail");
+    let stderr = String::from_utf8(output.stderr).context("stderr was not UTF-8")?;
+    assert!(
+        stderr.contains("invalid gateway gRPC bind address or port"),
+        "unexpected stderr output: {stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn config_validate_with_explicit_path_rejects_invalid_gateway_quic_bind_when_enabled() -> Result<()>
+{
+    let workdir = TempDir::new().context("failed to create temporary workdir")?;
+    let config_path = workdir.path().join("invalid-gateway-quic-bind.toml");
+    fs::write(
+        &config_path,
+        "[gateway]\nquic_enabled=true\nquic_bind_addr='bad host value'\nquic_port=7444\n",
+    )
+    .with_context(|| format!("failed to write {}", config_path.display()))?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
+        .current_dir(workdir.path())
+        .args(["config", "validate", "--path", "invalid-gateway-quic-bind.toml"])
+        .output()
+        .context("failed to execute palyra config validate with invalid gateway QUIC bind")?;
+
+    assert!(!output.status.success(), "config with invalid gateway QUIC bind must fail");
+    let stderr = String::from_utf8(output.stderr).context("stderr was not UTF-8")?;
+    assert!(
+        stderr.contains("invalid gateway QUIC bind address or port"),
+        "unexpected stderr output: {stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn config_validate_with_explicit_path_ignores_invalid_gateway_quic_bind_when_disabled() -> Result<()>
+{
+    let workdir = TempDir::new().context("failed to create temporary workdir")?;
+    let config_path = workdir.path().join("disabled-gateway-quic-invalid-bind.toml");
+    fs::write(
+        &config_path,
+        "[gateway]\nquic_enabled=false\nquic_bind_addr='bad host value'\nquic_port=7444\n",
+    )
+    .with_context(|| format!("failed to write {}", config_path.display()))?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
+        .current_dir(workdir.path())
+        .args(["config", "validate", "--path", "disabled-gateway-quic-invalid-bind.toml"])
+        .output()
+        .context("failed to execute palyra config validate with disabled QUIC")?;
+
+    assert!(
+        output.status.success(),
+        "config validate should ignore invalid QUIC bind when QUIC is disabled: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).context("stdout was not UTF-8")?;
+    assert!(stdout.contains("config=valid source=disabled-gateway-quic-invalid-bind.toml"));
+    Ok(())
+}
+
+#[test]
 fn config_validate_with_explicit_path_accepts_valid_bind_address_and_port() -> Result<()> {
     let workdir = TempDir::new().context("failed to create temporary workdir")?;
     let config_path = workdir.path().join("valid-bind.toml");

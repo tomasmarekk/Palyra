@@ -10,6 +10,8 @@ use std::{
 use anyhow::{Context, Result};
 use reqwest::blocking::Client;
 
+const DEVICE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+
 #[test]
 fn palyra_daemon_status_reads_health_endpoint() -> Result<()> {
     let (child, port) = spawn_palyrad_with_dynamic_port()?;
@@ -32,9 +34,80 @@ fn palyra_daemon_status_reads_health_endpoint() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn palyra_daemon_admin_status_without_token_succeeds_when_auth_is_disabled() -> Result<()> {
+    let (child, port) =
+        spawn_palyrad_with_dynamic_port_and_env(&[("PALYRA_ADMIN_REQUIRE_AUTH", "false")])?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(port, daemon.child_mut())?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
+        .args([
+            "daemon",
+            "admin-status",
+            "--url",
+            &format!("http://127.0.0.1:{port}"),
+            "--principal",
+            "user:ops",
+            "--device-id",
+            DEVICE_ID,
+        ])
+        .output()
+        .context("failed to execute palyra daemon admin-status without token")?;
+
+    assert!(
+        output.status.success(),
+        "admin-status should work without token when auth is disabled: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).context("stdout was not valid UTF-8")?;
+    assert!(
+        stdout.contains("admin.status=ok"),
+        "expected admin.status=ok in output, got: {stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn palyra_daemon_admin_status_without_token_fails_when_auth_is_required() -> Result<()> {
+    let (child, port) = spawn_palyrad_with_dynamic_port()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(port, daemon.child_mut())?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
+        .args([
+            "daemon",
+            "admin-status",
+            "--url",
+            &format!("http://127.0.0.1:{port}"),
+            "--principal",
+            "user:ops",
+            "--device-id",
+            DEVICE_ID,
+        ])
+        .output()
+        .context("failed to execute palyra daemon admin-status without token")?;
+
+    assert!(
+        !output.status.success(),
+        "admin-status should fail without token when auth is required"
+    );
+    let stderr = String::from_utf8(output.stderr).context("stderr was not valid UTF-8")?;
+    assert!(
+        stderr.contains("daemon admin status endpoint returned non-success status"),
+        "expected CLI to fail on endpoint status, got: {stderr}"
+    );
+    Ok(())
+}
+
 fn spawn_palyrad_with_dynamic_port() -> Result<(Child, u16)> {
+    spawn_palyrad_with_dynamic_port_and_env(&[])
+}
+
+fn spawn_palyrad_with_dynamic_port_and_env(extra_env: &[(&str, &str)]) -> Result<(Child, u16)> {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
-    let mut child = Command::new(cargo)
+    let mut command = Command::new(cargo);
+    command
         .args([
             "run",
             "--quiet",
@@ -52,11 +125,13 @@ fn spawn_palyrad_with_dynamic_port() -> Result<(Child, u16)> {
             "--grpc-port",
             "0",
         ])
-        .env("RUST_LOG", "info")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn()
-        .context("failed to spawn palyrad process")?;
+        .env("RUST_LOG", "info");
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    let mut child = command.spawn().context("failed to spawn palyrad process")?;
     let stdout = child.stdout.take().context("failed to capture palyrad stdout")?;
     let port = wait_for_listen_port(stdout, &mut child)?;
     Ok((child, port))
