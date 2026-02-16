@@ -578,11 +578,12 @@ fn sanitize_remote_error(body: &str) -> String {
     if trimmed.is_empty() {
         return "<empty>".to_owned();
     }
-    const MAX_LEN: usize = 240;
-    if trimmed.len() <= MAX_LEN {
+    const MAX_CHARS: usize = 240;
+    if trimmed.chars().count() <= MAX_CHARS {
         trimmed.to_owned()
     } else {
-        format!("{}…", &trimmed[..MAX_LEN])
+        let truncated: String = trimmed.chars().take(MAX_CHARS).collect();
+        format!("{truncated}…")
     }
 }
 
@@ -632,8 +633,8 @@ mod tests {
     };
 
     use super::{
-        build_model_provider, extract_completion_text, ModelProviderConfig, ModelProviderKind,
-        ProviderError, ProviderEvent, ProviderRequest,
+        build_model_provider, extract_completion_text, sanitize_remote_error, ModelProviderConfig,
+        ModelProviderKind, ProviderError, ProviderEvent, ProviderRequest,
     };
 
     fn openai_test_config(base_url: String) -> ModelProviderConfig {
@@ -765,6 +766,28 @@ mod tests {
             {"type":"output_text","text":"beta"}
         ])));
         assert_eq!(text, "alpha beta");
+    }
+
+    #[test]
+    fn sanitize_remote_error_truncates_multibyte_text_without_panicking() {
+        let input = "é".repeat(300);
+        let sanitized = sanitize_remote_error(input.as_str());
+        assert!(
+            sanitized.ends_with('…'),
+            "long multi-byte messages should be truncated with marker"
+        );
+        let truncated =
+            sanitized.strip_suffix('…').expect("truncated message should include marker suffix");
+        assert_eq!(
+            truncated.chars().count(),
+            240,
+            "truncated body should keep first 240 Unicode scalar values"
+        );
+        assert_eq!(
+            sanitized.chars().count(),
+            241,
+            "result should include 240 chars plus a truncation marker"
+        );
     }
 
     fn spawn_scripted_server(

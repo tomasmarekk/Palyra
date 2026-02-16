@@ -421,10 +421,18 @@ fn parse_openai_base_url(raw: &str) -> Result<String> {
         anyhow::bail!("openai base URL cannot be empty");
     }
     let normalized = raw.trim();
-    if !(normalized.starts_with("http://") || normalized.starts_with("https://")) {
-        anyhow::bail!("openai base URL must start with http:// or https://");
+    let parsed =
+        reqwest::Url::parse(normalized).context("openai base URL must be a valid absolute URL")?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        anyhow::bail!("openai base URL must use http or https");
     }
-    Ok(normalized.to_owned())
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        anyhow::bail!("openai base URL must not embed credentials");
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        anyhow::bail!("openai base URL must not include query or fragment");
+    }
+    Ok(parsed.as_str().trim_end_matches('/').to_owned())
 }
 
 fn parse_openai_model(raw: &str) -> Result<String> {
@@ -599,5 +607,24 @@ mod tests {
     fn openai_base_url_requires_http_scheme() {
         let result = parse_openai_base_url("file:///tmp/openai");
         assert!(result.is_err(), "openai base URL without http/https scheme must fail");
+    }
+
+    #[test]
+    fn openai_base_url_rejects_embedded_credentials() {
+        let result = parse_openai_base_url("https://user:pass@example.com/v1");
+        assert!(result.is_err(), "openai base URL with embedded credentials must be rejected");
+    }
+
+    #[test]
+    fn openai_base_url_rejects_query_and_fragment() {
+        let result = parse_openai_base_url("https://example.com/v1?api_key=secret#anchor");
+        assert!(result.is_err(), "openai base URL with query or fragment must be rejected");
+    }
+
+    #[test]
+    fn openai_base_url_accepts_clean_https_url() {
+        let parsed =
+            parse_openai_base_url("https://api.openai.com/v1").expect("base URL should parse");
+        assert_eq!(parsed, "https://api.openai.com/v1");
     }
 }

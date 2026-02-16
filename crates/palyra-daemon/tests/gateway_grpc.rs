@@ -150,10 +150,11 @@ async fn grpc_gateway_run_stream_emits_at_most_sixteen_model_tokens() -> Result<
 
 #[tokio::test(flavor = "multi_thread")]
 async fn grpc_run_stream_uses_openai_compatible_provider_when_configured() -> Result<()> {
-    let (openai_base_url, request_count, server_handle) = spawn_scripted_openai_server(vec![(
-        200,
-        r#"{"choices":[{"message":{"content":"provider says hello"}}]}"#.to_owned(),
-    )])?;
+    let (openai_base_url, request_count, server_handle) =
+        spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::immediate(
+            200,
+            r#"{"choices":[{"message":{"content":"provider says hello"}}]}"#.to_owned(),
+        )])?;
     let (child, admin_port, grpc_port, _journal_db_path) =
         spawn_palyrad_with_openai_provider(openai_base_url.as_str(), OPENAI_API_KEY)?;
     let mut daemon = ChildGuard::new(child);
@@ -203,6 +204,111 @@ async fn grpc_run_stream_uses_openai_compatible_provider_when_configured() -> Re
     assert!(
         !serialized_status.contains(OPENAI_API_KEY),
         "admin status snapshot must not leak provider API key"
+    );
+
+    server_handle.join().expect("scripted openai server thread should exit");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_run_stream_admin_cancel_preempts_inflight_provider_call() -> Result<()> {
+    let (openai_base_url, request_count, server_handle) =
+        spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::delayed(
+            200,
+            r#"{"choices":[{"message":{"content":"slow provider response"}}]}"#.to_owned(),
+            Duration::from_secs(5),
+        )])?;
+    let (child, admin_port, grpc_port, _journal_db_path) =
+        spawn_palyrad_with_openai_provider(openai_base_url.as_str(), OPENAI_API_KEY)?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+
+    let mut stream_request =
+        tonic::Request::new(tokio_stream::iter(vec![sample_run_stream_request_with_text(
+            "this request should be cancelled while provider call is in-flight".to_owned(),
+        )]));
+    stream_request.metadata_mut().insert("authorization", format!("Bearer {ADMIN_TOKEN}").parse()?);
+    stream_request.metadata_mut().insert("x-palyra-principal", "user:ops".parse()?);
+    stream_request.metadata_mut().insert("x-palyra-device-id", DEVICE_ID.parse()?);
+    stream_request.metadata_mut().insert("x-palyra-channel", "cli".parse()?);
+
+    let mut response_stream =
+        client.run_stream(stream_request).await.context("failed to call RunStream")?.into_inner();
+
+    let in_progress_kind = common_v1::stream_status::StatusKind::InProgress as i32;
+    loop {
+        let next_event = tokio::time::timeout(Duration::from_secs(2), response_stream.next())
+            .await
+            .context("run stream did not emit in-progress status before timeout")?;
+        let Some(event) = next_event else {
+            anyhow::bail!("run stream ended before entering in-progress state");
+        };
+        let event = event.context("failed to read RunStream event while waiting in-progress")?;
+        if let Some(common_v1::run_stream_event::Body::Status(status)) = event.body {
+            if status.kind == in_progress_kind {
+                break;
+            }
+        }
+    }
+
+    let cancel_started_at = Instant::now();
+    let cancel_snapshot = admin_post_json_async(
+        admin_port,
+        format!("/admin/v1/runs/{RUN_ID}/cancel"),
+        serde_json::json!({ "reason": "integration_cancel_request" }),
+    )
+    .await?;
+    assert_eq!(
+        cancel_snapshot.get("cancel_requested").and_then(Value::as_bool),
+        Some(true),
+        "admin cancel endpoint should persist cancel flag"
+    );
+
+    let mut saw_failed = false;
+    let mut saw_done = false;
+    let failed_kind = common_v1::stream_status::StatusKind::Failed as i32;
+    let done_kind = common_v1::stream_status::StatusKind::Done as i32;
+    loop {
+        let next_event = tokio::time::timeout(Duration::from_secs(2), response_stream.next())
+            .await
+            .context("run stream did not terminate quickly after cancellation")?;
+        let Some(event) = next_event else {
+            break;
+        };
+        let event = event.context("failed to read RunStream event after cancellation")?;
+        if let Some(common_v1::run_stream_event::Body::Status(status)) = event.body {
+            if status.kind == failed_kind {
+                saw_failed = true;
+                break;
+            }
+            if status.kind == done_kind {
+                saw_done = true;
+                break;
+            }
+        }
+    }
+
+    assert!(
+        cancel_started_at.elapsed() < Duration::from_secs(2),
+        "run cancellation should preempt in-flight provider call without waiting for upstream timeout"
+    );
+    assert!(saw_failed, "cancelled run should emit failed status");
+    assert!(!saw_done, "cancelled run must not emit done status");
+    assert_eq!(
+        request_count.load(Ordering::Relaxed),
+        1,
+        "cancel preemption should not trigger extra upstream retries in this scenario"
+    );
+
+    let run_snapshot = admin_get_json_async(admin_port, format!("/admin/v1/runs/{RUN_ID}")).await?;
+    assert_eq!(
+        run_snapshot.get("state").and_then(Value::as_str).context("run snapshot missing state")?,
+        "cancelled"
     );
 
     server_handle.join().expect("scripted openai server thread should exit");
@@ -675,6 +781,32 @@ async fn admin_get_json_async(admin_port: u16, path: String) -> Result<Value> {
         .context("admin JSON worker panicked")?
 }
 
+fn admin_post_json(admin_port: u16, path: &str, payload: Value) -> Result<Value> {
+    let endpoint = format!("http://127.0.0.1:{admin_port}{path}");
+    Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("failed to build admin HTTP client")?
+        .post(endpoint)
+        .header("Authorization", format!("Bearer {ADMIN_TOKEN}"))
+        .header("x-palyra-principal", "user:ops")
+        .header("x-palyra-device-id", DEVICE_ID)
+        .header("x-palyra-channel", "cli")
+        .json(&payload)
+        .send()
+        .context("failed to call daemon admin endpoint")?
+        .error_for_status()
+        .context("daemon admin endpoint returned non-success status")?
+        .json()
+        .context("failed to parse daemon admin JSON response")
+}
+
+async fn admin_post_json_async(admin_port: u16, path: String, payload: Value) -> Result<Value> {
+    tokio::task::spawn_blocking(move || admin_post_json(admin_port, path.as_str(), payload))
+        .await
+        .context("admin JSON worker panicked")?
+}
+
 fn load_golden_json(name: &str) -> Result<Value> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests").join("golden").join(name);
     let content =
@@ -752,8 +884,25 @@ fn spawn_palyrad_with_openai_provider(
     Ok((child, admin_port, grpc_port, journal_db_path))
 }
 
+#[derive(Debug, Clone)]
+struct ScriptedOpenAiResponse {
+    status_code: u16,
+    body: String,
+    delay_before_response: Duration,
+}
+
+impl ScriptedOpenAiResponse {
+    fn immediate(status_code: u16, body: String) -> Self {
+        Self { status_code, body, delay_before_response: Duration::ZERO }
+    }
+
+    fn delayed(status_code: u16, body: String, delay_before_response: Duration) -> Self {
+        Self { status_code, body, delay_before_response }
+    }
+}
+
 fn spawn_scripted_openai_server(
-    responses: Vec<(u16, String)>,
+    responses: Vec<ScriptedOpenAiResponse>,
 ) -> Result<(String, Arc<AtomicUsize>, thread::JoinHandle<()>)> {
     let listener =
         TcpListener::bind("127.0.0.1:0").context("failed to bind scripted openai listener")?;
@@ -761,13 +910,17 @@ fn spawn_scripted_openai_server(
     let request_count = Arc::new(AtomicUsize::new(0));
     let request_count_for_thread = Arc::clone(&request_count);
     let handle = thread::spawn(move || {
-        for (status_code, body) in responses {
+        for response_spec in responses {
             let (mut stream, _) =
                 listener.accept().expect("scripted openai listener should accept connection");
             request_count_for_thread.fetch_add(1, Ordering::Relaxed);
-            read_http_request_for_scripted_server(&mut stream)
-                .expect("scripted openai server should read request");
-            let reason = match status_code {
+            if read_http_request_for_scripted_server(&mut stream).is_err() {
+                continue;
+            }
+            if !response_spec.delay_before_response.is_zero() {
+                thread::sleep(response_spec.delay_before_response);
+            }
+            let reason = match response_spec.status_code {
                 200 => "OK",
                 429 => "Too Many Requests",
                 500 => "Internal Server Error",
@@ -777,12 +930,12 @@ fn spawn_scripted_openai_server(
                 _ => "Error",
             };
             let response = format!(
-                "HTTP/1.1 {status_code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
+                "HTTP/1.1 {} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_spec.status_code,
+                response_spec.body.len(),
+                response_spec.body
             );
-            stream
-                .write_all(response.as_bytes())
-                .expect("scripted openai server should write response");
+            let _ = stream.write_all(response.as_bytes());
             let _ = stream.flush();
         }
     });

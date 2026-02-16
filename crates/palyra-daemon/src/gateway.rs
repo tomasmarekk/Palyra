@@ -4,7 +4,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use axum::http::{header::AUTHORIZATION, HeaderMap};
@@ -12,6 +12,7 @@ use palyra_common::{build_metadata, validate_canonical_id, CANONICAL_PROTOCOL_MA
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
+use tokio::time::{interval, MissedTickBehavior};
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tonic::{metadata::MetadataMap, Request, Response, Status, Streaming};
 use tracing::{info, warn};
@@ -1275,27 +1276,102 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     in_progress_emitted = true;
                 }
 
-                let provider_response = match state_for_stream
-                    .execute_model_provider(ProviderRequest {
+                let mut provider_future =
+                    Box::pin(state_for_stream.execute_model_provider(ProviderRequest {
                         input_text: input_text.clone(),
                         json_mode: json_mode_requested,
                         vision_requested,
-                    })
-                    .await
-                {
-                    Ok(response) => response,
-                    Err(error) => {
-                        finalize_run_failure(
-                            &sender,
-                            &state_for_stream,
-                            &mut run_state,
-                            active_run_id.as_deref(),
-                            &mut tape_seq,
-                            error.message(),
-                        )
-                        .await;
-                        let _ = sender.send(Err(error)).await;
-                        return;
+                    }));
+                let mut cancel_poll = interval(Duration::from_millis(100));
+                cancel_poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+                let provider_response = loop {
+                    tokio::select! {
+                        provider_result = &mut provider_future => {
+                            match provider_result {
+                                Ok(response) => break response,
+                                Err(error) => {
+                                    finalize_run_failure(
+                                        &sender,
+                                        &state_for_stream,
+                                        &mut run_state,
+                                        active_run_id.as_deref(),
+                                        &mut tape_seq,
+                                        error.message(),
+                                    )
+                                    .await;
+                                    let _ = sender.send(Err(error)).await;
+                                    return;
+                                }
+                            }
+                        }
+                        _ = cancel_poll.tick() => {
+                            match state_for_stream.is_orchestrator_cancel_requested(run_id.clone()).await {
+                                Ok(true) => {
+                                    if let Err(error) = run_state.transition(RunTransition::Cancel) {
+                                        let status = Status::internal(error.to_string());
+                                        finalize_run_failure(
+                                            &sender,
+                                            &state_for_stream,
+                                            &mut run_state,
+                                            active_run_id.as_deref(),
+                                            &mut tape_seq,
+                                            status.message(),
+                                        )
+                                        .await;
+                                        let _ = sender.send(Err(status)).await;
+                                        return;
+                                    }
+                                    if let Err(error) = state_for_stream
+                                        .update_orchestrator_run_state(
+                                            run_id.clone(),
+                                            RunLifecycleState::Cancelled,
+                                            Some(CANCELLED_REASON.to_owned()),
+                                        )
+                                        .await
+                                    {
+                                        finalize_run_failure(
+                                            &sender,
+                                            &state_for_stream,
+                                            &mut run_state,
+                                            active_run_id.as_deref(),
+                                            &mut tape_seq,
+                                            error.message(),
+                                        )
+                                        .await;
+                                        let _ = sender.send(Err(error)).await;
+                                        return;
+                                    }
+                                    if let Err(error) = send_status_with_tape(
+                                        &sender,
+                                        &state_for_stream,
+                                        run_id.as_str(),
+                                        &mut tape_seq,
+                                        common_v1::stream_status::StatusKind::Failed,
+                                        CANCELLED_REASON,
+                                    )
+                                    .await
+                                    {
+                                        let _ = sender.send(Err(error)).await;
+                                    }
+                                    return;
+                                }
+                                Ok(false) => {}
+                                Err(error) => {
+                                    finalize_run_failure(
+                                        &sender,
+                                        &state_for_stream,
+                                        &mut run_state,
+                                        active_run_id.as_deref(),
+                                        &mut tape_seq,
+                                        error.message(),
+                                    )
+                                    .await;
+                                    let _ = sender.send(Err(error)).await;
+                                    return;
+                                }
+                            }
+                        }
                     }
                 };
 
