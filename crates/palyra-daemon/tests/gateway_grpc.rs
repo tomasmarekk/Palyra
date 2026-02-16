@@ -152,30 +152,16 @@ async fn grpc_append_event_persists_redacted_payload_and_hash_chain() -> Result<
         .await
         .context("failed to connect gRPC client")?;
 
-    let mut first_request = tonic::Request::new(gateway_v1::AppendEventRequest {
-        v: 1,
-        event: Some(sample_journal_event(
-            "01ARZ3NDEKTSV4RRFFQ69G5FB0",
-            br#"{"stage":"first","note":"safe"}"#,
-        )),
-    });
-    first_request.metadata_mut().insert("authorization", format!("Bearer {ADMIN_TOKEN}").parse()?);
-    first_request.metadata_mut().insert("x-palyra-principal", "user:ops".parse()?);
-    first_request.metadata_mut().insert("x-palyra-device-id", DEVICE_ID.parse()?);
-    first_request.metadata_mut().insert("x-palyra-channel", "cli".parse()?);
+    let first_request = authorized_append_event_request(sample_journal_event(
+        "01ARZ3NDEKTSV4RRFFQ69G5FB0",
+        br#"{"stage":"first","note":"safe"}"#,
+    ))?;
     client.append_event(first_request).await.context("failed to append first journal event")?;
 
-    let mut second_request = tonic::Request::new(gateway_v1::AppendEventRequest {
-        v: 1,
-        event: Some(sample_journal_event(
-            "01ARZ3NDEKTSV4RRFFQ69G5FB1",
-            br#"{"api_token":"SECRET_TOKEN_VALUE","nested":{"password":"123456"}}"#,
-        )),
-    });
-    second_request.metadata_mut().insert("authorization", format!("Bearer {ADMIN_TOKEN}").parse()?);
-    second_request.metadata_mut().insert("x-palyra-principal", "user:ops".parse()?);
-    second_request.metadata_mut().insert("x-palyra-device-id", DEVICE_ID.parse()?);
-    second_request.metadata_mut().insert("x-palyra-channel", "cli".parse()?);
+    let second_request = authorized_append_event_request(sample_journal_event(
+        "01ARZ3NDEKTSV4RRFFQ69G5FB1",
+        br#"{"api_token":"SECRET_TOKEN_VALUE","nested":{"password":"123456"}}"#,
+    ))?;
     client.append_event(second_request).await.context("failed to append second journal event")?;
 
     let connection =
@@ -225,6 +211,58 @@ async fn grpc_append_event_persists_redacted_payload_and_hash_chain() -> Result<
         "second event prev_hash must reference first event hash"
     );
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_append_event_duplicate_event_id_returns_already_exists() -> Result<()> {
+    let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+
+    let duplicate_event_id = "01ARZ3NDEKTSV4RRFFQ69G5FB7";
+    let first_request = authorized_append_event_request(sample_journal_event(
+        duplicate_event_id,
+        br#"{"attempt":1}"#,
+    ))?;
+    client.append_event(first_request).await.context("first append should succeed")?;
+
+    let second_request = authorized_append_event_request(sample_journal_event(
+        duplicate_event_id,
+        br#"{"attempt":2}"#,
+    ))?;
+    let error =
+        client.append_event(second_request).await.expect_err("duplicate append must be rejected");
+    assert_eq!(error.code(), Code::AlreadyExists, "duplicate event IDs should be deterministic");
+    assert!(
+        error.message().contains(duplicate_event_id),
+        "duplicate error should include conflicting event id"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_append_event_rejects_mismatched_embedded_event_version() -> Result<()> {
+    let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+
+    let mut event = sample_journal_event("01ARZ3NDEKTSV4RRFFQ69G5FB8", br#"{"state":"invalid"}"#);
+    event.v = 0;
+    let request = authorized_append_event_request(event)?;
+    let error =
+        client.append_event(request).await.expect_err("mismatched event.v should be rejected");
+    assert_eq!(error.code(), Code::FailedPrecondition, "event.v mismatch should fail precondition");
     Ok(())
 }
 
@@ -300,6 +338,18 @@ fn sample_journal_event(event_id: &str, payload_json: &[u8]) -> common_v1::Journ
         hash: String::new(),
         prev_hash: String::new(),
     }
+}
+
+fn authorized_append_event_request(
+    event: common_v1::JournalEvent,
+) -> Result<tonic::Request<gateway_v1::AppendEventRequest>> {
+    let mut request =
+        tonic::Request::new(gateway_v1::AppendEventRequest { v: 1, event: Some(event) });
+    request.metadata_mut().insert("authorization", format!("Bearer {ADMIN_TOKEN}").parse()?);
+    request.metadata_mut().insert("x-palyra-principal", "user:ops".parse()?);
+    request.metadata_mut().insert("x-palyra-device-id", DEVICE_ID.parse()?);
+    request.metadata_mut().insert("x-palyra-channel", "cli".parse()?);
+    Ok(request)
 }
 
 fn wait_for_listen_ports(stdout: ChildStdout, daemon: &mut Child) -> Result<(u16, u16)> {

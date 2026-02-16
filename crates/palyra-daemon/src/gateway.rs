@@ -235,12 +235,17 @@ impl GatewayRuntimeState {
     }
 
     #[allow(clippy::result_large_err)]
-    fn record_journal_event(
+    fn record_journal_event_blocking(
         &self,
         request: &JournalAppendRequest,
     ) -> Result<crate::journal::JournalAppendOutcome, Status> {
         let outcome = match self.journal_store.append(request) {
             Ok(outcome) => outcome,
+            Err(JournalError::DuplicateEventId { event_id }) => {
+                return Err(Status::already_exists(format!(
+                    "journal event already exists: {event_id}"
+                )));
+            }
             Err(error) => {
                 self.counters.journal_persist_failures.fetch_add(1, Ordering::Relaxed);
                 return Err(Status::internal(format!(
@@ -262,6 +267,17 @@ impl GatewayRuntimeState {
             );
         }
         Ok(outcome)
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn record_journal_event(
+        self: &Arc<Self>,
+        request: JournalAppendRequest,
+    ) -> Result<crate::journal::JournalAppendOutcome, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.record_journal_event_blocking(&request))
+            .await
+            .map_err(|_| Status::internal("journal write worker panicked"))?
     }
 
     pub fn status_snapshot(
@@ -302,7 +318,22 @@ impl GatewayRuntimeState {
     }
 
     #[allow(clippy::result_large_err)]
-    pub fn recent_journal_snapshot(&self, limit: usize) -> Result<JournalRecentSnapshot, Status> {
+    pub async fn status_snapshot_async(
+        self: &Arc<Self>,
+        context: RequestContext,
+        auth_config: GatewayAuthConfig,
+    ) -> Result<GatewayStatusSnapshot, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.status_snapshot(context, &auth_config))
+            .await
+            .map_err(|_| Status::internal("status snapshot worker panicked"))
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn recent_journal_snapshot_blocking(
+        &self,
+        limit: usize,
+    ) -> Result<JournalRecentSnapshot, Status> {
         let limit = limit.clamp(1, MAX_JOURNAL_RECENT_EVENTS);
         let events = self.journal_store.recent(limit).map_err(|error| {
             Status::internal(format!("failed to load recent journal events: {error}"))
@@ -316,6 +347,17 @@ impl GatewayRuntimeState {
             hash_chain_enabled: self.journal_config.hash_chain_enabled,
             events,
         })
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn recent_journal_snapshot(
+        self: &Arc<Self>,
+        limit: usize,
+    ) -> Result<JournalRecentSnapshot, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.recent_journal_snapshot_blocking(limit))
+            .await
+            .map_err(|_| Status::internal("journal read worker panicked"))?
     }
 }
 
@@ -376,6 +418,11 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
             return Err(Status::failed_precondition("unsupported protocol major version"));
         }
         let event = payload.event.ok_or_else(|| Status::invalid_argument("event is required"))?;
+        if event.v != CANONICAL_PROTOCOL_MAJOR {
+            return Err(Status::failed_precondition(
+                "event uses an unsupported protocol major version",
+            ));
+        }
         let event_id = if let Some(id) = event.event_id.and_then(|value| non_empty(value.ulid)) {
             validate_canonical_id(&id)
                 .map_err(|_| Status::invalid_argument("event.event_id must be a canonical ULID"))?;
@@ -397,18 +444,21 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
             return Err(Status::invalid_argument("event.actor must be specified"));
         }
 
-        let journal_outcome = self.state.record_journal_event(&JournalAppendRequest {
-            event_id: event_id.clone(),
-            session_id,
-            run_id,
-            kind: event.kind,
-            actor: event.actor,
-            timestamp_unix_ms: event.timestamp_unix_ms,
-            payload_json: event.payload_json,
-            principal: context.principal.clone(),
-            device_id: context.device_id.clone(),
-            channel: context.channel.clone(),
-        })?;
+        let journal_outcome = self
+            .state
+            .record_journal_event(JournalAppendRequest {
+                event_id: event_id.clone(),
+                session_id,
+                run_id,
+                kind: event.kind,
+                actor: event.actor,
+                timestamp_unix_ms: event.timestamp_unix_ms,
+                payload_json: event.payload_json,
+                principal: context.principal.clone(),
+                device_id: context.device_id.clone(),
+                channel: context.channel.clone(),
+            })
+            .await?;
 
         info!(
             method = "AppendEvent",
@@ -816,7 +866,7 @@ mod tests {
         let state = build_test_runtime_state(true);
 
         state
-            .record_journal_event(&JournalAppendRequest {
+            .record_journal_event_blocking(&JournalAppendRequest {
                 event_id: "01ARZ3NDEKTSV4RRFFQ69G5FB0".to_owned(),
                 session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned(),
                 run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),
@@ -856,7 +906,7 @@ mod tests {
 
         for index in 0..3 {
             state
-                .record_journal_event(&JournalAppendRequest {
+                .record_journal_event_blocking(&JournalAppendRequest {
                     event_id: format!("01ARZ3NDEKTSV4RRFFQ69G5FD{index}"),
                     session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned(),
                     run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),
@@ -872,7 +922,7 @@ mod tests {
         }
 
         let snapshot = state
-            .recent_journal_snapshot(1000)
+            .recent_journal_snapshot_blocking(1000)
             .expect("recent journal snapshot should be returned");
         assert_eq!(snapshot.total_events, 3);
         assert_eq!(snapshot.events.len(), 3);
