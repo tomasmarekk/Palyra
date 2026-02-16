@@ -1,13 +1,15 @@
 use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpStream},
+    path::PathBuf,
     process::{Child, ChildStdout, Command, Stdio},
     sync::mpsc,
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
+use rusqlite::Connection;
 use tokio_stream::StreamExt;
 use tonic::Code;
 
@@ -37,7 +39,7 @@ use proto::palyra::{common::v1 as common_v1, gateway::v1 as gateway_v1};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn grpc_gateway_enforces_auth_and_streams_status() -> Result<()> {
-    let (child, admin_port, grpc_port) = spawn_palyrad_with_dynamic_ports()?;
+    let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
 
@@ -96,7 +98,7 @@ async fn grpc_gateway_enforces_auth_and_streams_status() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn grpc_gateway_run_stream_emits_at_most_sixteen_model_tokens() -> Result<()> {
-    let (child, admin_port, grpc_port) = spawn_palyrad_with_dynamic_ports()?;
+    let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
 
@@ -138,6 +140,94 @@ async fn grpc_gateway_run_stream_emits_at_most_sixteen_model_tokens() -> Result<
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_append_event_persists_redacted_payload_and_hash_chain() -> Result<()> {
+    let (child, admin_port, grpc_port, journal_db_path) =
+        spawn_palyrad_with_dynamic_ports_and_hash_chain(true)?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+
+    let mut first_request = tonic::Request::new(gateway_v1::AppendEventRequest {
+        v: 1,
+        event: Some(sample_journal_event(
+            "01ARZ3NDEKTSV4RRFFQ69G5FB0",
+            br#"{"stage":"first","note":"safe"}"#,
+        )),
+    });
+    first_request.metadata_mut().insert("authorization", format!("Bearer {ADMIN_TOKEN}").parse()?);
+    first_request.metadata_mut().insert("x-palyra-principal", "user:ops".parse()?);
+    first_request.metadata_mut().insert("x-palyra-device-id", DEVICE_ID.parse()?);
+    first_request.metadata_mut().insert("x-palyra-channel", "cli".parse()?);
+    client.append_event(first_request).await.context("failed to append first journal event")?;
+
+    let mut second_request = tonic::Request::new(gateway_v1::AppendEventRequest {
+        v: 1,
+        event: Some(sample_journal_event(
+            "01ARZ3NDEKTSV4RRFFQ69G5FB1",
+            br#"{"api_token":"SECRET_TOKEN_VALUE","nested":{"password":"123456"}}"#,
+        )),
+    });
+    second_request.metadata_mut().insert("authorization", format!("Bearer {ADMIN_TOKEN}").parse()?);
+    second_request.metadata_mut().insert("x-palyra-principal", "user:ops".parse()?);
+    second_request.metadata_mut().insert("x-palyra-device-id", DEVICE_ID.parse()?);
+    second_request.metadata_mut().insert("x-palyra-channel", "cli".parse()?);
+    client.append_event(second_request).await.context("failed to append second journal event")?;
+
+    let connection =
+        Connection::open(journal_db_path).context("failed to open journal sqlite db")?;
+    let mut statement = connection
+        .prepare(
+            r#"
+                SELECT payload_json, redacted, hash, prev_hash
+                FROM journal_events
+                ORDER BY seq ASC
+            "#,
+        )
+        .context("failed to prepare journal query")?;
+    let mut rows = statement.query([]).context("failed to query journal rows")?;
+    let first = rows
+        .next()
+        .context("failed to read first row")?
+        .context("first journal row should exist")?;
+    let first_hash: Option<String> = first.get(2).context("first hash should be readable")?;
+    let first_prev_hash: Option<String> =
+        first.get(3).context("first prev_hash should be readable")?;
+    assert!(first_hash.is_some(), "hash-chain mode should generate first hash");
+    assert!(first_prev_hash.is_none(), "first event must not have prev_hash");
+
+    let second = rows
+        .next()
+        .context("failed to read second row")?
+        .context("second journal row should exist")?;
+    let second_payload: String = second.get(0).context("second payload should be readable")?;
+    let second_redacted: i64 = second.get(1).context("second redaction flag should be readable")?;
+    let second_hash: Option<String> = second.get(2).context("second hash should be readable")?;
+    let second_prev_hash: Option<String> =
+        second.get(3).context("second prev_hash should be readable")?;
+
+    assert_eq!(second_redacted, 1, "secret-bearing payload must be marked redacted");
+    assert!(
+        !second_payload.contains("SECRET_TOKEN_VALUE") && !second_payload.contains("123456"),
+        "journal payload must not contain raw secret values"
+    );
+    assert!(
+        second_payload.contains("<redacted>"),
+        "journal payload should include redaction marker"
+    );
+    assert!(second_hash.is_some(), "second event should include hash");
+    assert_eq!(
+        second_prev_hash, first_hash,
+        "second event prev_hash must reference first event hash"
+    );
+
+    Ok(())
+}
+
 fn sample_run_stream_request() -> common_v1::RunStreamRequest {
     sample_run_stream_request_with_text("hello from grpc integration".to_owned())
 }
@@ -157,7 +247,14 @@ fn sample_run_stream_request_with_text(text: String) -> common_v1::RunStreamRequ
     }
 }
 
-fn spawn_palyrad_with_dynamic_ports() -> Result<(Child, u16, u16)> {
+fn spawn_palyrad_with_dynamic_ports() -> Result<(Child, u16, u16, PathBuf)> {
+    spawn_palyrad_with_dynamic_ports_and_hash_chain(false)
+}
+
+fn spawn_palyrad_with_dynamic_ports_and_hash_chain(
+    hash_chain_enabled: bool,
+) -> Result<(Child, u16, u16, PathBuf)> {
+    let journal_db_path = unique_temp_journal_db_path();
     let mut child = Command::new(env!("CARGO_BIN_EXE_palyrad"))
         .args([
             "--bind",
@@ -170,6 +267,8 @@ fn spawn_palyrad_with_dynamic_ports() -> Result<(Child, u16, u16)> {
             "0",
         ])
         .env("PALYRA_ADMIN_TOKEN", ADMIN_TOKEN)
+        .env("PALYRA_JOURNAL_DB_PATH", journal_db_path.to_string_lossy().to_string())
+        .env("PALYRA_JOURNAL_HASH_CHAIN_ENABLED", if hash_chain_enabled { "true" } else { "false" })
         .env("RUST_LOG", "info")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -177,7 +276,30 @@ fn spawn_palyrad_with_dynamic_ports() -> Result<(Child, u16, u16)> {
         .context("failed to start palyrad")?;
     let stdout = child.stdout.take().context("failed to capture palyrad stdout")?;
     let (admin_port, grpc_port) = wait_for_listen_ports(stdout, &mut child)?;
-    Ok((child, admin_port, grpc_port))
+    Ok((child, admin_port, grpc_port, journal_db_path))
+}
+
+fn unique_temp_journal_db_path() -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!("palyra-gateway-grpc-{nonce}-{}.sqlite3", std::process::id()))
+}
+
+fn sample_journal_event(event_id: &str, payload_json: &[u8]) -> common_v1::JournalEvent {
+    common_v1::JournalEvent {
+        v: 1,
+        event_id: Some(common_v1::CanonicalId { ulid: event_id.to_owned() }),
+        session_id: Some(common_v1::CanonicalId { ulid: SESSION_ID.to_owned() }),
+        run_id: Some(common_v1::CanonicalId { ulid: RUN_ID.to_owned() }),
+        kind: common_v1::journal_event::EventKind::ToolExecuted as i32,
+        actor: common_v1::journal_event::EventActor::User as i32,
+        timestamp_unix_ms: 1_730_000_000_000,
+        payload_json: payload_json.to_vec(),
+        hash: String::new(),
+        prev_hash: String::new(),
+    }
 }
 
 fn wait_for_listen_ports(stdout: ChildStdout, daemon: &mut Child) -> Result<(u16, u16)> {

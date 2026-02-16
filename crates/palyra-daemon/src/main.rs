@@ -1,11 +1,12 @@
 mod config;
 mod gateway;
+mod journal;
 
 use std::time::Instant;
 
 use anyhow::{Context, Result};
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
@@ -15,13 +16,14 @@ use clap::Parser;
 use config::load_config;
 use gateway::{
     authorize_headers, request_context_from_headers, AuthError, GatewayAuthConfig,
-    GatewayRuntimeConfigSnapshot, GatewayRuntimeState,
+    GatewayJournalConfigSnapshot, GatewayRuntimeConfigSnapshot, GatewayRuntimeState,
 };
+use journal::{JournalConfig, JournalStore};
 use palyra_common::{build_metadata, health_response, parse_daemon_bind_socket, HealthResponse};
 use palyra_identity::IdentityManager;
 #[cfg(not(windows))]
 use palyra_identity::{default_identity_storage_path, FilesystemSecretStore, SecretStore};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use tracing::info;
@@ -38,6 +40,8 @@ struct Args {
     grpc_bind: Option<String>,
     #[arg(long)]
     grpc_port: Option<u16>,
+    #[arg(long, default_value_t = false)]
+    journal_migrate_only: bool,
 }
 
 #[derive(Clone)]
@@ -50,6 +54,11 @@ struct AppState {
 #[derive(Debug, Serialize)]
 struct ErrorBody {
     error: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct JournalRecentQuery {
+    limit: Option<usize>,
 }
 
 #[tokio::main]
@@ -80,6 +89,11 @@ async fn main() -> Result<()> {
         require_auth: loaded.admin.require_auth,
         admin_token: loaded.admin.auth_token.clone(),
     };
+    let journal_store = JournalStore::open(JournalConfig {
+        db_path: loaded.storage.journal_db_path.clone(),
+        hash_chain_enabled: loaded.storage.journal_hash_chain_enabled,
+    })
+    .context("failed to initialize event journal storage")?;
     let runtime = GatewayRuntimeState::new(
         GatewayRuntimeConfigSnapshot {
             grpc_bind_addr: loaded.gateway.grpc_bind_addr.clone(),
@@ -90,8 +104,28 @@ async fn main() -> Result<()> {
             node_rpc_mtls_required: !loaded.identity.allow_insecure_node_rpc_without_mtls,
             admin_auth_required: loaded.admin.require_auth,
         },
+        GatewayJournalConfigSnapshot {
+            db_path: loaded.storage.journal_db_path.clone(),
+            hash_chain_enabled: loaded.storage.journal_hash_chain_enabled,
+        },
+        journal_store,
         revoked_certificates,
-    );
+    )
+    .context("failed to initialize gateway runtime state")?;
+
+    if args.journal_migrate_only {
+        info!(
+            journal_db_path = %loaded.storage.journal_db_path.display(),
+            hash_chain_enabled = loaded.storage.journal_hash_chain_enabled,
+            "journal migrations applied; exiting due to --journal-migrate-only"
+        );
+        println!(
+            "journal.migration=ok db_path={} hash_chain_enabled={}",
+            loaded.storage.journal_db_path.display(),
+            loaded.storage.journal_hash_chain_enabled
+        );
+        return Ok(());
+    }
 
     let build = build_metadata();
     info!(
@@ -110,6 +144,8 @@ async fn main() -> Result<()> {
         admin_auth_required = loaded.admin.require_auth,
         admin_token_configured = loaded.admin.auth_token.is_some(),
         node_rpc_mtls_required = !loaded.identity.allow_insecure_node_rpc_without_mtls,
+        journal_db_path = %loaded.storage.journal_db_path.display(),
+        journal_hash_chain_enabled = loaded.storage.journal_hash_chain_enabled,
         identity_store_root = %identity_store_root.display(),
         revoked_certificate_count = revoked_certificates,
         "gateway startup"
@@ -120,6 +156,7 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/healthz", get(health_handler))
         .route("/admin/v1/status", get(admin_status_handler))
+        .route("/admin/v1/journal/recent", get(admin_journal_recent_handler))
         .with_state(state);
 
     let admin_address = parse_daemon_bind_socket(&loaded.daemon.bind_addr, loaded.daemon.port)
@@ -202,6 +239,24 @@ async fn admin_status_handler(
     Ok(Json(state.runtime.status_snapshot(context, &state.auth)))
 }
 
+async fn admin_journal_recent_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<JournalRecentQuery>,
+) -> Result<Json<gateway::JournalRecentSnapshot>, Response> {
+    authorize_headers(&headers, &state.auth).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    let _context = request_context_from_headers(&headers).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    state.runtime.record_admin_status_request();
+    let limit = query.limit.unwrap_or(20);
+    state.runtime.recent_journal_snapshot(limit).map(Json).map_err(runtime_status_response)
+}
+
 fn auth_error_response(error: AuthError) -> Response {
     let status = match error {
         AuthError::MissingConfiguredToken => StatusCode::SERVICE_UNAVAILABLE,
@@ -211,6 +266,15 @@ fn auth_error_response(error: AuthError) -> Response {
         }
     };
     (status, Json(ErrorBody { error: error.to_string() })).into_response()
+}
+
+fn runtime_status_response(status: tonic::Status) -> Response {
+    let http_status = match status.code() {
+        tonic::Code::PermissionDenied => StatusCode::FORBIDDEN,
+        tonic::Code::InvalidArgument => StatusCode::BAD_REQUEST,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (http_status, Json(ErrorBody { error: status.message().to_owned() })).into_response()
 }
 
 fn load_identity_runtime() -> Result<(std::path::PathBuf, usize)> {

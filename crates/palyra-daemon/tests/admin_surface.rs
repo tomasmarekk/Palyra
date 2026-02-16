@@ -1,10 +1,11 @@
 use std::{
     io::{BufRead, BufReader},
     net::SocketAddr,
+    path::PathBuf,
     process::{Child, ChildStdout, Command, Stdio},
     sync::mpsc,
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
@@ -56,7 +57,43 @@ fn admin_status_requires_token_and_context() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn admin_journal_recent_requires_token_and_returns_snapshot() -> Result<()> {
+    let (child, admin_port) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("failed to build HTTP client")?;
+    let url = format!("http://127.0.0.1:{admin_port}/admin/v1/journal/recent?limit=5");
+
+    let missing_auth = client.get(&url).send().context("failed to call admin journal recent")?;
+    assert_eq!(missing_auth.status().as_u16(), 401, "missing auth must be rejected");
+
+    let response_body = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {ADMIN_TOKEN}"))
+        .header("x-palyra-principal", "user:ops")
+        .header("x-palyra-device-id", DEVICE_ID)
+        .header("x-palyra-channel", "cli")
+        .send()
+        .context("failed to call admin journal recent with valid context")?
+        .error_for_status()
+        .context("admin journal recent returned non-success status")?
+        .text()
+        .context("failed to read admin journal recent response body")?;
+
+    assert!(
+        response_body.contains("\"events\":") && response_body.contains("\"total_events\":"),
+        "journal snapshot response should include events and total count"
+    );
+    Ok(())
+}
+
 fn spawn_palyrad_with_dynamic_ports() -> Result<(Child, u16)> {
+    let journal_db_path = unique_temp_journal_db_path();
     let mut child = Command::new(env!("CARGO_BIN_EXE_palyrad"))
         .args([
             "--bind",
@@ -69,6 +106,7 @@ fn spawn_palyrad_with_dynamic_ports() -> Result<(Child, u16)> {
             "0",
         ])
         .env("PALYRA_ADMIN_TOKEN", ADMIN_TOKEN)
+        .env("PALYRA_JOURNAL_DB_PATH", journal_db_path.to_string_lossy().to_string())
         .env("RUST_LOG", "info")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -77,6 +115,15 @@ fn spawn_palyrad_with_dynamic_ports() -> Result<(Child, u16)> {
     let stdout = child.stdout.take().context("failed to capture palyrad stdout")?;
     let admin_port = wait_for_admin_port(stdout, &mut child)?;
     Ok((child, admin_port))
+}
+
+fn unique_temp_journal_db_path() -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_nanos();
+    std::env::temp_dir()
+        .join(format!("palyra-admin-surface-{nonce}-{}.sqlite3", std::process::id()))
 }
 
 fn wait_for_admin_port(stdout: ChildStdout, daemon: &mut Child) -> Result<u16> {

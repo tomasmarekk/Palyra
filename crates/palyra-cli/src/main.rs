@@ -222,6 +222,57 @@ fn run_daemon(command: DaemonCommand) -> Result<()> {
             );
             std::io::stdout().flush().context("stdout flush failed")
         }
+        DaemonCommand::JournalRecent { url, token, principal, device_id, channel, limit } => {
+            let base_url = url
+                .or_else(|| env::var("PALYRA_DAEMON_URL").ok())
+                .unwrap_or_else(|| "http://127.0.0.1:7142".to_owned());
+            let endpoint = format!("{}/admin/v1/journal/recent", base_url.trim_end_matches('/'));
+            let token = token.or_else(|| env::var("PALYRA_ADMIN_TOKEN").ok());
+            let client = Client::builder()
+                .timeout(std::time::Duration::from_secs(2))
+                .build()
+                .context("failed to build HTTP client")?;
+            let mut request = client
+                .get(endpoint)
+                .header("x-palyra-principal", principal)
+                .header("x-palyra-device-id", device_id);
+            if let Some(token) = token {
+                request = request.header("Authorization", format!("Bearer {token}"));
+            }
+            if let Some(channel) = channel {
+                request = request.header("x-palyra-channel", channel);
+            }
+            if let Some(limit) = limit {
+                request = request.query(&[("limit", limit)]);
+            }
+
+            let response: JournalRecentResponse = request
+                .send()
+                .context("failed to call daemon journal recent endpoint")?
+                .error_for_status()
+                .context("daemon journal recent endpoint returned non-success status")?
+                .json()
+                .context("failed to parse daemon journal recent payload")?;
+
+            println!(
+                "journal.total_events={} hash_chain_enabled={} returned_events={}",
+                response.total_events,
+                response.hash_chain_enabled,
+                response.events.len()
+            );
+            for event in response.events {
+                println!(
+                    "journal.event event_id={} kind={} actor={} redacted={} timestamp_unix_ms={} hash={}",
+                    event.event_id,
+                    event.kind,
+                    event.actor,
+                    event.redacted,
+                    event.timestamp_unix_ms,
+                    event.hash.as_deref().unwrap_or("none")
+                );
+            }
+            std::io::stdout().flush().context("stdout flush failed")
+        }
     }
 }
 
@@ -617,7 +668,24 @@ struct AdminTransportSnapshot {
 #[derive(Debug, Deserialize)]
 struct AdminCountersSnapshot {
     denied_requests: u64,
-    journal_events: usize,
+    journal_events: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct JournalRecentResponse {
+    total_events: u64,
+    hash_chain_enabled: bool,
+    events: Vec<JournalRecentEvent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JournalRecentEvent {
+    event_id: String,
+    kind: i32,
+    actor: i32,
+    redacted: bool,
+    timestamp_unix_ms: i64,
+    hash: Option<String>,
 }
 
 #[cfg(all(test, not(windows)))]

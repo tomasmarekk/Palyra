@@ -1,4 +1,7 @@
-use std::{env, fs, path::PathBuf};
+use std::{
+    env, fs,
+    path::{Component, PathBuf},
+};
 
 use anyhow::{Context, Result};
 use palyra_common::{
@@ -14,6 +17,8 @@ const DEFAULT_QUIC_PORT: u16 = 7444;
 const DEFAULT_QUIC_ENABLED: bool = true;
 const DEFAULT_ADMIN_REQUIRE_AUTH: bool = true;
 const DEFAULT_ALLOW_INSECURE_NODE_RPC_WITHOUT_MTLS: bool = false;
+const DEFAULT_JOURNAL_DB_PATH: &str = "data/journal.sqlite3";
+const DEFAULT_JOURNAL_HASH_CHAIN_ENABLED: bool = false;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadedConfig {
@@ -22,6 +27,7 @@ pub struct LoadedConfig {
     pub gateway: GatewayConfig,
     pub admin: AdminConfig,
     pub identity: IdentityConfig,
+    pub storage: StorageConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +56,12 @@ pub struct IdentityConfig {
     pub allow_insecure_node_rpc_without_mtls: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageConfig {
+    pub journal_db_path: PathBuf,
+    pub journal_hash_chain_enabled: bool,
+}
+
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self { bind_addr: DEFAULT_BIND_ADDR.to_owned(), port: DEFAULT_PORT }
@@ -59,6 +71,15 @@ impl Default for DaemonConfig {
 impl Default for IdentityConfig {
     fn default() -> Self {
         Self { allow_insecure_node_rpc_without_mtls: DEFAULT_ALLOW_INSECURE_NODE_RPC_WITHOUT_MTLS }
+    }
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            journal_db_path: PathBuf::from(DEFAULT_JOURNAL_DB_PATH),
+            journal_hash_chain_enabled: DEFAULT_JOURNAL_HASH_CHAIN_ENABLED,
+        }
     }
 }
 
@@ -85,6 +106,7 @@ pub fn load_config() -> Result<LoadedConfig> {
     let mut gateway = GatewayConfig::default();
     let mut admin = AdminConfig::default();
     let mut identity = IdentityConfig::default();
+    let mut storage = StorageConfig::default();
     let mut source = "defaults".to_owned();
 
     if let Some(path) = find_config_path()? {
@@ -129,6 +151,14 @@ pub fn load_config() -> Result<LoadedConfig> {
         if let Some(file_identity) = parsed.identity {
             if let Some(allow_insecure) = file_identity.allow_insecure_node_rpc_without_mtls {
                 identity.allow_insecure_node_rpc_without_mtls = allow_insecure;
+            }
+        }
+        if let Some(file_storage) = parsed.storage {
+            if let Some(path) = file_storage.journal_db_path {
+                storage.journal_db_path = parse_journal_db_path(&path)?;
+            }
+            if let Some(hash_chain_enabled) = file_storage.journal_hash_chain_enabled {
+                storage.journal_hash_chain_enabled = hash_chain_enabled;
             }
         }
         source = path.to_string_lossy().into_owned();
@@ -192,7 +222,19 @@ pub fn load_config() -> Result<LoadedConfig> {
         source.push_str(" +env(PALYRA_ALLOW_INSECURE_NODE_RPC_WITHOUT_MTLS)");
     }
 
-    Ok(LoadedConfig { source, daemon, gateway, admin, identity })
+    if let Ok(path) = env::var("PALYRA_JOURNAL_DB_PATH") {
+        storage.journal_db_path = parse_journal_db_path(&path)?;
+        source.push_str(" +env(PALYRA_JOURNAL_DB_PATH)");
+    }
+
+    if let Ok(hash_chain_enabled) = env::var("PALYRA_JOURNAL_HASH_CHAIN_ENABLED") {
+        storage.journal_hash_chain_enabled = hash_chain_enabled
+            .parse::<bool>()
+            .context("PALYRA_JOURNAL_HASH_CHAIN_ENABLED must be true or false")?;
+        source.push_str(" +env(PALYRA_JOURNAL_HASH_CHAIN_ENABLED)");
+    }
+
+    Ok(LoadedConfig { source, daemon, gateway, admin, identity, storage })
 }
 
 fn find_config_path() -> Result<Option<PathBuf>> {
@@ -214,9 +256,25 @@ fn find_config_path() -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
+fn parse_journal_db_path(raw: &str) -> Result<PathBuf> {
+    if raw.trim().is_empty() {
+        anyhow::bail!("journal db path cannot be empty");
+    }
+    if raw.contains('\0') {
+        anyhow::bail!("journal db path cannot contain embedded NUL byte");
+    }
+    let path = PathBuf::from(raw);
+    if path.components().any(|component| matches!(component, Component::ParentDir)) {
+        anyhow::bail!("journal db path cannot contain parent traversal ('..')");
+    }
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{AdminConfig, GatewayConfig, IdentityConfig};
+    use std::path::PathBuf;
+
+    use super::{parse_journal_db_path, AdminConfig, GatewayConfig, IdentityConfig, StorageConfig};
     use palyra_common::daemon_config_schema::RootFileConfig;
 
     #[test]
@@ -256,6 +314,16 @@ mod tests {
     }
 
     #[test]
+    fn storage_config_defaults_to_safe_journal_mode() {
+        let config = StorageConfig::default();
+        assert_eq!(config.journal_db_path, PathBuf::from("data/journal.sqlite3"));
+        assert!(
+            !config.journal_hash_chain_enabled,
+            "hash chain must default to disabled until audit mode is explicitly enabled"
+        );
+    }
+
+    #[test]
     fn config_rejects_unknown_top_level_key() {
         let result: Result<RootFileConfig, _> =
             toml::from_str("unexpected=true\n[daemon]\nport=7142\n");
@@ -289,5 +357,18 @@ mod tests {
         let result: Result<RootFileConfig, _> =
             toml::from_str("[admin]\nrequire_auth=true\nunexpected=true\n");
         assert!(result.is_err(), "unknown admin keys must be rejected");
+    }
+
+    #[test]
+    fn config_rejects_unknown_storage_key() {
+        let result: Result<RootFileConfig, _> =
+            toml::from_str("[storage]\njournal_db_path='data/journal.sqlite3'\nunexpected=true\n");
+        assert!(result.is_err(), "unknown storage keys must be rejected");
+    }
+
+    #[test]
+    fn journal_db_path_rejects_parent_traversal() {
+        let result = parse_journal_db_path("../secrets/journal.sqlite3");
+        assert!(result.is_err(), "journal db path must reject parent traversal");
     }
 }

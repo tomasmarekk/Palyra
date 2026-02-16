@@ -1,8 +1,8 @@
 use std::{
-    collections::VecDeque,
+    path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc,
     },
     time::Instant,
 };
@@ -15,6 +15,8 @@ use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tonic::{metadata::MetadataMap, Request, Response, Status, Streaming};
 use tracing::{info, warn};
 use ulid::Ulid;
+
+use crate::journal::{JournalAppendRequest, JournalError, JournalEventRecord, JournalStore};
 
 pub mod proto {
     pub mod palyra {
@@ -37,8 +39,11 @@ use proto::palyra::{common::v1 as common_v1, gateway::v1 as gateway_v1};
 pub const HEADER_PRINCIPAL: &str = "x-palyra-principal";
 pub const HEADER_DEVICE_ID: &str = "x-palyra-device-id";
 pub const HEADER_CHANNEL: &str = "x-palyra-channel";
-const MAX_JOURNAL_EVENTS: usize = 10_000;
 const MAX_MODEL_TOKENS_PER_EVENT: usize = 16;
+const MAX_JOURNAL_RECENT_EVENTS: usize = 100;
+const JOURNAL_WRITE_LATENCY_BUDGET_MS: u128 = 25;
+const SENSITIVE_TOOLS_DENY_REASON: &str =
+    "allow_sensitive_tools=true is denied by default and requires explicit approvals";
 
 #[derive(Debug, Clone)]
 pub struct GatewayRuntimeConfigSnapshot {
@@ -49,6 +54,12 @@ pub struct GatewayRuntimeConfigSnapshot {
     pub quic_enabled: bool,
     pub node_rpc_mtls_required: bool,
     pub admin_auth_required: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct GatewayJournalConfigSnapshot {
+    pub db_path: PathBuf,
+    pub hash_chain_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -70,8 +81,9 @@ pub struct GatewayRuntimeState {
     started_at: Instant,
     build: BuildSnapshot,
     config: GatewayRuntimeConfigSnapshot,
+    journal_config: GatewayJournalConfigSnapshot,
     counters: RuntimeCounters,
-    journal: Mutex<VecDeque<String>>,
+    journal_store: JournalStore,
     revoked_certificate_count: usize,
 }
 
@@ -81,6 +93,9 @@ struct RuntimeCounters {
     append_event_requests: AtomicU64,
     admin_status_requests: AtomicU64,
     denied_requests: AtomicU64,
+    journal_events: AtomicU64,
+    journal_persist_failures: AtomicU64,
+    journal_redacted_events: AtomicU64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -100,6 +115,7 @@ pub struct GatewayStatusSnapshot {
     pub uptime_seconds: u64,
     pub transport: TransportSnapshot,
     pub security: SecuritySnapshot,
+    pub storage: StorageSnapshot,
     pub counters: CountersSnapshot,
     pub request_context: RequestContext,
 }
@@ -123,12 +139,29 @@ pub struct SecuritySnapshot {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct StorageSnapshot {
+    pub journal_db_path: String,
+    pub journal_hash_chain_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_event_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct CountersSnapshot {
     pub run_stream_requests: u64,
     pub append_event_requests: u64,
     pub admin_status_requests: u64,
     pub denied_requests: u64,
-    pub journal_events: usize,
+    pub journal_events: u64,
+    pub journal_persist_failures: u64,
+    pub journal_redacted_events: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct JournalRecentSnapshot {
+    pub total_events: u64,
+    pub hash_chain_enabled: bool,
+    pub events: Vec<JournalEventRecord>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -148,13 +181,15 @@ pub enum AuthError {
 }
 
 impl RuntimeCounters {
-    fn snapshot(&self, journal_events: usize) -> CountersSnapshot {
+    fn snapshot(&self) -> CountersSnapshot {
         CountersSnapshot {
             run_stream_requests: self.run_stream_requests.load(Ordering::Relaxed),
             append_event_requests: self.append_event_requests.load(Ordering::Relaxed),
             admin_status_requests: self.admin_status_requests.load(Ordering::Relaxed),
             denied_requests: self.denied_requests.load(Ordering::Relaxed),
-            journal_events,
+            journal_events: self.journal_events.load(Ordering::Relaxed),
+            journal_persist_failures: self.journal_persist_failures.load(Ordering::Relaxed),
+            journal_redacted_events: self.journal_redacted_events.load(Ordering::Relaxed),
         }
     }
 }
@@ -162,10 +197,13 @@ impl RuntimeCounters {
 impl GatewayRuntimeState {
     pub fn new(
         config: GatewayRuntimeConfigSnapshot,
+        journal_config: GatewayJournalConfigSnapshot,
+        journal_store: JournalStore,
         revoked_certificate_count: usize,
-    ) -> Arc<Self> {
+    ) -> Result<Arc<Self>, JournalError> {
         let build = build_metadata();
-        Arc::new(Self {
+        let existing_events = journal_store.total_events()? as u64;
+        Ok(Arc::new(Self {
             started_at: Instant::now(),
             build: BuildSnapshot {
                 version: build.version.to_owned(),
@@ -173,15 +211,19 @@ impl GatewayRuntimeState {
                 build_profile: build.build_profile.to_owned(),
             },
             config,
+            journal_config,
             counters: RuntimeCounters {
                 run_stream_requests: AtomicU64::new(0),
                 append_event_requests: AtomicU64::new(0),
                 admin_status_requests: AtomicU64::new(0),
                 denied_requests: AtomicU64::new(0),
+                journal_events: AtomicU64::new(existing_events),
+                journal_persist_failures: AtomicU64::new(0),
+                journal_redacted_events: AtomicU64::new(0),
             },
-            journal: Mutex::new(VecDeque::new()),
+            journal_store,
             revoked_certificate_count,
-        })
+        }))
     }
 
     pub fn record_denied(&self) {
@@ -193,14 +235,33 @@ impl GatewayRuntimeState {
     }
 
     #[allow(clippy::result_large_err)]
-    fn record_journal_event(&self, event_id: String) -> Result<(), Status> {
-        let mut journal =
-            self.journal.lock().map_err(|_| Status::internal("gateway journal lock poisoned"))?;
-        journal.push_back(event_id);
-        if journal.len() > MAX_JOURNAL_EVENTS {
-            let _ = journal.pop_front();
+    fn record_journal_event(
+        &self,
+        request: &JournalAppendRequest,
+    ) -> Result<crate::journal::JournalAppendOutcome, Status> {
+        let outcome = match self.journal_store.append(request) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.counters.journal_persist_failures.fetch_add(1, Ordering::Relaxed);
+                return Err(Status::internal(format!(
+                    "failed to persist journal event '{}': {error}",
+                    request.event_id
+                )));
+            }
+        };
+        self.counters.journal_events.fetch_add(1, Ordering::Relaxed);
+        if outcome.redacted {
+            self.counters.journal_redacted_events.fetch_add(1, Ordering::Relaxed);
         }
-        Ok(())
+        if outcome.write_duration.as_millis() > JOURNAL_WRITE_LATENCY_BUDGET_MS {
+            warn!(
+                event_id = %request.event_id,
+                write_duration_ms = outcome.write_duration.as_millis(),
+                budget_ms = JOURNAL_WRITE_LATENCY_BUDGET_MS,
+                "journal write exceeded latency budget"
+            );
+        }
+        Ok(outcome)
     }
 
     pub fn status_snapshot(
@@ -208,7 +269,7 @@ impl GatewayRuntimeState {
         context: RequestContext,
         auth_config: &GatewayAuthConfig,
     ) -> GatewayStatusSnapshot {
-        let journal_events = self.journal.lock().map(|journal| journal.len()).unwrap_or(0);
+        let latest_event_hash = self.journal_store.latest_hash().ok().flatten();
         GatewayStatusSnapshot {
             service: "palyrad",
             status: "ok",
@@ -230,9 +291,31 @@ impl GatewayRuntimeState {
                 node_rpc_mtls_required: self.config.node_rpc_mtls_required,
                 revoked_certificate_count: self.revoked_certificate_count,
             },
-            counters: self.counters.snapshot(journal_events),
+            storage: StorageSnapshot {
+                journal_db_path: self.journal_config.db_path.to_string_lossy().into_owned(),
+                journal_hash_chain_enabled: self.journal_config.hash_chain_enabled,
+                latest_event_hash,
+            },
+            counters: self.counters.snapshot(),
             request_context: context,
         }
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub fn recent_journal_snapshot(&self, limit: usize) -> Result<JournalRecentSnapshot, Status> {
+        let limit = limit.clamp(1, MAX_JOURNAL_RECENT_EVENTS);
+        let events = self.journal_store.recent(limit).map_err(|error| {
+            Status::internal(format!("failed to load recent journal events: {error}"))
+        })?;
+        let total_events =
+            self.journal_store.total_events().map_err(|error| {
+                Status::internal(format!("failed to count journal events: {error}"))
+            })? as u64;
+        Ok(JournalRecentSnapshot {
+            total_events,
+            hash_chain_enabled: self.journal_config.hash_chain_enabled,
+            events,
+        })
     }
 }
 
@@ -300,8 +383,32 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
         } else {
             Ulid::new().to_string()
         };
+        let session_id = canonical_id(event.session_id, "event.session_id")?;
+        let run_id = canonical_id(event.run_id, "event.run_id")?;
+        if event.timestamp_unix_ms <= 0 {
+            return Err(Status::invalid_argument(
+                "event.timestamp_unix_ms must be a unix timestamp",
+            ));
+        }
+        if event.kind == common_v1::journal_event::EventKind::Unspecified as i32 {
+            return Err(Status::invalid_argument("event.kind must be specified"));
+        }
+        if event.actor == common_v1::journal_event::EventActor::Unspecified as i32 {
+            return Err(Status::invalid_argument("event.actor must be specified"));
+        }
 
-        self.state.record_journal_event(event_id.clone())?;
+        let journal_outcome = self.state.record_journal_event(&JournalAppendRequest {
+            event_id: event_id.clone(),
+            session_id,
+            run_id,
+            kind: event.kind,
+            actor: event.actor,
+            timestamp_unix_ms: event.timestamp_unix_ms,
+            payload_json: event.payload_json,
+            principal: context.principal.clone(),
+            device_id: context.device_id.clone(),
+            channel: context.channel.clone(),
+        })?;
 
         info!(
             method = "AppendEvent",
@@ -309,6 +416,10 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
             device_id = %context.device_id,
             channel = context.channel.as_deref().unwrap_or("n/a"),
             event_id = %event_id,
+            redacted_payload = journal_outcome.redacted,
+            hash_chain_enabled = self.state.journal_config.hash_chain_enabled,
+            write_duration_ms = journal_outcome.write_duration.as_millis(),
+            event_hash = journal_outcome.hash.as_deref().unwrap_or("disabled"),
             "gateway event appended"
         );
 
@@ -329,6 +440,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
         let mut stream = request.into_inner();
         let (sender, receiver) = mpsc::channel(16);
         let context_for_stream = context.clone();
+        let state_for_stream = self.state.clone();
 
         tokio::spawn(async move {
             let mut last_run_id = None::<String>;
@@ -354,10 +466,11 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     return;
                 }
                 if message.allow_sensitive_tools {
+                    state_for_stream.record_denied();
                     let _ = sender
-                        .send(Err(Status::permission_denied(
-                            "allow_sensitive_tools=true is denied by default and requires approvals",
-                        )))
+                        .send(Err(Status::permission_denied(format!(
+                            "decision=deny_by_default approval_required=true reason={SENSITIVE_TOOLS_DENY_REASON}",
+                        ))))
                         .await;
                     return;
                 }
@@ -609,13 +722,51 @@ fn non_empty(input: String) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
     use axum::http::{header::AUTHORIZATION, HeaderMap, HeaderValue};
+
+    use crate::journal::{JournalAppendRequest, JournalConfig, JournalStore};
 
     use super::{
         authorize_headers, request_context_from_headers, AuthError, GatewayAuthConfig,
-        GatewayRuntimeConfigSnapshot, GatewayRuntimeState, RequestContext, HEADER_CHANNEL,
-        HEADER_DEVICE_ID, HEADER_PRINCIPAL, MAX_JOURNAL_EVENTS,
+        GatewayJournalConfigSnapshot, GatewayRuntimeConfigSnapshot, GatewayRuntimeState,
+        RequestContext, HEADER_CHANNEL, HEADER_DEVICE_ID, HEADER_PRINCIPAL,
     };
+
+    fn unique_temp_journal_path() -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!("palyra-gateway-unit-{nonce}-{}.sqlite3", std::process::id()))
+    }
+
+    fn build_test_runtime_state(hash_chain_enabled: bool) -> std::sync::Arc<GatewayRuntimeState> {
+        let db_path = unique_temp_journal_path();
+        let journal_store =
+            JournalStore::open(JournalConfig { db_path: db_path.clone(), hash_chain_enabled })
+                .expect("journal store should initialize");
+        GatewayRuntimeState::new(
+            GatewayRuntimeConfigSnapshot {
+                grpc_bind_addr: "127.0.0.1".to_owned(),
+                grpc_port: 7443,
+                quic_bind_addr: "127.0.0.1".to_owned(),
+                quic_port: 7444,
+                quic_enabled: true,
+                node_rpc_mtls_required: true,
+                admin_auth_required: true,
+            },
+            GatewayJournalConfigSnapshot { db_path, hash_chain_enabled },
+            journal_store,
+            0,
+        )
+        .expect("runtime state should initialize")
+    }
 
     #[test]
     fn authorize_headers_rejects_missing_token_when_required() {
@@ -661,25 +812,23 @@ mod tests {
     }
 
     #[test]
-    fn journal_retention_is_bounded_and_status_reports_capped_size() {
-        let state = GatewayRuntimeState::new(
-            GatewayRuntimeConfigSnapshot {
-                grpc_bind_addr: "127.0.0.1".to_owned(),
-                grpc_port: 7443,
-                quic_bind_addr: "127.0.0.1".to_owned(),
-                quic_port: 7444,
-                quic_enabled: true,
-                node_rpc_mtls_required: true,
-                admin_auth_required: true,
-            },
-            0,
-        );
+    fn status_snapshot_reports_journal_counters_and_storage_metadata() {
+        let state = build_test_runtime_state(true);
 
-        for index in 0..(MAX_JOURNAL_EVENTS + 32) {
-            state
-                .record_journal_event(format!("event-{index}"))
-                .expect("journal record should succeed");
-        }
+        state
+            .record_journal_event(&JournalAppendRequest {
+                event_id: "01ARZ3NDEKTSV4RRFFQ69G5FB0".to_owned(),
+                session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned(),
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),
+                kind: 1,
+                actor: 1,
+                timestamp_unix_ms: 1_730_000_000_000,
+                payload_json: br#"{"token":"SECRET","safe":"ok"}"#.to_vec(),
+                principal: "user:ops".to_owned(),
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                channel: Some("cli".to_owned()),
+            })
+            .expect("journal record should succeed");
 
         let status = state.status_snapshot(
             RequestContext {
@@ -690,8 +839,46 @@ mod tests {
             &GatewayAuthConfig { require_auth: true, admin_token: Some("token".to_owned()) },
         );
         assert_eq!(
-            status.counters.journal_events, MAX_JOURNAL_EVENTS,
-            "journal retention should cap stored event count"
+            status.counters.journal_events, 1,
+            "status should report persisted journal count"
+        );
+        assert_eq!(status.counters.journal_redacted_events, 1, "status should report redactions");
+        assert!(status.storage.journal_hash_chain_enabled, "hash-chain flag should be surfaced");
+        assert!(
+            status.storage.latest_event_hash.is_some(),
+            "latest hash should be available when hash-chain is enabled"
+        );
+    }
+
+    #[test]
+    fn recent_journal_snapshot_returns_events_for_admin_surface() {
+        let state = build_test_runtime_state(false);
+
+        for index in 0..3 {
+            state
+                .record_journal_event(&JournalAppendRequest {
+                    event_id: format!("01ARZ3NDEKTSV4RRFFQ69G5FD{index}"),
+                    session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned(),
+                    run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),
+                    kind: 1,
+                    actor: 1,
+                    timestamp_unix_ms: 1_730_000_000_000 + index,
+                    payload_json: format!(r#"{{"index":{index}}}"#).into_bytes(),
+                    principal: "user:ops".to_owned(),
+                    device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                    channel: Some("cli".to_owned()),
+                })
+                .expect("journal record should succeed");
+        }
+
+        let snapshot = state
+            .recent_journal_snapshot(1000)
+            .expect("recent journal snapshot should be returned");
+        assert_eq!(snapshot.total_events, 3);
+        assert_eq!(snapshot.events.len(), 3);
+        assert!(
+            snapshot.events[0].event_id.ends_with('2'),
+            "recent events should be returned in descending order"
         );
     }
 }

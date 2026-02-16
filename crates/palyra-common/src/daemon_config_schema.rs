@@ -7,6 +7,7 @@ pub struct RootFileConfig {
     pub gateway: Option<FileGatewayConfig>,
     pub admin: Option<FileAdminConfig>,
     pub identity: Option<FileIdentityConfig>,
+    pub storage: Option<FileStorageConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -37,4 +38,11 @@ pub struct FileAdminConfig {
 #[serde(deny_unknown_fields)]
 pub struct FileIdentityConfig {
     pub allow_insecure_node_rpc_without_mtls: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileStorageConfig {
+    pub journal_db_path: Option<String>,
+    pub journal_hash_chain_enabled: Option<bool>,
 }
