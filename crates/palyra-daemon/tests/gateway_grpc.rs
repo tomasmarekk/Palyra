@@ -1,4 +1,5 @@
 use std::{
+    fs,
     io::{BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpStream},
     path::PathBuf,
@@ -9,7 +10,9 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use reqwest::blocking::Client;
 use rusqlite::Connection;
+use serde_json::Value;
 use tokio_stream::StreamExt;
 use tonic::Code;
 
@@ -266,6 +269,115 @@ async fn grpc_append_event_rejects_mismatched_embedded_event_version() -> Result
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_run_stream_persists_orchestrator_snapshot_and_matches_golden_tape() -> Result<()> {
+    let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+
+    let mut stream_request =
+        tonic::Request::new(tokio_stream::iter(vec![sample_run_stream_request_with_text(
+            "alpha beta gamma".to_owned(),
+        )]));
+    stream_request.metadata_mut().insert("authorization", format!("Bearer {ADMIN_TOKEN}").parse()?);
+    stream_request.metadata_mut().insert("x-palyra-principal", "user:ops".parse()?);
+    stream_request.metadata_mut().insert("x-palyra-device-id", DEVICE_ID.parse()?);
+    stream_request.metadata_mut().insert("x-palyra-channel", "cli".parse()?);
+
+    let mut response_stream =
+        client.run_stream(stream_request).await.context("failed to call RunStream")?.into_inner();
+    while let Some(event) = response_stream.next().await {
+        let _event = event.context("failed to read RunStream event")?;
+    }
+
+    let run_snapshot = admin_get_json_async(admin_port, format!("/admin/v1/runs/{RUN_ID}")).await?;
+    assert_eq!(
+        run_snapshot.get("state").and_then(Value::as_str).context("run snapshot missing state")?,
+        "done"
+    );
+    assert_eq!(
+        run_snapshot
+            .get("prompt_tokens")
+            .and_then(Value::as_u64)
+            .context("run snapshot missing prompt_tokens")?,
+        3
+    );
+    assert_eq!(
+        run_snapshot
+            .get("completion_tokens")
+            .and_then(Value::as_u64)
+            .context("run snapshot missing completion_tokens")?,
+        3
+    );
+
+    let expected_tape = load_golden_json("run_tape_basic.json")?;
+    assert_eq!(
+        run_snapshot.get("tape").cloned().context("run snapshot missing tape")?,
+        expected_tape
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_run_stream_honors_cancel_command_and_marks_run_cancelled() -> Result<()> {
+    let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+
+    let mut stream_request = tonic::Request::new(tokio_stream::iter(vec![
+        sample_run_stream_request_with_text(
+            "one two three four five six seven eight nine ten".to_owned(),
+        ),
+        sample_run_stream_request_with_text("/cancel".to_owned()),
+    ]));
+    stream_request.metadata_mut().insert("authorization", format!("Bearer {ADMIN_TOKEN}").parse()?);
+    stream_request.metadata_mut().insert("x-palyra-principal", "user:ops".parse()?);
+    stream_request.metadata_mut().insert("x-palyra-device-id", DEVICE_ID.parse()?);
+    stream_request.metadata_mut().insert("x-palyra-channel", "cli".parse()?);
+
+    let mut response_stream =
+        client.run_stream(stream_request).await.context("failed to call RunStream")?.into_inner();
+    let mut saw_failed = false;
+    let mut saw_done = false;
+    while let Some(event) = response_stream.next().await {
+        let event = event.context("failed to read RunStream event")?;
+        if let Some(common_v1::run_stream_event::Body::Status(status)) = event.body {
+            if status.kind == common_v1::stream_status::StatusKind::Failed as i32 {
+                saw_failed = true;
+            }
+            if status.kind == common_v1::stream_status::StatusKind::Done as i32 {
+                saw_done = true;
+            }
+        }
+    }
+    assert!(saw_failed, "cancelled run should emit failed status");
+    assert!(!saw_done, "cancelled run must not emit done status");
+
+    let run_snapshot = admin_get_json_async(admin_port, format!("/admin/v1/runs/{RUN_ID}")).await?;
+    assert_eq!(
+        run_snapshot.get("state").and_then(Value::as_str).context("run snapshot missing state")?,
+        "cancelled"
+    );
+    assert!(
+        run_snapshot
+            .get("cancel_requested")
+            .and_then(Value::as_bool)
+            .context("run snapshot missing cancel_requested")?,
+        "cancelled run should persist cancel_requested=true"
+    );
+    Ok(())
+}
+
 fn sample_run_stream_request() -> common_v1::RunStreamRequest {
     sample_run_stream_request_with_text("hello from grpc integration".to_owned())
 }
@@ -283,6 +395,39 @@ fn sample_run_stream_request_with_text(text: String) -> common_v1::RunStreamRequ
         }),
         allow_sensitive_tools: false,
     }
+}
+
+fn admin_get_json(admin_port: u16, path: &str) -> Result<Value> {
+    let endpoint = format!("http://127.0.0.1:{admin_port}{path}");
+    Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("failed to build admin HTTP client")?
+        .get(endpoint)
+        .header("Authorization", format!("Bearer {ADMIN_TOKEN}"))
+        .header("x-palyra-principal", "user:ops")
+        .header("x-palyra-device-id", DEVICE_ID)
+        .header("x-palyra-channel", "cli")
+        .send()
+        .context("failed to call daemon admin endpoint")?
+        .error_for_status()
+        .context("daemon admin endpoint returned non-success status")?
+        .json()
+        .context("failed to parse daemon admin JSON response")
+}
+
+async fn admin_get_json_async(admin_port: u16, path: String) -> Result<Value> {
+    tokio::task::spawn_blocking(move || admin_get_json(admin_port, path.as_str()))
+        .await
+        .context("admin JSON worker panicked")?
+}
+
+fn load_golden_json(name: &str) -> Result<Value> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests").join("golden").join(name);
+    let content =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_str(content.as_str())
+        .with_context(|| format!("failed to parse golden JSON {}", path.display()))
 }
 
 fn spawn_palyrad_with_dynamic_ports() -> Result<(Child, u16, u16, PathBuf)> {
@@ -307,6 +452,7 @@ fn spawn_palyrad_with_dynamic_ports_and_hash_chain(
         .env("PALYRA_ADMIN_TOKEN", ADMIN_TOKEN)
         .env("PALYRA_JOURNAL_DB_PATH", journal_db_path.to_string_lossy().to_string())
         .env("PALYRA_JOURNAL_HASH_CHAIN_ENABLED", if hash_chain_enabled { "true" } else { "false" })
+        .env("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED", "true")
         .env("RUST_LOG", "info")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

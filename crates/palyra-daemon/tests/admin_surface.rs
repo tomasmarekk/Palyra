@@ -13,6 +13,7 @@ use reqwest::blocking::Client;
 
 const ADMIN_TOKEN: &str = "test-admin-token";
 const DEVICE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+const RUN_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAX";
 
 #[test]
 fn admin_status_requires_token_and_context() -> Result<()> {
@@ -89,6 +90,43 @@ fn admin_journal_recent_requires_token_and_returns_snapshot() -> Result<()> {
         response_body.contains("\"events\":") && response_body.contains("\"total_events\":"),
         "journal snapshot response should include events and total count"
     );
+    Ok(())
+}
+
+#[test]
+fn admin_run_endpoints_require_token_and_report_not_found_for_unknown_run() -> Result<()> {
+    let (child, admin_port) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("failed to build HTTP client")?;
+    let status_url = format!("http://127.0.0.1:{admin_port}/admin/v1/runs/{RUN_ID}");
+    let cancel_url = format!("http://127.0.0.1:{admin_port}/admin/v1/runs/{RUN_ID}/cancel");
+
+    let missing_auth =
+        client.get(&status_url).send().context("failed to call admin run status without auth")?;
+    assert_eq!(missing_auth.status().as_u16(), 401, "missing auth must be rejected");
+
+    let unknown_run = client
+        .get(&status_url)
+        .header("Authorization", format!("Bearer {ADMIN_TOKEN}"))
+        .header("x-palyra-principal", "user:ops")
+        .header("x-palyra-device-id", DEVICE_ID)
+        .send()
+        .context("failed to call admin run status with auth")?;
+    assert_eq!(unknown_run.status().as_u16(), 404, "unknown run should return not found");
+
+    let unknown_cancel = client
+        .post(&cancel_url)
+        .header("Authorization", format!("Bearer {ADMIN_TOKEN}"))
+        .header("x-palyra-principal", "user:ops")
+        .header("x-palyra-device-id", DEVICE_ID)
+        .send()
+        .context("failed to call admin run cancel with auth")?;
+    assert_eq!(unknown_cancel.status().as_u16(), 404, "unknown run cancel should return not found");
     Ok(())
 }
 

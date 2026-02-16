@@ -25,7 +25,7 @@ use palyra_identity::{
 };
 use palyra_policy::{evaluate, PolicyDecision, PolicyRequest};
 use reqwest::blocking::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const MAX_HEALTH_ATTEMPTS: usize = 3;
 const BASE_HEALTH_BACKOFF_MS: u64 = 100;
@@ -271,6 +271,125 @@ fn run_daemon(command: DaemonCommand) -> Result<()> {
                     event.hash.as_deref().unwrap_or("none")
                 );
             }
+            std::io::stdout().flush().context("stdout flush failed")
+        }
+        DaemonCommand::RunStatus { url, token, principal, device_id, channel, run_id } => {
+            validate_canonical_id(run_id.as_str())
+                .context("run_id must be a canonical ULID for daemon run-status")?;
+            let base_url = url
+                .or_else(|| env::var("PALYRA_DAEMON_URL").ok())
+                .unwrap_or_else(|| "http://127.0.0.1:7142".to_owned());
+            let endpoint = format!("{}/admin/v1/runs/{run_id}", base_url.trim_end_matches('/'));
+            let token = token.or_else(|| env::var("PALYRA_ADMIN_TOKEN").ok());
+            let client = Client::builder()
+                .timeout(std::time::Duration::from_secs(2))
+                .build()
+                .context("failed to build HTTP client")?;
+            let mut request = client
+                .get(endpoint)
+                .header("x-palyra-principal", principal)
+                .header("x-palyra-device-id", device_id);
+            if let Some(token) = token {
+                request = request.header("Authorization", format!("Bearer {token}"));
+            }
+            if let Some(channel) = channel {
+                request = request.header("x-palyra-channel", channel);
+            }
+            let response: RunStatusResponse = request
+                .send()
+                .context("failed to call daemon run status endpoint")?
+                .error_for_status()
+                .context("daemon run status endpoint returned non-success status")?
+                .json()
+                .context("failed to parse daemon run status payload")?;
+            println!(
+                "run.status run_id={} state={} cancel_requested={} prompt_tokens={} completion_tokens={} total_tokens={} tape_events={}",
+                response.run_id,
+                response.state,
+                response.cancel_requested,
+                response.prompt_tokens,
+                response.completion_tokens,
+                response.total_tokens,
+                response.tape.len()
+            );
+            std::io::stdout().flush().context("stdout flush failed")
+        }
+        DaemonCommand::RunTape { url, token, principal, device_id, channel, run_id } => {
+            validate_canonical_id(run_id.as_str())
+                .context("run_id must be a canonical ULID for daemon run-tape")?;
+            let base_url = url
+                .or_else(|| env::var("PALYRA_DAEMON_URL").ok())
+                .unwrap_or_else(|| "http://127.0.0.1:7142".to_owned());
+            let endpoint =
+                format!("{}/admin/v1/runs/{run_id}/tape", base_url.trim_end_matches('/'));
+            let token = token.or_else(|| env::var("PALYRA_ADMIN_TOKEN").ok());
+            let client = Client::builder()
+                .timeout(std::time::Duration::from_secs(2))
+                .build()
+                .context("failed to build HTTP client")?;
+            let mut request = client
+                .get(endpoint)
+                .header("x-palyra-principal", principal)
+                .header("x-palyra-device-id", device_id);
+            if let Some(token) = token {
+                request = request.header("Authorization", format!("Bearer {token}"));
+            }
+            if let Some(channel) = channel {
+                request = request.header("x-palyra-channel", channel);
+            }
+            let response: RunTapeResponse = request
+                .send()
+                .context("failed to call daemon run tape endpoint")?
+                .error_for_status()
+                .context("daemon run tape endpoint returned non-success status")?
+                .json()
+                .context("failed to parse daemon run tape payload")?;
+            println!("run.tape run_id={} events={}", response.run_id, response.events.len());
+            for event in response.events {
+                println!(
+                    "run.tape.event seq={} type={} payload_json={}",
+                    event.seq, event.event_type, event.payload_json
+                );
+            }
+            std::io::stdout().flush().context("stdout flush failed")
+        }
+        DaemonCommand::RunCancel { url, token, principal, device_id, channel, run_id, reason } => {
+            validate_canonical_id(run_id.as_str())
+                .context("run_id must be a canonical ULID for daemon run-cancel")?;
+            let base_url = url
+                .or_else(|| env::var("PALYRA_DAEMON_URL").ok())
+                .unwrap_or_else(|| "http://127.0.0.1:7142".to_owned());
+            let endpoint =
+                format!("{}/admin/v1/runs/{run_id}/cancel", base_url.trim_end_matches('/'));
+            let token = token.or_else(|| env::var("PALYRA_ADMIN_TOKEN").ok());
+            let client = Client::builder()
+                .timeout(std::time::Duration::from_secs(2))
+                .build()
+                .context("failed to build HTTP client")?;
+            let mut request = client
+                .post(endpoint)
+                .header("x-palyra-principal", principal)
+                .header("x-palyra-device-id", device_id);
+            if let Some(token) = token {
+                request = request.header("Authorization", format!("Bearer {token}"));
+            }
+            if let Some(channel) = channel {
+                request = request.header("x-palyra-channel", channel);
+            }
+            if let Some(reason) = reason {
+                request = request.json(&RunCancelRequestBody { reason });
+            }
+            let response: RunCancelResponse = request
+                .send()
+                .context("failed to call daemon run cancel endpoint")?
+                .error_for_status()
+                .context("daemon run cancel endpoint returned non-success status")?
+                .json()
+                .context("failed to parse daemon run cancel payload")?;
+            println!(
+                "run.cancel run_id={} cancel_requested={} reason={}",
+                response.run_id, response.cancel_requested, response.reason
+            );
             std::io::stdout().flush().context("stdout flush failed")
         }
     }
@@ -686,6 +805,42 @@ struct JournalRecentEvent {
     redacted: bool,
     timestamp_unix_ms: i64,
     hash: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RunCancelRequestBody {
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RunStatusResponse {
+    run_id: String,
+    state: String,
+    cancel_requested: bool,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    total_tokens: u64,
+    tape: Vec<RunTapeEvent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RunTapeResponse {
+    run_id: String,
+    events: Vec<RunTapeEvent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RunTapeEvent {
+    seq: i64,
+    event_type: String,
+    payload_json: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RunCancelResponse {
+    run_id: String,
+    cancel_requested: bool,
+    reason: String,
 }
 
 #[cfg(all(test, not(windows)))]

@@ -100,6 +100,36 @@ fn palyra_daemon_admin_status_without_token_fails_when_auth_is_required() -> Res
     Ok(())
 }
 
+#[test]
+fn palyra_daemon_run_status_rejects_non_canonical_run_id() -> Result<()> {
+    let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
+        .args(["daemon", "run-status", "--run-id", "invalid-ulid"])
+        .output()
+        .context("failed to execute palyra daemon run-status")?;
+    assert!(!output.status.success(), "run-status should reject non-canonical run IDs");
+    let stderr = String::from_utf8(output.stderr).context("stderr was not valid UTF-8")?;
+    assert!(
+        stderr.contains("run_id must be a canonical ULID"),
+        "expected canonical ULID validation failure, got: {stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn palyra_daemon_run_cancel_rejects_non_canonical_run_id() -> Result<()> {
+    let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
+        .args(["daemon", "run-cancel", "--run-id", "invalid-ulid"])
+        .output()
+        .context("failed to execute palyra daemon run-cancel")?;
+    assert!(!output.status.success(), "run-cancel should reject non-canonical run IDs");
+    let stderr = String::from_utf8(output.stderr).context("stderr was not valid UTF-8")?;
+    assert!(
+        stderr.contains("run_id must be a canonical ULID"),
+        "expected canonical ULID validation failure, got: {stderr}"
+    );
+    Ok(())
+}
+
 fn spawn_palyrad_with_dynamic_port() -> Result<(Child, u16)> {
     spawn_palyrad_with_dynamic_port_and_env(&[])
 }

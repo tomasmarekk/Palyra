@@ -1,0 +1,32 @@
+[
+  {
+    "seq": 0,
+    "event_type": "status",
+    "payload_json": "{\"kind\":\"accepted\",\"message\":\"accepted session=01ARZ3NDEKTSV4RRFFQ69G5FAW principal=user:ops\"}"
+  },
+  {
+    "seq": 1,
+    "event_type": "status",
+    "payload_json": "{\"kind\":\"in_progress\",\"message\":\"streaming\"}"
+  },
+  {
+    "seq": 2,
+    "event_type": "model_token",
+    "payload_json": "{\"is_final\":false,\"token\":\"alpha\"}"
+  },
+  {
+    "seq": 3,
+    "event_type": "model_token",
+    "payload_json": "{\"is_final\":false,\"token\":\"beta\"}"
+  },
+  {
+    "seq": 4,
+    "event_type": "model_token",
+    "payload_json": "{\"is_final\":true,\"token\":\"gamma\"}"
+  },
+  {
+    "seq": 5,
+    "event_type": "status",
+    "payload_json": "{\"kind\":\"done\",\"message\":\"completed\"}"
+  }
+]

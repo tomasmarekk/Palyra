@@ -295,3 +295,22 @@ fn config_validate_with_explicit_path_rejects_unknown_identity_key() -> Result<(
     assert!(stderr.contains("invalid daemon config schema"), "unexpected stderr output: {stderr}");
     Ok(())
 }
+
+#[test]
+fn config_validate_with_explicit_path_rejects_non_boolean_orchestrator_flag() -> Result<()> {
+    let workdir = TempDir::new().context("failed to create temporary workdir")?;
+    let config_path = workdir.path().join("invalid-orchestrator.toml");
+    fs::write(&config_path, "[orchestrator]\nrunloop_v1_enabled='sometimes'\n")
+        .with_context(|| format!("failed to write {}", config_path.display()))?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
+        .current_dir(workdir.path())
+        .args(["config", "validate", "--path", "invalid-orchestrator.toml"])
+        .output()
+        .context("failed to execute palyra config validate with invalid orchestrator flag")?;
+
+    assert!(!output.status.success(), "config with non-boolean orchestrator flag must fail");
+    let stderr = String::from_utf8(output.stderr).context("stderr was not UTF-8")?;
+    assert!(stderr.contains("invalid daemon config schema"), "unexpected stderr output: {stderr}");
+    Ok(())
+}

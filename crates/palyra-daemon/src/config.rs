@@ -15,6 +15,7 @@ const DEFAULT_GRPC_PORT: u16 = 7443;
 const DEFAULT_QUIC_BIND_ADDR: &str = "127.0.0.1";
 const DEFAULT_QUIC_PORT: u16 = 7444;
 const DEFAULT_QUIC_ENABLED: bool = true;
+const DEFAULT_ORCHESTRATOR_RUNLOOP_V1_ENABLED: bool = false;
 const DEFAULT_ADMIN_REQUIRE_AUTH: bool = true;
 const DEFAULT_ALLOW_INSECURE_NODE_RPC_WITHOUT_MTLS: bool = false;
 const DEFAULT_JOURNAL_DB_PATH: &str = "data/journal.sqlite3";
@@ -25,6 +26,7 @@ pub struct LoadedConfig {
     pub source: String,
     pub daemon: DaemonConfig,
     pub gateway: GatewayConfig,
+    pub orchestrator: OrchestratorConfig,
     pub admin: AdminConfig,
     pub identity: IdentityConfig,
     pub storage: StorageConfig,
@@ -43,6 +45,11 @@ pub struct GatewayConfig {
     pub quic_bind_addr: String,
     pub quic_port: u16,
     pub quic_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrchestratorConfig {
+    pub runloop_v1_enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,6 +102,12 @@ impl Default for GatewayConfig {
     }
 }
 
+impl Default for OrchestratorConfig {
+    fn default() -> Self {
+        Self { runloop_v1_enabled: DEFAULT_ORCHESTRATOR_RUNLOOP_V1_ENABLED }
+    }
+}
+
 impl Default for AdminConfig {
     fn default() -> Self {
         Self { require_auth: DEFAULT_ADMIN_REQUIRE_AUTH, auth_token: None }
@@ -104,6 +117,7 @@ impl Default for AdminConfig {
 pub fn load_config() -> Result<LoadedConfig> {
     let mut daemon = DaemonConfig::default();
     let mut gateway = GatewayConfig::default();
+    let mut orchestrator = OrchestratorConfig::default();
     let mut admin = AdminConfig::default();
     let mut identity = IdentityConfig::default();
     let mut storage = StorageConfig::default();
@@ -137,6 +151,11 @@ pub fn load_config() -> Result<LoadedConfig> {
             }
             if let Some(quic_enabled) = file_gateway.quic_enabled {
                 gateway.quic_enabled = quic_enabled;
+            }
+        }
+        if let Some(file_orchestrator) = parsed.orchestrator {
+            if let Some(runloop_v1_enabled) = file_orchestrator.runloop_v1_enabled {
+                orchestrator.runloop_v1_enabled = runloop_v1_enabled;
             }
         }
         if let Some(file_admin) = parsed.admin {
@@ -203,6 +222,13 @@ pub fn load_config() -> Result<LoadedConfig> {
         source.push_str(" +env(PALYRA_GATEWAY_QUIC_ENABLED)");
     }
 
+    if let Ok(runloop_v1_enabled) = env::var("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED") {
+        orchestrator.runloop_v1_enabled = runloop_v1_enabled
+            .parse::<bool>()
+            .context("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED must be true or false")?;
+        source.push_str(" +env(PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED)");
+    }
+
     if let Ok(require_auth) = env::var("PALYRA_ADMIN_REQUIRE_AUTH") {
         admin.require_auth = require_auth
             .parse::<bool>()
@@ -234,7 +260,7 @@ pub fn load_config() -> Result<LoadedConfig> {
         source.push_str(" +env(PALYRA_JOURNAL_HASH_CHAIN_ENABLED)");
     }
 
-    Ok(LoadedConfig { source, daemon, gateway, admin, identity, storage })
+    Ok(LoadedConfig { source, daemon, gateway, orchestrator, admin, identity, storage })
 }
 
 fn find_config_path() -> Result<Option<PathBuf>> {
@@ -274,7 +300,10 @@ fn parse_journal_db_path(raw: &str) -> Result<PathBuf> {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{parse_journal_db_path, AdminConfig, GatewayConfig, IdentityConfig, StorageConfig};
+    use super::{
+        parse_journal_db_path, AdminConfig, GatewayConfig, IdentityConfig, OrchestratorConfig,
+        StorageConfig,
+    };
     use palyra_common::daemon_config_schema::RootFileConfig;
 
     #[test]
@@ -304,6 +333,15 @@ mod tests {
         assert_eq!(config.quic_bind_addr, "127.0.0.1");
         assert_eq!(config.quic_port, 7444);
         assert!(config.quic_enabled, "gateway transport should default to QUIC-enabled mode");
+    }
+
+    #[test]
+    fn orchestrator_config_defaults_to_disabled_runloop() {
+        let config = OrchestratorConfig::default();
+        assert!(
+            !config.runloop_v1_enabled,
+            "orchestrator run loop should default disabled until explicitly enabled"
+        );
     }
 
     #[test]
@@ -350,6 +388,13 @@ mod tests {
         let result: Result<RootFileConfig, _> =
             toml::from_str("[gateway]\ngrpc_port=7443\nunexpected=true\n");
         assert!(result.is_err(), "unknown gateway keys must be rejected");
+    }
+
+    #[test]
+    fn config_rejects_unknown_orchestrator_key() {
+        let result: Result<RootFileConfig, _> =
+            toml::from_str("[orchestrator]\nrunloop_v1_enabled=true\nunexpected=true\n");
+        assert!(result.is_err(), "unknown orchestrator keys must be rejected");
     }
 
     #[test]

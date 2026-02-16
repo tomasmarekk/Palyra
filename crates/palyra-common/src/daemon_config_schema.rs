@@ -5,6 +5,7 @@ use serde::Deserialize;
 pub struct RootFileConfig {
     pub daemon: Option<FileDaemonConfig>,
     pub gateway: Option<FileGatewayConfig>,
+    pub orchestrator: Option<FileOrchestratorConfig>,
     pub admin: Option<FileAdminConfig>,
     pub identity: Option<FileIdentityConfig>,
     pub storage: Option<FileStorageConfig>,
@@ -25,6 +26,12 @@ pub struct FileGatewayConfig {
     pub quic_bind_addr: Option<String>,
     pub quic_port: Option<u16>,
     pub quic_enabled: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileOrchestratorConfig {
+    pub runloop_v1_enabled: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]

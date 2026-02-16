@@ -1,15 +1,16 @@
 mod config;
 mod gateway;
 mod journal;
+mod orchestrator;
 
 use std::time::Instant;
 
 use anyhow::{Context, Result};
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use clap::Parser;
@@ -18,8 +19,11 @@ use gateway::{
     authorize_headers, request_context_from_headers, AuthError, GatewayAuthConfig,
     GatewayJournalConfigSnapshot, GatewayRuntimeConfigSnapshot, GatewayRuntimeState,
 };
-use journal::{JournalConfig, JournalStore};
-use palyra_common::{build_metadata, health_response, parse_daemon_bind_socket, HealthResponse};
+use journal::{JournalConfig, JournalStore, OrchestratorCancelRequest, OrchestratorRunSnapshot};
+use palyra_common::{
+    build_metadata, health_response, parse_daemon_bind_socket, validate_canonical_id,
+    HealthResponse,
+};
 use palyra_identity::IdentityManager;
 #[cfg(not(windows))]
 use palyra_identity::{default_identity_storage_path, FilesystemSecretStore, SecretStore};
@@ -59,6 +63,11 @@ struct ErrorBody {
 #[derive(Debug, Deserialize)]
 struct JournalRecentQuery {
     limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RunCancelRequest {
+    reason: Option<String>,
 }
 
 #[tokio::main]
@@ -101,6 +110,7 @@ async fn main() -> Result<()> {
             quic_bind_addr: loaded.gateway.quic_bind_addr.clone(),
             quic_port: loaded.gateway.quic_port,
             quic_enabled: loaded.gateway.quic_enabled,
+            orchestrator_runloop_v1_enabled: loaded.orchestrator.runloop_v1_enabled,
             node_rpc_mtls_required: !loaded.identity.allow_insecure_node_rpc_without_mtls,
             admin_auth_required: loaded.admin.require_auth,
         },
@@ -141,6 +151,7 @@ async fn main() -> Result<()> {
         quic_bind_addr = %loaded.gateway.quic_bind_addr,
         quic_port = loaded.gateway.quic_port,
         quic_enabled = loaded.gateway.quic_enabled,
+        orchestrator_runloop_v1_enabled = loaded.orchestrator.runloop_v1_enabled,
         admin_auth_required = loaded.admin.require_auth,
         admin_token_configured = loaded.admin.auth_token.is_some(),
         node_rpc_mtls_required = !loaded.identity.allow_insecure_node_rpc_without_mtls,
@@ -157,6 +168,9 @@ async fn main() -> Result<()> {
         .route("/healthz", get(health_handler))
         .route("/admin/v1/status", get(admin_status_handler))
         .route("/admin/v1/journal/recent", get(admin_journal_recent_handler))
+        .route("/admin/v1/runs/{run_id}", get(admin_run_status_handler))
+        .route("/admin/v1/runs/{run_id}/tape", get(admin_run_tape_handler))
+        .route("/admin/v1/runs/{run_id}/cancel", post(admin_run_cancel_handler))
         .with_state(state);
 
     let admin_address = parse_daemon_bind_socket(&loaded.daemon.bind_addr, loaded.daemon.port)
@@ -264,6 +278,95 @@ async fn admin_journal_recent_handler(
     Ok(Json(snapshot))
 }
 
+async fn admin_run_status_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+) -> Result<Json<OrchestratorRunSnapshot>, Response> {
+    authorize_headers(&headers, &state.auth).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    let _context = request_context_from_headers(&headers).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    validate_canonical_id(run_id.as_str()).map_err(|_| {
+        runtime_status_response(tonic::Status::invalid_argument("run_id must be a canonical ULID"))
+    })?;
+    state.runtime.record_admin_status_request();
+    let snapshot = state
+        .runtime
+        .orchestrator_run_snapshot(run_id.clone())
+        .await
+        .map_err(runtime_status_response)?;
+    let Some(snapshot) = snapshot else {
+        return Err(runtime_status_response(tonic::Status::not_found(format!(
+            "orchestrator run not found: {run_id}"
+        ))));
+    };
+    Ok(Json(snapshot))
+}
+
+async fn admin_run_tape_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+) -> Result<Json<gateway::RunTapeSnapshot>, Response> {
+    authorize_headers(&headers, &state.auth).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    let _context = request_context_from_headers(&headers).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    validate_canonical_id(run_id.as_str()).map_err(|_| {
+        runtime_status_response(tonic::Status::invalid_argument("run_id must be a canonical ULID"))
+    })?;
+    state.runtime.record_admin_status_request();
+    let snapshot =
+        state.runtime.orchestrator_tape_snapshot(run_id).await.map_err(runtime_status_response)?;
+    Ok(Json(snapshot))
+}
+
+async fn admin_run_cancel_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+    payload: Option<Json<RunCancelRequest>>,
+) -> Result<Json<gateway::RunCancelSnapshot>, Response> {
+    authorize_headers(&headers, &state.auth).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    let _context = request_context_from_headers(&headers).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    validate_canonical_id(run_id.as_str()).map_err(|_| {
+        runtime_status_response(tonic::Status::invalid_argument("run_id must be a canonical ULID"))
+    })?;
+    state.runtime.record_admin_status_request();
+    let reason = payload
+        .and_then(|body| body.0.reason)
+        .and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_owned())
+            }
+        })
+        .unwrap_or_else(|| "admin_cancel_requested".to_owned());
+    let response = state
+        .runtime
+        .request_orchestrator_cancel(OrchestratorCancelRequest { run_id, reason })
+        .await
+        .map_err(runtime_status_response)?;
+    Ok(Json(response))
+}
+
 fn auth_error_response(error: AuthError) -> Response {
     let status = match error {
         AuthError::MissingConfiguredToken => StatusCode::SERVICE_UNAVAILABLE,
@@ -279,6 +382,8 @@ fn runtime_status_response(status: tonic::Status) -> Response {
     let http_status = match status.code() {
         tonic::Code::PermissionDenied => StatusCode::FORBIDDEN,
         tonic::Code::InvalidArgument => StatusCode::BAD_REQUEST,
+        tonic::Code::FailedPrecondition => StatusCode::PRECONDITION_FAILED,
+        tonic::Code::NotFound => StatusCode::NOT_FOUND,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (http_status, Json(ErrorBody { error: status.message().to_owned() })).into_response()

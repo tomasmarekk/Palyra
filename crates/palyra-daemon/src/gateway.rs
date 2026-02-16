@@ -10,13 +10,25 @@ use std::{
 use axum::http::{header::AUTHORIZATION, HeaderMap};
 use palyra_common::{build_metadata, validate_canonical_id, CANONICAL_PROTOCOL_MAJOR};
 use serde::Serialize;
+use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tonic::{metadata::MetadataMap, Request, Response, Status, Streaming};
 use tracing::{info, warn};
 use ulid::Ulid;
 
-use crate::journal::{JournalAppendRequest, JournalError, JournalEventRecord, JournalStore};
+use crate::{
+    journal::{
+        JournalAppendRequest, JournalError, JournalEventRecord, JournalStore,
+        OrchestratorCancelRequest, OrchestratorRunSnapshot, OrchestratorRunStartRequest,
+        OrchestratorSessionUpsertRequest, OrchestratorTapeAppendRequest, OrchestratorTapeRecord,
+        OrchestratorUsageDelta,
+    },
+    orchestrator::{
+        estimate_token_count, is_cancel_command, split_model_tokens, RunLifecycleState,
+        RunStateMachine, RunTransition, MAX_MODEL_TOKENS_PER_EVENT,
+    },
+};
 
 pub mod proto {
     pub mod palyra {
@@ -39,11 +51,11 @@ use proto::palyra::{common::v1 as common_v1, gateway::v1 as gateway_v1};
 pub const HEADER_PRINCIPAL: &str = "x-palyra-principal";
 pub const HEADER_DEVICE_ID: &str = "x-palyra-device-id";
 pub const HEADER_CHANNEL: &str = "x-palyra-channel";
-const MAX_MODEL_TOKENS_PER_EVENT: usize = 16;
 const MAX_JOURNAL_RECENT_EVENTS: usize = 100;
 const JOURNAL_WRITE_LATENCY_BUDGET_MS: u128 = 25;
 const SENSITIVE_TOOLS_DENY_REASON: &str =
     "allow_sensitive_tools=true is denied by default and requires explicit approvals";
+const CANCELLED_REASON: &str = "cancelled by request";
 
 #[derive(Debug, Clone)]
 pub struct GatewayRuntimeConfigSnapshot {
@@ -52,6 +64,7 @@ pub struct GatewayRuntimeConfigSnapshot {
     pub quic_bind_addr: String,
     pub quic_port: u16,
     pub quic_enabled: bool,
+    pub orchestrator_runloop_v1_enabled: bool,
     pub node_rpc_mtls_required: bool,
     pub admin_auth_required: bool,
 }
@@ -96,6 +109,11 @@ struct RuntimeCounters {
     journal_events: AtomicU64,
     journal_persist_failures: AtomicU64,
     journal_redacted_events: AtomicU64,
+    orchestrator_runs_started: AtomicU64,
+    orchestrator_runs_completed: AtomicU64,
+    orchestrator_runs_cancelled: AtomicU64,
+    orchestrator_cancel_requests: AtomicU64,
+    orchestrator_tape_events: AtomicU64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -134,6 +152,7 @@ pub struct SecuritySnapshot {
     pub deny_by_default: bool,
     pub admin_auth_required: bool,
     pub admin_token_configured: bool,
+    pub orchestrator_runloop_v1_enabled: bool,
     pub node_rpc_mtls_required: bool,
     pub revoked_certificate_count: usize,
 }
@@ -155,6 +174,11 @@ pub struct CountersSnapshot {
     pub journal_events: u64,
     pub journal_persist_failures: u64,
     pub journal_redacted_events: u64,
+    pub orchestrator_runs_started: u64,
+    pub orchestrator_runs_completed: u64,
+    pub orchestrator_runs_cancelled: u64,
+    pub orchestrator_cancel_requests: u64,
+    pub orchestrator_tape_events: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -162,6 +186,19 @@ pub struct JournalRecentSnapshot {
     pub total_events: u64,
     pub hash_chain_enabled: bool,
     pub events: Vec<JournalEventRecord>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RunTapeSnapshot {
+    pub run_id: String,
+    pub events: Vec<OrchestratorTapeRecord>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RunCancelSnapshot {
+    pub run_id: String,
+    pub cancel_requested: bool,
+    pub reason: String,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -190,6 +227,11 @@ impl RuntimeCounters {
             journal_events: self.journal_events.load(Ordering::Relaxed),
             journal_persist_failures: self.journal_persist_failures.load(Ordering::Relaxed),
             journal_redacted_events: self.journal_redacted_events.load(Ordering::Relaxed),
+            orchestrator_runs_started: self.orchestrator_runs_started.load(Ordering::Relaxed),
+            orchestrator_runs_completed: self.orchestrator_runs_completed.load(Ordering::Relaxed),
+            orchestrator_runs_cancelled: self.orchestrator_runs_cancelled.load(Ordering::Relaxed),
+            orchestrator_cancel_requests: self.orchestrator_cancel_requests.load(Ordering::Relaxed),
+            orchestrator_tape_events: self.orchestrator_tape_events.load(Ordering::Relaxed),
         }
     }
 }
@@ -220,6 +262,11 @@ impl GatewayRuntimeState {
                 journal_events: AtomicU64::new(existing_events),
                 journal_persist_failures: AtomicU64::new(0),
                 journal_redacted_events: AtomicU64::new(0),
+                orchestrator_runs_started: AtomicU64::new(0),
+                orchestrator_runs_completed: AtomicU64::new(0),
+                orchestrator_runs_cancelled: AtomicU64::new(0),
+                orchestrator_cancel_requests: AtomicU64::new(0),
+                orchestrator_tape_events: AtomicU64::new(0),
             },
             journal_store,
             revoked_certificate_count,
@@ -304,6 +351,7 @@ impl GatewayRuntimeState {
                 deny_by_default: true,
                 admin_auth_required: self.config.admin_auth_required,
                 admin_token_configured: auth_config.admin_token.is_some(),
+                orchestrator_runloop_v1_enabled: self.config.orchestrator_runloop_v1_enabled,
                 node_rpc_mtls_required: self.config.node_rpc_mtls_required,
                 revoked_certificate_count: self.revoked_certificate_count,
             },
@@ -358,6 +406,252 @@ impl GatewayRuntimeState {
         tokio::task::spawn_blocking(move || state.recent_journal_snapshot_blocking(limit))
             .await
             .map_err(|_| Status::internal("journal read worker panicked"))?
+    }
+
+    #[must_use]
+    pub const fn is_orchestrator_runloop_enabled(&self) -> bool {
+        self.config.orchestrator_runloop_v1_enabled
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn upsert_orchestrator_session_blocking(
+        &self,
+        request: &OrchestratorSessionUpsertRequest,
+    ) -> Result<(), Status> {
+        self.journal_store
+            .upsert_orchestrator_session(request)
+            .map_err(|error| map_orchestrator_store_error("upsert orchestrator session", error))
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn upsert_orchestrator_session(
+        self: &Arc<Self>,
+        request: OrchestratorSessionUpsertRequest,
+    ) -> Result<(), Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.upsert_orchestrator_session_blocking(&request))
+            .await
+            .map_err(|_| Status::internal("orchestrator session worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn start_orchestrator_run_blocking(
+        &self,
+        request: &OrchestratorRunStartRequest,
+    ) -> Result<(), Status> {
+        self.journal_store
+            .start_orchestrator_run(request)
+            .map_err(|error| map_orchestrator_store_error("start orchestrator run", error))
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn start_orchestrator_run(
+        self: &Arc<Self>,
+        request: OrchestratorRunStartRequest,
+    ) -> Result<(), Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.start_orchestrator_run_blocking(&request))
+            .await
+            .map_err(|_| Status::internal("orchestrator run worker panicked"))??;
+        self.counters.orchestrator_runs_started.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn update_orchestrator_run_state_blocking(
+        &self,
+        run_id: &str,
+        state: RunLifecycleState,
+        error_message: Option<&str>,
+    ) -> Result<(), Status> {
+        self.journal_store
+            .update_orchestrator_run_state(run_id, state, error_message)
+            .map_err(|error| map_orchestrator_store_error("update orchestrator run state", error))
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn update_orchestrator_run_state(
+        self: &Arc<Self>,
+        run_id: String,
+        state: RunLifecycleState,
+        error_message: Option<String>,
+    ) -> Result<(), Status> {
+        let state_ref = Arc::clone(self);
+        let error_message_ref = error_message.clone();
+        tokio::task::spawn_blocking(move || {
+            state_ref.update_orchestrator_run_state_blocking(
+                run_id.as_str(),
+                state,
+                error_message_ref.as_deref(),
+            )
+        })
+        .await
+        .map_err(|_| Status::internal("orchestrator run state worker panicked"))??;
+        if state == RunLifecycleState::Done {
+            self.counters.orchestrator_runs_completed.fetch_add(1, Ordering::Relaxed);
+        } else if state == RunLifecycleState::Cancelled {
+            self.counters.orchestrator_runs_cancelled.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn add_orchestrator_usage_blocking(
+        &self,
+        delta: &OrchestratorUsageDelta,
+    ) -> Result<(), Status> {
+        self.journal_store
+            .add_orchestrator_usage(delta)
+            .map_err(|error| map_orchestrator_store_error("update orchestrator usage", error))
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn add_orchestrator_usage(
+        self: &Arc<Self>,
+        delta: OrchestratorUsageDelta,
+    ) -> Result<(), Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.add_orchestrator_usage_blocking(&delta))
+            .await
+            .map_err(|_| Status::internal("orchestrator usage worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn append_orchestrator_tape_event_blocking(
+        &self,
+        request: &OrchestratorTapeAppendRequest,
+    ) -> Result<(), Status> {
+        self.journal_store
+            .append_orchestrator_tape_event(request)
+            .map_err(|error| map_orchestrator_store_error("append orchestrator tape event", error))
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn append_orchestrator_tape_event(
+        self: &Arc<Self>,
+        request: OrchestratorTapeAppendRequest,
+    ) -> Result<(), Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.append_orchestrator_tape_event_blocking(&request)
+        })
+        .await
+        .map_err(|_| Status::internal("orchestrator tape worker panicked"))??;
+        self.counters.orchestrator_tape_events.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn request_orchestrator_cancel_blocking(
+        &self,
+        request: &OrchestratorCancelRequest,
+    ) -> Result<(), Status> {
+        self.journal_store
+            .request_orchestrator_cancel(request)
+            .map_err(|error| map_orchestrator_store_error("request orchestrator cancel", error))
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn request_orchestrator_cancel(
+        self: &Arc<Self>,
+        request: OrchestratorCancelRequest,
+    ) -> Result<RunCancelSnapshot, Status> {
+        let state = Arc::clone(self);
+        let run_id = request.run_id.clone();
+        let reason = request.reason.clone();
+        tokio::task::spawn_blocking(move || state.request_orchestrator_cancel_blocking(&request))
+            .await
+            .map_err(|_| Status::internal("orchestrator cancel worker panicked"))??;
+        self.counters.orchestrator_cancel_requests.fetch_add(1, Ordering::Relaxed);
+        Ok(RunCancelSnapshot { run_id, cancel_requested: true, reason })
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn is_orchestrator_cancel_requested_blocking(&self, run_id: &str) -> Result<bool, Status> {
+        self.journal_store
+            .is_orchestrator_cancel_requested(run_id)
+            .map_err(|error| map_orchestrator_store_error("load orchestrator cancel flag", error))
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn is_orchestrator_cancel_requested(
+        self: &Arc<Self>,
+        run_id: String,
+    ) -> Result<bool, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.is_orchestrator_cancel_requested_blocking(run_id.as_str())
+        })
+        .await
+        .map_err(|_| Status::internal("orchestrator cancel read worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn orchestrator_run_snapshot_blocking(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<OrchestratorRunSnapshot>, Status> {
+        self.journal_store
+            .orchestrator_run_snapshot(run_id)
+            .map_err(|error| map_orchestrator_store_error("load orchestrator run snapshot", error))
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn orchestrator_run_snapshot(
+        self: &Arc<Self>,
+        run_id: String,
+    ) -> Result<Option<OrchestratorRunSnapshot>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.orchestrator_run_snapshot_blocking(run_id.as_str())
+        })
+        .await
+        .map_err(|_| Status::internal("orchestrator snapshot worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn orchestrator_tape_snapshot_blocking(&self, run_id: &str) -> Result<RunTapeSnapshot, Status> {
+        let run_exists = self
+            .journal_store
+            .orchestrator_run_snapshot(run_id)
+            .map_err(|error| map_orchestrator_store_error("load orchestrator run snapshot", error))?
+            .is_some();
+        if !run_exists {
+            return Err(Status::not_found(format!("orchestrator run not found: {run_id}")));
+        }
+        let events = self
+            .journal_store
+            .orchestrator_tape(run_id)
+            .map_err(|error| map_orchestrator_store_error("load orchestrator tape", error))?;
+        Ok(RunTapeSnapshot { run_id: run_id.to_owned(), events })
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn orchestrator_tape_snapshot(
+        self: &Arc<Self>,
+        run_id: String,
+    ) -> Result<RunTapeSnapshot, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.orchestrator_tape_snapshot_blocking(run_id.as_str())
+        })
+        .await
+        .map_err(|_| Status::internal("orchestrator tape snapshot worker panicked"))?
+    }
+}
+
+fn map_orchestrator_store_error(operation: &str, error: JournalError) -> Status {
+    match error {
+        JournalError::DuplicateRunId { run_id } => {
+            Status::already_exists(format!("orchestrator run already exists: {run_id}"))
+        }
+        JournalError::DuplicateTapeSequence { run_id, seq } => Status::already_exists(format!(
+            "orchestrator tape already contains seq={seq} for run {run_id}"
+        )),
+        JournalError::RunNotFound { run_id } => {
+            Status::not_found(format!("orchestrator run not found: {run_id}"))
+        }
+        other => Status::internal(format!("{operation} failed: {other}")),
     }
 }
 
@@ -484,6 +778,12 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
         &self,
         request: Request<Streaming<common_v1::RunStreamRequest>>,
     ) -> Result<Response<Self::RunStreamStream>, Status> {
+        if !self.state.is_orchestrator_runloop_enabled() {
+            self.state.record_denied();
+            return Err(Status::failed_precondition(
+                "orchestrator run loop v1 is disabled; set PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED=true",
+            ));
+        }
         let context = self.authorize_rpc(request.metadata(), "RunStream")?;
         self.state.counters.run_stream_requests.fetch_add(1, Ordering::Relaxed);
 
@@ -493,8 +793,12 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
         let state_for_stream = self.state.clone();
 
         tokio::spawn(async move {
-            let mut last_run_id = None::<String>;
-            let mut accepted_emitted = false;
+            let mut active_session_id = None::<String>;
+            let mut active_run_id = None::<String>;
+            let mut run_state = RunStateMachine::default();
+            let mut tape_seq = 0_i64;
+            let mut in_progress_emitted = false;
+
             while let Some(item) = stream.next().await {
                 let message = match item {
                     Ok(value) => value,
@@ -517,6 +821,16 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                 }
                 if message.allow_sensitive_tools {
                     state_for_stream.record_denied();
+                    if let Some(run_id) = active_run_id.clone() {
+                        let _ = run_state.transition(RunTransition::Fail);
+                        let _ = state_for_stream
+                            .update_orchestrator_run_state(
+                                run_id.clone(),
+                                RunLifecycleState::Failed,
+                                Some(SENSITIVE_TOOLS_DENY_REASON.to_owned()),
+                            )
+                            .await;
+                    }
                     let _ = sender
                         .send(Err(Status::permission_denied(format!(
                             "decision=deny_by_default approval_required=true reason={SENSITIVE_TOOLS_DENY_REASON}",
@@ -539,76 +853,323 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                         return;
                     }
                 };
-                last_run_id = Some(run_id.clone());
 
-                if !accepted_emitted {
-                    if sender
-                        .send(Ok(status_event(
-                            run_id.clone(),
-                            common_v1::stream_status::StatusKind::Accepted,
-                            format!(
-                                "accepted session={session_id} principal={}",
-                                context_for_stream.principal
-                            ),
-                        )))
-                        .await
-                        .is_err()
-                    {
+                if let Some(expected_session) = active_session_id.as_ref() {
+                    if expected_session != &session_id {
+                        let _ = sender
+                            .send(Err(Status::invalid_argument(
+                                "run stream cannot switch session_id mid-stream",
+                            )))
+                            .await;
                         return;
                     }
-                    accepted_emitted = true;
+                }
+                if let Some(expected_run) = active_run_id.as_ref() {
+                    if expected_run != &run_id {
+                        let _ = sender
+                            .send(Err(Status::invalid_argument(
+                                "run stream cannot switch run_id mid-stream",
+                            )))
+                            .await;
+                        return;
+                    }
                 }
 
-                if sender
-                    .send(Ok(status_event(
-                        run_id.clone(),
+                if active_run_id.is_none() {
+                    if let Err(error) = run_state.transition(RunTransition::Accept) {
+                        let _ = sender.send(Err(Status::internal(error.to_string()))).await;
+                        return;
+                    }
+                    if let Err(error) = state_for_stream
+                        .upsert_orchestrator_session(OrchestratorSessionUpsertRequest {
+                            session_id: session_id.clone(),
+                            principal: context_for_stream.principal.clone(),
+                            device_id: context_for_stream.device_id.clone(),
+                            channel: context_for_stream.channel.clone(),
+                        })
+                        .await
+                    {
+                        let _ = sender.send(Err(error)).await;
+                        return;
+                    }
+                    if let Err(error) = state_for_stream
+                        .start_orchestrator_run(OrchestratorRunStartRequest {
+                            run_id: run_id.clone(),
+                            session_id: session_id.clone(),
+                        })
+                        .await
+                    {
+                        let _ = sender.send(Err(error)).await;
+                        return;
+                    }
+
+                    let accepted_message = format!(
+                        "accepted session={session_id} principal={}",
+                        context_for_stream.principal
+                    );
+                    if let Err(error) = send_status_with_tape(
+                        &sender,
+                        &state_for_stream,
+                        run_id.as_str(),
+                        &mut tape_seq,
+                        common_v1::stream_status::StatusKind::Accepted,
+                        accepted_message.as_str(),
+                    )
+                    .await
+                    {
+                        let _ = sender.send(Err(error)).await;
+                        return;
+                    }
+
+                    active_session_id = Some(session_id.clone());
+                    active_run_id = Some(run_id.clone());
+                }
+
+                let input_text = message
+                    .input
+                    .and_then(|input| input.content)
+                    .map(|content| content.text)
+                    .unwrap_or_default();
+
+                if is_cancel_command(input_text.as_str()) {
+                    if let Err(error) = state_for_stream
+                        .request_orchestrator_cancel(OrchestratorCancelRequest {
+                            run_id: run_id.clone(),
+                            reason: "stream_cancel_command".to_owned(),
+                        })
+                        .await
+                    {
+                        let _ = sender.send(Err(error)).await;
+                        return;
+                    }
+                }
+
+                match state_for_stream.is_orchestrator_cancel_requested(run_id.clone()).await {
+                    Ok(true) => {
+                        if let Err(error) = run_state.transition(RunTransition::Cancel) {
+                            let _ = sender.send(Err(Status::internal(error.to_string()))).await;
+                            return;
+                        }
+                        if let Err(error) = state_for_stream
+                            .update_orchestrator_run_state(
+                                run_id.clone(),
+                                RunLifecycleState::Cancelled,
+                                Some(CANCELLED_REASON.to_owned()),
+                            )
+                            .await
+                        {
+                            let _ = sender.send(Err(error)).await;
+                            return;
+                        }
+                        if let Err(error) = send_status_with_tape(
+                            &sender,
+                            &state_for_stream,
+                            run_id.as_str(),
+                            &mut tape_seq,
+                            common_v1::stream_status::StatusKind::Failed,
+                            CANCELLED_REASON,
+                        )
+                        .await
+                        {
+                            let _ = sender.send(Err(error)).await;
+                        }
+                        return;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        let _ = sender.send(Err(error)).await;
+                        return;
+                    }
+                }
+
+                if !in_progress_emitted {
+                    if let Err(error) = run_state.transition(RunTransition::StartStreaming) {
+                        let _ = sender.send(Err(Status::internal(error.to_string()))).await;
+                        return;
+                    }
+                    if let Err(error) = state_for_stream
+                        .update_orchestrator_run_state(
+                            run_id.clone(),
+                            RunLifecycleState::InProgress,
+                            None,
+                        )
+                        .await
+                    {
+                        let _ = sender.send(Err(error)).await;
+                        return;
+                    }
+                    if let Err(error) = send_status_with_tape(
+                        &sender,
+                        &state_for_stream,
+                        run_id.as_str(),
+                        &mut tape_seq,
                         common_v1::stream_status::StatusKind::InProgress,
                         "streaming",
-                    )))
+                    )
                     .await
-                    .is_err()
+                    {
+                        let _ = sender.send(Err(error)).await;
+                        return;
+                    }
+                    in_progress_emitted = true;
+                }
+
+                let prompt_tokens = estimate_token_count(input_text.as_str());
+                if let Err(error) = state_for_stream
+                    .add_orchestrator_usage(OrchestratorUsageDelta {
+                        run_id: run_id.clone(),
+                        prompt_tokens_delta: prompt_tokens,
+                        completion_tokens_delta: 0,
+                    })
+                    .await
                 {
+                    let _ = sender.send(Err(error)).await;
                     return;
                 }
 
-                let mut emitted_token = false;
-                if let Some(text) = message
-                    .input
-                    .and_then(|input| input.content)
-                    .and_then(|content| non_empty(content.text))
-                {
-                    let mut tokens =
-                        text.split_whitespace().take(MAX_MODEL_TOKENS_PER_EVENT).peekable();
-                    if tokens.peek().is_none() {
-                        let _ =
-                            sender.send(Ok(model_token_event(run_id.clone(), "ack", true))).await;
-                    } else {
-                        while let Some(token) = tokens.next() {
-                            let is_final = tokens.peek().is_none();
-                            if sender
-                                .send(Ok(model_token_event(run_id.clone(), token, is_final)))
-                                .await
-                                .is_err()
-                            {
+                let mut tokens =
+                    split_model_tokens(input_text.as_str(), MAX_MODEL_TOKENS_PER_EVENT);
+                if tokens.is_empty() {
+                    tokens.push("ack".to_owned());
+                }
+                let mut completion_tokens = 0_u64;
+                let token_count = tokens.len();
+                for (index, token) in tokens.into_iter().enumerate() {
+                    match state_for_stream.is_orchestrator_cancel_requested(run_id.clone()).await {
+                        Ok(true) => {
+                            if let Err(error) = run_state.transition(RunTransition::Cancel) {
+                                let _ = sender.send(Err(Status::internal(error.to_string()))).await;
                                 return;
                             }
+                            if let Err(error) = state_for_stream
+                                .update_orchestrator_run_state(
+                                    run_id.clone(),
+                                    RunLifecycleState::Cancelled,
+                                    Some(CANCELLED_REASON.to_owned()),
+                                )
+                                .await
+                            {
+                                let _ = sender.send(Err(error)).await;
+                                return;
+                            }
+                            if let Err(error) = send_status_with_tape(
+                                &sender,
+                                &state_for_stream,
+                                run_id.as_str(),
+                                &mut tape_seq,
+                                common_v1::stream_status::StatusKind::Failed,
+                                CANCELLED_REASON,
+                            )
+                            .await
+                            {
+                                let _ = sender.send(Err(error)).await;
+                            }
+                            return;
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            let _ = sender.send(Err(error)).await;
+                            return;
                         }
                     }
-                    emitted_token = true;
+
+                    let is_final = index + 1 == token_count;
+                    if let Err(error) = send_model_token_with_tape(
+                        &sender,
+                        &state_for_stream,
+                        run_id.as_str(),
+                        &mut tape_seq,
+                        token.as_str(),
+                        is_final,
+                    )
+                    .await
+                    {
+                        let _ = sender.send(Err(error)).await;
+                        return;
+                    }
+                    completion_tokens += 1;
                 }
-                if !emitted_token {
-                    let _ = sender.send(Ok(model_token_event(run_id, "ack", true))).await;
+                if let Err(error) = state_for_stream
+                    .add_orchestrator_usage(OrchestratorUsageDelta {
+                        run_id: run_id.clone(),
+                        prompt_tokens_delta: 0,
+                        completion_tokens_delta: completion_tokens,
+                    })
+                    .await
+                {
+                    let _ = sender.send(Err(error)).await;
+                    return;
                 }
             }
 
-            if let Some(run_id) = last_run_id {
-                let _ = sender
-                    .send(Ok(status_event(
-                        run_id,
+            if let Some(run_id) = active_run_id {
+                match state_for_stream.is_orchestrator_cancel_requested(run_id.clone()).await {
+                    Ok(true) => {
+                        if let Err(error) = run_state.transition(RunTransition::Cancel) {
+                            let _ = sender.send(Err(Status::internal(error.to_string()))).await;
+                            return;
+                        }
+                        if let Err(error) = state_for_stream
+                            .update_orchestrator_run_state(
+                                run_id.clone(),
+                                RunLifecycleState::Cancelled,
+                                Some(CANCELLED_REASON.to_owned()),
+                            )
+                            .await
+                        {
+                            let _ = sender.send(Err(error)).await;
+                            return;
+                        }
+                        if let Err(error) = send_status_with_tape(
+                            &sender,
+                            &state_for_stream,
+                            run_id.as_str(),
+                            &mut tape_seq,
+                            common_v1::stream_status::StatusKind::Failed,
+                            CANCELLED_REASON,
+                        )
+                        .await
+                        {
+                            let _ = sender.send(Err(error)).await;
+                        }
+                        return;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        let _ = sender.send(Err(error)).await;
+                        return;
+                    }
+                }
+
+                if run_state.state() == RunLifecycleState::InProgress {
+                    if let Err(error) = run_state.transition(RunTransition::Complete) {
+                        let _ = sender.send(Err(Status::internal(error.to_string()))).await;
+                        return;
+                    }
+                    if let Err(error) = state_for_stream
+                        .update_orchestrator_run_state(
+                            run_id.clone(),
+                            RunLifecycleState::Done,
+                            None,
+                        )
+                        .await
+                    {
+                        let _ = sender.send(Err(error)).await;
+                        return;
+                    }
+                    if let Err(error) = send_status_with_tape(
+                        &sender,
+                        &state_for_stream,
+                        run_id.as_str(),
+                        &mut tape_seq,
                         common_v1::stream_status::StatusKind::Done,
                         "completed",
-                    )))
-                    .await;
+                    )
+                    .await
+                    {
+                        let _ = sender.send(Err(error)).await;
+                    }
+                }
             }
         });
 
@@ -651,6 +1212,84 @@ fn model_token_event(
             token: token.into(),
             is_final,
         })),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+async fn send_status_with_tape(
+    sender: &mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    kind: common_v1::stream_status::StatusKind,
+    message: &str,
+) -> Result<(), Status> {
+    let event = status_event(run_id.to_owned(), kind, message.to_owned());
+    sender
+        .send(Ok(event))
+        .await
+        .map_err(|_| Status::cancelled("run stream response channel closed"))?;
+    runtime_state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: *tape_seq,
+            event_type: "status".to_owned(),
+            payload_json: status_tape_payload(kind, message),
+        })
+        .await?;
+    *tape_seq += 1;
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+async fn send_model_token_with_tape(
+    sender: &mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    token: &str,
+    is_final: bool,
+) -> Result<(), Status> {
+    let event = model_token_event(run_id.to_owned(), token.to_owned(), is_final);
+    sender
+        .send(Ok(event))
+        .await
+        .map_err(|_| Status::cancelled("run stream response channel closed"))?;
+    runtime_state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: *tape_seq,
+            event_type: "model_token".to_owned(),
+            payload_json: model_token_tape_payload(token, is_final),
+        })
+        .await?;
+    *tape_seq += 1;
+    Ok(())
+}
+
+fn status_tape_payload(kind: common_v1::stream_status::StatusKind, message: &str) -> String {
+    json!({
+        "kind": status_kind_name(kind),
+        "message": message,
+    })
+    .to_string()
+}
+
+fn model_token_tape_payload(token: &str, is_final: bool) -> String {
+    json!({
+        "token": token,
+        "is_final": is_final,
+    })
+    .to_string()
+}
+
+const fn status_kind_name(kind: common_v1::stream_status::StatusKind) -> &'static str {
+    match kind {
+        common_v1::stream_status::StatusKind::Unspecified => "unspecified",
+        common_v1::stream_status::StatusKind::Accepted => "accepted",
+        common_v1::stream_status::StatusKind::InProgress => "in_progress",
+        common_v1::stream_status::StatusKind::Done => "done",
+        common_v1::stream_status::StatusKind::Failed => "failed",
     }
 }
 
@@ -808,6 +1447,7 @@ mod tests {
                 quic_bind_addr: "127.0.0.1".to_owned(),
                 quic_port: 7444,
                 quic_enabled: true,
+                orchestrator_runloop_v1_enabled: true,
                 node_rpc_mtls_required: true,
                 admin_auth_required: true,
             },
@@ -894,6 +1534,10 @@ mod tests {
         );
         assert_eq!(status.counters.journal_redacted_events, 1, "status should report redactions");
         assert!(status.storage.journal_hash_chain_enabled, "hash-chain flag should be surfaced");
+        assert!(
+            status.security.orchestrator_runloop_v1_enabled,
+            "status should expose orchestrator runloop flag"
+        );
         assert!(
             status.storage.latest_event_hash.is_some(),
             "latest hash should be available when hash-chain is enabled"

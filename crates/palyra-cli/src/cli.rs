@@ -69,6 +69,50 @@ pub enum DaemonCommand {
         #[arg(long)]
         limit: Option<usize>,
     },
+    RunStatus {
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long, default_value = "user:local")]
+        principal: String,
+        #[arg(long, default_value = "01ARZ3NDEKTSV4RRFFQ69G5FAV")]
+        device_id: String,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long)]
+        run_id: String,
+    },
+    RunTape {
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long, default_value = "user:local")]
+        principal: String,
+        #[arg(long, default_value = "01ARZ3NDEKTSV4RRFFQ69G5FAV")]
+        device_id: String,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long)]
+        run_id: String,
+    },
+    RunCancel {
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long, default_value = "user:local")]
+        principal: String,
+        #[arg(long, default_value = "01ARZ3NDEKTSV4RRFFQ69G5FAV")]
+        device_id: String,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long)]
+        run_id: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
@@ -245,6 +289,71 @@ mod tests {
                     device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
                     channel: Some("cli".to_owned()),
                     limit: Some(25),
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn parse_daemon_run_status_with_run_id() {
+        let parsed = Cli::parse_from([
+            "palyra",
+            "daemon",
+            "run-status",
+            "--url",
+            "http://127.0.0.1:7142",
+            "--token",
+            "test-token",
+            "--principal",
+            "user:ops",
+            "--device-id",
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "--channel",
+            "cli",
+            "--run-id",
+            "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+        ]);
+        assert_eq!(
+            parsed.command,
+            Command::Daemon {
+                command: DaemonCommand::RunStatus {
+                    url: Some("http://127.0.0.1:7142".to_owned()),
+                    token: Some("test-token".to_owned()),
+                    principal: "user:ops".to_owned(),
+                    device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                    channel: Some("cli".to_owned()),
+                    run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn parse_daemon_run_cancel_with_reason() {
+        let parsed = Cli::parse_from([
+            "palyra",
+            "daemon",
+            "run-cancel",
+            "--url",
+            "http://127.0.0.1:7142",
+            "--token",
+            "test-token",
+            "--run-id",
+            "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+            "--reason",
+            "operator requested",
+        ]);
+        assert_eq!(
+            parsed.command,
+            Command::Daemon {
+                command: DaemonCommand::RunCancel {
+                    url: Some("http://127.0.0.1:7142".to_owned()),
+                    token: Some("test-token".to_owned()),
+                    principal: "user:local".to_owned(),
+                    device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                    channel: None,
+                    run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),
+                    reason: Some("operator requested".to_owned()),
                 }
             }
         );
