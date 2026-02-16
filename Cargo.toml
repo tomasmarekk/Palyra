@@ -28,6 +28,8 @@ ed25519-dalek = { version = "2.1.1", features = ["rand_core"] }
 hex = "0.4.3"
 hkdf = "0.12.4"
 proptest = "1.6.0"
+protoc-bin-vendored = "3.0.0"
+prost = "0.13.5"
 rand = "0.8.5"
 reqwest = { version = "0.12.12", default-features = false, features = ["blocking", "json"] }
 rcgen = { version = "0.13.1", features = ["x509-parser"] }
@@ -38,7 +40,10 @@ sha2 = "0.10.8"
 tempfile = "3.17.1"
 thiserror = "2.0.11"
 tokio = { version = "1.43.0", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tokio-stream = { version = "0.1.17", features = ["net"] }
 tokio-rustls = { version = "0.26.1", default-features = false, features = ["logging", "ring", "tls12"] }
+tonic = { version = "0.12.3", features = ["transport"] }
+tonic-build = "0.12.3"
 toml = "0.8.20"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }

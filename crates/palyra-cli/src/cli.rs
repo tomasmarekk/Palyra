@@ -43,6 +43,18 @@ pub enum DaemonCommand {
         #[arg(long)]
         url: Option<String>,
     },
+    AdminStatus {
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long, default_value = "user:local")]
+        principal: String,
+        #[arg(long, default_value = "01ARZ3NDEKTSV4RRFFQ69G5FAV")]
+        device_id: String,
+        #[arg(long)]
+        channel: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
@@ -155,6 +167,37 @@ mod tests {
             parsed.command,
             Command::Daemon {
                 command: DaemonCommand::Status { url: Some("http://127.0.0.1:7142".to_owned()) }
+            }
+        );
+    }
+
+    #[test]
+    fn parse_daemon_admin_status_with_explicit_context() {
+        let parsed = Cli::parse_from([
+            "palyra",
+            "daemon",
+            "admin-status",
+            "--url",
+            "http://127.0.0.1:7142",
+            "--token",
+            "test-token",
+            "--principal",
+            "user:ops",
+            "--device-id",
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "--channel",
+            "cli",
+        ]);
+        assert_eq!(
+            parsed.command,
+            Command::Daemon {
+                command: DaemonCommand::AdminStatus {
+                    url: Some("http://127.0.0.1:7142".to_owned()),
+                    token: Some("test-token".to_owned()),
+                    principal: "user:ops".to_owned(),
+                    device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                    channel: Some("cli".to_owned()),
+                }
             }
         );
     }

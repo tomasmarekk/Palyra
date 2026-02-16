@@ -47,6 +47,10 @@ fn spawn_palyrad_with_dynamic_port() -> Result<(Child, u16)> {
             "127.0.0.1",
             "--port",
             "0",
+            "--grpc-bind",
+            "127.0.0.1",
+            "--grpc-port",
+            "0",
         ])
         .env("RUST_LOG", "info")
         .stdout(Stdio::piped())

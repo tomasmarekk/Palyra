@@ -25,6 +25,7 @@ use palyra_identity::{
 };
 use palyra_policy::{evaluate, PolicyDecision, PolicyRequest};
 use reqwest::blocking::Client;
+use serde::Deserialize;
 
 const MAX_HEALTH_ATTEMPTS: usize = 3;
 const BASE_HEALTH_BACKOFF_MS: u64 = 100;
@@ -172,6 +173,47 @@ fn run_daemon(command: DaemonCommand) -> Result<()> {
                 response.version,
                 response.git_hash,
                 response.uptime_seconds
+            );
+            std::io::stdout().flush().context("stdout flush failed")
+        }
+        DaemonCommand::AdminStatus { url, token, principal, device_id, channel } => {
+            let base_url = url
+                .or_else(|| env::var("PALYRA_DAEMON_URL").ok())
+                .unwrap_or_else(|| "http://127.0.0.1:7142".to_owned());
+            let status_url = format!("{}/admin/v1/status", base_url.trim_end_matches('/'));
+            let token = token
+                .or_else(|| env::var("PALYRA_ADMIN_TOKEN").ok())
+                .context("admin status requires --token or PALYRA_ADMIN_TOKEN")?;
+            let client = Client::builder()
+                .timeout(std::time::Duration::from_secs(2))
+                .build()
+                .context("failed to build HTTP client")?;
+            let mut request = client
+                .get(status_url)
+                .header("Authorization", format!("Bearer {token}"))
+                .header("x-palyra-principal", principal)
+                .header("x-palyra-device-id", device_id);
+            if let Some(channel) = channel {
+                request = request.header("x-palyra-channel", channel);
+            }
+
+            let response: AdminStatusResponse = request
+                .send()
+                .context("failed to call daemon admin status endpoint")?
+                .error_for_status()
+                .context("daemon admin status endpoint returned non-success status")?
+                .json()
+                .context("failed to parse daemon admin status payload")?;
+
+            println!(
+                "admin.status={} service={} grpc={}:{} quic_enabled={} denied_requests={} journal_events={}",
+                response.status,
+                response.service,
+                response.transport.grpc_bind_addr,
+                response.transport.grpc_port,
+                response.transport.quic_enabled,
+                response.counters.denied_requests,
+                response.counters.journal_events
             );
             std::io::stdout().flush().context("stdout flush failed")
         }
@@ -516,6 +558,27 @@ struct DoctorCheck {
     key: &'static str,
     ok: bool,
     required: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminStatusResponse {
+    service: String,
+    status: String,
+    transport: AdminTransportSnapshot,
+    counters: AdminCountersSnapshot,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminTransportSnapshot {
+    grpc_bind_addr: String,
+    grpc_port: u16,
+    quic_enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminCountersSnapshot {
+    denied_requests: u64,
+    journal_events: usize,
 }
 
 #[cfg(all(test, not(windows)))]

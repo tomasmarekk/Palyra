@@ -1,27 +1,55 @@
 mod config;
+mod gateway;
 
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use axum::{extract::State, response::IntoResponse, routing::get, Json, Router};
+use axum::{
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
+    routing::get,
+    Json, Router,
+};
 use clap::Parser;
 use config::load_config;
+use gateway::{
+    authorize_headers, request_context_from_headers, AuthError, GatewayAuthConfig,
+    GatewayRuntimeConfigSnapshot, GatewayRuntimeState,
+};
 use palyra_common::{build_metadata, health_response, parse_daemon_bind_socket, HealthResponse};
+use palyra_identity::IdentityManager;
+#[cfg(not(windows))]
+use palyra_identity::{default_identity_storage_path, FilesystemSecretStore, SecretStore};
+use serde::Serialize;
+use tokio_stream::wrappers::TcpListenerStream;
+use tonic::transport::Server;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Clone, Parser)]
-#[command(name = "palyrad", about = "Palyra daemon bootstrap stub")]
+#[command(name = "palyrad", about = "Palyra gateway skeleton daemon")]
 struct Args {
     #[arg(long)]
     bind: Option<String>,
     #[arg(long)]
     port: Option<u16>,
+    #[arg(long)]
+    grpc_bind: Option<String>,
+    #[arg(long)]
+    grpc_port: Option<u16>,
 }
 
 #[derive(Clone)]
 struct AppState {
     started_at: Instant,
+    runtime: std::sync::Arc<GatewayRuntimeState>,
+    auth: GatewayAuthConfig,
+}
+
+#[derive(Debug, Serialize)]
+struct ErrorBody {
+    error: String,
 }
 
 #[tokio::main]
@@ -37,6 +65,33 @@ async fn main() -> Result<()> {
         loaded.daemon.port = port;
         loaded.source.push_str(" +cli(--port)");
     }
+    if let Some(grpc_bind) = args.grpc_bind {
+        loaded.gateway.grpc_bind_addr = grpc_bind;
+        loaded.source.push_str(" +cli(--grpc-bind)");
+    }
+    if let Some(grpc_port) = args.grpc_port {
+        loaded.gateway.grpc_port = grpc_port;
+        loaded.source.push_str(" +cli(--grpc-port)");
+    }
+
+    let (identity_store_root, revoked_certificates) =
+        load_identity_runtime().context("failed to initialize gateway identity runtime")?;
+    let auth = GatewayAuthConfig {
+        require_auth: loaded.admin.require_auth,
+        admin_token: loaded.admin.auth_token.clone(),
+    };
+    let runtime = GatewayRuntimeState::new(
+        GatewayRuntimeConfigSnapshot {
+            grpc_bind_addr: loaded.gateway.grpc_bind_addr.clone(),
+            grpc_port: loaded.gateway.grpc_port,
+            quic_bind_addr: loaded.gateway.quic_bind_addr.clone(),
+            quic_port: loaded.gateway.quic_port,
+            quic_enabled: loaded.gateway.quic_enabled,
+            node_rpc_mtls_required: !loaded.identity.allow_insecure_node_rpc_without_mtls,
+            admin_auth_required: loaded.admin.require_auth,
+        },
+        revoked_certificates,
+    );
 
     let build = build_metadata();
     info!(
@@ -45,27 +100,80 @@ async fn main() -> Result<()> {
         git_hash = build.git_hash,
         build_profile = build.build_profile,
         config_source = %loaded.source,
-        bind_addr = %loaded.daemon.bind_addr,
-        port = loaded.daemon.port,
+        admin_bind_addr = %loaded.daemon.bind_addr,
+        admin_port = loaded.daemon.port,
+        grpc_bind_addr = %loaded.gateway.grpc_bind_addr,
+        grpc_port = loaded.gateway.grpc_port,
+        quic_bind_addr = %loaded.gateway.quic_bind_addr,
+        quic_port = loaded.gateway.quic_port,
+        quic_enabled = loaded.gateway.quic_enabled,
+        admin_auth_required = loaded.admin.require_auth,
+        admin_token_configured = loaded.admin.auth_token.is_some(),
         node_rpc_mtls_required = !loaded.identity.allow_insecure_node_rpc_without_mtls,
-        "daemon startup"
+        identity_store_root = %identity_store_root.display(),
+        revoked_certificate_count = revoked_certificates,
+        "gateway startup"
     );
 
     let started_at = Instant::now();
-    let state = AppState { started_at };
-    let app = Router::new().route("/healthz", get(health_handler)).with_state(state);
+    let state = AppState { started_at, runtime: runtime.clone(), auth: auth.clone() };
+    let app = Router::new()
+        .route("/healthz", get(health_handler))
+        .route("/admin/v1/status", get(admin_status_handler))
+        .with_state(state);
 
-    let address = parse_daemon_bind_socket(&loaded.daemon.bind_addr, loaded.daemon.port)
-        .context("invalid bind address or port")?;
-    let listener =
-        tokio::net::TcpListener::bind(address).await.context("failed to bind palyrad listener")?;
-    let bound_address =
-        listener.local_addr().context("failed to resolve palyrad bound listener address")?;
-    info!(listen_addr = %bound_address, "daemon listening");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+    let admin_address = parse_daemon_bind_socket(&loaded.daemon.bind_addr, loaded.daemon.port)
+        .context("invalid admin bind address or port")?;
+    let grpc_address =
+        parse_daemon_bind_socket(&loaded.gateway.grpc_bind_addr, loaded.gateway.grpc_port)
+            .context("invalid gRPC bind address or port")?;
+
+    let admin_listener = tokio::net::TcpListener::bind(admin_address)
         .await
-        .context("palyrad server failed")?;
+        .context("failed to bind palyrad admin listener")?;
+    let admin_bound =
+        admin_listener.local_addr().context("failed to resolve palyrad admin listen address")?;
+    let grpc_listener = tokio::net::TcpListener::bind(grpc_address)
+        .await
+        .context("failed to bind palyrad gRPC listener")?;
+    let grpc_bound =
+        grpc_listener.local_addr().context("failed to resolve palyrad gRPC listen address")?;
+
+    info!(listen_addr = %admin_bound, "daemon listening");
+    info!(grpc_listen_addr = %grpc_bound, "gateway gRPC listening");
+    if loaded.gateway.quic_enabled {
+        info!(
+            quic_bind_addr = %loaded.gateway.quic_bind_addr,
+            quic_port = loaded.gateway.quic_port,
+            "gateway QUIC transport configured for upcoming runtime integration"
+        );
+    }
+
+    let gateway_service = gateway::GatewayServiceImpl::new(runtime, auth);
+    let grpc_server =
+        gateway::proto::palyra::gateway::v1::gateway_service_server::GatewayServiceServer::new(
+            gateway_service,
+        );
+
+    tokio::try_join!(
+        async move {
+            axum::serve(admin_listener, app)
+                .with_graceful_shutdown(shutdown_signal())
+                .await
+                .context("palyrad admin server failed")
+        },
+        async move {
+            Server::builder()
+                .add_service(grpc_server)
+                .serve_with_incoming_shutdown(
+                    TcpListenerStream::new(grpc_listener),
+                    shutdown_signal(),
+                )
+                .await
+                .context("palyrad gRPC server failed")
+        },
+    )?;
+
     Ok(())
 }
 
@@ -76,6 +184,58 @@ fn init_tracing() {
 
 async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
     Json::<HealthResponse>(health_response("palyrad", state.started_at))
+}
+
+async fn admin_status_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<gateway::GatewayStatusSnapshot>, Response> {
+    authorize_headers(&headers, &state.auth).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    let context = request_context_from_headers(&headers).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    state.runtime.record_admin_status_request();
+    Ok(Json(state.runtime.status_snapshot(context, &state.auth)))
+}
+
+fn auth_error_response(error: AuthError) -> Response {
+    let status = match error {
+        AuthError::MissingConfiguredToken => StatusCode::SERVICE_UNAVAILABLE,
+        AuthError::InvalidAuthorizationHeader | AuthError::InvalidToken => StatusCode::UNAUTHORIZED,
+        AuthError::MissingContext(_) | AuthError::EmptyContext(_) | AuthError::InvalidDeviceId => {
+            StatusCode::BAD_REQUEST
+        }
+    };
+    (status, Json(ErrorBody { error: error.to_string() })).into_response()
+}
+
+fn load_identity_runtime() -> Result<(std::path::PathBuf, usize)> {
+    #[cfg(windows)]
+    {
+        let manager = IdentityManager::with_memory_store()
+            .context("failed to initialize in-memory identity runtime")?;
+        tracing::warn!(
+            "filesystem identity store is unavailable on windows; using in-memory identity runtime"
+        );
+        Ok((std::path::PathBuf::from("<memory>"), manager.revoked_certificate_fingerprints().len()))
+    }
+
+    #[cfg(not(windows))]
+    {
+        let cwd = std::env::current_dir().context("failed to resolve current working directory")?;
+        let store_root = default_identity_storage_path(&cwd);
+        let store = FilesystemSecretStore::new(&store_root).with_context(|| {
+            format!("failed to initialize identity store at {}", store_root.display())
+        })?;
+        let store: std::sync::Arc<dyn SecretStore> = std::sync::Arc::new(store);
+        let manager =
+            IdentityManager::with_store(store).context("failed to initialize identity manager")?;
+        Ok((store_root, manager.revoked_certificate_fingerprints().len()))
+    }
 }
 
 async fn shutdown_signal() {
