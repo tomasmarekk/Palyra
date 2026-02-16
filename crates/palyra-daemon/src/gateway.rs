@@ -20,7 +20,7 @@ use ulid::Ulid;
 use crate::{
     journal::{
         JournalAppendRequest, JournalError, JournalEventRecord, JournalStore,
-        OrchestratorCancelRequest, OrchestratorRunSnapshot, OrchestratorRunStartRequest,
+        OrchestratorCancelRequest, OrchestratorRunStartRequest, OrchestratorRunStatusSnapshot,
         OrchestratorSessionUpsertRequest, OrchestratorTapeAppendRequest, OrchestratorTapeRecord,
         OrchestratorUsageDelta,
     },
@@ -587,23 +587,23 @@ impl GatewayRuntimeState {
     }
 
     #[allow(clippy::result_large_err)]
-    fn orchestrator_run_snapshot_blocking(
+    fn orchestrator_run_status_snapshot_blocking(
         &self,
         run_id: &str,
-    ) -> Result<Option<OrchestratorRunSnapshot>, Status> {
+    ) -> Result<Option<OrchestratorRunStatusSnapshot>, Status> {
         self.journal_store
-            .orchestrator_run_snapshot(run_id)
+            .orchestrator_run_status_snapshot(run_id)
             .map_err(|error| map_orchestrator_store_error("load orchestrator run snapshot", error))
     }
 
     #[allow(clippy::result_large_err)]
-    pub async fn orchestrator_run_snapshot(
+    pub async fn orchestrator_run_status_snapshot(
         self: &Arc<Self>,
         run_id: String,
-    ) -> Result<Option<OrchestratorRunSnapshot>, Status> {
+    ) -> Result<Option<OrchestratorRunStatusSnapshot>, Status> {
         let state = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
-            state.orchestrator_run_snapshot_blocking(run_id.as_str())
+            state.orchestrator_run_status_snapshot_blocking(run_id.as_str())
         })
         .await
         .map_err(|_| Status::internal("orchestrator snapshot worker panicked"))?
@@ -613,7 +613,7 @@ impl GatewayRuntimeState {
     fn orchestrator_tape_snapshot_blocking(&self, run_id: &str) -> Result<RunTapeSnapshot, Status> {
         let run_exists = self
             .journal_store
-            .orchestrator_run_snapshot(run_id)
+            .orchestrator_run_status_snapshot(run_id)
             .map_err(|error| map_orchestrator_store_error("load orchestrator run snapshot", error))?
             .is_some();
         if !run_exists {
@@ -651,6 +651,9 @@ fn map_orchestrator_store_error(operation: &str, error: JournalError) -> Status 
         JournalError::RunNotFound { run_id } => {
             Status::not_found(format!("orchestrator run not found: {run_id}"))
         }
+        JournalError::SessionIdentityMismatch { session_id } => Status::failed_precondition(
+            format!("orchestrator session identity mismatch for session: {session_id}"),
+        ),
         other => Status::internal(format!("{operation} failed: {other}")),
     }
 }
@@ -803,45 +806,65 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                 let message = match item {
                     Ok(value) => value,
                     Err(error) => {
-                        let _ = sender
-                            .send(Err(Status::internal(format!(
-                                "failed to read run stream request: {error}"
-                            ))))
-                            .await;
+                        let status =
+                            Status::internal(format!("failed to read run stream request: {error}"));
+                        finalize_run_failure(
+                            &sender,
+                            &state_for_stream,
+                            &mut run_state,
+                            active_run_id.as_deref(),
+                            &mut tape_seq,
+                            status.message(),
+                        )
+                        .await;
+                        let _ = sender.send(Err(status)).await;
                         return;
                     }
                 };
                 if message.v != CANONICAL_PROTOCOL_MAJOR {
-                    let _ = sender
-                        .send(Err(Status::failed_precondition(
-                            "unsupported protocol major version",
-                        )))
-                        .await;
+                    let status = Status::failed_precondition("unsupported protocol major version");
+                    finalize_run_failure(
+                        &sender,
+                        &state_for_stream,
+                        &mut run_state,
+                        active_run_id.as_deref(),
+                        &mut tape_seq,
+                        status.message(),
+                    )
+                    .await;
+                    let _ = sender.send(Err(status)).await;
                     return;
                 }
                 if message.allow_sensitive_tools {
                     state_for_stream.record_denied();
-                    if let Some(run_id) = active_run_id.clone() {
-                        let _ = run_state.transition(RunTransition::Fail);
-                        let _ = state_for_stream
-                            .update_orchestrator_run_state(
-                                run_id.clone(),
-                                RunLifecycleState::Failed,
-                                Some(SENSITIVE_TOOLS_DENY_REASON.to_owned()),
-                            )
-                            .await;
-                    }
-                    let _ = sender
-                        .send(Err(Status::permission_denied(format!(
-                            "decision=deny_by_default approval_required=true reason={SENSITIVE_TOOLS_DENY_REASON}",
-                        ))))
-                        .await;
+                    let status = Status::permission_denied(format!(
+                        "decision=deny_by_default approval_required=true reason={SENSITIVE_TOOLS_DENY_REASON}",
+                    ));
+                    finalize_run_failure(
+                        &sender,
+                        &state_for_stream,
+                        &mut run_state,
+                        active_run_id.as_deref(),
+                        &mut tape_seq,
+                        SENSITIVE_TOOLS_DENY_REASON,
+                    )
+                    .await;
+                    let _ = sender.send(Err(status)).await;
                     return;
                 }
 
                 let session_id = match canonical_id(message.session_id, "session_id") {
                     Ok(value) => value,
                     Err(error) => {
+                        finalize_run_failure(
+                            &sender,
+                            &state_for_stream,
+                            &mut run_state,
+                            active_run_id.as_deref(),
+                            &mut tape_seq,
+                            error.message(),
+                        )
+                        .await;
                         let _ = sender.send(Err(error)).await;
                         return;
                     }
@@ -849,6 +872,15 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                 let run_id = match canonical_id(message.run_id, "run_id") {
                     Ok(value) => value,
                     Err(error) => {
+                        finalize_run_failure(
+                            &sender,
+                            &state_for_stream,
+                            &mut run_state,
+                            active_run_id.as_deref(),
+                            &mut tape_seq,
+                            error.message(),
+                        )
+                        .await;
                         let _ = sender.send(Err(error)).await;
                         return;
                     }
@@ -856,28 +888,53 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
 
                 if let Some(expected_session) = active_session_id.as_ref() {
                     if expected_session != &session_id {
-                        let _ = sender
-                            .send(Err(Status::invalid_argument(
-                                "run stream cannot switch session_id mid-stream",
-                            )))
-                            .await;
+                        let status = Status::invalid_argument(
+                            "run stream cannot switch session_id mid-stream",
+                        );
+                        finalize_run_failure(
+                            &sender,
+                            &state_for_stream,
+                            &mut run_state,
+                            active_run_id.as_deref(),
+                            &mut tape_seq,
+                            status.message(),
+                        )
+                        .await;
+                        let _ = sender.send(Err(status)).await;
                         return;
                     }
                 }
                 if let Some(expected_run) = active_run_id.as_ref() {
                     if expected_run != &run_id {
-                        let _ = sender
-                            .send(Err(Status::invalid_argument(
-                                "run stream cannot switch run_id mid-stream",
-                            )))
-                            .await;
+                        let status =
+                            Status::invalid_argument("run stream cannot switch run_id mid-stream");
+                        finalize_run_failure(
+                            &sender,
+                            &state_for_stream,
+                            &mut run_state,
+                            active_run_id.as_deref(),
+                            &mut tape_seq,
+                            status.message(),
+                        )
+                        .await;
+                        let _ = sender.send(Err(status)).await;
                         return;
                     }
                 }
 
                 if active_run_id.is_none() {
                     if let Err(error) = run_state.transition(RunTransition::Accept) {
-                        let _ = sender.send(Err(Status::internal(error.to_string()))).await;
+                        let status = Status::internal(error.to_string());
+                        finalize_run_failure(
+                            &sender,
+                            &state_for_stream,
+                            &mut run_state,
+                            active_run_id.as_deref(),
+                            &mut tape_seq,
+                            status.message(),
+                        )
+                        .await;
+                        let _ = sender.send(Err(status)).await;
                         return;
                     }
                     if let Err(error) = state_for_stream
@@ -889,6 +946,15 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                         })
                         .await
                     {
+                        finalize_run_failure(
+                            &sender,
+                            &state_for_stream,
+                            &mut run_state,
+                            active_run_id.as_deref(),
+                            &mut tape_seq,
+                            error.message(),
+                        )
+                        .await;
                         let _ = sender.send(Err(error)).await;
                         return;
                     }
@@ -899,9 +965,21 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                         })
                         .await
                     {
+                        finalize_run_failure(
+                            &sender,
+                            &state_for_stream,
+                            &mut run_state,
+                            active_run_id.as_deref(),
+                            &mut tape_seq,
+                            error.message(),
+                        )
+                        .await;
                         let _ = sender.send(Err(error)).await;
                         return;
                     }
+
+                    active_session_id = Some(session_id.clone());
+                    active_run_id = Some(run_id.clone());
 
                     let accepted_message = format!(
                         "accepted session={session_id} principal={}",
@@ -917,12 +995,18 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     )
                     .await
                     {
+                        finalize_run_failure(
+                            &sender,
+                            &state_for_stream,
+                            &mut run_state,
+                            active_run_id.as_deref(),
+                            &mut tape_seq,
+                            error.message(),
+                        )
+                        .await;
                         let _ = sender.send(Err(error)).await;
                         return;
                     }
-
-                    active_session_id = Some(session_id.clone());
-                    active_run_id = Some(run_id.clone());
                 }
 
                 let input_text = message
@@ -939,6 +1023,15 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                         })
                         .await
                     {
+                        finalize_run_failure(
+                            &sender,
+                            &state_for_stream,
+                            &mut run_state,
+                            active_run_id.as_deref(),
+                            &mut tape_seq,
+                            error.message(),
+                        )
+                        .await;
                         let _ = sender.send(Err(error)).await;
                         return;
                     }
@@ -947,7 +1040,17 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                 match state_for_stream.is_orchestrator_cancel_requested(run_id.clone()).await {
                     Ok(true) => {
                         if let Err(error) = run_state.transition(RunTransition::Cancel) {
-                            let _ = sender.send(Err(Status::internal(error.to_string()))).await;
+                            let status = Status::internal(error.to_string());
+                            finalize_run_failure(
+                                &sender,
+                                &state_for_stream,
+                                &mut run_state,
+                                active_run_id.as_deref(),
+                                &mut tape_seq,
+                                status.message(),
+                            )
+                            .await;
+                            let _ = sender.send(Err(status)).await;
                             return;
                         }
                         if let Err(error) = state_for_stream
@@ -958,6 +1061,15 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                             )
                             .await
                         {
+                            finalize_run_failure(
+                                &sender,
+                                &state_for_stream,
+                                &mut run_state,
+                                active_run_id.as_deref(),
+                                &mut tape_seq,
+                                error.message(),
+                            )
+                            .await;
                             let _ = sender.send(Err(error)).await;
                             return;
                         }
@@ -977,6 +1089,15 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     }
                     Ok(false) => {}
                     Err(error) => {
+                        finalize_run_failure(
+                            &sender,
+                            &state_for_stream,
+                            &mut run_state,
+                            active_run_id.as_deref(),
+                            &mut tape_seq,
+                            error.message(),
+                        )
+                        .await;
                         let _ = sender.send(Err(error)).await;
                         return;
                     }
@@ -984,7 +1105,17 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
 
                 if !in_progress_emitted {
                     if let Err(error) = run_state.transition(RunTransition::StartStreaming) {
-                        let _ = sender.send(Err(Status::internal(error.to_string()))).await;
+                        let status = Status::internal(error.to_string());
+                        finalize_run_failure(
+                            &sender,
+                            &state_for_stream,
+                            &mut run_state,
+                            active_run_id.as_deref(),
+                            &mut tape_seq,
+                            status.message(),
+                        )
+                        .await;
+                        let _ = sender.send(Err(status)).await;
                         return;
                     }
                     if let Err(error) = state_for_stream
@@ -995,6 +1126,15 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                         )
                         .await
                     {
+                        finalize_run_failure(
+                            &sender,
+                            &state_for_stream,
+                            &mut run_state,
+                            active_run_id.as_deref(),
+                            &mut tape_seq,
+                            error.message(),
+                        )
+                        .await;
                         let _ = sender.send(Err(error)).await;
                         return;
                     }
@@ -1008,6 +1148,15 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     )
                     .await
                     {
+                        finalize_run_failure(
+                            &sender,
+                            &state_for_stream,
+                            &mut run_state,
+                            active_run_id.as_deref(),
+                            &mut tape_seq,
+                            error.message(),
+                        )
+                        .await;
                         let _ = sender.send(Err(error)).await;
                         return;
                     }
@@ -1023,6 +1172,15 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     })
                     .await
                 {
+                    finalize_run_failure(
+                        &sender,
+                        &state_for_stream,
+                        &mut run_state,
+                        active_run_id.as_deref(),
+                        &mut tape_seq,
+                        error.message(),
+                    )
+                    .await;
                     let _ = sender.send(Err(error)).await;
                     return;
                 }
@@ -1038,7 +1196,17 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     match state_for_stream.is_orchestrator_cancel_requested(run_id.clone()).await {
                         Ok(true) => {
                             if let Err(error) = run_state.transition(RunTransition::Cancel) {
-                                let _ = sender.send(Err(Status::internal(error.to_string()))).await;
+                                let status = Status::internal(error.to_string());
+                                finalize_run_failure(
+                                    &sender,
+                                    &state_for_stream,
+                                    &mut run_state,
+                                    active_run_id.as_deref(),
+                                    &mut tape_seq,
+                                    status.message(),
+                                )
+                                .await;
+                                let _ = sender.send(Err(status)).await;
                                 return;
                             }
                             if let Err(error) = state_for_stream
@@ -1049,6 +1217,15 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                                 )
                                 .await
                             {
+                                finalize_run_failure(
+                                    &sender,
+                                    &state_for_stream,
+                                    &mut run_state,
+                                    active_run_id.as_deref(),
+                                    &mut tape_seq,
+                                    error.message(),
+                                )
+                                .await;
                                 let _ = sender.send(Err(error)).await;
                                 return;
                             }
@@ -1068,6 +1245,15 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                         }
                         Ok(false) => {}
                         Err(error) => {
+                            finalize_run_failure(
+                                &sender,
+                                &state_for_stream,
+                                &mut run_state,
+                                active_run_id.as_deref(),
+                                &mut tape_seq,
+                                error.message(),
+                            )
+                            .await;
                             let _ = sender.send(Err(error)).await;
                             return;
                         }
@@ -1084,6 +1270,15 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     )
                     .await
                     {
+                        finalize_run_failure(
+                            &sender,
+                            &state_for_stream,
+                            &mut run_state,
+                            active_run_id.as_deref(),
+                            &mut tape_seq,
+                            error.message(),
+                        )
+                        .await;
                         let _ = sender.send(Err(error)).await;
                         return;
                     }
@@ -1097,6 +1292,15 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     })
                     .await
                 {
+                    finalize_run_failure(
+                        &sender,
+                        &state_for_stream,
+                        &mut run_state,
+                        active_run_id.as_deref(),
+                        &mut tape_seq,
+                        error.message(),
+                    )
+                    .await;
                     let _ = sender.send(Err(error)).await;
                     return;
                 }
@@ -1106,7 +1310,17 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                 match state_for_stream.is_orchestrator_cancel_requested(run_id.clone()).await {
                     Ok(true) => {
                         if let Err(error) = run_state.transition(RunTransition::Cancel) {
-                            let _ = sender.send(Err(Status::internal(error.to_string()))).await;
+                            let status = Status::internal(error.to_string());
+                            finalize_run_failure(
+                                &sender,
+                                &state_for_stream,
+                                &mut run_state,
+                                Some(run_id.as_str()),
+                                &mut tape_seq,
+                                status.message(),
+                            )
+                            .await;
+                            let _ = sender.send(Err(status)).await;
                             return;
                         }
                         if let Err(error) = state_for_stream
@@ -1117,6 +1331,15 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                             )
                             .await
                         {
+                            finalize_run_failure(
+                                &sender,
+                                &state_for_stream,
+                                &mut run_state,
+                                Some(run_id.as_str()),
+                                &mut tape_seq,
+                                error.message(),
+                            )
+                            .await;
                             let _ = sender.send(Err(error)).await;
                             return;
                         }
@@ -1136,6 +1359,15 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     }
                     Ok(false) => {}
                     Err(error) => {
+                        finalize_run_failure(
+                            &sender,
+                            &state_for_stream,
+                            &mut run_state,
+                            Some(run_id.as_str()),
+                            &mut tape_seq,
+                            error.message(),
+                        )
+                        .await;
                         let _ = sender.send(Err(error)).await;
                         return;
                     }
@@ -1143,7 +1375,17 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
 
                 if run_state.state() == RunLifecycleState::InProgress {
                     if let Err(error) = run_state.transition(RunTransition::Complete) {
-                        let _ = sender.send(Err(Status::internal(error.to_string()))).await;
+                        let status = Status::internal(error.to_string());
+                        finalize_run_failure(
+                            &sender,
+                            &state_for_stream,
+                            &mut run_state,
+                            Some(run_id.as_str()),
+                            &mut tape_seq,
+                            status.message(),
+                        )
+                        .await;
+                        let _ = sender.send(Err(status)).await;
                         return;
                     }
                     if let Err(error) = state_for_stream
@@ -1154,6 +1396,15 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                         )
                         .await
                     {
+                        finalize_run_failure(
+                            &sender,
+                            &state_for_stream,
+                            &mut run_state,
+                            Some(run_id.as_str()),
+                            &mut tape_seq,
+                            error.message(),
+                        )
+                        .await;
                         let _ = sender.send(Err(error)).await;
                         return;
                     }
@@ -1167,6 +1418,15 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     )
                     .await
                     {
+                        finalize_run_failure(
+                            &sender,
+                            &state_for_stream,
+                            &mut run_state,
+                            Some(run_id.as_str()),
+                            &mut tape_seq,
+                            error.message(),
+                        )
+                        .await;
                         let _ = sender.send(Err(error)).await;
                     }
                 }
@@ -1183,6 +1443,41 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
 
         Ok(Response::new(ReceiverStream::new(receiver)))
     }
+}
+
+async fn finalize_run_failure(
+    sender: &mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_state: &mut RunStateMachine,
+    active_run_id: Option<&str>,
+    tape_seq: &mut i64,
+    reason: &str,
+) {
+    let Some(run_id) = active_run_id else {
+        return;
+    };
+    if run_state.state().is_terminal() {
+        return;
+    }
+    if run_state.transition(RunTransition::Fail).is_err() {
+        return;
+    }
+    let _ = runtime_state
+        .update_orchestrator_run_state(
+            run_id.to_owned(),
+            RunLifecycleState::Failed,
+            Some(reason.to_owned()),
+        )
+        .await;
+    let _ = send_status_with_tape(
+        sender,
+        runtime_state,
+        run_id,
+        tape_seq,
+        common_v1::stream_status::StatusKind::Failed,
+        reason,
+    )
+    .await;
 }
 
 fn status_event(

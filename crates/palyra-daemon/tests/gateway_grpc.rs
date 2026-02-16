@@ -20,6 +20,7 @@ const ADMIN_TOKEN: &str = "test-admin-token";
 const DEVICE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const SESSION_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
 const RUN_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAX";
+const RUN_ID_ALT: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAZ";
 const ENVELOPE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAY";
 
 pub mod proto {
@@ -317,7 +318,21 @@ async fn grpc_run_stream_persists_orchestrator_snapshot_and_matches_golden_tape(
 
     let expected_tape = load_golden_json("run_tape_basic.json")?;
     assert_eq!(
-        run_snapshot.get("tape").cloned().context("run snapshot missing tape")?,
+        run_snapshot
+            .get("tape_events")
+            .and_then(Value::as_u64)
+            .context("run snapshot missing tape_events")?,
+        expected_tape.as_array().context("golden tape must be a JSON array")?.len() as u64
+    );
+    assert!(
+        run_snapshot.get("tape").is_none(),
+        "run status endpoint should not include full tape payload"
+    );
+
+    let tape_snapshot =
+        admin_get_json_async(admin_port, format!("/admin/v1/runs/{RUN_ID}/tape")).await?;
+    assert_eq!(
+        tape_snapshot.get("events").cloned().context("run tape snapshot missing events")?,
         expected_tape
     );
     Ok(())
@@ -378,15 +393,188 @@ async fn grpc_run_stream_honors_cancel_command_and_marks_run_cancelled() -> Resu
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_run_stream_rejects_session_identity_mismatch_as_failed_precondition() -> Result<()> {
+    let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client =
+        gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint.clone())
+            .await
+            .context("failed to connect gRPC client for initial stream")?;
+
+    let mut first_stream =
+        tonic::Request::new(tokio_stream::iter(vec![sample_run_stream_request_with_ids(
+            SESSION_ID,
+            RUN_ID,
+            "seed-session".to_owned(),
+        )]));
+    first_stream.metadata_mut().insert("authorization", format!("Bearer {ADMIN_TOKEN}").parse()?);
+    first_stream.metadata_mut().insert("x-palyra-principal", "user:ops".parse()?);
+    first_stream.metadata_mut().insert("x-palyra-device-id", DEVICE_ID.parse()?);
+    first_stream.metadata_mut().insert("x-palyra-channel", "cli".parse()?);
+    let mut first_response = client
+        .run_stream(first_stream)
+        .await
+        .context("failed to call first RunStream")?
+        .into_inner();
+    while let Some(event) = first_response.next().await {
+        let _ = event.context("first run stream should finish without errors")?;
+    }
+
+    let mut second_client =
+        gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+            .await
+            .context("failed to connect gRPC client for mismatch stream")?;
+    let mut second_stream =
+        tonic::Request::new(tokio_stream::iter(vec![sample_run_stream_request_with_ids(
+            SESSION_ID,
+            RUN_ID_ALT,
+            "mismatch-session".to_owned(),
+        )]));
+    second_stream.metadata_mut().insert("authorization", format!("Bearer {ADMIN_TOKEN}").parse()?);
+    second_stream.metadata_mut().insert("x-palyra-principal", "user:other".parse()?);
+    second_stream.metadata_mut().insert("x-palyra-device-id", DEVICE_ID.parse()?);
+    second_stream.metadata_mut().insert("x-palyra-channel", "cli".parse()?);
+
+    let mut second_response = second_client
+        .run_stream(second_stream)
+        .await
+        .context("failed to call second RunStream")?
+        .into_inner();
+    let mismatch_error = second_response
+        .next()
+        .await
+        .transpose()
+        .expect_err("second run stream should fail before emitting any events");
+    assert_eq!(mismatch_error.code(), Code::FailedPrecondition);
+    assert!(
+        mismatch_error.message().contains("session identity mismatch"),
+        "expected session identity mismatch message, got: {}",
+        mismatch_error.message()
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_run_stream_protocol_error_after_accept_marks_run_failed() -> Result<()> {
+    let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+
+    let mut invalid_protocol_message =
+        sample_run_stream_request_with_ids(SESSION_ID, RUN_ID, "second-message".to_owned());
+    invalid_protocol_message.v = 0;
+    let mut stream_request = tonic::Request::new(tokio_stream::iter(vec![
+        sample_run_stream_request_with_ids(SESSION_ID, RUN_ID, "first-message".to_owned()),
+        invalid_protocol_message,
+    ]));
+    stream_request.metadata_mut().insert("authorization", format!("Bearer {ADMIN_TOKEN}").parse()?);
+    stream_request.metadata_mut().insert("x-palyra-principal", "user:ops".parse()?);
+    stream_request.metadata_mut().insert("x-palyra-device-id", DEVICE_ID.parse()?);
+    stream_request.metadata_mut().insert("x-palyra-channel", "cli".parse()?);
+
+    let mut response_stream =
+        client.run_stream(stream_request).await.context("failed to call RunStream")?.into_inner();
+    let mut terminal_error = None;
+    while let Some(event) = response_stream.next().await {
+        if let Err(status) = event {
+            terminal_error = Some(status);
+            break;
+        }
+    }
+    let status = terminal_error.context("run stream should terminate with a protocol error")?;
+    assert_eq!(status.code(), Code::FailedPrecondition);
+
+    let run_snapshot = admin_get_json_async(admin_port, format!("/admin/v1/runs/{RUN_ID}")).await?;
+    assert_eq!(
+        run_snapshot.get("state").and_then(Value::as_str).context("run snapshot missing state")?,
+        "failed"
+    );
+    assert!(
+        run_snapshot
+            .get("last_error")
+            .and_then(Value::as_str)
+            .context("run snapshot missing last_error")?
+            .contains("unsupported protocol major version"),
+        "failure reason should be persisted for protocol errors"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_run_stream_mid_stream_run_id_switch_marks_original_run_failed() -> Result<()> {
+    let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+
+    let mut stream_request = tonic::Request::new(tokio_stream::iter(vec![
+        sample_run_stream_request_with_ids(SESSION_ID, RUN_ID, "first-message".to_owned()),
+        sample_run_stream_request_with_ids(SESSION_ID, RUN_ID_ALT, "switch-run".to_owned()),
+    ]));
+    stream_request.metadata_mut().insert("authorization", format!("Bearer {ADMIN_TOKEN}").parse()?);
+    stream_request.metadata_mut().insert("x-palyra-principal", "user:ops".parse()?);
+    stream_request.metadata_mut().insert("x-palyra-device-id", DEVICE_ID.parse()?);
+    stream_request.metadata_mut().insert("x-palyra-channel", "cli".parse()?);
+
+    let mut response_stream =
+        client.run_stream(stream_request).await.context("failed to call RunStream")?.into_inner();
+    let mut terminal_error = None;
+    while let Some(event) = response_stream.next().await {
+        if let Err(status) = event {
+            terminal_error = Some(status);
+            break;
+        }
+    }
+    let status =
+        terminal_error.context("run stream should terminate with a run_id mismatch error")?;
+    assert_eq!(status.code(), Code::InvalidArgument);
+
+    let run_snapshot = admin_get_json_async(admin_port, format!("/admin/v1/runs/{RUN_ID}")).await?;
+    assert_eq!(
+        run_snapshot.get("state").and_then(Value::as_str).context("run snapshot missing state")?,
+        "failed"
+    );
+    assert!(
+        run_snapshot
+            .get("last_error")
+            .and_then(Value::as_str)
+            .context("run snapshot missing last_error")?
+            .contains("cannot switch run_id mid-stream"),
+        "failure reason should be persisted for run_id mismatch"
+    );
+    Ok(())
+}
+
 fn sample_run_stream_request() -> common_v1::RunStreamRequest {
     sample_run_stream_request_with_text("hello from grpc integration".to_owned())
 }
 
 fn sample_run_stream_request_with_text(text: String) -> common_v1::RunStreamRequest {
+    sample_run_stream_request_with_ids(SESSION_ID, RUN_ID, text)
+}
+
+fn sample_run_stream_request_with_ids(
+    session_id: &str,
+    run_id: &str,
+    text: String,
+) -> common_v1::RunStreamRequest {
     common_v1::RunStreamRequest {
         v: 1,
-        session_id: Some(common_v1::CanonicalId { ulid: SESSION_ID.to_owned() }),
-        run_id: Some(common_v1::CanonicalId { ulid: RUN_ID.to_owned() }),
+        session_id: Some(common_v1::CanonicalId { ulid: session_id.to_owned() }),
+        run_id: Some(common_v1::CanonicalId { ulid: run_id.to_owned() }),
         input: Some(common_v1::MessageEnvelope {
             v: 1,
             envelope_id: Some(common_v1::CanonicalId { ulid: ENVELOPE_ID.to_owned() }),

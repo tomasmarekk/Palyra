@@ -19,7 +19,9 @@ use gateway::{
     authorize_headers, request_context_from_headers, AuthError, GatewayAuthConfig,
     GatewayJournalConfigSnapshot, GatewayRuntimeConfigSnapshot, GatewayRuntimeState,
 };
-use journal::{JournalConfig, JournalStore, OrchestratorCancelRequest, OrchestratorRunSnapshot};
+use journal::{
+    JournalConfig, JournalStore, OrchestratorCancelRequest, OrchestratorRunStatusSnapshot,
+};
 use palyra_common::{
     build_metadata, health_response, parse_daemon_bind_socket, validate_canonical_id,
     HealthResponse,
@@ -282,7 +284,7 @@ async fn admin_run_status_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(run_id): Path<String>,
-) -> Result<Json<OrchestratorRunSnapshot>, Response> {
+) -> Result<Json<OrchestratorRunStatusSnapshot>, Response> {
     authorize_headers(&headers, &state.auth).map_err(|error| {
         state.runtime.record_denied();
         auth_error_response(error)
@@ -297,7 +299,7 @@ async fn admin_run_status_handler(
     state.runtime.record_admin_status_request();
     let snapshot = state
         .runtime
-        .orchestrator_run_snapshot(run_id.clone())
+        .orchestrator_run_status_snapshot(run_id.clone())
         .await
         .map_err(runtime_status_response)?;
     let Some(snapshot) = snapshot else {

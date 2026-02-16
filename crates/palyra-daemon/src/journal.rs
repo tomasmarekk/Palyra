@@ -120,7 +120,7 @@ pub struct OrchestratorTapeRecord {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct OrchestratorRunSnapshot {
+pub struct OrchestratorRunStatusSnapshot {
     pub run_id: String,
     pub session_id: String,
     pub state: String,
@@ -141,7 +141,7 @@ pub struct OrchestratorRunSnapshot {
     pub updated_at_unix_ms: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
-    pub tape: Vec<OrchestratorTapeRecord>,
+    pub tape_events: u64,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -172,6 +172,8 @@ pub enum JournalError {
     DuplicateTapeSequence { run_id: String, seq: i64 },
     #[error("orchestrator run not found: {run_id}")]
     RunNotFound { run_id: String },
+    #[error("orchestrator session identity mismatch for session: {session_id}")]
+    SessionIdentityMismatch { session_id: String },
     #[error("journal sqlite operation failed: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("failed to serialize journal payload: {0}")]
@@ -477,8 +479,9 @@ impl JournalStore {
     ) -> Result<(), JournalError> {
         let now = current_unix_ms()?;
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
-        guard.execute(
-            r#"
+        let updated =
+            guard.execute(
+                r#"
                 INSERT INTO orchestrator_sessions (
                     session_ulid,
                     principal,
@@ -488,19 +491,24 @@ impl JournalStore {
                     updated_at_unix_ms
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?5)
                 ON CONFLICT(session_ulid) DO UPDATE SET
-                    principal = excluded.principal,
-                    device_id = excluded.device_id,
-                    channel = excluded.channel,
                     updated_at_unix_ms = excluded.updated_at_unix_ms
+                WHERE orchestrator_sessions.principal = excluded.principal
+                  AND orchestrator_sessions.device_id = excluded.device_id
+                  AND COALESCE(orchestrator_sessions.channel, '') = COALESCE(excluded.channel, '')
             "#,
-            params![
-                request.session_id,
-                request.principal,
-                request.device_id,
-                request.channel,
-                now,
-            ],
-        )?;
+                params![
+                    request.session_id,
+                    request.principal,
+                    request.device_id,
+                    request.channel,
+                    now,
+                ],
+            )?;
+        if updated == 0 {
+            return Err(JournalError::SessionIdentityMismatch {
+                session_id: request.session_id.clone(),
+            });
+        }
         Ok(())
     }
 
@@ -688,10 +696,10 @@ impl JournalStore {
         load_orchestrator_tape(&guard, run_id)
     }
 
-    pub fn orchestrator_run_snapshot(
+    pub fn orchestrator_run_status_snapshot(
         &self,
         run_id: &str,
-    ) -> Result<Option<OrchestratorRunSnapshot>, JournalError> {
+    ) -> Result<Option<OrchestratorRunStatusSnapshot>, JournalError> {
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         let mut statement = guard.prepare(
             r#"
@@ -724,7 +732,7 @@ impl JournalStore {
                 let normalized_state = RunLifecycleState::from_str(raw_state.as_str())
                     .map(|state| state.as_str().to_owned())
                     .unwrap_or(raw_state);
-                Ok(OrchestratorRunSnapshot {
+                Ok(OrchestratorRunStatusSnapshot {
                     run_id: row.get(0)?,
                     session_id: row.get(1)?,
                     state: normalized_state,
@@ -741,14 +749,18 @@ impl JournalStore {
                     completed_at_unix_ms: row.get(13)?,
                     updated_at_unix_ms: row.get(14)?,
                     last_error: row.get(15)?,
-                    tape: Vec::new(),
+                    tape_events: 0,
                 })
             })
             .optional()?;
         let Some(mut snapshot) = row else {
             return Ok(None);
         };
-        snapshot.tape = load_orchestrator_tape(&guard, run_id)?;
+        snapshot.tape_events = guard.query_row(
+            "SELECT COUNT(*) FROM orchestrator_tape WHERE run_ulid = ?1",
+            params![run_id],
+            |row| row.get::<_, i64>(0),
+        )? as u64;
         Ok(Some(snapshot))
     }
 }
@@ -1170,7 +1182,7 @@ mod tests {
     }
 
     #[test]
-    fn orchestrator_run_snapshot_persists_usage_and_tape() {
+    fn orchestrator_run_status_snapshot_persists_usage_and_tape_count() {
         let db_path = temp_db_path();
         let store = JournalStore::open(JournalConfig { db_path, hash_chain_enabled: false })
             .expect("journal store should open");
@@ -1221,16 +1233,65 @@ mod tests {
             .expect("run should transition to done");
 
         let snapshot = store
-            .orchestrator_run_snapshot("01ARZ3NDEKTSV4RRFFQ69G5FAX")
+            .orchestrator_run_status_snapshot("01ARZ3NDEKTSV4RRFFQ69G5FAX")
             .expect("run snapshot query should succeed")
             .expect("snapshot should exist");
         assert_eq!(snapshot.state, "done");
         assert_eq!(snapshot.prompt_tokens, 3);
         assert_eq!(snapshot.completion_tokens, 2);
         assert_eq!(snapshot.total_tokens, 5);
-        assert_eq!(snapshot.tape.len(), 2);
-        assert_eq!(snapshot.tape[0].seq, 0);
-        assert_eq!(snapshot.tape[1].event_type, "model_token");
+        assert_eq!(snapshot.tape_events, 2);
+
+        let tape = store
+            .orchestrator_tape("01ARZ3NDEKTSV4RRFFQ69G5FAX")
+            .expect("run tape query should succeed");
+        assert_eq!(tape.len(), 2);
+        assert_eq!(tape[0].seq, 0);
+        assert_eq!(tape[1].event_type, "model_token");
+    }
+
+    #[test]
+    fn orchestrator_session_identity_is_immutable() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(JournalConfig { db_path, hash_chain_enabled: false })
+            .expect("journal store should open");
+
+        store
+            .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
+                session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned(),
+                principal: "user:ops".to_owned(),
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                channel: Some("cli".to_owned()),
+            })
+            .expect("initial session upsert should succeed");
+        store
+            .start_orchestrator_run(&OrchestratorRunStartRequest {
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),
+                session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned(),
+            })
+            .expect("run start should succeed");
+
+        let mismatch = store
+            .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
+                session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned(),
+                principal: "user:other".to_owned(),
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAZ".to_owned(),
+                channel: Some("web".to_owned()),
+            })
+            .expect_err("session identity mismatch should be rejected");
+        assert!(matches!(
+            mismatch,
+            JournalError::SessionIdentityMismatch { ref session_id }
+                if session_id == "01ARZ3NDEKTSV4RRFFQ69G5FAW"
+        ));
+
+        let snapshot = store
+            .orchestrator_run_status_snapshot("01ARZ3NDEKTSV4RRFFQ69G5FAX")
+            .expect("run snapshot query should succeed")
+            .expect("run snapshot should exist");
+        assert_eq!(snapshot.principal, "user:ops");
+        assert_eq!(snapshot.device_id, "01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        assert_eq!(snapshot.channel.as_deref(), Some("cli"));
     }
 
     #[test]

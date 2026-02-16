@@ -310,7 +310,7 @@ fn run_daemon(command: DaemonCommand) -> Result<()> {
                 response.prompt_tokens,
                 response.completion_tokens,
                 response.total_tokens,
-                response.tape.len()
+                response.tape_events
             );
             std::io::stdout().flush().context("stdout flush failed")
         }
@@ -820,7 +820,7 @@ struct RunStatusResponse {
     prompt_tokens: u64,
     completion_tokens: u64,
     total_tokens: u64,
-    tape: Vec<RunTapeEvent>,
+    tape_events: u64,
 }
 
 #[derive(Debug, Deserialize)]
