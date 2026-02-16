@@ -93,7 +93,7 @@ struct ActivePairingSession {
     gateway_ephemeral_secret: StaticSecret,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DevicePairingHello {
     pub session_id: String,
     pub protocol_version: u32,
@@ -104,6 +104,22 @@ pub struct DevicePairingHello {
     pub device_x25519_public: [u8; 32],
     pub challenge_signature: [u8; 64],
     pub transcript_mac: [u8; 32],
+}
+
+impl std::fmt::Debug for DevicePairingHello {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DevicePairingHello")
+            .field("session_id", &self.session_id)
+            .field("protocol_version", &self.protocol_version)
+            .field("device_id", &self.device_id)
+            .field("client_kind", &self.client_kind)
+            .field("proof_len", &self.proof.len())
+            .field("device_signing_public", &self.device_signing_public)
+            .field("device_x25519_public", &self.device_x25519_public)
+            .field("challenge_signature", &"<redacted>")
+            .field("transcript_mac", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -668,7 +684,10 @@ fn try_reclaim_stale_filesystem_lock(
         Err(_) => return Ok(false),
     };
     let Some(marker) = parse_filesystem_lock_marker(&marker_raw) else {
-        return Ok(false);
+        if !lock_file_age_is_stale(lock_path, now, stale_age)? {
+            return Ok(false);
+        }
+        return remove_filesystem_lock_file(lock_path);
     };
     if !lock_marker_is_stale(marker, now, stale_age)? {
         return Ok(false);
@@ -676,11 +695,7 @@ fn try_reclaim_stale_filesystem_lock(
     if process_is_alive(marker.pid) {
         return Ok(false);
     }
-    match fs::remove_file(lock_path) {
-        Ok(()) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
-        Err(_) => Ok(false),
-    }
+    remove_filesystem_lock_file(lock_path)
 }
 
 fn parse_filesystem_lock_marker(raw: &str) -> Option<FilesystemLockMarker> {
@@ -708,6 +723,31 @@ fn lock_marker_is_stale(
         IdentityError::Internal("identity state stale lock age overflow".to_owned())
     })?;
     Ok(now_ms.saturating_sub(marker.ts_ms) >= stale_age_ms)
+}
+
+fn lock_file_age_is_stale(
+    lock_path: &Path,
+    now: SystemTime,
+    stale_age: Duration,
+) -> IdentityResult<bool> {
+    let metadata = match fs::metadata(lock_path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(_) => return Ok(false),
+    };
+    let modified = match metadata.modified() {
+        Ok(value) => value,
+        Err(_) => return Ok(false),
+    };
+    Ok(now.duration_since(modified).unwrap_or_default() >= stale_age)
+}
+
+fn remove_filesystem_lock_file(lock_path: &Path) -> IdentityResult<bool> {
+    match fs::remove_file(lock_path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(_) => Ok(false),
+    }
 }
 
 #[cfg(unix)]
@@ -1034,6 +1074,17 @@ mod tests {
         assert!(formatted.contains("token_len"), "debug output should preserve safe diagnostics");
     }
 
+    #[test]
+    fn device_pairing_hello_debug_redacts_secret_material() {
+        let mut manager = IdentityManager::with_memory_store().expect("manager should initialize");
+        let (_, _, hello) = start_pin_pairing(&mut manager, "123456");
+
+        let formatted = format!("{hello:?}");
+        assert!(!formatted.contains("123456"), "debug output must redact proof");
+        assert!(formatted.contains("<redacted>"), "sensitive binary fields should be redacted");
+        assert!(formatted.contains("proof_len"), "debug output should preserve safe diagnostics");
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn filesystem_lock_is_not_reclaimed_when_owner_pid_is_live() {
@@ -1075,6 +1126,39 @@ mod tests {
         let issued = manager.issue_gateway_server_certificate("localhost");
         assert!(issued.is_ok(), "stale dead lock marker should be reclaimed");
         assert!(!lock_path.exists(), "stale lock file should be removed after successful mutation");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn malformed_recent_filesystem_lock_marker_is_not_reclaimed() {
+        let root = TempDir::new().expect("temp directory should be created");
+        let lock_path = root.path().join(IDENTITY_STATE_LOCK_FILENAME);
+        fs::write(&lock_path, "invalid lock marker payload")
+            .expect("malformed lock marker should be written");
+
+        let reclaimed = try_reclaim_stale_filesystem_lock(
+            &lock_path,
+            SystemTime::now(),
+            Duration::from_secs(60),
+        )
+        .expect("reclaim evaluation should succeed");
+        assert!(!reclaimed, "fresh malformed lock marker should not be reclaimed");
+        assert!(lock_path.exists(), "fresh malformed lock marker must remain in place");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn malformed_stale_filesystem_lock_marker_is_reclaimed() {
+        let root = TempDir::new().expect("temp directory should be created");
+        let lock_path = root.path().join(IDENTITY_STATE_LOCK_FILENAME);
+        fs::write(&lock_path, "invalid lock marker payload")
+            .expect("malformed lock marker should be written");
+
+        let reclaimed =
+            try_reclaim_stale_filesystem_lock(&lock_path, SystemTime::now(), Duration::ZERO)
+                .expect("reclaim evaluation should succeed");
+        assert!(reclaimed, "stale malformed lock marker should be reclaimed");
+        assert!(!lock_path.exists(), "stale malformed lock marker should be removed");
     }
 
     #[test]

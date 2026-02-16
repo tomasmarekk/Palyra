@@ -1,6 +1,8 @@
 use std::{
-    net::TcpListener,
-    process::{Child, Command, Stdio},
+    io::{BufRead, BufReader},
+    net::SocketAddr,
+    process::{Child, ChildStdout, Command, Stdio},
+    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
@@ -10,8 +12,7 @@ use reqwest::blocking::Client;
 
 #[test]
 fn palyra_daemon_status_reads_health_endpoint() -> Result<()> {
-    let port = random_port()?;
-    let child = spawn_palyrad(port)?;
+    let (child, port) = spawn_palyrad_with_dynamic_port()?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(port, daemon.child_mut())?;
 
@@ -31,9 +32,9 @@ fn palyra_daemon_status_reads_health_endpoint() -> Result<()> {
     Ok(())
 }
 
-fn spawn_palyrad(port: u16) -> Result<Child> {
+fn spawn_palyrad_with_dynamic_port() -> Result<(Child, u16)> {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
-    let child = Command::new(cargo)
+    let mut child = Command::new(cargo)
         .args([
             "run",
             "--quiet",
@@ -45,13 +46,69 @@ fn spawn_palyrad(port: u16) -> Result<Child> {
             "--bind",
             "127.0.0.1",
             "--port",
-            &port.to_string(),
+            "0",
         ])
-        .stdout(Stdio::null())
+        .env("RUST_LOG", "info")
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .context("failed to spawn palyrad process")?;
-    Ok(child)
+    let stdout = child.stdout.take().context("failed to capture palyrad stdout")?;
+    let port = wait_for_listen_port(stdout, &mut child)?;
+    Ok((child, port))
+}
+
+fn wait_for_listen_port(stdout: ChildStdout, daemon: &mut Child) -> Result<u16> {
+    let (sender, receiver) = mpsc::channel::<Result<u16, String>>();
+    thread::spawn(move || {
+        let mut sender = Some(sender);
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else {
+                if let Some(sender) = sender.take() {
+                    let _ = sender.send(Err("failed to read palyrad stdout line".to_owned()));
+                }
+                return;
+            };
+
+            if let Some(port) = parse_listen_port(&line) {
+                if let Some(sender) = sender.take() {
+                    let _ = sender.send(Ok(port));
+                }
+            }
+        }
+
+        if let Some(sender) = sender.take() {
+            let _ = sender
+                .send(Err("palyrad stdout closed before listen address was published".to_owned()));
+        }
+    });
+
+    let timeout_at = Instant::now() + Duration::from_secs(90);
+    loop {
+        match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(Ok(port)) => return Ok(port),
+            Ok(Err(message)) => anyhow::bail!("{message}"),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                anyhow::bail!("listen-address reader disconnected before publishing a port");
+            }
+        }
+
+        if Instant::now() > timeout_at {
+            anyhow::bail!("timed out waiting for daemon listen address log");
+        }
+        if let Some(status) = daemon.try_wait().context("failed to check daemon status")? {
+            anyhow::bail!("palyrad exited before publishing listen address with status: {status}");
+        }
+    }
+}
+
+fn parse_listen_port(line: &str) -> Option<u16> {
+    const LISTEN_ADDR_PREFIX: &str = "\"listen_addr\":\"";
+    let start = line.find(LISTEN_ADDR_PREFIX)? + LISTEN_ADDR_PREFIX.len();
+    let rest = &line[start..];
+    let end = rest.find('"')?;
+    rest[..end].parse::<SocketAddr>().ok().map(|address| address.port())
 }
 
 fn wait_for_health(port: u16, daemon: &mut Child) -> Result<()> {
@@ -74,13 +131,6 @@ fn wait_for_health(port: u16, daemon: &mut Child) -> Result<()> {
         }
         thread::sleep(Duration::from_millis(100));
     }
-}
-
-fn random_port() -> Result<u16> {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).context("failed to reserve random port")?;
-    let port = listener.local_addr().context("failed to resolve listener local addr")?.port();
-    drop(listener);
-    Ok(port)
 }
 
 struct ChildGuard {

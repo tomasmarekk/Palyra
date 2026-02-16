@@ -155,6 +155,9 @@ pub fn parse_daemon_bind_socket(
     bind_addr: &str,
     port: u16,
 ) -> Result<std::net::SocketAddr, std::net::AddrParseError> {
+    if let Ok(ip) = bind_addr.parse::<std::net::IpAddr>() {
+        return Ok(std::net::SocketAddr::new(ip, port));
+    }
     format!("{bind_addr}:{port}").parse()
 }
 
@@ -563,6 +566,26 @@ mod tests {
     fn parse_daemon_bind_socket_rejects_invalid_bind_host() {
         let result = parse_daemon_bind_socket("bad host value", 7142);
         assert!(result.is_err(), "invalid bind host should be rejected");
+    }
+
+    #[test]
+    fn parse_daemon_bind_socket_accepts_ipv6_loopback_without_brackets() {
+        let parsed = parse_daemon_bind_socket("::1", 7142)
+            .expect("ipv6 loopback bind endpoint should parse");
+        assert_eq!(
+            parsed,
+            "[::1]:7142".parse::<SocketAddr>().expect("expected endpoint should parse"),
+        );
+    }
+
+    #[test]
+    fn parse_daemon_bind_socket_accepts_non_loopback_ipv6_without_brackets() {
+        let parsed =
+            parse_daemon_bind_socket("2001:db8::1", 7142).expect("ipv6 bind endpoint should parse");
+        assert_eq!(
+            parsed,
+            "[2001:db8::1]:7142".parse::<SocketAddr>().expect("expected endpoint should parse"),
+        );
     }
 
     #[test]

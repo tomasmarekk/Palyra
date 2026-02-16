@@ -1,9 +1,9 @@
-use std::{net::SocketAddr, time::Instant};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use axum::{extract::State, response::IntoResponse, routing::get, Json, Router};
 use clap::Parser;
-use palyra_common::{build_metadata, health_response, HealthResponse};
+use palyra_common::{build_metadata, health_response, parse_daemon_bind_socket, HealthResponse};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -39,8 +39,8 @@ async fn main() -> Result<()> {
     let state = AppState { started_at: Instant::now() };
     let app = Router::new().route("/healthz", get(health_handler)).with_state(state);
 
-    let address: SocketAddr =
-        format!("{}:{}", args.bind, args.port).parse().context("invalid bind address or port")?;
+    let address =
+        parse_daemon_bind_socket(&args.bind, args.port).context("invalid bind address or port")?;
     let listener = tokio::net::TcpListener::bind(address)
         .await
         .context("failed to bind palyra-browserd listener")?;

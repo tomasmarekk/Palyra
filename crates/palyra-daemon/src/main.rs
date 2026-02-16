@@ -59,6 +59,9 @@ async fn main() -> Result<()> {
         .context("invalid bind address or port")?;
     let listener =
         tokio::net::TcpListener::bind(address).await.context("failed to bind palyrad listener")?;
+    let bound_address =
+        listener.local_addr().context("failed to resolve palyrad bound listener address")?;
+    info!(listen_addr = %bound_address, "daemon listening");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
