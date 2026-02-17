@@ -1002,14 +1002,19 @@ mod tests {
         let outside = unique_temp_dir("outside-file-url-outside");
         fs::create_dir_all(&workspace).expect("workspace directory should be created");
         fs::create_dir_all(&outside).expect("outside directory should be created");
+        let canonical_workspace = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
 
         let outside_file = outside.join("secret.txt");
         fs::write(&outside_file, b"secret").expect("outside file should be created");
         let args = vec![format!("file://{}", outside_file.to_string_lossy())];
 
-        let error =
-            validate_argument_workspace_scope(workspace.as_path(), workspace.as_path(), &args)
-                .expect_err("file URLs outside workspace must be denied");
+        let error = validate_argument_workspace_scope(
+            canonical_workspace.as_path(),
+            canonical_workspace.as_path(),
+            &args,
+        )
+        .expect_err("file URLs outside workspace must be denied");
         assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
 
         let _ = fs::remove_file(&outside_file);
@@ -1022,13 +1027,19 @@ mod tests {
     fn validate_argument_workspace_scope_allows_file_url_inside_workspace() {
         let workspace = unique_temp_dir("workspace-file-url-inside");
         fs::create_dir_all(&workspace).expect("workspace directory should be created");
+        let canonical_workspace = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
 
         let inside_file = workspace.join("inside.txt");
         fs::write(&inside_file, b"ok").expect("inside file should be created");
         let args = vec![format!("file://{}", inside_file.to_string_lossy())];
 
-        validate_argument_workspace_scope(workspace.as_path(), workspace.as_path(), &args)
-            .expect("file URLs inside workspace should be allowed");
+        validate_argument_workspace_scope(
+            canonical_workspace.as_path(),
+            canonical_workspace.as_path(),
+            &args,
+        )
+        .expect("file URLs inside workspace should be allowed");
 
         let _ = fs::remove_file(&inside_file);
         let _ = fs::remove_dir_all(&workspace);
