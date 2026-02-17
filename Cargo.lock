@@ -2060,6 +2060,7 @@ dependencies = [
  "anyhow",
  "axum 0.8.8",
  "clap",
+ "libc",
  "palyra-common",
  "palyra-identity",
  "palyra-policy",

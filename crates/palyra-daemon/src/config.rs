@@ -24,6 +24,11 @@ const DEFAULT_JOURNAL_DB_PATH: &str = "data/journal.sqlite3";
 const DEFAULT_JOURNAL_HASH_CHAIN_ENABLED: bool = false;
 const DEFAULT_TOOL_CALL_MAX_CALLS_PER_RUN: u32 = 4;
 const DEFAULT_TOOL_CALL_EXECUTION_TIMEOUT_MS: u64 = 750;
+const DEFAULT_PROCESS_RUNNER_ENABLED: bool = false;
+const DEFAULT_PROCESS_RUNNER_WORKSPACE_ROOT: &str = ".";
+const DEFAULT_PROCESS_RUNNER_CPU_TIME_LIMIT_MS: u64 = 2_000;
+const DEFAULT_PROCESS_RUNNER_MEMORY_LIMIT_BYTES: u64 = 256 * 1024 * 1024;
+const DEFAULT_PROCESS_RUNNER_MAX_OUTPUT_BYTES: u64 = 64 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadedConfig {
     pub source: String,
@@ -62,6 +67,19 @@ pub struct ToolCallConfig {
     pub allowed_tools: Vec<String>,
     pub max_calls_per_run: u32,
     pub execution_timeout_ms: u64,
+    pub process_runner: ProcessRunnerConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessRunnerConfig {
+    pub enabled: bool,
+    pub workspace_root: PathBuf,
+    pub allowed_executables: Vec<String>,
+    pub allowed_egress_hosts: Vec<String>,
+    pub allowed_dns_suffixes: Vec<String>,
+    pub cpu_time_limit_ms: u64,
+    pub memory_limit_bytes: u64,
+    pub max_output_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,6 +144,22 @@ impl Default for ToolCallConfig {
             allowed_tools: Vec::new(),
             max_calls_per_run: DEFAULT_TOOL_CALL_MAX_CALLS_PER_RUN,
             execution_timeout_ms: DEFAULT_TOOL_CALL_EXECUTION_TIMEOUT_MS,
+            process_runner: ProcessRunnerConfig::default(),
+        }
+    }
+}
+
+impl Default for ProcessRunnerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: DEFAULT_PROCESS_RUNNER_ENABLED,
+            workspace_root: PathBuf::from(DEFAULT_PROCESS_RUNNER_WORKSPACE_ROOT),
+            allowed_executables: Vec::new(),
+            allowed_egress_hosts: Vec::new(),
+            allowed_dns_suffixes: Vec::new(),
+            cpu_time_limit_ms: DEFAULT_PROCESS_RUNNER_CPU_TIME_LIMIT_MS,
+            memory_limit_bytes: DEFAULT_PROCESS_RUNNER_MEMORY_LIMIT_BYTES,
+            max_output_bytes: DEFAULT_PROCESS_RUNNER_MAX_OUTPUT_BYTES,
         }
     }
 }
@@ -230,6 +264,52 @@ pub fn load_config() -> Result<LoadedConfig> {
             if let Some(execution_timeout_ms) = file_tool_call.execution_timeout_ms {
                 tool_call.execution_timeout_ms =
                     parse_positive_u64(execution_timeout_ms, "tool_call.execution_timeout_ms")?;
+            }
+            if let Some(file_process_runner) = file_tool_call.process_runner {
+                if let Some(enabled) = file_process_runner.enabled {
+                    tool_call.process_runner.enabled = enabled;
+                }
+                if let Some(workspace_root) = file_process_runner.workspace_root {
+                    tool_call.process_runner.workspace_root =
+                        parse_workspace_root(workspace_root.as_str())?;
+                }
+                if let Some(allowed_executables) = file_process_runner.allowed_executables {
+                    tool_call.process_runner.allowed_executables =
+                        parse_process_executable_allowlist(
+                            allowed_executables.join(",").as_str(),
+                            "tool_call.process_runner.allowed_executables",
+                        )?;
+                }
+                if let Some(allowed_egress_hosts) = file_process_runner.allowed_egress_hosts {
+                    tool_call.process_runner.allowed_egress_hosts = parse_host_allowlist(
+                        allowed_egress_hosts.join(",").as_str(),
+                        "tool_call.process_runner.allowed_egress_hosts",
+                    )?;
+                }
+                if let Some(allowed_dns_suffixes) = file_process_runner.allowed_dns_suffixes {
+                    tool_call.process_runner.allowed_dns_suffixes = parse_dns_suffix_allowlist(
+                        allowed_dns_suffixes.join(",").as_str(),
+                        "tool_call.process_runner.allowed_dns_suffixes",
+                    )?;
+                }
+                if let Some(cpu_time_limit_ms) = file_process_runner.cpu_time_limit_ms {
+                    tool_call.process_runner.cpu_time_limit_ms = parse_positive_u64(
+                        cpu_time_limit_ms,
+                        "tool_call.process_runner.cpu_time_limit_ms",
+                    )?;
+                }
+                if let Some(memory_limit_bytes) = file_process_runner.memory_limit_bytes {
+                    tool_call.process_runner.memory_limit_bytes = parse_positive_u64(
+                        memory_limit_bytes,
+                        "tool_call.process_runner.memory_limit_bytes",
+                    )?;
+                }
+                if let Some(max_output_bytes) = file_process_runner.max_output_bytes {
+                    tool_call.process_runner.max_output_bytes = parse_positive_u64(
+                        max_output_bytes,
+                        "tool_call.process_runner.max_output_bytes",
+                    )?;
+                }
             }
         }
         if let Some(file_admin) = parsed.admin {
@@ -507,18 +587,94 @@ fn parse_openai_model(raw: &str) -> Result<String> {
 }
 
 fn parse_tool_allowlist(raw: &str, source_name: &str) -> Result<Vec<String>> {
+    parse_identifier_allowlist(raw, source_name, "tool name")
+}
+
+fn parse_process_executable_allowlist(raw: &str, source_name: &str) -> Result<Vec<String>> {
+    parse_identifier_allowlist(raw, source_name, "executable name")
+}
+
+fn parse_identifier_allowlist(raw: &str, source_name: &str, label: &str) -> Result<Vec<String>> {
     let mut allowlist = Vec::new();
     for candidate in raw.split(',').map(str::trim).filter(|value| !value.is_empty()) {
         if !candidate.chars().all(|ch| {
             ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-')
         }) {
-            anyhow::bail!("{source_name} contains invalid tool name '{candidate}'");
+            anyhow::bail!("{source_name} contains invalid {label} '{candidate}'");
         }
         if !allowlist.iter().any(|existing| existing == candidate) {
             allowlist.push(candidate.to_owned());
         }
     }
     Ok(allowlist)
+}
+
+fn parse_workspace_root(raw: &str) -> Result<PathBuf> {
+    if raw.trim().is_empty() {
+        anyhow::bail!("process runner workspace root cannot be empty");
+    }
+    if raw.contains('\0') {
+        anyhow::bail!("process runner workspace root cannot contain embedded NUL byte");
+    }
+    Ok(PathBuf::from(raw))
+}
+
+fn parse_host_allowlist(raw: &str, source_name: &str) -> Result<Vec<String>> {
+    let mut allowlist = Vec::new();
+    for candidate in raw.split(',').map(str::trim).filter(|value| !value.is_empty()) {
+        let normalized = normalize_host_candidate(candidate)
+            .with_context(|| format!("{source_name} contains invalid host '{candidate}'"))?;
+        if !allowlist.iter().any(|existing| existing == &normalized) {
+            allowlist.push(normalized);
+        }
+    }
+    Ok(allowlist)
+}
+
+fn parse_dns_suffix_allowlist(raw: &str, source_name: &str) -> Result<Vec<String>> {
+    let mut allowlist = Vec::new();
+    for candidate in raw.split(',').map(str::trim).filter(|value| !value.is_empty()) {
+        let normalized = normalize_dns_suffix_candidate(candidate)
+            .with_context(|| format!("{source_name} contains invalid dns suffix '{candidate}'"))?;
+        if !allowlist.iter().any(|existing| existing == &normalized) {
+            allowlist.push(normalized);
+        }
+    }
+    Ok(allowlist)
+}
+
+fn normalize_host_candidate(raw: &str) -> Result<String> {
+    let trimmed = raw.trim().trim_end_matches('.').to_ascii_lowercase();
+    if trimmed.is_empty() {
+        anyhow::bail!("host cannot be empty");
+    }
+    if !trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '-'))
+    {
+        anyhow::bail!("host must contain only ASCII letters, digits, dots, and hyphens");
+    }
+    if trimmed.starts_with('-')
+        || trimmed.ends_with('-')
+        || trimmed.starts_with('.')
+        || trimmed.ends_with('.')
+        || trimmed.contains("..")
+    {
+        anyhow::bail!("host has invalid dot/hyphen placement");
+    }
+    Ok(trimmed)
+}
+
+fn normalize_dns_suffix_candidate(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("dns suffix cannot be empty");
+    }
+    if trimmed.contains("..") {
+        anyhow::bail!("dns suffix cannot contain empty labels");
+    }
+    let normalized_host = normalize_host_candidate(trimmed.trim_start_matches('.'))?;
+    Ok(format!(".{normalized_host}"))
 }
 
 fn parse_positive_u64(value: u64, name: &str) -> Result<u64> {
@@ -548,9 +704,10 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        parse_journal_db_path, parse_openai_base_url, parse_tool_allowlist, AdminConfig,
-        GatewayConfig, IdentityConfig, ModelProviderConfig, OrchestratorConfig, StorageConfig,
-        ToolCallConfig,
+        parse_dns_suffix_allowlist, parse_host_allowlist, parse_journal_db_path,
+        parse_openai_base_url, parse_process_executable_allowlist, parse_tool_allowlist,
+        AdminConfig, GatewayConfig, IdentityConfig, ModelProviderConfig, OrchestratorConfig,
+        StorageConfig, ToolCallConfig,
     };
     use crate::model_provider::ModelProviderKind;
     use palyra_common::daemon_config_schema::RootFileConfig;
@@ -602,6 +759,11 @@ mod tests {
         );
         assert_eq!(config.max_calls_per_run, 4);
         assert_eq!(config.execution_timeout_ms, 750);
+        assert!(!config.process_runner.enabled, "sandbox process runner must default to disabled");
+        assert!(
+            config.process_runner.allowed_executables.is_empty(),
+            "sandbox process runner executable allowlist must default empty"
+        );
     }
 
     #[test]
@@ -689,6 +851,13 @@ mod tests {
     }
 
     #[test]
+    fn config_rejects_unknown_process_runner_key() {
+        let result: Result<RootFileConfig, _> =
+            toml::from_str("[tool_call.process_runner]\nenabled=true\nunexpected=true\n");
+        assert!(result.is_err(), "unknown process runner keys must be rejected");
+    }
+
+    #[test]
     fn journal_db_path_rejects_parent_traversal() {
         let result = parse_journal_db_path("../secrets/journal.sqlite3");
         assert!(result.is_err(), "journal db path must reject parent traversal");
@@ -733,5 +902,44 @@ mod tests {
     fn parse_tool_allowlist_rejects_invalid_characters() {
         let result = parse_tool_allowlist("palyra.echo,../shell", "tool_call.allowed_tools");
         assert!(result.is_err(), "allowlist parser must reject invalid tool names");
+    }
+
+    #[test]
+    fn parse_process_executable_allowlist_normalizes_and_deduplicates_values() {
+        let parsed = parse_process_executable_allowlist(
+            "rustc, cargo ,rustc,,",
+            "tool_call.process_runner.allowed_executables",
+        )
+        .expect("allowlist should parse");
+        assert_eq!(parsed, vec!["rustc".to_owned(), "cargo".to_owned()]);
+    }
+
+    #[test]
+    fn parse_host_allowlist_normalizes_and_deduplicates_values() {
+        let parsed = parse_host_allowlist(
+            "EXAMPLE.COM, api.example.com.,example.com",
+            "tool_call.process_runner.allowed_egress_hosts",
+        )
+        .expect("host allowlist should parse");
+        assert_eq!(parsed, vec!["example.com".to_owned(), "api.example.com".to_owned()]);
+    }
+
+    #[test]
+    fn parse_dns_suffix_allowlist_normalizes_and_deduplicates_values() {
+        let parsed = parse_dns_suffix_allowlist(
+            "example.com,.corp.local,example.com",
+            "tool_call.process_runner.allowed_dns_suffixes",
+        )
+        .expect("dns suffix allowlist should parse");
+        assert_eq!(parsed, vec![".example.com".to_owned(), ".corp.local".to_owned()]);
+    }
+
+    #[test]
+    fn parse_dns_suffix_allowlist_rejects_invalid_values() {
+        let result = parse_dns_suffix_allowlist(
+            "..example.com",
+            "tool_call.process_runner.allowed_dns_suffixes",
+        );
+        assert!(result.is_err(), "dns suffix allowlist must reject malformed entries");
     }
 }

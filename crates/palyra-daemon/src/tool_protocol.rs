@@ -4,13 +4,19 @@ use palyra_policy::{evaluate_with_config, PolicyDecision, PolicyEvaluationConfig
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use tracing::warn;
 use ulid::Ulid;
+
+use crate::sandbox_runner::{
+    run_constrained_process, SandboxProcessRunErrorKind, SandboxProcessRunnerPolicy,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCallConfig {
     pub allowed_tools: Vec<String>,
     pub max_calls_per_run: u32,
     pub execution_timeout_ms: u64,
+    pub process_runner: SandboxProcessRunnerPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +49,19 @@ pub struct ToolCallPolicySnapshot {
     pub allowed_tools: Vec<String>,
     pub max_calls_per_run: u32,
     pub execution_timeout_ms: u64,
+    pub process_runner: ProcessRunnerPolicySnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ProcessRunnerPolicySnapshot {
+    pub enabled: bool,
+    pub workspace_root: String,
+    pub allowed_executables: Vec<String>,
+    pub allowed_egress_hosts: Vec<String>,
+    pub allowed_dns_suffixes: Vec<String>,
+    pub cpu_time_limit_ms: u64,
+    pub memory_limit_bytes: u64,
+    pub max_output_bytes: u64,
 }
 
 const BUDGET_DENY_REASON: &str = "tool execution budget exhausted for run";
@@ -55,6 +74,16 @@ pub fn tool_policy_snapshot(config: &ToolCallConfig) -> ToolCallPolicySnapshot {
         allowed_tools: config.allowed_tools.clone(),
         max_calls_per_run: config.max_calls_per_run,
         execution_timeout_ms: config.execution_timeout_ms,
+        process_runner: ProcessRunnerPolicySnapshot {
+            enabled: config.process_runner.enabled,
+            workspace_root: config.process_runner.workspace_root.to_string_lossy().into_owned(),
+            allowed_executables: config.process_runner.allowed_executables.clone(),
+            allowed_egress_hosts: config.process_runner.allowed_egress_hosts.clone(),
+            allowed_dns_suffixes: config.process_runner.allowed_dns_suffixes.clone(),
+            cpu_time_limit_ms: config.process_runner.cpu_time_limit_ms,
+            memory_limit_bytes: config.process_runner.memory_limit_bytes,
+            max_output_bytes: config.process_runner.max_output_bytes,
+        },
     }
 }
 
@@ -169,32 +198,19 @@ pub async fn execute_tool_call(
     input_json: &[u8],
 ) -> ToolExecutionOutcome {
     let timeout = Duration::from_millis(config.execution_timeout_ms);
-    let raw = match tokio::time::timeout(timeout, run_allowlisted_tool(tool_name, input_json)).await
-    {
-        Ok(result) => match result {
-            Ok(output_json) => ToolExecutionRawResult {
-                success: true,
-                output_json,
-                error: String::new(),
-                timed_out: false,
-                executor: "builtin".to_owned(),
-            },
-            Err(error) => ToolExecutionRawResult {
+    let raw =
+        match tokio::time::timeout(timeout, run_allowlisted_tool(config, tool_name, input_json))
+            .await
+        {
+            Ok(raw) => raw,
+            Err(_) => ToolExecutionRawResult {
                 success: false,
                 output_json: b"{}".to_vec(),
-                error,
-                timed_out: false,
-                executor: "builtin".to_owned(),
+                error: format!("tool execution timed out after {}ms", config.execution_timeout_ms),
+                timed_out: true,
+                executor: tool_executor_name(tool_name).to_owned(),
             },
-        },
-        Err(_) => ToolExecutionRawResult {
-            success: false,
-            output_json: b"{}".to_vec(),
-            error: format!("tool execution timed out after {}ms", config.execution_timeout_ms),
-            timed_out: true,
-            executor: "builtin".to_owned(),
-        },
-    };
+        };
 
     build_execution_outcome(proposal_id, tool_name, input_json, raw)
 }
@@ -240,16 +256,109 @@ fn build_execution_outcome(
     }
 }
 
-async fn run_allowlisted_tool(tool_name: &str, input_json: &[u8]) -> Result<Vec<u8>, String> {
+async fn run_allowlisted_tool(
+    config: &ToolCallConfig,
+    tool_name: &str,
+    input_json: &[u8],
+) -> ToolExecutionRawResult {
     match tool_name {
-        "palyra.echo" => execute_echo_tool(input_json),
-        "palyra.sleep" => execute_sleep_tool(input_json).await,
-        _ => Err("allowlisted tool is not implemented by runtime executor".to_owned()),
+        "palyra.echo" => match execute_echo_tool(input_json) {
+            Ok(output_json) => ToolExecutionRawResult {
+                success: true,
+                output_json,
+                error: String::new(),
+                timed_out: false,
+                executor: "builtin".to_owned(),
+            },
+            Err(error) => ToolExecutionRawResult {
+                success: false,
+                output_json: b"{}".to_vec(),
+                error,
+                timed_out: false,
+                executor: "builtin".to_owned(),
+            },
+        },
+        "palyra.sleep" => match execute_sleep_tool(input_json).await {
+            Ok(output_json) => ToolExecutionRawResult {
+                success: true,
+                output_json,
+                error: String::new(),
+                timed_out: false,
+                executor: "builtin".to_owned(),
+            },
+            Err(error) => ToolExecutionRawResult {
+                success: false,
+                output_json: b"{}".to_vec(),
+                error,
+                timed_out: false,
+                executor: "builtin".to_owned(),
+            },
+        },
+        "palyra.process.run" => execute_process_runner_tool(config, input_json).await,
+        _ => ToolExecutionRawResult {
+            success: false,
+            output_json: b"{}".to_vec(),
+            error: "allowlisted tool is not implemented by runtime executor".to_owned(),
+            timed_out: false,
+            executor: "builtin".to_owned(),
+        },
     }
 }
 
 fn is_runtime_supported_tool(tool_name: &str) -> bool {
-    matches!(tool_name, "palyra.echo" | "palyra.sleep")
+    matches!(tool_name, "palyra.echo" | "palyra.sleep" | "palyra.process.run")
+}
+
+fn tool_executor_name(tool_name: &str) -> &'static str {
+    if tool_name == "palyra.process.run" {
+        "sandbox_tier_b"
+    } else {
+        "builtin"
+    }
+}
+
+async fn execute_process_runner_tool(
+    config: &ToolCallConfig,
+    input_json: &[u8],
+) -> ToolExecutionRawResult {
+    let policy = config.process_runner.clone();
+    let input = input_json.to_vec();
+    let timeout = Duration::from_millis(config.execution_timeout_ms);
+    match tokio::task::spawn_blocking(move || {
+        run_constrained_process(&policy, input.as_slice(), timeout)
+    })
+    .await
+    {
+        Ok(Ok(success)) => ToolExecutionRawResult {
+            success: true,
+            output_json: success.output_json,
+            error: String::new(),
+            timed_out: false,
+            executor: "sandbox_tier_b".to_owned(),
+        },
+        Ok(Err(error)) => {
+            if matches!(
+                error.kind,
+                SandboxProcessRunErrorKind::QuotaExceeded | SandboxProcessRunErrorKind::TimedOut
+            ) {
+                warn!(error = %error.message, "sandbox process runner terminated execution due to quota");
+            }
+            ToolExecutionRawResult {
+                success: false,
+                output_json: b"{}".to_vec(),
+                error: error.message,
+                timed_out: matches!(error.kind, SandboxProcessRunErrorKind::TimedOut),
+                executor: "sandbox_tier_b".to_owned(),
+            }
+        }
+        Err(join_error) => ToolExecutionRawResult {
+            success: false,
+            output_json: b"{}".to_vec(),
+            error: format!("sandbox process runner worker failed: {join_error}"),
+            timed_out: false,
+            executor: "sandbox_tier_b".to_owned(),
+        },
+    }
 }
 
 fn execute_echo_tool(input_json: &[u8]) -> Result<Vec<u8>, String> {
@@ -334,12 +443,27 @@ mod tests {
         decide_tool_call, denied_execution_outcome, execute_tool_call, tool_policy_snapshot,
         ToolCallConfig,
     };
+    use crate::sandbox_runner::SandboxProcessRunnerPolicy;
+
+    fn default_process_runner_policy() -> SandboxProcessRunnerPolicy {
+        SandboxProcessRunnerPolicy {
+            enabled: false,
+            workspace_root: std::env::current_dir().unwrap_or_else(|_| ".".into()),
+            allowed_executables: Vec::new(),
+            allowed_egress_hosts: Vec::new(),
+            allowed_dns_suffixes: Vec::new(),
+            cpu_time_limit_ms: 2_000,
+            memory_limit_bytes: 256 * 1024 * 1024,
+            max_output_bytes: 64 * 1024,
+        }
+    }
 
     fn allowlisted_config() -> ToolCallConfig {
         ToolCallConfig {
             allowed_tools: vec!["palyra.echo".to_owned(), "palyra.sleep".to_owned()],
             max_calls_per_run: 2,
             execution_timeout_ms: 250,
+            process_runner: default_process_runner_policy(),
         }
     }
 
@@ -349,6 +473,7 @@ mod tests {
             allowed_tools: Vec::new(),
             max_calls_per_run: 2,
             execution_timeout_ms: 250,
+            process_runner: default_process_runner_policy(),
         };
         let mut budget = 2;
         let decision = decide_tool_call(&config, &mut budget, "user:ops", "palyra.echo");
@@ -377,6 +502,7 @@ mod tests {
             allowed_tools: vec!["custom.noop".to_owned()],
             max_calls_per_run: 2,
             execution_timeout_ms: 250,
+            process_runner: default_process_runner_policy(),
         };
         let mut budget = config.max_calls_per_run;
         let decision = decide_tool_call(&config, &mut budget, "user:ops", "custom.noop");
@@ -391,6 +517,7 @@ mod tests {
             allowed_tools: vec!["shell.exec".to_owned()],
             max_calls_per_run: 2,
             execution_timeout_ms: 250,
+            process_runner: default_process_runner_policy(),
         };
         let mut budget = config.max_calls_per_run;
 
@@ -426,6 +553,7 @@ mod tests {
             allowed_tools: vec!["palyra.sleep".to_owned()],
             max_calls_per_run: 1,
             execution_timeout_ms: 5,
+            process_runner: default_process_runner_policy(),
         };
         let outcome = execute_tool_call(
             &config,
@@ -436,6 +564,72 @@ mod tests {
         .await;
         assert!(!outcome.success, "sleep tool should time out under a tiny timeout budget");
         assert!(outcome.attestation.timed_out, "attestation must record timeout");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg(unix)]
+    async fn execute_tool_call_runs_sandbox_process_runner() {
+        if std::process::Command::new("rustc").arg("--version").output().is_err() {
+            return;
+        }
+        let config = ToolCallConfig {
+            allowed_tools: vec!["palyra.process.run".to_owned()],
+            max_calls_per_run: 1,
+            execution_timeout_ms: 2_000,
+            process_runner: SandboxProcessRunnerPolicy {
+                enabled: true,
+                workspace_root: std::env::current_dir().expect("current_dir should resolve"),
+                allowed_executables: vec!["rustc".to_owned()],
+                allowed_egress_hosts: Vec::new(),
+                allowed_dns_suffixes: Vec::new(),
+                cpu_time_limit_ms: 2_000,
+                memory_limit_bytes: 128 * 1024 * 1024,
+                max_output_bytes: 64 * 1024,
+            },
+        };
+
+        let outcome = execute_tool_call(
+            &config,
+            "01ARZ3NDEKTSV4RRFFQ69G5FA2",
+            "palyra.process.run",
+            br#"{"command":"rustc","args":["--version"]}"#,
+        )
+        .await;
+
+        assert!(outcome.success, "sandbox process runner should execute allowlisted command");
+        assert_eq!(outcome.attestation.executor, "sandbox_tier_b");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg(unix)]
+    async fn execute_tool_call_denies_sandbox_path_traversal() {
+        let config = ToolCallConfig {
+            allowed_tools: vec!["palyra.process.run".to_owned()],
+            max_calls_per_run: 1,
+            execution_timeout_ms: 2_000,
+            process_runner: SandboxProcessRunnerPolicy {
+                enabled: true,
+                workspace_root: std::env::current_dir().expect("current_dir should resolve"),
+                allowed_executables: vec!["rustc".to_owned()],
+                allowed_egress_hosts: Vec::new(),
+                allowed_dns_suffixes: Vec::new(),
+                cpu_time_limit_ms: 2_000,
+                memory_limit_bytes: 128 * 1024 * 1024,
+                max_output_bytes: 64 * 1024,
+            },
+        };
+
+        let outcome = execute_tool_call(
+            &config,
+            "01ARZ3NDEKTSV4RRFFQ69G5FA2",
+            "palyra.process.run",
+            br#"{"command":"rustc","args":["../outside.txt"]}"#,
+        )
+        .await;
+
+        assert!(!outcome.success, "sandbox runner must block traversal path");
+        assert_eq!(outcome.attestation.executor, "sandbox_tier_b");
+        assert!(outcome.error.contains("path traversal"));
     }
 
     #[test]

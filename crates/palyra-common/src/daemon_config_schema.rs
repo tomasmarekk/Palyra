@@ -55,6 +55,20 @@ pub struct FileToolCallConfig {
     pub allowed_tools: Option<Vec<String>>,
     pub max_calls_per_run: Option<u32>,
     pub execution_timeout_ms: Option<u64>,
+    pub process_runner: Option<FileProcessRunnerConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileProcessRunnerConfig {
+    pub enabled: Option<bool>,
+    pub workspace_root: Option<String>,
+    pub allowed_executables: Option<Vec<String>>,
+    pub allowed_egress_hosts: Option<Vec<String>>,
+    pub allowed_dns_suffixes: Option<Vec<String>>,
+    pub cpu_time_limit_ms: Option<u64>,
+    pub memory_limit_bytes: Option<u64>,
+    pub max_output_bytes: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]

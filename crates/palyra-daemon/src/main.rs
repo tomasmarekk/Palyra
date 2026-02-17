@@ -3,6 +3,7 @@ mod gateway;
 mod journal;
 mod model_provider;
 mod orchestrator;
+mod sandbox_runner;
 mod tool_protocol;
 
 use std::time::Instant;
@@ -124,6 +125,28 @@ async fn main() -> Result<()> {
                 allowed_tools: loaded.tool_call.allowed_tools.clone(),
                 max_calls_per_run: loaded.tool_call.max_calls_per_run,
                 execution_timeout_ms: loaded.tool_call.execution_timeout_ms,
+                process_runner: sandbox_runner::SandboxProcessRunnerPolicy {
+                    enabled: loaded.tool_call.process_runner.enabled,
+                    workspace_root: loaded.tool_call.process_runner.workspace_root.clone(),
+                    allowed_executables: loaded
+                        .tool_call
+                        .process_runner
+                        .allowed_executables
+                        .clone(),
+                    allowed_egress_hosts: loaded
+                        .tool_call
+                        .process_runner
+                        .allowed_egress_hosts
+                        .clone(),
+                    allowed_dns_suffixes: loaded
+                        .tool_call
+                        .process_runner
+                        .allowed_dns_suffixes
+                        .clone(),
+                    cpu_time_limit_ms: loaded.tool_call.process_runner.cpu_time_limit_ms,
+                    memory_limit_bytes: loaded.tool_call.process_runner.memory_limit_bytes,
+                    max_output_bytes: loaded.tool_call.process_runner.max_output_bytes,
+                },
             },
         },
         GatewayJournalConfigSnapshot {
@@ -172,6 +195,14 @@ async fn main() -> Result<()> {
         tool_call_allowed_tools = ?loaded.tool_call.allowed_tools,
         tool_call_max_calls_per_run = loaded.tool_call.max_calls_per_run,
         tool_call_execution_timeout_ms = loaded.tool_call.execution_timeout_ms,
+        tool_call_process_runner_enabled = loaded.tool_call.process_runner.enabled,
+        tool_call_process_runner_workspace_root = %loaded.tool_call.process_runner.workspace_root.display(),
+        tool_call_process_runner_allowed_executables = ?loaded.tool_call.process_runner.allowed_executables,
+        tool_call_process_runner_allowed_egress_hosts = ?loaded.tool_call.process_runner.allowed_egress_hosts,
+        tool_call_process_runner_allowed_dns_suffixes = ?loaded.tool_call.process_runner.allowed_dns_suffixes,
+        tool_call_process_runner_cpu_time_limit_ms = loaded.tool_call.process_runner.cpu_time_limit_ms,
+        tool_call_process_runner_memory_limit_bytes = loaded.tool_call.process_runner.memory_limit_bytes,
+        tool_call_process_runner_max_output_bytes = loaded.tool_call.process_runner.max_output_bytes,
         admin_auth_required = loaded.admin.require_auth,
         admin_token_configured = loaded.admin.auth_token.is_some(),
         node_rpc_mtls_required = !loaded.identity.allow_insecure_node_rpc_without_mtls,

@@ -28,6 +28,7 @@ ed25519-dalek = { version = "2.1.1", features = ["rand_core"] }
 hex = "0.4.3"
 hkdf = "0.12.4"
 proptest = "1.6.0"
+libc = "0.2.171"
 protoc-bin-vendored = "3.0.0"
 prost = "0.13.5"
 rand = "0.8.5"
