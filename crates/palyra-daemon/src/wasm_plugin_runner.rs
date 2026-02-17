@@ -40,6 +40,7 @@ pub enum WasmPluginRunErrorKind {
     Disabled,
     InvalidInput,
     CapabilityDenied,
+    TimedOut,
     QuotaExceeded,
     RuntimeFailure,
 }
@@ -70,6 +71,7 @@ struct RequestedCapabilities {
 pub fn run_wasm_plugin(
     policy: &WasmPluginRunnerPolicy,
     input_json: &[u8],
+    timeout: Duration,
 ) -> Result<WasmPluginRunSuccess, WasmPluginRunError> {
     if !policy.enabled {
         return Err(WasmPluginRunError {
@@ -168,7 +170,12 @@ pub fn run_wasm_plugin(
     let runtime = WasmRuntime::new_with_limits(limits).map_err(map_runtime_error)?;
     let started_at = Instant::now();
     let execution = runtime
-        .execute_i32_entrypoint(module_bytes.as_slice(), entrypoint.as_str(), &grants)
+        .execute_i32_entrypoint_with_timeout(
+            module_bytes.as_slice(),
+            entrypoint.as_str(),
+            &grants,
+            timeout,
+        )
         .map_err(map_runtime_error)?;
     let duration = started_at.elapsed();
     let output_json = serde_json::to_vec(&json!({
@@ -301,7 +308,10 @@ fn normalize_host_allowlist(
     {
         let value = candidate.trim_end_matches('.').to_ascii_lowercase();
         if value.is_empty() {
-            continue;
+            return Err(WasmPluginRunError {
+                kind: WasmPluginRunErrorKind::InvalidInput,
+                message: format!("{source_name} contains invalid host '{candidate}'"),
+            });
         }
         if !value
             .chars()
@@ -372,6 +382,10 @@ fn normalize_storage_prefix_allowlist(
 
 fn map_runtime_error(error: RuntimeError) -> WasmPluginRunError {
     match error {
+        RuntimeError::ExecutionTimedOut => WasmPluginRunError {
+            kind: WasmPluginRunErrorKind::TimedOut,
+            message: "palyra.plugin.run execution timed out".to_owned(),
+        },
         RuntimeError::ExecutionLimitExceeded => WasmPluginRunError {
             kind: WasmPluginRunErrorKind::QuotaExceeded,
             message: "palyra.plugin.run execution exceeded wasm runtime quota".to_owned(),
@@ -403,6 +417,8 @@ fn duration_to_millis(duration: Duration) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{run_wasm_plugin, WasmPluginRunErrorKind, WasmPluginRunnerPolicy};
     use serde_json::Value;
 
@@ -428,6 +444,7 @@ mod tests {
         let error = run_wasm_plugin(
             &policy,
             br#"{"module_wat":"(module (func (export \"run\") (result i32) i32.const 1))"}"#,
+            Duration::from_secs(2),
         )
         .expect_err("disabled runner must fail closed");
         assert_eq!(error.kind, WasmPluginRunErrorKind::Disabled);
@@ -463,7 +480,7 @@ mod tests {
         });
         let input_json = serde_json::to_vec(&input).expect("input JSON should serialize");
 
-        let success = run_wasm_plugin(&policy, input_json.as_slice())
+        let success = run_wasm_plugin(&policy, input_json.as_slice(), Duration::from_secs(2))
             .expect("capability-allowlisted wasm module should execute");
         let output: Value =
             serde_json::from_slice(&success.output_json).expect("output_json should parse");
@@ -490,7 +507,7 @@ mod tests {
         });
         let input_json = serde_json::to_vec(&input).expect("input JSON should serialize");
 
-        let error = run_wasm_plugin(&policy, input_json.as_slice())
+        let error = run_wasm_plugin(&policy, input_json.as_slice(), Duration::from_secs(2))
             .expect_err("non-allowlisted capability request must fail");
 
         assert_eq!(error.kind, WasmPluginRunErrorKind::CapabilityDenied);
@@ -506,7 +523,7 @@ mod tests {
         });
         let input_json = serde_json::to_vec(&input).expect("input JSON should serialize");
 
-        let error = run_wasm_plugin(&policy, input_json.as_slice())
+        let error = run_wasm_plugin(&policy, input_json.as_slice(), Duration::from_secs(2))
             .expect_err("oversized module payload must be denied");
 
         assert_eq!(error.kind, WasmPluginRunErrorKind::QuotaExceeded);
@@ -530,9 +547,74 @@ mod tests {
         });
         let input_json = serde_json::to_vec(&input).expect("input JSON should serialize");
 
-        let error = run_wasm_plugin(&policy, input_json.as_slice())
+        let error = run_wasm_plugin(&policy, input_json.as_slice(), Duration::from_secs(2))
             .expect_err("infinite loop plugin should hit runtime fuel quota");
 
         assert_eq!(error.kind, WasmPluginRunErrorKind::QuotaExceeded);
+    }
+
+    #[test]
+    fn run_wasm_plugin_reports_wall_clock_timeout() {
+        let mut policy = test_policy();
+        policy.fuel_budget = 1_000_000_000;
+        let input = serde_json::json!({
+            "module_wat": r#"
+                (module
+                    (func (export "run") (result i32)
+                        (loop
+                            br 0
+                        )
+                        i32.const 0
+                    )
+                )
+            "#
+        });
+        let input_json = serde_json::to_vec(&input).expect("input JSON should serialize");
+
+        let error = run_wasm_plugin(&policy, input_json.as_slice(), Duration::from_millis(10))
+            .expect_err("infinite loop plugin should hit wall-clock timeout");
+
+        assert_eq!(error.kind, WasmPluginRunErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn run_wasm_plugin_rejects_dot_only_host_entries() {
+        let policy = test_policy();
+        let input = serde_json::json!({
+            "module_wat": "(module (func (export \"run\") (result i32) i32.const 1))",
+            "capabilities": {
+                "http_hosts": ["..."]
+            }
+        });
+        let input_json = serde_json::to_vec(&input).expect("input JSON should serialize");
+
+        let error = run_wasm_plugin(&policy, input_json.as_slice(), Duration::from_secs(2))
+            .expect_err("dot-only host capability must fail fast");
+
+        assert_eq!(error.kind, WasmPluginRunErrorKind::InvalidInput);
+        assert!(error.message.contains("invalid host"), "error should name host validation");
+    }
+
+    #[test]
+    fn run_wasm_plugin_reports_import_contract_mismatch_as_invalid_input() {
+        let policy = test_policy();
+        let input = serde_json::json!({
+            "module_wat": r#"
+                (module
+                    (import "palyra:plugins/host-capabilities@0.1.0" "http-count" (func $http_count (param i32) (result i32)))
+                    (func (export "run") (result i32) i32.const 7)
+                )
+            "#
+        });
+        let input_json = serde_json::to_vec(&input).expect("input JSON should serialize");
+
+        let error = run_wasm_plugin(&policy, input_json.as_slice(), Duration::from_secs(2))
+            .expect_err("invalid import contract must fail");
+
+        assert_eq!(error.kind, WasmPluginRunErrorKind::InvalidInput);
+        assert!(
+            error.message.contains("import contract"),
+            "error should explain host capability import contract mismatch"
+        );
     }
 }

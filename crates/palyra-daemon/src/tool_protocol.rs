@@ -226,8 +226,10 @@ pub async fn execute_tool_call(
     tool_name: &str,
     input_json: &[u8],
 ) -> ToolExecutionOutcome {
-    let timeout = Duration::from_millis(config.execution_timeout_ms);
-    let raw =
+    let raw = if tool_name == "palyra.plugin.run" {
+        run_allowlisted_tool(config, tool_name, input_json).await
+    } else {
+        let timeout = Duration::from_millis(config.execution_timeout_ms);
         match tokio::time::timeout(timeout, run_allowlisted_tool(config, tool_name, input_json))
             .await
         {
@@ -239,7 +241,8 @@ pub async fn execute_tool_call(
                 timed_out: true,
                 executor: tool_executor_name(tool_name).to_owned(),
             },
-        };
+        }
+    };
 
     build_execution_outcome(proposal_id, tool_name, input_json, raw)
 }
@@ -399,7 +402,10 @@ async fn execute_wasm_plugin_tool(
 ) -> ToolExecutionRawResult {
     let policy = config.wasm_runtime.clone();
     let input = input_json.to_vec();
-    match tokio::task::spawn_blocking(move || run_wasm_plugin(&policy, input.as_slice())).await {
+    let timeout = Duration::from_millis(config.execution_timeout_ms);
+    match tokio::task::spawn_blocking(move || run_wasm_plugin(&policy, input.as_slice(), timeout))
+        .await
+    {
         Ok(Ok(success)) => ToolExecutionRawResult {
             success: true,
             output_json: success.output_json,
@@ -408,14 +414,20 @@ async fn execute_wasm_plugin_tool(
             executor: "sandbox_tier_a".to_owned(),
         },
         Ok(Err(error)) => {
-            if matches!(error.kind, WasmPluginRunErrorKind::QuotaExceeded) {
-                warn!(error = %error.message, "sandbox wasm runtime terminated execution due to quota");
+            if matches!(
+                error.kind,
+                WasmPluginRunErrorKind::QuotaExceeded | WasmPluginRunErrorKind::TimedOut
+            ) {
+                warn!(
+                    error = %error.message,
+                    "sandbox wasm runtime terminated execution due to quota or timeout"
+                );
             }
             ToolExecutionRawResult {
                 success: false,
                 output_json: b"{}".to_vec(),
                 error: error.message,
-                timed_out: false,
+                timed_out: matches!(error.kind, WasmPluginRunErrorKind::TimedOut),
                 executor: "sandbox_tier_a".to_owned(),
             }
         }
@@ -760,6 +772,45 @@ mod tests {
         let output: serde_json::Value =
             serde_json::from_slice(&outcome.output_json).expect("output should parse");
         assert_eq!(output.get("exit_code").and_then(serde_json::Value::as_i64), Some(1));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn execute_tool_call_marks_wasm_timeout_in_attestation() {
+        let config = ToolCallConfig {
+            allowed_tools: vec!["palyra.plugin.run".to_owned()],
+            max_calls_per_run: 1,
+            execution_timeout_ms: 10,
+            process_runner: default_process_runner_policy(),
+            wasm_runtime: WasmPluginRunnerPolicy {
+                enabled: true,
+                max_module_size_bytes: 256 * 1024,
+                fuel_budget: 1_000_000_000,
+                max_memory_bytes: 64 * 1024 * 1024,
+                max_table_elements: 100_000,
+                max_instances: 256,
+                allowed_http_hosts: Vec::new(),
+                allowed_secrets: Vec::new(),
+                allowed_storage_prefixes: Vec::new(),
+                allowed_channels: Vec::new(),
+            },
+        };
+
+        let outcome = execute_tool_call(
+            &config,
+            "01ARZ3NDEKTSV4RRFFQ69G5FA2",
+            "palyra.plugin.run",
+            br#"{
+                "module_wat":"(module (func (export \"run\") (result i32) (loop (br 0)) i32.const 0))"
+            }"#,
+        )
+        .await;
+
+        assert!(!outcome.success, "infinite loop plugin must time out");
+        assert_eq!(outcome.attestation.executor, "sandbox_tier_a");
+        assert!(
+            outcome.attestation.timed_out,
+            "attestation must record wasm runtime wall-clock timeout"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

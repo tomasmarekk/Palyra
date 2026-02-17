@@ -15,7 +15,8 @@ use crate::orchestrator::{estimate_token_count, split_model_tokens, MAX_MODEL_TO
 
 const OPENAI_CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 const OPENAI_RETRYABLE_STATUS_CODES: &[u16] = &[429, 500, 502, 503, 504];
-const MAX_TOOL_ARGUMENT_BYTES: usize = 16 * 1024;
+// Keep provider envelope above default wasm module quota (256KiB) including base64 and JSON overhead.
+const MAX_TOOL_ARGUMENT_BYTES: usize = 512 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelProviderKind {
@@ -776,6 +777,20 @@ mod tests {
             snapshot_json.contains("\"api_key_configured\":true"),
             "status snapshot should surface whether an API key is configured"
         );
+    }
+
+    #[test]
+    fn normalize_tool_arguments_accepts_large_json_payload_within_limit() {
+        let json_overhead = r#"{"text":""}"#.len();
+        let payload = format!(
+            r#"{{"text":"{}"}}"#,
+            "a".repeat(super::MAX_TOOL_ARGUMENT_BYTES - json_overhead)
+        );
+
+        let normalized = normalize_tool_arguments(payload.as_str())
+            .expect("payload within byte limit should be accepted");
+
+        assert_eq!(normalized.len(), super::MAX_TOOL_ARGUMENT_BYTES);
     }
 
     #[test]

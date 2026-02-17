@@ -1,3 +1,5 @@
+use std::{sync::mpsc, time::Duration};
+
 use palyra_plugins_sdk::{
     HOST_CAPABILITIES_IMPORT_MODULE, HOST_CAPABILITY_CHANNEL_COUNT_FN,
     HOST_CAPABILITY_CHANNEL_HANDLE_FN, HOST_CAPABILITY_HTTP_COUNT_FN,
@@ -15,6 +17,8 @@ const HTTP_HANDLE_BASE: i32 = 10_000;
 const SECRET_HANDLE_BASE: i32 = 20_000;
 const STORAGE_HANDLE_BASE: i32 = 30_000;
 const CHANNEL_HANDLE_BASE: i32 = 40_000;
+const EPOCH_DEADLINE_TICKS_WITH_TIMEOUT: u64 = 1;
+const EPOCH_DEADLINE_TICKS_WITHOUT_TIMEOUT: u64 = 1_000_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeLimits {
@@ -90,6 +94,8 @@ pub enum RuntimeError {
     Linker(wasmtime::Error),
     #[error("wasm execution failed: {0}")]
     Execution(wasmtime::Error),
+    #[error("wasm execution timed out")]
+    ExecutionTimedOut,
     #[error("failed to resolve exported function '{0}'")]
     MissingExport(String),
     #[error("wasm execution exceeded runtime limits")]
@@ -109,6 +115,7 @@ impl WasmRuntime {
     pub fn new_with_limits(limits: RuntimeLimits) -> Result<Self, RuntimeError> {
         let mut config = Config::new();
         config.consume_fuel(true);
+        config.epoch_interruption(true);
         let engine = Engine::new(&config)?;
         Ok(Self { engine, limits })
     }
@@ -129,6 +136,26 @@ impl WasmRuntime {
         entrypoint: &str,
         capabilities: &CapabilityGrantSet,
     ) -> Result<WasmExecutionResult, RuntimeError> {
+        self.execute_i32_entrypoint_internal(module_bytes, entrypoint, capabilities, None)
+    }
+
+    pub fn execute_i32_entrypoint_with_timeout(
+        &self,
+        module_bytes: &[u8],
+        entrypoint: &str,
+        capabilities: &CapabilityGrantSet,
+        timeout: Duration,
+    ) -> Result<WasmExecutionResult, RuntimeError> {
+        self.execute_i32_entrypoint_internal(module_bytes, entrypoint, capabilities, Some(timeout))
+    }
+
+    fn execute_i32_entrypoint_internal(
+        &self,
+        module_bytes: &[u8],
+        entrypoint: &str,
+        capabilities: &CapabilityGrantSet,
+        timeout: Option<Duration>,
+    ) -> Result<WasmExecutionResult, RuntimeError> {
         let module = Module::new(&self.engine, module_bytes)?;
         let capability_handles = CapabilityHandles::from_grants(capabilities);
         let store_limits = StoreLimitsBuilder::new()
@@ -145,6 +172,9 @@ impl WasmRuntime {
         );
         store.limiter(|state| &mut state.limits);
         store.set_fuel(self.limits.fuel_budget)?;
+        configure_epoch_deadline(&mut store, timeout.is_some());
+        let _timeout_guard =
+            timeout.map(|duration| arm_epoch_timeout_guard(self.engine.clone(), duration));
         let instance = self.instantiate_with_linker(&module, &mut store)?;
         let function: TypedFunc<(), i32> = instance
             .get_typed_func(&mut store, entrypoint)
@@ -164,7 +194,7 @@ impl WasmRuntime {
         register_capability_bindings(&mut linker)?;
         linker
             .instantiate(&mut *store, module)
-            .map_err(|error| map_execution_error_with_store(error, store))
+            .map_err(|error| map_instantiate_error_with_store(error, store))
     }
 }
 
@@ -270,20 +300,86 @@ fn resolve_capability_handle(handles: &[i32], index: i32) -> i32 {
     handles.get(index as usize).copied().unwrap_or(-1)
 }
 
+fn configure_epoch_deadline(store: &mut Store<RuntimeStoreState>, timeout_enabled: bool) {
+    #[cfg(target_has_atomic = "64")]
+    {
+        let delta = if timeout_enabled {
+            EPOCH_DEADLINE_TICKS_WITH_TIMEOUT
+        } else {
+            EPOCH_DEADLINE_TICKS_WITHOUT_TIMEOUT
+        };
+        store.set_epoch_deadline(delta);
+    }
+    #[cfg(not(target_has_atomic = "64"))]
+    let _ = (store, timeout_enabled);
+}
+
+struct EpochTimeoutGuard {
+    cancel_tx: Option<mpsc::Sender<()>>,
+}
+
+impl Drop for EpochTimeoutGuard {
+    fn drop(&mut self) {
+        if let Some(cancel_tx) = self.cancel_tx.take() {
+            let _ = cancel_tx.send(());
+        }
+    }
+}
+
+fn arm_epoch_timeout_guard(engine: Engine, timeout: Duration) -> EpochTimeoutGuard {
+    #[cfg(target_has_atomic = "64")]
+    {
+        let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
+        std::thread::spawn(move || match cancel_rx.recv_timeout(timeout) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => engine.increment_epoch(),
+        });
+        EpochTimeoutGuard { cancel_tx: Some(cancel_tx) }
+    }
+    #[cfg(not(target_has_atomic = "64"))]
+    {
+        let _ = (engine, timeout);
+        EpochTimeoutGuard { cancel_tx: None }
+    }
+}
+
+fn map_instantiate_error_with_store(
+    error: wasmtime::Error,
+    store: &Store<RuntimeStoreState>,
+) -> RuntimeError {
+    if is_timeout_error(&error) {
+        return RuntimeError::ExecutionTimedOut;
+    }
+    if is_execution_limit_error(&error, store) {
+        return RuntimeError::ExecutionLimitExceeded;
+    }
+    RuntimeError::Linker(error)
+}
+
 fn map_execution_error_with_store(
     error: wasmtime::Error,
     store: &Store<RuntimeStoreState>,
 ) -> RuntimeError {
-    if store.get_fuel().ok() == Some(0)
+    if is_timeout_error(&error) {
+        return RuntimeError::ExecutionTimedOut;
+    }
+    if is_execution_limit_error(&error, store) {
+        return RuntimeError::ExecutionLimitExceeded;
+    }
+    RuntimeError::Execution(error)
+}
+
+fn is_timeout_error(error: &wasmtime::Error) -> bool {
+    matches!(error.downcast_ref::<wasmtime::Trap>(), Some(wasmtime::Trap::Interrupt))
+}
+
+fn is_execution_limit_error(error: &wasmtime::Error, store: &Store<RuntimeStoreState>) -> bool {
+    store.get_fuel().ok() == Some(0)
         || matches!(
             error.downcast_ref::<wasmtime::Trap>(),
             Some(wasmtime::Trap::OutOfFuel | wasmtime::Trap::AllocationTooLarge)
         )
-        || error_chain_contains_any(&error, &["resource limit exceeded", "exceeds memory limits"])
-    {
-        return RuntimeError::ExecutionLimitExceeded;
-    }
-    RuntimeError::Execution(error)
+        || error_chain_contains_any(error, &["resource limit exceeded", "exceeds memory limits"])
 }
 
 fn error_chain_contains_any(error: &wasmtime::Error, needles: &[&str]) -> bool {
@@ -319,6 +415,8 @@ fn build_handles(values: &[String], base: i32) -> Vec<i32> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{CapabilityGrantSet, RuntimeError, RuntimeLimits, WasmRuntime};
     use palyra_plugins_sdk::{
         DEFAULT_RUNTIME_ENTRYPOINT, HOST_CAPABILITIES_IMPORT_MODULE,
@@ -516,6 +614,69 @@ mod tests {
         assert!(
             matches!(result, Err(RuntimeError::Execution(_))),
             "expected execution trap error, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn runtime_interrupts_infinite_loop_with_wall_clock_timeout() {
+        let module = format!(
+            r#"
+            (module
+                (func (export "{entrypoint}") (result i32)
+                    (loop
+                        br 0
+                    )
+                    i32.const 0
+                )
+            )
+            "#,
+            entrypoint = DEFAULT_RUNTIME_ENTRYPOINT,
+        );
+        let runtime = WasmRuntime::new_with_limits(RuntimeLimits {
+            fuel_budget: 1_000_000_000,
+            ..RuntimeLimits::default()
+        })
+        .expect("runtime should initialize");
+
+        let result = runtime.execute_i32_entrypoint_with_timeout(
+            module.as_bytes(),
+            DEFAULT_RUNTIME_ENTRYPOINT,
+            &CapabilityGrantSet::default(),
+            Duration::from_millis(10),
+        );
+
+        assert!(
+            matches!(result, Err(RuntimeError::ExecutionTimedOut)),
+            "expected wall-clock timeout error, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn runtime_reports_import_contract_mismatch_as_linker_error() {
+        let module = format!(
+            r#"
+            (module
+                (import "{host_module}" "{http_count_fn}" (func $http_count (param i32) (result i32)))
+                (func (export "{entrypoint}") (result i32)
+                    i32.const 7
+                )
+            )
+            "#,
+            host_module = HOST_CAPABILITIES_IMPORT_MODULE,
+            http_count_fn = HOST_CAPABILITY_HTTP_COUNT_FN,
+            entrypoint = DEFAULT_RUNTIME_ENTRYPOINT,
+        );
+        let runtime = WasmRuntime::new().expect("runtime should initialize");
+
+        let result = runtime.execute_i32_entrypoint(
+            module.as_bytes(),
+            DEFAULT_RUNTIME_ENTRYPOINT,
+            &CapabilityGrantSet::default(),
+        );
+
+        assert!(
+            matches!(result, Err(RuntimeError::Linker(_))),
+            "expected linker/import-contract error, got: {result:?}"
         );
     }
 
