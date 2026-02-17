@@ -385,6 +385,94 @@ async fn grpc_run_stream_denies_non_allowlisted_tool_by_default() -> Result<()> 
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn grpc_run_stream_denies_allowlisted_unsupported_tool() -> Result<()> {
+    let (openai_base_url, _request_count, server_handle) =
+        spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::immediate(
+            200,
+            r#"{"choices":[{"message":{"tool_calls":[{"function":{"name":"custom.noop","arguments":"{\"payload\":\"x\"}"}}]}}]}"#
+                .to_owned(),
+        )])?;
+    let (child, admin_port, grpc_port, _journal_db_path) =
+        spawn_palyrad_with_openai_provider_and_tool_policy(
+            openai_base_url.as_str(),
+            OPENAI_API_KEY,
+            "custom.noop",
+            2,
+            250,
+        )?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+
+    let mut stream_request =
+        tonic::Request::new(tokio_stream::iter(vec![sample_run_stream_request_with_text(
+            "unsupported tool path".to_owned(),
+        )]));
+    stream_request.metadata_mut().insert("authorization", format!("Bearer {ADMIN_TOKEN}").parse()?);
+    stream_request.metadata_mut().insert("x-palyra-principal", "user:ops".parse()?);
+    stream_request.metadata_mut().insert("x-palyra-device-id", DEVICE_ID.parse()?);
+    stream_request.metadata_mut().insert("x-palyra-channel", "cli".parse()?);
+
+    let mut response_stream =
+        client.run_stream(stream_request).await.context("failed to call RunStream")?.into_inner();
+
+    let mut saw_deny_decision = false;
+    let mut saw_failed_result = false;
+    let mut saw_policy_attestation = false;
+    while let Some(event) = response_stream.next().await {
+        let event = event.context("failed to read RunStream event")?;
+        if let Some(body) = event.body {
+            match body {
+                common_v1::run_stream_event::Body::ToolDecision(decision) => {
+                    if decision.kind == common_v1::tool_decision::DecisionKind::Deny as i32 {
+                        assert!(
+                            decision.reason.contains("unsupported by runtime executor"),
+                            "deny decision should describe unsupported runtime tool"
+                        );
+                        saw_deny_decision = true;
+                    }
+                }
+                common_v1::run_stream_event::Body::ToolResult(result) => {
+                    if !result.success {
+                        assert!(
+                            result.error.contains("unsupported by runtime executor"),
+                            "denied result should carry unsupported runtime reason"
+                        );
+                        saw_failed_result = true;
+                    }
+                }
+                common_v1::run_stream_event::Body::ToolAttestation(attestation) => {
+                    if attestation.executor == "policy" {
+                        saw_policy_attestation = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    assert!(saw_deny_decision, "unsupported tool should be denied before execution");
+    assert!(saw_failed_result, "denied tool should emit failed tool result");
+    assert!(saw_policy_attestation, "denied tool should emit policy attestation");
+
+    let status_snapshot = admin_get_json_async(admin_port, "/admin/v1/status".to_owned()).await?;
+    assert_eq!(
+        status_snapshot.pointer("/counters/tool_decisions_denied").and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        status_snapshot.pointer("/counters/tool_execution_attempts").and_then(Value::as_u64),
+        Some(0)
+    );
+
+    server_handle.join().expect("scripted openai server thread should exit");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn grpc_run_stream_admin_cancel_preempts_inflight_provider_call() -> Result<()> {
     let (openai_base_url, request_count, server_handle) =
         spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::delayed(

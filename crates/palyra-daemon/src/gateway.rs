@@ -1537,7 +1537,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                                 &mut tape_seq,
                                 proposal_id.as_str(),
                                 tool_name.as_str(),
-                                input_json.clone(),
+                                input_json.as_slice(),
                             )
                             .await
                             {
@@ -1652,7 +1652,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                                 &mut tape_seq,
                                 proposal_id.as_str(),
                                 execution_outcome.success,
-                                execution_outcome.output_json.clone(),
+                                execution_outcome.output_json.as_slice(),
                                 execution_outcome.error.as_str(),
                             )
                             .await
@@ -2080,13 +2080,13 @@ async fn send_tool_proposal_with_tape(
     tape_seq: &mut i64,
     proposal_id: &str,
     tool_name: &str,
-    input_json: Vec<u8>,
+    input_json: &[u8],
 ) -> Result<(), Status> {
     let event = tool_proposal_event(
         run_id.to_owned(),
         proposal_id.to_owned(),
         tool_name.to_owned(),
-        input_json.clone(),
+        input_json.to_vec(),
     );
     sender
         .send(Ok(event))
@@ -2097,7 +2097,7 @@ async fn send_tool_proposal_with_tape(
             run_id: run_id.to_owned(),
             seq: *tape_seq,
             event_type: "tool_proposal".to_owned(),
-            payload_json: tool_proposal_tape_payload(proposal_id, tool_name, input_json.as_slice()),
+            payload_json: tool_proposal_tape_payload(proposal_id, tool_name, input_json),
         })
         .await?;
     *tape_seq += 1;
@@ -2156,14 +2156,14 @@ async fn send_tool_result_with_tape(
     tape_seq: &mut i64,
     proposal_id: &str,
     success: bool,
-    output_json: Vec<u8>,
+    output_json: &[u8],
     error: &str,
 ) -> Result<(), Status> {
     let event = tool_result_event(
         run_id.to_owned(),
         proposal_id.to_owned(),
         success,
-        output_json.clone(),
+        output_json.to_vec(),
         error.to_owned(),
     );
     sender
@@ -2175,12 +2175,7 @@ async fn send_tool_result_with_tape(
             run_id: run_id.to_owned(),
             seq: *tape_seq,
             event_type: "tool_result".to_owned(),
-            payload_json: tool_result_tape_payload(
-                proposal_id,
-                success,
-                output_json.as_slice(),
-                error,
-            ),
+            payload_json: tool_result_tape_payload(proposal_id, success, output_json, error),
         })
         .await?;
     *tape_seq += 1;
