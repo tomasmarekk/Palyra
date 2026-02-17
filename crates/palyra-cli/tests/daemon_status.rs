@@ -1,6 +1,7 @@
 use std::{
     io::{BufRead, BufReader},
     net::SocketAddr,
+    path::PathBuf,
     process::{Child, ChildStdout, Command, Stdio},
     sync::mpsc,
     thread,
@@ -135,17 +136,9 @@ fn spawn_palyrad_with_dynamic_port() -> Result<(Child, u16)> {
 }
 
 fn spawn_palyrad_with_dynamic_port_and_env(extra_env: &[(&str, &str)]) -> Result<(Child, u16)> {
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
-    let mut command = Command::new(cargo);
+    let mut command = Command::new(resolve_palyrad_binary_path()?);
     command
         .args([
-            "run",
-            "--quiet",
-            "-p",
-            "palyra-daemon",
-            "--bin",
-            "palyrad",
-            "--",
             "--bind",
             "127.0.0.1",
             "--port",
@@ -165,6 +158,21 @@ fn spawn_palyrad_with_dynamic_port_and_env(extra_env: &[(&str, &str)]) -> Result
     let stdout = child.stdout.take().context("failed to capture palyrad stdout")?;
     let port = wait_for_listen_port(stdout, &mut child)?;
     Ok((child, port))
+}
+
+fn resolve_palyrad_binary_path() -> Result<PathBuf> {
+    let mut path = std::env::current_exe().context("failed to resolve test binary path")?;
+    path.pop();
+    if path.ends_with("deps") {
+        path.pop();
+    }
+    let executable = if cfg!(windows) { "palyrad.exe" } else { "palyrad" };
+    path.push(executable);
+    if path.exists() {
+        Ok(path)
+    } else {
+        anyhow::bail!("failed to resolve palyrad binary path: {}", path.display());
+    }
 }
 
 fn wait_for_listen_port(stdout: ChildStdout, daemon: &mut Child) -> Result<u16> {

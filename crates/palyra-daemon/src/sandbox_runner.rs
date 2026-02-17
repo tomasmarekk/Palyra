@@ -538,7 +538,7 @@ fn attach_resource_limits_unix(command: &mut Command, policy: &SandboxProcessRun
                 libc::RLIMIT_CPU as libc::c_int,
                 cpu_ms_to_rlimit_seconds(cpu_time_limit_ms),
             )?;
-            set_rlimit(libc::RLIMIT_AS as libc::c_int, memory_limit_bytes as libc::rlim_t)?;
+            set_memory_rlimit(memory_limit_bytes)?;
             Ok(())
         });
     }
@@ -555,6 +555,18 @@ fn set_rlimit(resource: libc::c_int, limit: libc::rlim_t) -> std::io::Result<()>
         Ok(())
     } else {
         Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+fn set_memory_rlimit(memory_limit_bytes: u64) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        return set_rlimit(libc::RLIMIT_DATA as libc::c_int, memory_limit_bytes as libc::rlim_t);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        set_rlimit(libc::RLIMIT_AS as libc::c_int, memory_limit_bytes as libc::rlim_t)
     }
 }
 
