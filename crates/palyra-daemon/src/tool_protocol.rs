@@ -10,6 +10,7 @@ use ulid::Ulid;
 use crate::sandbox_runner::{
     run_constrained_process, SandboxProcessRunErrorKind, SandboxProcessRunnerPolicy,
 };
+use crate::wasm_plugin_runner::{run_wasm_plugin, WasmPluginRunErrorKind, WasmPluginRunnerPolicy};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCallConfig {
@@ -17,6 +18,7 @@ pub struct ToolCallConfig {
     pub max_calls_per_run: u32,
     pub execution_timeout_ms: u64,
     pub process_runner: SandboxProcessRunnerPolicy,
+    pub wasm_runtime: WasmPluginRunnerPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +52,7 @@ pub struct ToolCallPolicySnapshot {
     pub max_calls_per_run: u32,
     pub execution_timeout_ms: u64,
     pub process_runner: ProcessRunnerPolicySnapshot,
+    pub wasm_runtime: WasmRuntimePolicySnapshot,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -62,6 +65,20 @@ pub struct ProcessRunnerPolicySnapshot {
     pub cpu_time_limit_ms: u64,
     pub memory_limit_bytes: u64,
     pub max_output_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WasmRuntimePolicySnapshot {
+    pub enabled: bool,
+    pub max_module_size_bytes: u64,
+    pub fuel_budget: u64,
+    pub max_memory_bytes: u64,
+    pub max_table_elements: u64,
+    pub max_instances: u64,
+    pub allowed_http_hosts: Vec<String>,
+    pub allowed_secrets: Vec<String>,
+    pub allowed_storage_prefixes: Vec<String>,
+    pub allowed_channels: Vec<String>,
 }
 
 const BUDGET_DENY_REASON: &str = "tool execution budget exhausted for run";
@@ -83,6 +100,18 @@ pub fn tool_policy_snapshot(config: &ToolCallConfig) -> ToolCallPolicySnapshot {
             cpu_time_limit_ms: config.process_runner.cpu_time_limit_ms,
             memory_limit_bytes: config.process_runner.memory_limit_bytes,
             max_output_bytes: config.process_runner.max_output_bytes,
+        },
+        wasm_runtime: WasmRuntimePolicySnapshot {
+            enabled: config.wasm_runtime.enabled,
+            max_module_size_bytes: config.wasm_runtime.max_module_size_bytes,
+            fuel_budget: config.wasm_runtime.fuel_budget,
+            max_memory_bytes: config.wasm_runtime.max_memory_bytes,
+            max_table_elements: config.wasm_runtime.max_table_elements,
+            max_instances: config.wasm_runtime.max_instances,
+            allowed_http_hosts: config.wasm_runtime.allowed_http_hosts.clone(),
+            allowed_secrets: config.wasm_runtime.allowed_secrets.clone(),
+            allowed_storage_prefixes: config.wasm_runtime.allowed_storage_prefixes.clone(),
+            allowed_channels: config.wasm_runtime.allowed_channels.clone(),
         },
     }
 }
@@ -295,6 +324,7 @@ async fn run_allowlisted_tool(
             },
         },
         "palyra.process.run" => execute_process_runner_tool(config, input_json).await,
+        "palyra.plugin.run" => execute_wasm_plugin_tool(config, input_json).await,
         _ => ToolExecutionRawResult {
             success: false,
             output_json: b"{}".to_vec(),
@@ -306,12 +336,14 @@ async fn run_allowlisted_tool(
 }
 
 fn is_runtime_supported_tool(tool_name: &str) -> bool {
-    matches!(tool_name, "palyra.echo" | "palyra.sleep" | "palyra.process.run")
+    matches!(tool_name, "palyra.echo" | "palyra.sleep" | "palyra.process.run" | "palyra.plugin.run")
 }
 
 fn tool_executor_name(tool_name: &str) -> &'static str {
     if tool_name == "palyra.process.run" {
         "sandbox_tier_b"
+    } else if tool_name == "palyra.plugin.run" {
+        "sandbox_tier_a"
     } else {
         "builtin"
     }
@@ -357,6 +389,42 @@ async fn execute_process_runner_tool(
             error: format!("sandbox process runner worker failed: {join_error}"),
             timed_out: false,
             executor: "sandbox_tier_b".to_owned(),
+        },
+    }
+}
+
+async fn execute_wasm_plugin_tool(
+    config: &ToolCallConfig,
+    input_json: &[u8],
+) -> ToolExecutionRawResult {
+    let policy = config.wasm_runtime.clone();
+    let input = input_json.to_vec();
+    match tokio::task::spawn_blocking(move || run_wasm_plugin(&policy, input.as_slice())).await {
+        Ok(Ok(success)) => ToolExecutionRawResult {
+            success: true,
+            output_json: success.output_json,
+            error: String::new(),
+            timed_out: false,
+            executor: "sandbox_tier_a".to_owned(),
+        },
+        Ok(Err(error)) => {
+            if matches!(error.kind, WasmPluginRunErrorKind::QuotaExceeded) {
+                warn!(error = %error.message, "sandbox wasm runtime terminated execution due to quota");
+            }
+            ToolExecutionRawResult {
+                success: false,
+                output_json: b"{}".to_vec(),
+                error: error.message,
+                timed_out: false,
+                executor: "sandbox_tier_a".to_owned(),
+            }
+        }
+        Err(join_error) => ToolExecutionRawResult {
+            success: false,
+            output_json: b"{}".to_vec(),
+            error: format!("sandbox wasm plugin worker failed: {join_error}"),
+            timed_out: false,
+            executor: "sandbox_tier_a".to_owned(),
         },
     }
 }
@@ -444,6 +512,7 @@ mod tests {
         ToolCallConfig,
     };
     use crate::sandbox_runner::SandboxProcessRunnerPolicy;
+    use crate::wasm_plugin_runner::WasmPluginRunnerPolicy;
 
     fn default_process_runner_policy() -> SandboxProcessRunnerPolicy {
         SandboxProcessRunnerPolicy {
@@ -458,12 +527,28 @@ mod tests {
         }
     }
 
+    fn default_wasm_runtime_policy() -> WasmPluginRunnerPolicy {
+        WasmPluginRunnerPolicy {
+            enabled: false,
+            max_module_size_bytes: 256 * 1024,
+            fuel_budget: 10_000_000,
+            max_memory_bytes: 64 * 1024 * 1024,
+            max_table_elements: 100_000,
+            max_instances: 256,
+            allowed_http_hosts: Vec::new(),
+            allowed_secrets: Vec::new(),
+            allowed_storage_prefixes: Vec::new(),
+            allowed_channels: Vec::new(),
+        }
+    }
+
     fn allowlisted_config() -> ToolCallConfig {
         ToolCallConfig {
             allowed_tools: vec!["palyra.echo".to_owned(), "palyra.sleep".to_owned()],
             max_calls_per_run: 2,
             execution_timeout_ms: 250,
             process_runner: default_process_runner_policy(),
+            wasm_runtime: default_wasm_runtime_policy(),
         }
     }
 
@@ -474,6 +559,7 @@ mod tests {
             max_calls_per_run: 2,
             execution_timeout_ms: 250,
             process_runner: default_process_runner_policy(),
+            wasm_runtime: default_wasm_runtime_policy(),
         };
         let mut budget = 2;
         let decision = decide_tool_call(&config, &mut budget, "user:ops", "palyra.echo");
@@ -503,6 +589,7 @@ mod tests {
             max_calls_per_run: 2,
             execution_timeout_ms: 250,
             process_runner: default_process_runner_policy(),
+            wasm_runtime: default_wasm_runtime_policy(),
         };
         let mut budget = config.max_calls_per_run;
         let decision = decide_tool_call(&config, &mut budget, "user:ops", "custom.noop");
@@ -518,6 +605,7 @@ mod tests {
             max_calls_per_run: 2,
             execution_timeout_ms: 250,
             process_runner: default_process_runner_policy(),
+            wasm_runtime: default_wasm_runtime_policy(),
         };
         let mut budget = config.max_calls_per_run;
 
@@ -554,6 +642,7 @@ mod tests {
             max_calls_per_run: 1,
             execution_timeout_ms: 5,
             process_runner: default_process_runner_policy(),
+            wasm_runtime: default_wasm_runtime_policy(),
         };
         let outcome = execute_tool_call(
             &config,
@@ -586,6 +675,7 @@ mod tests {
                 memory_limit_bytes: 128 * 1024 * 1024,
                 max_output_bytes: 64 * 1024,
             },
+            wasm_runtime: default_wasm_runtime_policy(),
         };
 
         let outcome = execute_tool_call(
@@ -617,6 +707,7 @@ mod tests {
                 memory_limit_bytes: 128 * 1024 * 1024,
                 max_output_bytes: 64 * 1024,
             },
+            wasm_runtime: default_wasm_runtime_policy(),
         };
 
         let outcome = execute_tool_call(
@@ -630,6 +721,82 @@ mod tests {
         assert!(!outcome.success, "sandbox runner must block traversal path");
         assert_eq!(outcome.attestation.executor, "sandbox_tier_b");
         assert!(outcome.error.contains("path traversal"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn execute_tool_call_runs_sandbox_wasm_plugin() {
+        let config = ToolCallConfig {
+            allowed_tools: vec!["palyra.plugin.run".to_owned()],
+            max_calls_per_run: 1,
+            execution_timeout_ms: 2_000,
+            process_runner: default_process_runner_policy(),
+            wasm_runtime: WasmPluginRunnerPolicy {
+                enabled: true,
+                max_module_size_bytes: 256 * 1024,
+                fuel_budget: 10_000_000,
+                max_memory_bytes: 64 * 1024 * 1024,
+                max_table_elements: 100_000,
+                max_instances: 256,
+                allowed_http_hosts: vec!["api.example.com".to_owned()],
+                allowed_secrets: Vec::new(),
+                allowed_storage_prefixes: Vec::new(),
+                allowed_channels: Vec::new(),
+            },
+        };
+
+        let outcome = execute_tool_call(
+            &config,
+            "01ARZ3NDEKTSV4RRFFQ69G5FA2",
+            "palyra.plugin.run",
+            br#"{
+                "module_wat":"(module (import \"palyra:plugins/host-capabilities@0.1.0\" \"http-count\" (func $http_count (result i32))) (func (export \"run\") (result i32) call $http_count))",
+                "capabilities":{"http_hosts":["api.example.com"]}
+            }"#,
+        )
+        .await;
+
+        assert!(outcome.success, "wasm plugin runner should execute allowlisted module");
+        assert_eq!(outcome.attestation.executor, "sandbox_tier_a");
+        let output: serde_json::Value =
+            serde_json::from_slice(&outcome.output_json).expect("output should parse");
+        assert_eq!(output.get("exit_code").and_then(serde_json::Value::as_i64), Some(1));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn execute_tool_call_denies_wasm_plugin_non_allowlisted_capability() {
+        let config = ToolCallConfig {
+            allowed_tools: vec!["palyra.plugin.run".to_owned()],
+            max_calls_per_run: 1,
+            execution_timeout_ms: 2_000,
+            process_runner: default_process_runner_policy(),
+            wasm_runtime: WasmPluginRunnerPolicy {
+                enabled: true,
+                max_module_size_bytes: 256 * 1024,
+                fuel_budget: 10_000_000,
+                max_memory_bytes: 64 * 1024 * 1024,
+                max_table_elements: 100_000,
+                max_instances: 256,
+                allowed_http_hosts: vec!["api.example.com".to_owned()],
+                allowed_secrets: Vec::new(),
+                allowed_storage_prefixes: Vec::new(),
+                allowed_channels: Vec::new(),
+            },
+        };
+
+        let outcome = execute_tool_call(
+            &config,
+            "01ARZ3NDEKTSV4RRFFQ69G5FA2",
+            "palyra.plugin.run",
+            br#"{
+                "module_wat":"(module (func (export \"run\") (result i32) i32.const 1))",
+                "capabilities":{"http_hosts":["blocked.example"]}
+            }"#,
+        )
+        .await;
+
+        assert!(!outcome.success, "wasm plugin runner must deny non-allowlisted capabilities");
+        assert_eq!(outcome.attestation.executor, "sandbox_tier_a");
+        assert!(outcome.error.contains("capability denied"));
     }
 
     #[test]
@@ -652,6 +819,7 @@ mod tests {
         assert_eq!(snapshot.max_calls_per_run, 2);
         assert_eq!(snapshot.execution_timeout_ms, 250);
         assert_eq!(snapshot.allowed_tools.len(), 2);
+        assert!(!snapshot.wasm_runtime.enabled);
     }
 
     #[test]

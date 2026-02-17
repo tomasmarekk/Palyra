@@ -29,6 +29,12 @@ const DEFAULT_PROCESS_RUNNER_WORKSPACE_ROOT: &str = ".";
 const DEFAULT_PROCESS_RUNNER_CPU_TIME_LIMIT_MS: u64 = 2_000;
 const DEFAULT_PROCESS_RUNNER_MEMORY_LIMIT_BYTES: u64 = 256 * 1024 * 1024;
 const DEFAULT_PROCESS_RUNNER_MAX_OUTPUT_BYTES: u64 = 64 * 1024;
+const DEFAULT_WASM_RUNTIME_ENABLED: bool = false;
+const DEFAULT_WASM_RUNTIME_MAX_MODULE_SIZE_BYTES: u64 = 256 * 1024;
+const DEFAULT_WASM_RUNTIME_FUEL_BUDGET: u64 = 10_000_000;
+const DEFAULT_WASM_RUNTIME_MAX_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
+const DEFAULT_WASM_RUNTIME_MAX_TABLE_ELEMENTS: u64 = 100_000;
+const DEFAULT_WASM_RUNTIME_MAX_INSTANCES: u64 = 256;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadedConfig {
     pub source: String,
@@ -68,6 +74,7 @@ pub struct ToolCallConfig {
     pub max_calls_per_run: u32,
     pub execution_timeout_ms: u64,
     pub process_runner: ProcessRunnerConfig,
+    pub wasm_runtime: WasmRuntimeConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +87,20 @@ pub struct ProcessRunnerConfig {
     pub cpu_time_limit_ms: u64,
     pub memory_limit_bytes: u64,
     pub max_output_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WasmRuntimeConfig {
+    pub enabled: bool,
+    pub max_module_size_bytes: u64,
+    pub fuel_budget: u64,
+    pub max_memory_bytes: u64,
+    pub max_table_elements: u64,
+    pub max_instances: u64,
+    pub allowed_http_hosts: Vec<String>,
+    pub allowed_secrets: Vec<String>,
+    pub allowed_storage_prefixes: Vec<String>,
+    pub allowed_channels: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +166,7 @@ impl Default for ToolCallConfig {
             max_calls_per_run: DEFAULT_TOOL_CALL_MAX_CALLS_PER_RUN,
             execution_timeout_ms: DEFAULT_TOOL_CALL_EXECUTION_TIMEOUT_MS,
             process_runner: ProcessRunnerConfig::default(),
+            wasm_runtime: WasmRuntimeConfig::default(),
         }
     }
 }
@@ -160,6 +182,23 @@ impl Default for ProcessRunnerConfig {
             cpu_time_limit_ms: DEFAULT_PROCESS_RUNNER_CPU_TIME_LIMIT_MS,
             memory_limit_bytes: DEFAULT_PROCESS_RUNNER_MEMORY_LIMIT_BYTES,
             max_output_bytes: DEFAULT_PROCESS_RUNNER_MAX_OUTPUT_BYTES,
+        }
+    }
+}
+
+impl Default for WasmRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: DEFAULT_WASM_RUNTIME_ENABLED,
+            max_module_size_bytes: DEFAULT_WASM_RUNTIME_MAX_MODULE_SIZE_BYTES,
+            fuel_budget: DEFAULT_WASM_RUNTIME_FUEL_BUDGET,
+            max_memory_bytes: DEFAULT_WASM_RUNTIME_MAX_MEMORY_BYTES,
+            max_table_elements: DEFAULT_WASM_RUNTIME_MAX_TABLE_ELEMENTS,
+            max_instances: DEFAULT_WASM_RUNTIME_MAX_INSTANCES,
+            allowed_http_hosts: Vec::new(),
+            allowed_secrets: Vec::new(),
+            allowed_storage_prefixes: Vec::new(),
+            allowed_channels: Vec::new(),
         }
     }
 }
@@ -308,6 +347,64 @@ pub fn load_config() -> Result<LoadedConfig> {
                     tool_call.process_runner.max_output_bytes = parse_positive_u64(
                         max_output_bytes,
                         "tool_call.process_runner.max_output_bytes",
+                    )?;
+                }
+            }
+            if let Some(file_wasm_runtime) = file_tool_call.wasm_runtime {
+                if let Some(enabled) = file_wasm_runtime.enabled {
+                    tool_call.wasm_runtime.enabled = enabled;
+                }
+                if let Some(max_module_size_bytes) = file_wasm_runtime.max_module_size_bytes {
+                    tool_call.wasm_runtime.max_module_size_bytes = parse_positive_u64(
+                        max_module_size_bytes,
+                        "tool_call.wasm_runtime.max_module_size_bytes",
+                    )?;
+                }
+                if let Some(fuel_budget) = file_wasm_runtime.fuel_budget {
+                    tool_call.wasm_runtime.fuel_budget =
+                        parse_positive_u64(fuel_budget, "tool_call.wasm_runtime.fuel_budget")?;
+                }
+                if let Some(max_memory_bytes) = file_wasm_runtime.max_memory_bytes {
+                    tool_call.wasm_runtime.max_memory_bytes = parse_positive_u64(
+                        max_memory_bytes,
+                        "tool_call.wasm_runtime.max_memory_bytes",
+                    )?;
+                }
+                if let Some(max_table_elements) = file_wasm_runtime.max_table_elements {
+                    tool_call.wasm_runtime.max_table_elements = parse_positive_u64(
+                        max_table_elements,
+                        "tool_call.wasm_runtime.max_table_elements",
+                    )?;
+                }
+                if let Some(max_instances) = file_wasm_runtime.max_instances {
+                    tool_call.wasm_runtime.max_instances =
+                        parse_positive_u64(max_instances, "tool_call.wasm_runtime.max_instances")?;
+                }
+                if let Some(allowed_http_hosts) = file_wasm_runtime.allowed_http_hosts {
+                    tool_call.wasm_runtime.allowed_http_hosts = parse_host_allowlist(
+                        allowed_http_hosts.join(",").as_str(),
+                        "tool_call.wasm_runtime.allowed_http_hosts",
+                    )?;
+                }
+                if let Some(allowed_secrets) = file_wasm_runtime.allowed_secrets {
+                    tool_call.wasm_runtime.allowed_secrets = parse_identifier_allowlist(
+                        allowed_secrets.join(",").as_str(),
+                        "tool_call.wasm_runtime.allowed_secrets",
+                        "secret handle",
+                    )?;
+                }
+                if let Some(allowed_storage_prefixes) = file_wasm_runtime.allowed_storage_prefixes {
+                    tool_call.wasm_runtime.allowed_storage_prefixes =
+                        parse_storage_prefix_allowlist(
+                            allowed_storage_prefixes.join(",").as_str(),
+                            "tool_call.wasm_runtime.allowed_storage_prefixes",
+                        )?;
+                }
+                if let Some(allowed_channels) = file_wasm_runtime.allowed_channels {
+                    tool_call.wasm_runtime.allowed_channels = parse_identifier_allowlist(
+                        allowed_channels.join(",").as_str(),
+                        "tool_call.wasm_runtime.allowed_channels",
+                        "channel handle",
                     )?;
                 }
             }
@@ -643,6 +740,28 @@ fn parse_dns_suffix_allowlist(raw: &str, source_name: &str) -> Result<Vec<String
     Ok(allowlist)
 }
 
+fn parse_storage_prefix_allowlist(raw: &str, source_name: &str) -> Result<Vec<String>> {
+    let mut allowlist = Vec::new();
+    for candidate in raw.split(',').map(str::trim).filter(|value| !value.is_empty()) {
+        if candidate.contains('\0')
+            || candidate.contains("..")
+            || candidate.starts_with('/')
+            || candidate.starts_with('\\')
+            || !candidate.chars().all(|ch| {
+                ch.is_ascii_lowercase()
+                    || ch.is_ascii_digit()
+                    || matches!(ch, '/' | '.' | '_' | '-')
+            })
+        {
+            anyhow::bail!("{source_name} contains invalid storage prefix '{candidate}'");
+        }
+        if !allowlist.iter().any(|existing| existing == candidate) {
+            allowlist.push(candidate.to_owned());
+        }
+    }
+    Ok(allowlist)
+}
+
 fn normalize_host_candidate(raw: &str) -> Result<String> {
     let trimmed = raw.trim().trim_end_matches('.').to_ascii_lowercase();
     if trimmed.is_empty() {
@@ -705,9 +824,9 @@ mod tests {
 
     use super::{
         parse_dns_suffix_allowlist, parse_host_allowlist, parse_journal_db_path,
-        parse_openai_base_url, parse_process_executable_allowlist, parse_tool_allowlist,
-        AdminConfig, GatewayConfig, IdentityConfig, ModelProviderConfig, OrchestratorConfig,
-        StorageConfig, ToolCallConfig,
+        parse_openai_base_url, parse_process_executable_allowlist, parse_storage_prefix_allowlist,
+        parse_tool_allowlist, AdminConfig, GatewayConfig, IdentityConfig, ModelProviderConfig,
+        OrchestratorConfig, StorageConfig, ToolCallConfig,
     };
     use crate::model_provider::ModelProviderKind;
     use palyra_common::daemon_config_schema::RootFileConfig;
@@ -763,6 +882,12 @@ mod tests {
         assert!(
             config.process_runner.allowed_executables.is_empty(),
             "sandbox process runner executable allowlist must default empty"
+        );
+        assert!(!config.wasm_runtime.enabled, "wasm plugin runtime must default to disabled");
+        assert_eq!(config.wasm_runtime.max_module_size_bytes, 256 * 1024);
+        assert!(
+            config.wasm_runtime.allowed_http_hosts.is_empty(),
+            "wasm runtime http allowlist must default empty"
         );
     }
 
@@ -858,6 +983,13 @@ mod tests {
     }
 
     #[test]
+    fn config_rejects_unknown_wasm_runtime_key() {
+        let result: Result<RootFileConfig, _> =
+            toml::from_str("[tool_call.wasm_runtime]\nenabled=true\nunexpected=true\n");
+        assert!(result.is_err(), "unknown wasm runtime keys must be rejected");
+    }
+
+    #[test]
     fn journal_db_path_rejects_parent_traversal() {
         let result = parse_journal_db_path("../secrets/journal.sqlite3");
         assert!(result.is_err(), "journal db path must reject parent traversal");
@@ -941,5 +1073,24 @@ mod tests {
             "tool_call.process_runner.allowed_dns_suffixes",
         );
         assert!(result.is_err(), "dns suffix allowlist must reject malformed entries");
+    }
+
+    #[test]
+    fn parse_storage_prefix_allowlist_normalizes_and_deduplicates_values() {
+        let parsed = parse_storage_prefix_allowlist(
+            "plugins/cache, plugins/cache ,plugins/artifacts",
+            "tool_call.wasm_runtime.allowed_storage_prefixes",
+        )
+        .expect("storage prefix allowlist should parse");
+        assert_eq!(parsed, vec!["plugins/cache".to_owned(), "plugins/artifacts".to_owned()]);
+    }
+
+    #[test]
+    fn parse_storage_prefix_allowlist_rejects_parent_traversal() {
+        let result = parse_storage_prefix_allowlist(
+            "plugins/../escape",
+            "tool_call.wasm_runtime.allowed_storage_prefixes",
+        );
+        assert!(result.is_err(), "storage prefix allowlist must reject parent traversal");
     }
 }
