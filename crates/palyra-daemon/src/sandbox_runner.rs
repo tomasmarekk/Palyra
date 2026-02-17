@@ -49,6 +49,7 @@ pub struct SandboxProcessRunError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SandboxProcessRunErrorKind {
     Disabled,
+    #[cfg(not(unix))]
     UnsupportedPlatform,
     InvalidInput,
     WorkspaceScopeDenied,
