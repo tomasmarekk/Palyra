@@ -532,7 +532,7 @@ async fn grpc_run_stream_executes_sandbox_process_runner_within_workspace_scope(
         )])?;
     let workspace_root =
         std::env::current_dir().context("failed to resolve workspace root for process runner")?;
-    let (child, admin_port, grpc_port, _journal_db_path) =
+    let (child, admin_port, grpc_port, _journal_db_path, config_path) =
         spawn_palyrad_with_openai_provider_tool_policy_and_process_runner(
             ProcessRunnerSpawnConfig {
                 openai_base_url: openai_base_url.as_str(),
@@ -546,6 +546,7 @@ async fn grpc_run_stream_executes_sandbox_process_runner_within_workspace_scope(
                 allowed_dns_suffixes: ".corp.local",
             },
         )?;
+    let _config_guard = TempFileGuard::new(config_path);
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
 
@@ -624,7 +625,7 @@ async fn grpc_run_stream_blocks_sandbox_process_runner_path_traversal() -> Resul
         )])?;
     let workspace_root =
         std::env::current_dir().context("failed to resolve workspace root for process runner")?;
-    let (child, admin_port, grpc_port, _journal_db_path) =
+    let (child, admin_port, grpc_port, _journal_db_path, config_path) =
         spawn_palyrad_with_openai_provider_tool_policy_and_process_runner(
             ProcessRunnerSpawnConfig {
                 openai_base_url: openai_base_url.as_str(),
@@ -638,6 +639,7 @@ async fn grpc_run_stream_blocks_sandbox_process_runner_path_traversal() -> Resul
                 allowed_dns_suffixes: ".corp.local",
             },
         )?;
+    let _config_guard = TempFileGuard::new(config_path);
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
 
@@ -689,7 +691,7 @@ async fn grpc_run_stream_blocks_sandbox_process_runner_non_allowlisted_egress_ho
         )])?;
     let workspace_root =
         std::env::current_dir().context("failed to resolve workspace root for process runner")?;
-    let (child, admin_port, grpc_port, _journal_db_path) =
+    let (child, admin_port, grpc_port, _journal_db_path, config_path) =
         spawn_palyrad_with_openai_provider_tool_policy_and_process_runner(
             ProcessRunnerSpawnConfig {
                 openai_base_url: openai_base_url.as_str(),
@@ -703,6 +705,7 @@ async fn grpc_run_stream_blocks_sandbox_process_runner_non_allowlisted_egress_ho
                 allowed_dns_suffixes: ".corp.local",
             },
         )?;
+    let _config_guard = TempFileGuard::new(config_path);
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
 
@@ -1446,7 +1449,7 @@ struct ProcessRunnerSpawnConfig<'a> {
 #[cfg(unix)]
 fn spawn_palyrad_with_openai_provider_tool_policy_and_process_runner(
     config: ProcessRunnerSpawnConfig<'_>,
-) -> Result<(Child, u16, u16, PathBuf)> {
+) -> Result<(Child, u16, u16, PathBuf, PathBuf)> {
     let config_path = write_process_runner_config(
         config.workspace_root,
         config.allowed_executables,
@@ -1487,7 +1490,7 @@ fn spawn_palyrad_with_openai_provider_tool_policy_and_process_runner(
         .context("failed to start palyrad with process runner policy")?;
     let stdout = child.stdout.take().context("failed to capture palyrad stdout")?;
     let (admin_port, grpc_port) = wait_for_listen_ports(stdout, &mut child)?;
-    Ok((child, admin_port, grpc_port, journal_db_path))
+    Ok((child, admin_port, grpc_port, journal_db_path, config_path))
 }
 
 #[cfg(unix)]
@@ -1787,5 +1790,24 @@ impl Drop for ChildGuard {
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
+    }
+}
+
+#[cfg(unix)]
+struct TempFileGuard {
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+impl TempFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
     }
 }

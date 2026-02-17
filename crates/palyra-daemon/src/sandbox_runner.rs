@@ -6,7 +6,7 @@ use std::{
     path::{Component, Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     thread,
@@ -317,6 +317,10 @@ fn validate_argument_workspace_scope(
     args: &[String],
 ) -> Result<(), SandboxProcessRunError> {
     for arg in args {
+        if let Some(file_url_path) = parse_file_url_path(arg.as_str())? {
+            let _ = resolve_scoped_path(workspace_root, cwd, file_url_path.as_str(), false)?;
+            continue;
+        }
         if !argument_requires_path_validation(arg.as_str()) {
             continue;
         }
@@ -330,7 +334,26 @@ fn argument_requires_path_validation(arg: &str) -> bool {
     if trimmed.is_empty() || trimmed.starts_with('-') {
         return false;
     }
-    reqwest::Url::parse(trimmed).is_err()
+    match reqwest::Url::parse(trimmed) {
+        Ok(url) => url.scheme().eq_ignore_ascii_case("file"),
+        Err(_) => true,
+    }
+}
+
+fn parse_file_url_path(arg: &str) -> Result<Option<String>, SandboxProcessRunError> {
+    let trimmed = arg.trim();
+    let url = match reqwest::Url::parse(trimmed) {
+        Ok(url) => url,
+        Err(_) => return Ok(None),
+    };
+    if !url.scheme().eq_ignore_ascii_case("file") {
+        return Ok(None);
+    }
+    let file_path = url.to_file_path().map_err(|_| SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
+        message: format!("sandbox denied: invalid file URL '{trimmed}'"),
+    })?;
+    Ok(Some(file_path.to_string_lossy().to_string()))
 }
 
 fn resolve_scoped_path(
@@ -420,10 +443,16 @@ fn collect_requested_egress_hosts(
     for requested in &input.requested_egress_hosts {
         push_normalized_host(&mut hosts, requested)?;
     }
-    for arg in &input.args {
-        collect_hosts_from_token(&mut hosts, arg)?;
-        if let Some((_, value)) = arg.split_once('=') {
-            collect_hosts_from_token(&mut hosts, value)?;
+    for (index, arg) in input.args.iter().enumerate() {
+        collect_hosts_from_token(&mut hosts, arg, false)?;
+        if let Some((key, value)) = arg.split_once('=') {
+            collect_hosts_from_token(&mut hosts, value, is_host_hint_key(key))?;
+            continue;
+        }
+        if is_host_hint_key(arg.as_str()) {
+            if let Some(next_value) = input.args.get(index + 1) {
+                collect_hosts_from_token(&mut hosts, next_value, true)?;
+            }
         }
     }
     Ok(hosts)
@@ -432,6 +461,7 @@ fn collect_requested_egress_hosts(
 fn collect_hosts_from_token(
     hosts: &mut Vec<String>,
     raw: &str,
+    host_context: bool,
 ) -> Result<(), SandboxProcessRunError> {
     let token = raw.trim().trim_matches(['"', '\'']);
     if token.is_empty() {
@@ -441,8 +471,87 @@ fn collect_hosts_from_token(
         if let Some(host) = url.host_str() {
             push_normalized_host(hosts, host)?;
         }
+        return Ok(());
+    }
+    if let Some(host) = maybe_extract_bare_host(token, host_context) {
+        push_normalized_host(hosts, host)?;
     }
     Ok(())
+}
+
+fn maybe_extract_bare_host(token: &str, host_context: bool) -> Option<&str> {
+    let sanitized = token.trim_end_matches([')', ',', ';']);
+    if sanitized.is_empty()
+        || sanitized.starts_with('-')
+        || sanitized.contains(char::is_whitespace)
+        || sanitized.contains('/')
+        || sanitized.contains('\\')
+        || sanitized.contains('=')
+    {
+        return None;
+    }
+
+    if host_context && looks_like_domain_or_ipv4(sanitized) {
+        return Some(sanitized);
+    }
+
+    let (host, port) = split_host_and_port(sanitized)?;
+    if !port.chars().all(|ch| ch.is_ascii_digit()) || !looks_like_domain_or_ipv4(host) {
+        return None;
+    }
+    Some(host)
+}
+
+fn split_host_and_port(token: &str) -> Option<(&str, &str)> {
+    let (host, port) = token.rsplit_once(':')?;
+    if host.is_empty() || port.is_empty() || host.contains(':') {
+        return None;
+    }
+    Some((host, port))
+}
+
+fn looks_like_domain_or_ipv4(raw: &str) -> bool {
+    let candidate = raw.trim_matches(['[', ']']).trim_end_matches('.').to_ascii_lowercase();
+
+    if candidate.eq("localhost") || candidate.parse::<std::net::Ipv4Addr>().is_ok() {
+        return true;
+    }
+    if !candidate.contains('.')
+        || !candidate
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '-'))
+        || candidate.starts_with('.')
+        || candidate.ends_with('.')
+        || candidate.starts_with('-')
+        || candidate.ends_with('-')
+        || candidate.contains("..")
+    {
+        return false;
+    }
+    candidate
+        .rsplit('.')
+        .next()
+        .map(|suffix| suffix.len() >= 2 && suffix.chars().all(|ch| ch.is_ascii_alphabetic()))
+        .unwrap_or(false)
+}
+
+fn is_host_hint_key(raw: &str) -> bool {
+    let normalized = raw.trim().trim_start_matches('-').to_ascii_lowercase();
+    normalized.split(|ch: char| !ch.is_ascii_alphanumeric()).any(|segment| {
+        matches!(
+            segment,
+            "host"
+                | "hostname"
+                | "server"
+                | "endpoint"
+                | "url"
+                | "uri"
+                | "domain"
+                | "proxy"
+                | "address"
+                | "addr"
+        )
+    })
 }
 
 fn push_normalized_host(hosts: &mut Vec<String>, raw: &str) -> Result<(), SandboxProcessRunError> {
@@ -513,6 +622,10 @@ fn execute_process(
     command
         .args(input.args.as_slice())
         .current_dir(cwd)
+        .env_clear()
+        .env("PATH", sandbox_process_path())
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -524,6 +637,17 @@ fn execute_process(
     })?;
 
     capture_child_output(&mut child, timeout, policy.max_output_bytes as usize)
+}
+
+fn sandbox_process_path() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "/usr/bin:/bin:/usr/sbin:/sbin"
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    }
 }
 
 #[cfg(unix)]
@@ -613,10 +737,11 @@ fn capture_child_output(
     })?;
 
     let quota_triggered = Arc::new(AtomicBool::new(false));
+    let remaining_budget = Arc::new(AtomicUsize::new(max_output_bytes));
     let stdout_reader =
-        spawn_capture_reader(stdout, max_output_bytes, Arc::clone(&quota_triggered));
+        spawn_capture_reader(stdout, Arc::clone(&remaining_budget), Arc::clone(&quota_triggered));
     let stderr_reader =
-        spawn_capture_reader(stderr, max_output_bytes, Arc::clone(&quota_triggered));
+        spawn_capture_reader(stderr, Arc::clone(&remaining_budget), Arc::clone(&quota_triggered));
 
     let started_at = Instant::now();
     let mut timed_out = false;
@@ -664,7 +789,7 @@ fn capture_child_output(
 
 fn spawn_capture_reader<R>(
     mut reader: R,
-    max_output_bytes: usize,
+    remaining_budget: Arc<AtomicUsize>,
     quota_triggered: Arc<AtomicBool>,
 ) -> thread::JoinHandle<StreamCapture>
 where
@@ -678,14 +803,15 @@ where
             match reader.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(read_count) => {
-                    let remaining = max_output_bytes.saturating_sub(bytes.len());
-                    if read_count > remaining {
-                        bytes.extend_from_slice(&buffer[..remaining]);
+                    let granted = reserve_output_budget(remaining_budget.as_ref(), read_count);
+                    if granted > 0 {
+                        bytes.extend_from_slice(&buffer[..granted]);
+                    }
+                    if granted < read_count {
                         truncated = true;
                         quota_triggered.store(true, Ordering::Relaxed);
                         break;
                     }
-                    bytes.extend_from_slice(&buffer[..read_count]);
                 }
                 Err(error) => {
                     return StreamCapture { bytes, truncated, read_error: Some(error.to_string()) };
@@ -696,26 +822,57 @@ where
     })
 }
 
+fn reserve_output_budget(remaining_budget: &AtomicUsize, requested_bytes: usize) -> usize {
+    let mut available = remaining_budget.load(Ordering::Relaxed);
+    loop {
+        if available == 0 {
+            return 0;
+        }
+        let granted = requested_bytes.min(available);
+        match remaining_budget.compare_exchange_weak(
+            available,
+            available - granted,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return granted,
+            Err(updated) => available = updated,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
+        fs,
         path::PathBuf,
+        process::Command,
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
-    use super::{run_constrained_process, SandboxProcessRunErrorKind, SandboxProcessRunnerPolicy};
+    use super::{
+        collect_requested_egress_hosts, run_constrained_process, validate_argument_workspace_scope,
+        ProcessRunnerInput, SandboxProcessRunErrorKind, SandboxProcessRunnerPolicy,
+    };
 
-    fn sandbox_policy(workspace_root: PathBuf) -> SandboxProcessRunnerPolicy {
+    fn sandbox_policy_with_allowed_executables(
+        workspace_root: PathBuf,
+        allowed_executables: Vec<String>,
+    ) -> SandboxProcessRunnerPolicy {
         SandboxProcessRunnerPolicy {
             enabled: true,
             workspace_root,
-            allowed_executables: vec!["uname".to_owned()],
+            allowed_executables,
             allowed_egress_hosts: vec!["allowed.example".to_owned()],
             allowed_dns_suffixes: vec![".corp.local".to_owned()],
             cpu_time_limit_ms: 2_000,
             memory_limit_bytes: 128 * 1024 * 1024,
             max_output_bytes: 64 * 1024,
         }
+    }
+
+    fn sandbox_policy(workspace_root: PathBuf) -> SandboxProcessRunnerPolicy {
+        sandbox_policy_with_allowed_executables(workspace_root, vec!["uname".to_owned()])
     }
 
     fn unique_temp_dir(suffix: &str) -> PathBuf {
@@ -753,6 +910,18 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn run_constrained_process_rejects_non_allowlisted_egress_host_from_host_hint() {
+        let workspace = std::env::current_dir().expect("workspace current_dir should resolve");
+        let policy = sandbox_policy(workspace);
+        let input = br#"{"command":"uname","args":["--host=blocked.example"]}"#;
+        let error = run_constrained_process(&policy, input, Duration::from_millis(1_000))
+            .expect_err("host hint should be validated against egress allowlists");
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::EgressDenied);
+        assert!(error.message.contains("blocked.example"));
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn run_constrained_process_rejects_non_allowlisted_executable() {
         let workspace = std::env::current_dir().expect("workspace current_dir should resolve");
         let policy = sandbox_policy(workspace);
@@ -777,8 +946,6 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn run_constrained_process_executes_allowlisted_command() {
-        use std::process::Command;
-
         if Command::new("uname").output().is_err() {
             return;
         }
@@ -801,7 +968,6 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn run_constrained_process_rejects_symlink_escape() {
-        use std::fs;
         use std::os::unix::fs::symlink;
 
         let workspace = unique_temp_dir("workspace");
@@ -823,5 +989,120 @@ mod tests {
         let _ = fs::remove_file(&symlink_path);
         let _ = fs::remove_dir_all(&workspace);
         let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn validate_argument_workspace_scope_rejects_file_url_outside_workspace() {
+        let workspace = unique_temp_dir("workspace-file-url-outside");
+        let outside = unique_temp_dir("outside-file-url-outside");
+        fs::create_dir_all(&workspace).expect("workspace directory should be created");
+        fs::create_dir_all(&outside).expect("outside directory should be created");
+
+        let outside_file = outside.join("secret.txt");
+        fs::write(&outside_file, b"secret").expect("outside file should be created");
+        let args = vec![format!("file://{}", outside_file.to_string_lossy())];
+
+        let error =
+            validate_argument_workspace_scope(workspace.as_path(), workspace.as_path(), &args)
+                .expect_err("file URLs outside workspace must be denied");
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
+
+        let _ = fs::remove_file(&outside_file);
+        let _ = fs::remove_dir_all(&workspace);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn validate_argument_workspace_scope_allows_file_url_inside_workspace() {
+        let workspace = unique_temp_dir("workspace-file-url-inside");
+        fs::create_dir_all(&workspace).expect("workspace directory should be created");
+
+        let inside_file = workspace.join("inside.txt");
+        fs::write(&inside_file, b"ok").expect("inside file should be created");
+        let args = vec![format!("file://{}", inside_file.to_string_lossy())];
+
+        validate_argument_workspace_scope(workspace.as_path(), workspace.as_path(), &args)
+            .expect("file URLs inside workspace should be allowed");
+
+        let _ = fs::remove_file(&inside_file);
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn collect_requested_egress_hosts_extracts_hosts_from_host_hints() {
+        let input = ProcessRunnerInput {
+            command: "uname".to_owned(),
+            args: vec![
+                "--host=blocked.example".to_owned(),
+                "--endpoint".to_owned(),
+                "allowed.example:443".to_owned(),
+                "README.md".to_owned(),
+            ],
+            cwd: None,
+            requested_egress_hosts: Vec::new(),
+            timeout_ms: None,
+        };
+
+        let hosts = collect_requested_egress_hosts(&input)
+            .expect("host hint parsing should succeed for valid host values");
+        assert!(hosts.iter().any(|host| host == "blocked.example"));
+        assert!(hosts.iter().any(|host| host == "allowed.example"));
+        assert!(
+            !hosts.iter().any(|host| host == "readme.md"),
+            "file-like args should not be treated as host candidates by default"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_constrained_process_sanitizes_child_environment() {
+        if Command::new("env").output().is_err() {
+            return;
+        }
+
+        let workspace = std::env::current_dir().expect("workspace current_dir should resolve");
+        let policy = sandbox_policy_with_allowed_executables(workspace, vec!["env".to_owned()]);
+        let input = br#"{"command":"env","args":[]}"#;
+
+        let result = run_constrained_process(&policy, input, Duration::from_millis(3_000))
+            .expect("allowlisted env command should execute");
+        let output: serde_json::Value =
+            serde_json::from_slice(&result.output_json).expect("output should parse");
+        let stdout = output
+            .get("stdout")
+            .and_then(serde_json::Value::as_str)
+            .expect("stdout should be present in process output");
+
+        for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+            let key = line.split_once('=').map(|(key, _)| key).unwrap_or(line);
+            assert!(
+                matches!(key, "PATH" | "LANG" | "LC_ALL"),
+                "unexpected environment variable leaked into sandbox process: {line}"
+            );
+        }
+        assert!(stdout.contains("PATH="), "sandbox process should retain deterministic PATH");
+        assert!(stdout.contains("LANG=C"), "sandbox process should set LANG=C");
+        assert!(stdout.contains("LC_ALL=C"), "sandbox process should set LC_ALL=C");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_constrained_process_enforces_combined_output_quota() {
+        if Command::new("sh").arg("-c").arg("true").output().is_err() {
+            return;
+        }
+
+        let workspace = std::env::current_dir().expect("workspace current_dir should resolve");
+        let mut policy = sandbox_policy_with_allowed_executables(workspace, vec!["sh".to_owned()]);
+        policy.max_output_bytes = 16;
+        let input =
+            br#"{"command":"sh","args":["-c","printf '1234567890'; printf 'abcdefghij' 1>&2"]}"#;
+
+        let error = run_constrained_process(&policy, input, Duration::from_millis(1_000))
+            .expect_err("combined stdout+stderr output should hit global quota");
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::QuotaExceeded);
     }
 }
