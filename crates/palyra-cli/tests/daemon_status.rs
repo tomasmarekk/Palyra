@@ -1,21 +1,23 @@
 use std::{
+    io::Read,
     net::TcpListener,
     path::PathBuf,
-    process::{Child, Command, Stdio},
+    process::{Child, ChildStderr, Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use reqwest::blocking::Client;
 
 const DEVICE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+const STARTUP_RETRY_ATTEMPTS: usize = 8;
+const STARTUP_HEALTH_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[test]
 fn palyra_daemon_status_reads_health_endpoint() -> Result<()> {
     let (child, port) = spawn_palyrad_with_dynamic_port()?;
-    let mut daemon = ChildGuard::new(child);
-    wait_for_health(port, daemon.child_mut())?;
+    let _daemon = ChildGuard::new(child);
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_palyra"));
     let output = command
@@ -37,8 +39,7 @@ fn palyra_daemon_status_reads_health_endpoint() -> Result<()> {
 fn palyra_daemon_admin_status_without_token_succeeds_when_auth_is_disabled() -> Result<()> {
     let (child, port) =
         spawn_palyrad_with_dynamic_port_and_env(&[("PALYRA_ADMIN_REQUIRE_AUTH", "false")])?;
-    let mut daemon = ChildGuard::new(child);
-    wait_for_health(port, daemon.child_mut())?;
+    let _daemon = ChildGuard::new(child);
 
     let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
         .args([
@@ -70,8 +71,7 @@ fn palyra_daemon_admin_status_without_token_succeeds_when_auth_is_disabled() -> 
 #[test]
 fn palyra_daemon_admin_status_without_token_fails_when_auth_is_required() -> Result<()> {
     let (child, port) = spawn_palyrad_with_dynamic_port()?;
-    let mut daemon = ChildGuard::new(child);
-    wait_for_health(port, daemon.child_mut())?;
+    let _daemon = ChildGuard::new(child);
 
     let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
         .args([
@@ -134,27 +134,43 @@ fn spawn_palyrad_with_dynamic_port() -> Result<(Child, u16)> {
 }
 
 fn spawn_palyrad_with_dynamic_port_and_env(extra_env: &[(&str, &str)]) -> Result<(Child, u16)> {
-    let port = reserve_loopback_port()?;
-    let mut command = Command::new(resolve_palyrad_binary_path()?);
-    command
-        .args([
-            "--bind",
-            "127.0.0.1",
-            "--port",
-            &port.to_string(),
-            "--grpc-bind",
-            "127.0.0.1",
-            "--grpc-port",
-            "0",
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .env("RUST_LOG", "info");
-    for (key, value) in extra_env {
-        command.env(key, value);
+    let mut last_error = None;
+
+    for attempt in 1..=STARTUP_RETRY_ATTEMPTS {
+        let port = reserve_loopback_port()?;
+        let mut command = Command::new(resolve_palyrad_binary_path()?);
+        command
+            .args([
+                "--bind",
+                "127.0.0.1",
+                "--port",
+                &port.to_string(),
+                "--grpc-bind",
+                "127.0.0.1",
+                "--grpc-port",
+                "0",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .env("RUST_LOG", "info");
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+
+        let mut child = command.spawn().context("failed to spawn palyrad process")?;
+        match wait_for_health(port, &mut child, STARTUP_HEALTH_TIMEOUT) {
+            Ok(()) => return Ok((child, port)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                last_error = Some(error.context(format!(
+                    "palyrad startup attempt {attempt}/{STARTUP_RETRY_ATTEMPTS} failed on port {port}"
+                )));
+            }
+        }
     }
-    let child = command.spawn().context("failed to spawn palyrad process")?;
-    Ok((child, port))
+
+    Err(last_error.unwrap_or_else(|| anyhow!("failed to start palyrad for tests")))
 }
 
 fn resolve_palyrad_binary_path() -> Result<PathBuf> {
@@ -183,8 +199,8 @@ fn reserve_loopback_port() -> Result<u16> {
     Ok(port)
 }
 
-fn wait_for_health(port: u16, daemon: &mut Child) -> Result<()> {
-    let timeout_at = Instant::now() + Duration::from_secs(90);
+fn wait_for_health(port: u16, daemon: &mut Child, timeout: Duration) -> Result<()> {
+    let timeout_at = Instant::now() + timeout;
     let url = format!("http://127.0.0.1:{port}/healthz");
     let client = Client::builder()
         .timeout(Duration::from_millis(300))
@@ -196,13 +212,30 @@ fn wait_for_health(port: u16, daemon: &mut Child) -> Result<()> {
             anyhow::bail!("timed out waiting for daemon health endpoint");
         }
         if let Some(status) = daemon.try_wait().context("failed to check daemon status")? {
-            anyhow::bail!("palyrad exited before becoming healthy with status: {status}");
+            let stderr = read_child_stderr(daemon.stderr.take());
+            if stderr.is_empty() {
+                anyhow::bail!("palyrad exited before becoming healthy with status: {status}");
+            }
+            anyhow::bail!(
+                "palyrad exited before becoming healthy with status: {status}; stderr: {stderr}"
+            );
         }
         if client.get(&url).send().and_then(|response| response.error_for_status()).is_ok() {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn read_child_stderr(stderr: Option<ChildStderr>) -> String {
+    let Some(mut stderr) = stderr else {
+        return String::new();
+    };
+    let mut output = String::new();
+    if stderr.read_to_string(&mut output).is_err() {
+        return String::new();
+    }
+    output.trim().to_owned()
 }
 
 struct ChildGuard {
@@ -212,10 +245,6 @@ struct ChildGuard {
 impl ChildGuard {
     fn new(child: Child) -> Self {
         Self { child }
-    }
-
-    fn child_mut(&mut self) -> &mut Child {
-        &mut self.child
     }
 }
 
