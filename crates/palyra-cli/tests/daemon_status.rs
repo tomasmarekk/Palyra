@@ -1,9 +1,7 @@
 use std::{
-    io::{BufRead, BufReader},
-    net::SocketAddr,
+    net::TcpListener,
     path::PathBuf,
-    process::{Child, ChildStdout, Command, Stdio},
-    sync::mpsc,
+    process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -136,27 +134,26 @@ fn spawn_palyrad_with_dynamic_port() -> Result<(Child, u16)> {
 }
 
 fn spawn_palyrad_with_dynamic_port_and_env(extra_env: &[(&str, &str)]) -> Result<(Child, u16)> {
+    let port = reserve_loopback_port()?;
     let mut command = Command::new(resolve_palyrad_binary_path()?);
     command
         .args([
             "--bind",
             "127.0.0.1",
             "--port",
-            "0",
+            &port.to_string(),
             "--grpc-bind",
             "127.0.0.1",
             "--grpc-port",
             "0",
         ])
-        .stdout(Stdio::piped())
+        .stdout(Stdio::null())
         .stderr(Stdio::null())
         .env("RUST_LOG", "info");
     for (key, value) in extra_env {
         command.env(key, value);
     }
-    let mut child = command.spawn().context("failed to spawn palyrad process")?;
-    let stdout = child.stdout.take().context("failed to capture palyrad stdout")?;
-    let port = wait_for_listen_port(stdout, &mut child)?;
+    let child = command.spawn().context("failed to spawn palyrad process")?;
     Ok((child, port))
 }
 
@@ -175,57 +172,15 @@ fn resolve_palyrad_binary_path() -> Result<PathBuf> {
     }
 }
 
-fn wait_for_listen_port(stdout: ChildStdout, daemon: &mut Child) -> Result<u16> {
-    let (sender, receiver) = mpsc::channel::<Result<u16, String>>();
-    thread::spawn(move || {
-        let mut sender = Some(sender);
-        for line in BufReader::new(stdout).lines() {
-            let Ok(line) = line else {
-                if let Some(sender) = sender.take() {
-                    let _ = sender.send(Err("failed to read palyrad stdout line".to_owned()));
-                }
-                return;
-            };
-
-            if let Some(port) = parse_listen_port(&line) {
-                if let Some(sender) = sender.take() {
-                    let _ = sender.send(Ok(port));
-                }
-            }
-        }
-
-        if let Some(sender) = sender.take() {
-            let _ = sender
-                .send(Err("palyrad stdout closed before listen address was published".to_owned()));
-        }
-    });
-
-    let timeout_at = Instant::now() + Duration::from_secs(90);
-    loop {
-        match receiver.recv_timeout(Duration::from_millis(100)) {
-            Ok(Ok(port)) => return Ok(port),
-            Ok(Err(message)) => anyhow::bail!("{message}"),
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                anyhow::bail!("listen-address reader disconnected before publishing a port");
-            }
-        }
-
-        if Instant::now() > timeout_at {
-            anyhow::bail!("timed out waiting for daemon listen address log");
-        }
-        if let Some(status) = daemon.try_wait().context("failed to check daemon status")? {
-            anyhow::bail!("palyrad exited before publishing listen address with status: {status}");
-        }
-    }
-}
-
-fn parse_listen_port(line: &str) -> Option<u16> {
-    const LISTEN_ADDR_PREFIX: &str = "\"listen_addr\":\"";
-    let start = line.find(LISTEN_ADDR_PREFIX)? + LISTEN_ADDR_PREFIX.len();
-    let rest = &line[start..];
-    let end = rest.find('"')?;
-    rest[..end].parse::<SocketAddr>().ok().map(|address| address.port())
+fn reserve_loopback_port() -> Result<u16> {
+    let listener =
+        TcpListener::bind("127.0.0.1:0").context("failed to reserve loopback port for palyrad")?;
+    let port = listener
+        .local_addr()
+        .context("failed to inspect reserved loopback listener address")?
+        .port();
+    drop(listener);
+    Ok(port)
 }
 
 fn wait_for_health(port: u16, daemon: &mut Child) -> Result<()> {
