@@ -15,6 +15,7 @@ use crate::orchestrator::{estimate_token_count, split_model_tokens, MAX_MODEL_TO
 
 const OPENAI_CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 const OPENAI_RETRYABLE_STATUS_CODES: &[u16] = &[429, 500, 502, 503, 504];
+const MAX_TOOL_ARGUMENT_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelProviderKind {
@@ -454,10 +455,16 @@ impl OpenAiCompatibleProvider {
             if function.name.trim().is_empty() {
                 continue;
             }
+            let input_json =
+                normalize_tool_arguments(function.arguments.as_str()).map_err(|error| {
+                    AttemptError::invalid_response(format!(
+                        "openai-compatible tool arguments are invalid: {error}"
+                    ))
+                })?;
             events.push(ProviderEvent::ToolProposal {
                 proposal_id: Ulid::new().to_string(),
                 tool_name: function.name,
-                input_json: normalize_tool_arguments(function.arguments.as_str()),
+                input_json,
             });
         }
 
@@ -609,14 +616,25 @@ fn extract_completion_text(content: Option<Value>) -> String {
     }
 }
 
-fn normalize_tool_arguments(raw: &str) -> Vec<u8> {
+fn normalize_tool_arguments(raw: &str) -> Result<Vec<u8>, String> {
     if raw.trim().is_empty() {
-        return b"{}".to_vec();
+        return Ok(b"{}".to_vec());
+    }
+    if raw.len() > MAX_TOOL_ARGUMENT_BYTES {
+        return Err(format!(
+            "tool arguments exceed {MAX_TOOL_ARGUMENT_BYTES} bytes before normalization"
+        ));
     }
     if serde_json::from_str::<Value>(raw).is_ok() {
-        return raw.as_bytes().to_vec();
+        return Ok(raw.as_bytes().to_vec());
     }
-    json!({ "raw": raw }).to_string().into_bytes()
+    let normalized = json!({ "raw": raw }).to_string().into_bytes();
+    if normalized.len() > MAX_TOOL_ARGUMENT_BYTES {
+        return Err(format!(
+            "tool arguments exceed {MAX_TOOL_ARGUMENT_BYTES} bytes after normalization"
+        ));
+    }
+    Ok(normalized)
 }
 
 #[cfg(test)]
@@ -633,8 +651,9 @@ mod tests {
     };
 
     use super::{
-        build_model_provider, extract_completion_text, sanitize_remote_error, ModelProviderConfig,
-        ModelProviderKind, ProviderError, ProviderEvent, ProviderRequest,
+        build_model_provider, extract_completion_text, normalize_tool_arguments,
+        sanitize_remote_error, ModelProviderConfig, ModelProviderKind, ProviderError,
+        ProviderEvent, ProviderRequest,
     };
 
     fn openai_test_config(base_url: String) -> ModelProviderConfig {
@@ -757,6 +776,66 @@ mod tests {
             snapshot_json.contains("\"api_key_configured\":true"),
             "status snapshot should surface whether an API key is configured"
         );
+    }
+
+    #[test]
+    fn normalize_tool_arguments_rejects_oversized_payload() {
+        let oversized = "a".repeat(super::MAX_TOOL_ARGUMENT_BYTES + 1);
+        let error =
+            normalize_tool_arguments(oversized.as_str()).expect_err("oversized payload must fail");
+        assert!(error.contains("tool arguments exceed"), "error should mention byte limit");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn openai_provider_rejects_oversized_tool_arguments() {
+        let oversized_arguments = serde_json::json!({
+            "text": "a".repeat(super::MAX_TOOL_ARGUMENT_BYTES + 1)
+        })
+        .to_string();
+        let body = serde_json::json!({
+            "choices": [
+                {
+                    "message": {
+                        "tool_calls": [
+                            {
+                                "function": {
+                                    "name": "palyra.echo",
+                                    "arguments": oversized_arguments
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        })
+        .to_string();
+        let (base_url, request_count, handle) = spawn_scripted_server(vec![(200_u16, body)]);
+        let provider = build_model_provider(&openai_test_config(base_url))
+            .expect("openai provider should build");
+
+        let response = provider
+            .complete(ProviderRequest {
+                input_text: "hello".to_owned(),
+                json_mode: false,
+                vision_requested: false,
+            })
+            .await;
+
+        match response {
+            Err(ProviderError::InvalidResponse { message, .. }) => {
+                assert!(
+                    message.contains("tool arguments exceed"),
+                    "invalid response should explain tool argument size limit"
+                );
+            }
+            other => panic!("expected invalid-response error, got {other:?}"),
+        }
+        assert_eq!(
+            request_count.load(Ordering::Relaxed),
+            1,
+            "provider should issue one upstream request before rejecting response"
+        );
+        handle.join().expect("scripted server thread should exit");
     }
 
     #[test]

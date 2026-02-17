@@ -46,6 +46,8 @@ pub struct ToolCallPolicySnapshot {
 
 const POLICY_DENY_REASON: &str = "tool execution denied by default: tool is not allowlisted";
 const BUDGET_DENY_REASON: &str = "tool execution budget exhausted for run";
+const UNSUPPORTED_TOOL_DENY_REASON: &str =
+    "tool is allowlisted but unsupported by runtime executor";
 const TOOL_MAX_SLEEP_MS: u64 = 5_000;
 
 pub fn tool_policy_snapshot(config: &ToolCallConfig) -> ToolCallPolicySnapshot {
@@ -74,6 +76,15 @@ pub fn decide_tool_call(
         return ToolDecision {
             allowed: false,
             reason: POLICY_DENY_REASON.to_owned(),
+            approval_required: true,
+            policy_enforced: true,
+        };
+    }
+
+    if !is_runtime_supported_tool(tool_name) {
+        return ToolDecision {
+            allowed: false,
+            reason: UNSUPPORTED_TOOL_DENY_REASON.to_owned(),
             approval_required: true,
             policy_enforced: true,
         };
@@ -194,6 +205,10 @@ async fn run_allowlisted_tool(tool_name: &str, input_json: &[u8]) -> Result<Vec<
     }
 }
 
+fn is_runtime_supported_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "palyra.echo" | "palyra.sleep")
+}
+
 fn execute_echo_tool(input_json: &[u8]) -> Result<Vec<u8>, String> {
     let payload = parse_input_json(input_json)?;
     let text = payload
@@ -244,24 +259,26 @@ fn compute_execution_hash(
     executed_at_unix_ms: i64,
 ) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(proposal_id.as_bytes());
-    hasher.update(b"|");
-    hasher.update(tool_name.as_bytes());
-    hasher.update(b"|");
-    hasher.update(input_json);
-    hasher.update(b"|");
-    hasher.update(if success { b"1" } else { b"0" });
-    hasher.update(b"|");
-    hasher.update(output_json);
-    hasher.update(b"|");
-    hasher.update(error.as_bytes());
-    hasher.update(b"|");
-    hasher.update(if timed_out { b"1" } else { b"0" });
-    hasher.update(b"|");
-    hasher.update(executor.as_bytes());
-    hasher.update(b"|");
-    hasher.update(executed_at_unix_ms.to_string().as_bytes());
+    hasher.update(b"palyra.tool.attestation.v1");
+    hash_len_prefixed_str(&mut hasher, proposal_id);
+    hash_len_prefixed_str(&mut hasher, tool_name);
+    hash_len_prefixed_bytes(&mut hasher, input_json);
+    hasher.update([u8::from(success)]);
+    hash_len_prefixed_bytes(&mut hasher, output_json);
+    hash_len_prefixed_str(&mut hasher, error);
+    hasher.update([u8::from(timed_out)]);
+    hash_len_prefixed_str(&mut hasher, executor);
+    hasher.update(executed_at_unix_ms.to_be_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+fn hash_len_prefixed_str(hasher: &mut Sha256, value: &str) {
+    hash_len_prefixed_bytes(hasher, value.as_bytes());
+}
+
+fn hash_len_prefixed_bytes(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
 }
 
 fn current_unix_ms() -> i64 {
@@ -309,6 +326,20 @@ mod tests {
         assert_eq!(budget, 0);
         let third = decide_tool_call(&config, &mut budget, "palyra.echo");
         assert!(!third.allowed, "third call should be denied by budget");
+    }
+
+    #[test]
+    fn decide_tool_call_denies_allowlisted_unsupported_runtime_tool() {
+        let config = ToolCallConfig {
+            allowed_tools: vec!["custom.noop".to_owned()],
+            max_calls_per_run: 2,
+            execution_timeout_ms: 250,
+        };
+        let mut budget = config.max_calls_per_run;
+        let decision = decide_tool_call(&config, &mut budget, "custom.noop");
+        assert!(!decision.allowed, "unsupported runtime tool must be denied");
+        assert_eq!(budget, 2, "denied decisions must not consume budget");
+        assert!(decision.reason.contains("unsupported by runtime executor"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -368,5 +399,32 @@ mod tests {
         assert_eq!(snapshot.max_calls_per_run, 2);
         assert_eq!(snapshot.execution_timeout_ms, 250);
         assert_eq!(snapshot.allowed_tools.len(), 2);
+    }
+
+    #[test]
+    fn compute_execution_hash_is_unambiguous_for_delimiter_like_payloads() {
+        let hash_one = super::compute_execution_hash(
+            "01ARZ3NDEKTSV4RRFFQ69G5FA4",
+            "palyra.echo",
+            br#"{"text":"hello|world"}"#,
+            false,
+            b"A",
+            "B|C",
+            false,
+            "builtin",
+            1_735_689_600_000,
+        );
+        let hash_two = super::compute_execution_hash(
+            "01ARZ3NDEKTSV4RRFFQ69G5FA4",
+            "palyra.echo",
+            br#"{"text":"hello|world"}"#,
+            false,
+            b"A|B",
+            "C",
+            false,
+            "builtin",
+            1_735_689_600_000,
+        );
+        assert_ne!(hash_one, hash_two, "distinct field tuples must hash differently");
     }
 }
