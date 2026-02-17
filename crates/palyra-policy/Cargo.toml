@@ -6,6 +6,9 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+cedar-policy = "4.9.0"
+serde_json.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

@@ -4,7 +4,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::http::{header::AUTHORIZATION, HeaderMap};
@@ -1557,6 +1557,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                             let decision = decide_tool_call(
                                 &state_for_stream.config.tool_call,
                                 &mut remaining_tool_budget,
+                                context_for_stream.principal.as_str(),
                                 tool_name.as_str(),
                             );
                             if decision.allowed {
@@ -1578,6 +1579,51 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                                 run_id.as_str(),
                                 &mut tape_seq,
                                 proposal_id.as_str(),
+                                decision.allowed,
+                                decision.reason.as_str(),
+                                decision.approval_required,
+                                decision.policy_enforced,
+                            )
+                            .await
+                            {
+                                finalize_run_failure(
+                                    &sender,
+                                    &state_for_stream,
+                                    &mut run_state,
+                                    active_run_id.as_deref(),
+                                    &mut tape_seq,
+                                    error.message(),
+                                )
+                                .await;
+                                let _ = sender.send(Err(error)).await;
+                                return;
+                            }
+                            let session_id = if let Some(session_id) = active_session_id.as_deref()
+                            {
+                                session_id
+                            } else {
+                                let status = Status::internal(
+                                    "run stream internal invariant violated: missing session_id while recording policy decision",
+                                );
+                                finalize_run_failure(
+                                    &sender,
+                                    &state_for_stream,
+                                    &mut run_state,
+                                    active_run_id.as_deref(),
+                                    &mut tape_seq,
+                                    status.message(),
+                                )
+                                .await;
+                                let _ = sender.send(Err(status)).await;
+                                return;
+                            };
+                            if let Err(error) = record_policy_decision_journal_event(
+                                &state_for_stream,
+                                &context_for_stream,
+                                session_id,
+                                run_id.as_str(),
+                                proposal_id.as_str(),
+                                tool_name.as_str(),
                                 decision.allowed,
                                 decision.reason.as_str(),
                                 decision.approval_required,
@@ -2238,8 +2284,8 @@ fn status_tape_payload(kind: common_v1::stream_status::StatusKind, message: &str
 
 fn model_token_tape_payload(token: &str, is_final: bool) -> String {
     json!({
-        "token": token,
         "is_final": is_final,
+        "token": token,
     })
     .to_string()
 }
@@ -2271,6 +2317,65 @@ fn tool_decision_tape_payload(
         "policy_enforced": policy_enforced,
     })
     .to_string()
+}
+
+#[allow(clippy::result_large_err)]
+#[allow(clippy::too_many_arguments)]
+async fn record_policy_decision_journal_event(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: &RequestContext,
+    session_id: &str,
+    run_id: &str,
+    proposal_id: &str,
+    tool_name: &str,
+    allowed: bool,
+    reason: &str,
+    approval_required: bool,
+    policy_enforced: bool,
+) -> Result<(), Status> {
+    runtime_state
+        .record_journal_event(JournalAppendRequest {
+            event_id: Ulid::new().to_string(),
+            session_id: session_id.to_owned(),
+            run_id: run_id.to_owned(),
+            kind: common_v1::journal_event::EventKind::ToolExecuted as i32,
+            actor: common_v1::journal_event::EventActor::System as i32,
+            timestamp_unix_ms: current_unix_ms(),
+            payload_json: tool_decision_journal_payload(
+                proposal_id,
+                tool_name,
+                allowed,
+                reason,
+                approval_required,
+                policy_enforced,
+            ),
+            principal: context.principal.clone(),
+            device_id: context.device_id.clone(),
+            channel: context.channel.clone(),
+        })
+        .await
+        .map(|_| ())
+}
+
+fn tool_decision_journal_payload(
+    proposal_id: &str,
+    tool_name: &str,
+    allowed: bool,
+    reason: &str,
+    approval_required: bool,
+    policy_enforced: bool,
+) -> Vec<u8> {
+    json!({
+        "event": "policy_decision",
+        "proposal_id": proposal_id,
+        "tool_name": tool_name,
+        "kind": if allowed { "allow" } else { "deny" },
+        "reason": reason,
+        "approval_required": approval_required,
+        "policy_enforced": policy_enforced,
+    })
+    .to_string()
+    .into_bytes()
 }
 
 fn tool_result_tape_payload(
@@ -2307,6 +2412,10 @@ fn tool_attestation_tape_payload(
         "executor": executor,
     })
     .to_string()
+}
+
+fn current_unix_ms() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64
 }
 
 const fn status_kind_name(kind: common_v1::stream_status::StatusKind) -> &'static str {
