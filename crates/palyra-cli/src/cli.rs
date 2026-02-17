@@ -142,6 +142,44 @@ pub enum ConfigCommand {
         #[arg(long)]
         path: Option<String>,
     },
+    Get {
+        #[arg(long)]
+        path: Option<String>,
+        #[arg(long)]
+        key: String,
+    },
+    Set {
+        #[arg(long)]
+        path: Option<String>,
+        #[arg(long)]
+        key: String,
+        #[arg(long)]
+        value: String,
+        #[arg(long, default_value_t = 5)]
+        backups: usize,
+    },
+    Unset {
+        #[arg(long)]
+        path: Option<String>,
+        #[arg(long)]
+        key: String,
+        #[arg(long, default_value_t = 5)]
+        backups: usize,
+    },
+    Migrate {
+        #[arg(long)]
+        path: Option<String>,
+        #[arg(long, default_value_t = 5)]
+        backups: usize,
+    },
+    Recover {
+        #[arg(long)]
+        path: Option<String>,
+        #[arg(long, default_value_t = 1)]
+        backup: usize,
+        #[arg(long, default_value_t = 5)]
+        backups: usize,
+    },
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
@@ -416,6 +454,126 @@ mod tests {
             parsed.command,
             Command::Config {
                 command: ConfigCommand::Validate { path: Some("custom.toml".to_owned()) }
+            }
+        );
+    }
+
+    #[test]
+    fn parse_config_get_with_key() {
+        let parsed = Cli::parse_from([
+            "palyra",
+            "config",
+            "get",
+            "--path",
+            "custom.toml",
+            "--key",
+            "daemon.port",
+        ]);
+        assert_eq!(
+            parsed.command,
+            Command::Config {
+                command: ConfigCommand::Get {
+                    path: Some("custom.toml".to_owned()),
+                    key: "daemon.port".to_owned(),
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn parse_config_set_with_backups() {
+        let parsed = Cli::parse_from([
+            "palyra",
+            "config",
+            "set",
+            "--path",
+            "custom.toml",
+            "--key",
+            "daemon.port",
+            "--value",
+            "7443",
+            "--backups",
+            "7",
+        ]);
+        assert_eq!(
+            parsed.command,
+            Command::Config {
+                command: ConfigCommand::Set {
+                    path: Some("custom.toml".to_owned()),
+                    key: "daemon.port".to_owned(),
+                    value: "7443".to_owned(),
+                    backups: 7,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn parse_config_unset_with_defaults() {
+        let parsed = Cli::parse_from([
+            "palyra",
+            "config",
+            "unset",
+            "--path",
+            "custom.toml",
+            "--key",
+            "daemon.port",
+        ]);
+        assert_eq!(
+            parsed.command,
+            Command::Config {
+                command: ConfigCommand::Unset {
+                    path: Some("custom.toml".to_owned()),
+                    key: "daemon.port".to_owned(),
+                    backups: 5,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn parse_config_migrate_with_backups() {
+        let parsed = Cli::parse_from([
+            "palyra",
+            "config",
+            "migrate",
+            "--path",
+            "custom.toml",
+            "--backups",
+            "3",
+        ]);
+        assert_eq!(
+            parsed.command,
+            Command::Config {
+                command: ConfigCommand::Migrate {
+                    path: Some("custom.toml".to_owned()),
+                    backups: 3
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn parse_config_recover_with_backup_index() {
+        let parsed = Cli::parse_from([
+            "palyra",
+            "config",
+            "recover",
+            "--path",
+            "custom.toml",
+            "--backup",
+            "2",
+            "--backups",
+            "4",
+        ]);
+        assert_eq!(
+            parsed.command,
+            Command::Config {
+                command: ConfigCommand::Recover {
+                    path: Some("custom.toml".to_owned()),
+                    backup: 2,
+                    backups: 4,
+                }
             }
         );
     }

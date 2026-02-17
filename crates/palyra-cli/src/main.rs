@@ -12,9 +12,16 @@ use cli::{
 #[cfg(not(windows))]
 use cli::{PairingClientKindArg, PairingCommand, PairingMethodArg};
 use palyra_common::{
-    build_metadata, daemon_config_schema::RootFileConfig, default_config_search_paths,
-    parse_daemon_bind_socket, validate_canonical_id, HealthResponse,
-    CANONICAL_JSON_ENVELOPE_VERSION, CANONICAL_PROTOCOL_MAJOR,
+    build_metadata,
+    config_system::{
+        format_toml_value, get_value_at_path, parse_document_with_migration,
+        parse_toml_value_literal, recover_config_from_backup, set_value_at_path,
+        unset_value_at_path, write_document_with_backups, ConfigMigrationInfo,
+    },
+    daemon_config_schema::RootFileConfig,
+    default_config_search_paths, parse_config_path, parse_daemon_bind_socket,
+    validate_canonical_id, HealthResponse, CANONICAL_JSON_ENVELOPE_VERSION,
+    CANONICAL_PROTOCOL_MAJOR,
 };
 #[cfg(not(windows))]
 use palyra_identity::FilesystemSecretStore;
@@ -437,12 +444,7 @@ fn run_config(command: ConfigCommand) -> Result<()> {
     match command {
         ConfigCommand::Validate { path } => {
             let path = match path {
-                Some(explicit_path) => {
-                    if !Path::new(&explicit_path).exists() {
-                        anyhow::bail!("config file does not exist: {}", explicit_path);
-                    }
-                    explicit_path
-                }
+                Some(explicit) => resolve_config_path(Some(explicit), true)?,
                 None => {
                     if let Some(found) = find_default_config_path() {
                         found
@@ -453,18 +455,115 @@ fn run_config(command: ConfigCommand) -> Result<()> {
                 }
             };
 
-            let content =
-                fs::read_to_string(&path).with_context(|| format!("failed to read {}", path))?;
-            validate_daemon_compatible_config(&content)
-                .with_context(|| format!("failed to parse {}", path))?;
-            println!("config=valid source={path}");
+            let (document, migration) = load_document_from_existing_path(Path::new(&path))
+                .with_context(|| format!("failed to parse {path}"))?;
+            validate_daemon_compatible_document(&document)
+                .with_context(|| format!("failed to parse {path}"))?;
+            println!(
+                "config=valid source={path} version={} migrated={}",
+                migration.target_version, migration.migrated
+            );
+            std::io::stdout().flush().context("stdout flush failed")
+        }
+        ConfigCommand::Get { path, key } => {
+            let path = resolve_config_path(path, true)?;
+            let (document, _) = load_document_from_existing_path(Path::new(&path))
+                .with_context(|| format!("failed to parse {path}"))?;
+            let value = get_value_at_path(&document, key.as_str())
+                .with_context(|| format!("invalid config key path: {}", key))?
+                .with_context(|| format!("config key not found: {}", key))?;
+            println!("config.get key={} value={} source={}", key, format_toml_value(value), path);
+            std::io::stdout().flush().context("stdout flush failed")
+        }
+        ConfigCommand::Set { path, key, value, backups } => {
+            let path = resolve_config_path(path, false)?;
+            let path_ref = Path::new(&path);
+            let (mut document, migration) = load_document_for_mutation(path_ref)
+                .with_context(|| format!("failed to parse {}", path_ref.display()))?;
+            let literal = parse_toml_value_literal(value.as_str())
+                .context("config set value must be a valid TOML literal")?;
+            set_value_at_path(&mut document, key.as_str(), literal)
+                .with_context(|| format!("invalid config key path: {}", key))?;
+            write_document_with_backups(path_ref, &document, backups)
+                .with_context(|| format!("failed to persist config {}", path_ref.display()))?;
+            println!(
+                "config.set key={} source={} backups={} migrated={}",
+                key,
+                path_ref.display(),
+                backups,
+                migration.migrated
+            );
+            std::io::stdout().flush().context("stdout flush failed")
+        }
+        ConfigCommand::Unset { path, key, backups } => {
+            let path = resolve_config_path(path, true)?;
+            let path_ref = Path::new(&path);
+            let (mut document, _) = load_document_from_existing_path(path_ref)
+                .with_context(|| format!("failed to parse {}", path_ref.display()))?;
+            let removed = unset_value_at_path(&mut document, key.as_str())
+                .with_context(|| format!("invalid config key path: {}", key))?;
+            if !removed {
+                anyhow::bail!("config key not found: {}", key);
+            }
+            write_document_with_backups(path_ref, &document, backups)
+                .with_context(|| format!("failed to persist config {}", path_ref.display()))?;
+            println!("config.unset key={} source={} backups={}", key, path_ref.display(), backups);
+            std::io::stdout().flush().context("stdout flush failed")
+        }
+        ConfigCommand::Migrate { path, backups } => {
+            let path = resolve_config_path(path, true)?;
+            let path_ref = Path::new(&path);
+            let (document, migration) = load_document_from_existing_path(path_ref)
+                .with_context(|| format!("failed to parse {}", path_ref.display()))?;
+            if migration.migrated {
+                write_document_with_backups(path_ref, &document, backups).with_context(|| {
+                    format!("failed to persist migrated config {}", path_ref.display())
+                })?;
+            }
+            println!(
+                "config.migrate source={} source_version={} target_version={} migrated={} backups={}",
+                path_ref.display(),
+                migration.source_version,
+                migration.target_version,
+                migration.migrated,
+                backups
+            );
+            std::io::stdout().flush().context("stdout flush failed")
+        }
+        ConfigCommand::Recover { path, backup, backups } => {
+            let path = resolve_config_path(path, false)?;
+            let path_ref = Path::new(&path);
+            let recovered =
+                recover_config_from_backup(path_ref, backup, backups).with_context(|| {
+                    format!(
+                        "failed to recover config {} from backup index {}",
+                        path_ref.display(),
+                        backup
+                    )
+                })?;
+            let (document, _) = load_document_from_existing_path(path_ref).with_context(|| {
+                format!("failed to parse recovered config {}", path_ref.display())
+            })?;
+            validate_daemon_compatible_document(&document).with_context(|| {
+                format!("recovered config {} does not match daemon schema", path_ref.display())
+            })?;
+            println!(
+                "config.recover source={} backup={} recovered_from={} backups={}",
+                path_ref.display(),
+                backup,
+                recovered.display(),
+                backups
+            );
             std::io::stdout().flush().context("stdout flush failed")
         }
     }
 }
 
-fn validate_daemon_compatible_config(content: &str) -> Result<()> {
-    let parsed: RootFileConfig = toml::from_str(content).context("invalid daemon config schema")?;
+fn validate_daemon_compatible_document(document: &toml::Value) -> Result<()> {
+    let content =
+        toml::to_string(document).context("failed to serialize daemon config document")?;
+    let parsed: RootFileConfig =
+        toml::from_str(&content).context("invalid daemon config schema")?;
     let bind_addr = parsed
         .daemon
         .as_ref()
@@ -508,6 +607,37 @@ fn validate_daemon_compatible_config(content: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn load_document_from_existing_path(path: &Path) -> Result<(toml::Value, ConfigMigrationInfo)> {
+    let content =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    parse_document_with_migration(&content).context("failed to migrate config document")
+}
+
+fn load_document_for_mutation(path: &Path) -> Result<(toml::Value, ConfigMigrationInfo)> {
+    if path.exists() {
+        return load_document_from_existing_path(path);
+    }
+    parse_document_with_migration("").context("failed to initialize config document")
+}
+
+fn resolve_config_path(path: Option<String>, require_existing: bool) -> Result<String> {
+    let resolved = match path {
+        Some(explicit) => {
+            let parsed = parse_config_path(&explicit)
+                .with_context(|| format!("config path is invalid: {}", explicit))?;
+            parsed.to_string_lossy().into_owned()
+        }
+        None => find_default_config_path()
+            .context("no default config file found; pass --path to select a config file")?,
+    };
+
+    if require_existing && !Path::new(&resolved).exists() {
+        anyhow::bail!("config file does not exist: {}", resolved);
+    }
+
+    Ok(resolved)
 }
 
 fn find_default_config_path() -> Option<String> {

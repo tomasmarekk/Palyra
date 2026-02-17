@@ -197,6 +197,8 @@ async fn main() -> Result<()> {
         git_hash = build.git_hash,
         build_profile = build.build_profile,
         config_source = %loaded.source,
+        config_version = loaded.config_version,
+        config_migrated_from_version = ?loaded.migrated_from_version,
         admin_bind_addr = %loaded.daemon.bind_addr,
         admin_port = loaded.daemon.port,
         grpc_bind_addr = %loaded.gateway.grpc_bind_addr,

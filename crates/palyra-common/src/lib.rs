@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
 
+pub mod config_system;
 pub mod daemon_config_schema;
 
 pub const CANONICAL_PROTOCOL_MAJOR: u32 = 1;

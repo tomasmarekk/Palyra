@@ -5,7 +5,11 @@ use std::{
 
 use anyhow::{Context, Result};
 use palyra_common::{
-    daemon_config_schema::RootFileConfig, default_config_search_paths, parse_config_path,
+    config_system::{
+        parse_document_with_migration, serialize_document_pretty, ConfigMigrationInfo,
+    },
+    daemon_config_schema::RootFileConfig,
+    default_config_search_paths, parse_config_path,
 };
 
 use crate::model_provider::{ModelProviderConfig, ModelProviderKind};
@@ -38,6 +42,8 @@ const DEFAULT_WASM_RUNTIME_MAX_INSTANCES: u64 = 256;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadedConfig {
     pub source: String,
+    pub config_version: u32,
+    pub migrated_from_version: Option<u32>,
     pub daemon: DaemonConfig,
     pub gateway: GatewayConfig,
     pub orchestrator: OrchestratorConfig,
@@ -219,12 +225,18 @@ pub fn load_config() -> Result<LoadedConfig> {
     let mut identity = IdentityConfig::default();
     let mut storage = StorageConfig::default();
     let mut source = "defaults".to_owned();
+    let mut config_version = 1_u32;
+    let mut migrated_from_version = None;
 
     if let Some(path) = find_config_path()? {
         let content = fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        let parsed: RootFileConfig = toml::from_str(&content)
+        let (parsed, migration) = parse_root_file_config(&content)
             .with_context(|| format!("failed to parse config {}", path.display()))?;
+        config_version = migration.target_version;
+        if migration.migrated {
+            migrated_from_version = Some(migration.source_version);
+        }
         if let Some(file_daemon) = parsed.daemon {
             if let Some(bind_addr) = file_daemon.bind_addr {
                 daemon.bind_addr = bind_addr;
@@ -432,6 +444,9 @@ pub fn load_config() -> Result<LoadedConfig> {
             }
         }
         source = path.to_string_lossy().into_owned();
+        if migration.migrated {
+            source.push_str(" +migration(v0->v1)");
+        }
     }
 
     if let Ok(bind_addr) = env::var("PALYRA_DAEMON_BIND_ADDR") {
@@ -613,6 +628,8 @@ pub fn load_config() -> Result<LoadedConfig> {
 
     Ok(LoadedConfig {
         source,
+        config_version,
+        migrated_from_version,
         daemon,
         gateway,
         orchestrator,
@@ -622,6 +639,16 @@ pub fn load_config() -> Result<LoadedConfig> {
         identity,
         storage,
     })
+}
+
+fn parse_root_file_config(content: &str) -> Result<(RootFileConfig, ConfigMigrationInfo)> {
+    let (document, migration) =
+        parse_document_with_migration(content).context("failed to migrate config document")?;
+    let normalized =
+        serialize_document_pretty(&document).context("failed to serialize normalized config")?;
+    let parsed: RootFileConfig =
+        toml::from_str(&normalized).context("invalid daemon config schema")?;
+    Ok((parsed, migration))
 }
 
 fn find_config_path() -> Result<Option<PathBuf>> {
@@ -824,9 +851,9 @@ mod tests {
 
     use super::{
         parse_dns_suffix_allowlist, parse_host_allowlist, parse_journal_db_path,
-        parse_openai_base_url, parse_process_executable_allowlist, parse_storage_prefix_allowlist,
-        parse_tool_allowlist, AdminConfig, GatewayConfig, IdentityConfig, ModelProviderConfig,
-        OrchestratorConfig, StorageConfig, ToolCallConfig,
+        parse_openai_base_url, parse_process_executable_allowlist, parse_root_file_config,
+        parse_storage_prefix_allowlist, parse_tool_allowlist, AdminConfig, GatewayConfig,
+        IdentityConfig, ModelProviderConfig, OrchestratorConfig, StorageConfig, ToolCallConfig,
     };
     use crate::model_provider::ModelProviderKind;
     use palyra_common::daemon_config_schema::RootFileConfig;
@@ -923,6 +950,24 @@ mod tests {
         let result: Result<RootFileConfig, _> =
             toml::from_str("unexpected=true\n[daemon]\nport=7142\n");
         assert!(result.is_err(), "unknown top-level keys must be rejected");
+    }
+
+    #[test]
+    fn config_migrates_legacy_documents_without_explicit_version() {
+        let (parsed, migration) =
+            parse_root_file_config("[daemon]\nport=7142\n").expect("legacy config should parse");
+        assert_eq!(parsed.version, Some(1));
+        assert!(migration.migrated, "legacy config should trigger migration");
+        assert_eq!(migration.source_version, 0);
+        assert_eq!(migration.target_version, 1);
+    }
+
+    #[test]
+    fn config_rejects_unsupported_future_version() {
+        let error =
+            parse_root_file_config("version=2\n[daemon]\nport=7142\n").expect_err("must fail");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("unsupported config version 2"), "unexpected error: {rendered}");
     }
 
     #[test]

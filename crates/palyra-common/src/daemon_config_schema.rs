@@ -3,6 +3,7 @@ use serde::Deserialize;
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RootFileConfig {
+    pub version: Option<u32>,
     pub daemon: Option<FileDaemonConfig>,
     pub gateway: Option<FileGatewayConfig>,
     pub orchestrator: Option<FileOrchestratorConfig>,
