@@ -2059,10 +2059,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum 0.8.8",
+ "base64",
  "clap",
  "libc",
  "palyra-common",
  "palyra-identity",
+ "palyra-plugins-runtime",
+ "palyra-plugins-sdk",
  "palyra-policy",
  "prost",
  "protoc-bin-vendored",
@@ -2114,6 +2117,7 @@ dependencies = [
 name = "palyra-plugins-runtime"
 version = "0.1.0"
 dependencies = [
+ "palyra-plugins-sdk",
  "thiserror 2.0.18",
  "wasmtime",
 ]

@@ -1,10 +1,32 @@
 package palyra:plugins/sdk@0.1.0;
 
+/// Host-provided capability handles exposed to sandboxed plugins.
+///
+/// Plugins must treat returned integers as opaque handles. A value of `-1`
+/// means the indexed capability was not granted.
+interface host-capabilities {
+  http-count: func() -> u32;
+  http-handle: func(index: u32) -> s32;
+
+  secret-count: func() -> u32;
+  secret-handle: func(index: u32) -> s32;
+
+  storage-count: func() -> u32;
+  storage-handle: func(index: u32) -> s32;
+
+  channel-count: func() -> u32;
+  channel-handle: func(index: u32) -> s32;
+}
+
 interface runtime {
-  /// Returns a static plugin runtime compatibility string.
+  /// Returns a static runtime compatibility marker.
   plugin-hello: func() -> string;
+
+  /// Executes the plugin and returns deterministic exit code.
+  run: func() -> s32;
 }
 
 world palyra-plugin {
+  import host-capabilities;
   export runtime;
 }

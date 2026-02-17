@@ -5,6 +5,7 @@ mod model_provider;
 mod orchestrator;
 mod sandbox_runner;
 mod tool_protocol;
+mod wasm_plugin_runner;
 
 use std::time::Instant;
 
@@ -147,6 +148,22 @@ async fn main() -> Result<()> {
                     memory_limit_bytes: loaded.tool_call.process_runner.memory_limit_bytes,
                     max_output_bytes: loaded.tool_call.process_runner.max_output_bytes,
                 },
+                wasm_runtime: wasm_plugin_runner::WasmPluginRunnerPolicy {
+                    enabled: loaded.tool_call.wasm_runtime.enabled,
+                    max_module_size_bytes: loaded.tool_call.wasm_runtime.max_module_size_bytes,
+                    fuel_budget: loaded.tool_call.wasm_runtime.fuel_budget,
+                    max_memory_bytes: loaded.tool_call.wasm_runtime.max_memory_bytes,
+                    max_table_elements: loaded.tool_call.wasm_runtime.max_table_elements,
+                    max_instances: loaded.tool_call.wasm_runtime.max_instances,
+                    allowed_http_hosts: loaded.tool_call.wasm_runtime.allowed_http_hosts.clone(),
+                    allowed_secrets: loaded.tool_call.wasm_runtime.allowed_secrets.clone(),
+                    allowed_storage_prefixes: loaded
+                        .tool_call
+                        .wasm_runtime
+                        .allowed_storage_prefixes
+                        .clone(),
+                    allowed_channels: loaded.tool_call.wasm_runtime.allowed_channels.clone(),
+                },
             },
         },
         GatewayJournalConfigSnapshot {
@@ -203,6 +220,16 @@ async fn main() -> Result<()> {
         tool_call_process_runner_cpu_time_limit_ms = loaded.tool_call.process_runner.cpu_time_limit_ms,
         tool_call_process_runner_memory_limit_bytes = loaded.tool_call.process_runner.memory_limit_bytes,
         tool_call_process_runner_max_output_bytes = loaded.tool_call.process_runner.max_output_bytes,
+        tool_call_wasm_runtime_enabled = loaded.tool_call.wasm_runtime.enabled,
+        tool_call_wasm_runtime_max_module_size_bytes = loaded.tool_call.wasm_runtime.max_module_size_bytes,
+        tool_call_wasm_runtime_fuel_budget = loaded.tool_call.wasm_runtime.fuel_budget,
+        tool_call_wasm_runtime_max_memory_bytes = loaded.tool_call.wasm_runtime.max_memory_bytes,
+        tool_call_wasm_runtime_max_table_elements = loaded.tool_call.wasm_runtime.max_table_elements,
+        tool_call_wasm_runtime_max_instances = loaded.tool_call.wasm_runtime.max_instances,
+        tool_call_wasm_runtime_allowed_http_hosts = ?loaded.tool_call.wasm_runtime.allowed_http_hosts,
+        tool_call_wasm_runtime_allowed_secrets = ?loaded.tool_call.wasm_runtime.allowed_secrets,
+        tool_call_wasm_runtime_allowed_storage_prefixes = ?loaded.tool_call.wasm_runtime.allowed_storage_prefixes,
+        tool_call_wasm_runtime_allowed_channels = ?loaded.tool_call.wasm_runtime.allowed_channels,
         admin_auth_required = loaded.admin.require_auth,
         admin_token_configured = loaded.admin.auth_token.is_some(),
         node_rpc_mtls_required = !loaded.identity.allow_insecure_node_rpc_without_mtls,

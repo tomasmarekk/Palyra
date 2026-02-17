@@ -29,7 +29,6 @@ const RUN_ID_ALT: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAZ";
 const ENVELOPE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAY";
 const OPENAI_API_KEY: &str = "sk-openai-integration-test";
 static TEMP_JOURNAL_COUNTER: AtomicU64 = AtomicU64::new(0);
-#[cfg(unix)]
 static TEMP_CONFIG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub mod proto {
@@ -741,6 +740,186 @@ async fn grpc_run_stream_blocks_sandbox_process_runner_non_allowlisted_egress_ho
     }
 
     assert!(saw_failed_result, "sandbox denied egress host must produce failed tool result");
+
+    server_handle.join().expect("scripted openai server thread should exit");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_run_stream_executes_wasm_plugin_runtime_with_allowlisted_capabilities() -> Result<()>
+{
+    let tool_arguments = serde_json::json!({
+        "module_wat": r#"
+            (module
+                (import "palyra:plugins/host-capabilities@0.1.0" "http-count" (func $http_count (result i32)))
+                (func (export "run") (result i32)
+                    call $http_count
+                )
+            )
+        "#,
+        "capabilities": {
+            "http_hosts": ["api.example.com"]
+        }
+    });
+    let response_body = openai_tool_call_response("palyra.plugin.run", &tool_arguments)?;
+    let (openai_base_url, _request_count, server_handle) =
+        spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::immediate(200, response_body)])?;
+    let (child, admin_port, grpc_port, _journal_db_path, config_path) =
+        spawn_palyrad_with_openai_provider_tool_policy_and_wasm_runtime(WasmRuntimeSpawnConfig {
+            openai_base_url: openai_base_url.as_str(),
+            openai_api_key: OPENAI_API_KEY,
+            allowed_tools: "palyra.plugin.run",
+            max_calls_per_run: 2,
+            execution_timeout_ms: 2_000,
+            allowed_http_hosts: "api.example.com",
+            allowed_secrets: "db_password",
+            allowed_storage_prefixes: "plugins/cache",
+            allowed_channels: "cli",
+            fuel_budget: 10_000_000,
+            max_memory_bytes: 64 * 1024 * 1024,
+            max_table_elements: 100_000,
+            max_instances: 256,
+        })?;
+    let _config_guard = TempFileGuard::new(config_path);
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+
+    let mut stream_request =
+        tonic::Request::new(tokio_stream::iter(vec![sample_run_stream_request_with_text(
+            "wasm plugin runtime success path".to_owned(),
+        )]));
+    stream_request.metadata_mut().insert("authorization", format!("Bearer {ADMIN_TOKEN}").parse()?);
+    stream_request.metadata_mut().insert("x-palyra-principal", "user:ops".parse()?);
+    stream_request.metadata_mut().insert("x-palyra-device-id", DEVICE_ID.parse()?);
+    stream_request.metadata_mut().insert("x-palyra-channel", "cli".parse()?);
+
+    let mut response_stream =
+        client.run_stream(stream_request).await.context("failed to call RunStream")?.into_inner();
+
+    let mut saw_allow_decision = false;
+    let mut saw_success_result = false;
+    let mut saw_wasm_attestation = false;
+    while let Some(event) = response_stream.next().await {
+        let event = event.context("failed to read RunStream event")?;
+        if let Some(body) = event.body {
+            match body {
+                common_v1::run_stream_event::Body::ToolDecision(decision) => {
+                    if decision.kind == common_v1::tool_decision::DecisionKind::Allow as i32 {
+                        saw_allow_decision = true;
+                    }
+                }
+                common_v1::run_stream_event::Body::ToolResult(result) => {
+                    if result.success {
+                        let output = serde_json::from_slice::<Value>(&result.output_json)
+                            .context("wasm plugin output_json should be valid JSON")?;
+                        assert_eq!(output.get("exit_code").and_then(Value::as_i64), Some(1));
+                        saw_success_result = true;
+                    }
+                }
+                common_v1::run_stream_event::Body::ToolAttestation(attestation) => {
+                    if attestation.executor == "sandbox_tier_a" {
+                        saw_wasm_attestation = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    assert!(saw_allow_decision, "wasm plugin tool call should be allowed by policy");
+    assert!(saw_success_result, "wasm plugin tool call should execute successfully");
+    assert!(saw_wasm_attestation, "wasm plugin tool call should emit sandbox attestation");
+
+    let status_snapshot = admin_get_json_async(admin_port, "/admin/v1/status".to_owned()).await?;
+    assert_eq!(
+        status_snapshot.pointer("/tool_call_policy/wasm_runtime/enabled").and_then(Value::as_bool),
+        Some(true)
+    );
+
+    server_handle.join().expect("scripted openai server thread should exit");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_run_stream_blocks_wasm_plugin_runtime_non_allowlisted_capability() -> Result<()> {
+    let tool_arguments = serde_json::json!({
+        "module_wat": "(module (func (export \"run\") (result i32) i32.const 1))",
+        "capabilities": {
+            "http_hosts": ["blocked.example"]
+        }
+    });
+    let response_body = openai_tool_call_response("palyra.plugin.run", &tool_arguments)?;
+    let (openai_base_url, _request_count, server_handle) =
+        spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::immediate(200, response_body)])?;
+    let (child, admin_port, grpc_port, _journal_db_path, config_path) =
+        spawn_palyrad_with_openai_provider_tool_policy_and_wasm_runtime(WasmRuntimeSpawnConfig {
+            openai_base_url: openai_base_url.as_str(),
+            openai_api_key: OPENAI_API_KEY,
+            allowed_tools: "palyra.plugin.run",
+            max_calls_per_run: 2,
+            execution_timeout_ms: 2_000,
+            allowed_http_hosts: "api.example.com",
+            allowed_secrets: "",
+            allowed_storage_prefixes: "",
+            allowed_channels: "",
+            fuel_budget: 10_000_000,
+            max_memory_bytes: 64 * 1024 * 1024,
+            max_table_elements: 100_000,
+            max_instances: 256,
+        })?;
+    let _config_guard = TempFileGuard::new(config_path);
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+
+    let mut stream_request =
+        tonic::Request::new(tokio_stream::iter(vec![sample_run_stream_request_with_text(
+            "wasm plugin capability deny path".to_owned(),
+        )]));
+    stream_request.metadata_mut().insert("authorization", format!("Bearer {ADMIN_TOKEN}").parse()?);
+    stream_request.metadata_mut().insert("x-palyra-principal", "user:ops".parse()?);
+    stream_request.metadata_mut().insert("x-palyra-device-id", DEVICE_ID.parse()?);
+    stream_request.metadata_mut().insert("x-palyra-channel", "cli".parse()?);
+
+    let mut response_stream =
+        client.run_stream(stream_request).await.context("failed to call RunStream")?.into_inner();
+
+    let mut saw_failed_result = false;
+    let mut saw_sandbox_attestation = false;
+    while let Some(event) = response_stream.next().await {
+        let event = event.context("failed to read RunStream event")?;
+        if let Some(body) = event.body {
+            match body {
+                common_v1::run_stream_event::Body::ToolResult(result) => {
+                    if !result.success {
+                        assert!(
+                            result.error.contains("capability denied"),
+                            "wasm runtime denial should include capability explain text"
+                        );
+                        saw_failed_result = true;
+                    }
+                }
+                common_v1::run_stream_event::Body::ToolAttestation(attestation) => {
+                    if attestation.executor == "sandbox_tier_a" {
+                        saw_sandbox_attestation = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    assert!(saw_failed_result, "wasm capability denial must produce failed tool result");
+    assert!(saw_sandbox_attestation, "wasm capability denial must emit sandbox attestation");
 
     server_handle.join().expect("scripted openai server thread should exit");
     Ok(())
@@ -1493,6 +1672,63 @@ fn spawn_palyrad_with_openai_provider_tool_policy_and_process_runner(
     Ok((child, admin_port, grpc_port, journal_db_path, config_path))
 }
 
+struct WasmRuntimeSpawnConfig<'a> {
+    openai_base_url: &'a str,
+    openai_api_key: &'a str,
+    allowed_tools: &'a str,
+    max_calls_per_run: u32,
+    execution_timeout_ms: u64,
+    allowed_http_hosts: &'a str,
+    allowed_secrets: &'a str,
+    allowed_storage_prefixes: &'a str,
+    allowed_channels: &'a str,
+    fuel_budget: u64,
+    max_memory_bytes: u64,
+    max_table_elements: u64,
+    max_instances: u64,
+}
+
+fn spawn_palyrad_with_openai_provider_tool_policy_and_wasm_runtime(
+    config: WasmRuntimeSpawnConfig<'_>,
+) -> Result<(Child, u16, u16, PathBuf, PathBuf)> {
+    let config_path = write_wasm_runtime_config(&config)?;
+
+    let journal_db_path = unique_temp_journal_db_path();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_palyrad"))
+        .args([
+            "--bind",
+            "127.0.0.1",
+            "--port",
+            "0",
+            "--grpc-bind",
+            "127.0.0.1",
+            "--grpc-port",
+            "0",
+        ])
+        .env("PALYRA_CONFIG", config_path.to_string_lossy().to_string())
+        .env("PALYRA_ADMIN_TOKEN", ADMIN_TOKEN)
+        .env("PALYRA_JOURNAL_DB_PATH", journal_db_path.to_string_lossy().to_string())
+        .env("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED", "true")
+        .env("PALYRA_MODEL_PROVIDER_KIND", "openai_compatible")
+        .env("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", config.openai_base_url)
+        .env("PALYRA_MODEL_PROVIDER_OPENAI_API_KEY", config.openai_api_key)
+        .env("PALYRA_MODEL_PROVIDER_MAX_RETRIES", "0")
+        .env("PALYRA_MODEL_PROVIDER_RETRY_BACKOFF_MS", "1")
+        .env("PALYRA_MODEL_PROVIDER_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "1")
+        .env("PALYRA_MODEL_PROVIDER_CIRCUIT_BREAKER_COOLDOWN_MS", "30000")
+        .env("PALYRA_TOOL_CALL_ALLOWED_TOOLS", config.allowed_tools)
+        .env("PALYRA_TOOL_CALL_MAX_CALLS_PER_RUN", config.max_calls_per_run.to_string())
+        .env("PALYRA_TOOL_CALL_TIMEOUT_MS", config.execution_timeout_ms.to_string())
+        .env("RUST_LOG", "info")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to start palyrad with wasm runtime policy")?;
+    let stdout = child.stdout.take().context("failed to capture palyrad stdout")?;
+    let (admin_port, grpc_port) = wait_for_listen_ports(stdout, &mut child)?;
+    Ok((child, admin_port, grpc_port, journal_db_path, config_path))
+}
+
 #[cfg(unix)]
 fn write_process_runner_config(
     workspace_root: &Path,
@@ -1524,7 +1760,37 @@ max_output_bytes = 65536
     Ok(config_path)
 }
 
-#[cfg(unix)]
+fn write_wasm_runtime_config(config: &WasmRuntimeSpawnConfig<'_>) -> Result<PathBuf> {
+    let config_path = unique_temp_daemon_config_path();
+    let config_body = format!(
+        "\
+[tool_call.wasm_runtime]
+enabled = true
+max_module_size_bytes = 262144
+fuel_budget = {fuel_budget}
+max_memory_bytes = {max_memory_bytes}
+max_table_elements = {max_table_elements}
+max_instances = {max_instances}
+allowed_http_hosts = {allowed_http_hosts}
+allowed_secrets = {allowed_secrets}
+allowed_storage_prefixes = {allowed_storage_prefixes}
+allowed_channels = {allowed_channels}
+",
+        fuel_budget = config.fuel_budget,
+        max_memory_bytes = config.max_memory_bytes,
+        max_table_elements = config.max_table_elements,
+        max_instances = config.max_instances,
+        allowed_http_hosts = toml_string_array(config.allowed_http_hosts),
+        allowed_secrets = toml_string_array(config.allowed_secrets),
+        allowed_storage_prefixes = toml_string_array(config.allowed_storage_prefixes),
+        allowed_channels = toml_string_array(config.allowed_channels),
+    );
+    fs::write(&config_path, config_body).with_context(|| {
+        format!("failed to write wasm runtime test config at {}", config_path.display())
+    })?;
+    Ok(config_path)
+}
+
 fn unique_temp_daemon_config_path() -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1535,7 +1801,6 @@ fn unique_temp_daemon_config_path() -> PathBuf {
         .join(format!("palyra-gateway-config-{nonce}-{}-{counter}.toml", std::process::id()))
 }
 
-#[cfg(unix)]
 fn toml_string_array(raw: &str) -> String {
     let values = raw
         .split(',')
@@ -1546,7 +1811,6 @@ fn toml_string_array(raw: &str) -> String {
     format!("[{}]", values.join(", "))
 }
 
-#[cfg(unix)]
 fn toml_string(raw: &str) -> String {
     format!("\"{}\"", raw.replace('\\', "\\\\").replace('"', "\\\""))
 }
@@ -1566,6 +1830,24 @@ impl ScriptedOpenAiResponse {
     fn delayed(status_code: u16, body: String, delay_before_response: Duration) -> Self {
         Self { status_code, body, delay_before_response }
     }
+}
+
+fn openai_tool_call_response(tool_name: &str, arguments: &Value) -> Result<String> {
+    let arguments_json =
+        serde_json::to_string(arguments).context("failed to serialize tool arguments string")?;
+    Ok(serde_json::json!({
+        "choices": [{
+            "message": {
+                "tool_calls": [{
+                    "function": {
+                        "name": tool_name,
+                        "arguments": arguments_json
+                    }
+                }]
+            }
+        }]
+    })
+    .to_string())
 }
 
 fn spawn_scripted_openai_server(
@@ -1793,19 +2075,16 @@ impl Drop for ChildGuard {
     }
 }
 
-#[cfg(unix)]
 struct TempFileGuard {
     path: PathBuf,
 }
 
-#[cfg(unix)]
 impl TempFileGuard {
     fn new(path: PathBuf) -> Self {
         Self { path }
     }
 }
 
-#[cfg(unix)]
 impl Drop for TempFileGuard {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);

@@ -56,6 +56,7 @@ pub struct FileToolCallConfig {
     pub max_calls_per_run: Option<u32>,
     pub execution_timeout_ms: Option<u64>,
     pub process_runner: Option<FileProcessRunnerConfig>,
+    pub wasm_runtime: Option<FileWasmRuntimeConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -69,6 +70,21 @@ pub struct FileProcessRunnerConfig {
     pub cpu_time_limit_ms: Option<u64>,
     pub memory_limit_bytes: Option<u64>,
     pub max_output_bytes: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileWasmRuntimeConfig {
+    pub enabled: Option<bool>,
+    pub max_module_size_bytes: Option<u64>,
+    pub fuel_budget: Option<u64>,
+    pub max_memory_bytes: Option<u64>,
+    pub max_table_elements: Option<u64>,
+    pub max_instances: Option<u64>,
+    pub allowed_http_hosts: Option<Vec<String>>,
+    pub allowed_secrets: Option<Vec<String>>,
+    pub allowed_storage_prefixes: Option<Vec<String>>,
+    pub allowed_channels: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
