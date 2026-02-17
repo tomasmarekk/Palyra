@@ -14,6 +14,46 @@ pub enum Command {
         #[arg(long, default_value_t = false)]
         strict: bool,
     },
+    Status {
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        grpc_url: Option<String>,
+        #[arg(long, default_value_t = false)]
+        admin: bool,
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long, default_value = "user:local")]
+        principal: String,
+        #[arg(long, default_value = "01ARZ3NDEKTSV4RRFFQ69G5FAV")]
+        device_id: String,
+        #[arg(long)]
+        channel: Option<String>,
+    },
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommand,
+    },
+    Cron {
+        #[command(subcommand)]
+        command: CronCommand,
+    },
+    Channels {
+        #[command(subcommand)]
+        command: ChannelsCommand,
+    },
+    Browser {
+        #[command(subcommand)]
+        command: BrowserCommand,
+    },
+    Completion {
+        #[arg(long, value_enum)]
+        shell: CompletionShell,
+    },
+    Onboarding {
+        #[command(subcommand)]
+        command: OnboardingCommand,
+    },
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
@@ -34,6 +74,141 @@ pub enum Command {
     Pairing {
         #[command(subcommand)]
         command: PairingCommand,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum AgentCommand {
+    Run {
+        #[arg(long)]
+        grpc_url: Option<String>,
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long, default_value = "user:local")]
+        principal: String,
+        #[arg(long, default_value = "01ARZ3NDEKTSV4RRFFQ69G5FAV")]
+        device_id: String,
+        #[arg(long, default_value = "cli")]
+        channel: String,
+        #[arg(long)]
+        session_id: Option<String>,
+        #[arg(long)]
+        run_id: Option<String>,
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(long, default_value_t = false)]
+        prompt_stdin: bool,
+        #[arg(long, default_value_t = false)]
+        allow_sensitive_tools: bool,
+        #[arg(long, default_value_t = false)]
+        ndjson: bool,
+    },
+    Interactive {
+        #[arg(long)]
+        grpc_url: Option<String>,
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long, default_value = "user:local")]
+        principal: String,
+        #[arg(long, default_value = "01ARZ3NDEKTSV4RRFFQ69G5FAV")]
+        device_id: String,
+        #[arg(long, default_value = "cli")]
+        channel: String,
+        #[arg(long)]
+        session_id: Option<String>,
+        #[arg(long, default_value_t = false)]
+        allow_sensitive_tools: bool,
+        #[arg(long, default_value_t = false)]
+        ndjson: bool,
+    },
+    AcpShim {
+        #[arg(long)]
+        grpc_url: Option<String>,
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long, default_value = "user:local")]
+        principal: String,
+        #[arg(long, default_value = "01ARZ3NDEKTSV4RRFFQ69G5FAV")]
+        device_id: String,
+        #[arg(long, default_value = "cli")]
+        channel: String,
+        #[arg(long)]
+        session_id: Option<String>,
+        #[arg(long)]
+        run_id: Option<String>,
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(long, default_value_t = false)]
+        prompt_stdin: bool,
+        #[arg(long, default_value_t = false)]
+        allow_sensitive_tools: bool,
+        #[arg(long, default_value_t = false)]
+        ndjson_stdin: bool,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum CronCommand {
+    List,
+    Add {
+        #[arg(long)]
+        schedule: String,
+        #[arg(long)]
+        action: String,
+    },
+    Remove {
+        #[arg(long)]
+        id: String,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum ChannelsCommand {
+    List,
+    Connect {
+        #[arg(long)]
+        kind: String,
+        #[arg(long)]
+        name: String,
+    },
+    Disconnect {
+        #[arg(long)]
+        name: String,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum BrowserCommand {
+    Status {
+        #[arg(long)]
+        url: Option<String>,
+    },
+    Open {
+        #[arg(long)]
+        url: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CompletionShell {
+    Bash,
+    Zsh,
+    Fish,
+    Powershell,
+    Elvish,
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum OnboardingCommand {
+    Wizard {
+        #[arg(long)]
+        path: Option<String>,
+        #[arg(long, default_value_t = false)]
+        force: bool,
+        #[arg(long, default_value = "http://127.0.0.1:7142")]
+        daemon_url: String,
+        #[arg(long, default_value = "PALYRA_ADMIN_TOKEN")]
+        admin_token_env: String,
     },
 }
 
@@ -239,7 +414,11 @@ impl PairingMethodArg {
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Command, ConfigCommand, DaemonCommand, PolicyCommand, ProtocolCommand};
+    use super::{
+        AgentCommand, BrowserCommand, ChannelsCommand, Cli, Command, CompletionShell,
+        ConfigCommand, CronCommand, DaemonCommand, OnboardingCommand, PolicyCommand,
+        ProtocolCommand,
+    };
     #[cfg(not(windows))]
     use super::{PairingClientKindArg, PairingCommand, PairingMethodArg};
 
@@ -253,6 +432,210 @@ mod tests {
     fn parse_doctor_strict() {
         let parsed = Cli::parse_from(["palyra", "doctor", "--strict"]);
         assert_eq!(parsed.command, Command::Doctor { strict: true });
+    }
+
+    #[test]
+    fn parse_status_with_admin_context() {
+        let parsed = Cli::parse_from([
+            "palyra",
+            "status",
+            "--url",
+            "http://127.0.0.1:7142",
+            "--grpc-url",
+            "http://127.0.0.1:7443",
+            "--admin",
+            "--token",
+            "test-token",
+            "--principal",
+            "user:ops",
+            "--device-id",
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "--channel",
+            "cli",
+        ]);
+        assert_eq!(
+            parsed.command,
+            Command::Status {
+                url: Some("http://127.0.0.1:7142".to_owned()),
+                grpc_url: Some("http://127.0.0.1:7443".to_owned()),
+                admin: true,
+                token: Some("test-token".to_owned()),
+                principal: "user:ops".to_owned(),
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                channel: Some("cli".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_agent_run_with_prompt() {
+        let parsed = Cli::parse_from([
+            "palyra",
+            "agent",
+            "run",
+            "--grpc-url",
+            "http://127.0.0.1:7443",
+            "--token",
+            "test-token",
+            "--session-id",
+            "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+            "--run-id",
+            "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+            "--prompt",
+            "hello",
+            "--allow-sensitive-tools",
+            "--ndjson",
+        ]);
+        assert_eq!(
+            parsed.command,
+            Command::Agent {
+                command: AgentCommand::Run {
+                    grpc_url: Some("http://127.0.0.1:7443".to_owned()),
+                    token: Some("test-token".to_owned()),
+                    principal: "user:local".to_owned(),
+                    device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                    channel: "cli".to_owned(),
+                    session_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned()),
+                    run_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned()),
+                    prompt: Some("hello".to_owned()),
+                    prompt_stdin: false,
+                    allow_sensitive_tools: true,
+                    ndjson: true,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn parse_agent_interactive_with_defaults() {
+        let parsed = Cli::parse_from(["palyra", "agent", "interactive"]);
+        assert_eq!(
+            parsed.command,
+            Command::Agent {
+                command: AgentCommand::Interactive {
+                    grpc_url: None,
+                    token: None,
+                    principal: "user:local".to_owned(),
+                    device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                    channel: "cli".to_owned(),
+                    session_id: None,
+                    allow_sensitive_tools: false,
+                    ndjson: false,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn parse_agent_acp_shim_from_ndjson_stdin() {
+        let parsed = Cli::parse_from([
+            "palyra",
+            "agent",
+            "acp-shim",
+            "--grpc-url",
+            "http://127.0.0.1:7443",
+            "--ndjson-stdin",
+        ]);
+        assert_eq!(
+            parsed.command,
+            Command::Agent {
+                command: AgentCommand::AcpShim {
+                    grpc_url: Some("http://127.0.0.1:7443".to_owned()),
+                    token: None,
+                    principal: "user:local".to_owned(),
+                    device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                    channel: "cli".to_owned(),
+                    session_id: None,
+                    run_id: None,
+                    prompt: None,
+                    prompt_stdin: false,
+                    allow_sensitive_tools: false,
+                    ndjson_stdin: true,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn parse_cron_add() {
+        let parsed = Cli::parse_from([
+            "palyra",
+            "cron",
+            "add",
+            "--schedule",
+            "*/5 * * * *",
+            "--action",
+            "agent.run",
+        ]);
+        assert_eq!(
+            parsed.command,
+            Command::Cron {
+                command: CronCommand::Add {
+                    schedule: "*/5 * * * *".to_owned(),
+                    action: "agent.run".to_owned(),
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn parse_channels_connect() {
+        let parsed =
+            Cli::parse_from(["palyra", "channels", "connect", "--kind", "slack", "--name", "ops"]);
+        assert_eq!(
+            parsed.command,
+            Command::Channels {
+                command: ChannelsCommand::Connect {
+                    kind: "slack".to_owned(),
+                    name: "ops".to_owned(),
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn parse_browser_status() {
+        let parsed =
+            Cli::parse_from(["palyra", "browser", "status", "--url", "http://127.0.0.1:7143"]);
+        assert_eq!(
+            parsed.command,
+            Command::Browser {
+                command: BrowserCommand::Status { url: Some("http://127.0.0.1:7143".to_owned()) }
+            }
+        );
+    }
+
+    #[test]
+    fn parse_completion_powershell() {
+        let parsed = Cli::parse_from(["palyra", "completion", "--shell", "powershell"]);
+        assert_eq!(parsed.command, Command::Completion { shell: CompletionShell::Powershell });
+    }
+
+    #[test]
+    fn parse_onboarding_wizard_with_custom_path() {
+        let parsed = Cli::parse_from([
+            "palyra",
+            "onboarding",
+            "wizard",
+            "--path",
+            "config/palyra.toml",
+            "--force",
+            "--daemon-url",
+            "http://127.0.0.1:7142",
+            "--admin-token-env",
+            "PALYRA_ADMIN_TOKEN",
+        ]);
+        assert_eq!(
+            parsed.command,
+            Command::Onboarding {
+                command: OnboardingCommand::Wizard {
+                    path: Some("config/palyra.toml".to_owned()),
+                    force: true,
+                    daemon_url: "http://127.0.0.1:7142".to_owned(),
+                    admin_token_env: "PALYRA_ADMIN_TOKEN".to_owned(),
+                }
+            }
+        );
     }
 
     #[test]

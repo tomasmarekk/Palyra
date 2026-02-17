@@ -1,13 +1,37 @@
 mod cli;
 
-use std::{env, fs, io::Write, path::Path, process::Command, thread, time::Duration};
+pub mod proto {
+    pub mod palyra {
+        pub mod common {
+            pub mod v1 {
+                tonic::include_proto!("palyra.common.v1");
+            }
+        }
+
+        pub mod gateway {
+            pub mod v1 {
+                tonic::include_proto!("palyra.gateway.v1");
+            }
+        }
+    }
+}
+
+use std::{
+    env, fs,
+    io::{BufRead, Write},
+    path::{Path, PathBuf},
+    process::Command,
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 #[cfg(not(windows))]
-use std::{ffi::OsString, io::BufRead, path::PathBuf, sync::Arc, time::SystemTime};
+use std::{ffi::OsString, sync::Arc};
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use cli::{
-    Cli, Command as CliCommand, ConfigCommand, DaemonCommand, PolicyCommand, ProtocolCommand,
+    AgentCommand, BrowserCommand, ChannelsCommand, Cli, Command as CliCommand, CompletionShell,
+    ConfigCommand, CronCommand, DaemonCommand, OnboardingCommand, PolicyCommand, ProtocolCommand,
 };
 #[cfg(not(windows))]
 use cli::{PairingClientKindArg, PairingCommand, PairingMethodArg};
@@ -33,20 +57,43 @@ use palyra_identity::{
 use palyra_policy::{evaluate_with_config, PolicyDecision, PolicyEvaluationConfig, PolicyRequest};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
+use tokio::runtime::Builder as RuntimeBuilder;
+use tokio::time::sleep;
+use tokio_stream::{iter, StreamExt};
+use tonic::Request;
+use ulid::Ulid;
+
+use crate::proto::palyra::{common::v1 as common_v1, gateway::v1 as gateway_v1};
 
 const MAX_HEALTH_ATTEMPTS: usize = 3;
 const BASE_HEALTH_BACKOFF_MS: u64 = 100;
+const MAX_GRPC_ATTEMPTS: usize = 3;
+const BASE_GRPC_BACKOFF_MS: u64 = 100;
+const RUN_STREAM_REQUEST_VERSION: u32 = 1;
 const DEFAULT_GATEWAY_GRPC_BIND_ADDR: &str = "127.0.0.1";
 const DEFAULT_GATEWAY_GRPC_PORT: u16 = 7443;
 const DEFAULT_GATEWAY_QUIC_BIND_ADDR: &str = "127.0.0.1";
 const DEFAULT_GATEWAY_QUIC_PORT: u16 = 7444;
 const DEFAULT_GATEWAY_QUIC_ENABLED: bool = true;
+const DEFAULT_DAEMON_URL: &str = "http://127.0.0.1:7142";
+const DEFAULT_BROWSER_URL: &str = "http://127.0.0.1:7143";
+const DEFAULT_CHANNEL: &str = "cli";
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         CliCommand::Version => print_version(),
         CliCommand::Doctor { strict } => run_doctor(strict),
+        CliCommand::Status { url, grpc_url, admin, token, principal, device_id, channel } => {
+            run_status(url, grpc_url, admin, token, principal, device_id, channel)
+        }
+        CliCommand::Agent { command } => run_agent(command),
+        CliCommand::Cron { command } => run_cron(command),
+        CliCommand::Channels { command } => run_channels(command),
+        CliCommand::Browser { command } => run_browser(command),
+        CliCommand::Completion { shell } => run_completion(shell),
+        CliCommand::Onboarding { command } => run_onboarding(command),
         CliCommand::Daemon { command } => run_daemon(command),
         CliCommand::Policy { command } => run_policy(command),
         CliCommand::Protocol { command } => run_protocol(command),
@@ -165,12 +212,851 @@ fn run_doctor(strict: bool) -> Result<()> {
     std::io::stdout().flush().context("stdout flush failed")
 }
 
+fn run_status(
+    url: Option<String>,
+    grpc_url: Option<String>,
+    admin: bool,
+    token: Option<String>,
+    principal: String,
+    device_id: String,
+    channel: Option<String>,
+) -> Result<()> {
+    let base_url = url
+        .or_else(|| env::var("PALYRA_DAEMON_URL").ok())
+        .unwrap_or_else(|| DEFAULT_DAEMON_URL.to_owned());
+    let status_url = format!("{}/healthz", base_url.trim_end_matches('/'));
+    let http_client = Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .context("failed to build HTTP client")?;
+    let health = fetch_health_with_retry(&http_client, &status_url)?;
+    println!(
+        "status.http={} service={} version={} git_hash={} uptime_seconds={}",
+        health.status, health.service, health.version, health.git_hash, health.uptime_seconds
+    );
+
+    let runtime = build_runtime()?;
+    let grpc_health =
+        runtime.block_on(fetch_grpc_health_with_retry(resolve_grpc_url(grpc_url)?))?;
+    println!(
+        "status.grpc={} service={} version={} git_hash={} uptime_seconds={}",
+        grpc_health.status,
+        grpc_health.service,
+        grpc_health.version,
+        grpc_health.git_hash,
+        grpc_health.uptime_seconds
+    );
+
+    if admin {
+        let admin_response = fetch_admin_status(
+            &http_client,
+            base_url.as_str(),
+            token.or_else(|| env::var("PALYRA_ADMIN_TOKEN").ok()),
+            principal,
+            device_id,
+            channel,
+        )?;
+        println!(
+            "status.admin={} service={} grpc={}:{} quic_enabled={} denied_requests={} journal_events={}",
+            admin_response.status,
+            admin_response.service,
+            admin_response.transport.grpc_bind_addr,
+            admin_response.transport.grpc_port,
+            admin_response.transport.quic_enabled,
+            admin_response.counters.denied_requests,
+            admin_response.counters.journal_events
+        );
+    }
+
+    std::io::stdout().flush().context("stdout flush failed")
+}
+
+fn run_agent(command: AgentCommand) -> Result<()> {
+    match command {
+        AgentCommand::Run {
+            grpc_url,
+            token,
+            principal,
+            device_id,
+            channel,
+            session_id,
+            run_id,
+            prompt,
+            prompt_stdin,
+            allow_sensitive_tools,
+            ndjson,
+        } => {
+            let input_prompt = resolve_prompt_input(prompt, prompt_stdin)?;
+            let connection = AgentConnection {
+                grpc_url: resolve_grpc_url(grpc_url)?,
+                token: token.or_else(|| env::var("PALYRA_ADMIN_TOKEN").ok()),
+                principal,
+                device_id,
+                channel,
+            };
+            let request =
+                build_agent_run_input(session_id, run_id, input_prompt, allow_sensitive_tools)?;
+            execute_agent_stream(connection, request, ndjson)
+        }
+        AgentCommand::Interactive {
+            grpc_url,
+            token,
+            principal,
+            device_id,
+            channel,
+            session_id,
+            allow_sensitive_tools,
+            ndjson,
+        } => {
+            let connection = AgentConnection {
+                grpc_url: resolve_grpc_url(grpc_url)?,
+                token: token.or_else(|| env::var("PALYRA_ADMIN_TOKEN").ok()),
+                principal,
+                device_id,
+                channel,
+            };
+            let session_id = resolve_or_generate_canonical_id(session_id)?;
+            println!("agent.interactive=session_started session_id={} exit_hint=/exit", session_id);
+            std::io::stdout().flush().context("stdout flush failed")?;
+
+            let stdin = std::io::stdin();
+            for line in stdin.lock().lines() {
+                let prompt = line.context("failed to read interactive prompt from stdin")?;
+                let prompt = prompt.trim();
+                if prompt.is_empty() {
+                    continue;
+                }
+                if prompt.eq_ignore_ascii_case("/exit") {
+                    break;
+                }
+                let request = AgentRunInput {
+                    session_id: session_id.clone(),
+                    run_id: generate_canonical_ulid(),
+                    prompt: prompt.to_owned(),
+                    allow_sensitive_tools,
+                };
+                execute_agent_stream(connection.clone(), request, ndjson)?;
+            }
+            Ok(())
+        }
+        AgentCommand::AcpShim {
+            grpc_url,
+            token,
+            principal,
+            device_id,
+            channel,
+            session_id,
+            run_id,
+            prompt,
+            prompt_stdin,
+            allow_sensitive_tools,
+            ndjson_stdin,
+        } => {
+            let connection = AgentConnection {
+                grpc_url: resolve_grpc_url(grpc_url)?,
+                token: token.or_else(|| env::var("PALYRA_ADMIN_TOKEN").ok()),
+                principal,
+                device_id,
+                channel,
+            };
+            if ndjson_stdin {
+                return run_acp_shim_from_stdin(connection);
+            }
+
+            let input_prompt = resolve_prompt_input(prompt, prompt_stdin)?;
+            let request =
+                build_agent_run_input(session_id, run_id, input_prompt, allow_sensitive_tools)?;
+            run_agent_stream_as_acp(connection, request)
+        }
+    }
+}
+
+fn run_cron(command: CronCommand) -> Result<()> {
+    match command {
+        CronCommand::List => {
+            println!("cron.list status=stub message=\"scheduler v1 arrives in M16\"");
+        }
+        CronCommand::Add { schedule, action } => {
+            println!(
+                "cron.add status=stub schedule=\"{}\" action=\"{}\" message=\"scheduler v1 arrives in M16\"",
+                schedule, action
+            );
+        }
+        CronCommand::Remove { id } => {
+            println!("cron.remove status=stub id={} message=\"scheduler v1 arrives in M16\"", id);
+        }
+    }
+    std::io::stdout().flush().context("stdout flush failed")
+}
+
+fn run_channels(command: ChannelsCommand) -> Result<()> {
+    match command {
+        ChannelsCommand::List => {
+            println!("channels.list status=stub message=\"channel plugins start in M31\"");
+        }
+        ChannelsCommand::Connect { kind, name } => {
+            println!(
+                "channels.connect status=stub kind={} name={} message=\"channel plugins start in M31\"",
+                kind, name
+            );
+        }
+        ChannelsCommand::Disconnect { name } => {
+            println!(
+                "channels.disconnect status=stub name={} message=\"channel plugins start in M31\"",
+                name
+            );
+        }
+    }
+    std::io::stdout().flush().context("stdout flush failed")
+}
+
+fn run_browser(command: BrowserCommand) -> Result<()> {
+    match command {
+        BrowserCommand::Status { url } => {
+            let base_url = url.unwrap_or_else(|| DEFAULT_BROWSER_URL.to_owned());
+            let status_url = format!("{}/healthz", base_url.trim_end_matches('/'));
+            let client = Client::builder()
+                .timeout(std::time::Duration::from_secs(2))
+                .build()
+                .context("failed to build HTTP client")?;
+            let response = fetch_health_with_retry(&client, &status_url)?;
+            println!(
+                "browser.status={} service={} version={} git_hash={} uptime_seconds={}",
+                response.status,
+                response.service,
+                response.version,
+                response.git_hash,
+                response.uptime_seconds
+            );
+            std::io::stdout().flush().context("stdout flush failed")
+        }
+        BrowserCommand::Open { url } => {
+            println!(
+                "browser.open status=stub target_url={} message=\"browser action APIs ship in M24-M26\"",
+                url
+            );
+            std::io::stdout().flush().context("stdout flush failed")
+        }
+    }
+}
+
+fn run_completion(shell: CompletionShell) -> Result<()> {
+    let mut command = Cli::command();
+    clap_complete::generate(to_clap_shell(shell), &mut command, "palyra", &mut std::io::stdout());
+    std::io::stdout().flush().context("stdout flush failed")
+}
+
+fn run_onboarding(command: OnboardingCommand) -> Result<()> {
+    match command {
+        OnboardingCommand::Wizard { path, force, daemon_url, admin_token_env } => {
+            if admin_token_env.trim().is_empty() {
+                anyhow::bail!("admin token env variable name cannot be empty");
+            }
+
+            let config_path = resolve_onboarding_path(path)?;
+            if config_path.exists() && !force {
+                anyhow::bail!(
+                    "onboarding target already exists: {} (use --force to overwrite)",
+                    config_path.display()
+                );
+            }
+            if let Some(parent) = config_path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    fs::create_dir_all(parent).with_context(|| {
+                        format!("failed to create config directory {}", parent.display())
+                    })?;
+                }
+            }
+
+            let template = onboarding_template();
+            let (document, _) = parse_document_with_migration(template)
+                .context("failed to validate generated onboarding config")?;
+            validate_daemon_compatible_document(&document)
+                .context("generated onboarding config does not match daemon schema")?;
+            fs::write(&config_path, template).with_context(|| {
+                format!("failed to write onboarding config {}", config_path.display())
+            })?;
+
+            println!(
+                "onboarding.status=complete config_path={} daemon_url={} admin_token_env={}",
+                config_path.display(),
+                daemon_url,
+                admin_token_env
+            );
+            std::io::stdout().flush().context("stdout flush failed")
+        }
+    }
+}
+
+fn execute_agent_stream(
+    connection: AgentConnection,
+    request: AgentRunInput,
+    ndjson: bool,
+) -> Result<()> {
+    let runtime = build_runtime()?;
+    let events = runtime.block_on(run_stream_with_retry(&connection, &request))?;
+    for event in &events {
+        if ndjson {
+            emit_acp_event_ndjson(event)?;
+        } else {
+            emit_agent_event_text(event)?;
+        }
+    }
+    std::io::stdout().flush().context("stdout flush failed")
+}
+
+fn run_agent_stream_as_acp(connection: AgentConnection, request: AgentRunInput) -> Result<()> {
+    let runtime = build_runtime()?;
+    let events = runtime.block_on(run_stream_with_retry(&connection, &request))?;
+    for event in &events {
+        emit_acp_event_ndjson(event)?;
+    }
+    std::io::stdout().flush().context("stdout flush failed")
+}
+
+fn run_acp_shim_from_stdin(connection: AgentConnection) -> Result<()> {
+    let stdin = std::io::stdin();
+    for (line_index, line_result) in stdin.lock().lines().enumerate() {
+        let line = line_result.context("failed to read NDJSON ACP input line")?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let parsed: AcpShimInput = serde_json::from_str(line.as_str())
+            .with_context(|| format!("failed to parse NDJSON ACP input line {}", line_index + 1))?;
+        let prompt = parsed
+            .prompt
+            .context("NDJSON ACP input requires `prompt` field with non-empty text")?;
+        let request = build_agent_run_input(
+            parsed.session_id,
+            parsed.run_id,
+            prompt,
+            parsed.allow_sensitive_tools.unwrap_or(false),
+        )?;
+        run_agent_stream_as_acp(connection.clone(), request)?;
+    }
+    Ok(())
+}
+
+fn resolve_prompt_input(prompt: Option<String>, prompt_stdin: bool) -> Result<String> {
+    if prompt_stdin {
+        if prompt.is_some() {
+            anyhow::bail!("cannot use --prompt together with --prompt-stdin");
+        }
+        let mut input = String::new();
+        std::io::stdin()
+            .lock()
+            .read_line(&mut input)
+            .context("failed to read prompt from stdin")?;
+        let prompt = input.trim_end_matches(['\r', '\n']).trim();
+        if prompt.is_empty() {
+            anyhow::bail!("prompt from stdin is empty");
+        }
+        return Ok(prompt.to_owned());
+    }
+
+    let prompt = prompt.context("missing prompt: use --prompt or --prompt-stdin")?;
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        anyhow::bail!("prompt cannot be empty");
+    }
+    Ok(prompt.to_owned())
+}
+
+fn build_agent_run_input(
+    session_id: Option<String>,
+    run_id: Option<String>,
+    prompt: String,
+    allow_sensitive_tools: bool,
+) -> Result<AgentRunInput> {
+    Ok(AgentRunInput {
+        session_id: resolve_or_generate_canonical_id(session_id)?,
+        run_id: resolve_or_generate_canonical_id(run_id)?,
+        prompt,
+        allow_sensitive_tools,
+    })
+}
+
+fn resolve_or_generate_canonical_id(value: Option<String>) -> Result<String> {
+    let resolved = value.unwrap_or_else(generate_canonical_ulid);
+    validate_canonical_id(resolved.as_str())
+        .with_context(|| format!("invalid canonical ULID: {}", resolved))?;
+    Ok(resolved)
+}
+
+fn generate_canonical_ulid() -> String {
+    Ulid::new().to_string()
+}
+
+fn resolve_grpc_url(explicit: Option<String>) -> Result<String> {
+    if let Some(url) = explicit {
+        return Ok(url);
+    }
+    if let Ok(url) = env::var("PALYRA_GATEWAY_GRPC_URL") {
+        if !url.trim().is_empty() {
+            return Ok(url);
+        }
+    }
+    let bind = env::var("PALYRA_GATEWAY_GRPC_BIND_ADDR")
+        .unwrap_or_else(|_| DEFAULT_GATEWAY_GRPC_BIND_ADDR.to_owned());
+    let port = env::var("PALYRA_GATEWAY_GRPC_PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(DEFAULT_GATEWAY_GRPC_PORT);
+    let socket = parse_daemon_bind_socket(bind.as_str(), port)
+        .context("invalid gateway gRPC bind config")?;
+    Ok(format!("http://{socket}"))
+}
+
+fn build_runtime() -> Result<tokio::runtime::Runtime> {
+    RuntimeBuilder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to initialize async runtime")
+}
+
+fn resolve_onboarding_path(path: Option<String>) -> Result<PathBuf> {
+    if let Some(path) = path {
+        return parse_config_path(path.as_str())
+            .with_context(|| format!("onboarding config path is invalid: {}", path));
+    }
+    Ok(PathBuf::from("palyra.toml"))
+}
+
+fn onboarding_template() -> &'static str {
+    "version = 1\n\
+[daemon]\n\
+bind_addr = \"127.0.0.1\"\n\
+port = 7142\n\
+\n\
+[gateway]\n\
+grpc_bind_addr = \"127.0.0.1\"\n\
+grpc_port = 7443\n\
+quic_bind_addr = \"127.0.0.1\"\n\
+quic_port = 7444\n\
+quic_enabled = true\n\
+\n\
+[orchestrator]\n\
+runloop_v1_enabled = true\n"
+}
+
+async fn fetch_grpc_health_with_retry(grpc_url: String) -> Result<gateway_v1::HealthResponse> {
+    let mut last_error = None;
+    for attempt in 1..=MAX_GRPC_ATTEMPTS {
+        match fetch_grpc_health_once(grpc_url.as_str()).await {
+            Ok(response) => return Ok(response),
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < MAX_GRPC_ATTEMPTS {
+                    let delay_ms = BASE_GRPC_BACKOFF_MS * (1_u64 << (attempt - 1));
+                    sleep(Duration::from_millis(delay_ms)).await;
+                }
+            }
+        }
+    }
+
+    if let Some(error) = last_error {
+        Err(error).context(format!("gRPC health check failed after {MAX_GRPC_ATTEMPTS} attempts"))
+    } else {
+        anyhow::bail!("gRPC health check failed with no captured error")
+    }
+}
+
+async fn fetch_grpc_health_once(grpc_url: &str) -> Result<gateway_v1::HealthResponse> {
+    let mut client =
+        gateway_v1::gateway_service_client::GatewayServiceClient::connect(grpc_url.to_owned())
+            .await
+            .with_context(|| format!("failed to connect gateway gRPC endpoint {grpc_url}"))?;
+    let response = client
+        .get_health(gateway_v1::HealthRequest { v: RUN_STREAM_REQUEST_VERSION })
+        .await
+        .context("failed to call gateway GetHealth")?;
+    Ok(response.into_inner())
+}
+
+async fn run_stream_with_retry(
+    connection: &AgentConnection,
+    request: &AgentRunInput,
+) -> Result<Vec<common_v1::RunStreamEvent>> {
+    let mut last_error = None;
+    for attempt in 1..=MAX_GRPC_ATTEMPTS {
+        match run_stream_once(connection, request).await {
+            Ok(events) => return Ok(events),
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < MAX_GRPC_ATTEMPTS {
+                    let delay_ms = BASE_GRPC_BACKOFF_MS * (1_u64 << (attempt - 1));
+                    sleep(Duration::from_millis(delay_ms)).await;
+                }
+            }
+        }
+    }
+
+    if let Some(error) = last_error {
+        Err(error).context(format!("agent stream failed after {MAX_GRPC_ATTEMPTS} attempts"))
+    } else {
+        anyhow::bail!("agent stream failed with no captured error")
+    }
+}
+
+async fn run_stream_once(
+    connection: &AgentConnection,
+    input: &AgentRunInput,
+) -> Result<Vec<common_v1::RunStreamEvent>> {
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(
+        connection.grpc_url.clone(),
+    )
+    .await
+    .with_context(|| format!("failed to connect gateway gRPC endpoint {}", connection.grpc_url))?;
+    let request = build_run_stream_request(input)?;
+    let mut stream_request = Request::new(iter(vec![request]));
+    inject_run_stream_metadata(stream_request.metadata_mut(), connection)?;
+    let mut stream = client
+        .run_stream(stream_request)
+        .await
+        .context("failed to call gateway RunStream")?
+        .into_inner();
+    let mut events = Vec::new();
+    while let Some(event) = stream.next().await {
+        let event = event.context("failed to read RunStream event")?;
+        events.push(event);
+    }
+    Ok(events)
+}
+
+fn inject_run_stream_metadata(
+    metadata: &mut tonic::metadata::MetadataMap,
+    connection: &AgentConnection,
+) -> Result<()> {
+    if let Some(token) = connection.token.as_ref() {
+        metadata.insert(
+            "authorization",
+            format!("Bearer {token}").parse().context("invalid admin token metadata")?,
+        );
+    }
+    metadata.insert(
+        "x-palyra-principal",
+        connection.principal.parse().context("invalid principal metadata value")?,
+    );
+    metadata.insert(
+        "x-palyra-device-id",
+        connection.device_id.parse().context("invalid device_id metadata value")?,
+    );
+    metadata.insert(
+        "x-palyra-channel",
+        connection.channel.parse().context("invalid channel metadata value")?,
+    );
+    Ok(())
+}
+
+fn build_run_stream_request(input: &AgentRunInput) -> Result<common_v1::RunStreamRequest> {
+    let timestamp_unix_ms = now_unix_ms_i64()?;
+    Ok(common_v1::RunStreamRequest {
+        v: RUN_STREAM_REQUEST_VERSION,
+        session_id: Some(common_v1::CanonicalId { ulid: input.session_id.clone() }),
+        run_id: Some(common_v1::CanonicalId { ulid: input.run_id.clone() }),
+        input: Some(common_v1::MessageEnvelope {
+            v: CANONICAL_JSON_ENVELOPE_VERSION,
+            envelope_id: Some(common_v1::CanonicalId { ulid: generate_canonical_ulid() }),
+            timestamp_unix_ms,
+            origin: Some(common_v1::EnvelopeOrigin {
+                r#type: common_v1::envelope_origin::OriginType::Cli as i32,
+                channel: DEFAULT_CHANNEL.to_owned(),
+                conversation_id: input.session_id.clone(),
+                sender_display: "palyra-cli".to_owned(),
+                sender_handle: "cli".to_owned(),
+                sender_verified: true,
+            }),
+            content: Some(common_v1::MessageContent {
+                text: input.prompt.clone(),
+                attachments: Vec::new(),
+            }),
+            security: None,
+            max_payload_bytes: 0,
+        }),
+        allow_sensitive_tools: input.allow_sensitive_tools,
+    })
+}
+
+fn emit_agent_event_text(event: &common_v1::RunStreamEvent) -> Result<()> {
+    let run_id = event.run_id.as_ref().map(|id| id.ulid.as_str()).unwrap_or("unknown");
+    match event.body.as_ref() {
+        Some(common_v1::run_stream_event::Body::ModelToken(token)) => {
+            println!(
+                "agent.token run_id={} token={} final={}",
+                run_id, token.token, token.is_final
+            );
+        }
+        Some(common_v1::run_stream_event::Body::Status(status)) => {
+            println!(
+                "agent.status run_id={} kind={} message={}",
+                run_id,
+                stream_status_kind_to_text(status.kind),
+                status.message
+            );
+        }
+        Some(common_v1::run_stream_event::Body::ToolProposal(proposal)) => {
+            println!(
+                "agent.tool.proposal run_id={} proposal_id={} tool_name={} approval_required={}",
+                run_id,
+                proposal.proposal_id.as_ref().map(|value| value.ulid.as_str()).unwrap_or("unknown"),
+                proposal.tool_name,
+                proposal.approval_required
+            );
+        }
+        Some(common_v1::run_stream_event::Body::ToolDecision(decision)) => {
+            println!(
+                "agent.tool.decision run_id={} proposal_id={} kind={} reason={} approval_required={} policy_enforced={}",
+                run_id,
+                decision
+                    .proposal_id
+                    .as_ref()
+                    .map(|value| value.ulid.as_str())
+                    .unwrap_or("unknown"),
+                tool_decision_kind_to_text(decision.kind),
+                decision.reason,
+                decision.approval_required,
+                decision.policy_enforced
+            );
+        }
+        Some(common_v1::run_stream_event::Body::ToolResult(result)) => {
+            println!(
+                "agent.tool.result run_id={} proposal_id={} success={} error={}",
+                run_id,
+                result.proposal_id.as_ref().map(|value| value.ulid.as_str()).unwrap_or("unknown"),
+                result.success,
+                result.error
+            );
+        }
+        Some(common_v1::run_stream_event::Body::ToolAttestation(attestation)) => {
+            println!(
+                "agent.tool.attestation run_id={} proposal_id={} attestation_id={} timed_out={} executor={}",
+                run_id,
+                attestation
+                    .proposal_id
+                    .as_ref()
+                    .map(|value| value.ulid.as_str())
+                    .unwrap_or("unknown"),
+                attestation
+                    .attestation_id
+                    .as_ref()
+                    .map(|value| value.ulid.as_str())
+                    .unwrap_or("unknown"),
+                attestation.timed_out,
+                attestation.executor
+            );
+        }
+        Some(common_v1::run_stream_event::Body::A2uiUpdate(update)) => {
+            println!(
+                "agent.a2ui.update run_id={} surface={} version={}",
+                run_id, update.surface, update.v
+            );
+        }
+        Some(common_v1::run_stream_event::Body::JournalEvent(journal_event)) => {
+            println!(
+                "agent.journal.event run_id={} event_id={} kind={} actor={}",
+                run_id,
+                journal_event
+                    .event_id
+                    .as_ref()
+                    .map(|value| value.ulid.as_str())
+                    .unwrap_or("unknown"),
+                journal_event.kind,
+                journal_event.actor
+            );
+        }
+        None => {
+            println!("agent.event run_id={} kind=unknown", run_id);
+        }
+    }
+    Ok(())
+}
+
+fn emit_acp_event_ndjson(event: &common_v1::RunStreamEvent) -> Result<()> {
+    let run_id =
+        event.run_id.as_ref().map(|id| id.ulid.clone()).unwrap_or_else(|| "unknown".to_owned());
+    let payload = match event.body.as_ref() {
+        Some(common_v1::run_stream_event::Body::ModelToken(token)) => json!({
+            "type": "model.token",
+            "run_id": run_id,
+            "token": token.token,
+            "is_final": token.is_final,
+        }),
+        Some(common_v1::run_stream_event::Body::Status(status)) => json!({
+            "type": "run.status",
+            "run_id": run_id,
+            "kind": stream_status_kind_to_text(status.kind),
+            "message": status.message,
+        }),
+        Some(common_v1::run_stream_event::Body::ToolProposal(proposal)) => json!({
+            "type": "tool.proposal",
+            "run_id": run_id,
+            "proposal_id": proposal.proposal_id.as_ref().map(|value| value.ulid.clone()),
+            "tool_name": proposal.tool_name,
+            "approval_required": proposal.approval_required,
+            "input_json": proposal.input_json,
+        }),
+        Some(common_v1::run_stream_event::Body::ToolDecision(decision)) => json!({
+            "type": "tool.decision",
+            "run_id": run_id,
+            "proposal_id": decision.proposal_id.as_ref().map(|value| value.ulid.clone()),
+            "kind": tool_decision_kind_to_text(decision.kind),
+            "reason": decision.reason,
+            "approval_required": decision.approval_required,
+            "policy_enforced": decision.policy_enforced,
+        }),
+        Some(common_v1::run_stream_event::Body::ToolResult(result)) => json!({
+            "type": "tool.result",
+            "run_id": run_id,
+            "proposal_id": result.proposal_id.as_ref().map(|value| value.ulid.clone()),
+            "success": result.success,
+            "output_json": result.output_json,
+            "error": result.error,
+        }),
+        Some(common_v1::run_stream_event::Body::ToolAttestation(attestation)) => json!({
+            "type": "tool.attestation",
+            "run_id": run_id,
+            "proposal_id": attestation.proposal_id.as_ref().map(|value| value.ulid.clone()),
+            "attestation_id": attestation.attestation_id.as_ref().map(|value| value.ulid.clone()),
+            "execution_sha256": attestation.execution_sha256,
+            "executed_at_unix_ms": attestation.executed_at_unix_ms,
+            "timed_out": attestation.timed_out,
+            "executor": attestation.executor,
+        }),
+        Some(common_v1::run_stream_event::Body::A2uiUpdate(update)) => json!({
+            "type": "a2ui.update",
+            "run_id": run_id,
+            "surface": update.surface,
+            "version": update.v,
+            "patch_json": update.patch_json,
+        }),
+        Some(common_v1::run_stream_event::Body::JournalEvent(journal_event)) => json!({
+            "type": "journal.event",
+            "run_id": run_id,
+            "event_id": journal_event.event_id.as_ref().map(|value| value.ulid.clone()),
+            "kind": journal_event.kind,
+            "actor": journal_event.actor,
+            "timestamp_unix_ms": journal_event.timestamp_unix_ms,
+            "payload_json": journal_event.payload_json,
+            "hash": journal_event.hash,
+        }),
+        None => json!({
+            "type": "unknown",
+            "run_id": run_id,
+        }),
+    };
+    println!(
+        "{}",
+        serde_json::to_string(&payload).context("failed to serialize ACP NDJSON event")?
+    );
+    Ok(())
+}
+
+fn stream_status_kind_to_text(kind: i32) -> &'static str {
+    if kind == common_v1::stream_status::StatusKind::Unspecified as i32 {
+        "unspecified"
+    } else if kind == common_v1::stream_status::StatusKind::Accepted as i32 {
+        "accepted"
+    } else if kind == common_v1::stream_status::StatusKind::InProgress as i32 {
+        "in_progress"
+    } else if kind == common_v1::stream_status::StatusKind::Done as i32 {
+        "done"
+    } else if kind == common_v1::stream_status::StatusKind::Failed as i32 {
+        "failed"
+    } else {
+        "unknown"
+    }
+}
+
+fn tool_decision_kind_to_text(kind: i32) -> &'static str {
+    if kind == common_v1::tool_decision::DecisionKind::Unspecified as i32 {
+        "unspecified"
+    } else if kind == common_v1::tool_decision::DecisionKind::Allow as i32 {
+        "allow"
+    } else if kind == common_v1::tool_decision::DecisionKind::Deny as i32 {
+        "deny"
+    } else {
+        "unknown"
+    }
+}
+
+fn now_unix_ms_i64() -> Result<i64> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before UNIX_EPOCH")?;
+    let millis = elapsed.as_millis();
+    i64::try_from(millis).context("system clock value exceeds i64 range")
+}
+
+fn to_clap_shell(shell: CompletionShell) -> clap_complete::Shell {
+    match shell {
+        CompletionShell::Bash => clap_complete::Shell::Bash,
+        CompletionShell::Zsh => clap_complete::Shell::Zsh,
+        CompletionShell::Fish => clap_complete::Shell::Fish,
+        CompletionShell::Powershell => clap_complete::Shell::PowerShell,
+        CompletionShell::Elvish => clap_complete::Shell::Elvish,
+    }
+}
+
+fn fetch_admin_status(
+    client: &Client,
+    base_url: &str,
+    token: Option<String>,
+    principal: String,
+    device_id: String,
+    channel: Option<String>,
+) -> Result<AdminStatusResponse> {
+    let status_url = format!("{}/admin/v1/status", base_url.trim_end_matches('/'));
+    let mut request = client
+        .get(status_url)
+        .header("x-palyra-principal", principal)
+        .header("x-palyra-device-id", device_id);
+    if let Some(token) = token {
+        request = request.header("Authorization", format!("Bearer {token}"));
+    }
+    if let Some(channel) = channel {
+        request = request.header("x-palyra-channel", channel);
+    }
+
+    request
+        .send()
+        .context("failed to call daemon admin status endpoint")?
+        .error_for_status()
+        .context("daemon admin status endpoint returned non-success status")?
+        .json()
+        .context("failed to parse daemon admin status payload")
+}
+
+#[derive(Debug, Clone)]
+struct AgentConnection {
+    grpc_url: String,
+    token: Option<String>,
+    principal: String,
+    device_id: String,
+    channel: String,
+}
+
+#[derive(Debug, Clone)]
+struct AgentRunInput {
+    session_id: String,
+    run_id: String,
+    prompt: String,
+    allow_sensitive_tools: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct AcpShimInput {
+    session_id: Option<String>,
+    run_id: Option<String>,
+    prompt: Option<String>,
+    allow_sensitive_tools: Option<bool>,
+}
+
 fn run_daemon(command: DaemonCommand) -> Result<()> {
     match command {
         DaemonCommand::Status { url } => {
             let base_url = url
                 .or_else(|| env::var("PALYRA_DAEMON_URL").ok())
-                .unwrap_or_else(|| "http://127.0.0.1:7142".to_owned());
+                .unwrap_or_else(|| DEFAULT_DAEMON_URL.to_owned());
             let status_url = format!("{}/healthz", base_url.trim_end_matches('/'));
             let client = Client::builder()
                 .timeout(std::time::Duration::from_secs(2))
@@ -191,31 +1077,20 @@ fn run_daemon(command: DaemonCommand) -> Result<()> {
         DaemonCommand::AdminStatus { url, token, principal, device_id, channel } => {
             let base_url = url
                 .or_else(|| env::var("PALYRA_DAEMON_URL").ok())
-                .unwrap_or_else(|| "http://127.0.0.1:7142".to_owned());
-            let status_url = format!("{}/admin/v1/status", base_url.trim_end_matches('/'));
+                .unwrap_or_else(|| DEFAULT_DAEMON_URL.to_owned());
             let token = token.or_else(|| env::var("PALYRA_ADMIN_TOKEN").ok());
             let client = Client::builder()
                 .timeout(std::time::Duration::from_secs(2))
                 .build()
                 .context("failed to build HTTP client")?;
-            let mut request = client
-                .get(status_url)
-                .header("x-palyra-principal", principal)
-                .header("x-palyra-device-id", device_id);
-            if let Some(token) = token {
-                request = request.header("Authorization", format!("Bearer {token}"));
-            }
-            if let Some(channel) = channel {
-                request = request.header("x-palyra-channel", channel);
-            }
-
-            let response: AdminStatusResponse = request
-                .send()
-                .context("failed to call daemon admin status endpoint")?
-                .error_for_status()
-                .context("daemon admin status endpoint returned non-success status")?
-                .json()
-                .context("failed to parse daemon admin status payload")?;
+            let response = fetch_admin_status(
+                &client,
+                base_url.as_str(),
+                token,
+                principal,
+                device_id,
+                channel,
+            )?;
 
             println!(
                 "admin.status={} service={} grpc={}:{} quic_enabled={} denied_requests={} journal_events={}",
