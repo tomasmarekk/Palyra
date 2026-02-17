@@ -569,7 +569,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[cfg(unix)]
     async fn execute_tool_call_runs_sandbox_process_runner() {
-        if std::process::Command::new("rustc").arg("--version").output().is_err() {
+        if std::process::Command::new("uname").output().is_err() {
             return;
         }
         let config = ToolCallConfig {
@@ -579,7 +579,7 @@ mod tests {
             process_runner: SandboxProcessRunnerPolicy {
                 enabled: true,
                 workspace_root: std::env::current_dir().expect("current_dir should resolve"),
-                allowed_executables: vec!["rustc".to_owned()],
+                allowed_executables: vec!["uname".to_owned()],
                 allowed_egress_hosts: Vec::new(),
                 allowed_dns_suffixes: Vec::new(),
                 cpu_time_limit_ms: 2_000,
@@ -592,7 +592,7 @@ mod tests {
             &config,
             "01ARZ3NDEKTSV4RRFFQ69G5FA2",
             "palyra.process.run",
-            br#"{"command":"rustc","args":["--version"]}"#,
+            br#"{"command":"uname","args":[]}"#,
         )
         .await;
 
@@ -610,7 +610,7 @@ mod tests {
             process_runner: SandboxProcessRunnerPolicy {
                 enabled: true,
                 workspace_root: std::env::current_dir().expect("current_dir should resolve"),
-                allowed_executables: vec!["rustc".to_owned()],
+                allowed_executables: vec!["uname".to_owned()],
                 allowed_egress_hosts: Vec::new(),
                 allowed_dns_suffixes: Vec::new(),
                 cpu_time_limit_ms: 2_000,
@@ -623,7 +623,7 @@ mod tests {
             &config,
             "01ARZ3NDEKTSV4RRFFQ69G5FA2",
             "palyra.process.run",
-            br#"{"command":"rustc","args":["../outside.txt"]}"#,
+            br#"{"command":"uname","args":["../outside.txt"]}"#,
         )
         .await;
 

@@ -527,22 +527,24 @@ async fn grpc_run_stream_executes_sandbox_process_runner_within_workspace_scope(
     let (openai_base_url, _request_count, server_handle) =
         spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::immediate(
             200,
-            r#"{"choices":[{"message":{"tool_calls":[{"function":{"name":"palyra.process.run","arguments":"{\"command\":\"rustc\",\"args\":[\"--version\"]}"}}]}}]}"#
+            r#"{"choices":[{"message":{"tool_calls":[{"function":{"name":"palyra.process.run","arguments":"{\"command\":\"uname\",\"args\":[]}"}}]}}]}"#
                 .to_owned(),
         )])?;
     let workspace_root =
         std::env::current_dir().context("failed to resolve workspace root for process runner")?;
     let (child, admin_port, grpc_port, _journal_db_path) =
         spawn_palyrad_with_openai_provider_tool_policy_and_process_runner(
-            openai_base_url.as_str(),
-            OPENAI_API_KEY,
-            "palyra.process.run",
-            2,
-            2_000,
-            workspace_root.as_path(),
-            "rustc",
-            "allowed.example",
-            ".corp.local",
+            ProcessRunnerSpawnConfig {
+                openai_base_url: openai_base_url.as_str(),
+                openai_api_key: OPENAI_API_KEY,
+                allowed_tools: "palyra.process.run",
+                max_calls_per_run: 2,
+                execution_timeout_ms: 2_000,
+                workspace_root: workspace_root.as_path(),
+                allowed_executables: "uname",
+                allowed_egress_hosts: "allowed.example",
+                allowed_dns_suffixes: ".corp.local",
+            },
         )?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
@@ -585,9 +587,9 @@ async fn grpc_run_stream_executes_sandbox_process_runner_within_workspace_scope(
                             output
                                 .get("stdout")
                                 .and_then(Value::as_str)
-                                .map(|stdout| stdout.to_ascii_lowercase().contains("rustc"))
+                                .map(|stdout| !stdout.trim().is_empty())
                                 .unwrap_or(false),
-                            "sandbox process stdout should contain rustc version banner"
+                            "sandbox process stdout should include uname output"
                         );
                         saw_success_result = true;
                     }
@@ -617,22 +619,24 @@ async fn grpc_run_stream_blocks_sandbox_process_runner_path_traversal() -> Resul
     let (openai_base_url, _request_count, server_handle) =
         spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::immediate(
             200,
-            r#"{"choices":[{"message":{"tool_calls":[{"function":{"name":"palyra.process.run","arguments":"{\"command\":\"rustc\",\"args\":[\"../outside.txt\"]}"}}]}}]}"#
+            r#"{"choices":[{"message":{"tool_calls":[{"function":{"name":"palyra.process.run","arguments":"{\"command\":\"uname\",\"args\":[\"../outside.txt\"]}"}}]}}]}"#
                 .to_owned(),
         )])?;
     let workspace_root =
         std::env::current_dir().context("failed to resolve workspace root for process runner")?;
     let (child, admin_port, grpc_port, _journal_db_path) =
         spawn_palyrad_with_openai_provider_tool_policy_and_process_runner(
-            openai_base_url.as_str(),
-            OPENAI_API_KEY,
-            "palyra.process.run",
-            2,
-            2_000,
-            workspace_root.as_path(),
-            "rustc",
-            "allowed.example",
-            ".corp.local",
+            ProcessRunnerSpawnConfig {
+                openai_base_url: openai_base_url.as_str(),
+                openai_api_key: OPENAI_API_KEY,
+                allowed_tools: "palyra.process.run",
+                max_calls_per_run: 2,
+                execution_timeout_ms: 2_000,
+                workspace_root: workspace_root.as_path(),
+                allowed_executables: "uname",
+                allowed_egress_hosts: "allowed.example",
+                allowed_dns_suffixes: ".corp.local",
+            },
         )?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
@@ -680,22 +684,24 @@ async fn grpc_run_stream_blocks_sandbox_process_runner_non_allowlisted_egress_ho
     let (openai_base_url, _request_count, server_handle) =
         spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::immediate(
             200,
-            r#"{"choices":[{"message":{"tool_calls":[{"function":{"name":"palyra.process.run","arguments":"{\"command\":\"rustc\",\"args\":[\"--version\",\"https://blocked.example/path\"]}"}}]}}]}"#
+            r#"{"choices":[{"message":{"tool_calls":[{"function":{"name":"palyra.process.run","arguments":"{\"command\":\"uname\",\"args\":[\"https://blocked.example/path\"]}"}}]}}]}"#
                 .to_owned(),
         )])?;
     let workspace_root =
         std::env::current_dir().context("failed to resolve workspace root for process runner")?;
     let (child, admin_port, grpc_port, _journal_db_path) =
         spawn_palyrad_with_openai_provider_tool_policy_and_process_runner(
-            openai_base_url.as_str(),
-            OPENAI_API_KEY,
-            "palyra.process.run",
-            2,
-            2_000,
-            workspace_root.as_path(),
-            "rustc",
-            "allowed.example",
-            ".corp.local",
+            ProcessRunnerSpawnConfig {
+                openai_base_url: openai_base_url.as_str(),
+                openai_api_key: OPENAI_API_KEY,
+                allowed_tools: "palyra.process.run",
+                max_calls_per_run: 2,
+                execution_timeout_ms: 2_000,
+                workspace_root: workspace_root.as_path(),
+                allowed_executables: "uname",
+                allowed_egress_hosts: "allowed.example",
+                allowed_dns_suffixes: ".corp.local",
+            },
         )?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
@@ -1425,22 +1431,27 @@ fn spawn_palyrad_with_openai_provider_and_tool_policy(
 }
 
 #[cfg(unix)]
-fn spawn_palyrad_with_openai_provider_tool_policy_and_process_runner(
-    openai_base_url: &str,
-    openai_api_key: &str,
-    allowed_tools: &str,
+struct ProcessRunnerSpawnConfig<'a> {
+    openai_base_url: &'a str,
+    openai_api_key: &'a str,
+    allowed_tools: &'a str,
     max_calls_per_run: u32,
     execution_timeout_ms: u64,
-    workspace_root: &Path,
-    allowed_executables: &str,
-    allowed_egress_hosts: &str,
-    allowed_dns_suffixes: &str,
+    workspace_root: &'a Path,
+    allowed_executables: &'a str,
+    allowed_egress_hosts: &'a str,
+    allowed_dns_suffixes: &'a str,
+}
+
+#[cfg(unix)]
+fn spawn_palyrad_with_openai_provider_tool_policy_and_process_runner(
+    config: ProcessRunnerSpawnConfig<'_>,
 ) -> Result<(Child, u16, u16, PathBuf)> {
     let config_path = write_process_runner_config(
-        workspace_root,
-        allowed_executables,
-        allowed_egress_hosts,
-        allowed_dns_suffixes,
+        config.workspace_root,
+        config.allowed_executables,
+        config.allowed_egress_hosts,
+        config.allowed_dns_suffixes,
     )?;
 
     let journal_db_path = unique_temp_journal_db_path();
@@ -1460,15 +1471,15 @@ fn spawn_palyrad_with_openai_provider_tool_policy_and_process_runner(
         .env("PALYRA_JOURNAL_DB_PATH", journal_db_path.to_string_lossy().to_string())
         .env("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED", "true")
         .env("PALYRA_MODEL_PROVIDER_KIND", "openai_compatible")
-        .env("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", openai_base_url)
-        .env("PALYRA_MODEL_PROVIDER_OPENAI_API_KEY", openai_api_key)
+        .env("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", config.openai_base_url)
+        .env("PALYRA_MODEL_PROVIDER_OPENAI_API_KEY", config.openai_api_key)
         .env("PALYRA_MODEL_PROVIDER_MAX_RETRIES", "0")
         .env("PALYRA_MODEL_PROVIDER_RETRY_BACKOFF_MS", "1")
         .env("PALYRA_MODEL_PROVIDER_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "1")
         .env("PALYRA_MODEL_PROVIDER_CIRCUIT_BREAKER_COOLDOWN_MS", "30000")
-        .env("PALYRA_TOOL_CALL_ALLOWED_TOOLS", allowed_tools)
-        .env("PALYRA_TOOL_CALL_MAX_CALLS_PER_RUN", max_calls_per_run.to_string())
-        .env("PALYRA_TOOL_CALL_TIMEOUT_MS", execution_timeout_ms.to_string())
+        .env("PALYRA_TOOL_CALL_ALLOWED_TOOLS", config.allowed_tools)
+        .env("PALYRA_TOOL_CALL_MAX_CALLS_PER_RUN", config.max_calls_per_run.to_string())
+        .env("PALYRA_TOOL_CALL_TIMEOUT_MS", config.execution_timeout_ms.to_string())
         .env("RUST_LOG", "info")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

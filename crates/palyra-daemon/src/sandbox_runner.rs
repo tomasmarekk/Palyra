@@ -533,8 +533,11 @@ fn attach_resource_limits_unix(command: &mut Command, policy: &SandboxProcessRun
     let memory_limit_bytes = policy.memory_limit_bytes;
     unsafe {
         command.pre_exec(move || {
-            set_rlimit(libc::RLIMIT_CPU, cpu_ms_to_rlimit_seconds(cpu_time_limit_ms))?;
-            set_rlimit(libc::RLIMIT_AS, memory_limit_bytes as libc::rlim_t)?;
+            set_rlimit(
+                libc::RLIMIT_CPU as libc::c_int,
+                cpu_ms_to_rlimit_seconds(cpu_time_limit_ms),
+            )?;
+            set_rlimit(libc::RLIMIT_AS as libc::c_int, memory_limit_bytes as libc::rlim_t)?;
             Ok(())
         });
     }
@@ -544,9 +547,9 @@ fn attach_resource_limits_unix(command: &mut Command, policy: &SandboxProcessRun
 fn attach_resource_limits_unix(_command: &mut Command, _policy: &SandboxProcessRunnerPolicy) {}
 
 #[cfg(unix)]
-fn set_rlimit(resource: libc::__rlimit_resource_t, limit: libc::rlim_t) -> std::io::Result<()> {
+fn set_rlimit(resource: libc::c_int, limit: libc::rlim_t) -> std::io::Result<()> {
     let rlimit = libc::rlimit { rlim_cur: limit, rlim_max: limit };
-    let result = unsafe { libc::setrlimit(resource, &rlimit) };
+    let result = unsafe { libc::setrlimit(resource as _, &rlimit) };
     if result == 0 {
         Ok(())
     } else {
@@ -670,7 +673,7 @@ mod tests {
         SandboxProcessRunnerPolicy {
             enabled: true,
             workspace_root,
-            allowed_executables: vec!["rustc".to_owned()],
+            allowed_executables: vec!["uname".to_owned()],
             allowed_egress_hosts: vec!["allowed.example".to_owned()],
             allowed_dns_suffixes: vec![".corp.local".to_owned()],
             cpu_time_limit_ms: 2_000,
@@ -693,7 +696,7 @@ mod tests {
     fn run_constrained_process_rejects_path_traversal_arguments() {
         let workspace = std::env::current_dir().expect("workspace current_dir should resolve");
         let policy = sandbox_policy(workspace);
-        let input = br#"{"command":"rustc","args":["../outside.txt"]}"#;
+        let input = br#"{"command":"uname","args":["../outside.txt"]}"#;
         let error = run_constrained_process(&policy, input, Duration::from_millis(1_000))
             .expect_err("path traversal must be denied");
         assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
@@ -705,7 +708,7 @@ mod tests {
     fn run_constrained_process_rejects_non_allowlisted_egress_host() {
         let workspace = std::env::current_dir().expect("workspace current_dir should resolve");
         let policy = sandbox_policy(workspace);
-        let input = br#"{"command":"rustc","args":["--version","https://blocked.example/path"]}"#;
+        let input = br#"{"command":"uname","args":["--version","https://blocked.example/path"]}"#;
         let error = run_constrained_process(&policy, input, Duration::from_millis(1_000))
             .expect_err("blocked host must be denied");
         assert_eq!(error.kind, SandboxProcessRunErrorKind::EgressDenied);
@@ -729,7 +732,7 @@ mod tests {
     fn run_constrained_process_fails_closed_on_non_unix() {
         let workspace = std::env::current_dir().expect("workspace current_dir should resolve");
         let policy = sandbox_policy(workspace);
-        let input = br#"{"command":"rustc","args":["--version"]}"#;
+        let input = br#"{"command":"uname","args":["--version"]}"#;
         let error = run_constrained_process(&policy, input, Duration::from_millis(1_000))
             .expect_err("non-unix sandbox runner must fail closed");
         assert_eq!(error.kind, SandboxProcessRunErrorKind::UnsupportedPlatform);
@@ -740,26 +743,23 @@ mod tests {
     fn run_constrained_process_executes_allowlisted_command() {
         use std::process::Command;
 
-        if Command::new("rustc").arg("--version").output().is_err() {
+        if Command::new("uname").output().is_err() {
             return;
         }
         let workspace = std::env::current_dir().expect("workspace current_dir should resolve");
         let policy = sandbox_policy(workspace);
-        let input = br#"{"command":"rustc","args":["--version"]}"#;
+        let input = br#"{"command":"uname","args":[]}"#;
 
         let result = run_constrained_process(&policy, input, Duration::from_millis(3_000))
             .expect("allowlisted command should execute");
         let output: serde_json::Value =
             serde_json::from_slice(&result.output_json).expect("output should parse");
         assert_eq!(output.get("exit_code").and_then(serde_json::Value::as_i64), Some(0));
-        assert!(
-            output
-                .get("stdout")
-                .and_then(serde_json::Value::as_str)
-                .map(|stdout| stdout.to_ascii_lowercase().contains("rustc"))
-                .unwrap_or(false),
-            "stdout should contain rustc version output"
-        );
+        let stdout = output
+            .get("stdout")
+            .and_then(serde_json::Value::as_str)
+            .expect("stdout should be present in process output");
+        assert!(!stdout.trim().is_empty(), "stdout should include uname output");
     }
 
     #[test]
@@ -778,7 +778,7 @@ mod tests {
 
         let policy = sandbox_policy(workspace.clone());
         let input =
-            format!("{{\"command\":\"rustc\",\"args\":[\"{}\"]}}", symlink_path.to_string_lossy());
+            format!("{{\"command\":\"uname\",\"args\":[\"{}\"]}}", symlink_path.to_string_lossy());
         let error =
             run_constrained_process(&policy, input.as_bytes(), Duration::from_millis(1_000))
                 .expect_err("symlink escape must be denied");
