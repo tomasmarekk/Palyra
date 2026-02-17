@@ -385,6 +385,22 @@ mod tests {
         assert!(decision.reason.contains("unsupported by runtime executor"));
     }
 
+    #[test]
+    fn decide_tool_call_denies_sensitive_allowlisted_tool() {
+        let config = ToolCallConfig {
+            allowed_tools: vec!["shell.exec".to_owned()],
+            max_calls_per_run: 2,
+            execution_timeout_ms: 250,
+        };
+        let mut budget = config.max_calls_per_run;
+
+        let decision = decide_tool_call(&config, &mut budget, "user:ops", "shell.exec");
+
+        assert!(!decision.allowed, "sensitive allowlisted tool must require explicit approval");
+        assert_eq!(budget, 2, "denied decisions must not consume budget");
+        assert!(decision.reason.contains("sensitive action blocked by default"));
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn execute_tool_call_runs_echo_tool() {
         let config = allowlisted_config();
