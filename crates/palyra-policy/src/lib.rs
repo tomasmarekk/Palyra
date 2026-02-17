@@ -255,9 +255,9 @@ fn is_allowlisted_tool(requested_tool: Option<&str>, allowlisted_tools: &[String
 fn is_sensitive_action(request: &PolicyRequest) -> bool {
     let action = request.action.to_ascii_lowercase();
     let resource = request.resource.to_ascii_lowercase();
-    action.contains("shell")
-        || action.contains("delete")
-        || action.contains("payment")
+    ["shell", "delete", "payment"]
+        .iter()
+        .any(|keyword| action.contains(keyword) || resource.contains(keyword))
         || resource.contains("secrets")
         || resource.contains("credential")
 }
@@ -299,6 +299,28 @@ mod tests {
         );
         assert!(evaluation.explanation.is_sensitive_action);
         assert!(!evaluation.explanation.matched_policy_ids.is_empty());
+    }
+
+    #[test]
+    fn allowlisted_sensitive_tool_resource_requires_explicit_approval() {
+        let request = PolicyRequest {
+            principal: "user:bootstrap".to_owned(),
+            action: "tool.execute".to_owned(),
+            resource: "tool:shell.exec".to_owned(),
+        };
+        let config = PolicyEvaluationConfig {
+            allowlisted_tools: vec!["shell.exec".to_owned()],
+            allow_sensitive_tools: false,
+        };
+
+        let evaluation = evaluate_with_config(&request, &config).expect("evaluation");
+
+        assert_eq!(
+            evaluation.decision,
+            PolicyDecision::DenyByDefault { reason: SENSITIVE_DENY_REASON.to_owned() }
+        );
+        assert!(evaluation.explanation.is_sensitive_action);
+        assert!(evaluation.explanation.is_allowlisted_tool);
     }
 
     #[test]

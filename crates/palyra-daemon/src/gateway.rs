@@ -2338,7 +2338,7 @@ async fn record_policy_decision_journal_event(
             event_id: Ulid::new().to_string(),
             session_id: session_id.to_owned(),
             run_id: run_id.to_owned(),
-            kind: common_v1::journal_event::EventKind::ToolExecuted as i32,
+            kind: common_v1::journal_event::EventKind::ToolProposed as i32,
             actor: common_v1::journal_event::EventActor::System as i32,
             timestamp_unix_ms: current_unix_ms(),
             payload_json: tool_decision_journal_payload(

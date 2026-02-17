@@ -301,7 +301,7 @@ async fn grpc_run_stream_denies_non_allowlisted_tool_by_default() -> Result<()> 
     let (openai_base_url, _request_count, server_handle) =
         spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::immediate(
             200,
-            r#"{"choices":[{"message":{"tool_calls":[{"function":{"name":"shell.exec","arguments":"{\"command\":\"whoami\"}"}}]}}]}"#
+            r#"{"choices":[{"message":{"tool_calls":[{"function":{"name":"custom.noop","arguments":"{\"payload\":\"x\"}"}}]}}]}"#
                 .to_owned(),
         )])?;
     let (child, admin_port, grpc_port, journal_db_path) =
@@ -384,7 +384,7 @@ async fn grpc_run_stream_denies_non_allowlisted_tool_by_default() -> Result<()> 
     let mut statement = connection
         .prepare(
             r#"
-                SELECT payload_json
+                SELECT kind, payload_json
                 FROM journal_events
                 ORDER BY seq ASC
             "#,
@@ -392,19 +392,34 @@ async fn grpc_run_stream_denies_non_allowlisted_tool_by_default() -> Result<()> 
         .context("failed to prepare journal decision query")?;
     let mut rows = statement.query([]).context("failed to query journal decision rows")?;
     let mut saw_policy_decision_event = false;
+    let mut saw_policy_decision_kind = false;
     let mut saw_denied_policy_payload = false;
     while let Some(row) = rows.next().context("failed to iterate journal decision rows")? {
-        let payload_json: String = row.get(0).context("journal payload_json should be readable")?;
-        if payload_json.contains("\"event\":\"policy_decision\"") {
+        let kind: i32 = row.get(0).context("journal kind should be readable")?;
+        let payload_json: String = row.get(1).context("journal payload_json should be readable")?;
+        let payload: Value = serde_json::from_str(payload_json.as_str())
+            .context("journal payload_json must be valid json")?;
+        if payload.get("event").and_then(Value::as_str) == Some("policy_decision") {
             saw_policy_decision_event = true;
-            if payload_json.contains("\"kind\":\"deny\"")
-                && payload_json.contains("denied by default")
+            if kind == common_v1::journal_event::EventKind::ToolProposed as i32 {
+                saw_policy_decision_kind = true;
+            }
+            if payload.get("kind").and_then(Value::as_str) == Some("deny")
+                && payload
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .map(|reason| reason.contains("denied by default"))
+                    .unwrap_or(false)
             {
                 saw_denied_policy_payload = true;
             }
         }
     }
     assert!(saw_policy_decision_event, "policy decisions must be persisted in journal entries");
+    assert!(
+        saw_policy_decision_kind,
+        "policy decision journal entries must use EVENT_KIND_TOOL_PROPOSED"
+    );
     assert!(
         saw_denied_policy_payload,
         "denied policy decision should be persisted with explainable denial reason"
