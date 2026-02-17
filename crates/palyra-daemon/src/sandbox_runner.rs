@@ -470,8 +470,8 @@ fn collect_hosts_from_token(
     if let Ok(url) = reqwest::Url::parse(token) {
         if let Some(host) = url.host_str() {
             push_normalized_host(hosts, host)?;
+            return Ok(());
         }
-        return Ok(());
     }
     if let Some(host) = maybe_extract_bare_host(token, host_context) {
         push_normalized_host(hosts, host)?;
@@ -776,6 +776,10 @@ fn capture_child_output(
         kind: SandboxProcessRunErrorKind::RuntimeFailure,
         message: "sandbox stderr reader thread panicked".to_owned(),
     })?;
+    quota_exceeded = quota_exceeded
+        || quota_triggered.load(Ordering::Relaxed)
+        || stdout.truncated
+        || stderr.truncated;
 
     Ok(ProcessExecutionCapture {
         exit_status,
