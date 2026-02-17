@@ -1,5 +1,6 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use palyra_policy::{evaluate_with_config, PolicyDecision, PolicyEvaluationConfig, PolicyRequest};
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -44,7 +45,6 @@ pub struct ToolCallPolicySnapshot {
     pub execution_timeout_ms: u64,
 }
 
-const POLICY_DENY_REASON: &str = "tool execution denied by default: tool is not allowlisted";
 const BUDGET_DENY_REASON: &str = "tool execution budget exhausted for run";
 const UNSUPPORTED_TOOL_DENY_REASON: &str =
     "tool is allowlisted but unsupported by runtime executor";
@@ -61,6 +61,7 @@ pub fn tool_policy_snapshot(config: &ToolCallConfig) -> ToolCallPolicySnapshot {
 pub fn decide_tool_call(
     config: &ToolCallConfig,
     remaining_budget: &mut u32,
+    principal: &str,
     tool_name: &str,
 ) -> ToolDecision {
     if *remaining_budget == 0 {
@@ -72,10 +73,34 @@ pub fn decide_tool_call(
         };
     }
 
-    if !config.allowed_tools.iter().any(|allowed| allowed == tool_name) {
+    let policy_request = PolicyRequest {
+        principal: principal.to_owned(),
+        action: "tool.execute".to_owned(),
+        resource: format!("tool:{tool_name}"),
+    };
+    let policy_config = PolicyEvaluationConfig {
+        allowlisted_tools: config.allowed_tools.clone(),
+        allow_sensitive_tools: false,
+    };
+    let policy_evaluation = match evaluate_with_config(&policy_request, &policy_config) {
+        Ok(evaluation) => evaluation,
+        Err(error) => {
+            return ToolDecision {
+                allowed: false,
+                reason: format!("policy evaluation failed safely: {error}"),
+                approval_required: true,
+                policy_enforced: true,
+            };
+        }
+    };
+    if let PolicyDecision::DenyByDefault { reason } = policy_evaluation.decision {
         return ToolDecision {
             allowed: false,
-            reason: POLICY_DENY_REASON.to_owned(),
+            reason: format_policy_reason(
+                reason.as_str(),
+                policy_evaluation.explanation.matched_policy_ids.as_slice(),
+                policy_evaluation.explanation.diagnostics_errors.as_slice(),
+            ),
             approval_required: true,
             policy_enforced: true,
         };
@@ -93,10 +118,28 @@ pub fn decide_tool_call(
     *remaining_budget = remaining_budget.saturating_sub(1);
     ToolDecision {
         allowed: true,
-        reason: "tool is allowlisted by runtime policy".to_owned(),
+        reason: format_policy_reason(
+            "tool is allowlisted by Cedar runtime policy",
+            policy_evaluation.explanation.matched_policy_ids.as_slice(),
+            policy_evaluation.explanation.diagnostics_errors.as_slice(),
+        ),
         approval_required: true,
         policy_enforced: true,
     }
+}
+
+fn format_policy_reason(
+    base_reason: &str,
+    matched_policy_ids: &[String],
+    diagnostics_errors: &[String],
+) -> String {
+    if !diagnostics_errors.is_empty() {
+        return format!("{base_reason}; diagnostics_errors={}", diagnostics_errors.join("|"));
+    }
+    if !matched_policy_ids.is_empty() {
+        return format!("{base_reason}; matched_policies={}", matched_policy_ids.join(","));
+    }
+    base_reason.to_owned()
 }
 
 pub fn denied_execution_outcome(
@@ -308,7 +351,7 @@ mod tests {
             execution_timeout_ms: 250,
         };
         let mut budget = 2;
-        let decision = decide_tool_call(&config, &mut budget, "palyra.echo");
+        let decision = decide_tool_call(&config, &mut budget, "user:ops", "palyra.echo");
         assert!(!decision.allowed);
         assert_eq!(budget, 2, "denied decisions must not consume budget");
         assert!(decision.reason.contains("denied by default"));
@@ -318,13 +361,13 @@ mod tests {
     fn decide_tool_call_consumes_budget_for_allowed_tools() {
         let config = allowlisted_config();
         let mut budget = config.max_calls_per_run;
-        let first = decide_tool_call(&config, &mut budget, "palyra.echo");
+        let first = decide_tool_call(&config, &mut budget, "user:ops", "palyra.echo");
         assert!(first.allowed);
         assert_eq!(budget, 1);
-        let second = decide_tool_call(&config, &mut budget, "palyra.sleep");
+        let second = decide_tool_call(&config, &mut budget, "user:ops", "palyra.sleep");
         assert!(second.allowed);
         assert_eq!(budget, 0);
-        let third = decide_tool_call(&config, &mut budget, "palyra.echo");
+        let third = decide_tool_call(&config, &mut budget, "user:ops", "palyra.echo");
         assert!(!third.allowed, "third call should be denied by budget");
     }
 
@@ -336,7 +379,7 @@ mod tests {
             execution_timeout_ms: 250,
         };
         let mut budget = config.max_calls_per_run;
-        let decision = decide_tool_call(&config, &mut budget, "custom.noop");
+        let decision = decide_tool_call(&config, &mut budget, "user:ops", "custom.noop");
         assert!(!decision.allowed, "unsupported runtime tool must be denied");
         assert_eq!(budget, 2, "denied decisions must not consume budget");
         assert!(decision.reason.contains("unsupported by runtime executor"));

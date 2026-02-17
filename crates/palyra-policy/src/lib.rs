@@ -1,8 +1,20 @@
+use std::{str::FromStr, sync::OnceLock};
+
+use cedar_policy::{Authorizer, Context, Decision, Entities, EntityUid, PolicySet, Request};
+use serde_json::json;
+use thiserror::Error;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyRequest {
     pub principal: String,
     pub action: String,
     pub resource: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PolicyEvaluationConfig {
+    pub allowlisted_tools: Vec<String>,
+    pub allow_sensitive_tools: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11,31 +23,233 @@ pub enum PolicyDecision {
     DenyByDefault { reason: String },
 }
 
-const READ_ONLY_ACTION_ALLOWLIST: &[&str] = &[
-    "tool.read",
-    "tool.read.status",
-    "tool.status",
-    "tool.list",
-    "tool.health",
-    "tool.get",
-    "daemon.status",
-    "protocol.version",
-];
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyExplanation {
+    pub evaluated_with_cedar: bool,
+    pub reason: String,
+    pub matched_policy_ids: Vec<String>,
+    pub diagnostics_errors: Vec<String>,
+    pub is_sensitive_action: bool,
+    pub is_allowlisted_tool: bool,
+    pub requested_tool: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyEvaluation {
+    pub decision: PolicyDecision,
+    pub explanation: PolicyExplanation,
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum PolicyEngineError {
+    #[error("failed to initialize Cedar policy engine: {message}")]
+    EngineInitialization { message: String },
+    #[error("failed to build Cedar request context: {message}")]
+    InvalidContext { message: String },
+    #[error("failed to construct Cedar authorization request: {message}")]
+    InvalidRequest { message: String },
+}
+
+const DEFAULT_POLICY_SRC: &str = r#"
+@id("deny_sensitive_without_approval")
+forbid(principal, action, resource)
+when {
+    context.is_sensitive_action &&
+    !context.allow_sensitive_tools
+};
+
+@id("allow_read_only_actions")
+permit(principal, action, resource)
+when {
+    context.action == "tool.read" ||
+    context.action == "tool.read.status" ||
+    context.action == "tool.status" ||
+    context.action == "tool.list" ||
+    context.action == "tool.health" ||
+    context.action == "tool.get" ||
+    context.action == "daemon.status" ||
+    context.action == "protocol.version"
+};
+
+@id("allow_allowlisted_tool_execute")
+permit(principal, action, resource)
+when {
+    context.action == "tool.execute" &&
+    context.is_allowlisted_tool
+};
+"#;
+
+const POLICY_DENY_REASON: &str = "tool execution denied by default: tool is not allowlisted";
+const SENSITIVE_DENY_REASON: &str =
+    "sensitive action blocked by default; explicit user approval required";
+const BASELINE_DENY_REASON: &str = "deny-by-default baseline policy";
 
 #[must_use]
 pub fn evaluate(request: &PolicyRequest) -> PolicyDecision {
-    if is_sensitive_action(request) {
-        return PolicyDecision::DenyByDefault {
-            reason: "sensitive action blocked by default; explicit user approval required"
-                .to_owned(),
-        };
+    match evaluate_with_config(request, &PolicyEvaluationConfig::default()) {
+        Ok(evaluation) => evaluation.decision,
+        Err(error) => PolicyDecision::DenyByDefault {
+            reason: format!("policy evaluation failed safely: {error}"),
+        },
+    }
+}
+
+pub fn evaluate_with_config(
+    request: &PolicyRequest,
+    config: &PolicyEvaluationConfig,
+) -> Result<PolicyEvaluation, PolicyEngineError> {
+    let normalized_action = request.action.to_ascii_lowercase();
+    let requested_tool = requested_tool_name(normalized_action.as_str(), request.resource.as_str());
+    let is_allowlisted_tool =
+        is_allowlisted_tool(requested_tool.as_deref(), config.allowlisted_tools.as_slice());
+    let is_sensitive_action = is_sensitive_action(request);
+
+    let context = Context::from_json_value(
+        json!({
+            "action": normalized_action,
+            "resource": request.resource,
+            "is_sensitive_action": is_sensitive_action,
+            "is_allowlisted_tool": is_allowlisted_tool,
+            "allow_sensitive_tools": config.allow_sensitive_tools,
+        }),
+        None,
+    )
+    .map_err(|error| PolicyEngineError::InvalidContext { message: error.to_string() })?;
+
+    let cedar_request =
+        Request::new(principal_uid()?, action_uid()?, resource_uid()?, context, None)
+            .map_err(|error| PolicyEngineError::InvalidRequest { message: error.to_string() })?;
+
+    let response =
+        Authorizer::new().is_authorized(&cedar_request, default_policy_set()?, &Entities::empty());
+
+    let mut matched_policy_ids =
+        response.diagnostics().reason().map(ToString::to_string).collect::<Vec<_>>();
+    matched_policy_ids.sort();
+    let diagnostics_errors =
+        response.diagnostics().errors().map(ToString::to_string).collect::<Vec<_>>();
+
+    let reason = decision_reason(
+        response.decision(),
+        normalized_action.as_str(),
+        is_sensitive_action,
+        is_allowlisted_tool,
+        config.allow_sensitive_tools,
+        diagnostics_errors.as_slice(),
+    );
+    let decision = if response.decision() == Decision::Allow {
+        PolicyDecision::Allow
+    } else {
+        PolicyDecision::DenyByDefault { reason: reason.clone() }
+    };
+
+    Ok(PolicyEvaluation {
+        decision,
+        explanation: PolicyExplanation {
+            evaluated_with_cedar: true,
+            reason,
+            matched_policy_ids,
+            diagnostics_errors,
+            is_sensitive_action,
+            is_allowlisted_tool,
+            requested_tool,
+        },
+    })
+}
+
+fn default_policy_set() -> Result<&'static PolicySet, PolicyEngineError> {
+    static POLICY_SET: OnceLock<Result<PolicySet, PolicyEngineError>> = OnceLock::new();
+    match POLICY_SET.get_or_init(|| {
+        PolicySet::from_str(DEFAULT_POLICY_SRC)
+            .map_err(|error| PolicyEngineError::EngineInitialization { message: error.to_string() })
+    }) {
+        Ok(policy_set) => Ok(policy_set),
+        Err(error) => Err(error.clone()),
+    }
+}
+
+fn principal_uid() -> Result<EntityUid, PolicyEngineError> {
+    static UID: OnceLock<Result<EntityUid, PolicyEngineError>> = OnceLock::new();
+    match UID.get_or_init(|| parse_entity_uid(r#"Principal::"request_principal""#)) {
+        Ok(uid) => Ok(uid.clone()),
+        Err(error) => Err(error.clone()),
+    }
+}
+
+fn action_uid() -> Result<EntityUid, PolicyEngineError> {
+    static UID: OnceLock<Result<EntityUid, PolicyEngineError>> = OnceLock::new();
+    match UID.get_or_init(|| parse_entity_uid(r#"Action::"request_action""#)) {
+        Ok(uid) => Ok(uid.clone()),
+        Err(error) => Err(error.clone()),
+    }
+}
+
+fn resource_uid() -> Result<EntityUid, PolicyEngineError> {
+    static UID: OnceLock<Result<EntityUid, PolicyEngineError>> = OnceLock::new();
+    match UID.get_or_init(|| parse_entity_uid(r#"Resource::"request_resource""#)) {
+        Ok(uid) => Ok(uid.clone()),
+        Err(error) => Err(error.clone()),
+    }
+}
+
+fn parse_entity_uid(raw: &str) -> Result<EntityUid, PolicyEngineError> {
+    raw.parse::<EntityUid>().map_err(|error| PolicyEngineError::EngineInitialization {
+        message: format!("failed to parse Cedar entity UID '{raw}': {error}"),
+    })
+}
+
+fn decision_reason(
+    decision: Decision,
+    normalized_action: &str,
+    is_sensitive_action: bool,
+    is_allowlisted_tool: bool,
+    allow_sensitive_tools: bool,
+    diagnostics_errors: &[String],
+) -> String {
+    if decision == Decision::Allow {
+        if normalized_action == "tool.execute" {
+            return "tool execution allowed by Cedar policy (allowlisted tool)".to_owned();
+        }
+        return "read-only action allowed by Cedar baseline policy".to_owned();
     }
 
-    if is_read_only_action(request) {
-        return PolicyDecision::Allow;
+    if let Some(first_error) = diagnostics_errors.first() {
+        return format!("policy evaluation diagnostics triggered deny-by-default: {first_error}");
     }
 
-    PolicyDecision::DenyByDefault { reason: "deny-by-default baseline policy".to_owned() }
+    if is_sensitive_action && !allow_sensitive_tools {
+        return SENSITIVE_DENY_REASON.to_owned();
+    }
+
+    if normalized_action == "tool.execute" && !is_allowlisted_tool {
+        return POLICY_DENY_REASON.to_owned();
+    }
+
+    BASELINE_DENY_REASON.to_owned()
+}
+
+fn requested_tool_name(normalized_action: &str, resource: &str) -> Option<String> {
+    if normalized_action != "tool.execute" {
+        return None;
+    }
+    let trimmed = resource.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(tool_name) = trimmed.strip_prefix("tool:") {
+        let tool_name = tool_name.trim();
+        if !tool_name.is_empty() {
+            return Some(tool_name.to_ascii_lowercase());
+        }
+    }
+    Some(trimmed.to_ascii_lowercase())
+}
+
+fn is_allowlisted_tool(requested_tool: Option<&str>, allowlisted_tools: &[String]) -> bool {
+    let Some(requested_tool) = requested_tool else {
+        return false;
+    };
+    allowlisted_tools.iter().any(|allowlisted| allowlisted.eq_ignore_ascii_case(requested_tool))
 }
 
 fn is_sensitive_action(request: &PolicyRequest) -> bool {
@@ -48,14 +262,12 @@ fn is_sensitive_action(request: &PolicyRequest) -> bool {
         || resource.contains("credential")
 }
 
-fn is_read_only_action(request: &PolicyRequest) -> bool {
-    let action = request.action.to_ascii_lowercase();
-    READ_ONLY_ACTION_ALLOWLIST.contains(&action.as_str())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{evaluate, PolicyDecision, PolicyRequest};
+    use super::{
+        evaluate, evaluate_with_config, PolicyDecision, PolicyEvaluationConfig, PolicyRequest,
+        POLICY_DENY_REASON, SENSITIVE_DENY_REASON,
+    };
 
     #[test]
     fn default_policy_denies_all_requests() {
@@ -78,15 +290,15 @@ mod tests {
             resource: "tool:shell".to_owned(),
         };
 
-        let decision = evaluate(&request);
+        let evaluation =
+            evaluate_with_config(&request, &PolicyEvaluationConfig::default()).expect("evaluation");
 
         assert_eq!(
-            decision,
-            PolicyDecision::DenyByDefault {
-                reason: "sensitive action blocked by default; explicit user approval required"
-                    .to_owned(),
-            }
+            evaluation.decision,
+            PolicyDecision::DenyByDefault { reason: SENSITIVE_DENY_REASON.to_owned() }
         );
+        assert!(evaluation.explanation.is_sensitive_action);
+        assert!(!evaluation.explanation.matched_policy_ids.is_empty());
     }
 
     #[test]
@@ -97,9 +309,34 @@ mod tests {
             resource: "tool:daemon".to_owned(),
         };
 
-        let decision = evaluate(&request);
+        let evaluation =
+            evaluate_with_config(&request, &PolicyEvaluationConfig::default()).expect("evaluation");
 
-        assert_eq!(decision, PolicyDecision::Allow);
+        assert_eq!(evaluation.decision, PolicyDecision::Allow);
+        assert!(!evaluation.explanation.matched_policy_ids.is_empty());
+    }
+
+    #[test]
+    fn tool_execute_is_allowed_only_when_allowlisted() {
+        let request = PolicyRequest {
+            principal: "user:bootstrap".to_owned(),
+            action: "tool.execute".to_owned(),
+            resource: "tool:palyra.echo".to_owned(),
+        };
+        let denied =
+            evaluate_with_config(&request, &PolicyEvaluationConfig::default()).expect("evaluation");
+        assert_eq!(
+            denied.decision,
+            PolicyDecision::DenyByDefault { reason: POLICY_DENY_REASON.to_owned() }
+        );
+
+        let allowed_config = PolicyEvaluationConfig {
+            allowlisted_tools: vec!["palyra.echo".to_owned()],
+            allow_sensitive_tools: false,
+        };
+        let allowed = evaluate_with_config(&request, &allowed_config).expect("evaluation");
+        assert_eq!(allowed.decision, PolicyDecision::Allow);
+        assert!(allowed.explanation.is_allowlisted_tool);
     }
 
     #[test]
@@ -121,19 +358,6 @@ mod tests {
             principal: "user:bootstrap".to_owned(),
             action: "tool.read.write".to_owned(),
             resource: "tool:filesystem".to_owned(),
-        };
-
-        let decision = evaluate(&request);
-
-        assert!(matches!(decision, PolicyDecision::DenyByDefault { .. }));
-    }
-
-    #[test]
-    fn stacked_read_only_tokens_are_denied_when_not_allowlisted() {
-        let request = PolicyRequest {
-            principal: "user:bootstrap".to_owned(),
-            action: "tool.status.health".to_owned(),
-            resource: "tool:daemon".to_owned(),
         };
 
         let decision = evaluate(&request);

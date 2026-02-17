@@ -304,7 +304,7 @@ async fn grpc_run_stream_denies_non_allowlisted_tool_by_default() -> Result<()> 
             r#"{"choices":[{"message":{"tool_calls":[{"function":{"name":"shell.exec","arguments":"{\"command\":\"whoami\"}"}}]}}]}"#
                 .to_owned(),
         )])?;
-    let (child, admin_port, grpc_port, _journal_db_path) =
+    let (child, admin_port, grpc_port, journal_db_path) =
         spawn_palyrad_with_openai_provider_and_tool_policy(
             openai_base_url.as_str(),
             OPENAI_API_KEY,
@@ -378,6 +378,36 @@ async fn grpc_run_stream_denies_non_allowlisted_tool_by_default() -> Result<()> 
     assert_eq!(
         status_snapshot.pointer("/counters/tool_execution_attempts").and_then(Value::as_u64),
         Some(0)
+    );
+    let connection =
+        Connection::open(journal_db_path).context("failed to open journal sqlite db")?;
+    let mut statement = connection
+        .prepare(
+            r#"
+                SELECT payload_json
+                FROM journal_events
+                ORDER BY seq ASC
+            "#,
+        )
+        .context("failed to prepare journal decision query")?;
+    let mut rows = statement.query([]).context("failed to query journal decision rows")?;
+    let mut saw_policy_decision_event = false;
+    let mut saw_denied_policy_payload = false;
+    while let Some(row) = rows.next().context("failed to iterate journal decision rows")? {
+        let payload_json: String = row.get(0).context("journal payload_json should be readable")?;
+        if payload_json.contains("\"event\":\"policy_decision\"") {
+            saw_policy_decision_event = true;
+            if payload_json.contains("\"kind\":\"deny\"")
+                && payload_json.contains("denied by default")
+            {
+                saw_denied_policy_payload = true;
+            }
+        }
+    }
+    assert!(saw_policy_decision_event, "policy decisions must be persisted in journal entries");
+    assert!(
+        saw_denied_policy_payload,
+        "denied policy decision should be persisted with explainable denial reason"
     );
 
     server_handle.join().expect("scripted openai server thread should exit");
