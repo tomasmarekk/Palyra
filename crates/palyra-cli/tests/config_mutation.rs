@@ -217,3 +217,145 @@ fn config_set_requires_valid_toml_value_literal() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn config_set_rejects_schema_invalid_typed_value_and_preserves_file() -> Result<()> {
+    let workdir = TempDir::new().context("failed to create temporary workdir")?;
+    let config_path = workdir.path().join("palyra.toml");
+    fs::write(&config_path, "version = 1\n[daemon]\nport = 7142\n")
+        .with_context(|| format!("failed to write {}", config_path.display()))?;
+    let before = fs::read(&config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    let config_path_string = config_path.to_string_lossy().into_owned();
+
+    let output = run_cli(
+        &workdir,
+        &[
+            "config",
+            "set",
+            "--path",
+            &config_path_string,
+            "--key",
+            "daemon.port",
+            "--value",
+            "\"oops\"",
+            "--backups",
+            "2",
+        ],
+    )?;
+    assert!(!output.status.success(), "schema-invalid set should fail");
+    let stderr = String::from_utf8(output.stderr).context("stderr was not UTF-8")?;
+    assert!(stderr.contains("does not match daemon schema"), "unexpected stderr output: {stderr}");
+    let after = fs::read(&config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    assert_eq!(before, after, "failed set must not mutate active config");
+    assert!(!backup_path(&config_path, 1).exists(), "failed set must not rotate backups");
+    Ok(())
+}
+
+#[test]
+fn config_set_rejects_unknown_top_level_key_and_preserves_file() -> Result<()> {
+    let workdir = TempDir::new().context("failed to create temporary workdir")?;
+    let config_path = workdir.path().join("palyra.toml");
+    fs::write(&config_path, "version = 1\n")
+        .with_context(|| format!("failed to write {}", config_path.display()))?;
+    let before = fs::read(&config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    let config_path_string = config_path.to_string_lossy().into_owned();
+
+    let output = run_cli(
+        &workdir,
+        &[
+            "config",
+            "set",
+            "--path",
+            &config_path_string,
+            "--key",
+            "unknown.section",
+            "--value",
+            "1",
+            "--backups",
+            "2",
+        ],
+    )?;
+    assert!(!output.status.success(), "unknown top-level section should fail");
+    let stderr = String::from_utf8(output.stderr).context("stderr was not UTF-8")?;
+    assert!(stderr.contains("does not match daemon schema"), "unexpected stderr output: {stderr}");
+    let after = fs::read(&config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    assert_eq!(before, after, "failed set must not mutate active config");
+    assert!(!backup_path(&config_path, 1).exists(), "failed set must not rotate backups");
+    Ok(())
+}
+
+#[test]
+fn config_migrate_rejects_schema_invalid_document() -> Result<()> {
+    let workdir = TempDir::new().context("failed to create temporary workdir")?;
+    let config_path = workdir.path().join("palyra.toml");
+    fs::write(&config_path, "version = 1\n[daemon]\nport = \"bad\"\n")
+        .with_context(|| format!("failed to write {}", config_path.display()))?;
+    let before = fs::read(&config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    let config_path_string = config_path.to_string_lossy().into_owned();
+
+    let output =
+        run_cli(&workdir, &["config", "migrate", "--path", &config_path_string, "--backups", "2"])?;
+    assert!(!output.status.success(), "schema-invalid migrate should fail");
+    let stderr = String::from_utf8(output.stderr).context("stderr was not UTF-8")?;
+    assert!(stderr.contains("does not match daemon schema"), "unexpected stderr output: {stderr}");
+    let after = fs::read(&config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    assert_eq!(before, after, "failed migrate must not mutate active config");
+    assert!(!backup_path(&config_path, 1).exists(), "failed migrate must not rotate backups");
+    Ok(())
+}
+
+#[test]
+fn config_recover_rejects_invalid_backup_without_mutating_active_config() -> Result<()> {
+    let workdir = TempDir::new().context("failed to create temporary workdir")?;
+    let config_path = workdir.path().join("palyra.toml");
+    fs::write(&config_path, "version = 1\n[daemon]\nport = 7142\n")
+        .with_context(|| format!("failed to write {}", config_path.display()))?;
+    fs::write(backup_path(&config_path, 1), "version = 1\n[daemon\nport = 7000\n")
+        .with_context(|| format!("failed to write backup for {}", config_path.display()))?;
+    let before = fs::read(&config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    let config_path_string = config_path.to_string_lossy().into_owned();
+
+    let output = run_cli(
+        &workdir,
+        &["config", "recover", "--path", &config_path_string, "--backup", "1", "--backups", "3"],
+    )?;
+    assert!(!output.status.success(), "recover with invalid backup TOML should fail");
+    let stderr = String::from_utf8(output.stderr).context("stderr was not UTF-8")?;
+    assert!(stderr.contains("failed to parse backup config"), "unexpected stderr output: {stderr}");
+    let after = fs::read(&config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    assert_eq!(before, after, "failed recover must not mutate active config");
+    Ok(())
+}
+
+#[test]
+fn config_recover_rejects_schema_invalid_backup_without_mutating_active_config() -> Result<()> {
+    let workdir = TempDir::new().context("failed to create temporary workdir")?;
+    let config_path = workdir.path().join("palyra.toml");
+    fs::write(&config_path, "version = 1\n[daemon]\nport = 7142\n")
+        .with_context(|| format!("failed to write {}", config_path.display()))?;
+    fs::write(backup_path(&config_path, 1), "version = 1\n[daemon]\nport = \"oops\"\n")
+        .with_context(|| format!("failed to write backup for {}", config_path.display()))?;
+    let before = fs::read(&config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    let config_path_string = config_path.to_string_lossy().into_owned();
+
+    let output = run_cli(
+        &workdir,
+        &["config", "recover", "--path", &config_path_string, "--backup", "1", "--backups", "3"],
+    )?;
+    assert!(!output.status.success(), "recover with schema-invalid backup should fail");
+    let stderr = String::from_utf8(output.stderr).context("stderr was not UTF-8")?;
+    assert!(stderr.contains("does not match daemon schema"), "unexpected stderr output: {stderr}");
+    let after = fs::read(&config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    assert_eq!(before, after, "failed recover must not mutate active config");
+    Ok(())
+}

@@ -359,15 +359,31 @@ fn write_atomically(path: &Path, content: &str) -> Result<(), ConfigSystemError>
     fs::write(&temporary_path, content)
         .map_err(|source| ConfigSystemError::WriteFile { path: temporary_path.clone(), source })?;
 
-    if path.exists() {
-        remove_file_if_exists(path)
-            .map_err(|source| ConfigSystemError::WriteFile { path: path.to_path_buf(), source })?;
-    }
     if let Err(source) = fs::rename(&temporary_path, path) {
-        let _ = remove_file_if_exists(&temporary_path);
-        return Err(ConfigSystemError::WriteFile { path: path.to_path_buf(), source });
+        if !path.exists() || !path.is_file() {
+            let _ = remove_file_if_exists(&temporary_path);
+            return Err(ConfigSystemError::WriteFile { path: path.to_path_buf(), source });
+        }
+
+        let rollback_path = swap_path(path, timestamp_ns);
+        if let Err(source) = fs::rename(path, &rollback_path) {
+            let _ = remove_file_if_exists(&temporary_path);
+            return Err(ConfigSystemError::WriteFile { path: path.to_path_buf(), source });
+        }
+        if let Err(source) = fs::rename(&temporary_path, path) {
+            let _ = fs::rename(&rollback_path, path);
+            let _ = remove_file_if_exists(&temporary_path);
+            return Err(ConfigSystemError::WriteFile { path: path.to_path_buf(), source });
+        }
+        let _ = remove_file_if_exists(&rollback_path);
     }
     Ok(())
+}
+
+fn swap_path(path: &Path, timestamp_ns: u128) -> PathBuf {
+    let mut rollback_name = path.as_os_str().to_os_string();
+    rollback_name.push(format!(".swap.{}.{}", std::process::id(), timestamp_ns));
+    PathBuf::from(rollback_name)
 }
 
 fn remove_file_if_exists(path: &Path) -> std::io::Result<()> {
@@ -483,6 +499,34 @@ mod tests {
         let backup_2 = fs::read_to_string(backup_path(&config_path, 2))?;
         assert!(backup_1.contains("7001"));
         assert!(backup_2.contains("7000"));
+        Ok(())
+    }
+
+    #[test]
+    fn write_document_with_backups_replaces_file_without_temporary_artifacts() -> Result<()> {
+        let tempdir = TempDir::new().expect("failed to create tempdir");
+        let config_path = tempdir.path().join("palyra.toml");
+        fs::write(&config_path, "version = 1\n[daemon]\nport = 7000\n")?;
+
+        let (mut document, _) = parse_document_with_migration(&fs::read_to_string(&config_path)?)?;
+        set_value_at_path(&mut document, "daemon.port", Value::Integer(7443))?;
+        write_document_with_backups(&config_path, &document, 0)?;
+
+        let persisted = fs::read_to_string(&config_path)?;
+        assert!(persisted.contains("7443"), "updated config should be persisted");
+
+        for entry in fs::read_dir(tempdir.path())? {
+            let entry = entry?;
+            let file_name = entry.file_name().to_string_lossy().into_owned();
+            assert!(
+                !file_name.contains(".tmp."),
+                "temporary writer artifact should be removed: {file_name}"
+            );
+            assert!(
+                !file_name.contains(".swap."),
+                "rollback artifact should be removed: {file_name}"
+            );
+        }
         Ok(())
     }
 

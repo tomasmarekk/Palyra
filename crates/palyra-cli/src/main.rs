@@ -14,7 +14,7 @@ use cli::{PairingClientKindArg, PairingCommand, PairingMethodArg};
 use palyra_common::{
     build_metadata,
     config_system::{
-        format_toml_value, get_value_at_path, parse_document_with_migration,
+        backup_path, format_toml_value, get_value_at_path, parse_document_with_migration,
         parse_toml_value_literal, recover_config_from_backup, set_value_at_path,
         unset_value_at_path, write_document_with_backups, ConfigMigrationInfo,
     },
@@ -484,6 +484,9 @@ fn run_config(command: ConfigCommand) -> Result<()> {
                 .context("config set value must be a valid TOML literal")?;
             set_value_at_path(&mut document, key.as_str(), literal)
                 .with_context(|| format!("invalid config key path: {}", key))?;
+            validate_daemon_compatible_document(&document).with_context(|| {
+                format!("mutated config {} does not match daemon schema", path_ref.display())
+            })?;
             write_document_with_backups(path_ref, &document, backups)
                 .with_context(|| format!("failed to persist config {}", path_ref.display()))?;
             println!(
@@ -505,6 +508,9 @@ fn run_config(command: ConfigCommand) -> Result<()> {
             if !removed {
                 anyhow::bail!("config key not found: {}", key);
             }
+            validate_daemon_compatible_document(&document).with_context(|| {
+                format!("mutated config {} does not match daemon schema", path_ref.display())
+            })?;
             write_document_with_backups(path_ref, &document, backups)
                 .with_context(|| format!("failed to persist config {}", path_ref.display()))?;
             println!("config.unset key={} source={} backups={}", key, path_ref.display(), backups);
@@ -515,6 +521,9 @@ fn run_config(command: ConfigCommand) -> Result<()> {
             let path_ref = Path::new(&path);
             let (document, migration) = load_document_from_existing_path(path_ref)
                 .with_context(|| format!("failed to parse {}", path_ref.display()))?;
+            validate_daemon_compatible_document(&document).with_context(|| {
+                format!("migrated config {} does not match daemon schema", path_ref.display())
+            })?;
             if migration.migrated {
                 write_document_with_backups(path_ref, &document, backups).with_context(|| {
                     format!("failed to persist migrated config {}", path_ref.display())
@@ -533,6 +542,14 @@ fn run_config(command: ConfigCommand) -> Result<()> {
         ConfigCommand::Recover { path, backup, backups } => {
             let path = resolve_config_path(path, false)?;
             let path_ref = Path::new(&path);
+            let candidate_backup = backup_path(path_ref, backup);
+            let (backup_document, _) = load_document_from_existing_path(&candidate_backup)
+                .with_context(|| {
+                    format!("failed to parse backup config {}", candidate_backup.display())
+                })?;
+            validate_daemon_compatible_document(&backup_document).with_context(|| {
+                format!("backup config {} does not match daemon schema", candidate_backup.display())
+            })?;
             let recovered =
                 recover_config_from_backup(path_ref, backup, backups).with_context(|| {
                     format!(
