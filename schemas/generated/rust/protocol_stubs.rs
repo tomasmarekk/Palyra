@@ -52,6 +52,10 @@ pub mod palyra_common_v1 {
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct StreamStatus;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ToolAttestation;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ToolDecision;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct ToolProposal;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct ToolResult;

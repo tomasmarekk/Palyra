@@ -29,6 +29,8 @@ object PalyraCommonV1 {
     data class RunStreamRequest(val placeholder: Int = 0)
     data class SecurityContext(val placeholder: Int = 0)
     data class StreamStatus(val placeholder: Int = 0)
+    data class ToolAttestation(val placeholder: Int = 0)
+    data class ToolDecision(val placeholder: Int = 0)
     data class ToolProposal(val placeholder: Int = 0)
     data class ToolResult(val placeholder: Int = 0)
 }

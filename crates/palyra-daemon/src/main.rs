@@ -3,6 +3,7 @@ mod gateway;
 mod journal;
 mod model_provider;
 mod orchestrator;
+mod tool_protocol;
 
 use std::time::Instant;
 
@@ -119,6 +120,11 @@ async fn main() -> Result<()> {
             orchestrator_runloop_v1_enabled: loaded.orchestrator.runloop_v1_enabled,
             node_rpc_mtls_required: !loaded.identity.allow_insecure_node_rpc_without_mtls,
             admin_auth_required: loaded.admin.require_auth,
+            tool_call: tool_protocol::ToolCallConfig {
+                allowed_tools: loaded.tool_call.allowed_tools.clone(),
+                max_calls_per_run: loaded.tool_call.max_calls_per_run,
+                execution_timeout_ms: loaded.tool_call.execution_timeout_ms,
+            },
         },
         GatewayJournalConfigSnapshot {
             db_path: loaded.storage.journal_db_path.clone(),
@@ -163,6 +169,9 @@ async fn main() -> Result<()> {
         model_provider_openai_base_url = %loaded.model_provider.openai_base_url,
         model_provider_openai_model = %loaded.model_provider.openai_model,
         model_provider_api_key_configured = loaded.model_provider.openai_api_key.is_some(),
+        tool_call_allowed_tools = ?loaded.tool_call.allowed_tools,
+        tool_call_max_calls_per_run = loaded.tool_call.max_calls_per_run,
+        tool_call_execution_timeout_ms = loaded.tool_call.execution_timeout_ms,
         admin_auth_required = loaded.admin.require_auth,
         admin_token_configured = loaded.admin.auth_token.is_some(),
         node_rpc_mtls_required = !loaded.identity.allow_insecure_node_rpc_without_mtls,

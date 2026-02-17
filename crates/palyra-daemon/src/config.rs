@@ -22,6 +22,8 @@ const DEFAULT_ADMIN_REQUIRE_AUTH: bool = true;
 const DEFAULT_ALLOW_INSECURE_NODE_RPC_WITHOUT_MTLS: bool = false;
 const DEFAULT_JOURNAL_DB_PATH: &str = "data/journal.sqlite3";
 const DEFAULT_JOURNAL_HASH_CHAIN_ENABLED: bool = false;
+const DEFAULT_TOOL_CALL_MAX_CALLS_PER_RUN: u32 = 4;
+const DEFAULT_TOOL_CALL_EXECUTION_TIMEOUT_MS: u64 = 750;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadedConfig {
     pub source: String,
@@ -29,6 +31,7 @@ pub struct LoadedConfig {
     pub gateway: GatewayConfig,
     pub orchestrator: OrchestratorConfig,
     pub model_provider: ModelProviderConfig,
+    pub tool_call: ToolCallConfig,
     pub admin: AdminConfig,
     pub identity: IdentityConfig,
     pub storage: StorageConfig,
@@ -52,6 +55,13 @@ pub struct GatewayConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrchestratorConfig {
     pub runloop_v1_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCallConfig {
+    pub allowed_tools: Vec<String>,
+    pub max_calls_per_run: u32,
+    pub execution_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,6 +120,16 @@ impl Default for OrchestratorConfig {
     }
 }
 
+impl Default for ToolCallConfig {
+    fn default() -> Self {
+        Self {
+            allowed_tools: Vec::new(),
+            max_calls_per_run: DEFAULT_TOOL_CALL_MAX_CALLS_PER_RUN,
+            execution_timeout_ms: DEFAULT_TOOL_CALL_EXECUTION_TIMEOUT_MS,
+        }
+    }
+}
+
 impl Default for AdminConfig {
     fn default() -> Self {
         Self { require_auth: DEFAULT_ADMIN_REQUIRE_AUTH, auth_token: None }
@@ -121,6 +141,7 @@ pub fn load_config() -> Result<LoadedConfig> {
     let mut gateway = GatewayConfig::default();
     let mut orchestrator = OrchestratorConfig::default();
     let mut model_provider = ModelProviderConfig::default();
+    let mut tool_call = ToolCallConfig::default();
     let mut admin = AdminConfig::default();
     let mut identity = IdentityConfig::default();
     let mut storage = StorageConfig::default();
@@ -193,6 +214,22 @@ pub fn load_config() -> Result<LoadedConfig> {
             if let Some(cooldown_ms) = file_model_provider.circuit_breaker_cooldown_ms {
                 model_provider.circuit_breaker_cooldown_ms =
                     parse_positive_u64(cooldown_ms, "model_provider.circuit_breaker_cooldown_ms")?;
+            }
+        }
+        if let Some(file_tool_call) = parsed.tool_call {
+            if let Some(allowed_tools) = file_tool_call.allowed_tools {
+                tool_call.allowed_tools = parse_tool_allowlist(
+                    allowed_tools.join(",").as_str(),
+                    "tool_call.allowed_tools",
+                )?;
+            }
+            if let Some(max_calls_per_run) = file_tool_call.max_calls_per_run {
+                tool_call.max_calls_per_run =
+                    parse_positive_u32(max_calls_per_run, "tool_call.max_calls_per_run")?;
+            }
+            if let Some(execution_timeout_ms) = file_tool_call.execution_timeout_ms {
+                tool_call.execution_timeout_ms =
+                    parse_positive_u64(execution_timeout_ms, "tool_call.execution_timeout_ms")?;
             }
         }
         if let Some(file_admin) = parsed.admin {
@@ -340,6 +377,32 @@ pub fn load_config() -> Result<LoadedConfig> {
         source.push_str(" +env(PALYRA_MODEL_PROVIDER_CIRCUIT_BREAKER_COOLDOWN_MS)");
     }
 
+    if let Ok(allowed_tools) = env::var("PALYRA_TOOL_CALL_ALLOWED_TOOLS") {
+        tool_call.allowed_tools =
+            parse_tool_allowlist(allowed_tools.as_str(), "PALYRA_TOOL_CALL_ALLOWED_TOOLS")?;
+        source.push_str(" +env(PALYRA_TOOL_CALL_ALLOWED_TOOLS)");
+    }
+
+    if let Ok(max_calls_per_run) = env::var("PALYRA_TOOL_CALL_MAX_CALLS_PER_RUN") {
+        tool_call.max_calls_per_run = parse_positive_u32(
+            max_calls_per_run
+                .parse::<u32>()
+                .context("PALYRA_TOOL_CALL_MAX_CALLS_PER_RUN must be a valid u32")?,
+            "PALYRA_TOOL_CALL_MAX_CALLS_PER_RUN",
+        )?;
+        source.push_str(" +env(PALYRA_TOOL_CALL_MAX_CALLS_PER_RUN)");
+    }
+
+    if let Ok(execution_timeout_ms) = env::var("PALYRA_TOOL_CALL_TIMEOUT_MS") {
+        tool_call.execution_timeout_ms = parse_positive_u64(
+            execution_timeout_ms
+                .parse::<u64>()
+                .context("PALYRA_TOOL_CALL_TIMEOUT_MS must be a valid u64")?,
+            "PALYRA_TOOL_CALL_TIMEOUT_MS",
+        )?;
+        source.push_str(" +env(PALYRA_TOOL_CALL_TIMEOUT_MS)");
+    }
+
     if let Ok(require_auth) = env::var("PALYRA_ADMIN_REQUIRE_AUTH") {
         admin.require_auth = require_auth
             .parse::<bool>()
@@ -377,6 +440,7 @@ pub fn load_config() -> Result<LoadedConfig> {
         gateway,
         orchestrator,
         model_provider,
+        tool_call,
         admin,
         identity,
         storage,
@@ -442,6 +506,21 @@ fn parse_openai_model(raw: &str) -> Result<String> {
     Ok(raw.trim().to_owned())
 }
 
+fn parse_tool_allowlist(raw: &str, source_name: &str) -> Result<Vec<String>> {
+    let mut allowlist = Vec::new();
+    for candidate in raw.split(',').map(str::trim).filter(|value| !value.is_empty()) {
+        if !candidate.chars().all(|ch| {
+            ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-')
+        }) {
+            anyhow::bail!("{source_name} contains invalid tool name '{candidate}'");
+        }
+        if !allowlist.iter().any(|existing| existing == candidate) {
+            allowlist.push(candidate.to_owned());
+        }
+    }
+    Ok(allowlist)
+}
+
 fn parse_positive_u64(value: u64, name: &str) -> Result<u64> {
     if value == 0 {
         anyhow::bail!("{name} must be greater than 0");
@@ -469,8 +548,9 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        parse_journal_db_path, parse_openai_base_url, AdminConfig, GatewayConfig, IdentityConfig,
-        ModelProviderConfig, OrchestratorConfig, StorageConfig,
+        parse_journal_db_path, parse_openai_base_url, parse_tool_allowlist, AdminConfig,
+        GatewayConfig, IdentityConfig, ModelProviderConfig, OrchestratorConfig, StorageConfig,
+        ToolCallConfig,
     };
     use crate::model_provider::ModelProviderKind;
     use palyra_common::daemon_config_schema::RootFileConfig;
@@ -511,6 +591,17 @@ mod tests {
             !config.runloop_v1_enabled,
             "orchestrator run loop should default disabled until explicitly enabled"
         );
+    }
+
+    #[test]
+    fn tool_call_config_defaults_to_deny_by_default_with_execution_limits() {
+        let config = ToolCallConfig::default();
+        assert!(
+            config.allowed_tools.is_empty(),
+            "tool call allowlist must default empty to enforce deny-by-default"
+        );
+        assert_eq!(config.max_calls_per_run, 4);
+        assert_eq!(config.execution_timeout_ms, 750);
     }
 
     #[test]
@@ -626,5 +717,21 @@ mod tests {
         let parsed =
             parse_openai_base_url("https://api.openai.com/v1").expect("base URL should parse");
         assert_eq!(parsed, "https://api.openai.com/v1");
+    }
+
+    #[test]
+    fn parse_tool_allowlist_normalizes_and_deduplicates_values() {
+        let parsed = parse_tool_allowlist(
+            "palyra.echo, palyra.sleep ,palyra.echo,,",
+            "PALYRA_TOOL_CALL_ALLOWED_TOOLS",
+        )
+        .expect("allowlist should parse");
+        assert_eq!(parsed, vec!["palyra.echo".to_owned(), "palyra.sleep".to_owned()]);
+    }
+
+    #[test]
+    fn parse_tool_allowlist_rejects_invalid_characters() {
+        let result = parse_tool_allowlist("palyra.echo,../shell", "tool_call.allowed_tools");
+        assert!(result.is_err(), "allowlist parser must reject invalid tool names");
     }
 }

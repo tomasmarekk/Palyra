@@ -66,6 +66,12 @@ public enum PalyraCommonV1 {
     public struct StreamStatus: Equatable {
         public init() {}
     }
+    public struct ToolAttestation: Equatable {
+        public init() {}
+    }
+    public struct ToolDecision: Equatable {
+        public init() {}
+    }
     public struct ToolProposal: Equatable {
         public init() {}
     }

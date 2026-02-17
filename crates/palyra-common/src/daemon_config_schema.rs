@@ -7,6 +7,7 @@ pub struct RootFileConfig {
     pub gateway: Option<FileGatewayConfig>,
     pub orchestrator: Option<FileOrchestratorConfig>,
     pub model_provider: Option<FileModelProviderConfig>,
+    pub tool_call: Option<FileToolCallConfig>,
     pub admin: Option<FileAdminConfig>,
     pub identity: Option<FileIdentityConfig>,
     pub storage: Option<FileStorageConfig>,
@@ -46,6 +47,14 @@ pub struct FileModelProviderConfig {
     pub retry_backoff_ms: Option<u64>,
     pub circuit_breaker_failure_threshold: Option<u32>,
     pub circuit_breaker_cooldown_ms: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileToolCallConfig {
+    pub allowed_tools: Option<Vec<String>>,
+    pub max_calls_per_run: Option<u32>,
+    pub execution_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]

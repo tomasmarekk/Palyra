@@ -29,6 +29,10 @@ use crate::{
         ModelProvider, ProviderError, ProviderEvent, ProviderRequest, ProviderStatusSnapshot,
     },
     orchestrator::{is_cancel_command, RunLifecycleState, RunStateMachine, RunTransition},
+    tool_protocol::{
+        decide_tool_call, denied_execution_outcome, execute_tool_call, tool_policy_snapshot,
+        ToolCallConfig, ToolCallPolicySnapshot,
+    },
 };
 
 pub mod proto {
@@ -54,6 +58,7 @@ pub const HEADER_DEVICE_ID: &str = "x-palyra-device-id";
 pub const HEADER_CHANNEL: &str = "x-palyra-channel";
 const MAX_JOURNAL_RECENT_EVENTS: usize = 100;
 const JOURNAL_WRITE_LATENCY_BUDGET_MS: u128 = 25;
+const TOOL_EXECUTION_LATENCY_BUDGET_MS: u128 = 200;
 const SENSITIVE_TOOLS_DENY_REASON: &str =
     "allow_sensitive_tools=true is denied by default and requires explicit approvals";
 const CANCELLED_REASON: &str = "cancelled by request";
@@ -68,6 +73,7 @@ pub struct GatewayRuntimeConfigSnapshot {
     pub orchestrator_runloop_v1_enabled: bool,
     pub node_rpc_mtls_required: bool,
     pub admin_auth_required: bool,
+    pub tool_call: ToolCallConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -119,6 +125,13 @@ struct RuntimeCounters {
     model_provider_failures: AtomicU64,
     model_provider_retry_attempts: AtomicU64,
     model_provider_circuit_open_rejections: AtomicU64,
+    tool_proposals: AtomicU64,
+    tool_decisions_allowed: AtomicU64,
+    tool_decisions_denied: AtomicU64,
+    tool_execution_attempts: AtomicU64,
+    tool_execution_failures: AtomicU64,
+    tool_execution_timeouts: AtomicU64,
+    tool_attestations_emitted: AtomicU64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -140,6 +153,7 @@ pub struct GatewayStatusSnapshot {
     pub security: SecuritySnapshot,
     pub storage: StorageSnapshot,
     pub model_provider: ProviderStatusSnapshot,
+    pub tool_call_policy: ToolCallPolicySnapshot,
     pub counters: CountersSnapshot,
     pub request_context: RequestContext,
 }
@@ -189,6 +203,13 @@ pub struct CountersSnapshot {
     pub model_provider_failures: u64,
     pub model_provider_retry_attempts: u64,
     pub model_provider_circuit_open_rejections: u64,
+    pub tool_proposals: u64,
+    pub tool_decisions_allowed: u64,
+    pub tool_decisions_denied: u64,
+    pub tool_execution_attempts: u64,
+    pub tool_execution_failures: u64,
+    pub tool_execution_timeouts: u64,
+    pub tool_attestations_emitted: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -250,6 +271,13 @@ impl RuntimeCounters {
             model_provider_circuit_open_rejections: self
                 .model_provider_circuit_open_rejections
                 .load(Ordering::Relaxed),
+            tool_proposals: self.tool_proposals.load(Ordering::Relaxed),
+            tool_decisions_allowed: self.tool_decisions_allowed.load(Ordering::Relaxed),
+            tool_decisions_denied: self.tool_decisions_denied.load(Ordering::Relaxed),
+            tool_execution_attempts: self.tool_execution_attempts.load(Ordering::Relaxed),
+            tool_execution_failures: self.tool_execution_failures.load(Ordering::Relaxed),
+            tool_execution_timeouts: self.tool_execution_timeouts.load(Ordering::Relaxed),
+            tool_attestations_emitted: self.tool_attestations_emitted.load(Ordering::Relaxed),
         }
     }
 }
@@ -310,6 +338,13 @@ impl GatewayRuntimeState {
                 model_provider_failures: AtomicU64::new(0),
                 model_provider_retry_attempts: AtomicU64::new(0),
                 model_provider_circuit_open_rejections: AtomicU64::new(0),
+                tool_proposals: AtomicU64::new(0),
+                tool_decisions_allowed: AtomicU64::new(0),
+                tool_decisions_denied: AtomicU64::new(0),
+                tool_execution_attempts: AtomicU64::new(0),
+                tool_execution_failures: AtomicU64::new(0),
+                tool_execution_timeouts: AtomicU64::new(0),
+                tool_attestations_emitted: AtomicU64::new(0),
             },
             journal_store,
             revoked_certificate_count,
@@ -405,6 +440,7 @@ impl GatewayRuntimeState {
                 latest_event_hash,
             },
             model_provider: self.model_provider.status_snapshot(),
+            tool_call_policy: tool_policy_snapshot(&self.config.tool_call),
             counters: self.counters.snapshot(),
             request_context: context,
         }
@@ -906,6 +942,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
             let mut run_state = RunStateMachine::default();
             let mut tape_seq = 0_i64;
             let mut in_progress_emitted = false;
+            let mut remaining_tool_budget = state_for_stream.config.tool_call.max_calls_per_run;
 
             while let Some(item) = stream.next().await {
                 let message = match item {
@@ -1489,6 +1526,10 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                             }
                         }
                         ProviderEvent::ToolProposal { proposal_id, tool_name, input_json } => {
+                            state_for_stream
+                                .counters
+                                .tool_proposals
+                                .fetch_add(1, Ordering::Relaxed);
                             if let Err(error) = send_tool_proposal_with_tape(
                                 &sender,
                                 &state_for_stream,
@@ -1496,7 +1537,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                                 &mut tape_seq,
                                 proposal_id.as_str(),
                                 tool_name.as_str(),
-                                input_json,
+                                input_json.clone(),
                             )
                             .await
                             {
@@ -1512,6 +1553,153 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                                 let _ = sender.send(Err(error)).await;
                                 return;
                             }
+
+                            let decision = decide_tool_call(
+                                &state_for_stream.config.tool_call,
+                                &mut remaining_tool_budget,
+                                tool_name.as_str(),
+                            );
+                            if decision.allowed {
+                                state_for_stream
+                                    .counters
+                                    .tool_decisions_allowed
+                                    .fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                state_for_stream
+                                    .counters
+                                    .tool_decisions_denied
+                                    .fetch_add(1, Ordering::Relaxed);
+                                state_for_stream.record_denied();
+                            }
+
+                            if let Err(error) = send_tool_decision_with_tape(
+                                &sender,
+                                &state_for_stream,
+                                run_id.as_str(),
+                                &mut tape_seq,
+                                proposal_id.as_str(),
+                                decision.allowed,
+                                decision.reason.as_str(),
+                                decision.approval_required,
+                                decision.policy_enforced,
+                            )
+                            .await
+                            {
+                                finalize_run_failure(
+                                    &sender,
+                                    &state_for_stream,
+                                    &mut run_state,
+                                    active_run_id.as_deref(),
+                                    &mut tape_seq,
+                                    error.message(),
+                                )
+                                .await;
+                                let _ = sender.send(Err(error)).await;
+                                return;
+                            }
+
+                            let execution_outcome = if decision.allowed {
+                                state_for_stream
+                                    .counters
+                                    .tool_execution_attempts
+                                    .fetch_add(1, Ordering::Relaxed);
+                                let started_at = Instant::now();
+                                let outcome = execute_tool_call(
+                                    &state_for_stream.config.tool_call,
+                                    proposal_id.as_str(),
+                                    tool_name.as_str(),
+                                    input_json.as_slice(),
+                                )
+                                .await;
+                                if started_at.elapsed().as_millis()
+                                    > TOOL_EXECUTION_LATENCY_BUDGET_MS
+                                {
+                                    warn!(
+                                        run_id = %run_id,
+                                        proposal_id = %proposal_id,
+                                        tool_name = %tool_name,
+                                        execution_duration_ms = started_at.elapsed().as_millis(),
+                                        budget_ms = TOOL_EXECUTION_LATENCY_BUDGET_MS,
+                                        "tool execution exceeded latency budget"
+                                    );
+                                }
+                                if !outcome.success {
+                                    state_for_stream
+                                        .counters
+                                        .tool_execution_failures
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                                if outcome.attestation.timed_out {
+                                    state_for_stream
+                                        .counters
+                                        .tool_execution_timeouts
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                                outcome
+                            } else {
+                                denied_execution_outcome(
+                                    proposal_id.as_str(),
+                                    tool_name.as_str(),
+                                    input_json.as_slice(),
+                                    decision.reason.as_str(),
+                                )
+                            };
+
+                            if let Err(error) = send_tool_result_with_tape(
+                                &sender,
+                                &state_for_stream,
+                                run_id.as_str(),
+                                &mut tape_seq,
+                                proposal_id.as_str(),
+                                execution_outcome.success,
+                                execution_outcome.output_json.clone(),
+                                execution_outcome.error.as_str(),
+                            )
+                            .await
+                            {
+                                finalize_run_failure(
+                                    &sender,
+                                    &state_for_stream,
+                                    &mut run_state,
+                                    active_run_id.as_deref(),
+                                    &mut tape_seq,
+                                    error.message(),
+                                )
+                                .await;
+                                let _ = sender.send(Err(error)).await;
+                                return;
+                            }
+
+                            if let Err(error) = send_tool_attestation_with_tape(
+                                &sender,
+                                &state_for_stream,
+                                run_id.as_str(),
+                                &mut tape_seq,
+                                proposal_id.as_str(),
+                                execution_outcome.attestation.attestation_id.as_str(),
+                                execution_outcome.attestation.execution_sha256.as_str(),
+                                execution_outcome.attestation.executed_at_unix_ms,
+                                execution_outcome.attestation.timed_out,
+                                execution_outcome.attestation.executor.as_str(),
+                            )
+                            .await
+                            {
+                                finalize_run_failure(
+                                    &sender,
+                                    &state_for_stream,
+                                    &mut run_state,
+                                    active_run_id.as_deref(),
+                                    &mut tape_seq,
+                                    error.message(),
+                                )
+                                .await;
+                                let _ = sender.send(Err(error)).await;
+                                return;
+                            }
+                            state_for_stream
+                                .counters
+                                .tool_attestations_emitted
+                                .fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }
@@ -1762,6 +1950,76 @@ fn tool_proposal_event(
     }
 }
 
+fn tool_decision_event(
+    run_id: String,
+    proposal_id: impl Into<String>,
+    allowed: bool,
+    reason: impl Into<String>,
+    approval_required: bool,
+    policy_enforced: bool,
+) -> common_v1::RunStreamEvent {
+    let kind = if allowed {
+        common_v1::tool_decision::DecisionKind::Allow
+    } else {
+        common_v1::tool_decision::DecisionKind::Deny
+    };
+    common_v1::RunStreamEvent {
+        v: CANONICAL_PROTOCOL_MAJOR,
+        run_id: Some(common_v1::CanonicalId { ulid: run_id }),
+        body: Some(common_v1::run_stream_event::Body::ToolDecision(common_v1::ToolDecision {
+            proposal_id: Some(common_v1::CanonicalId { ulid: proposal_id.into() }),
+            kind: kind as i32,
+            reason: reason.into(),
+            approval_required,
+            policy_enforced,
+        })),
+    }
+}
+
+fn tool_result_event(
+    run_id: String,
+    proposal_id: impl Into<String>,
+    success: bool,
+    output_json: Vec<u8>,
+    error: impl Into<String>,
+) -> common_v1::RunStreamEvent {
+    common_v1::RunStreamEvent {
+        v: CANONICAL_PROTOCOL_MAJOR,
+        run_id: Some(common_v1::CanonicalId { ulid: run_id }),
+        body: Some(common_v1::run_stream_event::Body::ToolResult(common_v1::ToolResult {
+            proposal_id: Some(common_v1::CanonicalId { ulid: proposal_id.into() }),
+            success,
+            output_json,
+            error: error.into(),
+        })),
+    }
+}
+
+fn tool_attestation_event(
+    run_id: String,
+    proposal_id: impl Into<String>,
+    attestation_id: impl Into<String>,
+    execution_sha256: impl Into<String>,
+    executed_at_unix_ms: i64,
+    timed_out: bool,
+    executor: impl Into<String>,
+) -> common_v1::RunStreamEvent {
+    common_v1::RunStreamEvent {
+        v: CANONICAL_PROTOCOL_MAJOR,
+        run_id: Some(common_v1::CanonicalId { ulid: run_id }),
+        body: Some(common_v1::run_stream_event::Body::ToolAttestation(
+            common_v1::ToolAttestation {
+                proposal_id: Some(common_v1::CanonicalId { ulid: proposal_id.into() }),
+                attestation_id: Some(common_v1::CanonicalId { ulid: attestation_id.into() }),
+                execution_sha256: execution_sha256.into(),
+                executed_at_unix_ms,
+                timed_out,
+                executor: executor.into(),
+            },
+        )),
+    }
+}
+
 #[allow(clippy::result_large_err)]
 async fn send_status_with_tape(
     sender: &mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
@@ -1846,6 +2104,135 @@ async fn send_tool_proposal_with_tape(
     Ok(())
 }
 
+#[allow(clippy::result_large_err)]
+#[allow(clippy::too_many_arguments)]
+async fn send_tool_decision_with_tape(
+    sender: &mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    proposal_id: &str,
+    allowed: bool,
+    reason: &str,
+    approval_required: bool,
+    policy_enforced: bool,
+) -> Result<(), Status> {
+    let event = tool_decision_event(
+        run_id.to_owned(),
+        proposal_id.to_owned(),
+        allowed,
+        reason.to_owned(),
+        approval_required,
+        policy_enforced,
+    );
+    sender
+        .send(Ok(event))
+        .await
+        .map_err(|_| Status::cancelled("run stream response channel closed"))?;
+    runtime_state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: *tape_seq,
+            event_type: "tool_decision".to_owned(),
+            payload_json: tool_decision_tape_payload(
+                proposal_id,
+                allowed,
+                reason,
+                approval_required,
+                policy_enforced,
+            ),
+        })
+        .await?;
+    *tape_seq += 1;
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+#[allow(clippy::too_many_arguments)]
+async fn send_tool_result_with_tape(
+    sender: &mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    proposal_id: &str,
+    success: bool,
+    output_json: Vec<u8>,
+    error: &str,
+) -> Result<(), Status> {
+    let event = tool_result_event(
+        run_id.to_owned(),
+        proposal_id.to_owned(),
+        success,
+        output_json.clone(),
+        error.to_owned(),
+    );
+    sender
+        .send(Ok(event))
+        .await
+        .map_err(|_| Status::cancelled("run stream response channel closed"))?;
+    runtime_state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: *tape_seq,
+            event_type: "tool_result".to_owned(),
+            payload_json: tool_result_tape_payload(
+                proposal_id,
+                success,
+                output_json.as_slice(),
+                error,
+            ),
+        })
+        .await?;
+    *tape_seq += 1;
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+#[allow(clippy::too_many_arguments)]
+async fn send_tool_attestation_with_tape(
+    sender: &mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    proposal_id: &str,
+    attestation_id: &str,
+    execution_sha256: &str,
+    executed_at_unix_ms: i64,
+    timed_out: bool,
+    executor: &str,
+) -> Result<(), Status> {
+    let event = tool_attestation_event(
+        run_id.to_owned(),
+        proposal_id.to_owned(),
+        attestation_id.to_owned(),
+        execution_sha256.to_owned(),
+        executed_at_unix_ms,
+        timed_out,
+        executor.to_owned(),
+    );
+    sender
+        .send(Ok(event))
+        .await
+        .map_err(|_| Status::cancelled("run stream response channel closed"))?;
+    runtime_state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: *tape_seq,
+            event_type: "tool_attestation".to_owned(),
+            payload_json: tool_attestation_tape_payload(
+                proposal_id,
+                attestation_id,
+                execution_sha256,
+                executed_at_unix_ms,
+                timed_out,
+                executor,
+            ),
+        })
+        .await?;
+    *tape_seq += 1;
+    Ok(())
+}
+
 fn status_tape_payload(kind: common_v1::stream_status::StatusKind, message: &str) -> String {
     json!({
         "kind": status_kind_name(kind),
@@ -1870,6 +2257,59 @@ fn tool_proposal_tape_payload(proposal_id: &str, tool_name: &str, input_json: &[
         "tool_name": tool_name,
         "input_json": normalized_input,
         "approval_required": true,
+    })
+    .to_string()
+}
+
+fn tool_decision_tape_payload(
+    proposal_id: &str,
+    allowed: bool,
+    reason: &str,
+    approval_required: bool,
+    policy_enforced: bool,
+) -> String {
+    json!({
+        "proposal_id": proposal_id,
+        "kind": if allowed { "allow" } else { "deny" },
+        "reason": reason,
+        "approval_required": approval_required,
+        "policy_enforced": policy_enforced,
+    })
+    .to_string()
+}
+
+fn tool_result_tape_payload(
+    proposal_id: &str,
+    success: bool,
+    output_json: &[u8],
+    error: &str,
+) -> String {
+    let normalized_output = serde_json::from_slice::<Value>(output_json)
+        .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(output_json).to_string() }));
+    json!({
+        "proposal_id": proposal_id,
+        "success": success,
+        "output_json": normalized_output,
+        "error": error,
+    })
+    .to_string()
+}
+
+fn tool_attestation_tape_payload(
+    proposal_id: &str,
+    attestation_id: &str,
+    execution_sha256: &str,
+    executed_at_unix_ms: i64,
+    timed_out: bool,
+    executor: &str,
+) -> String {
+    json!({
+        "proposal_id": proposal_id,
+        "attestation_id": attestation_id,
+        "execution_sha256": execution_sha256,
+        "executed_at_unix_ms": executed_at_unix_ms,
+        "timed_out": timed_out,
+        "executor": executor,
     })
     .to_string()
 }
@@ -2041,6 +2481,11 @@ mod tests {
                 orchestrator_runloop_v1_enabled: true,
                 node_rpc_mtls_required: true,
                 admin_auth_required: true,
+                tool_call: crate::tool_protocol::ToolCallConfig {
+                    allowed_tools: vec!["palyra.echo".to_owned()],
+                    max_calls_per_run: 4,
+                    execution_timeout_ms: 250,
+                },
             },
             GatewayJournalConfigSnapshot { db_path, hash_chain_enabled },
             journal_store,

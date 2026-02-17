@@ -139,6 +139,22 @@ message ToolProposal {
   reserved 5 to 10;
 }
 
+message ToolDecision {
+  enum DecisionKind {
+    DECISION_KIND_UNSPECIFIED = 0;
+    DECISION_KIND_ALLOW = 1;
+    DECISION_KIND_DENY = 2;
+  }
+
+  CanonicalId proposal_id = 1;
+  DecisionKind kind = 2;
+  string reason = 3;
+  bool approval_required = 4;
+  bool policy_enforced = 5;
+
+  reserved 6 to 10;
+}
+
 message ToolResult {
   CanonicalId proposal_id = 1;
   bool success = 2;
@@ -146,6 +162,17 @@ message ToolResult {
   string error = 4;
 
   reserved 5 to 10;
+}
+
+message ToolAttestation {
+  CanonicalId proposal_id = 1;
+  CanonicalId attestation_id = 2;
+  string execution_sha256 = 3;
+  int64 executed_at_unix_ms = 4;
+  bool timed_out = 5;
+  string executor = 6;
+
+  reserved 7 to 12;
 }
 
 message A2uiUpdate {
@@ -199,7 +226,9 @@ message RunStreamEvent {
     A2uiUpdate a2ui_update = 6;
     StreamStatus status = 7;
     JournalEvent journal_event = 8;
+    ToolDecision tool_decision = 9;
+    ToolAttestation tool_attestation = 10;
   }
 
-  reserved 9 to 24;
+  reserved 11 to 24;
 }
