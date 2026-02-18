@@ -18,9 +18,7 @@ use rusqlite::Connection;
 use serde_json::Value;
 #[cfg(unix)]
 use std::path::Path;
-#[cfg(unix)]
 use tokio::sync::mpsc as tokio_mpsc;
-#[cfg(unix)]
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use tonic::Code;
@@ -568,10 +566,12 @@ async fn grpc_run_stream_denies_allowlisted_unsupported_tool() -> Result<()> {
         .await
         .context("failed to connect gRPC client")?;
 
-    let mut stream_request =
-        tonic::Request::new(tokio_stream::iter(vec![sample_run_stream_request_with_text(
-            "unsupported tool path".to_owned(),
-        )]));
+    let (request_sender, request_receiver) = tokio_mpsc::channel(4);
+    request_sender
+        .send(sample_run_stream_request_with_text("unsupported tool path".to_owned()))
+        .await
+        .context("failed to send initial unsupported tool request")?;
+    let mut stream_request = tonic::Request::new(ReceiverStream::new(request_receiver));
     stream_request.metadata_mut().insert("authorization", format!("Bearer {ADMIN_TOKEN}").parse()?);
     stream_request.metadata_mut().insert("x-palyra-principal", "user:ops".parse()?);
     stream_request.metadata_mut().insert("x-palyra-device-id", DEVICE_ID.parse()?);
@@ -580,13 +580,36 @@ async fn grpc_run_stream_denies_allowlisted_unsupported_tool() -> Result<()> {
     let mut response_stream =
         client.run_stream(stream_request).await.context("failed to call RunStream")?.into_inner();
 
+    let mut saw_approval_request = false;
     let mut saw_deny_decision = false;
     let mut saw_failed_result = false;
     let mut saw_policy_attestation = false;
-    while let Some(event) = response_stream.next().await {
+    loop {
+        let next_event = tokio::time::timeout(Duration::from_secs(5), response_stream.next())
+            .await
+            .context("unsupported tool stream stalled before expected events")?;
+        let Some(event) = next_event else {
+            break;
+        };
         let event = event.context("failed to read RunStream event")?;
         if let Some(body) = event.body {
             match body {
+                common_v1::run_stream_event::Body::ToolApprovalRequest(approval_request) => {
+                    let proposal_id = approval_request
+                        .proposal_id
+                        .as_ref()
+                        .map(|proposal_id| proposal_id.ulid.as_str())
+                        .context("tool approval request missing proposal_id")?;
+                    request_sender
+                        .send(sample_tool_approval_response_request(
+                            proposal_id,
+                            true,
+                            "allow_once",
+                        ))
+                        .await
+                        .context("failed to send unsupported-tool approval response")?;
+                    saw_approval_request = true;
+                }
                 common_v1::run_stream_event::Body::ToolDecision(decision) => {
                     if decision.kind == common_v1::tool_decision::DecisionKind::Deny as i32 {
                         assert!(
@@ -613,7 +636,12 @@ async fn grpc_run_stream_denies_allowlisted_unsupported_tool() -> Result<()> {
                 _ => {}
             }
         }
+        if saw_approval_request && saw_deny_decision && saw_failed_result && saw_policy_attestation
+        {
+            break;
+        }
     }
+    assert!(saw_approval_request, "unsupported tool proposal should request explicit approval");
     assert!(saw_deny_decision, "unsupported tool should be denied before execution");
     assert!(saw_failed_result, "denied tool should emit failed tool result");
     assert!(saw_policy_attestation, "denied tool should emit policy attestation");
@@ -1722,7 +1750,6 @@ fn sample_run_stream_request_with_ids(
     }
 }
 
-#[cfg(unix)]
 fn sample_tool_approval_response_request(
     proposal_id: &str,
     approved: bool,

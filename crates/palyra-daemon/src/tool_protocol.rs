@@ -139,6 +139,7 @@ pub fn decide_tool_call(
     remaining_budget: &mut u32,
     principal: &str,
     tool_name: &str,
+    allow_sensitive_tools: bool,
 ) -> ToolDecision {
     let approval_required = tool_requires_approval(tool_name);
     if *remaining_budget == 0 {
@@ -157,7 +158,8 @@ pub fn decide_tool_call(
     };
     let policy_config = PolicyEvaluationConfig {
         allowlisted_tools: config.allowed_tools.clone(),
-        allow_sensitive_tools: false,
+        allow_sensitive_tools,
+        sensitive_tool_names: sensitive_allowlisted_tool_names(config.allowed_tools.as_slice()),
     };
     let policy_evaluation = match evaluate_with_config(&policy_request, &policy_config) {
         Ok(evaluation) => evaluation,
@@ -240,6 +242,14 @@ pub fn tool_requires_approval(tool_name: &str) -> bool {
                     | ToolCapability::FilesystemWrite
             )
         })
+}
+
+fn sensitive_allowlisted_tool_names(allowlisted_tools: &[String]) -> Vec<String> {
+    allowlisted_tools
+        .iter()
+        .filter(|tool_name| tool_requires_approval(tool_name.as_str()))
+        .map(|tool_name| tool_name.to_ascii_lowercase())
+        .collect()
 }
 
 fn format_policy_reason(
@@ -630,7 +640,7 @@ mod tests {
             wasm_runtime: default_wasm_runtime_policy(),
         };
         let mut budget = 2;
-        let decision = decide_tool_call(&config, &mut budget, "user:ops", "palyra.echo");
+        let decision = decide_tool_call(&config, &mut budget, "user:ops", "palyra.echo", false);
         assert!(!decision.allowed);
         assert_eq!(budget, 2, "denied decisions must not consume budget");
         assert!(decision.reason.contains("denied by default"));
@@ -640,15 +650,15 @@ mod tests {
     fn decide_tool_call_consumes_budget_for_allowed_tools() {
         let config = allowlisted_config();
         let mut budget = config.max_calls_per_run;
-        let first = decide_tool_call(&config, &mut budget, "user:ops", "palyra.echo");
+        let first = decide_tool_call(&config, &mut budget, "user:ops", "palyra.echo", false);
         assert!(first.allowed);
         assert!(!first.approval_required, "safe tools should not require approval by default");
         assert_eq!(budget, 1);
-        let second = decide_tool_call(&config, &mut budget, "user:ops", "palyra.sleep");
+        let second = decide_tool_call(&config, &mut budget, "user:ops", "palyra.sleep", false);
         assert!(second.allowed);
         assert!(!second.approval_required, "safe tools should not require approval by default");
         assert_eq!(budget, 0);
-        let third = decide_tool_call(&config, &mut budget, "user:ops", "palyra.echo");
+        let third = decide_tool_call(&config, &mut budget, "user:ops", "palyra.echo", false);
         assert!(!third.allowed, "third call should be denied by budget");
     }
 
@@ -662,7 +672,7 @@ mod tests {
             wasm_runtime: default_wasm_runtime_policy(),
         };
         let mut budget = config.max_calls_per_run;
-        let decision = decide_tool_call(&config, &mut budget, "user:ops", "custom.noop");
+        let decision = decide_tool_call(&config, &mut budget, "user:ops", "custom.noop", true);
         assert!(!decision.allowed, "unsupported runtime tool must be denied");
         assert_eq!(budget, 2, "denied decisions must not consume budget");
         assert!(decision.reason.contains("unsupported by runtime executor"));
@@ -679,7 +689,37 @@ mod tests {
         };
         let mut budget = config.max_calls_per_run;
 
-        let decision = decide_tool_call(&config, &mut budget, "user:ops", "palyra.process.run");
+        let decision =
+            decide_tool_call(&config, &mut budget, "user:ops", "palyra.process.run", false);
+
+        assert!(
+            !decision.allowed,
+            "sensitive tool call should stay denied until explicit approval is present"
+        );
+        assert!(
+            decision.approval_required,
+            "process execution should always require explicit approval"
+        );
+        assert_eq!(budget, 2, "denied decision must not consume budget");
+        assert!(
+            decision.reason.contains("sensitive action blocked by default"),
+            "policy deny reason should explain explicit approval requirement"
+        );
+    }
+
+    #[test]
+    fn decide_tool_call_allows_sensitive_tool_with_explicit_approval() {
+        let config = ToolCallConfig {
+            allowed_tools: vec!["palyra.process.run".to_owned()],
+            max_calls_per_run: 2,
+            execution_timeout_ms: 250,
+            process_runner: default_process_runner_policy(),
+            wasm_runtime: default_wasm_runtime_policy(),
+        };
+        let mut budget = config.max_calls_per_run;
+
+        let decision =
+            decide_tool_call(&config, &mut budget, "user:ops", "palyra.process.run", true);
 
         assert!(decision.allowed, "allowlisted process runner tool should pass policy gate");
         assert!(
