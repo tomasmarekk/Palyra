@@ -66,6 +66,12 @@ public enum PalyraCommonV1 {
     public struct StreamStatus: Equatable {
         public init() {}
     }
+    public struct ToolApprovalRequest: Equatable {
+        public init() {}
+    }
+    public struct ToolApprovalResponse: Equatable {
+        public init() {}
+    }
     public struct ToolAttestation: Equatable {
         public init() {}
     }
@@ -81,6 +87,12 @@ public enum PalyraCommonV1 {
 }
 
 public enum PalyraGatewayV1 {
+    public struct AbortRunRequest: Equatable {
+        public init() {}
+    }
+    public struct AbortRunResponse: Equatable {
+        public init() {}
+    }
     public struct AppendEventRequest: Equatable {
         public init() {}
     }
@@ -93,9 +105,27 @@ public enum PalyraGatewayV1 {
     public struct HealthResponse: Equatable {
         public init() {}
     }
+    public struct ListSessionsRequest: Equatable {
+        public init() {}
+    }
+    public struct ListSessionsResponse: Equatable {
+        public init() {}
+    }
+    public struct ResolveSessionRequest: Equatable {
+        public init() {}
+    }
+    public struct ResolveSessionResponse: Equatable {
+        public init() {}
+    }
+    public struct SessionSummary: Equatable {
+        public init() {}
+    }
     public protocol GatewayServiceClient {
+        func abortRun()
         func appendEvent()
         func getHealth()
+        func listSessions()
+        func resolveSession()
         func runStream()
     }
 }

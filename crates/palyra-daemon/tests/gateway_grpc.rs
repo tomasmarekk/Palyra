@@ -18,6 +18,10 @@ use rusqlite::Connection;
 use serde_json::Value;
 #[cfg(unix)]
 use std::path::Path;
+#[cfg(unix)]
+use tokio::sync::mpsc as tokio_mpsc;
+#[cfg(unix)]
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use tonic::Code;
 
@@ -662,10 +666,12 @@ async fn grpc_run_stream_executes_sandbox_process_runner_within_workspace_scope(
         .await
         .context("failed to connect gRPC client")?;
 
-    let mut stream_request =
-        tonic::Request::new(tokio_stream::iter(vec![sample_run_stream_request_with_text(
-            "sandbox process runner success path".to_owned(),
-        )]));
+    let (request_sender, request_receiver) = tokio_mpsc::channel(4);
+    request_sender
+        .send(sample_run_stream_request_with_text("sandbox process runner success path".to_owned()))
+        .await
+        .context("failed to send initial sandbox process runner request")?;
+    let mut stream_request = tonic::Request::new(ReceiverStream::new(request_receiver));
     stream_request.metadata_mut().insert("authorization", format!("Bearer {ADMIN_TOKEN}").parse()?);
     stream_request.metadata_mut().insert("x-palyra-principal", "user:ops".parse()?);
     stream_request.metadata_mut().insert("x-palyra-device-id", DEVICE_ID.parse()?);
@@ -675,12 +681,29 @@ async fn grpc_run_stream_executes_sandbox_process_runner_within_workspace_scope(
         client.run_stream(stream_request).await.context("failed to call RunStream")?.into_inner();
 
     let mut saw_allow_decision = false;
+    let mut saw_approval_request = false;
     let mut saw_success_result = false;
     let mut saw_sandbox_attestation = false;
     while let Some(event) = response_stream.next().await {
         let event = event.context("failed to read RunStream event")?;
         if let Some(body) = event.body {
             match body {
+                common_v1::run_stream_event::Body::ToolApprovalRequest(approval_request) => {
+                    let proposal_id = approval_request
+                        .proposal_id
+                        .as_ref()
+                        .map(|proposal_id| proposal_id.ulid.as_str())
+                        .context("tool approval request missing proposal_id")?;
+                    request_sender
+                        .send(sample_tool_approval_response_request(
+                            proposal_id,
+                            true,
+                            "allow_once",
+                        ))
+                        .await
+                        .context("failed to send tool approval response")?;
+                    saw_approval_request = true;
+                }
                 common_v1::run_stream_event::Body::ToolDecision(decision) => {
                     if decision.kind == common_v1::tool_decision::DecisionKind::Allow as i32 {
                         saw_allow_decision = true;
@@ -713,6 +736,10 @@ async fn grpc_run_stream_executes_sandbox_process_runner_within_workspace_scope(
         }
     }
 
+    assert!(
+        saw_approval_request,
+        "sensitive process runner tool call should request explicit approval"
+    );
     assert!(saw_allow_decision, "sandbox process tool call should be allowed by policy");
     assert!(saw_success_result, "sandbox process tool call should execute successfully");
     assert!(saw_sandbox_attestation, "sandbox process tool call should emit sandbox attestation");
@@ -755,10 +782,12 @@ async fn grpc_run_stream_blocks_sandbox_process_runner_path_traversal() -> Resul
         .await
         .context("failed to connect gRPC client")?;
 
-    let mut stream_request =
-        tonic::Request::new(tokio_stream::iter(vec![sample_run_stream_request_with_text(
-            "sandbox traversal deny path".to_owned(),
-        )]));
+    let (request_sender, request_receiver) = tokio_mpsc::channel(4);
+    request_sender
+        .send(sample_run_stream_request_with_text("sandbox traversal deny path".to_owned()))
+        .await
+        .context("failed to send initial sandbox traversal request")?;
+    let mut stream_request = tonic::Request::new(ReceiverStream::new(request_receiver));
     stream_request.metadata_mut().insert("authorization", format!("Bearer {ADMIN_TOKEN}").parse()?);
     stream_request.metadata_mut().insert("x-palyra-principal", "user:ops".parse()?);
     stream_request.metadata_mut().insert("x-palyra-device-id", DEVICE_ID.parse()?);
@@ -767,20 +796,46 @@ async fn grpc_run_stream_blocks_sandbox_process_runner_path_traversal() -> Resul
     let mut response_stream =
         client.run_stream(stream_request).await.context("failed to call RunStream")?.into_inner();
 
+    let mut saw_approval_request = false;
     let mut saw_failed_result = false;
     while let Some(event) = response_stream.next().await {
         let event = event.context("failed to read RunStream event")?;
-        if let Some(common_v1::run_stream_event::Body::ToolResult(result)) = event.body {
-            if !result.success {
-                assert!(
-                    result.error.contains("path traversal"),
-                    "sandbox denial should explain traversal block"
-                );
-                saw_failed_result = true;
+        if let Some(body) = event.body {
+            match body {
+                common_v1::run_stream_event::Body::ToolApprovalRequest(approval_request) => {
+                    let proposal_id = approval_request
+                        .proposal_id
+                        .as_ref()
+                        .map(|proposal_id| proposal_id.ulid.as_str())
+                        .context("tool approval request missing proposal_id")?;
+                    request_sender
+                        .send(sample_tool_approval_response_request(
+                            proposal_id,
+                            true,
+                            "allow_once",
+                        ))
+                        .await
+                        .context("failed to send tool approval response")?;
+                    saw_approval_request = true;
+                }
+                common_v1::run_stream_event::Body::ToolResult(result) => {
+                    if !result.success {
+                        assert!(
+                            result.error.contains("path traversal"),
+                            "sandbox denial should explain traversal block"
+                        );
+                        saw_failed_result = true;
+                    }
+                }
+                _ => {}
             }
         }
     }
 
+    assert!(
+        saw_approval_request,
+        "sensitive process runner tool call should request explicit approval"
+    );
     assert!(saw_failed_result, "sandbox traversal must produce failed tool result");
 
     server_handle.join().expect("scripted openai server thread should exit");
@@ -821,10 +876,12 @@ async fn grpc_run_stream_blocks_sandbox_process_runner_non_allowlisted_egress_ho
         .await
         .context("failed to connect gRPC client")?;
 
-    let mut stream_request =
-        tonic::Request::new(tokio_stream::iter(vec![sample_run_stream_request_with_text(
-            "sandbox egress deny path".to_owned(),
-        )]));
+    let (request_sender, request_receiver) = tokio_mpsc::channel(4);
+    request_sender
+        .send(sample_run_stream_request_with_text("sandbox egress deny path".to_owned()))
+        .await
+        .context("failed to send initial sandbox egress request")?;
+    let mut stream_request = tonic::Request::new(ReceiverStream::new(request_receiver));
     stream_request.metadata_mut().insert("authorization", format!("Bearer {ADMIN_TOKEN}").parse()?);
     stream_request.metadata_mut().insert("x-palyra-principal", "user:ops".parse()?);
     stream_request.metadata_mut().insert("x-palyra-device-id", DEVICE_ID.parse()?);
@@ -833,20 +890,46 @@ async fn grpc_run_stream_blocks_sandbox_process_runner_non_allowlisted_egress_ho
     let mut response_stream =
         client.run_stream(stream_request).await.context("failed to call RunStream")?.into_inner();
 
+    let mut saw_approval_request = false;
     let mut saw_failed_result = false;
     while let Some(event) = response_stream.next().await {
         let event = event.context("failed to read RunStream event")?;
-        if let Some(common_v1::run_stream_event::Body::ToolResult(result)) = event.body {
-            if !result.success {
-                assert!(
-                    result.error.contains("blocked.example"),
-                    "sandbox denial should include denied host context"
-                );
-                saw_failed_result = true;
+        if let Some(body) = event.body {
+            match body {
+                common_v1::run_stream_event::Body::ToolApprovalRequest(approval_request) => {
+                    let proposal_id = approval_request
+                        .proposal_id
+                        .as_ref()
+                        .map(|proposal_id| proposal_id.ulid.as_str())
+                        .context("tool approval request missing proposal_id")?;
+                    request_sender
+                        .send(sample_tool_approval_response_request(
+                            proposal_id,
+                            true,
+                            "allow_once",
+                        ))
+                        .await
+                        .context("failed to send tool approval response")?;
+                    saw_approval_request = true;
+                }
+                common_v1::run_stream_event::Body::ToolResult(result) => {
+                    if !result.success {
+                        assert!(
+                            result.error.contains("blocked.example"),
+                            "sandbox denial should include denied host context"
+                        );
+                        saw_failed_result = true;
+                    }
+                }
+                _ => {}
             }
         }
     }
 
+    assert!(
+        saw_approval_request,
+        "sensitive process runner tool call should request explicit approval"
+    );
     assert!(saw_failed_result, "sandbox denied egress host must produce failed tool result");
 
     server_handle.join().expect("scripted openai server thread should exit");
@@ -1605,6 +1688,30 @@ fn sample_run_stream_request_with_ids(
         reset_session: false,
         require_existing: false,
         tool_approval_response: None,
+    }
+}
+
+#[cfg(unix)]
+fn sample_tool_approval_response_request(
+    proposal_id: &str,
+    approved: bool,
+    reason: &str,
+) -> common_v1::RunStreamRequest {
+    common_v1::RunStreamRequest {
+        v: 1,
+        session_id: Some(common_v1::CanonicalId { ulid: SESSION_ID.to_owned() }),
+        run_id: Some(common_v1::CanonicalId { ulid: RUN_ID.to_owned() }),
+        input: None,
+        allow_sensitive_tools: false,
+        session_key: String::new(),
+        session_label: String::new(),
+        reset_session: false,
+        require_existing: false,
+        tool_approval_response: Some(common_v1::ToolApprovalResponse {
+            proposal_id: Some(common_v1::CanonicalId { ulid: proposal_id.to_owned() }),
+            approved,
+            reason: reason.to_owned(),
+        }),
     }
 }
 
