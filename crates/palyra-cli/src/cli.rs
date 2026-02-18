@@ -142,7 +142,11 @@ pub enum AgentCommand {
         prompt_stdin: bool,
         #[arg(long, default_value_t = false)]
         allow_sensitive_tools: bool,
-        #[arg(long, default_value_t = false)]
+        #[arg(
+            long,
+            default_value_t = false,
+            conflicts_with_all = ["session_id", "run_id", "prompt", "prompt_stdin"]
+        )]
         ndjson_stdin: bool,
     },
 }
@@ -554,6 +558,54 @@ mod tests {
                 }
             }
         );
+    }
+
+    #[test]
+    fn parse_agent_acp_shim_ndjson_stdin_conflicts_with_prompt() {
+        let result = Cli::try_parse_from([
+            "palyra",
+            "agent",
+            "acp-shim",
+            "--ndjson-stdin",
+            "--prompt",
+            "hello",
+        ]);
+        assert!(result.is_err(), "--ndjson-stdin must conflict with --prompt");
+    }
+
+    #[test]
+    fn parse_agent_acp_shim_ndjson_stdin_conflicts_with_prompt_stdin() {
+        let result = Cli::try_parse_from([
+            "palyra",
+            "agent",
+            "acp-shim",
+            "--ndjson-stdin",
+            "--prompt-stdin",
+        ]);
+        assert!(result.is_err(), "--ndjson-stdin must conflict with --prompt-stdin");
+    }
+
+    #[test]
+    fn parse_agent_acp_shim_ndjson_stdin_conflicts_with_session_and_run_ids() {
+        let with_session = Cli::try_parse_from([
+            "palyra",
+            "agent",
+            "acp-shim",
+            "--ndjson-stdin",
+            "--session-id",
+            "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+        ]);
+        assert!(with_session.is_err(), "--ndjson-stdin must conflict with --session-id");
+
+        let with_run = Cli::try_parse_from([
+            "palyra",
+            "agent",
+            "acp-shim",
+            "--ndjson-stdin",
+            "--run-id",
+            "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+        ]);
+        assert!(with_run.is_err(), "--ndjson-stdin must conflict with --run-id");
     }
 
     #[test]

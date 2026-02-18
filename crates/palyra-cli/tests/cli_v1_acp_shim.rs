@@ -182,6 +182,66 @@ fn agent_acp_shim_rejects_invalid_ndjson_input() -> Result<()> {
 }
 
 #[test]
+fn agent_interactive_ndjson_keeps_stdout_machine_readable() -> Result<()> {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_palyra"))
+        .args(["agent", "interactive", "--ndjson"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to spawn palyra agent interactive")?;
+    let mut stdin = child.stdin.take().context("failed to access child stdin")?;
+    stdin.write_all(b"/exit\n").context("failed to write stdin payload")?;
+    drop(stdin);
+
+    let output = child.wait_with_output().context("failed waiting for command output")?;
+    assert!(
+        output.status.success(),
+        "interactive mode should exit cleanly: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).context("stdout was not valid UTF-8")?;
+    assert!(
+        stdout.trim().is_empty(),
+        "interactive --ndjson must not write non-NDJSON banners to stdout: {stdout}"
+    );
+    let stderr = String::from_utf8(output.stderr).context("stderr was not valid UTF-8")?;
+    assert!(
+        stderr.contains("agent.interactive=session_started"),
+        "interactive start hint should move to stderr in --ndjson mode: {stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn agent_acp_shim_rejects_whitespace_prompt_ndjson_input() -> Result<()> {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_palyra"))
+        .args(["agent", "acp-shim", "--grpc-url", "http://127.0.0.1:7443", "--ndjson-stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to spawn palyra agent acp-shim")?;
+    let mut stdin = child.stdin.take().context("failed to access child stdin")?;
+    stdin.write_all(b"{\"prompt\":\"   \"}").context("failed to write stdin payload")?;
+    stdin.write_all(b"\n").context("failed to write stdin newline")?;
+    drop(stdin);
+
+    let output = child.wait_with_output().context("failed waiting for command output")?;
+    assert!(!output.status.success(), "whitespace prompt NDJSON input should fail");
+    let stderr = String::from_utf8(output.stderr).context("stderr was not valid UTF-8")?;
+    assert!(
+        stderr.contains("non-empty text"),
+        "expected prompt validation error for whitespace-only NDJSON input: {stderr}"
+    );
+    assert!(
+        !stderr.contains("failed to connect gateway gRPC endpoint"),
+        "prompt validation should fail before gRPC connection attempts: {stderr}"
+    );
+    Ok(())
+}
+
+#[test]
 fn completion_generates_bash_script() -> Result<()> {
     let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
         .args(["completion", "--shell", "bash"])

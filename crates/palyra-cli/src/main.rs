@@ -19,6 +19,7 @@ pub mod proto {
 use std::{
     env, fs,
     io::{BufRead, Write},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     process::Command,
     thread,
@@ -316,8 +317,19 @@ fn run_agent(command: AgentCommand) -> Result<()> {
                 channel,
             };
             let session_id = resolve_or_generate_canonical_id(session_id)?;
-            println!("agent.interactive=session_started session_id={} exit_hint=/exit", session_id);
-            std::io::stdout().flush().context("stdout flush failed")?;
+            if ndjson {
+                eprintln!(
+                    "agent.interactive=session_started session_id={} exit_hint=/exit",
+                    session_id
+                );
+                std::io::stderr().flush().context("stderr flush failed")?;
+            } else {
+                println!(
+                    "agent.interactive=session_started session_id={} exit_hint=/exit",
+                    session_id
+                );
+                std::io::stdout().flush().context("stdout flush failed")?;
+            }
 
             let stdin = std::io::stdin();
             for line in stdin.lock().lines() {
@@ -360,7 +372,7 @@ fn run_agent(command: AgentCommand) -> Result<()> {
                 channel,
             };
             if ndjson_stdin {
-                return run_acp_shim_from_stdin(connection);
+                return run_acp_shim_from_stdin(connection, allow_sensitive_tools);
             }
 
             let input_prompt = resolve_prompt_input(prompt, prompt_stdin)?;
@@ -493,48 +505,78 @@ fn execute_agent_stream(
     request: AgentRunInput,
     ndjson: bool,
 ) -> Result<()> {
-    let runtime = build_runtime()?;
-    let events = runtime.block_on(run_stream_with_retry(&connection, &request))?;
-    for event in &events {
+    stream_agent_events(connection, request, |event| {
         if ndjson {
-            emit_acp_event_ndjson(event)?;
+            emit_acp_event_ndjson(event)
         } else {
-            emit_agent_event_text(event)?;
+            emit_agent_event_text(event)
         }
-    }
-    std::io::stdout().flush().context("stdout flush failed")
+    })
 }
 
 fn run_agent_stream_as_acp(connection: AgentConnection, request: AgentRunInput) -> Result<()> {
-    let runtime = build_runtime()?;
-    let events = runtime.block_on(run_stream_with_retry(&connection, &request))?;
-    for event in &events {
-        emit_acp_event_ndjson(event)?;
-    }
-    std::io::stdout().flush().context("stdout flush failed")
+    stream_agent_events(connection, request, emit_acp_event_ndjson)
 }
 
-fn run_acp_shim_from_stdin(connection: AgentConnection) -> Result<()> {
+fn stream_agent_events<F>(
+    connection: AgentConnection,
+    request: AgentRunInput,
+    mut emit_event: F,
+) -> Result<()>
+where
+    F: FnMut(&common_v1::RunStreamEvent) -> Result<()>,
+{
+    let runtime = build_runtime()?;
+    runtime.block_on(async {
+        let mut stream = run_stream_with_retry(&connection, &request).await?;
+        while let Some(event) = stream.next().await {
+            let event = event.context("failed to read RunStream event")?;
+            emit_event(&event)?;
+            std::io::stdout().flush().context("stdout flush failed")?;
+        }
+        Result::<()>::Ok(())
+    })
+}
+
+fn run_acp_shim_from_stdin(
+    connection: AgentConnection,
+    default_allow_sensitive_tools: bool,
+) -> Result<()> {
     let stdin = std::io::stdin();
     for (line_index, line_result) in stdin.lock().lines().enumerate() {
         let line = line_result.context("failed to read NDJSON ACP input line")?;
         if line.trim().is_empty() {
             continue;
         }
-        let parsed: AcpShimInput = serde_json::from_str(line.as_str())
-            .with_context(|| format!("failed to parse NDJSON ACP input line {}", line_index + 1))?;
-        let prompt = parsed
-            .prompt
-            .context("NDJSON ACP input requires `prompt` field with non-empty text")?;
-        let request = build_agent_run_input(
-            parsed.session_id,
-            parsed.run_id,
-            prompt,
-            parsed.allow_sensitive_tools.unwrap_or(false),
+        let request = parse_acp_shim_input_line(
+            line.as_str(),
+            line_index + 1,
+            default_allow_sensitive_tools,
         )?;
         run_agent_stream_as_acp(connection.clone(), request)?;
     }
     Ok(())
+}
+
+fn parse_acp_shim_input_line(
+    line: &str,
+    line_index: usize,
+    default_allow_sensitive_tools: bool,
+) -> Result<AgentRunInput> {
+    let parsed: AcpShimInput = serde_json::from_str(line)
+        .with_context(|| format!("failed to parse NDJSON ACP input line {}", line_index))?;
+    let prompt =
+        parsed.prompt.context("NDJSON ACP input requires `prompt` field with non-empty text")?;
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        anyhow::bail!("NDJSON ACP input requires `prompt` field with non-empty text");
+    }
+    build_agent_run_input(
+        parsed.session_id,
+        parsed.run_id,
+        prompt.to_owned(),
+        parsed.allow_sensitive_tools.unwrap_or(default_allow_sensitive_tools),
+    )
 }
 
 fn resolve_prompt_input(prompt: Option<String>, prompt_stdin: bool) -> Result<String> {
@@ -604,7 +646,20 @@ fn resolve_grpc_url(explicit: Option<String>) -> Result<String> {
         .unwrap_or(DEFAULT_GATEWAY_GRPC_PORT);
     let socket = parse_daemon_bind_socket(bind.as_str(), port)
         .context("invalid gateway gRPC bind config")?;
+    let socket = normalize_client_socket(socket);
     Ok(format!("http://{socket}"))
+}
+
+fn normalize_client_socket(socket: SocketAddr) -> SocketAddr {
+    match socket {
+        SocketAddr::V4(v4) if v4.ip().is_unspecified() => {
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), v4.port())
+        }
+        SocketAddr::V6(v6) if v6.ip().is_unspecified() => {
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), v6.port())
+        }
+        other => other,
+    }
 }
 
 fn build_runtime() -> Result<tokio::runtime::Runtime> {
@@ -645,10 +700,13 @@ async fn fetch_grpc_health_with_retry(grpc_url: String) -> Result<gateway_v1::He
         match fetch_grpc_health_once(grpc_url.as_str()).await {
             Ok(response) => return Ok(response),
             Err(error) => {
+                let retryable = is_retryable_grpc_error(&error);
                 last_error = Some(error);
-                if attempt < MAX_GRPC_ATTEMPTS {
+                if attempt < MAX_GRPC_ATTEMPTS && retryable {
                     let delay_ms = BASE_GRPC_BACKOFF_MS * (1_u64 << (attempt - 1));
                     sleep(Duration::from_millis(delay_ms)).await;
+                } else {
+                    break;
                 }
             }
         }
@@ -676,16 +734,19 @@ async fn fetch_grpc_health_once(grpc_url: &str) -> Result<gateway_v1::HealthResp
 async fn run_stream_with_retry(
     connection: &AgentConnection,
     request: &AgentRunInput,
-) -> Result<Vec<common_v1::RunStreamEvent>> {
+) -> Result<tonic::Streaming<common_v1::RunStreamEvent>> {
     let mut last_error = None;
     for attempt in 1..=MAX_GRPC_ATTEMPTS {
         match run_stream_once(connection, request).await {
-            Ok(events) => return Ok(events),
+            Ok(stream) => return Ok(stream),
             Err(error) => {
+                let retryable = is_retryable_grpc_error(&error);
                 last_error = Some(error);
-                if attempt < MAX_GRPC_ATTEMPTS {
+                if attempt < MAX_GRPC_ATTEMPTS && retryable {
                     let delay_ms = BASE_GRPC_BACKOFF_MS * (1_u64 << (attempt - 1));
                     sleep(Duration::from_millis(delay_ms)).await;
+                } else {
+                    break;
                 }
             }
         }
@@ -701,7 +762,7 @@ async fn run_stream_with_retry(
 async fn run_stream_once(
     connection: &AgentConnection,
     input: &AgentRunInput,
-) -> Result<Vec<common_v1::RunStreamEvent>> {
+) -> Result<tonic::Streaming<common_v1::RunStreamEvent>> {
     let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(
         connection.grpc_url.clone(),
     )
@@ -710,17 +771,27 @@ async fn run_stream_once(
     let request = build_run_stream_request(input)?;
     let mut stream_request = Request::new(iter(vec![request]));
     inject_run_stream_metadata(stream_request.metadata_mut(), connection)?;
-    let mut stream = client
+    let stream = client
         .run_stream(stream_request)
         .await
         .context("failed to call gateway RunStream")?
         .into_inner();
-    let mut events = Vec::new();
-    while let Some(event) = stream.next().await {
-        let event = event.context("failed to read RunStream event")?;
-        events.push(event);
+    Ok(stream)
+}
+
+fn is_retryable_grpc_error(error: &anyhow::Error) -> bool {
+    if error.chain().any(|cause| cause.is::<tonic::transport::Error>()) {
+        return true;
     }
-    Ok(events)
+    error.chain().find_map(|cause| cause.downcast_ref::<tonic::Status>()).is_some_and(|status| {
+        matches!(
+            status.code(),
+            tonic::Code::Unavailable
+                | tonic::Code::DeadlineExceeded
+                | tonic::Code::ResourceExhausted
+                | tonic::Code::Internal
+        )
+    })
 }
 
 fn inject_run_stream_metadata(
@@ -1877,6 +1948,54 @@ struct RunCancelResponse {
     run_id: String,
     cancel_requested: bool,
     reason: String,
+}
+
+#[cfg(test)]
+mod cli_v1_tests {
+    use super::{is_retryable_grpc_error, normalize_client_socket, parse_acp_shim_input_line};
+    use std::net::SocketAddr;
+
+    #[test]
+    fn ndjson_stdin_uses_top_level_allow_sensitive_tools_default() {
+        let request = parse_acp_shim_input_line(
+            r#"{"session_id":"01ARZ3NDEKTSV4RRFFQ69G5FAW","run_id":"01ARZ3NDEKTSV4RRFFQ69G5FAX","prompt":"hello"}"#,
+            1,
+            true,
+        )
+        .expect("NDJSON line should parse");
+        assert!(request.allow_sensitive_tools);
+    }
+
+    #[test]
+    fn ndjson_stdin_rejects_whitespace_only_prompt() {
+        let result = parse_acp_shim_input_line(
+            "{\"session_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"run_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAX\",\"prompt\":\"   \"}",
+            1,
+            false,
+        );
+        let error = result.expect_err("whitespace-only prompt must be rejected");
+        assert!(error.to_string().contains("non-empty text"), "unexpected error message: {error}");
+    }
+
+    #[test]
+    fn normalize_client_socket_maps_unspecified_addresses_to_loopback() {
+        let ipv4_unspecified: SocketAddr = "0.0.0.0:7443".parse().expect("valid socket addr");
+        let ipv6_unspecified: SocketAddr = "[::]:7443".parse().expect("valid socket addr");
+        let named: SocketAddr = "127.0.0.1:7443".parse().expect("valid socket addr");
+
+        assert_eq!(normalize_client_socket(ipv4_unspecified).to_string(), "127.0.0.1:7443");
+        assert_eq!(normalize_client_socket(ipv6_unspecified).to_string(), "[::1]:7443");
+        assert_eq!(normalize_client_socket(named).to_string(), "127.0.0.1:7443");
+    }
+
+    #[test]
+    fn grpc_retry_only_for_retryable_status_codes() {
+        let unavailable = anyhow::Error::new(tonic::Status::unavailable("transient"));
+        let invalid_argument = anyhow::Error::new(tonic::Status::invalid_argument("invalid"));
+
+        assert!(is_retryable_grpc_error(&unavailable));
+        assert!(!is_retryable_grpc_error(&invalid_argument));
+    }
 }
 
 #[cfg(all(test, not(windows)))]
