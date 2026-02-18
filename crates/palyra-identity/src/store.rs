@@ -3,6 +3,7 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
+    process::Command,
     sync::Mutex,
 };
 
@@ -61,25 +62,24 @@ impl SecretStore for InMemorySecretStore {
 
 pub struct FilesystemSecretStore {
     root: PathBuf,
+    #[cfg(windows)]
+    owner_sid: String,
 }
 
 impl FilesystemSecretStore {
     pub fn new(root: impl Into<PathBuf>) -> IdentityResult<Self> {
         let root = root.into();
+        fs::create_dir_all(&root).map_err(|error| IdentityError::Internal(error.to_string()))?;
         #[cfg(windows)]
         {
-            let _ = &root;
-            Err(IdentityError::Internal(
-                "FilesystemSecretStore on Windows is disabled until ACL hardening is implemented"
-                    .to_owned(),
-            ))
+            let owner_sid = current_user_sid()?;
+            harden_windows_path_permissions(&root, owner_sid.as_str(), true)?;
+            Ok(Self { root, owner_sid })
         }
         #[cfg(not(windows))]
         {
             use std::os::unix::fs::PermissionsExt;
 
-            fs::create_dir_all(&root)
-                .map_err(|error| IdentityError::Internal(error.to_string()))?;
             fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
                 .map_err(|error| IdentityError::Internal(error.to_string()))?;
             Ok(Self { root })
@@ -108,12 +108,36 @@ impl SecretStore for FilesystemSecretStore {
     fn write_secret(&self, key: &str, value: &[u8]) -> IdentityResult<()> {
         #[cfg(windows)]
         {
-            let _ = key;
-            let _ = value;
-            Err(IdentityError::Internal(
-                "FilesystemSecretStore on Windows is disabled until ACL hardening is implemented"
-                    .to_owned(),
-            ))
+            use std::io::Write;
+
+            let path = self.key_path(key)?;
+            let tmp_path = loop {
+                let candidate = path.with_extension(format!("tmp.{}", ulid::Ulid::new()));
+                if !candidate.exists() {
+                    break candidate;
+                }
+            };
+
+            let write_result: IdentityResult<()> = (|| {
+                let mut file = fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&tmp_path)
+                    .map_err(|error| IdentityError::Internal(error.to_string()))?;
+                harden_windows_path_permissions(&tmp_path, self.owner_sid.as_str(), false)?;
+                file.write_all(value)
+                    .map_err(|error| IdentityError::Internal(error.to_string()))?;
+                file.sync_all().map_err(|error| IdentityError::Internal(error.to_string()))?;
+                fs::rename(&tmp_path, &path)
+                    .map_err(|error| IdentityError::Internal(error.to_string()))?;
+                harden_windows_path_permissions(&path, self.owner_sid.as_str(), false)?;
+                Ok(())
+            })();
+
+            if write_result.is_err() && tmp_path.exists() {
+                let _ = fs::remove_file(&tmp_path);
+            }
+            write_result
         }
         #[cfg(not(windows))]
         {
@@ -184,12 +208,97 @@ impl SecretStore for FilesystemSecretStore {
     }
 }
 
+#[cfg(windows)]
+const WINDOWS_SYSTEM_SID: &str = "S-1-5-18";
+
+#[cfg(windows)]
+fn current_user_sid() -> IdentityResult<String> {
+    let output = Command::new("whoami")
+        .args(["/user", "/fo", "csv", "/nh"])
+        .output()
+        .map_err(|error| IdentityError::Internal(format!("failed to execute whoami: {error}")))?;
+    if !output.status.success() {
+        return Err(IdentityError::Internal(format!(
+            "whoami returned non-success status {}: stdout={} stderr={}",
+            output.status.code().map_or_else(|| "unknown".to_owned(), |code| code.to_string()),
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim(),
+        )));
+    }
+    parse_whoami_sid_csv(String::from_utf8_lossy(&output.stdout).trim()).ok_or_else(|| {
+        IdentityError::Internal("failed to parse current user SID from whoami output".to_owned())
+    })
+}
+
+#[cfg(windows)]
+fn parse_whoami_sid_csv(raw: &str) -> Option<String> {
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    for ch in raw.chars() {
+        match ch {
+            '"' => in_quotes = !in_quotes,
+            ',' if !in_quotes => {
+                fields.push(current.trim().to_owned());
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+    fields.push(current.trim().to_owned());
+    if fields.len() < 2 {
+        return None;
+    }
+    let sid = fields[1].trim().trim_matches('"').to_owned();
+    if sid.starts_with("S-1-") {
+        Some(sid)
+    } else {
+        None
+    }
+}
+
+#[cfg(windows)]
+fn harden_windows_path_permissions(
+    path: &Path,
+    owner_sid: &str,
+    is_directory: bool,
+) -> IdentityResult<()> {
+    let grant_mask = if is_directory { "(OI)(CI)F" } else { "F" };
+    let owner_grant = format!("*{owner_sid}:{grant_mask}");
+    let system_grant = format!("*{WINDOWS_SYSTEM_SID}:{grant_mask}");
+    let output = Command::new("icacls")
+        .arg(path)
+        .args(["/inheritance:r", "/grant:r"])
+        .arg(owner_grant)
+        .args(["/grant:r"])
+        .arg(system_grant)
+        .output()
+        .map_err(|error| {
+            IdentityError::Internal(format!(
+                "failed to execute icacls for {}: {error}",
+                path.display()
+            ))
+        })?;
+    if !output.status.success() {
+        return Err(IdentityError::Internal(format!(
+            "icacls returned non-success status {} for {}: stdout={} stderr={}",
+            output.status.code().map_or_else(|| "unknown".to_owned(), |code| code.to_string()),
+            path.display(),
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim(),
+        )));
+    }
+    Ok(())
+}
+
 pub fn default_identity_storage_path(root: impl AsRef<Path>) -> PathBuf {
     root.as_ref().join(".palyra").join("identity")
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use super::{parse_whoami_sid_csv, FilesystemSecretStore, SecretStore};
     #[cfg(unix)]
     use super::{FilesystemSecretStore, SecretStore};
     #[cfg(unix)]
@@ -198,6 +307,8 @@ mod tests {
     use std::sync::Arc;
     #[cfg(unix)]
     use std::thread;
+    #[cfg(windows)]
+    use tempfile::tempdir;
     #[cfg(unix)]
     use tempfile::tempdir;
 
@@ -331,5 +442,26 @@ mod tests {
             stale_tmp_files.is_empty(),
             "temporary files should not remain after concurrent writes: {stale_tmp_files:?}"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parse_whoami_sid_csv_extracts_sid() {
+        let parsed = parse_whoami_sid_csv(r#""admin\palo","S-1-5-21-1-2-3-1001""#);
+        assert_eq!(parsed.as_deref(), Some("S-1-5-21-1-2-3-1001"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn filesystem_secret_store_roundtrips_on_windows() {
+        let temp = tempdir().expect("temp dir should initialize");
+        let store = FilesystemSecretStore::new(temp.path()).expect("store should initialize");
+        let key = "identity/pairing/paired_devices.json";
+        let payload = br#"{"device":"ok"}"#;
+        store.write_secret(key, payload).expect("secret should persist");
+        let loaded = store.read_secret(key).expect("secret should be readable");
+        assert_eq!(loaded, payload);
+        store.delete_secret(key).expect("secret should delete");
+        assert!(matches!(store.read_secret(key), Err(crate::error::IdentityError::SecretNotFound)));
     }
 }

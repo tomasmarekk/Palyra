@@ -1,3 +1,4 @@
+mod acp_bridge;
 mod cli;
 
 pub mod proto {
@@ -16,6 +17,8 @@ pub mod proto {
     }
 }
 
+#[cfg(not(windows))]
+use std::sync::Arc;
 use std::{
     env, fs,
     io::{BufRead, Write},
@@ -25,8 +28,6 @@ use std::{
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-#[cfg(not(windows))]
-use std::{ffi::OsString, sync::Arc};
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
@@ -36,6 +37,8 @@ use cli::{
 };
 #[cfg(not(windows))]
 use cli::{PairingClientKindArg, PairingCommand, PairingMethodArg};
+#[cfg(not(windows))]
+use palyra_common::default_identity_store_root;
 use palyra_common::{
     build_metadata,
     config_system::{
@@ -43,7 +46,7 @@ use palyra_common::{
         parse_toml_value_literal, recover_config_from_backup, set_value_at_path,
         unset_value_at_path, write_document_with_backups, ConfigMigrationInfo,
     },
-    daemon_config_schema::RootFileConfig,
+    daemon_config_schema::{is_secret_config_path, redact_secret_config_values, RootFileConfig},
     default_config_search_paths, parse_config_path, parse_daemon_bind_socket,
     validate_canonical_id, HealthResponse, CANONICAL_JSON_ENVELOPE_VERSION,
     CANONICAL_PROTOCOL_MAJOR,
@@ -80,6 +83,7 @@ const DEFAULT_GATEWAY_QUIC_ENABLED: bool = true;
 const DEFAULT_DAEMON_URL: &str = "http://127.0.0.1:7142";
 const DEFAULT_BROWSER_URL: &str = "http://127.0.0.1:7143";
 const DEFAULT_CHANNEL: &str = "cli";
+const REDACTED_CONFIG_VALUE: &str = "<redacted>";
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -379,6 +383,23 @@ fn run_agent(command: AgentCommand) -> Result<()> {
             let request =
                 build_agent_run_input(session_id, run_id, input_prompt, allow_sensitive_tools)?;
             run_agent_stream_as_acp(connection, request)
+        }
+        AgentCommand::Acp {
+            grpc_url,
+            token,
+            principal,
+            device_id,
+            channel,
+            allow_sensitive_tools,
+        } => {
+            let connection = AgentConnection {
+                grpc_url: resolve_grpc_url(grpc_url)?,
+                token: token.or_else(|| env::var("PALYRA_ADMIN_TOKEN").ok()),
+                principal,
+                device_id,
+                channel,
+            };
+            acp_bridge::run_agent_acp_bridge(connection, allow_sensitive_tools)
         }
     }
 }
@@ -845,6 +866,11 @@ fn build_run_stream_request(input: &AgentRunInput) -> Result<common_v1::RunStrea
             max_payload_bytes: 0,
         }),
         allow_sensitive_tools: input.allow_sensitive_tools,
+        session_key: String::new(),
+        session_label: String::new(),
+        reset_session: false,
+        require_existing: false,
+        tool_approval_response: None,
     })
 }
 
@@ -887,6 +913,32 @@ fn emit_agent_event_text(event: &common_v1::RunStreamEvent) -> Result<()> {
                 decision.reason,
                 decision.approval_required,
                 decision.policy_enforced
+            );
+        }
+        Some(common_v1::run_stream_event::Body::ToolApprovalRequest(approval_request)) => {
+            println!(
+                "agent.tool.approval.request run_id={} proposal_id={} tool_name={} approval_required={}",
+                run_id,
+                approval_request
+                    .proposal_id
+                    .as_ref()
+                    .map(|value| value.ulid.as_str())
+                    .unwrap_or("unknown"),
+                approval_request.tool_name,
+                approval_request.approval_required
+            );
+        }
+        Some(common_v1::run_stream_event::Body::ToolApprovalResponse(approval_response)) => {
+            println!(
+                "agent.tool.approval.response run_id={} proposal_id={} approved={} reason={}",
+                run_id,
+                approval_response
+                    .proposal_id
+                    .as_ref()
+                    .map(|value| value.ulid.as_str())
+                    .unwrap_or("unknown"),
+                approval_response.approved,
+                approval_response.reason
             );
         }
         Some(common_v1::run_stream_event::Body::ToolResult(result)) => {
@@ -974,6 +1026,21 @@ fn emit_acp_event_ndjson(event: &common_v1::RunStreamEvent) -> Result<()> {
             "reason": decision.reason,
             "approval_required": decision.approval_required,
             "policy_enforced": decision.policy_enforced,
+        }),
+        Some(common_v1::run_stream_event::Body::ToolApprovalRequest(approval_request)) => json!({
+            "type": "tool.approval.request",
+            "run_id": run_id,
+            "proposal_id": approval_request.proposal_id.as_ref().map(|value| value.ulid.clone()),
+            "tool_name": approval_request.tool_name,
+            "approval_required": approval_request.approval_required,
+            "input_json": approval_request.input_json,
+        }),
+        Some(common_v1::run_stream_event::Body::ToolApprovalResponse(approval_response)) => json!({
+            "type": "tool.approval.response",
+            "run_id": run_id,
+            "proposal_id": approval_response.proposal_id.as_ref().map(|value| value.ulid.clone()),
+            "approved": approval_response.approved,
+            "reason": approval_response.reason,
         }),
         Some(common_v1::run_stream_event::Body::ToolResult(result)) => json!({
             "type": "tool.result",
@@ -1267,7 +1334,16 @@ fn run_daemon(command: DaemonCommand) -> Result<()> {
             );
             std::io::stdout().flush().context("stdout flush failed")
         }
-        DaemonCommand::RunTape { url, token, principal, device_id, channel, run_id } => {
+        DaemonCommand::RunTape {
+            url,
+            token,
+            principal,
+            device_id,
+            channel,
+            run_id,
+            after_seq,
+            limit,
+        } => {
             validate_canonical_id(run_id.as_str())
                 .context("run_id must be a canonical ULID for daemon run-tape")?;
             let base_url = url
@@ -1290,6 +1366,12 @@ fn run_daemon(command: DaemonCommand) -> Result<()> {
             if let Some(channel) = channel {
                 request = request.header("x-palyra-channel", channel);
             }
+            if let Some(after_seq) = after_seq {
+                request = request.query(&[("after_seq", after_seq)]);
+            }
+            if let Some(limit) = limit {
+                request = request.query(&[("limit", limit)]);
+            }
             let response: RunTapeResponse = request
                 .send()
                 .context("failed to call daemon run tape endpoint")?
@@ -1297,7 +1379,16 @@ fn run_daemon(command: DaemonCommand) -> Result<()> {
                 .context("daemon run tape endpoint returned non-success status")?
                 .json()
                 .context("failed to parse daemon run tape payload")?;
-            println!("run.tape run_id={} events={}", response.run_id, response.events.len());
+            println!(
+                "run.tape run_id={} events={} returned_bytes={} next_after_seq={}",
+                response.run_id,
+                response.events.len(),
+                response.returned_bytes,
+                response
+                    .next_after_seq
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_owned())
+            );
             for event in response.events {
                 println!(
                     "run.tape.event seq={} type={} payload_json={}",
@@ -1411,14 +1502,35 @@ fn run_config(command: ConfigCommand) -> Result<()> {
             );
             std::io::stdout().flush().context("stdout flush failed")
         }
-        ConfigCommand::Get { path, key } => {
+        ConfigCommand::List { path, show_secrets } => {
+            let path = resolve_config_path(path, true)?;
+            let (mut document, _) = load_document_from_existing_path(Path::new(&path))
+                .with_context(|| format!("failed to parse {path}"))?;
+            if !show_secrets {
+                redact_secret_config_values(&mut document);
+            }
+            let rendered =
+                toml::to_string_pretty(&document).context("failed to serialize config document")?;
+            println!("config.list source={} show_secrets={show_secrets}", path);
+            print!("{rendered}");
+            std::io::stdout().flush().context("stdout flush failed")
+        }
+        ConfigCommand::Get { path, key, show_secrets } => {
             let path = resolve_config_path(path, true)?;
             let (document, _) = load_document_from_existing_path(Path::new(&path))
                 .with_context(|| format!("failed to parse {path}"))?;
             let value = get_value_at_path(&document, key.as_str())
                 .with_context(|| format!("invalid config key path: {}", key))?
                 .with_context(|| format!("config key not found: {}", key))?;
-            println!("config.get key={} value={} source={}", key, format_toml_value(value), path);
+            let display_value = if show_secrets || !is_secret_config_path(key.as_str()) {
+                format_toml_value(value)
+            } else {
+                format_toml_value(&toml::Value::String(REDACTED_CONFIG_VALUE.to_owned()))
+            };
+            println!(
+                "config.get key={} value={} source={} show_secrets={show_secrets}",
+                key, display_value, path
+            );
             std::io::stdout().flush().context("stdout flush failed")
         }
         ConfigCommand::Set { path, key, value, backups } => {
@@ -1706,20 +1818,7 @@ fn resolve_identity_store_root(store_dir: Option<String>) -> Result<PathBuf> {
     if let Some(path) = store_dir {
         return Ok(PathBuf::from(path));
     }
-    default_identity_store_root_from_env(env::var_os("XDG_STATE_HOME"), env::var_os("HOME"))
-}
-
-#[cfg(not(windows))]
-fn default_identity_store_root_from_env(
-    xdg_state_home: Option<OsString>,
-    home: Option<OsString>,
-) -> Result<PathBuf> {
-    if let Some(state_home) = xdg_state_home {
-        return Ok(PathBuf::from(state_home).join("palyra").join("identity"));
-    }
-
-    let home = home.map(PathBuf::from).context("HOME is not set")?;
-    Ok(home.join(".local").join("state").join("palyra").join("identity"))
+    default_identity_store_root().context("failed to resolve default identity store root")
 }
 
 #[cfg(not(windows))]
@@ -1933,6 +2032,9 @@ struct RunStatusResponse {
 #[derive(Debug, Deserialize)]
 struct RunTapeResponse {
     run_id: String,
+    #[serde(default)]
+    returned_bytes: usize,
+    next_after_seq: Option<i64>,
     events: Vec<RunTapeEvent>,
 }
 
@@ -2000,8 +2102,9 @@ mod cli_v1_tests {
 
 #[cfg(all(test, not(windows)))]
 mod tests {
-    use super::{default_identity_store_root_from_env, resolve_pairing_proof};
+    use super::resolve_pairing_proof;
     use anyhow::Result;
+    use palyra_common::default_identity_store_root_from_env;
     use std::ffi::OsString;
     use std::path::PathBuf;
 

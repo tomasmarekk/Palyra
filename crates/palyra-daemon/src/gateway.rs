@@ -22,7 +22,8 @@ use crate::{
     journal::{
         JournalAppendRequest, JournalError, JournalEventRecord, JournalStore,
         OrchestratorCancelRequest, OrchestratorRunStartRequest, OrchestratorRunStatusSnapshot,
-        OrchestratorSessionUpsertRequest, OrchestratorTapeAppendRequest, OrchestratorTapeRecord,
+        OrchestratorSessionRecord, OrchestratorSessionResolveOutcome,
+        OrchestratorSessionResolveRequest, OrchestratorTapeAppendRequest, OrchestratorTapeRecord,
         OrchestratorUsageDelta,
     },
     model_provider::{
@@ -31,7 +32,7 @@ use crate::{
     orchestrator::{is_cancel_command, RunLifecycleState, RunStateMachine, RunTransition},
     tool_protocol::{
         decide_tool_call, denied_execution_outcome, execute_tool_call, tool_policy_snapshot,
-        ToolCallConfig, ToolCallPolicySnapshot,
+        tool_requires_approval, ToolCallConfig, ToolCallPolicySnapshot,
     },
 };
 
@@ -48,6 +49,12 @@ pub mod proto {
                 tonic::include_proto!("palyra.gateway.v1");
             }
         }
+
+        pub mod node {
+            pub mod v1 {
+                tonic::include_proto!("palyra.node.v1");
+            }
+        }
     }
 }
 
@@ -57,11 +64,17 @@ pub const HEADER_PRINCIPAL: &str = "x-palyra-principal";
 pub const HEADER_DEVICE_ID: &str = "x-palyra-device-id";
 pub const HEADER_CHANNEL: &str = "x-palyra-channel";
 const MAX_JOURNAL_RECENT_EVENTS: usize = 100;
+const MAX_SESSIONS_PAGE_LIMIT: usize = 500;
 const JOURNAL_WRITE_LATENCY_BUDGET_MS: u128 = 25;
 const TOOL_EXECUTION_LATENCY_BUDGET_MS: u128 = 200;
+const MIN_TAPE_PAGE_LIMIT: usize = 1;
 const SENSITIVE_TOOLS_DENY_REASON: &str =
     "allow_sensitive_tools=true is denied by default and requires explicit approvals";
 const CANCELLED_REASON: &str = "cancelled by request";
+const APPROVAL_CHANNEL_UNAVAILABLE_REASON: &str =
+    "approval required but no interactive approval channel is available for this run";
+const APPROVAL_DENIED_REASON: &str = "tool execution denied by explicit client approval response";
+const MAX_MODEL_TOKEN_TAPE_EVENTS_PER_RUN: usize = 1_024;
 
 #[derive(Debug, Clone)]
 pub struct GatewayRuntimeConfigSnapshot {
@@ -73,7 +86,15 @@ pub struct GatewayRuntimeConfigSnapshot {
     pub orchestrator_runloop_v1_enabled: bool,
     pub node_rpc_mtls_required: bool,
     pub admin_auth_required: bool,
+    pub max_tape_entries_per_response: usize,
+    pub max_tape_bytes_per_response: usize,
     pub tool_call: ToolCallConfig,
+}
+
+#[derive(Debug, Clone)]
+struct ToolApprovalOutcome {
+    approved: bool,
+    reason: String,
 }
 
 #[derive(Debug, Clone)]
@@ -222,6 +243,13 @@ pub struct JournalRecentSnapshot {
 #[derive(Debug, Clone, Serialize)]
 pub struct RunTapeSnapshot {
     pub run_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_after_seq: Option<i64>,
+    pub limit: usize,
+    pub max_response_bytes: usize,
+    pub returned_bytes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_after_seq: Option<i64>,
     pub events: Vec<OrchestratorTapeRecord>,
 }
 
@@ -527,24 +555,61 @@ impl GatewayRuntimeState {
     }
 
     #[allow(clippy::result_large_err)]
-    fn upsert_orchestrator_session_blocking(
+    fn resolve_orchestrator_session_blocking(
         &self,
-        request: &OrchestratorSessionUpsertRequest,
-    ) -> Result<(), Status> {
+        request: &OrchestratorSessionResolveRequest,
+    ) -> Result<OrchestratorSessionResolveOutcome, Status> {
         self.journal_store
-            .upsert_orchestrator_session(request)
-            .map_err(|error| map_orchestrator_store_error("upsert orchestrator session", error))
+            .resolve_orchestrator_session(request)
+            .map_err(|error| map_orchestrator_store_error("resolve orchestrator session", error))
     }
 
     #[allow(clippy::result_large_err)]
-    pub async fn upsert_orchestrator_session(
+    pub async fn resolve_orchestrator_session(
         self: &Arc<Self>,
-        request: OrchestratorSessionUpsertRequest,
-    ) -> Result<(), Status> {
+        request: OrchestratorSessionResolveRequest,
+    ) -> Result<OrchestratorSessionResolveOutcome, Status> {
         let state = Arc::clone(self);
-        tokio::task::spawn_blocking(move || state.upsert_orchestrator_session_blocking(&request))
+        tokio::task::spawn_blocking(move || state.resolve_orchestrator_session_blocking(&request))
             .await
-            .map_err(|_| Status::internal("orchestrator session worker panicked"))?
+            .map_err(|_| Status::internal("orchestrator session resolve worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn list_orchestrator_sessions_blocking(
+        &self,
+        after_session_key: Option<String>,
+        requested_limit: Option<usize>,
+    ) -> Result<(Vec<OrchestratorSessionRecord>, Option<String>), Status> {
+        let limit = requested_limit.unwrap_or(100).clamp(1, MAX_SESSIONS_PAGE_LIMIT);
+        let mut sessions = self
+            .journal_store
+            .list_orchestrator_sessions(after_session_key.as_deref(), limit.saturating_add(1))
+            .map_err(|error| map_orchestrator_store_error("list orchestrator sessions", error))?;
+        let has_more = sessions.len() > limit;
+        if has_more {
+            sessions.truncate(limit);
+        }
+        let next_after_session_key = if has_more {
+            sessions.last().map(|session| session.session_key.clone())
+        } else {
+            None
+        };
+        Ok((sessions, next_after_session_key))
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn list_orchestrator_sessions(
+        self: &Arc<Self>,
+        after_session_key: Option<String>,
+        requested_limit: Option<usize>,
+    ) -> Result<(Vec<OrchestratorSessionRecord>, Option<String>), Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.list_orchestrator_sessions_blocking(after_session_key, requested_limit)
+        })
+        .await
+        .map_err(|_| Status::internal("orchestrator session list worker panicked"))?
     }
 
     #[allow(clippy::result_large_err)]
@@ -723,7 +788,12 @@ impl GatewayRuntimeState {
     }
 
     #[allow(clippy::result_large_err)]
-    fn orchestrator_tape_snapshot_blocking(&self, run_id: &str) -> Result<RunTapeSnapshot, Status> {
+    fn orchestrator_tape_snapshot_blocking(
+        &self,
+        run_id: &str,
+        after_seq: Option<i64>,
+        requested_limit: Option<usize>,
+    ) -> Result<RunTapeSnapshot, Status> {
         let run_exists = self
             .journal_store
             .orchestrator_run_status_snapshot(run_id)
@@ -732,21 +802,69 @@ impl GatewayRuntimeState {
         if !run_exists {
             return Err(Status::not_found(format!("orchestrator run not found: {run_id}")));
         }
-        let events = self
+        let limit = requested_limit
+            .unwrap_or(self.config.max_tape_entries_per_response)
+            .clamp(MIN_TAPE_PAGE_LIMIT, self.config.max_tape_entries_per_response);
+        let fetched_events = self
             .journal_store
-            .orchestrator_tape(run_id)
+            .orchestrator_tape_page(run_id, after_seq, limit.saturating_add(1))
             .map_err(|error| map_orchestrator_store_error("load orchestrator tape", error))?;
-        Ok(RunTapeSnapshot { run_id: run_id.to_owned(), events })
+        let mut events = Vec::with_capacity(limit);
+        let mut returned_bytes = 0_usize;
+        let mut has_more = false;
+
+        for record in fetched_events {
+            if events.len() >= limit {
+                has_more = true;
+                break;
+            }
+            let sanitized_payload =
+                crate::journal::redact_payload_json(record.payload_json.as_bytes()).map_err(
+                    |error| map_orchestrator_store_error("redact orchestrator tape payload", error),
+                )?;
+            let payload_bytes = sanitized_payload.len();
+            if events.is_empty() && payload_bytes > self.config.max_tape_bytes_per_response {
+                return Err(Status::resource_exhausted(format!(
+                    "single orchestrator tape event exceeds response byte limit ({payload_bytes} > {})",
+                    self.config.max_tape_bytes_per_response
+                )));
+            }
+            if returned_bytes.saturating_add(payload_bytes)
+                > self.config.max_tape_bytes_per_response
+            {
+                has_more = true;
+                break;
+            }
+            returned_bytes = returned_bytes.saturating_add(payload_bytes);
+            events.push(OrchestratorTapeRecord {
+                seq: record.seq,
+                event_type: record.event_type,
+                payload_json: sanitized_payload,
+            });
+        }
+
+        let next_after_seq = if has_more { events.last().map(|event| event.seq) } else { None };
+        Ok(RunTapeSnapshot {
+            run_id: run_id.to_owned(),
+            requested_after_seq: after_seq,
+            limit,
+            max_response_bytes: self.config.max_tape_bytes_per_response,
+            returned_bytes,
+            next_after_seq,
+            events,
+        })
     }
 
     #[allow(clippy::result_large_err)]
     pub async fn orchestrator_tape_snapshot(
         self: &Arc<Self>,
         run_id: String,
+        after_seq: Option<i64>,
+        limit: Option<usize>,
     ) -> Result<RunTapeSnapshot, Status> {
         let state = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
-            state.orchestrator_tape_snapshot_blocking(run_id.as_str())
+            state.orchestrator_tape_snapshot_blocking(run_id.as_str(), after_seq, limit)
         })
         .await
         .map_err(|_| Status::internal("orchestrator tape snapshot worker panicked"))?
@@ -764,11 +882,116 @@ fn map_orchestrator_store_error(operation: &str, error: JournalError) -> Status 
         JournalError::RunNotFound { run_id } => {
             Status::not_found(format!("orchestrator run not found: {run_id}"))
         }
+        JournalError::PayloadTooLarge { payload_kind, actual_bytes, max_bytes } => {
+            Status::invalid_argument(format!(
+                "{payload_kind} payload exceeds maximum size ({actual_bytes} > {max_bytes})"
+            ))
+        }
         JournalError::SessionIdentityMismatch { session_id } => Status::failed_precondition(
             format!("orchestrator session identity mismatch for session: {session_id}"),
         ),
+        JournalError::SessionNotFound { selector } => {
+            Status::not_found(format!("orchestrator session not found for selector: {selector}"))
+        }
+        JournalError::InvalidSessionSelector { reason } => {
+            Status::invalid_argument(format!("invalid orchestrator session selector: {reason}"))
+        }
         other => Status::internal(format!("{operation} failed: {other}")),
     }
+}
+
+fn apply_tool_approval_outcome(
+    mut decision: crate::tool_protocol::ToolDecision,
+    tool_name: &str,
+    approval: Option<&ToolApprovalOutcome>,
+) -> crate::tool_protocol::ToolDecision {
+    if !(decision.allowed && decision.approval_required) {
+        return decision;
+    }
+
+    let Some(approval) = approval else {
+        decision.allowed = false;
+        decision.reason = format!(
+            "{APPROVAL_CHANNEL_UNAVAILABLE_REASON}; tool={tool_name}; original_reason={}",
+            decision.reason
+        );
+        return decision;
+    };
+
+    if approval.approved {
+        decision.reason = format!(
+            "explicit approval granted for tool={tool_name}; approval_reason={}; original_reason={}",
+            approval.reason, decision.reason
+        );
+        return decision;
+    }
+
+    decision.allowed = false;
+    decision.reason = format!(
+        "{APPROVAL_DENIED_REASON}; tool={tool_name}; approval_reason={}; original_reason={}",
+        approval.reason, decision.reason
+    );
+    decision
+}
+
+#[allow(clippy::result_large_err)]
+async fn await_tool_approval_response(
+    stream: &mut Streaming<common_v1::RunStreamRequest>,
+    expected_session_id: &str,
+    expected_run_id: &str,
+    proposal_id: &str,
+) -> Result<ToolApprovalOutcome, Status> {
+    while let Some(item) = stream.next().await {
+        let message = item.map_err(|error| {
+            Status::internal(format!("failed to read approval stream item: {error}"))
+        })?;
+        if message.v != CANONICAL_PROTOCOL_MAJOR {
+            return Err(Status::failed_precondition("unsupported protocol major version"));
+        }
+
+        let message_session_id = canonical_id(message.session_id, "session_id")?;
+        if message_session_id != expected_session_id {
+            return Err(Status::invalid_argument(
+                "run stream cannot switch session_id while awaiting tool approval response",
+            ));
+        }
+        let message_run_id = canonical_id(message.run_id, "run_id")?;
+        if message_run_id != expected_run_id {
+            return Err(Status::invalid_argument(
+                "run stream cannot switch run_id while awaiting tool approval response",
+            ));
+        }
+        if message.input.is_some() {
+            return Err(Status::invalid_argument(
+                "received prompt payload while waiting for tool approval response",
+            ));
+        }
+
+        let Some(response) = message.tool_approval_response else {
+            continue;
+        };
+        let response_proposal_id =
+            canonical_id(response.proposal_id, "tool_approval_response.proposal_id")?;
+        if response_proposal_id != proposal_id {
+            return Err(Status::invalid_argument(
+                "tool approval response proposal_id does not match pending tool proposal",
+            ));
+        }
+
+        let reason = non_empty(response.reason).unwrap_or_else(|| {
+            if response.approved {
+                "approved_by_client".to_owned()
+            } else {
+                "denied_by_client".to_owned()
+            }
+        });
+        return Ok(ToolApprovalOutcome { approved: response.approved, reason });
+    }
+
+    Ok(ToolApprovalOutcome {
+        approved: false,
+        reason: APPROVAL_CHANNEL_UNAVAILABLE_REASON.to_owned(),
+    })
 }
 
 fn map_provider_error(error: ProviderError) -> Status {
@@ -796,6 +1019,20 @@ fn map_provider_error(error: ProviderError) -> Status {
             "model provider response invalid after {retry_count} retries: {message}"
         )),
         ProviderError::StatePoisoned => Status::internal("model provider state lock poisoned"),
+    }
+}
+
+fn session_summary_message(session: &OrchestratorSessionRecord) -> gateway_v1::SessionSummary {
+    gateway_v1::SessionSummary {
+        session_id: Some(common_v1::CanonicalId { ulid: session.session_id.clone() }),
+        session_key: session.session_key.clone(),
+        session_label: session.session_label.clone().unwrap_or_default(),
+        created_at_unix_ms: session.created_at_unix_ms,
+        updated_at_unix_ms: session.updated_at_unix_ms,
+        last_run_id: session
+            .last_run_id
+            .as_ref()
+            .map(|run_id| common_v1::CanonicalId { ulid: run_id.clone() }),
     }
 }
 
@@ -918,6 +1155,85 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
         }))
     }
 
+    async fn abort_run(
+        &self,
+        request: Request<gateway_v1::AbortRunRequest>,
+    ) -> Result<Response<gateway_v1::AbortRunResponse>, Status> {
+        let _context = self.authorize_rpc(request.metadata(), "AbortRun")?;
+        let payload = request.into_inner();
+        if payload.v != CANONICAL_PROTOCOL_MAJOR {
+            return Err(Status::failed_precondition("unsupported protocol major version"));
+        }
+        let run_id = canonical_id(payload.run_id, "run_id")?;
+        let reason = non_empty(payload.reason).unwrap_or_else(|| "grpc_abort_requested".to_owned());
+        let snapshot = self
+            .state
+            .request_orchestrator_cancel(OrchestratorCancelRequest {
+                run_id: run_id.clone(),
+                reason: reason.clone(),
+            })
+            .await?;
+        Ok(Response::new(gateway_v1::AbortRunResponse {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            run_id: Some(common_v1::CanonicalId { ulid: snapshot.run_id }),
+            cancel_requested: snapshot.cancel_requested,
+            reason: snapshot.reason,
+        }))
+    }
+
+    async fn list_sessions(
+        &self,
+        request: Request<gateway_v1::ListSessionsRequest>,
+    ) -> Result<Response<gateway_v1::ListSessionsResponse>, Status> {
+        let _context = self.authorize_rpc(request.metadata(), "ListSessions")?;
+        let payload = request.into_inner();
+        if payload.v != CANONICAL_PROTOCOL_MAJOR {
+            return Err(Status::failed_precondition("unsupported protocol major version"));
+        }
+        let after_session_key = non_empty(payload.after_session_key);
+        let requested_limit = if payload.limit == 0 { None } else { Some(payload.limit as usize) };
+        let (sessions, next_after_session_key) =
+            self.state.list_orchestrator_sessions(after_session_key, requested_limit).await?;
+        Ok(Response::new(gateway_v1::ListSessionsResponse {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            sessions: sessions.iter().map(session_summary_message).collect(),
+            next_after_session_key: next_after_session_key.unwrap_or_default(),
+        }))
+    }
+
+    async fn resolve_session(
+        &self,
+        request: Request<gateway_v1::ResolveSessionRequest>,
+    ) -> Result<Response<gateway_v1::ResolveSessionResponse>, Status> {
+        let context = self.authorize_rpc(request.metadata(), "ResolveSession")?;
+        let payload = request.into_inner();
+        if payload.v != CANONICAL_PROTOCOL_MAJOR {
+            return Err(Status::failed_precondition("unsupported protocol major version"));
+        }
+        let session_id = optional_canonical_id(payload.session_id, "session_id")?;
+        let session_key = non_empty(payload.session_key);
+        let session_label = non_empty(payload.session_label);
+        let outcome = self
+            .state
+            .resolve_orchestrator_session(OrchestratorSessionResolveRequest {
+                session_id,
+                session_key,
+                session_label,
+                principal: context.principal,
+                device_id: context.device_id,
+                channel: context.channel,
+                require_existing: payload.require_existing,
+                reset_session: payload.reset_session,
+            })
+            .await?;
+        Ok(Response::new(gateway_v1::ResolveSessionResponse {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            session: Some(session_summary_message(&outcome.session)),
+            created: outcome.created,
+            reset_applied: outcome.reset_applied,
+        }))
+    }
+
     async fn run_stream(
         &self,
         request: Request<Streaming<common_v1::RunStreamRequest>>,
@@ -941,6 +1257,8 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
             let mut active_run_id = None::<String>;
             let mut run_state = RunStateMachine::default();
             let mut tape_seq = 0_i64;
+            let mut model_token_tape_events = 0_usize;
+            let mut model_token_compaction_emitted = false;
             let mut in_progress_emitted = false;
             let mut remaining_tool_budget = state_for_stream.config.tool_call.max_calls_per_run;
 
@@ -1079,25 +1397,48 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                         let _ = sender.send(Err(status)).await;
                         return;
                     }
-                    if let Err(error) = state_for_stream
-                        .upsert_orchestrator_session(OrchestratorSessionUpsertRequest {
-                            session_id: session_id.clone(),
+                    let resolved_session = state_for_stream
+                        .resolve_orchestrator_session(OrchestratorSessionResolveRequest {
+                            session_id: Some(session_id.clone()),
+                            session_key: non_empty(message.session_key.clone()),
+                            session_label: non_empty(message.session_label.clone()),
                             principal: context_for_stream.principal.clone(),
                             device_id: context_for_stream.device_id.clone(),
                             channel: context_for_stream.channel.clone(),
+                            require_existing: message.require_existing,
+                            reset_session: message.reset_session,
                         })
-                        .await
-                    {
+                        .await;
+                    let resolved_session = match resolved_session {
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            finalize_run_failure(
+                                &sender,
+                                &state_for_stream,
+                                &mut run_state,
+                                active_run_id.as_deref(),
+                                &mut tape_seq,
+                                error.message(),
+                            )
+                            .await;
+                            let _ = sender.send(Err(error)).await;
+                            return;
+                        }
+                    };
+                    if resolved_session.session.session_id != session_id {
+                        let status = Status::failed_precondition(
+                            "resolved session_id does not match RunStream session_id",
+                        );
                         finalize_run_failure(
                             &sender,
                             &state_for_stream,
                             &mut run_state,
                             active_run_id.as_deref(),
                             &mut tape_seq,
-                            error.message(),
+                            status.message(),
                         )
                         .await;
-                        let _ = sender.send(Err(error)).await;
+                        let _ = sender.send(Err(status)).await;
                         return;
                     }
                     if let Err(error) = state_for_stream
@@ -1507,6 +1848,8 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                                 &state_for_stream,
                                 run_id.as_str(),
                                 &mut tape_seq,
+                                &mut model_token_tape_events,
+                                &mut model_token_compaction_emitted,
                                 token.as_str(),
                                 is_final,
                             )
@@ -1526,6 +1869,8 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                             }
                         }
                         ProviderEvent::ToolProposal { proposal_id, tool_name, input_json } => {
+                            let proposal_approval_required =
+                                tool_requires_approval(tool_name.as_str());
                             state_for_stream
                                 .counters
                                 .tool_proposals
@@ -1538,6 +1883,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                                 proposal_id.as_str(),
                                 tool_name.as_str(),
                                 input_json.as_slice(),
+                                proposal_approval_required,
                             )
                             .await
                             {
@@ -1554,11 +1900,94 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                                 return;
                             }
 
+                            let approval_outcome = if proposal_approval_required {
+                                if let Err(error) = send_tool_approval_request_with_tape(
+                                    &sender,
+                                    &state_for_stream,
+                                    run_id.as_str(),
+                                    &mut tape_seq,
+                                    proposal_id.as_str(),
+                                    tool_name.as_str(),
+                                    input_json.as_slice(),
+                                    true,
+                                )
+                                .await
+                                {
+                                    finalize_run_failure(
+                                        &sender,
+                                        &state_for_stream,
+                                        &mut run_state,
+                                        active_run_id.as_deref(),
+                                        &mut tape_seq,
+                                        error.message(),
+                                    )
+                                    .await;
+                                    let _ = sender.send(Err(error)).await;
+                                    return;
+                                }
+
+                                let response = match await_tool_approval_response(
+                                    &mut stream,
+                                    session_id.as_str(),
+                                    run_id.as_str(),
+                                    proposal_id.as_str(),
+                                )
+                                .await
+                                {
+                                    Ok(value) => value,
+                                    Err(error) => {
+                                        finalize_run_failure(
+                                            &sender,
+                                            &state_for_stream,
+                                            &mut run_state,
+                                            active_run_id.as_deref(),
+                                            &mut tape_seq,
+                                            error.message(),
+                                        )
+                                        .await;
+                                        let _ = sender.send(Err(error)).await;
+                                        return;
+                                    }
+                                };
+
+                                if let Err(error) = send_tool_approval_response_with_tape(
+                                    &sender,
+                                    &state_for_stream,
+                                    run_id.as_str(),
+                                    &mut tape_seq,
+                                    proposal_id.as_str(),
+                                    response.approved,
+                                    response.reason.as_str(),
+                                )
+                                .await
+                                {
+                                    finalize_run_failure(
+                                        &sender,
+                                        &state_for_stream,
+                                        &mut run_state,
+                                        active_run_id.as_deref(),
+                                        &mut tape_seq,
+                                        error.message(),
+                                    )
+                                    .await;
+                                    let _ = sender.send(Err(error)).await;
+                                    return;
+                                }
+                                Some(response)
+                            } else {
+                                None
+                            };
+
                             let decision = decide_tool_call(
                                 &state_for_stream.config.tool_call,
                                 &mut remaining_tool_budget,
                                 context_for_stream.principal.as_str(),
                                 tool_name.as_str(),
+                            );
+                            let decision = apply_tool_approval_outcome(
+                                decision,
+                                tool_name.as_str(),
+                                approval_outcome.as_ref(),
                             );
                             if decision.allowed {
                                 state_for_stream
@@ -1983,6 +2412,7 @@ fn tool_proposal_event(
     proposal_id: impl Into<String>,
     tool_name: impl Into<String>,
     input_json: Vec<u8>,
+    approval_required: bool,
 ) -> common_v1::RunStreamEvent {
     common_v1::RunStreamEvent {
         v: CANONICAL_PROTOCOL_MAJOR,
@@ -1991,8 +2421,48 @@ fn tool_proposal_event(
             proposal_id: Some(common_v1::CanonicalId { ulid: proposal_id.into() }),
             tool_name: tool_name.into(),
             input_json,
-            approval_required: true,
+            approval_required,
         })),
+    }
+}
+
+fn tool_approval_request_event(
+    run_id: String,
+    proposal_id: impl Into<String>,
+    tool_name: impl Into<String>,
+    input_json: Vec<u8>,
+    approval_required: bool,
+) -> common_v1::RunStreamEvent {
+    common_v1::RunStreamEvent {
+        v: CANONICAL_PROTOCOL_MAJOR,
+        run_id: Some(common_v1::CanonicalId { ulid: run_id }),
+        body: Some(common_v1::run_stream_event::Body::ToolApprovalRequest(
+            common_v1::ToolApprovalRequest {
+                proposal_id: Some(common_v1::CanonicalId { ulid: proposal_id.into() }),
+                tool_name: tool_name.into(),
+                input_json,
+                approval_required,
+            },
+        )),
+    }
+}
+
+fn tool_approval_response_event(
+    run_id: String,
+    proposal_id: impl Into<String>,
+    approved: bool,
+    reason: impl Into<String>,
+) -> common_v1::RunStreamEvent {
+    common_v1::RunStreamEvent {
+        v: CANONICAL_PROTOCOL_MAJOR,
+        run_id: Some(common_v1::CanonicalId { ulid: run_id }),
+        body: Some(common_v1::run_stream_event::Body::ToolApprovalResponse(
+            common_v1::ToolApprovalResponse {
+                proposal_id: Some(common_v1::CanonicalId { ulid: proposal_id.into() }),
+                approved,
+                reason: reason.into(),
+            },
+        )),
     }
 }
 
@@ -2093,11 +2563,14 @@ async fn send_status_with_tape(
 }
 
 #[allow(clippy::result_large_err)]
+#[allow(clippy::too_many_arguments)]
 async fn send_model_token_with_tape(
     sender: &mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
     runtime_state: &Arc<GatewayRuntimeState>,
     run_id: &str,
     tape_seq: &mut i64,
+    token_tape_events: &mut usize,
+    compaction_emitted: &mut bool,
     token: &str,
     is_final: bool,
 ) -> Result<(), Status> {
@@ -2106,6 +2579,13 @@ async fn send_model_token_with_tape(
         .send(Ok(event))
         .await
         .map_err(|_| Status::cancelled("run stream response channel closed"))?;
+    if !is_final && *token_tape_events >= MAX_MODEL_TOKEN_TAPE_EVENTS_PER_RUN {
+        if !*compaction_emitted {
+            compact_model_token_tape_stub(runtime_state, run_id, tape_seq).await?;
+            *compaction_emitted = true;
+        }
+        return Ok(());
+    }
     runtime_state
         .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
             run_id: run_id.to_owned(),
@@ -2115,10 +2595,30 @@ async fn send_model_token_with_tape(
         })
         .await?;
     *tape_seq += 1;
+    *token_tape_events += 1;
     Ok(())
 }
 
 #[allow(clippy::result_large_err)]
+async fn compact_model_token_tape_stub(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+) -> Result<(), Status> {
+    runtime_state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: *tape_seq,
+            event_type: "model_token_compaction".to_owned(),
+            payload_json: model_token_compaction_tape_payload(MAX_MODEL_TOKEN_TAPE_EVENTS_PER_RUN),
+        })
+        .await?;
+    *tape_seq += 1;
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+#[allow(clippy::too_many_arguments)]
 async fn send_tool_proposal_with_tape(
     sender: &mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -2127,12 +2627,14 @@ async fn send_tool_proposal_with_tape(
     proposal_id: &str,
     tool_name: &str,
     input_json: &[u8],
+    approval_required: bool,
 ) -> Result<(), Status> {
     let event = tool_proposal_event(
         run_id.to_owned(),
         proposal_id.to_owned(),
         tool_name.to_owned(),
         input_json.to_vec(),
+        approval_required,
     );
     sender
         .send(Ok(event))
@@ -2143,7 +2645,84 @@ async fn send_tool_proposal_with_tape(
             run_id: run_id.to_owned(),
             seq: *tape_seq,
             event_type: "tool_proposal".to_owned(),
-            payload_json: tool_proposal_tape_payload(proposal_id, tool_name, input_json),
+            payload_json: tool_proposal_tape_payload(
+                proposal_id,
+                tool_name,
+                input_json,
+                approval_required,
+            ),
+        })
+        .await?;
+    *tape_seq += 1;
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+#[allow(clippy::too_many_arguments)]
+async fn send_tool_approval_request_with_tape(
+    sender: &mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    proposal_id: &str,
+    tool_name: &str,
+    input_json: &[u8],
+    approval_required: bool,
+) -> Result<(), Status> {
+    let event = tool_approval_request_event(
+        run_id.to_owned(),
+        proposal_id.to_owned(),
+        tool_name.to_owned(),
+        input_json.to_vec(),
+        approval_required,
+    );
+    sender
+        .send(Ok(event))
+        .await
+        .map_err(|_| Status::cancelled("run stream response channel closed"))?;
+    runtime_state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: *tape_seq,
+            event_type: "tool_approval_request".to_owned(),
+            payload_json: tool_approval_request_tape_payload(
+                proposal_id,
+                tool_name,
+                input_json,
+                approval_required,
+            ),
+        })
+        .await?;
+    *tape_seq += 1;
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+async fn send_tool_approval_response_with_tape(
+    sender: &mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    proposal_id: &str,
+    approved: bool,
+    reason: &str,
+) -> Result<(), Status> {
+    let event = tool_approval_response_event(
+        run_id.to_owned(),
+        proposal_id.to_owned(),
+        approved,
+        reason.to_owned(),
+    );
+    sender
+        .send(Ok(event))
+        .await
+        .map_err(|_| Status::cancelled("run stream response channel closed"))?;
+    runtime_state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: *tape_seq,
+            event_type: "tool_approval_response".to_owned(),
+            payload_json: tool_approval_response_tape_payload(proposal_id, approved, reason),
         })
         .await?;
     *tape_seq += 1;
@@ -2290,14 +2869,54 @@ fn model_token_tape_payload(token: &str, is_final: bool) -> String {
     .to_string()
 }
 
-fn tool_proposal_tape_payload(proposal_id: &str, tool_name: &str, input_json: &[u8]) -> String {
+fn model_token_compaction_tape_payload(max_model_token_events: usize) -> String {
+    json!({
+        "kind": "token_cap_reached",
+        "max_model_token_tape_events": max_model_token_events,
+        "compaction_hook": "stub",
+    })
+    .to_string()
+}
+
+fn tool_proposal_tape_payload(
+    proposal_id: &str,
+    tool_name: &str,
+    input_json: &[u8],
+    approval_required: bool,
+) -> String {
     let normalized_input = serde_json::from_slice::<Value>(input_json)
         .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(input_json).to_string() }));
     json!({
         "proposal_id": proposal_id,
         "tool_name": tool_name,
         "input_json": normalized_input,
-        "approval_required": true,
+        "approval_required": approval_required,
+    })
+    .to_string()
+}
+
+fn tool_approval_request_tape_payload(
+    proposal_id: &str,
+    tool_name: &str,
+    input_json: &[u8],
+    approval_required: bool,
+) -> String {
+    let normalized_input = serde_json::from_slice::<Value>(input_json)
+        .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(input_json).to_string() }));
+    json!({
+        "proposal_id": proposal_id,
+        "tool_name": tool_name,
+        "input_json": normalized_input,
+        "approval_required": approval_required,
+    })
+    .to_string()
+}
+
+fn tool_approval_response_tape_payload(proposal_id: &str, approved: bool, reason: &str) -> String {
+    json!({
+        "proposal_id": proposal_id,
+        "approved": approved,
+        "reason": reason,
     })
     .to_string()
 }
@@ -2441,6 +3060,21 @@ fn canonical_id(
     Ok(id)
 }
 
+#[allow(clippy::result_large_err)]
+fn optional_canonical_id(
+    value: Option<common_v1::CanonicalId>,
+    field_name: &'static str,
+) -> Result<Option<String>, Status> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let id = non_empty(value.ulid)
+        .ok_or_else(|| Status::invalid_argument(format!("{field_name} must be non-empty")))?;
+    validate_canonical_id(id.as_str())
+        .map_err(|_| Status::invalid_argument(format!("{field_name} must be a canonical ULID")))?;
+    Ok(Some(id))
+}
+
 pub fn authorize_headers(headers: &HeaderMap, auth: &GatewayAuthConfig) -> Result<(), AuthError> {
     if !auth.require_auth {
         return Ok(());
@@ -2553,12 +3187,16 @@ mod tests {
 
     use axum::http::{header::AUTHORIZATION, HeaderMap, HeaderValue};
 
-    use crate::journal::{JournalAppendRequest, JournalConfig, JournalStore};
+    use crate::journal::{
+        JournalAppendRequest, JournalConfig, JournalStore, OrchestratorRunStartRequest,
+        OrchestratorSessionUpsertRequest, OrchestratorTapeAppendRequest,
+    };
 
     use super::{
-        authorize_headers, request_context_from_headers, AuthError, GatewayAuthConfig,
-        GatewayJournalConfigSnapshot, GatewayRuntimeConfigSnapshot, GatewayRuntimeState,
-        RequestContext, HEADER_CHANNEL, HEADER_DEVICE_ID, HEADER_PRINCIPAL,
+        apply_tool_approval_outcome, authorize_headers, request_context_from_headers, AuthError,
+        GatewayAuthConfig, GatewayJournalConfigSnapshot, GatewayRuntimeConfigSnapshot,
+        GatewayRuntimeState, RequestContext, ToolApprovalOutcome, HEADER_CHANNEL, HEADER_DEVICE_ID,
+        HEADER_PRINCIPAL,
     };
 
     fn unique_temp_journal_path() -> PathBuf {
@@ -2572,9 +3210,12 @@ mod tests {
 
     fn build_test_runtime_state(hash_chain_enabled: bool) -> std::sync::Arc<GatewayRuntimeState> {
         let db_path = unique_temp_journal_path();
-        let journal_store =
-            JournalStore::open(JournalConfig { db_path: db_path.clone(), hash_chain_enabled })
-                .expect("journal store should initialize");
+        let journal_store = JournalStore::open(JournalConfig {
+            db_path: db_path.clone(),
+            hash_chain_enabled,
+            max_payload_bytes: 256 * 1024,
+        })
+        .expect("journal store should initialize");
         GatewayRuntimeState::new(
             GatewayRuntimeConfigSnapshot {
                 grpc_bind_addr: "127.0.0.1".to_owned(),
@@ -2585,6 +3226,8 @@ mod tests {
                 orchestrator_runloop_v1_enabled: true,
                 node_rpc_mtls_required: true,
                 admin_auth_required: true,
+                max_tape_entries_per_response: 1_000,
+                max_tape_bytes_per_response: 2 * 1024 * 1024,
                 tool_call: crate::tool_protocol::ToolCallConfig {
                     allowed_tools: vec!["palyra.echo".to_owned()],
                     max_calls_per_run: 4,
@@ -2735,6 +3378,145 @@ mod tests {
         assert!(
             snapshot.events[0].event_id.ends_with('2'),
             "recent events should be returned in descending order"
+        );
+    }
+
+    #[test]
+    fn approval_required_decision_is_denied_without_interactive_channel() {
+        let decision = crate::tool_protocol::ToolDecision {
+            allowed: true,
+            reason: "allowlisted by policy".to_owned(),
+            approval_required: true,
+            policy_enforced: true,
+        };
+        let enforced = apply_tool_approval_outcome(decision, "palyra.process.run", None);
+        assert!(!enforced.allowed, "allowed decisions must be denied until approval is granted");
+        assert!(
+            enforced.reason.contains("approval required"),
+            "denial reason should explain why execution was blocked"
+        );
+    }
+
+    #[test]
+    fn approval_required_decision_is_allowed_with_explicit_approval() {
+        let decision = crate::tool_protocol::ToolDecision {
+            allowed: true,
+            reason: "allowlisted by policy".to_owned(),
+            approval_required: true,
+            policy_enforced: true,
+        };
+        let approval = ToolApprovalOutcome { approved: true, reason: "allow_once".to_owned() };
+        let enforced = apply_tool_approval_outcome(decision, "palyra.process.run", Some(&approval));
+        assert!(enforced.allowed, "explicit approval should keep allow decisions allowed");
+        assert!(
+            enforced.reason.contains("explicit approval granted"),
+            "allow reason should preserve approval context"
+        );
+    }
+
+    #[test]
+    fn orchestrator_tape_snapshot_paginates_and_redacts_payloads() {
+        let state = build_test_runtime_state(false);
+        state
+            .journal_store
+            .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
+                session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned(),
+                session_key: "session:test".to_owned(),
+                session_label: Some("Test session".to_owned()),
+                principal: "user:ops".to_owned(),
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                channel: Some("cli".to_owned()),
+            })
+            .expect("orchestrator session should be upserted");
+        state
+            .journal_store
+            .start_orchestrator_run(&OrchestratorRunStartRequest {
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),
+                session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned(),
+            })
+            .expect("orchestrator run should start");
+        state
+            .journal_store
+            .append_orchestrator_tape_event(&OrchestratorTapeAppendRequest {
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),
+                seq: 0,
+                event_type: "status".to_owned(),
+                payload_json: r#"{"kind":"accepted"}"#.to_owned(),
+            })
+            .expect("first tape event should persist");
+        state
+            .journal_store
+            .append_orchestrator_tape_event(&OrchestratorTapeAppendRequest {
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),
+                seq: 1,
+                event_type: "tool_result".to_owned(),
+                payload_json: r#"{"token":"secret-value","ok":true}"#.to_owned(),
+            })
+            .expect("second tape event should persist");
+
+        let first_page = state
+            .orchestrator_tape_snapshot_blocking("01ARZ3NDEKTSV4RRFFQ69G5FAX", None, Some(1))
+            .expect("first tape page should succeed");
+        assert_eq!(first_page.events.len(), 1);
+        assert_eq!(first_page.events[0].seq, 0);
+        assert_eq!(first_page.next_after_seq, Some(0));
+
+        let second_page = state
+            .orchestrator_tape_snapshot_blocking(
+                "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+                first_page.next_after_seq,
+                Some(2),
+            )
+            .expect("second tape page should succeed");
+        assert_eq!(second_page.events.len(), 1);
+        assert_eq!(second_page.events[0].seq, 1);
+        assert!(
+            !second_page.events[0].payload_json.contains("secret-value"),
+            "tape snapshots must redact sensitive token values"
+        );
+        assert!(
+            second_page.events[0].payload_json.contains("<redacted>"),
+            "redacted marker should be present in tape payloads"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn model_token_tape_compaction_stub_emits_marker_event() {
+        let state = build_test_runtime_state(false);
+        state
+            .journal_store
+            .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
+                session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned(),
+                session_key: "session:test".to_owned(),
+                session_label: Some("Test session".to_owned()),
+                principal: "user:ops".to_owned(),
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                channel: Some("cli".to_owned()),
+            })
+            .expect("orchestrator session should be upserted");
+        state
+            .journal_store
+            .start_orchestrator_run(&OrchestratorRunStartRequest {
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),
+                session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned(),
+            })
+            .expect("orchestrator run should start");
+
+        let mut tape_seq = 0_i64;
+        super::compact_model_token_tape_stub(&state, "01ARZ3NDEKTSV4RRFFQ69G5FAX", &mut tape_seq)
+            .await
+            .expect("compaction stub should append marker tape event");
+        assert_eq!(tape_seq, 1);
+
+        let tape = state
+            .journal_store
+            .orchestrator_tape("01ARZ3NDEKTSV4RRFFQ69G5FAX")
+            .expect("orchestrator tape should be queryable");
+        assert_eq!(tape.len(), 1);
+        assert_eq!(tape[0].event_type, "model_token_compaction");
+        assert!(
+            tape[0].payload_json.contains("token_cap_reached"),
+            "marker payload should describe compaction trigger"
         );
     }
 }

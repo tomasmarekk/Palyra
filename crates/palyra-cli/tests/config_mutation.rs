@@ -103,6 +103,101 @@ fn config_set_get_unset_roundtrip_and_rotates_backups() -> Result<()> {
 }
 
 #[test]
+fn config_get_redacts_secret_values_by_default() -> Result<()> {
+    let workdir = TempDir::new().context("failed to create temporary workdir")?;
+    let config_path = workdir.path().join("palyra.toml");
+    fs::write(&config_path, "version = 1\n[admin]\nauth_token = \"super-secret-token\"\n")
+        .with_context(|| format!("failed to write {}", config_path.display()))?;
+
+    let config_path_string = config_path.to_string_lossy().into_owned();
+    let redacted_output = run_cli(
+        &workdir,
+        &["config", "get", "--path", &config_path_string, "--key", "admin.auth_token"],
+    )?;
+    assert!(redacted_output.status.success(), "config get should succeed");
+    let redacted_stdout =
+        String::from_utf8(redacted_output.stdout).context("stdout was not UTF-8")?;
+    assert!(
+        redacted_stdout.contains("value=\"<redacted>\""),
+        "secret config value must be redacted by default: {redacted_stdout}"
+    );
+    assert!(
+        !redacted_stdout.contains("super-secret-token"),
+        "raw secret value must not be printed by default: {redacted_stdout}"
+    );
+
+    let unredacted_output = run_cli(
+        &workdir,
+        &[
+            "config",
+            "get",
+            "--path",
+            &config_path_string,
+            "--key",
+            "admin.auth_token",
+            "--show-secrets",
+        ],
+    )?;
+    assert!(unredacted_output.status.success(), "config get --show-secrets should succeed");
+    let unredacted_stdout =
+        String::from_utf8(unredacted_output.stdout).context("stdout was not UTF-8")?;
+    assert!(
+        unredacted_stdout.contains("value=\"super-secret-token\""),
+        "show-secrets should print the actual value: {unredacted_stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn config_list_redacts_secret_paths_unless_show_secrets_is_used() -> Result<()> {
+    let workdir = TempDir::new().context("failed to create temporary workdir")?;
+    let config_path = workdir.path().join("palyra.toml");
+    fs::write(
+        &config_path,
+        r#"version = 1
+[admin]
+auth_token = "super-secret-token"
+[model_provider]
+kind = "openai"
+openai_api_key = "sk-test-secret"
+openai_model = "gpt-4o-mini"
+"#,
+    )
+    .with_context(|| format!("failed to write {}", config_path.display()))?;
+
+    let config_path_string = config_path.to_string_lossy().into_owned();
+    let redacted_output = run_cli(&workdir, &["config", "list", "--path", &config_path_string])?;
+    assert!(redacted_output.status.success(), "config list should succeed");
+    let redacted_stdout =
+        String::from_utf8(redacted_output.stdout).context("stdout was not UTF-8")?;
+    assert!(
+        redacted_stdout.contains("auth_token = \"<redacted>\""),
+        "auth token should be redacted in list output: {redacted_stdout}"
+    );
+    assert!(
+        redacted_stdout.contains("openai_api_key = \"<redacted>\""),
+        "openai api key should be redacted in list output: {redacted_stdout}"
+    );
+    assert!(
+        !redacted_stdout.contains("super-secret-token")
+            && !redacted_stdout.contains("sk-test-secret"),
+        "raw secrets must not appear in redacted list output: {redacted_stdout}"
+    );
+
+    let unredacted_output =
+        run_cli(&workdir, &["config", "list", "--path", &config_path_string, "--show-secrets"])?;
+    assert!(unredacted_output.status.success(), "config list --show-secrets should succeed");
+    let unredacted_stdout =
+        String::from_utf8(unredacted_output.stdout).context("stdout was not UTF-8")?;
+    assert!(
+        unredacted_stdout.contains("auth_token = \"super-secret-token\"")
+            && unredacted_stdout.contains("openai_api_key = \"sk-test-secret\""),
+        "show-secrets should preserve secret values: {unredacted_stdout}"
+    );
+    Ok(())
+}
+
+#[test]
 fn config_set_rejects_prototype_pollution_key_path() -> Result<()> {
     let workdir = TempDir::new().context("failed to create temporary workdir")?;
     let config_path = workdir.path().join("palyra.toml");

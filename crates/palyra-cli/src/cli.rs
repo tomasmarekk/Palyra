@@ -149,6 +149,20 @@ pub enum AgentCommand {
         )]
         ndjson_stdin: bool,
     },
+    Acp {
+        #[arg(long)]
+        grpc_url: Option<String>,
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long, default_value = "user:local")]
+        principal: String,
+        #[arg(long, default_value = "01ARZ3NDEKTSV4RRFFQ69G5FAV")]
+        device_id: String,
+        #[arg(long, default_value = "cli")]
+        channel: String,
+        #[arg(long, default_value_t = false)]
+        allow_sensitive_tools: bool,
+    },
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
@@ -275,6 +289,10 @@ pub enum DaemonCommand {
         channel: Option<String>,
         #[arg(long)]
         run_id: String,
+        #[arg(long)]
+        after_seq: Option<i64>,
+        #[arg(long)]
+        limit: Option<usize>,
     },
     RunCancel {
         #[arg(long)]
@@ -321,11 +339,19 @@ pub enum ConfigCommand {
         #[arg(long)]
         path: Option<String>,
     },
+    List {
+        #[arg(long)]
+        path: Option<String>,
+        #[arg(long, default_value_t = false)]
+        show_secrets: bool,
+    },
     Get {
         #[arg(long)]
         path: Option<String>,
         #[arg(long)]
         key: String,
+        #[arg(long, default_value_t = false)]
+        show_secrets: bool,
     },
     Set {
         #[arg(long)]
@@ -555,6 +581,24 @@ mod tests {
                     prompt_stdin: false,
                     allow_sensitive_tools: false,
                     ndjson_stdin: true,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn parse_agent_acp_with_defaults() {
+        let parsed = Cli::parse_from(["palyra", "agent", "acp"]);
+        assert_eq!(
+            parsed.command,
+            Command::Agent {
+                command: AgentCommand::Acp {
+                    grpc_url: None,
+                    token: None,
+                    principal: "user:local".to_owned(),
+                    device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                    channel: "cli".to_owned(),
+                    allow_sensitive_tools: false,
                 }
             }
         );
@@ -910,6 +954,52 @@ mod tests {
                 command: ConfigCommand::Get {
                     path: Some("custom.toml".to_owned()),
                     key: "daemon.port".to_owned(),
+                    show_secrets: false,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn parse_config_get_with_show_secrets() {
+        let parsed = Cli::parse_from([
+            "palyra",
+            "config",
+            "get",
+            "--path",
+            "custom.toml",
+            "--key",
+            "admin.auth_token",
+            "--show-secrets",
+        ]);
+        assert_eq!(
+            parsed.command,
+            Command::Config {
+                command: ConfigCommand::Get {
+                    path: Some("custom.toml".to_owned()),
+                    key: "admin.auth_token".to_owned(),
+                    show_secrets: true,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn parse_config_list_with_show_secrets() {
+        let parsed = Cli::parse_from([
+            "palyra",
+            "config",
+            "list",
+            "--path",
+            "custom.toml",
+            "--show-secrets",
+        ]);
+        assert_eq!(
+            parsed.command,
+            Command::Config {
+                command: ConfigCommand::List {
+                    path: Some("custom.toml".to_owned()),
+                    show_secrets: true,
                 }
             }
         );

@@ -1,4 +1,56 @@
 use serde::Deserialize;
+use toml::Value;
+
+const REDACTED_CONFIG_VALUE: &str = "<redacted>";
+
+pub const SECRET_CONFIG_PATHS: &[&str] =
+    &["admin.auth_token", "model_provider.openai_api_key", "gateway.admin_token"];
+
+#[must_use]
+pub fn is_secret_config_path(path: &str) -> bool {
+    let normalized = normalize_config_path(path);
+    SECRET_CONFIG_PATHS.iter().any(|candidate| *candidate == normalized)
+}
+
+pub fn redact_secret_config_values(document: &mut Value) {
+    for secret_path in SECRET_CONFIG_PATHS {
+        redact_config_path(document, secret_path);
+    }
+}
+
+fn redact_config_path(document: &mut Value, path: &str) {
+    let mut segments = path.split('.').peekable();
+    let mut cursor = document;
+    while let Some(segment) = segments.next() {
+        let Some(table) = cursor.as_table_mut() else {
+            return;
+        };
+        if segments.peek().is_none() {
+            if table.contains_key(segment) {
+                table.insert(segment.to_owned(), Value::String(REDACTED_CONFIG_VALUE.to_owned()));
+            }
+            return;
+        }
+        let Some(next) = table.get_mut(segment) else {
+            return;
+        };
+        cursor = next;
+    }
+}
+
+fn normalize_config_path(path: &str) -> String {
+    path.split('.')
+        .filter_map(|segment| {
+            let trimmed = segment.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_ascii_lowercase())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -29,6 +81,20 @@ pub struct FileGatewayConfig {
     pub quic_bind_addr: Option<String>,
     pub quic_port: Option<u16>,
     pub quic_enabled: Option<bool>,
+    pub allow_insecure_remote: Option<bool>,
+    pub identity_store_dir: Option<String>,
+    pub max_tape_entries_per_response: Option<u64>,
+    pub max_tape_bytes_per_response: Option<u64>,
+    pub tls: Option<FileGatewayTlsConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileGatewayTlsConfig {
+    pub enabled: Option<bool>,
+    pub cert_path: Option<String>,
+    pub key_path: Option<String>,
+    pub client_ca_path: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -106,4 +172,49 @@ pub struct FileIdentityConfig {
 pub struct FileStorageConfig {
     pub journal_db_path: Option<String>,
     pub journal_hash_chain_enabled: Option<bool>,
+    pub max_journal_payload_bytes: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_secret_config_path, redact_secret_config_values};
+
+    #[test]
+    fn secret_config_path_matching_is_case_insensitive() {
+        assert!(is_secret_config_path("model_provider.openai_api_key"));
+        assert!(is_secret_config_path("model_provider.OPENAI_API_KEY"));
+        assert!(is_secret_config_path(" admin.auth_token "));
+        assert!(!is_secret_config_path("daemon.port"));
+    }
+
+    #[test]
+    fn redaction_replaces_known_secret_fields() {
+        let mut document: toml::Value = toml::from_str(
+            r#"
+            version = 1
+            [admin]
+            auth_token = "token-value"
+            [model_provider]
+            openai_api_key = "sk-secret"
+            "#,
+        )
+        .expect("config document should parse");
+
+        redact_secret_config_values(&mut document);
+
+        assert_eq!(
+            document
+                .get("admin")
+                .and_then(|admin| admin.get("auth_token"))
+                .and_then(toml::Value::as_str),
+            Some("<redacted>")
+        );
+        assert_eq!(
+            document
+                .get("model_provider")
+                .and_then(|provider| provider.get("openai_api_key"))
+                .and_then(toml::Value::as_str),
+            Some("<redacted>")
+        );
+    }
 }

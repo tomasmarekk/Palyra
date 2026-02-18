@@ -2,12 +2,13 @@ mod config;
 mod gateway;
 mod journal;
 mod model_provider;
+mod node_rpc;
 mod orchestrator;
 mod sandbox_runner;
 mod tool_protocol;
 mod wasm_plugin_runner;
 
-use std::time::Instant;
+use std::{collections::HashSet, net::SocketAddr, path::PathBuf, time::Instant};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -27,16 +28,17 @@ use journal::{
     JournalConfig, JournalStore, OrchestratorCancelRequest, OrchestratorRunStatusSnapshot,
 };
 use model_provider::build_model_provider;
+use palyra_common::default_identity_store_root;
 use palyra_common::{
     build_metadata, health_response, parse_daemon_bind_socket, validate_canonical_id,
     HealthResponse,
 };
 use palyra_identity::IdentityManager;
-#[cfg(not(windows))]
-use palyra_identity::{default_identity_storage_path, FilesystemSecretStore, SecretStore};
+use palyra_identity::{FilesystemSecretStore, SecretStore};
+use palyra_policy::{evaluate_with_config, PolicyDecision, PolicyEvaluationConfig, PolicyRequest};
 use serde::{Deserialize, Serialize};
 use tokio_stream::wrappers::TcpListenerStream;
-use tonic::transport::Server;
+use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -73,8 +75,41 @@ struct JournalRecentQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct RunTapeQuery {
+    after_seq: Option<i64>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
 struct RunCancelRequest {
     reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PolicyExplainQuery {
+    principal: String,
+    action: String,
+    resource: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PolicyExplainResponse {
+    principal: String,
+    action: String,
+    resource: String,
+    decision: String,
+    approval_required: bool,
+    reason: String,
+    matched_policies: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct IdentityRuntime {
+    store_root: PathBuf,
+    revoked_certificate_count: usize,
+    revoked_certificate_fingerprints: HashSet<String>,
+    gateway_ca_certificate_pem: String,
+    node_server_certificate: palyra_identity::IssuedCertificate,
 }
 
 #[tokio::main]
@@ -99,8 +134,8 @@ async fn main() -> Result<()> {
         loaded.source.push_str(" +cli(--grpc-port)");
     }
 
-    let (identity_store_root, revoked_certificates) =
-        load_identity_runtime().context("failed to initialize gateway identity runtime")?;
+    let identity_runtime = load_identity_runtime(loaded.gateway.identity_store_dir.clone())
+        .context("failed to initialize gateway identity runtime")?;
     let auth = GatewayAuthConfig {
         require_auth: loaded.admin.require_auth,
         admin_token: loaded.admin.auth_token.clone(),
@@ -108,6 +143,7 @@ async fn main() -> Result<()> {
     let journal_store = JournalStore::open(JournalConfig {
         db_path: loaded.storage.journal_db_path.clone(),
         hash_chain_enabled: loaded.storage.journal_hash_chain_enabled,
+        max_payload_bytes: loaded.storage.max_journal_payload_bytes,
     })
     .context("failed to initialize event journal storage")?;
     let model_provider = build_model_provider(&loaded.model_provider)
@@ -122,6 +158,8 @@ async fn main() -> Result<()> {
             orchestrator_runloop_v1_enabled: loaded.orchestrator.runloop_v1_enabled,
             node_rpc_mtls_required: !loaded.identity.allow_insecure_node_rpc_without_mtls,
             admin_auth_required: loaded.admin.require_auth,
+            max_tape_entries_per_response: loaded.gateway.max_tape_entries_per_response,
+            max_tape_bytes_per_response: loaded.gateway.max_tape_bytes_per_response,
             tool_call: tool_protocol::ToolCallConfig {
                 allowed_tools: loaded.tool_call.allowed_tools.clone(),
                 max_calls_per_run: loaded.tool_call.max_calls_per_run,
@@ -171,7 +209,7 @@ async fn main() -> Result<()> {
             hash_chain_enabled: loaded.storage.journal_hash_chain_enabled,
         },
         journal_store,
-        revoked_certificates,
+        identity_runtime.revoked_certificate_count,
         model_provider,
     )
     .context("failed to initialize gateway runtime state")?;
@@ -206,6 +244,14 @@ async fn main() -> Result<()> {
         quic_bind_addr = %loaded.gateway.quic_bind_addr,
         quic_port = loaded.gateway.quic_port,
         quic_enabled = loaded.gateway.quic_enabled,
+        allow_insecure_remote = loaded.gateway.allow_insecure_remote,
+        gateway_identity_store_dir = ?loaded.gateway.identity_store_dir.as_ref().map(|path| path.display().to_string()),
+        gateway_max_tape_entries_per_response = loaded.gateway.max_tape_entries_per_response,
+        gateway_max_tape_bytes_per_response = loaded.gateway.max_tape_bytes_per_response,
+        gateway_tls_enabled = loaded.gateway.tls.enabled,
+        gateway_tls_cert_path = ?loaded.gateway.tls.cert_path.as_ref().map(|path| path.display().to_string()),
+        gateway_tls_key_path = ?loaded.gateway.tls.key_path.as_ref().map(|path| path.display().to_string()),
+        gateway_tls_client_ca_path = ?loaded.gateway.tls.client_ca_path.as_ref().map(|path| path.display().to_string()),
         orchestrator_runloop_v1_enabled = loaded.orchestrator.runloop_v1_enabled,
         model_provider_kind = loaded.model_provider.kind.as_str(),
         model_provider_openai_base_url = %loaded.model_provider.openai_base_url,
@@ -237,8 +283,9 @@ async fn main() -> Result<()> {
         node_rpc_mtls_required = !loaded.identity.allow_insecure_node_rpc_without_mtls,
         journal_db_path = %loaded.storage.journal_db_path.display(),
         journal_hash_chain_enabled = loaded.storage.journal_hash_chain_enabled,
-        identity_store_root = %identity_store_root.display(),
-        revoked_certificate_count = revoked_certificates,
+        journal_max_payload_bytes = loaded.storage.max_journal_payload_bytes,
+        identity_store_root = %identity_runtime.store_root.display(),
+        revoked_certificate_count = identity_runtime.revoked_certificate_count,
         "gateway startup"
     );
 
@@ -248,6 +295,7 @@ async fn main() -> Result<()> {
         .route("/healthz", get(health_handler))
         .route("/admin/v1/status", get(admin_status_handler))
         .route("/admin/v1/journal/recent", get(admin_journal_recent_handler))
+        .route("/admin/v1/policy/explain", get(admin_policy_explain_handler))
         .route("/admin/v1/runs/{run_id}", get(admin_run_status_handler))
         .route("/admin/v1/runs/{run_id}/tape", get(admin_run_tape_handler))
         .route("/admin/v1/runs/{run_id}/cancel", post(admin_run_cancel_handler))
@@ -258,6 +306,7 @@ async fn main() -> Result<()> {
     let grpc_address =
         parse_daemon_bind_socket(&loaded.gateway.grpc_bind_addr, loaded.gateway.grpc_port)
             .context("invalid gRPC bind address or port")?;
+    enforce_remote_bind_guard(admin_address, grpc_address, loaded.gateway.allow_insecure_remote)?;
 
     let admin_listener = tokio::net::TcpListener::bind(admin_address)
         .await
@@ -269,9 +318,24 @@ async fn main() -> Result<()> {
         .context("failed to bind palyrad gRPC listener")?;
     let grpc_bound =
         grpc_listener.local_addr().context("failed to resolve palyrad gRPC listen address")?;
+    let node_rpc_port =
+        if loaded.gateway.grpc_port == 0 { 0 } else { loaded.gateway.grpc_port.saturating_add(1) };
+    let node_rpc_address = parse_daemon_bind_socket(&loaded.gateway.grpc_bind_addr, node_rpc_port)
+        .context("invalid node RPC bind address or port")?;
+    let node_rpc_listener = tokio::net::TcpListener::bind(node_rpc_address)
+        .await
+        .context("failed to bind palyrad node RPC listener")?;
+    let node_rpc_bound = node_rpc_listener
+        .local_addr()
+        .context("failed to resolve palyrad node RPC listen address")?;
 
     info!(listen_addr = %admin_bound, "daemon listening");
     info!(grpc_listen_addr = %grpc_bound, "gateway gRPC listening");
+    info!(
+        node_rpc_listen_addr = %node_rpc_bound,
+        node_rpc_mtls_required = !loaded.identity.allow_insecure_node_rpc_without_mtls,
+        "node RPC listener initialized"
+    );
     if loaded.gateway.quic_enabled {
         info!(
             quic_bind_addr = %loaded.gateway.quic_bind_addr,
@@ -285,6 +349,26 @@ async fn main() -> Result<()> {
         gateway::proto::palyra::gateway::v1::gateway_service_server::GatewayServiceServer::new(
             gateway_service,
         );
+    let node_rpc_service = node_rpc::NodeRpcServiceImpl::new(
+        identity_runtime.revoked_certificate_fingerprints.clone(),
+    );
+    let node_rpc_server =
+        gateway::proto::palyra::node::v1::node_service_server::NodeServiceServer::new(
+            node_rpc_service,
+        );
+    let mut grpc_server_builder = Server::builder();
+    if loaded.gateway.tls.enabled {
+        grpc_server_builder = grpc_server_builder
+            .tls_config(build_gateway_tls_config(&loaded.gateway.tls)?)
+            .context("failed to apply gRPC TLS configuration")?;
+    }
+    let mut node_rpc_server_builder = Server::builder();
+    node_rpc_server_builder = node_rpc_server_builder
+        .tls_config(build_node_rpc_tls_config(
+            &identity_runtime,
+            !loaded.identity.allow_insecure_node_rpc_without_mtls,
+        ))
+        .context("failed to apply node RPC TLS configuration")?;
 
     tokio::try_join!(
         async move {
@@ -294,7 +378,7 @@ async fn main() -> Result<()> {
                 .context("palyrad admin server failed")
         },
         async move {
-            Server::builder()
+            grpc_server_builder
                 .add_service(grpc_server)
                 .serve_with_incoming_shutdown(
                     TcpListenerStream::new(grpc_listener),
@@ -302,6 +386,16 @@ async fn main() -> Result<()> {
                 )
                 .await
                 .context("palyrad gRPC server failed")
+        },
+        async move {
+            node_rpc_server_builder
+                .add_service(node_rpc_server)
+                .serve_with_incoming_shutdown(
+                    TcpListenerStream::new(node_rpc_listener),
+                    shutdown_signal(),
+                )
+                .await
+                .context("palyrad node RPC server failed")
         },
     )?;
 
@@ -358,6 +452,48 @@ async fn admin_journal_recent_handler(
     Ok(Json(snapshot))
 }
 
+async fn admin_policy_explain_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<PolicyExplainQuery>,
+) -> Result<Json<PolicyExplainResponse>, Response> {
+    authorize_headers(&headers, &state.auth).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    let _context = request_context_from_headers(&headers).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    state.runtime.record_admin_status_request();
+
+    let request = PolicyRequest {
+        principal: query.principal,
+        action: query.action,
+        resource: query.resource,
+    };
+    let evaluation =
+        evaluate_with_config(&request, &PolicyEvaluationConfig::default()).map_err(|error| {
+            runtime_status_response(tonic::Status::internal(format!(
+                "failed to evaluate policy with Cedar engine: {error}"
+            )))
+        })?;
+    let (decision, approval_required, reason) = match evaluation.decision {
+        PolicyDecision::Allow => ("allow".to_owned(), false, evaluation.explanation.reason),
+        PolicyDecision::DenyByDefault { reason } => ("deny_by_default".to_owned(), true, reason),
+    };
+
+    Ok(Json(PolicyExplainResponse {
+        principal: request.principal,
+        action: request.action,
+        resource: request.resource,
+        decision,
+        approval_required,
+        reason,
+        matched_policies: evaluation.explanation.matched_policy_ids,
+    }))
+}
+
 async fn admin_run_status_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -392,6 +528,7 @@ async fn admin_run_tape_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(run_id): Path<String>,
+    Query(query): Query<RunTapeQuery>,
 ) -> Result<Json<gateway::RunTapeSnapshot>, Response> {
     authorize_headers(&headers, &state.auth).map_err(|error| {
         state.runtime.record_denied();
@@ -405,8 +542,11 @@ async fn admin_run_tape_handler(
         runtime_status_response(tonic::Status::invalid_argument("run_id must be a canonical ULID"))
     })?;
     state.runtime.record_admin_status_request();
-    let snapshot =
-        state.runtime.orchestrator_tape_snapshot(run_id).await.map_err(runtime_status_response)?;
+    let snapshot = state
+        .runtime
+        .orchestrator_tape_snapshot(run_id, query.after_seq, query.limit)
+        .await
+        .map_err(runtime_status_response)?;
     Ok(Json(snapshot))
 }
 
@@ -464,33 +604,123 @@ fn runtime_status_response(status: tonic::Status) -> Response {
         tonic::Code::InvalidArgument => StatusCode::BAD_REQUEST,
         tonic::Code::FailedPrecondition => StatusCode::PRECONDITION_FAILED,
         tonic::Code::NotFound => StatusCode::NOT_FOUND,
+        tonic::Code::ResourceExhausted => StatusCode::PAYLOAD_TOO_LARGE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (http_status, Json(ErrorBody { error: status.message().to_owned() })).into_response()
 }
 
-fn load_identity_runtime() -> Result<(std::path::PathBuf, usize)> {
-    #[cfg(windows)]
-    {
-        let manager = IdentityManager::with_memory_store()
-            .context("failed to initialize in-memory identity runtime")?;
-        tracing::warn!(
-            "filesystem identity store is unavailable on windows; using in-memory identity runtime"
+fn load_identity_runtime(configured_store_root: Option<PathBuf>) -> Result<IdentityRuntime> {
+    let store_root = if let Some(configured_store_root) = configured_store_root {
+        configured_store_root
+    } else {
+        default_identity_store_root().context("failed to resolve default identity store path")?
+    };
+    let store = FilesystemSecretStore::new(&store_root).with_context(|| {
+        format!("failed to initialize identity store at {}", store_root.display())
+    })?;
+    let store: std::sync::Arc<dyn SecretStore> = std::sync::Arc::new(store);
+    let mut manager =
+        IdentityManager::with_store(store).context("failed to initialize identity manager")?;
+    let revoked_certificate_fingerprints = manager.revoked_certificate_fingerprints();
+    let gateway_ca_certificate_pem = manager.gateway_ca_certificate_pem();
+    let node_server_certificate = manager
+        .issue_gateway_server_certificate("palyrad-node-rpc")
+        .context("failed to issue node RPC gateway certificate")?;
+    Ok(IdentityRuntime {
+        store_root,
+        revoked_certificate_count: revoked_certificate_fingerprints.len(),
+        revoked_certificate_fingerprints,
+        gateway_ca_certificate_pem,
+        node_server_certificate,
+    })
+}
+
+fn build_gateway_tls_config(tls: &config::GatewayTlsConfig) -> Result<ServerTlsConfig> {
+    let cert_path =
+        tls.cert_path.as_ref().context("gateway TLS enabled but cert path is missing")?;
+    let key_path = tls.key_path.as_ref().context("gateway TLS enabled but key path is missing")?;
+    let cert_pem = std::fs::read(cert_path)
+        .with_context(|| format!("failed to read gateway TLS cert {}", cert_path.display()))?;
+    let key_pem = std::fs::read(key_path)
+        .with_context(|| format!("failed to read gateway TLS key {}", key_path.display()))?;
+
+    let mut tls_config = ServerTlsConfig::new().identity(Identity::from_pem(cert_pem, key_pem));
+    if let Some(client_ca_path) = tls.client_ca_path.as_ref() {
+        let client_ca_pem = std::fs::read(client_ca_path).with_context(|| {
+            format!("failed to read gateway TLS client CA {}", client_ca_path.display())
+        })?;
+        tls_config = tls_config.client_ca_root(Certificate::from_pem(client_ca_pem));
+    }
+    Ok(tls_config)
+}
+
+fn build_node_rpc_tls_config(
+    identity_runtime: &IdentityRuntime,
+    mtls_required: bool,
+) -> ServerTlsConfig {
+    let mut tls_config = ServerTlsConfig::new().identity(Identity::from_pem(
+        identity_runtime.node_server_certificate.certificate_pem.clone(),
+        identity_runtime.node_server_certificate.private_key_pem.clone(),
+    ));
+    if mtls_required {
+        tls_config = tls_config.client_ca_root(Certificate::from_pem(
+            identity_runtime.gateway_ca_certificate_pem.clone(),
+        ));
+    }
+    tls_config
+}
+
+fn enforce_remote_bind_guard(
+    admin_address: SocketAddr,
+    grpc_address: SocketAddr,
+    allow_insecure_remote: bool,
+) -> Result<()> {
+    let admin_remote = !admin_address.ip().is_loopback();
+    let grpc_remote = !grpc_address.ip().is_loopback();
+    if (admin_remote || grpc_remote) && !allow_insecure_remote {
+        anyhow::bail!(
+            "refusing non-loopback bind without explicit insecure opt-in: admin={} grpc={} (set gateway.allow_insecure_remote=true or PALYRA_GATEWAY_ALLOW_INSECURE_REMOTE=true to override)",
+            admin_address,
+            grpc_address
         );
-        Ok((std::path::PathBuf::from("<memory>"), manager.revoked_certificate_fingerprints().len()))
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::enforce_remote_bind_guard;
+
+    #[test]
+    fn remote_bind_guard_allows_loopback_without_opt_in() {
+        let result = enforce_remote_bind_guard(
+            "127.0.0.1:7142".parse().expect("loopback endpoint should parse"),
+            "127.0.0.1:7443".parse().expect("loopback endpoint should parse"),
+            false,
+        );
+        assert!(result.is_ok(), "loopback bind should not require insecure opt-in");
     }
 
-    #[cfg(not(windows))]
-    {
-        let cwd = std::env::current_dir().context("failed to resolve current working directory")?;
-        let store_root = default_identity_storage_path(&cwd);
-        let store = FilesystemSecretStore::new(&store_root).with_context(|| {
-            format!("failed to initialize identity store at {}", store_root.display())
-        })?;
-        let store: std::sync::Arc<dyn SecretStore> = std::sync::Arc::new(store);
-        let manager =
-            IdentityManager::with_store(store).context("failed to initialize identity manager")?;
-        Ok((store_root, manager.revoked_certificate_fingerprints().len()))
+    #[test]
+    fn remote_bind_guard_rejects_non_loopback_without_opt_in() {
+        let result = enforce_remote_bind_guard(
+            "0.0.0.0:7142".parse().expect("remote endpoint should parse"),
+            "127.0.0.1:7443".parse().expect("loopback endpoint should parse"),
+            false,
+        );
+        assert!(result.is_err(), "non-loopback bind should require explicit opt-in");
+    }
+
+    #[test]
+    fn remote_bind_guard_allows_non_loopback_with_explicit_opt_in() {
+        let result = enforce_remote_bind_guard(
+            "0.0.0.0:7142".parse().expect("remote endpoint should parse"),
+            "0.0.0.0:7443".parse().expect("remote endpoint should parse"),
+            true,
+        );
+        assert!(result.is_ok(), "explicit insecure opt-in should bypass the remote bind guard");
     }
 }
 

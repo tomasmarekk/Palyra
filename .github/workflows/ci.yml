@@ -43,6 +43,9 @@ jobs:
       - name: Enforce pinned GitHub Actions
         run: bash scripts/check-gh-actions-pinned.sh
 
+      - name: Guard vendored artifacts
+        run: bash scripts/check-no-vendored-artifacts.sh
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7
         with:

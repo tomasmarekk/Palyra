@@ -12,17 +12,17 @@
   {
     "seq": 2,
     "event_type": "model_token",
-    "payload_json": "{\"is_final\":false,\"token\":\"alpha\"}"
+    "payload_json": "{\"is_final\":false,\"token\":\"<redacted>\"}"
   },
   {
     "seq": 3,
     "event_type": "model_token",
-    "payload_json": "{\"is_final\":false,\"token\":\"beta\"}"
+    "payload_json": "{\"is_final\":false,\"token\":\"<redacted>\"}"
   },
   {
     "seq": 4,
     "event_type": "model_token",
-    "payload_json": "{\"is_final\":true,\"token\":\"gamma\"}"
+    "payload_json": "{\"is_final\":true,\"token\":\"<redacted>\"}"
   },
   {
     "seq": 5,

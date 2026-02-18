@@ -19,13 +19,16 @@ version = "0.1.0"
 rust-version = "1.90"
 
 [workspace.dependencies]
+agent-client-protocol = { version = "0.9.4", features = ["unstable_session_list"] }
 anyhow = "1.0.96"
+async-trait = "0.1.89"
 axum = "0.8.1"
 base64 = "0.22.1"
 clap = { version = "4.5.31", features = ["derive"] }
 clap_complete = "4.5.31"
 criterion = "0.5.1"
 ed25519-dalek = { version = "2.1.1", features = ["rand_core"] }
+futures = "0.3.31"
 hex = "0.4.3"
 hkdf = "0.12.4"
 proptest = "1.6.0"
@@ -45,7 +48,7 @@ thiserror = "2.0.11"
 tokio = { version = "1.43.0", features = ["macros", "rt-multi-thread", "signal", "time"] }
 tokio-stream = { version = "0.1.17", features = ["net"] }
 tokio-rustls = { version = "0.26.1", default-features = false, features = ["logging", "ring", "tls12"] }
-tonic = { version = "0.12.3", features = ["transport"] }
+tonic = { version = "0.12.3", features = ["transport", "tls"] }
 tonic-build = "0.12.3"
 toml = "0.8.20"
 tracing = "0.1.41"

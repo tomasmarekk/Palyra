@@ -9,6 +9,9 @@ service GatewayService {
   rpc RunStream(stream palyra.common.v1.RunStreamRequest)
       returns (stream palyra.common.v1.RunStreamEvent);
   rpc AppendEvent(AppendEventRequest) returns (AppendEventResponse);
+  rpc AbortRun(AbortRunRequest) returns (AbortRunResponse);
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  rpc ResolveSession(ResolveSessionRequest) returns (ResolveSessionResponse);
 }
 
 message HealthRequest {
@@ -42,4 +45,68 @@ message AppendEventResponse {
   bool accepted = 3;
 
   reserved 4 to 10;
+}
+
+message AbortRunRequest {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId run_id = 2;
+  string reason = 3;
+
+  reserved 4 to 12;
+}
+
+message AbortRunResponse {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId run_id = 2;
+  bool cancel_requested = 3;
+  string reason = 4;
+
+  reserved 5 to 12;
+}
+
+message SessionSummary {
+  palyra.common.v1.CanonicalId session_id = 1;
+  string session_key = 2;
+  string session_label = 3;
+  int64 created_at_unix_ms = 4;
+  int64 updated_at_unix_ms = 5;
+  palyra.common.v1.CanonicalId last_run_id = 6;
+
+  reserved 7 to 16;
+}
+
+message ListSessionsRequest {
+  uint32 v = 1;
+  string after_session_key = 2;
+  uint32 limit = 3;
+
+  reserved 4 to 10;
+}
+
+message ListSessionsResponse {
+  uint32 v = 1;
+  repeated SessionSummary sessions = 2;
+  string next_after_session_key = 3;
+
+  reserved 4 to 10;
+}
+
+message ResolveSessionRequest {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId session_id = 2;
+  string session_key = 3;
+  string session_label = 4;
+  bool require_existing = 5;
+  bool reset_session = 6;
+
+  reserved 7 to 16;
+}
+
+message ResolveSessionResponse {
+  uint32 v = 1;
+  SessionSummary session = 2;
+  bool created = 3;
+  bool reset_applied = 4;
+
+  reserved 5 to 12;
 }

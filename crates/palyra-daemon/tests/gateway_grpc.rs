@@ -109,6 +109,113 @@ async fn grpc_gateway_enforces_auth_and_streams_status() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn grpc_resolve_session_and_list_sessions_roundtrip() -> Result<()> {
+    let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+
+    let mut resolve_request = tonic::Request::new(gateway_v1::ResolveSessionRequest {
+        v: 1,
+        session_id: None,
+        session_key: "agent:main:main".to_owned(),
+        session_label: "Main".to_owned(),
+        require_existing: false,
+        reset_session: false,
+    });
+    authorize_metadata(resolve_request.metadata_mut())?;
+    let resolved = client
+        .resolve_session(resolve_request)
+        .await
+        .context("failed to call ResolveSession")?
+        .into_inner();
+    assert!(resolved.created, "first resolve should create a session");
+    let summary = resolved.session.context("resolve response missing session summary")?;
+    assert_eq!(summary.session_key, "agent:main:main");
+    assert_eq!(summary.session_label, "Main");
+    assert!(summary.session_id.is_some(), "resolve response must include canonical session id");
+
+    let mut second_resolve_request = tonic::Request::new(gateway_v1::ResolveSessionRequest {
+        v: 1,
+        session_id: None,
+        session_key: "agent:main:main".to_owned(),
+        session_label: String::new(),
+        require_existing: true,
+        reset_session: false,
+    });
+    authorize_metadata(second_resolve_request.metadata_mut())?;
+    let second = client
+        .resolve_session(second_resolve_request)
+        .await
+        .context("failed to call ResolveSession for existing key")?
+        .into_inner();
+    assert!(!second.created, "existing session key should resolve without creating a new session");
+
+    let mut list_request = tonic::Request::new(gateway_v1::ListSessionsRequest {
+        v: 1,
+        after_session_key: String::new(),
+        limit: 10,
+    });
+    authorize_metadata(list_request.metadata_mut())?;
+    let listed = client
+        .list_sessions(list_request)
+        .await
+        .context("failed to call ListSessions")?
+        .into_inner();
+    assert!(
+        listed.sessions.iter().any(|session| session.session_key == "agent:main:main"),
+        "listed sessions must include resolved session key"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_abort_run_requests_cancellation() -> Result<()> {
+    let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+
+    let mut stream_request =
+        tonic::Request::new(tokio_stream::iter(vec![sample_run_stream_request_with_text(
+            "abort me later".to_owned(),
+        )]));
+    authorize_metadata(stream_request.metadata_mut())?;
+    let mut response_stream =
+        client.run_stream(stream_request).await.context("failed to call RunStream")?.into_inner();
+    while let Some(event) = response_stream.next().await {
+        let _ = event.context("failed to read RunStream event")?;
+    }
+
+    let mut abort_request = tonic::Request::new(gateway_v1::AbortRunRequest {
+        v: 1,
+        run_id: Some(common_v1::CanonicalId { ulid: RUN_ID.to_owned() }),
+        reason: "grpc_abort_requested".to_owned(),
+    });
+    authorize_metadata(abort_request.metadata_mut())?;
+    let aborted =
+        client.abort_run(abort_request).await.context("failed to call AbortRun")?.into_inner();
+    assert!(aborted.cancel_requested, "abort RPC should mark run as cancel requested");
+    assert_eq!(aborted.reason, "grpc_abort_requested");
+
+    let run_snapshot = admin_get_json_async(admin_port, format!("/admin/v1/runs/{RUN_ID}")).await?;
+    assert_eq!(
+        run_snapshot.get("cancel_requested").and_then(Value::as_bool),
+        Some(true),
+        "run snapshot should expose cancel_requested after AbortRun"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn grpc_gateway_run_stream_emits_at_most_sixteen_model_tokens() -> Result<()> {
     let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
     let mut daemon = ChildGuard::new(child);
@@ -746,8 +853,7 @@ async fn grpc_run_stream_blocks_sandbox_process_runner_non_allowlisted_egress_ho
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn grpc_run_stream_executes_wasm_plugin_runtime_with_allowlisted_capabilities() -> Result<()>
-{
+async fn grpc_run_stream_denies_wasm_plugin_runtime_without_approval_channel() -> Result<()> {
     let tool_arguments = serde_json::json!({
         "module_wat": r#"
             (module
@@ -801,29 +907,38 @@ async fn grpc_run_stream_executes_wasm_plugin_runtime_with_allowlisted_capabilit
     let mut response_stream =
         client.run_stream(stream_request).await.context("failed to call RunStream")?.into_inner();
 
-    let mut saw_allow_decision = false;
-    let mut saw_success_result = false;
-    let mut saw_wasm_attestation = false;
+    let mut saw_deny_decision = false;
+    let mut saw_failed_result = false;
+    let mut saw_policy_attestation = false;
     while let Some(event) = response_stream.next().await {
         let event = event.context("failed to read RunStream event")?;
         if let Some(body) = event.body {
             match body {
                 common_v1::run_stream_event::Body::ToolDecision(decision) => {
-                    if decision.kind == common_v1::tool_decision::DecisionKind::Allow as i32 {
-                        saw_allow_decision = true;
+                    if decision.kind == common_v1::tool_decision::DecisionKind::Deny as i32 {
+                        assert!(
+                            decision.approval_required,
+                            "sensitive wasm plugin tools must keep approval_required=true"
+                        );
+                        assert!(
+                            decision.reason.contains("approval required"),
+                            "decision reason should explain missing approval channel"
+                        );
+                        saw_deny_decision = true;
                     }
                 }
                 common_v1::run_stream_event::Body::ToolResult(result) => {
-                    if result.success {
-                        let output = serde_json::from_slice::<Value>(&result.output_json)
-                            .context("wasm plugin output_json should be valid JSON")?;
-                        assert_eq!(output.get("exit_code").and_then(Value::as_i64), Some(1));
-                        saw_success_result = true;
+                    if !result.success {
+                        assert!(
+                            result.error.contains("approval required"),
+                            "failed result should explain approval gating"
+                        );
+                        saw_failed_result = true;
                     }
                 }
                 common_v1::run_stream_event::Body::ToolAttestation(attestation) => {
-                    if attestation.executor == "sandbox_tier_a" {
-                        saw_wasm_attestation = true;
+                    if attestation.executor == "policy" {
+                        saw_policy_attestation = true;
                     }
                 }
                 _ => {}
@@ -831,9 +946,9 @@ async fn grpc_run_stream_executes_wasm_plugin_runtime_with_allowlisted_capabilit
         }
     }
 
-    assert!(saw_allow_decision, "wasm plugin tool call should be allowed by policy");
-    assert!(saw_success_result, "wasm plugin tool call should execute successfully");
-    assert!(saw_wasm_attestation, "wasm plugin tool call should emit sandbox attestation");
+    assert!(saw_deny_decision, "sensitive wasm plugin tool call must be denied without approval");
+    assert!(saw_failed_result, "denied wasm plugin tool call must return failed result");
+    assert!(saw_policy_attestation, "approval denial must emit policy attestation");
 
     let status_snapshot = admin_get_json_async(admin_port, "/admin/v1/status".to_owned()).await?;
     assert_eq!(
@@ -893,22 +1008,36 @@ async fn grpc_run_stream_blocks_wasm_plugin_runtime_non_allowlisted_capability()
     let mut response_stream =
         client.run_stream(stream_request).await.context("failed to call RunStream")?.into_inner();
 
+    let mut saw_deny_decision = false;
     let mut saw_failed_result = false;
+    let mut saw_policy_attestation = false;
     let mut saw_sandbox_attestation = false;
     while let Some(event) = response_stream.next().await {
         let event = event.context("failed to read RunStream event")?;
         if let Some(body) = event.body {
             match body {
+                common_v1::run_stream_event::Body::ToolDecision(decision) => {
+                    if decision.kind == common_v1::tool_decision::DecisionKind::Deny as i32 {
+                        assert!(
+                            decision.reason.contains("approval required"),
+                            "approval gating should run before wasm capability evaluation"
+                        );
+                        saw_deny_decision = true;
+                    }
+                }
                 common_v1::run_stream_event::Body::ToolResult(result) => {
                     if !result.success {
                         assert!(
-                            result.error.contains("capability denied"),
-                            "wasm runtime denial should include capability explain text"
+                            result.error.contains("approval required"),
+                            "denied result should explain missing approval"
                         );
                         saw_failed_result = true;
                     }
                 }
                 common_v1::run_stream_event::Body::ToolAttestation(attestation) => {
+                    if attestation.executor == "policy" {
+                        saw_policy_attestation = true;
+                    }
                     if attestation.executor == "sandbox_tier_a" {
                         saw_sandbox_attestation = true;
                     }
@@ -918,8 +1047,10 @@ async fn grpc_run_stream_blocks_wasm_plugin_runtime_non_allowlisted_capability()
         }
     }
 
-    assert!(saw_failed_result, "wasm capability denial must produce failed tool result");
-    assert!(saw_sandbox_attestation, "wasm capability denial must emit sandbox attestation");
+    assert!(saw_deny_decision, "sensitive wasm proposal must emit deny decision");
+    assert!(saw_failed_result, "denied wasm proposal must produce failed tool result");
+    assert!(saw_policy_attestation, "denied wasm proposal must emit policy attestation");
+    assert!(!saw_sandbox_attestation, "sandbox runtime must not execute when approval is missing");
 
     server_handle.join().expect("scripted openai server thread should exit");
     Ok(())
@@ -1468,6 +1599,11 @@ fn sample_run_stream_request_with_ids(
             ..Default::default()
         }),
         allow_sensitive_tools: false,
+        session_key: String::new(),
+        session_label: String::new(),
+        reset_session: false,
+        require_existing: false,
+        tool_approval_response: None,
     }
 }
 
@@ -1945,6 +2081,14 @@ fn sample_journal_event(event_id: &str, payload_json: &[u8]) -> common_v1::Journ
         hash: String::new(),
         prev_hash: String::new(),
     }
+}
+
+fn authorize_metadata(metadata: &mut tonic::metadata::MetadataMap) -> Result<()> {
+    metadata.insert("authorization", format!("Bearer {ADMIN_TOKEN}").parse()?);
+    metadata.insert("x-palyra-principal", "user:ops".parse()?);
+    metadata.insert("x-palyra-device-id", DEVICE_ID.parse()?);
+    metadata.insert("x-palyra-channel", "cli".parse()?);
+    Ok(())
 }
 
 fn authorized_append_event_request(
