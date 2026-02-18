@@ -153,6 +153,24 @@ impl PalyraAcpAgent {
         })
     }
 
+    fn format_resource_link_block(link: &acp::ResourceLink) -> Option<String> {
+        let uri = link.uri.trim();
+        if uri.is_empty() {
+            return None;
+        }
+        let label = link
+            .title
+            .as_deref()
+            .or(link.description.as_deref())
+            .unwrap_or(link.name.as_str())
+            .trim();
+        if label.is_empty() {
+            Some(format!("link: {uri}"))
+        } else {
+            Some(format!("link ({label}): {uri}"))
+        }
+    }
+
     fn prompt_text(prompt: &[acp::ContentBlock]) -> String {
         let mut chunks = Vec::new();
         for block in prompt {
@@ -171,6 +189,11 @@ impl PalyraAcpAgent {
                         if !trimmed.is_empty() {
                             chunks.push(trimmed.to_owned());
                         }
+                    }
+                }
+                acp::ContentBlock::ResourceLink(link) => {
+                    if let Some(serialized_link) = Self::format_resource_link_block(link) {
+                        chunks.push(serialized_link);
                     }
                 }
                 _ => {}
@@ -785,4 +808,60 @@ fn non_empty(value: Option<String>) -> Option<String> {
             Some(trimmed.to_owned())
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{acp, AgentConnection, BridgeState, ClientBridgeRequest, PalyraAcpAgent};
+    use std::{
+        path::PathBuf,
+        sync::{Arc, Mutex},
+    };
+    use tokio::sync::mpsc;
+
+    fn test_agent() -> PalyraAcpAgent {
+        let (client_request_tx, _client_request_rx) =
+            mpsc::unbounded_channel::<ClientBridgeRequest>();
+        PalyraAcpAgent::new(
+            AgentConnection {
+                grpc_url: "http://127.0.0.1:7443".to_owned(),
+                token: None,
+                principal: "user:test".to_owned(),
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                channel: "cli".to_owned(),
+            },
+            false,
+            Arc::new(Mutex::new(BridgeState::default())),
+            client_request_tx,
+            PathBuf::from("."),
+        )
+    }
+
+    #[test]
+    fn prompt_text_includes_resource_link_blocks() {
+        let prompt = vec![
+            acp::ContentBlock::from("Summarize the context"),
+            acp::ContentBlock::ResourceLink(
+                acp::ResourceLink::new("runbook", "https://example.test/runbook").title("Runbook"),
+            ),
+        ];
+
+        let prompt = PalyraAcpAgent::prompt_text(&prompt);
+
+        assert_eq!(prompt, "Summarize the context\nlink (Runbook): https://example.test/runbook");
+    }
+
+    #[tokio::test]
+    async fn initialize_negotiates_requested_protocol_version() {
+        let agent = test_agent();
+        let requested_version = acp::ProtocolVersion::V0;
+        let response = <PalyraAcpAgent as acp::Agent>::initialize(
+            &agent,
+            acp::InitializeRequest::new(requested_version.clone()),
+        )
+        .await
+        .expect("initialize must succeed");
+
+        assert_eq!(response.protocol_version, requested_version);
+    }
 }

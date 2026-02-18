@@ -44,7 +44,7 @@ use proto::palyra::{common::v1 as common_v1, node::v1 as node_v1};
 async fn node_rpc_mtls_rejects_clients_without_certificate() -> Result<()> {
     let identity = prepare_identity_store(false)?;
     let (child, admin_port, node_rpc_port) =
-        spawn_palyrad_with_dynamic_ports(identity.store_dir())?;
+        spawn_palyrad_with_dynamic_ports(identity.store_dir(), false)?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut()).await?;
 
@@ -71,7 +71,7 @@ async fn node_rpc_mtls_rejects_clients_without_certificate() -> Result<()> {
 async fn node_rpc_mtls_accepts_valid_client_certificate() -> Result<()> {
     let identity = prepare_identity_store(false)?;
     let (child, admin_port, node_rpc_port) =
-        spawn_palyrad_with_dynamic_ports(identity.store_dir())?;
+        spawn_palyrad_with_dynamic_ports(identity.store_dir(), false)?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut()).await?;
 
@@ -93,7 +93,7 @@ async fn node_rpc_mtls_accepts_valid_client_certificate() -> Result<()> {
 async fn node_rpc_mtls_rejects_revoked_client_certificate() -> Result<()> {
     let identity = prepare_identity_store(true)?;
     let (child, admin_port, node_rpc_port) =
-        spawn_palyrad_with_dynamic_ports(identity.store_dir())?;
+        spawn_palyrad_with_dynamic_ports(identity.store_dir(), false)?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut()).await?;
 
@@ -111,6 +111,26 @@ async fn node_rpc_mtls_rejects_revoked_client_certificate() -> Result<()> {
         status.code(),
         Code::PermissionDenied,
         "revoked client certificate should be denied by node RPC verifier"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn node_rpc_insecure_opt_out_accepts_clients_without_certificate() -> Result<()> {
+    let identity = prepare_identity_store(false)?;
+    let (child, admin_port, node_rpc_port) =
+        spawn_palyrad_with_dynamic_ports(identity.store_dir(), true)?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut()).await?;
+
+    let mut client = connect_node_client(node_rpc_port, identity.gateway_ca_pem(), None).await?;
+    let response = client.register_node(tonic::Request::new(sample_register_node_request())).await;
+    let status =
+        response.expect_err("insecure node RPC opt-out should allow request to reach service");
+    assert_eq!(
+        status.code(),
+        Code::Unimplemented,
+        "without mTLS enforcement, unauthenticated client should reach node RPC handler"
     );
     Ok(())
 }
@@ -208,9 +228,13 @@ fn prepare_identity_store(revoke_after_pairing: bool) -> Result<PreparedIdentity
     })
 }
 
-fn spawn_palyrad_with_dynamic_ports(identity_store_dir: &Path) -> Result<(Child, u16, u16)> {
+fn spawn_palyrad_with_dynamic_ports(
+    identity_store_dir: &Path,
+    allow_insecure_node_rpc_without_mtls: bool,
+) -> Result<(Child, u16, u16)> {
     let journal_db_path = unique_temp_journal_db_path();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_palyrad"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_palyrad"));
+    command
         .args([
             "--bind",
             "127.0.0.1",
@@ -226,9 +250,11 @@ fn spawn_palyrad_with_dynamic_ports(identity_store_dir: &Path) -> Result<(Child,
         .env("PALYRA_GATEWAY_IDENTITY_STORE_DIR", identity_store_dir.to_string_lossy().to_string())
         .env("RUST_LOG", "info")
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("failed to start palyrad")?;
+        .stderr(Stdio::null());
+    if allow_insecure_node_rpc_without_mtls {
+        command.env("PALYRA_ALLOW_INSECURE_NODE_RPC_WITHOUT_MTLS", "true");
+    }
+    let mut child = command.spawn().context("failed to start palyrad")?;
     let stdout = child.stdout.take().context("failed to capture palyrad stdout")?;
     let (admin_port, node_rpc_port) = wait_for_admin_and_node_rpc_ports(stdout, &mut child)?;
     Ok((child, admin_port, node_rpc_port))

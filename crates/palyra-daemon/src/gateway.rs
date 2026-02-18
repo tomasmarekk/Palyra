@@ -1983,6 +1983,10 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                                 &mut remaining_tool_budget,
                                 context_for_stream.principal.as_str(),
                                 tool_name.as_str(),
+                                approval_outcome
+                                    .as_ref()
+                                    .map(|response| response.approved)
+                                    .unwrap_or(false),
                             );
                             let decision = apply_tool_approval_outcome(
                                 decision,

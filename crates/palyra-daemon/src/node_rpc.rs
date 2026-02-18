@@ -11,18 +11,37 @@ use crate::gateway::proto::palyra::node::v1 as node_v1;
 #[derive(Debug, Clone)]
 pub struct NodeRpcServiceImpl {
     revoked_certificate_fingerprints: Arc<HashSet<String>>,
+    require_mtls: bool,
 }
 
 impl NodeRpcServiceImpl {
     #[must_use]
-    pub fn new(revoked_certificate_fingerprints: HashSet<String>) -> Self {
-        Self { revoked_certificate_fingerprints: Arc::new(revoked_certificate_fingerprints) }
+    pub fn new(revoked_certificate_fingerprints: HashSet<String>, require_mtls: bool) -> Self {
+        Self {
+            revoked_certificate_fingerprints: Arc::new(revoked_certificate_fingerprints),
+            require_mtls,
+        }
     }
 
     #[allow(clippy::result_large_err)]
     fn enforce_peer_certificate<B>(&self, request: &Request<B>) -> Result<(), Status> {
-        let Some(connect_info) = request.extensions().get::<TlsConnectInfo<TcpConnectInfo>>()
-        else {
+        let connect_info = request.extensions().get::<TlsConnectInfo<TcpConnectInfo>>();
+        if !self.require_mtls {
+            if let Some(connect_info) = connect_info {
+                if let Some(peer_certificates) = connect_info.peer_certs() {
+                    if let Some(peer_cert) = peer_certificates.first() {
+                        let fingerprint = hex::encode(Sha256::digest(peer_cert.as_ref()));
+                        if self.revoked_certificate_fingerprints.contains(&fingerprint) {
+                            return Err(Status::permission_denied(
+                                "node RPC client certificate fingerprint is revoked",
+                            ));
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
+        let Some(connect_info) = connect_info else {
             return Err(Status::failed_precondition(
                 "node RPC endpoint requires mTLS transport metadata",
             ));

@@ -15,6 +15,7 @@ pub struct PolicyRequest {
 pub struct PolicyEvaluationConfig {
     pub allowlisted_tools: Vec<String>,
     pub allow_sensitive_tools: bool,
+    pub sensitive_tool_names: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,7 +103,12 @@ pub fn evaluate_with_config(
     let requested_tool = requested_tool_name(normalized_action.as_str(), request.resource.as_str());
     let is_allowlisted_tool =
         is_allowlisted_tool(requested_tool.as_deref(), config.allowlisted_tools.as_slice());
-    let is_sensitive_action = is_sensitive_action(request);
+    let is_sensitive_action = is_sensitive_action(
+        normalized_action.as_str(),
+        requested_tool.as_deref(),
+        request,
+        config.sensitive_tool_names.as_slice(),
+    );
 
     let context = Context::from_json_value(
         json!({
@@ -252,7 +258,28 @@ fn is_allowlisted_tool(requested_tool: Option<&str>, allowlisted_tools: &[String
     allowlisted_tools.iter().any(|allowlisted| allowlisted.eq_ignore_ascii_case(requested_tool))
 }
 
-fn is_sensitive_action(request: &PolicyRequest) -> bool {
+fn is_sensitive_action(
+    normalized_action: &str,
+    requested_tool: Option<&str>,
+    request: &PolicyRequest,
+    sensitive_tool_names: &[String],
+) -> bool {
+    if normalized_action == "tool.execute" {
+        return is_sensitive_tool_name(requested_tool, sensitive_tool_names);
+    }
+    is_sensitive_action_heuristic(request)
+}
+
+fn is_sensitive_tool_name(requested_tool: Option<&str>, sensitive_tool_names: &[String]) -> bool {
+    let Some(requested_tool) = requested_tool else {
+        return false;
+    };
+    sensitive_tool_names
+        .iter()
+        .any(|sensitive_tool| sensitive_tool.eq_ignore_ascii_case(requested_tool))
+}
+
+fn is_sensitive_action_heuristic(request: &PolicyRequest) -> bool {
     let action = request.action.to_ascii_lowercase();
     let resource = request.resource.to_ascii_lowercase();
     ["shell", "delete", "payment"]
@@ -286,12 +313,15 @@ mod tests {
     fn sensitive_actions_require_explicit_approval() {
         let request = PolicyRequest {
             principal: "user:bootstrap".to_owned(),
-            action: "tool.execute.shell".to_owned(),
-            resource: "tool:shell".to_owned(),
+            action: "tool.execute".to_owned(),
+            resource: "tool:palyra.process.run".to_owned(),
+        };
+        let config = PolicyEvaluationConfig {
+            sensitive_tool_names: vec!["palyra.process.run".to_owned()],
+            ..PolicyEvaluationConfig::default()
         };
 
-        let evaluation =
-            evaluate_with_config(&request, &PolicyEvaluationConfig::default()).expect("evaluation");
+        let evaluation = evaluate_with_config(&request, &config).expect("evaluation");
 
         assert_eq!(
             evaluation.decision,
@@ -306,11 +336,12 @@ mod tests {
         let request = PolicyRequest {
             principal: "user:bootstrap".to_owned(),
             action: "tool.execute".to_owned(),
-            resource: "tool:shell.exec".to_owned(),
+            resource: "tool:palyra.process.run".to_owned(),
         };
         let config = PolicyEvaluationConfig {
-            allowlisted_tools: vec!["shell.exec".to_owned()],
+            allowlisted_tools: vec!["palyra.process.run".to_owned()],
             allow_sensitive_tools: false,
+            sensitive_tool_names: vec!["palyra.process.run".to_owned()],
         };
 
         let evaluation = evaluate_with_config(&request, &config).expect("evaluation");
@@ -355,6 +386,7 @@ mod tests {
         let allowed_config = PolicyEvaluationConfig {
             allowlisted_tools: vec!["palyra.echo".to_owned()],
             allow_sensitive_tools: false,
+            sensitive_tool_names: Vec::new(),
         };
         let allowed = evaluate_with_config(&request, &allowed_config).expect("evaluation");
         assert_eq!(allowed.decision, PolicyDecision::Allow);

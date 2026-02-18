@@ -42,6 +42,8 @@ use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+const DANGEROUS_REMOTE_BIND_ACK_ENV: &str = "PALYRA_GATEWAY_DANGEROUS_REMOTE_BIND_ACK";
+
 #[derive(Debug, Clone, Parser)]
 #[command(name = "palyrad", about = "Palyra gateway skeleton daemon")]
 struct Args {
@@ -306,7 +308,13 @@ async fn main() -> Result<()> {
     let grpc_address =
         parse_daemon_bind_socket(&loaded.gateway.grpc_bind_addr, loaded.gateway.grpc_port)
             .context("invalid gRPC bind address or port")?;
-    enforce_remote_bind_guard(admin_address, grpc_address, loaded.gateway.allow_insecure_remote)?;
+    enforce_remote_bind_guard(
+        admin_address,
+        grpc_address,
+        loaded.gateway.allow_insecure_remote,
+        loaded.gateway.tls.enabled,
+        dangerous_remote_bind_acknowledged()?,
+    )?;
 
     let admin_listener = tokio::net::TcpListener::bind(admin_address)
         .await
@@ -351,6 +359,7 @@ async fn main() -> Result<()> {
         );
     let node_rpc_service = node_rpc::NodeRpcServiceImpl::new(
         identity_runtime.revoked_certificate_fingerprints.clone(),
+        !loaded.identity.allow_insecure_node_rpc_without_mtls,
     );
     let node_rpc_server =
         gateway::proto::palyra::node::v1::node_service_server::NodeServiceServer::new(
@@ -675,6 +684,8 @@ fn enforce_remote_bind_guard(
     admin_address: SocketAddr,
     grpc_address: SocketAddr,
     allow_insecure_remote: bool,
+    gateway_tls_enabled: bool,
+    dangerous_remote_bind_acknowledged: bool,
 ) -> Result<()> {
     let admin_remote = !admin_address.ip().is_loopback();
     let grpc_remote = !grpc_address.ip().is_loopback();
@@ -685,7 +696,29 @@ fn enforce_remote_bind_guard(
             grpc_address
         );
     }
+    let requires_danger_ack = admin_remote || (grpc_remote && !gateway_tls_enabled);
+    if requires_danger_ack && !dangerous_remote_bind_acknowledged {
+        anyhow::bail!(
+            "refusing insecure remote bind without explicit danger acknowledgement: admin={} grpc={} gateway_tls_enabled={} (set {}=true to acknowledge risk, or keep admin loopback and enable gateway TLS)",
+            admin_address,
+            grpc_address,
+            gateway_tls_enabled,
+            DANGEROUS_REMOTE_BIND_ACK_ENV,
+        );
+    }
     Ok(())
+}
+
+fn dangerous_remote_bind_acknowledged() -> Result<bool> {
+    match std::env::var(DANGEROUS_REMOTE_BIND_ACK_ENV) {
+        Ok(raw) => raw
+            .parse::<bool>()
+            .with_context(|| format!("{DANGEROUS_REMOTE_BIND_ACK_ENV} must be true or false")),
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("{DANGEROUS_REMOTE_BIND_ACK_ENV} must contain valid UTF-8")
+        }
+    }
 }
 
 #[cfg(test)]
@@ -699,6 +732,8 @@ mod tests {
             "127.0.0.1:7142".parse().expect("loopback endpoint should parse"),
             "127.0.0.1:7443".parse().expect("loopback endpoint should parse"),
             false,
+            false,
+            false,
         );
         assert!(result.is_ok(), "loopback bind should not require insecure opt-in");
     }
@@ -709,18 +744,67 @@ mod tests {
             "0.0.0.0:7142".parse().expect("remote endpoint should parse"),
             "127.0.0.1:7443".parse().expect("loopback endpoint should parse"),
             false,
+            false,
+            false,
         );
         assert!(result.is_err(), "non-loopback bind should require explicit opt-in");
     }
 
     #[test]
-    fn remote_bind_guard_allows_non_loopback_with_explicit_opt_in() {
+    fn remote_bind_guard_allows_tls_grpc_remote_with_explicit_opt_in() {
+        let result = enforce_remote_bind_guard(
+            "127.0.0.1:7142".parse().expect("loopback endpoint should parse"),
+            "0.0.0.0:7443".parse().expect("remote endpoint should parse"),
+            true,
+            true,
+            false,
+        );
+        assert!(
+            result.is_ok(),
+            "TLS-enabled remote gRPC bind should be allowed with explicit opt-in"
+        );
+    }
+
+    #[test]
+    fn remote_bind_guard_requires_danger_ack_for_non_tls_grpc_remote() {
+        let result = enforce_remote_bind_guard(
+            "127.0.0.1:7142".parse().expect("loopback endpoint should parse"),
+            "0.0.0.0:7443".parse().expect("remote endpoint should parse"),
+            true,
+            false,
+            false,
+        );
+        assert!(
+            result.is_err(),
+            "non-TLS remote gRPC bind should require explicit danger acknowledgement"
+        );
+    }
+
+    #[test]
+    fn remote_bind_guard_allows_non_tls_grpc_remote_with_danger_ack() {
+        let result = enforce_remote_bind_guard(
+            "127.0.0.1:7142".parse().expect("loopback endpoint should parse"),
+            "0.0.0.0:7443".parse().expect("remote endpoint should parse"),
+            true,
+            false,
+            true,
+        );
+        assert!(result.is_ok(), "danger acknowledgement should allow non-TLS remote gRPC bind");
+    }
+
+    #[test]
+    fn remote_bind_guard_requires_danger_ack_for_remote_admin_bind() {
         let result = enforce_remote_bind_guard(
             "0.0.0.0:7142".parse().expect("remote endpoint should parse"),
             "0.0.0.0:7443".parse().expect("remote endpoint should parse"),
             true,
+            true,
+            false,
         );
-        assert!(result.is_ok(), "explicit insecure opt-in should bypass the remote bind guard");
+        assert!(
+            result.is_err(),
+            "remote admin bind should require explicit danger acknowledgement"
+        );
     }
 }
 
