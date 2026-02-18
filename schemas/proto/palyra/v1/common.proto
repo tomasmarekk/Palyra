@@ -155,6 +155,23 @@ message ToolDecision {
   reserved 6 to 10;
 }
 
+message ToolApprovalRequest {
+  CanonicalId proposal_id = 1;
+  string tool_name = 2;
+  bytes input_json = 3;
+  bool approval_required = 4;
+
+  reserved 5 to 10;
+}
+
+message ToolApprovalResponse {
+  CanonicalId proposal_id = 1;
+  bool approved = 2;
+  string reason = 3;
+
+  reserved 4 to 10;
+}
+
 message ToolResult {
   CanonicalId proposal_id = 1;
   bool success = 2;
@@ -189,8 +206,13 @@ message RunStreamRequest {
   CanonicalId run_id = 3;
   MessageEnvelope input = 4;
   bool allow_sensitive_tools = 5;
+  string session_key = 6;
+  string session_label = 7;
+  bool reset_session = 8;
+  bool require_existing = 9;
+  ToolApprovalResponse tool_approval_response = 10;
 
-  reserved 6 to 16;
+  reserved 11 to 16;
 }
 
 message ModelToken {
@@ -228,7 +250,9 @@ message RunStreamEvent {
     JournalEvent journal_event = 8;
     ToolDecision tool_decision = 9;
     ToolAttestation tool_attestation = 10;
+    ToolApprovalRequest tool_approval_request = 11;
+    ToolApprovalResponse tool_approval_response = 12;
   }
 
-  reserved 11 to 24;
+  reserved 13 to 24;
 }

@@ -10,9 +10,12 @@ name = "palyra"
 path = "src/main.rs"
 
 [dependencies]
+agent-client-protocol.workspace = true
 anyhow.workspace = true
+async-trait.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
+futures.workspace = true
 palyra-common = { version = "0.1.0", path = "../palyra-common" }
 palyra-identity = { version = "0.1.0", path = "../palyra-identity" }
 palyra-policy = { version = "0.1.0", path = "../palyra-policy" }

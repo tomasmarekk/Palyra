@@ -29,6 +29,20 @@ pub struct ToolDecision {
     pub policy_enforced: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolCapability {
+    ProcessExec,
+    Network,
+    SecretsRead,
+    FilesystemWrite,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolMetadata {
+    pub capabilities: &'static [ToolCapability],
+    pub default_sensitive: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolAttestation {
     pub attestation_id: String,
@@ -85,6 +99,10 @@ const BUDGET_DENY_REASON: &str = "tool execution budget exhausted for run";
 const UNSUPPORTED_TOOL_DENY_REASON: &str =
     "tool is allowlisted but unsupported by runtime executor";
 const TOOL_MAX_SLEEP_MS: u64 = 5_000;
+const EMPTY_TOOL_CAPABILITIES: &[ToolCapability] = &[];
+const PROCESS_RUNNER_CAPABILITIES: &[ToolCapability] = &[ToolCapability::ProcessExec];
+const WASM_PLUGIN_CAPABILITIES: &[ToolCapability] =
+    &[ToolCapability::Network, ToolCapability::SecretsRead, ToolCapability::FilesystemWrite];
 
 pub fn tool_policy_snapshot(config: &ToolCallConfig) -> ToolCallPolicySnapshot {
     ToolCallPolicySnapshot {
@@ -122,11 +140,12 @@ pub fn decide_tool_call(
     principal: &str,
     tool_name: &str,
 ) -> ToolDecision {
+    let approval_required = tool_requires_approval(tool_name);
     if *remaining_budget == 0 {
         return ToolDecision {
             allowed: false,
             reason: BUDGET_DENY_REASON.to_owned(),
-            approval_required: true,
+            approval_required,
             policy_enforced: true,
         };
     }
@@ -146,7 +165,7 @@ pub fn decide_tool_call(
             return ToolDecision {
                 allowed: false,
                 reason: format!("policy evaluation failed safely: {error}"),
-                approval_required: true,
+                approval_required,
                 policy_enforced: true,
             };
         }
@@ -159,7 +178,7 @@ pub fn decide_tool_call(
                 policy_evaluation.explanation.matched_policy_ids.as_slice(),
                 policy_evaluation.explanation.diagnostics_errors.as_slice(),
             ),
-            approval_required: true,
+            approval_required,
             policy_enforced: true,
         };
     }
@@ -168,7 +187,7 @@ pub fn decide_tool_call(
         return ToolDecision {
             allowed: false,
             reason: UNSUPPORTED_TOOL_DENY_REASON.to_owned(),
-            approval_required: true,
+            approval_required,
             policy_enforced: true,
         };
     }
@@ -181,9 +200,46 @@ pub fn decide_tool_call(
             policy_evaluation.explanation.matched_policy_ids.as_slice(),
             policy_evaluation.explanation.diagnostics_errors.as_slice(),
         ),
-        approval_required: true,
+        approval_required,
         policy_enforced: true,
     }
+}
+
+#[must_use]
+pub fn tool_metadata(tool_name: &str) -> Option<ToolMetadata> {
+    match tool_name {
+        "palyra.echo" => {
+            Some(ToolMetadata { capabilities: EMPTY_TOOL_CAPABILITIES, default_sensitive: false })
+        }
+        "palyra.sleep" => {
+            Some(ToolMetadata { capabilities: EMPTY_TOOL_CAPABILITIES, default_sensitive: false })
+        }
+        "palyra.process.run" => Some(ToolMetadata {
+            capabilities: PROCESS_RUNNER_CAPABILITIES,
+            default_sensitive: true,
+        }),
+        "palyra.plugin.run" => {
+            Some(ToolMetadata { capabilities: WASM_PLUGIN_CAPABILITIES, default_sensitive: true })
+        }
+        _ => None,
+    }
+}
+
+#[must_use]
+pub fn tool_requires_approval(tool_name: &str) -> bool {
+    let Some(metadata) = tool_metadata(tool_name) else {
+        return true;
+    };
+    metadata.default_sensitive
+        || metadata.capabilities.iter().any(|capability| {
+            matches!(
+                capability,
+                ToolCapability::ProcessExec
+                    | ToolCapability::Network
+                    | ToolCapability::SecretsRead
+                    | ToolCapability::FilesystemWrite
+            )
+        })
 }
 
 fn format_policy_reason(
@@ -521,7 +577,7 @@ fn current_unix_ms() -> i64 {
 mod tests {
     use super::{
         decide_tool_call, denied_execution_outcome, execute_tool_call, tool_policy_snapshot,
-        ToolCallConfig,
+        tool_requires_approval, ToolCallConfig,
     };
     use crate::sandbox_runner::SandboxProcessRunnerPolicy;
     use crate::wasm_plugin_runner::WasmPluginRunnerPolicy;
@@ -586,9 +642,11 @@ mod tests {
         let mut budget = config.max_calls_per_run;
         let first = decide_tool_call(&config, &mut budget, "user:ops", "palyra.echo");
         assert!(first.allowed);
+        assert!(!first.approval_required, "safe tools should not require approval by default");
         assert_eq!(budget, 1);
         let second = decide_tool_call(&config, &mut budget, "user:ops", "palyra.sleep");
         assert!(second.allowed);
+        assert!(!second.approval_required, "safe tools should not require approval by default");
         assert_eq!(budget, 0);
         let third = decide_tool_call(&config, &mut budget, "user:ops", "palyra.echo");
         assert!(!third.allowed, "third call should be denied by budget");
@@ -611,9 +669,9 @@ mod tests {
     }
 
     #[test]
-    fn decide_tool_call_denies_sensitive_allowlisted_tool() {
+    fn decide_tool_call_marks_sensitive_tool_as_approval_required() {
         let config = ToolCallConfig {
-            allowed_tools: vec!["shell.exec".to_owned()],
+            allowed_tools: vec!["palyra.process.run".to_owned()],
             max_calls_per_run: 2,
             execution_timeout_ms: 250,
             process_runner: default_process_runner_policy(),
@@ -621,11 +679,26 @@ mod tests {
         };
         let mut budget = config.max_calls_per_run;
 
-        let decision = decide_tool_call(&config, &mut budget, "user:ops", "shell.exec");
+        let decision = decide_tool_call(&config, &mut budget, "user:ops", "palyra.process.run");
 
-        assert!(!decision.allowed, "sensitive allowlisted tool must require explicit approval");
-        assert_eq!(budget, 2, "denied decisions must not consume budget");
-        assert!(decision.reason.contains("sensitive action blocked by default"));
+        assert!(decision.allowed, "allowlisted process runner tool should pass policy gate");
+        assert!(
+            decision.approval_required,
+            "process execution should always require explicit approval"
+        );
+        assert_eq!(budget, 1, "allowed decision should consume budget");
+    }
+
+    #[test]
+    fn tool_requires_approval_flags_sensitive_capabilities() {
+        assert!(!tool_requires_approval("palyra.echo"));
+        assert!(!tool_requires_approval("palyra.sleep"));
+        assert!(tool_requires_approval("palyra.process.run"));
+        assert!(tool_requires_approval("palyra.plugin.run"));
+        assert!(
+            tool_requires_approval("custom.unknown"),
+            "unknown tools should default to approval-required"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

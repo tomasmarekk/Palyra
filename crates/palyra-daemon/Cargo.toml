@@ -26,6 +26,7 @@ serde_json.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true
 sha2.workspace = true
+hex.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
@@ -38,6 +39,7 @@ ulid.workspace = true
 [dev-dependencies]
 anyhow.workspace = true
 reqwest.workspace = true
+tempfile.workspace = true
 tonic.workspace = true
 
 [build-dependencies]

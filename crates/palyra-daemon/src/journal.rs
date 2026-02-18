@@ -34,6 +34,7 @@ const SENSITIVE_KEY_FRAGMENTS: &[&str] = &[
 pub struct JournalConfig {
     pub db_path: PathBuf,
     pub hash_chain_enabled: bool,
+    pub max_payload_bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,12 +78,50 @@ pub struct JournalEventRecord {
     pub created_at_unix_ms: i64,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrchestratorSessionUpsertRequest {
     pub session_id: String,
+    pub session_key: String,
+    pub session_label: Option<String>,
     pub principal: String,
     pub device_id: String,
     pub channel: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrchestratorSessionResolveRequest {
+    pub session_id: Option<String>,
+    pub session_key: Option<String>,
+    pub session_label: Option<String>,
+    pub principal: String,
+    pub device_id: String,
+    pub channel: Option<String>,
+    pub require_existing: bool,
+    pub reset_session: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct OrchestratorSessionRecord {
+    pub session_id: String,
+    pub session_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_label: Option<String>,
+    pub principal: String,
+    pub device_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    pub created_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_run_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct OrchestratorSessionResolveOutcome {
+    pub session: OrchestratorSessionRecord,
+    pub created: bool,
+    pub reset_applied: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,6 +213,14 @@ pub enum JournalError {
     RunNotFound { run_id: String },
     #[error("orchestrator session identity mismatch for session: {session_id}")]
     SessionIdentityMismatch { session_id: String },
+    #[error("orchestrator session not found for selector: {selector}")]
+    SessionNotFound { selector: String },
+    #[error("invalid orchestrator session selector: {reason}")]
+    InvalidSessionSelector { reason: String },
+    #[error("{payload_kind} payload exceeds max bytes ({actual_bytes} > {max_bytes})")]
+    PayloadTooLarge { payload_kind: &'static str, actual_bytes: usize, max_bytes: usize },
+    #[error("journal max payload bytes must be greater than 0")]
+    InvalidPayloadLimit,
     #[error("journal sqlite operation failed: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("failed to serialize journal payload: {0}")]
@@ -281,6 +328,27 @@ const MIGRATIONS: &[Migration] = &[
             END;
         "#,
     },
+    Migration {
+        version: 3,
+        name: "orchestrator_session_keys_and_labels",
+        sql: r#"
+            ALTER TABLE orchestrator_sessions
+                ADD COLUMN session_key TEXT;
+            ALTER TABLE orchestrator_sessions
+                ADD COLUMN session_label TEXT;
+            ALTER TABLE orchestrator_sessions
+                ADD COLUMN last_run_ulid TEXT;
+
+            UPDATE orchestrator_sessions
+            SET session_key = session_ulid
+            WHERE session_key IS NULL OR TRIM(session_key) = '';
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_orchestrator_sessions_session_key
+                ON orchestrator_sessions(session_key);
+            CREATE INDEX IF NOT EXISTS idx_orchestrator_sessions_session_label
+                ON orchestrator_sessions(session_label);
+        "#,
+    },
 ];
 
 pub struct JournalStore {
@@ -294,12 +362,16 @@ impl fmt::Debug for JournalStore {
             .debug_struct("JournalStore")
             .field("db_path", &self.config.db_path)
             .field("hash_chain_enabled", &self.config.hash_chain_enabled)
+            .field("max_payload_bytes", &self.config.max_payload_bytes)
             .finish()
     }
 }
 
 impl JournalStore {
     pub fn open(config: JournalConfig) -> Result<Self, JournalError> {
+        if config.max_payload_bytes == 0 {
+            return Err(JournalError::InvalidPayloadLimit);
+        }
         validate_db_path(&config.db_path)?;
         if let Some(parent) = config.db_path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -327,6 +399,13 @@ impl JournalStore {
         &self,
         request: &JournalAppendRequest,
     ) -> Result<JournalAppendOutcome, JournalError> {
+        if request.payload_json.len() > self.config.max_payload_bytes {
+            return Err(JournalError::PayloadTooLarge {
+                payload_kind: "journal",
+                actual_bytes: request.payload_json.len(),
+                max_bytes: self.config.max_payload_bytes,
+            });
+        }
         let started_at = Instant::now();
         let (payload_json, redacted) = sanitize_payload(&request.payload_json)?;
         let created_at_unix_ms = current_unix_ms()?;
@@ -473,6 +552,7 @@ impl JournalStore {
         Ok(events)
     }
 
+    #[cfg(test)]
     pub fn upsert_orchestrator_session(
         &self,
         request: &OrchestratorSessionUpsertRequest,
@@ -484,20 +564,26 @@ impl JournalStore {
                 r#"
                 INSERT INTO orchestrator_sessions (
                     session_ulid,
+                    session_key,
+                    session_label,
                     principal,
                     device_id,
                     channel,
                     created_at_unix_ms,
                     updated_at_unix_ms
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
                 ON CONFLICT(session_ulid) DO UPDATE SET
-                    updated_at_unix_ms = excluded.updated_at_unix_ms
+                    updated_at_unix_ms = excluded.updated_at_unix_ms,
+                    session_label = COALESCE(excluded.session_label, orchestrator_sessions.session_label)
                 WHERE orchestrator_sessions.principal = excluded.principal
                   AND orchestrator_sessions.device_id = excluded.device_id
                   AND COALESCE(orchestrator_sessions.channel, '') = COALESCE(excluded.channel, '')
+                  AND orchestrator_sessions.session_key = excluded.session_key
             "#,
                 params![
                     request.session_id,
+                    request.session_key,
+                    request.session_label,
                     request.principal,
                     request.device_id,
                     request.channel,
@@ -510,6 +596,183 @@ impl JournalStore {
             });
         }
         Ok(())
+    }
+
+    pub fn resolve_orchestrator_session(
+        &self,
+        request: &OrchestratorSessionResolveRequest,
+    ) -> Result<OrchestratorSessionResolveOutcome, JournalError> {
+        let now = current_unix_ms()?;
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+
+        let requested_session_id =
+            request.session_id.clone().and_then(normalize_optional_session_field);
+        let requested_session_key =
+            request.session_key.clone().and_then(normalize_optional_session_field);
+        let requested_session_label =
+            request.session_label.clone().and_then(normalize_optional_session_field);
+
+        let existing_by_id = if let Some(session_id) = requested_session_id.as_deref() {
+            load_orchestrator_session_by_id(&guard, session_id)?
+        } else {
+            None
+        };
+        let existing_by_key = if let Some(session_key) = requested_session_key.as_deref() {
+            load_orchestrator_session_by_key(&guard, session_key)?
+        } else {
+            None
+        };
+
+        let mut existing = match (existing_by_id, existing_by_key) {
+            (Some(by_id), Some(by_key)) => {
+                if by_id.session_id != by_key.session_id {
+                    return Err(JournalError::InvalidSessionSelector {
+                        reason:
+                            "session_id and session_key selectors resolve to different sessions"
+                                .to_owned(),
+                    });
+                }
+                Some(by_id)
+            }
+            (Some(by_id), None) => {
+                if let Some(session_key) = requested_session_key.as_deref() {
+                    if by_id.session_key != session_key {
+                        return Err(JournalError::InvalidSessionSelector {
+                            reason: "provided session_id does not match existing session_key"
+                                .to_owned(),
+                        });
+                    }
+                }
+                Some(by_id)
+            }
+            (None, Some(by_key)) => {
+                if let Some(session_id) = requested_session_id.as_deref() {
+                    if by_key.session_id != session_id {
+                        return Err(JournalError::InvalidSessionSelector {
+                            reason: "provided session_key does not match existing session_id"
+                                .to_owned(),
+                        });
+                    }
+                }
+                Some(by_key)
+            }
+            (None, None) => {
+                if requested_session_id.is_none() && requested_session_key.is_none() {
+                    if let Some(session_label) = requested_session_label.as_deref() {
+                        load_orchestrator_session_by_label(&guard, session_label)?
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+        };
+
+        if let Some(mut session) = existing.take() {
+            if session.principal != request.principal
+                || session.device_id != request.device_id
+                || session.channel != request.channel
+            {
+                return Err(JournalError::SessionIdentityMismatch {
+                    session_id: session.session_id,
+                });
+            }
+
+            guard.execute(
+                r#"
+                    UPDATE orchestrator_sessions
+                    SET
+                        updated_at_unix_ms = ?2,
+                        session_label = COALESCE(?3, session_label),
+                        last_run_ulid = CASE WHEN ?4 = 1 THEN NULL ELSE last_run_ulid END
+                    WHERE session_ulid = ?1
+                "#,
+                params![
+                    session.session_id,
+                    now,
+                    requested_session_label,
+                    if request.reset_session { 1_i64 } else { 0_i64 },
+                ],
+            )?;
+
+            session.updated_at_unix_ms = now;
+            if requested_session_label.is_some() {
+                session.session_label = requested_session_label.clone();
+            }
+            if request.reset_session {
+                session.last_run_id = None;
+            }
+            return Ok(OrchestratorSessionResolveOutcome {
+                session,
+                created: false,
+                reset_applied: request.reset_session,
+            });
+        }
+
+        if request.require_existing {
+            let selector = requested_session_id
+                .clone()
+                .or(requested_session_key.clone())
+                .or(requested_session_label.clone())
+                .unwrap_or_else(|| "<unspecified>".to_owned());
+            return Err(JournalError::SessionNotFound { selector });
+        }
+
+        let session_id = requested_session_id.unwrap_or_else(|| ulid::Ulid::new().to_string());
+        let session_key = requested_session_key.unwrap_or_else(|| session_id.clone());
+        let session_label = requested_session_label;
+
+        guard.execute(
+            r#"
+                INSERT INTO orchestrator_sessions (
+                    session_ulid,
+                    session_key,
+                    session_label,
+                    principal,
+                    device_id,
+                    channel,
+                    created_at_unix_ms,
+                    updated_at_unix_ms,
+                    last_run_ulid
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, NULL)
+            "#,
+            params![
+                session_id,
+                session_key,
+                session_label,
+                request.principal,
+                request.device_id,
+                request.channel,
+                now,
+            ],
+        )?;
+
+        Ok(OrchestratorSessionResolveOutcome {
+            session: OrchestratorSessionRecord {
+                session_id: session_id.clone(),
+                session_key,
+                session_label,
+                principal: request.principal.clone(),
+                device_id: request.device_id.clone(),
+                channel: request.channel.clone(),
+                created_at_unix_ms: now,
+                updated_at_unix_ms: now,
+                last_run_id: None,
+            },
+            created: true,
+            reset_applied: false,
+        })
+    }
+
+    pub fn list_orchestrator_sessions(
+        &self,
+        after_session_key: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<OrchestratorSessionRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let limit = limit.max(1);
+        load_orchestrator_sessions_page(&guard, after_session_key, limit)
     }
 
     pub fn start_orchestrator_run(
@@ -538,7 +801,19 @@ impl JournalStore {
             "#,
             params![request.run_id, request.session_id, RunLifecycleState::Accepted.as_str(), now,],
         ) {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                guard.execute(
+                    r#"
+                        UPDATE orchestrator_sessions
+                        SET
+                            updated_at_unix_ms = ?2,
+                            last_run_ulid = ?3
+                        WHERE session_ulid = ?1
+                    "#,
+                    params![request.session_id, now, request.run_id],
+                )?;
+                Ok(())
+            }
             Err(rusqlite::Error::SqliteFailure(error, message))
                 if error.code == ErrorCode::ConstraintViolation
                     && (error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
@@ -617,6 +892,14 @@ impl JournalStore {
         &self,
         request: &OrchestratorTapeAppendRequest,
     ) -> Result<(), JournalError> {
+        if request.payload_json.len() > self.config.max_payload_bytes {
+            return Err(JournalError::PayloadTooLarge {
+                payload_kind: "orchestrator_tape",
+                actual_bytes: request.payload_json.len(),
+                max_bytes: self.config.max_payload_bytes,
+            });
+        }
+        let (payload_json, _) = sanitize_payload(request.payload_json.as_bytes())?;
         let now = current_unix_ms()?;
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         match guard.execute(
@@ -629,7 +912,7 @@ impl JournalStore {
                     created_at_unix_ms
                 ) VALUES (?1, ?2, ?3, ?4, ?5)
             "#,
-            params![request.run_id, request.seq, request.event_type, request.payload_json, now,],
+            params![request.run_id, request.seq, request.event_type, payload_json, now,],
         ) {
             Ok(_) => Ok(()),
             Err(rusqlite::Error::SqliteFailure(error, message))
@@ -688,12 +971,24 @@ impl JournalStore {
         Ok(value == 1)
     }
 
+    #[cfg(test)]
     pub fn orchestrator_tape(
         &self,
         run_id: &str,
     ) -> Result<Vec<OrchestratorTapeRecord>, JournalError> {
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         load_orchestrator_tape(&guard, run_id)
+    }
+
+    pub fn orchestrator_tape_page(
+        &self,
+        run_id: &str,
+        after_seq: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<OrchestratorTapeRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let limit = limit.max(1);
+        load_orchestrator_tape_page(&guard, run_id, after_seq, limit)
     }
 
     pub fn orchestrator_run_status_snapshot(
@@ -765,6 +1060,7 @@ impl JournalStore {
     }
 }
 
+#[cfg(test)]
 fn load_orchestrator_tape(
     connection: &Connection,
     run_id: &str,
@@ -787,6 +1083,163 @@ fn load_orchestrator_tape(
         });
     }
     Ok(tape)
+}
+
+fn load_orchestrator_tape_page(
+    connection: &Connection,
+    run_id: &str,
+    after_seq: Option<i64>,
+    limit: usize,
+) -> Result<Vec<OrchestratorTapeRecord>, JournalError> {
+    let mut statement = connection.prepare(
+        r#"
+            SELECT seq, event_type, payload_json
+            FROM orchestrator_tape
+            WHERE run_ulid = ?1
+              AND (?2 IS NULL OR seq > ?2)
+            ORDER BY seq ASC
+            LIMIT ?3
+        "#,
+    )?;
+    let mut rows = statement.query(params![run_id, after_seq, limit as i64])?;
+    let mut tape = Vec::new();
+    while let Some(row) = rows.next()? {
+        tape.push(OrchestratorTapeRecord {
+            seq: row.get(0)?,
+            event_type: row.get(1)?,
+            payload_json: row.get(2)?,
+        });
+    }
+    Ok(tape)
+}
+
+fn map_orchestrator_session_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<OrchestratorSessionRecord, rusqlite::Error> {
+    Ok(OrchestratorSessionRecord {
+        session_id: row.get(0)?,
+        session_key: row.get(1)?,
+        session_label: row.get(2)?,
+        principal: row.get(3)?,
+        device_id: row.get(4)?,
+        channel: row.get(5)?,
+        created_at_unix_ms: row.get(6)?,
+        updated_at_unix_ms: row.get(7)?,
+        last_run_id: row.get(8)?,
+    })
+}
+
+fn load_orchestrator_session_by_id(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Option<OrchestratorSessionRecord>, JournalError> {
+    let mut statement = connection.prepare(
+        r#"
+            SELECT
+                session_ulid,
+                session_key,
+                session_label,
+                principal,
+                device_id,
+                channel,
+                created_at_unix_ms,
+                updated_at_unix_ms,
+                last_run_ulid
+            FROM orchestrator_sessions
+            WHERE session_ulid = ?1
+            LIMIT 1
+        "#,
+    )?;
+    statement
+        .query_row(params![session_id], map_orchestrator_session_row)
+        .optional()
+        .map_err(Into::into)
+}
+
+fn load_orchestrator_session_by_key(
+    connection: &Connection,
+    session_key: &str,
+) -> Result<Option<OrchestratorSessionRecord>, JournalError> {
+    let mut statement = connection.prepare(
+        r#"
+            SELECT
+                session_ulid,
+                session_key,
+                session_label,
+                principal,
+                device_id,
+                channel,
+                created_at_unix_ms,
+                updated_at_unix_ms,
+                last_run_ulid
+            FROM orchestrator_sessions
+            WHERE session_key = ?1
+            LIMIT 1
+        "#,
+    )?;
+    statement
+        .query_row(params![session_key], map_orchestrator_session_row)
+        .optional()
+        .map_err(Into::into)
+}
+
+fn load_orchestrator_session_by_label(
+    connection: &Connection,
+    session_label: &str,
+) -> Result<Option<OrchestratorSessionRecord>, JournalError> {
+    let mut statement = connection.prepare(
+        r#"
+            SELECT
+                session_ulid,
+                session_key,
+                session_label,
+                principal,
+                device_id,
+                channel,
+                created_at_unix_ms,
+                updated_at_unix_ms,
+                last_run_ulid
+            FROM orchestrator_sessions
+            WHERE session_label = ?1
+            ORDER BY updated_at_unix_ms DESC
+            LIMIT 1
+        "#,
+    )?;
+    statement
+        .query_row(params![session_label], map_orchestrator_session_row)
+        .optional()
+        .map_err(Into::into)
+}
+
+fn load_orchestrator_sessions_page(
+    connection: &Connection,
+    after_session_key: Option<&str>,
+    limit: usize,
+) -> Result<Vec<OrchestratorSessionRecord>, JournalError> {
+    let mut statement = connection.prepare(
+        r#"
+            SELECT
+                session_ulid,
+                session_key,
+                session_label,
+                principal,
+                device_id,
+                channel,
+                created_at_unix_ms,
+                updated_at_unix_ms,
+                last_run_ulid
+            FROM orchestrator_sessions
+            WHERE (?1 IS NULL OR session_key > ?1)
+            ORDER BY session_key ASC
+            LIMIT ?2
+        "#,
+    )?;
+    let mut rows = statement.query(params![after_session_key, limit as i64])?;
+    let mut sessions = Vec::new();
+    while let Some(row) = rows.next()? {
+        sessions.push(map_orchestrator_session_row(row)?);
+    }
+    Ok(sessions)
 }
 
 fn apply_migrations(connection: &mut Connection) -> Result<(), JournalError> {
@@ -861,6 +1314,11 @@ fn sanitize_payload(raw_payload: &[u8]) -> Result<(String, bool), JournalError> 
 
     let redacted = redact_value(&mut value, None);
     Ok((serde_json::to_string(&value)?, redacted))
+}
+
+pub fn redact_payload_json(raw_payload: &[u8]) -> Result<String, JournalError> {
+    let (payload, _) = sanitize_payload(raw_payload)?;
+    Ok(payload)
 }
 
 fn redact_value(value: &mut Value, key_context: Option<&str>) -> bool {
@@ -949,6 +1407,15 @@ fn current_unix_ms() -> Result<i64, JournalError> {
     Ok(now.as_millis() as i64)
 }
 
+fn normalize_optional_session_field(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    }
+}
+
 fn validate_db_path(path: &Path) -> Result<(), JournalError> {
     let path_text = path.to_string_lossy();
     if path_text.trim().is_empty() {
@@ -999,6 +1466,8 @@ mod tests {
         store
             .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
                 session_id: session_id.to_owned(),
+                session_key: session_id.to_owned(),
+                session_label: None,
                 principal: "user:ops".to_owned(),
                 device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
                 channel: Some("cli".to_owned()),
@@ -1016,14 +1485,15 @@ mod tests {
             .join(format!("palyra-journal-test-{nonce}-{}-{counter}.sqlite3", std::process::id()))
     }
 
+    fn test_journal_config(db_path: PathBuf, hash_chain_enabled: bool) -> JournalConfig {
+        JournalConfig { db_path, hash_chain_enabled, max_payload_bytes: 256 * 1024 }
+    }
+
     #[test]
     fn open_applies_initial_migration() {
         let db_path = temp_db_path();
-        let _store = JournalStore::open(JournalConfig {
-            db_path: db_path.clone(),
-            hash_chain_enabled: false,
-        })
-        .expect("journal store should open");
+        let _store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
 
         let connection = Connection::open(db_path).expect("journal db should open");
         let migration_v1: i64 = connection
@@ -1047,7 +1517,7 @@ mod tests {
     #[test]
     fn append_redacts_sensitive_payload_fields() {
         let db_path = temp_db_path();
-        let store = JournalStore::open(JournalConfig { db_path, hash_chain_enabled: false })
+        let store = JournalStore::open(test_journal_config(db_path, false))
             .expect("journal store should open");
 
         store
@@ -1070,7 +1540,7 @@ mod tests {
     #[test]
     fn append_non_json_payload_is_stored_as_redacted_metadata() {
         let db_path = temp_db_path();
-        let store = JournalStore::open(JournalConfig { db_path, hash_chain_enabled: false })
+        let store = JournalStore::open(test_journal_config(db_path, false))
             .expect("journal store should open");
 
         store
@@ -1086,9 +1556,33 @@ mod tests {
     }
 
     #[test]
+    fn append_rejects_payloads_over_configured_limit() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(JournalConfig {
+            db_path,
+            hash_chain_enabled: false,
+            max_payload_bytes: 32,
+        })
+        .expect("journal store should open");
+
+        let oversized_payload = vec![b'a'; 64];
+        let error = store
+            .append(&build_request("01ARZ3NDEKTSV4RRFFQ69G5FB7", oversized_payload.as_slice()))
+            .expect_err("oversized journal payload must fail");
+        assert!(matches!(
+            error,
+            JournalError::PayloadTooLarge {
+                payload_kind,
+                actual_bytes,
+                max_bytes
+            } if payload_kind == "journal" && actual_bytes == 64 && max_bytes == 32
+        ));
+    }
+
+    #[test]
     fn append_duplicate_event_id_returns_deterministic_duplicate_error() {
         let db_path = temp_db_path();
-        let store = JournalStore::open(JournalConfig { db_path, hash_chain_enabled: false })
+        let store = JournalStore::open(test_journal_config(db_path, false))
             .expect("journal store should open");
 
         store
@@ -1107,11 +1601,8 @@ mod tests {
     #[test]
     fn hash_chain_links_events_when_enabled() {
         let db_path = temp_db_path();
-        let store = JournalStore::open(JournalConfig {
-            db_path: db_path.clone(),
-            hash_chain_enabled: true,
-        })
-        .expect("journal store should open");
+        let store = JournalStore::open(test_journal_config(db_path.clone(), true))
+            .expect("journal store should open");
 
         let first = store
             .append(&build_request("01ARZ3NDEKTSV4RRFFQ69G5FB2", br#"{"kind":"first"}"#))
@@ -1133,11 +1624,8 @@ mod tests {
     #[test]
     fn append_only_triggers_reject_update_and_delete() {
         let db_path = temp_db_path();
-        let store = JournalStore::open(JournalConfig {
-            db_path: db_path.clone(),
-            hash_chain_enabled: false,
-        })
-        .expect("journal store should open");
+        let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("journal store should open");
 
         store
             .append(&build_request("01ARZ3NDEKTSV4RRFFQ69G5FB4", br#"{"kind":"immutable"}"#))
@@ -1170,7 +1658,7 @@ mod tests {
     #[test]
     fn recent_query_limit_is_clamped_to_prevent_unbounded_reads() {
         let db_path = temp_db_path();
-        let store = JournalStore::open(JournalConfig { db_path, hash_chain_enabled: false })
+        let store = JournalStore::open(test_journal_config(db_path, false))
             .expect("journal store should open");
 
         for index in 0..3 {
@@ -1188,7 +1676,7 @@ mod tests {
     #[test]
     fn orchestrator_run_status_snapshot_persists_usage_and_tape_count() {
         let db_path = temp_db_path();
-        let store = JournalStore::open(JournalConfig { db_path, hash_chain_enabled: false })
+        let store = JournalStore::open(test_journal_config(db_path, false))
             .expect("journal store should open");
 
         upsert_orchestrator_session(&store, "01ARZ3NDEKTSV4RRFFQ69G5FAW");
@@ -1252,17 +1740,93 @@ mod tests {
         assert_eq!(tape.len(), 2);
         assert_eq!(tape[0].seq, 0);
         assert_eq!(tape[1].event_type, "model_token");
+        assert!(
+            !tape[1].payload_json.contains("alpha"),
+            "sensitive token values must not leak into persisted tape payloads"
+        );
+        assert!(
+            tape[1].payload_json.contains("<redacted>"),
+            "persisted tape payloads should preserve explicit redaction marker"
+        );
+    }
+
+    #[test]
+    fn orchestrator_tape_page_applies_after_seq_and_limit() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        upsert_orchestrator_session(&store, "01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        store
+            .start_orchestrator_run(&OrchestratorRunStartRequest {
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),
+                session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned(),
+            })
+            .expect("run start should succeed");
+        for seq in 0..5 {
+            store
+                .append_orchestrator_tape_event(&OrchestratorTapeAppendRequest {
+                    run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),
+                    seq,
+                    event_type: "status".to_owned(),
+                    payload_json: format!(r#"{{"seq":{seq}}}"#),
+                })
+                .expect("tape append should succeed");
+        }
+
+        let page = store
+            .orchestrator_tape_page("01ARZ3NDEKTSV4RRFFQ69G5FAX", Some(1), 2)
+            .expect("page query should succeed");
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].seq, 2);
+        assert_eq!(page[1].seq, 3);
+    }
+
+    #[test]
+    fn orchestrator_tape_append_rejects_payload_over_configured_limit() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(JournalConfig {
+            db_path,
+            hash_chain_enabled: false,
+            max_payload_bytes: 24,
+        })
+        .expect("journal store should open");
+        upsert_orchestrator_session(&store, "01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        store
+            .start_orchestrator_run(&OrchestratorRunStartRequest {
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),
+                session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned(),
+            })
+            .expect("run start should succeed");
+
+        let error = store
+            .append_orchestrator_tape_event(&OrchestratorTapeAppendRequest {
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),
+                seq: 0,
+                event_type: "status".to_owned(),
+                payload_json: r#"{"token":"secret-value-that-is-too-long"}"#.to_owned(),
+            })
+            .expect_err("oversized tape payload should fail");
+        assert!(matches!(
+            error,
+            JournalError::PayloadTooLarge {
+                payload_kind,
+                actual_bytes,
+                max_bytes
+            } if payload_kind == "orchestrator_tape" && actual_bytes > max_bytes && max_bytes == 24
+        ));
     }
 
     #[test]
     fn orchestrator_session_identity_is_immutable() {
         let db_path = temp_db_path();
-        let store = JournalStore::open(JournalConfig { db_path, hash_chain_enabled: false })
+        let store = JournalStore::open(test_journal_config(db_path, false))
             .expect("journal store should open");
 
         store
             .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
                 session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned(),
+                session_key: "session:immutable".to_owned(),
+                session_label: Some("Immutable session".to_owned()),
                 principal: "user:ops".to_owned(),
                 device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
                 channel: Some("cli".to_owned()),
@@ -1278,6 +1842,8 @@ mod tests {
         let mismatch = store
             .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
                 session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned(),
+                session_key: "session:immutable".to_owned(),
+                session_label: Some("Immutable session".to_owned()),
                 principal: "user:other".to_owned(),
                 device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAZ".to_owned(),
                 channel: Some("web".to_owned()),
@@ -1301,7 +1867,7 @@ mod tests {
     #[test]
     fn orchestrator_rejects_duplicate_run_id_and_tape_sequence() {
         let db_path = temp_db_path();
-        let store = JournalStore::open(JournalConfig { db_path, hash_chain_enabled: false })
+        let store = JournalStore::open(test_journal_config(db_path, false))
             .expect("journal store should open");
 
         upsert_orchestrator_session(&store, "01ARZ3NDEKTSV4RRFFQ69G5FAW");
@@ -1349,7 +1915,7 @@ mod tests {
     #[test]
     fn orchestrator_cancel_flag_is_persisted() {
         let db_path = temp_db_path();
-        let store = JournalStore::open(JournalConfig { db_path, hash_chain_enabled: false })
+        let store = JournalStore::open(test_journal_config(db_path, false))
             .expect("journal store should open");
 
         upsert_orchestrator_session(&store, "01ARZ3NDEKTSV4RRFFQ69G5FAW");
@@ -1382,7 +1948,7 @@ mod tests {
     #[test]
     fn write_duration_is_reported_for_observability() {
         let db_path = temp_db_path();
-        let store = JournalStore::open(JournalConfig { db_path, hash_chain_enabled: false })
+        let store = JournalStore::open(test_journal_config(db_path, false))
             .expect("journal store should open");
 
         let outcome = store

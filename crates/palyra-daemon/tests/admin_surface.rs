@@ -94,6 +94,48 @@ fn admin_journal_recent_requires_token_and_returns_snapshot() -> Result<()> {
 }
 
 #[test]
+fn admin_policy_explain_requires_token_and_returns_decision_payload() -> Result<()> {
+    let (child, admin_port) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("failed to build HTTP client")?;
+    let url = format!(
+        "http://127.0.0.1:{admin_port}/admin/v1/policy/explain?principal=user%3Aops&action=tool.execute.shell&resource=tool%3Ashell"
+    );
+
+    let missing_auth = client.get(&url).send().context("failed to call admin policy explain")?;
+    assert_eq!(missing_auth.status().as_u16(), 401, "missing auth must be rejected");
+
+    let body = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {ADMIN_TOKEN}"))
+        .header("x-palyra-principal", "user:ops")
+        .header("x-palyra-device-id", DEVICE_ID)
+        .header("x-palyra-channel", "cli")
+        .send()
+        .context("failed to call admin policy explain with valid context")?
+        .error_for_status()
+        .context("admin policy explain returned non-success status")?
+        .text()
+        .context("failed to read admin policy explain response body")?;
+
+    assert!(body.contains("\"decision\":"), "policy explain must include decision: {body}");
+    assert!(
+        body.contains("\"approval_required\":"),
+        "policy explain must include approval_required flag: {body}"
+    );
+    assert!(
+        body.contains("\"matched_policies\":"),
+        "policy explain must include matched policies: {body}"
+    );
+    Ok(())
+}
+
+#[test]
 fn admin_run_endpoints_require_token_and_report_not_found_for_unknown_run() -> Result<()> {
     let (child, admin_port) = spawn_palyrad_with_dynamic_ports()?;
     let mut daemon = ChildGuard::new(child);

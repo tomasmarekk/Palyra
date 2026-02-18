@@ -586,13 +586,95 @@ fn sanitize_remote_error(body: &str) -> String {
     if trimmed.is_empty() {
         return "<empty>".to_owned();
     }
+    let redacted = redact_remote_error_secrets(trimmed);
     const MAX_CHARS: usize = 240;
-    if trimmed.chars().count() <= MAX_CHARS {
-        trimmed.to_owned()
+    if redacted.chars().count() <= MAX_CHARS {
+        redacted
     } else {
-        let truncated: String = trimmed.chars().take(MAX_CHARS).collect();
+        let truncated: String = redacted.chars().take(MAX_CHARS).collect();
         format!("{truncated}…")
     }
+}
+
+fn redact_remote_error_secrets(raw: &str) -> String {
+    const REDACTED: &[u8] = b"<redacted>";
+    const KV_PATTERNS: [&[u8]; 3] = [b"api_key=", b"token=", b"secret="];
+
+    let source = raw.as_bytes();
+    let mut output = Vec::with_capacity(source.len());
+    let mut index = 0;
+
+    while index < source.len() {
+        if starts_with_ascii_case_insensitive(source, index, b"bearer ") {
+            output.extend_from_slice(b"Bearer ");
+            output.extend_from_slice(REDACTED);
+            index += b"bearer ".len();
+            while index < source.len() && is_bearer_token_byte(source[index]) {
+                index += 1;
+            }
+            continue;
+        }
+
+        if starts_with_ascii_case_insensitive(source, index, b"sk-") {
+            let mut end = index + b"sk-".len();
+            while end < source.len() && is_sk_token_byte(source[end]) {
+                end += 1;
+            }
+            if end.saturating_sub(index + b"sk-".len()) >= 8 {
+                output.extend_from_slice(REDACTED);
+                index = end;
+                continue;
+            }
+        }
+
+        let mut matched_kv = false;
+        for pattern in KV_PATTERNS {
+            if starts_with_ascii_case_insensitive(source, index, pattern) {
+                output.extend_from_slice(&source[index..index + pattern.len()]);
+                index += pattern.len();
+                let value_start = index;
+                while index < source.len() && !is_secret_value_delimiter(source[index]) {
+                    index += 1;
+                }
+                if index > value_start {
+                    output.extend_from_slice(REDACTED);
+                }
+                matched_kv = true;
+                break;
+            }
+        }
+        if matched_kv {
+            continue;
+        }
+
+        output.push(source[index]);
+        index += 1;
+    }
+
+    String::from_utf8_lossy(output.as_slice()).into_owned()
+}
+
+fn starts_with_ascii_case_insensitive(source: &[u8], offset: usize, pattern: &[u8]) -> bool {
+    if source.len().saturating_sub(offset) < pattern.len() {
+        return false;
+    }
+    source[offset..offset + pattern.len()]
+        .iter()
+        .zip(pattern.iter())
+        .all(|(left, right)| left.eq_ignore_ascii_case(right))
+}
+
+fn is_bearer_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'+' | b'/' | b'=')
+}
+
+fn is_sk_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')
+}
+
+fn is_secret_value_delimiter(byte: u8) -> bool {
+    byte.is_ascii_whitespace()
+        || matches!(byte, b'&' | b',' | b';' | b'"' | b'\'' | b')' | b']' | b'}')
 }
 
 fn extract_completion_text(content: Option<Value>) -> String {
@@ -882,6 +964,19 @@ mod tests {
             241,
             "result should include 240 chars plus a truncation marker"
         );
+    }
+
+    #[test]
+    fn sanitize_remote_error_redacts_common_secret_patterns() {
+        let input = "Bearer topsecret123 sk-test-secret-token api_key=abc token=qwe secret=xyz";
+        let sanitized = sanitize_remote_error(input);
+
+        assert!(!sanitized.contains("topsecret123"), "bearer token value must be redacted");
+        assert!(!sanitized.contains("sk-test-secret-token"), "sk-* token should be redacted");
+        assert!(!sanitized.contains("api_key=abc"), "api_key value must be redacted");
+        assert!(!sanitized.contains("token=qwe"), "token value must be redacted");
+        assert!(!sanitized.contains("secret=xyz"), "secret value must be redacted");
+        assert!(sanitized.contains("<redacted>"), "sanitized error should carry redaction markers");
     }
 
     fn spawn_scripted_server(

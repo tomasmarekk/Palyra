@@ -21,11 +21,16 @@ const DEFAULT_GRPC_PORT: u16 = 7443;
 const DEFAULT_QUIC_BIND_ADDR: &str = "127.0.0.1";
 const DEFAULT_QUIC_PORT: u16 = 7444;
 const DEFAULT_QUIC_ENABLED: bool = true;
+const DEFAULT_GATEWAY_ALLOW_INSECURE_REMOTE: bool = false;
+const DEFAULT_GATEWAY_MAX_TAPE_ENTRIES_PER_RESPONSE: usize = 1_000;
+const DEFAULT_GATEWAY_MAX_TAPE_BYTES_PER_RESPONSE: usize = 2 * 1024 * 1024;
+const DEFAULT_GATEWAY_TLS_ENABLED: bool = false;
 const DEFAULT_ORCHESTRATOR_RUNLOOP_V1_ENABLED: bool = false;
 const DEFAULT_ADMIN_REQUIRE_AUTH: bool = true;
 const DEFAULT_ALLOW_INSECURE_NODE_RPC_WITHOUT_MTLS: bool = false;
 const DEFAULT_JOURNAL_DB_PATH: &str = "data/journal.sqlite3";
 const DEFAULT_JOURNAL_HASH_CHAIN_ENABLED: bool = false;
+const DEFAULT_MAX_JOURNAL_PAYLOAD_BYTES: usize = 256 * 1024;
 const DEFAULT_TOOL_CALL_MAX_CALLS_PER_RUN: u32 = 4;
 const DEFAULT_TOOL_CALL_EXECUTION_TIMEOUT_MS: u64 = 750;
 const DEFAULT_PROCESS_RUNNER_ENABLED: bool = false;
@@ -67,6 +72,19 @@ pub struct GatewayConfig {
     pub quic_bind_addr: String,
     pub quic_port: u16,
     pub quic_enabled: bool,
+    pub allow_insecure_remote: bool,
+    pub identity_store_dir: Option<PathBuf>,
+    pub max_tape_entries_per_response: usize,
+    pub max_tape_bytes_per_response: usize,
+    pub tls: GatewayTlsConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayTlsConfig {
+    pub enabled: bool,
+    pub cert_path: Option<PathBuf>,
+    pub key_path: Option<PathBuf>,
+    pub client_ca_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,6 +142,7 @@ pub struct IdentityConfig {
 pub struct StorageConfig {
     pub journal_db_path: PathBuf,
     pub journal_hash_chain_enabled: bool,
+    pub max_journal_payload_bytes: usize,
 }
 
 impl Default for DaemonConfig {
@@ -143,6 +162,7 @@ impl Default for StorageConfig {
         Self {
             journal_db_path: PathBuf::from(DEFAULT_JOURNAL_DB_PATH),
             journal_hash_chain_enabled: DEFAULT_JOURNAL_HASH_CHAIN_ENABLED,
+            max_journal_payload_bytes: DEFAULT_MAX_JOURNAL_PAYLOAD_BYTES,
         }
     }
 }
@@ -155,6 +175,22 @@ impl Default for GatewayConfig {
             quic_bind_addr: DEFAULT_QUIC_BIND_ADDR.to_owned(),
             quic_port: DEFAULT_QUIC_PORT,
             quic_enabled: DEFAULT_QUIC_ENABLED,
+            allow_insecure_remote: DEFAULT_GATEWAY_ALLOW_INSECURE_REMOTE,
+            identity_store_dir: None,
+            max_tape_entries_per_response: DEFAULT_GATEWAY_MAX_TAPE_ENTRIES_PER_RESPONSE,
+            max_tape_bytes_per_response: DEFAULT_GATEWAY_MAX_TAPE_BYTES_PER_RESPONSE,
+            tls: GatewayTlsConfig::default(),
+        }
+    }
+}
+
+impl Default for GatewayTlsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: DEFAULT_GATEWAY_TLS_ENABLED,
+            cert_path: None,
+            key_path: None,
+            client_ca_path: None,
         }
     }
 }
@@ -260,6 +296,41 @@ pub fn load_config() -> Result<LoadedConfig> {
             }
             if let Some(quic_enabled) = file_gateway.quic_enabled {
                 gateway.quic_enabled = quic_enabled;
+            }
+            if let Some(allow_insecure_remote) = file_gateway.allow_insecure_remote {
+                gateway.allow_insecure_remote = allow_insecure_remote;
+            }
+            if let Some(identity_store_dir) = file_gateway.identity_store_dir {
+                gateway.identity_store_dir =
+                    Some(parse_identity_store_dir(identity_store_dir.as_str())?);
+            }
+            if let Some(max_tape_entries_per_response) = file_gateway.max_tape_entries_per_response
+            {
+                gateway.max_tape_entries_per_response = parse_positive_usize(
+                    max_tape_entries_per_response,
+                    "gateway.max_tape_entries_per_response",
+                )?;
+            }
+            if let Some(max_tape_bytes_per_response) = file_gateway.max_tape_bytes_per_response {
+                gateway.max_tape_bytes_per_response = parse_positive_usize(
+                    max_tape_bytes_per_response,
+                    "gateway.max_tape_bytes_per_response",
+                )?;
+            }
+            if let Some(file_tls) = file_gateway.tls {
+                if let Some(enabled) = file_tls.enabled {
+                    gateway.tls.enabled = enabled;
+                }
+                if let Some(cert_path) = file_tls.cert_path {
+                    gateway.tls.cert_path = Some(parse_gateway_tls_path(cert_path.as_str())?);
+                }
+                if let Some(key_path) = file_tls.key_path {
+                    gateway.tls.key_path = Some(parse_gateway_tls_path(key_path.as_str())?);
+                }
+                if let Some(client_ca_path) = file_tls.client_ca_path {
+                    gateway.tls.client_ca_path =
+                        Some(parse_gateway_tls_path(client_ca_path.as_str())?);
+                }
             }
         }
         if let Some(file_orchestrator) = parsed.orchestrator {
@@ -442,6 +513,12 @@ pub fn load_config() -> Result<LoadedConfig> {
             if let Some(hash_chain_enabled) = file_storage.journal_hash_chain_enabled {
                 storage.journal_hash_chain_enabled = hash_chain_enabled;
             }
+            if let Some(max_journal_payload_bytes) = file_storage.max_journal_payload_bytes {
+                storage.max_journal_payload_bytes = parse_positive_usize(
+                    max_journal_payload_bytes,
+                    "storage.max_journal_payload_bytes",
+                )?;
+            }
         }
         source = path.to_string_lossy().into_owned();
         if migration.migrated {
@@ -486,6 +563,63 @@ pub fn load_config() -> Result<LoadedConfig> {
             .parse::<bool>()
             .context("PALYRA_GATEWAY_QUIC_ENABLED must be true or false")?;
         source.push_str(" +env(PALYRA_GATEWAY_QUIC_ENABLED)");
+    }
+
+    if let Ok(allow_insecure_remote) = env::var("PALYRA_GATEWAY_ALLOW_INSECURE_REMOTE") {
+        gateway.allow_insecure_remote = allow_insecure_remote
+            .parse::<bool>()
+            .context("PALYRA_GATEWAY_ALLOW_INSECURE_REMOTE must be true or false")?;
+        source.push_str(" +env(PALYRA_GATEWAY_ALLOW_INSECURE_REMOTE)");
+    }
+
+    if let Ok(identity_store_dir) = env::var("PALYRA_GATEWAY_IDENTITY_STORE_DIR") {
+        gateway.identity_store_dir = Some(parse_identity_store_dir(identity_store_dir.as_str())?);
+        source.push_str(" +env(PALYRA_GATEWAY_IDENTITY_STORE_DIR)");
+    }
+
+    if let Ok(max_tape_entries_per_response) =
+        env::var("PALYRA_GATEWAY_MAX_TAPE_ENTRIES_PER_RESPONSE")
+    {
+        gateway.max_tape_entries_per_response = parse_positive_usize(
+            max_tape_entries_per_response
+                .parse::<u64>()
+                .context("PALYRA_GATEWAY_MAX_TAPE_ENTRIES_PER_RESPONSE must be a valid u64")?,
+            "PALYRA_GATEWAY_MAX_TAPE_ENTRIES_PER_RESPONSE",
+        )?;
+        source.push_str(" +env(PALYRA_GATEWAY_MAX_TAPE_ENTRIES_PER_RESPONSE)");
+    }
+
+    if let Ok(max_tape_bytes_per_response) = env::var("PALYRA_GATEWAY_MAX_TAPE_BYTES_PER_RESPONSE")
+    {
+        gateway.max_tape_bytes_per_response = parse_positive_usize(
+            max_tape_bytes_per_response
+                .parse::<u64>()
+                .context("PALYRA_GATEWAY_MAX_TAPE_BYTES_PER_RESPONSE must be a valid u64")?,
+            "PALYRA_GATEWAY_MAX_TAPE_BYTES_PER_RESPONSE",
+        )?;
+        source.push_str(" +env(PALYRA_GATEWAY_MAX_TAPE_BYTES_PER_RESPONSE)");
+    }
+
+    if let Ok(tls_enabled) = env::var("PALYRA_GATEWAY_TLS_ENABLED") {
+        gateway.tls.enabled = tls_enabled
+            .parse::<bool>()
+            .context("PALYRA_GATEWAY_TLS_ENABLED must be true or false")?;
+        source.push_str(" +env(PALYRA_GATEWAY_TLS_ENABLED)");
+    }
+
+    if let Ok(tls_cert_path) = env::var("PALYRA_GATEWAY_TLS_CERT_PATH") {
+        gateway.tls.cert_path = Some(parse_gateway_tls_path(tls_cert_path.as_str())?);
+        source.push_str(" +env(PALYRA_GATEWAY_TLS_CERT_PATH)");
+    }
+
+    if let Ok(tls_key_path) = env::var("PALYRA_GATEWAY_TLS_KEY_PATH") {
+        gateway.tls.key_path = Some(parse_gateway_tls_path(tls_key_path.as_str())?);
+        source.push_str(" +env(PALYRA_GATEWAY_TLS_KEY_PATH)");
+    }
+
+    if let Ok(tls_client_ca_path) = env::var("PALYRA_GATEWAY_TLS_CLIENT_CA_PATH") {
+        gateway.tls.client_ca_path = Some(parse_gateway_tls_path(tls_client_ca_path.as_str())?);
+        source.push_str(" +env(PALYRA_GATEWAY_TLS_CLIENT_CA_PATH)");
     }
 
     if let Ok(runloop_v1_enabled) = env::var("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED") {
@@ -626,6 +760,22 @@ pub fn load_config() -> Result<LoadedConfig> {
         source.push_str(" +env(PALYRA_JOURNAL_HASH_CHAIN_ENABLED)");
     }
 
+    if let Ok(max_journal_payload_bytes) = env::var("PALYRA_JOURNAL_MAX_PAYLOAD_BYTES") {
+        storage.max_journal_payload_bytes = parse_positive_usize(
+            max_journal_payload_bytes
+                .parse::<u64>()
+                .context("PALYRA_JOURNAL_MAX_PAYLOAD_BYTES must be a valid u64")?,
+            "PALYRA_JOURNAL_MAX_PAYLOAD_BYTES",
+        )?;
+        source.push_str(" +env(PALYRA_JOURNAL_MAX_PAYLOAD_BYTES)");
+    }
+
+    if gateway.tls.enabled && (gateway.tls.cert_path.is_none() || gateway.tls.key_path.is_none()) {
+        anyhow::bail!(
+            "gateway.tls.enabled=true requires both gateway.tls.cert_path and gateway.tls.key_path"
+        );
+    }
+
     Ok(LoadedConfig {
         source,
         config_version,
@@ -682,6 +832,26 @@ fn parse_journal_db_path(raw: &str) -> Result<PathBuf> {
         anyhow::bail!("journal db path cannot contain parent traversal ('..')");
     }
     Ok(path)
+}
+
+fn parse_identity_store_dir(raw: &str) -> Result<PathBuf> {
+    if raw.trim().is_empty() {
+        anyhow::bail!("identity store directory cannot be empty");
+    }
+    if raw.contains('\0') {
+        anyhow::bail!("identity store directory cannot contain embedded NUL byte");
+    }
+    Ok(PathBuf::from(raw))
+}
+
+fn parse_gateway_tls_path(raw: &str) -> Result<PathBuf> {
+    if raw.trim().is_empty() {
+        anyhow::bail!("gateway tls path cannot be empty");
+    }
+    if raw.contains('\0') {
+        anyhow::bail!("gateway tls path cannot contain embedded NUL byte");
+    }
+    Ok(PathBuf::from(raw))
 }
 
 fn parse_openai_base_url(raw: &str) -> Result<String> {
@@ -837,6 +1007,13 @@ fn parse_positive_u32(value: u32, name: &str) -> Result<u32> {
     Ok(value)
 }
 
+fn parse_positive_usize(value: u64, name: &str) -> Result<usize> {
+    if value == 0 {
+        anyhow::bail!("{name} must be greater than 0");
+    }
+    usize::try_from(value).with_context(|| format!("{name} exceeds platform usize range"))
+}
+
 fn parse_retries(value: u32, name: &str) -> Result<u32> {
     const MAX_RETRIES: u32 = 10;
     if value > MAX_RETRIES {
@@ -851,9 +1028,10 @@ mod tests {
 
     use super::{
         parse_dns_suffix_allowlist, parse_host_allowlist, parse_journal_db_path,
-        parse_openai_base_url, parse_process_executable_allowlist, parse_root_file_config,
-        parse_storage_prefix_allowlist, parse_tool_allowlist, AdminConfig, GatewayConfig,
-        IdentityConfig, ModelProviderConfig, OrchestratorConfig, StorageConfig, ToolCallConfig,
+        parse_openai_base_url, parse_positive_usize, parse_process_executable_allowlist,
+        parse_root_file_config, parse_storage_prefix_allowlist, parse_tool_allowlist, AdminConfig,
+        GatewayConfig, GatewayTlsConfig, IdentityConfig, ModelProviderConfig, OrchestratorConfig,
+        StorageConfig, ToolCallConfig,
     };
     use crate::model_provider::ModelProviderKind;
     use palyra_common::daemon_config_schema::RootFileConfig;
@@ -885,6 +1063,13 @@ mod tests {
         assert_eq!(config.quic_bind_addr, "127.0.0.1");
         assert_eq!(config.quic_port, 7444);
         assert!(config.quic_enabled, "gateway transport should default to QUIC-enabled mode");
+        assert!(
+            !config.allow_insecure_remote,
+            "remote exposure must require explicit insecure opt-in"
+        );
+        assert_eq!(config.max_tape_entries_per_response, 1_000);
+        assert_eq!(config.max_tape_bytes_per_response, 2 * 1024 * 1024);
+        assert_eq!(config.tls, GatewayTlsConfig::default());
     }
 
     #[test]
@@ -942,6 +1127,11 @@ mod tests {
         assert!(
             !config.journal_hash_chain_enabled,
             "hash chain must default to disabled until audit mode is explicitly enabled"
+        );
+        assert_eq!(
+            config.max_journal_payload_bytes,
+            256 * 1024,
+            "journal payload limit should default to 256 KiB"
         );
     }
 
@@ -1137,5 +1327,11 @@ mod tests {
             "tool_call.wasm_runtime.allowed_storage_prefixes",
         );
         assert!(result.is_err(), "storage prefix allowlist must reject parent traversal");
+    }
+
+    #[test]
+    fn parse_positive_usize_rejects_zero() {
+        let result = parse_positive_usize(0, "gateway.max_tape_entries_per_response");
+        assert!(result.is_err(), "zero should not be accepted for positive usize fields");
     }
 }
