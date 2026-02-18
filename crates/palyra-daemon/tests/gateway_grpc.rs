@@ -684,7 +684,13 @@ async fn grpc_run_stream_executes_sandbox_process_runner_within_workspace_scope(
     let mut saw_approval_request = false;
     let mut saw_success_result = false;
     let mut saw_sandbox_attestation = false;
-    while let Some(event) = response_stream.next().await {
+    loop {
+        let next_event = tokio::time::timeout(Duration::from_secs(5), response_stream.next())
+            .await
+            .context("sandbox process runner success stream stalled before expected events")?;
+        let Some(event) = next_event else {
+            break;
+        };
         let event = event.context("failed to read RunStream event")?;
         if let Some(body) = event.body {
             match body {
@@ -733,6 +739,13 @@ async fn grpc_run_stream_executes_sandbox_process_runner_within_workspace_scope(
                 }
                 _ => {}
             }
+        }
+        if saw_approval_request
+            && saw_allow_decision
+            && saw_success_result
+            && saw_sandbox_attestation
+        {
+            break;
         }
     }
 
@@ -798,7 +811,13 @@ async fn grpc_run_stream_blocks_sandbox_process_runner_path_traversal() -> Resul
 
     let mut saw_approval_request = false;
     let mut saw_failed_result = false;
-    while let Some(event) = response_stream.next().await {
+    loop {
+        let next_event = tokio::time::timeout(Duration::from_secs(5), response_stream.next())
+            .await
+            .context("sandbox traversal stream stalled before expected events")?;
+        let Some(event) = next_event else {
+            break;
+        };
         let event = event.context("failed to read RunStream event")?;
         if let Some(body) = event.body {
             match body {
@@ -829,6 +848,9 @@ async fn grpc_run_stream_blocks_sandbox_process_runner_path_traversal() -> Resul
                 }
                 _ => {}
             }
+        }
+        if saw_approval_request && saw_failed_result {
+            break;
         }
     }
 
@@ -892,7 +914,13 @@ async fn grpc_run_stream_blocks_sandbox_process_runner_non_allowlisted_egress_ho
 
     let mut saw_approval_request = false;
     let mut saw_failed_result = false;
-    while let Some(event) = response_stream.next().await {
+    loop {
+        let next_event = tokio::time::timeout(Duration::from_secs(5), response_stream.next())
+            .await
+            .context("sandbox egress stream stalled before expected events")?;
+        let Some(event) = next_event else {
+            break;
+        };
         let event = event.context("failed to read RunStream event")?;
         if let Some(body) = event.body {
             match body {
@@ -923,6 +951,9 @@ async fn grpc_run_stream_blocks_sandbox_process_runner_non_allowlisted_egress_ho
                 }
                 _ => {}
             }
+        }
+        if saw_approval_request && saw_failed_result {
+            break;
         }
     }
 
