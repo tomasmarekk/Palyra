@@ -25,7 +25,7 @@ commands:
   dependency-audit:
     - cargo audit
     - cargo deny check
-    - osv-scanner --config osv-scanner.toml scan -L Cargo.lock
+    - osv-scanner scan --config osv-scanner.toml -L Cargo.lock
   secret-scanning:
     - gitleaks detect --source .
     - bash scripts/check-high-risk-patterns.sh

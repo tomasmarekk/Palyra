@@ -71,7 +71,7 @@ jobs:
       - name: OSV scan
         run: |
           mkdir -p security-artifacts
-          osv-scanner --config osv-scanner.toml scan -L Cargo.lock --format json --output security-artifacts/osv-results.json
+          osv-scanner scan --config osv-scanner.toml -L Cargo.lock --format json --output security-artifacts/osv-results.json
 
       - name: Gitleaks scan
         uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7
