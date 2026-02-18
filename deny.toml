@@ -4,7 +4,11 @@ all-features = true
 
 [advisories]
 version = 2
-ignore = []
+ignore = [
+  # rustls-pemfile is a transitive dependency (via reqwest/rustls stack) with no drop-in
+  # maintained replacement in current upstream graph; tracked until dependency chain migrates.
+  "RUSTSEC-2025-0134",
+]
 
 [licenses]
 version = 2

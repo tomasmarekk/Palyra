@@ -3,9 +3,11 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    process::Command,
     sync::Mutex,
 };
+
+#[cfg(windows)]
+use std::process::Command;
 
 use crate::error::{IdentityError, IdentityResult};
 

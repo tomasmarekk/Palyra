@@ -52,6 +52,10 @@ pub mod palyra_common_v1 {
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct StreamStatus;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ToolApprovalRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ToolApprovalResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct ToolAttestation;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct ToolDecision;
@@ -63,6 +67,10 @@ pub mod palyra_common_v1 {
 
 pub mod palyra_gateway_v1 {
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct AbortRunRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct AbortRunResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct AppendEventRequest;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct AppendEventResponse;
@@ -70,9 +78,22 @@ pub mod palyra_gateway_v1 {
     pub struct HealthRequest;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct HealthResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ListSessionsRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ListSessionsResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ResolveSessionRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ResolveSessionResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct SessionSummary;
     pub trait GatewayServiceClient {
+        fn AbortRun(&self);
         fn AppendEvent(&self);
         fn GetHealth(&self);
+        fn ListSessions(&self);
+        fn ResolveSession(&self);
         fn RunStream(&self);
     }
 }

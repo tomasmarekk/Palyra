@@ -29,6 +29,8 @@ object PalyraCommonV1 {
     data class RunStreamRequest(val placeholder: Int = 0)
     data class SecurityContext(val placeholder: Int = 0)
     data class StreamStatus(val placeholder: Int = 0)
+    data class ToolApprovalRequest(val placeholder: Int = 0)
+    data class ToolApprovalResponse(val placeholder: Int = 0)
     data class ToolAttestation(val placeholder: Int = 0)
     data class ToolDecision(val placeholder: Int = 0)
     data class ToolProposal(val placeholder: Int = 0)
@@ -36,13 +38,23 @@ object PalyraCommonV1 {
 }
 
 object PalyraGatewayV1 {
+    data class AbortRunRequest(val placeholder: Int = 0)
+    data class AbortRunResponse(val placeholder: Int = 0)
     data class AppendEventRequest(val placeholder: Int = 0)
     data class AppendEventResponse(val placeholder: Int = 0)
     data class HealthRequest(val placeholder: Int = 0)
     data class HealthResponse(val placeholder: Int = 0)
+    data class ListSessionsRequest(val placeholder: Int = 0)
+    data class ListSessionsResponse(val placeholder: Int = 0)
+    data class ResolveSessionRequest(val placeholder: Int = 0)
+    data class ResolveSessionResponse(val placeholder: Int = 0)
+    data class SessionSummary(val placeholder: Int = 0)
     interface GatewayServiceClient {
+        fun abortRun()
         fun appendEvent()
         fun getHealth()
+        fun listSessions()
+        fun resolveSession()
         fun runStream()
     }
 }
