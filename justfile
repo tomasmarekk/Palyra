@@ -44,7 +44,7 @@ deny:
 
 osv:
     @if command -v osv-scanner >/dev/null 2>&1; then \
-      osv-scanner scan -L Cargo.lock; \
+      osv-scanner --config osv-scanner.toml scan -L Cargo.lock; \
     else \
       echo "osv-scanner is not installed. Install it to run this gate locally."; \
       exit 1; \
