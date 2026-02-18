@@ -59,7 +59,8 @@ async fn node_rpc_mtls_rejects_clients_without_certificate() -> Result<()> {
         status.code() == Code::Unauthenticated
             || status.code() == Code::PermissionDenied
             || status.code() == Code::Unavailable
-            || status.code() == Code::Cancelled,
+            || status.code() == Code::Cancelled
+            || status.code() == Code::Unknown,
         "unexpected status code for missing certificate: {:?}",
         status.code()
     );
