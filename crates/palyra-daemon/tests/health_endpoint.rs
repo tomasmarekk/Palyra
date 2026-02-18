@@ -3,6 +3,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     process::{Child, ChildStdout, Command, Stdio},
+    sync::atomic::{AtomicU64, Ordering},
     sync::mpsc,
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -10,6 +11,8 @@ use std::{
 
 use anyhow::{Context, Result};
 use reqwest::blocking::Client;
+
+static TEMP_IDENTITY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[test]
 fn palyrad_health_endpoint_returns_ok() -> Result<()> {
@@ -36,6 +39,7 @@ fn palyrad_health_endpoint_returns_ok() -> Result<()> {
 
 fn spawn_palyrad_with_dynamic_port() -> Result<(Child, u16)> {
     let journal_db_path = unique_temp_journal_db_path();
+    let identity_store_dir = unique_temp_identity_store_dir();
     let mut child = Command::new(env!("CARGO_BIN_EXE_palyrad"))
         .args([
             "--bind",
@@ -48,6 +52,7 @@ fn spawn_palyrad_with_dynamic_port() -> Result<(Child, u16)> {
             "0",
         ])
         .env("PALYRA_JOURNAL_DB_PATH", journal_db_path.to_string_lossy().to_string())
+        .env("PALYRA_GATEWAY_IDENTITY_STORE_DIR", identity_store_dir.to_string_lossy().to_string())
         .env("RUST_LOG", "info")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -65,6 +70,16 @@ fn unique_temp_journal_db_path() -> PathBuf {
         .as_nanos();
     std::env::temp_dir()
         .join(format!("palyra-health-endpoint-{nonce}-{}.sqlite3", std::process::id()))
+}
+
+fn unique_temp_identity_store_dir() -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_nanos();
+    let counter = TEMP_IDENTITY_COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir()
+        .join(format!("palyra-health-identity-{nonce}-{}-{counter}", std::process::id()))
 }
 
 fn wait_for_listen_port(stdout: ChildStdout, daemon: &mut Child) -> Result<u16> {
