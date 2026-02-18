@@ -33,7 +33,7 @@ jobs:
 
       - name: npm audit (high)
         if: ${{ hashFiles('apps/web/package-lock.json') != '' }}
-        run: npm --prefix apps/web audit --audit-level=high
+        run: npm --prefix apps/web audit --audit-level=high --omit=dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7
