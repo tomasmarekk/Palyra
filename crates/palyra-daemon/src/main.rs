@@ -31,6 +31,7 @@ use cron::spawn_scheduler_loop;
 use gateway::{
     authorize_headers, request_context_from_headers, AuthError, GatewayAuthConfig,
     GatewayJournalConfigSnapshot, GatewayRuntimeConfigSnapshot, GatewayRuntimeState,
+    MemoryRuntimeConfig,
 };
 use journal::{
     JournalConfig, JournalStore, OrchestratorCancelRequest, OrchestratorRunStatusSnapshot,
@@ -224,6 +225,13 @@ async fn main() -> Result<()> {
         model_provider,
     )
     .context("failed to initialize gateway runtime state")?;
+    runtime.configure_memory(MemoryRuntimeConfig {
+        max_item_bytes: loaded.memory.max_item_bytes,
+        max_item_tokens: loaded.memory.max_item_tokens,
+        auto_inject_enabled: loaded.memory.auto_inject.enabled,
+        auto_inject_max_items: loaded.memory.auto_inject.max_items,
+        default_ttl_ms: loaded.memory.default_ttl_ms,
+    });
 
     if args.journal_migrate_only {
         info!(
@@ -264,6 +272,11 @@ async fn main() -> Result<()> {
         gateway_tls_key_path = ?loaded.gateway.tls.key_path.as_ref().map(|path| path.display().to_string()),
         gateway_tls_client_ca_path = ?loaded.gateway.tls.client_ca_path.as_ref().map(|path| path.display().to_string()),
         orchestrator_runloop_v1_enabled = loaded.orchestrator.runloop_v1_enabled,
+        memory_max_item_bytes = loaded.memory.max_item_bytes,
+        memory_max_item_tokens = loaded.memory.max_item_tokens,
+        memory_default_ttl_ms = ?loaded.memory.default_ttl_ms,
+        memory_auto_inject_enabled = loaded.memory.auto_inject.enabled,
+        memory_auto_inject_max_items = loaded.memory.auto_inject.max_items,
         model_provider_kind = loaded.model_provider.kind.as_str(),
         model_provider_openai_base_url = %loaded.model_provider.openai_base_url,
         model_provider_openai_model = %loaded.model_provider.openai_model,
@@ -389,6 +402,11 @@ async fn main() -> Result<()> {
         gateway::proto::palyra::gateway::v1::approvals_service_server::ApprovalsServiceServer::new(
             approvals_service,
         );
+    let memory_service = gateway::MemoryServiceImpl::new(runtime.clone(), auth.clone());
+    let grpc_memory_server =
+        gateway::proto::palyra::memory::v1::memory_service_server::MemoryServiceServer::new(
+            memory_service,
+        );
     let node_rpc_service = node_rpc::NodeRpcServiceImpl::new(
         identity_runtime.revoked_certificate_fingerprints.clone(),
         !loaded.identity.allow_insecure_node_rpc_without_mtls,
@@ -423,6 +441,7 @@ async fn main() -> Result<()> {
                 .add_service(grpc_gateway_server)
                 .add_service(grpc_cron_server)
                 .add_service(grpc_approvals_server)
+                .add_service(grpc_memory_server)
                 .serve_with_incoming_shutdown(
                     TcpListenerStream::new(grpc_listener),
                     shutdown_signal(),

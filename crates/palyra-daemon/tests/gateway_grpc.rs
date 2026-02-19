@@ -54,10 +54,19 @@ pub mod proto {
                 tonic::include_proto!("palyra.cron.v1");
             }
         }
+
+        pub mod memory {
+            pub mod v1 {
+                tonic::include_proto!("palyra.memory.v1");
+            }
+        }
     }
 }
 
-use proto::palyra::{common::v1 as common_v1, cron::v1 as cron_v1, gateway::v1 as gateway_v1};
+use proto::palyra::{
+    common::v1 as common_v1, cron::v1 as cron_v1, gateway::v1 as gateway_v1,
+    memory::v1 as memory_v1,
+};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn grpc_gateway_enforces_auth_and_streams_status() -> Result<()> {
@@ -1071,6 +1080,179 @@ async fn grpc_cron_jobs_survive_daemon_restart() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn grpc_memory_ingest_search_list_and_purge_roundtrip() -> Result<()> {
+    let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut memory_client =
+        memory_v1::memory_service_client::MemoryServiceClient::connect(endpoint)
+            .await
+            .context("failed to connect memory gRPC client")?;
+
+    let mut ingest_request = tonic::Request::new(memory_v1::IngestMemoryRequest {
+        v: 1,
+        source: memory_v1::MemorySource::Manual as i32,
+        content_text: "release train rollback checklist".to_owned(),
+        channel: "cli".to_owned(),
+        session_id: Some(common_v1::CanonicalId { ulid: SESSION_ID.to_owned() }),
+        tags: vec!["release".to_owned()],
+        confidence: 0.9,
+        ttl_unix_ms: 0,
+    });
+    authorize_metadata(ingest_request.metadata_mut())?;
+    let ingested = memory_client
+        .ingest_memory(ingest_request)
+        .await
+        .context("failed to call memory IngestMemory")?
+        .into_inner();
+    let memory_id = ingested
+        .item
+        .as_ref()
+        .and_then(|item| item.memory_id.as_ref())
+        .map(|value| value.ulid.clone())
+        .context("memory ingest should return canonical memory id")?;
+
+    let mut search_request = tonic::Request::new(memory_v1::SearchMemoryRequest {
+        v: 1,
+        query: "rollback checklist".to_owned(),
+        channel: "cli".to_owned(),
+        session_id: Some(common_v1::CanonicalId { ulid: SESSION_ID.to_owned() }),
+        top_k: 5,
+        min_score: 0.0,
+        tags: Vec::new(),
+        sources: Vec::new(),
+        include_score_breakdown: true,
+    });
+    authorize_metadata(search_request.metadata_mut())?;
+    let search = memory_client
+        .search_memory(search_request)
+        .await
+        .context("failed to call memory SearchMemory")?
+        .into_inner();
+    assert!(
+        search.hits.iter().any(|hit| {
+            hit.item.as_ref().and_then(|item| item.memory_id.as_ref()).map(|id| id.ulid.as_str())
+                == Some(memory_id.as_str())
+        }),
+        "memory search should return the ingested memory record"
+    );
+
+    let mut list_request = tonic::Request::new(memory_v1::ListMemoryItemsRequest {
+        v: 1,
+        after_memory_ulid: String::new(),
+        limit: 50,
+        channel: "cli".to_owned(),
+        session_id: Some(common_v1::CanonicalId { ulid: SESSION_ID.to_owned() }),
+        tags: Vec::new(),
+        sources: Vec::new(),
+    });
+    authorize_metadata(list_request.metadata_mut())?;
+    let listed = memory_client
+        .list_memory_items(list_request)
+        .await
+        .context("failed to call memory ListMemoryItems")?
+        .into_inner();
+    assert!(
+        listed.items.iter().any(|item| {
+            item.memory_id.as_ref().map(|id| id.ulid.as_str()) == Some(memory_id.as_str())
+        }),
+        "list memory should include ingested record"
+    );
+
+    let mut purge_request = tonic::Request::new(memory_v1::PurgeMemoryRequest {
+        v: 1,
+        channel: "cli".to_owned(),
+        session_id: Some(common_v1::CanonicalId { ulid: SESSION_ID.to_owned() }),
+        purge_all_principal: false,
+    });
+    authorize_metadata(purge_request.metadata_mut())?;
+    let purged = memory_client
+        .purge_memory(purge_request)
+        .await
+        .context("failed to call memory PurgeMemory")?
+        .into_inner();
+    assert!(
+        purged.deleted_count >= 1,
+        "session purge should delete at least the memory created in this test"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_memory_scope_isolation_blocks_cross_principal_get() -> Result<()> {
+    let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut memory_client =
+        memory_v1::memory_service_client::MemoryServiceClient::connect(endpoint)
+            .await
+            .context("failed to connect memory gRPC client")?;
+
+    let mut ingest_request = tonic::Request::new(memory_v1::IngestMemoryRequest {
+        v: 1,
+        source: memory_v1::MemorySource::Manual as i32,
+        content_text: "owner-private memory item".to_owned(),
+        channel: "cli".to_owned(),
+        session_id: Some(common_v1::CanonicalId { ulid: SESSION_ID.to_owned() }),
+        tags: Vec::new(),
+        confidence: 0.8,
+        ttl_unix_ms: 0,
+    });
+    authorize_metadata_with_principal(ingest_request.metadata_mut(), "user:ops")?;
+    let ingested = memory_client
+        .ingest_memory(ingest_request)
+        .await
+        .context("failed to ingest owner memory item")?
+        .into_inner();
+    let memory_id = ingested
+        .item
+        .as_ref()
+        .and_then(|item| item.memory_id.as_ref())
+        .map(|value| value.ulid.clone())
+        .context("memory ingest should return canonical memory id")?;
+
+    let mut denied_get_request = tonic::Request::new(memory_v1::GetMemoryItemRequest {
+        v: 1,
+        memory_id: Some(common_v1::CanonicalId { ulid: memory_id.clone() }),
+    });
+    authorize_metadata_with_principal(denied_get_request.metadata_mut(), "user:auditor")?;
+    let denied = memory_client
+        .get_memory_item(denied_get_request)
+        .await
+        .expect_err("cross-principal get should be denied");
+    assert_eq!(denied.code(), Code::PermissionDenied);
+
+    let mut search_request = tonic::Request::new(memory_v1::SearchMemoryRequest {
+        v: 1,
+        query: "owner-private".to_owned(),
+        channel: "cli".to_owned(),
+        session_id: Some(common_v1::CanonicalId { ulid: SESSION_ID.to_owned() }),
+        top_k: 10,
+        min_score: 0.0,
+        tags: Vec::new(),
+        sources: Vec::new(),
+        include_score_breakdown: false,
+    });
+    authorize_metadata_with_principal(search_request.metadata_mut(), "user:auditor")?;
+    let search = memory_client
+        .search_memory(search_request)
+        .await
+        .context("cross-principal search request should succeed with scoped empty result")?
+        .into_inner();
+    assert!(
+        search.hits.is_empty(),
+        "cross-principal memory search must not return data owned by another principal"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn grpc_abort_run_requests_cancellation() -> Result<()> {
     let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
     let mut daemon = ChildGuard::new(child);
@@ -1297,6 +1479,214 @@ async fn grpc_run_stream_executes_allowlisted_tool_and_emits_attestation() -> Re
     assert_eq!(
         run_snapshot.get("state").and_then(Value::as_str).context("run snapshot missing state")?,
         "done"
+    );
+
+    server_handle.join().expect("scripted openai server thread should exit");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_run_stream_executes_memory_search_tool_and_emits_memory_attestation() -> Result<()> {
+    let response_body = openai_tool_call_response(
+        "palyra.memory.search",
+        &serde_json::json!({
+            "query": "rollback checklist",
+            "scope": "session",
+            "top_k": 5,
+            "min_score": 0.0
+        }),
+    )?;
+    let (openai_base_url, _request_count, server_handle) =
+        spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::immediate(200, response_body)])?;
+    let (child, admin_port, grpc_port, _journal_db_path) =
+        spawn_palyrad_with_openai_provider_and_tool_policy(
+            openai_base_url.as_str(),
+            OPENAI_API_KEY,
+            "palyra.memory.search",
+            2,
+            250,
+        )?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut memory_client =
+        memory_v1::memory_service_client::MemoryServiceClient::connect(endpoint.clone())
+            .await
+            .context("failed to connect memory gRPC client")?;
+    let mut ingest_request = tonic::Request::new(memory_v1::IngestMemoryRequest {
+        v: 1,
+        source: memory_v1::MemorySource::Manual as i32,
+        content_text: "rollback checklist for release train".to_owned(),
+        channel: "cli".to_owned(),
+        session_id: Some(common_v1::CanonicalId { ulid: SESSION_ID.to_owned() }),
+        tags: vec!["release".to_owned()],
+        confidence: 0.9,
+        ttl_unix_ms: 0,
+    });
+    authorize_metadata(ingest_request.metadata_mut())?;
+    let ingested = memory_client
+        .ingest_memory(ingest_request)
+        .await
+        .context("failed to ingest memory item for tool search test")?
+        .into_inner();
+    let ingested_memory_id = ingested
+        .item
+        .as_ref()
+        .and_then(|item| item.memory_id.as_ref())
+        .map(|id| id.ulid.clone())
+        .context("ingested memory should include canonical id")?;
+
+    let mut gateway_client =
+        gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+            .await
+            .context("failed to connect gateway gRPC client")?;
+    let mut stream_request =
+        tonic::Request::new(tokio_stream::iter(vec![sample_run_stream_request_with_text(
+            "trigger memory search tool".to_owned(),
+        )]));
+    authorize_metadata(stream_request.metadata_mut())?;
+    let mut response_stream = gateway_client
+        .run_stream(stream_request)
+        .await
+        .context("failed to call RunStream")?
+        .into_inner();
+
+    let mut saw_allow_decision = false;
+    let mut saw_memory_result = false;
+    let mut saw_memory_attestation = false;
+    while let Some(event) = response_stream.next().await {
+        let event = event.context("failed to read RunStream event")?;
+        if let Some(body) = event.body {
+            match body {
+                common_v1::run_stream_event::Body::ToolDecision(decision) => {
+                    if decision.kind == common_v1::tool_decision::DecisionKind::Allow as i32 {
+                        saw_allow_decision = true;
+                    }
+                }
+                common_v1::run_stream_event::Body::ToolResult(result) => {
+                    if result.success {
+                        let output = serde_json::from_slice::<Value>(&result.output_json)
+                            .context("memory tool output_json should be valid JSON")?;
+                        let hits = output
+                            .get("hits")
+                            .and_then(Value::as_array)
+                            .context("memory tool output must contain hits array")?;
+                        let contains_ingested = hits.iter().any(|hit| {
+                            hit.get("memory_id").and_then(Value::as_str)
+                                == Some(ingested_memory_id.as_str())
+                        });
+                        assert!(
+                            contains_ingested,
+                            "memory search tool output should include the ingested memory item"
+                        );
+                        saw_memory_result = true;
+                    }
+                }
+                common_v1::run_stream_event::Body::ToolAttestation(attestation) => {
+                    if attestation.executor == "memory_runtime" {
+                        saw_memory_attestation = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    assert!(saw_allow_decision, "memory search tool should produce allow decision");
+    assert!(saw_memory_result, "memory search tool should produce successful tool result");
+    assert!(saw_memory_attestation, "memory search tool should emit memory_runtime attestation");
+
+    server_handle.join().expect("scripted openai server thread should exit");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_run_stream_records_memory_auto_inject_tape_event() -> Result<()> {
+    let (openai_base_url, _request_count, server_handle) =
+        spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::immediate(
+            200,
+            r#"{"choices":[{"message":{"content":"model response"}}]}"#.to_owned(),
+        )])?;
+    let (child, admin_port, grpc_port, _journal_db_path) =
+        spawn_palyrad_with_openai_provider_tool_policy_and_memory_auto_inject(
+            openai_base_url.as_str(),
+            OPENAI_API_KEY,
+            "",
+            2,
+            250,
+            3,
+        )?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut gateway_client =
+        gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+            .await
+            .context("failed to connect gateway gRPC client")?;
+    let mut stream_request =
+        tonic::Request::new(tokio_stream::iter(vec![sample_run_stream_request_with_text(
+            "please recall the release rollback checklist".to_owned(),
+        )]));
+    authorize_metadata(stream_request.metadata_mut())?;
+    let mut response_stream = gateway_client
+        .run_stream(stream_request)
+        .await
+        .context("failed to call RunStream")?
+        .into_inner();
+    while let Some(event) = response_stream.next().await {
+        let _event = event.context("failed to read RunStream event")?;
+    }
+
+    let tape_snapshot =
+        admin_get_json_async(admin_port, format!("/admin/v1/runs/{RUN_ID}/tape")).await?;
+    let events = tape_snapshot
+        .get("events")
+        .and_then(Value::as_array)
+        .context("run tape snapshot missing events")?;
+    let memory_auto_inject_event = events
+        .iter()
+        .find(|event| event.get("event_type").and_then(Value::as_str) == Some("memory_auto_inject"))
+        .context("run tape must contain memory_auto_inject event when auto-inject is enabled")?;
+    let payload_json = memory_auto_inject_event
+        .get("payload_json")
+        .and_then(Value::as_str)
+        .context("memory_auto_inject event missing payload_json")?;
+    let payload: Value = serde_json::from_str(payload_json)
+        .context("memory_auto_inject payload_json must be valid JSON")?;
+    let injected_count = payload.get("injected_count").and_then(Value::as_u64).unwrap_or_default();
+    assert!(injected_count >= 1, "memory auto-inject should include at least one matching item");
+    assert_eq!(
+        payload.get("query").and_then(Value::as_str),
+        Some("please recall the release rollback checklist"),
+        "memory auto-inject payload should keep the search query for auditability"
+    );
+    let hits = payload
+        .get("hits")
+        .and_then(Value::as_array)
+        .context("memory_auto_inject payload must include hits array")?;
+    let contains_user_memory_hit = hits
+        .iter()
+        .any(|hit| hit.get("source").and_then(Value::as_str) == Some("tape:user_message"));
+    assert!(
+        contains_user_memory_hit,
+        "memory_auto_inject should be able to reuse scoped user-message memories"
+    );
+
+    let status_snapshot = admin_get_json_async(admin_port, "/admin/v1/status".to_owned()).await?;
+    assert_eq!(
+        status_snapshot.pointer("/counters/memory_auto_inject_events").and_then(Value::as_u64),
+        Some(1),
+        "runtime counters should report one memory auto-inject event"
+    );
+    let search_requests = status_snapshot
+        .pointer("/counters/memory_search_requests")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    assert!(
+        search_requests >= 1,
+        "memory search requests counter should increase when auto-inject runs"
     );
 
     server_handle.join().expect("scripted openai server thread should exit");
@@ -3020,6 +3410,53 @@ fn spawn_palyrad_with_openai_provider_and_tool_policy(
         .stderr(Stdio::null())
         .spawn()
         .context("failed to start palyrad with openai-compatible provider")?;
+    let stdout = child.stdout.take().context("failed to capture palyrad stdout")?;
+    let (admin_port, grpc_port) = wait_for_listen_ports(stdout, &mut child)?;
+    Ok((child, admin_port, grpc_port, journal_db_path))
+}
+
+fn spawn_palyrad_with_openai_provider_tool_policy_and_memory_auto_inject(
+    openai_base_url: &str,
+    openai_api_key: &str,
+    allowed_tools: &str,
+    max_calls_per_run: u32,
+    execution_timeout_ms: u64,
+    auto_inject_max_items: u32,
+) -> Result<(Child, u16, u16, PathBuf)> {
+    let journal_db_path = unique_temp_journal_db_path();
+    let identity_store_dir = unique_temp_identity_store_dir();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_palyrad"))
+        .args([
+            "--bind",
+            "127.0.0.1",
+            "--port",
+            "0",
+            "--grpc-bind",
+            "127.0.0.1",
+            "--grpc-port",
+            "0",
+        ])
+        .env("PALYRA_ADMIN_TOKEN", ADMIN_TOKEN)
+        .env("PALYRA_JOURNAL_DB_PATH", journal_db_path.to_string_lossy().to_string())
+        .env("PALYRA_GATEWAY_IDENTITY_STORE_DIR", identity_store_dir.to_string_lossy().to_string())
+        .env("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED", "true")
+        .env("PALYRA_MODEL_PROVIDER_KIND", "openai_compatible")
+        .env("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", openai_base_url)
+        .env("PALYRA_MODEL_PROVIDER_OPENAI_API_KEY", openai_api_key)
+        .env("PALYRA_MODEL_PROVIDER_MAX_RETRIES", "0")
+        .env("PALYRA_MODEL_PROVIDER_RETRY_BACKOFF_MS", "1")
+        .env("PALYRA_MODEL_PROVIDER_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "1")
+        .env("PALYRA_MODEL_PROVIDER_CIRCUIT_BREAKER_COOLDOWN_MS", "30000")
+        .env("PALYRA_TOOL_CALL_ALLOWED_TOOLS", allowed_tools)
+        .env("PALYRA_TOOL_CALL_MAX_CALLS_PER_RUN", max_calls_per_run.to_string())
+        .env("PALYRA_TOOL_CALL_TIMEOUT_MS", execution_timeout_ms.to_string())
+        .env("PALYRA_MEMORY_AUTO_INJECT_ENABLED", "true")
+        .env("PALYRA_MEMORY_AUTO_INJECT_MAX_ITEMS", auto_inject_max_items.to_string())
+        .env("RUST_LOG", "info")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to start palyrad with memory auto-inject enabled")?;
     let stdout = child.stdout.take().context("failed to capture palyrad stdout")?;
     let (admin_port, grpc_port) = wait_for_listen_ports(stdout, &mut child)?;
     Ok((child, admin_port, grpc_port, journal_db_path))

@@ -1,0 +1,164 @@
+syntax = "proto3";
+
+package palyra.memory.v1;
+
+import "palyra/v1/common.proto";
+
+service MemoryService {
+  rpc IngestMemory(IngestMemoryRequest) returns (IngestMemoryResponse);
+  rpc SearchMemory(SearchMemoryRequest) returns (SearchMemoryResponse);
+  rpc GetMemoryItem(GetMemoryItemRequest) returns (GetMemoryItemResponse);
+  rpc DeleteMemoryItem(DeleteMemoryItemRequest) returns (DeleteMemoryItemResponse);
+  rpc ListMemoryItems(ListMemoryItemsRequest) returns (ListMemoryItemsResponse);
+  rpc PurgeMemory(PurgeMemoryRequest) returns (PurgeMemoryResponse);
+}
+
+enum MemorySource {
+  MEMORY_SOURCE_UNSPECIFIED = 0;
+  MEMORY_SOURCE_TAPE_USER_MESSAGE = 1;
+  MEMORY_SOURCE_TAPE_TOOL_RESULT = 2;
+  MEMORY_SOURCE_SUMMARY = 3;
+  MEMORY_SOURCE_MANUAL = 4;
+  MEMORY_SOURCE_IMPORT = 5;
+}
+
+message MemoryItem {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId memory_id = 2;
+  string principal = 3;
+  string channel = 4;
+  palyra.common.v1.CanonicalId session_id = 5;
+  MemorySource source = 6;
+  string content_text = 7;
+  string content_hash = 8;
+  repeated string tags = 9;
+  double confidence = 10;
+  int64 ttl_unix_ms = 11;
+  int64 created_at_unix_ms = 12;
+  int64 updated_at_unix_ms = 13;
+
+  reserved 14 to 20;
+}
+
+message MemoryScoreBreakdown {
+  double lexical_score = 1;
+  double vector_score = 2;
+  double recency_score = 3;
+  double final_score = 4;
+
+  reserved 5 to 10;
+}
+
+message MemorySearchHit {
+  MemoryItem item = 1;
+  string snippet = 2;
+  double score = 3;
+  MemoryScoreBreakdown breakdown = 4;
+
+  reserved 5 to 10;
+}
+
+message IngestMemoryRequest {
+  uint32 v = 1;
+  MemorySource source = 2;
+  string content_text = 3;
+  string channel = 4;
+  palyra.common.v1.CanonicalId session_id = 5;
+  repeated string tags = 6;
+  double confidence = 7;
+  int64 ttl_unix_ms = 8;
+
+  reserved 9 to 16;
+}
+
+message IngestMemoryResponse {
+  uint32 v = 1;
+  MemoryItem item = 2;
+
+  reserved 3 to 10;
+}
+
+message SearchMemoryRequest {
+  uint32 v = 1;
+  string query = 2;
+  string channel = 3;
+  palyra.common.v1.CanonicalId session_id = 4;
+  uint32 top_k = 5;
+  double min_score = 6;
+  repeated string tags = 7;
+  repeated MemorySource sources = 8;
+  bool include_score_breakdown = 9;
+
+  reserved 10 to 16;
+}
+
+message SearchMemoryResponse {
+  uint32 v = 1;
+  repeated MemorySearchHit hits = 2;
+
+  reserved 3 to 10;
+}
+
+message GetMemoryItemRequest {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId memory_id = 2;
+
+  reserved 3 to 10;
+}
+
+message GetMemoryItemResponse {
+  uint32 v = 1;
+  MemoryItem item = 2;
+
+  reserved 3 to 10;
+}
+
+message DeleteMemoryItemRequest {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId memory_id = 2;
+
+  reserved 3 to 10;
+}
+
+message DeleteMemoryItemResponse {
+  uint32 v = 1;
+  bool deleted = 2;
+
+  reserved 3 to 10;
+}
+
+message ListMemoryItemsRequest {
+  uint32 v = 1;
+  string after_memory_ulid = 2;
+  uint32 limit = 3;
+  string channel = 4;
+  palyra.common.v1.CanonicalId session_id = 5;
+  repeated string tags = 6;
+  repeated MemorySource sources = 7;
+
+  reserved 8 to 16;
+}
+
+message ListMemoryItemsResponse {
+  uint32 v = 1;
+  repeated MemoryItem items = 2;
+  string next_after_memory_ulid = 3;
+
+  reserved 4 to 10;
+}
+
+message PurgeMemoryRequest {
+  uint32 v = 1;
+  string channel = 2;
+  palyra.common.v1.CanonicalId session_id = 3;
+  bool purge_all_principal = 4;
+
+  reserved 5 to 10;
+}
+
+message PurgeMemoryResponse {
+  uint32 v = 1;
+  uint64 deleted_count = 2;
+
+  reserved 3 to 10;
+}

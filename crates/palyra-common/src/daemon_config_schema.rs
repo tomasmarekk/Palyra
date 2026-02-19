@@ -59,6 +59,7 @@ pub struct RootFileConfig {
     pub daemon: Option<FileDaemonConfig>,
     pub gateway: Option<FileGatewayConfig>,
     pub orchestrator: Option<FileOrchestratorConfig>,
+    pub memory: Option<FileMemoryConfig>,
     pub model_provider: Option<FileModelProviderConfig>,
     pub tool_call: Option<FileToolCallConfig>,
     pub admin: Option<FileAdminConfig>,
@@ -101,6 +102,22 @@ pub struct FileGatewayTlsConfig {
 #[serde(deny_unknown_fields)]
 pub struct FileOrchestratorConfig {
     pub runloop_v1_enabled: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileMemoryConfig {
+    pub max_item_bytes: Option<u64>,
+    pub max_item_tokens: Option<u64>,
+    pub default_ttl_ms: Option<i64>,
+    pub auto_inject: Option<FileMemoryAutoInjectConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileMemoryAutoInjectConfig {
+    pub enabled: Option<bool>,
+    pub max_items: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]

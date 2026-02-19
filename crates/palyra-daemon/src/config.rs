@@ -26,6 +26,11 @@ const DEFAULT_GATEWAY_MAX_TAPE_ENTRIES_PER_RESPONSE: usize = 1_000;
 const DEFAULT_GATEWAY_MAX_TAPE_BYTES_PER_RESPONSE: usize = 2 * 1024 * 1024;
 const DEFAULT_GATEWAY_TLS_ENABLED: bool = false;
 const DEFAULT_ORCHESTRATOR_RUNLOOP_V1_ENABLED: bool = false;
+const DEFAULT_MEMORY_MAX_ITEM_BYTES: usize = 16 * 1024;
+const DEFAULT_MEMORY_MAX_ITEM_TOKENS: usize = 2_048;
+const DEFAULT_MEMORY_DEFAULT_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
+const DEFAULT_MEMORY_AUTO_INJECT_ENABLED: bool = false;
+const DEFAULT_MEMORY_AUTO_INJECT_MAX_ITEMS: usize = 3;
 const DEFAULT_ADMIN_REQUIRE_AUTH: bool = true;
 const DEFAULT_ALLOW_INSECURE_NODE_RPC_WITHOUT_MTLS: bool = false;
 const DEFAULT_JOURNAL_DB_PATH: &str = "data/journal.sqlite3";
@@ -52,6 +57,7 @@ pub struct LoadedConfig {
     pub daemon: DaemonConfig,
     pub gateway: GatewayConfig,
     pub orchestrator: OrchestratorConfig,
+    pub memory: MemoryConfig,
     pub model_provider: ModelProviderConfig,
     pub tool_call: ToolCallConfig,
     pub admin: AdminConfig,
@@ -90,6 +96,20 @@ pub struct GatewayTlsConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrchestratorConfig {
     pub runloop_v1_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryConfig {
+    pub max_item_bytes: usize,
+    pub max_item_tokens: usize,
+    pub default_ttl_ms: Option<i64>,
+    pub auto_inject: MemoryAutoInjectConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryAutoInjectConfig {
+    pub enabled: bool,
+    pub max_items: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,6 +221,26 @@ impl Default for OrchestratorConfig {
     }
 }
 
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            max_item_bytes: DEFAULT_MEMORY_MAX_ITEM_BYTES,
+            max_item_tokens: DEFAULT_MEMORY_MAX_ITEM_TOKENS,
+            default_ttl_ms: Some(DEFAULT_MEMORY_DEFAULT_TTL_MS),
+            auto_inject: MemoryAutoInjectConfig::default(),
+        }
+    }
+}
+
+impl Default for MemoryAutoInjectConfig {
+    fn default() -> Self {
+        Self {
+            enabled: DEFAULT_MEMORY_AUTO_INJECT_ENABLED,
+            max_items: DEFAULT_MEMORY_AUTO_INJECT_MAX_ITEMS,
+        }
+    }
+}
+
 impl Default for ToolCallConfig {
     fn default() -> Self {
         Self {
@@ -255,6 +295,7 @@ pub fn load_config() -> Result<LoadedConfig> {
     let mut daemon = DaemonConfig::default();
     let mut gateway = GatewayConfig::default();
     let mut orchestrator = OrchestratorConfig::default();
+    let mut memory = MemoryConfig::default();
     let mut model_provider = ModelProviderConfig::default();
     let mut tool_call = ToolCallConfig::default();
     let mut admin = AdminConfig::default();
@@ -336,6 +377,29 @@ pub fn load_config() -> Result<LoadedConfig> {
         if let Some(file_orchestrator) = parsed.orchestrator {
             if let Some(runloop_v1_enabled) = file_orchestrator.runloop_v1_enabled {
                 orchestrator.runloop_v1_enabled = runloop_v1_enabled;
+            }
+        }
+        if let Some(file_memory) = parsed.memory {
+            if let Some(max_item_bytes) = file_memory.max_item_bytes {
+                memory.max_item_bytes =
+                    parse_positive_usize(max_item_bytes, "memory.max_item_bytes")?;
+            }
+            if let Some(max_item_tokens) = file_memory.max_item_tokens {
+                memory.max_item_tokens =
+                    parse_positive_usize(max_item_tokens, "memory.max_item_tokens")?;
+            }
+            if let Some(default_ttl_ms) = file_memory.default_ttl_ms {
+                memory.default_ttl_ms =
+                    parse_default_memory_ttl_ms(default_ttl_ms, "memory.default_ttl_ms")?;
+            }
+            if let Some(file_auto_inject) = file_memory.auto_inject {
+                if let Some(enabled) = file_auto_inject.enabled {
+                    memory.auto_inject.enabled = enabled;
+                }
+                if let Some(max_items) = file_auto_inject.max_items {
+                    memory.auto_inject.max_items =
+                        parse_positive_usize(max_items, "memory.auto_inject.max_items")?;
+                }
             }
         }
         if let Some(file_model_provider) = parsed.model_provider {
@@ -629,6 +693,53 @@ pub fn load_config() -> Result<LoadedConfig> {
         source.push_str(" +env(PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED)");
     }
 
+    if let Ok(max_item_bytes) = env::var("PALYRA_MEMORY_MAX_ITEM_BYTES") {
+        memory.max_item_bytes = parse_positive_usize(
+            max_item_bytes
+                .parse::<u64>()
+                .context("PALYRA_MEMORY_MAX_ITEM_BYTES must be a valid u64")?,
+            "PALYRA_MEMORY_MAX_ITEM_BYTES",
+        )?;
+        source.push_str(" +env(PALYRA_MEMORY_MAX_ITEM_BYTES)");
+    }
+
+    if let Ok(max_item_tokens) = env::var("PALYRA_MEMORY_MAX_ITEM_TOKENS") {
+        memory.max_item_tokens = parse_positive_usize(
+            max_item_tokens
+                .parse::<u64>()
+                .context("PALYRA_MEMORY_MAX_ITEM_TOKENS must be a valid u64")?,
+            "PALYRA_MEMORY_MAX_ITEM_TOKENS",
+        )?;
+        source.push_str(" +env(PALYRA_MEMORY_MAX_ITEM_TOKENS)");
+    }
+
+    if let Ok(default_ttl_ms) = env::var("PALYRA_MEMORY_DEFAULT_TTL_MS") {
+        memory.default_ttl_ms = parse_default_memory_ttl_ms(
+            default_ttl_ms
+                .parse::<i64>()
+                .context("PALYRA_MEMORY_DEFAULT_TTL_MS must be a valid i64")?,
+            "PALYRA_MEMORY_DEFAULT_TTL_MS",
+        )?;
+        source.push_str(" +env(PALYRA_MEMORY_DEFAULT_TTL_MS)");
+    }
+
+    if let Ok(auto_inject_enabled) = env::var("PALYRA_MEMORY_AUTO_INJECT_ENABLED") {
+        memory.auto_inject.enabled = auto_inject_enabled
+            .parse::<bool>()
+            .context("PALYRA_MEMORY_AUTO_INJECT_ENABLED must be true or false")?;
+        source.push_str(" +env(PALYRA_MEMORY_AUTO_INJECT_ENABLED)");
+    }
+
+    if let Ok(auto_inject_max_items) = env::var("PALYRA_MEMORY_AUTO_INJECT_MAX_ITEMS") {
+        memory.auto_inject.max_items = parse_positive_usize(
+            auto_inject_max_items
+                .parse::<u64>()
+                .context("PALYRA_MEMORY_AUTO_INJECT_MAX_ITEMS must be a valid u64")?,
+            "PALYRA_MEMORY_AUTO_INJECT_MAX_ITEMS",
+        )?;
+        source.push_str(" +env(PALYRA_MEMORY_AUTO_INJECT_MAX_ITEMS)");
+    }
+
     if let Ok(kind) = env::var("PALYRA_MODEL_PROVIDER_KIND") {
         model_provider.kind = ModelProviderKind::parse(kind.as_str())
             .context("PALYRA_MODEL_PROVIDER_KIND must be deterministic or openai_compatible")?;
@@ -783,6 +894,7 @@ pub fn load_config() -> Result<LoadedConfig> {
         daemon,
         gateway,
         orchestrator,
+        memory,
         model_provider,
         tool_call,
         admin,
@@ -1014,6 +1126,16 @@ fn parse_positive_usize(value: u64, name: &str) -> Result<usize> {
     usize::try_from(value).with_context(|| format!("{name} exceeds platform usize range"))
 }
 
+fn parse_default_memory_ttl_ms(value: i64, name: &str) -> Result<Option<i64>> {
+    if value < 0 {
+        anyhow::bail!("{name} must be >= 0");
+    }
+    if value == 0 {
+        return Ok(None);
+    }
+    Ok(Some(value))
+}
+
 fn parse_retries(value: u32, name: &str) -> Result<u32> {
     const MAX_RETRIES: u32 = 10;
     if value > MAX_RETRIES {
@@ -1027,11 +1149,11 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        parse_dns_suffix_allowlist, parse_host_allowlist, parse_journal_db_path,
-        parse_openai_base_url, parse_positive_usize, parse_process_executable_allowlist,
-        parse_root_file_config, parse_storage_prefix_allowlist, parse_tool_allowlist, AdminConfig,
-        GatewayConfig, GatewayTlsConfig, IdentityConfig, ModelProviderConfig, OrchestratorConfig,
-        StorageConfig, ToolCallConfig,
+        parse_default_memory_ttl_ms, parse_dns_suffix_allowlist, parse_host_allowlist,
+        parse_journal_db_path, parse_openai_base_url, parse_positive_usize,
+        parse_process_executable_allowlist, parse_root_file_config, parse_storage_prefix_allowlist,
+        parse_tool_allowlist, AdminConfig, GatewayConfig, GatewayTlsConfig, IdentityConfig,
+        MemoryConfig, ModelProviderConfig, OrchestratorConfig, StorageConfig, ToolCallConfig,
     };
     use crate::model_provider::ModelProviderKind;
     use palyra_common::daemon_config_schema::RootFileConfig;
@@ -1079,6 +1201,16 @@ mod tests {
             !config.runloop_v1_enabled,
             "orchestrator run loop should default disabled until explicitly enabled"
         );
+    }
+
+    #[test]
+    fn memory_config_defaults_to_constrained_ingestion_with_auto_inject_disabled() {
+        let config = MemoryConfig::default();
+        assert_eq!(config.max_item_bytes, 16 * 1024);
+        assert_eq!(config.max_item_tokens, 2_048);
+        assert_eq!(config.default_ttl_ms, Some(30 * 24 * 60 * 60 * 1_000));
+        assert!(!config.auto_inject.enabled, "memory auto-inject must default to disabled");
+        assert_eq!(config.auto_inject.max_items, 3);
     }
 
     #[test]
@@ -1187,6 +1319,20 @@ mod tests {
         let result: Result<RootFileConfig, _> =
             toml::from_str("[orchestrator]\nrunloop_v1_enabled=true\nunexpected=true\n");
         assert!(result.is_err(), "unknown orchestrator keys must be rejected");
+    }
+
+    #[test]
+    fn config_rejects_unknown_memory_key() {
+        let result: Result<RootFileConfig, _> =
+            toml::from_str("[memory]\nmax_item_bytes=4096\nunexpected=true\n");
+        assert!(result.is_err(), "unknown memory keys must be rejected");
+    }
+
+    #[test]
+    fn config_rejects_unknown_memory_auto_inject_key() {
+        let result: Result<RootFileConfig, _> =
+            toml::from_str("[memory.auto_inject]\nenabled=true\nunexpected=true\n");
+        assert!(result.is_err(), "unknown memory.auto_inject keys must be rejected");
     }
 
     #[test]
@@ -1333,5 +1479,18 @@ mod tests {
     fn parse_positive_usize_rejects_zero() {
         let result = parse_positive_usize(0, "gateway.max_tape_entries_per_response");
         assert!(result.is_err(), "zero should not be accepted for positive usize fields");
+    }
+
+    #[test]
+    fn parse_default_memory_ttl_zero_disables_default_ttl() {
+        let parsed =
+            parse_default_memory_ttl_ms(0, "memory.default_ttl_ms").expect("ttl should parse");
+        assert_eq!(parsed, None);
+    }
+
+    #[test]
+    fn parse_default_memory_ttl_rejects_negative_values() {
+        let result = parse_default_memory_ttl_ms(-1, "memory.default_ttl_ms");
+        assert!(result.is_err(), "negative ttl should be rejected");
     }
 }

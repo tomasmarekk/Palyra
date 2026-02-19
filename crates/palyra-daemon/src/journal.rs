@@ -33,6 +33,10 @@ const MAX_CRON_JOBS_LIST_LIMIT: usize = 500;
 const MAX_CRON_RUNS_LIST_LIMIT: usize = 500;
 const MAX_APPROVALS_LIST_LIMIT: usize = 500;
 const MAX_APPROVALS_QUERY_LIMIT: usize = MAX_APPROVALS_LIST_LIMIT + 1;
+const MAX_MEMORY_ITEMS_LIST_LIMIT: usize = 500;
+const MAX_MEMORY_SEARCH_CANDIDATES: usize = 256;
+const DEFAULT_MEMORY_VECTOR_DIMS: usize = 64;
+const DEFAULT_MEMORY_EMBEDDING_MODEL: &str = "hash-embedding-v1";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -293,6 +297,120 @@ pub struct CronRunRecord {
     pub tool_denies: u64,
     pub created_at_unix_ms: i64,
     pub updated_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemorySource {
+    TapeUserMessage,
+    TapeToolResult,
+    Summary,
+    Manual,
+    Import,
+}
+
+impl MemorySource {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TapeUserMessage => "tape:user_message",
+            Self::TapeToolResult => "tape:tool_result",
+            Self::Summary => "summary",
+            Self::Manual => "manual",
+            Self::Import => "import",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "tape:user_message" => Some(Self::TapeUserMessage),
+            "tape:tool_result" => Some(Self::TapeToolResult),
+            "summary" => Some(Self::Summary),
+            "manual" => Some(Self::Manual),
+            "import" => Some(Self::Import),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryItemCreateRequest {
+    pub memory_id: String,
+    pub principal: String,
+    pub channel: Option<String>,
+    pub session_id: Option<String>,
+    pub source: MemorySource,
+    pub content_text: String,
+    pub tags: Vec<String>,
+    pub confidence: Option<f64>,
+    pub ttl_unix_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemorySearchRequest {
+    pub principal: String,
+    pub channel: Option<String>,
+    pub session_id: Option<String>,
+    pub query: String,
+    pub top_k: usize,
+    pub min_score: f64,
+    pub tags: Vec<String>,
+    pub sources: Vec<MemorySource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryItemsListFilter {
+    pub after_memory_id: Option<String>,
+    pub principal: String,
+    pub channel: Option<String>,
+    pub session_id: Option<String>,
+    pub limit: usize,
+    pub tags: Vec<String>,
+    pub sources: Vec<MemorySource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryPurgeRequest {
+    pub principal: String,
+    pub channel: Option<String>,
+    pub session_id: Option<String>,
+    pub purge_all_principal: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct MemoryItemRecord {
+    pub memory_id: String,
+    pub principal: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub source: MemorySource,
+    pub content_text: String,
+    pub content_hash: String,
+    pub tags: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl_unix_ms: Option<i64>,
+    pub created_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct MemoryScoreBreakdown {
+    pub lexical_score: f64,
+    pub vector_score: f64,
+    pub recency_score: f64,
+    pub final_score: f64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct MemorySearchHit {
+    pub item: MemoryItemRecord,
+    pub snippet: String,
+    pub score: f64,
+    pub breakdown: MemoryScoreBreakdown,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -689,10 +807,14 @@ pub enum JournalError {
     DuplicateCronJobId { job_id: String },
     #[error("cron run already exists: {run_id}")]
     DuplicateCronRunId { run_id: String },
+    #[error("memory item already exists: {memory_id}")]
+    DuplicateMemoryId { memory_id: String },
     #[error("cron job not found: {job_id}")]
     CronJobNotFound { job_id: String },
     #[error("cron run not found: {run_id}")]
     CronRunNotFound { run_id: String },
+    #[error("memory item not found: {memory_id}")]
+    MemoryNotFound { memory_id: String },
     #[error("approval record not found: {approval_id}")]
     ApprovalNotFound { approval_id: String },
     #[error("orchestrator run not found: {run_id}")]
@@ -929,6 +1051,57 @@ const MIGRATIONS: &[Migration] = &[
                 ON approvals(subject_id);
             CREATE INDEX IF NOT EXISTS idx_approvals_resolved
                 ON approvals(resolved_at_unix_ms DESC, approval_ulid ASC);
+        "#,
+    },
+    Migration {
+        version: 6,
+        name: "create_memory_tables",
+        sql: r#"
+            CREATE TABLE IF NOT EXISTS memory_items (
+                memory_ulid TEXT PRIMARY KEY,
+                principal TEXT NOT NULL,
+                channel TEXT,
+                session_ulid TEXT,
+                source TEXT NOT NULL,
+                content_text TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                tags_json TEXT NOT NULL,
+                confidence REAL,
+                ttl_unix_ms INTEGER,
+                created_at_unix_ms INTEGER NOT NULL,
+                updated_at_unix_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_items_scope
+                ON memory_items(principal, channel, session_ulid, created_at_unix_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_memory_items_ttl
+                ON memory_items(ttl_unix_ms);
+            CREATE INDEX IF NOT EXISTS idx_memory_items_source
+                ON memory_items(source);
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS memory_items_fts
+                USING fts5(memory_ulid UNINDEXED, content_text, tokenize='unicode61');
+            CREATE TRIGGER IF NOT EXISTS trg_memory_items_ai
+            AFTER INSERT ON memory_items
+            BEGIN
+                INSERT INTO memory_items_fts(memory_ulid, content_text)
+                VALUES (new.memory_ulid, new.content_text);
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_memory_items_ad
+            AFTER DELETE ON memory_items
+            BEGIN
+                DELETE FROM memory_items_fts WHERE memory_ulid = old.memory_ulid;
+            END;
+
+            CREATE TABLE IF NOT EXISTS memory_vectors (
+                memory_ulid TEXT PRIMARY KEY,
+                embedding_model TEXT NOT NULL,
+                dims INTEGER NOT NULL,
+                vector_blob BLOB NOT NULL,
+                created_at_unix_ms INTEGER NOT NULL,
+                FOREIGN KEY(memory_ulid) REFERENCES memory_items(memory_ulid) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_vectors_model
+                ON memory_vectors(embedding_model);
         "#,
     },
 ];
@@ -2318,6 +2491,357 @@ impl JournalStore {
         }
         Ok(records)
     }
+
+    pub fn create_memory_item(
+        &self,
+        request: &MemoryItemCreateRequest,
+    ) -> Result<MemoryItemRecord, JournalError> {
+        let now = current_unix_ms()?;
+        let normalized_content = normalize_memory_text(request.content_text.as_str());
+        let content_text = sanitize_object_text_field("content_text", normalized_content.as_str())?;
+        let tags = normalize_memory_tags(request.tags.as_slice());
+        let tags_json = serde_json::to_string(&tags)?;
+        let content_hash = sha256_hex(content_text.as_bytes());
+        let vector = embed_text(content_text.as_str(), DEFAULT_MEMORY_VECTOR_DIMS);
+        let vector_blob = encode_vector_blob(vector.as_slice());
+
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction()?;
+        match transaction.execute(
+            r#"
+                INSERT INTO memory_items (
+                    memory_ulid,
+                    principal,
+                    channel,
+                    session_ulid,
+                    source,
+                    content_text,
+                    content_hash,
+                    tags_json,
+                    confidence,
+                    ttl_unix_ms,
+                    created_at_unix_ms,
+                    updated_at_unix_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)
+            "#,
+            params![
+                request.memory_id.as_str(),
+                request.principal.as_str(),
+                request.channel.as_deref(),
+                request.session_id.as_deref(),
+                request.source.as_str(),
+                content_text,
+                content_hash,
+                tags_json,
+                request.confidence,
+                request.ttl_unix_ms,
+                now,
+            ],
+        ) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(error, message))
+                if error.code == ErrorCode::ConstraintViolation
+                    && (error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+                        || error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                        || message
+                            .as_deref()
+                            .map(|value| value.contains("memory_items.memory_ulid"))
+                            .unwrap_or(false)) =>
+            {
+                return Err(JournalError::DuplicateMemoryId {
+                    memory_id: request.memory_id.clone(),
+                });
+            }
+            Err(error) => return Err(error.into()),
+        }
+
+        transaction.execute(
+            r#"
+                INSERT INTO memory_vectors (
+                    memory_ulid,
+                    embedding_model,
+                    dims,
+                    vector_blob,
+                    created_at_unix_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+            params![
+                request.memory_id.as_str(),
+                DEFAULT_MEMORY_EMBEDDING_MODEL,
+                DEFAULT_MEMORY_VECTOR_DIMS as i64,
+                vector_blob,
+                now,
+            ],
+        )?;
+
+        transaction.commit()?;
+        drop(guard);
+        self.purge_expired_memory_items(now)?;
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        load_memory_item_by_id(&guard, request.memory_id.as_str())?
+            .ok_or_else(|| JournalError::MemoryNotFound { memory_id: request.memory_id.clone() })
+    }
+
+    pub fn memory_item(&self, memory_id: &str) -> Result<Option<MemoryItemRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        load_memory_item_by_id(&guard, memory_id)
+    }
+
+    pub fn delete_memory_item(
+        &self,
+        memory_id: &str,
+        principal: &str,
+    ) -> Result<bool, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let deleted = guard.execute(
+            "DELETE FROM memory_items WHERE memory_ulid = ?1 AND principal = ?2",
+            params![memory_id, principal],
+        )?;
+        Ok(deleted > 0)
+    }
+
+    pub fn list_memory_items(
+        &self,
+        filter: &MemoryItemsListFilter,
+    ) -> Result<Vec<MemoryItemRecord>, JournalError> {
+        let now = current_unix_ms()?;
+        let requested_tags = normalize_memory_tags(filter.tags.as_slice());
+        self.purge_expired_memory_items(now)?;
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let limit = filter.limit.clamp(1, MAX_MEMORY_ITEMS_LIST_LIMIT);
+        let fetch_limit = limit.saturating_mul(4).clamp(limit, MAX_MEMORY_SEARCH_CANDIDATES);
+        let mut statement = guard.prepare(
+            r#"
+                SELECT
+                    memory_ulid,
+                    principal,
+                    channel,
+                    session_ulid,
+                    source,
+                    content_text,
+                    content_hash,
+                    tags_json,
+                    confidence,
+                    ttl_unix_ms,
+                    created_at_unix_ms,
+                    updated_at_unix_ms
+                FROM memory_items
+                WHERE
+                    (?1 IS NULL OR memory_ulid > ?1) AND
+                    principal = ?2 AND
+                    (?3 IS NULL OR channel = ?3) AND
+                    (?4 IS NULL OR session_ulid = ?4) AND
+                    (ttl_unix_ms IS NULL OR ttl_unix_ms > ?5)
+                ORDER BY memory_ulid ASC
+                LIMIT ?6
+            "#,
+        )?;
+        let mut rows = statement.query(params![
+            filter.after_memory_id.as_deref(),
+            filter.principal.as_str(),
+            filter.channel.as_deref(),
+            filter.session_id.as_deref(),
+            now,
+            fetch_limit as i64
+        ])?;
+        let mut items = Vec::new();
+        while let Some(row) = rows.next()? {
+            let item = map_memory_item_row(row)?;
+            if !memory_source_matches(item.source, filter.sources.as_slice()) {
+                continue;
+            }
+            if !memory_tags_match(item.tags.as_slice(), requested_tags.as_slice()) {
+                continue;
+            }
+            items.push(item);
+            if items.len() >= limit {
+                break;
+            }
+        }
+        Ok(items)
+    }
+
+    pub fn purge_memory(&self, request: &MemoryPurgeRequest) -> Result<u64, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let deleted = if request.purge_all_principal {
+            guard.execute(
+                "DELETE FROM memory_items WHERE principal = ?1",
+                params![request.principal.as_str()],
+            )?
+        } else if let Some(session_id) = request.session_id.as_deref() {
+            guard.execute(
+                r#"
+                    DELETE FROM memory_items
+                    WHERE principal = ?1
+                      AND session_ulid = ?2
+                      AND (?3 IS NULL OR channel = ?3)
+                "#,
+                params![request.principal.as_str(), session_id, request.channel.as_deref()],
+            )?
+        } else if let Some(channel) = request.channel.as_deref() {
+            guard.execute(
+                "DELETE FROM memory_items WHERE principal = ?1 AND channel = ?2",
+                params![request.principal.as_str(), channel],
+            )?
+        } else {
+            0
+        };
+        Ok(deleted as u64)
+    }
+
+    pub fn purge_expired_memory_items(&self, now_unix_ms: i64) -> Result<u64, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let deleted = guard.execute(
+            "DELETE FROM memory_items WHERE ttl_unix_ms IS NOT NULL AND ttl_unix_ms <= ?1",
+            params![now_unix_ms],
+        )?;
+        Ok(deleted as u64)
+    }
+
+    pub fn search_memory(
+        &self,
+        request: &MemorySearchRequest,
+    ) -> Result<Vec<MemorySearchHit>, JournalError> {
+        let query_text = normalize_memory_text(request.query.as_str());
+        let requested_tags = normalize_memory_tags(request.tags.as_slice());
+        if query_text.is_empty() {
+            return Ok(Vec::new());
+        }
+        let now = current_unix_ms()?;
+        let top_k = request.top_k.clamp(1, MAX_MEMORY_ITEMS_LIST_LIMIT);
+        let candidate_limit = top_k.saturating_mul(8).clamp(top_k, MAX_MEMORY_SEARCH_CANDIDATES);
+        let fts_query = build_fts_query(query_text.as_str());
+        if fts_query.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let query_vector = embed_text(query_text.as_str(), DEFAULT_MEMORY_VECTOR_DIMS);
+        self.purge_expired_memory_items(now)?;
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let mut statement = guard.prepare(
+            r#"
+                SELECT
+                    memory.memory_ulid,
+                    memory.principal,
+                    memory.channel,
+                    memory.session_ulid,
+                    memory.source,
+                    memory.content_text,
+                    memory.content_hash,
+                    memory.tags_json,
+                    memory.confidence,
+                    memory.ttl_unix_ms,
+                    memory.created_at_unix_ms,
+                    memory.updated_at_unix_ms,
+                    bm25(memory_items_fts) AS lexical_rank,
+                    vectors.dims,
+                    vectors.vector_blob
+                FROM memory_items_fts
+                INNER JOIN memory_items AS memory
+                    ON memory.memory_ulid = memory_items_fts.memory_ulid
+                LEFT JOIN memory_vectors AS vectors
+                    ON vectors.memory_ulid = memory.memory_ulid
+                WHERE
+                    memory_items_fts MATCH ?1 AND
+                    memory.principal = ?2 AND
+                    (?3 IS NULL OR memory.channel = ?3) AND
+                    (?4 IS NULL OR memory.session_ulid = ?4) AND
+                    (memory.ttl_unix_ms IS NULL OR memory.ttl_unix_ms > ?5)
+                ORDER BY lexical_rank ASC, memory.created_at_unix_ms DESC
+                LIMIT ?6
+            "#,
+        )?;
+        let mut rows = statement.query(params![
+            fts_query,
+            request.principal.as_str(),
+            request.channel.as_deref(),
+            request.session_id.as_deref(),
+            now,
+            candidate_limit as i64,
+        ])?;
+
+        let mut candidates = Vec::new();
+        while let Some(row) = rows.next()? {
+            let item = map_memory_item_row(row)?;
+            if !memory_source_matches(item.source, request.sources.as_slice()) {
+                continue;
+            }
+            if !memory_tags_match(item.tags.as_slice(), requested_tags.as_slice()) {
+                continue;
+            }
+            let lexical_rank: f64 = row.get(12)?;
+            let lexical_raw = (-lexical_rank).max(0.0);
+            let dims = row.get::<_, Option<i64>>(13)?.unwrap_or_default() as usize;
+            let vector_raw = if dims == DEFAULT_MEMORY_VECTOR_DIMS {
+                let vector_blob: Option<Vec<u8>> = row.get(14)?;
+                vector_blob
+                    .as_ref()
+                    .map(|blob| decode_vector_blob(blob.as_slice(), dims))
+                    .map(|embedding| {
+                        cosine_similarity(query_vector.as_slice(), embedding.as_slice())
+                    })
+                    .unwrap_or(0.0)
+                    .max(0.0)
+            } else {
+                0.0
+            };
+            let recency_raw = recency_score(now, item.created_at_unix_ms);
+            candidates.push(RankedMemoryCandidate {
+                item,
+                lexical_raw,
+                vector_raw,
+                recency_raw,
+                lexical_score: 0.0,
+                vector_score: 0.0,
+                final_score: 0.0,
+            });
+        }
+
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let lexical_max =
+            candidates.iter().map(|candidate| candidate.lexical_raw).fold(0.0, f64::max);
+        let vector_max =
+            candidates.iter().map(|candidate| candidate.vector_raw).fold(0.0, f64::max);
+
+        for candidate in &mut candidates {
+            candidate.lexical_score =
+                if lexical_max > 0.0 { candidate.lexical_raw / lexical_max } else { 0.0 };
+            candidate.vector_score =
+                if vector_max > 0.0 { candidate.vector_raw / vector_max } else { 0.0 };
+            candidate.final_score = (0.55 * candidate.lexical_score)
+                + (0.35 * candidate.vector_score)
+                + (0.10 * candidate.recency_raw);
+        }
+
+        candidates.retain(|candidate| candidate.final_score >= request.min_score);
+        candidates.sort_by(|left, right| {
+            right
+                .final_score
+                .total_cmp(&left.final_score)
+                .then_with(|| right.item.created_at_unix_ms.cmp(&left.item.created_at_unix_ms))
+                .then_with(|| left.item.memory_id.cmp(&right.item.memory_id))
+        });
+        candidates.truncate(top_k);
+
+        let hits = candidates
+            .into_iter()
+            .map(|candidate| MemorySearchHit {
+                snippet: memory_snippet(candidate.item.content_text.as_str(), query_text.as_str()),
+                score: candidate.final_score,
+                breakdown: MemoryScoreBreakdown {
+                    lexical_score: candidate.lexical_score,
+                    vector_score: candidate.vector_score,
+                    recency_score: candidate.recency_raw,
+                    final_score: candidate.final_score,
+                },
+                item: candidate.item,
+            })
+            .collect();
+        Ok(hits)
+    }
 }
 
 #[cfg(test)]
@@ -2797,6 +3321,243 @@ fn load_approval_by_id(
     statement.query_row(params![approval_id], map_approval_row).optional().map_err(Into::into)
 }
 
+#[derive(Debug, Clone)]
+struct RankedMemoryCandidate {
+    item: MemoryItemRecord,
+    lexical_raw: f64,
+    vector_raw: f64,
+    recency_raw: f64,
+    lexical_score: f64,
+    vector_score: f64,
+    final_score: f64,
+}
+
+fn map_memory_item_row(row: &rusqlite::Row<'_>) -> Result<MemoryItemRecord, rusqlite::Error> {
+    let source_raw: String = row.get(4)?;
+    let source = MemorySource::from_str(source_raw.as_str()).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            4,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid memory source value: {source_raw}"),
+            )),
+        )
+    })?;
+    let tags_json: String = row.get(7)?;
+    let tags: Vec<String> = serde_json::from_str(tags_json.as_str()).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            7,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid memory tags_json: {error}"),
+            )),
+        )
+    })?;
+    Ok(MemoryItemRecord {
+        memory_id: row.get(0)?,
+        principal: row.get(1)?,
+        channel: row.get(2)?,
+        session_id: row.get(3)?,
+        source,
+        content_text: row.get(5)?,
+        content_hash: row.get(6)?,
+        tags,
+        confidence: row.get(8)?,
+        ttl_unix_ms: row.get(9)?,
+        created_at_unix_ms: row.get(10)?,
+        updated_at_unix_ms: row.get(11)?,
+    })
+}
+
+fn load_memory_item_by_id(
+    connection: &Connection,
+    memory_id: &str,
+) -> Result<Option<MemoryItemRecord>, JournalError> {
+    let mut statement = connection.prepare(
+        r#"
+            SELECT
+                memory_ulid,
+                principal,
+                channel,
+                session_ulid,
+                source,
+                content_text,
+                content_hash,
+                tags_json,
+                confidence,
+                ttl_unix_ms,
+                created_at_unix_ms,
+                updated_at_unix_ms
+            FROM memory_items
+            WHERE memory_ulid = ?1
+            LIMIT 1
+        "#,
+    )?;
+    statement.query_row(params![memory_id], map_memory_item_row).optional().map_err(Into::into)
+}
+
+fn normalize_memory_text(raw: &str) -> String {
+    let mut normalized = String::with_capacity(raw.len());
+    let mut previous_was_whitespace = false;
+    for character in raw.chars() {
+        if character.is_control() && !character.is_whitespace() {
+            continue;
+        }
+        if character.is_whitespace() {
+            if !previous_was_whitespace {
+                normalized.push(' ');
+                previous_was_whitespace = true;
+            }
+        } else {
+            normalized.push(character);
+            previous_was_whitespace = false;
+        }
+    }
+    normalized.trim().to_owned()
+}
+
+fn normalize_memory_tags(raw: &[String]) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for tag in raw {
+        let trimmed = tag.trim().to_ascii_lowercase();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !trimmed.chars().all(|ch| {
+            ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, ':' | '_' | '-' | '.')
+        }) {
+            continue;
+        }
+        if !normalized.iter().any(|existing| existing == &trimmed) {
+            normalized.push(trimmed);
+        }
+    }
+    normalized
+}
+
+fn build_fts_query(query: &str) -> String {
+    let mut terms = Vec::new();
+    for token in query.split_whitespace() {
+        let normalized = token
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || ch == '_' {
+                    ch.to_ascii_lowercase()
+                } else {
+                    ' '
+                }
+            })
+            .collect::<String>();
+        for term in normalized.split_whitespace() {
+            if !term.is_empty() {
+                terms.push(term.to_owned());
+            }
+        }
+    }
+    terms.join(" ")
+}
+
+fn memory_source_matches(source: MemorySource, filter_sources: &[MemorySource]) -> bool {
+    filter_sources.is_empty() || filter_sources.contains(&source)
+}
+
+fn memory_tags_match(item_tags: &[String], requested_tags: &[String]) -> bool {
+    requested_tags.is_empty()
+        || requested_tags
+            .iter()
+            .all(|required| item_tags.iter().any(|candidate| candidate == required))
+}
+
+fn recency_score(now_unix_ms: i64, created_at_unix_ms: i64) -> f64 {
+    let age_ms = (now_unix_ms - created_at_unix_ms).max(0) as f64;
+    1.0 / (1.0 + (age_ms / (24.0 * 60.0 * 60.0 * 1_000.0)))
+}
+
+fn memory_snippet(content: &str, query: &str) -> String {
+    const MAX_SNIPPET_CHARS: usize = 200;
+    if content.chars().count() <= MAX_SNIPPET_CHARS {
+        return content.to_owned();
+    }
+    let lowered_content = content.to_ascii_lowercase();
+    let first_term = query.split_whitespace().next().unwrap_or_default().to_ascii_lowercase();
+    if first_term.is_empty() {
+        return content.chars().take(MAX_SNIPPET_CHARS).collect();
+    }
+    let byte_index = lowered_content.find(first_term.as_str()).unwrap_or_default();
+    let start_chars = content[..byte_index].chars().count().saturating_sub(48);
+    content.chars().skip(start_chars).take(MAX_SNIPPET_CHARS).collect()
+}
+
+fn sha256_hex(payload: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(payload);
+    format!("{:x}", hasher.finalize())
+}
+
+fn embed_text(text: &str, dims: usize) -> Vec<f32> {
+    let mut vector = vec![0_f32; dims];
+    if dims == 0 {
+        return vector;
+    }
+    for token in text.split_whitespace() {
+        let normalized = token.to_ascii_lowercase();
+        if normalized.is_empty() {
+            continue;
+        }
+        let digest = Sha256::digest(normalized.as_bytes());
+        let index = usize::from(digest[0]) % dims;
+        let sign = if digest[1] % 2 == 0 { 1.0_f32 } else { -1.0_f32 };
+        let magnitude = 1.0 + (f32::from(digest[2]) / 255.0);
+        vector[index] += sign * magnitude;
+    }
+    normalize_vector(vector.as_mut_slice());
+    vector
+}
+
+fn normalize_vector(vector: &mut [f32]) {
+    let norm = vector.iter().map(|value| f64::from(*value).powi(2)).sum::<f64>().sqrt();
+    if norm <= f64::EPSILON {
+        return;
+    }
+    for value in vector {
+        *value = (f64::from(*value) / norm) as f32;
+    }
+}
+
+fn cosine_similarity(left: &[f32], right: &[f32]) -> f64 {
+    if left.len() != right.len() || left.is_empty() {
+        return 0.0;
+    }
+    left.iter()
+        .zip(right.iter())
+        .map(|(a, b)| f64::from(*a) * f64::from(*b))
+        .sum::<f64>()
+        .clamp(-1.0, 1.0)
+}
+
+fn encode_vector_blob(vector: &[f32]) -> Vec<u8> {
+    let mut blob = Vec::with_capacity(std::mem::size_of_val(vector));
+    for value in vector {
+        blob.extend_from_slice(value.to_le_bytes().as_slice());
+    }
+    blob
+}
+
+fn decode_vector_blob(blob: &[u8], dims: usize) -> Vec<f32> {
+    let expected_bytes = dims.saturating_mul(std::mem::size_of::<f32>());
+    if blob.len() != expected_bytes {
+        return vec![0_f32; dims];
+    }
+    let mut vector = Vec::with_capacity(dims);
+    for chunk in blob.chunks_exact(std::mem::size_of::<f32>()) {
+        vector.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    normalize_vector(vector.as_mut_slice());
+    vector
+}
+
 fn apply_migrations(connection: &mut Connection) -> Result<(), JournalError> {
     connection.execute_batch(
         r#"
@@ -3040,8 +3801,9 @@ mod tests {
         ApprovalSubjectType, ApprovalsListFilter, CronConcurrencyPolicy, CronJobCreateRequest,
         CronJobsListFilter, CronMisfirePolicy, CronRetryPolicy, CronRunFinalizeRequest,
         CronRunStartRequest, CronRunStatus, CronRunsListFilter, CronScheduleType,
-        JournalAppendRequest, JournalConfig, JournalError, JournalStore, OrchestratorCancelRequest,
-        OrchestratorRunStartRequest, OrchestratorSessionUpsertRequest,
+        JournalAppendRequest, JournalConfig, JournalError, JournalStore, MemoryItemCreateRequest,
+        MemoryItemsListFilter, MemoryPurgeRequest, MemorySearchRequest, MemorySource,
+        OrchestratorCancelRequest, OrchestratorRunStartRequest, OrchestratorSessionUpsertRequest,
         OrchestratorTapeAppendRequest, OrchestratorUsageDelta,
     };
 
@@ -3147,6 +3909,27 @@ mod tests {
         }
     }
 
+    fn sample_memory_request(
+        memory_id: &str,
+        principal: &str,
+        channel: Option<&str>,
+        session_id: Option<&str>,
+        source: MemorySource,
+        content_text: &str,
+    ) -> MemoryItemCreateRequest {
+        MemoryItemCreateRequest {
+            memory_id: memory_id.to_owned(),
+            principal: principal.to_owned(),
+            channel: channel.map(str::to_owned),
+            session_id: session_id.map(str::to_owned),
+            source,
+            content_text: content_text.to_owned(),
+            tags: Vec::new(),
+            confidence: Some(0.9),
+            ttl_unix_ms: None,
+        }
+    }
+
     fn temp_db_path() -> PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -3203,11 +3986,19 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("schema migrations should be queryable");
+        let migration_v6: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = ?1",
+                params![6],
+                |row| row.get(0),
+            )
+            .expect("schema migrations should be queryable");
         assert_eq!(migration_v1, 1, "migration v1 should be recorded exactly once");
         assert_eq!(migration_v2, 1, "migration v2 should be recorded exactly once");
         assert_eq!(migration_v3, 1, "migration v3 should be recorded exactly once");
         assert_eq!(migration_v4, 1, "migration v4 should be recorded exactly once");
         assert_eq!(migration_v5, 1, "migration v5 should be recorded exactly once");
+        assert_eq!(migration_v6, 1, "migration v6 should be recorded exactly once");
     }
 
     #[test]
@@ -3919,6 +4710,258 @@ mod tests {
             stored.prompt.details_json.contains("<redacted>"),
             "prompt details should include redaction marker"
         );
+    }
+
+    #[test]
+    fn memory_ingest_and_search_returns_expected_hits() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let session_id = "01ARZ3NDEKTSV4RRFFQ69G5FAR";
+        store
+            .create_memory_item(&sample_memory_request(
+                "01ARZ3NDEKTSV4RRFFQ69G5FC1",
+                "user:ops",
+                Some("cli"),
+                Some(session_id),
+                MemorySource::TapeUserMessage,
+                "deploy checklist for release candidate validation",
+            ))
+            .expect("memory item should be created");
+        store
+            .create_memory_item(&sample_memory_request(
+                "01ARZ3NDEKTSV4RRFFQ69G5FC2",
+                "user:ops",
+                Some("cli"),
+                Some(session_id),
+                MemorySource::Summary,
+                "release summary and rollback note",
+            ))
+            .expect("memory item should be created");
+
+        let hits = store
+            .search_memory(&MemorySearchRequest {
+                principal: "user:ops".to_owned(),
+                channel: Some("cli".to_owned()),
+                session_id: Some(session_id.to_owned()),
+                query: "deploy checklist".to_owned(),
+                top_k: 5,
+                min_score: 0.0,
+                tags: Vec::new(),
+                sources: Vec::new(),
+            })
+            .expect("memory search should succeed");
+        assert!(
+            hits.iter().any(|hit| hit.item.memory_id == "01ARZ3NDEKTSV4RRFFQ69G5FC1"),
+            "search should return the matching memory item"
+        );
+    }
+
+    #[test]
+    fn memory_scope_isolation_enforces_principal_and_channel_boundaries() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+
+        store
+            .create_memory_item(&sample_memory_request(
+                "01ARZ3NDEKTSV4RRFFQ69G5FC3",
+                "user:a",
+                Some("cli"),
+                Some("01ARZ3NDEKTSV4RRFFQ69G5FAS"),
+                MemorySource::Manual,
+                "alpha private memory",
+            ))
+            .expect("memory item should be created");
+        store
+            .create_memory_item(&sample_memory_request(
+                "01ARZ3NDEKTSV4RRFFQ69G5FC4",
+                "user:b",
+                Some("cli"),
+                Some("01ARZ3NDEKTSV4RRFFQ69G5FAS"),
+                MemorySource::Manual,
+                "beta private memory",
+            ))
+            .expect("memory item should be created");
+        store
+            .create_memory_item(&sample_memory_request(
+                "01ARZ3NDEKTSV4RRFFQ69G5FC5",
+                "user:a",
+                Some("slack"),
+                Some("01ARZ3NDEKTSV4RRFFQ69G5FAS"),
+                MemorySource::Manual,
+                "alpha slack-only memory",
+            ))
+            .expect("memory item should be created");
+
+        let principal_hits = store
+            .search_memory(&MemorySearchRequest {
+                principal: "user:a".to_owned(),
+                channel: None,
+                session_id: None,
+                query: "private memory".to_owned(),
+                top_k: 10,
+                min_score: 0.0,
+                tags: Vec::new(),
+                sources: Vec::new(),
+            })
+            .expect("principal search should succeed");
+        assert!(
+            principal_hits.iter().all(|hit| hit.item.principal == "user:a"),
+            "search must not cross principal boundaries"
+        );
+
+        let channel_hits = store
+            .search_memory(&MemorySearchRequest {
+                principal: "user:a".to_owned(),
+                channel: Some("cli".to_owned()),
+                session_id: None,
+                query: "memory".to_owned(),
+                top_k: 10,
+                min_score: 0.0,
+                tags: Vec::new(),
+                sources: Vec::new(),
+            })
+            .expect("channel search should succeed");
+        assert!(
+            channel_hits.iter().all(|hit| hit.item.channel.as_deref() == Some("cli")),
+            "channel-scoped search must not return memories from a different channel"
+        );
+    }
+
+    #[test]
+    fn memory_ranking_prefers_exact_matches_over_weak_matches() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let session_id = "01ARZ3NDEKTSV4RRFFQ69G5FAT";
+
+        store
+            .create_memory_item(&sample_memory_request(
+                "01ARZ3NDEKTSV4RRFFQ69G5FC6",
+                "user:ops",
+                Some("cli"),
+                Some(session_id),
+                MemorySource::Summary,
+                "database migration rollback strategy for tenant upgrade",
+            ))
+            .expect("exact-match memory should be created");
+        store
+            .create_memory_item(&sample_memory_request(
+                "01ARZ3NDEKTSV4RRFFQ69G5FC7",
+                "user:ops",
+                Some("cli"),
+                Some(session_id),
+                MemorySource::Summary,
+                "database notes and maintenance checklist",
+            ))
+            .expect("weak-match memory should be created");
+
+        let hits = store
+            .search_memory(&MemorySearchRequest {
+                principal: "user:ops".to_owned(),
+                channel: Some("cli".to_owned()),
+                session_id: Some(session_id.to_owned()),
+                query: "database migration rollback strategy".to_owned(),
+                top_k: 5,
+                min_score: 0.0,
+                tags: Vec::new(),
+                sources: Vec::new(),
+            })
+            .expect("memory search should succeed");
+        assert!(!hits.is_empty(), "search should return ranked memory hits");
+        assert_eq!(
+            hits[0].item.memory_id, "01ARZ3NDEKTSV4RRFFQ69G5FC6",
+            "exact phrase match should rank ahead of weaker matches"
+        );
+    }
+
+    #[test]
+    fn memory_redaction_removes_secrets_from_store_and_results() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let session_id = "01ARZ3NDEKTSV4RRFFQ69G5FAU";
+
+        let stored = store
+            .create_memory_item(&sample_memory_request(
+                "01ARZ3NDEKTSV4RRFFQ69G5FC8",
+                "user:ops",
+                Some("cli"),
+                Some(session_id),
+                MemorySource::Manual,
+                "api_key=secret123 cookie:sessionid=abc123 release note",
+            ))
+            .expect("memory item should be created");
+        assert!(
+            !stored.content_text.contains("secret123"),
+            "ingested memory should redact secret values before persistence"
+        );
+        assert!(
+            !stored.content_text.contains("sessionid=abc123"),
+            "ingested memory should redact cookie values before persistence"
+        );
+        assert!(
+            stored.content_text.contains("<redacted>"),
+            "ingested memory should include redaction marker"
+        );
+
+        let fetched = store
+            .memory_item("01ARZ3NDEKTSV4RRFFQ69G5FC8")
+            .expect("memory lookup should succeed")
+            .expect("memory item should exist");
+        assert!(
+            !fetched.content_text.contains("secret123"),
+            "memory item lookup must not leak raw secret values"
+        );
+
+        let listed = store
+            .list_memory_items(&MemoryItemsListFilter {
+                after_memory_id: None,
+                principal: "user:ops".to_owned(),
+                channel: Some("cli".to_owned()),
+                session_id: Some(session_id.to_owned()),
+                limit: 10,
+                tags: Vec::new(),
+                sources: Vec::new(),
+            })
+            .expect("memory listing should succeed");
+        assert_eq!(listed.len(), 1, "list should return the stored redacted memory item");
+        assert!(
+            !listed[0].content_text.contains("secret123"),
+            "list results must not leak raw secret values"
+        );
+        assert!(
+            !listed[0].content_text.contains("sessionid=abc123"),
+            "list results must not leak raw cookie values"
+        );
+    }
+
+    #[test]
+    fn memory_purge_forgets_session_items() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let session_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        store
+            .create_memory_item(&sample_memory_request(
+                "01ARZ3NDEKTSV4RRFFQ69G5FC9",
+                "user:ops",
+                Some("cli"),
+                Some(session_id),
+                MemorySource::Manual,
+                "session-specific memory to purge",
+            ))
+            .expect("memory item should be created");
+        let deleted = store
+            .purge_memory(&MemoryPurgeRequest {
+                principal: "user:ops".to_owned(),
+                channel: Some("cli".to_owned()),
+                session_id: Some(session_id.to_owned()),
+                purge_all_principal: false,
+            })
+            .expect("purge should succeed");
+        assert_eq!(deleted, 1, "session purge should delete matching session memories");
     }
 
     #[test]
