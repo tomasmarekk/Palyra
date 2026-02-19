@@ -38,9 +38,10 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use clap::{CommandFactory, Parser};
 use cli::{
-    AgentCommand, BrowserCommand, ChannelsCommand, Cli, Command as CliCommand, CompletionShell,
-    ConfigCommand, CronCommand, CronConcurrencyPolicyArg, CronMisfirePolicyArg,
-    CronScheduleTypeArg, DaemonCommand, OnboardingCommand, PolicyCommand, ProtocolCommand,
+    AgentCommand, ApprovalDecisionArg, ApprovalExportFormatArg, ApprovalsCommand, BrowserCommand,
+    ChannelsCommand, Cli, Command as CliCommand, CompletionShell, ConfigCommand, CronCommand,
+    CronConcurrencyPolicyArg, CronMisfirePolicyArg, CronScheduleTypeArg, DaemonCommand,
+    OnboardingCommand, PolicyCommand, ProtocolCommand,
 };
 #[cfg(not(windows))]
 use cli::{PairingClientKindArg, PairingCommand, PairingMethodArg};
@@ -104,6 +105,7 @@ fn main() -> Result<()> {
         }
         CliCommand::Agent { command } => run_agent(command),
         CliCommand::Cron { command } => run_cron(command),
+        CliCommand::Approvals { command } => run_approvals(command),
         CliCommand::Channels { command } => run_channels(command),
         CliCommand::Browser { command } => run_browser(command),
         CliCommand::Completion { shell } => run_completion(shell),
@@ -780,6 +782,174 @@ async fn run_cron_async(command: CronCommand, connection: AgentConnection) -> Re
     std::io::stdout().flush().context("stdout flush failed")
 }
 
+fn run_approvals(command: ApprovalsCommand) -> Result<()> {
+    let connection = AgentConnection {
+        grpc_url: resolve_grpc_url(None)?,
+        token: env::var("PALYRA_ADMIN_TOKEN").ok(),
+        principal: "user:local".to_owned(),
+        device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+        channel: DEFAULT_CHANNEL.to_owned(),
+    };
+    let runtime = build_runtime()?;
+    runtime.block_on(run_approvals_async(command, connection))
+}
+
+async fn run_approvals_async(command: ApprovalsCommand, connection: AgentConnection) -> Result<()> {
+    let mut client = gateway_v1::approvals_service_client::ApprovalsServiceClient::connect(
+        connection.grpc_url.clone(),
+    )
+    .await
+    .with_context(|| format!("failed to connect gateway gRPC endpoint {}", connection.grpc_url))?;
+
+    match command {
+        ApprovalsCommand::List {
+            after,
+            limit,
+            since,
+            until,
+            subject,
+            principal,
+            decision,
+            json,
+        } => {
+            if let (Some(since_ms), Some(until_ms)) = (since, until) {
+                if since_ms > until_ms {
+                    return Err(anyhow!(
+                        "approvals list requires --since <= --until when both filters are set"
+                    ));
+                }
+            }
+            if let Some(after_value) = after.as_deref() {
+                validate_canonical_id(after_value)
+                    .context("approval cursor (--after) must be a canonical ULID")?;
+            }
+            let mut request = Request::new(gateway_v1::ListApprovalsRequest {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                after_approval_ulid: after.unwrap_or_default(),
+                limit: limit.unwrap_or(100),
+                since_unix_ms: since.unwrap_or_default(),
+                until_unix_ms: until.unwrap_or_default(),
+                subject_id: subject.unwrap_or_default(),
+                principal: principal.unwrap_or_default(),
+                decision: approval_decision_filter_to_proto(decision),
+                subject_type: gateway_v1::ApprovalSubjectType::Unspecified as i32,
+            });
+            inject_run_stream_metadata(request.metadata_mut(), &connection)?;
+            let response = client
+                .list_approvals(request)
+                .await
+                .context("failed to call approvals ListApprovals")?
+                .into_inner();
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "approvals": response.approvals.iter().map(approval_record_to_json).collect::<Vec<_>>(),
+                        "next_after_approval_ulid": response.next_after_approval_ulid,
+                    }))?
+                );
+            } else {
+                println!(
+                    "approvals.list approvals={} next_after={}",
+                    response.approvals.len(),
+                    if response.next_after_approval_ulid.is_empty() {
+                        "none"
+                    } else {
+                        response.next_after_approval_ulid.as_str()
+                    }
+                );
+                for approval in response.approvals {
+                    println!(
+                        "approval id={} subject={} decision={} principal={} requested_at_ms={} resolved_at_ms={}",
+                        approval
+                            .approval_id
+                            .as_ref()
+                            .map(|value| value.ulid.as_str())
+                            .unwrap_or("unknown"),
+                        approval.subject_id,
+                        approval_decision_to_text(approval.decision),
+                        approval.principal,
+                        approval.requested_at_unix_ms,
+                        approval.resolved_at_unix_ms
+                    );
+                }
+            }
+        }
+        ApprovalsCommand::Show { approval_id, json } => {
+            validate_canonical_id(approval_id.as_str())
+                .context("approval id must be a canonical ULID")?;
+            let mut request = Request::new(gateway_v1::GetApprovalRequest {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                approval_id: Some(common_v1::CanonicalId { ulid: approval_id.clone() }),
+            });
+            inject_run_stream_metadata(request.metadata_mut(), &connection)?;
+            let response = client
+                .get_approval(request)
+                .await
+                .context("failed to call approvals GetApproval")?
+                .into_inner();
+            let approval = response
+                .approval
+                .context("approvals GetApproval returned empty approval payload")?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&approval_record_to_json(&approval))?);
+            } else {
+                println!(
+                    "approvals.show id={} subject={} decision={} scope={} reason={}",
+                    approval
+                        .approval_id
+                        .as_ref()
+                        .map(|value| value.ulid.as_str())
+                        .unwrap_or("unknown"),
+                    approval.subject_id,
+                    approval_decision_to_text(approval.decision),
+                    approval_scope_to_text(approval.decision_scope),
+                    approval.decision_reason
+                );
+            }
+        }
+        ApprovalsCommand::Export { format, limit, since, until, subject, principal, decision } => {
+            if let (Some(since_ms), Some(until_ms)) = (since, until) {
+                if since_ms > until_ms {
+                    return Err(anyhow!(
+                        "approvals export requires --since <= --until when both filters are set"
+                    ));
+                }
+            }
+            let mut request = Request::new(gateway_v1::ExportApprovalsRequest {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                format: approval_export_format_to_proto(format),
+                limit: limit.unwrap_or(1_000),
+                since_unix_ms: since.unwrap_or_default(),
+                until_unix_ms: until.unwrap_or_default(),
+                subject_id: subject.unwrap_or_default(),
+                principal: principal.unwrap_or_default(),
+                decision: approval_decision_filter_to_proto(decision),
+                subject_type: gateway_v1::ApprovalSubjectType::Unspecified as i32,
+            });
+            inject_run_stream_metadata(request.metadata_mut(), &connection)?;
+            let mut stream = client
+                .export_approvals(request)
+                .await
+                .context("failed to call approvals ExportApprovals")?
+                .into_inner();
+            while let Some(item) = stream.next().await {
+                let chunk = item.context("failed to read approvals export stream chunk")?;
+                if !chunk.chunk.is_empty() {
+                    std::io::stdout()
+                        .write_all(chunk.chunk.as_slice())
+                        .context("failed to write approvals export chunk to stdout")?;
+                }
+                if chunk.done {
+                    break;
+                }
+            }
+        }
+    }
+
+    std::io::stdout().flush().context("stdout flush failed")
+}
+
 async fn update_cron_enabled(
     client: &mut cron_v1::cron_service_client::CronServiceClient<tonic::transport::Channel>,
     connection: &AgentConnection,
@@ -954,6 +1124,122 @@ fn cron_run_to_json(run: &cron_v1::JobRun) -> serde_json::Value {
         "tool_calls": run.tool_calls,
         "tool_denies": run.tool_denies,
     })
+}
+
+fn approval_record_to_json(approval: &gateway_v1::ApprovalRecord) -> serde_json::Value {
+    let prompt = approval.prompt.as_ref().map(|prompt| {
+        let details_json = if prompt.details_json.is_empty() {
+            json!({})
+        } else {
+            serde_json::from_slice::<serde_json::Value>(prompt.details_json.as_slice())
+                .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(prompt.details_json.as_slice()).to_string() }))
+        };
+        json!({
+            "title": prompt.title,
+            "risk_level": approval_risk_to_text(prompt.risk_level),
+            "subject_id": prompt.subject_id,
+            "summary": prompt.summary,
+            "timeout_seconds": prompt.timeout_seconds,
+            "policy_explanation": prompt.policy_explanation,
+            "options": prompt.options.iter().map(|option| json!({
+                "option_id": option.option_id,
+                "label": option.label,
+                "description": option.description,
+                "default_selected": option.default_selected,
+                "decision_scope": approval_scope_to_text(option.decision_scope),
+                "timebox_ttl_ms": option.timebox_ttl_ms,
+            })).collect::<Vec<_>>(),
+            "details_json": details_json,
+        })
+    });
+    json!({
+        "approval_id": approval.approval_id.as_ref().map(|value| value.ulid.clone()),
+        "session_id": approval.session_id.as_ref().map(|value| value.ulid.clone()),
+        "run_id": approval.run_id.as_ref().map(|value| value.ulid.clone()),
+        "principal": approval.principal,
+        "device_id": approval.device_id,
+        "channel": approval.channel,
+        "requested_at_unix_ms": approval.requested_at_unix_ms,
+        "resolved_at_unix_ms": approval.resolved_at_unix_ms,
+        "subject_type": approval_subject_type_to_text(approval.subject_type),
+        "subject_id": approval.subject_id,
+        "request_summary": approval.request_summary,
+        "decision": approval_decision_to_text(approval.decision),
+        "decision_scope": approval_scope_to_text(approval.decision_scope),
+        "decision_reason": approval.decision_reason,
+        "decision_scope_ttl_ms": approval.decision_scope_ttl_ms,
+        "policy_snapshot": approval.policy_snapshot.as_ref().map(|value| json!({
+            "policy_id": value.policy_id,
+            "policy_hash": value.policy_hash,
+            "evaluation_summary": value.evaluation_summary,
+        })),
+        "prompt": prompt,
+    })
+}
+
+fn approval_subject_type_to_text(value: i32) -> &'static str {
+    match gateway_v1::ApprovalSubjectType::try_from(value)
+        .unwrap_or(gateway_v1::ApprovalSubjectType::Unspecified)
+    {
+        gateway_v1::ApprovalSubjectType::Tool => "tool",
+        gateway_v1::ApprovalSubjectType::ChannelSend => "channel_send",
+        gateway_v1::ApprovalSubjectType::SecretAccess => "secret_access",
+        gateway_v1::ApprovalSubjectType::BrowserAction => "browser_action",
+        gateway_v1::ApprovalSubjectType::NodeCapability => "node_capability",
+        gateway_v1::ApprovalSubjectType::Unspecified => "unspecified",
+    }
+}
+
+fn approval_decision_to_text(value: i32) -> &'static str {
+    match gateway_v1::ApprovalDecision::try_from(value)
+        .unwrap_or(gateway_v1::ApprovalDecision::Unspecified)
+    {
+        gateway_v1::ApprovalDecision::Allow => "allow",
+        gateway_v1::ApprovalDecision::Deny => "deny",
+        gateway_v1::ApprovalDecision::Timeout => "timeout",
+        gateway_v1::ApprovalDecision::Error => "error",
+        gateway_v1::ApprovalDecision::Unspecified => "unspecified",
+    }
+}
+
+fn approval_scope_to_text(value: i32) -> &'static str {
+    match common_v1::ApprovalDecisionScope::try_from(value)
+        .unwrap_or(common_v1::ApprovalDecisionScope::Unspecified)
+    {
+        common_v1::ApprovalDecisionScope::Once => "once",
+        common_v1::ApprovalDecisionScope::Session => "session",
+        common_v1::ApprovalDecisionScope::Timeboxed => "timeboxed",
+        common_v1::ApprovalDecisionScope::Unspecified => "unspecified",
+    }
+}
+
+fn approval_risk_to_text(value: i32) -> &'static str {
+    match common_v1::ApprovalRiskLevel::try_from(value)
+        .unwrap_or(common_v1::ApprovalRiskLevel::Unspecified)
+    {
+        common_v1::ApprovalRiskLevel::Low => "low",
+        common_v1::ApprovalRiskLevel::Medium => "medium",
+        common_v1::ApprovalRiskLevel::High => "high",
+        common_v1::ApprovalRiskLevel::Critical => "critical",
+        common_v1::ApprovalRiskLevel::Unspecified => "unspecified",
+    }
+}
+
+fn approval_decision_filter_to_proto(value: Option<ApprovalDecisionArg>) -> i32 {
+    match value {
+        Some(ApprovalDecisionArg::Allow) => gateway_v1::ApprovalDecision::Allow as i32,
+        Some(ApprovalDecisionArg::Deny) => gateway_v1::ApprovalDecision::Deny as i32,
+        Some(ApprovalDecisionArg::Timeout) => gateway_v1::ApprovalDecision::Timeout as i32,
+        Some(ApprovalDecisionArg::Error) => gateway_v1::ApprovalDecision::Error as i32,
+        None => gateway_v1::ApprovalDecision::Unspecified as i32,
+    }
+}
+
+fn approval_export_format_to_proto(value: ApprovalExportFormatArg) -> i32 {
+    match value {
+        ApprovalExportFormatArg::Ndjson => gateway_v1::ApprovalExportFormat::Ndjson as i32,
+        ApprovalExportFormatArg::Json => gateway_v1::ApprovalExportFormat::Json as i32,
+    }
 }
 
 fn run_channels(command: ChannelsCommand) -> Result<()> {
@@ -1451,27 +1737,40 @@ fn emit_agent_event_text(event: &common_v1::RunStreamEvent) -> Result<()> {
         }
         Some(common_v1::run_stream_event::Body::ToolApprovalRequest(approval_request)) => {
             println!(
-                "agent.tool.approval.request run_id={} proposal_id={} tool_name={} approval_required={}",
+                "agent.tool.approval.request run_id={} proposal_id={} approval_id={} tool_name={} approval_required={} summary=\"{}\"",
                 run_id,
                 approval_request
                     .proposal_id
                     .as_ref()
                     .map(|value| value.ulid.as_str())
                     .unwrap_or("unknown"),
+                approval_request
+                    .approval_id
+                    .as_ref()
+                    .map(|value| value.ulid.as_str())
+                    .unwrap_or("unknown"),
                 approval_request.tool_name,
-                approval_request.approval_required
+                approval_request.approval_required,
+                approval_request.request_summary
             );
         }
         Some(common_v1::run_stream_event::Body::ToolApprovalResponse(approval_response)) => {
             println!(
-                "agent.tool.approval.response run_id={} proposal_id={} approved={} reason={}",
+                "agent.tool.approval.response run_id={} proposal_id={} approval_id={} approved={} scope={} ttl_ms={} reason={}",
                 run_id,
                 approval_response
                     .proposal_id
                     .as_ref()
                     .map(|value| value.ulid.as_str())
                     .unwrap_or("unknown"),
+                approval_response
+                    .approval_id
+                    .as_ref()
+                    .map(|value| value.ulid.as_str())
+                    .unwrap_or("unknown"),
                 approval_response.approved,
+                approval_scope_to_text(approval_response.decision_scope),
+                approval_response.decision_scope_ttl_ms,
                 approval_response.reason
             );
         }
@@ -1565,16 +1864,43 @@ fn emit_acp_event_ndjson(event: &common_v1::RunStreamEvent) -> Result<()> {
             "type": "tool.approval.request",
             "run_id": run_id,
             "proposal_id": approval_request.proposal_id.as_ref().map(|value| value.ulid.clone()),
+            "approval_id": approval_request.approval_id.as_ref().map(|value| value.ulid.clone()),
             "tool_name": approval_request.tool_name,
             "approval_required": approval_request.approval_required,
+            "request_summary": approval_request.request_summary,
+            "prompt": approval_request.prompt.as_ref().map(|prompt| json!({
+                "title": prompt.title,
+                "risk_level": approval_risk_to_text(prompt.risk_level),
+                "subject_id": prompt.subject_id,
+                "summary": prompt.summary,
+                "policy_explanation": prompt.policy_explanation,
+                "timeout_seconds": prompt.timeout_seconds,
+                "options": prompt.options.iter().map(|option| json!({
+                    "option_id": option.option_id,
+                    "label": option.label,
+                    "description": option.description,
+                    "default_selected": option.default_selected,
+                    "decision_scope": approval_scope_to_text(option.decision_scope),
+                    "timebox_ttl_ms": option.timebox_ttl_ms,
+                })).collect::<Vec<_>>(),
+                    "details_json": if prompt.details_json.is_empty() {
+                        json!({})
+                    } else {
+                        serde_json::from_slice::<serde_json::Value>(prompt.details_json.as_slice())
+                            .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(prompt.details_json.as_slice()).to_string() }))
+                    },
+            })),
             "input_json": approval_request.input_json,
         }),
         Some(common_v1::run_stream_event::Body::ToolApprovalResponse(approval_response)) => json!({
             "type": "tool.approval.response",
             "run_id": run_id,
             "proposal_id": approval_response.proposal_id.as_ref().map(|value| value.ulid.clone()),
+            "approval_id": approval_response.approval_id.as_ref().map(|value| value.ulid.clone()),
             "approved": approval_response.approved,
             "reason": approval_response.reason,
+            "decision_scope": approval_scope_to_text(approval_response.decision_scope),
+            "decision_scope_ttl_ms": approval_response.decision_scope_ttl_ms,
         }),
         Some(common_v1::run_stream_event::Body::ToolResult(result)) => json!({
             "type": "tool.result",

@@ -38,6 +38,10 @@ pub enum Command {
         #[command(subcommand)]
         command: CronCommand,
     },
+    Approvals {
+        #[command(subcommand)]
+        command: ApprovalsCommand,
+    },
     Channels {
         #[command(subcommand)]
         command: ChannelsCommand,
@@ -287,6 +291,63 @@ pub enum CronCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum ApprovalsCommand {
+    List {
+        #[arg(long)]
+        after: Option<String>,
+        #[arg(long)]
+        limit: Option<u32>,
+        #[arg(long)]
+        since: Option<i64>,
+        #[arg(long)]
+        until: Option<i64>,
+        #[arg(long)]
+        subject: Option<String>,
+        #[arg(long)]
+        principal: Option<String>,
+        #[arg(long, value_enum)]
+        decision: Option<ApprovalDecisionArg>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Show {
+        approval_id: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Export {
+        #[arg(long, value_enum, default_value_t = ApprovalExportFormatArg::Ndjson)]
+        format: ApprovalExportFormatArg,
+        #[arg(long)]
+        limit: Option<u32>,
+        #[arg(long)]
+        since: Option<i64>,
+        #[arg(long)]
+        until: Option<i64>,
+        #[arg(long)]
+        subject: Option<String>,
+        #[arg(long)]
+        principal: Option<String>,
+        #[arg(long, value_enum)]
+        decision: Option<ApprovalDecisionArg>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ApprovalDecisionArg {
+    Allow,
+    Deny,
+    Timeout,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ApprovalExportFormatArg {
+    Ndjson,
+    Json,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -574,9 +635,10 @@ mod tests {
     use clap::Parser;
 
     use super::{
-        AgentCommand, BrowserCommand, ChannelsCommand, Cli, Command, CompletionShell,
-        ConfigCommand, CronCommand, CronConcurrencyPolicyArg, CronMisfirePolicyArg,
-        CronScheduleTypeArg, DaemonCommand, OnboardingCommand, PolicyCommand, ProtocolCommand,
+        AgentCommand, ApprovalDecisionArg, ApprovalExportFormatArg, ApprovalsCommand,
+        BrowserCommand, ChannelsCommand, Cli, Command, CompletionShell, ConfigCommand, CronCommand,
+        CronConcurrencyPolicyArg, CronMisfirePolicyArg, CronScheduleTypeArg, DaemonCommand,
+        OnboardingCommand, PolicyCommand, ProtocolCommand,
     };
     #[cfg(not(windows))]
     use super::{PairingClientKindArg, PairingCommand, PairingMethodArg};
@@ -940,6 +1002,94 @@ mod tests {
                 command: CronCommand::Delete {
                     id: "01ARZ3NDEKTSV4RRFFQ69G5FB0".to_owned(),
                     json: true,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn parse_approvals_list() {
+        let parsed = Cli::parse_from([
+            "palyra",
+            "approvals",
+            "list",
+            "--after",
+            "01ARZ3NDEKTSV4RRFFQ69G5FB1",
+            "--limit",
+            "50",
+            "--since",
+            "1730000000000",
+            "--until",
+            "1730001000000",
+            "--subject",
+            "tool:palyra.process.run",
+            "--principal",
+            "user:ops",
+            "--decision",
+            "deny",
+            "--json",
+        ]);
+        assert_eq!(
+            parsed.command,
+            Command::Approvals {
+                command: ApprovalsCommand::List {
+                    after: Some("01ARZ3NDEKTSV4RRFFQ69G5FB1".to_owned()),
+                    limit: Some(50),
+                    since: Some(1_730_000_000_000),
+                    until: Some(1_730_001_000_000),
+                    subject: Some("tool:palyra.process.run".to_owned()),
+                    principal: Some("user:ops".to_owned()),
+                    decision: Some(ApprovalDecisionArg::Deny),
+                    json: true,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn parse_approvals_show() {
+        let parsed = Cli::parse_from([
+            "palyra",
+            "approvals",
+            "show",
+            "01ARZ3NDEKTSV4RRFFQ69G5FB2",
+            "--json",
+        ]);
+        assert_eq!(
+            parsed.command,
+            Command::Approvals {
+                command: ApprovalsCommand::Show {
+                    approval_id: "01ARZ3NDEKTSV4RRFFQ69G5FB2".to_owned(),
+                    json: true,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn parse_approvals_export() {
+        let parsed = Cli::parse_from([
+            "palyra",
+            "approvals",
+            "export",
+            "--format",
+            "json",
+            "--limit",
+            "200",
+            "--decision",
+            "allow",
+        ]);
+        assert_eq!(
+            parsed.command,
+            Command::Approvals {
+                command: ApprovalsCommand::Export {
+                    format: ApprovalExportFormatArg::Json,
+                    limit: Some(200),
+                    since: None,
+                    until: None,
+                    subject: None,
+                    principal: None,
+                    decision: Some(ApprovalDecisionArg::Allow),
                 }
             }
         );

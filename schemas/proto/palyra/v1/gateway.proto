@@ -14,6 +14,125 @@ service GatewayService {
   rpc ResolveSession(ResolveSessionRequest) returns (ResolveSessionResponse);
 }
 
+service ApprovalsService {
+  rpc ListApprovals(ListApprovalsRequest) returns (ListApprovalsResponse);
+  rpc GetApproval(GetApprovalRequest) returns (GetApprovalResponse);
+  rpc ExportApprovals(ExportApprovalsRequest) returns (stream ExportApprovalsResponse);
+}
+
+enum ApprovalSubjectType {
+  APPROVAL_SUBJECT_TYPE_UNSPECIFIED = 0;
+  APPROVAL_SUBJECT_TYPE_TOOL = 1;
+  APPROVAL_SUBJECT_TYPE_CHANNEL_SEND = 2;
+  APPROVAL_SUBJECT_TYPE_SECRET_ACCESS = 3;
+  APPROVAL_SUBJECT_TYPE_BROWSER_ACTION = 4;
+  APPROVAL_SUBJECT_TYPE_NODE_CAPABILITY = 5;
+}
+
+enum ApprovalDecision {
+  APPROVAL_DECISION_UNSPECIFIED = 0;
+  APPROVAL_DECISION_ALLOW = 1;
+  APPROVAL_DECISION_DENY = 2;
+  APPROVAL_DECISION_TIMEOUT = 3;
+  APPROVAL_DECISION_ERROR = 4;
+}
+
+enum ApprovalExportFormat {
+  APPROVAL_EXPORT_FORMAT_UNSPECIFIED = 0;
+  APPROVAL_EXPORT_FORMAT_NDJSON = 1;
+  APPROVAL_EXPORT_FORMAT_JSON = 2;
+}
+
+message ApprovalPolicySnapshot {
+  string policy_id = 1;
+  string policy_hash = 2;
+  string evaluation_summary = 3;
+
+  reserved 4 to 10;
+}
+
+message ApprovalRecord {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId approval_id = 2;
+  palyra.common.v1.CanonicalId session_id = 3;
+  palyra.common.v1.CanonicalId run_id = 4;
+  string principal = 5;
+  string device_id = 6;
+  string channel = 7;
+  int64 requested_at_unix_ms = 8;
+  int64 resolved_at_unix_ms = 9;
+  ApprovalSubjectType subject_type = 10;
+  string subject_id = 11;
+  string request_summary = 12;
+  ApprovalDecision decision = 13;
+  palyra.common.v1.ApprovalDecisionScope decision_scope = 14;
+  ApprovalPolicySnapshot policy_snapshot = 15;
+  palyra.common.v1.ApprovalPrompt prompt = 16;
+  string decision_reason = 17;
+  int64 decision_scope_ttl_ms = 18;
+
+  reserved 19 to 28;
+}
+
+message ListApprovalsRequest {
+  uint32 v = 1;
+  string after_approval_ulid = 2;
+  uint32 limit = 3;
+  int64 since_unix_ms = 4;
+  int64 until_unix_ms = 5;
+  string subject_id = 6;
+  string principal = 7;
+  ApprovalDecision decision = 8;
+  ApprovalSubjectType subject_type = 9;
+
+  reserved 10 to 16;
+}
+
+message ListApprovalsResponse {
+  uint32 v = 1;
+  repeated ApprovalRecord approvals = 2;
+  string next_after_approval_ulid = 3;
+
+  reserved 4 to 10;
+}
+
+message GetApprovalRequest {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId approval_id = 2;
+
+  reserved 3 to 10;
+}
+
+message GetApprovalResponse {
+  uint32 v = 1;
+  ApprovalRecord approval = 2;
+
+  reserved 3 to 10;
+}
+
+message ExportApprovalsRequest {
+  uint32 v = 1;
+  ApprovalExportFormat format = 2;
+  uint32 limit = 3;
+  int64 since_unix_ms = 4;
+  int64 until_unix_ms = 5;
+  string subject_id = 6;
+  string principal = 7;
+  ApprovalDecision decision = 8;
+  ApprovalSubjectType subject_type = 9;
+
+  reserved 10 to 16;
+}
+
+message ExportApprovalsResponse {
+  uint32 v = 1;
+  bytes chunk = 2;
+  uint32 chunk_seq = 3;
+  bool done = 4;
+
+  reserved 5 to 10;
+}
+
 message HealthRequest {
   uint32 v = 1;
 

@@ -384,6 +384,11 @@ async fn main() -> Result<()> {
     );
     let grpc_cron_server =
         gateway::proto::palyra::cron::v1::cron_service_server::CronServiceServer::new(cron_service);
+    let approvals_service = gateway::ApprovalsServiceImpl::new(runtime.clone(), auth.clone());
+    let grpc_approvals_server =
+        gateway::proto::palyra::gateway::v1::approvals_service_server::ApprovalsServiceServer::new(
+            approvals_service,
+        );
     let node_rpc_service = node_rpc::NodeRpcServiceImpl::new(
         identity_runtime.revoked_certificate_fingerprints.clone(),
         !loaded.identity.allow_insecure_node_rpc_without_mtls,
@@ -417,6 +422,7 @@ async fn main() -> Result<()> {
             grpc_server_builder
                 .add_service(grpc_gateway_server)
                 .add_service(grpc_cron_server)
+                .add_service(grpc_approvals_server)
                 .serve_with_incoming_shutdown(
                     TcpListenerStream::new(grpc_listener),
                     shutdown_signal(),

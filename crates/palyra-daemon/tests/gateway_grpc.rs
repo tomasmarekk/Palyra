@@ -1555,6 +1555,189 @@ async fn grpc_run_stream_denies_allowlisted_unsupported_tool() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn grpc_approvals_service_persists_and_exports_denied_tool_approval() -> Result<()> {
+    let (openai_base_url, _request_count, server_handle) =
+        spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::immediate(
+            200,
+            r#"{"choices":[{"message":{"tool_calls":[{"function":{"name":"custom.noop","arguments":"{\"payload\":\"secret-token\",\"cookie\":\"sessionid=abc123\"}"}}]}}]}"#
+                .to_owned(),
+        )])?;
+    let (child, admin_port, grpc_port, _journal_db_path) =
+        spawn_palyrad_with_openai_provider_and_tool_policy(
+            openai_base_url.as_str(),
+            OPENAI_API_KEY,
+            "custom.noop",
+            2,
+            250,
+        )?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut gateway_client =
+        gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint.clone())
+            .await
+            .context("failed to connect gateway gRPC client")?;
+    let mut approvals_client =
+        gateway_v1::approvals_service_client::ApprovalsServiceClient::connect(endpoint)
+            .await
+            .context("failed to connect approvals gRPC client")?;
+
+    let (request_sender, request_receiver) = tokio_mpsc::channel(4);
+    request_sender
+        .send(sample_run_stream_request_with_text("approval audit deny path".to_owned()))
+        .await
+        .context("failed to send initial deny-path stream request")?;
+    let mut stream_request = tonic::Request::new(ReceiverStream::new(request_receiver));
+    authorize_metadata(stream_request.metadata_mut())?;
+    let mut response_stream = gateway_client
+        .run_stream(stream_request)
+        .await
+        .context("failed to call RunStream")?
+        .into_inner();
+
+    let mut captured_approval_id: Option<String> = None;
+    let mut saw_deny_decision = false;
+    loop {
+        let next_event = tokio::time::timeout(Duration::from_secs(5), response_stream.next())
+            .await
+            .context("deny-path stream stalled before expected events")?;
+        let Some(event) = next_event else {
+            break;
+        };
+        let event = event.context("failed to read deny-path RunStream event")?;
+        if let Some(body) = event.body {
+            match body {
+                common_v1::run_stream_event::Body::ToolApprovalRequest(approval_request) => {
+                    let proposal_id = approval_request
+                        .proposal_id
+                        .as_ref()
+                        .map(|proposal_id| proposal_id.ulid.as_str())
+                        .context("tool approval request missing proposal_id")?;
+                    captured_approval_id =
+                        approval_request.approval_id.as_ref().map(|value| value.ulid.clone());
+                    request_sender
+                        .send(sample_tool_approval_response_request(
+                            proposal_id,
+                            false,
+                            "deny token=abc cookie:sessionid=abc123",
+                        ))
+                        .await
+                        .context("failed to send deny approval response")?;
+                }
+                common_v1::run_stream_event::Body::ToolDecision(decision) => {
+                    if decision.kind == common_v1::tool_decision::DecisionKind::Deny as i32 {
+                        saw_deny_decision = true;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    assert!(saw_deny_decision, "tool proposal should be denied after explicit approval rejection");
+    let approval_id = captured_approval_id.context("approval stream should include approval_id")?;
+
+    let mut list_request = tonic::Request::new(gateway_v1::ListApprovalsRequest {
+        v: 1,
+        after_approval_ulid: String::new(),
+        limit: 20,
+        since_unix_ms: 0,
+        until_unix_ms: 0,
+        subject_id: "tool:custom.noop".to_owned(),
+        principal: "user:ops".to_owned(),
+        decision: gateway_v1::ApprovalDecision::Deny as i32,
+        subject_type: gateway_v1::ApprovalSubjectType::Tool as i32,
+    });
+    authorize_metadata(list_request.metadata_mut())?;
+    let list_response = approvals_client
+        .list_approvals(list_request)
+        .await
+        .context("failed to call ListApprovals")?
+        .into_inner();
+    assert!(!list_response.approvals.is_empty(), "list approvals should return denied records");
+    let listed = list_response
+        .approvals
+        .iter()
+        .find(|record| {
+            record
+                .approval_id
+                .as_ref()
+                .map(|value| value.ulid.as_str() == approval_id.as_str())
+                .unwrap_or(false)
+        })
+        .context("list approvals should include the stream approval_id")?;
+    assert_eq!(listed.subject_type, gateway_v1::ApprovalSubjectType::Tool as i32);
+    assert_eq!(listed.decision, gateway_v1::ApprovalDecision::Deny as i32);
+    assert!(
+        !listed.request_summary.contains("token=abc"),
+        "stored request summary must redact token-like values"
+    );
+    assert!(
+        !listed.request_summary.contains("sessionid=abc123"),
+        "stored request summary must redact cookie-like values"
+    );
+
+    let mut get_request = tonic::Request::new(gateway_v1::GetApprovalRequest {
+        v: 1,
+        approval_id: Some(common_v1::CanonicalId { ulid: approval_id.clone() }),
+    });
+    authorize_metadata(get_request.metadata_mut())?;
+    let get_response = approvals_client
+        .get_approval(get_request)
+        .await
+        .context("failed to call GetApproval")?
+        .into_inner();
+    let fetched = get_response.approval.context("GetApproval must return approval payload")?;
+    assert_eq!(
+        fetched.approval_id.as_ref().map(|value| value.ulid.as_str()).unwrap_or_default(),
+        approval_id.as_str()
+    );
+
+    let mut export_request = tonic::Request::new(gateway_v1::ExportApprovalsRequest {
+        v: 1,
+        format: gateway_v1::ApprovalExportFormat::Ndjson as i32,
+        limit: 50,
+        since_unix_ms: 0,
+        until_unix_ms: 0,
+        subject_id: "tool:custom.noop".to_owned(),
+        principal: "user:ops".to_owned(),
+        decision: gateway_v1::ApprovalDecision::Deny as i32,
+        subject_type: gateway_v1::ApprovalSubjectType::Tool as i32,
+    });
+    authorize_metadata(export_request.metadata_mut())?;
+    let mut export_stream = approvals_client
+        .export_approvals(export_request)
+        .await
+        .context("failed to call ExportApprovals")?
+        .into_inner();
+    let mut exported = Vec::new();
+    while let Some(chunk) = export_stream.next().await {
+        let chunk = chunk.context("failed to read ExportApprovals chunk")?;
+        if !chunk.chunk.is_empty() {
+            exported.extend_from_slice(chunk.chunk.as_slice());
+        }
+        if chunk.done {
+            break;
+        }
+    }
+    let exported_text =
+        String::from_utf8(exported).context("exported approvals payload must be UTF-8 NDJSON")?;
+    assert!(
+        exported_text.contains(approval_id.as_str()),
+        "export output must contain persisted approval_id"
+    );
+    assert!(!exported_text.contains("token=abc"), "export output must keep redacted token values");
+    assert!(
+        !exported_text.contains("sessionid=abc123"),
+        "export output must keep redacted cookie values"
+    );
+
+    server_handle.join().expect("scripted openai server thread should exit");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 #[cfg(unix)]
 async fn grpc_run_stream_executes_sandbox_process_runner_within_workspace_scope() -> Result<()> {
     let (openai_base_url, _request_count, server_handle) =
@@ -2663,6 +2846,9 @@ fn sample_tool_approval_response_request(
             proposal_id: Some(common_v1::CanonicalId { ulid: proposal_id.to_owned() }),
             approved,
             reason: reason.to_owned(),
+            approval_id: None,
+            decision_scope: common_v1::ApprovalDecisionScope::Once as i32,
+            decision_scope_ttl_ms: 0,
         }),
     }
 }

@@ -28,6 +28,10 @@ pub mod palyra_common_v1 {
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct A2uiUpdate;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ApprovalOption;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ApprovalPrompt;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct CanonicalId;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct EnvelopeOrigin;
@@ -134,9 +138,25 @@ pub mod palyra_gateway_v1 {
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct AppendEventResponse;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ApprovalPolicySnapshot;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ApprovalRecord;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ExportApprovalsRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ExportApprovalsResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct GetApprovalRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct GetApprovalResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct HealthRequest;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct HealthResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ListApprovalsRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ListApprovalsResponse;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct ListSessionsRequest;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -147,6 +167,11 @@ pub mod palyra_gateway_v1 {
     pub struct ResolveSessionResponse;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct SessionSummary;
+    pub trait ApprovalsServiceClient {
+        fn ExportApprovals(&self);
+        fn GetApproval(&self);
+        fn ListApprovals(&self);
+    }
     pub trait GatewayServiceClient {
         fn AbortRun(&self);
         fn AppendEvent(&self);

@@ -155,11 +155,53 @@ message ToolDecision {
   reserved 6 to 10;
 }
 
+enum ApprovalRiskLevel {
+  APPROVAL_RISK_LEVEL_UNSPECIFIED = 0;
+  APPROVAL_RISK_LEVEL_LOW = 1;
+  APPROVAL_RISK_LEVEL_MEDIUM = 2;
+  APPROVAL_RISK_LEVEL_HIGH = 3;
+  APPROVAL_RISK_LEVEL_CRITICAL = 4;
+}
+
+enum ApprovalDecisionScope {
+  APPROVAL_DECISION_SCOPE_UNSPECIFIED = 0;
+  APPROVAL_DECISION_SCOPE_ONCE = 1;
+  APPROVAL_DECISION_SCOPE_SESSION = 2;
+  APPROVAL_DECISION_SCOPE_TIMEBOXED = 3;
+}
+
+message ApprovalOption {
+  string option_id = 1;
+  string label = 2;
+  string description = 3;
+  bool default_selected = 4;
+  ApprovalDecisionScope decision_scope = 5;
+  int64 timebox_ttl_ms = 6;
+
+  reserved 7 to 10;
+}
+
+message ApprovalPrompt {
+  string title = 1;
+  ApprovalRiskLevel risk_level = 2;
+  string subject_id = 3;
+  string summary = 4;
+  repeated ApprovalOption options = 5;
+  uint32 timeout_seconds = 6;
+  bytes details_json = 7;
+  string policy_explanation = 8;
+
+  reserved 9 to 16;
+}
+
 message ToolApprovalRequest {
   CanonicalId proposal_id = 1;
   string tool_name = 2;
   bytes input_json = 3;
   bool approval_required = 4;
+  CanonicalId approval_id = 11;
+  ApprovalPrompt prompt = 12;
+  string request_summary = 13;
 
   reserved 5 to 10;
 }
@@ -168,6 +210,9 @@ message ToolApprovalResponse {
   CanonicalId proposal_id = 1;
   bool approved = 2;
   string reason = 3;
+  CanonicalId approval_id = 11;
+  ApprovalDecisionScope decision_scope = 12;
+  int64 decision_scope_ttl_ms = 13;
 
   reserved 4 to 10;
 }

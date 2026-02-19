@@ -30,6 +30,12 @@ public enum PalyraCommonV1 {
     public struct A2uiUpdate: Equatable {
         public init() {}
     }
+    public struct ApprovalOption: Equatable {
+        public init() {}
+    }
+    public struct ApprovalPrompt: Equatable {
+        public init() {}
+    }
     public struct CanonicalId: Equatable {
         public init() {}
     }
@@ -181,10 +187,34 @@ public enum PalyraGatewayV1 {
     public struct AppendEventResponse: Equatable {
         public init() {}
     }
+    public struct ApprovalPolicySnapshot: Equatable {
+        public init() {}
+    }
+    public struct ApprovalRecord: Equatable {
+        public init() {}
+    }
+    public struct ExportApprovalsRequest: Equatable {
+        public init() {}
+    }
+    public struct ExportApprovalsResponse: Equatable {
+        public init() {}
+    }
+    public struct GetApprovalRequest: Equatable {
+        public init() {}
+    }
+    public struct GetApprovalResponse: Equatable {
+        public init() {}
+    }
     public struct HealthRequest: Equatable {
         public init() {}
     }
     public struct HealthResponse: Equatable {
+        public init() {}
+    }
+    public struct ListApprovalsRequest: Equatable {
+        public init() {}
+    }
+    public struct ListApprovalsResponse: Equatable {
         public init() {}
     }
     public struct ListSessionsRequest: Equatable {
@@ -201,6 +231,11 @@ public enum PalyraGatewayV1 {
     }
     public struct SessionSummary: Equatable {
         public init() {}
+    }
+    public protocol ApprovalsServiceClient {
+        func exportApprovals()
+        func getApproval()
+        func listApprovals()
     }
     public protocol GatewayServiceClient {
         func abortRun()

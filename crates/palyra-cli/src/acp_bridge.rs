@@ -7,7 +7,7 @@ use std::{
 use agent_client_protocol::{self as acp, Client as _};
 use anyhow::{Context, Result};
 use futures::io::AllowStdIo;
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tonic::Request;
@@ -426,7 +426,8 @@ impl PalyraAcpAgent {
                         build_tool_permission_request(&arguments.session_id, &approval)?
                     {
                         let permission = self.request_permission(request).await?;
-                        let (approved, reason) = map_permission_outcome(permission);
+                        let (approved, reason, decision_scope, decision_scope_ttl_ms) =
+                            map_permission_outcome(permission);
                         let approval_request = build_tool_approval_stream_request(
                             binding.gateway_session_id_ulid.as_str(),
                             run_input.run_id.as_str(),
@@ -435,8 +436,11 @@ impl PalyraAcpAgent {
                                 .as_ref()
                                 .map(|value| value.ulid.as_str())
                                 .unwrap_or(""),
+                            approval.approval_id.as_ref().map(|value| value.ulid.as_str()),
                             approved,
                             reason.as_str(),
+                            decision_scope,
+                            decision_scope_ttl_ms,
                         )?;
                         request_tx.send(approval_request).await.map_err(|_| {
                             acp::Error::new(
@@ -719,11 +723,31 @@ fn build_tool_permission_request(
         return Ok(None);
     };
 
+    let prompt = approval.prompt.as_ref();
+    let title = prompt
+        .map(|value| value.title.trim())
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("Execute {}", approval.tool_name));
     let mut fields = acp::ToolCallUpdateFields::new()
-        .title(format!("Execute {}", approval.tool_name))
+        .title(title)
         .kind(acp::ToolKind::Execute)
         .status(acp::ToolCallStatus::Pending);
-    if let Some(input_json) = parse_json_bytes(approval.input_json.as_slice()) {
+    if let Some(prompt) = prompt {
+        let details_json = parse_json_bytes(prompt.details_json.as_slice())
+            .unwrap_or_else(|| json!({ "raw": String::from_utf8_lossy(prompt.details_json.as_slice()).to_string() }));
+        fields = fields.raw_input(json!({
+            "tool_name": approval.tool_name,
+            "request_summary": approval.request_summary,
+            "prompt": {
+                "subject_id": prompt.subject_id,
+                "summary": prompt.summary,
+                "risk_level": prompt.risk_level,
+                "policy_explanation": prompt.policy_explanation,
+                "details_json": details_json,
+            }
+        }));
+    } else if let Some(input_json) = parse_json_bytes(approval.input_json.as_slice()) {
         fields = fields.raw_input(input_json);
     }
 
@@ -753,27 +777,67 @@ fn build_tool_permission_request(
     Ok(Some(acp::RequestPermissionRequest::new(session_id.clone(), tool_call, options)))
 }
 
-fn map_permission_outcome(response: acp::RequestPermissionResponse) -> (bool, String) {
+fn map_permission_outcome(
+    response: acp::RequestPermissionResponse,
+) -> (bool, String, i32, Option<i64>) {
     match response.outcome {
-        acp::RequestPermissionOutcome::Cancelled => (false, "cancelled_by_client".to_owned()),
+        acp::RequestPermissionOutcome::Cancelled => (
+            false,
+            "cancelled_by_client".to_owned(),
+            common_v1::ApprovalDecisionScope::Once as i32,
+            None,
+        ),
         acp::RequestPermissionOutcome::Selected(selection) => {
             let option_id = selection.option_id.0.as_ref();
-            if option_id == PERMISSION_ALLOW_ONCE || option_id == PERMISSION_ALLOW_ALWAYS {
-                (true, format!("approved:{option_id}"))
+            if option_id == PERMISSION_ALLOW_ONCE {
+                (
+                    true,
+                    format!("approved:{option_id}"),
+                    common_v1::ApprovalDecisionScope::Once as i32,
+                    None,
+                )
+            } else if option_id == PERMISSION_ALLOW_ALWAYS {
+                (
+                    true,
+                    format!("approved:{option_id}"),
+                    common_v1::ApprovalDecisionScope::Session as i32,
+                    None,
+                )
+            } else if option_id == PERMISSION_REJECT_ALWAYS {
+                (
+                    false,
+                    format!("denied:{option_id}"),
+                    common_v1::ApprovalDecisionScope::Session as i32,
+                    None,
+                )
             } else {
-                (false, format!("denied:{option_id}"))
+                (
+                    false,
+                    format!("denied:{option_id}"),
+                    common_v1::ApprovalDecisionScope::Once as i32,
+                    None,
+                )
             }
         }
-        _ => (false, "denied:unsupported_permission_outcome".to_owned()),
+        _ => (
+            false,
+            "denied:unsupported_permission_outcome".to_owned(),
+            common_v1::ApprovalDecisionScope::Once as i32,
+            None,
+        ),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_tool_approval_stream_request(
     session_id_ulid: &str,
     run_id_ulid: &str,
     proposal_id_ulid: &str,
+    approval_id_ulid: Option<&str>,
     approved: bool,
     reason: &str,
+    decision_scope: i32,
+    decision_scope_ttl_ms: Option<i64>,
 ) -> acp::Result<common_v1::RunStreamRequest> {
     if proposal_id_ulid.trim().is_empty() {
         return Err(acp::Error::new(
@@ -795,6 +859,10 @@ fn build_tool_approval_stream_request(
             proposal_id: Some(common_v1::CanonicalId { ulid: proposal_id_ulid.to_owned() }),
             approved,
             reason: reason.to_owned(),
+            approval_id: approval_id_ulid
+                .map(|value| common_v1::CanonicalId { ulid: value.to_owned() }),
+            decision_scope,
+            decision_scope_ttl_ms: decision_scope_ttl_ms.unwrap_or_default(),
         }),
     })
 }

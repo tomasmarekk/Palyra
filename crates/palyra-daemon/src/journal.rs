@@ -31,6 +31,7 @@ const SENSITIVE_KEY_FRAGMENTS: &[&str] = &[
 ];
 const MAX_CRON_JOBS_LIST_LIMIT: usize = 500;
 const MAX_CRON_RUNS_LIST_LIMIT: usize = 500;
+const MAX_APPROVALS_LIST_LIMIT: usize = 500;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -293,6 +294,215 @@ pub struct CronRunRecord {
     pub updated_at_unix_ms: i64,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalSubjectType {
+    Tool,
+    ChannelSend,
+    SecretAccess,
+    BrowserAction,
+    NodeCapability,
+}
+
+impl ApprovalSubjectType {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tool => "tool",
+            Self::ChannelSend => "channel_send",
+            Self::SecretAccess => "secret_access",
+            Self::BrowserAction => "browser_action",
+            Self::NodeCapability => "node_capability",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "tool" => Some(Self::Tool),
+            "channel_send" => Some(Self::ChannelSend),
+            "secret_access" => Some(Self::SecretAccess),
+            "browser_action" => Some(Self::BrowserAction),
+            "node_capability" => Some(Self::NodeCapability),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalDecision {
+    Allow,
+    Deny,
+    Timeout,
+    Error,
+}
+
+impl ApprovalDecision {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+            Self::Timeout => "timeout",
+            Self::Error => "error",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "allow" => Some(Self::Allow),
+            "deny" => Some(Self::Deny),
+            "timeout" => Some(Self::Timeout),
+            "error" => Some(Self::Error),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalDecisionScope {
+    Once,
+    Session,
+    Timeboxed,
+}
+
+impl ApprovalDecisionScope {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Once => "once",
+            Self::Session => "session",
+            Self::Timeboxed => "timeboxed",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "once" => Some(Self::Once),
+            "session" => Some(Self::Session),
+            "timeboxed" => Some(Self::Timeboxed),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalRiskLevel {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+impl ApprovalRiskLevel {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Critical => "critical",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApprovalPolicySnapshot {
+    pub policy_id: String,
+    pub policy_hash: String,
+    pub evaluation_summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApprovalPromptOption {
+    pub option_id: String,
+    pub label: String,
+    pub description: String,
+    pub default_selected: bool,
+    pub decision_scope: ApprovalDecisionScope,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timebox_ttl_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApprovalPromptRecord {
+    pub title: String,
+    pub risk_level: ApprovalRiskLevel,
+    pub subject_id: String,
+    pub summary: String,
+    pub options: Vec<ApprovalPromptOption>,
+    pub timeout_seconds: u32,
+    pub details_json: String,
+    pub policy_explanation: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalCreateRequest {
+    pub approval_id: String,
+    pub session_id: String,
+    pub run_id: String,
+    pub principal: String,
+    pub device_id: String,
+    pub channel: Option<String>,
+    pub subject_type: ApprovalSubjectType,
+    pub subject_id: String,
+    pub request_summary: String,
+    pub policy_snapshot: ApprovalPolicySnapshot,
+    pub prompt: ApprovalPromptRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalResolveRequest {
+    pub approval_id: String,
+    pub decision: ApprovalDecision,
+    pub decision_scope: ApprovalDecisionScope,
+    pub decision_reason: String,
+    pub decision_scope_ttl_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ApprovalRecord {
+    pub approval_id: String,
+    pub session_id: String,
+    pub run_id: String,
+    pub principal: String,
+    pub device_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    pub requested_at_unix_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_at_unix_ms: Option<i64>,
+    pub subject_type: ApprovalSubjectType,
+    pub subject_id: String,
+    pub request_summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision: Option<ApprovalDecision>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision_scope: Option<ApprovalDecisionScope>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision_scope_ttl_ms: Option<i64>,
+    pub policy_snapshot: ApprovalPolicySnapshot,
+    pub prompt: ApprovalPromptRecord,
+    pub created_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalsListFilter<'a> {
+    pub after_approval_id: Option<&'a str>,
+    pub limit: usize,
+    pub since_unix_ms: Option<i64>,
+    pub until_unix_ms: Option<i64>,
+    pub subject_id: Option<&'a str>,
+    pub principal: Option<&'a str>,
+    pub decision: Option<ApprovalDecision>,
+    pub subject_type: Option<ApprovalSubjectType>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalConfig {
     pub db_path: PathBuf,
@@ -472,6 +682,8 @@ pub enum JournalError {
     DuplicateRunId { run_id: String },
     #[error("orchestrator tape sequence already exists for run {run_id} at seq {seq}")]
     DuplicateTapeSequence { run_id: String, seq: i64 },
+    #[error("approval record already exists: {approval_id}")]
+    DuplicateApprovalId { approval_id: String },
     #[error("cron job already exists: {job_id}")]
     DuplicateCronJobId { job_id: String },
     #[error("cron run already exists: {run_id}")]
@@ -480,6 +692,8 @@ pub enum JournalError {
     CronJobNotFound { job_id: String },
     #[error("cron run not found: {run_id}")]
     CronRunNotFound { run_id: String },
+    #[error("approval record not found: {approval_id}")]
+    ApprovalNotFound { approval_id: String },
     #[error("orchestrator run not found: {run_id}")]
     RunNotFound { run_id: String },
     #[error("orchestrator session identity mismatch for session: {session_id}")]
@@ -677,6 +891,43 @@ const MIGRATIONS: &[Migration] = &[
                 ON cron_runs(job_ulid, status);
             CREATE INDEX IF NOT EXISTS idx_cron_runs_started
                 ON cron_runs(started_at_unix_ms DESC);
+        "#,
+    },
+    Migration {
+        version: 5,
+        name: "create_approvals_table",
+        sql: r#"
+            CREATE TABLE IF NOT EXISTS approvals (
+                approval_ulid TEXT PRIMARY KEY,
+                session_ulid TEXT NOT NULL,
+                run_ulid TEXT NOT NULL,
+                principal TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                channel TEXT,
+                requested_at_unix_ms INTEGER NOT NULL,
+                resolved_at_unix_ms INTEGER,
+                subject_type TEXT NOT NULL,
+                subject_id TEXT NOT NULL,
+                request_summary TEXT NOT NULL,
+                decision TEXT,
+                decision_scope TEXT,
+                decision_reason TEXT,
+                decision_scope_ttl_ms INTEGER,
+                policy_snapshot_json TEXT NOT NULL,
+                prompt_json TEXT NOT NULL,
+                created_at_unix_ms INTEGER NOT NULL,
+                updated_at_unix_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_approvals_run
+                ON approvals(run_ulid, requested_at_unix_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_approvals_session
+                ON approvals(session_ulid, requested_at_unix_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_approvals_principal
+                ON approvals(principal);
+            CREATE INDEX IF NOT EXISTS idx_approvals_subject_id
+                ON approvals(subject_id);
+            CREATE INDEX IF NOT EXISTS idx_approvals_resolved
+                ON approvals(resolved_at_unix_ms DESC, approval_ulid ASC);
         "#,
     },
 ];
@@ -1890,6 +2141,182 @@ impl JournalStore {
         }
         Ok(runs)
     }
+
+    pub fn create_approval(
+        &self,
+        request: &ApprovalCreateRequest,
+    ) -> Result<ApprovalRecord, JournalError> {
+        let now = current_unix_ms()?;
+        let policy_snapshot_json =
+            sanitize_payload(serde_json::to_string(&request.policy_snapshot)?.as_bytes())?.0;
+        let prompt_json = sanitize_payload(serde_json::to_string(&request.prompt)?.as_bytes())?.0;
+        let request_summary =
+            sanitize_object_text_field("summary", request.request_summary.as_str())?;
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        match guard.execute(
+            r#"
+                INSERT INTO approvals (
+                    approval_ulid,
+                    session_ulid,
+                    run_ulid,
+                    principal,
+                    device_id,
+                    channel,
+                    requested_at_unix_ms,
+                    resolved_at_unix_ms,
+                    subject_type,
+                    subject_id,
+                    request_summary,
+                    decision,
+                    decision_scope,
+                    decision_reason,
+                    decision_scope_ttl_ms,
+                    policy_snapshot_json,
+                    prompt_json,
+                    created_at_unix_ms,
+                    updated_at_unix_ms
+                ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9, ?10, NULL, NULL, NULL, NULL, ?11, ?12, ?13, ?13
+                )
+            "#,
+            params![
+                request.approval_id,
+                request.session_id,
+                request.run_id,
+                request.principal,
+                request.device_id,
+                request.channel,
+                now,
+                request.subject_type.as_str(),
+                request.subject_id,
+                request_summary,
+                policy_snapshot_json,
+                prompt_json,
+                now,
+            ],
+        ) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(error, message))
+                if error.code == ErrorCode::ConstraintViolation
+                    && (error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+                        || error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                        || message
+                            .as_deref()
+                            .map(|value| value.contains("approvals.approval_ulid"))
+                            .unwrap_or(false)) =>
+            {
+                return Err(JournalError::DuplicateApprovalId {
+                    approval_id: request.approval_id.clone(),
+                });
+            }
+            Err(error) => return Err(error.into()),
+        }
+        load_approval_by_id(&guard, request.approval_id.as_str())?.ok_or_else(|| {
+            JournalError::ApprovalNotFound { approval_id: request.approval_id.clone() }
+        })
+    }
+
+    pub fn resolve_approval(
+        &self,
+        request: &ApprovalResolveRequest,
+    ) -> Result<ApprovalRecord, JournalError> {
+        let now = current_unix_ms()?;
+        let decision_reason =
+            sanitize_object_text_field("reason", request.decision_reason.as_str())?;
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let updated = guard.execute(
+            r#"
+                UPDATE approvals
+                SET
+                    decision = ?2,
+                    decision_scope = ?3,
+                    decision_reason = ?4,
+                    decision_scope_ttl_ms = ?5,
+                    resolved_at_unix_ms = COALESCE(resolved_at_unix_ms, ?6),
+                    updated_at_unix_ms = ?6
+                WHERE approval_ulid = ?1
+            "#,
+            params![
+                request.approval_id,
+                request.decision.as_str(),
+                request.decision_scope.as_str(),
+                decision_reason,
+                request.decision_scope_ttl_ms,
+                now
+            ],
+        )?;
+        if updated == 0 {
+            return Err(JournalError::ApprovalNotFound {
+                approval_id: request.approval_id.clone(),
+            });
+        }
+        load_approval_by_id(&guard, request.approval_id.as_str())?.ok_or_else(|| {
+            JournalError::ApprovalNotFound { approval_id: request.approval_id.clone() }
+        })
+    }
+
+    pub fn approval(&self, approval_id: &str) -> Result<Option<ApprovalRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        load_approval_by_id(&guard, approval_id)
+    }
+
+    pub fn list_approvals(
+        &self,
+        filter: ApprovalsListFilter<'_>,
+    ) -> Result<Vec<ApprovalRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let limit = filter.limit.clamp(1, MAX_APPROVALS_LIST_LIMIT);
+        let mut statement = guard.prepare(
+            r#"
+                SELECT
+                    approval_ulid,
+                    session_ulid,
+                    run_ulid,
+                    principal,
+                    device_id,
+                    channel,
+                    requested_at_unix_ms,
+                    resolved_at_unix_ms,
+                    subject_type,
+                    subject_id,
+                    request_summary,
+                    decision,
+                    decision_scope,
+                    decision_reason,
+                    decision_scope_ttl_ms,
+                    policy_snapshot_json,
+                    prompt_json,
+                    created_at_unix_ms,
+                    updated_at_unix_ms
+                FROM approvals
+                WHERE
+                    (?1 IS NULL OR approval_ulid > ?1) AND
+                    (?2 IS NULL OR requested_at_unix_ms >= ?2) AND
+                    (?3 IS NULL OR requested_at_unix_ms <= ?3) AND
+                    (?4 IS NULL OR subject_id = ?4) AND
+                    (?5 IS NULL OR principal = ?5) AND
+                    (?6 IS NULL OR decision = ?6) AND
+                    (?7 IS NULL OR subject_type = ?7)
+                ORDER BY approval_ulid ASC
+                LIMIT ?8
+            "#,
+        )?;
+        let mut rows = statement.query(params![
+            filter.after_approval_id,
+            filter.since_unix_ms,
+            filter.until_unix_ms,
+            filter.subject_id,
+            filter.principal,
+            filter.decision.map(|value| value.as_str()),
+            filter.subject_type.map(|value| value.as_str()),
+            limit as i64,
+        ])?;
+        let mut records = Vec::new();
+        while let Some(row) = rows.next()? {
+            records.push(map_approval_row(row)?);
+        }
+        Ok(records)
+    }
 }
 
 #[cfg(test)]
@@ -2244,6 +2671,131 @@ fn load_cron_run_by_id(
     statement.query_row(params![run_id], map_cron_run_row).optional().map_err(Into::into)
 }
 
+fn map_approval_row(row: &rusqlite::Row<'_>) -> Result<ApprovalRecord, rusqlite::Error> {
+    let subject_type_raw: String = row.get(8)?;
+    let subject_type =
+        ApprovalSubjectType::from_str(subject_type_raw.as_str()).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                8,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("invalid approval subject_type value: {subject_type_raw}"),
+                )),
+            )
+        })?;
+    let decision = row
+        .get::<_, Option<String>>(11)?
+        .map(|value| {
+            ApprovalDecision::from_str(value.as_str()).ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    11,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("invalid approval decision value: {value}"),
+                    )),
+                )
+            })
+        })
+        .transpose()?;
+    let decision_scope = row
+        .get::<_, Option<String>>(12)?
+        .map(|value| {
+            ApprovalDecisionScope::from_str(value.as_str()).ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    12,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("invalid approval decision_scope value: {value}"),
+                    )),
+                )
+            })
+        })
+        .transpose()?;
+    let policy_snapshot_json: String = row.get(15)?;
+    let policy_snapshot: ApprovalPolicySnapshot =
+        serde_json::from_str(policy_snapshot_json.as_str()).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                15,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("invalid approval policy_snapshot_json: {error}"),
+                )),
+            )
+        })?;
+    let prompt_json: String = row.get(16)?;
+    let prompt: ApprovalPromptRecord =
+        serde_json::from_str(prompt_json.as_str()).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                16,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("invalid approval prompt_json: {error}"),
+                )),
+            )
+        })?;
+
+    Ok(ApprovalRecord {
+        approval_id: row.get(0)?,
+        session_id: row.get(1)?,
+        run_id: row.get(2)?,
+        principal: row.get(3)?,
+        device_id: row.get(4)?,
+        channel: row.get(5)?,
+        requested_at_unix_ms: row.get(6)?,
+        resolved_at_unix_ms: row.get(7)?,
+        subject_type,
+        subject_id: row.get(9)?,
+        request_summary: row.get(10)?,
+        decision,
+        decision_scope,
+        decision_reason: row.get(13)?,
+        decision_scope_ttl_ms: row.get(14)?,
+        policy_snapshot,
+        prompt,
+        created_at_unix_ms: row.get(17)?,
+        updated_at_unix_ms: row.get(18)?,
+    })
+}
+
+fn load_approval_by_id(
+    connection: &Connection,
+    approval_id: &str,
+) -> Result<Option<ApprovalRecord>, JournalError> {
+    let mut statement = connection.prepare(
+        r#"
+            SELECT
+                approval_ulid,
+                session_ulid,
+                run_ulid,
+                principal,
+                device_id,
+                channel,
+                requested_at_unix_ms,
+                resolved_at_unix_ms,
+                subject_type,
+                subject_id,
+                request_summary,
+                decision,
+                decision_scope,
+                decision_reason,
+                decision_scope_ttl_ms,
+                policy_snapshot_json,
+                prompt_json,
+                created_at_unix_ms,
+                updated_at_unix_ms
+            FROM approvals
+            WHERE approval_ulid = ?1
+            LIMIT 1
+        "#,
+    )?;
+    statement.query_row(params![approval_id], map_approval_row).optional().map_err(Into::into)
+}
+
 fn apply_migrations(connection: &mut Connection) -> Result<(), JournalError> {
     connection.execute_batch(
         r#"
@@ -2323,6 +2875,18 @@ pub fn redact_payload_json(raw_payload: &[u8]) -> Result<String, JournalError> {
     Ok(payload)
 }
 
+fn sanitize_object_text_field(key: &str, value: &str) -> Result<String, JournalError> {
+    let payload = sanitize_payload(json!({ key: value }).to_string().as_bytes())?.0;
+    let parsed = serde_json::from_str::<Value>(payload.as_str()).ok();
+    let sanitized = parsed
+        .as_ref()
+        .and_then(|json| json.get(key))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| REDACTED_MARKER.to_owned());
+    Ok(sanitized)
+}
+
 fn redact_value(value: &mut Value, key_context: Option<&str>) -> bool {
     match value {
         Value::Object(object) => {
@@ -2345,12 +2909,27 @@ fn redact_value(value: &mut Value, key_context: Option<&str>) -> bool {
             redacted
         }
         Value::String(text) => {
-            if key_context.map(is_sensitive_key).unwrap_or(false) || looks_like_secret(text) {
+            if key_context.map(is_sensitive_key).unwrap_or(false) {
                 *value = Value::String(REDACTED_MARKER.to_owned());
-                true
-            } else {
-                false
+                return true;
             }
+
+            if let Ok(mut embedded_json) = serde_json::from_str::<Value>(text) {
+                if redact_value(&mut embedded_json, None) {
+                    *value = Value::String(
+                        serde_json::to_string(&embedded_json)
+                            .unwrap_or_else(|_| REDACTED_MARKER.to_owned()),
+                    );
+                    return true;
+                }
+            }
+
+            if looks_like_secret(text) {
+                *value = Value::String(REDACTED_MARKER.to_owned());
+                return true;
+            }
+
+            false
         }
         _ => key_context.map(is_sensitive_key).unwrap_or(false),
     }
@@ -2368,6 +2947,10 @@ fn looks_like_secret(value: &str) -> bool {
         || normalized.contains("api_key=")
         || normalized.contains("secret=")
         || normalized.contains("token=")
+        || normalized.contains("refresh_token")
+        || normalized.contains("oauth_refresh_token")
+        || normalized.contains("set-cookie:")
+        || normalized.contains("cookie:")
 }
 
 fn redact_error_text(input: &str) -> String {
@@ -2446,15 +3029,19 @@ mod tests {
     };
 
     use rusqlite::{params, Connection};
+    use serde_json::json;
 
     use crate::orchestrator::RunLifecycleState;
 
     use super::{
-        CronConcurrencyPolicy, CronJobCreateRequest, CronJobsListFilter, CronMisfirePolicy,
-        CronRetryPolicy, CronRunFinalizeRequest, CronRunStartRequest, CronRunStatus,
-        CronRunsListFilter, CronScheduleType, JournalAppendRequest, JournalConfig, JournalError,
-        JournalStore, OrchestratorCancelRequest, OrchestratorRunStartRequest,
-        OrchestratorSessionUpsertRequest, OrchestratorTapeAppendRequest, OrchestratorUsageDelta,
+        ApprovalCreateRequest, ApprovalDecision, ApprovalDecisionScope, ApprovalPolicySnapshot,
+        ApprovalPromptOption, ApprovalPromptRecord, ApprovalResolveRequest, ApprovalRiskLevel,
+        ApprovalSubjectType, ApprovalsListFilter, CronConcurrencyPolicy, CronJobCreateRequest,
+        CronJobsListFilter, CronMisfirePolicy, CronRetryPolicy, CronRunFinalizeRequest,
+        CronRunStartRequest, CronRunStatus, CronRunsListFilter, CronScheduleType,
+        JournalAppendRequest, JournalConfig, JournalError, JournalStore, OrchestratorCancelRequest,
+        OrchestratorRunStartRequest, OrchestratorSessionUpsertRequest,
+        OrchestratorTapeAppendRequest, OrchestratorUsageDelta,
     };
 
     static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -2507,6 +3094,58 @@ mod tests {
         }
     }
 
+    fn sample_approval_request(approval_id: &str) -> ApprovalCreateRequest {
+        ApprovalCreateRequest {
+            approval_id: approval_id.to_owned(),
+            session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned(),
+            run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),
+            principal: "user:ops".to_owned(),
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            channel: Some("cli".to_owned()),
+            subject_type: ApprovalSubjectType::Tool,
+            subject_id: "tool:palyra.process.run".to_owned(),
+            request_summary: "run process with oauth_refresh_token=super-secret".to_owned(),
+            policy_snapshot: ApprovalPolicySnapshot {
+                policy_id: "tool_call_policy.v1".to_owned(),
+                policy_hash: "sha256:test".to_owned(),
+                evaluation_summary: "approval_required=true policy_enforced=true".to_owned(),
+            },
+            prompt: ApprovalPromptRecord {
+                title: "Allow tool execution".to_owned(),
+                risk_level: ApprovalRiskLevel::High,
+                subject_id: "tool:palyra.process.run".to_owned(),
+                summary: "Run a local process in workspace".to_owned(),
+                options: vec![
+                    ApprovalPromptOption {
+                        option_id: "allow_once".to_owned(),
+                        label: "Allow once".to_owned(),
+                        description: "Allow this single action".to_owned(),
+                        default_selected: true,
+                        decision_scope: ApprovalDecisionScope::Once,
+                        timebox_ttl_ms: None,
+                    },
+                    ApprovalPromptOption {
+                        option_id: "deny_once".to_owned(),
+                        label: "Deny".to_owned(),
+                        description: "Deny this action".to_owned(),
+                        default_selected: false,
+                        decision_scope: ApprovalDecisionScope::Once,
+                        timebox_ttl_ms: None,
+                    },
+                ],
+                timeout_seconds: 60,
+                details_json: json!({
+                    "tool_name": "palyra.process.run",
+                    "args": ["echo", "hello"],
+                    "cookie": "sessionid=abc123"
+                })
+                .to_string(),
+                policy_explanation: "Sensitive process execution requires explicit approval"
+                    .to_owned(),
+            },
+        }
+    }
+
     fn temp_db_path() -> PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2556,10 +3195,18 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("schema migrations should be queryable");
+        let migration_v5: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = ?1",
+                params![5],
+                |row| row.get(0),
+            )
+            .expect("schema migrations should be queryable");
         assert_eq!(migration_v1, 1, "migration v1 should be recorded exactly once");
         assert_eq!(migration_v2, 1, "migration v2 should be recorded exactly once");
         assert_eq!(migration_v3, 1, "migration v3 should be recorded exactly once");
         assert_eq!(migration_v4, 1, "migration v4 should be recorded exactly once");
+        assert_eq!(migration_v5, 1, "migration v5 should be recorded exactly once");
     }
 
     #[test]
@@ -3181,6 +3828,96 @@ mod tests {
         assert!(!message.contains("token=qwe"), "token value must be redacted");
         assert!(!message.contains("secret=xyz"), "secret value must be redacted");
         assert!(message.contains("<redacted>"), "redaction marker should be present");
+    }
+
+    #[test]
+    fn approval_records_can_be_created_resolved_and_queried() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let approval_id = "01ARZ3NDEKTSV4RRFFQ69G5FBJ";
+        let created = store
+            .create_approval(&sample_approval_request(approval_id))
+            .expect("approval create should persist");
+        assert_eq!(created.approval_id, approval_id);
+        assert!(created.resolved_at_unix_ms.is_none(), "new approvals should be unresolved");
+        assert!(created.decision.is_none(), "new approvals should have no decision");
+
+        let resolved = store
+            .resolve_approval(&ApprovalResolveRequest {
+                approval_id: approval_id.to_owned(),
+                decision: ApprovalDecision::Deny,
+                decision_scope: ApprovalDecisionScope::Once,
+                decision_reason: "deny token=abc cookie:sessionid=abc123".to_owned(),
+                decision_scope_ttl_ms: None,
+            })
+            .expect("approval resolve should persist");
+        assert_eq!(resolved.decision, Some(ApprovalDecision::Deny));
+        assert_eq!(resolved.decision_scope, Some(ApprovalDecisionScope::Once));
+        assert!(
+            !resolved.decision_reason.as_deref().unwrap_or_default().contains("token=abc"),
+            "resolved decision reason should redact token values"
+        );
+        assert!(
+            !resolved.decision_reason.as_deref().unwrap_or_default().contains("sessionid=abc123"),
+            "resolved decision reason should redact cookie values"
+        );
+        assert!(
+            resolved.decision_reason.as_deref().unwrap_or_default().contains("<redacted>"),
+            "resolved decision reason should include redaction marker"
+        );
+        assert!(
+            resolved.resolved_at_unix_ms.is_some(),
+            "resolved approvals should include resolved timestamp"
+        );
+
+        let listed = store
+            .list_approvals(ApprovalsListFilter {
+                after_approval_id: None,
+                limit: 10,
+                since_unix_ms: None,
+                until_unix_ms: None,
+                subject_id: Some("tool:palyra.process.run"),
+                principal: Some("user:ops"),
+                decision: Some(ApprovalDecision::Deny),
+                subject_type: Some(ApprovalSubjectType::Tool),
+            })
+            .expect("approvals list should succeed");
+        assert_eq!(listed.len(), 1, "filters should return the matching approval record");
+        assert_eq!(listed[0].approval_id, approval_id);
+
+        let fetched = store
+            .approval(approval_id)
+            .expect("approval lookup should succeed")
+            .expect("approval should exist");
+        assert_eq!(fetched.decision, Some(ApprovalDecision::Deny));
+    }
+
+    #[test]
+    fn approval_request_summaries_and_prompt_details_are_redacted() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let approval_id = "01ARZ3NDEKTSV4RRFFQ69G5FBK";
+        let stored = store
+            .create_approval(&sample_approval_request(approval_id))
+            .expect("approval create should persist");
+        assert!(
+            !stored.request_summary.contains("super-secret"),
+            "request summary should redact refresh token values"
+        );
+        assert!(
+            stored.request_summary.contains("<redacted>"),
+            "request summary should include redaction marker"
+        );
+        assert!(
+            !stored.prompt.details_json.contains("sessionid=abc123"),
+            "prompt details should redact cookie values"
+        );
+        assert!(
+            stored.prompt.details_json.contains("<redacted>"),
+            "prompt details should include redaction marker"
+        );
     }
 
     #[test]

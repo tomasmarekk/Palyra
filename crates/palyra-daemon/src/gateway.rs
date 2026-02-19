@@ -12,8 +12,9 @@ use palyra_common::{build_metadata, validate_canonical_id, CANONICAL_PROTOCOL_MA
 use palyra_policy::{evaluate_with_config, PolicyDecision, PolicyEvaluationConfig, PolicyRequest};
 use serde::Serialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, Notify};
-use tokio::time::{interval, MissedTickBehavior};
+use tokio::time::{interval, timeout, MissedTickBehavior};
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tonic::{metadata::MetadataMap, Request, Response, Status, Streaming};
 use tracing::{info, warn};
@@ -22,13 +23,16 @@ use ulid::Ulid;
 use crate::{
     cron::{normalize_schedule, schedule_to_proto, trigger_job_now},
     journal::{
-        CronConcurrencyPolicy, CronJobCreateRequest, CronJobRecord, CronJobUpdatePatch,
-        CronJobsListFilter, CronRunFinalizeRequest, CronRunRecord, CronRunStartRequest,
-        CronRunStatus, CronRunsListFilter, JournalAppendRequest, JournalError, JournalEventRecord,
-        JournalStore, OrchestratorCancelRequest, OrchestratorRunStartRequest,
-        OrchestratorRunStatusSnapshot, OrchestratorSessionRecord,
-        OrchestratorSessionResolveOutcome, OrchestratorSessionResolveRequest,
-        OrchestratorTapeAppendRequest, OrchestratorTapeRecord, OrchestratorUsageDelta,
+        ApprovalCreateRequest, ApprovalDecision, ApprovalDecisionScope, ApprovalPolicySnapshot,
+        ApprovalPromptOption, ApprovalPromptRecord, ApprovalRecord, ApprovalResolveRequest,
+        ApprovalRiskLevel, ApprovalSubjectType, ApprovalsListFilter, CronConcurrencyPolicy,
+        CronJobCreateRequest, CronJobRecord, CronJobUpdatePatch, CronJobsListFilter,
+        CronRunFinalizeRequest, CronRunRecord, CronRunStartRequest, CronRunStatus,
+        CronRunsListFilter, JournalAppendRequest, JournalError, JournalEventRecord, JournalStore,
+        OrchestratorCancelRequest, OrchestratorRunStartRequest, OrchestratorRunStatusSnapshot,
+        OrchestratorSessionRecord, OrchestratorSessionResolveOutcome,
+        OrchestratorSessionResolveRequest, OrchestratorTapeAppendRequest, OrchestratorTapeRecord,
+        OrchestratorUsageDelta,
     },
     model_provider::{
         ModelProvider, ProviderError, ProviderEvent, ProviderRequest, ProviderStatusSnapshot,
@@ -89,6 +93,13 @@ const MAX_CRON_JOB_NAME_BYTES: usize = 128;
 const MAX_CRON_PROMPT_BYTES: usize = 16 * 1024;
 const MAX_CRON_JITTER_MS: u64 = 60_000;
 const MAX_CRON_PAGE_LIMIT: usize = 500;
+const MAX_APPROVAL_PAGE_LIMIT: usize = 500;
+const MAX_APPROVAL_EXPORT_LIMIT: usize = 5_000;
+const MAX_APPROVAL_EXPORT_CHUNK_BYTES: usize = 64 * 1024;
+const APPROVAL_POLICY_ID: &str = "tool_call_policy.v1";
+const APPROVAL_PROMPT_TIMEOUT_SECONDS: u32 = 60;
+const APPROVAL_REQUEST_SUMMARY_MAX_BYTES: usize = 1024;
+const TOOL_APPROVAL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
 pub struct GatewayRuntimeConfigSnapshot {
@@ -107,8 +118,20 @@ pub struct GatewayRuntimeConfigSnapshot {
 
 #[derive(Debug, Clone)]
 struct ToolApprovalOutcome {
+    approval_id: String,
     approved: bool,
     reason: String,
+    decision: ApprovalDecision,
+    decision_scope: ApprovalDecisionScope,
+    decision_scope_ttl_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingToolApproval {
+    approval_id: String,
+    request_summary: String,
+    policy_snapshot: ApprovalPolicySnapshot,
+    prompt: ApprovalPromptRecord,
 }
 
 #[derive(Debug, Clone)]
@@ -175,6 +198,11 @@ struct RuntimeCounters {
     cron_runs_completed: AtomicU64,
     cron_runs_failed: AtomicU64,
     cron_runs_skipped: AtomicU64,
+    approvals_tool_requested: AtomicU64,
+    approvals_tool_resolved_allow: AtomicU64,
+    approvals_tool_resolved_deny: AtomicU64,
+    approvals_tool_resolved_timeout: AtomicU64,
+    approvals_tool_resolved_error: AtomicU64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -261,6 +289,11 @@ pub struct CountersSnapshot {
     pub cron_runs_completed: u64,
     pub cron_runs_failed: u64,
     pub cron_runs_skipped: u64,
+    pub approvals_tool_requested: u64,
+    pub approvals_tool_resolved_allow: u64,
+    pub approvals_tool_resolved_deny: u64,
+    pub approvals_tool_resolved_timeout: u64,
+    pub approvals_tool_resolved_error: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -344,6 +377,17 @@ impl RuntimeCounters {
             cron_runs_completed: self.cron_runs_completed.load(Ordering::Relaxed),
             cron_runs_failed: self.cron_runs_failed.load(Ordering::Relaxed),
             cron_runs_skipped: self.cron_runs_skipped.load(Ordering::Relaxed),
+            approvals_tool_requested: self.approvals_tool_requested.load(Ordering::Relaxed),
+            approvals_tool_resolved_allow: self
+                .approvals_tool_resolved_allow
+                .load(Ordering::Relaxed),
+            approvals_tool_resolved_deny: self.approvals_tool_resolved_deny.load(Ordering::Relaxed),
+            approvals_tool_resolved_timeout: self
+                .approvals_tool_resolved_timeout
+                .load(Ordering::Relaxed),
+            approvals_tool_resolved_error: self
+                .approvals_tool_resolved_error
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -419,6 +463,11 @@ impl GatewayRuntimeState {
                 cron_runs_completed: AtomicU64::new(0),
                 cron_runs_failed: AtomicU64::new(0),
                 cron_runs_skipped: AtomicU64::new(0),
+                approvals_tool_requested: AtomicU64::new(0),
+                approvals_tool_resolved_allow: AtomicU64::new(0),
+                approvals_tool_resolved_deny: AtomicU64::new(0),
+                approvals_tool_resolved_timeout: AtomicU64::new(0),
+                approvals_tool_resolved_error: AtomicU64::new(0),
             },
             journal_store,
             revoked_certificate_count,
@@ -1219,6 +1268,124 @@ impl GatewayRuntimeState {
         })
     }
 
+    #[allow(clippy::result_large_err)]
+    pub async fn create_approval_record(
+        self: &Arc<Self>,
+        request: ApprovalCreateRequest,
+    ) -> Result<ApprovalRecord, Status> {
+        let subject_type = request.subject_type;
+        let state = Arc::clone(self);
+        let result = tokio::task::spawn_blocking(move || {
+            state
+                .journal_store
+                .create_approval(&request)
+                .map_err(|error| map_approval_store_error("create approval", error))
+        })
+        .await
+        .map_err(|_| Status::internal("approval create worker panicked"))??;
+        if subject_type == ApprovalSubjectType::Tool {
+            self.counters.approvals_tool_requested.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(result)
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn resolve_approval_record(
+        self: &Arc<Self>,
+        request: ApprovalResolveRequest,
+    ) -> Result<ApprovalRecord, Status> {
+        let decision = request.decision;
+        let state = Arc::clone(self);
+        let result = tokio::task::spawn_blocking(move || {
+            state
+                .journal_store
+                .resolve_approval(&request)
+                .map_err(|error| map_approval_store_error("resolve approval", error))
+        })
+        .await
+        .map_err(|_| Status::internal("approval resolve worker panicked"))??;
+        if result.subject_type == ApprovalSubjectType::Tool {
+            match decision {
+                ApprovalDecision::Allow => {
+                    self.counters.approvals_tool_resolved_allow.fetch_add(1, Ordering::Relaxed);
+                }
+                ApprovalDecision::Deny => {
+                    self.counters.approvals_tool_resolved_deny.fetch_add(1, Ordering::Relaxed);
+                }
+                ApprovalDecision::Timeout => {
+                    self.counters.approvals_tool_resolved_timeout.fetch_add(1, Ordering::Relaxed);
+                }
+                ApprovalDecision::Error => {
+                    self.counters.approvals_tool_resolved_error.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn approval_record(
+        self: &Arc<Self>,
+        approval_id: String,
+    ) -> Result<Option<ApprovalRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state
+                .journal_store
+                .approval(approval_id.as_str())
+                .map_err(|error| map_approval_store_error("load approval", error))
+        })
+        .await
+        .map_err(|_| Status::internal("approval read worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn list_approval_records(
+        self: &Arc<Self>,
+        after_approval_id: Option<String>,
+        requested_limit: Option<usize>,
+        since_unix_ms: Option<i64>,
+        until_unix_ms: Option<i64>,
+        subject_id: Option<String>,
+        principal: Option<String>,
+        decision: Option<ApprovalDecision>,
+        subject_type: Option<ApprovalSubjectType>,
+    ) -> Result<(Vec<ApprovalRecord>, Option<String>), Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let limit = requested_limit.unwrap_or(100).clamp(1, MAX_APPROVAL_PAGE_LIMIT);
+            state
+                .journal_store
+                .list_approvals(ApprovalsListFilter {
+                    after_approval_id: after_approval_id.as_deref(),
+                    limit: limit.saturating_add(1),
+                    since_unix_ms,
+                    until_unix_ms,
+                    subject_id: subject_id.as_deref(),
+                    principal: principal.as_deref(),
+                    decision,
+                    subject_type,
+                })
+                .map_err(|error| map_approval_store_error("list approvals", error))
+        })
+        .await
+        .map_err(|_| Status::internal("approvals list worker panicked"))?
+        .map(|mut approvals| {
+            let limit = requested_limit.unwrap_or(100).clamp(1, MAX_APPROVAL_PAGE_LIMIT);
+            let has_more = approvals.len() > limit;
+            if has_more {
+                approvals.truncate(limit);
+            }
+            let next_after = if has_more {
+                approvals.last().map(|approval| approval.approval_id.clone())
+            } else {
+                None
+            };
+            (approvals, next_after)
+        })
+    }
+
     pub fn record_cron_trigger_fired(&self) {
         self.counters.cron_triggers_fired.fetch_add(1, Ordering::Relaxed);
     }
@@ -1266,6 +1433,23 @@ fn map_cron_store_error(operation: &str, error: JournalError) -> Status {
         }
         JournalError::DuplicateCronRunId { run_id } => {
             Status::already_exists(format!("cron run already exists: {run_id}"))
+        }
+        JournalError::PayloadTooLarge { payload_kind, actual_bytes, max_bytes } => {
+            Status::invalid_argument(format!(
+                "{payload_kind} payload exceeds maximum size ({actual_bytes} > {max_bytes})"
+            ))
+        }
+        other => Status::internal(format!("{operation} failed: {other}")),
+    }
+}
+
+fn map_approval_store_error(operation: &str, error: JournalError) -> Status {
+    match error {
+        JournalError::ApprovalNotFound { approval_id } => {
+            Status::not_found(format!("approval record not found: {approval_id}"))
+        }
+        JournalError::DuplicateApprovalId { approval_id } => {
+            Status::already_exists(format!("approval record already exists: {approval_id}"))
         }
         JournalError::PayloadTooLarge { payload_kind, actual_bytes, max_bytes } => {
             Status::invalid_argument(format!(
@@ -1546,6 +1730,7 @@ async fn await_tool_approval_response(
     expected_session_id: &str,
     expected_run_id: &str,
     proposal_id: &str,
+    approval_id: &str,
 ) -> Result<ToolApprovalOutcome, Status> {
     while let Some(item) = stream.next().await {
         let message = item.map_err(|error| {
@@ -1583,6 +1768,23 @@ async fn await_tool_approval_response(
                 "tool approval response proposal_id does not match pending tool proposal",
             ));
         }
+        let response_approval_id = if let Some(response_approval_id) =
+            response.approval_id.and_then(|value| non_empty(value.ulid))
+        {
+            validate_canonical_id(response_approval_id.as_str()).map_err(|_| {
+                Status::invalid_argument(
+                    "tool_approval_response.approval_id must be a canonical ULID",
+                )
+            })?;
+            if response_approval_id != approval_id {
+                return Err(Status::invalid_argument(
+                    "tool approval response approval_id does not match pending approval record",
+                ));
+            }
+            response_approval_id
+        } else {
+            approval_id.to_owned()
+        };
 
         let reason = non_empty(response.reason).unwrap_or_else(|| {
             if response.approved {
@@ -1591,12 +1793,31 @@ async fn await_tool_approval_response(
                 "denied_by_client".to_owned()
             }
         });
-        return Ok(ToolApprovalOutcome { approved: response.approved, reason });
+        return Ok(ToolApprovalOutcome {
+            approval_id: response_approval_id,
+            approved: response.approved,
+            reason,
+            decision: if response.approved {
+                ApprovalDecision::Allow
+            } else {
+                ApprovalDecision::Deny
+            },
+            decision_scope: approval_scope_from_proto(response.decision_scope),
+            decision_scope_ttl_ms: if response.decision_scope_ttl_ms > 0 {
+                Some(response.decision_scope_ttl_ms)
+            } else {
+                None
+            },
+        });
     }
 
     Ok(ToolApprovalOutcome {
+        approval_id: approval_id.to_owned(),
         approved: false,
         reason: APPROVAL_CHANNEL_UNAVAILABLE_REASON.to_owned(),
+        decision: ApprovalDecision::Error,
+        decision_scope: ApprovalDecisionScope::Once,
+        decision_scope_ttl_ms: None,
     })
 }
 
@@ -1639,6 +1860,148 @@ fn session_summary_message(session: &OrchestratorSessionRecord) -> gateway_v1::S
             .last_run_id
             .as_ref()
             .map(|run_id| common_v1::CanonicalId { ulid: run_id.clone() }),
+    }
+}
+
+fn approval_option_messages(options: &[ApprovalPromptOption]) -> Vec<common_v1::ApprovalOption> {
+    options
+        .iter()
+        .map(|option| common_v1::ApprovalOption {
+            option_id: option.option_id.clone(),
+            label: option.label.clone(),
+            description: option.description.clone(),
+            default_selected: option.default_selected,
+            decision_scope: approval_scope_to_proto(option.decision_scope),
+            timebox_ttl_ms: option.timebox_ttl_ms.unwrap_or_default(),
+        })
+        .collect()
+}
+
+fn approval_prompt_message(prompt: &ApprovalPromptRecord) -> common_v1::ApprovalPrompt {
+    common_v1::ApprovalPrompt {
+        title: prompt.title.clone(),
+        risk_level: approval_risk_to_proto(prompt.risk_level),
+        subject_id: prompt.subject_id.clone(),
+        summary: prompt.summary.clone(),
+        options: approval_option_messages(prompt.options.as_slice()),
+        timeout_seconds: prompt.timeout_seconds,
+        details_json: prompt.details_json.as_bytes().to_vec(),
+        policy_explanation: prompt.policy_explanation.clone(),
+    }
+}
+
+fn approval_policy_snapshot_message(
+    value: &ApprovalPolicySnapshot,
+) -> gateway_v1::ApprovalPolicySnapshot {
+    gateway_v1::ApprovalPolicySnapshot {
+        policy_id: value.policy_id.clone(),
+        policy_hash: value.policy_hash.clone(),
+        evaluation_summary: value.evaluation_summary.clone(),
+    }
+}
+
+fn approval_record_message(record: &ApprovalRecord) -> gateway_v1::ApprovalRecord {
+    gateway_v1::ApprovalRecord {
+        v: CANONICAL_PROTOCOL_MAJOR,
+        approval_id: Some(common_v1::CanonicalId { ulid: record.approval_id.clone() }),
+        session_id: Some(common_v1::CanonicalId { ulid: record.session_id.clone() }),
+        run_id: Some(common_v1::CanonicalId { ulid: record.run_id.clone() }),
+        principal: record.principal.clone(),
+        device_id: record.device_id.clone(),
+        channel: record.channel.clone().unwrap_or_default(),
+        requested_at_unix_ms: record.requested_at_unix_ms,
+        resolved_at_unix_ms: record.resolved_at_unix_ms.unwrap_or_default(),
+        subject_type: approval_subject_type_to_proto(record.subject_type),
+        subject_id: record.subject_id.clone(),
+        request_summary: record.request_summary.clone(),
+        decision: record
+            .decision
+            .map(approval_decision_to_proto)
+            .unwrap_or(gateway_v1::ApprovalDecision::Unspecified as i32),
+        decision_scope: record
+            .decision_scope
+            .map(approval_scope_to_proto)
+            .unwrap_or(common_v1::ApprovalDecisionScope::Unspecified as i32),
+        policy_snapshot: Some(approval_policy_snapshot_message(&record.policy_snapshot)),
+        prompt: Some(approval_prompt_message(&record.prompt)),
+        decision_reason: record.decision_reason.clone().unwrap_or_default(),
+        decision_scope_ttl_ms: record.decision_scope_ttl_ms.unwrap_or_default(),
+    }
+}
+
+fn approval_subject_type_to_proto(value: ApprovalSubjectType) -> i32 {
+    match value {
+        ApprovalSubjectType::Tool => gateway_v1::ApprovalSubjectType::Tool as i32,
+        ApprovalSubjectType::ChannelSend => gateway_v1::ApprovalSubjectType::ChannelSend as i32,
+        ApprovalSubjectType::SecretAccess => gateway_v1::ApprovalSubjectType::SecretAccess as i32,
+        ApprovalSubjectType::BrowserAction => gateway_v1::ApprovalSubjectType::BrowserAction as i32,
+        ApprovalSubjectType::NodeCapability => {
+            gateway_v1::ApprovalSubjectType::NodeCapability as i32
+        }
+    }
+}
+
+fn approval_subject_type_from_proto(value: i32) -> Option<ApprovalSubjectType> {
+    match gateway_v1::ApprovalSubjectType::try_from(value)
+        .unwrap_or(gateway_v1::ApprovalSubjectType::Unspecified)
+    {
+        gateway_v1::ApprovalSubjectType::Unspecified => None,
+        gateway_v1::ApprovalSubjectType::Tool => Some(ApprovalSubjectType::Tool),
+        gateway_v1::ApprovalSubjectType::ChannelSend => Some(ApprovalSubjectType::ChannelSend),
+        gateway_v1::ApprovalSubjectType::SecretAccess => Some(ApprovalSubjectType::SecretAccess),
+        gateway_v1::ApprovalSubjectType::BrowserAction => Some(ApprovalSubjectType::BrowserAction),
+        gateway_v1::ApprovalSubjectType::NodeCapability => {
+            Some(ApprovalSubjectType::NodeCapability)
+        }
+    }
+}
+
+fn approval_decision_to_proto(value: ApprovalDecision) -> i32 {
+    match value {
+        ApprovalDecision::Allow => gateway_v1::ApprovalDecision::Allow as i32,
+        ApprovalDecision::Deny => gateway_v1::ApprovalDecision::Deny as i32,
+        ApprovalDecision::Timeout => gateway_v1::ApprovalDecision::Timeout as i32,
+        ApprovalDecision::Error => gateway_v1::ApprovalDecision::Error as i32,
+    }
+}
+
+fn approval_decision_from_proto(value: i32) -> Option<ApprovalDecision> {
+    match gateway_v1::ApprovalDecision::try_from(value)
+        .unwrap_or(gateway_v1::ApprovalDecision::Unspecified)
+    {
+        gateway_v1::ApprovalDecision::Unspecified => None,
+        gateway_v1::ApprovalDecision::Allow => Some(ApprovalDecision::Allow),
+        gateway_v1::ApprovalDecision::Deny => Some(ApprovalDecision::Deny),
+        gateway_v1::ApprovalDecision::Timeout => Some(ApprovalDecision::Timeout),
+        gateway_v1::ApprovalDecision::Error => Some(ApprovalDecision::Error),
+    }
+}
+
+fn approval_scope_to_proto(value: ApprovalDecisionScope) -> i32 {
+    match value {
+        ApprovalDecisionScope::Once => common_v1::ApprovalDecisionScope::Once as i32,
+        ApprovalDecisionScope::Session => common_v1::ApprovalDecisionScope::Session as i32,
+        ApprovalDecisionScope::Timeboxed => common_v1::ApprovalDecisionScope::Timeboxed as i32,
+    }
+}
+
+fn approval_scope_from_proto(value: i32) -> ApprovalDecisionScope {
+    match common_v1::ApprovalDecisionScope::try_from(value)
+        .unwrap_or(common_v1::ApprovalDecisionScope::Unspecified)
+    {
+        common_v1::ApprovalDecisionScope::Unspecified => ApprovalDecisionScope::Once,
+        common_v1::ApprovalDecisionScope::Once => ApprovalDecisionScope::Once,
+        common_v1::ApprovalDecisionScope::Session => ApprovalDecisionScope::Session,
+        common_v1::ApprovalDecisionScope::Timeboxed => ApprovalDecisionScope::Timeboxed,
+    }
+}
+
+fn approval_risk_to_proto(value: ApprovalRiskLevel) -> i32 {
+    match value {
+        ApprovalRiskLevel::Low => common_v1::ApprovalRiskLevel::Low as i32,
+        ApprovalRiskLevel::Medium => common_v1::ApprovalRiskLevel::Medium as i32,
+        ApprovalRiskLevel::High => common_v1::ApprovalRiskLevel::High as i32,
+        ApprovalRiskLevel::Critical => common_v1::ApprovalRiskLevel::Critical as i32,
     }
 }
 
@@ -1696,6 +2059,32 @@ impl CronServiceImpl {
         authorize_metadata(metadata, &self.auth).map_err(|error| {
             self.state.record_denied();
             warn!(method, error = %error, "cron rpc authorization denied");
+            Status::permission_denied(error.to_string())
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct ApprovalsServiceImpl {
+    state: Arc<GatewayRuntimeState>,
+    auth: GatewayAuthConfig,
+}
+
+impl ApprovalsServiceImpl {
+    #[must_use]
+    pub fn new(state: Arc<GatewayRuntimeState>, auth: GatewayAuthConfig) -> Self {
+        Self { state, auth }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn authorize_rpc(
+        &self,
+        metadata: &MetadataMap,
+        method: &'static str,
+    ) -> Result<RequestContext, Status> {
+        authorize_metadata(metadata, &self.auth).map_err(|error| {
+            self.state.record_denied();
+            warn!(method, error = %error, "approvals rpc authorization denied");
             Status::permission_denied(error.to_string())
         })
     }
@@ -2540,15 +2929,86 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                             }
 
                             let approval_outcome = if proposal_approval_required {
+                                let pending_approval = build_pending_tool_approval(
+                                    tool_name.as_str(),
+                                    input_json.as_slice(),
+                                    &state_for_stream.config.tool_call,
+                                );
+                                if let Err(error) = state_for_stream
+                                    .create_approval_record(ApprovalCreateRequest {
+                                        approval_id: pending_approval.approval_id.clone(),
+                                        session_id: session_id.clone(),
+                                        run_id: run_id.clone(),
+                                        principal: context_for_stream.principal.clone(),
+                                        device_id: context_for_stream.device_id.clone(),
+                                        channel: context_for_stream.channel.clone(),
+                                        subject_type: ApprovalSubjectType::Tool,
+                                        subject_id: pending_approval.prompt.subject_id.clone(),
+                                        request_summary: pending_approval.request_summary.clone(),
+                                        policy_snapshot: pending_approval.policy_snapshot.clone(),
+                                        prompt: pending_approval.prompt.clone(),
+                                    })
+                                    .await
+                                {
+                                    finalize_run_failure(
+                                        &sender,
+                                        &state_for_stream,
+                                        &mut run_state,
+                                        active_run_id.as_deref(),
+                                        &mut tape_seq,
+                                        error.message(),
+                                    )
+                                    .await;
+                                    let _ = sender.send(Err(error)).await;
+                                    return;
+                                }
+                                info!(
+                                    run_id = %run_id,
+                                    proposal_id = %proposal_id,
+                                    approval_id = %pending_approval.approval_id,
+                                    subject_id = %pending_approval.prompt.subject_id,
+                                    "approval requested"
+                                );
+
                                 if let Err(error) = send_tool_approval_request_with_tape(
                                     &sender,
                                     &state_for_stream,
                                     run_id.as_str(),
                                     &mut tape_seq,
                                     proposal_id.as_str(),
+                                    pending_approval.approval_id.as_str(),
                                     tool_name.as_str(),
                                     input_json.as_slice(),
                                     true,
+                                    pending_approval.request_summary.as_str(),
+                                    &pending_approval.prompt,
+                                )
+                                .await
+                                {
+                                    finalize_run_failure(
+                                        &sender,
+                                        &state_for_stream,
+                                        &mut run_state,
+                                        active_run_id.as_deref(),
+                                        &mut tape_seq,
+                                        error.message(),
+                                    )
+                                    .await;
+                                    let _ = sender.send(Err(error)).await;
+                                    return;
+                                }
+                                if let Err(error) = record_approval_requested_journal_event(
+                                    &state_for_stream,
+                                    &context_for_stream,
+                                    session_id.as_str(),
+                                    run_id.as_str(),
+                                    proposal_id.as_str(),
+                                    pending_approval.approval_id.as_str(),
+                                    tool_name.as_str(),
+                                    pending_approval.prompt.subject_id.as_str(),
+                                    pending_approval.request_summary.as_str(),
+                                    &pending_approval.policy_snapshot,
+                                    &pending_approval.prompt,
                                 )
                                 .await
                                 {
@@ -2565,13 +3025,49 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                                     return;
                                 }
 
-                                let response = match await_tool_approval_response(
-                                    &mut stream,
-                                    session_id.as_str(),
-                                    run_id.as_str(),
-                                    proposal_id.as_str(),
+                                let response = match timeout(
+                                    TOOL_APPROVAL_RESPONSE_TIMEOUT,
+                                    await_tool_approval_response(
+                                        &mut stream,
+                                        session_id.as_str(),
+                                        run_id.as_str(),
+                                        proposal_id.as_str(),
+                                        pending_approval.approval_id.as_str(),
+                                    ),
                                 )
                                 .await
+                                {
+                                    Ok(Ok(value)) => value,
+                                    Ok(Err(error)) => ToolApprovalOutcome {
+                                        approval_id: pending_approval.approval_id.clone(),
+                                        approved: false,
+                                        reason: format!(
+                                            "approval_response_error: {}",
+                                            error.message()
+                                        ),
+                                        decision: ApprovalDecision::Error,
+                                        decision_scope: ApprovalDecisionScope::Once,
+                                        decision_scope_ttl_ms: None,
+                                    },
+                                    Err(_) => ToolApprovalOutcome {
+                                        approval_id: pending_approval.approval_id.clone(),
+                                        approved: false,
+                                        reason: "approval_response_timeout".to_owned(),
+                                        decision: ApprovalDecision::Timeout,
+                                        decision_scope: ApprovalDecisionScope::Once,
+                                        decision_scope_ttl_ms: None,
+                                    },
+                                };
+
+                                let resolved = match state_for_stream
+                                    .resolve_approval_record(ApprovalResolveRequest {
+                                        approval_id: pending_approval.approval_id.clone(),
+                                        decision: response.decision,
+                                        decision_scope: response.decision_scope,
+                                        decision_reason: response.reason.clone(),
+                                        decision_scope_ttl_ms: response.decision_scope_ttl_ms,
+                                    })
+                                    .await
                                 {
                                     Ok(value) => value,
                                     Err(error) => {
@@ -2588,6 +3084,40 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                                         return;
                                     }
                                 };
+                                info!(
+                                    run_id = %run_id,
+                                    proposal_id = %proposal_id,
+                                    approval_id = %resolved.approval_id,
+                                    decision = %response.decision.as_str(),
+                                    decision_scope = %response.decision_scope.as_str(),
+                                    "approval resolved"
+                                );
+                                if let Err(error) = record_approval_resolved_journal_event(
+                                    &state_for_stream,
+                                    &context_for_stream,
+                                    session_id.as_str(),
+                                    run_id.as_str(),
+                                    proposal_id.as_str(),
+                                    response.approval_id.as_str(),
+                                    response.decision,
+                                    response.decision_scope,
+                                    response.decision_scope_ttl_ms,
+                                    response.reason.as_str(),
+                                )
+                                .await
+                                {
+                                    finalize_run_failure(
+                                        &sender,
+                                        &state_for_stream,
+                                        &mut run_state,
+                                        active_run_id.as_deref(),
+                                        &mut tape_seq,
+                                        error.message(),
+                                    )
+                                    .await;
+                                    let _ = sender.send(Err(error)).await;
+                                    return;
+                                }
 
                                 if let Err(error) = send_tool_approval_response_with_tape(
                                     &sender,
@@ -2595,8 +3125,11 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                                     run_id.as_str(),
                                     &mut tape_seq,
                                     proposal_id.as_str(),
+                                    response.approval_id.as_str(),
                                     response.approved,
                                     response.reason.as_str(),
+                                    response.decision_scope,
+                                    response.decision_scope_ttl_ms,
                                 )
                                 .await
                                 {
@@ -3293,6 +3826,231 @@ impl cron_v1::cron_service_server::CronService for CronServiceImpl {
     }
 }
 
+#[tonic::async_trait]
+impl gateway_v1::approvals_service_server::ApprovalsService for ApprovalsServiceImpl {
+    type ExportApprovalsStream =
+        ReceiverStream<Result<gateway_v1::ExportApprovalsResponse, Status>>;
+
+    async fn list_approvals(
+        &self,
+        request: Request<gateway_v1::ListApprovalsRequest>,
+    ) -> Result<Response<gateway_v1::ListApprovalsResponse>, Status> {
+        let _context = self.authorize_rpc(request.metadata(), "ListApprovals")?;
+        let payload = request.into_inner();
+        require_supported_version(payload.v)?;
+        let decision = approval_decision_from_proto(payload.decision);
+        let subject_type = approval_subject_type_from_proto(payload.subject_type);
+        let since_unix_ms =
+            if payload.since_unix_ms > 0 { Some(payload.since_unix_ms) } else { None };
+        let until_unix_ms =
+            if payload.until_unix_ms > 0 { Some(payload.until_unix_ms) } else { None };
+        if let (Some(since), Some(until)) = (since_unix_ms, until_unix_ms) {
+            if since > until {
+                return Err(Status::invalid_argument(
+                    "since_unix_ms cannot be greater than until_unix_ms",
+                ));
+            }
+        }
+
+        let (records, next_after_approval_ulid) = self
+            .state
+            .list_approval_records(
+                non_empty(payload.after_approval_ulid),
+                Some(payload.limit as usize),
+                since_unix_ms,
+                until_unix_ms,
+                non_empty(payload.subject_id),
+                non_empty(payload.principal),
+                decision,
+                subject_type,
+            )
+            .await?;
+        Ok(Response::new(gateway_v1::ListApprovalsResponse {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            approvals: records.iter().map(approval_record_message).collect(),
+            next_after_approval_ulid: next_after_approval_ulid.unwrap_or_default(),
+        }))
+    }
+
+    async fn get_approval(
+        &self,
+        request: Request<gateway_v1::GetApprovalRequest>,
+    ) -> Result<Response<gateway_v1::GetApprovalResponse>, Status> {
+        let _context = self.authorize_rpc(request.metadata(), "GetApproval")?;
+        let payload = request.into_inner();
+        require_supported_version(payload.v)?;
+        let approval_id = canonical_id(payload.approval_id, "approval_id")?;
+        let record = self.state.approval_record(approval_id.clone()).await?.ok_or_else(|| {
+            Status::not_found(format!("approval record not found: {approval_id}"))
+        })?;
+        Ok(Response::new(gateway_v1::GetApprovalResponse {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            approval: Some(approval_record_message(&record)),
+        }))
+    }
+
+    async fn export_approvals(
+        &self,
+        request: Request<gateway_v1::ExportApprovalsRequest>,
+    ) -> Result<Response<Self::ExportApprovalsStream>, Status> {
+        let _context = self.authorize_rpc(request.metadata(), "ExportApprovals")?;
+        let payload = request.into_inner();
+        require_supported_version(payload.v)?;
+        let decision = approval_decision_from_proto(payload.decision);
+        let subject_type = approval_subject_type_from_proto(payload.subject_type);
+        let since_unix_ms =
+            if payload.since_unix_ms > 0 { Some(payload.since_unix_ms) } else { None };
+        let until_unix_ms =
+            if payload.until_unix_ms > 0 { Some(payload.until_unix_ms) } else { None };
+        if let (Some(since), Some(until)) = (since_unix_ms, until_unix_ms) {
+            if since > until {
+                return Err(Status::invalid_argument(
+                    "since_unix_ms cannot be greater than until_unix_ms",
+                ));
+            }
+        }
+        let export_format = match gateway_v1::ApprovalExportFormat::try_from(payload.format)
+            .unwrap_or(gateway_v1::ApprovalExportFormat::Unspecified)
+        {
+            gateway_v1::ApprovalExportFormat::Unspecified => {
+                gateway_v1::ApprovalExportFormat::Ndjson
+            }
+            other => other,
+        };
+        let export_limit = if payload.limit == 0 { 1_000_usize } else { payload.limit as usize }
+            .clamp(1, MAX_APPROVAL_EXPORT_LIMIT);
+
+        let state = Arc::clone(&self.state);
+        let subject_id = non_empty(payload.subject_id);
+        let principal = non_empty(payload.principal);
+        let (sender, receiver) = mpsc::channel(8);
+        tokio::spawn(async move {
+            let mut after_approval_id: Option<String> = None;
+            let mut exported = 0_usize;
+            let mut chunk_seq = 0_u32;
+            let mut json_records = Vec::new();
+
+            loop {
+                if exported >= export_limit {
+                    break;
+                }
+                let page_limit =
+                    export_limit.saturating_sub(exported).clamp(1, MAX_APPROVAL_PAGE_LIMIT);
+                let (records, next_after) = match state
+                    .list_approval_records(
+                        after_approval_id.clone(),
+                        Some(page_limit),
+                        since_unix_ms,
+                        until_unix_ms,
+                        subject_id.clone(),
+                        principal.clone(),
+                        decision,
+                        subject_type,
+                    )
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = sender.send(Err(error)).await;
+                        return;
+                    }
+                };
+                if records.is_empty() {
+                    break;
+                }
+
+                for record in records {
+                    if exported >= export_limit {
+                        break;
+                    }
+                    match export_format {
+                        gateway_v1::ApprovalExportFormat::Ndjson => {
+                            let line = match serde_json::to_string(&record) {
+                                Ok(value) => format!("{value}\n"),
+                                Err(error) => {
+                                    let _ = sender
+                                        .send(Err(Status::internal(format!(
+                                            "failed to serialize approval export record: {error}"
+                                        ))))
+                                        .await;
+                                    return;
+                                }
+                            };
+                            let bytes = line.into_bytes();
+                            for chunk in bytes.chunks(MAX_APPROVAL_EXPORT_CHUNK_BYTES) {
+                                chunk_seq = chunk_seq.saturating_add(1);
+                                if sender
+                                    .send(Ok(gateway_v1::ExportApprovalsResponse {
+                                        v: CANONICAL_PROTOCOL_MAJOR,
+                                        chunk: chunk.to_vec(),
+                                        chunk_seq,
+                                        done: false,
+                                    }))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                        }
+                        gateway_v1::ApprovalExportFormat::Json => {
+                            json_records.push(record);
+                        }
+                        gateway_v1::ApprovalExportFormat::Unspecified => {}
+                    }
+                    exported = exported.saturating_add(1);
+                }
+
+                let Some(next_after) = next_after else {
+                    break;
+                };
+                after_approval_id = Some(next_after);
+            }
+
+            if export_format == gateway_v1::ApprovalExportFormat::Json {
+                let payload = match serde_json::to_vec(&json_records) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = sender
+                            .send(Err(Status::internal(format!(
+                                "failed to serialize approvals JSON export: {error}"
+                            ))))
+                            .await;
+                        return;
+                    }
+                };
+                for chunk in payload.chunks(MAX_APPROVAL_EXPORT_CHUNK_BYTES) {
+                    chunk_seq = chunk_seq.saturating_add(1);
+                    if sender
+                        .send(Ok(gateway_v1::ExportApprovalsResponse {
+                            v: CANONICAL_PROTOCOL_MAJOR,
+                            chunk: chunk.to_vec(),
+                            chunk_seq,
+                            done: false,
+                        }))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+
+            chunk_seq = chunk_seq.saturating_add(1);
+            let _ = sender
+                .send(Ok(gateway_v1::ExportApprovalsResponse {
+                    v: CANONICAL_PROTOCOL_MAJOR,
+                    chunk: Vec::new(),
+                    chunk_seq,
+                    done: true,
+                }))
+                .await;
+        });
+
+        Ok(Response::new(ReceiverStream::new(receiver)))
+    }
+}
+
 async fn finalize_run_failure(
     sender: &mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -3377,12 +4135,16 @@ fn tool_proposal_event(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn tool_approval_request_event(
     run_id: String,
     proposal_id: impl Into<String>,
+    approval_id: impl Into<String>,
     tool_name: impl Into<String>,
     input_json: Vec<u8>,
     approval_required: bool,
+    request_summary: impl Into<String>,
+    prompt: &ApprovalPromptRecord,
 ) -> common_v1::RunStreamEvent {
     common_v1::RunStreamEvent {
         v: CANONICAL_PROTOCOL_MAJOR,
@@ -3393,6 +4155,9 @@ fn tool_approval_request_event(
                 tool_name: tool_name.into(),
                 input_json,
                 approval_required,
+                approval_id: Some(common_v1::CanonicalId { ulid: approval_id.into() }),
+                prompt: Some(approval_prompt_message(prompt)),
+                request_summary: request_summary.into(),
             },
         )),
     }
@@ -3401,8 +4166,11 @@ fn tool_approval_request_event(
 fn tool_approval_response_event(
     run_id: String,
     proposal_id: impl Into<String>,
+    approval_id: impl Into<String>,
     approved: bool,
     reason: impl Into<String>,
+    decision_scope: ApprovalDecisionScope,
+    decision_scope_ttl_ms: Option<i64>,
 ) -> common_v1::RunStreamEvent {
     common_v1::RunStreamEvent {
         v: CANONICAL_PROTOCOL_MAJOR,
@@ -3412,6 +4180,9 @@ fn tool_approval_response_event(
                 proposal_id: Some(common_v1::CanonicalId { ulid: proposal_id.into() }),
                 approved,
                 reason: reason.into(),
+                approval_id: Some(common_v1::CanonicalId { ulid: approval_id.into() }),
+                decision_scope: approval_scope_to_proto(decision_scope),
+                decision_scope_ttl_ms: decision_scope_ttl_ms.unwrap_or_default(),
             },
         )),
     }
@@ -3616,16 +4387,22 @@ async fn send_tool_approval_request_with_tape(
     run_id: &str,
     tape_seq: &mut i64,
     proposal_id: &str,
+    approval_id: &str,
     tool_name: &str,
     input_json: &[u8],
     approval_required: bool,
+    request_summary: &str,
+    prompt: &ApprovalPromptRecord,
 ) -> Result<(), Status> {
     let event = tool_approval_request_event(
         run_id.to_owned(),
         proposal_id.to_owned(),
+        approval_id.to_owned(),
         tool_name.to_owned(),
         input_json.to_vec(),
         approval_required,
+        request_summary.to_owned(),
+        prompt,
     );
     sender
         .send(Ok(event))
@@ -3638,9 +4415,12 @@ async fn send_tool_approval_request_with_tape(
             event_type: "tool_approval_request".to_owned(),
             payload_json: tool_approval_request_tape_payload(
                 proposal_id,
+                approval_id,
                 tool_name,
                 input_json,
                 approval_required,
+                request_summary,
+                prompt,
             ),
         })
         .await?;
@@ -3649,20 +4429,27 @@ async fn send_tool_approval_request_with_tape(
 }
 
 #[allow(clippy::result_large_err)]
+#[allow(clippy::too_many_arguments)]
 async fn send_tool_approval_response_with_tape(
     sender: &mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
     runtime_state: &Arc<GatewayRuntimeState>,
     run_id: &str,
     tape_seq: &mut i64,
     proposal_id: &str,
+    approval_id: &str,
     approved: bool,
     reason: &str,
+    decision_scope: ApprovalDecisionScope,
+    decision_scope_ttl_ms: Option<i64>,
 ) -> Result<(), Status> {
     let event = tool_approval_response_event(
         run_id.to_owned(),
         proposal_id.to_owned(),
+        approval_id.to_owned(),
         approved,
         reason.to_owned(),
+        decision_scope,
+        decision_scope_ttl_ms,
     );
     sender
         .send(Ok(event))
@@ -3673,7 +4460,14 @@ async fn send_tool_approval_response_with_tape(
             run_id: run_id.to_owned(),
             seq: *tape_seq,
             event_type: "tool_approval_response".to_owned(),
-            payload_json: tool_approval_response_tape_payload(proposal_id, approved, reason),
+            payload_json: tool_approval_response_tape_payload(
+                proposal_id,
+                approval_id,
+                approved,
+                reason,
+                decision_scope,
+                decision_scope_ttl_ms,
+            ),
         })
         .await?;
     *tape_seq += 1;
@@ -3848,26 +4642,60 @@ fn tool_proposal_tape_payload(
 
 fn tool_approval_request_tape_payload(
     proposal_id: &str,
+    approval_id: &str,
     tool_name: &str,
     input_json: &[u8],
     approval_required: bool,
+    request_summary: &str,
+    prompt: &ApprovalPromptRecord,
 ) -> String {
     let normalized_input = serde_json::from_slice::<Value>(input_json)
         .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(input_json).to_string() }));
+    let prompt_details_json = serde_json::from_str::<Value>(prompt.details_json.as_str())
+        .unwrap_or_else(|_| json!({ "raw": prompt.details_json }));
     json!({
         "proposal_id": proposal_id,
+        "approval_id": approval_id,
         "tool_name": tool_name,
         "input_json": normalized_input,
         "approval_required": approval_required,
+        "request_summary": request_summary,
+        "prompt": {
+            "title": prompt.title,
+            "risk_level": prompt.risk_level.as_str(),
+            "subject_id": prompt.subject_id,
+            "summary": prompt.summary,
+            "timeout_seconds": prompt.timeout_seconds,
+            "policy_explanation": prompt.policy_explanation,
+            "options": prompt.options.iter().map(|option| json!({
+                "option_id": option.option_id,
+                "label": option.label,
+                "description": option.description,
+                "default_selected": option.default_selected,
+                "decision_scope": option.decision_scope.as_str(),
+                "timebox_ttl_ms": option.timebox_ttl_ms,
+            })).collect::<Vec<_>>(),
+            "details_json": prompt_details_json,
+        },
     })
     .to_string()
 }
 
-fn tool_approval_response_tape_payload(proposal_id: &str, approved: bool, reason: &str) -> String {
+fn tool_approval_response_tape_payload(
+    proposal_id: &str,
+    approval_id: &str,
+    approved: bool,
+    reason: &str,
+    decision_scope: ApprovalDecisionScope,
+    decision_scope_ttl_ms: Option<i64>,
+) -> String {
     json!({
         "proposal_id": proposal_id,
+        "approval_id": approval_id,
         "approved": approved,
         "reason": reason,
+        "decision_scope": decision_scope.as_str(),
+        "decision_scope_ttl_ms": decision_scope_ttl_ms,
     })
     .to_string()
 }
@@ -3887,6 +4715,254 @@ fn tool_decision_tape_payload(
         "policy_enforced": policy_enforced,
     })
     .to_string()
+}
+
+fn default_approval_prompt_options() -> Vec<ApprovalPromptOption> {
+    vec![
+        ApprovalPromptOption {
+            option_id: "allow_once".to_owned(),
+            label: "Allow once".to_owned(),
+            description: "Approve this single action".to_owned(),
+            default_selected: true,
+            decision_scope: ApprovalDecisionScope::Once,
+            timebox_ttl_ms: None,
+        },
+        ApprovalPromptOption {
+            option_id: "allow_session".to_owned(),
+            label: "Allow for session".to_owned(),
+            description: "Remember approval for this session".to_owned(),
+            default_selected: false,
+            decision_scope: ApprovalDecisionScope::Session,
+            timebox_ttl_ms: None,
+        },
+        ApprovalPromptOption {
+            option_id: "deny_once".to_owned(),
+            label: "Deny".to_owned(),
+            description: "Reject this action".to_owned(),
+            default_selected: false,
+            decision_scope: ApprovalDecisionScope::Once,
+            timebox_ttl_ms: None,
+        },
+    ]
+}
+
+fn truncate_with_ellipsis(input: String, max_bytes: usize) -> String {
+    if input.len() <= max_bytes {
+        return input;
+    }
+    let cutoff = max_bytes.saturating_sub(3);
+    let mut output = String::new();
+    for character in input.chars() {
+        if output.len().saturating_add(character.len_utf8()) > cutoff {
+            break;
+        }
+        output.push(character);
+    }
+    output.push_str("...");
+    output
+}
+
+fn build_tool_request_summary(tool_name: &str, input_json: &[u8]) -> String {
+    let normalized_input = serde_json::from_slice::<Value>(input_json)
+        .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(input_json).to_string() }));
+    truncate_with_ellipsis(
+        json!({
+            "tool_name": tool_name,
+            "input_json": normalized_input,
+        })
+        .to_string(),
+        APPROVAL_REQUEST_SUMMARY_MAX_BYTES,
+    )
+}
+
+fn build_tool_policy_snapshot(config: &ToolCallConfig, tool_name: &str) -> ApprovalPolicySnapshot {
+    let snapshot = tool_policy_snapshot(config);
+    let policy_snapshot_json = serde_json::to_vec(&snapshot).unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(policy_snapshot_json.as_slice());
+    let policy_hash = format!("{:x}", hasher.finalize());
+    ApprovalPolicySnapshot {
+        policy_id: APPROVAL_POLICY_ID.to_owned(),
+        policy_hash,
+        evaluation_summary: format!(
+            "action=tool.execute resource=tool:{tool_name} approval_required=true deny_by_default=true"
+        ),
+    }
+}
+
+fn build_pending_tool_approval(
+    tool_name: &str,
+    input_json: &[u8],
+    config: &ToolCallConfig,
+) -> PendingToolApproval {
+    let subject_id = format!("tool:{tool_name}");
+    let request_summary = build_tool_request_summary(tool_name, input_json);
+    let policy_snapshot = build_tool_policy_snapshot(config, tool_name);
+    let details = serde_json::from_slice::<Value>(input_json)
+        .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(input_json).to_string() }));
+    let prompt = ApprovalPromptRecord {
+        title: format!("Approve {}", tool_name),
+        risk_level: ApprovalRiskLevel::High,
+        subject_id: subject_id.clone(),
+        summary: format!("Tool `{tool_name}` requested explicit approval"),
+        options: default_approval_prompt_options(),
+        timeout_seconds: APPROVAL_PROMPT_TIMEOUT_SECONDS,
+        details_json: json!({
+            "tool_name": tool_name,
+            "subject_id": subject_id,
+            "input_json": details,
+        })
+        .to_string(),
+        policy_explanation: "Sensitive tool actions are deny-by-default until explicitly approved"
+            .to_owned(),
+    };
+    PendingToolApproval {
+        approval_id: Ulid::new().to_string(),
+        request_summary,
+        policy_snapshot,
+        prompt,
+    }
+}
+
+#[allow(clippy::result_large_err)]
+#[allow(clippy::too_many_arguments)]
+async fn record_approval_requested_journal_event(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: &RequestContext,
+    session_id: &str,
+    run_id: &str,
+    proposal_id: &str,
+    approval_id: &str,
+    tool_name: &str,
+    subject_id: &str,
+    request_summary: &str,
+    policy_snapshot: &ApprovalPolicySnapshot,
+    prompt: &ApprovalPromptRecord,
+) -> Result<(), Status> {
+    runtime_state
+        .record_journal_event(JournalAppendRequest {
+            event_id: Ulid::new().to_string(),
+            session_id: session_id.to_owned(),
+            run_id: run_id.to_owned(),
+            kind: common_v1::journal_event::EventKind::ToolProposed as i32,
+            actor: common_v1::journal_event::EventActor::System as i32,
+            timestamp_unix_ms: current_unix_ms(),
+            payload_json: approval_requested_journal_payload(
+                proposal_id,
+                approval_id,
+                tool_name,
+                subject_id,
+                request_summary,
+                policy_snapshot,
+                prompt,
+            ),
+            principal: context.principal.clone(),
+            device_id: context.device_id.clone(),
+            channel: context.channel.clone(),
+        })
+        .await
+        .map(|_| ())
+}
+
+fn approval_requested_journal_payload(
+    proposal_id: &str,
+    approval_id: &str,
+    tool_name: &str,
+    subject_id: &str,
+    request_summary: &str,
+    policy_snapshot: &ApprovalPolicySnapshot,
+    prompt: &ApprovalPromptRecord,
+) -> Vec<u8> {
+    let prompt_details_json = serde_json::from_str::<Value>(prompt.details_json.as_str())
+        .unwrap_or_else(|_| json!({ "raw": prompt.details_json }));
+    json!({
+        "event": "approval.requested",
+        "proposal_id": proposal_id,
+        "approval_id": approval_id,
+        "subject_type": "tool",
+        "subject_id": subject_id,
+        "tool_name": tool_name,
+        "request_summary": request_summary,
+        "policy_snapshot": policy_snapshot,
+        "prompt": {
+            "title": prompt.title,
+            "risk_level": prompt.risk_level.as_str(),
+            "subject_id": prompt.subject_id,
+            "summary": prompt.summary,
+            "timeout_seconds": prompt.timeout_seconds,
+            "policy_explanation": prompt.policy_explanation,
+            "options": prompt.options.iter().map(|option| json!({
+                "option_id": option.option_id,
+                "label": option.label,
+                "description": option.description,
+                "default_selected": option.default_selected,
+                "decision_scope": option.decision_scope.as_str(),
+                "timebox_ttl_ms": option.timebox_ttl_ms,
+            })).collect::<Vec<_>>(),
+            "details_json": prompt_details_json,
+        },
+    })
+    .to_string()
+    .into_bytes()
+}
+
+#[allow(clippy::result_large_err)]
+#[allow(clippy::too_many_arguments)]
+async fn record_approval_resolved_journal_event(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: &RequestContext,
+    session_id: &str,
+    run_id: &str,
+    proposal_id: &str,
+    approval_id: &str,
+    decision: ApprovalDecision,
+    decision_scope: ApprovalDecisionScope,
+    decision_scope_ttl_ms: Option<i64>,
+    reason: &str,
+) -> Result<(), Status> {
+    runtime_state
+        .record_journal_event(JournalAppendRequest {
+            event_id: Ulid::new().to_string(),
+            session_id: session_id.to_owned(),
+            run_id: run_id.to_owned(),
+            kind: common_v1::journal_event::EventKind::ToolExecuted as i32,
+            actor: common_v1::journal_event::EventActor::System as i32,
+            timestamp_unix_ms: current_unix_ms(),
+            payload_json: approval_resolved_journal_payload(
+                proposal_id,
+                approval_id,
+                decision,
+                decision_scope,
+                decision_scope_ttl_ms,
+                reason,
+            ),
+            principal: context.principal.clone(),
+            device_id: context.device_id.clone(),
+            channel: context.channel.clone(),
+        })
+        .await
+        .map(|_| ())
+}
+
+fn approval_resolved_journal_payload(
+    proposal_id: &str,
+    approval_id: &str,
+    decision: ApprovalDecision,
+    decision_scope: ApprovalDecisionScope,
+    decision_scope_ttl_ms: Option<i64>,
+    reason: &str,
+) -> Vec<u8> {
+    json!({
+        "event": "approval.resolved",
+        "proposal_id": proposal_id,
+        "approval_id": approval_id,
+        "decision": decision.as_str(),
+        "decision_scope": decision_scope.as_str(),
+        "decision_scope_ttl_ms": decision_scope_ttl_ms,
+        "reason": reason,
+    })
+    .to_string()
+    .into_bytes()
 }
 
 #[allow(clippy::result_large_err)]
@@ -4356,7 +5432,14 @@ mod tests {
             approval_required: true,
             policy_enforced: true,
         };
-        let approval = ToolApprovalOutcome { approved: true, reason: "allow_once".to_owned() };
+        let approval = ToolApprovalOutcome {
+            approval_id: "01ARZ3NDEKTSV4RRFFQ69G5FB0".to_owned(),
+            approved: true,
+            reason: "allow_once".to_owned(),
+            decision: crate::journal::ApprovalDecision::Allow,
+            decision_scope: crate::journal::ApprovalDecisionScope::Once,
+            decision_scope_ttl_ms: None,
+        };
         let enforced = apply_tool_approval_outcome(decision, "palyra.process.run", Some(&approval));
         assert!(enforced.allowed, "explicit approval should keep allow decisions allowed");
         assert!(

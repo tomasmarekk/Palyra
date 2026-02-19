@@ -17,6 +17,8 @@ object PalyraBrowserV1 {
 
 object PalyraCommonV1 {
     data class A2uiUpdate(val placeholder: Int = 0)
+    data class ApprovalOption(val placeholder: Int = 0)
+    data class ApprovalPrompt(val placeholder: Int = 0)
     data class CanonicalId(val placeholder: Int = 0)
     data class EnvelopeOrigin(val placeholder: Int = 0)
     data class JournalEvent(val placeholder: Int = 0)
@@ -78,13 +80,26 @@ object PalyraGatewayV1 {
     data class AbortRunResponse(val placeholder: Int = 0)
     data class AppendEventRequest(val placeholder: Int = 0)
     data class AppendEventResponse(val placeholder: Int = 0)
+    data class ApprovalPolicySnapshot(val placeholder: Int = 0)
+    data class ApprovalRecord(val placeholder: Int = 0)
+    data class ExportApprovalsRequest(val placeholder: Int = 0)
+    data class ExportApprovalsResponse(val placeholder: Int = 0)
+    data class GetApprovalRequest(val placeholder: Int = 0)
+    data class GetApprovalResponse(val placeholder: Int = 0)
     data class HealthRequest(val placeholder: Int = 0)
     data class HealthResponse(val placeholder: Int = 0)
+    data class ListApprovalsRequest(val placeholder: Int = 0)
+    data class ListApprovalsResponse(val placeholder: Int = 0)
     data class ListSessionsRequest(val placeholder: Int = 0)
     data class ListSessionsResponse(val placeholder: Int = 0)
     data class ResolveSessionRequest(val placeholder: Int = 0)
     data class ResolveSessionResponse(val placeholder: Int = 0)
     data class SessionSummary(val placeholder: Int = 0)
+    interface ApprovalsServiceClient {
+        fun exportApprovals()
+        fun getApproval()
+        fun listApprovals()
+    }
     interface GatewayServiceClient {
         fun abortRun()
         fun appendEvent()
