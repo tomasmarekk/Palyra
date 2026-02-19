@@ -87,7 +87,7 @@ const APPROVAL_DENIED_REASON: &str = "tool execution denied by explicit client a
 const MAX_MODEL_TOKEN_TAPE_EVENTS_PER_RUN: usize = 1_024;
 const MAX_CRON_JOB_NAME_BYTES: usize = 128;
 const MAX_CRON_PROMPT_BYTES: usize = 16 * 1024;
-const MAX_CRON_SCHEDULE_BYTES: usize = 4 * 1024;
+const MAX_CRON_JITTER_MS: u64 = 60_000;
 const MAX_CRON_PAGE_LIMIT: usize = 500;
 
 #[derive(Debug, Clone)]
@@ -1342,6 +1342,16 @@ fn validate_cron_job_prompt(prompt: String) -> Result<String, Status> {
 }
 
 #[allow(clippy::result_large_err)]
+fn validate_cron_jitter_ms(jitter_ms: u64) -> Result<u64, Status> {
+    if jitter_ms > MAX_CRON_JITTER_MS {
+        return Err(Status::invalid_argument(format!(
+            "jitter_ms exceeds maximum ({MAX_CRON_JITTER_MS})"
+        )));
+    }
+    Ok(jitter_ms)
+}
+
+#[allow(clippy::result_large_err)]
 fn validate_cron_job_owner_principal(
     authenticated_principal: &str,
     requested_owner_principal: String,
@@ -1368,6 +1378,17 @@ fn validate_cron_job_owner_principal_for_update(
         ));
     }
     Ok(owner_principal)
+}
+
+#[allow(clippy::result_large_err)]
+fn enforce_cron_job_owner(
+    authenticated_principal: &str,
+    job_owner_principal: &str,
+) -> Result<(), Status> {
+    if authenticated_principal == job_owner_principal {
+        return Ok(());
+    }
+    Err(Status::permission_denied("cron job owner mismatch for authenticated principal"))
 }
 
 #[allow(clippy::result_large_err)]
@@ -2988,7 +3009,7 @@ impl cron_v1::cron_service_server::CronService for CronServiceImpl {
         let concurrency_policy = cron_concurrency_from_proto(payload.concurrency_policy)?;
         let retry_policy = cron_retry_from_proto(payload.retry_policy)?;
         let misfire_policy = cron_misfire_from_proto(payload.misfire_policy)?;
-        let jitter_ms = payload.jitter_ms.min(MAX_CRON_SCHEDULE_BYTES as u64);
+        let jitter_ms = validate_cron_jitter_ms(payload.jitter_ms)?;
 
         let job = self
             .state
@@ -3030,6 +3051,12 @@ impl cron_v1::cron_service_server::CronService for CronServiceImpl {
             "cron.update",
             format!("cron:{job_id}").as_str(),
         )?;
+        let existing_job = self
+            .state
+            .cron_job(job_id.clone())
+            .await?
+            .ok_or_else(|| Status::not_found(format!("cron job not found: {job_id}")))?;
+        enforce_cron_job_owner(context.principal.as_str(), existing_job.owner_principal.as_str())?;
 
         let mut patch = CronJobUpdatePatch::default();
         if let Some(name) = payload.name {
@@ -3072,7 +3099,7 @@ impl cron_v1::cron_service_server::CronService for CronServiceImpl {
             patch.misfire_policy = Some(cron_misfire_from_proto(misfire_policy)?);
         }
         if let Some(jitter_ms) = payload.jitter_ms {
-            patch.jitter_ms = Some(jitter_ms.min(MAX_CRON_SCHEDULE_BYTES as u64));
+            patch.jitter_ms = Some(validate_cron_jitter_ms(jitter_ms)?);
         }
 
         let updated = self.state.update_cron_job(job_id, patch).await?;
@@ -3096,6 +3123,12 @@ impl cron_v1::cron_service_server::CronService for CronServiceImpl {
             "cron.delete",
             format!("cron:{job_id}").as_str(),
         )?;
+        let job = self
+            .state
+            .cron_job(job_id.clone())
+            .await?
+            .ok_or_else(|| Status::not_found(format!("cron job not found: {job_id}")))?;
+        enforce_cron_job_owner(context.principal.as_str(), job.owner_principal.as_str())?;
         let deleted = self.state.delete_cron_job(job_id).await?;
         self.scheduler_wake.notify_one();
         Ok(Response::new(cron_v1::DeleteJobResponse { v: CANONICAL_PROTOCOL_MAJOR, deleted }))
@@ -3119,6 +3152,7 @@ impl cron_v1::cron_service_server::CronService for CronServiceImpl {
             .cron_job(job_id.clone())
             .await?
             .ok_or_else(|| Status::not_found(format!("cron job not found: {job_id}")))?;
+        enforce_cron_job_owner(context.principal.as_str(), job.owner_principal.as_str())?;
         Ok(Response::new(cron_v1::GetJobResponse {
             v: CANONICAL_PROTOCOL_MAJOR,
             job: Some(cron_job_message(&job)?),
@@ -3133,6 +3167,13 @@ impl cron_v1::cron_service_server::CronService for CronServiceImpl {
         let payload = request.into_inner();
         require_supported_version(payload.v)?;
         authorize_cron_action(context.principal.as_str(), "cron.list", "cron:jobs")?;
+        if let Some(owner_principal) = payload.owner_principal.as_deref() {
+            if owner_principal != context.principal.as_str() {
+                return Err(Status::permission_denied(
+                    "owner_principal must match authenticated principal",
+                ));
+            }
+        }
 
         let (jobs, next_after_job_ulid) = self
             .state
@@ -3140,7 +3181,7 @@ impl cron_v1::cron_service_server::CronService for CronServiceImpl {
                 non_empty(payload.after_job_ulid),
                 Some(payload.limit as usize),
                 payload.enabled,
-                payload.owner_principal,
+                Some(context.principal.clone()),
                 payload.channel,
             )
             .await?;
@@ -3170,6 +3211,7 @@ impl cron_v1::cron_service_server::CronService for CronServiceImpl {
             .cron_job(job_id.clone())
             .await?
             .ok_or_else(|| Status::not_found(format!("cron job not found: {job_id}")))?;
+        enforce_cron_job_owner(context.principal.as_str(), job.owner_principal.as_str())?;
         let outcome = trigger_job_now(
             Arc::clone(&self.state),
             self.auth.clone(),
@@ -3180,7 +3222,7 @@ impl cron_v1::cron_service_server::CronService for CronServiceImpl {
         .await?;
         Ok(Response::new(cron_v1::RunJobNowResponse {
             v: CANONICAL_PROTOCOL_MAJOR,
-            run_id: Some(common_v1::CanonicalId { ulid: outcome.run_id }),
+            run_id: outcome.run_id.map(|ulid| common_v1::CanonicalId { ulid }),
             status: cron_run_status_to_proto(outcome.status),
             message: outcome.message,
         }))
@@ -3199,6 +3241,12 @@ impl cron_v1::cron_service_server::CronService for CronServiceImpl {
             "cron.logs",
             format!("cron:{job_id}").as_str(),
         )?;
+        let job = self
+            .state
+            .cron_job(job_id.clone())
+            .await?
+            .ok_or_else(|| Status::not_found(format!("cron job not found: {job_id}")))?;
+        enforce_cron_job_owner(context.principal.as_str(), job.owner_principal.as_str())?;
         let (runs, next_after_run_ulid) = self
             .state
             .list_cron_runs(
@@ -3232,6 +3280,12 @@ impl cron_v1::cron_service_server::CronService for CronServiceImpl {
             .cron_run(run_id.clone())
             .await?
             .ok_or_else(|| Status::not_found(format!("cron run not found: {run_id}")))?;
+        let job = self
+            .state
+            .cron_job(run.job_id.clone())
+            .await?
+            .ok_or_else(|| Status::internal("cron job for run not found"))?;
+        enforce_cron_job_owner(context.principal.as_str(), job.owner_principal.as_str())?;
         Ok(Response::new(cron_v1::GetJobRunResponse {
             v: CANONICAL_PROTOCOL_MAJOR,
             run: Some(cron_run_message(&run)),

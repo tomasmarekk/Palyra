@@ -30,6 +30,7 @@ const RUN_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAX";
 const RUN_ID_ALT: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAZ";
 const ENVELOPE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAY";
 const OPENAI_API_KEY: &str = "sk-openai-integration-test";
+const MAX_TEST_CRON_JITTER_MS: u64 = 60_000;
 static TEMP_JOURNAL_COUNTER: AtomicU64 = AtomicU64::new(0);
 static TEMP_CONFIG_COUNTER: AtomicU64 = AtomicU64::new(0);
 static TEMP_IDENTITY_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -457,6 +458,435 @@ async fn grpc_cron_update_rejects_owner_principal_impersonation() -> Result<()> 
         error.message().contains("owner_principal"),
         "error should explain owner principal mismatch"
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_cron_non_owner_access_is_denied_for_job_and_run_endpoints() -> Result<()> {
+    let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut cron_client = cron_v1::cron_service_client::CronServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect cron gRPC client")?;
+
+    let mut create_request = tonic::Request::new(cron_v1::CreateJobRequest {
+        v: 1,
+        name: "Owner-bound cron job".to_owned(),
+        prompt: "Owner-only access".to_owned(),
+        owner_principal: "user:ops".to_owned(),
+        channel: "system:cron".to_owned(),
+        session_key: "cron:owner-bound-job".to_owned(),
+        session_label: "Owner-bound".to_owned(),
+        schedule: Some(cron_v1::Schedule {
+            r#type: cron_v1::ScheduleType::Every as i32,
+            spec: Some(cron_v1::schedule::Spec::Every(cron_v1::EverySchedule {
+                interval_ms: 3_600_000,
+            })),
+        }),
+        enabled: true,
+        concurrency_policy: cron_v1::ConcurrencyPolicy::Forbid as i32,
+        retry_policy: Some(cron_v1::RetryPolicy { max_attempts: 1, backoff_ms: 1 }),
+        misfire_policy: cron_v1::MisfirePolicy::Skip as i32,
+        jitter_ms: 0,
+    });
+    authorize_metadata_with_principal(create_request.metadata_mut(), "user:ops")?;
+    let created = cron_client
+        .create_job(create_request)
+        .await
+        .context("failed to create baseline owner-bound cron job")?
+        .into_inner();
+    let job_id = created
+        .job
+        .as_ref()
+        .and_then(|job| job.job_id.as_ref())
+        .map(|id| id.ulid.clone())
+        .context("CreateJob must return canonical job id")?;
+
+    let mut owner_run_now_request = tonic::Request::new(cron_v1::RunJobNowRequest {
+        v: 1,
+        job_id: Some(common_v1::CanonicalId { ulid: job_id.clone() }),
+    });
+    authorize_metadata_with_principal(owner_run_now_request.metadata_mut(), "user:ops")?;
+    let owner_run_now = cron_client
+        .run_job_now(owner_run_now_request)
+        .await
+        .context("failed to call cron RunJobNow as owner")?
+        .into_inner();
+    let run_id = owner_run_now
+        .run_id
+        .as_ref()
+        .map(|id| id.ulid.clone())
+        .context("RunJobNow as owner must return run id when dispatch starts")?;
+
+    let mut get_request = tonic::Request::new(cron_v1::GetJobRequest {
+        v: 1,
+        job_id: Some(common_v1::CanonicalId { ulid: job_id.clone() }),
+    });
+    authorize_metadata_with_principal(get_request.metadata_mut(), "user:auditor")?;
+    let error =
+        cron_client.get_job(get_request).await.expect_err("cross-principal GetJob must be denied");
+    assert_eq!(error.code(), Code::PermissionDenied);
+
+    let mut update_request = tonic::Request::new(cron_v1::UpdateJobRequest {
+        v: 1,
+        job_id: Some(common_v1::CanonicalId { ulid: job_id.clone() }),
+        name: Some("Intrusive rename".to_owned()),
+        prompt: None,
+        owner_principal: None,
+        channel: None,
+        session_key: None,
+        session_label: None,
+        schedule: None,
+        enabled: None,
+        concurrency_policy: None,
+        retry_policy: None,
+        misfire_policy: None,
+        jitter_ms: None,
+    });
+    authorize_metadata_with_principal(update_request.metadata_mut(), "user:auditor")?;
+    let error = cron_client
+        .update_job(update_request)
+        .await
+        .expect_err("cross-principal UpdateJob must be denied");
+    assert_eq!(error.code(), Code::PermissionDenied);
+
+    let mut run_now_request = tonic::Request::new(cron_v1::RunJobNowRequest {
+        v: 1,
+        job_id: Some(common_v1::CanonicalId { ulid: job_id.clone() }),
+    });
+    authorize_metadata_with_principal(run_now_request.metadata_mut(), "user:auditor")?;
+    let error = cron_client
+        .run_job_now(run_now_request)
+        .await
+        .expect_err("cross-principal RunJobNow must be denied");
+    assert_eq!(error.code(), Code::PermissionDenied);
+
+    let mut list_runs_request = tonic::Request::new(cron_v1::ListJobRunsRequest {
+        v: 1,
+        job_id: Some(common_v1::CanonicalId { ulid: job_id.clone() }),
+        after_run_ulid: String::new(),
+        limit: 10,
+    });
+    authorize_metadata_with_principal(list_runs_request.metadata_mut(), "user:auditor")?;
+    let error = cron_client
+        .list_job_runs(list_runs_request)
+        .await
+        .expect_err("cross-principal ListJobRuns must be denied");
+    assert_eq!(error.code(), Code::PermissionDenied);
+
+    let mut get_run_request = tonic::Request::new(cron_v1::GetJobRunRequest {
+        v: 1,
+        run_id: Some(common_v1::CanonicalId { ulid: run_id }),
+    });
+    authorize_metadata_with_principal(get_run_request.metadata_mut(), "user:auditor")?;
+    let error = cron_client
+        .get_job_run(get_run_request)
+        .await
+        .expect_err("cross-principal GetJobRun must be denied");
+    assert_eq!(error.code(), Code::PermissionDenied);
+
+    let mut delete_request = tonic::Request::new(cron_v1::DeleteJobRequest {
+        v: 1,
+        job_id: Some(common_v1::CanonicalId { ulid: job_id }),
+    });
+    authorize_metadata_with_principal(delete_request.metadata_mut(), "user:auditor")?;
+    let error = cron_client
+        .delete_job(delete_request)
+        .await
+        .expect_err("cross-principal DeleteJob must be denied");
+    assert_eq!(error.code(), Code::PermissionDenied);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_cron_list_jobs_is_scoped_to_authenticated_principal() -> Result<()> {
+    let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut cron_client = cron_v1::cron_service_client::CronServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect cron gRPC client")?;
+
+    for principal in ["user:ops", "user:finance"] {
+        let mut create_request = tonic::Request::new(cron_v1::CreateJobRequest {
+            v: 1,
+            name: format!("Job for {principal}"),
+            prompt: "List ownership scope".to_owned(),
+            owner_principal: principal.to_owned(),
+            channel: "system:cron".to_owned(),
+            session_key: format!("cron:list-scope:{principal}"),
+            session_label: principal.to_owned(),
+            schedule: Some(cron_v1::Schedule {
+                r#type: cron_v1::ScheduleType::Every as i32,
+                spec: Some(cron_v1::schedule::Spec::Every(cron_v1::EverySchedule {
+                    interval_ms: 3_600_000,
+                })),
+            }),
+            enabled: true,
+            concurrency_policy: cron_v1::ConcurrencyPolicy::Forbid as i32,
+            retry_policy: Some(cron_v1::RetryPolicy { max_attempts: 1, backoff_ms: 1 }),
+            misfire_policy: cron_v1::MisfirePolicy::Skip as i32,
+            jitter_ms: 0,
+        });
+        authorize_metadata_with_principal(create_request.metadata_mut(), principal)?;
+        cron_client
+            .create_job(create_request)
+            .await
+            .with_context(|| format!("failed to create cron job for {principal}"))?;
+    }
+
+    let mut list_request = tonic::Request::new(cron_v1::ListJobsRequest {
+        v: 1,
+        after_job_ulid: String::new(),
+        limit: 100,
+        enabled: None,
+        owner_principal: None,
+        channel: None,
+    });
+    authorize_metadata_with_principal(list_request.metadata_mut(), "user:ops")?;
+    let listed = cron_client
+        .list_jobs(list_request)
+        .await
+        .context("failed to list cron jobs for user:ops")?
+        .into_inner();
+    assert!(
+        !listed.jobs.is_empty(),
+        "list response for user:ops should contain at least one owned job"
+    );
+    assert!(
+        listed.jobs.iter().all(|job| job.owner_principal == "user:ops"),
+        "list_jobs should return only jobs owned by authenticated principal"
+    );
+
+    let mut mismatched_owner_request = tonic::Request::new(cron_v1::ListJobsRequest {
+        v: 1,
+        after_job_ulid: String::new(),
+        limit: 100,
+        enabled: None,
+        owner_principal: Some("user:finance".to_owned()),
+        channel: None,
+    });
+    authorize_metadata_with_principal(mismatched_owner_request.metadata_mut(), "user:ops")?;
+    let error = cron_client
+        .list_jobs(mismatched_owner_request)
+        .await
+        .expect_err("list_jobs should reject owner filters that mismatch authenticated principal");
+    assert_eq!(error.code(), Code::PermissionDenied);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_cron_create_rejects_jitter_above_limit() -> Result<()> {
+    let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut cron_client = cron_v1::cron_service_client::CronServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect cron gRPC client")?;
+
+    let mut create_request = tonic::Request::new(cron_v1::CreateJobRequest {
+        v: 1,
+        name: "Jitter too high".to_owned(),
+        prompt: "Reject oversized jitter".to_owned(),
+        owner_principal: "user:ops".to_owned(),
+        channel: "system:cron".to_owned(),
+        session_key: "cron:jitter-too-high".to_owned(),
+        session_label: "Jitter too high".to_owned(),
+        schedule: Some(cron_v1::Schedule {
+            r#type: cron_v1::ScheduleType::Every as i32,
+            spec: Some(cron_v1::schedule::Spec::Every(cron_v1::EverySchedule {
+                interval_ms: 3_600_000,
+            })),
+        }),
+        enabled: true,
+        concurrency_policy: cron_v1::ConcurrencyPolicy::Forbid as i32,
+        retry_policy: Some(cron_v1::RetryPolicy { max_attempts: 1, backoff_ms: 1 }),
+        misfire_policy: cron_v1::MisfirePolicy::Skip as i32,
+        jitter_ms: MAX_TEST_CRON_JITTER_MS + 1,
+    });
+    authorize_metadata(create_request.metadata_mut())?;
+
+    let error = cron_client
+        .create_job(create_request)
+        .await
+        .expect_err("CreateJob should reject jitter above maximum limit");
+    assert_eq!(error.code(), Code::InvalidArgument);
+    assert!(error.message().contains("jitter_ms"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_cron_update_rejects_jitter_above_limit() -> Result<()> {
+    let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut cron_client = cron_v1::cron_service_client::CronServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect cron gRPC client")?;
+
+    let mut create_request = tonic::Request::new(cron_v1::CreateJobRequest {
+        v: 1,
+        name: "Jitter update baseline".to_owned(),
+        prompt: "Update jitter validation".to_owned(),
+        owner_principal: "user:ops".to_owned(),
+        channel: "system:cron".to_owned(),
+        session_key: "cron:jitter-update".to_owned(),
+        session_label: "Jitter update".to_owned(),
+        schedule: Some(cron_v1::Schedule {
+            r#type: cron_v1::ScheduleType::Every as i32,
+            spec: Some(cron_v1::schedule::Spec::Every(cron_v1::EverySchedule {
+                interval_ms: 3_600_000,
+            })),
+        }),
+        enabled: true,
+        concurrency_policy: cron_v1::ConcurrencyPolicy::Forbid as i32,
+        retry_policy: Some(cron_v1::RetryPolicy { max_attempts: 1, backoff_ms: 1 }),
+        misfire_policy: cron_v1::MisfirePolicy::Skip as i32,
+        jitter_ms: MAX_TEST_CRON_JITTER_MS,
+    });
+    authorize_metadata(create_request.metadata_mut())?;
+    let created = cron_client
+        .create_job(create_request)
+        .await
+        .context("failed to create baseline cron job for jitter update test")?
+        .into_inner();
+    let job_id = created
+        .job
+        .as_ref()
+        .and_then(|job| job.job_id.as_ref())
+        .map(|id| id.ulid.clone())
+        .context("CreateJob must return canonical job id")?;
+
+    let mut update_request = tonic::Request::new(cron_v1::UpdateJobRequest {
+        v: 1,
+        job_id: Some(common_v1::CanonicalId { ulid: job_id }),
+        name: None,
+        prompt: None,
+        owner_principal: None,
+        channel: None,
+        session_key: None,
+        session_label: None,
+        schedule: None,
+        enabled: None,
+        concurrency_policy: None,
+        retry_policy: None,
+        misfire_policy: None,
+        jitter_ms: Some(MAX_TEST_CRON_JITTER_MS + 1),
+    });
+    authorize_metadata(update_request.metadata_mut())?;
+    let error = cron_client
+        .update_job(update_request)
+        .await
+        .expect_err("UpdateJob should reject jitter above maximum limit");
+    assert_eq!(error.code(), Code::InvalidArgument);
+    assert!(error.message().contains("jitter_ms"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_cron_run_now_queue_one_returns_no_run_id_when_queued() -> Result<()> {
+    let (child, admin_port, grpc_port, journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut cron_client = cron_v1::cron_service_client::CronServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect cron gRPC client")?;
+
+    let mut create_request = tonic::Request::new(cron_v1::CreateJobRequest {
+        v: 1,
+        name: "Queue one response".to_owned(),
+        prompt: "Queue one should not return phantom run id".to_owned(),
+        owner_principal: "user:ops".to_owned(),
+        channel: "system:cron".to_owned(),
+        session_key: "cron:queue-one-response".to_owned(),
+        session_label: "Queue one response".to_owned(),
+        schedule: Some(cron_v1::Schedule {
+            r#type: cron_v1::ScheduleType::Every as i32,
+            spec: Some(cron_v1::schedule::Spec::Every(cron_v1::EverySchedule {
+                interval_ms: 3_600_000,
+            })),
+        }),
+        enabled: true,
+        concurrency_policy: cron_v1::ConcurrencyPolicy::QueueOne as i32,
+        retry_policy: Some(cron_v1::RetryPolicy { max_attempts: 1, backoff_ms: 1 }),
+        misfire_policy: cron_v1::MisfirePolicy::Skip as i32,
+        jitter_ms: 0,
+    });
+    authorize_metadata(create_request.metadata_mut())?;
+    let created = cron_client
+        .create_job(create_request)
+        .await
+        .context("failed to create queue-one cron job")?
+        .into_inner();
+    let job_id = created
+        .job
+        .as_ref()
+        .and_then(|job| job.job_id.as_ref())
+        .map(|id| id.ulid.clone())
+        .context("CreateJob must return canonical job id")?;
+
+    let now_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock should be after unix epoch")?
+        .as_millis() as i64;
+    let connection = Connection::open(journal_db_path)
+        .context("failed to open journal sqlite db for queue-one seed run")?;
+    connection
+        .execute(
+            r#"
+                INSERT INTO cron_runs (
+                    run_ulid,
+                    job_ulid,
+                    attempt,
+                    session_ulid,
+                    orchestrator_run_ulid,
+                    started_at_unix_ms,
+                    finished_at_unix_ms,
+                    status,
+                    error_kind,
+                    error_message_redacted,
+                    model_tokens_in,
+                    model_tokens_out,
+                    tool_calls,
+                    tool_denies,
+                    created_at_unix_ms,
+                    updated_at_unix_ms
+                ) VALUES (?1, ?2, 1, NULL, NULL, ?3, NULL, 'running', NULL, NULL, 0, 0, 0, 0, ?3, ?3)
+            "#,
+            params!["01ARZ3NDEKTSV4RRFFQ69G5FBC", job_id, now_unix_ms],
+        )
+        .context("failed to seed active cron run for queue-one test")?;
+
+    let mut run_now_request = tonic::Request::new(cron_v1::RunJobNowRequest {
+        v: 1,
+        job_id: Some(common_v1::CanonicalId { ulid: job_id }),
+    });
+    authorize_metadata(run_now_request.metadata_mut())?;
+    let run_now = cron_client
+        .run_job_now(run_now_request)
+        .await
+        .context("failed to call cron RunJobNow for queue-one test")?
+        .into_inner();
+    assert_eq!(
+        run_now.status,
+        cron_v1::JobRunStatus::Accepted as i32,
+        "QueueOne with active run should accept and queue the execution"
+    );
+    assert!(run_now.run_id.is_none(), "queued dispatch must not return a non-existent run id");
+    assert!(run_now.message.contains("queued"), "response should explain the run was queued");
     Ok(())
 }
 

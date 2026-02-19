@@ -45,7 +45,7 @@ pub struct ScheduleNormalization {
 
 #[derive(Debug, Clone)]
 pub struct DispatchOutcome {
-    pub run_id: String,
+    pub run_id: Option<String>,
     pub status: CronRunStatus,
     pub message: String,
 }
@@ -474,24 +474,51 @@ async fn process_queued_jobs(
     grpc_url: String,
     wake_signal: Arc<Notify>,
 ) -> Result<(), Status> {
-    let (jobs, _) = state.list_cron_jobs(None, Some(500), Some(true), None, None).await?;
-    for job in jobs {
-        if !job.queued_run {
-            continue;
+    let mut after_job_id = None::<String>;
+    loop {
+        let (jobs, next_after_job_id) =
+            state.list_cron_jobs(after_job_id.clone(), Some(500), Some(true), None, None).await?;
+        if jobs.is_empty() {
+            break;
         }
-        if state.active_cron_run_for_job(job.job_id.clone()).await?.is_some() {
-            continue;
+
+        for job in jobs {
+            if !job.queued_run {
+                continue;
+            }
+            if state.active_cron_run_for_job(job.job_id.clone()).await?.is_some() {
+                continue;
+            }
+            match dispatch_job(
+                Arc::clone(&state),
+                auth.clone(),
+                grpc_url.clone(),
+                job.clone(),
+                Arc::clone(&wake_signal),
+                false,
+            )
+            .await
+            {
+                Ok(outcome) => {
+                    if outcome.status == CronRunStatus::Accepted && outcome.run_id.is_none() {
+                        continue;
+                    }
+                    state.set_cron_job_queue_state(job.job_id.clone(), false).await?;
+                }
+                Err(error) => {
+                    warn!(
+                        job_id = %job.job_id,
+                        error = %error,
+                        "failed to dispatch queued cron run; keeping queued marker for retry"
+                    );
+                }
+            }
         }
-        state.set_cron_job_queue_state(job.job_id.clone(), false).await?;
-        let _ = dispatch_job(
-            Arc::clone(&state),
-            auth.clone(),
-            grpc_url.clone(),
-            job,
-            Arc::clone(&wake_signal),
-            false,
-        )
-        .await?;
+
+        let Some(next_after_job_id) = next_after_job_id else {
+            break;
+        };
+        after_job_id = Some(next_after_job_id);
     }
     Ok(())
 }
@@ -539,6 +566,14 @@ async fn dispatch_job(
             }
             CronConcurrencyPolicy::QueueOne => {
                 if job.queued_run {
+                    if !manual_trigger {
+                        return Ok(DispatchOutcome {
+                            run_id: None,
+                            status: CronRunStatus::Accepted,
+                            message: "run remains queued until active execution completes"
+                                .to_owned(),
+                        });
+                    }
                     return register_terminal(
                         Arc::clone(&state),
                         &job.job_id,
@@ -550,7 +585,7 @@ async fn dispatch_job(
                 }
                 state.set_cron_job_queue_state(job.job_id.clone(), true).await?;
                 return Ok(DispatchOutcome {
-                    run_id: Ulid::new().to_string(),
+                    run_id: None,
                     status: CronRunStatus::Accepted,
                     message: "run queued due to active execution".to_owned(),
                 });
@@ -599,7 +634,7 @@ async fn dispatch_job(
     });
 
     Ok(DispatchOutcome {
-        run_id: dispatch_run_id,
+        run_id: Some(dispatch_run_id),
         status: CronRunStatus::Running,
         message: if manual_trigger {
             "manual run dispatched".to_owned()
@@ -643,7 +678,7 @@ async fn register_terminal(
             session_id: None,
         })
         .await?;
-    Ok(DispatchOutcome { run_id, status, message: message.to_owned() })
+    Ok(DispatchOutcome { run_id: Some(run_id), status, message: message.to_owned() })
 }
 
 async fn run_job_with_retries(
