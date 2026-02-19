@@ -123,6 +123,7 @@ const MAX_VAULT_SECRET_BYTES: usize = 64 * 1024;
 const MAX_VAULT_LIST_RESULTS: usize = 1_000;
 const VAULT_RATE_LIMIT_WINDOW_MS: u64 = 1_000;
 const VAULT_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW: u32 = 30;
+const VAULT_RATE_LIMIT_MAX_PRINCIPAL_BUCKETS: usize = 4_096;
 const MEMORY_SEARCH_LATENCY_BUDGET_MS: u128 = 75;
 const MEMORY_SEARCH_CACHE_CAPACITY: usize = 128;
 const MEMORY_AUTO_INJECT_MIN_SCORE: f64 = 0.2;
@@ -647,6 +648,17 @@ impl GatewayRuntimeState {
             Ok(guard) => guard,
             Err(_) => return false,
         };
+        if !buckets.contains_key(principal)
+            && buckets.len() >= VAULT_RATE_LIMIT_MAX_PRINCIPAL_BUCKETS
+        {
+            buckets.retain(|_, entry| {
+                now.duration_since(entry.window_started_at).as_millis() as u64
+                    <= VAULT_RATE_LIMIT_WINDOW_MS
+            });
+            if buckets.len() >= VAULT_RATE_LIMIT_MAX_PRINCIPAL_BUCKETS {
+                return false;
+            }
+        }
         let entry = buckets
             .entry(principal.to_owned())
             .or_insert(VaultRateLimitEntry { window_started_at: now, requests_in_window: 0 });
@@ -1891,6 +1903,40 @@ fn map_vault_error(operation: &str, error: VaultError) -> Status {
 fn parse_vault_scope(raw: &str) -> Result<VaultScope, Status> {
     raw.parse::<VaultScope>()
         .map_err(|error| Status::invalid_argument(format!("invalid vault scope: {error}")))
+}
+
+#[allow(clippy::result_large_err)]
+fn enforce_vault_scope_access(scope: &VaultScope, context: &RequestContext) -> Result<(), Status> {
+    match scope {
+        VaultScope::Global => Ok(()),
+        VaultScope::Principal { principal_id } => {
+            if principal_id == &context.principal {
+                Ok(())
+            } else {
+                Err(Status::permission_denied(
+                    "vault principal scope must match authenticated principal context",
+                ))
+            }
+        }
+        VaultScope::Channel { channel_name, account_id } => {
+            let context_channel = context.channel.as_deref().ok_or_else(|| {
+                Status::permission_denied(
+                    "vault channel scope requires authenticated channel context",
+                )
+            })?;
+            let expected_with_account = format!("{channel_name}:{account_id}");
+            if context_channel == channel_name || context_channel == expected_with_account {
+                Ok(())
+            } else {
+                Err(Status::permission_denied(
+                    "vault channel scope must match authenticated channel context",
+                ))
+            }
+        }
+        VaultScope::Skill { .. } => Err(Status::permission_denied(
+            "vault skill scope is not allowed over external RPC context",
+        )),
+    }
 }
 
 fn vault_secret_metadata_message(
@@ -5083,6 +5129,7 @@ impl gateway_v1::vault_service_server::VaultService for VaultServiceImpl {
             )));
         }
         let scope = parse_vault_scope(payload.scope.as_str())?;
+        enforce_vault_scope_access(&scope, &context)?;
         let key = payload.key.trim().to_owned();
         authorize_vault_action(
             context.principal.as_str(),
@@ -5121,6 +5168,7 @@ impl gateway_v1::vault_service_server::VaultService for VaultServiceImpl {
         let payload = request.into_inner();
         require_supported_version(payload.v)?;
         let scope = parse_vault_scope(payload.scope.as_str())?;
+        enforce_vault_scope_access(&scope, &context)?;
         let key = payload.key.trim().to_owned();
         authorize_vault_action(
             context.principal.as_str(),
@@ -5155,6 +5203,7 @@ impl gateway_v1::vault_service_server::VaultService for VaultServiceImpl {
         let payload = request.into_inner();
         require_supported_version(payload.v)?;
         let scope = parse_vault_scope(payload.scope.as_str())?;
+        enforce_vault_scope_access(&scope, &context)?;
         let key = payload.key.trim().to_owned();
         authorize_vault_action(
             context.principal.as_str(),
@@ -5191,6 +5240,7 @@ impl gateway_v1::vault_service_server::VaultService for VaultServiceImpl {
         let payload = request.into_inner();
         require_supported_version(payload.v)?;
         let scope = parse_vault_scope(payload.scope.as_str())?;
+        enforce_vault_scope_access(&scope, &context)?;
         authorize_vault_action(
             context.principal.as_str(),
             "vault.list",
@@ -6931,9 +6981,10 @@ mod tests {
 
     use super::{
         apply_tool_approval_outcome, authorize_headers, best_effort_mark_approval_error,
-        request_context_from_headers, AuthError, GatewayAuthConfig, GatewayJournalConfigSnapshot,
-        GatewayRuntimeConfigSnapshot, GatewayRuntimeState, RequestContext, ToolApprovalOutcome,
-        HEADER_CHANNEL, HEADER_DEVICE_ID, HEADER_PRINCIPAL, MAX_APPROVAL_PAGE_LIMIT,
+        enforce_vault_scope_access, request_context_from_headers, AuthError, GatewayAuthConfig,
+        GatewayJournalConfigSnapshot, GatewayRuntimeConfigSnapshot, GatewayRuntimeState,
+        RequestContext, ToolApprovalOutcome, HEADER_CHANNEL, HEADER_DEVICE_ID, HEADER_PRINCIPAL,
+        MAX_APPROVAL_PAGE_LIMIT, VAULT_RATE_LIMIT_MAX_PRINCIPAL_BUCKETS,
     };
 
     static TEMP_JOURNAL_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -7089,6 +7140,106 @@ mod tests {
                 device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
                 channel: Some("cli".to_owned()),
             }
+        );
+    }
+
+    #[test]
+    fn vault_scope_enforcement_allows_matching_principal_scope() {
+        let context = RequestContext {
+            principal: "user:ops".to_owned(),
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            channel: Some("cli".to_owned()),
+        };
+        let scope = super::VaultScope::Principal { principal_id: "user:ops".to_owned() };
+        assert!(
+            enforce_vault_scope_access(&scope, &context).is_ok(),
+            "principal scope should be allowed when it matches authenticated principal"
+        );
+    }
+
+    #[test]
+    fn vault_scope_enforcement_rejects_mismatched_principal_scope() {
+        let context = RequestContext {
+            principal: "user:ops".to_owned(),
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            channel: Some("cli".to_owned()),
+        };
+        let scope = super::VaultScope::Principal { principal_id: "user:finance".to_owned() };
+        let error = enforce_vault_scope_access(&scope, &context)
+            .expect_err("mismatched principal scope must be denied");
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn vault_scope_enforcement_rejects_missing_or_mismatched_channel_scope() {
+        let missing_channel_context = RequestContext {
+            principal: "user:ops".to_owned(),
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            channel: None,
+        };
+        let scope = super::VaultScope::Channel {
+            channel_name: "cli".to_owned(),
+            account_id: "acct-1".to_owned(),
+        };
+        let missing_channel_error = enforce_vault_scope_access(&scope, &missing_channel_context)
+            .expect_err("channel scope without context channel must be denied");
+        assert_eq!(missing_channel_error.code(), tonic::Code::PermissionDenied);
+
+        let mismatched_channel_context = RequestContext {
+            principal: "user:ops".to_owned(),
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            channel: Some("slack".to_owned()),
+        };
+        let mismatched_channel_error =
+            enforce_vault_scope_access(&scope, &mismatched_channel_context)
+                .expect_err("mismatched channel scope must be denied");
+        assert_eq!(mismatched_channel_error.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn vault_scope_enforcement_accepts_channel_scope_with_exact_context_match() {
+        let context = RequestContext {
+            principal: "user:ops".to_owned(),
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            channel: Some("slack:acct-1".to_owned()),
+        };
+        let scope = super::VaultScope::Channel {
+            channel_name: "slack".to_owned(),
+            account_id: "acct-1".to_owned(),
+        };
+        assert!(
+            enforce_vault_scope_access(&scope, &context).is_ok(),
+            "channel scope should be allowed when authenticated channel context matches scope"
+        );
+    }
+
+    #[test]
+    fn vault_scope_enforcement_rejects_skill_scope_for_external_rpc() {
+        let context = RequestContext {
+            principal: "user:ops".to_owned(),
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            channel: Some("cli".to_owned()),
+        };
+        let scope = super::VaultScope::Skill { skill_id: "skill.slack.bot".to_owned() };
+        let error = enforce_vault_scope_access(&scope, &context)
+            .expect_err("skill scope should not be exposed via external vault RPC");
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn vault_rate_limit_principal_bucket_count_is_bounded() {
+        let state = build_test_runtime_state(false);
+        for index in 0..VAULT_RATE_LIMIT_MAX_PRINCIPAL_BUCKETS {
+            let allowed = state.consume_vault_rate_limit(format!("user:{index}").as_str());
+            assert!(allowed, "initial request for unique principal should be allowed");
+        }
+        assert!(
+            !state.consume_vault_rate_limit("user:overflow"),
+            "new principal should be denied when rate-limit bucket map reaches configured cap"
+        );
+        assert!(
+            state.consume_vault_rate_limit("user:0"),
+            "existing principal bucket should remain usable when cap is reached"
         );
     }
 

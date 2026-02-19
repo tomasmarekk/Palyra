@@ -390,6 +390,15 @@ impl LinuxSecretServiceBackend {
 }
 
 #[cfg(target_os = "linux")]
+fn secret_tool_stderr_is_not_found(stderr: &[u8]) -> bool {
+    let normalized = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    normalized.contains("not found")
+        || normalized.contains("no such secret")
+        || normalized.contains("no such item")
+        || normalized.contains("could not be found")
+}
+
+#[cfg(target_os = "linux")]
 impl BlobBackend for LinuxSecretServiceBackend {
     fn kind(&self) -> BackendKind {
         BackendKind::LinuxSecretService
@@ -447,7 +456,13 @@ impl BlobBackend for LinuxSecretServiceBackend {
                 VaultError::Io(format!("failed to execute secret-tool lookup: {error}"))
             })?;
         if !output.status.success() {
-            return Err(VaultError::NotFound);
+            if secret_tool_stderr_is_not_found(output.stderr.as_slice()) {
+                return Err(VaultError::NotFound);
+            }
+            return Err(VaultError::Io(format!(
+                "secret-tool lookup failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
         }
         let encoded = String::from_utf8(output.stdout)
             .map_err(|error| {
@@ -476,7 +491,32 @@ impl BlobBackend for LinuxSecretServiceBackend {
         if output.status.success() {
             return Ok(());
         }
-        Ok(())
+        if secret_tool_stderr_is_not_found(output.stderr.as_slice()) {
+            return Ok(());
+        }
+        Err(VaultError::Io(format!(
+            "secret-tool clear failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )))
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use super::secret_tool_stderr_is_not_found;
+
+    #[test]
+    fn secret_tool_not_found_detection_matches_expected_phrases() {
+        assert!(secret_tool_stderr_is_not_found(
+            b"No such secret item at path /org/freedesktop/secrets"
+        ));
+        assert!(secret_tool_stderr_is_not_found(b"could not be found"));
+        assert!(secret_tool_stderr_is_not_found(b"NOT FOUND"));
+    }
+
+    #[test]
+    fn secret_tool_not_found_detection_ignores_unrelated_failures() {
+        assert!(!secret_tool_stderr_is_not_found(b"Cannot autolaunch D-Bus without X11 $DISPLAY"));
     }
 }
 
