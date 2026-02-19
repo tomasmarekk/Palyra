@@ -580,7 +580,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
     }
 }
 
-fn sanitize_remote_error(body: &str) -> String {
+pub(crate) fn sanitize_remote_error(body: &str) -> String {
     let collapsed = body.replace(['\r', '\n', '\t'], " ");
     let trimmed = collapsed.trim();
     if trimmed.is_empty() {

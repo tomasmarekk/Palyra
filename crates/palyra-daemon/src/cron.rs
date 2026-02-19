@@ -697,12 +697,19 @@ async fn run_job_with_retries(
                 }
             }
             Err(error) => {
+                warn!(
+                    job_id = %job.job_id,
+                    run_id = %run_id,
+                    attempt,
+                    error = %error,
+                    "cron attempt failed before completion"
+                );
                 state
                     .finalize_cron_run(CronRunFinalizeRequest {
                         run_id: run_id.clone(),
                         status: CronRunStatus::Failed,
                         error_kind: Some("scheduler_internal".to_owned()),
-                        error_message_redacted: Some(error.to_string()),
+                        error_message_redacted: Some(format!("cron attempt {attempt} failed")),
                         model_tokens_in: 0,
                         model_tokens_out: 0,
                         tool_calls: 0,

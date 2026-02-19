@@ -2375,15 +2375,7 @@ fn redact_error_text(input: &str) -> String {
     if trimmed.is_empty() {
         return String::new();
     }
-    if looks_like_secret(trimmed) {
-        return REDACTED_MARKER.to_owned();
-    }
-    let bounded = trimmed.chars().take(512).collect::<String>();
-    if bounded.len() == trimmed.len() {
-        bounded
-    } else {
-        format!("{bounded}...")
-    }
+    crate::model_provider::sanitize_remote_error(trimmed)
 }
 
 fn compute_hash(
@@ -3151,6 +3143,44 @@ mod tests {
             JournalError::DuplicateCronRunId { ref run_id }
                 if run_id == "01ARZ3NDEKTSV4RRFFQ69G5FBF"
         ));
+    }
+
+    #[test]
+    fn cron_run_error_message_is_sanitized_before_persist() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let job = store
+            .create_cron_job(&sample_cron_job_request("01ARZ3NDEKTSV4RRFFQ69G5FBG"))
+            .expect("cron job should be inserted");
+
+        store
+            .start_cron_run(&CronRunStartRequest {
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FBH".to_owned(),
+                job_id: job.job_id.clone(),
+                attempt: 1,
+                session_id: None,
+                orchestrator_run_id: None,
+                status: CronRunStatus::Failed,
+                error_kind: Some("scheduler_internal".to_owned()),
+                error_message_redacted: Some(
+                    "Bearer topsecret123 api_key=abc token=qwe secret=xyz".to_owned(),
+                ),
+            })
+            .expect("cron run start should persist");
+
+        let stored = store
+            .cron_run("01ARZ3NDEKTSV4RRFFQ69G5FBH")
+            .expect("cron run lookup should succeed")
+            .expect("cron run should exist");
+        let message = stored
+            .error_message_redacted
+            .expect("stored cron run should include redacted error message");
+        assert!(!message.contains("topsecret123"), "bearer token value must be redacted");
+        assert!(!message.contains("api_key=abc"), "api_key value must be redacted");
+        assert!(!message.contains("token=qwe"), "token value must be redacted");
+        assert!(!message.contains("secret=xyz"), "secret value must be redacted");
+        assert!(message.contains("<redacted>"), "redaction marker should be present");
     }
 
     #[test]

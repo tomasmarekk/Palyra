@@ -1342,6 +1342,35 @@ fn validate_cron_job_prompt(prompt: String) -> Result<String, Status> {
 }
 
 #[allow(clippy::result_large_err)]
+fn validate_cron_job_owner_principal(
+    authenticated_principal: &str,
+    requested_owner_principal: String,
+) -> Result<String, Status> {
+    match non_empty(requested_owner_principal) {
+        Some(owner_principal) if owner_principal == authenticated_principal => Ok(owner_principal),
+        Some(_) => {
+            Err(Status::permission_denied("owner_principal must match authenticated principal"))
+        }
+        None => Ok(authenticated_principal.to_owned()),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_cron_job_owner_principal_for_update(
+    authenticated_principal: &str,
+    requested_owner_principal: String,
+) -> Result<String, Status> {
+    let owner_principal = non_empty(requested_owner_principal)
+        .ok_or_else(|| Status::invalid_argument("owner_principal cannot be empty"))?;
+    if owner_principal != authenticated_principal {
+        return Err(Status::permission_denied(
+            "owner_principal must match authenticated principal",
+        ));
+    }
+    Ok(owner_principal)
+}
+
+#[allow(clippy::result_large_err)]
 fn cron_concurrency_from_proto(raw: i32) -> Result<CronConcurrencyPolicy, Status> {
     match cron_v1::ConcurrencyPolicy::try_from(raw)
         .unwrap_or(cron_v1::ConcurrencyPolicy::Unspecified)
@@ -2950,7 +2979,8 @@ impl cron_v1::cron_service_server::CronService for CronServiceImpl {
         let schedule = normalize_schedule(payload.schedule, now_unix_ms)?;
         let name = validate_cron_job_name(payload.name)?;
         let prompt = validate_cron_job_prompt(payload.prompt)?;
-        let owner_principal = non_empty(payload.owner_principal).unwrap_or(context.principal);
+        let owner_principal =
+            validate_cron_job_owner_principal(context.principal.as_str(), payload.owner_principal)?;
         let channel = non_empty(payload.channel)
             .unwrap_or_else(|| context.channel.unwrap_or_else(|| "system:cron".to_owned()));
         let session_key = non_empty(payload.session_key);
@@ -3009,7 +3039,10 @@ impl cron_v1::cron_service_server::CronService for CronServiceImpl {
             patch.prompt = Some(validate_cron_job_prompt(prompt)?);
         }
         if let Some(owner_principal) = payload.owner_principal {
-            patch.owner_principal = non_empty(owner_principal);
+            patch.owner_principal = Some(validate_cron_job_owner_principal_for_update(
+                context.principal.as_str(),
+                owner_principal,
+            )?);
         }
         if let Some(channel) = payload.channel {
             patch.channel = non_empty(channel);

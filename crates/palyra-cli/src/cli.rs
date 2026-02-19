@@ -219,6 +219,40 @@ pub enum CronCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    Update {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(long, value_enum, requires = "schedule")]
+        schedule_type: Option<CronScheduleTypeArg>,
+        #[arg(long, requires = "schedule_type")]
+        schedule: Option<String>,
+        #[arg(long)]
+        enabled: Option<bool>,
+        #[arg(long, value_enum)]
+        concurrency: Option<CronConcurrencyPolicyArg>,
+        #[arg(long, requires = "retry_backoff_ms")]
+        retry_max_attempts: Option<u32>,
+        #[arg(long, requires = "retry_max_attempts")]
+        retry_backoff_ms: Option<u64>,
+        #[arg(long, value_enum)]
+        misfire: Option<CronMisfirePolicyArg>,
+        #[arg(long)]
+        jitter_ms: Option<u64>,
+        #[arg(long)]
+        owner: Option<String>,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long)]
+        session_key: Option<String>,
+        #[arg(long)]
+        session_label: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     Enable {
         #[arg(long)]
         id: String,
@@ -232,6 +266,12 @@ pub enum CronCommand {
         json: bool,
     },
     RunNow {
+        #[arg(long)]
+        id: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Delete {
         #[arg(long)]
         id: String,
         #[arg(long, default_value_t = false)]
@@ -794,6 +834,112 @@ mod tests {
                     session_key: Some("cron:health".to_owned()),
                     session_label: Some("Health".to_owned()),
                     json: false,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn parse_cron_update() {
+        let parsed = Cli::parse_from([
+            "palyra",
+            "cron",
+            "update",
+            "--id",
+            "01ARZ3NDEKTSV4RRFFQ69G5FB0",
+            "--name",
+            "Health summary v2",
+            "--schedule-type",
+            "every",
+            "--schedule",
+            "60000",
+            "--enabled",
+            "true",
+            "--concurrency",
+            "replace",
+            "--retry-max-attempts",
+            "4",
+            "--retry-backoff-ms",
+            "500",
+            "--misfire",
+            "catch-up",
+            "--jitter-ms",
+            "50",
+            "--owner",
+            "user:ops",
+            "--channel",
+            "system:cron",
+            "--session-key",
+            "cron:health-v2",
+            "--session-label",
+            "Health summary v2",
+        ]);
+        assert_eq!(
+            parsed.command,
+            Command::Cron {
+                command: CronCommand::Update {
+                    id: "01ARZ3NDEKTSV4RRFFQ69G5FB0".to_owned(),
+                    name: Some("Health summary v2".to_owned()),
+                    prompt: None,
+                    schedule_type: Some(CronScheduleTypeArg::Every),
+                    schedule: Some("60000".to_owned()),
+                    enabled: Some(true),
+                    concurrency: Some(CronConcurrencyPolicyArg::Replace),
+                    retry_max_attempts: Some(4),
+                    retry_backoff_ms: Some(500),
+                    misfire: Some(CronMisfirePolicyArg::CatchUp),
+                    jitter_ms: Some(50),
+                    owner: Some("user:ops".to_owned()),
+                    channel: Some("system:cron".to_owned()),
+                    session_key: Some("cron:health-v2".to_owned()),
+                    session_label: Some("Health summary v2".to_owned()),
+                    json: false,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn parse_cron_update_requires_schedule_pair() {
+        let missing_schedule = Cli::try_parse_from([
+            "palyra",
+            "cron",
+            "update",
+            "--id",
+            "01ARZ3NDEKTSV4RRFFQ69G5FB0",
+            "--schedule-type",
+            "cron",
+        ]);
+        assert!(missing_schedule.is_err(), "--schedule-type requires --schedule");
+
+        let missing_type = Cli::try_parse_from([
+            "palyra",
+            "cron",
+            "update",
+            "--id",
+            "01ARZ3NDEKTSV4RRFFQ69G5FB0",
+            "--schedule",
+            "*/5 * * * *",
+        ]);
+        assert!(missing_type.is_err(), "--schedule requires --schedule-type");
+    }
+
+    #[test]
+    fn parse_cron_delete() {
+        let parsed = Cli::parse_from([
+            "palyra",
+            "cron",
+            "delete",
+            "--id",
+            "01ARZ3NDEKTSV4RRFFQ69G5FB0",
+            "--json",
+        ]);
+        assert_eq!(
+            parsed.command,
+            Command::Cron {
+                command: CronCommand::Delete {
+                    id: "01ARZ3NDEKTSV4RRFFQ69G5FB0".to_owned(),
+                    json: true,
                 }
             }
         );

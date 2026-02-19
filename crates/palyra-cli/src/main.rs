@@ -35,7 +35,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::{CommandFactory, Parser};
 use cli::{
     AgentCommand, BrowserCommand, ChannelsCommand, Cli, Command as CliCommand, CompletionShell,
@@ -560,6 +560,93 @@ async fn run_cron_async(command: CronCommand, connection: AgentConnection) -> Re
                 );
             }
         }
+        CronCommand::Update {
+            id,
+            name,
+            prompt,
+            schedule_type,
+            schedule,
+            enabled,
+            concurrency,
+            retry_max_attempts,
+            retry_backoff_ms,
+            misfire,
+            jitter_ms,
+            owner,
+            channel,
+            session_key,
+            session_label,
+            json,
+        } => {
+            validate_canonical_id(id.as_str()).context("cron job id must be a canonical ULID")?;
+            let schedule = match (schedule_type, schedule) {
+                (Some(schedule_type), Some(schedule)) => {
+                    Some(build_cron_schedule(schedule_type, schedule)?)
+                }
+                (None, None) => None,
+                _ => {
+                    unreachable!("clap requires schedule-type and schedule to be provided together")
+                }
+            };
+            let retry_policy = match (retry_max_attempts, retry_backoff_ms) {
+                (Some(max_attempts), Some(backoff_ms)) => Some(cron_v1::RetryPolicy {
+                    max_attempts: max_attempts.max(1),
+                    backoff_ms: backoff_ms.max(1),
+                }),
+                (None, None) => None,
+                _ => unreachable!("clap requires retry policy fields to be provided together"),
+            };
+            let has_changes = name.is_some()
+                || prompt.is_some()
+                || owner.is_some()
+                || channel.is_some()
+                || session_key.is_some()
+                || session_label.is_some()
+                || schedule.is_some()
+                || enabled.is_some()
+                || concurrency.is_some()
+                || retry_policy.is_some()
+                || misfire.is_some()
+                || jitter_ms.is_some();
+            if !has_changes {
+                return Err(anyhow!("cron update requires at least one field to change"));
+            }
+
+            let mut request = Request::new(cron_v1::UpdateJobRequest {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                job_id: Some(common_v1::CanonicalId { ulid: id }),
+                name,
+                prompt,
+                owner_principal: owner,
+                channel,
+                session_key,
+                session_label,
+                schedule,
+                enabled,
+                concurrency_policy: concurrency.map(cron_concurrency_to_proto),
+                retry_policy,
+                misfire_policy: misfire.map(cron_misfire_to_proto),
+                jitter_ms,
+            });
+            inject_run_stream_metadata(request.metadata_mut(), &connection)?;
+            let response = client
+                .update_job(request)
+                .await
+                .context("failed to call cron UpdateJob")?
+                .into_inner();
+            let job = response.job.context("cron UpdateJob returned empty job payload")?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&cron_job_to_json(&job))?);
+            } else {
+                println!(
+                    "cron.update id={} enabled={} owner={} channel={}",
+                    job.job_id.map(|value| value.ulid).unwrap_or_default(),
+                    job.enabled,
+                    job.owner_principal,
+                    job.channel
+                );
+            }
+        }
         CronCommand::Enable { id, json } => {
             let response = update_cron_enabled(&mut client, &connection, id, true).await?;
             if json {
@@ -617,6 +704,29 @@ async fn run_cron_async(command: CronCommand, connection: AgentConnection) -> Re
                     response.status,
                     response.message
                 );
+            }
+        }
+        CronCommand::Delete { id, json } => {
+            validate_canonical_id(id.as_str()).context("cron job id must be a canonical ULID")?;
+            let mut request = Request::new(cron_v1::DeleteJobRequest {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                job_id: Some(common_v1::CanonicalId { ulid: id.clone() }),
+            });
+            inject_run_stream_metadata(request.metadata_mut(), &connection)?;
+            let response = client
+                .delete_job(request)
+                .await
+                .context("failed to call cron DeleteJob")?
+                .into_inner();
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "deleted": response.deleted,
+                    }))?
+                );
+            } else {
+                println!("cron.delete id={} deleted={}", id, response.deleted);
             }
         }
         CronCommand::Logs { id, after, limit, json } => {

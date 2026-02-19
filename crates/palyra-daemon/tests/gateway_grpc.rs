@@ -342,6 +342,125 @@ async fn grpc_cron_create_rejects_invalid_schedule_expression() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn grpc_cron_create_rejects_owner_principal_impersonation() -> Result<()> {
+    let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut cron_client = cron_v1::cron_service_client::CronServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect cron gRPC client")?;
+
+    let mut create_request = tonic::Request::new(cron_v1::CreateJobRequest {
+        v: 1,
+        name: "Impersonation attempt".to_owned(),
+        prompt: "This should be denied".to_owned(),
+        owner_principal: "user:finance".to_owned(),
+        channel: "system:cron".to_owned(),
+        session_key: "cron:impersonation-attempt".to_owned(),
+        session_label: "Impersonation attempt".to_owned(),
+        schedule: Some(cron_v1::Schedule {
+            r#type: cron_v1::ScheduleType::Every as i32,
+            spec: Some(cron_v1::schedule::Spec::Every(cron_v1::EverySchedule {
+                interval_ms: 3_600_000,
+            })),
+        }),
+        enabled: true,
+        concurrency_policy: cron_v1::ConcurrencyPolicy::Forbid as i32,
+        retry_policy: Some(cron_v1::RetryPolicy { max_attempts: 1, backoff_ms: 1 }),
+        misfire_policy: cron_v1::MisfirePolicy::Skip as i32,
+        jitter_ms: 0,
+    });
+    authorize_metadata_with_principal(create_request.metadata_mut(), "user:ops")?;
+
+    let error = cron_client
+        .create_job(create_request)
+        .await
+        .expect_err("CreateJob should reject mismatched owner_principal values");
+    assert_eq!(error.code(), Code::PermissionDenied);
+    assert!(
+        error.message().contains("owner_principal"),
+        "error should explain owner principal mismatch"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_cron_update_rejects_owner_principal_impersonation() -> Result<()> {
+    let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut cron_client = cron_v1::cron_service_client::CronServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect cron gRPC client")?;
+
+    let mut create_request = tonic::Request::new(cron_v1::CreateJobRequest {
+        v: 1,
+        name: "Owned by ops".to_owned(),
+        prompt: "Create before update".to_owned(),
+        owner_principal: "user:ops".to_owned(),
+        channel: "system:cron".to_owned(),
+        session_key: "cron:update-owner-guard".to_owned(),
+        session_label: "Owned by ops".to_owned(),
+        schedule: Some(cron_v1::Schedule {
+            r#type: cron_v1::ScheduleType::Every as i32,
+            spec: Some(cron_v1::schedule::Spec::Every(cron_v1::EverySchedule {
+                interval_ms: 3_600_000,
+            })),
+        }),
+        enabled: true,
+        concurrency_policy: cron_v1::ConcurrencyPolicy::Forbid as i32,
+        retry_policy: Some(cron_v1::RetryPolicy { max_attempts: 1, backoff_ms: 1 }),
+        misfire_policy: cron_v1::MisfirePolicy::Skip as i32,
+        jitter_ms: 0,
+    });
+    authorize_metadata_with_principal(create_request.metadata_mut(), "user:ops")?;
+    let created = cron_client
+        .create_job(create_request)
+        .await
+        .context("failed to create baseline cron job")?
+        .into_inner();
+    let job_id = created
+        .job
+        .as_ref()
+        .and_then(|job| job.job_id.as_ref())
+        .map(|id| id.ulid.clone())
+        .context("CreateJob must return canonical job id")?;
+
+    let mut update_request = tonic::Request::new(cron_v1::UpdateJobRequest {
+        v: 1,
+        job_id: Some(common_v1::CanonicalId { ulid: job_id }),
+        name: None,
+        prompt: None,
+        owner_principal: Some("user:finance".to_owned()),
+        channel: None,
+        session_key: None,
+        session_label: None,
+        schedule: None,
+        enabled: None,
+        concurrency_policy: None,
+        retry_policy: None,
+        misfire_policy: None,
+        jitter_ms: None,
+    });
+    authorize_metadata_with_principal(update_request.metadata_mut(), "user:ops")?;
+
+    let error = cron_client
+        .update_job(update_request)
+        .await
+        .expect_err("UpdateJob should reject mismatched owner_principal values");
+    assert_eq!(error.code(), Code::PermissionDenied);
+    assert!(
+        error.message().contains("owner_principal"),
+        "error should explain owner principal mismatch"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn grpc_cron_run_now_skips_when_forbid_policy_has_active_run() -> Result<()> {
     let (child, admin_port, grpc_port, journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
     let mut daemon = ChildGuard::new(child);
@@ -2640,8 +2759,15 @@ fn sample_journal_event(event_id: &str, payload_json: &[u8]) -> common_v1::Journ
 }
 
 fn authorize_metadata(metadata: &mut tonic::metadata::MetadataMap) -> Result<()> {
+    authorize_metadata_with_principal(metadata, "user:ops")
+}
+
+fn authorize_metadata_with_principal(
+    metadata: &mut tonic::metadata::MetadataMap,
+    principal: &str,
+) -> Result<()> {
     metadata.insert("authorization", format!("Bearer {ADMIN_TOKEN}").parse()?);
-    metadata.insert("x-palyra-principal", "user:ops".parse()?);
+    metadata.insert("x-palyra-principal", principal.parse()?);
     metadata.insert("x-palyra-device-id", DEVICE_ID.parse()?);
     metadata.insert("x-palyra-channel", "cli".parse()?);
     Ok(())
