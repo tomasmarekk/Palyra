@@ -247,6 +247,62 @@ public enum PalyraGatewayV1 {
     }
 }
 
+public enum PalyraMemoryV1 {
+    public struct DeleteMemoryItemRequest: Equatable {
+        public init() {}
+    }
+    public struct DeleteMemoryItemResponse: Equatable {
+        public init() {}
+    }
+    public struct GetMemoryItemRequest: Equatable {
+        public init() {}
+    }
+    public struct GetMemoryItemResponse: Equatable {
+        public init() {}
+    }
+    public struct IngestMemoryRequest: Equatable {
+        public init() {}
+    }
+    public struct IngestMemoryResponse: Equatable {
+        public init() {}
+    }
+    public struct ListMemoryItemsRequest: Equatable {
+        public init() {}
+    }
+    public struct ListMemoryItemsResponse: Equatable {
+        public init() {}
+    }
+    public struct MemoryItem: Equatable {
+        public init() {}
+    }
+    public struct MemoryScoreBreakdown: Equatable {
+        public init() {}
+    }
+    public struct MemorySearchHit: Equatable {
+        public init() {}
+    }
+    public struct PurgeMemoryRequest: Equatable {
+        public init() {}
+    }
+    public struct PurgeMemoryResponse: Equatable {
+        public init() {}
+    }
+    public struct SearchMemoryRequest: Equatable {
+        public init() {}
+    }
+    public struct SearchMemoryResponse: Equatable {
+        public init() {}
+    }
+    public protocol MemoryServiceClient {
+        func deleteMemoryItem()
+        func getMemoryItem()
+        func ingestMemory()
+        func listMemoryItems()
+        func purgeMemory()
+        func searchMemory()
+    }
+}
+
 public enum PalyraNodeV1 {
     public struct BeginPairingSessionRequest: Equatable {
         public init() {}

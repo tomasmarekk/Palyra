@@ -182,6 +182,47 @@ pub mod palyra_gateway_v1 {
     }
 }
 
+pub mod palyra_memory_v1 {
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct DeleteMemoryItemRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct DeleteMemoryItemResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct GetMemoryItemRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct GetMemoryItemResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct IngestMemoryRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct IngestMemoryResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ListMemoryItemsRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ListMemoryItemsResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct MemoryItem;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct MemoryScoreBreakdown;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct MemorySearchHit;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct PurgeMemoryRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct PurgeMemoryResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct SearchMemoryRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct SearchMemoryResponse;
+    pub trait MemoryServiceClient {
+        fn DeleteMemoryItem(&self);
+        fn GetMemoryItem(&self);
+        fn IngestMemory(&self);
+        fn ListMemoryItems(&self);
+        fn PurgeMemory(&self);
+        fn SearchMemory(&self);
+    }
+}
+
 pub mod palyra_node_v1 {
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct BeginPairingSessionRequest;

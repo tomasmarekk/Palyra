@@ -110,6 +110,32 @@ object PalyraGatewayV1 {
     }
 }
 
+object PalyraMemoryV1 {
+    data class DeleteMemoryItemRequest(val placeholder: Int = 0)
+    data class DeleteMemoryItemResponse(val placeholder: Int = 0)
+    data class GetMemoryItemRequest(val placeholder: Int = 0)
+    data class GetMemoryItemResponse(val placeholder: Int = 0)
+    data class IngestMemoryRequest(val placeholder: Int = 0)
+    data class IngestMemoryResponse(val placeholder: Int = 0)
+    data class ListMemoryItemsRequest(val placeholder: Int = 0)
+    data class ListMemoryItemsResponse(val placeholder: Int = 0)
+    data class MemoryItem(val placeholder: Int = 0)
+    data class MemoryScoreBreakdown(val placeholder: Int = 0)
+    data class MemorySearchHit(val placeholder: Int = 0)
+    data class PurgeMemoryRequest(val placeholder: Int = 0)
+    data class PurgeMemoryResponse(val placeholder: Int = 0)
+    data class SearchMemoryRequest(val placeholder: Int = 0)
+    data class SearchMemoryResponse(val placeholder: Int = 0)
+    interface MemoryServiceClient {
+        fun deleteMemoryItem()
+        fun getMemoryItem()
+        fun ingestMemory()
+        fun listMemoryItems()
+        fun purgeMemory()
+        fun searchMemory()
+    }
+}
+
 object PalyraNodeV1 {
     data class BeginPairingSessionRequest(val placeholder: Int = 0)
     data class BeginPairingSessionResponse(val placeholder: Int = 0)

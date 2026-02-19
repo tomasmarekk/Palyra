@@ -90,6 +90,17 @@ when {
     context.action == "cron.logs" ||
     context.action == "cron.run"
 };
+
+@id("allow_memory_actions")
+permit(principal, action, resource)
+when {
+    context.action == "memory.ingest" ||
+    context.action == "memory.search" ||
+    context.action == "memory.get" ||
+    context.action == "memory.list" ||
+    context.action == "memory.delete" ||
+    context.action == "memory.purge"
+};
 "#;
 
 const POLICY_DENY_REASON: &str = "tool execution denied by default: tool is not allowlisted";
@@ -227,6 +238,12 @@ fn decision_reason(
     if decision == Decision::Allow {
         if normalized_action == "tool.execute" {
             return "tool execution allowed by Cedar policy (allowlisted tool)".to_owned();
+        }
+        if normalized_action.starts_with("cron.") {
+            return "cron action allowed by Cedar policy".to_owned();
+        }
+        if normalized_action.starts_with("memory.") {
+            return "memory action allowed by Cedar policy".to_owned();
         }
         return "read-only action allowed by Cedar baseline policy".to_owned();
     }
@@ -394,6 +411,24 @@ mod tests {
 
         assert_eq!(evaluation.decision, PolicyDecision::Allow);
         assert!(!evaluation.explanation.matched_policy_ids.is_empty());
+    }
+
+    #[test]
+    fn memory_actions_are_explicitly_allowed() {
+        let request = PolicyRequest {
+            principal: "user:ops".to_owned(),
+            action: "memory.search".to_owned(),
+            resource: "memory:session".to_owned(),
+        };
+
+        let evaluation =
+            evaluate_with_config(&request, &PolicyEvaluationConfig::default()).expect("evaluation");
+
+        assert_eq!(evaluation.decision, PolicyDecision::Allow);
+        assert!(
+            evaluation.explanation.reason.contains("memory action allowed"),
+            "memory allow reason should reflect dedicated memory policy"
+        );
     }
 
     #[test]

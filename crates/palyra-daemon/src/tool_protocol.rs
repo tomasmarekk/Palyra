@@ -216,6 +216,9 @@ pub fn tool_metadata(tool_name: &str) -> Option<ToolMetadata> {
         "palyra.sleep" => {
             Some(ToolMetadata { capabilities: EMPTY_TOOL_CAPABILITIES, default_sensitive: false })
         }
+        "palyra.memory.search" => {
+            Some(ToolMetadata { capabilities: EMPTY_TOOL_CAPABILITIES, default_sensitive: false })
+        }
         "palyra.process.run" => Some(ToolMetadata {
             capabilities: PROCESS_RUNNER_CAPABILITIES,
             default_sensitive: true,
@@ -405,12 +408,21 @@ async fn run_allowlisted_tool(
 }
 
 fn is_runtime_supported_tool(tool_name: &str) -> bool {
-    matches!(tool_name, "palyra.echo" | "palyra.sleep" | "palyra.process.run" | "palyra.plugin.run")
+    matches!(
+        tool_name,
+        "palyra.echo"
+            | "palyra.sleep"
+            | "palyra.memory.search"
+            | "palyra.process.run"
+            | "palyra.plugin.run"
+    )
 }
 
 fn tool_executor_name(tool_name: &str) -> &'static str {
     if tool_name == "palyra.process.run" {
         "sandbox_tier_b"
+    } else if tool_name == "palyra.memory.search" {
+        "gateway_runtime"
     } else if tool_name == "palyra.plugin.run" {
         "sandbox_tier_a"
     } else {
@@ -663,6 +675,26 @@ mod tests {
     }
 
     #[test]
+    fn decide_tool_call_allows_memory_search_when_allowlisted() {
+        let config = ToolCallConfig {
+            allowed_tools: vec!["palyra.memory.search".to_owned()],
+            max_calls_per_run: 1,
+            execution_timeout_ms: 250,
+            process_runner: default_process_runner_policy(),
+            wasm_runtime: default_wasm_runtime_policy(),
+        };
+        let mut budget = 1;
+        let decision =
+            decide_tool_call(&config, &mut budget, "user:ops", "palyra.memory.search", false);
+        assert!(decision.allowed, "allowlisted memory search tool should be executable");
+        assert!(
+            !decision.approval_required,
+            "memory search should not require interactive approval"
+        );
+        assert_eq!(budget, 0, "allowed tool should consume budget");
+    }
+
+    #[test]
     fn decide_tool_call_denies_allowlisted_unsupported_runtime_tool() {
         let config = ToolCallConfig {
             allowed_tools: vec!["custom.noop".to_owned()],
@@ -733,6 +765,7 @@ mod tests {
     fn tool_requires_approval_flags_sensitive_capabilities() {
         assert!(!tool_requires_approval("palyra.echo"));
         assert!(!tool_requires_approval("palyra.sleep"));
+        assert!(!tool_requires_approval("palyra.memory.search"));
         assert!(tool_requires_approval("palyra.process.run"));
         assert!(tool_requires_approval("palyra.plugin.run"));
         assert!(

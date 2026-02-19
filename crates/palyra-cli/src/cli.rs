@@ -38,6 +38,10 @@ pub enum Command {
         #[command(subcommand)]
         command: CronCommand,
     },
+    Memory {
+        #[command(subcommand)]
+        command: MemoryCommand,
+    },
     Approvals {
         #[command(subcommand)]
         command: ApprovalsCommand,
@@ -294,6 +298,58 @@ pub enum CronCommand {
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum MemoryCommand {
+    Search {
+        query: String,
+        #[arg(long, value_enum, default_value_t = MemoryScopeArg::Principal)]
+        scope: MemoryScopeArg,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long)]
+        top_k: Option<u32>,
+        #[arg(long)]
+        min_score: Option<String>,
+        #[arg(long)]
+        tag: Vec<String>,
+        #[arg(long, value_enum)]
+        source: Vec<MemorySourceArg>,
+        #[arg(long, default_value_t = false)]
+        include_score_breakdown: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Purge {
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long, default_value_t = false)]
+        principal: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Ingest {
+        content: String,
+        #[arg(long, value_enum, default_value_t = MemorySourceArg::Manual)]
+        source: MemorySourceArg,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long)]
+        tag: Vec<String>,
+        #[arg(long)]
+        confidence: Option<String>,
+        #[arg(long)]
+        ttl_unix_ms: Option<i64>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum ApprovalsCommand {
     List {
         #[arg(long)]
@@ -368,6 +424,22 @@ pub enum CronConcurrencyPolicyArg {
 pub enum CronMisfirePolicyArg {
     Skip,
     CatchUp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum MemoryScopeArg {
+    Session,
+    Channel,
+    Principal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum MemorySourceArg {
+    TapeUserMessage,
+    TapeToolResult,
+    Summary,
+    Manual,
+    Import,
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
@@ -638,7 +710,8 @@ mod tests {
         AgentCommand, ApprovalDecisionArg, ApprovalExportFormatArg, ApprovalsCommand,
         BrowserCommand, ChannelsCommand, Cli, Command, CompletionShell, ConfigCommand, CronCommand,
         CronConcurrencyPolicyArg, CronMisfirePolicyArg, CronScheduleTypeArg, DaemonCommand,
-        OnboardingCommand, PolicyCommand, ProtocolCommand,
+        MemoryCommand, MemoryScopeArg, MemorySourceArg, OnboardingCommand, PolicyCommand,
+        ProtocolCommand,
     };
     #[cfg(not(windows))]
     use super::{PairingClientKindArg, PairingCommand, PairingMethodArg};
@@ -1002,6 +1075,101 @@ mod tests {
                 command: CronCommand::Delete {
                     id: "01ARZ3NDEKTSV4RRFFQ69G5FB0".to_owned(),
                     json: true,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn parse_memory_search() {
+        let parsed = Cli::parse_from([
+            "palyra",
+            "memory",
+            "search",
+            "release notes",
+            "--scope",
+            "channel",
+            "--top-k",
+            "8",
+            "--min-score",
+            "0.25",
+            "--tag",
+            "release",
+            "--source",
+            "summary",
+            "--include-score-breakdown",
+            "--json",
+        ]);
+        assert_eq!(
+            parsed.command,
+            Command::Memory {
+                command: MemoryCommand::Search {
+                    query: "release notes".to_owned(),
+                    scope: MemoryScopeArg::Channel,
+                    session: None,
+                    channel: None,
+                    top_k: Some(8),
+                    min_score: Some("0.25".to_owned()),
+                    tag: vec!["release".to_owned()],
+                    source: vec![MemorySourceArg::Summary],
+                    include_score_breakdown: true,
+                    json: true,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn parse_memory_purge() {
+        let parsed = Cli::parse_from([
+            "palyra",
+            "memory",
+            "purge",
+            "--session",
+            "01ARZ3NDEKTSV4RRFFQ69G5FB0",
+            "--json",
+        ]);
+        assert_eq!(
+            parsed.command,
+            Command::Memory {
+                command: MemoryCommand::Purge {
+                    session: Some("01ARZ3NDEKTSV4RRFFQ69G5FB0".to_owned()),
+                    channel: None,
+                    principal: false,
+                    json: true,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn parse_memory_ingest() {
+        let parsed = Cli::parse_from([
+            "palyra",
+            "memory",
+            "ingest",
+            "important finding",
+            "--source",
+            "manual",
+            "--tag",
+            "ops",
+            "--confidence",
+            "0.9",
+            "--ttl-unix-ms",
+            "1730000000000",
+        ]);
+        assert_eq!(
+            parsed.command,
+            Command::Memory {
+                command: MemoryCommand::Ingest {
+                    content: "important finding".to_owned(),
+                    source: MemorySourceArg::Manual,
+                    session: None,
+                    channel: None,
+                    tag: vec!["ops".to_owned()],
+                    confidence: Some("0.9".to_owned()),
+                    ttl_unix_ms: Some(1_730_000_000_000),
+                    json: false,
                 }
             }
         );

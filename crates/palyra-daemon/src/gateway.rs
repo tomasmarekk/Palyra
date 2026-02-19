@@ -1,8 +1,9 @@
 use std::{
+    collections::HashMap,
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex, RwLock,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -29,10 +30,11 @@ use crate::{
         CronJobCreateRequest, CronJobRecord, CronJobUpdatePatch, CronJobsListFilter,
         CronRunFinalizeRequest, CronRunRecord, CronRunStartRequest, CronRunStatus,
         CronRunsListFilter, JournalAppendRequest, JournalError, JournalEventRecord, JournalStore,
-        OrchestratorCancelRequest, OrchestratorRunStartRequest, OrchestratorRunStatusSnapshot,
-        OrchestratorSessionRecord, OrchestratorSessionResolveOutcome,
-        OrchestratorSessionResolveRequest, OrchestratorTapeAppendRequest, OrchestratorTapeRecord,
-        OrchestratorUsageDelta,
+        MemoryItemCreateRequest, MemoryItemRecord, MemoryItemsListFilter, MemoryPurgeRequest,
+        MemorySearchHit, MemorySearchRequest, MemorySource, OrchestratorCancelRequest,
+        OrchestratorRunStartRequest, OrchestratorRunStatusSnapshot, OrchestratorSessionRecord,
+        OrchestratorSessionResolveOutcome, OrchestratorSessionResolveRequest,
+        OrchestratorTapeAppendRequest, OrchestratorTapeRecord, OrchestratorUsageDelta,
     },
     model_provider::{
         ModelProvider, ProviderError, ProviderEvent, ProviderRequest, ProviderStatusSnapshot,
@@ -40,7 +42,8 @@ use crate::{
     orchestrator::{is_cancel_command, RunLifecycleState, RunStateMachine, RunTransition},
     tool_protocol::{
         decide_tool_call, denied_execution_outcome, execute_tool_call, tool_policy_snapshot,
-        tool_requires_approval, ToolCallConfig, ToolCallPolicySnapshot,
+        tool_requires_approval, ToolAttestation, ToolCallConfig, ToolCallPolicySnapshot,
+        ToolExecutionOutcome,
     },
 };
 
@@ -64,6 +67,12 @@ pub mod proto {
             }
         }
 
+        pub mod memory {
+            pub mod v1 {
+                tonic::include_proto!("palyra.memory.v1");
+            }
+        }
+
         pub mod node {
             pub mod v1 {
                 tonic::include_proto!("palyra.node.v1");
@@ -72,7 +81,10 @@ pub mod proto {
     }
 }
 
-use proto::palyra::{common::v1 as common_v1, cron::v1 as cron_v1, gateway::v1 as gateway_v1};
+use proto::palyra::{
+    common::v1 as common_v1, cron::v1 as cron_v1, gateway::v1 as gateway_v1,
+    memory::v1 as memory_v1,
+};
 
 pub const HEADER_PRINCIPAL: &str = "x-palyra-principal";
 pub const HEADER_DEVICE_ID: &str = "x-palyra-device-id";
@@ -96,6 +108,15 @@ const MAX_CRON_PAGE_LIMIT: usize = 500;
 const MAX_APPROVAL_PAGE_LIMIT: usize = 500;
 const MAX_APPROVAL_EXPORT_LIMIT: usize = 5_000;
 const MAX_APPROVAL_EXPORT_CHUNK_BYTES: usize = 64 * 1024;
+const MAX_MEMORY_PAGE_LIMIT: usize = 500;
+const MAX_MEMORY_SEARCH_TOP_K: usize = 64;
+const MAX_MEMORY_ITEM_BYTES: usize = 16 * 1024;
+const MAX_MEMORY_ITEM_TOKENS: usize = 2_048;
+const MAX_MEMORY_TOOL_QUERY_BYTES: usize = 4 * 1024;
+const MAX_MEMORY_TOOL_TAGS: usize = 32;
+const MEMORY_SEARCH_LATENCY_BUDGET_MS: u128 = 75;
+const MEMORY_SEARCH_CACHE_CAPACITY: usize = 128;
+const MEMORY_AUTO_INJECT_MIN_SCORE: f64 = 0.2;
 const APPROVAL_POLICY_ID: &str = "tool_call_policy.v1";
 const APPROVAL_PROMPT_TIMEOUT_SECONDS: u32 = 60;
 const APPROVAL_REQUEST_SUMMARY_MAX_BYTES: usize = 1024;
@@ -114,6 +135,27 @@ pub struct GatewayRuntimeConfigSnapshot {
     pub max_tape_entries_per_response: usize,
     pub max_tape_bytes_per_response: usize,
     pub tool_call: ToolCallConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MemoryRuntimeConfig {
+    pub max_item_bytes: usize,
+    pub max_item_tokens: usize,
+    pub auto_inject_enabled: bool,
+    pub auto_inject_max_items: usize,
+    pub default_ttl_ms: Option<i64>,
+}
+
+impl Default for MemoryRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            max_item_bytes: MAX_MEMORY_ITEM_BYTES,
+            max_item_tokens: MAX_MEMORY_ITEM_TOKENS,
+            auto_inject_enabled: false,
+            auto_inject_max_items: 3,
+            default_ttl_ms: Some(30 * 24 * 60 * 60 * 1_000),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -163,6 +205,8 @@ pub struct GatewayRuntimeState {
     journal_store: JournalStore,
     revoked_certificate_count: usize,
     model_provider: Arc<dyn ModelProvider>,
+    memory_config: RwLock<MemoryRuntimeConfig>,
+    memory_search_cache: Mutex<HashMap<String, Vec<MemorySearchHit>>>,
 }
 
 #[derive(Debug)]
@@ -198,6 +242,11 @@ struct RuntimeCounters {
     cron_runs_completed: AtomicU64,
     cron_runs_failed: AtomicU64,
     cron_runs_skipped: AtomicU64,
+    memory_items_ingested: AtomicU64,
+    memory_items_rejected: AtomicU64,
+    memory_search_requests: AtomicU64,
+    memory_search_cache_hits: AtomicU64,
+    memory_auto_inject_events: AtomicU64,
     approvals_tool_requested: AtomicU64,
     approvals_tool_resolved_allow: AtomicU64,
     approvals_tool_resolved_deny: AtomicU64,
@@ -289,6 +338,11 @@ pub struct CountersSnapshot {
     pub cron_runs_completed: u64,
     pub cron_runs_failed: u64,
     pub cron_runs_skipped: u64,
+    pub memory_items_ingested: u64,
+    pub memory_items_rejected: u64,
+    pub memory_search_requests: u64,
+    pub memory_search_cache_hits: u64,
+    pub memory_auto_inject_events: u64,
     pub approvals_tool_requested: u64,
     pub approvals_tool_resolved_allow: u64,
     pub approvals_tool_resolved_deny: u64,
@@ -377,6 +431,11 @@ impl RuntimeCounters {
             cron_runs_completed: self.cron_runs_completed.load(Ordering::Relaxed),
             cron_runs_failed: self.cron_runs_failed.load(Ordering::Relaxed),
             cron_runs_skipped: self.cron_runs_skipped.load(Ordering::Relaxed),
+            memory_items_ingested: self.memory_items_ingested.load(Ordering::Relaxed),
+            memory_items_rejected: self.memory_items_rejected.load(Ordering::Relaxed),
+            memory_search_requests: self.memory_search_requests.load(Ordering::Relaxed),
+            memory_search_cache_hits: self.memory_search_cache_hits.load(Ordering::Relaxed),
+            memory_auto_inject_events: self.memory_auto_inject_events.load(Ordering::Relaxed),
             approvals_tool_requested: self.approvals_tool_requested.load(Ordering::Relaxed),
             approvals_tool_resolved_allow: self
                 .approvals_tool_resolved_allow
@@ -463,6 +522,11 @@ impl GatewayRuntimeState {
                 cron_runs_completed: AtomicU64::new(0),
                 cron_runs_failed: AtomicU64::new(0),
                 cron_runs_skipped: AtomicU64::new(0),
+                memory_items_ingested: AtomicU64::new(0),
+                memory_items_rejected: AtomicU64::new(0),
+                memory_search_requests: AtomicU64::new(0),
+                memory_search_cache_hits: AtomicU64::new(0),
+                memory_auto_inject_events: AtomicU64::new(0),
                 approvals_tool_requested: AtomicU64::new(0),
                 approvals_tool_resolved_allow: AtomicU64::new(0),
                 approvals_tool_resolved_deny: AtomicU64::new(0),
@@ -472,6 +536,8 @@ impl GatewayRuntimeState {
             journal_store,
             revoked_certificate_count,
             model_provider,
+            memory_config: RwLock::new(MemoryRuntimeConfig::default()),
+            memory_search_cache: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -1388,6 +1454,210 @@ impl GatewayRuntimeState {
         })
     }
 
+    pub fn configure_memory(&self, config: MemoryRuntimeConfig) {
+        if let Ok(mut guard) = self.memory_config.write() {
+            *guard = config;
+        }
+        self.clear_memory_search_cache();
+    }
+
+    #[must_use]
+    pub fn memory_config_snapshot(&self) -> MemoryRuntimeConfig {
+        self.memory_config
+            .read()
+            .map(|config| config.clone())
+            .unwrap_or_else(|_| MemoryRuntimeConfig::default())
+    }
+
+    pub fn clear_memory_search_cache(&self) {
+        if let Ok(mut cache) = self.memory_search_cache.lock() {
+            cache.clear();
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn ingest_memory_item(
+        self: &Arc<Self>,
+        mut request: MemoryItemCreateRequest,
+    ) -> Result<MemoryItemRecord, Status> {
+        let config = self.memory_config_snapshot();
+        let payload_bytes = request.content_text.len();
+        let token_count = request.content_text.split_whitespace().count();
+        if payload_bytes > config.max_item_bytes {
+            self.counters.memory_items_rejected.fetch_add(1, Ordering::Relaxed);
+            return Err(Status::invalid_argument(format!(
+                "memory content exceeds byte limit ({payload_bytes} > {})",
+                config.max_item_bytes
+            )));
+        }
+        if token_count > config.max_item_tokens {
+            self.counters.memory_items_rejected.fetch_add(1, Ordering::Relaxed);
+            return Err(Status::invalid_argument(format!(
+                "memory content exceeds token limit ({token_count} > {})",
+                config.max_item_tokens
+            )));
+        }
+        if request.ttl_unix_ms.is_none() {
+            if let Some(default_ttl_ms) = config.default_ttl_ms {
+                let now = current_unix_ms_status()?;
+                request.ttl_unix_ms = Some(now.saturating_add(default_ttl_ms));
+            }
+        }
+
+        let state = Arc::clone(self);
+        let created = tokio::task::spawn_blocking(move || {
+            state
+                .journal_store
+                .create_memory_item(&request)
+                .map_err(|error| map_memory_store_error("ingest memory item", error))
+        })
+        .await
+        .map_err(|_| Status::internal("memory ingest worker panicked"))??;
+        self.counters.memory_items_ingested.fetch_add(1, Ordering::Relaxed);
+        self.clear_memory_search_cache();
+        Ok(created)
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn memory_item(
+        self: &Arc<Self>,
+        memory_id: String,
+    ) -> Result<Option<MemoryItemRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state
+                .journal_store
+                .memory_item(memory_id.as_str())
+                .map_err(|error| map_memory_store_error("load memory item", error))
+        })
+        .await
+        .map_err(|_| Status::internal("memory read worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn delete_memory_item(
+        self: &Arc<Self>,
+        memory_id: String,
+        principal: String,
+    ) -> Result<bool, Status> {
+        let state = Arc::clone(self);
+        let deleted = tokio::task::spawn_blocking(move || {
+            state
+                .journal_store
+                .delete_memory_item(memory_id.as_str(), principal.as_str())
+                .map_err(|error| map_memory_store_error("delete memory item", error))
+        })
+        .await
+        .map_err(|_| Status::internal("memory delete worker panicked"))??;
+        if deleted {
+            self.clear_memory_search_cache();
+        }
+        Ok(deleted)
+    }
+
+    #[allow(clippy::result_large_err, clippy::too_many_arguments)]
+    pub async fn list_memory_items(
+        self: &Arc<Self>,
+        after_memory_id: Option<String>,
+        requested_limit: Option<usize>,
+        principal: String,
+        channel: Option<String>,
+        session_id: Option<String>,
+        tags: Vec<String>,
+        sources: Vec<MemorySource>,
+    ) -> Result<(Vec<MemoryItemRecord>, Option<String>), Status> {
+        let effective_limit = requested_limit.unwrap_or(100).clamp(1, MAX_MEMORY_PAGE_LIMIT);
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state
+                .journal_store
+                .list_memory_items(&MemoryItemsListFilter {
+                    after_memory_id,
+                    principal,
+                    channel,
+                    session_id,
+                    limit: effective_limit.saturating_add(1),
+                    tags,
+                    sources,
+                })
+                .map_err(|error| map_memory_store_error("list memory items", error))
+        })
+        .await
+        .map_err(|_| Status::internal("memory list worker panicked"))?
+        .map(|mut items| {
+            let has_more = items.len() > effective_limit;
+            if has_more {
+                items.truncate(effective_limit);
+            }
+            let next_after =
+                if has_more { items.last().map(|item| item.memory_id.clone()) } else { None };
+            (items, next_after)
+        })
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn purge_memory(
+        self: &Arc<Self>,
+        request: MemoryPurgeRequest,
+    ) -> Result<u64, Status> {
+        let state = Arc::clone(self);
+        let deleted = tokio::task::spawn_blocking(move || {
+            state
+                .journal_store
+                .purge_memory(&request)
+                .map_err(|error| map_memory_store_error("purge memory items", error))
+        })
+        .await
+        .map_err(|_| Status::internal("memory purge worker panicked"))??;
+        if deleted > 0 {
+            self.clear_memory_search_cache();
+        }
+        Ok(deleted)
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn search_memory(
+        self: &Arc<Self>,
+        request: MemorySearchRequest,
+    ) -> Result<Vec<MemorySearchHit>, Status> {
+        self.counters.memory_search_requests.fetch_add(1, Ordering::Relaxed);
+        let cache_key = memory_search_cache_key(&request);
+        if let Ok(cache) = self.memory_search_cache.lock() {
+            if let Some(cached) = cache.get(cache_key.as_str()) {
+                self.counters.memory_search_cache_hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(cached.clone());
+            }
+        }
+
+        let started_at = Instant::now();
+        let state = Arc::clone(self);
+        let results = tokio::task::spawn_blocking(move || {
+            state
+                .journal_store
+                .search_memory(&request)
+                .map_err(|error| map_memory_store_error("search memory items", error))
+        })
+        .await
+        .map_err(|_| Status::internal("memory search worker panicked"))??;
+        if started_at.elapsed().as_millis() > MEMORY_SEARCH_LATENCY_BUDGET_MS {
+            warn!(
+                elapsed_ms = started_at.elapsed().as_millis(),
+                budget_ms = MEMORY_SEARCH_LATENCY_BUDGET_MS,
+                "memory search exceeded latency budget"
+            );
+        }
+
+        if let Ok(mut cache) = self.memory_search_cache.lock() {
+            if cache.len() >= MEMORY_SEARCH_CACHE_CAPACITY {
+                if let Some(first_key) = cache.keys().next().cloned() {
+                    cache.remove(first_key.as_str());
+                }
+            }
+            cache.insert(cache_key, results.clone());
+        }
+        Ok(results)
+    }
+
     pub fn record_cron_trigger_fired(&self) {
         self.counters.cron_triggers_fired.fetch_add(1, Ordering::Relaxed);
     }
@@ -1462,6 +1732,37 @@ fn map_approval_store_error(operation: &str, error: JournalError) -> Status {
     }
 }
 
+fn map_memory_store_error(operation: &str, error: JournalError) -> Status {
+    match error {
+        JournalError::MemoryNotFound { memory_id } => {
+            Status::not_found(format!("memory item not found: {memory_id}"))
+        }
+        JournalError::DuplicateMemoryId { memory_id } => {
+            Status::already_exists(format!("memory item already exists: {memory_id}"))
+        }
+        JournalError::PayloadTooLarge { payload_kind, actual_bytes, max_bytes } => {
+            Status::invalid_argument(format!(
+                "{payload_kind} payload exceeds maximum size ({actual_bytes} > {max_bytes})"
+            ))
+        }
+        other => Status::internal(format!("{operation} failed: {other}")),
+    }
+}
+
+fn memory_search_cache_key(request: &MemorySearchRequest) -> String {
+    json!({
+        "principal": request.principal,
+        "channel": request.channel,
+        "session_id": request.session_id,
+        "query": request.query,
+        "top_k": request.top_k,
+        "min_score": request.min_score,
+        "tags": request.tags,
+        "sources": request.sources.iter().map(|source| source.as_str()).collect::<Vec<_>>(),
+    })
+    .to_string()
+}
+
 #[allow(clippy::result_large_err)]
 fn require_supported_version(v: u32) -> Result<(), Status> {
     if v != CANONICAL_PROTOCOL_MAJOR {
@@ -1481,6 +1782,25 @@ fn authorize_cron_action(principal: &str, action: &str, resource: &str) -> Resul
         &PolicyEvaluationConfig::default(),
     )
     .map_err(|error| Status::internal(format!("failed to evaluate cron policy: {error}")))?;
+    match evaluation.decision {
+        PolicyDecision::Allow => Ok(()),
+        PolicyDecision::DenyByDefault { reason } => Err(Status::permission_denied(format!(
+            "policy denied action '{action}' on '{resource}': {reason}"
+        ))),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn authorize_memory_action(principal: &str, action: &str, resource: &str) -> Result<(), Status> {
+    let evaluation = evaluate_with_config(
+        &PolicyRequest {
+            principal: principal.to_owned(),
+            action: action.to_owned(),
+            resource: resource.to_owned(),
+        },
+        &PolicyEvaluationConfig::default(),
+    )
+    .map_err(|error| Status::internal(format!("failed to evaluate memory policy: {error}")))?;
     match evaluation.decision {
         PolicyDecision::Allow => Ok(()),
         PolicyDecision::DenyByDefault { reason } => Err(Status::permission_denied(format!(
@@ -1689,6 +2009,107 @@ fn cron_run_status_to_proto(status: CronRunStatus) -> i32 {
         CronRunStatus::Failed => cron_v1::JobRunStatus::Failed as i32,
         CronRunStatus::Skipped => cron_v1::JobRunStatus::Skipped as i32,
         CronRunStatus::Denied => cron_v1::JobRunStatus::Denied as i32,
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn resolve_memory_channel_scope(
+    context_channel: Option<&str>,
+    requested_channel: Option<String>,
+) -> Result<Option<String>, Status> {
+    let normalized_requested = requested_channel.and_then(non_empty);
+    if let (Some(context_channel), Some(requested_channel)) =
+        (context_channel, normalized_requested.as_deref())
+    {
+        if context_channel != requested_channel {
+            return Err(Status::permission_denied(
+                "memory scope channel must match authenticated channel context",
+            ));
+        }
+    }
+    Ok(normalized_requested.or_else(|| context_channel.map(str::to_owned)))
+}
+
+#[allow(clippy::result_large_err)]
+fn memory_source_from_proto(raw: i32) -> Result<MemorySource, Status> {
+    match memory_v1::MemorySource::try_from(raw).unwrap_or(memory_v1::MemorySource::Unspecified) {
+        memory_v1::MemorySource::TapeUserMessage => Ok(MemorySource::TapeUserMessage),
+        memory_v1::MemorySource::TapeToolResult => Ok(MemorySource::TapeToolResult),
+        memory_v1::MemorySource::Summary => Ok(MemorySource::Summary),
+        memory_v1::MemorySource::Manual => Ok(MemorySource::Manual),
+        memory_v1::MemorySource::Import => Ok(MemorySource::Import),
+        memory_v1::MemorySource::Unspecified => {
+            Err(Status::invalid_argument("memory source must be specified"))
+        }
+    }
+}
+
+fn memory_source_to_proto(source: MemorySource) -> i32 {
+    match source {
+        MemorySource::TapeUserMessage => memory_v1::MemorySource::TapeUserMessage as i32,
+        MemorySource::TapeToolResult => memory_v1::MemorySource::TapeToolResult as i32,
+        MemorySource::Summary => memory_v1::MemorySource::Summary as i32,
+        MemorySource::Manual => memory_v1::MemorySource::Manual as i32,
+        MemorySource::Import => memory_v1::MemorySource::Import as i32,
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn enforce_memory_item_scope(
+    item: &MemoryItemRecord,
+    principal: &str,
+    channel: Option<&str>,
+) -> Result<(), Status> {
+    if item.principal != principal {
+        return Err(Status::permission_denied("memory item principal does not match context"));
+    }
+    if let (Some(context_channel), Some(item_channel)) = (channel, item.channel.as_deref()) {
+        if context_channel != item_channel {
+            return Err(Status::permission_denied("memory item channel does not match context"));
+        }
+    }
+    Ok(())
+}
+
+fn memory_item_message(item: &MemoryItemRecord) -> memory_v1::MemoryItem {
+    memory_v1::MemoryItem {
+        v: CANONICAL_PROTOCOL_MAJOR,
+        memory_id: Some(common_v1::CanonicalId { ulid: item.memory_id.clone() }),
+        principal: item.principal.clone(),
+        channel: item.channel.clone().unwrap_or_default(),
+        session_id: item
+            .session_id
+            .as_ref()
+            .map(|value| common_v1::CanonicalId { ulid: value.clone() }),
+        source: memory_source_to_proto(item.source),
+        content_text: item.content_text.clone(),
+        content_hash: item.content_hash.clone(),
+        tags: item.tags.clone(),
+        confidence: item.confidence.unwrap_or_default(),
+        ttl_unix_ms: item.ttl_unix_ms.unwrap_or_default(),
+        created_at_unix_ms: item.created_at_unix_ms,
+        updated_at_unix_ms: item.updated_at_unix_ms,
+    }
+}
+
+fn memory_search_hit_message(
+    hit: &MemorySearchHit,
+    include_score_breakdown: bool,
+) -> memory_v1::MemorySearchHit {
+    memory_v1::MemorySearchHit {
+        item: Some(memory_item_message(&hit.item)),
+        snippet: hit.snippet.clone(),
+        score: hit.score,
+        breakdown: if include_score_breakdown {
+            Some(memory_v1::MemoryScoreBreakdown {
+                lexical_score: hit.breakdown.lexical_score,
+                vector_score: hit.breakdown.vector_score,
+                recency_score: hit.breakdown.recency_score,
+                final_score: hit.breakdown.final_score,
+            })
+        } else {
+            None
+        },
     }
 }
 
@@ -2087,6 +2508,32 @@ impl ApprovalsServiceImpl {
         authorize_metadata(metadata, &self.auth).map_err(|error| {
             self.state.record_denied();
             warn!(method, error = %error, "approvals rpc authorization denied");
+            Status::permission_denied(error.to_string())
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct MemoryServiceImpl {
+    state: Arc<GatewayRuntimeState>,
+    auth: GatewayAuthConfig,
+}
+
+impl MemoryServiceImpl {
+    #[must_use]
+    pub fn new(state: Arc<GatewayRuntimeState>, auth: GatewayAuthConfig) -> Self {
+        Self { state, auth }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn authorize_rpc(
+        &self,
+        metadata: &MetadataMap,
+        method: &'static str,
+    ) -> Result<RequestContext, Status> {
+        authorize_metadata(metadata, &self.auth).map_err(|error| {
+            self.state.record_denied();
+            warn!(method, error = %error, "memory rpc authorization denied");
             Status::permission_denied(error.to_string())
         })
     }
@@ -2535,6 +2982,64 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                         security.labels.iter().any(|label| label.eq_ignore_ascii_case("json_mode"))
                     })
                     .unwrap_or(false);
+                let session_id_for_message = if let Some(session_id) = active_session_id.as_deref()
+                {
+                    session_id.to_owned()
+                } else {
+                    let status = Status::internal(
+                        "run stream internal invariant violated: missing session_id for message",
+                    );
+                    finalize_run_failure(
+                        &sender,
+                        &state_for_stream,
+                        &mut run_state,
+                        active_run_id.as_deref(),
+                        &mut tape_seq,
+                        status.message(),
+                    )
+                    .await;
+                    let _ = sender.send(Err(status)).await;
+                    return;
+                };
+
+                ingest_memory_best_effort(
+                    &state_for_stream,
+                    context_for_stream.principal.as_str(),
+                    context_for_stream.channel.as_deref(),
+                    Some(session_id_for_message.as_str()),
+                    MemorySource::TapeUserMessage,
+                    input_text.as_str(),
+                    Vec::new(),
+                    Some(0.9),
+                    "run_stream_user_input",
+                )
+                .await;
+
+                let provider_input_text = match build_memory_augmented_prompt(
+                    &state_for_stream,
+                    &context_for_stream,
+                    run_id.as_str(),
+                    &mut tape_seq,
+                    session_id_for_message.as_str(),
+                    input_text.as_str(),
+                )
+                .await
+                {
+                    Ok(value) => value,
+                    Err(error) => {
+                        finalize_run_failure(
+                            &sender,
+                            &state_for_stream,
+                            &mut run_state,
+                            active_run_id.as_deref(),
+                            &mut tape_seq,
+                            error.message(),
+                        )
+                        .await;
+                        let _ = sender.send(Err(error)).await;
+                        return;
+                    }
+                };
 
                 if is_cancel_command(input_text.as_str()) {
                     if let Err(error) = state_for_stream
@@ -2686,7 +3191,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
 
                 let mut provider_future =
                     Box::pin(state_for_stream.execute_model_provider(ProviderRequest {
-                        input_text: input_text.clone(),
+                        input_text: provider_input_text,
                         json_mode: json_mode_requested,
                         vision_requested,
                     }));
@@ -2804,6 +3309,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     return;
                 }
 
+                let mut summary_tokens = Vec::new();
                 for provider_event in provider_response.events {
                     match state_for_stream.is_orchestrator_cancel_requested(run_id.clone()).await {
                         Ok(true) => {
@@ -2873,6 +3379,9 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
 
                     match provider_event {
                         ProviderEvent::ModelToken { token, is_final } => {
+                            if !token.trim().is_empty() {
+                                summary_tokens.push(token.clone());
+                            }
                             if let Err(error) = send_model_token_with_tape(
                                 &sender,
                                 &state_for_stream,
@@ -3275,13 +3784,25 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                                     .tool_execution_attempts
                                     .fetch_add(1, Ordering::Relaxed);
                                 let started_at = Instant::now();
-                                let outcome = execute_tool_call(
-                                    &state_for_stream.config.tool_call,
-                                    proposal_id.as_str(),
-                                    tool_name.as_str(),
-                                    input_json.as_slice(),
-                                )
-                                .await;
+                                let outcome = if tool_name == "palyra.memory.search" {
+                                    execute_memory_search_tool(
+                                        &state_for_stream,
+                                        context_for_stream.principal.as_str(),
+                                        context_for_stream.channel.as_deref(),
+                                        session_id,
+                                        proposal_id.as_str(),
+                                        input_json.as_slice(),
+                                    )
+                                    .await
+                                } else {
+                                    execute_tool_call(
+                                        &state_for_stream.config.tool_call,
+                                        proposal_id.as_str(),
+                                        tool_name.as_str(),
+                                        input_json.as_slice(),
+                                    )
+                                    .await
+                                };
                                 if started_at.elapsed().as_millis()
                                     > TOOL_EXECUTION_LATENCY_BUDGET_MS
                                 {
@@ -3371,6 +3892,27 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                                 .counters
                                 .tool_attestations_emitted
                                 .fetch_add(1, Ordering::Relaxed);
+
+                            if decision.allowed || execution_outcome.success {
+                                let tool_memory_text = build_tool_result_memory_text(
+                                    tool_name.as_str(),
+                                    execution_outcome.success,
+                                    execution_outcome.output_json.as_slice(),
+                                    execution_outcome.error.as_str(),
+                                );
+                                ingest_memory_best_effort(
+                                    &state_for_stream,
+                                    context_for_stream.principal.as_str(),
+                                    context_for_stream.channel.as_deref(),
+                                    Some(session_id),
+                                    MemorySource::TapeToolResult,
+                                    tool_memory_text.as_str(),
+                                    vec![format!("tool:{tool_name}")],
+                                    Some(if execution_outcome.success { 0.85 } else { 0.55 }),
+                                    "run_stream_tool_result",
+                                )
+                                .await;
+                            }
                         }
                     }
                 }
@@ -3396,6 +3938,22 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                         let _ = sender.send(Err(error)).await;
                         return;
                     }
+                }
+
+                if !summary_tokens.is_empty() {
+                    let summary_text = summary_tokens.join(" ");
+                    ingest_memory_best_effort(
+                        &state_for_stream,
+                        context_for_stream.principal.as_str(),
+                        context_for_stream.channel.as_deref(),
+                        Some(session_id_for_message.as_str()),
+                        MemorySource::Summary,
+                        summary_text.as_str(),
+                        vec!["summary:model_output".to_owned()],
+                        Some(0.75),
+                        "run_stream_model_summary",
+                    )
+                    .await;
                 }
             }
 
@@ -4068,6 +4626,688 @@ impl gateway_v1::approvals_service_server::ApprovalsService for ApprovalsService
         });
 
         Ok(Response::new(ReceiverStream::new(receiver)))
+    }
+}
+
+#[tonic::async_trait]
+impl memory_v1::memory_service_server::MemoryService for MemoryServiceImpl {
+    async fn ingest_memory(
+        &self,
+        request: Request<memory_v1::IngestMemoryRequest>,
+    ) -> Result<Response<memory_v1::IngestMemoryResponse>, Status> {
+        let context = self.authorize_rpc(request.metadata(), "IngestMemory")?;
+        let payload = request.into_inner();
+        require_supported_version(payload.v)?;
+        authorize_memory_action(context.principal.as_str(), "memory.ingest", "memory:item")?;
+
+        let source = memory_source_from_proto(payload.source)?;
+        let channel =
+            resolve_memory_channel_scope(context.channel.as_deref(), non_empty(payload.channel))?;
+        let session_id = optional_canonical_id(payload.session_id, "session_id")?;
+        let confidence = if payload.confidence == 0.0 {
+            None
+        } else if payload.confidence.is_finite() && (0.0..=1.0).contains(&payload.confidence) {
+            Some(payload.confidence)
+        } else {
+            return Err(Status::invalid_argument(
+                "memory confidence must be a finite value in range 0.0..=1.0",
+            ));
+        };
+        let ttl_unix_ms = if payload.ttl_unix_ms > 0 { Some(payload.ttl_unix_ms) } else { None };
+
+        let created = self
+            .state
+            .ingest_memory_item(MemoryItemCreateRequest {
+                memory_id: Ulid::new().to_string(),
+                principal: context.principal,
+                channel,
+                session_id,
+                source,
+                content_text: payload.content_text,
+                tags: payload.tags,
+                confidence,
+                ttl_unix_ms,
+            })
+            .await?;
+        Ok(Response::new(memory_v1::IngestMemoryResponse {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            item: Some(memory_item_message(&created)),
+        }))
+    }
+
+    async fn search_memory(
+        &self,
+        request: Request<memory_v1::SearchMemoryRequest>,
+    ) -> Result<Response<memory_v1::SearchMemoryResponse>, Status> {
+        let context = self.authorize_rpc(request.metadata(), "SearchMemory")?;
+        let payload = request.into_inner();
+        require_supported_version(payload.v)?;
+
+        let channel =
+            resolve_memory_channel_scope(context.channel.as_deref(), non_empty(payload.channel))?;
+        let session_id = optional_canonical_id(payload.session_id, "session_id")?;
+        let resource = if let Some(session_id) = session_id.as_deref() {
+            format!("memory:session:{session_id}")
+        } else if let Some(channel) = channel.as_deref() {
+            format!("memory:channel:{channel}")
+        } else {
+            "memory:principal".to_owned()
+        };
+        authorize_memory_action(context.principal.as_str(), "memory.search", resource.as_str())?;
+
+        if !payload.min_score.is_finite() || payload.min_score < 0.0 || payload.min_score > 1.0 {
+            return Err(Status::invalid_argument(
+                "memory min_score must be a finite value in range 0.0..=1.0",
+            ));
+        }
+        let sources = payload
+            .sources
+            .into_iter()
+            .map(memory_source_from_proto)
+            .collect::<Result<Vec<_>, _>>()?;
+        let top_k = if payload.top_k == 0 {
+            None
+        } else {
+            Some((payload.top_k as usize).clamp(1, MAX_MEMORY_SEARCH_TOP_K))
+        };
+
+        let hits = self
+            .state
+            .search_memory(MemorySearchRequest {
+                principal: context.principal,
+                channel,
+                session_id,
+                query: payload.query,
+                top_k: top_k.unwrap_or(8),
+                min_score: payload.min_score,
+                tags: payload.tags,
+                sources,
+            })
+            .await?;
+        Ok(Response::new(memory_v1::SearchMemoryResponse {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            hits: hits
+                .iter()
+                .map(|hit| memory_search_hit_message(hit, payload.include_score_breakdown))
+                .collect(),
+        }))
+    }
+
+    async fn get_memory_item(
+        &self,
+        request: Request<memory_v1::GetMemoryItemRequest>,
+    ) -> Result<Response<memory_v1::GetMemoryItemResponse>, Status> {
+        let context = self.authorize_rpc(request.metadata(), "GetMemoryItem")?;
+        let payload = request.into_inner();
+        require_supported_version(payload.v)?;
+        let memory_id = canonical_id(payload.memory_id, "memory_id")?;
+        authorize_memory_action(
+            context.principal.as_str(),
+            "memory.get",
+            format!("memory:{memory_id}").as_str(),
+        )?;
+        let item = self
+            .state
+            .memory_item(memory_id.clone())
+            .await?
+            .ok_or_else(|| Status::not_found(format!("memory item not found: {memory_id}")))?;
+        enforce_memory_item_scope(&item, context.principal.as_str(), context.channel.as_deref())?;
+        Ok(Response::new(memory_v1::GetMemoryItemResponse {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            item: Some(memory_item_message(&item)),
+        }))
+    }
+
+    async fn delete_memory_item(
+        &self,
+        request: Request<memory_v1::DeleteMemoryItemRequest>,
+    ) -> Result<Response<memory_v1::DeleteMemoryItemResponse>, Status> {
+        let context = self.authorize_rpc(request.metadata(), "DeleteMemoryItem")?;
+        let payload = request.into_inner();
+        require_supported_version(payload.v)?;
+        let memory_id = canonical_id(payload.memory_id, "memory_id")?;
+        authorize_memory_action(
+            context.principal.as_str(),
+            "memory.delete",
+            format!("memory:{memory_id}").as_str(),
+        )?;
+        let deleted = self.state.delete_memory_item(memory_id, context.principal).await?;
+        Ok(Response::new(memory_v1::DeleteMemoryItemResponse {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            deleted,
+        }))
+    }
+
+    async fn list_memory_items(
+        &self,
+        request: Request<memory_v1::ListMemoryItemsRequest>,
+    ) -> Result<Response<memory_v1::ListMemoryItemsResponse>, Status> {
+        let context = self.authorize_rpc(request.metadata(), "ListMemoryItems")?;
+        let payload = request.into_inner();
+        require_supported_version(payload.v)?;
+        authorize_memory_action(context.principal.as_str(), "memory.list", "memory:items")?;
+        let after_memory_id = non_empty(payload.after_memory_ulid);
+        if let Some(after) = after_memory_id.as_deref() {
+            validate_canonical_id(after).map_err(|_| {
+                Status::invalid_argument("after_memory_ulid must be a canonical ULID")
+            })?;
+        }
+        let channel =
+            resolve_memory_channel_scope(context.channel.as_deref(), non_empty(payload.channel))?;
+        let session_id = optional_canonical_id(payload.session_id, "session_id")?;
+        let sources = payload
+            .sources
+            .into_iter()
+            .map(memory_source_from_proto)
+            .collect::<Result<Vec<_>, _>>()?;
+        let (items, next_after_memory_id) = self
+            .state
+            .list_memory_items(
+                after_memory_id,
+                if payload.limit == 0 { None } else { Some(payload.limit as usize) },
+                context.principal,
+                channel,
+                session_id,
+                payload.tags,
+                sources,
+            )
+            .await?;
+        Ok(Response::new(memory_v1::ListMemoryItemsResponse {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            items: items.iter().map(memory_item_message).collect(),
+            next_after_memory_ulid: next_after_memory_id.unwrap_or_default(),
+        }))
+    }
+
+    async fn purge_memory(
+        &self,
+        request: Request<memory_v1::PurgeMemoryRequest>,
+    ) -> Result<Response<memory_v1::PurgeMemoryResponse>, Status> {
+        let context = self.authorize_rpc(request.metadata(), "PurgeMemory")?;
+        let payload = request.into_inner();
+        require_supported_version(payload.v)?;
+        authorize_memory_action(context.principal.as_str(), "memory.purge", "memory:items")?;
+        let channel =
+            resolve_memory_channel_scope(context.channel.as_deref(), non_empty(payload.channel))?;
+        let session_id = optional_canonical_id(payload.session_id, "session_id")?;
+        if !payload.purge_all_principal && channel.is_none() && session_id.is_none() {
+            return Err(Status::invalid_argument(
+                "purge request requires purge_all_principal=true or a channel/session scope",
+            ));
+        }
+
+        let deleted_count = self
+            .state
+            .purge_memory(MemoryPurgeRequest {
+                principal: context.principal,
+                channel,
+                session_id,
+                purge_all_principal: payload.purge_all_principal,
+            })
+            .await?;
+        Ok(Response::new(memory_v1::PurgeMemoryResponse {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            deleted_count,
+        }))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn ingest_memory_best_effort(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    principal: &str,
+    channel: Option<&str>,
+    session_id: Option<&str>,
+    source: MemorySource,
+    content_text: &str,
+    tags: Vec<String>,
+    confidence: Option<f64>,
+    reason: &str,
+) {
+    if content_text.trim().is_empty() {
+        return;
+    }
+    if let Err(error) = runtime_state
+        .ingest_memory_item(MemoryItemCreateRequest {
+            memory_id: Ulid::new().to_string(),
+            principal: principal.to_owned(),
+            channel: channel.map(str::to_owned),
+            session_id: session_id.map(str::to_owned),
+            source,
+            content_text: content_text.to_owned(),
+            tags,
+            confidence,
+            ttl_unix_ms: None,
+        })
+        .await
+    {
+        warn!(
+            reason,
+            status_code = ?error.code(),
+            status_message = %error.message(),
+            "memory ingest best-effort path rejected candidate"
+        );
+    }
+}
+
+#[allow(clippy::result_large_err)]
+async fn build_memory_augmented_prompt(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: &RequestContext,
+    run_id: &str,
+    tape_seq: &mut i64,
+    session_id: &str,
+    input_text: &str,
+) -> Result<String, Status> {
+    let trimmed_input = input_text.trim();
+    if trimmed_input.is_empty() {
+        return Ok(input_text.to_owned());
+    }
+    let memory_config = runtime_state.memory_config_snapshot();
+    if !memory_config.auto_inject_enabled || memory_config.auto_inject_max_items == 0 {
+        return Ok(input_text.to_owned());
+    }
+    let resource = format!("memory:session:{session_id}");
+    if let Err(error) =
+        authorize_memory_action(context.principal.as_str(), "memory.search", resource.as_str())
+    {
+        warn!(
+            run_id,
+            principal = %context.principal,
+            session_id,
+            status_message = %error.message(),
+            "memory auto-inject skipped because policy denied access"
+        );
+        return Ok(input_text.to_owned());
+    }
+
+    let search_hits = match runtime_state
+        .search_memory(MemorySearchRequest {
+            principal: context.principal.clone(),
+            channel: context.channel.clone(),
+            session_id: Some(session_id.to_owned()),
+            query: input_text.to_owned(),
+            top_k: memory_config.auto_inject_max_items,
+            min_score: MEMORY_AUTO_INJECT_MIN_SCORE,
+            tags: Vec::new(),
+            sources: Vec::new(),
+        })
+        .await
+    {
+        Ok(hits) => hits,
+        Err(error) => {
+            warn!(
+                run_id,
+                principal = %context.principal,
+                session_id,
+                status_code = ?error.code(),
+                status_message = %error.message(),
+                "memory auto-inject search failed"
+            );
+            return Ok(input_text.to_owned());
+        }
+    };
+    if search_hits.is_empty() {
+        return Ok(input_text.to_owned());
+    }
+
+    let selected_hits =
+        search_hits.into_iter().take(memory_config.auto_inject_max_items).collect::<Vec<_>>();
+    let mut context_lines = Vec::new();
+    for (index, hit) in selected_hits.iter().enumerate() {
+        let snippet = hit.snippet.replace(['\r', '\n'], " ").trim().to_owned();
+        context_lines.push(format!(
+            "{}. id={} source={} score={:.4} created_at_unix_ms={} snippet={}",
+            index + 1,
+            hit.item.memory_id,
+            hit.item.source.as_str(),
+            hit.score,
+            hit.item.created_at_unix_ms,
+            truncate_with_ellipsis(snippet, 256),
+        ));
+    }
+
+    runtime_state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: *tape_seq,
+            event_type: "memory_auto_inject".to_owned(),
+            payload_json: memory_auto_inject_tape_payload(input_text, selected_hits.as_slice()),
+        })
+        .await?;
+    *tape_seq = tape_seq.saturating_add(1);
+    runtime_state.counters.memory_auto_inject_events.fetch_add(1, Ordering::Relaxed);
+
+    let mut block = String::from("<memory_context>\n");
+    block.push_str(context_lines.join("\n").as_str());
+    block.push_str("\n</memory_context>");
+    Ok(format!("{block}\n\n{input_text}"))
+}
+
+fn memory_auto_inject_tape_payload(query: &str, hits: &[MemorySearchHit]) -> String {
+    json!({
+        "query": truncate_with_ellipsis(query.to_owned(), 512),
+        "injected_count": hits.len(),
+        "hits": hits.iter().map(|hit| {
+            json!({
+                "memory_id": hit.item.memory_id,
+                "source": hit.item.source.as_str(),
+                "score": hit.score,
+                "created_at_unix_ms": hit.item.created_at_unix_ms,
+                "snippet": truncate_with_ellipsis(hit.snippet.clone(), 256),
+            })
+        }).collect::<Vec<_>>(),
+    })
+    .to_string()
+}
+
+fn build_tool_result_memory_text(
+    tool_name: &str,
+    success: bool,
+    output_json: &[u8],
+    error: &str,
+) -> String {
+    let output_preview = truncate_with_ellipsis(
+        String::from_utf8_lossy(output_json).replace(['\r', '\n'], " "),
+        512,
+    );
+    let error_preview = truncate_with_ellipsis(error.replace(['\r', '\n'], " "), 256);
+    if success {
+        format!("tool={tool_name} success=true output={output_preview}")
+    } else {
+        format!("tool={tool_name} success=false output={} error={error_preview}", output_preview)
+    }
+}
+
+async fn execute_memory_search_tool(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    principal: &str,
+    channel: Option<&str>,
+    session_id: &str,
+    proposal_id: &str,
+    input_json: &[u8],
+) -> ToolExecutionOutcome {
+    let parsed = match serde_json::from_slice::<Value>(input_json) {
+        Ok(Value::Object(map)) => map,
+        Ok(_) => {
+            return memory_tool_execution_outcome(
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                "palyra.memory.search requires JSON object input".to_owned(),
+            );
+        }
+        Err(error) => {
+            return memory_tool_execution_outcome(
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                format!("palyra.memory.search invalid JSON input: {error}"),
+            );
+        }
+    };
+
+    let query = match parsed.get("query").and_then(Value::as_str).map(str::trim) {
+        Some(value) if !value.is_empty() => value.to_owned(),
+        _ => {
+            return memory_tool_execution_outcome(
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                "palyra.memory.search requires non-empty string field 'query'".to_owned(),
+            );
+        }
+    };
+    if query.len() > MAX_MEMORY_TOOL_QUERY_BYTES {
+        return memory_tool_execution_outcome(
+            proposal_id,
+            input_json,
+            false,
+            b"{}".to_vec(),
+            format!("palyra.memory.search query exceeds {MAX_MEMORY_TOOL_QUERY_BYTES} bytes"),
+        );
+    }
+
+    let scope = parsed.get("scope").and_then(Value::as_str).unwrap_or("session");
+    let (channel_scope, session_scope, resource) = match scope {
+        "principal" => (None, None, "memory:principal".to_owned()),
+        "channel" => {
+            let channel = channel.map(str::to_owned);
+            let resource = channel
+                .as_deref()
+                .map(|value| format!("memory:channel:{value}"))
+                .unwrap_or_else(|| "memory:channel:unknown".to_owned());
+            (channel, None, resource)
+        }
+        "session" => {
+            let channel = channel.map(str::to_owned);
+            let session = Some(session_id.to_owned());
+            (channel, session, format!("memory:session:{session_id}"))
+        }
+        _ => {
+            return memory_tool_execution_outcome(
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                "palyra.memory.search scope must be one of: session|channel|principal".to_owned(),
+            );
+        }
+    };
+
+    if let Err(error) = authorize_memory_action(principal, "memory.search", resource.as_str()) {
+        return memory_tool_execution_outcome(
+            proposal_id,
+            input_json,
+            false,
+            b"{}".to_vec(),
+            format!("memory policy denied tool search request: {}", error.message()),
+        );
+    }
+
+    let min_score = parsed.get("min_score").and_then(Value::as_f64).unwrap_or(0.0);
+    if !min_score.is_finite() || !(0.0..=1.0).contains(&min_score) {
+        return memory_tool_execution_outcome(
+            proposal_id,
+            input_json,
+            false,
+            b"{}".to_vec(),
+            "palyra.memory.search min_score must be in range 0.0..=1.0".to_owned(),
+        );
+    }
+    let top_k = parsed
+        .get("top_k")
+        .and_then(Value::as_u64)
+        .map(|value| (value as usize).clamp(1, MAX_MEMORY_SEARCH_TOP_K))
+        .unwrap_or(8);
+    let tags = match parsed.get("tags") {
+        Some(Value::Array(values)) => {
+            if values.len() > MAX_MEMORY_TOOL_TAGS {
+                return memory_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    format!("palyra.memory.search tags exceeds limit ({})", MAX_MEMORY_TOOL_TAGS),
+                );
+            }
+            let mut parsed_tags = Vec::new();
+            for value in values {
+                let Some(tag) = value.as_str() else {
+                    return memory_tool_execution_outcome(
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        "palyra.memory.search tags must be strings".to_owned(),
+                    );
+                };
+                if !tag.trim().is_empty() {
+                    parsed_tags.push(tag.trim().to_owned());
+                }
+            }
+            parsed_tags
+        }
+        Some(_) => {
+            return memory_tool_execution_outcome(
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                "palyra.memory.search tags must be an array of strings".to_owned(),
+            );
+        }
+        None => Vec::new(),
+    };
+    let sources = match parsed.get("sources") {
+        Some(Value::Array(values)) => {
+            let mut parsed_sources = Vec::new();
+            for value in values {
+                let Some(source) = value.as_str() else {
+                    return memory_tool_execution_outcome(
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        "palyra.memory.search sources must be an array of strings".to_owned(),
+                    );
+                };
+                let Some(memory_source) = parse_memory_source_literal(source) else {
+                    return memory_tool_execution_outcome(
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        format!("palyra.memory.search unknown source value: {source}"),
+                    );
+                };
+                parsed_sources.push(memory_source);
+            }
+            parsed_sources
+        }
+        Some(_) => {
+            return memory_tool_execution_outcome(
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                "palyra.memory.search sources must be an array of strings".to_owned(),
+            );
+        }
+        None => Vec::new(),
+    };
+
+    let search_hits = match runtime_state
+        .search_memory(MemorySearchRequest {
+            principal: principal.to_owned(),
+            channel: channel_scope,
+            session_id: session_scope,
+            query,
+            top_k,
+            min_score,
+            tags,
+            sources,
+        })
+        .await
+    {
+        Ok(hits) => hits,
+        Err(error) => {
+            return memory_tool_execution_outcome(
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                format!("palyra.memory.search failed: {}", error.message()),
+            );
+        }
+    };
+
+    let payload = json!({
+        "hits": search_hits.iter().map(|hit| {
+            json!({
+                "memory_id": hit.item.memory_id,
+                "source": hit.item.source.as_str(),
+                "snippet": hit.snippet,
+                "score": hit.score,
+                "created_at_unix_ms": hit.item.created_at_unix_ms,
+                "content_text": hit.item.content_text,
+                "content_hash": hit.item.content_hash,
+                "tags": hit.item.tags,
+                "confidence": hit.item.confidence,
+                "breakdown": {
+                    "lexical_score": hit.breakdown.lexical_score,
+                    "vector_score": hit.breakdown.vector_score,
+                    "recency_score": hit.breakdown.recency_score,
+                    "final_score": hit.breakdown.final_score,
+                }
+            })
+        }).collect::<Vec<_>>()
+    });
+    match serde_json::to_vec(&payload) {
+        Ok(output_json) => {
+            memory_tool_execution_outcome(proposal_id, input_json, true, output_json, String::new())
+        }
+        Err(error) => memory_tool_execution_outcome(
+            proposal_id,
+            input_json,
+            false,
+            b"{}".to_vec(),
+            format!("palyra.memory.search failed to serialize output: {error}"),
+        ),
+    }
+}
+
+fn parse_memory_source_literal(raw: &str) -> Option<MemorySource> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "tape:user_message" | "tape_user_message" | "user_message" => {
+            Some(MemorySource::TapeUserMessage)
+        }
+        "tape:tool_result" | "tape_tool_result" | "tool_result" => {
+            Some(MemorySource::TapeToolResult)
+        }
+        "summary" => Some(MemorySource::Summary),
+        "manual" => Some(MemorySource::Manual),
+        "import" => Some(MemorySource::Import),
+        _ => None,
+    }
+}
+
+fn memory_tool_execution_outcome(
+    proposal_id: &str,
+    input_json: &[u8],
+    success: bool,
+    output_json: Vec<u8>,
+    error: String,
+) -> ToolExecutionOutcome {
+    let executed_at_unix_ms = current_unix_ms();
+    let mut hasher = Sha256::new();
+    hasher.update(b"palyra.memory.search.attestation.v1");
+    hasher.update((proposal_id.len() as u64).to_be_bytes());
+    hasher.update(proposal_id.as_bytes());
+    hasher.update((input_json.len() as u64).to_be_bytes());
+    hasher.update(input_json);
+    hasher.update([u8::from(success)]);
+    hasher.update((output_json.len() as u64).to_be_bytes());
+    hasher.update(output_json.as_slice());
+    hasher.update((error.len() as u64).to_be_bytes());
+    hasher.update(error.as_bytes());
+    hasher.update(executed_at_unix_ms.to_be_bytes());
+    let execution_sha256 = format!("{:x}", hasher.finalize());
+
+    ToolExecutionOutcome {
+        success,
+        output_json,
+        error,
+        attestation: ToolAttestation {
+            attestation_id: Ulid::new().to_string(),
+            execution_sha256,
+            executed_at_unix_ms,
+            timed_out: false,
+            executor: "memory_runtime".to_owned(),
+        },
     }
 }
 
@@ -5249,6 +6489,7 @@ fn non_empty(input: String) -> Option<String> {
 mod tests {
     use std::{
         path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -5269,13 +6510,16 @@ mod tests {
         HEADER_CHANNEL, HEADER_DEVICE_ID, HEADER_PRINCIPAL, MAX_APPROVAL_PAGE_LIMIT,
     };
 
+    static TEMP_JOURNAL_COUNTER: AtomicU64 = AtomicU64::new(0);
+
     fn unique_temp_journal_path() -> PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time should be after unix epoch")
             .as_nanos();
+        let counter = TEMP_JOURNAL_COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir()
-            .join(format!("palyra-gateway-unit-{nonce}-{}.sqlite3", std::process::id()))
+            .join(format!("palyra-gateway-unit-{nonce}-{}-{counter}.sqlite3", std::process::id()))
     }
 
     fn build_test_runtime_state(hash_chain_enabled: bool) -> std::sync::Arc<GatewayRuntimeState> {

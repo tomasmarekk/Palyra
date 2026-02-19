@@ -20,6 +20,12 @@ pub mod proto {
                 tonic::include_proto!("palyra.cron.v1");
             }
         }
+
+        pub mod memory {
+            pub mod v1 {
+                tonic::include_proto!("palyra.memory.v1");
+            }
+        }
     }
 }
 
@@ -41,7 +47,8 @@ use cli::{
     AgentCommand, ApprovalDecisionArg, ApprovalExportFormatArg, ApprovalsCommand, BrowserCommand,
     ChannelsCommand, Cli, Command as CliCommand, CompletionShell, ConfigCommand, CronCommand,
     CronConcurrencyPolicyArg, CronMisfirePolicyArg, CronScheduleTypeArg, DaemonCommand,
-    OnboardingCommand, PolicyCommand, ProtocolCommand,
+    MemoryCommand, MemoryScopeArg, MemorySourceArg, OnboardingCommand, PolicyCommand,
+    ProtocolCommand,
 };
 #[cfg(not(windows))]
 use cli::{PairingClientKindArg, PairingCommand, PairingMethodArg};
@@ -78,6 +85,7 @@ use ulid::Ulid;
 
 use crate::proto::palyra::{
     common::v1 as common_v1, cron::v1 as cron_v1, gateway::v1 as gateway_v1,
+    memory::v1 as memory_v1,
 };
 
 const MAX_HEALTH_ATTEMPTS: usize = 3;
@@ -105,6 +113,7 @@ fn main() -> Result<()> {
         }
         CliCommand::Agent { command } => run_agent(command),
         CliCommand::Cron { command } => run_cron(command),
+        CliCommand::Memory { command } => run_memory(command),
         CliCommand::Approvals { command } => run_approvals(command),
         CliCommand::Channels { command } => run_channels(command),
         CliCommand::Browser { command } => run_browser(command),
@@ -425,6 +434,181 @@ fn run_cron(command: CronCommand) -> Result<()> {
     };
     let runtime = build_runtime()?;
     runtime.block_on(run_cron_async(command, connection))
+}
+
+fn run_memory(command: MemoryCommand) -> Result<()> {
+    let connection = AgentConnection {
+        grpc_url: resolve_grpc_url(None)?,
+        token: env::var("PALYRA_ADMIN_TOKEN").ok(),
+        principal: "user:local".to_owned(),
+        device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+        channel: DEFAULT_CHANNEL.to_owned(),
+    };
+    let runtime = build_runtime()?;
+    runtime.block_on(run_memory_async(command, connection))
+}
+
+async fn run_memory_async(command: MemoryCommand, connection: AgentConnection) -> Result<()> {
+    let mut client =
+        memory_v1::memory_service_client::MemoryServiceClient::connect(connection.grpc_url.clone())
+            .await
+            .with_context(|| {
+                format!("failed to connect gateway gRPC endpoint {}", connection.grpc_url)
+            })?;
+
+    match command {
+        MemoryCommand::Search {
+            query,
+            scope,
+            session,
+            channel,
+            top_k,
+            min_score,
+            tag,
+            source,
+            include_score_breakdown,
+            json,
+        } => {
+            if query.trim().is_empty() {
+                return Err(anyhow!("memory search query cannot be empty"));
+            }
+            let min_score =
+                parse_float_arg(min_score, "memory search --min-score", 0.0, 1.0, Some(0.0))?;
+            let (channel_scope, session_scope) =
+                resolve_memory_scope(scope, channel, session, &connection)?;
+            let mut request = Request::new(memory_v1::SearchMemoryRequest {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                query,
+                channel: channel_scope.unwrap_or_default(),
+                session_id: session_scope.map(|ulid| common_v1::CanonicalId { ulid }),
+                top_k: top_k.unwrap_or(5),
+                min_score,
+                tags: tag,
+                sources: source.into_iter().map(memory_source_to_proto).collect(),
+                include_score_breakdown,
+            });
+            inject_run_stream_metadata(request.metadata_mut(), &connection)?;
+            let response = client
+                .search_memory(request)
+                .await
+                .context("failed to call memory SearchMemory")?
+                .into_inner();
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "hits": response.hits.iter().map(memory_search_hit_to_json).collect::<Vec<_>>(),
+                    }))
+                    .context("failed to serialize JSON output")?
+                );
+            } else {
+                println!("memory.search hits={}", response.hits.len());
+                for hit in response.hits {
+                    let item = hit.item.as_ref();
+                    let id = item
+                        .and_then(|value| value.memory_id.as_ref())
+                        .map(|value| value.ulid.as_str())
+                        .unwrap_or("unknown");
+                    let source_label =
+                        item.map(|value| memory_source_to_text(value.source)).unwrap_or("unknown");
+                    let created_at = item.map(|value| value.created_at_unix_ms).unwrap_or_default();
+                    println!(
+                        "memory.hit id={} source={} score={:.4} created_at_ms={} snippet={}",
+                        id, source_label, hit.score, created_at, hit.snippet
+                    );
+                }
+            }
+        }
+        MemoryCommand::Purge { session, channel, principal, json } => {
+            if !principal && session.is_none() && channel.is_none() {
+                return Err(anyhow!(
+                    "memory purge requires one of: --principal, --session, or --channel"
+                ));
+            }
+            let session_id = if let Some(session) = session {
+                validate_canonical_id(session.as_str())
+                    .context("memory purge --session must be a canonical ULID")?;
+                Some(common_v1::CanonicalId { ulid: session })
+            } else {
+                None
+            };
+            let mut request = Request::new(memory_v1::PurgeMemoryRequest {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                channel: channel.unwrap_or_default(),
+                session_id,
+                purge_all_principal: principal,
+            });
+            inject_run_stream_metadata(request.metadata_mut(), &connection)?;
+            let response = client
+                .purge_memory(request)
+                .await
+                .context("failed to call memory PurgeMemory")?
+                .into_inner();
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &json!({ "deleted_count": response.deleted_count })
+                    )
+                    .context("failed to serialize JSON output")?
+                );
+            } else {
+                println!("memory.purge deleted_count={}", response.deleted_count);
+            }
+        }
+        MemoryCommand::Ingest {
+            content,
+            source,
+            session,
+            channel,
+            tag,
+            confidence,
+            ttl_unix_ms,
+            json,
+        } => {
+            if content.trim().is_empty() {
+                return Err(anyhow!("memory ingest content cannot be empty"));
+            }
+            let confidence =
+                parse_float_arg(confidence, "memory ingest --confidence", 0.0, 1.0, Some(1.0))?;
+            let session_id = if let Some(session) = session {
+                validate_canonical_id(session.as_str())
+                    .context("memory ingest --session must be a canonical ULID")?;
+                Some(common_v1::CanonicalId { ulid: session })
+            } else {
+                None
+            };
+            let mut request = Request::new(memory_v1::IngestMemoryRequest {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                source: memory_source_to_proto(source),
+                content_text: content,
+                channel: channel.unwrap_or(connection.channel.clone()),
+                session_id,
+                tags: tag,
+                confidence,
+                ttl_unix_ms: ttl_unix_ms.unwrap_or_default(),
+            });
+            inject_run_stream_metadata(request.metadata_mut(), &connection)?;
+            let response = client
+                .ingest_memory(request)
+                .await
+                .context("failed to call memory IngestMemory")?
+                .into_inner();
+            let item = response.item.context("memory IngestMemory returned empty item payload")?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&memory_item_to_json(&item))?);
+            } else {
+                println!(
+                    "memory.ingest id={} source={} created_at_ms={}",
+                    item.memory_id.map(|value| value.ulid).unwrap_or_default(),
+                    memory_source_to_text(item.source),
+                    item.created_at_unix_ms
+                );
+            }
+        }
+    }
+
+    std::io::stdout().flush().context("stdout flush failed")
 }
 
 async fn run_cron_async(command: CronCommand, connection: AgentConnection) -> Result<()> {
@@ -1059,6 +1243,27 @@ fn parse_interval_ms(raw: &str) -> Result<u64> {
     Ok(parsed)
 }
 
+fn parse_float_arg(
+    raw: Option<String>,
+    name: &str,
+    min: f64,
+    max: f64,
+    default: Option<f64>,
+) -> Result<f64> {
+    if let Some(raw) = raw {
+        let value =
+            raw.parse::<f64>().with_context(|| format!("{name} must be a valid floating value"))?;
+        if !value.is_finite() || value < min || value > max {
+            anyhow::bail!("{name} must be in range {min}..={max}");
+        }
+        return Ok(value);
+    }
+    if let Some(default) = default {
+        return Ok(default);
+    }
+    anyhow::bail!("{name} is required")
+}
+
 fn cron_concurrency_to_proto(value: CronConcurrencyPolicyArg) -> i32 {
     match value {
         CronConcurrencyPolicyArg::Forbid => cron_v1::ConcurrencyPolicy::Forbid as i32,
@@ -1123,6 +1328,97 @@ fn cron_run_to_json(run: &cron_v1::JobRun) -> serde_json::Value {
         "model_tokens_out": run.model_tokens_out,
         "tool_calls": run.tool_calls,
         "tool_denies": run.tool_denies,
+    })
+}
+
+fn resolve_memory_scope(
+    scope: MemoryScopeArg,
+    channel: Option<String>,
+    session: Option<String>,
+    connection: &AgentConnection,
+) -> Result<(Option<String>, Option<String>)> {
+    let channel = channel.map(|value| value.trim().to_owned()).and_then(|value| {
+        if value.is_empty() {
+            None
+        } else {
+            Some(value)
+        }
+    });
+    let session = session.map(|value| value.trim().to_owned()).and_then(|value| {
+        if value.is_empty() {
+            None
+        } else {
+            Some(value)
+        }
+    });
+    if let Some(session_id) = session.as_deref() {
+        validate_canonical_id(session_id).context("memory --session must be a canonical ULID")?;
+    }
+
+    match scope {
+        MemoryScopeArg::Principal => Ok((None, None)),
+        MemoryScopeArg::Channel => Ok((channel.or(Some(connection.channel.clone())), None)),
+        MemoryScopeArg::Session => {
+            let session = session.ok_or_else(|| {
+                anyhow!("memory --scope session requires --session <canonical-ulid>")
+            })?;
+            Ok((channel.or(Some(connection.channel.clone())), Some(session)))
+        }
+    }
+}
+
+fn memory_source_to_proto(value: MemorySourceArg) -> i32 {
+    match value {
+        MemorySourceArg::TapeUserMessage => memory_v1::MemorySource::TapeUserMessage as i32,
+        MemorySourceArg::TapeToolResult => memory_v1::MemorySource::TapeToolResult as i32,
+        MemorySourceArg::Summary => memory_v1::MemorySource::Summary as i32,
+        MemorySourceArg::Manual => memory_v1::MemorySource::Manual as i32,
+        MemorySourceArg::Import => memory_v1::MemorySource::Import as i32,
+    }
+}
+
+fn memory_source_to_text(value: i32) -> &'static str {
+    match memory_v1::MemorySource::try_from(value).unwrap_or(memory_v1::MemorySource::Unspecified) {
+        memory_v1::MemorySource::TapeUserMessage => "tape:user_message",
+        memory_v1::MemorySource::TapeToolResult => "tape:tool_result",
+        memory_v1::MemorySource::Summary => "summary",
+        memory_v1::MemorySource::Manual => "manual",
+        memory_v1::MemorySource::Import => "import",
+        memory_v1::MemorySource::Unspecified => "unspecified",
+    }
+}
+
+fn memory_item_to_json(item: &memory_v1::MemoryItem) -> serde_json::Value {
+    json!({
+        "memory_id": item.memory_id.as_ref().map(|value| value.ulid.clone()),
+        "principal": item.principal,
+        "channel": item.channel,
+        "session_id": item.session_id.as_ref().map(|value| value.ulid.clone()),
+        "source": memory_source_to_text(item.source),
+        "content_text": item.content_text,
+        "content_hash": item.content_hash,
+        "tags": item.tags,
+        "confidence": item.confidence,
+        "ttl_unix_ms": item.ttl_unix_ms,
+        "created_at_unix_ms": item.created_at_unix_ms,
+        "updated_at_unix_ms": item.updated_at_unix_ms,
+    })
+}
+
+fn memory_search_hit_to_json(hit: &memory_v1::MemorySearchHit) -> serde_json::Value {
+    let breakdown = hit.breakdown.as_ref().map(|value| {
+        json!({
+            "lexical_score": value.lexical_score,
+            "vector_score": value.vector_score,
+            "recency_score": value.recency_score,
+            "final_score": value.final_score,
+        })
+    });
+    json!({
+        "item": hit.item.as_ref().map(memory_item_to_json),
+        "snippet": hit.snippet,
+        "score": hit.score,
+        "breakdown": breakdown,
     })
 }
 
