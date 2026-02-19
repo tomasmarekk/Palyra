@@ -78,6 +78,10 @@ pub enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    Secrets {
+        #[command(subcommand)]
+        command: SecretsCommand,
+    },
     #[cfg(not(windows))]
     Pairing {
         #[command(subcommand)]
@@ -650,6 +654,29 @@ pub enum ConfigCommand {
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum SecretsCommand {
+    Set {
+        scope: String,
+        key: String,
+        #[arg(long, default_value_t = false)]
+        value_stdin: bool,
+    },
+    Get {
+        scope: String,
+        key: String,
+        #[arg(long, default_value_t = false)]
+        reveal: bool,
+    },
+    List {
+        scope: String,
+    },
+    Delete {
+        scope: String,
+        key: String,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum PairingCommand {
     Pair {
         #[arg(long)]
@@ -711,7 +738,7 @@ mod tests {
         BrowserCommand, ChannelsCommand, Cli, Command, CompletionShell, ConfigCommand, CronCommand,
         CronConcurrencyPolicyArg, CronMisfirePolicyArg, CronScheduleTypeArg, DaemonCommand,
         MemoryCommand, MemoryScopeArg, MemorySourceArg, OnboardingCommand, PolicyCommand,
-        ProtocolCommand,
+        ProtocolCommand, SecretsCommand,
     };
     #[cfg(not(windows))]
     use super::{PairingClientKindArg, PairingCommand, PairingMethodArg};
@@ -1687,6 +1714,69 @@ mod tests {
                     path: Some("custom.toml".to_owned()),
                     backup: 2,
                     backups: 4,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn parse_secrets_set_with_stdin() {
+        let parsed = Cli::parse_from([
+            "palyra",
+            "secrets",
+            "set",
+            "global",
+            "openai_api_key",
+            "--value-stdin",
+        ]);
+        assert_eq!(
+            parsed.command,
+            Command::Secrets {
+                command: SecretsCommand::Set {
+                    scope: "global".to_owned(),
+                    key: "openai_api_key".to_owned(),
+                    value_stdin: true,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn parse_secrets_get_with_reveal() {
+        let parsed =
+            Cli::parse_from(["palyra", "secrets", "get", "global", "openai_api_key", "--reveal"]);
+        assert_eq!(
+            parsed.command,
+            Command::Secrets {
+                command: SecretsCommand::Get {
+                    scope: "global".to_owned(),
+                    key: "openai_api_key".to_owned(),
+                    reveal: true,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn parse_secrets_list_scope() {
+        let parsed = Cli::parse_from(["palyra", "secrets", "list", "principal:user:ops"]);
+        assert_eq!(
+            parsed.command,
+            Command::Secrets {
+                command: SecretsCommand::List { scope: "principal:user:ops".to_owned() }
+            }
+        );
+    }
+
+    #[test]
+    fn parse_secrets_delete_scope_key() {
+        let parsed = Cli::parse_from(["palyra", "secrets", "delete", "skill:slack", "bot_token"]);
+        assert_eq!(
+            parsed.command,
+            Command::Secrets {
+                command: SecretsCommand::Delete {
+                    scope: "skill:slack".to_owned(),
+                    key: "bot_token".to_owned(),
                 }
             }
         );

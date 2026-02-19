@@ -142,6 +142,10 @@ pub mod palyra_gateway_v1 {
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct ApprovalRecord;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct DeleteSecretRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct DeleteSecretResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct ExportApprovalsRequest;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct ExportApprovalsResponse;
@@ -149,6 +153,10 @@ pub mod palyra_gateway_v1 {
     pub struct GetApprovalRequest;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct GetApprovalResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct GetSecretRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct GetSecretResponse;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct HealthRequest;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -158,15 +166,25 @@ pub mod palyra_gateway_v1 {
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct ListApprovalsResponse;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ListSecretsRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ListSecretsResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct ListSessionsRequest;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct ListSessionsResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct PutSecretRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct PutSecretResponse;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct ResolveSessionRequest;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct ResolveSessionResponse;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct SessionSummary;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct VaultSecretMetadata;
     pub trait ApprovalsServiceClient {
         fn ExportApprovals(&self);
         fn GetApproval(&self);
@@ -179,6 +197,12 @@ pub mod palyra_gateway_v1 {
         fn ListSessions(&self);
         fn ResolveSession(&self);
         fn RunStream(&self);
+    }
+    pub trait VaultServiceClient {
+        fn DeleteSecret(&self);
+        fn GetSecret(&self);
+        fn ListSecrets(&self);
+        fn PutSecret(&self);
     }
 }
 

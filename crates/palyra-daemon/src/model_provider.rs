@@ -48,6 +48,7 @@ pub struct ModelProviderConfig {
     pub openai_base_url: String,
     pub openai_model: String,
     pub openai_api_key: Option<String>,
+    pub openai_api_key_vault_ref: Option<String>,
     pub request_timeout_ms: u64,
     pub max_retries: u32,
     pub retry_backoff_ms: u64,
@@ -62,6 +63,7 @@ impl Default for ModelProviderConfig {
             openai_base_url: "https://api.openai.com/v1".to_owned(),
             openai_model: "gpt-4o-mini".to_owned(),
             openai_api_key: None,
+            openai_api_key_vault_ref: None,
             request_timeout_ms: 15_000,
             max_retries: 2,
             retry_backoff_ms: 150,
@@ -96,7 +98,9 @@ pub struct ProviderResponse {
 pub enum ProviderError {
     #[error("model provider circuit breaker is open; retry after {retry_after_ms}ms")]
     CircuitOpen { retry_after_ms: u64 },
-    #[error("openai-compatible provider requires PALYRA_MODEL_PROVIDER_OPENAI_API_KEY")]
+    #[error(
+        "openai-compatible provider requires PALYRA_MODEL_PROVIDER_OPENAI_API_KEY or model_provider.openai_api_key_vault_ref"
+    )]
     MissingApiKey,
     #[error("provider '{provider}' does not support vision inputs")]
     VisionUnsupported { provider: String },
@@ -745,6 +749,7 @@ mod tests {
             openai_base_url: base_url,
             openai_model: "gpt-4o-mini".to_owned(),
             openai_api_key: Some("sk-test-secret".to_owned()),
+            openai_api_key_vault_ref: None,
             request_timeout_ms: 5_000,
             max_retries: 2,
             retry_backoff_ms: 1,

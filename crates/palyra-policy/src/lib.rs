@@ -101,6 +101,15 @@ when {
     context.action == "memory.delete" ||
     context.action == "memory.purge"
 };
+
+@id("allow_vault_actions")
+permit(principal, action, resource)
+when {
+    context.action == "vault.put" ||
+    context.action == "vault.get" ||
+    context.action == "vault.delete" ||
+    context.action == "vault.list"
+};
 "#;
 
 const POLICY_DENY_REASON: &str = "tool execution denied by default: tool is not allowlisted";
@@ -245,6 +254,9 @@ fn decision_reason(
         if normalized_action.starts_with("memory.") {
             return "memory action allowed by Cedar policy".to_owned();
         }
+        if normalized_action.starts_with("vault.") {
+            return "vault action allowed by Cedar policy".to_owned();
+        }
         return "read-only action allowed by Cedar baseline policy".to_owned();
     }
 
@@ -293,6 +305,9 @@ fn is_sensitive_action(
     request: &PolicyRequest,
     sensitive_tool_names: &[String],
 ) -> bool {
+    if normalized_action.starts_with("vault.") {
+        return false;
+    }
     if normalized_action == "tool.execute" {
         return is_sensitive_tool_name(requested_tool, sensitive_tool_names);
     }
@@ -428,6 +443,24 @@ mod tests {
         assert!(
             evaluation.explanation.reason.contains("memory action allowed"),
             "memory allow reason should reflect dedicated memory policy"
+        );
+    }
+
+    #[test]
+    fn vault_actions_are_explicitly_allowed() {
+        let request = PolicyRequest {
+            principal: "user:ops".to_owned(),
+            action: "vault.get".to_owned(),
+            resource: "secrets:global:openai_api_key".to_owned(),
+        };
+
+        let evaluation =
+            evaluate_with_config(&request, &PolicyEvaluationConfig::default()).expect("evaluation");
+
+        assert_eq!(evaluation.decision, PolicyDecision::Allow);
+        assert!(
+            evaluation.explanation.reason.contains("vault action allowed"),
+            "vault allow reason should reflect dedicated vault policy"
         );
     }
 

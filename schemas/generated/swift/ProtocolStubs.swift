@@ -193,6 +193,12 @@ public enum PalyraGatewayV1 {
     public struct ApprovalRecord: Equatable {
         public init() {}
     }
+    public struct DeleteSecretRequest: Equatable {
+        public init() {}
+    }
+    public struct DeleteSecretResponse: Equatable {
+        public init() {}
+    }
     public struct ExportApprovalsRequest: Equatable {
         public init() {}
     }
@@ -203,6 +209,12 @@ public enum PalyraGatewayV1 {
         public init() {}
     }
     public struct GetApprovalResponse: Equatable {
+        public init() {}
+    }
+    public struct GetSecretRequest: Equatable {
+        public init() {}
+    }
+    public struct GetSecretResponse: Equatable {
         public init() {}
     }
     public struct HealthRequest: Equatable {
@@ -217,10 +229,22 @@ public enum PalyraGatewayV1 {
     public struct ListApprovalsResponse: Equatable {
         public init() {}
     }
+    public struct ListSecretsRequest: Equatable {
+        public init() {}
+    }
+    public struct ListSecretsResponse: Equatable {
+        public init() {}
+    }
     public struct ListSessionsRequest: Equatable {
         public init() {}
     }
     public struct ListSessionsResponse: Equatable {
+        public init() {}
+    }
+    public struct PutSecretRequest: Equatable {
+        public init() {}
+    }
+    public struct PutSecretResponse: Equatable {
         public init() {}
     }
     public struct ResolveSessionRequest: Equatable {
@@ -230,6 +254,9 @@ public enum PalyraGatewayV1 {
         public init() {}
     }
     public struct SessionSummary: Equatable {
+        public init() {}
+    }
+    public struct VaultSecretMetadata: Equatable {
         public init() {}
     }
     public protocol ApprovalsServiceClient {
@@ -244,6 +271,12 @@ public enum PalyraGatewayV1 {
         func listSessions()
         func resolveSession()
         func runStream()
+    }
+    public protocol VaultServiceClient {
+        func deleteSecret()
+        func getSecret()
+        func listSecrets()
+        func putSecret()
     }
 }
 

@@ -126,6 +126,8 @@ pub struct FileModelProviderConfig {
     pub kind: Option<String>,
     pub openai_base_url: Option<String>,
     pub openai_model: Option<String>,
+    pub openai_api_key: Option<String>,
+    pub openai_api_key_vault_ref: Option<String>,
     pub request_timeout_ms: Option<u64>,
     pub max_retries: Option<u32>,
     pub retry_backoff_ms: Option<u64>,
@@ -190,6 +192,7 @@ pub struct FileStorageConfig {
     pub journal_db_path: Option<String>,
     pub journal_hash_chain_enabled: Option<bool>,
     pub max_journal_payload_bytes: Option<u64>,
+    pub vault_dir: Option<String>,
 }
 
 #[cfg(test)]
