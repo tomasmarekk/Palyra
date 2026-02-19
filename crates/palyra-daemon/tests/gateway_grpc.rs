@@ -440,6 +440,88 @@ async fn grpc_cron_run_now_skips_when_forbid_policy_has_active_run() -> Result<(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn grpc_cron_jobs_survive_daemon_restart() -> Result<()> {
+    let (child, admin_port, grpc_port, journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut cron_client = cron_v1::cron_service_client::CronServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect cron gRPC client")?;
+
+    let mut create_request = tonic::Request::new(cron_v1::CreateJobRequest {
+        v: 1,
+        name: "Persistent cron job".to_owned(),
+        prompt: "Persist me".to_owned(),
+        owner_principal: "user:ops".to_owned(),
+        channel: "system:cron".to_owned(),
+        session_key: "cron:persistent-job".to_owned(),
+        session_label: "Persistent cron job".to_owned(),
+        schedule: Some(cron_v1::Schedule {
+            r#type: cron_v1::ScheduleType::Every as i32,
+            spec: Some(cron_v1::schedule::Spec::Every(cron_v1::EverySchedule {
+                interval_ms: 60_000,
+            })),
+        }),
+        enabled: true,
+        concurrency_policy: cron_v1::ConcurrencyPolicy::Forbid as i32,
+        retry_policy: Some(cron_v1::RetryPolicy { max_attempts: 1, backoff_ms: 1 }),
+        misfire_policy: cron_v1::MisfirePolicy::Skip as i32,
+        jitter_ms: 0,
+    });
+    authorize_metadata(create_request.metadata_mut())?;
+    let created = cron_client
+        .create_job(create_request)
+        .await
+        .context("failed to create persistent cron job")?
+        .into_inner();
+    let created_job_id = created
+        .job
+        .as_ref()
+        .and_then(|job| job.job_id.as_ref())
+        .map(|id| id.ulid.clone())
+        .context("CreateJob must return canonical job id")?;
+
+    daemon.child_mut().kill().context("failed to stop daemon before restart")?;
+    daemon.child_mut().wait().context("failed to wait for daemon shutdown")?;
+    drop(daemon);
+
+    let (child, restarted_admin_port, restarted_grpc_port) =
+        spawn_palyrad_with_existing_journal(journal_db_path.clone())?;
+    let mut restarted = ChildGuard::new(child);
+    wait_for_health(restarted_admin_port, restarted.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{restarted_grpc_port}");
+    let mut cron_client = cron_v1::cron_service_client::CronServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect cron gRPC client after restart")?;
+
+    let mut list_request = tonic::Request::new(cron_v1::ListJobsRequest {
+        v: 1,
+        after_job_ulid: String::new(),
+        limit: 100,
+        enabled: None,
+        owner_principal: None,
+        channel: None,
+    });
+    authorize_metadata(list_request.metadata_mut())?;
+    let listed = cron_client
+        .list_jobs(list_request)
+        .await
+        .context("failed to list cron jobs after restart")?
+        .into_inner();
+    assert!(
+        listed.jobs.iter().any(|job| {
+            job.job_id.as_ref().map(|id| id.ulid.as_str()) == Some(created_job_id.as_str())
+        }),
+        "cron job should survive daemon restart when journal database is reused"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn grpc_abort_run_requests_cancellation() -> Result<()> {
     let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
     let mut daemon = ChildGuard::new(child);
@@ -2128,6 +2210,33 @@ fn spawn_palyrad_with_dynamic_ports_and_hash_chain(
     let stdout = child.stdout.take().context("failed to capture palyrad stdout")?;
     let (admin_port, grpc_port) = wait_for_listen_ports(stdout, &mut child)?;
     Ok((child, admin_port, grpc_port, journal_db_path))
+}
+
+fn spawn_palyrad_with_existing_journal(journal_db_path: PathBuf) -> Result<(Child, u16, u16)> {
+    let identity_store_dir = unique_temp_identity_store_dir();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_palyrad"))
+        .args([
+            "--bind",
+            "127.0.0.1",
+            "--port",
+            "0",
+            "--grpc-bind",
+            "127.0.0.1",
+            "--grpc-port",
+            "0",
+        ])
+        .env("PALYRA_ADMIN_TOKEN", ADMIN_TOKEN)
+        .env("PALYRA_JOURNAL_DB_PATH", journal_db_path.to_string_lossy().to_string())
+        .env("PALYRA_GATEWAY_IDENTITY_STORE_DIR", identity_store_dir.to_string_lossy().to_string())
+        .env("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED", "true")
+        .env("RUST_LOG", "info")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to restart palyrad with existing journal")?;
+    let stdout = child.stdout.take().context("failed to capture restarted palyrad stdout")?;
+    let (admin_port, grpc_port) = wait_for_listen_ports(stdout, &mut child)?;
+    Ok((child, admin_port, grpc_port))
 }
 
 fn spawn_palyrad_with_openai_provider(
