@@ -1539,12 +1539,13 @@ impl GatewayRuntimeState {
         self: &Arc<Self>,
         memory_id: String,
         principal: String,
+        channel: Option<String>,
     ) -> Result<bool, Status> {
         let state = Arc::clone(self);
         let deleted = tokio::task::spawn_blocking(move || {
             state
                 .journal_store
-                .delete_memory_item(memory_id.as_str(), principal.as_str())
+                .delete_memory_item(memory_id.as_str(), principal.as_str(), channel.as_deref())
                 .map_err(|error| map_memory_store_error("delete memory item", error))
         })
         .await
@@ -4771,7 +4772,15 @@ impl memory_v1::memory_service_server::MemoryService for MemoryServiceImpl {
             "memory.delete",
             format!("memory:{memory_id}").as_str(),
         )?;
-        let deleted = self.state.delete_memory_item(memory_id, context.principal).await?;
+        if let Some(item) = self.state.memory_item(memory_id.clone()).await? {
+            enforce_memory_item_scope(
+                &item,
+                context.principal.as_str(),
+                context.channel.as_deref(),
+            )?;
+        }
+        let deleted =
+            self.state.delete_memory_item(memory_id, context.principal, context.channel).await?;
         Ok(Response::new(memory_v1::DeleteMemoryItemResponse {
             v: CANONICAL_PROTOCOL_MAJOR,
             deleted,
@@ -5073,7 +5082,14 @@ async fn execute_memory_search_tool(
 
     let scope = parsed.get("scope").and_then(Value::as_str).unwrap_or("session");
     let (channel_scope, session_scope, resource) = match scope {
-        "principal" => (None, None, "memory:principal".to_owned()),
+        "principal" => {
+            let channel_scope = channel.map(str::to_owned);
+            let resource = channel_scope
+                .as_deref()
+                .map(|value| format!("memory:channel:{value}"))
+                .unwrap_or_else(|| "memory:principal".to_owned());
+            (channel_scope, None, resource)
+        }
         "channel" => {
             let channel = channel.map(str::to_owned);
             let resource = channel

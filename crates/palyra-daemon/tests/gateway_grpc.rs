@@ -1253,6 +1253,235 @@ async fn grpc_memory_scope_isolation_blocks_cross_principal_get() -> Result<()> 
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn grpc_memory_purge_all_respects_authenticated_channel_scope() -> Result<()> {
+    let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut memory_client =
+        memory_v1::memory_service_client::MemoryServiceClient::connect(endpoint)
+            .await
+            .context("failed to connect memory gRPC client")?;
+
+    let mut cli_ingest_request = tonic::Request::new(memory_v1::IngestMemoryRequest {
+        v: 1,
+        source: memory_v1::MemorySource::Manual as i32,
+        content_text: "cli memory for scoped purge".to_owned(),
+        channel: "cli".to_owned(),
+        session_id: Some(common_v1::CanonicalId { ulid: SESSION_ID.to_owned() }),
+        tags: Vec::new(),
+        confidence: 0.8,
+        ttl_unix_ms: 0,
+    });
+    authorize_metadata_with_principal_and_channel(
+        cli_ingest_request.metadata_mut(),
+        "user:ops",
+        "cli",
+    )?;
+    let cli_memory_id = memory_client
+        .ingest_memory(cli_ingest_request)
+        .await
+        .context("failed to ingest cli-scoped memory")?
+        .into_inner()
+        .item
+        .and_then(|item| item.memory_id)
+        .map(|id| id.ulid)
+        .context("cli ingest should return memory id")?;
+
+    let mut slack_ingest_request = tonic::Request::new(memory_v1::IngestMemoryRequest {
+        v: 1,
+        source: memory_v1::MemorySource::Manual as i32,
+        content_text: "slack memory that must survive cli purge".to_owned(),
+        channel: "slack".to_owned(),
+        session_id: Some(common_v1::CanonicalId { ulid: SESSION_ID.to_owned() }),
+        tags: Vec::new(),
+        confidence: 0.8,
+        ttl_unix_ms: 0,
+    });
+    authorize_metadata_with_principal_and_channel(
+        slack_ingest_request.metadata_mut(),
+        "user:ops",
+        "slack",
+    )?;
+    let slack_memory_id = memory_client
+        .ingest_memory(slack_ingest_request)
+        .await
+        .context("failed to ingest slack-scoped memory")?
+        .into_inner()
+        .item
+        .and_then(|item| item.memory_id)
+        .map(|id| id.ulid)
+        .context("slack ingest should return memory id")?;
+
+    let mut purge_request = tonic::Request::new(memory_v1::PurgeMemoryRequest {
+        v: 1,
+        channel: String::new(),
+        session_id: None,
+        purge_all_principal: true,
+    });
+    authorize_metadata_with_principal_and_channel(purge_request.metadata_mut(), "user:ops", "cli")?;
+    let purge_response = memory_client
+        .purge_memory(purge_request)
+        .await
+        .context("failed to purge memory with purge_all_principal=true")?
+        .into_inner();
+    assert_eq!(
+        purge_response.deleted_count, 1,
+        "channel-authenticated purge-all must only remove channel-scoped memories"
+    );
+
+    let mut deleted_cli_get = tonic::Request::new(memory_v1::GetMemoryItemRequest {
+        v: 1,
+        memory_id: Some(common_v1::CanonicalId { ulid: cli_memory_id }),
+    });
+    authorize_metadata_with_principal_and_channel(
+        deleted_cli_get.metadata_mut(),
+        "user:ops",
+        "cli",
+    )?;
+    let deleted_cli_error = memory_client
+        .get_memory_item(deleted_cli_get)
+        .await
+        .expect_err("purged cli memory should not be retrievable");
+    assert_eq!(deleted_cli_error.code(), Code::NotFound);
+
+    let mut surviving_slack_get = tonic::Request::new(memory_v1::GetMemoryItemRequest {
+        v: 1,
+        memory_id: Some(common_v1::CanonicalId { ulid: slack_memory_id }),
+    });
+    authorize_metadata_with_principal_and_channel(
+        surviving_slack_get.metadata_mut(),
+        "user:ops",
+        "slack",
+    )?;
+    let surviving = memory_client
+        .get_memory_item(surviving_slack_get)
+        .await
+        .context("slack memory should survive cli-scoped purge-all")?
+        .into_inner();
+    assert!(
+        surviving.item.is_some(),
+        "slack-scoped memory should remain accessible after cli purge-all"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_memory_delete_rejects_cross_channel_access() -> Result<()> {
+    let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut memory_client =
+        memory_v1::memory_service_client::MemoryServiceClient::connect(endpoint)
+            .await
+            .context("failed to connect memory gRPC client")?;
+
+    let mut ingest_request = tonic::Request::new(memory_v1::IngestMemoryRequest {
+        v: 1,
+        source: memory_v1::MemorySource::Manual as i32,
+        content_text: "slack memory that cli must not delete".to_owned(),
+        channel: "slack".to_owned(),
+        session_id: Some(common_v1::CanonicalId { ulid: SESSION_ID.to_owned() }),
+        tags: Vec::new(),
+        confidence: 0.8,
+        ttl_unix_ms: 0,
+    });
+    authorize_metadata_with_principal_and_channel(
+        ingest_request.metadata_mut(),
+        "user:ops",
+        "slack",
+    )?;
+    let memory_id = memory_client
+        .ingest_memory(ingest_request)
+        .await
+        .context("failed to ingest slack memory")?
+        .into_inner()
+        .item
+        .and_then(|item| item.memory_id)
+        .map(|id| id.ulid)
+        .context("ingest should return memory id")?;
+
+    let mut denied_delete = tonic::Request::new(memory_v1::DeleteMemoryItemRequest {
+        v: 1,
+        memory_id: Some(common_v1::CanonicalId { ulid: memory_id.clone() }),
+    });
+    authorize_metadata_with_principal_and_channel(denied_delete.metadata_mut(), "user:ops", "cli")?;
+    let denied_error = memory_client
+        .delete_memory_item(denied_delete)
+        .await
+        .expect_err("cross-channel delete must be denied");
+    assert_eq!(denied_error.code(), Code::PermissionDenied);
+
+    let mut verify_get = tonic::Request::new(memory_v1::GetMemoryItemRequest {
+        v: 1,
+        memory_id: Some(common_v1::CanonicalId { ulid: memory_id.clone() }),
+    });
+    authorize_metadata_with_principal_and_channel(verify_get.metadata_mut(), "user:ops", "slack")?;
+    let verify = memory_client
+        .get_memory_item(verify_get)
+        .await
+        .context("slack memory should still exist after denied delete")?
+        .into_inner();
+    assert!(verify.item.is_some(), "denied delete must not remove the target memory item");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_memory_get_hides_ttl_expired_item() -> Result<()> {
+    let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut memory_client =
+        memory_v1::memory_service_client::MemoryServiceClient::connect(endpoint)
+            .await
+            .context("failed to connect memory gRPC client")?;
+
+    let now_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system time should be after unix epoch")?
+        .as_millis() as i64;
+    let mut ingest_request = tonic::Request::new(memory_v1::IngestMemoryRequest {
+        v: 1,
+        source: memory_v1::MemorySource::Manual as i32,
+        content_text: "expiring memory item".to_owned(),
+        channel: "cli".to_owned(),
+        session_id: Some(common_v1::CanonicalId { ulid: SESSION_ID.to_owned() }),
+        tags: Vec::new(),
+        confidence: 0.8,
+        ttl_unix_ms: now_unix_ms.saturating_add(120),
+    });
+    authorize_metadata(ingest_request.metadata_mut())?;
+    let memory_id = memory_client
+        .ingest_memory(ingest_request)
+        .await
+        .context("failed to ingest expiring memory item")?
+        .into_inner()
+        .item
+        .and_then(|item| item.memory_id)
+        .map(|id| id.ulid)
+        .context("expiring ingest should return memory id")?;
+
+    tokio::time::sleep(Duration::from_millis(220)).await;
+
+    let mut get_request = tonic::Request::new(memory_v1::GetMemoryItemRequest {
+        v: 1,
+        memory_id: Some(common_v1::CanonicalId { ulid: memory_id }),
+    });
+    authorize_metadata(get_request.metadata_mut())?;
+    let error = memory_client
+        .get_memory_item(get_request)
+        .await
+        .expect_err("expired memory item should not be visible through get path");
+    assert_eq!(error.code(), Code::NotFound);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn grpc_abort_run_requests_cancellation() -> Result<()> {
     let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
     let mut daemon = ChildGuard::new(child);
@@ -1597,6 +1826,137 @@ async fn grpc_run_stream_executes_memory_search_tool_and_emits_memory_attestatio
     assert!(saw_memory_result, "memory search tool should produce successful tool result");
     assert!(saw_memory_attestation, "memory search tool should emit memory_runtime attestation");
 
+    server_handle.join().expect("scripted openai server thread should exit");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_run_stream_memory_search_principal_scope_stays_channel_bounded() -> Result<()> {
+    let response_body = openai_tool_call_response(
+        "palyra.memory.search",
+        &serde_json::json!({
+            "query": "cross-channel marker",
+            "scope": "principal",
+            "top_k": 10,
+            "min_score": 0.0
+        }),
+    )?;
+    let (openai_base_url, _request_count, server_handle) =
+        spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::immediate(200, response_body)])?;
+    let (child, admin_port, grpc_port, _journal_db_path) =
+        spawn_palyrad_with_openai_provider_and_tool_policy(
+            openai_base_url.as_str(),
+            OPENAI_API_KEY,
+            "palyra.memory.search",
+            2,
+            250,
+        )?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut memory_client =
+        memory_v1::memory_service_client::MemoryServiceClient::connect(endpoint.clone())
+            .await
+            .context("failed to connect memory gRPC client")?;
+
+    let mut cli_ingest = tonic::Request::new(memory_v1::IngestMemoryRequest {
+        v: 1,
+        source: memory_v1::MemorySource::Manual as i32,
+        content_text: "cross-channel marker cli".to_owned(),
+        channel: "cli".to_owned(),
+        session_id: Some(common_v1::CanonicalId { ulid: SESSION_ID.to_owned() }),
+        tags: Vec::new(),
+        confidence: 0.9,
+        ttl_unix_ms: 0,
+    });
+    authorize_metadata_with_principal_and_channel(cli_ingest.metadata_mut(), "user:ops", "cli")?;
+    let cli_memory_id = memory_client
+        .ingest_memory(cli_ingest)
+        .await
+        .context("failed to ingest cli memory for principal-scope test")?
+        .into_inner()
+        .item
+        .and_then(|item| item.memory_id)
+        .map(|id| id.ulid)
+        .context("cli ingest should return memory id")?;
+
+    let mut slack_ingest = tonic::Request::new(memory_v1::IngestMemoryRequest {
+        v: 1,
+        source: memory_v1::MemorySource::Manual as i32,
+        content_text: "cross-channel marker slack".to_owned(),
+        channel: "slack".to_owned(),
+        session_id: Some(common_v1::CanonicalId { ulid: SESSION_ID.to_owned() }),
+        tags: Vec::new(),
+        confidence: 0.9,
+        ttl_unix_ms: 0,
+    });
+    authorize_metadata_with_principal_and_channel(
+        slack_ingest.metadata_mut(),
+        "user:ops",
+        "slack",
+    )?;
+    let slack_memory_id = memory_client
+        .ingest_memory(slack_ingest)
+        .await
+        .context("failed to ingest slack memory for principal-scope test")?
+        .into_inner()
+        .item
+        .and_then(|item| item.memory_id)
+        .map(|id| id.ulid)
+        .context("slack ingest should return memory id")?;
+
+    let mut gateway_client =
+        gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+            .await
+            .context("failed to connect gateway gRPC client")?;
+    let mut stream_request =
+        tonic::Request::new(tokio_stream::iter(vec![sample_run_stream_request_with_text(
+            "trigger principal scope memory search".to_owned(),
+        )]));
+    authorize_metadata_with_principal_and_channel(
+        stream_request.metadata_mut(),
+        "user:ops",
+        "cli",
+    )?;
+    let mut response_stream = gateway_client
+        .run_stream(stream_request)
+        .await
+        .context("failed to call RunStream")?
+        .into_inner();
+
+    let mut saw_memory_result = false;
+    while let Some(event) = response_stream.next().await {
+        let event = event.context("failed to read RunStream event")?;
+        if let Some(common_v1::run_stream_event::Body::ToolResult(result)) = event.body {
+            if result.success {
+                let output = serde_json::from_slice::<Value>(&result.output_json)
+                    .context("memory tool output_json should be valid JSON")?;
+                let hits = output
+                    .get("hits")
+                    .and_then(Value::as_array)
+                    .context("memory tool output must contain hits array")?;
+                let returned_ids = hits
+                    .iter()
+                    .filter_map(|hit| hit.get("memory_id").and_then(Value::as_str))
+                    .collect::<Vec<_>>();
+                assert!(
+                    returned_ids.contains(&cli_memory_id.as_str()),
+                    "principal-scope tool search from cli channel should include cli memory"
+                );
+                assert!(
+                    returned_ids.iter().all(|memory_id| *memory_id != slack_memory_id.as_str()),
+                    "principal-scope tool search from cli channel must not return slack memory"
+                );
+                saw_memory_result = true;
+            }
+        }
+    }
+
+    assert!(
+        saw_memory_result,
+        "principal-scope memory tool search should produce a successful tool result"
+    );
     server_handle.join().expect("scripted openai server thread should exit");
     Ok(())
 }
@@ -3819,10 +4179,18 @@ fn authorize_metadata_with_principal(
     metadata: &mut tonic::metadata::MetadataMap,
     principal: &str,
 ) -> Result<()> {
+    authorize_metadata_with_principal_and_channel(metadata, principal, "cli")
+}
+
+fn authorize_metadata_with_principal_and_channel(
+    metadata: &mut tonic::metadata::MetadataMap,
+    principal: &str,
+    channel: &str,
+) -> Result<()> {
     metadata.insert("authorization", format!("Bearer {ADMIN_TOKEN}").parse()?);
     metadata.insert("x-palyra-principal", principal.parse()?);
     metadata.insert("x-palyra-device-id", DEVICE_ID.parse()?);
-    metadata.insert("x-palyra-channel", "cli".parse()?);
+    metadata.insert("x-palyra-channel", channel.parse()?);
     Ok(())
 }
 

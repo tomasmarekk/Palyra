@@ -2578,24 +2578,32 @@ impl JournalStore {
         drop(guard);
         self.purge_expired_memory_items(now)?;
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
-        load_memory_item_by_id(&guard, request.memory_id.as_str())?
+        load_memory_item_by_id(&guard, request.memory_id.as_str(), now)?
             .ok_or_else(|| JournalError::MemoryNotFound { memory_id: request.memory_id.clone() })
     }
 
     pub fn memory_item(&self, memory_id: &str) -> Result<Option<MemoryItemRecord>, JournalError> {
+        let now = current_unix_ms()?;
+        self.purge_expired_memory_items(now)?;
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
-        load_memory_item_by_id(&guard, memory_id)
+        load_memory_item_by_id(&guard, memory_id, now)
     }
 
     pub fn delete_memory_item(
         &self,
         memory_id: &str,
         principal: &str,
+        channel: Option<&str>,
     ) -> Result<bool, JournalError> {
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         let deleted = guard.execute(
-            "DELETE FROM memory_items WHERE memory_ulid = ?1 AND principal = ?2",
-            params![memory_id, principal],
+            r#"
+                DELETE FROM memory_items
+                WHERE memory_ulid = ?1
+                  AND principal = ?2
+                  AND (?3 IS NULL OR channel = ?3 OR channel IS NULL)
+            "#,
+            params![memory_id, principal, channel],
         )?;
         Ok(deleted > 0)
     }
@@ -2665,8 +2673,17 @@ impl JournalStore {
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         let deleted = if request.purge_all_principal {
             guard.execute(
-                "DELETE FROM memory_items WHERE principal = ?1",
-                params![request.principal.as_str()],
+                r#"
+                    DELETE FROM memory_items
+                    WHERE principal = ?1
+                      AND (?2 IS NULL OR channel = ?2)
+                      AND (?3 IS NULL OR session_ulid = ?3)
+                "#,
+                params![
+                    request.principal.as_str(),
+                    request.channel.as_deref(),
+                    request.session_id.as_deref()
+                ],
             )?
         } else if let Some(session_id) = request.session_id.as_deref() {
             guard.execute(
@@ -3374,6 +3391,7 @@ fn map_memory_item_row(row: &rusqlite::Row<'_>) -> Result<MemoryItemRecord, rusq
 fn load_memory_item_by_id(
     connection: &Connection,
     memory_id: &str,
+    now_unix_ms: i64,
 ) -> Result<Option<MemoryItemRecord>, JournalError> {
     let mut statement = connection.prepare(
         r#"
@@ -3392,10 +3410,14 @@ fn load_memory_item_by_id(
                 updated_at_unix_ms
             FROM memory_items
             WHERE memory_ulid = ?1
+              AND (ttl_unix_ms IS NULL OR ttl_unix_ms > ?2)
             LIMIT 1
         "#,
     )?;
-    statement.query_row(params![memory_id], map_memory_item_row).optional().map_err(Into::into)
+    statement
+        .query_row(params![memory_id, now_unix_ms], map_memory_item_row)
+        .optional()
+        .map_err(Into::into)
 }
 
 fn normalize_memory_text(raw: &str) -> String {
@@ -4962,6 +4984,119 @@ mod tests {
             })
             .expect("purge should succeed");
         assert_eq!(deleted, 1, "session purge should delete matching session memories");
+    }
+
+    #[test]
+    fn memory_purge_all_principal_respects_channel_scope() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+
+        store
+            .create_memory_item(&sample_memory_request(
+                "01ARZ3NDEKTSV4RRFFQ69G5FDA",
+                "user:ops",
+                Some("cli"),
+                Some("01ARZ3NDEKTSV4RRFFQ69G5FAA"),
+                MemorySource::Manual,
+                "cli-only memory item",
+            ))
+            .expect("cli memory should be created");
+        store
+            .create_memory_item(&sample_memory_request(
+                "01ARZ3NDEKTSV4RRFFQ69G5FDB",
+                "user:ops",
+                Some("slack"),
+                Some("01ARZ3NDEKTSV4RRFFQ69G5FAB"),
+                MemorySource::Manual,
+                "slack-only memory item",
+            ))
+            .expect("slack memory should be created");
+
+        let deleted = store
+            .purge_memory(&MemoryPurgeRequest {
+                principal: "user:ops".to_owned(),
+                channel: Some("cli".to_owned()),
+                session_id: None,
+                purge_all_principal: true,
+            })
+            .expect("channel-scoped purge-all should succeed");
+        assert_eq!(deleted, 1, "purge-all should not widen past channel scope");
+
+        let remaining_slack = store
+            .list_memory_items(&MemoryItemsListFilter {
+                after_memory_id: None,
+                principal: "user:ops".to_owned(),
+                channel: Some("slack".to_owned()),
+                session_id: None,
+                limit: 10,
+                tags: Vec::new(),
+                sources: Vec::new(),
+            })
+            .expect("slack listing should succeed");
+        assert_eq!(
+            remaining_slack.len(),
+            1,
+            "channel-scoped purge-all must preserve unrelated channel memories"
+        );
+    }
+
+    #[test]
+    fn memory_lookup_hides_expired_items() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+
+        let ttl_now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_millis() as i64;
+        let mut request = sample_memory_request(
+            "01ARZ3NDEKTSV4RRFFQ69G5FDC",
+            "user:ops",
+            Some("cli"),
+            Some("01ARZ3NDEKTSV4RRFFQ69G5FAC"),
+            MemorySource::Manual,
+            "short-lived memory",
+        );
+        request.ttl_unix_ms = Some(ttl_now.saturating_add(120));
+        store.create_memory_item(&request).expect("memory item should be created");
+
+        std::thread::sleep(Duration::from_millis(220));
+        let fetched =
+            store.memory_item("01ARZ3NDEKTSV4RRFFQ69G5FDC").expect("memory lookup should succeed");
+        assert!(fetched.is_none(), "memory lookup should not return items after ttl expiration");
+    }
+
+    #[test]
+    fn memory_delete_respects_channel_scope_filter() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+
+        store
+            .create_memory_item(&sample_memory_request(
+                "01ARZ3NDEKTSV4RRFFQ69G5FDD",
+                "user:ops",
+                Some("slack"),
+                Some("01ARZ3NDEKTSV4RRFFQ69G5FAD"),
+                MemorySource::Manual,
+                "channel-filtered delete target",
+            ))
+            .expect("memory item should be created");
+
+        let denied_delete = store
+            .delete_memory_item("01ARZ3NDEKTSV4RRFFQ69G5FDD", "user:ops", Some("cli"))
+            .expect("cross-channel delete should complete without storage error");
+        assert!(
+            !denied_delete,
+            "channel-constrained delete should not remove memory from another channel"
+        );
+
+        let allowed_delete = store
+            .delete_memory_item("01ARZ3NDEKTSV4RRFFQ69G5FDD", "user:ops", Some("slack"))
+            .expect("same-channel delete should complete without storage error");
+        assert!(allowed_delete, "same-channel delete should remove matching memory");
     }
 
     #[test]
