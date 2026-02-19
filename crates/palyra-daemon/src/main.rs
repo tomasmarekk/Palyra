@@ -14,7 +14,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::PathBuf,
     sync::Arc,
-    time::Instant,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
@@ -34,9 +34,10 @@ use gateway::{
     MemoryRuntimeConfig,
 };
 use journal::{
-    JournalConfig, JournalStore, OrchestratorCancelRequest, OrchestratorRunStatusSnapshot,
+    JournalAppendRequest, JournalConfig, JournalStore, OrchestratorCancelRequest,
+    OrchestratorRunStatusSnapshot,
 };
-use model_provider::build_model_provider;
+use model_provider::{build_model_provider, ModelProviderKind};
 use palyra_common::default_identity_store_root;
 use palyra_common::{
     build_metadata, health_response, parse_daemon_bind_socket, validate_canonical_id,
@@ -45,14 +46,20 @@ use palyra_common::{
 use palyra_identity::IdentityManager;
 use palyra_identity::{FilesystemSecretStore, SecretStore};
 use palyra_policy::{evaluate_with_config, PolicyDecision, PolicyEvaluationConfig, PolicyRequest};
+use palyra_vault::{Vault, VaultConfig as VaultConfigOptions, VaultRef};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tokio::sync::Notify;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
+use ulid::Ulid;
 
 const DANGEROUS_REMOTE_BIND_ACK_ENV: &str = "PALYRA_GATEWAY_DANGEROUS_REMOTE_BIND_ACK";
+const SYSTEM_DAEMON_PRINCIPAL: &str = "system:daemon";
+const SYSTEM_VAULT_CHANNEL: &str = "system:vault";
+const SYSTEM_DAEMON_DEVICE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "palyrad", about = "Palyra gateway skeleton daemon")]
@@ -124,6 +131,14 @@ struct IdentityRuntime {
     node_server_certificate: palyra_identity::IssuedCertificate,
 }
 
+#[derive(Debug, Clone)]
+struct SecretAccessAuditRecord {
+    scope: String,
+    key: String,
+    action: String,
+    value_bytes: usize,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
@@ -158,6 +173,20 @@ async fn main() -> Result<()> {
         max_payload_bytes: loaded.storage.max_journal_payload_bytes,
     })
     .context("failed to initialize event journal storage")?;
+    let vault = Arc::new(
+        Vault::open_with_config(VaultConfigOptions {
+            root: Some(loaded.storage.vault_dir.clone()),
+            identity_store_root: Some(identity_runtime.store_root.clone()),
+            ..VaultConfigOptions::default()
+        })
+        .context("failed to initialize vault runtime")?,
+    );
+    if let Some(access_audit) =
+        resolve_model_provider_secret_from_vault(&mut loaded, vault.as_ref())?
+    {
+        record_secret_access_journal_event(&journal_store, &access_audit)
+            .context("failed to audit model provider secret access")?;
+    }
     let model_provider = build_model_provider(&loaded.model_provider)
         .context("failed to initialize model provider runtime")?;
     let runtime = GatewayRuntimeState::new_with_provider(
@@ -223,6 +252,7 @@ async fn main() -> Result<()> {
         journal_store,
         identity_runtime.revoked_certificate_count,
         model_provider,
+        Arc::clone(&vault),
     )
     .context("failed to initialize gateway runtime state")?;
     runtime.configure_memory(MemoryRuntimeConfig {
@@ -281,6 +311,9 @@ async fn main() -> Result<()> {
         model_provider_openai_base_url = %loaded.model_provider.openai_base_url,
         model_provider_openai_model = %loaded.model_provider.openai_model,
         model_provider_api_key_configured = loaded.model_provider.openai_api_key.is_some(),
+        model_provider_openai_api_key_vault_ref_configured =
+            loaded.model_provider.openai_api_key_vault_ref.is_some(),
+        vault_backend = vault.backend_kind().as_str(),
         tool_call_allowed_tools = ?loaded.tool_call.allowed_tools,
         tool_call_max_calls_per_run = loaded.tool_call.max_calls_per_run,
         tool_call_execution_timeout_ms = loaded.tool_call.execution_timeout_ms,
@@ -308,6 +341,7 @@ async fn main() -> Result<()> {
         journal_db_path = %loaded.storage.journal_db_path.display(),
         journal_hash_chain_enabled = loaded.storage.journal_hash_chain_enabled,
         journal_max_payload_bytes = loaded.storage.max_journal_payload_bytes,
+        storage_vault_dir = %loaded.storage.vault_dir.display(),
         identity_store_root = %identity_runtime.store_root.display(),
         revoked_certificate_count = identity_runtime.revoked_certificate_count,
         "gateway startup"
@@ -407,6 +441,11 @@ async fn main() -> Result<()> {
         gateway::proto::palyra::memory::v1::memory_service_server::MemoryServiceServer::new(
             memory_service,
         );
+    let vault_service = gateway::VaultServiceImpl::new(runtime.clone(), auth.clone());
+    let grpc_vault_server =
+        gateway::proto::palyra::gateway::v1::vault_service_server::VaultServiceServer::new(
+            vault_service,
+        );
     let node_rpc_service = node_rpc::NodeRpcServiceImpl::new(
         identity_runtime.revoked_certificate_fingerprints.clone(),
         !loaded.identity.allow_insecure_node_rpc_without_mtls,
@@ -442,6 +481,7 @@ async fn main() -> Result<()> {
                 .add_service(grpc_cron_server)
                 .add_service(grpc_approvals_server)
                 .add_service(grpc_memory_server)
+                .add_service(grpc_vault_server)
                 .serve_with_incoming_shutdown(
                     TcpListenerStream::new(grpc_listener),
                     shutdown_signal(),
@@ -683,6 +723,80 @@ fn runtime_status_response(status: tonic::Status) -> Response {
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (http_status, Json(ErrorBody { error: status.message().to_owned() })).into_response()
+}
+
+fn resolve_model_provider_secret_from_vault(
+    loaded: &mut config::LoadedConfig,
+    vault: &Vault,
+) -> Result<Option<SecretAccessAuditRecord>> {
+    if loaded.model_provider.kind != ModelProviderKind::OpenAiCompatible {
+        return Ok(None);
+    }
+    if loaded.model_provider.openai_api_key.is_some() {
+        return Ok(None);
+    }
+    let Some(vault_ref_raw) = loaded.model_provider.openai_api_key_vault_ref.clone() else {
+        return Ok(None);
+    };
+    let vault_ref = VaultRef::parse(vault_ref_raw.as_str()).with_context(|| {
+        format!("invalid model_provider.openai_api_key_vault_ref: {vault_ref_raw}")
+    })?;
+    let value = vault.get_secret(&vault_ref.scope, vault_ref.key.as_str()).with_context(|| {
+        format!("failed to load model provider API key from vault ref {}", vault_ref_raw)
+    })?;
+    if value.is_empty() {
+        anyhow::bail!("vault ref {} resolved to an empty secret value", vault_ref_raw);
+    }
+    let decoded = String::from_utf8(value.clone())
+        .context("model provider API key from vault must be valid UTF-8 text")?;
+    if decoded.trim().is_empty() {
+        anyhow::bail!(
+            "model provider API key from vault ref {} cannot be whitespace only",
+            vault_ref_raw
+        );
+    }
+    loaded.model_provider.openai_api_key = Some(decoded);
+    Ok(Some(SecretAccessAuditRecord {
+        scope: vault_ref.scope.to_string(),
+        key: vault_ref.key,
+        action: "model_provider.openai_api_key.resolve".to_owned(),
+        value_bytes: value.len(),
+    }))
+}
+
+fn record_secret_access_journal_event(
+    journal_store: &JournalStore,
+    audit: &SecretAccessAuditRecord,
+) -> Result<()> {
+    journal_store
+        .append(&JournalAppendRequest {
+            event_id: Ulid::new().to_string(),
+            session_id: Ulid::new().to_string(),
+            run_id: Ulid::new().to_string(),
+            kind: gateway::proto::palyra::common::v1::journal_event::EventKind::ToolExecuted as i32,
+            actor: gateway::proto::palyra::common::v1::journal_event::EventActor::System as i32,
+            timestamp_unix_ms: unix_ms_now()?,
+            payload_json: json!({
+                "event": "secret.accessed",
+                "action": audit.action,
+                "scope": audit.scope,
+                "key": audit.key,
+                "value_bytes": audit.value_bytes,
+            })
+            .to_string()
+            .into_bytes(),
+            principal: SYSTEM_DAEMON_PRINCIPAL.to_owned(),
+            device_id: SYSTEM_DAEMON_DEVICE_ID.to_owned(),
+            channel: Some(SYSTEM_VAULT_CHANNEL.to_owned()),
+        })
+        .context("failed to append secret.accessed journal event")?;
+    Ok(())
+}
+
+fn unix_ms_now() -> Result<i64> {
+    let elapsed =
+        SystemTime::now().duration_since(UNIX_EPOCH).context("system clock before UNIX epoch")?;
+    Ok(elapsed.as_millis() as i64)
 }
 
 fn load_identity_runtime(configured_store_root: Option<PathBuf>) -> Result<IdentityRuntime> {

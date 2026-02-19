@@ -33,7 +33,7 @@ pub mod proto {
 use std::sync::Arc;
 use std::{
     env, fs,
-    io::{BufRead, Write},
+    io::{BufRead, Read, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     process::Command,
@@ -48,11 +48,10 @@ use cli::{
     ChannelsCommand, Cli, Command as CliCommand, CompletionShell, ConfigCommand, CronCommand,
     CronConcurrencyPolicyArg, CronMisfirePolicyArg, CronScheduleTypeArg, DaemonCommand,
     MemoryCommand, MemoryScopeArg, MemorySourceArg, OnboardingCommand, PolicyCommand,
-    ProtocolCommand,
+    ProtocolCommand, SecretsCommand,
 };
 #[cfg(not(windows))]
 use cli::{PairingClientKindArg, PairingCommand, PairingMethodArg};
-#[cfg(not(windows))]
 use palyra_common::default_identity_store_root;
 use palyra_common::{
     build_metadata,
@@ -74,6 +73,10 @@ use palyra_identity::{
     DEFAULT_CERT_VALIDITY,
 };
 use palyra_policy::{evaluate_with_config, PolicyDecision, PolicyEvaluationConfig, PolicyRequest};
+use palyra_vault::{
+    BackendPreference as VaultBackendPreference, Vault, VaultConfig as VaultConfigOptions,
+    VaultScope,
+};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -123,6 +126,7 @@ fn main() -> Result<()> {
         CliCommand::Policy { command } => run_policy(command),
         CliCommand::Protocol { command } => run_protocol(command),
         CliCommand::Config { command } => run_config(command),
+        CliCommand::Secrets { command } => run_secrets(command),
         #[cfg(not(windows))]
         CliCommand::Pairing { command } => run_pairing(command),
     }
@@ -2788,6 +2792,127 @@ fn run_config(command: ConfigCommand) -> Result<()> {
             std::io::stdout().flush().context("stdout flush failed")
         }
     }
+}
+
+fn run_secrets(command: SecretsCommand) -> Result<()> {
+    let vault = open_cli_vault().context("failed to initialize vault runtime")?;
+    match command {
+        SecretsCommand::Set { scope, key, value_stdin } => {
+            if !value_stdin {
+                anyhow::bail!(
+                    "secrets set requires --value-stdin to avoid exposing raw values in process args"
+                );
+            }
+            let scope = parse_vault_scope(scope.as_str())?;
+            let mut value = Vec::new();
+            std::io::stdin()
+                .read_to_end(&mut value)
+                .context("failed to read secret value from stdin")?;
+            if value.is_empty() {
+                anyhow::bail!("stdin did not contain any secret bytes");
+            }
+            let metadata = vault
+                .put_secret(&scope, key.as_str(), value.as_slice())
+                .with_context(|| format!("failed to store secret key={} scope={scope}", key))?;
+            println!(
+                "secrets.set scope={} key={} value_bytes={} backend={}",
+                scope,
+                metadata.key,
+                metadata.value_bytes,
+                vault.backend_kind().as_str(),
+            );
+            std::io::stdout().flush().context("stdout flush failed")
+        }
+        SecretsCommand::Get { scope, key, reveal } => {
+            let scope = parse_vault_scope(scope.as_str())?;
+            let value = vault
+                .get_secret(&scope, key.as_str())
+                .with_context(|| format!("failed to load secret key={} scope={scope}", key))?;
+            if reveal {
+                eprintln!(
+                    "warning: printing secret bytes to stdout can leak via shell history or logs"
+                );
+                std::io::stdout()
+                    .write_all(value.as_slice())
+                    .context("failed to write secret value to stdout")?;
+            } else {
+                println!(
+                    "secrets.get scope={} key={} value=<redacted> value_bytes={} reveal=false",
+                    scope,
+                    key,
+                    value.len()
+                );
+            }
+            std::io::stdout().flush().context("stdout flush failed")
+        }
+        SecretsCommand::List { scope } => {
+            let scope = parse_vault_scope(scope.as_str())?;
+            let secrets = vault
+                .list_secrets(&scope)
+                .with_context(|| format!("failed to list secrets for scope={scope}"))?;
+            println!(
+                "secrets.list scope={} count={} backend={}",
+                scope,
+                secrets.len(),
+                vault.backend_kind().as_str()
+            );
+            for metadata in secrets {
+                println!(
+                    "secrets.entry key={} created_at_unix_ms={} updated_at_unix_ms={} value_bytes={}",
+                    metadata.key,
+                    metadata.created_at_unix_ms,
+                    metadata.updated_at_unix_ms,
+                    metadata.value_bytes
+                );
+            }
+            std::io::stdout().flush().context("stdout flush failed")
+        }
+        SecretsCommand::Delete { scope, key } => {
+            let scope = parse_vault_scope(scope.as_str())?;
+            let deleted = vault
+                .delete_secret(&scope, key.as_str())
+                .with_context(|| format!("failed to delete secret key={} scope={scope}", key))?;
+            println!("secrets.delete scope={} key={} deleted={}", scope, key, deleted);
+            std::io::stdout().flush().context("stdout flush failed")
+        }
+    }
+}
+
+fn open_cli_vault() -> Result<Vault> {
+    let identity_store_root =
+        default_identity_store_root().context("failed to resolve default identity store root")?;
+    let vault_root = env::var("PALYRA_VAULT_DIR").ok().map(PathBuf::from);
+    let backend_preference = parse_cli_vault_backend_preference()?;
+    Vault::open_with_config(VaultConfigOptions {
+        root: vault_root,
+        identity_store_root: Some(identity_store_root),
+        backend_preference,
+        ..VaultConfigOptions::default()
+    })
+    .map_err(anyhow::Error::from)
+}
+
+fn parse_cli_vault_backend_preference() -> Result<VaultBackendPreference> {
+    match env::var("PALYRA_VAULT_BACKEND") {
+        Ok(raw) => {
+            let normalized = raw.trim().to_ascii_lowercase();
+            match normalized.as_str() {
+                "" | "auto" | "default" => Ok(VaultBackendPreference::Auto),
+                "encrypted_file" => Ok(VaultBackendPreference::EncryptedFile),
+                _ => anyhow::bail!("PALYRA_VAULT_BACKEND must be one of: auto | encrypted_file"),
+            }
+        }
+        Err(std::env::VarError::NotPresent) => Ok(VaultBackendPreference::Auto),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("PALYRA_VAULT_BACKEND must contain valid UTF-8")
+        }
+    }
+}
+
+fn parse_vault_scope(raw: &str) -> Result<VaultScope> {
+    raw.parse::<VaultScope>()
+        .map_err(anyhow::Error::from)
+        .with_context(|| format!("invalid vault scope: {}", raw.trim()))
 }
 
 fn validate_daemon_compatible_document(document: &toml::Value) -> Result<()> {

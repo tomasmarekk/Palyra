@@ -20,6 +20,13 @@ service ApprovalsService {
   rpc ExportApprovals(ExportApprovalsRequest) returns (stream ExportApprovalsResponse);
 }
 
+service VaultService {
+  rpc PutSecret(PutSecretRequest) returns (PutSecretResponse);
+  rpc GetSecret(GetSecretRequest) returns (GetSecretResponse);
+  rpc DeleteSecret(DeleteSecretRequest) returns (DeleteSecretResponse);
+  rpc ListSecrets(ListSecretsRequest) returns (ListSecretsResponse);
+}
+
 enum ApprovalSubjectType {
   APPROVAL_SUBJECT_TYPE_UNSPECIFIED = 0;
   APPROVAL_SUBJECT_TYPE_TOOL = 1;
@@ -131,6 +138,76 @@ message ExportApprovalsResponse {
   bool done = 4;
 
   reserved 5 to 10;
+}
+
+message VaultSecretMetadata {
+  string scope = 1;
+  string key = 2;
+  int64 created_at_unix_ms = 3;
+  int64 updated_at_unix_ms = 4;
+  uint32 value_bytes = 5;
+
+  reserved 6 to 10;
+}
+
+message PutSecretRequest {
+  uint32 v = 1;
+  string scope = 2;
+  string key = 3;
+  bytes value = 4;
+
+  reserved 5 to 12;
+}
+
+message PutSecretResponse {
+  uint32 v = 1;
+  VaultSecretMetadata secret = 2;
+
+  reserved 3 to 10;
+}
+
+message GetSecretRequest {
+  uint32 v = 1;
+  string scope = 2;
+  string key = 3;
+
+  reserved 4 to 12;
+}
+
+message GetSecretResponse {
+  uint32 v = 1;
+  bytes value = 2;
+
+  reserved 3 to 10;
+}
+
+message DeleteSecretRequest {
+  uint32 v = 1;
+  string scope = 2;
+  string key = 3;
+
+  reserved 4 to 12;
+}
+
+message DeleteSecretResponse {
+  uint32 v = 1;
+  bool deleted = 2;
+
+  reserved 3 to 10;
+}
+
+message ListSecretsRequest {
+  uint32 v = 1;
+  string scope = 2;
+
+  reserved 3 to 10;
+}
+
+message ListSecretsResponse {
+  uint32 v = 1;
+  repeated VaultSecretMetadata secrets = 2;
+
+  reserved 3 to 10;
 }
 
 message HealthRequest {

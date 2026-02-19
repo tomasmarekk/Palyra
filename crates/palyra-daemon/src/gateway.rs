@@ -11,6 +11,11 @@ use std::{
 use axum::http::{header::AUTHORIZATION, HeaderMap};
 use palyra_common::{build_metadata, validate_canonical_id, CANONICAL_PROTOCOL_MAJOR};
 use palyra_policy::{evaluate_with_config, PolicyDecision, PolicyEvaluationConfig, PolicyRequest};
+#[cfg(test)]
+use palyra_vault::{
+    BackendPreference as VaultBackendPreference, VaultConfig as VaultConfigOptions,
+};
+use palyra_vault::{SecretMetadata as VaultSecretMetadata, Vault, VaultError, VaultScope};
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -114,6 +119,10 @@ const MAX_MEMORY_ITEM_BYTES: usize = 16 * 1024;
 const MAX_MEMORY_ITEM_TOKENS: usize = 2_048;
 const MAX_MEMORY_TOOL_QUERY_BYTES: usize = 4 * 1024;
 const MAX_MEMORY_TOOL_TAGS: usize = 32;
+const MAX_VAULT_SECRET_BYTES: usize = 64 * 1024;
+const MAX_VAULT_LIST_RESULTS: usize = 1_000;
+const VAULT_RATE_LIMIT_WINDOW_MS: u64 = 1_000;
+const VAULT_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW: u32 = 30;
 const MEMORY_SEARCH_LATENCY_BUDGET_MS: u128 = 75;
 const MEMORY_SEARCH_CACHE_CAPACITY: usize = 128;
 const MEMORY_AUTO_INJECT_MIN_SCORE: f64 = 0.2;
@@ -176,6 +185,12 @@ struct PendingToolApproval {
     prompt: ApprovalPromptRecord,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct VaultRateLimitEntry {
+    window_started_at: Instant,
+    requests_in_window: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct GatewayJournalConfigSnapshot {
     pub db_path: PathBuf,
@@ -205,8 +220,10 @@ pub struct GatewayRuntimeState {
     journal_store: JournalStore,
     revoked_certificate_count: usize,
     model_provider: Arc<dyn ModelProvider>,
+    vault: Arc<Vault>,
     memory_config: RwLock<MemoryRuntimeConfig>,
     memory_search_cache: Mutex<HashMap<String, Vec<MemorySearchHit>>>,
+    vault_rate_limit: Mutex<HashMap<String, VaultRateLimitEntry>>,
 }
 
 #[derive(Debug)]
@@ -247,6 +264,12 @@ struct RuntimeCounters {
     memory_search_requests: AtomicU64,
     memory_search_cache_hits: AtomicU64,
     memory_auto_inject_events: AtomicU64,
+    vault_put_requests: AtomicU64,
+    vault_get_requests: AtomicU64,
+    vault_delete_requests: AtomicU64,
+    vault_list_requests: AtomicU64,
+    vault_rate_limited_requests: AtomicU64,
+    vault_access_audit_events: AtomicU64,
     approvals_tool_requested: AtomicU64,
     approvals_tool_resolved_allow: AtomicU64,
     approvals_tool_resolved_deny: AtomicU64,
@@ -343,6 +366,12 @@ pub struct CountersSnapshot {
     pub memory_search_requests: u64,
     pub memory_search_cache_hits: u64,
     pub memory_auto_inject_events: u64,
+    pub vault_put_requests: u64,
+    pub vault_get_requests: u64,
+    pub vault_delete_requests: u64,
+    pub vault_list_requests: u64,
+    pub vault_rate_limited_requests: u64,
+    pub vault_access_audit_events: u64,
     pub approvals_tool_requested: u64,
     pub approvals_tool_resolved_allow: u64,
     pub approvals_tool_resolved_deny: u64,
@@ -436,6 +465,12 @@ impl RuntimeCounters {
             memory_search_requests: self.memory_search_requests.load(Ordering::Relaxed),
             memory_search_cache_hits: self.memory_search_cache_hits.load(Ordering::Relaxed),
             memory_auto_inject_events: self.memory_auto_inject_events.load(Ordering::Relaxed),
+            vault_put_requests: self.vault_put_requests.load(Ordering::Relaxed),
+            vault_get_requests: self.vault_get_requests.load(Ordering::Relaxed),
+            vault_delete_requests: self.vault_delete_requests.load(Ordering::Relaxed),
+            vault_list_requests: self.vault_list_requests.load(Ordering::Relaxed),
+            vault_rate_limited_requests: self.vault_rate_limited_requests.load(Ordering::Relaxed),
+            vault_access_audit_events: self.vault_access_audit_events.load(Ordering::Relaxed),
             approvals_tool_requested: self.approvals_tool_requested.load(Ordering::Relaxed),
             approvals_tool_resolved_allow: self
                 .approvals_tool_resolved_allow
@@ -463,12 +498,14 @@ impl GatewayRuntimeState {
             &crate::model_provider::ModelProviderConfig::default(),
         )
         .expect("default deterministic model provider should initialize");
+        let default_vault = build_test_vault();
         Self::new_with_provider(
             config,
             journal_config,
             journal_store,
             revoked_certificate_count,
             default_provider,
+            default_vault,
         )
     }
 
@@ -478,6 +515,7 @@ impl GatewayRuntimeState {
         journal_store: JournalStore,
         revoked_certificate_count: usize,
         model_provider: Arc<dyn ModelProvider>,
+        vault: Arc<Vault>,
     ) -> Result<Arc<Self>, JournalError> {
         let build = build_metadata();
         let existing_events = journal_store.total_events()? as u64;
@@ -527,6 +565,12 @@ impl GatewayRuntimeState {
                 memory_search_requests: AtomicU64::new(0),
                 memory_search_cache_hits: AtomicU64::new(0),
                 memory_auto_inject_events: AtomicU64::new(0),
+                vault_put_requests: AtomicU64::new(0),
+                vault_get_requests: AtomicU64::new(0),
+                vault_delete_requests: AtomicU64::new(0),
+                vault_list_requests: AtomicU64::new(0),
+                vault_rate_limited_requests: AtomicU64::new(0),
+                vault_access_audit_events: AtomicU64::new(0),
                 approvals_tool_requested: AtomicU64::new(0),
                 approvals_tool_resolved_allow: AtomicU64::new(0),
                 approvals_tool_resolved_deny: AtomicU64::new(0),
@@ -536,8 +580,10 @@ impl GatewayRuntimeState {
             journal_store,
             revoked_certificate_count,
             model_provider,
+            vault,
             memory_config: RwLock::new(MemoryRuntimeConfig::default()),
             memory_search_cache: Mutex::new(HashMap::new()),
+            vault_rate_limit: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -593,6 +639,82 @@ impl GatewayRuntimeState {
         tokio::task::spawn_blocking(move || state.record_journal_event_blocking(&request))
             .await
             .map_err(|_| Status::internal("journal write worker panicked"))?
+    }
+
+    fn consume_vault_rate_limit(&self, principal: &str) -> bool {
+        let now = Instant::now();
+        let mut buckets = match self.vault_rate_limit.lock() {
+            Ok(guard) => guard,
+            Err(_) => return false,
+        };
+        let entry = buckets
+            .entry(principal.to_owned())
+            .or_insert(VaultRateLimitEntry { window_started_at: now, requests_in_window: 0 });
+        if now.duration_since(entry.window_started_at).as_millis() as u64
+            > VAULT_RATE_LIMIT_WINDOW_MS
+        {
+            entry.window_started_at = now;
+            entry.requests_in_window = 0;
+        }
+        if entry.requests_in_window >= VAULT_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW {
+            return false;
+        }
+        entry.requests_in_window = entry.requests_in_window.saturating_add(1);
+        true
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn vault_put_secret(
+        self: &Arc<Self>,
+        scope: VaultScope,
+        key: String,
+        value: Vec<u8>,
+    ) -> Result<VaultSecretMetadata, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.vault.put_secret(&scope, key.as_str(), value.as_slice())
+        })
+        .await
+        .map_err(|_| Status::internal("vault write worker panicked"))?
+        .map_err(|error| map_vault_error("put secret", error))
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn vault_get_secret(
+        self: &Arc<Self>,
+        scope: VaultScope,
+        key: String,
+    ) -> Result<Vec<u8>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.vault.get_secret(&scope, key.as_str()))
+            .await
+            .map_err(|_| Status::internal("vault read worker panicked"))?
+            .map_err(|error| map_vault_error("get secret", error))
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn vault_delete_secret(
+        self: &Arc<Self>,
+        scope: VaultScope,
+        key: String,
+    ) -> Result<bool, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.vault.delete_secret(&scope, key.as_str()))
+            .await
+            .map_err(|_| Status::internal("vault delete worker panicked"))?
+            .map_err(|error| map_vault_error("delete secret", error))
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn vault_list_secrets(
+        self: &Arc<Self>,
+        scope: VaultScope,
+    ) -> Result<Vec<VaultSecretMetadata>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.vault.list_secrets(&scope))
+            .await
+            .map_err(|_| Status::internal("vault list worker panicked"))?
+            .map_err(|error| map_vault_error("list secrets", error))
     }
 
     pub fn status_snapshot(
@@ -1750,6 +1872,39 @@ fn map_memory_store_error(operation: &str, error: JournalError) -> Status {
     }
 }
 
+fn map_vault_error(operation: &str, error: VaultError) -> Status {
+    match error {
+        VaultError::NotFound => Status::not_found("secret not found"),
+        VaultError::InvalidScope(message)
+        | VaultError::InvalidKey(message)
+        | VaultError::InvalidObjectId(message)
+        | VaultError::Crypto(message) => Status::invalid_argument(message),
+        VaultError::ValueTooLarge { actual, max } => {
+            Status::invalid_argument(format!("secret value exceeds limit ({actual} > {max})"))
+        }
+        VaultError::BackendUnavailable(message) => Status::failed_precondition(message),
+        VaultError::Io(message) => Status::internal(format!("{operation} failed: {message}")),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn parse_vault_scope(raw: &str) -> Result<VaultScope, Status> {
+    raw.parse::<VaultScope>()
+        .map_err(|error| Status::invalid_argument(format!("invalid vault scope: {error}")))
+}
+
+fn vault_secret_metadata_message(
+    metadata: &VaultSecretMetadata,
+) -> gateway_v1::VaultSecretMetadata {
+    gateway_v1::VaultSecretMetadata {
+        scope: metadata.scope.to_string(),
+        key: metadata.key.clone(),
+        created_at_unix_ms: metadata.created_at_unix_ms,
+        updated_at_unix_ms: metadata.updated_at_unix_ms,
+        value_bytes: metadata.value_bytes as u32,
+    }
+}
+
 fn memory_search_cache_key(request: &MemorySearchRequest) -> String {
     json!({
         "principal": request.principal,
@@ -1802,6 +1957,25 @@ fn authorize_memory_action(principal: &str, action: &str, resource: &str) -> Res
         &PolicyEvaluationConfig::default(),
     )
     .map_err(|error| Status::internal(format!("failed to evaluate memory policy: {error}")))?;
+    match evaluation.decision {
+        PolicyDecision::Allow => Ok(()),
+        PolicyDecision::DenyByDefault { reason } => Err(Status::permission_denied(format!(
+            "policy denied action '{action}' on '{resource}': {reason}"
+        ))),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn authorize_vault_action(principal: &str, action: &str, resource: &str) -> Result<(), Status> {
+    let evaluation = evaluate_with_config(
+        &PolicyRequest {
+            principal: principal.to_owned(),
+            action: action.to_owned(),
+            resource: resource.to_owned(),
+        },
+        &PolicyEvaluationConfig::default(),
+    )
+    .map_err(|error| Status::internal(format!("failed to evaluate vault policy: {error}")))?;
     match evaluation.decision {
         PolicyDecision::Allow => Ok(()),
         PolicyDecision::DenyByDefault { reason } => Err(Status::permission_denied(format!(
@@ -2535,6 +2709,32 @@ impl MemoryServiceImpl {
         authorize_metadata(metadata, &self.auth).map_err(|error| {
             self.state.record_denied();
             warn!(method, error = %error, "memory rpc authorization denied");
+            Status::permission_denied(error.to_string())
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct VaultServiceImpl {
+    state: Arc<GatewayRuntimeState>,
+    auth: GatewayAuthConfig,
+}
+
+impl VaultServiceImpl {
+    #[must_use]
+    pub fn new(state: Arc<GatewayRuntimeState>, auth: GatewayAuthConfig) -> Self {
+        Self { state, auth }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn authorize_rpc(
+        &self,
+        metadata: &MetadataMap,
+        method: &'static str,
+    ) -> Result<RequestContext, Status> {
+        authorize_metadata(metadata, &self.auth).map_err(|error| {
+            self.state.record_denied();
+            warn!(method, error = %error, "vault rpc authorization denied");
             Status::permission_denied(error.to_string())
         })
     }
@@ -4861,6 +5061,162 @@ impl memory_v1::memory_service_server::MemoryService for MemoryServiceImpl {
     }
 }
 
+#[tonic::async_trait]
+impl gateway_v1::vault_service_server::VaultService for VaultServiceImpl {
+    async fn put_secret(
+        &self,
+        request: Request<gateway_v1::PutSecretRequest>,
+    ) -> Result<Response<gateway_v1::PutSecretResponse>, Status> {
+        let context = self.authorize_rpc(request.metadata(), "PutSecret")?;
+        if !self.state.consume_vault_rate_limit(context.principal.as_str()) {
+            self.state.counters.vault_rate_limited_requests.fetch_add(1, Ordering::Relaxed);
+            return Err(Status::resource_exhausted("vault rate limit exceeded"));
+        }
+        self.state.counters.vault_put_requests.fetch_add(1, Ordering::Relaxed);
+
+        let payload = request.into_inner();
+        require_supported_version(payload.v)?;
+        if payload.value.len() > MAX_VAULT_SECRET_BYTES {
+            return Err(Status::invalid_argument(format!(
+                "secret value exceeds maximum bytes ({} > {MAX_VAULT_SECRET_BYTES})",
+                payload.value.len()
+            )));
+        }
+        let scope = parse_vault_scope(payload.scope.as_str())?;
+        let key = payload.key.trim().to_owned();
+        authorize_vault_action(
+            context.principal.as_str(),
+            "vault.put",
+            format!("secrets:{scope}:{key}").as_str(),
+        )?;
+        let metadata =
+            self.state.vault_put_secret(scope.clone(), key.clone(), payload.value).await?;
+        record_vault_journal_event(
+            &self.state,
+            &context,
+            "secret.updated",
+            "vault.put",
+            &scope,
+            Some(key.as_str()),
+            Some(metadata.value_bytes),
+        )
+        .await?;
+        Ok(Response::new(gateway_v1::PutSecretResponse {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            secret: Some(vault_secret_metadata_message(&metadata)),
+        }))
+    }
+
+    async fn get_secret(
+        &self,
+        request: Request<gateway_v1::GetSecretRequest>,
+    ) -> Result<Response<gateway_v1::GetSecretResponse>, Status> {
+        let context = self.authorize_rpc(request.metadata(), "GetSecret")?;
+        if !self.state.consume_vault_rate_limit(context.principal.as_str()) {
+            self.state.counters.vault_rate_limited_requests.fetch_add(1, Ordering::Relaxed);
+            return Err(Status::resource_exhausted("vault rate limit exceeded"));
+        }
+        self.state.counters.vault_get_requests.fetch_add(1, Ordering::Relaxed);
+
+        let payload = request.into_inner();
+        require_supported_version(payload.v)?;
+        let scope = parse_vault_scope(payload.scope.as_str())?;
+        let key = payload.key.trim().to_owned();
+        authorize_vault_action(
+            context.principal.as_str(),
+            "vault.get",
+            format!("secrets:{scope}:{key}").as_str(),
+        )?;
+        let value = self.state.vault_get_secret(scope.clone(), key.clone()).await?;
+        record_vault_journal_event(
+            &self.state,
+            &context,
+            "secret.accessed",
+            "vault.get",
+            &scope,
+            Some(key.as_str()),
+            Some(value.len()),
+        )
+        .await?;
+        Ok(Response::new(gateway_v1::GetSecretResponse { v: CANONICAL_PROTOCOL_MAJOR, value }))
+    }
+
+    async fn delete_secret(
+        &self,
+        request: Request<gateway_v1::DeleteSecretRequest>,
+    ) -> Result<Response<gateway_v1::DeleteSecretResponse>, Status> {
+        let context = self.authorize_rpc(request.metadata(), "DeleteSecret")?;
+        if !self.state.consume_vault_rate_limit(context.principal.as_str()) {
+            self.state.counters.vault_rate_limited_requests.fetch_add(1, Ordering::Relaxed);
+            return Err(Status::resource_exhausted("vault rate limit exceeded"));
+        }
+        self.state.counters.vault_delete_requests.fetch_add(1, Ordering::Relaxed);
+
+        let payload = request.into_inner();
+        require_supported_version(payload.v)?;
+        let scope = parse_vault_scope(payload.scope.as_str())?;
+        let key = payload.key.trim().to_owned();
+        authorize_vault_action(
+            context.principal.as_str(),
+            "vault.delete",
+            format!("secrets:{scope}:{key}").as_str(),
+        )?;
+        let deleted = self.state.vault_delete_secret(scope.clone(), key.clone()).await?;
+        if deleted {
+            record_vault_journal_event(
+                &self.state,
+                &context,
+                "secret.deleted",
+                "vault.delete",
+                &scope,
+                Some(key.as_str()),
+                None,
+            )
+            .await?;
+        }
+        Ok(Response::new(gateway_v1::DeleteSecretResponse { v: CANONICAL_PROTOCOL_MAJOR, deleted }))
+    }
+
+    async fn list_secrets(
+        &self,
+        request: Request<gateway_v1::ListSecretsRequest>,
+    ) -> Result<Response<gateway_v1::ListSecretsResponse>, Status> {
+        let context = self.authorize_rpc(request.metadata(), "ListSecrets")?;
+        if !self.state.consume_vault_rate_limit(context.principal.as_str()) {
+            self.state.counters.vault_rate_limited_requests.fetch_add(1, Ordering::Relaxed);
+            return Err(Status::resource_exhausted("vault rate limit exceeded"));
+        }
+        self.state.counters.vault_list_requests.fetch_add(1, Ordering::Relaxed);
+
+        let payload = request.into_inner();
+        require_supported_version(payload.v)?;
+        let scope = parse_vault_scope(payload.scope.as_str())?;
+        authorize_vault_action(
+            context.principal.as_str(),
+            "vault.list",
+            format!("secrets:{scope}").as_str(),
+        )?;
+        let mut secrets = self.state.vault_list_secrets(scope.clone()).await?;
+        if secrets.len() > MAX_VAULT_LIST_RESULTS {
+            secrets.truncate(MAX_VAULT_LIST_RESULTS);
+        }
+        record_vault_journal_event(
+            &self.state,
+            &context,
+            "secret.listed",
+            "vault.list",
+            &scope,
+            None,
+            Some(secrets.len()),
+        )
+        .await?;
+        Ok(Response::new(gateway_v1::ListSecretsResponse {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            secrets: secrets.iter().map(vault_secret_metadata_message).collect(),
+        }))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn ingest_memory_best_effort(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -6320,6 +6676,43 @@ fn tool_decision_journal_payload(
     .into_bytes()
 }
 
+#[allow(clippy::result_large_err)]
+async fn record_vault_journal_event(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: &RequestContext,
+    event: &str,
+    action: &str,
+    scope: &VaultScope,
+    key: Option<&str>,
+    value_size: Option<usize>,
+) -> Result<(), Status> {
+    runtime_state
+        .record_journal_event(JournalAppendRequest {
+            event_id: Ulid::new().to_string(),
+            session_id: Ulid::new().to_string(),
+            run_id: Ulid::new().to_string(),
+            kind: common_v1::journal_event::EventKind::ToolExecuted as i32,
+            actor: common_v1::journal_event::EventActor::System as i32,
+            timestamp_unix_ms: current_unix_ms(),
+            payload_json: json!({
+                "event": event,
+                "action": action,
+                "scope": scope.to_string(),
+                "key": key.unwrap_or_default(),
+                "value_bytes": value_size,
+                "vault_backend": runtime_state.vault.backend_kind().as_str(),
+            })
+            .to_string()
+            .into_bytes(),
+            principal: context.principal.clone(),
+            device_id: context.device_id.clone(),
+            channel: context.channel.clone(),
+        })
+        .await?;
+    runtime_state.counters.vault_access_audit_events.fetch_add(1, Ordering::Relaxed);
+    Ok(())
+}
+
 fn tool_result_tape_payload(
     proposal_id: &str,
     success: bool,
@@ -6475,6 +6868,23 @@ where
         return Err(AuthError::EmptyContext(key));
     }
     Ok(Some(value.to_owned()))
+}
+
+#[cfg(test)]
+fn build_test_vault() -> Arc<Vault> {
+    let nonce = Ulid::new();
+    let root = std::env::temp_dir().join(format!("palyra-gateway-test-vault-{nonce}"));
+    let identity_root =
+        std::env::temp_dir().join(format!("palyra-gateway-test-vault-identity-{nonce}"));
+    Arc::new(
+        Vault::open_with_config(VaultConfigOptions {
+            root: Some(root),
+            identity_store_root: Some(identity_root),
+            backend_preference: VaultBackendPreference::EncryptedFile,
+            max_secret_bytes: MAX_VAULT_SECRET_BYTES,
+        })
+        .expect("test vault should initialize"),
+    )
 }
 
 fn extract_bearer_token(raw: Option<&str>) -> Option<&str> {

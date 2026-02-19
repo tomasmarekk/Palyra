@@ -9,7 +9,7 @@ use palyra_common::{
         parse_document_with_migration, serialize_document_pretty, ConfigMigrationInfo,
     },
     daemon_config_schema::RootFileConfig,
-    default_config_search_paths, parse_config_path,
+    default_config_search_paths, default_identity_store_root, parse_config_path,
 };
 
 use crate::model_provider::{ModelProviderConfig, ModelProviderKind};
@@ -163,6 +163,7 @@ pub struct StorageConfig {
     pub journal_db_path: PathBuf,
     pub journal_hash_chain_enabled: bool,
     pub max_journal_payload_bytes: usize,
+    pub vault_dir: PathBuf,
 }
 
 impl Default for DaemonConfig {
@@ -183,6 +184,7 @@ impl Default for StorageConfig {
             journal_db_path: PathBuf::from(DEFAULT_JOURNAL_DB_PATH),
             journal_hash_chain_enabled: DEFAULT_JOURNAL_HASH_CHAIN_ENABLED,
             max_journal_payload_bytes: DEFAULT_MAX_JOURNAL_PAYLOAD_BYTES,
+            vault_dir: default_vault_dir(),
         }
     }
 }
@@ -413,6 +415,18 @@ pub fn load_config() -> Result<LoadedConfig> {
             if let Some(openai_model) = file_model_provider.openai_model {
                 model_provider.openai_model = parse_openai_model(openai_model.as_str())?;
             }
+            if let Some(openai_api_key) = file_model_provider.openai_api_key {
+                model_provider.openai_api_key =
+                    if openai_api_key.trim().is_empty() { None } else { Some(openai_api_key) };
+            }
+            if let Some(openai_api_key_vault_ref) = file_model_provider.openai_api_key_vault_ref {
+                model_provider.openai_api_key_vault_ref =
+                    if openai_api_key_vault_ref.trim().is_empty() {
+                        None
+                    } else {
+                        Some(openai_api_key_vault_ref)
+                    };
+            }
             if let Some(request_timeout_ms) = file_model_provider.request_timeout_ms {
                 model_provider.request_timeout_ms =
                     parse_positive_u64(request_timeout_ms, "model_provider.request_timeout_ms")?;
@@ -582,6 +596,9 @@ pub fn load_config() -> Result<LoadedConfig> {
                     max_journal_payload_bytes,
                     "storage.max_journal_payload_bytes",
                 )?;
+            }
+            if let Some(vault_dir) = file_storage.vault_dir {
+                storage.vault_dir = parse_vault_dir(&vault_dir)?;
             }
         }
         source = path.to_string_lossy().into_owned();
@@ -762,6 +779,16 @@ pub fn load_config() -> Result<LoadedConfig> {
         source.push_str(" +env(PALYRA_MODEL_PROVIDER_OPENAI_API_KEY)");
     }
 
+    if let Ok(openai_api_key_vault_ref) = env::var("PALYRA_MODEL_PROVIDER_OPENAI_API_KEY_VAULT_REF")
+    {
+        model_provider.openai_api_key_vault_ref = if openai_api_key_vault_ref.trim().is_empty() {
+            None
+        } else {
+            Some(openai_api_key_vault_ref)
+        };
+        source.push_str(" +env(PALYRA_MODEL_PROVIDER_OPENAI_API_KEY_VAULT_REF)");
+    }
+
     if let Ok(request_timeout_ms) = env::var("PALYRA_MODEL_PROVIDER_REQUEST_TIMEOUT_MS") {
         model_provider.request_timeout_ms = parse_positive_u64(
             request_timeout_ms
@@ -881,6 +908,11 @@ pub fn load_config() -> Result<LoadedConfig> {
         source.push_str(" +env(PALYRA_JOURNAL_MAX_PAYLOAD_BYTES)");
     }
 
+    if let Ok(vault_dir) = env::var("PALYRA_VAULT_DIR") {
+        storage.vault_dir = parse_vault_dir(&vault_dir)?;
+        source.push_str(" +env(PALYRA_VAULT_DIR)");
+    }
+
     if gateway.tls.enabled && (gateway.tls.cert_path.is_none() || gateway.tls.key_path.is_none()) {
         anyhow::bail!(
             "gateway.tls.enabled=true requires both gateway.tls.cert_path and gateway.tls.key_path"
@@ -946,6 +978,16 @@ fn parse_journal_db_path(raw: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+fn parse_vault_dir(raw: &str) -> Result<PathBuf> {
+    if raw.trim().is_empty() {
+        anyhow::bail!("vault directory cannot be empty");
+    }
+    if raw.contains('\0') {
+        anyhow::bail!("vault directory cannot contain embedded NUL byte");
+    }
+    Ok(PathBuf::from(raw))
+}
+
 fn parse_identity_store_dir(raw: &str) -> Result<PathBuf> {
     if raw.trim().is_empty() {
         anyhow::bail!("identity store directory cannot be empty");
@@ -954,6 +996,16 @@ fn parse_identity_store_dir(raw: &str) -> Result<PathBuf> {
         anyhow::bail!("identity store directory cannot contain embedded NUL byte");
     }
     Ok(PathBuf::from(raw))
+}
+
+fn default_vault_dir() -> PathBuf {
+    let identity_root =
+        default_identity_store_root().unwrap_or_else(|_| PathBuf::from(".palyra/identity"));
+    if let Some(parent) = identity_root.parent() {
+        parent.join("vault")
+    } else {
+        identity_root.join("vault")
+    }
 }
 
 fn parse_gateway_tls_path(raw: &str) -> Result<PathBuf> {
@@ -1152,8 +1204,9 @@ mod tests {
         parse_default_memory_ttl_ms, parse_dns_suffix_allowlist, parse_host_allowlist,
         parse_journal_db_path, parse_openai_base_url, parse_positive_usize,
         parse_process_executable_allowlist, parse_root_file_config, parse_storage_prefix_allowlist,
-        parse_tool_allowlist, AdminConfig, GatewayConfig, GatewayTlsConfig, IdentityConfig,
-        MemoryConfig, ModelProviderConfig, OrchestratorConfig, StorageConfig, ToolCallConfig,
+        parse_tool_allowlist, parse_vault_dir, AdminConfig, GatewayConfig, GatewayTlsConfig,
+        IdentityConfig, MemoryConfig, ModelProviderConfig, OrchestratorConfig, StorageConfig,
+        ToolCallConfig,
     };
     use crate::model_provider::ModelProviderKind;
     use palyra_common::daemon_config_schema::RootFileConfig;
@@ -1242,6 +1295,10 @@ mod tests {
         assert_eq!(config.openai_base_url, "https://api.openai.com/v1");
         assert_eq!(config.openai_model, "gpt-4o-mini");
         assert!(config.openai_api_key.is_none(), "openai API key should default to unset");
+        assert!(
+            config.openai_api_key_vault_ref.is_none(),
+            "openai API key vault ref should default to unset"
+        );
         assert_eq!(config.max_retries, 2);
     }
 
@@ -1264,6 +1321,10 @@ mod tests {
             config.max_journal_payload_bytes,
             256 * 1024,
             "journal payload limit should default to 256 KiB"
+        );
+        assert!(
+            config.vault_dir.ends_with("vault"),
+            "default vault directory should be rooted under state/vault"
         );
     }
 
@@ -1374,6 +1435,12 @@ mod tests {
     fn journal_db_path_rejects_parent_traversal() {
         let result = parse_journal_db_path("../secrets/journal.sqlite3");
         assert!(result.is_err(), "journal db path must reject parent traversal");
+    }
+
+    #[test]
+    fn vault_dir_rejects_empty_and_nul() {
+        assert!(parse_vault_dir("").is_err(), "vault dir must reject empty values");
+        assert!(parse_vault_dir("vault\0dir").is_err(), "vault dir must reject embedded NUL");
     }
 
     #[test]

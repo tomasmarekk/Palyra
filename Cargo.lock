@@ -2195,6 +2195,7 @@ dependencies = [
  "palyra-common",
  "palyra-identity",
  "palyra-policy",
+ "palyra-vault",
  "prost",
  "protoc-bin-vendored",
  "reqwest",
@@ -2237,6 +2238,7 @@ dependencies = [
  "palyra-plugins-runtime",
  "palyra-plugins-sdk",
  "palyra-policy",
+ "palyra-vault",
  "prost",
  "protoc-bin-vendored",
  "reqwest",
@@ -2305,6 +2307,26 @@ dependencies = [
  "criterion",
  "serde_json",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "palyra-vault"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "hex",
+ "hkdf",
+ "palyra-common",
+ "palyra-identity",
+ "rand 0.8.5",
+ "ring",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "ulid",
 ]
 
 [[package]]
