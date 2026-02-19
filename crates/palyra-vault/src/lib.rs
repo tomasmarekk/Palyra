@@ -220,6 +220,7 @@ impl Vault {
         validate_secret_key(key)?;
         let _lock = self.acquire_metadata_lock()?;
         let mut index = self.read_metadata()?;
+        let index_before_delete = index.clone();
         let mut deleted = false;
         let mut removed_object_id = None;
         index.entries.retain(|entry| {
@@ -232,8 +233,15 @@ impl Vault {
             }
         });
         if let Some(object_id) = removed_object_id {
-            self.backend.delete_blob(object_id.as_str())?;
             self.write_metadata(&index)?;
+            if let Err(error) = self.backend.delete_blob(object_id.as_str()) {
+                self.write_metadata(&index_before_delete).map_err(|rollback_error| {
+                    VaultError::Io(format!(
+                        "failed to delete secret blob and rollback metadata: delete_error={error}; rollback_error={rollback_error}"
+                    ))
+                })?;
+                return Err(error);
+            }
         }
         Ok(deleted)
     }
@@ -602,11 +610,45 @@ pub fn ensure_owner_only_file(path: &Path) -> Result<(), VaultError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        derive_kek_from_seed_material, extract_kek_seed_material, BackendPreference, Vault,
-        VaultConfig, VaultRef, VaultScope,
+        backend::{BackendKind, BlobBackend},
+        derive_kek_from_seed_material, ensure_owner_only_dir, extract_kek_seed_material,
+        BackendPreference, Vault, VaultConfig, VaultError, VaultRef, VaultScope,
     };
     use anyhow::Result;
+    use std::{collections::HashMap, sync::Mutex};
     use tempfile::tempdir;
+
+    #[derive(Default)]
+    struct FailingDeleteBackend {
+        objects: Mutex<HashMap<String, Vec<u8>>>,
+    }
+
+    impl BlobBackend for FailingDeleteBackend {
+        fn kind(&self) -> BackendKind {
+            BackendKind::EncryptedFile
+        }
+
+        fn put_blob(&self, object_id: &str, payload: &[u8]) -> Result<(), VaultError> {
+            let mut objects = self
+                .objects
+                .lock()
+                .map_err(|_| VaultError::Io("failing-delete backend mutex poisoned".to_owned()))?;
+            objects.insert(object_id.to_owned(), payload.to_vec());
+            Ok(())
+        }
+
+        fn get_blob(&self, object_id: &str) -> Result<Vec<u8>, VaultError> {
+            let objects = self
+                .objects
+                .lock()
+                .map_err(|_| VaultError::Io("failing-delete backend mutex poisoned".to_owned()))?;
+            objects.get(object_id).cloned().ok_or(VaultError::NotFound)
+        }
+
+        fn delete_blob(&self, _object_id: &str) -> Result<(), VaultError> {
+            Err(VaultError::Io("injected backend delete failure".to_owned()))
+        }
+    }
 
     #[test]
     fn vault_put_get_list_delete_roundtrip() -> Result<()> {
@@ -662,6 +704,33 @@ mod tests {
             matches!(error, super::VaultError::Crypto(_)),
             "unexpected error for wrong key material: {error}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn vault_delete_restores_metadata_when_backend_delete_fails() -> Result<()> {
+        let temp = tempdir()?;
+        let vault_root = temp.path().join("vault");
+        ensure_owner_only_dir(&vault_root)?;
+        let vault = Vault {
+            root: vault_root,
+            backend: Box::new(FailingDeleteBackend::default()),
+            max_secret_bytes: 1024,
+            kek: derive_kek_from_seed_material(b"palyra.vault.tests.delete_rollback")?,
+        };
+        vault.ensure_metadata_exists()?;
+        let scope = VaultScope::Principal { principal_id: "user:ops".to_owned() };
+        vault.put_secret(&scope, "api_key", b"secret-value")?;
+
+        let error = vault
+            .delete_secret(&scope, "api_key")
+            .expect_err("delete should fail when backend returns an I/O error");
+        assert!(
+            matches!(error, VaultError::Io(message) if message.contains("injected backend delete failure")),
+            "delete error should preserve backend failure context"
+        );
+        let loaded = vault.get_secret(&scope, "api_key")?;
+        assert_eq!(loaded, b"secret-value");
         Ok(())
     }
 
