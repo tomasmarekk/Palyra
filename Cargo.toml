@@ -40,7 +40,7 @@ libc = "0.2.171"
 protoc-bin-vendored = "3.0.0"
 prost = "0.13.5"
 rand = "0.8.5"
-reqwest = { version = "0.12.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+reqwest = { version = "0.12.12", default-features = false, features = ["blocking", "json", "native-tls"] }
 rcgen = { version = "0.13.1", features = ["x509-parser"] }
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 rustls = { version = "0.23.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
