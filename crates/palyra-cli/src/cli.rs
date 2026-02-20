@@ -78,6 +78,10 @@ pub enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    Skills {
+        #[command(subcommand)]
+        command: SkillsCommand,
+    },
     Secrets {
         #[command(subcommand)]
         command: SecretsCommand,
@@ -677,6 +681,50 @@ pub enum SecretsCommand {
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum SkillsCommand {
+    Package {
+        #[command(subcommand)]
+        command: SkillsPackageCommand,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum SkillsPackageCommand {
+    Build {
+        #[arg(long)]
+        manifest: String,
+        #[arg(long)]
+        module: Vec<String>,
+        #[arg(long)]
+        asset: Vec<String>,
+        #[arg(long)]
+        sbom: String,
+        #[arg(long)]
+        provenance: String,
+        #[arg(long)]
+        output: String,
+        #[arg(long)]
+        signing_key_vault_ref: Option<String>,
+        #[arg(long, default_value_t = false, conflicts_with = "signing_key_vault_ref")]
+        signing_key_stdin: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Verify {
+        #[arg(long)]
+        artifact: String,
+        #[arg(long)]
+        trust_store: Option<String>,
+        #[arg(long = "trusted-publisher")]
+        trusted_publishers: Vec<String>,
+        #[arg(long, default_value_t = false)]
+        allow_tofu: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum PairingCommand {
     Pair {
         #[arg(long)]
@@ -738,7 +786,7 @@ mod tests {
         BrowserCommand, ChannelsCommand, Cli, Command, CompletionShell, ConfigCommand, CronCommand,
         CronConcurrencyPolicyArg, CronMisfirePolicyArg, CronScheduleTypeArg, DaemonCommand,
         MemoryCommand, MemoryScopeArg, MemorySourceArg, OnboardingCommand, PolicyCommand,
-        ProtocolCommand, SecretsCommand,
+        ProtocolCommand, SecretsCommand, SkillsCommand, SkillsPackageCommand,
     };
     #[cfg(not(windows))]
     use super::{PairingClientKindArg, PairingCommand, PairingMethodArg};
@@ -1715,6 +1763,80 @@ mod tests {
                     backup: 2,
                     backups: 4,
                 }
+            }
+        );
+    }
+
+    #[test]
+    fn parse_skills_package_build() {
+        let parsed = Cli::parse_from([
+            "palyra",
+            "skills",
+            "package",
+            "build",
+            "--manifest",
+            "examples/skill.toml",
+            "--module",
+            "build/module.wasm",
+            "--asset",
+            "assets/prompt.txt",
+            "--sbom",
+            "build/sbom.cdx.json",
+            "--provenance",
+            "build/provenance.json",
+            "--output",
+            "dist/acme.palyra-skill",
+            "--signing-key-stdin",
+            "--json",
+        ]);
+        assert_eq!(
+            parsed.command,
+            Command::Skills {
+                command: SkillsCommand::Package {
+                    command: SkillsPackageCommand::Build {
+                        manifest: "examples/skill.toml".to_owned(),
+                        module: vec!["build/module.wasm".to_owned()],
+                        asset: vec!["assets/prompt.txt".to_owned()],
+                        sbom: "build/sbom.cdx.json".to_owned(),
+                        provenance: "build/provenance.json".to_owned(),
+                        output: "dist/acme.palyra-skill".to_owned(),
+                        signing_key_vault_ref: None,
+                        signing_key_stdin: true,
+                        json: true,
+                    },
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn parse_skills_package_verify() {
+        let parsed = Cli::parse_from([
+            "palyra",
+            "skills",
+            "package",
+            "verify",
+            "--artifact",
+            "dist/acme.palyra-skill",
+            "--trust-store",
+            "state/skills-trust.json",
+            "--trusted-publisher",
+            "acme=001122",
+            "--allow-tofu",
+            "--json",
+        ]);
+        assert_eq!(
+            parsed.command,
+            Command::Skills {
+                command: SkillsCommand::Package {
+                    command: SkillsPackageCommand::Verify {
+                        artifact: "dist/acme.palyra-skill".to_owned(),
+                        trust_store: Some("state/skills-trust.json".to_owned()),
+                        trusted_publishers: vec!["acme=001122".to_owned()],
+                        allow_tofu: true,
+                        json: true,
+                    },
+                },
             }
         );
     }

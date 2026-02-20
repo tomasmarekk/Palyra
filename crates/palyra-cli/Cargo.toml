@@ -19,6 +19,7 @@ futures.workspace = true
 palyra-common = { version = "0.1.0", path = "../palyra-common" }
 palyra-identity = { version = "0.1.0", path = "../palyra-identity" }
 palyra-policy = { version = "0.1.0", path = "../palyra-policy" }
+palyra-skills = { version = "0.1.0", path = "../palyra-skills" }
 palyra-vault = { version = "0.1.0", path = "../palyra-vault" }
 prost.workspace = true
 reqwest.workspace = true

@@ -1,0 +1,13 @@
+{
+  "builder": {
+    "id": "local-dev"
+  },
+  "subject": [
+    {
+      "name": "module.wasm",
+      "digest": {
+        "sha256": "placeholder-generated-at-build"
+      }
+    }
+  ]
+}

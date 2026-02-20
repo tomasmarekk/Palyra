@@ -1,0 +1,13 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.6",
+  "version": 1,
+  "metadata": {
+    "component": {
+      "name": "acme.echo_http",
+      "type": "application",
+      "version": "1.0.0"
+    }
+  },
+  "components": []
+}

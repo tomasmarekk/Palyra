@@ -48,7 +48,7 @@ use cli::{
     ChannelsCommand, Cli, Command as CliCommand, CompletionShell, ConfigCommand, CronCommand,
     CronConcurrencyPolicyArg, CronMisfirePolicyArg, CronScheduleTypeArg, DaemonCommand,
     MemoryCommand, MemoryScopeArg, MemorySourceArg, OnboardingCommand, PolicyCommand,
-    ProtocolCommand, SecretsCommand,
+    ProtocolCommand, SecretsCommand, SkillsCommand, SkillsPackageCommand,
 };
 #[cfg(not(windows))]
 use cli::{PairingClientKindArg, PairingCommand, PairingMethodArg};
@@ -73,9 +73,13 @@ use palyra_identity::{
     DEFAULT_CERT_VALIDITY,
 };
 use palyra_policy::{evaluate_with_config, PolicyDecision, PolicyEvaluationConfig, PolicyRequest};
+use palyra_skills::{
+    build_signed_skill_artifact, parse_ed25519_signing_key, verify_skill_artifact, ArtifactFile,
+    SkillArtifactBuildRequest, SkillTrustStore,
+};
 use palyra_vault::{
     BackendPreference as VaultBackendPreference, Vault, VaultConfig as VaultConfigOptions,
-    VaultScope,
+    VaultRef, VaultScope,
 };
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -126,6 +130,7 @@ fn main() -> Result<()> {
         CliCommand::Policy { command } => run_policy(command),
         CliCommand::Protocol { command } => run_protocol(command),
         CliCommand::Config { command } => run_config(command),
+        CliCommand::Skills { command } => run_skills(command),
         CliCommand::Secrets { command } => run_secrets(command),
         #[cfg(not(windows))]
         CliCommand::Pairing { command } => run_pairing(command),
@@ -2792,6 +2797,260 @@ fn run_config(command: ConfigCommand) -> Result<()> {
             std::io::stdout().flush().context("stdout flush failed")
         }
     }
+}
+
+fn run_skills(command: SkillsCommand) -> Result<()> {
+    match command {
+        SkillsCommand::Package { command } => match command {
+            SkillsPackageCommand::Build {
+                manifest,
+                module,
+                asset,
+                sbom,
+                provenance,
+                output,
+                signing_key_vault_ref,
+                signing_key_stdin,
+                json,
+            } => {
+                if module.is_empty() {
+                    anyhow::bail!("skills package build requires at least one --module");
+                }
+                let manifest_toml = fs::read_to_string(manifest.as_str()).with_context(|| {
+                    format!("failed to read skills manifest {}", Path::new(&manifest).display())
+                })?;
+                let modules = module
+                    .iter()
+                    .map(|path| {
+                        let bytes = fs::read(path).with_context(|| {
+                            format!("failed to read module {}", Path::new(path).display())
+                        })?;
+                        let entry_path = skill_entry_path_from_cli(path)?;
+                        Ok(ArtifactFile { path: entry_path, bytes })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let assets = asset
+                    .iter()
+                    .map(|path| {
+                        let bytes = fs::read(path).with_context(|| {
+                            format!("failed to read asset {}", Path::new(path).display())
+                        })?;
+                        let entry_path = skill_entry_path_from_cli(path)?;
+                        Ok(ArtifactFile { path: entry_path, bytes })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let sbom_payload = fs::read(sbom.as_str()).with_context(|| {
+                    format!("failed to read SBOM {}", Path::new(&sbom).display())
+                })?;
+                let provenance_payload = fs::read(provenance.as_str()).with_context(|| {
+                    format!(
+                        "failed to read provenance payload {}",
+                        Path::new(&provenance).display()
+                    )
+                })?;
+                let signing_key_secret = read_skills_signing_key_source(
+                    signing_key_vault_ref.as_deref(),
+                    signing_key_stdin,
+                )?;
+                let signing_key = parse_ed25519_signing_key(signing_key_secret.as_slice())
+                    .context("invalid signing key bytes (expected raw 32-byte, hex, or base64)")?;
+
+                let build_output = build_signed_skill_artifact(SkillArtifactBuildRequest {
+                    manifest_toml,
+                    modules,
+                    assets,
+                    sbom_cyclonedx_json: sbom_payload,
+                    provenance_json: provenance_payload,
+                    signing_key,
+                })
+                .context("failed to build signed skill artifact")?;
+
+                let output_path = Path::new(&output);
+                if let Some(parent) = output_path.parent() {
+                    fs::create_dir_all(parent).with_context(|| {
+                        format!("failed to create output directory {}", parent.to_string_lossy())
+                    })?;
+                }
+                fs::write(output_path, build_output.artifact_bytes.as_slice()).with_context(
+                    || format!("failed to write skill artifact {}", output_path.display()),
+                )?;
+
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({
+                            "artifact_path": output_path,
+                            "payload_sha256": build_output.payload_sha256,
+                            "publisher": build_output.manifest.publisher,
+                            "skill_id": build_output.manifest.skill_id,
+                            "version": build_output.manifest.version,
+                            "signature_key_id": build_output.signature.key_id,
+                            "artifact_bytes": build_output.artifact_bytes.len(),
+                        }))?
+                    );
+                } else {
+                    println!(
+                        "skills.package.build artifact={} skill_id={} publisher={} version={} payload_sha256={} key_id={} bytes={}",
+                        output_path.display(),
+                        build_output.manifest.skill_id,
+                        build_output.manifest.publisher,
+                        build_output.manifest.version,
+                        build_output.payload_sha256,
+                        build_output.signature.key_id,
+                        build_output.artifact_bytes.len(),
+                    );
+                }
+                std::io::stdout().flush().context("stdout flush failed")
+            }
+            SkillsPackageCommand::Verify {
+                artifact,
+                trust_store,
+                trusted_publishers,
+                allow_tofu,
+                json,
+            } => {
+                let artifact_path = Path::new(artifact.as_str());
+                let artifact_bytes = fs::read(artifact_path).with_context(|| {
+                    format!("failed to read skill artifact {}", artifact_path.display())
+                })?;
+                let trust_store_path = resolve_skills_trust_store_path(trust_store.as_deref())
+                    .with_context(|| "failed to resolve skills trust store path".to_owned())?;
+                let mut store = SkillTrustStore::load(trust_store_path.as_path())?;
+                for trusted in trusted_publishers {
+                    let (publisher, key) = parse_trusted_publisher_arg(trusted.as_str())?;
+                    store.add_trusted_key(publisher, key)?;
+                }
+                let report =
+                    verify_skill_artifact(artifact_bytes.as_slice(), &mut store, allow_tofu)
+                        .context("failed to verify skill artifact")?;
+                store.save(trust_store_path.as_path())?;
+
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!(
+                        "skills.package.verify artifact={} accepted={} trust={} skill_id={} publisher={} version={} payload_sha256={} trust_store={}",
+                        artifact_path.display(),
+                        report.accepted,
+                        match report.trust_decision {
+                            palyra_skills::TrustDecision::Allowlisted => "allowlisted",
+                            palyra_skills::TrustDecision::TofuPinned => "tofu_pinned",
+                            palyra_skills::TrustDecision::TofuNewlyPinned => "tofu_newly_pinned",
+                        },
+                        report.manifest.skill_id,
+                        report.manifest.publisher,
+                        report.manifest.version,
+                        report.payload_sha256,
+                        trust_store_path.display()
+                    );
+                }
+                std::io::stdout().flush().context("stdout flush failed")
+            }
+        },
+    }
+}
+
+fn read_skills_signing_key_source(
+    signing_key_vault_ref: Option<&str>,
+    signing_key_stdin: bool,
+) -> Result<Vec<u8>> {
+    match (signing_key_vault_ref, signing_key_stdin) {
+        (Some(_), true) => {
+            anyhow::bail!(
+                "skills package build accepts either --signing-key-vault-ref or --signing-key-stdin"
+            );
+        }
+        (Some(vault_ref_raw), false) => {
+            let vault_ref = VaultRef::parse(vault_ref_raw).with_context(|| {
+                format!(
+                    "invalid --signing-key-vault-ref '{}'; expected '<scope>/<key>'",
+                    vault_ref_raw.trim()
+                )
+            })?;
+            let vault = open_cli_vault().context("failed to initialize vault runtime")?;
+            vault
+                .get_secret(&vault_ref.scope, vault_ref.key.as_str())
+                .map_err(anyhow::Error::from)
+                .with_context(|| {
+                    format!(
+                        "failed to load signing key from vault scope={} key={}",
+                        vault_ref.scope, vault_ref.key
+                    )
+                })
+        }
+        (None, true) => {
+            let mut secret = Vec::new();
+            std::io::stdin()
+                .read_to_end(&mut secret)
+                .context("failed to read signing key from stdin")?;
+            if secret.is_empty() {
+                anyhow::bail!("stdin did not contain any signing key bytes");
+            }
+            Ok(secret)
+        }
+        (None, false) => {
+            anyhow::bail!(
+                "skills package build requires --signing-key-vault-ref <scope/key> or --signing-key-stdin"
+            );
+        }
+    }
+}
+
+fn parse_trusted_publisher_arg(raw: &str) -> Result<(&str, &str)> {
+    let (publisher, key) = raw.split_once('=').ok_or_else(|| {
+        anyhow!(
+            "invalid --trusted-publisher value '{}'; expected 'publisher=ed25519_hex_key'",
+            raw.trim()
+        )
+    })?;
+    if publisher.trim().is_empty() || key.trim().is_empty() {
+        anyhow::bail!(
+            "invalid --trusted-publisher value '{}'; expected non-empty 'publisher=ed25519_hex_key'",
+            raw.trim()
+        );
+    }
+    Ok((publisher.trim(), key.trim()))
+}
+
+fn resolve_skills_trust_store_path(raw: Option<&str>) -> Result<PathBuf> {
+    if let Some(value) = raw {
+        if value.trim().is_empty() {
+            anyhow::bail!("--trust-store path cannot be empty");
+        }
+        return Ok(PathBuf::from(value));
+    }
+
+    match env::var("PALYRA_SKILLS_TRUST_STORE") {
+        Ok(value) if !value.trim().is_empty() => Ok(PathBuf::from(value)),
+        Ok(_) => anyhow::bail!("PALYRA_SKILLS_TRUST_STORE cannot be empty when set"),
+        Err(std::env::VarError::NotPresent) => {
+            let identity_root = default_identity_store_root()
+                .context("failed to resolve default identity store root")?;
+            let state_root = identity_root
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| identity_root.clone());
+            Ok(state_root.join("skills").join("trust-store.json"))
+        }
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("PALYRA_SKILLS_TRUST_STORE must contain valid UTF-8")
+        }
+    }
+}
+
+fn skill_entry_path_from_cli(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("artifact file path cannot be empty");
+    }
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+            anyhow::bail!("absolute artifact path '{}' has no file name", path.display());
+        };
+        return Ok(file_name.to_owned());
+    }
+    Ok(trimmed.replace('\\', "/"))
 }
 
 fn run_secrets(command: SecretsCommand) -> Result<()> {

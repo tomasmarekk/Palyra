@@ -1,0 +1,44 @@
+manifest_version = 1
+skill_id = "acme.echo_http"
+name = "Echo + HTTP"
+version = "1.0.0"
+publisher = "acme"
+
+[entrypoints]
+[[entrypoints.tools]]
+id = "acme.echo"
+name = "echo"
+description = "Echoes provided text"
+input_schema = { type = "object", properties = { text = { type = "string" } }, required = ["text"] }
+output_schema = { type = "object", properties = { echo = { type = "string" } }, required = ["echo"] }
+risk = { default_sensitive = false, requires_approval = false }
+
+[[entrypoints.tools]]
+id = "acme.http_get"
+name = "http_get"
+description = "Fetches one allowlisted URL"
+input_schema = { type = "object", properties = { url = { type = "string" } }, required = ["url"] }
+output_schema = { type = "object", properties = { status = { type = "number" }, body = { type = "string" } }, required = ["status"] }
+risk = { default_sensitive = true, requires_approval = true }
+
+[capabilities.filesystem]
+read_roots = ["skills/data"]
+write_roots = ["skills/cache"]
+
+[capabilities]
+http_egress_allowlist = ["api.example.com"]
+device_capabilities = []
+node_capabilities = []
+
+[[capabilities.secrets]]
+scope = "skill:acme.echo_http"
+key_names = ["api_token"]
+
+[capabilities.quotas]
+wall_clock_timeout_ms = 2000
+fuel_budget = 5000000
+max_memory_bytes = 33554432
+
+[compat]
+min_protocol_major = 1
+min_runtime_version = "0.1.0"
