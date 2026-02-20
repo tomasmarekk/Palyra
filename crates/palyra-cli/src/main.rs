@@ -3891,7 +3891,7 @@ fn write_file_atomically(path: &Path, payload: &[u8]) -> Result<()> {
                 path.display()
             )
         })?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(windows)]
