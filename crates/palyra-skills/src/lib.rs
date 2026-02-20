@@ -426,7 +426,32 @@ pub fn build_signed_skill_artifact(
     })?;
     insert_entry(&mut payload_entries, SIGNATURE_PATH, signature_json)?;
 
+    if payload_entries.len() > MAX_ENTRIES {
+        return Err(SkillPackagingError::ArtifactTooManyEntries {
+            actual: payload_entries.len(),
+            limit: MAX_ENTRIES,
+        });
+    }
+    let total_uncompressed = payload_entries.values().try_fold(0_usize, |sum, payload| {
+        sum.checked_add(payload.len()).ok_or(SkillPackagingError::ArtifactTooLarge {
+            actual: usize::MAX,
+            limit: MAX_ARTIFACT_BYTES,
+        })
+    })?;
+    if total_uncompressed > MAX_ARTIFACT_BYTES {
+        return Err(SkillPackagingError::ArtifactTooLarge {
+            actual: total_uncompressed,
+            limit: MAX_ARTIFACT_BYTES,
+        });
+    }
+
     let artifact_bytes = encode_zip(payload_entries.iter())?;
+    if artifact_bytes.len() > MAX_ARTIFACT_BYTES {
+        return Err(SkillPackagingError::ArtifactTooLarge {
+            actual: artifact_bytes.len(),
+            limit: MAX_ARTIFACT_BYTES,
+        });
+    }
     Ok(SkillArtifactBuildOutput {
         artifact_bytes,
         manifest,
@@ -444,7 +469,7 @@ pub fn verify_skill_artifact(
     let parsed = parse_and_verify_artifact(&entries)?;
     assert_runtime_compatibility(&parsed.manifest.compat)?;
 
-    trust_store.normalize();
+    trust_store.normalize()?;
     let verifying_key = parse_verifying_key(&parsed.signature)?;
     let observed_key = hex::encode(verifying_key.as_bytes());
     let publisher = parsed.manifest.publisher.clone();
@@ -599,7 +624,7 @@ impl SkillTrustStore {
                     path.display()
                 ))
             })?;
-        trust_store.normalize();
+        trust_store.normalize()?;
         Ok(trust_store)
     }
 
@@ -613,7 +638,7 @@ impl SkillTrustStore {
             })?;
         }
         let mut normalized = self.clone();
-        normalized.normalize();
+        normalized.normalize()?;
         let payload = serde_json::to_vec_pretty(&normalized).map_err(|error| {
             SkillPackagingError::Serialization(format!("failed to serialize trust store: {error}"))
         })?;
@@ -641,40 +666,59 @@ impl SkillTrustStore {
         Ok(())
     }
 
-    fn normalize(&mut self) {
-        self.trusted_publishers = self
-            .trusted_publishers
-            .iter()
-            .filter_map(|(publisher, keys)| {
-                let Ok(publisher) = normalize_identifier(publisher, "publisher") else {
-                    return None;
-                };
-                let mut normalized = keys
-                    .iter()
-                    .filter_map(|value| normalize_public_key_hex(value).ok())
-                    .collect::<Vec<_>>();
-                normalized.sort();
-                normalized.dedup();
-                if normalized.is_empty() {
-                    None
-                } else {
-                    Some((publisher, normalized))
+    fn normalize(&mut self) -> Result<(), SkillPackagingError> {
+        let mut trusted_publishers = BTreeMap::<String, Vec<String>>::new();
+        for (publisher_raw, keys_raw) in &self.trusted_publishers {
+            let publisher = normalize_identifier(publisher_raw, "publisher").map_err(|error| {
+                SkillPackagingError::Serialization(format!(
+                    "invalid trust-store publisher '{publisher_raw}': {error}"
+                ))
+            })?;
+            let mut normalized_keys = Vec::with_capacity(keys_raw.len());
+            for key_raw in keys_raw {
+                let key = normalize_public_key_hex(key_raw).map_err(|error| {
+                    SkillPackagingError::Serialization(format!(
+                        "invalid trusted key for publisher '{publisher}': {error}"
+                    ))
+                })?;
+                normalized_keys.push(key);
+            }
+            if normalized_keys.is_empty() {
+                return Err(SkillPackagingError::Serialization(format!(
+                    "trusted publisher '{publisher}' must include at least one key"
+                )));
+            }
+            let keys = trusted_publishers.entry(publisher).or_default();
+            keys.extend(normalized_keys);
+            keys.sort();
+            keys.dedup();
+        }
+
+        let mut tofu_publishers = BTreeMap::<String, String>::new();
+        for (publisher_raw, key_raw) in &self.tofu_publishers {
+            let publisher = normalize_identifier(publisher_raw, "publisher").map_err(|error| {
+                SkillPackagingError::Serialization(format!(
+                    "invalid trust-store TOFU publisher '{publisher_raw}': {error}"
+                ))
+            })?;
+            let key = normalize_public_key_hex(key_raw).map_err(|error| {
+                SkillPackagingError::Serialization(format!(
+                    "invalid TOFU key for publisher '{publisher}': {error}"
+                ))
+            })?;
+            if let Some(existing) = tofu_publishers.get(&publisher) {
+                if existing != &key {
+                    return Err(SkillPackagingError::Serialization(format!(
+                        "conflicting TOFU keys for publisher '{publisher}'"
+                    )));
                 }
-            })
-            .collect();
-        self.tofu_publishers = self
-            .tofu_publishers
-            .iter()
-            .filter_map(|(publisher, key)| {
-                let Ok(publisher) = normalize_identifier(publisher, "publisher") else {
-                    return None;
-                };
-                let Ok(key) = normalize_public_key_hex(key) else {
-                    return None;
-                };
-                Some((publisher, key))
-            })
-            .collect();
+            }
+            tofu_publishers.insert(publisher, key);
+        }
+
+        self.trusted_publishers = trusted_publishers;
+        self.tofu_publishers = tofu_publishers;
+        Ok(())
     }
 }
 
@@ -1032,24 +1076,64 @@ fn decode_zip(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>, SkillPackagingE
         });
     }
     let mut entries = BTreeMap::new();
+    let mut total_uncompressed = 0_usize;
     for index in 0..archive.len() {
-        let mut file =
+        let file =
             archive.by_index(index).map_err(|error| SkillPackagingError::Zip(error.to_string()))?;
         if file.is_dir() {
             continue;
         }
         let path = normalize_artifact_path(file.name())?;
-        let size = usize::try_from(file.size()).unwrap_or(usize::MAX);
-        if size > MAX_ENTRY_BYTES {
+        let declared_size = usize::try_from(file.size()).unwrap_or(usize::MAX);
+        if declared_size > MAX_ENTRY_BYTES {
             return Err(SkillPackagingError::ArtifactEntryTooLarge {
                 path,
-                actual: size,
+                actual: declared_size,
                 limit: MAX_ENTRY_BYTES,
             });
         }
-        let mut payload = Vec::with_capacity(size);
-        file.read_to_end(&mut payload)
+        if total_uncompressed >= MAX_ARTIFACT_BYTES {
+            return Err(SkillPackagingError::ArtifactTooLarge {
+                actual: total_uncompressed,
+                limit: MAX_ARTIFACT_BYTES,
+            });
+        }
+        let remaining_total = MAX_ARTIFACT_BYTES - total_uncompressed;
+        if declared_size > remaining_total {
+            return Err(SkillPackagingError::ArtifactTooLarge {
+                actual: total_uncompressed.saturating_add(declared_size),
+                limit: MAX_ARTIFACT_BYTES,
+            });
+        }
+        let entry_limit = remaining_total.min(MAX_ENTRY_BYTES);
+        let mut payload = Vec::with_capacity(declared_size.min(entry_limit));
+        let read_limit = u64::try_from(entry_limit).unwrap_or(u64::MAX).saturating_add(1);
+        let mut limited_reader = file.take(read_limit);
+        limited_reader
+            .read_to_end(&mut payload)
             .map_err(|error| SkillPackagingError::Io(format!("zip read failed: {error}")))?;
+        if payload.len() > entry_limit {
+            if entry_limit < MAX_ENTRY_BYTES {
+                return Err(SkillPackagingError::ArtifactTooLarge {
+                    actual: total_uncompressed.saturating_add(payload.len()),
+                    limit: MAX_ARTIFACT_BYTES,
+                });
+            }
+            return Err(SkillPackagingError::ArtifactEntryTooLarge {
+                path,
+                actual: payload.len(),
+                limit: MAX_ENTRY_BYTES,
+            });
+        }
+        total_uncompressed = total_uncompressed.checked_add(payload.len()).ok_or(
+            SkillPackagingError::ArtifactTooLarge { actual: usize::MAX, limit: MAX_ARTIFACT_BYTES },
+        )?;
+        if total_uncompressed > MAX_ARTIFACT_BYTES {
+            return Err(SkillPackagingError::ArtifactTooLarge {
+                actual: total_uncompressed,
+                limit: MAX_ARTIFACT_BYTES,
+            });
+        }
         insert_entry(&mut entries, path.as_str(), payload)?;
     }
     Ok(entries)
@@ -1231,7 +1315,8 @@ mod tests {
     use super::{
         build_signed_skill_artifact, capability_grants_from_manifest, parse_ed25519_signing_key,
         parse_manifest_toml, policy_requests_from_manifest, verify_skill_artifact, ArtifactFile,
-        SkillArtifactBuildRequest, SkillPackagingError, SkillTrustStore, TrustDecision, SBOM_PATH,
+        SkillArtifactBuildRequest, SkillPackagingError, SkillTrustStore, TrustDecision,
+        MAX_ARTIFACT_BYTES, MAX_ENTRIES, SBOM_PATH,
     };
     use base64::Engine as _;
 
@@ -1311,6 +1396,15 @@ min_runtime_version = "0.1.0"
         }
     }
 
+    fn unique_temp_trust_store_path() -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!("palyra-skills-trust-store-{nonce}-{}.json", std::process::id()))
+    }
+
     #[test]
     fn manifest_rejects_wildcard_without_opt_in() {
         let manifest = sample_manifest().replace("api.example.com", "*");
@@ -1365,6 +1459,105 @@ min_runtime_version = "0.1.0"
             SkillPackagingError::PayloadHashMismatch
                 | SkillPackagingError::SignatureVerificationFailed
         ));
+    }
+
+    #[test]
+    fn verify_rejects_artifact_with_excessive_total_uncompressed_size() {
+        let mut entries = std::collections::BTreeMap::new();
+        let chunk = vec![0_u8; 1024 * 1024];
+        for index in 0..65 {
+            entries.insert(format!("assets/chunk-{index}.bin"), chunk.clone());
+        }
+        let encoded = super::encode_zip(entries.iter()).expect("zip encode");
+        assert!(
+            encoded.len() < MAX_ARTIFACT_BYTES,
+            "test artifact should stay under compressed artifact limit"
+        );
+        let error =
+            super::decode_zip(encoded.as_slice()).expect_err("decode should enforce total budget");
+        match error {
+            SkillPackagingError::ArtifactTooLarge { limit, .. } => {
+                assert_eq!(limit, MAX_ARTIFACT_BYTES);
+            }
+            other => panic!("expected ArtifactTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_rejects_artifact_with_too_many_entries() {
+        let mut request = sample_request();
+        request.assets.clear();
+        request.modules = (0..MAX_ENTRIES)
+            .map(|index| ArtifactFile {
+                path: format!("module-{index}.wasm"),
+                bytes: vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00],
+            })
+            .collect();
+
+        let error = build_signed_skill_artifact(request).expect_err("build should fail");
+        match error {
+            SkillPackagingError::ArtifactTooManyEntries { limit, .. } => {
+                assert_eq!(limit, MAX_ENTRIES);
+            }
+            other => panic!("expected ArtifactTooManyEntries, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_rejects_artifact_with_excessive_total_payload_size() {
+        let mut request = sample_request();
+        request.assets.clear();
+        let module = vec![0_u8; 14 * 1024 * 1024];
+        request.modules = (0..5)
+            .map(|index| ArtifactFile {
+                path: format!("large-{index}.wasm"),
+                bytes: module.clone(),
+            })
+            .collect();
+
+        let error = build_signed_skill_artifact(request).expect_err("build should fail");
+        match error {
+            SkillPackagingError::ArtifactTooLarge { limit, .. } => {
+                assert_eq!(limit, MAX_ARTIFACT_BYTES);
+            }
+            other => panic!("expected ArtifactTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trust_store_load_rejects_invalid_publisher() {
+        let path = unique_temp_trust_store_path();
+        let payload = serde_json::json!({
+            "trusted_publishers": { "Acme": [hex::encode([7_u8; 32])] },
+            "tofu_publishers": {}
+        });
+        std::fs::write(&path, serde_json::to_vec(&payload).expect("json payload"))
+            .expect("trust store should be written");
+
+        let error = SkillTrustStore::load(path.as_path()).expect_err("load should fail");
+        assert!(
+            error.to_string().contains("invalid trust-store publisher"),
+            "error should explain trust-store publisher validation: {error}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn trust_store_load_rejects_invalid_key() {
+        let path = unique_temp_trust_store_path();
+        let payload = serde_json::json!({
+            "trusted_publishers": { "acme": ["not-hex"] },
+            "tofu_publishers": {}
+        });
+        std::fs::write(&path, serde_json::to_vec(&payload).expect("json payload"))
+            .expect("trust store should be written");
+
+        let error = SkillTrustStore::load(path.as_path()).expect_err("load should fail");
+        assert!(
+            error.to_string().contains("invalid trusted key for publisher"),
+            "error should explain trust-store key validation: {error}"
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
