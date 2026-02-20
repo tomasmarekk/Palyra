@@ -3936,7 +3936,7 @@ fn is_sensitive_key(key: &str) -> bool {
     }
     normalized
         .split(|ch: char| !ch.is_ascii_alphanumeric())
-        .any(|token| SENSITIVE_KEY_TOKENS.iter().any(|fragment| token == *fragment))
+        .any(|token| SENSITIVE_KEY_TOKENS.contains(&token))
 }
 
 fn looks_like_secret(value: &str) -> bool {
