@@ -34,6 +34,7 @@ const MAX_TEST_CRON_JITTER_MS: u64 = 60_000;
 static TEMP_JOURNAL_COUNTER: AtomicU64 = AtomicU64::new(0);
 static TEMP_CONFIG_COUNTER: AtomicU64 = AtomicU64::new(0);
 static TEMP_IDENTITY_COUNTER: AtomicU64 = AtomicU64::new(0);
+static TEMP_VAULT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub mod proto {
     pub mod palyra {
@@ -3671,6 +3672,8 @@ fn spawn_palyrad_with_dynamic_ports_and_hash_chain(
 ) -> Result<(Child, u16, u16, PathBuf)> {
     let journal_db_path = unique_temp_journal_db_path();
     let identity_store_dir = unique_temp_identity_store_dir();
+    let vault_dir = unique_temp_vault_dir();
+    prepare_test_vault_dir(&vault_dir)?;
     let mut child = Command::new(env!("CARGO_BIN_EXE_palyrad"))
         .args([
             "--bind",
@@ -3685,6 +3688,7 @@ fn spawn_palyrad_with_dynamic_ports_and_hash_chain(
         .env("PALYRA_ADMIN_TOKEN", ADMIN_TOKEN)
         .env("PALYRA_JOURNAL_DB_PATH", journal_db_path.to_string_lossy().to_string())
         .env("PALYRA_GATEWAY_IDENTITY_STORE_DIR", identity_store_dir.to_string_lossy().to_string())
+        .env("PALYRA_VAULT_DIR", vault_dir.to_string_lossy().to_string())
         .env("PALYRA_JOURNAL_HASH_CHAIN_ENABLED", if hash_chain_enabled { "true" } else { "false" })
         .env("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED", "true")
         .env("RUST_LOG", "info")
@@ -3699,6 +3703,8 @@ fn spawn_palyrad_with_dynamic_ports_and_hash_chain(
 
 fn spawn_palyrad_with_existing_journal(journal_db_path: PathBuf) -> Result<(Child, u16, u16)> {
     let identity_store_dir = unique_temp_identity_store_dir();
+    let vault_dir = unique_temp_vault_dir();
+    prepare_test_vault_dir(&vault_dir)?;
     let mut child = Command::new(env!("CARGO_BIN_EXE_palyrad"))
         .args([
             "--bind",
@@ -3713,6 +3719,7 @@ fn spawn_palyrad_with_existing_journal(journal_db_path: PathBuf) -> Result<(Chil
         .env("PALYRA_ADMIN_TOKEN", ADMIN_TOKEN)
         .env("PALYRA_JOURNAL_DB_PATH", journal_db_path.to_string_lossy().to_string())
         .env("PALYRA_GATEWAY_IDENTITY_STORE_DIR", identity_store_dir.to_string_lossy().to_string())
+        .env("PALYRA_VAULT_DIR", vault_dir.to_string_lossy().to_string())
         .env("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED", "true")
         .env("RUST_LOG", "info")
         .stdout(Stdio::piped())
@@ -3740,6 +3747,8 @@ fn spawn_palyrad_with_openai_provider_and_tool_policy(
 ) -> Result<(Child, u16, u16, PathBuf)> {
     let journal_db_path = unique_temp_journal_db_path();
     let identity_store_dir = unique_temp_identity_store_dir();
+    let vault_dir = unique_temp_vault_dir();
+    prepare_test_vault_dir(&vault_dir)?;
     let mut child = Command::new(env!("CARGO_BIN_EXE_palyrad"))
         .args([
             "--bind",
@@ -3754,6 +3763,7 @@ fn spawn_palyrad_with_openai_provider_and_tool_policy(
         .env("PALYRA_ADMIN_TOKEN", ADMIN_TOKEN)
         .env("PALYRA_JOURNAL_DB_PATH", journal_db_path.to_string_lossy().to_string())
         .env("PALYRA_GATEWAY_IDENTITY_STORE_DIR", identity_store_dir.to_string_lossy().to_string())
+        .env("PALYRA_VAULT_DIR", vault_dir.to_string_lossy().to_string())
         .env("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED", "true")
         .env("PALYRA_MODEL_PROVIDER_KIND", "openai_compatible")
         .env("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", openai_base_url)
@@ -3785,6 +3795,8 @@ fn spawn_palyrad_with_openai_provider_tool_policy_and_memory_auto_inject(
 ) -> Result<(Child, u16, u16, PathBuf)> {
     let journal_db_path = unique_temp_journal_db_path();
     let identity_store_dir = unique_temp_identity_store_dir();
+    let vault_dir = unique_temp_vault_dir();
+    prepare_test_vault_dir(&vault_dir)?;
     let mut child = Command::new(env!("CARGO_BIN_EXE_palyrad"))
         .args([
             "--bind",
@@ -3799,6 +3811,7 @@ fn spawn_palyrad_with_openai_provider_tool_policy_and_memory_auto_inject(
         .env("PALYRA_ADMIN_TOKEN", ADMIN_TOKEN)
         .env("PALYRA_JOURNAL_DB_PATH", journal_db_path.to_string_lossy().to_string())
         .env("PALYRA_GATEWAY_IDENTITY_STORE_DIR", identity_store_dir.to_string_lossy().to_string())
+        .env("PALYRA_VAULT_DIR", vault_dir.to_string_lossy().to_string())
         .env("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED", "true")
         .env("PALYRA_MODEL_PROVIDER_KIND", "openai_compatible")
         .env("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", openai_base_url)
@@ -3848,6 +3861,8 @@ fn spawn_palyrad_with_openai_provider_tool_policy_and_process_runner(
 
     let journal_db_path = unique_temp_journal_db_path();
     let identity_store_dir = unique_temp_identity_store_dir();
+    let vault_dir = unique_temp_vault_dir();
+    prepare_test_vault_dir(&vault_dir)?;
     let mut child = Command::new(env!("CARGO_BIN_EXE_palyrad"))
         .args([
             "--bind",
@@ -3863,6 +3878,7 @@ fn spawn_palyrad_with_openai_provider_tool_policy_and_process_runner(
         .env("PALYRA_ADMIN_TOKEN", ADMIN_TOKEN)
         .env("PALYRA_JOURNAL_DB_PATH", journal_db_path.to_string_lossy().to_string())
         .env("PALYRA_GATEWAY_IDENTITY_STORE_DIR", identity_store_dir.to_string_lossy().to_string())
+        .env("PALYRA_VAULT_DIR", vault_dir.to_string_lossy().to_string())
         .env("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED", "true")
         .env("PALYRA_MODEL_PROVIDER_KIND", "openai_compatible")
         .env("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", config.openai_base_url)
@@ -3907,6 +3923,8 @@ fn spawn_palyrad_with_openai_provider_tool_policy_and_wasm_runtime(
 
     let journal_db_path = unique_temp_journal_db_path();
     let identity_store_dir = unique_temp_identity_store_dir();
+    let vault_dir = unique_temp_vault_dir();
+    prepare_test_vault_dir(&vault_dir)?;
     let mut child = Command::new(env!("CARGO_BIN_EXE_palyrad"))
         .args([
             "--bind",
@@ -3922,6 +3940,7 @@ fn spawn_palyrad_with_openai_provider_tool_policy_and_wasm_runtime(
         .env("PALYRA_ADMIN_TOKEN", ADMIN_TOKEN)
         .env("PALYRA_JOURNAL_DB_PATH", journal_db_path.to_string_lossy().to_string())
         .env("PALYRA_GATEWAY_IDENTITY_STORE_DIR", identity_store_dir.to_string_lossy().to_string())
+        .env("PALYRA_VAULT_DIR", vault_dir.to_string_lossy().to_string())
         .env("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED", "true")
         .env("PALYRA_MODEL_PROVIDER_KIND", "openai_compatible")
         .env("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", config.openai_base_url)
@@ -4154,6 +4173,26 @@ fn unique_temp_identity_store_dir() -> PathBuf {
     let counter = TEMP_IDENTITY_COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir()
         .join(format!("palyra-gateway-identity-{nonce}-{}-{counter}", std::process::id()))
+}
+
+fn unique_temp_vault_dir() -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_nanos();
+    let counter = TEMP_VAULT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir()
+        .join(format!("palyra-gateway-vault-{nonce}-{}-{counter}", std::process::id()))
+}
+
+fn prepare_test_vault_dir(vault_dir: &PathBuf) -> Result<()> {
+    fs::create_dir_all(vault_dir)
+        .with_context(|| format!("failed to create test vault dir {}", vault_dir.display()))?;
+    let backend_marker = vault_dir.join("backend.kind");
+    fs::write(&backend_marker, b"encrypted_file").with_context(|| {
+        format!("failed to write vault backend marker {}", backend_marker.display())
+    })?;
+    Ok(())
 }
 
 fn sample_journal_event(event_id: &str, payload_json: &[u8]) -> common_v1::JournalEvent {

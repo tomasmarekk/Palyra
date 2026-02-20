@@ -1,4 +1,5 @@
 use std::{
+    fs,
     io::{BufRead, BufReader},
     net::SocketAddr,
     path::PathBuf,
@@ -177,6 +178,8 @@ fn admin_run_endpoints_require_token_and_report_not_found_for_unknown_run() -> R
 fn spawn_palyrad_with_dynamic_ports() -> Result<(Child, u16)> {
     let journal_db_path = unique_temp_journal_db_path();
     let identity_store_dir = unique_temp_identity_store_dir();
+    let vault_dir = unique_temp_vault_dir();
+    prepare_test_vault_dir(&vault_dir)?;
     let mut child = Command::new(env!("CARGO_BIN_EXE_palyrad"))
         .args([
             "--bind",
@@ -191,6 +194,7 @@ fn spawn_palyrad_with_dynamic_ports() -> Result<(Child, u16)> {
         .env("PALYRA_ADMIN_TOKEN", ADMIN_TOKEN)
         .env("PALYRA_JOURNAL_DB_PATH", journal_db_path.to_string_lossy().to_string())
         .env("PALYRA_GATEWAY_IDENTITY_STORE_DIR", identity_store_dir.to_string_lossy().to_string())
+        .env("PALYRA_VAULT_DIR", vault_dir.to_string_lossy().to_string())
         .env("RUST_LOG", "info")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -206,8 +210,9 @@ fn unique_temp_journal_db_path() -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("system time should be after unix epoch")
         .as_nanos();
+    let counter = TEMP_IDENTITY_COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir()
-        .join(format!("palyra-admin-surface-{nonce}-{}.sqlite3", std::process::id()))
+        .join(format!("palyra-admin-surface-{nonce}-{}-{counter}.sqlite3", std::process::id()))
 }
 
 fn unique_temp_identity_store_dir() -> PathBuf {
@@ -218,6 +223,26 @@ fn unique_temp_identity_store_dir() -> PathBuf {
     let counter = TEMP_IDENTITY_COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir()
         .join(format!("palyra-admin-identity-{nonce}-{}-{counter}", std::process::id()))
+}
+
+fn unique_temp_vault_dir() -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_nanos();
+    let counter = TEMP_IDENTITY_COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir()
+        .join(format!("palyra-admin-vault-{nonce}-{}-{counter}", std::process::id()))
+}
+
+fn prepare_test_vault_dir(vault_dir: &PathBuf) -> Result<()> {
+    fs::create_dir_all(vault_dir)
+        .with_context(|| format!("failed to create test vault dir {}", vault_dir.display()))?;
+    let backend_marker = vault_dir.join("backend.kind");
+    fs::write(&backend_marker, b"encrypted_file").with_context(|| {
+        format!("failed to write vault backend marker {}", backend_marker.display())
+    })?;
+    Ok(())
 }
 
 fn wait_for_admin_port(stdout: ChildStdout, daemon: &mut Child) -> Result<u16> {
