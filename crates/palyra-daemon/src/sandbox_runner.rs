@@ -877,9 +877,9 @@ mod tests {
     };
 
     use super::{
-        canonical_workspace_root, collect_requested_egress_hosts, run_constrained_process,
-        validate_argument_workspace_scope, ProcessRunnerInput, SandboxProcessRunErrorKind,
-        SandboxProcessRunnerPolicy,
+        canonical_workspace_root, collect_requested_egress_hosts, is_host_allowlisted,
+        run_constrained_process, validate_argument_workspace_scope, ProcessRunnerInput,
+        SandboxProcessRunErrorKind, SandboxProcessRunnerPolicy,
     };
 
     fn sandbox_policy_with_allowed_executables(
