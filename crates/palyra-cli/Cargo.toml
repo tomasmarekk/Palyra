@@ -13,8 +13,10 @@ path = "src/main.rs"
 agent-client-protocol.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
+base64.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
+ed25519-dalek.workspace = true
 futures.workspace = true
 palyra-common = { version = "0.1.0", path = "../palyra-common" }
 palyra-identity = { version = "0.1.0", path = "../palyra-identity" }
@@ -25,6 +27,7 @@ prost.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tonic.workspace = true

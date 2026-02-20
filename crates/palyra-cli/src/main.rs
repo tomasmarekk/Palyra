@@ -32,16 +32,18 @@ pub mod proto {
 #[cfg(not(windows))]
 use std::sync::Arc;
 use std::{
+    collections::HashSet,
     env, fs,
-    io::{BufRead, Read, Write},
+    io::{BufRead, IsTerminal, Read, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::Command,
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{anyhow, Context, Result};
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use clap::{CommandFactory, Parser};
 use cli::{
     AgentCommand, ApprovalDecisionArg, ApprovalExportFormatArg, ApprovalsCommand, BrowserCommand,
@@ -52,6 +54,7 @@ use cli::{
 };
 #[cfg(not(windows))]
 use cli::{PairingClientKindArg, PairingCommand, PairingMethodArg};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use palyra_common::default_identity_store_root;
 use palyra_common::{
     build_metadata,
@@ -74,16 +77,18 @@ use palyra_identity::{
 };
 use palyra_policy::{evaluate_with_config, PolicyDecision, PolicyEvaluationConfig, PolicyRequest};
 use palyra_skills::{
-    build_signed_skill_artifact, parse_ed25519_signing_key, verify_skill_artifact, ArtifactFile,
-    SkillArtifactBuildRequest, SkillTrustStore,
+    build_signed_skill_artifact, inspect_skill_artifact, parse_ed25519_signing_key,
+    verify_skill_artifact, ArtifactFile, SkillArtifactBuildRequest, SkillTrustStore, TrustDecision,
 };
 use palyra_vault::{
     BackendPreference as VaultBackendPreference, Vault, VaultConfig as VaultConfigOptions,
-    VaultRef, VaultScope,
+    VaultError, VaultRef, VaultScope,
 };
 use reqwest::blocking::Client;
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tokio::runtime::Builder as RuntimeBuilder;
 use tokio::time::sleep;
 use tokio_stream::{iter, StreamExt};
@@ -109,6 +114,19 @@ const DEFAULT_DAEMON_URL: &str = "http://127.0.0.1:7142";
 const DEFAULT_BROWSER_URL: &str = "http://127.0.0.1:7143";
 const DEFAULT_CHANNEL: &str = "cli";
 const REDACTED_CONFIG_VALUE: &str = "<redacted>";
+const SKILLS_LAYOUT_VERSION: u32 = 1;
+const SKILLS_INDEX_FILE_NAME: &str = "installed-index.json";
+const SKILLS_AUDIT_FILE_NAME: &str = "audit.ndjson";
+const SKILLS_INSTALL_METADATA_FILE_NAME: &str = "install-metadata.json";
+const SKILLS_ARTIFACT_FILE_NAME: &str = "artifact.palyra-skill";
+const SKILLS_CURRENT_LINK_NAME: &str = "current";
+const REGISTRY_INDEX_FILE_NAME: &str = "index.json";
+const REGISTRY_INDEX_SCHEMA_VERSION: u32 = 1;
+const REGISTRY_SIGNED_INDEX_SCHEMA_VERSION: u32 = 1;
+const MAX_REGISTRY_INDEX_BYTES: usize = 2 * 1024 * 1024;
+const MAX_REGISTRY_ENTRIES: usize = 10_000;
+const MAX_REGISTRY_PAGES: usize = 20;
+const REGISTRY_SIGNATURE_ALGORITHM: &str = "ed25519-sha256";
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -2947,6 +2965,79 @@ fn run_skills(command: SkillsCommand) -> Result<()> {
                 std::io::stdout().flush().context("stdout flush failed")
             }
         },
+        SkillsCommand::Install {
+            artifact,
+            registry_dir,
+            registry_url,
+            skill_id,
+            version,
+            registry_ca_cert,
+            skills_dir,
+            trust_store,
+            trusted_publishers,
+            allow_untrusted,
+            non_interactive,
+            json,
+        } => run_skills_install(SkillsInstallCommand {
+            artifact,
+            registry_dir,
+            registry_url,
+            skill_id,
+            version,
+            registry_ca_cert,
+            skills_dir,
+            trust_store,
+            trusted_publishers,
+            allow_untrusted,
+            non_interactive,
+            json,
+        }),
+        SkillsCommand::Remove { skill_id, version, skills_dir, json } => {
+            run_skills_remove(skill_id, version, skills_dir, json)
+        }
+        SkillsCommand::List { skills_dir, json } => run_skills_list(skills_dir, json),
+        SkillsCommand::Update {
+            registry_dir,
+            registry_url,
+            skill_id,
+            version,
+            registry_ca_cert,
+            skills_dir,
+            trust_store,
+            trusted_publishers,
+            allow_untrusted,
+            non_interactive,
+            json,
+        } => run_skills_update(SkillsUpdateCommand {
+            registry_dir,
+            registry_url,
+            skill_id,
+            version,
+            registry_ca_cert,
+            skills_dir,
+            trust_store,
+            trusted_publishers,
+            allow_untrusted,
+            non_interactive,
+            json,
+        }),
+        SkillsCommand::Verify {
+            skill_id,
+            version,
+            skills_dir,
+            trust_store,
+            trusted_publishers,
+            allow_untrusted,
+            json,
+        } => run_skills_verify(
+            skill_id,
+            version,
+            skills_dir,
+            trust_store,
+            trusted_publishers,
+            allow_untrusted,
+            json,
+        ),
     }
 }
 
@@ -3051,6 +3142,1642 @@ fn skill_entry_path_from_cli(raw: &str) -> Result<String> {
         return Ok(file_name.to_owned());
     }
     Ok(trimmed.replace('\\', "/"))
+}
+
+#[derive(Debug, Clone)]
+struct SkillsInstallCommand {
+    artifact: Option<String>,
+    registry_dir: Option<String>,
+    registry_url: Option<String>,
+    skill_id: Option<String>,
+    version: Option<String>,
+    registry_ca_cert: Option<String>,
+    skills_dir: Option<String>,
+    trust_store: Option<String>,
+    trusted_publishers: Vec<String>,
+    allow_untrusted: bool,
+    non_interactive: bool,
+    json: bool,
+}
+
+#[derive(Debug, Clone)]
+struct SkillsUpdateCommand {
+    registry_dir: Option<String>,
+    registry_url: Option<String>,
+    skill_id: String,
+    version: Option<String>,
+    registry_ca_cert: Option<String>,
+    skills_dir: Option<String>,
+    trust_store: Option<String>,
+    trusted_publishers: Vec<String>,
+    allow_untrusted: bool,
+    non_interactive: bool,
+    json: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InstalledSkillsIndex {
+    schema_version: u32,
+    updated_at_unix_ms: i64,
+    #[serde(default)]
+    entries: Vec<InstalledSkillRecord>,
+}
+
+impl Default for InstalledSkillsIndex {
+    fn default() -> Self {
+        Self { schema_version: SKILLS_LAYOUT_VERSION, updated_at_unix_ms: 0, entries: Vec::new() }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InstalledSkillRecord {
+    skill_id: String,
+    version: String,
+    publisher: String,
+    current: bool,
+    installed_at_unix_ms: i64,
+    artifact_sha256: String,
+    payload_sha256: String,
+    signature_key_id: String,
+    trust_decision: String,
+    source: InstalledSkillSource,
+    #[serde(default)]
+    missing_secrets: Vec<MissingSkillSecret>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InstalledSkillSource {
+    kind: String,
+    reference: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct MissingSkillSecret {
+    scope: String,
+    key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SkillInstallMetadata {
+    schema_version: u32,
+    installed_at_unix_ms: i64,
+    source: InstalledSkillSource,
+    artifact_sha256: String,
+    payload_sha256: String,
+    publisher: String,
+    signature_key_id: String,
+    trust_decision: String,
+    #[serde(default)]
+    missing_secrets: Vec<MissingSkillSecret>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SkillRegistryIndex {
+    schema_version: u32,
+    generated_at_unix_ms: i64,
+    #[serde(default)]
+    entries: Vec<SkillRegistryEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    next_page: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SkillRegistryEntry {
+    skill_id: String,
+    version: String,
+    publisher: String,
+    artifact: String,
+    artifact_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    artifact_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SignedSkillRegistryIndex {
+    schema_version: u32,
+    index: SkillRegistryIndex,
+    signature: RegistrySignature,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegistrySignature {
+    algorithm: String,
+    publisher: String,
+    key_id: String,
+    public_key_base64: String,
+    payload_sha256: String,
+    signature_base64: String,
+    signed_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedRegistryArtifact {
+    entry: SkillRegistryEntry,
+    artifact_bytes: Vec<u8>,
+    source: InstalledSkillSource,
+}
+
+#[derive(Debug, Clone)]
+struct RemoteRegistryResolvedEntry {
+    entry: SkillRegistryEntry,
+    artifact_url: Url,
+}
+
+fn trust_decision_label(decision: TrustDecision) -> &'static str {
+    match decision {
+        TrustDecision::Allowlisted => "allowlisted",
+        TrustDecision::TofuPinned => "tofu_pinned",
+        TrustDecision::TofuNewlyPinned => "tofu_newly_pinned",
+    }
+}
+
+fn sha256_hex(payload: &[u8]) -> String {
+    let digest = Sha256::digest(payload);
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        output.push_str(format!("{byte:02x}").as_str());
+    }
+    output
+}
+
+fn parse_semver_triplet(raw: &str) -> Option<(u32, u32, u32)> {
+    let parts = raw.trim().split('.').collect::<Vec<_>>();
+    if parts.len() != 3 {
+        return None;
+    }
+    let major = parts[0].parse::<u32>().ok()?;
+    let minor = parts[1].parse::<u32>().ok()?;
+    let patch = parts[2].parse::<u32>().ok()?;
+    Some((major, minor, patch))
+}
+
+fn compare_semver_versions(left: &str, right: &str) -> std::cmp::Ordering {
+    match (parse_semver_triplet(left), parse_semver_triplet(right)) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (None, None) => left.cmp(right),
+    }
+}
+
+fn unix_now_ms() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64
+}
+
+fn run_skills_install(command: SkillsInstallCommand) -> Result<()> {
+    let skills_root = resolve_skills_root(command.skills_dir.as_deref())?;
+    fs::create_dir_all(skills_root.as_path()).with_context(|| {
+        format!("failed to create managed skills directory {}", skills_root.display())
+    })?;
+
+    let trust_store_path = resolve_skills_trust_store_path(command.trust_store.as_deref())?;
+    let mut trust_store = SkillTrustStore::load(trust_store_path.as_path())?;
+    let trusted_publishers = command.trusted_publishers.clone();
+    for trusted in &trusted_publishers {
+        let (publisher, key) = parse_trusted_publisher_arg(trusted.as_str())?;
+        trust_store.add_trusted_key(publisher, key)?;
+    }
+
+    let resolved = resolve_install_artifact(&command, &mut trust_store, command.allow_untrusted)?;
+    let artifact_sha256 = sha256_hex(resolved.artifact_bytes.as_slice());
+    if artifact_sha256 != resolved.entry.artifact_sha256 {
+        anyhow::bail!(
+            "registry hash mismatch for {} {}: expected {} got {}",
+            resolved.entry.skill_id,
+            resolved.entry.version,
+            resolved.entry.artifact_sha256,
+            artifact_sha256
+        );
+    }
+    let inspected = inspect_skill_artifact(resolved.artifact_bytes.as_slice())
+        .context("skill artifact failed structural verification")?;
+    if inspected.manifest.skill_id != resolved.entry.skill_id
+        || inspected.manifest.version != resolved.entry.version
+        || inspected.manifest.publisher != resolved.entry.publisher
+    {
+        anyhow::bail!(
+            "registry metadata mismatch for artifact {}: expected skill_id={} version={} publisher={}, got skill_id={} version={} publisher={}",
+            resolved.source.reference,
+            resolved.entry.skill_id,
+            resolved.entry.version,
+            resolved.entry.publisher,
+            inspected.manifest.skill_id,
+            inspected.manifest.version,
+            inspected.manifest.publisher
+        );
+    }
+    let verification_report = verify_skill_artifact(
+        resolved.artifact_bytes.as_slice(),
+        &mut trust_store,
+        command.allow_untrusted,
+    )
+    .context("failed to verify skill artifact trust policy")?;
+    trust_store.save(trust_store_path.as_path())?;
+
+    let missing_secrets = resolve_and_prompt_missing_skill_secrets(
+        &verification_report.manifest,
+        command.non_interactive,
+    )?;
+    let mut index = load_installed_skills_index(skills_root.as_path())?;
+    let outcome = install_verified_skill_artifact(
+        skills_root.as_path(),
+        &mut index,
+        resolved.artifact_bytes.as_slice(),
+        &inspected,
+        &verification_report,
+        InstallMetadataContext {
+            source: resolved.source.clone(),
+            artifact_sha256,
+            missing_secrets,
+        },
+    )?;
+    save_installed_skills_index(skills_root.as_path(), &index)?;
+
+    let event_kind = if outcome.previous_current_version.is_some() {
+        "skill.updated"
+    } else {
+        "skill.installed"
+    };
+    append_skills_audit_event(
+        skills_root.as_path(),
+        event_kind,
+        json!({
+            "skill_id": outcome.record.skill_id,
+            "version": outcome.record.version,
+            "publisher": outcome.record.publisher,
+            "artifact_sha256": outcome.record.artifact_sha256,
+            "payload_sha256": outcome.record.payload_sha256,
+            "signature_key_id": outcome.record.signature_key_id,
+            "trust_decision": outcome.record.trust_decision,
+            "source": outcome.record.source,
+            "missing_secrets": outcome.record.missing_secrets,
+            "previous_version": outcome.previous_current_version,
+        }),
+    )?;
+
+    if command.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "event_kind": event_kind,
+                "skill_id": outcome.record.skill_id,
+                "version": outcome.record.version,
+                "publisher": outcome.record.publisher,
+                "artifact_sha256": outcome.record.artifact_sha256,
+                "payload_sha256": outcome.record.payload_sha256,
+                "signature_key_id": outcome.record.signature_key_id,
+                "trust_decision": outcome.record.trust_decision,
+                "source": outcome.record.source,
+                "missing_secrets": outcome.record.missing_secrets,
+                "skills_root": skills_root,
+                "trust_store": trust_store_path,
+            }))?
+        );
+    } else {
+        println!(
+            "{} skill_id={} version={} publisher={} trust={} source={} missing_secrets={} skills_root={} trust_store={}",
+            event_kind,
+            outcome.record.skill_id,
+            outcome.record.version,
+            outcome.record.publisher,
+            outcome.record.trust_decision,
+            outcome.record.source.reference,
+            outcome.record.missing_secrets.len(),
+            skills_root.display(),
+            trust_store_path.display()
+        );
+    }
+    std::io::stdout().flush().context("stdout flush failed")
+}
+
+fn run_skills_update(command: SkillsUpdateCommand) -> Result<()> {
+    if command.registry_dir.is_some() == command.registry_url.is_some() {
+        anyhow::bail!(
+            "skills update requires exactly one source: --registry-dir or --registry-url"
+        );
+    }
+    let skills_root = resolve_skills_root(command.skills_dir.as_deref())?;
+    fs::create_dir_all(skills_root.as_path()).with_context(|| {
+        format!("failed to create managed skills directory {}", skills_root.display())
+    })?;
+    let index = load_installed_skills_index(skills_root.as_path())?;
+    let current_version = index
+        .entries
+        .iter()
+        .find(|entry| entry.skill_id == command.skill_id && entry.current)
+        .map(|entry| entry.version.clone());
+
+    let trust_store_path = resolve_skills_trust_store_path(command.trust_store.as_deref())?;
+    let mut trust_store = SkillTrustStore::load(trust_store_path.as_path())?;
+    let trusted_publishers = command.trusted_publishers.clone();
+    for trusted in &trusted_publishers {
+        let (publisher, key) = parse_trusted_publisher_arg(trusted.as_str())?;
+        trust_store.add_trusted_key(publisher, key)?;
+    }
+    let resolved = resolve_registry_artifact_for_skill(
+        command.registry_dir.as_deref(),
+        command.registry_url.as_deref(),
+        command.registry_ca_cert.as_deref(),
+        command.skill_id.as_str(),
+        command.version.as_deref(),
+        &mut trust_store,
+        command.allow_untrusted,
+    )?;
+    if current_version.as_deref() == Some(resolved.entry.version.as_str()) {
+        trust_store.save(trust_store_path.as_path())?;
+        if command.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "event_kind": "skill.updated",
+                    "updated": false,
+                    "reason": "already_current",
+                    "skill_id": command.skill_id,
+                    "version": resolved.entry.version,
+                    "skills_root": skills_root,
+                }))?
+            );
+        } else {
+            println!(
+                "skill.updated updated=false reason=already_current skill_id={} version={} skills_root={}",
+                command.skill_id,
+                resolved.entry.version,
+                skills_root.display()
+            );
+        }
+        return std::io::stdout().flush().context("stdout flush failed");
+    }
+
+    trust_store.save(trust_store_path.as_path())?;
+
+    let install_command = SkillsInstallCommand {
+        artifact: None,
+        registry_dir: command.registry_dir,
+        registry_url: command.registry_url,
+        skill_id: Some(command.skill_id),
+        version: command.version,
+        registry_ca_cert: command.registry_ca_cert,
+        skills_dir: Some(skills_root.to_string_lossy().into_owned()),
+        trust_store: Some(trust_store_path.to_string_lossy().into_owned()),
+        trusted_publishers,
+        allow_untrusted: command.allow_untrusted,
+        non_interactive: command.non_interactive,
+        json: command.json,
+    };
+    run_skills_install(install_command)
+}
+
+fn run_skills_remove(
+    skill_id: String,
+    version: Option<String>,
+    skills_dir: Option<String>,
+    json_output: bool,
+) -> Result<()> {
+    let skills_root = resolve_skills_root(skills_dir.as_deref())?;
+    let mut index = load_installed_skills_index(skills_root.as_path())?;
+    let target_positions = if let Some(version) = version.as_deref() {
+        let selected = index
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(position, entry)| {
+                (entry.skill_id == skill_id && entry.version == version).then_some(position)
+            })
+            .collect::<Vec<_>>();
+        if selected.is_empty() {
+            anyhow::bail!("skill {} version {} is not installed", skill_id, version);
+        }
+        selected
+    } else {
+        let Some(current_position) =
+            index.entries.iter().position(|entry| entry.skill_id == skill_id && entry.current)
+        else {
+            anyhow::bail!("skill {} has no current installed version; pass --version", skill_id);
+        };
+        vec![current_position]
+    };
+
+    let mut removed_versions = target_positions
+        .iter()
+        .map(|position| index.entries[*position].version.clone())
+        .collect::<Vec<_>>();
+    removed_versions.sort();
+    removed_versions.dedup();
+
+    for version in &removed_versions {
+        let path = skills_root.join(skill_id.as_str()).join(version);
+        if path.exists() {
+            fs::remove_dir_all(path.as_path()).with_context(|| {
+                format!("failed to remove installed skill directory {}", path.display())
+            })?;
+        }
+    }
+    index.entries.retain(|entry| {
+        !(entry.skill_id == skill_id
+            && removed_versions.iter().any(|version| version == &entry.version))
+    });
+    normalize_installed_skills_index(&mut index);
+    if let Some(current) = index
+        .entries
+        .iter()
+        .find(|entry| entry.skill_id == skill_id && entry.current)
+        .map(|entry| entry.version.clone())
+    {
+        if let Err(error) = update_skill_current_pointer(
+            skills_root.join(skill_id.as_str()).as_path(),
+            current.as_str(),
+        ) {
+            eprintln!(
+                "warning: failed to update optional '{}' pointer for skill {}: {}",
+                SKILLS_CURRENT_LINK_NAME, skill_id, error
+            );
+        }
+    } else if let Err(error) =
+        remove_skill_current_pointer(skills_root.join(skill_id.as_str()).as_path())
+    {
+        eprintln!(
+            "warning: failed to remove optional '{}' pointer for skill {}: {}",
+            SKILLS_CURRENT_LINK_NAME, skill_id, error
+        );
+    }
+    save_installed_skills_index(skills_root.as_path(), &index)?;
+    append_skills_audit_event(
+        skills_root.as_path(),
+        "skill.removed",
+        json!({
+            "skill_id": skill_id,
+            "removed_versions": removed_versions,
+        }),
+    )?;
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "event_kind": "skill.removed",
+                "skill_id": skill_id,
+                "removed_versions": removed_versions,
+                "skills_root": skills_root,
+            }))?
+        );
+    } else {
+        println!(
+            "skill.removed skill_id={} removed_versions={} skills_root={}",
+            skill_id,
+            removed_versions.join(","),
+            skills_root.display()
+        );
+    }
+    std::io::stdout().flush().context("stdout flush failed")
+}
+
+fn run_skills_list(skills_dir: Option<String>, json_output: bool) -> Result<()> {
+    let skills_root = resolve_skills_root(skills_dir.as_deref())?;
+    let mut index = load_installed_skills_index(skills_root.as_path())?;
+    normalize_installed_skills_index(&mut index);
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "skills_root": skills_root,
+                "count": index.entries.len(),
+                "entries": index.entries,
+            }))?
+        );
+    } else {
+        println!("skills.list root={} count={}", skills_root.display(), index.entries.len());
+        for entry in &index.entries {
+            println!(
+                "skills.entry skill_id={} version={} publisher={} current={} trust={} installed_at_unix_ms={} source={}",
+                entry.skill_id,
+                entry.version,
+                entry.publisher,
+                entry.current,
+                entry.trust_decision,
+                entry.installed_at_unix_ms,
+                entry.source.reference
+            );
+        }
+    }
+    std::io::stdout().flush().context("stdout flush failed")
+}
+
+fn run_skills_verify(
+    skill_id: String,
+    version: Option<String>,
+    skills_dir: Option<String>,
+    trust_store: Option<String>,
+    trusted_publishers: Vec<String>,
+    allow_untrusted: bool,
+    json_output: bool,
+) -> Result<()> {
+    let skills_root = resolve_skills_root(skills_dir.as_deref())?;
+    let mut index = load_installed_skills_index(skills_root.as_path())?;
+    let record_index = find_installed_skill_record(&index, skill_id.as_str(), version.as_deref())?;
+    let record = index.entries[record_index].clone();
+    let artifact_path = skills_root
+        .join(record.skill_id.as_str())
+        .join(record.version.as_str())
+        .join(SKILLS_ARTIFACT_FILE_NAME);
+    let artifact_bytes = fs::read(artifact_path.as_path()).with_context(|| {
+        format!("failed to read installed artifact {}", artifact_path.display())
+    })?;
+
+    let trust_store_path = resolve_skills_trust_store_path(trust_store.as_deref())?;
+    let mut store = SkillTrustStore::load(trust_store_path.as_path())?;
+    for trusted in trusted_publishers {
+        let (publisher, key) = parse_trusted_publisher_arg(trusted.as_str())?;
+        store.add_trusted_key(publisher, key)?;
+    }
+    let report = verify_skill_artifact(artifact_bytes.as_slice(), &mut store, allow_untrusted)
+        .context("failed to verify installed skill artifact")?;
+    store.save(trust_store_path.as_path())?;
+
+    index.entries[record_index].trust_decision =
+        trust_decision_label(report.trust_decision).to_owned();
+    index.entries[record_index].payload_sha256 = report.payload_sha256.clone();
+    save_installed_skills_index(skills_root.as_path(), &index)?;
+    append_skills_audit_event(
+        skills_root.as_path(),
+        "skill.verified",
+        json!({
+            "skill_id": report.manifest.skill_id,
+            "version": report.manifest.version,
+            "publisher": report.manifest.publisher,
+            "payload_sha256": report.payload_sha256,
+            "trust_decision": trust_decision_label(report.trust_decision),
+            "accepted": report.accepted,
+            "policy_bindings": report.policy_bindings,
+        }),
+    )?;
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "skill.verified skill_id={} version={} publisher={} accepted={} trust={} payload_sha256={} trust_store={}",
+            report.manifest.skill_id,
+            report.manifest.version,
+            report.manifest.publisher,
+            report.accepted,
+            trust_decision_label(report.trust_decision),
+            report.payload_sha256,
+            trust_store_path.display()
+        );
+    }
+    std::io::stdout().flush().context("stdout flush failed")
+}
+
+fn resolve_skills_root(raw: Option<&str>) -> Result<PathBuf> {
+    if let Some(raw) = raw {
+        if raw.trim().is_empty() {
+            anyhow::bail!("--skills-dir path cannot be empty");
+        }
+        return Ok(PathBuf::from(raw));
+    }
+    let identity_root =
+        default_identity_store_root().context("failed to resolve default identity store root")?;
+    let state_root =
+        identity_root.parent().map(Path::to_path_buf).unwrap_or_else(|| identity_root.clone());
+    Ok(state_root.join("skills"))
+}
+
+fn load_installed_skills_index(skills_root: &Path) -> Result<InstalledSkillsIndex> {
+    let index_path = skills_root.join(SKILLS_INDEX_FILE_NAME);
+    if !index_path.exists() {
+        return Ok(InstalledSkillsIndex::default());
+    }
+    let payload = fs::read(index_path.as_path()).with_context(|| {
+        format!("failed to read installed skills index {}", index_path.display())
+    })?;
+    let mut index: InstalledSkillsIndex =
+        serde_json::from_slice(payload.as_slice()).with_context(|| {
+            format!("failed to parse installed skills index {}", index_path.display())
+        })?;
+    if index.schema_version != SKILLS_LAYOUT_VERSION {
+        anyhow::bail!(
+            "unsupported installed skills index schema version {}; expected {}",
+            index.schema_version,
+            SKILLS_LAYOUT_VERSION
+        );
+    }
+    normalize_installed_skills_index(&mut index);
+    Ok(index)
+}
+
+fn save_installed_skills_index(skills_root: &Path, index: &InstalledSkillsIndex) -> Result<()> {
+    let mut normalized = index.clone();
+    normalized.schema_version = SKILLS_LAYOUT_VERSION;
+    normalized.updated_at_unix_ms = unix_now_ms();
+    normalize_installed_skills_index(&mut normalized);
+    let payload = serde_json::to_vec_pretty(&normalized)
+        .context("failed to serialize installed skills index")?;
+    write_file_atomically(skills_root.join(SKILLS_INDEX_FILE_NAME).as_path(), payload.as_slice())
+}
+
+fn normalize_installed_skills_index(index: &mut InstalledSkillsIndex) {
+    index.entries.sort_by(|left, right| {
+        left.skill_id
+            .cmp(&right.skill_id)
+            .then_with(|| compare_semver_versions(left.version.as_str(), right.version.as_str()))
+    });
+
+    let mut skill_ids =
+        index.entries.iter().map(|entry| entry.skill_id.clone()).collect::<Vec<_>>();
+    skill_ids.sort();
+    skill_ids.dedup();
+    for skill_id in skill_ids {
+        let mut positions = index
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(position, entry)| (entry.skill_id == skill_id).then_some(position))
+            .collect::<Vec<_>>();
+        if positions.is_empty() {
+            continue;
+        }
+        let current_positions = positions
+            .iter()
+            .copied()
+            .filter(|position| index.entries[*position].current)
+            .collect::<Vec<_>>();
+        if current_positions.len() == 1 {
+            continue;
+        }
+        positions.sort_by(|left, right| {
+            compare_semver_versions(
+                index.entries[*left].version.as_str(),
+                index.entries[*right].version.as_str(),
+            )
+        });
+        for position in &positions {
+            index.entries[*position].current = false;
+        }
+        if let Some(position) = positions.last() {
+            index.entries[*position].current = true;
+        }
+    }
+}
+
+fn find_installed_skill_record(
+    index: &InstalledSkillsIndex,
+    skill_id: &str,
+    version: Option<&str>,
+) -> Result<usize> {
+    if let Some(version) = version {
+        return index
+            .entries
+            .iter()
+            .position(|entry| entry.skill_id == skill_id && entry.version == version)
+            .ok_or_else(|| anyhow!("skill {} version {} is not installed", skill_id, version));
+    }
+    index
+        .entries
+        .iter()
+        .position(|entry| entry.skill_id == skill_id && entry.current)
+        .ok_or_else(|| anyhow!("skill {} has no current installed version", skill_id))
+}
+
+fn append_skills_audit_event(
+    skills_root: &Path,
+    event_kind: &str,
+    payload: serde_json::Value,
+) -> Result<()> {
+    let audit_path = skills_root.join(SKILLS_AUDIT_FILE_NAME);
+    if let Some(parent) = audit_path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!("failed to create skills audit directory {}", parent.display())
+        })?;
+    }
+    let event = json!({
+        "event_kind": event_kind,
+        "timestamp_unix_ms": unix_now_ms(),
+        "payload": payload
+    });
+    let line = serde_json::to_string(&event).context("failed to serialize skills audit event")?;
+    let mut file =
+        fs::OpenOptions::new().create(true).append(true).open(audit_path.as_path()).with_context(
+            || format!("failed to open skills audit file {}", audit_path.display()),
+        )?;
+    file.write_all(line.as_bytes()).context("failed to write skills audit event")?;
+    file.write_all(b"\n").context("failed to terminate skills audit event line")?;
+    Ok(())
+}
+
+fn write_file_atomically(path: &Path, payload: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create parent directory {}", parent.display()))?;
+    }
+    let temporary_path = path.with_extension(format!("tmp.{}.{}", std::process::id(), Ulid::new()));
+    fs::write(temporary_path.as_path(), payload)
+        .with_context(|| format!("failed to write temporary file {}", temporary_path.display()))?;
+    if path.exists() {
+        fs::remove_file(path)
+            .with_context(|| format!("failed to replace target file {}", path.display()))?;
+    }
+    fs::rename(temporary_path.as_path(), path).with_context(|| {
+        format!(
+            "failed to atomically move temporary file {} into {}",
+            temporary_path.display(),
+            path.display()
+        )
+    })
+}
+
+struct InstallExecutionOutcome {
+    record: InstalledSkillRecord,
+    previous_current_version: Option<String>,
+}
+
+struct InstallMetadataContext {
+    source: InstalledSkillSource,
+    artifact_sha256: String,
+    missing_secrets: Vec<MissingSkillSecret>,
+}
+
+fn install_verified_skill_artifact(
+    skills_root: &Path,
+    index: &mut InstalledSkillsIndex,
+    artifact_bytes: &[u8],
+    inspected: &palyra_skills::SkillArtifactInspection,
+    verification_report: &palyra_skills::SkillVerificationReport,
+    install_context: InstallMetadataContext,
+) -> Result<InstallExecutionOutcome> {
+    let skill_id = inspected.manifest.skill_id.as_str();
+    let version = inspected.manifest.version.as_str();
+    let skill_root = skills_root.join(skill_id);
+    let final_dir = skill_root.join(version);
+    if final_dir.exists() {
+        anyhow::bail!(
+            "skill {} version {} is already installed at {}",
+            skill_id,
+            version,
+            final_dir.display()
+        );
+    }
+    fs::create_dir_all(skill_root.as_path())
+        .with_context(|| format!("failed to create skill root {}", skill_root.display()))?;
+
+    let staging = skill_root.join(format!(".tmp-install-{}", Ulid::new()));
+    fs::create_dir_all(staging.as_path()).with_context(|| {
+        format!("failed to create skill staging directory {}", staging.display())
+    })?;
+    extract_inspected_artifact_entries(staging.as_path(), &inspected.entries)?;
+    assert_directory_matches_expected_entries(staging.as_path(), &inspected.entries)?;
+
+    let metadata = SkillInstallMetadata {
+        schema_version: SKILLS_LAYOUT_VERSION,
+        installed_at_unix_ms: unix_now_ms(),
+        source: install_context.source.clone(),
+        artifact_sha256: install_context.artifact_sha256.clone(),
+        payload_sha256: verification_report.payload_sha256.clone(),
+        publisher: verification_report.manifest.publisher.clone(),
+        signature_key_id: inspected.signature.key_id.clone(),
+        trust_decision: trust_decision_label(verification_report.trust_decision).to_owned(),
+        missing_secrets: install_context.missing_secrets.clone(),
+    };
+    let metadata_payload =
+        serde_json::to_vec_pretty(&metadata).context("failed to serialize install metadata")?;
+    fs::write(staging.join(SKILLS_INSTALL_METADATA_FILE_NAME), metadata_payload.as_slice())
+        .with_context(|| format!("failed to write install metadata in {}", staging.display()))?;
+    fs::write(staging.join(SKILLS_ARTIFACT_FILE_NAME), artifact_bytes)
+        .with_context(|| format!("failed to write artifact cache in {}", staging.display()))?;
+
+    fs::rename(staging.as_path(), final_dir.as_path()).with_context(|| {
+        format!(
+            "failed to atomically promote staged install from {} to {}",
+            staging.display(),
+            final_dir.display()
+        )
+    })?;
+
+    let previous_current_version = index
+        .entries
+        .iter()
+        .find(|entry| entry.skill_id == skill_id && entry.current)
+        .map(|entry| entry.version.clone());
+    for entry in &mut index.entries {
+        if entry.skill_id == skill_id {
+            entry.current = false;
+        }
+    }
+    let record = InstalledSkillRecord {
+        skill_id: skill_id.to_owned(),
+        version: version.to_owned(),
+        publisher: verification_report.manifest.publisher.clone(),
+        current: true,
+        installed_at_unix_ms: unix_now_ms(),
+        artifact_sha256: install_context.artifact_sha256,
+        payload_sha256: verification_report.payload_sha256.clone(),
+        signature_key_id: inspected.signature.key_id.clone(),
+        trust_decision: trust_decision_label(verification_report.trust_decision).to_owned(),
+        source: install_context.source,
+        missing_secrets: install_context.missing_secrets,
+    };
+    index.entries.push(record.clone());
+    normalize_installed_skills_index(index);
+    if let Err(error) = update_skill_current_pointer(skill_root.as_path(), version) {
+        eprintln!(
+            "warning: failed to update optional '{}' pointer for skill {}: {}",
+            SKILLS_CURRENT_LINK_NAME, skill_id, error
+        );
+    }
+    Ok(InstallExecutionOutcome { record, previous_current_version })
+}
+
+fn extract_inspected_artifact_entries(
+    destination: &Path,
+    entries: &std::collections::BTreeMap<String, Vec<u8>>,
+) -> Result<()> {
+    for (entry_path, payload) in entries {
+        let target = safe_join_relative_path(destination, entry_path.as_str())?;
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create artifact directory {}", parent.display())
+            })?;
+        }
+        fs::write(target.as_path(), payload.as_slice()).with_context(|| {
+            format!("failed to write extracted artifact file {}", target.display())
+        })?;
+    }
+    Ok(())
+}
+
+fn safe_join_relative_path(base: &Path, relative: &str) -> Result<PathBuf> {
+    let path = Path::new(relative.trim());
+    if relative.trim().is_empty() {
+        anyhow::bail!("artifact relative path cannot be empty");
+    }
+    if path.is_absolute() {
+        anyhow::bail!("artifact relative path cannot be absolute: {}", relative);
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            Component::Prefix(_) | Component::RootDir | Component::CurDir | Component::ParentDir
+        )
+    }) {
+        anyhow::bail!("artifact relative path is invalid: {}", relative);
+    }
+    Ok(base.join(path))
+}
+
+fn assert_directory_matches_expected_entries(
+    root: &Path,
+    entries: &std::collections::BTreeMap<String, Vec<u8>>,
+) -> Result<()> {
+    let expected = entries.keys().cloned().collect::<HashSet<_>>();
+    let observed = collect_relative_files(root, root)?;
+    if expected != observed {
+        anyhow::bail!(
+            "extracted artifact tree mismatch: expected {} files, found {} files",
+            expected.len(),
+            observed.len()
+        );
+    }
+    Ok(())
+}
+
+fn collect_relative_files(root: &Path, cursor: &Path) -> Result<HashSet<String>> {
+    let mut files = HashSet::new();
+    for entry in fs::read_dir(cursor)
+        .with_context(|| format!("failed to read directory {}", cursor.display()))?
+    {
+        let entry = entry.context("failed to read directory entry")?;
+        let path = entry.path();
+        if path.is_dir() {
+            files.extend(collect_relative_files(root, path.as_path())?);
+            continue;
+        }
+        let relative = path.strip_prefix(root).with_context(|| {
+            format!("failed to compute relative extracted path {}", path.display())
+        })?;
+        files.insert(normalize_relative_registry_path(relative)?);
+    }
+    Ok(files)
+}
+
+fn resolve_install_artifact(
+    command: &SkillsInstallCommand,
+    trust_store: &mut SkillTrustStore,
+    allow_untrusted: bool,
+) -> Result<ResolvedRegistryArtifact> {
+    let use_artifact = command.artifact.is_some();
+    let use_registry = command.registry_dir.is_some() || command.registry_url.is_some();
+    if use_artifact == use_registry {
+        anyhow::bail!(
+            "skills install requires either --artifact or a registry source (--registry-dir / --registry-url)"
+        );
+    }
+    if let Some(artifact) = command.artifact.as_deref() {
+        let artifact_path = Path::new(artifact);
+        let artifact_bytes = fs::read(artifact_path).with_context(|| {
+            format!("failed to read skill artifact {}", artifact_path.display())
+        })?;
+        let inspected = inspect_skill_artifact(artifact_bytes.as_slice())
+            .context("skill artifact failed structural verification")?;
+        return Ok(ResolvedRegistryArtifact {
+            entry: SkillRegistryEntry {
+                skill_id: inspected.manifest.skill_id,
+                version: inspected.manifest.version,
+                publisher: inspected.manifest.publisher,
+                artifact: artifact_path.to_string_lossy().into_owned(),
+                artifact_sha256: sha256_hex(artifact_bytes.as_slice()),
+                artifact_bytes: Some(u64::try_from(artifact_bytes.len()).unwrap_or(u64::MAX)),
+            },
+            artifact_bytes,
+            source: InstalledSkillSource {
+                kind: "local_artifact".to_owned(),
+                reference: artifact_path.to_string_lossy().into_owned(),
+            },
+        });
+    }
+    let skill_id = command
+        .skill_id
+        .as_deref()
+        .ok_or_else(|| anyhow!("skills install from registry requires --skill-id"))?;
+    resolve_registry_artifact_for_skill(
+        command.registry_dir.as_deref(),
+        command.registry_url.as_deref(),
+        command.registry_ca_cert.as_deref(),
+        skill_id,
+        command.version.as_deref(),
+        trust_store,
+        allow_untrusted,
+    )
+}
+
+fn resolve_registry_artifact_for_skill(
+    registry_dir: Option<&str>,
+    registry_url: Option<&str>,
+    registry_ca_cert: Option<&str>,
+    skill_id: &str,
+    version: Option<&str>,
+    trust_store: &mut SkillTrustStore,
+    allow_untrusted: bool,
+) -> Result<ResolvedRegistryArtifact> {
+    if registry_dir.is_some() == registry_url.is_some() {
+        anyhow::bail!("registry source must be exactly one of --registry-dir or --registry-url");
+    }
+    if let Some(registry_dir) = registry_dir {
+        let root = PathBuf::from(registry_dir);
+        if !root.is_dir() {
+            anyhow::bail!("registry directory does not exist: {}", root.display());
+        }
+        let index = build_local_registry_index(root.as_path())?;
+        persist_local_registry_index(root.as_path(), &index)?;
+        let entry = select_registry_entry(index.entries.as_slice(), skill_id, version)?;
+        let artifact_path =
+            resolve_local_registry_artifact_path(root.as_path(), entry.artifact.as_str())?;
+        let artifact_bytes = fs::read(artifact_path.as_path()).with_context(|| {
+            format!("failed to read registry artifact {}", artifact_path.display())
+        })?;
+        return Ok(ResolvedRegistryArtifact {
+            entry,
+            artifact_bytes,
+            source: InstalledSkillSource {
+                kind: "local_registry".to_owned(),
+                reference: artifact_path.to_string_lossy().into_owned(),
+            },
+        });
+    }
+
+    let remote_entries = fetch_remote_registry_entries(
+        registry_url.expect("checked"),
+        registry_ca_cert,
+        trust_store,
+        allow_untrusted,
+    )?;
+    let selected = select_remote_registry_entry(remote_entries.as_slice(), skill_id, version)?;
+    let client = build_registry_http_client(registry_ca_cert)?;
+    let artifact_bytes =
+        fetch_limited_bytes(&client, selected.artifact_url.as_str(), MAX_REGISTRY_INDEX_BYTES * 32)
+            .with_context(|| format!("failed to fetch artifact {}", selected.artifact_url))?;
+    Ok(ResolvedRegistryArtifact {
+        entry: selected.entry,
+        artifact_bytes,
+        source: InstalledSkillSource {
+            kind: "remote_registry".to_owned(),
+            reference: selected.artifact_url.to_string(),
+        },
+    })
+}
+
+fn build_local_registry_index(registry_dir: &Path) -> Result<SkillRegistryIndex> {
+    let mut artifact_paths = Vec::new();
+    collect_skill_artifact_paths(registry_dir, registry_dir, &mut artifact_paths)?;
+    let mut entries = Vec::new();
+    for artifact_path in artifact_paths {
+        let artifact_bytes = fs::read(artifact_path.as_path()).with_context(|| {
+            format!("failed to read local registry artifact {}", artifact_path.display())
+        })?;
+        let inspected = inspect_skill_artifact(artifact_bytes.as_slice()).with_context(|| {
+            format!(
+                "artifact {} failed verification and cannot be indexed",
+                artifact_path.display()
+            )
+        })?;
+        let relative = artifact_path.strip_prefix(registry_dir).with_context(|| {
+            format!("failed to compute registry-relative path for {}", artifact_path.display())
+        })?;
+        entries.push(SkillRegistryEntry {
+            skill_id: inspected.manifest.skill_id,
+            version: inspected.manifest.version,
+            publisher: inspected.manifest.publisher,
+            artifact: normalize_relative_registry_path(relative)?,
+            artifact_sha256: sha256_hex(artifact_bytes.as_slice()),
+            artifact_bytes: Some(u64::try_from(artifact_bytes.len()).unwrap_or(u64::MAX)),
+        });
+    }
+    entries.sort_by(|left, right| {
+        left.skill_id
+            .cmp(&right.skill_id)
+            .then_with(|| compare_semver_versions(left.version.as_str(), right.version.as_str()))
+    });
+    let index = SkillRegistryIndex {
+        schema_version: REGISTRY_INDEX_SCHEMA_VERSION,
+        generated_at_unix_ms: unix_now_ms(),
+        entries,
+        next_page: None,
+    };
+    validate_registry_index(&index)?;
+    Ok(index)
+}
+
+fn persist_local_registry_index(registry_dir: &Path, index: &SkillRegistryIndex) -> Result<()> {
+    let payload =
+        serde_json::to_vec_pretty(index).context("failed to serialize local registry index")?;
+    write_file_atomically(registry_dir.join(REGISTRY_INDEX_FILE_NAME).as_path(), payload.as_slice())
+}
+
+fn collect_skill_artifact_paths(
+    root: &Path,
+    cursor: &Path,
+    output: &mut Vec<PathBuf>,
+) -> Result<()> {
+    for entry in fs::read_dir(cursor)
+        .with_context(|| format!("failed to read directory {}", cursor.display()))?
+    {
+        let entry = entry.context("failed to read directory entry")?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_skill_artifact_paths(root, path.as_path(), output)?;
+            continue;
+        }
+        if path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("palyra-skill"))
+        {
+            let relative = path.strip_prefix(root).with_context(|| {
+                format!("artifact path {} escaped registry root", path.display())
+            })?;
+            if relative.components().any(|component| matches!(component, Component::ParentDir)) {
+                anyhow::bail!("artifact path escapes registry root: {}", path.display());
+            }
+            output.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn normalize_relative_registry_path(path: &Path) -> Result<String> {
+    if path.components().any(|component| {
+        matches!(
+            component,
+            Component::Prefix(_) | Component::RootDir | Component::CurDir | Component::ParentDir
+        )
+    }) {
+        anyhow::bail!("registry artifact path is invalid: {}", path.display());
+    }
+    let mut segments = Vec::new();
+    for component in path.components() {
+        let Component::Normal(segment) = component else {
+            anyhow::bail!("registry artifact path is invalid: {}", path.display());
+        };
+        let raw = segment.to_string_lossy();
+        if raw.is_empty() {
+            anyhow::bail!("registry artifact path is invalid: {}", path.display());
+        }
+        segments.push(raw.to_string());
+    }
+    if segments.is_empty() {
+        anyhow::bail!("registry artifact path cannot be empty");
+    }
+    Ok(segments.join("/"))
+}
+
+fn resolve_local_registry_artifact_path(registry_dir: &Path, raw: &str) -> Result<PathBuf> {
+    let path = Path::new(raw.trim());
+    if raw.trim().is_empty() {
+        anyhow::bail!("registry entry artifact path cannot be empty");
+    }
+    if path.is_absolute() {
+        anyhow::bail!("registry entry artifact path must be relative: {}", raw.trim());
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            Component::Prefix(_) | Component::RootDir | Component::CurDir | Component::ParentDir
+        )
+    }) {
+        anyhow::bail!("registry entry artifact path is invalid: {}", raw.trim());
+    }
+    Ok(registry_dir.join(path))
+}
+
+fn fetch_remote_registry_entries(
+    registry_url: &str,
+    registry_ca_cert: Option<&str>,
+    trust_store: &mut SkillTrustStore,
+    allow_untrusted: bool,
+) -> Result<Vec<RemoteRegistryResolvedEntry>> {
+    let mut page_url = parse_https_url(registry_url, "--registry-url")?;
+    let client = build_registry_http_client(registry_ca_cert)?;
+    let mut visited_pages = HashSet::<String>::new();
+    let mut merged = Vec::<RemoteRegistryResolvedEntry>::new();
+    for _ in 0..MAX_REGISTRY_PAGES {
+        if !visited_pages.insert(page_url.to_string()) {
+            anyhow::bail!("remote registry pagination loop detected at {}", page_url);
+        }
+        let payload = fetch_limited_bytes(&client, page_url.as_str(), MAX_REGISTRY_INDEX_BYTES)
+            .with_context(|| format!("failed to fetch remote registry index {}", page_url))?;
+        let index = parse_and_verify_signed_remote_registry_index(
+            payload.as_slice(),
+            trust_store,
+            allow_untrusted,
+        )
+        .with_context(|| format!("invalid remote registry index {}", page_url))?;
+        validate_registry_index(&index)?;
+        for entry in index.entries {
+            let artifact_url = page_url.join(entry.artifact.as_str()).with_context(|| {
+                format!("failed to resolve artifact URL '{}' against {}", entry.artifact, page_url)
+            })?;
+            if artifact_url.scheme() != "https" {
+                anyhow::bail!("remote registry artifact URL must use https: {}", artifact_url);
+            }
+            merged.push(RemoteRegistryResolvedEntry { entry, artifact_url });
+        }
+        let Some(next_page) = index.next_page else {
+            return Ok(merged);
+        };
+        page_url = page_url.join(next_page.as_str()).with_context(|| {
+            format!("failed to resolve next_page '{}' against {}", next_page, page_url)
+        })?;
+        if page_url.scheme() != "https" {
+            anyhow::bail!("remote registry next_page must use https: {}", page_url);
+        }
+    }
+    anyhow::bail!("remote registry exceeded max pagination depth of {}", MAX_REGISTRY_PAGES)
+}
+
+fn parse_and_verify_signed_remote_registry_index(
+    payload: &[u8],
+    trust_store: &mut SkillTrustStore,
+    allow_untrusted: bool,
+) -> Result<SkillRegistryIndex> {
+    if payload.len() > MAX_REGISTRY_INDEX_BYTES {
+        anyhow::bail!(
+            "remote registry index exceeds max size ({} > {})",
+            payload.len(),
+            MAX_REGISTRY_INDEX_BYTES
+        );
+    }
+    let signed: SignedSkillRegistryIndex =
+        serde_json::from_slice(payload).context("failed to parse signed registry index JSON")?;
+    if signed.schema_version != REGISTRY_SIGNED_INDEX_SCHEMA_VERSION {
+        anyhow::bail!(
+            "unsupported signed registry schema version {}; expected {}",
+            signed.schema_version,
+            REGISTRY_SIGNED_INDEX_SCHEMA_VERSION
+        );
+    }
+    if signed.index.schema_version != REGISTRY_INDEX_SCHEMA_VERSION {
+        anyhow::bail!(
+            "unsupported registry index schema version {}; expected {}",
+            signed.index.schema_version,
+            REGISTRY_INDEX_SCHEMA_VERSION
+        );
+    }
+    if signed.signature.algorithm != REGISTRY_SIGNATURE_ALGORITHM {
+        anyhow::bail!("unsupported registry signature algorithm '{}'", signed.signature.algorithm);
+    }
+    let verifying_key = parse_registry_verifying_key(&signed.signature)?;
+    let expected_key_id = registry_key_id_for(&verifying_key);
+    if signed.signature.key_id != expected_key_id {
+        anyhow::bail!(
+            "registry signature key_id mismatch: expected {} got {}",
+            expected_key_id,
+            signed.signature.key_id
+        );
+    }
+    let payload_sha256 = sha256_hex(
+        serde_json::to_vec(&signed.index)
+            .context("failed to serialize canonical registry index")?
+            .as_slice(),
+    );
+    if payload_sha256 != signed.signature.payload_sha256 {
+        anyhow::bail!("registry index payload hash mismatch");
+    }
+    let signature = parse_registry_signature(&signed.signature)?;
+    verifying_key
+        .verify(payload_sha256.as_bytes(), &signature)
+        .map_err(|_| anyhow!("registry signature verification failed"))?;
+
+    let observed_key_hex = {
+        let mut output = String::with_capacity(64);
+        for byte in verifying_key.as_bytes() {
+            output.push_str(format!("{byte:02x}").as_str());
+        }
+        output
+    };
+    let _ = evaluate_trust_for_key(
+        trust_store,
+        signed.signature.publisher.as_str(),
+        observed_key_hex.as_str(),
+        allow_untrusted,
+        "remote registry signature",
+    )?;
+    Ok(signed.index)
+}
+
+fn parse_registry_verifying_key(signature: &RegistrySignature) -> Result<VerifyingKey> {
+    let decoded = BASE64_STANDARD
+        .decode(signature.public_key_base64.as_bytes())
+        .map_err(|_| anyhow!("registry public key is not valid base64"))?;
+    let key_bytes: [u8; 32] = decoded
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("registry public key must decode to 32 bytes"))?;
+    VerifyingKey::from_bytes(&key_bytes).map_err(|_| anyhow!("registry public key is invalid"))
+}
+
+fn parse_registry_signature(signature: &RegistrySignature) -> Result<Signature> {
+    let decoded = BASE64_STANDARD
+        .decode(signature.signature_base64.as_bytes())
+        .map_err(|_| anyhow!("registry signature is not valid base64"))?;
+    let signature_bytes: [u8; 64] = decoded
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("registry signature must decode to 64 bytes"))?;
+    Ok(Signature::from_bytes(&signature_bytes))
+}
+
+fn registry_key_id_for(key: &VerifyingKey) -> String {
+    let digest = Sha256::digest(key.as_bytes());
+    let mut suffix = String::with_capacity(16);
+    for byte in &digest[..8] {
+        suffix.push_str(format!("{byte:02x}").as_str());
+    }
+    format!("ed25519:{suffix}")
+}
+
+fn evaluate_trust_for_key(
+    trust_store: &mut SkillTrustStore,
+    publisher: &str,
+    observed_key_hex: &str,
+    allow_untrusted: bool,
+    context: &str,
+) -> Result<TrustDecision> {
+    let publisher = publisher.trim().to_ascii_lowercase();
+    if publisher.is_empty() {
+        anyhow::bail!("{context} publisher cannot be empty");
+    }
+    if let Some(keys) = trust_store.trusted_publishers.get(&publisher) {
+        if keys.iter().any(|key| key == observed_key_hex) {
+            return Ok(TrustDecision::Allowlisted);
+        }
+        anyhow::bail!("{context} trusted key mismatch for publisher '{}'", publisher);
+    }
+    if let Some(pinned) = trust_store.tofu_publishers.get(&publisher) {
+        if pinned == observed_key_hex {
+            return Ok(TrustDecision::TofuPinned);
+        }
+        anyhow::bail!("{context} TOFU key mismatch for publisher '{}'", publisher);
+    }
+    if allow_untrusted {
+        trust_store.tofu_publishers.insert(publisher.to_owned(), observed_key_hex.to_owned());
+        return Ok(TrustDecision::TofuNewlyPinned);
+    }
+    anyhow::bail!(
+        "{context} publisher '{}' is untrusted (pass --allow-untrusted to permit TOFU pinning)",
+        publisher
+    )
+}
+
+fn validate_registry_index(index: &SkillRegistryIndex) -> Result<()> {
+    if index.schema_version != REGISTRY_INDEX_SCHEMA_VERSION {
+        anyhow::bail!(
+            "unsupported registry index schema version {}; expected {}",
+            index.schema_version,
+            REGISTRY_INDEX_SCHEMA_VERSION
+        );
+    }
+    if index.entries.len() > MAX_REGISTRY_ENTRIES {
+        anyhow::bail!(
+            "registry index contains too many entries ({} > {})",
+            index.entries.len(),
+            MAX_REGISTRY_ENTRIES
+        );
+    }
+    for entry in &index.entries {
+        if entry.skill_id.trim().is_empty() {
+            anyhow::bail!("registry entry skill_id cannot be empty");
+        }
+        if parse_semver_triplet(entry.version.as_str()).is_none() {
+            anyhow::bail!(
+                "registry entry {} has invalid semantic version '{}'",
+                entry.skill_id,
+                entry.version
+            );
+        }
+        if entry.publisher.trim().is_empty() {
+            anyhow::bail!(
+                "registry entry {} {} publisher cannot be empty",
+                entry.skill_id,
+                entry.version
+            );
+        }
+        if entry.artifact.trim().is_empty() {
+            anyhow::bail!(
+                "registry entry {} {} artifact URL/path cannot be empty",
+                entry.skill_id,
+                entry.version
+            );
+        }
+        if entry.artifact_sha256.len() != 64
+            || !entry.artifact_sha256.chars().all(|ch| ch.is_ascii_hexdigit())
+        {
+            anyhow::bail!(
+                "registry entry {} {} has invalid artifact_sha256 '{}'",
+                entry.skill_id,
+                entry.version,
+                entry.artifact_sha256
+            );
+        }
+    }
+    Ok(())
+}
+
+fn select_registry_entry(
+    entries: &[SkillRegistryEntry],
+    skill_id: &str,
+    version: Option<&str>,
+) -> Result<SkillRegistryEntry> {
+    let mut candidates =
+        entries.iter().filter(|entry| entry.skill_id == skill_id).cloned().collect::<Vec<_>>();
+    if candidates.is_empty() {
+        anyhow::bail!("registry does not contain skill_id={}", skill_id);
+    }
+    if let Some(version) = version {
+        return candidates
+            .into_iter()
+            .find(|entry| entry.version == version)
+            .ok_or_else(|| anyhow!("registry does not contain {} version {}", skill_id, version));
+    }
+    candidates.sort_by(|left, right| {
+        compare_semver_versions(left.version.as_str(), right.version.as_str())
+    });
+    candidates
+        .into_iter()
+        .last()
+        .ok_or_else(|| anyhow!("registry does not contain installable versions for {}", skill_id))
+}
+
+fn select_remote_registry_entry(
+    entries: &[RemoteRegistryResolvedEntry],
+    skill_id: &str,
+    version: Option<&str>,
+) -> Result<RemoteRegistryResolvedEntry> {
+    let mut candidates = entries
+        .iter()
+        .filter(|entry| entry.entry.skill_id == skill_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        anyhow::bail!("remote registry does not contain skill_id={}", skill_id);
+    }
+    if let Some(version) = version {
+        return candidates.into_iter().find(|entry| entry.entry.version == version).ok_or_else(
+            || anyhow!("remote registry does not contain {} version {}", skill_id, version),
+        );
+    }
+    candidates.sort_by(|left, right| {
+        compare_semver_versions(left.entry.version.as_str(), right.entry.version.as_str())
+    });
+    candidates.into_iter().last().ok_or_else(|| {
+        anyhow!("remote registry does not contain installable versions for {}", skill_id)
+    })
+}
+
+fn parse_https_url(raw: &str, label: &str) -> Result<Url> {
+    let parsed =
+        Url::parse(raw.trim()).with_context(|| format!("{label} must be a valid absolute URL"))?;
+    if parsed.scheme() != "https" {
+        anyhow::bail!("{label} must use https");
+    }
+    Ok(parsed)
+}
+
+fn build_registry_http_client(registry_ca_cert: Option<&str>) -> Result<Client> {
+    let mut builder = Client::builder().https_only(true).timeout(Duration::from_secs(20));
+    if let Some(path) = registry_ca_cert {
+        let cert_path = Path::new(path);
+        let cert_bytes = fs::read(cert_path).with_context(|| {
+            format!("failed to read --registry-ca-cert {}", cert_path.display())
+        })?;
+        let certificate = reqwest::Certificate::from_pem(cert_bytes.as_slice())
+            .context("failed to parse --registry-ca-cert PEM")?;
+        builder = builder.add_root_certificate(certificate);
+    }
+    builder.build().context("failed to build registry HTTP client")
+}
+
+fn fetch_limited_bytes(client: &Client, url: &str, limit: usize) -> Result<Vec<u8>> {
+    let response = client
+        .get(url)
+        .send()
+        .with_context(|| format!("failed to fetch {}", url))?
+        .error_for_status()
+        .with_context(|| format!("remote endpoint returned non-success for {}", url))?;
+    let bytes =
+        response.bytes().with_context(|| format!("failed to read response body from {}", url))?;
+    if bytes.len() > limit {
+        anyhow::bail!(
+            "remote payload {} exceeds configured limit ({} > {})",
+            url,
+            bytes.len(),
+            limit
+        );
+    }
+    Ok(bytes.to_vec())
+}
+
+fn resolve_and_prompt_missing_skill_secrets(
+    manifest: &palyra_skills::SkillManifest,
+    non_interactive: bool,
+) -> Result<Vec<MissingSkillSecret>> {
+    let requested = manifest
+        .capabilities
+        .secrets
+        .iter()
+        .flat_map(|scope| {
+            scope
+                .key_names
+                .iter()
+                .map(|key| MissingSkillSecret { scope: scope.scope.clone(), key: key.clone() })
+        })
+        .collect::<Vec<_>>();
+    if requested.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let vault =
+        open_cli_vault().context("failed to initialize vault runtime for skills secrets")?;
+    let interactive =
+        !non_interactive && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let mut missing = Vec::new();
+    for secret in requested {
+        if secret.key.contains('*') {
+            missing.push(secret);
+            continue;
+        }
+        let scope = parse_vault_scope(secret.scope.as_str()).with_context(|| {
+            format!(
+                "skill manifest requested invalid vault scope '{}' for key '{}'",
+                secret.scope, secret.key
+            )
+        })?;
+        match vault.get_secret(&scope, secret.key.as_str()) {
+            Ok(_) => continue,
+            Err(VaultError::NotFound) => {
+                if interactive
+                    && prompt_yes_no(
+                        format!(
+                            "Missing skill secret {}/{}. Set now in vault? [y/N]: ",
+                            secret.scope, secret.key
+                        )
+                        .as_str(),
+                    )?
+                {
+                    let value = prompt_secret_value(
+                        format!(
+                            "Enter value for {}/{} (single line, empty aborts): ",
+                            secret.scope, secret.key
+                        )
+                        .as_str(),
+                    )?;
+                    if !value.is_empty() {
+                        vault
+                            .put_secret(&scope, secret.key.as_str(), value.as_bytes())
+                            .with_context(|| {
+                                format!(
+                                    "failed to persist prompted secret {}/{}",
+                                    secret.scope, secret.key
+                                )
+                            })?;
+                        continue;
+                    }
+                }
+                missing.push(secret);
+            }
+            Err(error) => {
+                return Err(anyhow!(
+                    "failed to read required skill secret {}/{} from vault: {}",
+                    secret.scope,
+                    secret.key,
+                    error
+                ));
+            }
+        }
+    }
+    Ok(missing)
+}
+
+fn prompt_yes_no(prompt: &str) -> Result<bool> {
+    eprint!("{prompt}");
+    std::io::stderr().flush().context("stderr flush failed")?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer).context("failed to read interactive answer")?;
+    let normalized = answer.trim().to_ascii_lowercase();
+    Ok(matches!(normalized.as_str(), "y" | "yes"))
+}
+
+fn prompt_secret_value(prompt: &str) -> Result<String> {
+    eprint!("{prompt}");
+    std::io::stderr().flush().context("stderr flush failed")?;
+    let mut value = String::new();
+    std::io::stdin().read_line(&mut value).context("failed to read secret value")?;
+    Ok(value.trim_end_matches(['\r', '\n']).to_owned())
+}
+
+fn update_skill_current_pointer(skill_root: &Path, version: &str) -> Result<()> {
+    let current = skill_root.join(SKILLS_CURRENT_LINK_NAME);
+    if current.exists() {
+        if current.is_dir() && !current.is_symlink() {
+            fs::remove_dir_all(current.as_path()).with_context(|| {
+                format!("failed to remove existing current directory {}", current.display())
+            })?;
+        } else {
+            fs::remove_file(current.as_path()).with_context(|| {
+                format!("failed to remove existing current pointer {}", current.display())
+            })?;
+        }
+    } else if fs::symlink_metadata(current.as_path()).is_ok() {
+        fs::remove_file(current.as_path()).with_context(|| {
+            format!("failed to remove existing current pointer {}", current.display())
+        })?;
+    }
+    let created = create_optional_directory_symlink(version, current.as_path())?;
+    if !created {
+        eprintln!(
+            "warning: could not create optional '{}' symlink for skill root {}",
+            SKILLS_CURRENT_LINK_NAME,
+            skill_root.display()
+        );
+    }
+    Ok(())
+}
+
+fn remove_skill_current_pointer(skill_root: &Path) -> Result<()> {
+    let current = skill_root.join(SKILLS_CURRENT_LINK_NAME);
+    if !current.exists() && fs::symlink_metadata(current.as_path()).is_err() {
+        return Ok(());
+    }
+    if current.is_dir() && !current.is_symlink() {
+        fs::remove_dir_all(current.as_path())
+            .with_context(|| format!("failed to remove current directory {}", current.display()))?;
+    } else {
+        fs::remove_file(current.as_path())
+            .with_context(|| format!("failed to remove current pointer {}", current.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_optional_directory_symlink(target: &str, link: &Path) -> Result<bool> {
+    match std::os::unix::fs::symlink(target, link) {
+        Ok(()) => Ok(true),
+        Err(_) => Ok(false),
+    }
+}
+
+#[cfg(windows)]
+fn create_optional_directory_symlink(target: &str, link: &Path) -> Result<bool> {
+    match std::os::windows::fs::symlink_dir(target, link) {
+        Ok(()) => Ok(true),
+        Err(_) => Ok(false),
+    }
 }
 
 fn run_secrets(command: SecretsCommand) -> Result<()> {
@@ -3594,8 +5321,20 @@ struct RunCancelResponse {
 
 #[cfg(test)]
 mod cli_v1_tests {
-    use super::{is_retryable_grpc_error, normalize_client_socket, parse_acp_shim_input_line};
+    use super::{
+        compare_semver_versions, is_retryable_grpc_error, normalize_client_socket,
+        normalize_installed_skills_index, normalize_relative_registry_path,
+        parse_acp_shim_input_line, parse_and_verify_signed_remote_registry_index,
+        registry_key_id_for, sha256_hex, InstalledSkillRecord, InstalledSkillSource,
+        InstalledSkillsIndex, RegistrySignature, SignedSkillRegistryIndex, SkillRegistryEntry,
+        SkillRegistryIndex, REGISTRY_INDEX_SCHEMA_VERSION, REGISTRY_SIGNATURE_ALGORITHM,
+        REGISTRY_SIGNED_INDEX_SCHEMA_VERSION,
+    };
+    use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+    use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
+    use palyra_skills::SkillTrustStore;
     use std::net::SocketAddr;
+    use std::path::Path;
 
     #[test]
     fn ndjson_stdin_uses_top_level_allow_sensitive_tools_default() {
@@ -3637,6 +5376,122 @@ mod cli_v1_tests {
 
         assert!(is_retryable_grpc_error(&unavailable));
         assert!(!is_retryable_grpc_error(&invalid_argument));
+    }
+
+    #[test]
+    fn semver_comparison_uses_numeric_ordering() {
+        assert_eq!(compare_semver_versions("1.10.0", "1.2.99"), std::cmp::Ordering::Greater);
+        assert_eq!(compare_semver_versions("1.2.0", "1.2.0"), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn normalize_registry_path_rejects_parent_traversal() {
+        let result = normalize_relative_registry_path(Path::new("../artifact.palyra-skill"));
+        assert!(result.is_err(), "parent traversal should be rejected");
+    }
+
+    #[test]
+    fn signed_registry_index_verification_rejects_payload_hash_mismatch() {
+        let signing_key = SigningKey::from_bytes(&[9_u8; 32]);
+        let verifying_key = VerifyingKey::from(&signing_key);
+        let index = SkillRegistryIndex {
+            schema_version: REGISTRY_INDEX_SCHEMA_VERSION,
+            generated_at_unix_ms: 1_730_000_000_000,
+            entries: vec![SkillRegistryEntry {
+                skill_id: "acme.echo_http".to_owned(),
+                version: "1.0.0".to_owned(),
+                publisher: "acme".to_owned(),
+                artifact: "acme.echo_http.palyra-skill".to_owned(),
+                artifact_sha256: "0".repeat(64),
+                artifact_bytes: Some(128),
+            }],
+            next_page: None,
+        };
+        let payload_sha256 =
+            sha256_hex(serde_json::to_vec(&index).expect("index should serialize").as_slice());
+        let signature = signing_key.sign(payload_sha256.as_bytes());
+        let mut signed = SignedSkillRegistryIndex {
+            schema_version: REGISTRY_SIGNED_INDEX_SCHEMA_VERSION,
+            index,
+            signature: RegistrySignature {
+                algorithm: REGISTRY_SIGNATURE_ALGORITHM.to_owned(),
+                publisher: "acme-registry".to_owned(),
+                key_id: registry_key_id_for(&verifying_key),
+                public_key_base64: BASE64_STANDARD.encode(verifying_key.as_bytes()),
+                payload_sha256: payload_sha256.clone(),
+                signature_base64: BASE64_STANDARD.encode(signature.to_bytes()),
+                signed_at_unix_ms: 1_730_000_000_123,
+            },
+        };
+        signed.signature.payload_sha256 = "f".repeat(64);
+        let payload = serde_json::to_vec(&signed).expect("signed index should serialize");
+
+        let mut store = SkillTrustStore::default();
+        let mut key_hex = String::with_capacity(64);
+        for byte in verifying_key.as_bytes() {
+            key_hex.push_str(format!("{byte:02x}").as_str());
+        }
+        store
+            .add_trusted_key("acme-registry", key_hex.as_str())
+            .expect("trusted key should be accepted");
+        let error =
+            parse_and_verify_signed_remote_registry_index(payload.as_slice(), &mut store, false)
+                .expect_err("hash mismatch should fail");
+        assert!(
+            error.to_string().contains("payload hash mismatch"),
+            "error should mention hash mismatch: {error}"
+        );
+    }
+
+    #[test]
+    fn normalize_installed_index_keeps_only_one_current_version() {
+        let mut index = InstalledSkillsIndex {
+            schema_version: 1,
+            updated_at_unix_ms: 0,
+            entries: vec![
+                InstalledSkillRecord {
+                    skill_id: "acme.echo_http".to_owned(),
+                    version: "1.0.0".to_owned(),
+                    publisher: "acme".to_owned(),
+                    current: true,
+                    installed_at_unix_ms: 1,
+                    artifact_sha256: "0".repeat(64),
+                    payload_sha256: "1".repeat(64),
+                    signature_key_id: "ed25519:0011223344556677".to_owned(),
+                    trust_decision: "allowlisted".to_owned(),
+                    source: InstalledSkillSource {
+                        kind: "local_artifact".to_owned(),
+                        reference: "a".to_owned(),
+                    },
+                    missing_secrets: Vec::new(),
+                },
+                InstalledSkillRecord {
+                    skill_id: "acme.echo_http".to_owned(),
+                    version: "1.1.0".to_owned(),
+                    publisher: "acme".to_owned(),
+                    current: true,
+                    installed_at_unix_ms: 2,
+                    artifact_sha256: "2".repeat(64),
+                    payload_sha256: "3".repeat(64),
+                    signature_key_id: "ed25519:8899aabbccddeeff".to_owned(),
+                    trust_decision: "allowlisted".to_owned(),
+                    source: InstalledSkillSource {
+                        kind: "local_artifact".to_owned(),
+                        reference: "b".to_owned(),
+                    },
+                    missing_secrets: Vec::new(),
+                },
+            ],
+        };
+
+        normalize_installed_skills_index(&mut index);
+        let current_versions = index
+            .entries
+            .iter()
+            .filter(|entry| entry.skill_id == "acme.echo_http" && entry.current)
+            .map(|entry| entry.version.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(current_versions, vec!["1.1.0".to_owned()]);
     }
 }
 

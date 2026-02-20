@@ -47,6 +47,7 @@ fuzz/corpus/
 fuzz/coverage/
 security-artifacts/
 .palyra/
+data/
 /roadmap/
 /oc-docs/
 TechStack_Architecture.md

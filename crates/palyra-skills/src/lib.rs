@@ -316,6 +316,14 @@ struct ParsedArtifact {
     payload_sha256: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct SkillArtifactInspection {
+    pub manifest: SkillManifest,
+    pub signature: SkillArtifactSignature,
+    pub payload_sha256: String,
+    pub entries: BTreeMap<String, Vec<u8>>,
+}
+
 pub fn parse_manifest_toml(raw: &str) -> Result<SkillManifest, SkillPackagingError> {
     let manifest = toml::from_str::<SkillManifest>(raw)
         .map_err(|error| SkillPackagingError::ManifestParse(error.to_string()))?;
@@ -465,14 +473,12 @@ pub fn verify_skill_artifact(
     trust_store: &mut SkillTrustStore,
     allow_tofu: bool,
 ) -> Result<SkillVerificationReport, SkillPackagingError> {
-    let entries = decode_zip(artifact_bytes)?;
-    let parsed = parse_and_verify_artifact(&entries)?;
-    assert_runtime_compatibility(&parsed.manifest.compat)?;
+    let inspected = inspect_skill_artifact(artifact_bytes)?;
 
     trust_store.normalize()?;
-    let verifying_key = parse_verifying_key(&parsed.signature)?;
+    let verifying_key = parse_verifying_key(&inspected.signature)?;
     let observed_key = hex::encode(verifying_key.as_bytes());
-    let publisher = parsed.manifest.publisher.clone();
+    let publisher = inspected.manifest.publisher.clone();
 
     let trust_decision = if let Some(keys) = trust_store.trusted_publishers.get(&publisher) {
         if keys.iter().any(|key| key == &observed_key) {
@@ -493,14 +499,14 @@ pub fn verify_skill_artifact(
         return Err(SkillPackagingError::UntrustedPublisher { publisher });
     };
 
-    let capability_grants = capability_grants_from_manifest(&parsed.manifest);
-    let policy_bindings = policy_bindings_from_manifest(&parsed.manifest);
+    let capability_grants = capability_grants_from_manifest(&inspected.manifest);
+    let policy_bindings = policy_bindings_from_manifest(&inspected.manifest);
     let audit_event = SkillVerificationAuditEvent {
         event_kind: SKILL_VERIFICATION_EVENT_KIND.to_owned(),
-        skill_id: parsed.manifest.skill_id.clone(),
-        publisher: parsed.manifest.publisher.clone(),
-        version: parsed.manifest.version.clone(),
-        payload_sha256: parsed.payload_sha256.clone(),
+        skill_id: inspected.manifest.skill_id.clone(),
+        publisher: inspected.manifest.publisher.clone(),
+        version: inspected.manifest.version.clone(),
+        payload_sha256: inspected.payload_sha256.clone(),
         trust_decision,
         verified_at_unix_ms: now_unix_ms(),
         policy_bindings: policy_bindings.clone(),
@@ -509,11 +515,25 @@ pub fn verify_skill_artifact(
     Ok(SkillVerificationReport {
         accepted: true,
         trust_decision,
-        payload_sha256: parsed.payload_sha256,
-        manifest: parsed.manifest,
+        payload_sha256: inspected.payload_sha256,
+        manifest: inspected.manifest,
         capability_grants,
         policy_bindings,
         audit_event,
+    })
+}
+
+pub fn inspect_skill_artifact(
+    artifact_bytes: &[u8],
+) -> Result<SkillArtifactInspection, SkillPackagingError> {
+    let entries = decode_zip(artifact_bytes)?;
+    let parsed = parse_and_verify_artifact(&entries)?;
+    assert_runtime_compatibility(&parsed.manifest.compat)?;
+    Ok(SkillArtifactInspection {
+        manifest: parsed.manifest,
+        signature: parsed.signature,
+        payload_sha256: parsed.payload_sha256,
+        entries,
     })
 }
 
@@ -1313,10 +1333,10 @@ fn default_quota_max_memory() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_signed_skill_artifact, capability_grants_from_manifest, parse_ed25519_signing_key,
-        parse_manifest_toml, policy_requests_from_manifest, verify_skill_artifact, ArtifactFile,
-        SkillArtifactBuildRequest, SkillPackagingError, SkillTrustStore, TrustDecision,
-        MAX_ARTIFACT_BYTES, MAX_ENTRIES, SBOM_PATH,
+        build_signed_skill_artifact, capability_grants_from_manifest, inspect_skill_artifact,
+        parse_ed25519_signing_key, parse_manifest_toml, policy_requests_from_manifest,
+        verify_skill_artifact, ArtifactFile, SkillArtifactBuildRequest, SkillPackagingError,
+        SkillTrustStore, TrustDecision, MAX_ARTIFACT_BYTES, MAX_ENTRIES, SBOM_PATH, SIGNATURE_PATH,
     };
     use base64::Engine as _;
 
@@ -1459,6 +1479,23 @@ min_runtime_version = "0.1.0"
             SkillPackagingError::PayloadHashMismatch
                 | SkillPackagingError::SignatureVerificationFailed
         ));
+    }
+
+    #[test]
+    fn inspect_returns_verified_entries_for_installer() {
+        let output = build_signed_skill_artifact(sample_request()).expect("artifact should build");
+        let inspected = inspect_skill_artifact(output.artifact_bytes.as_slice())
+            .expect("artifact should inspect");
+        assert_eq!(inspected.manifest.skill_id, "acme.echo_http");
+        assert_eq!(inspected.payload_sha256, output.payload_sha256);
+        assert!(
+            inspected.entries.contains_key(SIGNATURE_PATH),
+            "signature entry should be available for extraction"
+        );
+        assert!(
+            inspected.entries.contains_key("modules/module.wasm"),
+            "module entry should be available for extraction"
+        );
     }
 
     #[test]

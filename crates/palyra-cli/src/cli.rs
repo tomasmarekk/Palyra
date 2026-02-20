@@ -78,6 +78,7 @@ pub enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    #[command(visible_alias = "skill")]
     Skills {
         #[command(subcommand)]
         command: SkillsCommand,
@@ -685,6 +686,86 @@ pub enum SkillsCommand {
     Package {
         #[command(subcommand)]
         command: SkillsPackageCommand,
+    },
+    Install {
+        #[arg(long, conflicts_with_all = ["registry_dir", "registry_url", "skill_id", "version"])]
+        artifact: Option<String>,
+        #[arg(long, conflicts_with = "registry_url")]
+        registry_dir: Option<String>,
+        #[arg(long, conflicts_with = "registry_dir")]
+        registry_url: Option<String>,
+        #[arg(long)]
+        skill_id: Option<String>,
+        #[arg(long, requires = "skill_id")]
+        version: Option<String>,
+        #[arg(long, requires = "registry_url")]
+        registry_ca_cert: Option<String>,
+        #[arg(long)]
+        skills_dir: Option<String>,
+        #[arg(long)]
+        trust_store: Option<String>,
+        #[arg(long = "trusted-publisher")]
+        trusted_publishers: Vec<String>,
+        #[arg(long, default_value_t = false)]
+        allow_untrusted: bool,
+        #[arg(long, default_value_t = false)]
+        non_interactive: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Remove {
+        skill_id: String,
+        #[arg(long)]
+        version: Option<String>,
+        #[arg(long)]
+        skills_dir: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    List {
+        #[arg(long)]
+        skills_dir: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Update {
+        #[arg(long, conflicts_with = "registry_url")]
+        registry_dir: Option<String>,
+        #[arg(long, conflicts_with = "registry_dir")]
+        registry_url: Option<String>,
+        #[arg(long)]
+        skill_id: String,
+        #[arg(long)]
+        version: Option<String>,
+        #[arg(long, requires = "registry_url")]
+        registry_ca_cert: Option<String>,
+        #[arg(long)]
+        skills_dir: Option<String>,
+        #[arg(long)]
+        trust_store: Option<String>,
+        #[arg(long = "trusted-publisher")]
+        trusted_publishers: Vec<String>,
+        #[arg(long, default_value_t = false)]
+        allow_untrusted: bool,
+        #[arg(long, default_value_t = false)]
+        non_interactive: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Verify {
+        skill_id: String,
+        #[arg(long)]
+        version: Option<String>,
+        #[arg(long)]
+        skills_dir: Option<String>,
+        #[arg(long)]
+        trust_store: Option<String>,
+        #[arg(long = "trusted-publisher")]
+        trusted_publishers: Vec<String>,
+        #[arg(long, default_value_t = false)]
+        allow_untrusted: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 }
 
@@ -1836,6 +1917,177 @@ mod tests {
                         allow_tofu: true,
                         json: true,
                     },
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn parse_skill_alias_install_from_artifact() {
+        let parsed = Cli::parse_from([
+            "palyra",
+            "skill",
+            "install",
+            "--artifact",
+            "dist/acme.palyra-skill",
+            "--skills-dir",
+            "state/skills",
+            "--trust-store",
+            "state/skills-trust.json",
+            "--trusted-publisher",
+            "acme=001122",
+            "--allow-untrusted",
+            "--non-interactive",
+            "--json",
+        ]);
+        assert_eq!(
+            parsed.command,
+            Command::Skills {
+                command: SkillsCommand::Install {
+                    artifact: Some("dist/acme.palyra-skill".to_owned()),
+                    registry_dir: None,
+                    registry_url: None,
+                    skill_id: None,
+                    version: None,
+                    registry_ca_cert: None,
+                    skills_dir: Some("state/skills".to_owned()),
+                    trust_store: Some("state/skills-trust.json".to_owned()),
+                    trusted_publishers: vec!["acme=001122".to_owned()],
+                    allow_untrusted: true,
+                    non_interactive: true,
+                    json: true,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn parse_skills_install_from_remote_registry() {
+        let parsed = Cli::parse_from([
+            "palyra",
+            "skills",
+            "install",
+            "--registry-url",
+            "https://registry.example.com/index.json",
+            "--skill-id",
+            "acme.echo_http",
+            "--version",
+            "1.2.3",
+            "--registry-ca-cert",
+            "certs/registry-ca.pem",
+        ]);
+        assert_eq!(
+            parsed.command,
+            Command::Skills {
+                command: SkillsCommand::Install {
+                    artifact: None,
+                    registry_dir: None,
+                    registry_url: Some("https://registry.example.com/index.json".to_owned()),
+                    skill_id: Some("acme.echo_http".to_owned()),
+                    version: Some("1.2.3".to_owned()),
+                    registry_ca_cert: Some("certs/registry-ca.pem".to_owned()),
+                    skills_dir: None,
+                    trust_store: None,
+                    trusted_publishers: Vec::new(),
+                    allow_untrusted: false,
+                    non_interactive: false,
+                    json: false,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn parse_skills_update_from_local_registry() {
+        let parsed = Cli::parse_from([
+            "palyra",
+            "skills",
+            "update",
+            "--registry-dir",
+            "registry",
+            "--skill-id",
+            "acme.echo_http",
+            "--skills-dir",
+            "state/skills",
+            "--json",
+        ]);
+        assert_eq!(
+            parsed.command,
+            Command::Skills {
+                command: SkillsCommand::Update {
+                    registry_dir: Some("registry".to_owned()),
+                    registry_url: None,
+                    skill_id: "acme.echo_http".to_owned(),
+                    version: None,
+                    registry_ca_cert: None,
+                    skills_dir: Some("state/skills".to_owned()),
+                    trust_store: None,
+                    trusted_publishers: Vec::new(),
+                    allow_untrusted: false,
+                    non_interactive: false,
+                    json: true,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn parse_skills_remove_list_and_verify() {
+        let remove = Cli::parse_from([
+            "palyra",
+            "skills",
+            "remove",
+            "acme.echo_http",
+            "--version",
+            "1.2.3",
+            "--skills-dir",
+            "state/skills",
+            "--json",
+        ]);
+        assert_eq!(
+            remove.command,
+            Command::Skills {
+                command: SkillsCommand::Remove {
+                    skill_id: "acme.echo_http".to_owned(),
+                    version: Some("1.2.3".to_owned()),
+                    skills_dir: Some("state/skills".to_owned()),
+                    json: true,
+                },
+            }
+        );
+
+        let list = Cli::parse_from(["palyra", "skills", "list", "--skills-dir", "state/skills"]);
+        assert_eq!(
+            list.command,
+            Command::Skills {
+                command: SkillsCommand::List {
+                    skills_dir: Some("state/skills".to_owned()),
+                    json: false,
+                },
+            }
+        );
+
+        let verify = Cli::parse_from([
+            "palyra",
+            "skills",
+            "verify",
+            "acme.echo_http",
+            "--version",
+            "1.2.3",
+            "--allow-untrusted",
+            "--json",
+        ]);
+        assert_eq!(
+            verify.command,
+            Command::Skills {
+                command: SkillsCommand::Verify {
+                    skill_id: "acme.echo_http".to_owned(),
+                    version: Some("1.2.3".to_owned()),
+                    skills_dir: None,
+                    trust_store: None,
+                    trusted_publishers: Vec::new(),
+                    allow_untrusted: true,
+                    json: true,
                 },
             }
         );
