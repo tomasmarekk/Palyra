@@ -3881,17 +3881,64 @@ fn write_file_atomically(path: &Path, payload: &[u8]) -> Result<()> {
     let temporary_path = path.with_extension(format!("tmp.{}.{}", std::process::id(), Ulid::new()));
     fs::write(temporary_path.as_path(), payload)
         .with_context(|| format!("failed to write temporary file {}", temporary_path.display()))?;
-    if path.exists() {
-        fs::remove_file(path)
-            .with_context(|| format!("failed to replace target file {}", path.display()))?;
+
+    #[cfg(not(windows))]
+    {
+        fs::rename(temporary_path.as_path(), path).with_context(|| {
+            format!(
+                "failed to atomically move temporary file {} into {}",
+                temporary_path.display(),
+                path.display()
+            )
+        })?;
+        return Ok(());
     }
-    fs::rename(temporary_path.as_path(), path).with_context(|| {
-        format!(
-            "failed to atomically move temporary file {} into {}",
-            temporary_path.display(),
-            path.display()
-        )
-    })
+
+    #[cfg(windows)]
+    {
+        if !path.exists() {
+            fs::rename(temporary_path.as_path(), path).with_context(|| {
+                format!(
+                    "failed to atomically move temporary file {} into {}",
+                    temporary_path.display(),
+                    path.display()
+                )
+            })?;
+            return Ok(());
+        }
+
+        let backup_path =
+            path.with_extension(format!("bak.{}.{}", std::process::id(), Ulid::new()));
+        fs::rename(path, backup_path.as_path()).with_context(|| {
+            format!(
+                "failed to stage original file {} into backup {}",
+                path.display(),
+                backup_path.display()
+            )
+        })?;
+
+        match fs::rename(temporary_path.as_path(), path) {
+            Ok(()) => fs::remove_file(backup_path.as_path()).with_context(|| {
+                format!("failed to remove temporary backup file {}", backup_path.display())
+            }),
+            Err(replace_error) => {
+                fs::rename(backup_path.as_path(), path).with_context(|| {
+                    format!(
+                        "failed to restore original file {} from backup {} after replacement error {}",
+                        path.display(),
+                        backup_path.display(),
+                        replace_error
+                    )
+                })?;
+                anyhow::bail!(
+                    "failed to atomically move temporary file {} into {}: {}",
+                    temporary_path.display(),
+                    path.display(),
+                    replace_error
+                );
+            }
+        }
+    }
 }
 
 struct InstallExecutionOutcome {
@@ -4175,7 +4222,13 @@ fn resolve_registry_artifact_for_skill(
 
 fn build_local_registry_index(registry_dir: &Path) -> Result<SkillRegistryIndex> {
     let mut artifact_paths = Vec::new();
-    collect_skill_artifact_paths(registry_dir, registry_dir, &mut artifact_paths)?;
+    let mut visited_dirs = HashSet::<PathBuf>::new();
+    collect_skill_artifact_paths(
+        registry_dir,
+        registry_dir,
+        &mut artifact_paths,
+        &mut visited_dirs,
+    )?;
     let mut entries = Vec::new();
     for artifact_path in artifact_paths {
         let artifact_bytes = fs::read(artifact_path.as_path()).with_context(|| {
@@ -4224,14 +4277,24 @@ fn collect_skill_artifact_paths(
     root: &Path,
     cursor: &Path,
     output: &mut Vec<PathBuf>,
+    visited_dirs: &mut HashSet<PathBuf>,
 ) -> Result<()> {
+    let canonical_cursor = fs::canonicalize(cursor)
+        .with_context(|| format!("failed to canonicalize directory {}", cursor.display()))?;
+    if !visited_dirs.insert(canonical_cursor) {
+        return Ok(());
+    }
     for entry in fs::read_dir(cursor)
         .with_context(|| format!("failed to read directory {}", cursor.display()))?
     {
         let entry = entry.context("failed to read directory entry")?;
+        let file_type = entry.file_type().context("failed to read directory entry file type")?;
+        if file_type.is_symlink() {
+            continue;
+        }
         let path = entry.path();
-        if path.is_dir() {
-            collect_skill_artifact_paths(root, path.as_path(), output)?;
+        if file_type.is_dir() {
+            collect_skill_artifact_paths(root, path.as_path(), output, visited_dirs)?;
             continue;
         }
         if path
@@ -4490,6 +4553,7 @@ fn validate_registry_index(index: &SkillRegistryIndex) -> Result<()> {
             MAX_REGISTRY_ENTRIES
         );
     }
+    let mut seen_skill_versions = HashSet::<(String, String)>::new();
     for entry in &index.entries {
         if entry.skill_id.trim().is_empty() {
             anyhow::bail!("registry entry skill_id cannot be empty");
@@ -4523,6 +4587,13 @@ fn validate_registry_index(index: &SkillRegistryIndex) -> Result<()> {
                 entry.skill_id,
                 entry.version,
                 entry.artifact_sha256
+            );
+        }
+        if !seen_skill_versions.insert((entry.skill_id.clone(), entry.version.clone())) {
+            anyhow::bail!(
+                "registry contains duplicate entry for skill_id={} version={}",
+                entry.skill_id,
+                entry.version
             );
         }
     }
@@ -4604,23 +4675,37 @@ fn build_registry_http_client(registry_ca_cert: Option<&str>) -> Result<Client> 
 }
 
 fn fetch_limited_bytes(client: &Client, url: &str, limit: usize) -> Result<Vec<u8>> {
-    let response = client
+    let mut response = client
         .get(url)
         .send()
         .with_context(|| format!("failed to fetch {}", url))?
         .error_for_status()
         .with_context(|| format!("remote endpoint returned non-success for {}", url))?;
-    let bytes =
-        response.bytes().with_context(|| format!("failed to read response body from {}", url))?;
-    if bytes.len() > limit {
+    if response
+        .content_length()
+        .is_some_and(|content_length| usize::try_from(content_length).unwrap_or(usize::MAX) > limit)
+    {
         anyhow::bail!(
-            "remote payload {} exceeds configured limit ({} > {})",
+            "remote payload {} exceeds configured limit (content-length > {})",
             url,
-            bytes.len(),
             limit
         );
     }
-    Ok(bytes.to_vec())
+    let mut payload = Vec::with_capacity(limit.min(64 * 1024));
+    let mut chunk = [0_u8; 8 * 1024];
+    loop {
+        let bytes_read = response
+            .read(&mut chunk)
+            .with_context(|| format!("failed to read response body from {}", url))?;
+        if bytes_read == 0 {
+            break;
+        }
+        if payload.len().saturating_add(bytes_read) > limit {
+            anyhow::bail!("remote payload {} exceeds configured limit (>{})", url, limit);
+        }
+        payload.extend_from_slice(&chunk[..bytes_read]);
+    }
+    Ok(payload)
 }
 
 fn resolve_and_prompt_missing_skill_secrets(
@@ -5322,10 +5407,11 @@ struct RunCancelResponse {
 #[cfg(test)]
 mod cli_v1_tests {
     use super::{
-        compare_semver_versions, is_retryable_grpc_error, normalize_client_socket,
-        normalize_installed_skills_index, normalize_relative_registry_path,
-        parse_acp_shim_input_line, parse_and_verify_signed_remote_registry_index,
-        registry_key_id_for, sha256_hex, InstalledSkillRecord, InstalledSkillSource,
+        compare_semver_versions, fetch_limited_bytes, is_retryable_grpc_error,
+        normalize_client_socket, normalize_installed_skills_index,
+        normalize_relative_registry_path, parse_acp_shim_input_line,
+        parse_and_verify_signed_remote_registry_index, registry_key_id_for, sha256_hex,
+        validate_registry_index, write_file_atomically, InstalledSkillRecord, InstalledSkillSource,
         InstalledSkillsIndex, RegistrySignature, SignedSkillRegistryIndex, SkillRegistryEntry,
         SkillRegistryIndex, REGISTRY_INDEX_SCHEMA_VERSION, REGISTRY_SIGNATURE_ALGORITHM,
         REGISTRY_SIGNED_INDEX_SCHEMA_VERSION,
@@ -5333,8 +5419,35 @@ mod cli_v1_tests {
     use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
     use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
     use palyra_skills::SkillTrustStore;
-    use std::net::SocketAddr;
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpListener};
     use std::path::Path;
+    use std::thread;
+    use std::time::Duration;
+
+    fn spawn_one_shot_http_server(body: Vec<u8>) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test TCP listener should bind");
+        let address = listener.local_addr().expect("listener should report local address");
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("test server should accept one client");
+            let mut request_buffer = [0_u8; 512];
+            let _ = stream.read(&mut request_buffer);
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            if stream.write_all(headers.as_bytes()).is_err() {
+                return;
+            }
+            for chunk in body.chunks(1024) {
+                if stream.write_all(chunk).is_err() {
+                    break;
+                }
+            }
+            let _ = stream.flush();
+        });
+        (format!("http://{address}/registry/index.json"), handle)
+    }
 
     #[test]
     fn ndjson_stdin_uses_top_level_allow_sensitive_tools_default() {
@@ -5388,6 +5501,104 @@ mod cli_v1_tests {
     fn normalize_registry_path_rejects_parent_traversal() {
         let result = normalize_relative_registry_path(Path::new("../artifact.palyra-skill"));
         assert!(result.is_err(), "parent traversal should be rejected");
+    }
+
+    #[test]
+    fn validate_registry_index_rejects_duplicate_skill_version_tuples() {
+        let duplicate_entries = vec![
+            SkillRegistryEntry {
+                skill_id: "acme.echo_http".to_owned(),
+                version: "1.0.0".to_owned(),
+                publisher: "acme".to_owned(),
+                artifact: "echo-http-v1.palyra-skill".to_owned(),
+                artifact_sha256: "a".repeat(64),
+                artifact_bytes: Some(16),
+            },
+            SkillRegistryEntry {
+                skill_id: "acme.echo_http".to_owned(),
+                version: "1.0.0".to_owned(),
+                publisher: "acme".to_owned(),
+                artifact: "echo-http-v1-duplicate.palyra-skill".to_owned(),
+                artifact_sha256: "b".repeat(64),
+                artifact_bytes: Some(16),
+            },
+        ];
+        let index = SkillRegistryIndex {
+            schema_version: REGISTRY_INDEX_SCHEMA_VERSION,
+            generated_at_unix_ms: 1_730_000_000_000,
+            entries: duplicate_entries,
+            next_page: None,
+        };
+
+        let error = validate_registry_index(&index)
+            .expect_err("duplicate registry tuples must be rejected");
+        assert!(
+            error.to_string().contains("duplicate entry"),
+            "error should mention duplicate entry: {error}"
+        );
+    }
+
+    #[test]
+    fn fetch_limited_bytes_rejects_payloads_above_limit() {
+        let (url, server) = spawn_one_shot_http_server(vec![7_u8; 8 * 1024]);
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .expect("HTTP client should build");
+
+        let error = fetch_limited_bytes(&client, url.as_str(), 1024)
+            .expect_err("response over limit should fail");
+        assert!(
+            error.to_string().contains("exceeds configured limit"),
+            "error should mention payload limit: {error}"
+        );
+        server.join().expect("server thread should exit");
+    }
+
+    #[test]
+    fn fetch_limited_bytes_accepts_payload_equal_to_limit() {
+        let expected = vec![5_u8; 2048];
+        let (url, server) = spawn_one_shot_http_server(expected.clone());
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .expect("HTTP client should build");
+
+        let payload =
+            fetch_limited_bytes(&client, url.as_str(), expected.len()).expect("fetch should pass");
+        assert_eq!(payload, expected);
+        server.join().expect("server thread should exit");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn collect_skill_artifact_paths_skips_symlink_cycles() {
+        use std::os::unix::fs::symlink;
+
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let root = tempdir.path();
+        std::fs::create_dir_all(root.join("nested")).expect("nested directory should be created");
+        symlink(root, root.join("nested").join("loop-to-root"))
+            .expect("symlink loop should be created");
+
+        let mut artifact_paths = Vec::new();
+        let mut visited_dirs = std::collections::HashSet::new();
+        super::collect_skill_artifact_paths(root, root, &mut artifact_paths, &mut visited_dirs)
+            .expect("collector should skip symlink loops");
+        assert!(artifact_paths.is_empty(), "no artifacts should be discovered");
+    }
+
+    #[test]
+    fn write_file_atomically_replaces_existing_file_contents() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let target = tempdir.path().join("index.json");
+        std::fs::write(target.as_path(), b"{\"old\":true}").expect("seed file should be written");
+
+        write_file_atomically(target.as_path(), b"{\"new\":true}")
+            .expect("atomic write should succeed");
+        let payload =
+            std::fs::read_to_string(target.as_path()).expect("replacement file should be readable");
+        assert_eq!(payload, "{\"new\":true}");
     }
 
     #[test]
