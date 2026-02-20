@@ -53,6 +53,7 @@ fn spawn_palyrad_with_dynamic_port() -> Result<(Child, u16)> {
         ])
         .env("PALYRA_JOURNAL_DB_PATH", journal_db_path.to_string_lossy().to_string())
         .env("PALYRA_GATEWAY_IDENTITY_STORE_DIR", identity_store_dir.to_string_lossy().to_string())
+        .env("PALYRA_ADMIN_TOKEN", "test-admin-token")
         .env("RUST_LOG", "info")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

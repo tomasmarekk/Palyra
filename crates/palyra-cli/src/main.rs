@@ -4845,6 +4845,7 @@ fn fetch_remote_registry_entries(
     allow_untrusted: bool,
 ) -> Result<Vec<RemoteRegistryResolvedEntry>> {
     let mut page_url = parse_https_url(registry_url, "--registry-url")?;
+    let registry_origin = page_url.clone();
     let client = build_registry_http_client(registry_ca_cert)?;
     let mut visited_pages = HashSet::<String>::new();
     let mut merged = Vec::<RemoteRegistryResolvedEntry>::new();
@@ -4868,6 +4869,7 @@ fn fetch_remote_registry_entries(
             if artifact_url.scheme() != "https" {
                 anyhow::bail!("remote registry artifact URL must use https: {}", artifact_url);
             }
+            ensure_remote_registry_same_origin(&registry_origin, &artifact_url, "artifact URL")?;
             merged.push(RemoteRegistryResolvedEntry { entry, artifact_url });
         }
         let Some(next_page) = index.next_page else {
@@ -4879,8 +4881,29 @@ fn fetch_remote_registry_entries(
         if page_url.scheme() != "https" {
             anyhow::bail!("remote registry next_page must use https: {}", page_url);
         }
+        ensure_remote_registry_same_origin(&registry_origin, &page_url, "next_page URL")?;
     }
     anyhow::bail!("remote registry exceeded max pagination depth of {}", MAX_REGISTRY_PAGES)
+}
+
+fn ensure_remote_registry_same_origin(
+    registry_origin: &Url,
+    candidate: &Url,
+    field_label: &str,
+) -> Result<()> {
+    let same_origin = registry_origin.scheme() == candidate.scheme()
+        && registry_origin.host_str() == candidate.host_str()
+        && registry_origin.port_or_known_default() == candidate.port_or_known_default();
+    if !same_origin {
+        anyhow::bail!(
+            "remote registry {field_label} must stay on origin {}://{}:{} (resolved {})",
+            registry_origin.scheme(),
+            registry_origin.host_str().unwrap_or_default(),
+            registry_origin.port_or_known_default().unwrap_or_default(),
+            candidate
+        );
+    }
+    Ok(())
 }
 
 fn parse_and_verify_signed_remote_registry_index(
@@ -5906,8 +5929,8 @@ struct SkillStatusResponse {
 #[cfg(test)]
 mod cli_v1_tests {
     use super::{
-        compare_semver_versions, fetch_limited_bytes, is_retryable_grpc_error,
-        normalize_client_socket, normalize_installed_skills_index,
+        compare_semver_versions, ensure_remote_registry_same_origin, fetch_limited_bytes,
+        is_retryable_grpc_error, normalize_client_socket, normalize_installed_skills_index,
         normalize_relative_registry_path, parse_acp_shim_input_line,
         parse_and_verify_signed_remote_registry_index, registry_key_id_for, sha256_hex,
         validate_registry_index, write_file_atomically, InstalledSkillRecord, InstalledSkillSource,
@@ -5918,6 +5941,7 @@ mod cli_v1_tests {
     use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
     use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
     use palyra_skills::SkillTrustStore;
+    use reqwest::Url;
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener};
     use std::path::Path;
@@ -6000,6 +6024,33 @@ mod cli_v1_tests {
     fn normalize_registry_path_rejects_parent_traversal() {
         let result = normalize_relative_registry_path(Path::new("../artifact.palyra-skill"));
         assert!(result.is_err(), "parent traversal should be rejected");
+    }
+
+    #[test]
+    fn remote_registry_same_origin_rejects_cross_origin_urls() {
+        let registry_origin = Url::parse("https://registry.example/catalog/index.json")
+            .expect("origin URL should parse");
+        let candidate = Url::parse("https://evil.example/catalog/page-2.json")
+            .expect("candidate URL should parse");
+        let error =
+            ensure_remote_registry_same_origin(&registry_origin, &candidate, "next_page URL")
+                .expect_err("cross-origin pagination URL should be rejected");
+        assert!(
+            error.to_string().contains("must stay on origin"),
+            "error should explain same-origin restriction: {error}"
+        );
+    }
+
+    #[test]
+    fn remote_registry_same_origin_accepts_same_origin_urls() {
+        let registry_origin = Url::parse("https://registry.example/catalog/index.json")
+            .expect("origin URL should parse");
+        let candidate = registry_origin
+            .join("../artifacts/acme.echo.palyra-skill")
+            .expect("relative URL should resolve");
+        let result =
+            ensure_remote_registry_same_origin(&registry_origin, &candidate, "artifact URL");
+        assert!(result.is_ok(), "same-origin artifact URL should be accepted");
     }
 
     #[test]

@@ -321,12 +321,33 @@ fn validate_argument_workspace_scope(
             let _ = resolve_scoped_path(workspace_root, cwd, file_url_path.as_str(), false)?;
             continue;
         }
+        if let Some(value) = option_assignment_value(arg.as_str()) {
+            let value = value.trim();
+            if let Some(file_url_path) = parse_file_url_path(value)? {
+                let _ = resolve_scoped_path(workspace_root, cwd, file_url_path.as_str(), false)?;
+                continue;
+            }
+            if !argument_requires_path_validation(value) {
+                continue;
+            }
+            let _ = resolve_scoped_path(workspace_root, cwd, value, false)?;
+            continue;
+        }
         if !argument_requires_path_validation(arg.as_str()) {
             continue;
         }
         let _ = resolve_scoped_path(workspace_root, cwd, arg.as_str(), false)?;
     }
     Ok(())
+}
+
+fn option_assignment_value(arg: &str) -> Option<&str> {
+    let trimmed = arg.trim();
+    if !trimmed.starts_with('-') {
+        return None;
+    }
+    let (_, value) = trimmed.split_once('=')?;
+    Some(value)
 }
 
 fn argument_requires_path_validation(arg: &str) -> bool {
@@ -608,7 +629,8 @@ fn is_host_allowlisted(policy: &SandboxProcessRunnerPolicy, host: &str) -> bool 
             return false;
         }
         let bare_suffix = suffix.trim_start_matches('.');
-        host.eq_ignore_ascii_case(bare_suffix) || host.ends_with(suffix.as_str())
+        let dotted_suffix = format!(".{bare_suffix}");
+        host.eq_ignore_ascii_case(bare_suffix) || host.ends_with(dotted_suffix.as_str())
     })
 }
 
@@ -1044,6 +1066,82 @@ mod tests {
 
         let _ = fs::remove_file(&inside_file);
         let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn validate_argument_workspace_scope_rejects_absolute_path_in_flag_assignment() {
+        let workspace = unique_temp_dir("workspace-flag-assignment-absolute");
+        fs::create_dir_all(&workspace).expect("workspace directory should be created");
+        let canonical_workspace = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+        let args = vec!["--config=/etc/passwd".to_owned()];
+
+        let error = validate_argument_workspace_scope(
+            canonical_workspace.as_path(),
+            canonical_workspace.as_path(),
+            &args,
+        )
+        .expect_err("absolute path in flag assignment must be denied");
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
+
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn validate_argument_workspace_scope_allows_workspace_relative_flag_assignment() {
+        let workspace = unique_temp_dir("workspace-flag-assignment-relative");
+        let inside_dir = workspace.join("inside");
+        fs::create_dir_all(&inside_dir).expect("workspace subdirectory should be created");
+        let canonical_workspace = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+        let args = vec!["--config=inside/config.toml".to_owned()];
+
+        validate_argument_workspace_scope(
+            canonical_workspace.as_path(),
+            canonical_workspace.as_path(),
+            &args,
+        )
+        .expect("workspace-relative path in flag assignment should be allowed");
+
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn is_host_allowlisted_enforces_dns_suffix_label_boundary() {
+        let workspace = std::env::current_dir().expect("workspace current_dir should resolve");
+        let mut policy = sandbox_policy(workspace);
+        policy.allowed_egress_hosts.clear();
+        policy.allowed_dns_suffixes = vec!["corp.local".to_owned()];
+
+        assert!(
+            is_host_allowlisted(&policy, "api.corp.local"),
+            "subdomain with label boundary should be allowlisted"
+        );
+        assert!(
+            !is_host_allowlisted(&policy, "evilcorp.local"),
+            "superdomain without label boundary must be denied"
+        );
+        assert!(
+            is_host_allowlisted(&policy, "corp.local"),
+            "exact suffix host should remain allowlisted"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn is_host_allowlisted_accepts_leading_dot_suffix_configuration() {
+        let workspace = std::env::current_dir().expect("workspace current_dir should resolve");
+        let mut policy = sandbox_policy(workspace);
+        policy.allowed_egress_hosts.clear();
+        policy.allowed_dns_suffixes = vec![".corp.local".to_owned()];
+
+        assert!(
+            is_host_allowlisted(&policy, "api.corp.local"),
+            "leading-dot suffix must allow matching subdomains"
+        );
     }
 
     #[test]

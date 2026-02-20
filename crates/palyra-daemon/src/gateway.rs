@@ -2036,7 +2036,7 @@ fn enforce_vault_scope_access(scope: &VaultScope, context: &RequestContext) -> R
                 )
             })?;
             let expected_with_account = format!("{channel_name}:{account_id}");
-            if context_channel == channel_name || context_channel == expected_with_account {
+            if context_channel == expected_with_account {
                 Ok(())
             } else {
                 Err(Status::permission_denied(
@@ -2216,6 +2216,47 @@ fn validate_cron_job_owner_principal_for_update(
         ));
     }
     Ok(owner_principal)
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_cron_job_channel_context(
+    context_channel: Option<&str>,
+    requested_channel: Option<&str>,
+) -> Result<(), Status> {
+    let Some(requested_channel) = requested_channel else {
+        return Ok(());
+    };
+    let Some(context_channel) = context_channel else {
+        return Ok(());
+    };
+    if context_channel != requested_channel && requested_channel != "system:cron" {
+        return Err(Status::permission_denied(
+            "cron channel must match authenticated channel context",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn resolve_cron_job_channel_for_create(
+    context_channel: Option<&str>,
+    requested_channel: String,
+) -> Result<String, Status> {
+    let requested_channel = non_empty(requested_channel);
+    validate_cron_job_channel_context(context_channel, requested_channel.as_deref())?;
+    Ok(requested_channel
+        .or_else(|| context_channel.map(str::to_owned))
+        .unwrap_or_else(|| "system:cron".to_owned()))
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_cron_job_channel_for_update(
+    context_channel: Option<&str>,
+    requested_channel: String,
+) -> Result<Option<String>, Status> {
+    let requested_channel = non_empty(requested_channel);
+    validate_cron_job_channel_context(context_channel, requested_channel.as_deref())?;
+    Ok(requested_channel)
 }
 
 #[allow(clippy::result_large_err)]
@@ -4563,8 +4604,8 @@ impl cron_v1::cron_service_server::CronService for CronServiceImpl {
         let prompt = validate_cron_job_prompt(payload.prompt)?;
         let owner_principal =
             validate_cron_job_owner_principal(context.principal.as_str(), payload.owner_principal)?;
-        let channel = non_empty(payload.channel)
-            .unwrap_or_else(|| context.channel.unwrap_or_else(|| "system:cron".to_owned()));
+        let channel =
+            resolve_cron_job_channel_for_create(context.channel.as_deref(), payload.channel)?;
         let session_key = non_empty(payload.session_key);
         let session_label = non_empty(payload.session_label);
         let concurrency_policy = cron_concurrency_from_proto(payload.concurrency_policy)?;
@@ -4633,7 +4674,8 @@ impl cron_v1::cron_service_server::CronService for CronServiceImpl {
             )?);
         }
         if let Some(channel) = payload.channel {
-            patch.channel = non_empty(channel);
+            patch.channel =
+                validate_cron_job_channel_for_update(context.channel.as_deref(), channel)?;
         }
         if let Some(session_key) = payload.session_key {
             patch.session_key = Some(non_empty(session_key));
@@ -5700,12 +5742,18 @@ async fn execute_memory_search_tool(
             (channel_scope, None, resource)
         }
         "channel" => {
-            let channel = channel.map(str::to_owned);
-            let resource = channel
-                .as_deref()
-                .map(|value| format!("memory:channel:{value}"))
-                .unwrap_or_else(|| "memory:channel:unknown".to_owned());
-            (channel, None, resource)
+            let Some(channel) = channel.map(str::to_owned) else {
+                return memory_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    "palyra.memory.search scope=channel requires authenticated channel context"
+                        .to_owned(),
+                );
+            };
+            let resource = format!("memory:channel:{channel}");
+            (Some(channel), None, resource)
         }
         "session" => {
             let channel = channel.map(str::to_owned);
@@ -7292,17 +7340,26 @@ fn build_test_vault() -> Arc<Vault> {
 }
 
 fn extract_bearer_token(raw: Option<&str>) -> Option<&str> {
-    let value = raw?;
-    value.strip_prefix("Bearer ").filter(|token| !token.trim().is_empty())
+    let value = raw?.trim();
+    let separator_index = value.find(char::is_whitespace)?;
+    let (scheme, remainder) = value.split_at(separator_index);
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = remainder.trim();
+    if token.is_empty() {
+        return None;
+    }
+    Some(token)
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    let mut diff = 0_u8;
-    for (lhs, rhs) in left.iter().zip(right.iter()) {
-        diff |= lhs ^ rhs;
+    let max_len = left.len().max(right.len());
+    let mut diff = left.len() ^ right.len();
+    for index in 0..max_len {
+        let lhs = left.get(index).copied().unwrap_or_default();
+        let rhs = right.get(index).copied().unwrap_or_default();
+        diff |= usize::from(lhs ^ rhs);
     }
     diff == 0
 }
@@ -7335,10 +7392,11 @@ mod tests {
 
     use super::{
         apply_tool_approval_outcome, authorize_headers, best_effort_mark_approval_error,
-        enforce_vault_scope_access, request_context_from_headers, AuthError, GatewayAuthConfig,
-        GatewayJournalConfigSnapshot, GatewayRuntimeConfigSnapshot, GatewayRuntimeState,
-        RequestContext, ToolApprovalOutcome, HEADER_CHANNEL, HEADER_DEVICE_ID, HEADER_PRINCIPAL,
-        MAX_APPROVAL_PAGE_LIMIT, VAULT_RATE_LIMIT_MAX_PRINCIPAL_BUCKETS,
+        constant_time_eq, enforce_vault_scope_access, execute_memory_search_tool,
+        request_context_from_headers, resolve_cron_job_channel_for_create, AuthError,
+        GatewayAuthConfig, GatewayJournalConfigSnapshot, GatewayRuntimeConfigSnapshot,
+        GatewayRuntimeState, RequestContext, ToolApprovalOutcome, HEADER_CHANNEL, HEADER_DEVICE_ID,
+        HEADER_PRINCIPAL, MAX_APPROVAL_PAGE_LIMIT, VAULT_RATE_LIMIT_MAX_PRINCIPAL_BUCKETS,
     };
 
     static TEMP_JOURNAL_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -7472,6 +7530,23 @@ mod tests {
     }
 
     #[test]
+    fn authorize_headers_accepts_case_insensitive_bearer_scheme() {
+        let auth = GatewayAuthConfig { require_auth: true, admin_token: Some("secret".to_owned()) };
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("bEaReR secret"));
+        let result = authorize_headers(&headers, &auth);
+        assert!(result.is_ok(), "bearer auth scheme should be parsed case-insensitively");
+    }
+
+    #[test]
+    fn constant_time_eq_rejects_length_mismatch() {
+        assert!(
+            !constant_time_eq(b"secret", b"secret-longer"),
+            "length mismatch should never compare as equal"
+        );
+    }
+
+    #[test]
     fn request_context_from_headers_validates_device_id() {
         let mut headers = HeaderMap::new();
         headers.insert(HEADER_PRINCIPAL, HeaderValue::from_static("user:ops"));
@@ -7565,6 +7640,50 @@ mod tests {
             enforce_vault_scope_access(&scope, &context).is_ok(),
             "channel scope should be allowed when authenticated channel context matches scope"
         );
+    }
+
+    #[test]
+    fn vault_scope_enforcement_rejects_bare_channel_name_for_account_scope() {
+        let context = RequestContext {
+            principal: "user:ops".to_owned(),
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            channel: Some("slack".to_owned()),
+        };
+        let scope = super::VaultScope::Channel {
+            channel_name: "slack".to_owned(),
+            account_id: "acct-1".to_owned(),
+        };
+        let error = enforce_vault_scope_access(&scope, &context)
+            .expect_err("bare channel context must not satisfy account-scoped vault access");
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn cron_channel_create_allows_payload_channel_without_context() {
+        let channel = resolve_cron_job_channel_for_create(None, "slack:acct-1".to_owned())
+            .expect("payload channel should be accepted when no channel context is present");
+        assert_eq!(channel, "slack:acct-1");
+    }
+
+    #[test]
+    fn cron_channel_create_requires_context_match() {
+        let error = resolve_cron_job_channel_for_create(Some("cli"), "slack:acct-1".to_owned())
+            .expect_err("payload channel must match authenticated channel context");
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn cron_channel_create_allows_system_channel_with_context_mismatch() {
+        let channel = resolve_cron_job_channel_for_create(Some("cli"), "system:cron".to_owned())
+            .expect("system:cron channel should remain allowed for scheduler ownership");
+        assert_eq!(channel, "system:cron");
+    }
+
+    #[test]
+    fn cron_channel_create_defaults_to_system_when_context_and_payload_are_missing() {
+        let channel = resolve_cron_job_channel_for_create(None, String::new())
+            .expect("missing context and empty payload should default to system channel");
+        assert_eq!(channel, "system:cron");
     }
 
     #[test]
@@ -7891,6 +8010,26 @@ mod tests {
         assert!(
             second_page.events[0].payload_json.contains("<redacted>"),
             "redacted marker should be present in tape payloads"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn memory_search_tool_channel_scope_requires_authenticated_channel_context() {
+        let state = build_test_runtime_state(false);
+        let input_json = br#"{"query":"incident summary","scope":"channel"}"#;
+        let outcome = execute_memory_search_tool(
+            &state,
+            "user:ops",
+            None,
+            "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+            "01ARZ3NDEKTSV4RRFFQ69G5FB0",
+            input_json,
+        )
+        .await;
+        assert!(!outcome.success, "tool call should fail closed without channel context");
+        assert!(
+            outcome.error.contains("scope=channel requires authenticated channel context"),
+            "error should explain fail-closed channel scope behavior"
         );
     }
 

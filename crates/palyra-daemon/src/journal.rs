@@ -2735,7 +2735,7 @@ impl JournalStore {
                 DELETE FROM memory_items
                 WHERE memory_ulid = ?1
                   AND principal = ?2
-                  AND (?3 IS NULL OR channel = ?3 OR channel IS NULL)
+                  AND (?3 IS NULL OR channel = ?3)
             "#,
             params![memory_id, principal, channel],
         )?;
@@ -5391,6 +5391,36 @@ mod tests {
             .delete_memory_item("01ARZ3NDEKTSV4RRFFQ69G5FDD", "user:ops", Some("slack"))
             .expect("same-channel delete should complete without storage error");
         assert!(allowed_delete, "same-channel delete should remove matching memory");
+    }
+
+    #[test]
+    fn memory_delete_with_channel_filter_does_not_widen_to_channel_agnostic_items() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+
+        store
+            .create_memory_item(&sample_memory_request(
+                "01ARZ3NDEKTSV4RRFFQ69G5FDE",
+                "user:ops",
+                None,
+                Some("01ARZ3NDEKTSV4RRFFQ69G5FAE"),
+                MemorySource::Manual,
+                "channel-agnostic memory",
+            ))
+            .expect("memory item should be created");
+
+        let deleted = store
+            .delete_memory_item("01ARZ3NDEKTSV4RRFFQ69G5FDE", "user:ops", Some("cli"))
+            .expect("channel-filtered delete should complete without storage error");
+        assert!(!deleted, "channel-filtered delete must not remove channel-agnostic memory");
+
+        let remaining =
+            store.memory_item("01ARZ3NDEKTSV4RRFFQ69G5FDE").expect("memory lookup should succeed");
+        assert!(
+            remaining.is_some(),
+            "channel-agnostic memory should remain after mismatched channel-filtered delete"
+        );
     }
 
     #[test]

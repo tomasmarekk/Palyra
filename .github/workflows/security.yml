@@ -42,9 +42,8 @@ jobs:
           npm --prefix apps/web audit --json --omit=dev > security-artifacts/npm-audit-runtime.json || true
           npm --prefix apps/web audit --json > security-artifacts/npm-audit-full.json || true
 
-      - name: Validate dev-only npm advisories allowlist (non-blocking)
+      - name: Validate dev-only npm advisories allowlist
         if: ${{ hashFiles('apps/web/package-lock.json') != '' }}
-        continue-on-error: true
         run: |
           node scripts/validate-npm-audit-dev-allowlist.mjs \
             --full security-artifacts/npm-audit-full.json \

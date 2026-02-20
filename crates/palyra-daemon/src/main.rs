@@ -187,6 +187,7 @@ async fn main() -> Result<()> {
         require_auth: loaded.admin.require_auth,
         admin_token: loaded.admin.auth_token.clone(),
     };
+    validate_admin_auth_config(&auth)?;
     let journal_store = JournalStore::open(JournalConfig {
         db_path: loaded.storage.journal_db_path.clone(),
         hash_chain_enabled: loaded.storage.journal_hash_chain_enabled,
@@ -867,10 +868,20 @@ fn runtime_status_response(status: tonic::Status) -> Response {
         tonic::Code::InvalidArgument => StatusCode::BAD_REQUEST,
         tonic::Code::FailedPrecondition => StatusCode::PRECONDITION_FAILED,
         tonic::Code::NotFound => StatusCode::NOT_FOUND,
-        tonic::Code::ResourceExhausted => StatusCode::PAYLOAD_TOO_LARGE,
+        tonic::Code::ResourceExhausted => StatusCode::TOO_MANY_REQUESTS,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (http_status, Json(ErrorBody { error: status.message().to_owned() })).into_response()
+}
+
+fn validate_admin_auth_config(auth: &GatewayAuthConfig) -> Result<()> {
+    if auth.require_auth && auth.admin_token.as_deref().is_none_or(|value| value.trim().is_empty())
+    {
+        anyhow::bail!(
+            "admin auth is enabled but no admin token is configured; set PALYRA_ADMIN_TOKEN or admin.auth_token in config"
+        );
+    }
+    Ok(())
 }
 
 fn resolve_model_provider_secret_from_vault(
@@ -1055,7 +1066,10 @@ fn dangerous_remote_bind_acknowledged() -> Result<bool> {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use super::enforce_remote_bind_guard;
+    use axum::http::StatusCode;
+
+    use super::{enforce_remote_bind_guard, runtime_status_response, validate_admin_auth_config};
+    use crate::gateway::GatewayAuthConfig;
 
     #[test]
     fn remote_bind_guard_allows_loopback_without_opt_in() {
@@ -1174,6 +1188,34 @@ mod tests {
             result.is_ok(),
             "danger acknowledgement should allow remote gRPC bind when node RPC mTLS is disabled"
         );
+    }
+
+    #[test]
+    fn runtime_status_response_maps_resource_exhausted_to_too_many_requests() {
+        let response = runtime_status_response(tonic::Status::resource_exhausted("rate limited"));
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn admin_auth_config_validation_fails_when_token_missing() {
+        let error = validate_admin_auth_config(&GatewayAuthConfig {
+            require_auth: true,
+            admin_token: None,
+        })
+        .expect_err("missing admin token should fail preflight validation");
+        assert!(
+            error.to_string().contains("admin auth is enabled but no admin token is configured"),
+            "error should explain admin token preflight requirement"
+        );
+    }
+
+    #[test]
+    fn admin_auth_config_validation_allows_disabled_auth_without_token() {
+        let result = validate_admin_auth_config(&GatewayAuthConfig {
+            require_auth: false,
+            admin_token: None,
+        });
+        assert!(result.is_ok(), "disabled auth should allow missing token");
     }
 }
 
