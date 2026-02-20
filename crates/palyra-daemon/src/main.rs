@@ -844,6 +844,9 @@ fn normalize_non_empty_field(value: String, field_name: &'static str) -> Result<
             "{field_name} cannot be empty"
         ))));
     }
+    if field_name == "skill_id" {
+        return Ok(trimmed.to_ascii_lowercase());
+    }
     Ok(trimmed.to_owned())
 }
 

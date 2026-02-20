@@ -187,8 +187,8 @@ fn admin_skill_quarantine_and_enable_require_override_acknowledgement() -> Resul
         .build()
         .context("failed to build HTTP client")?;
     let quarantine_url =
-        format!("http://127.0.0.1:{admin_port}/admin/v1/skills/acme.echo_http/quarantine");
-    let enable_url = format!("http://127.0.0.1:{admin_port}/admin/v1/skills/acme.echo_http/enable");
+        format!("http://127.0.0.1:{admin_port}/admin/v1/skills/Acme.Echo_Http/quarantine");
+    let enable_url = format!("http://127.0.0.1:{admin_port}/admin/v1/skills/Acme.Echo_Http/enable");
 
     let missing_auth = client
         .post(&quarantine_url)
@@ -225,6 +225,11 @@ fn admin_skill_quarantine_and_enable_require_override_acknowledgement() -> Resul
         quarantine_response.get("version").and_then(Value::as_str),
         Some("1.2.3"),
         "quarantine endpoint should preserve requested version"
+    );
+    assert_eq!(
+        quarantine_response.get("skill_id").and_then(Value::as_str),
+        Some("acme.echo_http"),
+        "quarantine endpoint should canonicalize skill_id to lowercase"
     );
 
     let missing_override = client
@@ -266,6 +271,11 @@ fn admin_skill_quarantine_and_enable_require_override_acknowledgement() -> Resul
         enable_response.get("status").and_then(Value::as_str),
         Some("active"),
         "enable endpoint should restore active status"
+    );
+    assert_eq!(
+        enable_response.get("skill_id").and_then(Value::as_str),
+        Some("acme.echo_http"),
+        "enable endpoint should canonicalize skill_id to lowercase"
     );
 
     Ok(())

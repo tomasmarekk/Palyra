@@ -3513,7 +3513,7 @@ fn load_skill_status_by_key(
                 created_at_unix_ms,
                 updated_at_unix_ms
             FROM skill_status
-            WHERE skill_id = ?1
+            WHERE lower(skill_id) = lower(?1)
               AND version = ?2
             LIMIT 1
         "#,
@@ -3540,7 +3540,7 @@ fn load_latest_skill_status_by_id(
                 created_at_unix_ms,
                 updated_at_unix_ms
             FROM skill_status
-            WHERE skill_id = ?1
+            WHERE lower(skill_id) = lower(?1)
             ORDER BY detected_at_ms DESC, updated_at_unix_ms DESC, version DESC
             LIMIT 1
         "#,
@@ -4992,6 +4992,15 @@ mod tests {
             .expect("skill status lookup should succeed")
             .expect("skill status should exist");
         assert_eq!(loaded.status, SkillExecutionStatus::Quarantined);
+        let loaded_case_variant = store
+            .skill_status("Acme.Echo_Http", "1.0.0")
+            .expect("case-variant skill status lookup should succeed")
+            .expect("case-variant skill status should resolve");
+        assert_eq!(
+            loaded_case_variant.status,
+            SkillExecutionStatus::Quarantined,
+            "skill status lookup should be case-insensitive for skill_id"
+        );
 
         store
             .upsert_skill_status(&SkillStatusUpsertRequest {
@@ -5009,6 +5018,14 @@ mod tests {
             .expect("latest skill status should exist");
         assert_eq!(latest.version, "1.1.0");
         assert_eq!(latest.status, SkillExecutionStatus::Active);
+        let latest_case_variant = store
+            .latest_skill_status("Acme.Echo_Http")
+            .expect("case-variant latest lookup should succeed")
+            .expect("case-variant latest skill status should exist");
+        assert_eq!(
+            latest_case_variant.version, "1.1.0",
+            "latest lookup should be case-insensitive for skill_id"
+        );
     }
 
     #[test]

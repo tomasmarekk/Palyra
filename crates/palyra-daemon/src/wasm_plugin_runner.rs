@@ -48,6 +48,10 @@ pub enum WasmPluginRunErrorKind {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WasmPluginRunInput {
+    #[serde(default)]
+    skill_id: Option<String>,
+    #[serde(default)]
+    skill_version: Option<String>,
     module_wat: Option<String>,
     module_base64: Option<String>,
     entrypoint: Option<String>,
@@ -81,6 +85,8 @@ pub fn run_wasm_plugin(
     }
 
     let input = parse_input(input_json)?;
+    validate_optional_metadata(input.skill_id.as_deref(), "skill_id")?;
+    validate_optional_metadata(input.skill_version.as_deref(), "skill_version")?;
     let module_bytes = decode_module_bytes(policy, &input)?;
     let entrypoint = parse_entrypoint(input.entrypoint.as_deref())?;
     let requested_http_hosts = normalize_host_allowlist(
@@ -204,6 +210,21 @@ fn parse_input(input_json: &[u8]) -> Result<WasmPluginRunInput, WasmPluginRunErr
         kind: WasmPluginRunErrorKind::InvalidInput,
         message: format!("palyra.plugin.run input must be valid JSON object: {error}"),
     })
+}
+
+fn validate_optional_metadata(
+    raw: Option<&str>,
+    field_name: &str,
+) -> Result<(), WasmPluginRunError> {
+    if let Some(value) = raw {
+        if value.trim().is_empty() {
+            return Err(WasmPluginRunError {
+                kind: WasmPluginRunErrorKind::InvalidInput,
+                message: format!("palyra.plugin.run {field_name} cannot be empty when provided"),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn decode_module_bytes(
@@ -454,6 +475,8 @@ mod tests {
     fn run_wasm_plugin_executes_module_with_granted_capabilities() {
         let policy = test_policy();
         let input = serde_json::json!({
+            "skill_id": "acme.echo_http",
+            "skill_version": "1.2.3",
             "module_wat": r#"
                 (module
                     (import "palyra:plugins/host-capabilities@0.1.0" "http-count" (func $http_count (result i32)))
@@ -593,6 +616,26 @@ mod tests {
 
         assert_eq!(error.kind, WasmPluginRunErrorKind::InvalidInput);
         assert!(error.message.contains("invalid host"), "error should name host validation");
+    }
+
+    #[test]
+    fn run_wasm_plugin_rejects_unknown_root_fields() {
+        let policy = test_policy();
+        let input = serde_json::json!({
+            "skill_id": "acme.echo_http",
+            "module_wat": "(module (func (export \"run\") (result i32) i32.const 1))",
+            "unexpected": true
+        });
+        let input_json = serde_json::to_vec(&input).expect("input JSON should serialize");
+
+        let error = run_wasm_plugin(&policy, input_json.as_slice(), Duration::from_secs(2))
+            .expect_err("unknown root fields must still be rejected");
+
+        assert_eq!(error.kind, WasmPluginRunErrorKind::InvalidInput);
+        assert!(
+            error.message.contains("unknown field"),
+            "parse error should identify deny_unknown_fields rejection"
+        );
     }
 
     #[test]

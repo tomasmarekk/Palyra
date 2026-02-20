@@ -908,6 +908,8 @@ mod tests {
             "01ARZ3NDEKTSV4RRFFQ69G5FA2",
             "palyra.plugin.run",
             br#"{
+                "skill_id":"acme.echo_http",
+                "skill_version":"1.2.3",
                 "module_wat":"(module (import \"palyra:plugins/host-capabilities@0.1.0\" \"http-count\" (func $http_count (result i32))) (func (export \"run\") (result i32) call $http_count))",
                 "capabilities":{"http_hosts":["api.example.com"]}
             }"#,

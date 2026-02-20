@@ -6724,7 +6724,7 @@ fn parse_tool_skill_context(
         .ok_or_else(|| {
             Status::invalid_argument("palyra.plugin.run skill_id must be a non-empty string")
         })?
-        .to_owned();
+        .to_ascii_lowercase();
     let version = object
         .get("skill_version")
         .and_then(Value::as_str)
@@ -6741,34 +6741,35 @@ async fn evaluate_skill_execution_gate(
     context: &ToolSkillContext,
 ) -> Result<Option<ToolDecision>, Status> {
     let status_record = if let Some(version) = context.version.as_deref() {
-        let by_version =
-            runtime_state.skill_status(context.skill_id.clone(), version.to_owned()).await?;
-        if by_version.is_some() {
-            by_version
-        } else {
-            runtime_state.latest_skill_status(context.skill_id.clone()).await?
-        }
+        runtime_state.skill_status(context.skill_id.clone(), version.to_owned()).await?
     } else {
         runtime_state.latest_skill_status(context.skill_id.clone()).await?
     };
-    if let Some(status_record) = status_record {
-        if matches!(
-            status_record.status,
-            SkillExecutionStatus::Quarantined | SkillExecutionStatus::Disabled
-        ) {
-            return Ok(Some(ToolDecision {
-                allowed: false,
-                reason: format!(
-                    "{SKILL_EXECUTION_DENY_REASON_PREFIX}: skill={} version={} status={} reason={}",
-                    status_record.skill_id,
-                    status_record.version,
-                    status_record.status.as_str(),
-                    status_record.reason.unwrap_or_else(|| "none".to_owned())
-                ),
-                approval_required: false,
-                policy_enforced: true,
-            }));
-        }
+    let Some(status_record) = status_record else {
+        let version = context.version.as_deref().unwrap_or("latest");
+        return Ok(Some(ToolDecision {
+            allowed: false,
+            reason: format!(
+                "{SKILL_EXECUTION_DENY_REASON_PREFIX}: skill={} version={} status=missing",
+                context.skill_id, version
+            ),
+            approval_required: false,
+            policy_enforced: true,
+        }));
+    };
+    if !matches!(status_record.status, SkillExecutionStatus::Active) {
+        return Ok(Some(ToolDecision {
+            allowed: false,
+            reason: format!(
+                "{SKILL_EXECUTION_DENY_REASON_PREFIX}: skill={} version={} status={} reason={}",
+                status_record.skill_id,
+                status_record.version,
+                status_record.status.as_str(),
+                status_record.reason.unwrap_or_else(|| "none".to_owned())
+            ),
+            approval_required: false,
+            policy_enforced: true,
+        }));
     }
 
     let evaluation = evaluate_with_config(
@@ -6781,7 +6782,7 @@ async fn evaluate_skill_execution_gate(
             allowlisted_tools: Vec::new(),
             allow_sensitive_tools: false,
             sensitive_tool_names: Vec::new(),
-            allowlisted_skills: vec![context.skill_id.clone()],
+            allowlisted_skills: vec![status_record.skill_id.clone()],
         },
     )
     .map_err(|error| Status::internal(format!("failed to evaluate skill policy: {error}")))?;
