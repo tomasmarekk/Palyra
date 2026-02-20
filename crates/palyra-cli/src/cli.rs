@@ -767,6 +767,67 @@ pub enum SkillsCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    Audit {
+        skill_id: Option<String>,
+        #[arg(long, requires = "skill_id")]
+        version: Option<String>,
+        #[arg(long, conflicts_with = "skill_id")]
+        artifact: Option<String>,
+        #[arg(long)]
+        skills_dir: Option<String>,
+        #[arg(long)]
+        trust_store: Option<String>,
+        #[arg(long = "trusted-publisher")]
+        trusted_publishers: Vec<String>,
+        #[arg(long, default_value_t = false)]
+        allow_untrusted: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Quarantine {
+        skill_id: String,
+        #[arg(long)]
+        version: Option<String>,
+        #[arg(long)]
+        skills_dir: Option<String>,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long, default_value = "user:local")]
+        principal: String,
+        #[arg(long, default_value = "01ARZ3NDEKTSV4RRFFQ69G5FAV")]
+        device_id: String,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Enable {
+        skill_id: String,
+        #[arg(long)]
+        version: Option<String>,
+        #[arg(long)]
+        skills_dir: Option<String>,
+        #[arg(long = "override", default_value_t = false)]
+        override_enabled: bool,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long, default_value = "user:local")]
+        principal: String,
+        #[arg(long, default_value = "01ARZ3NDEKTSV4RRFFQ69G5FAV")]
+        device_id: String,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
@@ -2087,6 +2148,111 @@ mod tests {
                     trust_store: None,
                     trusted_publishers: Vec::new(),
                     allow_untrusted: true,
+                    json: true,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn parse_skills_audit_quarantine_and_enable() {
+        let audit = Cli::parse_from([
+            "palyra",
+            "skills",
+            "audit",
+            "acme.echo_http",
+            "--version",
+            "1.2.3",
+            "--skills-dir",
+            "state/skills",
+            "--trust-store",
+            "state/skills-trust.json",
+            "--trusted-publisher",
+            "acme=001122",
+            "--allow-untrusted",
+            "--json",
+        ]);
+        assert_eq!(
+            audit.command,
+            Command::Skills {
+                command: SkillsCommand::Audit {
+                    skill_id: Some("acme.echo_http".to_owned()),
+                    version: Some("1.2.3".to_owned()),
+                    artifact: None,
+                    skills_dir: Some("state/skills".to_owned()),
+                    trust_store: Some("state/skills-trust.json".to_owned()),
+                    trusted_publishers: vec!["acme=001122".to_owned()],
+                    allow_untrusted: true,
+                    json: true,
+                },
+            }
+        );
+
+        let quarantine = Cli::parse_from([
+            "palyra",
+            "skill",
+            "quarantine",
+            "acme.echo_http",
+            "--version",
+            "1.2.3",
+            "--reason",
+            "manual security hold",
+            "--url",
+            "http://127.0.0.1:7142",
+            "--token",
+            "admin-token",
+            "--principal",
+            "user:ops",
+            "--device-id",
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "--channel",
+            "cli",
+            "--json",
+        ]);
+        assert_eq!(
+            quarantine.command,
+            Command::Skills {
+                command: SkillsCommand::Quarantine {
+                    skill_id: "acme.echo_http".to_owned(),
+                    version: Some("1.2.3".to_owned()),
+                    skills_dir: None,
+                    reason: Some("manual security hold".to_owned()),
+                    url: Some("http://127.0.0.1:7142".to_owned()),
+                    token: Some("admin-token".to_owned()),
+                    principal: "user:ops".to_owned(),
+                    device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                    channel: Some("cli".to_owned()),
+                    json: true,
+                },
+            }
+        );
+
+        let enable = Cli::parse_from([
+            "palyra",
+            "skills",
+            "enable",
+            "acme.echo_http",
+            "--version",
+            "1.2.3",
+            "--override",
+            "--reason",
+            "operator re-enabled after review",
+            "--json",
+        ]);
+        assert_eq!(
+            enable.command,
+            Command::Skills {
+                command: SkillsCommand::Enable {
+                    skill_id: "acme.echo_http".to_owned(),
+                    version: Some("1.2.3".to_owned()),
+                    skills_dir: None,
+                    override_enabled: true,
+                    reason: Some("operator re-enabled after review".to_owned()),
+                    url: None,
+                    token: None,
+                    principal: "user:local".to_owned(),
+                    device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                    channel: None,
                     json: true,
                 },
             }

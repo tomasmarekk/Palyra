@@ -622,6 +622,57 @@ pub struct ApprovalsListFilter<'a> {
     pub subject_type: Option<ApprovalSubjectType>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillExecutionStatus {
+    Active,
+    Quarantined,
+    Disabled,
+}
+
+impl SkillExecutionStatus {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Quarantined => "quarantined",
+            Self::Disabled => "disabled",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "active" => Some(Self::Active),
+            "quarantined" => Some(Self::Quarantined),
+            "disabled" => Some(Self::Disabled),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillStatusUpsertRequest {
+    pub skill_id: String,
+    pub version: String,
+    pub status: SkillExecutionStatus,
+    pub reason: Option<String>,
+    pub detected_at_ms: i64,
+    pub operator_principal: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SkillStatusRecord {
+    pub skill_id: String,
+    pub version: String,
+    pub status: SkillExecutionStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub detected_at_ms: i64,
+    pub operator_principal: String,
+    pub created_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalConfig {
     pub db_path: PathBuf,
@@ -1102,6 +1153,27 @@ const MIGRATIONS: &[Migration] = &[
             );
             CREATE INDEX IF NOT EXISTS idx_memory_vectors_model
                 ON memory_vectors(embedding_model);
+        "#,
+    },
+    Migration {
+        version: 7,
+        name: "create_skill_status_table",
+        sql: r#"
+            CREATE TABLE IF NOT EXISTS skill_status (
+                skill_id TEXT NOT NULL,
+                version TEXT NOT NULL,
+                status TEXT NOT NULL,
+                reason TEXT,
+                detected_at_ms INTEGER NOT NULL,
+                operator_principal TEXT NOT NULL,
+                created_at_unix_ms INTEGER NOT NULL,
+                updated_at_unix_ms INTEGER NOT NULL,
+                PRIMARY KEY(skill_id, version)
+            );
+            CREATE INDEX IF NOT EXISTS idx_skill_status_skill_detected
+                ON skill_status(skill_id, detected_at_ms DESC, version DESC);
+            CREATE INDEX IF NOT EXISTS idx_skill_status_state
+                ON skill_status(status, detected_at_ms DESC);
         "#,
     },
 ];
@@ -2492,6 +2564,68 @@ impl JournalStore {
         Ok(records)
     }
 
+    pub fn upsert_skill_status(
+        &self,
+        request: &SkillStatusUpsertRequest,
+    ) -> Result<SkillStatusRecord, JournalError> {
+        let now = current_unix_ms()?;
+        let reason = request
+            .reason
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        guard.execute(
+            r#"
+                INSERT INTO skill_status (
+                    skill_id,
+                    version,
+                    status,
+                    reason,
+                    detected_at_ms,
+                    operator_principal,
+                    created_at_unix_ms,
+                    updated_at_unix_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+                ON CONFLICT(skill_id, version) DO UPDATE SET
+                    status = excluded.status,
+                    reason = excluded.reason,
+                    detected_at_ms = excluded.detected_at_ms,
+                    operator_principal = excluded.operator_principal,
+                    updated_at_unix_ms = excluded.updated_at_unix_ms
+            "#,
+            params![
+                request.skill_id.as_str(),
+                request.version.as_str(),
+                request.status.as_str(),
+                reason,
+                request.detected_at_ms,
+                request.operator_principal.as_str(),
+                now,
+            ],
+        )?;
+        load_skill_status_by_key(&guard, request.skill_id.as_str(), request.version.as_str())?
+            .ok_or(JournalError::Sqlite(rusqlite::Error::QueryReturnedNoRows))
+    }
+
+    pub fn skill_status(
+        &self,
+        skill_id: &str,
+        version: &str,
+    ) -> Result<Option<SkillStatusRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        load_skill_status_by_key(&guard, skill_id, version)
+    }
+
+    pub fn latest_skill_status(
+        &self,
+        skill_id: &str,
+    ) -> Result<Option<SkillStatusRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        load_latest_skill_status_by_id(&guard, skill_id)
+    }
+
     pub fn create_memory_item(
         &self,
         request: &MemoryItemCreateRequest,
@@ -3338,6 +3472,82 @@ fn load_approval_by_id(
     statement.query_row(params![approval_id], map_approval_row).optional().map_err(Into::into)
 }
 
+fn map_skill_status_row(row: &rusqlite::Row<'_>) -> Result<SkillStatusRecord, rusqlite::Error> {
+    let status_raw: String = row.get(2)?;
+    let status = SkillExecutionStatus::from_str(status_raw.as_str()).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            2,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid skill status value: {status_raw}"),
+            )),
+        )
+    })?;
+    Ok(SkillStatusRecord {
+        skill_id: row.get(0)?,
+        version: row.get(1)?,
+        status,
+        reason: row.get(3)?,
+        detected_at_ms: row.get(4)?,
+        operator_principal: row.get(5)?,
+        created_at_unix_ms: row.get(6)?,
+        updated_at_unix_ms: row.get(7)?,
+    })
+}
+
+fn load_skill_status_by_key(
+    connection: &Connection,
+    skill_id: &str,
+    version: &str,
+) -> Result<Option<SkillStatusRecord>, JournalError> {
+    let mut statement = connection.prepare(
+        r#"
+            SELECT
+                skill_id,
+                version,
+                status,
+                reason,
+                detected_at_ms,
+                operator_principal,
+                created_at_unix_ms,
+                updated_at_unix_ms
+            FROM skill_status
+            WHERE skill_id = ?1
+              AND version = ?2
+            LIMIT 1
+        "#,
+    )?;
+    statement
+        .query_row(params![skill_id, version], map_skill_status_row)
+        .optional()
+        .map_err(Into::into)
+}
+
+fn load_latest_skill_status_by_id(
+    connection: &Connection,
+    skill_id: &str,
+) -> Result<Option<SkillStatusRecord>, JournalError> {
+    let mut statement = connection.prepare(
+        r#"
+            SELECT
+                skill_id,
+                version,
+                status,
+                reason,
+                detected_at_ms,
+                operator_principal,
+                created_at_unix_ms,
+                updated_at_unix_ms
+            FROM skill_status
+            WHERE skill_id = ?1
+            ORDER BY detected_at_ms DESC, updated_at_unix_ms DESC, version DESC
+            LIMIT 1
+        "#,
+    )?;
+    statement.query_row(params![skill_id], map_skill_status_row).optional().map_err(Into::into)
+}
+
 #[derive(Debug, Clone)]
 struct RankedMemoryCandidate {
     item: MemoryItemRecord,
@@ -3826,7 +4036,8 @@ mod tests {
         JournalAppendRequest, JournalConfig, JournalError, JournalStore, MemoryItemCreateRequest,
         MemoryItemsListFilter, MemoryPurgeRequest, MemorySearchRequest, MemorySource,
         OrchestratorCancelRequest, OrchestratorRunStartRequest, OrchestratorSessionUpsertRequest,
-        OrchestratorTapeAppendRequest, OrchestratorUsageDelta,
+        OrchestratorTapeAppendRequest, OrchestratorUsageDelta, SkillExecutionStatus,
+        SkillStatusUpsertRequest,
     };
 
     static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -4015,12 +4226,20 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("schema migrations should be queryable");
+        let migration_v7: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = ?1",
+                params![7],
+                |row| row.get(0),
+            )
+            .expect("schema migrations should be queryable");
         assert_eq!(migration_v1, 1, "migration v1 should be recorded exactly once");
         assert_eq!(migration_v2, 1, "migration v2 should be recorded exactly once");
         assert_eq!(migration_v3, 1, "migration v3 should be recorded exactly once");
         assert_eq!(migration_v4, 1, "migration v4 should be recorded exactly once");
         assert_eq!(migration_v5, 1, "migration v5 should be recorded exactly once");
         assert_eq!(migration_v6, 1, "migration v6 should be recorded exactly once");
+        assert_eq!(migration_v7, 1, "migration v7 should be recorded exactly once");
     }
 
     #[test]
@@ -4732,6 +4951,64 @@ mod tests {
             stored.prompt.details_json.contains("<redacted>"),
             "prompt details should include redaction marker"
         );
+    }
+
+    #[test]
+    fn skill_status_upsert_and_latest_lookup_track_quarantine_state() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+
+        let active = store
+            .upsert_skill_status(&SkillStatusUpsertRequest {
+                skill_id: "acme.echo_http".to_owned(),
+                version: "1.0.0".to_owned(),
+                status: SkillExecutionStatus::Active,
+                reason: Some("initial audit pass".to_owned()),
+                detected_at_ms: 1_730_000_000_100,
+                operator_principal: "user:ops".to_owned(),
+            })
+            .expect("active status should persist");
+        assert_eq!(active.status, SkillExecutionStatus::Active);
+
+        let quarantined = store
+            .upsert_skill_status(&SkillStatusUpsertRequest {
+                skill_id: "acme.echo_http".to_owned(),
+                version: "1.0.0".to_owned(),
+                status: SkillExecutionStatus::Quarantined,
+                reason: Some("operator quarantine after audit".to_owned()),
+                detected_at_ms: 1_730_000_000_200,
+                operator_principal: "user:security".to_owned(),
+            })
+            .expect("quarantine status should update existing row");
+        assert_eq!(quarantined.status, SkillExecutionStatus::Quarantined);
+        assert_eq!(
+            quarantined.operator_principal, "user:security",
+            "operator principal should reflect latest update"
+        );
+
+        let loaded = store
+            .skill_status("acme.echo_http", "1.0.0")
+            .expect("skill status lookup should succeed")
+            .expect("skill status should exist");
+        assert_eq!(loaded.status, SkillExecutionStatus::Quarantined);
+
+        store
+            .upsert_skill_status(&SkillStatusUpsertRequest {
+                skill_id: "acme.echo_http".to_owned(),
+                version: "1.1.0".to_owned(),
+                status: SkillExecutionStatus::Active,
+                reason: Some("newer version enabled".to_owned()),
+                detected_at_ms: 1_730_000_000_300,
+                operator_principal: "user:ops".to_owned(),
+            })
+            .expect("newer version status should persist");
+        let latest = store
+            .latest_skill_status("acme.echo_http")
+            .expect("latest skill status lookup should succeed")
+            .expect("latest skill status should exist");
+        assert_eq!(latest.version, "1.1.0");
+        assert_eq!(latest.status, SkillExecutionStatus::Active);
     }
 
     #[test]

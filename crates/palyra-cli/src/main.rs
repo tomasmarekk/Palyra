@@ -77,8 +77,9 @@ use palyra_identity::{
 };
 use palyra_policy::{evaluate_with_config, PolicyDecision, PolicyEvaluationConfig, PolicyRequest};
 use palyra_skills::{
-    build_signed_skill_artifact, inspect_skill_artifact, parse_ed25519_signing_key,
-    verify_skill_artifact, ArtifactFile, SkillArtifactBuildRequest, SkillTrustStore, TrustDecision,
+    audit_skill_artifact_security, build_signed_skill_artifact, inspect_skill_artifact,
+    parse_ed25519_signing_key, verify_skill_artifact, ArtifactFile, SkillArtifactBuildRequest,
+    SkillAuditCheckStatus, SkillSecurityAuditPolicy, SkillTrustStore, TrustDecision,
 };
 use palyra_vault::{
     BackendPreference as VaultBackendPreference, Vault, VaultConfig as VaultConfigOptions,
@@ -3038,6 +3039,73 @@ fn run_skills(command: SkillsCommand) -> Result<()> {
             allow_untrusted,
             json,
         ),
+        SkillsCommand::Audit {
+            skill_id,
+            version,
+            artifact,
+            skills_dir,
+            trust_store,
+            trusted_publishers,
+            allow_untrusted,
+            json,
+        } => run_skills_audit(SkillsAuditCommand {
+            skill_id,
+            version,
+            artifact,
+            skills_dir,
+            trust_store,
+            trusted_publishers,
+            allow_untrusted,
+            json,
+        }),
+        SkillsCommand::Quarantine {
+            skill_id,
+            version,
+            skills_dir,
+            reason,
+            url,
+            token,
+            principal,
+            device_id,
+            channel,
+            json,
+        } => run_skills_quarantine(SkillsQuarantineCommand {
+            skill_id,
+            version,
+            skills_dir,
+            reason,
+            url,
+            token,
+            principal,
+            device_id,
+            channel,
+            json,
+        }),
+        SkillsCommand::Enable {
+            skill_id,
+            version,
+            skills_dir,
+            override_enabled,
+            reason,
+            url,
+            token,
+            principal,
+            device_id,
+            channel,
+            json,
+        } => run_skills_enable(SkillsEnableCommand {
+            skill_id,
+            version,
+            skills_dir,
+            override_enabled,
+            reason,
+            url,
+            token,
+            principal,
+            device_id,
+            channel,
+            json,
+        }),
     }
 }
 
@@ -3172,6 +3240,47 @@ struct SkillsUpdateCommand {
     trusted_publishers: Vec<String>,
     allow_untrusted: bool,
     non_interactive: bool,
+    json: bool,
+}
+
+#[derive(Debug, Clone)]
+struct SkillsAuditCommand {
+    skill_id: Option<String>,
+    version: Option<String>,
+    artifact: Option<String>,
+    skills_dir: Option<String>,
+    trust_store: Option<String>,
+    trusted_publishers: Vec<String>,
+    allow_untrusted: bool,
+    json: bool,
+}
+
+#[derive(Debug, Clone)]
+struct SkillsQuarantineCommand {
+    skill_id: String,
+    version: Option<String>,
+    skills_dir: Option<String>,
+    reason: Option<String>,
+    url: Option<String>,
+    token: Option<String>,
+    principal: String,
+    device_id: String,
+    channel: Option<String>,
+    json: bool,
+}
+
+#[derive(Debug, Clone)]
+struct SkillsEnableCommand {
+    skill_id: String,
+    version: Option<String>,
+    skills_dir: Option<String>,
+    override_enabled: bool,
+    reason: Option<String>,
+    url: Option<String>,
+    token: Option<String>,
+    principal: String,
+    device_id: String,
+    channel: Option<String>,
     json: bool,
 }
 
@@ -3381,7 +3490,47 @@ fn run_skills_install(command: SkillsInstallCommand) -> Result<()> {
         command.allow_untrusted,
     )
     .context("failed to verify skill artifact trust policy")?;
+    let security_report = audit_skill_artifact_security(
+        resolved.artifact_bytes.as_slice(),
+        &mut trust_store,
+        command.allow_untrusted,
+        &SkillSecurityAuditPolicy::default(),
+    )
+    .context("failed to evaluate skill security audit policy during install")?;
     trust_store.save(trust_store_path.as_path())?;
+    append_skills_audit_event(
+        skills_root.as_path(),
+        "skill.audit",
+        json!({
+            "skill_id": verification_report.manifest.skill_id,
+            "version": verification_report.manifest.version,
+            "publisher": verification_report.manifest.publisher,
+            "source": resolved.source.reference,
+            "passed": security_report.passed,
+            "should_quarantine": security_report.should_quarantine,
+            "quarantine_reasons": security_report.quarantine_reasons,
+            "checks": security_report.checks,
+        }),
+    )?;
+    if security_report.should_quarantine {
+        append_skills_audit_event(
+            skills_root.as_path(),
+            "skill.quarantined",
+            json!({
+                "skill_id": verification_report.manifest.skill_id,
+                "version": verification_report.manifest.version,
+                "publisher": verification_report.manifest.publisher,
+                "reason": "static_security_audit_failed",
+                "quarantine_reasons": security_report.quarantine_reasons,
+            }),
+        )?;
+        anyhow::bail!(
+            "skill security audit requires quarantine for {} {}: {}",
+            verification_report.manifest.skill_id,
+            verification_report.manifest.version,
+            security_report.quarantine_reasons.join(" | ")
+        );
+    }
 
     let missing_secrets = resolve_and_prompt_missing_skill_secrets(
         &verification_report.manifest,
@@ -3735,6 +3884,336 @@ fn run_skills_verify(
         );
     }
     std::io::stdout().flush().context("stdout flush failed")
+}
+
+#[derive(Debug, Clone)]
+struct SkillAuditTarget {
+    artifact_path: PathBuf,
+    source: String,
+    skill_id: Option<String>,
+    version: Option<String>,
+}
+
+fn run_skills_audit(command: SkillsAuditCommand) -> Result<()> {
+    let trust_store_path = resolve_skills_trust_store_path(command.trust_store.as_deref())?;
+    let mut store = SkillTrustStore::load(trust_store_path.as_path())?;
+    for trusted in &command.trusted_publishers {
+        let (publisher, key) = parse_trusted_publisher_arg(trusted.as_str())?;
+        store.add_trusted_key(publisher, key)?;
+    }
+
+    let mut targets = Vec::new();
+    let mut managed_skills_root: Option<PathBuf> = None;
+    if let Some(artifact) = command.artifact.as_deref() {
+        let artifact_path = PathBuf::from(artifact);
+        targets.push(SkillAuditTarget {
+            artifact_path,
+            source: "artifact".to_owned(),
+            skill_id: command.skill_id.clone(),
+            version: command.version.clone(),
+        });
+    } else {
+        let skills_root = resolve_skills_root(command.skills_dir.as_deref())?;
+        let index = load_installed_skills_index(skills_root.as_path())?;
+        managed_skills_root = Some(skills_root.clone());
+        if let Some(skill_id) = command.skill_id.as_deref() {
+            let record_index =
+                find_installed_skill_record(&index, skill_id, command.version.as_deref())?;
+            let record = &index.entries[record_index];
+            targets.push(SkillAuditTarget {
+                artifact_path: skills_root
+                    .join(record.skill_id.as_str())
+                    .join(record.version.as_str())
+                    .join(SKILLS_ARTIFACT_FILE_NAME),
+                source: "installed".to_owned(),
+                skill_id: Some(record.skill_id.clone()),
+                version: Some(record.version.clone()),
+            });
+        } else {
+            let mut records =
+                index.entries.iter().filter(|entry| entry.current).collect::<Vec<_>>();
+            if records.is_empty() {
+                records = index.entries.iter().collect::<Vec<_>>();
+            }
+            for record in records {
+                targets.push(SkillAuditTarget {
+                    artifact_path: skills_root
+                        .join(record.skill_id.as_str())
+                        .join(record.version.as_str())
+                        .join(SKILLS_ARTIFACT_FILE_NAME),
+                    source: "installed".to_owned(),
+                    skill_id: Some(record.skill_id.clone()),
+                    version: Some(record.version.clone()),
+                });
+            }
+        }
+    }
+
+    if targets.is_empty() {
+        anyhow::bail!(
+            "no skill artifacts were selected for audit; pass --artifact or install at least one skill first"
+        );
+    }
+
+    let mut reports = Vec::new();
+    for target in &targets {
+        let artifact_bytes = fs::read(target.artifact_path.as_path()).with_context(|| {
+            format!("failed to read skill artifact for audit {}", target.artifact_path.display())
+        })?;
+        let report = audit_skill_artifact_security(
+            artifact_bytes.as_slice(),
+            &mut store,
+            command.allow_untrusted,
+            &SkillSecurityAuditPolicy::default(),
+        )
+        .with_context(|| {
+            format!("failed to audit skill artifact security {}", target.artifact_path.display())
+        })?;
+        reports.push((target.clone(), report));
+    }
+    store.save(trust_store_path.as_path())?;
+
+    if let Some(skills_root) = managed_skills_root.as_deref() {
+        for (target, report) in &reports {
+            append_skills_audit_event(
+                skills_root,
+                "skill.audit",
+                json!({
+                    "source": target.source,
+                    "artifact": target.artifact_path,
+                    "skill_id": target.skill_id,
+                    "version": target.version,
+                    "should_quarantine": report.should_quarantine,
+                    "quarantine_reasons": report.quarantine_reasons,
+                    "checks": report.checks,
+                }),
+            )?;
+        }
+    }
+
+    let output_payload = json!({
+        "trust_store": trust_store_path,
+        "audits": reports
+            .iter()
+            .map(|(target, report)| {
+                json!({
+                    "source": target.source,
+                    "artifact": target.artifact_path,
+                    "skill_id": target.skill_id,
+                    "version": target.version,
+                    "report": report,
+                })
+            })
+            .collect::<Vec<_>>(),
+    });
+    let quarantine_required = reports.iter().any(|(_, report)| report.should_quarantine);
+
+    if command.json {
+        println!("{}", serde_json::to_string_pretty(&output_payload)?);
+    } else {
+        for (target, report) in &reports {
+            let skill_label = target
+                .skill_id
+                .as_deref()
+                .map(|value| value.to_owned())
+                .unwrap_or_else(|| "unknown".to_owned());
+            let version_label = target
+                .version
+                .as_deref()
+                .map(|value| value.to_owned())
+                .unwrap_or_else(|| "unknown".to_owned());
+            println!(
+                "skill.audit skill_id={} version={} source={} artifact={} passed={} should_quarantine={} failed_checks={} warnings={}",
+                skill_label,
+                version_label,
+                target.source,
+                target.artifact_path.display(),
+                report.passed,
+                report.should_quarantine,
+                report
+                    .checks
+                    .iter()
+                    .filter(|check| matches!(check.status, SkillAuditCheckStatus::Fail))
+                    .count(),
+                report
+                    .checks
+                    .iter()
+                    .filter(|check| matches!(check.status, SkillAuditCheckStatus::Warn))
+                    .count()
+            );
+            if report.should_quarantine && !report.quarantine_reasons.is_empty() {
+                println!(
+                    "skill.audit.quarantine_reasons {}",
+                    report.quarantine_reasons.join(" | ")
+                );
+            }
+        }
+    }
+    std::io::stdout().flush().context("stdout flush failed")?;
+    if quarantine_required {
+        anyhow::bail!(
+            "one or more audited skills require quarantine; inspect report output for details"
+        );
+    }
+    Ok(())
+}
+
+fn run_skills_quarantine(command: SkillsQuarantineCommand) -> Result<()> {
+    let skills_root = resolve_skills_root(command.skills_dir.as_deref())?;
+    let version = resolve_skills_status_version(
+        skills_root.as_path(),
+        command.skill_id.as_str(),
+        command.version.as_deref(),
+    )?;
+    let base_url = command
+        .url
+        .or_else(|| env::var("PALYRA_DAEMON_URL").ok())
+        .unwrap_or_else(|| DEFAULT_DAEMON_URL.to_owned());
+    let endpoint = format!(
+        "{}/admin/v1/skills/{}/quarantine",
+        base_url.trim_end_matches('/'),
+        command.skill_id
+    );
+    let token = command.token.or_else(|| env::var("PALYRA_ADMIN_TOKEN").ok());
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .context("failed to build HTTP client")?;
+    let mut request = client
+        .post(endpoint)
+        .header("x-palyra-principal", command.principal)
+        .header("x-palyra-device-id", command.device_id);
+    if let Some(token) = token {
+        request = request.header("Authorization", format!("Bearer {token}"));
+    }
+    if let Some(channel) = command.channel {
+        request = request.header("x-palyra-channel", channel);
+    }
+    let response: SkillStatusResponse = request
+        .json(&SkillStatusRequestBody { version, reason: command.reason, override_enabled: None })
+        .send()
+        .context("failed to call daemon skills quarantine endpoint")?
+        .error_for_status()
+        .context("daemon skills quarantine endpoint returned non-success status")?
+        .json()
+        .context("failed to parse daemon skills quarantine response")?;
+
+    append_skills_audit_event(
+        skills_root.as_path(),
+        "skill.quarantined",
+        json!({
+            "skill_id": response.skill_id,
+            "version": response.version,
+            "status": response.status,
+            "reason": response.reason,
+            "detected_at_ms": response.detected_at_ms,
+            "operator_principal": response.operator_principal,
+        }),
+    )?;
+
+    if command.json {
+        println!("{}", serde_json::to_string_pretty(&response)?);
+    } else {
+        println!(
+            "skill.quarantined skill_id={} version={} status={} reason={} detected_at_ms={} operator_principal={}",
+            response.skill_id,
+            response.version,
+            response.status,
+            response.reason.clone().unwrap_or_else(|| "none".to_owned()),
+            response.detected_at_ms,
+            response.operator_principal,
+        );
+    }
+    std::io::stdout().flush().context("stdout flush failed")
+}
+
+fn run_skills_enable(command: SkillsEnableCommand) -> Result<()> {
+    if !command.override_enabled {
+        anyhow::bail!("skills enable requires --override");
+    }
+    let skills_root = resolve_skills_root(command.skills_dir.as_deref())?;
+    let version = resolve_skills_status_version(
+        skills_root.as_path(),
+        command.skill_id.as_str(),
+        command.version.as_deref(),
+    )?;
+    let base_url = command
+        .url
+        .or_else(|| env::var("PALYRA_DAEMON_URL").ok())
+        .unwrap_or_else(|| DEFAULT_DAEMON_URL.to_owned());
+    let endpoint =
+        format!("{}/admin/v1/skills/{}/enable", base_url.trim_end_matches('/'), command.skill_id);
+    let token = command.token.or_else(|| env::var("PALYRA_ADMIN_TOKEN").ok());
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .context("failed to build HTTP client")?;
+    let mut request = client
+        .post(endpoint)
+        .header("x-palyra-principal", command.principal)
+        .header("x-palyra-device-id", command.device_id);
+    if let Some(token) = token {
+        request = request.header("Authorization", format!("Bearer {token}"));
+    }
+    if let Some(channel) = command.channel {
+        request = request.header("x-palyra-channel", channel);
+    }
+    let response: SkillStatusResponse = request
+        .json(&SkillStatusRequestBody {
+            version,
+            reason: command.reason,
+            override_enabled: Some(true),
+        })
+        .send()
+        .context("failed to call daemon skills enable endpoint")?
+        .error_for_status()
+        .context("daemon skills enable endpoint returned non-success status")?
+        .json()
+        .context("failed to parse daemon skills enable response")?;
+
+    append_skills_audit_event(
+        skills_root.as_path(),
+        "skill.enabled",
+        json!({
+            "skill_id": response.skill_id,
+            "version": response.version,
+            "status": response.status,
+            "reason": response.reason,
+            "detected_at_ms": response.detected_at_ms,
+            "operator_principal": response.operator_principal,
+        }),
+    )?;
+
+    if command.json {
+        println!("{}", serde_json::to_string_pretty(&response)?);
+    } else {
+        println!(
+            "skill.enabled skill_id={} version={} status={} reason={} detected_at_ms={} operator_principal={}",
+            response.skill_id,
+            response.version,
+            response.status,
+            response.reason.clone().unwrap_or_else(|| "none".to_owned()),
+            response.detected_at_ms,
+            response.operator_principal,
+        );
+    }
+    std::io::stdout().flush().context("stdout flush failed")
+}
+
+fn resolve_skills_status_version(
+    skills_root: &Path,
+    skill_id: &str,
+    version: Option<&str>,
+) -> Result<String> {
+    if let Some(version) = version {
+        if version.trim().is_empty() {
+            anyhow::bail!("--version cannot be empty");
+        }
+        return Ok(version.trim().to_owned());
+    }
+    let index = load_installed_skills_index(skills_root)?;
+    let position = find_installed_skill_record(&index, skill_id, None)?;
+    Ok(index.entries[position].version.clone())
 }
 
 fn resolve_skills_root(raw: Option<&str>) -> Result<PathBuf> {
@@ -5402,6 +5881,26 @@ struct RunCancelResponse {
     run_id: String,
     cancel_requested: bool,
     reason: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SkillStatusRequestBody {
+    version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(rename = "override", skip_serializing_if = "Option::is_none")]
+    override_enabled: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct SkillStatusResponse {
+    skill_id: String,
+    version: String,
+    status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    detected_at_ms: i64,
+    operator_principal: String,
 }
 
 #[cfg(test)]

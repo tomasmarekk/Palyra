@@ -14,6 +14,7 @@ pub struct PolicyRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PolicyEvaluationConfig {
     pub allowlisted_tools: Vec<String>,
+    pub allowlisted_skills: Vec<String>,
     pub allow_sensitive_tools: bool,
     pub sensitive_tool_names: Vec<String>,
 }
@@ -32,7 +33,9 @@ pub struct PolicyExplanation {
     pub diagnostics_errors: Vec<String>,
     pub is_sensitive_action: bool,
     pub is_allowlisted_tool: bool,
+    pub is_allowlisted_skill: bool,
     pub requested_tool: Option<String>,
+    pub requested_skill: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +82,13 @@ when {
     context.is_allowlisted_tool
 };
 
+@id("allow_allowlisted_skill_execute")
+permit(principal, action, resource)
+when {
+    context.action == "skill.execute" &&
+    context.is_allowlisted_skill
+};
+
 @id("allow_cron_management_actions")
 permit(principal, action, resource)
 when {
@@ -113,6 +123,8 @@ when {
 "#;
 
 const POLICY_DENY_REASON: &str = "tool execution denied by default: tool is not allowlisted";
+const SKILL_POLICY_DENY_REASON: &str =
+    "skill execution denied by default: skill is not active/allowlisted";
 const SENSITIVE_DENY_REASON: &str =
     "sensitive action blocked by default; explicit user approval required";
 const BASELINE_DENY_REASON: &str = "deny-by-default baseline policy";
@@ -133,8 +145,12 @@ pub fn evaluate_with_config(
 ) -> Result<PolicyEvaluation, PolicyEngineError> {
     let normalized_action = request.action.to_ascii_lowercase();
     let requested_tool = requested_tool_name(normalized_action.as_str(), request.resource.as_str());
+    let requested_skill =
+        requested_skill_name(normalized_action.as_str(), request.resource.as_str());
     let is_allowlisted_tool =
         is_allowlisted_tool(requested_tool.as_deref(), config.allowlisted_tools.as_slice());
+    let is_allowlisted_skill =
+        is_allowlisted_skill(requested_skill.as_deref(), config.allowlisted_skills.as_slice());
     let is_sensitive_action = is_sensitive_action(
         normalized_action.as_str(),
         requested_tool.as_deref(),
@@ -148,6 +164,7 @@ pub fn evaluate_with_config(
             "resource": request.resource,
             "is_sensitive_action": is_sensitive_action,
             "is_allowlisted_tool": is_allowlisted_tool,
+            "is_allowlisted_skill": is_allowlisted_skill,
             "allow_sensitive_tools": config.allow_sensitive_tools,
         }),
         None,
@@ -172,6 +189,7 @@ pub fn evaluate_with_config(
         normalized_action.as_str(),
         is_sensitive_action,
         is_allowlisted_tool,
+        is_allowlisted_skill,
         config.allow_sensitive_tools,
         diagnostics_errors.as_slice(),
     );
@@ -190,7 +208,9 @@ pub fn evaluate_with_config(
             diagnostics_errors,
             is_sensitive_action,
             is_allowlisted_tool,
+            is_allowlisted_skill,
             requested_tool,
+            requested_skill,
         },
     })
 }
@@ -241,12 +261,16 @@ fn decision_reason(
     normalized_action: &str,
     is_sensitive_action: bool,
     is_allowlisted_tool: bool,
+    is_allowlisted_skill: bool,
     allow_sensitive_tools: bool,
     diagnostics_errors: &[String],
 ) -> String {
     if decision == Decision::Allow {
         if normalized_action == "tool.execute" {
             return "tool execution allowed by Cedar policy (allowlisted tool)".to_owned();
+        }
+        if normalized_action == "skill.execute" {
+            return "skill execution allowed by Cedar policy (active/allowlisted skill)".to_owned();
         }
         if normalized_action.starts_with("cron.") {
             return "cron action allowed by Cedar policy".to_owned();
@@ -271,6 +295,9 @@ fn decision_reason(
     if normalized_action == "tool.execute" && !is_allowlisted_tool {
         return POLICY_DENY_REASON.to_owned();
     }
+    if normalized_action == "skill.execute" && !is_allowlisted_skill {
+        return SKILL_POLICY_DENY_REASON.to_owned();
+    }
 
     BASELINE_DENY_REASON.to_owned()
 }
@@ -292,11 +319,35 @@ fn requested_tool_name(normalized_action: &str, resource: &str) -> Option<String
     Some(trimmed.to_ascii_lowercase())
 }
 
+fn requested_skill_name(normalized_action: &str, resource: &str) -> Option<String> {
+    if normalized_action != "skill.execute" {
+        return None;
+    }
+    let trimmed = resource.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(skill_name) = trimmed.strip_prefix("skill:") {
+        let skill_name = skill_name.trim();
+        if !skill_name.is_empty() {
+            return Some(skill_name.to_ascii_lowercase());
+        }
+    }
+    Some(trimmed.to_ascii_lowercase())
+}
+
 fn is_allowlisted_tool(requested_tool: Option<&str>, allowlisted_tools: &[String]) -> bool {
     let Some(requested_tool) = requested_tool else {
         return false;
     };
     allowlisted_tools.iter().any(|allowlisted| allowlisted.eq_ignore_ascii_case(requested_tool))
+}
+
+fn is_allowlisted_skill(requested_skill: Option<&str>, allowlisted_skills: &[String]) -> bool {
+    let Some(requested_skill) = requested_skill else {
+        return false;
+    };
+    allowlisted_skills.iter().any(|allowlisted| allowlisted.eq_ignore_ascii_case(requested_skill))
 }
 
 fn is_sensitive_action(
@@ -337,7 +388,7 @@ fn is_sensitive_action_heuristic(request: &PolicyRequest) -> bool {
 mod tests {
     use super::{
         evaluate, evaluate_with_config, PolicyDecision, PolicyEvaluationConfig, PolicyRequest,
-        POLICY_DENY_REASON, SENSITIVE_DENY_REASON,
+        POLICY_DENY_REASON, SENSITIVE_DENY_REASON, SKILL_POLICY_DENY_REASON,
     };
 
     #[test]
@@ -384,6 +435,7 @@ mod tests {
         };
         let config = PolicyEvaluationConfig {
             allowlisted_tools: vec!["palyra.process.run".to_owned()],
+            allowlisted_skills: Vec::new(),
             allow_sensitive_tools: false,
             sensitive_tool_names: vec!["palyra.process.run".to_owned()],
         };
@@ -482,10 +534,36 @@ mod tests {
             allowlisted_tools: vec!["palyra.echo".to_owned()],
             allow_sensitive_tools: false,
             sensitive_tool_names: Vec::new(),
+            allowlisted_skills: Vec::new(),
         };
         let allowed = evaluate_with_config(&request, &allowed_config).expect("evaluation");
         assert_eq!(allowed.decision, PolicyDecision::Allow);
         assert!(allowed.explanation.is_allowlisted_tool);
+    }
+
+    #[test]
+    fn skill_execute_is_allowed_only_when_allowlisted() {
+        let request = PolicyRequest {
+            principal: "user:bootstrap".to_owned(),
+            action: "skill.execute".to_owned(),
+            resource: "skill:acme.echo_http".to_owned(),
+        };
+        let denied =
+            evaluate_with_config(&request, &PolicyEvaluationConfig::default()).expect("evaluation");
+        assert_eq!(
+            denied.decision,
+            PolicyDecision::DenyByDefault { reason: SKILL_POLICY_DENY_REASON.to_owned() }
+        );
+
+        let allowed_config = PolicyEvaluationConfig {
+            allowlisted_skills: vec!["acme.echo_http".to_owned()],
+            allow_sensitive_tools: false,
+            allowlisted_tools: Vec::new(),
+            sensitive_tool_names: Vec::new(),
+        };
+        let allowed = evaluate_with_config(&request, &allowed_config).expect("evaluation");
+        assert_eq!(allowed.decision, PolicyDecision::Allow);
+        assert!(allowed.explanation.is_allowlisted_skill);
     }
 
     #[test]

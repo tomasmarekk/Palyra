@@ -40,6 +40,7 @@ use crate::{
         OrchestratorRunStartRequest, OrchestratorRunStatusSnapshot, OrchestratorSessionRecord,
         OrchestratorSessionResolveOutcome, OrchestratorSessionResolveRequest,
         OrchestratorTapeAppendRequest, OrchestratorTapeRecord, OrchestratorUsageDelta,
+        SkillExecutionStatus, SkillStatusRecord, SkillStatusUpsertRequest,
     },
     model_provider::{
         ModelProvider, ProviderError, ProviderEvent, ProviderRequest, ProviderStatusSnapshot,
@@ -48,7 +49,7 @@ use crate::{
     tool_protocol::{
         decide_tool_call, denied_execution_outcome, execute_tool_call, tool_policy_snapshot,
         tool_requires_approval, ToolAttestation, ToolCallConfig, ToolCallPolicySnapshot,
-        ToolExecutionOutcome,
+        ToolDecision, ToolExecutionOutcome,
     },
 };
 
@@ -131,6 +132,7 @@ const APPROVAL_POLICY_ID: &str = "tool_call_policy.v1";
 const APPROVAL_PROMPT_TIMEOUT_SECONDS: u32 = 60;
 const APPROVAL_REQUEST_SUMMARY_MAX_BYTES: usize = 1024;
 const TOOL_APPROVAL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+const SKILL_EXECUTION_DENY_REASON_PREFIX: &str = "skill execution blocked by security gate";
 
 #[derive(Debug, Clone)]
 pub struct GatewayRuntimeConfigSnapshot {
@@ -184,6 +186,12 @@ struct PendingToolApproval {
     request_summary: String,
     policy_snapshot: ApprovalPolicySnapshot,
     prompt: ApprovalPromptRecord,
+}
+
+#[derive(Debug, Clone)]
+struct ToolSkillContext {
+    skill_id: String,
+    version: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -271,6 +279,8 @@ struct RuntimeCounters {
     vault_list_requests: AtomicU64,
     vault_rate_limited_requests: AtomicU64,
     vault_access_audit_events: AtomicU64,
+    skill_status_updates: AtomicU64,
+    skill_execution_denied: AtomicU64,
     approvals_tool_requested: AtomicU64,
     approvals_tool_resolved_allow: AtomicU64,
     approvals_tool_resolved_deny: AtomicU64,
@@ -373,6 +383,8 @@ pub struct CountersSnapshot {
     pub vault_list_requests: u64,
     pub vault_rate_limited_requests: u64,
     pub vault_access_audit_events: u64,
+    pub skill_status_updates: u64,
+    pub skill_execution_denied: u64,
     pub approvals_tool_requested: u64,
     pub approvals_tool_resolved_allow: u64,
     pub approvals_tool_resolved_deny: u64,
@@ -472,6 +484,8 @@ impl RuntimeCounters {
             vault_list_requests: self.vault_list_requests.load(Ordering::Relaxed),
             vault_rate_limited_requests: self.vault_rate_limited_requests.load(Ordering::Relaxed),
             vault_access_audit_events: self.vault_access_audit_events.load(Ordering::Relaxed),
+            skill_status_updates: self.skill_status_updates.load(Ordering::Relaxed),
+            skill_execution_denied: self.skill_execution_denied.load(Ordering::Relaxed),
             approvals_tool_requested: self.approvals_tool_requested.load(Ordering::Relaxed),
             approvals_tool_resolved_allow: self
                 .approvals_tool_resolved_allow
@@ -572,6 +586,8 @@ impl GatewayRuntimeState {
                 vault_list_requests: AtomicU64::new(0),
                 vault_rate_limited_requests: AtomicU64::new(0),
                 vault_access_audit_events: AtomicU64::new(0),
+                skill_status_updates: AtomicU64::new(0),
+                skill_execution_denied: AtomicU64::new(0),
                 approvals_tool_requested: AtomicU64::new(0),
                 approvals_tool_resolved_allow: AtomicU64::new(0),
                 approvals_tool_resolved_deny: AtomicU64::new(0),
@@ -1588,6 +1604,90 @@ impl GatewayRuntimeState {
         })
     }
 
+    #[allow(clippy::result_large_err)]
+    pub async fn upsert_skill_status(
+        self: &Arc<Self>,
+        request: SkillStatusUpsertRequest,
+    ) -> Result<SkillStatusRecord, Status> {
+        let state = Arc::clone(self);
+        let record = tokio::task::spawn_blocking(move || {
+            state
+                .journal_store
+                .upsert_skill_status(&request)
+                .map_err(|error| map_skill_store_error("upsert skill status", error))
+        })
+        .await
+        .map_err(|_| Status::internal("skill status update worker panicked"))??;
+        self.counters.skill_status_updates.fetch_add(1, Ordering::Relaxed);
+        Ok(record)
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn skill_status(
+        self: &Arc<Self>,
+        skill_id: String,
+        version: String,
+    ) -> Result<Option<SkillStatusRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state
+                .journal_store
+                .skill_status(skill_id.as_str(), version.as_str())
+                .map_err(|error| map_skill_store_error("load skill status", error))
+        })
+        .await
+        .map_err(|_| Status::internal("skill status read worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn latest_skill_status(
+        self: &Arc<Self>,
+        skill_id: String,
+    ) -> Result<Option<SkillStatusRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state
+                .journal_store
+                .latest_skill_status(skill_id.as_str())
+                .map_err(|error| map_skill_store_error("load latest skill status", error))
+        })
+        .await
+        .map_err(|_| Status::internal("latest skill status read worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn record_skill_status_event(
+        self: &Arc<Self>,
+        context: &RequestContext,
+        event: &str,
+        record: &SkillStatusRecord,
+    ) -> Result<(), Status> {
+        self.record_journal_event(JournalAppendRequest {
+            event_id: Ulid::new().to_string(),
+            session_id: Ulid::new().to_string(),
+            run_id: Ulid::new().to_string(),
+            kind: common_v1::journal_event::EventKind::ToolExecuted as i32,
+            actor: common_v1::journal_event::EventActor::System as i32,
+            timestamp_unix_ms: current_unix_ms(),
+            payload_json: json!({
+                "event": event,
+                "skill_id": record.skill_id,
+                "version": record.version,
+                "status": record.status.as_str(),
+                "reason": record.reason,
+                "detected_at_ms": record.detected_at_ms,
+                "operator_principal": record.operator_principal,
+            })
+            .to_string()
+            .into_bytes(),
+            principal: context.principal.clone(),
+            device_id: context.device_id.clone(),
+            channel: context.channel.clone(),
+        })
+        .await
+        .map(|_| ())
+    }
+
     pub fn configure_memory(&self, config: MemoryRuntimeConfig) {
         if let Ok(mut guard) = self.memory_config.write() {
             *guard = config;
@@ -1875,6 +1975,17 @@ fn map_memory_store_error(operation: &str, error: JournalError) -> Status {
         JournalError::DuplicateMemoryId { memory_id } => {
             Status::already_exists(format!("memory item already exists: {memory_id}"))
         }
+        JournalError::PayloadTooLarge { payload_kind, actual_bytes, max_bytes } => {
+            Status::invalid_argument(format!(
+                "{payload_kind} payload exceeds maximum size ({actual_bytes} > {max_bytes})"
+            ))
+        }
+        other => Status::internal(format!("{operation} failed: {other}")),
+    }
+}
+
+fn map_skill_store_error(operation: &str, error: JournalError) -> Status {
+    match error {
         JournalError::PayloadTooLarge { payload_kind, actual_bytes, max_bytes } => {
             Status::invalid_argument(format!(
                 "{payload_kind} payload exceeds maximum size ({actual_bytes} > {max_bytes})"
@@ -3655,8 +3766,61 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                             }
                         }
                         ProviderEvent::ToolProposal { proposal_id, tool_name, input_json } => {
-                            let proposal_approval_required =
-                                tool_requires_approval(tool_name.as_str());
+                            let mut skill_gate_decision: Option<ToolDecision> = None;
+                            let skill_context = match parse_tool_skill_context(
+                                tool_name.as_str(),
+                                input_json.as_slice(),
+                            ) {
+                                Ok(context) => context,
+                                Err(error) => {
+                                    warn!(
+                                        run_id = %run_id,
+                                        proposal_id = %proposal_id,
+                                        tool_name = %tool_name,
+                                        error = %error.message(),
+                                        "skill context parsing failed; proposal will be denied safely"
+                                    );
+                                    skill_gate_decision = Some(ToolDecision {
+                                        allowed: false,
+                                        reason: format!(
+                                            "{SKILL_EXECUTION_DENY_REASON_PREFIX}: invalid skill context: {}",
+                                            error.message()
+                                        ),
+                                        approval_required: false,
+                                        policy_enforced: true,
+                                    });
+                                    None
+                                }
+                            };
+                            if skill_gate_decision.is_none() {
+                                if let Some(skill_context) = skill_context.as_ref() {
+                                    skill_gate_decision = match evaluate_skill_execution_gate(
+                                        &state_for_stream,
+                                        context_for_stream.principal.as_str(),
+                                        skill_context,
+                                    )
+                                    .await
+                                    {
+                                        Ok(value) => value,
+                                        Err(error) => Some(ToolDecision {
+                                            allowed: false,
+                                            reason: format!(
+                                                "{SKILL_EXECUTION_DENY_REASON_PREFIX}: skill={} evaluation_error={}",
+                                                skill_context.skill_id,
+                                                error.message()
+                                            ),
+                                            approval_required: false,
+                                            policy_enforced: true,
+                                        }),
+                                    };
+                                }
+                            }
+                            let proposal_approval_required = skill_gate_decision
+                                .as_ref()
+                                .map(|decision| {
+                                    decision.allowed && tool_requires_approval(tool_name.as_str())
+                                })
+                                .unwrap_or_else(|| tool_requires_approval(tool_name.as_str()));
                             state_for_stream
                                 .counters
                                 .tool_proposals
@@ -3689,6 +3853,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                             let approval_outcome = if proposal_approval_required {
                                 let pending_approval = build_pending_tool_approval(
                                     tool_name.as_str(),
+                                    skill_context.as_ref(),
                                     input_json.as_slice(),
                                     &state_for_stream.config.tool_call,
                                 );
@@ -3926,21 +4091,25 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                                 None
                             };
 
-                            let decision = decide_tool_call(
-                                &state_for_stream.config.tool_call,
-                                &mut remaining_tool_budget,
-                                context_for_stream.principal.as_str(),
-                                tool_name.as_str(),
-                                approval_outcome
-                                    .as_ref()
-                                    .map(|response| response.approved)
-                                    .unwrap_or(false),
-                            );
-                            let decision = apply_tool_approval_outcome(
-                                decision,
-                                tool_name.as_str(),
-                                approval_outcome.as_ref(),
-                            );
+                            let decision = if let Some(skill_gate_decision) = skill_gate_decision {
+                                skill_gate_decision
+                            } else {
+                                let decision = decide_tool_call(
+                                    &state_for_stream.config.tool_call,
+                                    &mut remaining_tool_budget,
+                                    context_for_stream.principal.as_str(),
+                                    tool_name.as_str(),
+                                    approval_outcome
+                                        .as_ref()
+                                        .map(|response| response.approved)
+                                        .unwrap_or(false),
+                                );
+                                apply_tool_approval_outcome(
+                                    decision,
+                                    tool_name.as_str(),
+                                    approval_outcome.as_ref(),
+                                )
+                            };
                             if decision.allowed {
                                 state_for_stream
                                     .counters
@@ -4023,6 +4192,40 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                                 .await;
                                 let _ = sender.send(Err(error)).await;
                                 return;
+                            }
+                            if !decision.allowed
+                                && decision.reason.contains(SKILL_EXECUTION_DENY_REASON_PREFIX)
+                            {
+                                if let Some(skill_context) = skill_context.as_ref() {
+                                    state_for_stream
+                                        .counters
+                                        .skill_execution_denied
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    if let Err(error) = record_skill_execution_denied_journal_event(
+                                        &state_for_stream,
+                                        &context_for_stream,
+                                        session_id,
+                                        run_id.as_str(),
+                                        proposal_id.as_str(),
+                                        tool_name.as_str(),
+                                        skill_context,
+                                        decision.reason.as_str(),
+                                    )
+                                    .await
+                                    {
+                                        finalize_run_failure(
+                                            &sender,
+                                            &state_for_stream,
+                                            &mut run_state,
+                                            active_run_id.as_deref(),
+                                            &mut tape_seq,
+                                            error.message(),
+                                        )
+                                        .await;
+                                        let _ = sender.send(Err(error)).await;
+                                        return;
+                                    }
+                                }
                             }
 
                             let execution_outcome = if decision.allowed {
@@ -6464,12 +6667,18 @@ fn truncate_with_ellipsis(input: String, max_bytes: usize) -> String {
     output
 }
 
-fn build_tool_request_summary(tool_name: &str, input_json: &[u8]) -> String {
+fn build_tool_request_summary(
+    tool_name: &str,
+    skill_context: Option<&ToolSkillContext>,
+    input_json: &[u8],
+) -> String {
     let normalized_input = serde_json::from_slice::<Value>(input_json)
         .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(input_json).to_string() }));
     truncate_with_ellipsis(
         json!({
             "tool_name": tool_name,
+            "skill_id": skill_context.map(|context| context.skill_id.as_str()),
+            "skill_version": skill_context.and_then(|context| context.version.as_deref()),
             "input_json": normalized_input,
         })
         .to_string(),
@@ -6492,13 +6701,117 @@ fn build_tool_policy_snapshot(config: &ToolCallConfig, tool_name: &str) -> Appro
     }
 }
 
+#[allow(clippy::result_large_err)]
+fn parse_tool_skill_context(
+    tool_name: &str,
+    input_json: &[u8],
+) -> Result<Option<ToolSkillContext>, Status> {
+    if tool_name != "palyra.plugin.run" {
+        return Ok(None);
+    }
+    let payload = serde_json::from_slice::<Value>(input_json)
+        .map_err(|error| Status::invalid_argument(format!("invalid tool input JSON: {error}")))?;
+    let object = payload
+        .as_object()
+        .ok_or_else(|| Status::invalid_argument("tool input must be a JSON object"))?;
+    let skill_id_value = object.get("skill_id").ok_or_else(|| {
+        Status::invalid_argument("palyra.plugin.run requires non-empty skill_id for security gate")
+    })?;
+    let skill_id = skill_id_value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            Status::invalid_argument("palyra.plugin.run skill_id must be a non-empty string")
+        })?
+        .to_owned();
+    let version = object
+        .get("skill_version")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    Ok(Some(ToolSkillContext { skill_id, version }))
+}
+
+#[allow(clippy::result_large_err)]
+async fn evaluate_skill_execution_gate(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    principal: &str,
+    context: &ToolSkillContext,
+) -> Result<Option<ToolDecision>, Status> {
+    let status_record = if let Some(version) = context.version.as_deref() {
+        let by_version =
+            runtime_state.skill_status(context.skill_id.clone(), version.to_owned()).await?;
+        if by_version.is_some() {
+            by_version
+        } else {
+            runtime_state.latest_skill_status(context.skill_id.clone()).await?
+        }
+    } else {
+        runtime_state.latest_skill_status(context.skill_id.clone()).await?
+    };
+    if let Some(status_record) = status_record {
+        if matches!(
+            status_record.status,
+            SkillExecutionStatus::Quarantined | SkillExecutionStatus::Disabled
+        ) {
+            return Ok(Some(ToolDecision {
+                allowed: false,
+                reason: format!(
+                    "{SKILL_EXECUTION_DENY_REASON_PREFIX}: skill={} version={} status={} reason={}",
+                    status_record.skill_id,
+                    status_record.version,
+                    status_record.status.as_str(),
+                    status_record.reason.unwrap_or_else(|| "none".to_owned())
+                ),
+                approval_required: false,
+                policy_enforced: true,
+            }));
+        }
+    }
+
+    let evaluation = evaluate_with_config(
+        &PolicyRequest {
+            principal: principal.to_owned(),
+            action: "skill.execute".to_owned(),
+            resource: format!("skill:{}", context.skill_id),
+        },
+        &PolicyEvaluationConfig {
+            allowlisted_tools: Vec::new(),
+            allow_sensitive_tools: false,
+            sensitive_tool_names: Vec::new(),
+            allowlisted_skills: vec![context.skill_id.clone()],
+        },
+    )
+    .map_err(|error| Status::internal(format!("failed to evaluate skill policy: {error}")))?;
+
+    match evaluation.decision {
+        PolicyDecision::Allow => Ok(None),
+        PolicyDecision::DenyByDefault { reason } => Ok(Some(ToolDecision {
+            allowed: false,
+            reason: format!(
+                "{SKILL_EXECUTION_DENY_REASON_PREFIX}: skill={} reason={reason}",
+                context.skill_id
+            ),
+            approval_required: false,
+            policy_enforced: true,
+        })),
+    }
+}
+
 fn build_pending_tool_approval(
     tool_name: &str,
+    skill_context: Option<&ToolSkillContext>,
     input_json: &[u8],
     config: &ToolCallConfig,
 ) -> PendingToolApproval {
-    let subject_id = format!("tool:{tool_name}");
-    let request_summary = build_tool_request_summary(tool_name, input_json);
+    let subject_id = if let Some(skill_context) = skill_context {
+        format!("tool:{tool_name}|skill:{}", skill_context.skill_id)
+    } else {
+        format!("tool:{tool_name}")
+    };
+    let request_summary = build_tool_request_summary(tool_name, skill_context, input_json);
     let policy_snapshot = build_tool_policy_snapshot(config, tool_name);
     let details = serde_json::from_slice::<Value>(input_json)
         .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(input_json).to_string() }));
@@ -6512,6 +6825,8 @@ fn build_pending_tool_approval(
         details_json: json!({
             "tool_name": tool_name,
             "subject_id": subject_id,
+            "skill_id": skill_context.map(|context| context.skill_id.as_str()),
+            "skill_version": skill_context.and_then(|context| context.version.as_deref()),
             "input_json": details,
         })
         .to_string(),
@@ -6724,6 +7039,44 @@ fn tool_decision_journal_payload(
     })
     .to_string()
     .into_bytes()
+}
+
+#[allow(clippy::result_large_err)]
+#[allow(clippy::too_many_arguments)]
+async fn record_skill_execution_denied_journal_event(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: &RequestContext,
+    session_id: &str,
+    run_id: &str,
+    proposal_id: &str,
+    tool_name: &str,
+    skill_context: &ToolSkillContext,
+    reason: &str,
+) -> Result<(), Status> {
+    runtime_state
+        .record_journal_event(JournalAppendRequest {
+            event_id: Ulid::new().to_string(),
+            session_id: session_id.to_owned(),
+            run_id: run_id.to_owned(),
+            kind: common_v1::journal_event::EventKind::ToolProposed as i32,
+            actor: common_v1::journal_event::EventActor::System as i32,
+            timestamp_unix_ms: current_unix_ms(),
+            payload_json: json!({
+                "event": "skill.execution_denied",
+                "proposal_id": proposal_id,
+                "tool_name": tool_name,
+                "skill_id": skill_context.skill_id,
+                "skill_version": skill_context.version,
+                "reason": reason,
+            })
+            .to_string()
+            .into_bytes(),
+            principal: context.principal.clone(),
+            device_id: context.device_id.clone(),
+            channel: context.channel.clone(),
+        })
+        .await
+        .map(|_| ())
 }
 
 #[allow(clippy::result_large_err)]

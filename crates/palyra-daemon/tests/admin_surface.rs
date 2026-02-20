@@ -12,6 +12,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use reqwest::blocking::Client;
+use serde_json::Value;
 
 const ADMIN_TOKEN: &str = "test-admin-token";
 const DEVICE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
@@ -172,6 +173,101 @@ fn admin_run_endpoints_require_token_and_report_not_found_for_unknown_run() -> R
         .send()
         .context("failed to call admin run cancel with auth")?;
     assert_eq!(unknown_cancel.status().as_u16(), 404, "unknown run cancel should return not found");
+    Ok(())
+}
+
+#[test]
+fn admin_skill_quarantine_and_enable_require_override_acknowledgement() -> Result<()> {
+    let (child, admin_port) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("failed to build HTTP client")?;
+    let quarantine_url =
+        format!("http://127.0.0.1:{admin_port}/admin/v1/skills/acme.echo_http/quarantine");
+    let enable_url = format!("http://127.0.0.1:{admin_port}/admin/v1/skills/acme.echo_http/enable");
+
+    let missing_auth = client
+        .post(&quarantine_url)
+        .json(&serde_json::json!({
+            "version": "1.2.3",
+            "reason": "security hold",
+        }))
+        .send()
+        .context("failed to call quarantine endpoint without auth")?;
+    assert_eq!(missing_auth.status().as_u16(), 401, "missing auth must be rejected");
+
+    let quarantine_response = client
+        .post(&quarantine_url)
+        .header("Authorization", format!("Bearer {ADMIN_TOKEN}"))
+        .header("x-palyra-principal", "user:security")
+        .header("x-palyra-device-id", DEVICE_ID)
+        .header("x-palyra-channel", "cli")
+        .json(&serde_json::json!({
+            "version": "1.2.3",
+            "reason": "security hold",
+        }))
+        .send()
+        .context("failed to call quarantine endpoint with auth")?
+        .error_for_status()
+        .context("quarantine endpoint returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse quarantine JSON response")?;
+    assert_eq!(
+        quarantine_response.get("status").and_then(Value::as_str),
+        Some("quarantined"),
+        "quarantine endpoint should set quarantined status"
+    );
+    assert_eq!(
+        quarantine_response.get("version").and_then(Value::as_str),
+        Some("1.2.3"),
+        "quarantine endpoint should preserve requested version"
+    );
+
+    let missing_override = client
+        .post(&enable_url)
+        .header("Authorization", format!("Bearer {ADMIN_TOKEN}"))
+        .header("x-palyra-principal", "user:security")
+        .header("x-palyra-device-id", DEVICE_ID)
+        .header("x-palyra-channel", "cli")
+        .json(&serde_json::json!({
+            "version": "1.2.3",
+            "reason": "operator review complete",
+        }))
+        .send()
+        .context("failed to call enable endpoint without override")?;
+    assert_eq!(
+        missing_override.status().as_u16(),
+        400,
+        "enable endpoint must reject missing override acknowledgment"
+    );
+
+    let enable_response = client
+        .post(&enable_url)
+        .header("Authorization", format!("Bearer {ADMIN_TOKEN}"))
+        .header("x-palyra-principal", "user:security")
+        .header("x-palyra-device-id", DEVICE_ID)
+        .header("x-palyra-channel", "cli")
+        .json(&serde_json::json!({
+            "version": "1.2.3",
+            "reason": "operator review complete",
+            "override": true,
+        }))
+        .send()
+        .context("failed to call enable endpoint with override")?
+        .error_for_status()
+        .context("enable endpoint returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse enable JSON response")?;
+    assert_eq!(
+        enable_response.get("status").and_then(Value::as_str),
+        Some("active"),
+        "enable endpoint should restore active status"
+    );
+
     Ok(())
 }
 

@@ -2825,7 +2825,11 @@ async fn grpc_run_stream_blocks_sandbox_process_runner_non_allowlisted_egress_ho
 
 #[tokio::test(flavor = "multi_thread")]
 async fn grpc_run_stream_denies_wasm_plugin_runtime_without_approval_channel() -> Result<()> {
+    let skill_id = "acme.echo_http";
+    let skill_version = "1.2.3";
     let tool_arguments = serde_json::json!({
+        "skill_id": skill_id,
+        "skill_version": skill_version,
         "module_wat": r#"
             (module
                 (import "palyra:plugins/host-capabilities@0.1.0" "http-count" (func $http_count (result i32)))
@@ -2933,7 +2937,11 @@ async fn grpc_run_stream_denies_wasm_plugin_runtime_without_approval_channel() -
 
 #[tokio::test(flavor = "multi_thread")]
 async fn grpc_run_stream_blocks_wasm_plugin_runtime_non_allowlisted_capability() -> Result<()> {
+    let skill_id = "acme.echo_http";
+    let skill_version = "1.2.3";
     let tool_arguments = serde_json::json!({
+        "skill_id": skill_id,
+        "skill_version": skill_version,
         "module_wat": "(module (func (export \"run\") (result i32) i32.const 1))",
         "capabilities": {
             "http_hosts": ["blocked.example"]
@@ -3022,6 +3030,200 @@ async fn grpc_run_stream_blocks_wasm_plugin_runtime_non_allowlisted_capability()
     assert!(saw_failed_result, "denied wasm proposal must produce failed tool result");
     assert!(saw_policy_attestation, "denied wasm proposal must emit policy attestation");
     assert!(!saw_sandbox_attestation, "sandbox runtime must not execute when approval is missing");
+
+    server_handle.join().expect("scripted openai server thread should exit");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_run_stream_denies_quarantined_skill_before_approval_and_records_event() -> Result<()>
+{
+    let skill_id = "acme.echo_http";
+    let skill_version = "1.2.3";
+    let tool_arguments = serde_json::json!({
+        "skill_id": skill_id,
+        "skill_version": skill_version,
+        "module_wat": "(module (func (export \"run\") (result i32) i32.const 1))",
+        "capabilities": {
+            "http_hosts": ["api.example.com"]
+        }
+    });
+    let response_body = openai_tool_call_response("palyra.plugin.run", &tool_arguments)?;
+    let (openai_base_url, _request_count, server_handle) =
+        spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::immediate(200, response_body)])?;
+    let (child, admin_port, grpc_port, journal_db_path, config_path) =
+        spawn_palyrad_with_openai_provider_tool_policy_and_wasm_runtime(WasmRuntimeSpawnConfig {
+            openai_base_url: openai_base_url.as_str(),
+            openai_api_key: OPENAI_API_KEY,
+            allowed_tools: "palyra.plugin.run",
+            max_calls_per_run: 2,
+            execution_timeout_ms: 2_000,
+            allowed_http_hosts: "api.example.com",
+            allowed_secrets: "",
+            allowed_storage_prefixes: "",
+            allowed_channels: "cli",
+            fuel_budget: 10_000_000,
+            max_memory_bytes: 64 * 1024 * 1024,
+            max_table_elements: 100_000,
+            max_instances: 256,
+        })?;
+    let _config_guard = TempFileGuard::new(config_path);
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let quarantine_response = admin_post_json_async(
+        admin_port,
+        format!("/admin/v1/skills/{skill_id}/quarantine"),
+        serde_json::json!({
+            "version": skill_version,
+            "reason": "integration-test quarantine",
+        }),
+    )
+    .await?;
+    assert_eq!(
+        quarantine_response.get("status").and_then(Value::as_str),
+        Some("quarantined"),
+        "admin quarantine endpoint should persist quarantined status"
+    );
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+
+    let (request_sender, request_receiver) = tokio_mpsc::channel(4);
+    request_sender
+        .send(sample_run_stream_request_with_text("quarantined skill deny path".to_owned()))
+        .await
+        .context("failed to send initial quarantined skill request")?;
+    let mut stream_request = tonic::Request::new(ReceiverStream::new(request_receiver));
+    stream_request.metadata_mut().insert("authorization", format!("Bearer {ADMIN_TOKEN}").parse()?);
+    stream_request.metadata_mut().insert("x-palyra-principal", "user:ops".parse()?);
+    stream_request.metadata_mut().insert("x-palyra-device-id", DEVICE_ID.parse()?);
+    stream_request.metadata_mut().insert("x-palyra-channel", "cli".parse()?);
+
+    let mut response_stream =
+        client.run_stream(stream_request).await.context("failed to call RunStream")?.into_inner();
+
+    let mut saw_approval_request = false;
+    let mut saw_deny_decision = false;
+    let mut saw_failed_result = false;
+    loop {
+        let next_event = tokio::time::timeout(Duration::from_secs(5), response_stream.next())
+            .await
+            .context("quarantined skill stream stalled before expected events")?;
+        let Some(event) = next_event else {
+            break;
+        };
+        let event = event.context("failed to read RunStream event")?;
+        if let Some(body) = event.body {
+            match body {
+                common_v1::run_stream_event::Body::ToolApprovalRequest(approval_request) => {
+                    let proposal_id = approval_request
+                        .proposal_id
+                        .as_ref()
+                        .map(|proposal_id| proposal_id.ulid.as_str())
+                        .context("tool approval request missing proposal_id")?;
+                    request_sender
+                        .send(sample_tool_approval_response_request(
+                            proposal_id,
+                            true,
+                            "allow_once",
+                        ))
+                        .await
+                        .context("failed to send tool approval response")?;
+                    saw_approval_request = true;
+                }
+                common_v1::run_stream_event::Body::ToolDecision(decision) => {
+                    if decision.kind == common_v1::tool_decision::DecisionKind::Deny as i32 {
+                        assert!(
+                            decision.reason.contains("skill execution blocked by security gate"),
+                            "deny decision should explain skill security gate denial"
+                        );
+                        assert!(
+                            !decision.approval_required,
+                            "quarantined skill denial should short-circuit before approval"
+                        );
+                        saw_deny_decision = true;
+                    }
+                }
+                common_v1::run_stream_event::Body::ToolResult(result) => {
+                    if !result.success {
+                        assert!(
+                            result.error.contains("skill execution blocked by security gate"),
+                            "failed result should include skill gate denial context"
+                        );
+                        saw_failed_result = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if saw_deny_decision && saw_failed_result {
+            break;
+        }
+    }
+
+    assert!(!saw_approval_request, "quarantined skills must be denied before approval workflow");
+    assert!(saw_deny_decision, "quarantined skill should emit deny decision");
+    assert!(saw_failed_result, "quarantined skill should emit failed tool result");
+
+    let status_snapshot = admin_get_json_async(admin_port, "/admin/v1/status".to_owned()).await?;
+    assert_eq!(
+        status_snapshot.pointer("/counters/skill_execution_denied").and_then(Value::as_u64),
+        Some(1),
+        "skill_execution_denied counter should increment for quarantine denial"
+    );
+
+    let connection =
+        Connection::open(journal_db_path).context("failed to open journal sqlite db")?;
+    let mut statement = connection
+        .prepare(
+            r#"
+                SELECT kind, payload_json
+                FROM journal_events
+                ORDER BY seq ASC
+            "#,
+        )
+        .context("failed to prepare journal event query")?;
+    let mut rows = statement.query([]).context("failed to query journal event rows")?;
+    let mut saw_skill_execution_denied = false;
+    let mut saw_skill_execution_denied_kind = false;
+    let mut saw_skill_execution_denied_payload = false;
+    while let Some(row) = rows.next().context("failed to iterate journal rows")? {
+        let kind: i32 = row.get(0).context("journal kind should be readable")?;
+        let payload_json: String = row.get(1).context("journal payload_json should be readable")?;
+        let payload: Value = serde_json::from_str(payload_json.as_str())
+            .context("journal payload_json must be valid json")?;
+        if payload.get("event").and_then(Value::as_str) == Some("skill.execution_denied") {
+            saw_skill_execution_denied = true;
+            if kind == common_v1::journal_event::EventKind::ToolProposed as i32 {
+                saw_skill_execution_denied_kind = true;
+            }
+            if payload.get("skill_id").and_then(Value::as_str) == Some(skill_id)
+                && payload.get("skill_version").and_then(Value::as_str) == Some(skill_version)
+                && payload
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .map(|reason| reason.contains("skill execution blocked by security gate"))
+                    .unwrap_or(false)
+            {
+                saw_skill_execution_denied_payload = true;
+            }
+        }
+    }
+    assert!(
+        saw_skill_execution_denied,
+        "quarantine denials must persist skill.execution_denied journal event"
+    );
+    assert!(
+        saw_skill_execution_denied_kind,
+        "skill.execution_denied event should use EVENT_KIND_TOOL_PROPOSED"
+    );
+    assert!(
+        saw_skill_execution_denied_payload,
+        "skill.execution_denied payload must include skill id/version and denial reason"
+    );
 
     server_handle.join().expect("scripted openai server thread should exit");
     Ok(())

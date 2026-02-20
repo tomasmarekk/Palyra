@@ -13,9 +13,10 @@ use palyra_common::{build_metadata, CANONICAL_PROTOCOL_MAJOR};
 use palyra_plugins_runtime::CapabilityGrantSet;
 use palyra_policy::PolicyRequest;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use wasmtime::{Engine, ExternType, Module};
 use zip::{write::SimpleFileOptions, CompressionMethod, DateTime, ZipArchive, ZipWriter};
 
 pub const SKILL_MANIFEST_PATH: &str = "skill.toml";
@@ -25,6 +26,8 @@ pub const PROVENANCE_PATH: &str = "provenance.json";
 pub const SIGNATURE_PATH: &str = "signature.json";
 pub const SKILL_VERIFICATION_EVENT_KIND: &str = "skill.artifact.verified";
 pub const SKILL_MANIFEST_VERSION: u32 = 1;
+pub const DEFAULT_SKILL_AUDIT_MAX_MODULE_BYTES: u64 = 8 * 1024 * 1024;
+pub const DEFAULT_SKILL_AUDIT_MAX_EXPORTED_FUNCTIONS: usize = 128;
 
 const SIGNATURE_ALGORITHM: &str = "ed25519-sha256";
 const PAYLOAD_CONTEXT: &[u8] = b"palyra.skill.payload.v1";
@@ -309,6 +312,68 @@ pub struct SkillVerificationReport {
     pub audit_event: SkillVerificationAuditEvent,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillAuditCheckStatus {
+    Pass,
+    Warn,
+    Fail,
+    Skipped,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillAuditSeverity {
+    Info,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SkillSecurityAuditCheck {
+    pub check_id: String,
+    pub status: SkillAuditCheckStatus,
+    pub severity: SkillAuditSeverity,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SkillSecurityAuditPolicy {
+    pub max_module_bytes: u64,
+    pub max_exported_functions: usize,
+}
+
+impl Default for SkillSecurityAuditPolicy {
+    fn default() -> Self {
+        Self {
+            max_module_bytes: DEFAULT_SKILL_AUDIT_MAX_MODULE_BYTES,
+            max_exported_functions: DEFAULT_SKILL_AUDIT_MAX_EXPORTED_FUNCTIONS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SkillSecurityAuditReport {
+    pub skill_id: String,
+    pub version: String,
+    pub publisher: String,
+    pub accepted: bool,
+    pub passed: bool,
+    pub should_quarantine: bool,
+    pub trust_decision: TrustDecision,
+    pub payload_sha256: String,
+    pub generated_at_unix_ms: i64,
+    pub policy: SkillSecurityAuditPolicy,
+    pub checks: Vec<SkillSecurityAuditCheck>,
+    pub quarantine_reasons: Vec<String>,
+    pub vulnerability_scan: SkillSecurityAuditCheck,
+}
+
 #[derive(Debug, Clone)]
 struct ParsedArtifact {
     manifest: SkillManifest,
@@ -535,6 +600,246 @@ pub fn inspect_skill_artifact(
         payload_sha256: parsed.payload_sha256,
         entries,
     })
+}
+
+pub fn audit_skill_artifact_security(
+    artifact_bytes: &[u8],
+    trust_store: &mut SkillTrustStore,
+    allow_tofu: bool,
+    policy: &SkillSecurityAuditPolicy,
+) -> Result<SkillSecurityAuditReport, SkillPackagingError> {
+    let verification = verify_skill_artifact(artifact_bytes, trust_store, allow_tofu)?;
+    let inspected = inspect_skill_artifact(artifact_bytes)?;
+    let mut checks = Vec::new();
+    let mut quarantine_reasons = Vec::new();
+
+    checks.push(pass_audit_check(
+        "signature_validity",
+        "signature chain and payload hash verified",
+        None,
+    ));
+    checks.push(pass_audit_check("sbom_presence", "sbom.cdx.json is present and valid", None));
+    checks.push(pass_audit_check(
+        "provenance_presence",
+        "provenance.json is present and valid",
+        None,
+    ));
+    checks.push(pass_audit_check(
+        "manifest_sanity",
+        "manifest passed strict schema and wildcard validation",
+        None,
+    ));
+
+    let module_paths = inspected
+        .entries
+        .keys()
+        .filter(|path| path.starts_with("modules/") && path.ends_with(".wasm"))
+        .cloned()
+        .collect::<Vec<_>>();
+    if module_paths.is_empty() {
+        push_fail_check(
+            &mut checks,
+            &mut quarantine_reasons,
+            "wasm_module_presence",
+            "artifact does not contain any modules/*.wasm entries",
+            None,
+        );
+    } else {
+        checks.push(pass_audit_check(
+            "wasm_module_presence",
+            format!("artifact includes {} wasm module(s)", module_paths.len()),
+            Some(json!({ "modules": module_paths.clone() })),
+        ));
+    }
+
+    let filesystem_declared = !inspected.manifest.capabilities.filesystem.read_roots.is_empty()
+        || !inspected.manifest.capabilities.filesystem.write_roots.is_empty();
+    let engine = Engine::default();
+    for module_path in module_paths {
+        let Some(module_bytes) = inspected.entries.get(module_path.as_str()) else {
+            continue;
+        };
+        if module_bytes.len() as u64 > policy.max_module_bytes {
+            push_fail_check(
+                &mut checks,
+                &mut quarantine_reasons,
+                "wasm_module_size_limit",
+                format!(
+                    "module '{}' exceeds max_module_bytes ({} > {})",
+                    module_path,
+                    module_bytes.len(),
+                    policy.max_module_bytes
+                ),
+                Some(json!({
+                    "module_path": module_path,
+                    "module_bytes": module_bytes.len(),
+                    "max_module_bytes": policy.max_module_bytes,
+                })),
+            );
+            continue;
+        }
+
+        let module = match Module::new(&engine, module_bytes) {
+            Ok(module) => module,
+            Err(error) => {
+                push_fail_check(
+                    &mut checks,
+                    &mut quarantine_reasons,
+                    "wasm_module_validation",
+                    format!("module '{}' failed validation: {error}", module_path),
+                    Some(json!({ "module_path": module_path })),
+                );
+                continue;
+            }
+        };
+
+        checks.push(pass_audit_check(
+            "wasm_module_size_limit",
+            format!(
+                "module '{}' is within max_module_bytes ({} <= {})",
+                module_path,
+                module_bytes.len(),
+                policy.max_module_bytes
+            ),
+            Some(json!({
+                "module_path": module_path,
+                "module_bytes": module_bytes.len(),
+                "max_module_bytes": policy.max_module_bytes,
+            })),
+        ));
+
+        let exported_functions =
+            module.exports().filter(|export| matches!(export.ty(), ExternType::Func(_))).count();
+        if exported_functions > policy.max_exported_functions {
+            push_fail_check(
+                &mut checks,
+                &mut quarantine_reasons,
+                "wasm_exported_function_limit",
+                format!(
+                    "module '{}' exports too many functions ({} > {})",
+                    module_path, exported_functions, policy.max_exported_functions
+                ),
+                Some(json!({
+                    "module_path": module_path,
+                    "exported_functions": exported_functions,
+                    "max_exported_functions": policy.max_exported_functions,
+                })),
+            );
+        } else {
+            checks.push(pass_audit_check(
+                "wasm_exported_function_limit",
+                format!(
+                    "module '{}' export function count is within limit ({} <= {})",
+                    module_path, exported_functions, policy.max_exported_functions
+                ),
+                Some(json!({
+                    "module_path": module_path,
+                    "exported_functions": exported_functions,
+                    "max_exported_functions": policy.max_exported_functions,
+                })),
+            ));
+        }
+
+        if module_imports_wasi_filesystem(&module) && !filesystem_declared {
+            push_fail_check(
+                &mut checks,
+                &mut quarantine_reasons,
+                "wasm_wasi_filesystem_imports",
+                format!(
+                    "module '{}' imports wasi:filesystem without declared filesystem capability",
+                    module_path
+                ),
+                Some(json!({
+                    "module_path": module_path,
+                    "filesystem_declared": filesystem_declared,
+                })),
+            );
+        } else {
+            checks.push(pass_audit_check(
+                "wasm_wasi_filesystem_imports",
+                format!("module '{}' does not violate wasi:filesystem policy", module_path),
+                Some(json!({
+                    "module_path": module_path,
+                    "filesystem_declared": filesystem_declared,
+                })),
+            ));
+        }
+    }
+
+    let vulnerability_scan = match std::env::var("PALYRA_SKILL_AUDIT_VULN_FEED_HOOK") {
+        Ok(value) if !value.trim().is_empty() => pass_audit_check(
+            "vulnerability_feed_hook",
+            "vulnerability feed hook is configured",
+            Some(json!({ "hook": value.trim() })),
+        ),
+        _ => SkillSecurityAuditCheck {
+            check_id: "vulnerability_feed_hook".to_owned(),
+            status: SkillAuditCheckStatus::Warn,
+            severity: SkillAuditSeverity::Warning,
+            message:
+                "vulnerability feed hook is not configured (set PALYRA_SKILL_AUDIT_VULN_FEED_HOOK)"
+                    .to_owned(),
+            details: None,
+        },
+    };
+    checks.push(vulnerability_scan.clone());
+
+    let passed = !checks.iter().any(|check| check.status == SkillAuditCheckStatus::Fail);
+    let manifest = verification.manifest;
+    Ok(SkillSecurityAuditReport {
+        skill_id: manifest.skill_id,
+        version: manifest.version,
+        publisher: manifest.publisher,
+        accepted: verification.accepted,
+        passed,
+        should_quarantine: !passed,
+        trust_decision: verification.trust_decision,
+        payload_sha256: verification.payload_sha256,
+        generated_at_unix_ms: now_unix_ms(),
+        policy: policy.clone(),
+        checks,
+        quarantine_reasons,
+        vulnerability_scan,
+    })
+}
+
+fn module_imports_wasi_filesystem(module: &Module) -> bool {
+    module.imports().any(|import| {
+        let namespace = import.module().trim().to_ascii_lowercase();
+        namespace.starts_with("wasi:filesystem")
+    })
+}
+
+fn pass_audit_check(
+    check_id: impl Into<String>,
+    message: impl Into<String>,
+    details: Option<Value>,
+) -> SkillSecurityAuditCheck {
+    SkillSecurityAuditCheck {
+        check_id: check_id.into(),
+        status: SkillAuditCheckStatus::Pass,
+        severity: SkillAuditSeverity::Info,
+        message: message.into(),
+        details,
+    }
+}
+
+fn push_fail_check(
+    checks: &mut Vec<SkillSecurityAuditCheck>,
+    quarantine_reasons: &mut Vec<String>,
+    check_id: impl Into<String>,
+    message: impl Into<String>,
+    details: Option<Value>,
+) {
+    let message = message.into();
+    checks.push(SkillSecurityAuditCheck {
+        check_id: check_id.into(),
+        status: SkillAuditCheckStatus::Fail,
+        severity: SkillAuditSeverity::Error,
+        message: message.clone(),
+        details,
+    });
+    quarantine_reasons.push(message);
 }
 
 #[must_use]
@@ -1333,10 +1638,12 @@ fn default_quota_max_memory() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_signed_skill_artifact, capability_grants_from_manifest, inspect_skill_artifact,
-        parse_ed25519_signing_key, parse_manifest_toml, policy_requests_from_manifest,
-        verify_skill_artifact, ArtifactFile, SkillArtifactBuildRequest, SkillPackagingError,
-        SkillTrustStore, TrustDecision, MAX_ARTIFACT_BYTES, MAX_ENTRIES, SBOM_PATH, SIGNATURE_PATH,
+        audit_skill_artifact_security, build_signed_skill_artifact,
+        capability_grants_from_manifest, inspect_skill_artifact, parse_ed25519_signing_key,
+        parse_manifest_toml, policy_requests_from_manifest, verify_skill_artifact, ArtifactFile,
+        SkillArtifactBuildRequest, SkillAuditCheckStatus, SkillPackagingError,
+        SkillSecurityAuditPolicy, SkillTrustStore, TrustDecision, MAX_ARTIFACT_BYTES, MAX_ENTRIES,
+        SBOM_PATH, SIGNATURE_PATH,
     };
     use base64::Engine as _;
 
@@ -1414,6 +1721,24 @@ min_runtime_version = "0.1.0"
             provenance_json: sample_provenance(),
             signing_key: [5_u8; 32],
         }
+    }
+
+    fn build_artifact_for_audit(
+        manifest_toml: String,
+        module_bytes: Vec<u8>,
+    ) -> super::SkillArtifactBuildOutput {
+        build_signed_skill_artifact(SkillArtifactBuildRequest {
+            manifest_toml,
+            modules: vec![ArtifactFile { path: "module.wasm".to_owned(), bytes: module_bytes }],
+            assets: vec![ArtifactFile {
+                path: "templates/prompt.txt".to_owned(),
+                bytes: b"hello".to_vec(),
+            }],
+            sbom_cyclonedx_json: sample_sbom(),
+            provenance_json: sample_provenance(),
+            signing_key: [5_u8; 32],
+        })
+        .expect("artifact should build for audit test")
     }
 
     fn unique_temp_trust_store_path() -> std::path::PathBuf {
@@ -1607,6 +1932,119 @@ min_runtime_version = "0.1.0"
         assert!(
             requests.iter().any(|request| request.action == "tool.execute"),
             "tool policy requests should be generated"
+        );
+    }
+
+    #[test]
+    fn audit_reports_passing_result_for_baseline_skill() {
+        let artifact = build_artifact_for_audit(
+            sample_manifest(),
+            vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00],
+        );
+        let mut trust_store = SkillTrustStore::default();
+        let report = audit_skill_artifact_security(
+            artifact.artifact_bytes.as_slice(),
+            &mut trust_store,
+            true,
+            &SkillSecurityAuditPolicy::default(),
+        )
+        .expect("audit should succeed");
+
+        assert!(report.passed, "baseline skill should pass security audit");
+        assert!(
+            !report.should_quarantine,
+            "passing baseline skill should not be marked for quarantine"
+        );
+    }
+
+    #[test]
+    fn audit_quarantines_when_module_size_exceeds_policy_limit() {
+        let artifact = build_artifact_for_audit(
+            sample_manifest(),
+            vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00],
+        );
+        let mut trust_store = SkillTrustStore::default();
+        let policy = SkillSecurityAuditPolicy { max_module_bytes: 4, max_exported_functions: 16 };
+        let report = audit_skill_artifact_security(
+            artifact.artifact_bytes.as_slice(),
+            &mut trust_store,
+            true,
+            &policy,
+        )
+        .expect("audit should return report");
+
+        assert!(
+            report.should_quarantine,
+            "oversized module should trigger quarantine recommendation"
+        );
+        assert!(
+            report.checks.iter().any(|check| {
+                check.check_id == "wasm_module_size_limit"
+                    && check.status == SkillAuditCheckStatus::Fail
+            }),
+            "audit should include failing wasm module size check"
+        );
+    }
+
+    #[test]
+    fn audit_quarantines_wasi_filesystem_import_without_manifest_filesystem_capability() {
+        let manifest = sample_manifest()
+            .replace("read_roots = [\"skills/data\"]", "read_roots = []")
+            .replace("write_roots = [\"skills/cache\"]", "write_roots = []");
+        let module_wat = r#"
+            (module
+                (import "wasi:filesystem" "path_open" (func $path_open))
+                (func (export "run") (result i32) i32.const 0)
+            )
+        "#;
+        let artifact = build_artifact_for_audit(manifest, module_wat.as_bytes().to_vec());
+        let mut trust_store = SkillTrustStore::default();
+        let report = audit_skill_artifact_security(
+            artifact.artifact_bytes.as_slice(),
+            &mut trust_store,
+            true,
+            &SkillSecurityAuditPolicy::default(),
+        )
+        .expect("audit should return report");
+
+        assert!(report.should_quarantine, "filesystem import mismatch must quarantine");
+        assert!(
+            report.checks.iter().any(|check| {
+                check.check_id == "wasm_wasi_filesystem_imports"
+                    && check.status == SkillAuditCheckStatus::Fail
+            }),
+            "audit should record wasi:filesystem policy violation"
+        );
+    }
+
+    #[test]
+    fn audit_quarantines_module_export_count_over_limit() {
+        let module_wat = r#"
+            (module
+                (func (export "run") (result i32) i32.const 1)
+                (func (export "a") (result i32) i32.const 2)
+                (func (export "b") (result i32) i32.const 3)
+            )
+        "#;
+        let artifact = build_artifact_for_audit(sample_manifest(), module_wat.as_bytes().to_vec());
+        let mut trust_store = SkillTrustStore::default();
+        let policy =
+            SkillSecurityAuditPolicy { max_module_bytes: 64 * 1024, max_exported_functions: 1 };
+        let report = audit_skill_artifact_security(
+            artifact.artifact_bytes.as_slice(),
+            &mut trust_store,
+            true,
+            &policy,
+        )
+        .expect("audit should return report");
+
+        assert!(report.should_quarantine, "export count over policy should quarantine");
+        assert!(
+            report.checks.iter().any(|check| {
+                check.check_id == "wasm_exported_function_limit"
+                    && check.status == SkillAuditCheckStatus::Fail
+            }),
+            "audit should include exported function limit failure"
         );
     }
 

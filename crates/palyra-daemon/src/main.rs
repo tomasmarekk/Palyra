@@ -35,7 +35,8 @@ use gateway::{
 };
 use journal::{
     JournalAppendRequest, JournalConfig, JournalStore, OrchestratorCancelRequest,
-    OrchestratorRunStatusSnapshot,
+    OrchestratorRunStatusSnapshot, SkillExecutionStatus, SkillStatusRecord,
+    SkillStatusUpsertRequest,
 };
 use model_provider::{build_model_provider, ModelProviderKind};
 use palyra_common::default_identity_store_root;
@@ -102,6 +103,25 @@ struct RunTapeQuery {
 #[derive(Debug, Deserialize)]
 struct RunCancelRequest {
     reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SkillStatusRequest {
+    version: String,
+    reason: Option<String>,
+    #[serde(rename = "override")]
+    override_enabled: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct SkillStatusResponse {
+    skill_id: String,
+    version: String,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    detected_at_ms: i64,
+    operator_principal: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -357,6 +377,8 @@ async fn main() -> Result<()> {
         .route("/admin/v1/runs/{run_id}", get(admin_run_status_handler))
         .route("/admin/v1/runs/{run_id}/tape", get(admin_run_tape_handler))
         .route("/admin/v1/runs/{run_id}/cancel", post(admin_run_cancel_handler))
+        .route("/admin/v1/skills/{skill_id}/quarantine", post(admin_skill_quarantine_handler))
+        .route("/admin/v1/skills/{skill_id}/enable", post(admin_skill_enable_handler))
         .with_state(state);
 
     let admin_address = parse_daemon_bind_socket(&loaded.daemon.bind_addr, loaded.daemon.port)
@@ -700,6 +722,129 @@ async fn admin_run_cancel_handler(
         .await
         .map_err(runtime_status_response)?;
     Ok(Json(response))
+}
+
+async fn admin_skill_quarantine_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(skill_id): Path<String>,
+    Json(payload): Json<SkillStatusRequest>,
+) -> Result<Json<SkillStatusResponse>, Response> {
+    authorize_headers(&headers, &state.auth).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    let context = request_context_from_headers(&headers).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    state.runtime.record_admin_status_request();
+    let skill_id = normalize_non_empty_field(skill_id, "skill_id")?;
+    let version = normalize_non_empty_field(payload.version, "version")?;
+    let record = state
+        .runtime
+        .upsert_skill_status(SkillStatusUpsertRequest {
+            skill_id,
+            version,
+            status: SkillExecutionStatus::Quarantined,
+            reason: payload.reason.and_then(|value| {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_owned())
+                }
+            }),
+            detected_at_ms: unix_ms_now().map_err(|error| {
+                runtime_status_response(tonic::Status::internal(format!(
+                    "failed to read system clock: {error}"
+                )))
+            })?,
+            operator_principal: context.principal.clone(),
+        })
+        .await
+        .map_err(runtime_status_response)?;
+    state
+        .runtime
+        .record_skill_status_event(&context, "skill.quarantined", &record)
+        .await
+        .map_err(runtime_status_response)?;
+    Ok(Json(skill_status_response(record)))
+}
+
+async fn admin_skill_enable_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(skill_id): Path<String>,
+    Json(payload): Json<SkillStatusRequest>,
+) -> Result<Json<SkillStatusResponse>, Response> {
+    authorize_headers(&headers, &state.auth).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    let context = request_context_from_headers(&headers).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    state.runtime.record_admin_status_request();
+    if !payload.override_enabled.unwrap_or(false) {
+        return Err(runtime_status_response(tonic::Status::invalid_argument(
+            "enable requires explicit override=true acknowledgment",
+        )));
+    }
+    let skill_id = normalize_non_empty_field(skill_id, "skill_id")?;
+    let version = normalize_non_empty_field(payload.version, "version")?;
+    let record = state
+        .runtime
+        .upsert_skill_status(SkillStatusUpsertRequest {
+            skill_id,
+            version,
+            status: SkillExecutionStatus::Active,
+            reason: payload.reason.and_then(|value| {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_owned())
+                }
+            }),
+            detected_at_ms: unix_ms_now().map_err(|error| {
+                runtime_status_response(tonic::Status::internal(format!(
+                    "failed to read system clock: {error}"
+                )))
+            })?,
+            operator_principal: context.principal.clone(),
+        })
+        .await
+        .map_err(runtime_status_response)?;
+    state
+        .runtime
+        .record_skill_status_event(&context, "skill.enabled", &record)
+        .await
+        .map_err(runtime_status_response)?;
+    Ok(Json(skill_status_response(record)))
+}
+
+fn skill_status_response(record: SkillStatusRecord) -> SkillStatusResponse {
+    SkillStatusResponse {
+        skill_id: record.skill_id,
+        version: record.version,
+        status: record.status.as_str().to_owned(),
+        reason: record.reason,
+        detected_at_ms: record.detected_at_ms,
+        operator_principal: record.operator_principal,
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn normalize_non_empty_field(value: String, field_name: &'static str) -> Result<String, Response> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(runtime_status_response(tonic::Status::invalid_argument(format!(
+            "{field_name} cannot be empty"
+        ))));
+    }
+    Ok(trimmed.to_owned())
 }
 
 fn auth_error_response(error: AuthError) -> Response {
