@@ -39,8 +39,25 @@ jobs:
         if: ${{ hashFiles('apps/web/package-lock.json') != '' }}
         run: |
           mkdir -p security-artifacts
-          npm --prefix apps/web audit --json --omit=dev > security-artifacts/npm-audit-runtime.json
-          npm --prefix apps/web audit --json > security-artifacts/npm-audit-full.json
+          run_audit_json() {
+            local output_file="$1"
+            shift
+
+            set +e
+            npm --prefix apps/web audit --json "$@" > "$output_file"
+            local audit_exit_code=$?
+            set -e
+
+            # npm audit returns 1 when advisories are found. Treat that as expected
+            # so the dedicated allowlist validation step can make the policy decision.
+            if [ "$audit_exit_code" -ne 0 ] && [ "$audit_exit_code" -ne 1 ]; then
+              echo "npm audit failed with unexpected exit code: $audit_exit_code" >&2
+              exit "$audit_exit_code"
+            fi
+          }
+
+          run_audit_json security-artifacts/npm-audit-runtime.json --omit=dev
+          run_audit_json security-artifacts/npm-audit-full.json
 
       - name: Validate dev-only npm advisories allowlist
         if: ${{ hashFiles('apps/web/package-lock.json') != '' }}
