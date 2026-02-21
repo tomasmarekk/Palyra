@@ -114,6 +114,11 @@ const MAX_CRON_PAGE_LIMIT: usize = 500;
 const MAX_APPROVAL_PAGE_LIMIT: usize = 500;
 const MAX_APPROVAL_EXPORT_LIMIT: usize = 5_000;
 const MAX_APPROVAL_EXPORT_CHUNK_BYTES: usize = 64 * 1024;
+const APPROVAL_EXPORT_NDJSON_SCHEMA_ID: &str = "palyra.approvals.export.ndjson.v1";
+const APPROVAL_EXPORT_NDJSON_RECORD_TYPE_ENTRY: &str = "approval_record";
+const APPROVAL_EXPORT_NDJSON_RECORD_TYPE_TRAILER: &str = "export_trailer";
+const APPROVAL_EXPORT_CHAIN_SEED_HEX: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
 const MAX_MEMORY_PAGE_LIMIT: usize = 500;
 const MAX_MEMORY_SEARCH_TOP_K: usize = 64;
 const MAX_MEMORY_ITEM_BYTES: usize = 16 * 1024;
@@ -2773,6 +2778,80 @@ fn approval_record_message(record: &ApprovalRecord) -> gateway_v1::ApprovalRecor
     }
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+fn approval_export_chain_checksum(
+    sequence: u64,
+    previous_chain_checksum_sha256: &str,
+    record_checksum_sha256: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(APPROVAL_EXPORT_NDJSON_SCHEMA_ID.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(sequence.to_string().as_bytes());
+    hasher.update(b"\n");
+    hasher.update(previous_chain_checksum_sha256.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(record_checksum_sha256.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+#[allow(clippy::result_large_err)]
+fn approval_export_ndjson_record_line(
+    record: &ApprovalRecord,
+    sequence: u64,
+    previous_chain_checksum_sha256: &str,
+) -> Result<(Vec<u8>, String), Status> {
+    let record_payload = serde_json::to_value(record).map_err(|error| {
+        Status::internal(format!("failed to serialize approval export record payload: {error}"))
+    })?;
+    let record_payload_bytes = serde_json::to_vec(&record_payload).map_err(|error| {
+        Status::internal(format!("failed to encode approval export record payload bytes: {error}"))
+    })?;
+    let record_checksum_sha256 = sha256_hex(record_payload_bytes.as_slice());
+    let chain_checksum_sha256 = approval_export_chain_checksum(
+        sequence,
+        previous_chain_checksum_sha256,
+        record_checksum_sha256.as_str(),
+    );
+    let mut line = serde_json::to_vec(&json!({
+        "schema": APPROVAL_EXPORT_NDJSON_SCHEMA_ID,
+        "record_type": APPROVAL_EXPORT_NDJSON_RECORD_TYPE_ENTRY,
+        "sequence": sequence,
+        "prev_checksum_sha256": previous_chain_checksum_sha256,
+        "record_checksum_sha256": record_checksum_sha256,
+        "chain_checksum_sha256": chain_checksum_sha256,
+        "record": record_payload,
+    }))
+    .map_err(|error| {
+        Status::internal(format!("failed to encode approval export NDJSON record line: {error}"))
+    })?;
+    line.push(b'\n');
+    Ok((line, chain_checksum_sha256))
+}
+
+#[allow(clippy::result_large_err)]
+fn approval_export_ndjson_trailer_line(
+    exported_records: usize,
+    final_chain_checksum_sha256: &str,
+) -> Result<Vec<u8>, Status> {
+    let mut line = serde_json::to_vec(&json!({
+        "schema": APPROVAL_EXPORT_NDJSON_SCHEMA_ID,
+        "record_type": APPROVAL_EXPORT_NDJSON_RECORD_TYPE_TRAILER,
+        "exported_records": exported_records,
+        "final_chain_checksum_sha256": final_chain_checksum_sha256,
+    }))
+    .map_err(|error| {
+        Status::internal(format!("failed to encode approval export NDJSON trailer line: {error}"))
+    })?;
+    line.push(b'\n');
+    Ok(line)
+}
+
 fn approval_subject_type_to_proto(value: ApprovalSubjectType) -> i32 {
     match value {
         ApprovalSubjectType::Tool => gateway_v1::ApprovalSubjectType::Tool as i32,
@@ -5049,6 +5128,8 @@ impl gateway_v1::approvals_service_server::ApprovalsService for ApprovalsService
             let mut chunk_seq = 0_u32;
             let mut json_array_started = false;
             let mut json_first_item = true;
+            let mut ndjson_sequence = 0_u64;
+            let mut ndjson_last_chain_checksum = APPROVAL_EXPORT_CHAIN_SEED_HEX.to_owned();
 
             loop {
                 if exported >= export_limit {
@@ -5085,19 +5166,20 @@ impl gateway_v1::approvals_service_server::ApprovalsService for ApprovalsService
                     }
                     match export_format {
                         gateway_v1::ApprovalExportFormat::Ndjson => {
-                            let line = match serde_json::to_string(&record) {
-                                Ok(value) => format!("{value}\n"),
+                            ndjson_sequence = ndjson_sequence.saturating_add(1);
+                            let (line, chain_checksum) = match approval_export_ndjson_record_line(
+                                &record,
+                                ndjson_sequence,
+                                ndjson_last_chain_checksum.as_str(),
+                            ) {
+                                Ok(value) => value,
                                 Err(error) => {
-                                    let _ = sender
-                                        .send(Err(Status::internal(format!(
-                                            "failed to serialize approval export record: {error}"
-                                        ))))
-                                        .await;
+                                    let _ = sender.send(Err(error)).await;
                                     return;
                                 }
                             };
-                            let bytes = line.into_bytes();
-                            for chunk in bytes.chunks(MAX_APPROVAL_EXPORT_CHUNK_BYTES) {
+                            ndjson_last_chain_checksum = chain_checksum;
+                            for chunk in line.chunks(MAX_APPROVAL_EXPORT_CHUNK_BYTES) {
                                 chunk_seq = chunk_seq.saturating_add(1);
                                 if sender
                                     .send(Ok(gateway_v1::ExportApprovalsResponse {
@@ -5184,8 +5266,23 @@ impl gateway_v1::approvals_service_server::ApprovalsService for ApprovalsService
                 after_approval_id = Some(next_after);
             }
 
-            if export_format == gateway_v1::ApprovalExportFormat::Json {
-                let suffix: &[u8] = if json_array_started { b"]" } else { b"[]" };
+            let export_suffix = if export_format == gateway_v1::ApprovalExportFormat::Json {
+                Some(if json_array_started { b"]".to_vec() } else { b"[]".to_vec() })
+            } else if export_format == gateway_v1::ApprovalExportFormat::Ndjson {
+                match approval_export_ndjson_trailer_line(
+                    exported,
+                    ndjson_last_chain_checksum.as_str(),
+                ) {
+                    Ok(value) => Some(value),
+                    Err(error) => {
+                        let _ = sender.send(Err(error)).await;
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            if let Some(suffix) = export_suffix {
                 for chunk in suffix.chunks(MAX_APPROVAL_EXPORT_CHUNK_BYTES) {
                     chunk_seq = chunk_seq.saturating_add(1);
                     if sender

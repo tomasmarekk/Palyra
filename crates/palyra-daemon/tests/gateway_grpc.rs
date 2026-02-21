@@ -16,6 +16,7 @@ use anyhow::{Context, Result};
 use reqwest::blocking::Client;
 use rusqlite::{params, Connection};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use std::path::Path;
 use tokio::sync::mpsc as tokio_mpsc;
@@ -2471,6 +2472,107 @@ async fn grpc_approvals_service_persists_and_exports_denied_tool_approval() -> R
     assert!(
         exported_text.contains(approval_id.as_str()),
         "export output must contain persisted approval_id"
+    );
+    let mut ndjson_record_count = 0_usize;
+    let mut ndjson_previous_chain =
+        "0000000000000000000000000000000000000000000000000000000000000000".to_owned();
+    let mut saw_ndjson_trailer = false;
+    for line in exported_text.lines().filter(|line| !line.trim().is_empty()) {
+        let envelope = serde_json::from_str::<Value>(line)
+            .context("approval export line must be valid JSON")?;
+        let record_type = envelope
+            .get("record_type")
+            .and_then(Value::as_str)
+            .context("approval export line missing record_type")?;
+        assert_eq!(
+            envelope.get("schema").and_then(Value::as_str),
+            Some("palyra.approvals.export.ndjson.v1"),
+            "approval export NDJSON schema id mismatch"
+        );
+        match record_type {
+            "approval_record" => {
+                ndjson_record_count = ndjson_record_count.saturating_add(1);
+                let sequence = envelope
+                    .get("sequence")
+                    .and_then(Value::as_u64)
+                    .context("approval record line missing sequence")?;
+                assert_eq!(
+                    sequence as usize, ndjson_record_count,
+                    "approval export NDJSON sequence must be contiguous starting at 1"
+                );
+                let prev_checksum = envelope
+                    .get("prev_checksum_sha256")
+                    .and_then(Value::as_str)
+                    .context("approval record line missing prev checksum")?;
+                assert_eq!(
+                    prev_checksum,
+                    ndjson_previous_chain.as_str(),
+                    "approval export NDJSON chain previous checksum mismatch"
+                );
+                let record_payload = envelope
+                    .get("record")
+                    .context("approval record line missing nested record payload")?;
+                let record_payload_bytes = serde_json::to_vec(record_payload)
+                    .context("failed to serialize exported approval record payload bytes")?;
+                let mut record_hasher = Sha256::new();
+                record_hasher.update(record_payload_bytes.as_slice());
+                let expected_record_checksum = format!("{:x}", record_hasher.finalize());
+                let record_checksum = envelope
+                    .get("record_checksum_sha256")
+                    .and_then(Value::as_str)
+                    .context("approval record line missing record checksum")?;
+                assert_eq!(
+                    record_checksum, expected_record_checksum,
+                    "approval export NDJSON record checksum must match serialized record payload"
+                );
+                let mut chain_hasher = Sha256::new();
+                chain_hasher.update(b"palyra.approvals.export.ndjson.v1");
+                chain_hasher.update(b"\n");
+                chain_hasher.update(sequence.to_string().as_bytes());
+                chain_hasher.update(b"\n");
+                chain_hasher.update(prev_checksum.as_bytes());
+                chain_hasher.update(b"\n");
+                chain_hasher.update(record_checksum.as_bytes());
+                let expected_chain_checksum = format!("{:x}", chain_hasher.finalize());
+                let chain_checksum = envelope
+                    .get("chain_checksum_sha256")
+                    .and_then(Value::as_str)
+                    .context("approval record line missing chain checksum")?;
+                assert_eq!(
+                    chain_checksum, expected_chain_checksum,
+                    "approval export NDJSON chain checksum must match computed value"
+                );
+                ndjson_previous_chain = chain_checksum.to_owned();
+            }
+            "export_trailer" => {
+                saw_ndjson_trailer = true;
+                let exported_records = envelope
+                    .get("exported_records")
+                    .and_then(Value::as_u64)
+                    .context("approval export trailer missing exported_records")?;
+                assert_eq!(
+                    exported_records as usize, ndjson_record_count,
+                    "approval export trailer must report all exported approval records"
+                );
+                let final_chain_checksum = envelope
+                    .get("final_chain_checksum_sha256")
+                    .and_then(Value::as_str)
+                    .context("approval export trailer missing final chain checksum")?;
+                assert_eq!(
+                    final_chain_checksum,
+                    ndjson_previous_chain.as_str(),
+                    "approval export trailer final chain checksum must match record chain tip"
+                );
+            }
+            _ => {
+                panic!("unexpected approval export NDJSON record_type value: {record_type}");
+            }
+        }
+    }
+    assert!(ndjson_record_count > 0, "approval export NDJSON should include at least one record");
+    assert!(
+        saw_ndjson_trailer,
+        "approval export NDJSON must include terminal trailer line for tamper-evident chain"
     );
     assert!(!exported_text.contains("token=abc"), "export output must keep redacted token values");
     assert!(
