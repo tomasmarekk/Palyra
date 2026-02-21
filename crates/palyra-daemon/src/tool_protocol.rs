@@ -8,7 +8,8 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::sandbox_runner::{
-    run_constrained_process, SandboxProcessRunErrorKind, SandboxProcessRunnerPolicy,
+    run_constrained_process, EgressEnforcementMode, SandboxProcessRunErrorKind,
+    SandboxProcessRunnerPolicy,
 };
 use crate::wasm_plugin_runner::{run_wasm_plugin, WasmPluginRunErrorKind, WasmPluginRunnerPolicy};
 
@@ -50,6 +51,7 @@ pub struct ToolAttestation {
     pub executed_at_unix_ms: i64,
     pub timed_out: bool,
     pub executor: String,
+    pub sandbox_enforcement: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +76,8 @@ pub struct ProcessRunnerPolicySnapshot {
     pub enabled: bool,
     pub workspace_root: String,
     pub allowed_executables: Vec<String>,
+    pub allow_interpreters: bool,
+    pub egress_enforcement_mode: String,
     pub allowed_egress_hosts: Vec<String>,
     pub allowed_dns_suffixes: Vec<String>,
     pub cpu_time_limit_ms: u64,
@@ -113,6 +117,12 @@ pub fn tool_policy_snapshot(config: &ToolCallConfig) -> ToolCallPolicySnapshot {
             enabled: config.process_runner.enabled,
             workspace_root: config.process_runner.workspace_root.to_string_lossy().into_owned(),
             allowed_executables: config.process_runner.allowed_executables.clone(),
+            allow_interpreters: config.process_runner.allow_interpreters,
+            egress_enforcement_mode: config
+                .process_runner
+                .egress_enforcement_mode
+                .as_str()
+                .to_owned(),
             allowed_egress_hosts: config.process_runner.allowed_egress_hosts.clone(),
             allowed_dns_suffixes: config.process_runner.allowed_dns_suffixes.clone(),
             cpu_time_limit_ms: config.process_runner.cpu_time_limit_ms,
@@ -287,6 +297,7 @@ pub fn denied_execution_outcome(
             error: reason.to_owned(),
             timed_out: false,
             executor: "policy".to_owned(),
+            sandbox_enforcement: "none".to_owned(),
         },
     )
 }
@@ -311,6 +322,11 @@ pub async fn execute_tool_call(
                 error: format!("tool execution timed out after {}ms", config.execution_timeout_ms),
                 timed_out: true,
                 executor: tool_executor_name(tool_name).to_owned(),
+                sandbox_enforcement: if tool_name == "palyra.process.run" {
+                    config.process_runner.egress_enforcement_mode.as_str().to_owned()
+                } else {
+                    "none".to_owned()
+                },
             },
         }
     };
@@ -325,6 +341,7 @@ struct ToolExecutionRawResult {
     error: String,
     timed_out: bool,
     executor: String,
+    sandbox_enforcement: String,
 }
 
 fn build_execution_outcome(
@@ -343,6 +360,7 @@ fn build_execution_outcome(
         raw.error.as_str(),
         raw.timed_out,
         raw.executor.as_str(),
+        raw.sandbox_enforcement.as_str(),
         executed_at_unix_ms,
     );
     ToolExecutionOutcome {
@@ -355,6 +373,7 @@ fn build_execution_outcome(
             executed_at_unix_ms,
             timed_out: raw.timed_out,
             executor: raw.executor,
+            sandbox_enforcement: raw.sandbox_enforcement,
         },
     }
 }
@@ -372,6 +391,7 @@ async fn run_allowlisted_tool(
                 error: String::new(),
                 timed_out: false,
                 executor: "builtin".to_owned(),
+                sandbox_enforcement: "none".to_owned(),
             },
             Err(error) => ToolExecutionRawResult {
                 success: false,
@@ -379,6 +399,7 @@ async fn run_allowlisted_tool(
                 error,
                 timed_out: false,
                 executor: "builtin".to_owned(),
+                sandbox_enforcement: "none".to_owned(),
             },
         },
         "palyra.sleep" => match execute_sleep_tool(input_json).await {
@@ -388,6 +409,7 @@ async fn run_allowlisted_tool(
                 error: String::new(),
                 timed_out: false,
                 executor: "builtin".to_owned(),
+                sandbox_enforcement: "none".to_owned(),
             },
             Err(error) => ToolExecutionRawResult {
                 success: false,
@@ -395,6 +417,7 @@ async fn run_allowlisted_tool(
                 error,
                 timed_out: false,
                 executor: "builtin".to_owned(),
+                sandbox_enforcement: "none".to_owned(),
             },
         },
         "palyra.process.run" => execute_process_runner_tool(config, input_json).await,
@@ -405,6 +428,7 @@ async fn run_allowlisted_tool(
             error: "allowlisted tool is not implemented by runtime executor".to_owned(),
             timed_out: false,
             executor: "builtin".to_owned(),
+            sandbox_enforcement: "none".to_owned(),
         },
     }
 }
@@ -437,6 +461,14 @@ async fn execute_process_runner_tool(
     input_json: &[u8],
 ) -> ToolExecutionRawResult {
     let policy = config.process_runner.clone();
+    if matches!(policy.egress_enforcement_mode, EgressEnforcementMode::Preflight) {
+        warn!(
+            allowed_egress_hosts = ?policy.allowed_egress_hosts,
+            allowed_dns_suffixes = ?policy.allowed_dns_suffixes,
+            "sandbox process runner uses preflight egress validation only; OS-level network egress is not enforced"
+        );
+    }
+    let sandbox_enforcement = policy.egress_enforcement_mode.as_str().to_owned();
     let input = input_json.to_vec();
     let timeout = Duration::from_millis(config.execution_timeout_ms);
     match tokio::task::spawn_blocking(move || {
@@ -450,6 +482,7 @@ async fn execute_process_runner_tool(
             error: String::new(),
             timed_out: false,
             executor: "sandbox_tier_b".to_owned(),
+            sandbox_enforcement: sandbox_enforcement.clone(),
         },
         Ok(Err(error)) => {
             if matches!(
@@ -464,6 +497,7 @@ async fn execute_process_runner_tool(
                 error: error.message,
                 timed_out: matches!(error.kind, SandboxProcessRunErrorKind::TimedOut),
                 executor: "sandbox_tier_b".to_owned(),
+                sandbox_enforcement: sandbox_enforcement.clone(),
             }
         }
         Err(join_error) => ToolExecutionRawResult {
@@ -472,6 +506,7 @@ async fn execute_process_runner_tool(
             error: format!("sandbox process runner worker failed: {join_error}"),
             timed_out: false,
             executor: "sandbox_tier_b".to_owned(),
+            sandbox_enforcement,
         },
     }
 }
@@ -492,6 +527,7 @@ async fn execute_wasm_plugin_tool(
             error: String::new(),
             timed_out: false,
             executor: "sandbox_tier_a".to_owned(),
+            sandbox_enforcement: "none".to_owned(),
         },
         Ok(Err(error)) => {
             if matches!(
@@ -509,6 +545,7 @@ async fn execute_wasm_plugin_tool(
                 error: error.message,
                 timed_out: matches!(error.kind, WasmPluginRunErrorKind::TimedOut),
                 executor: "sandbox_tier_a".to_owned(),
+                sandbox_enforcement: "none".to_owned(),
             }
         }
         Err(join_error) => ToolExecutionRawResult {
@@ -517,6 +554,7 @@ async fn execute_wasm_plugin_tool(
             error: format!("sandbox wasm plugin worker failed: {join_error}"),
             timed_out: false,
             executor: "sandbox_tier_a".to_owned(),
+            sandbox_enforcement: "none".to_owned(),
         },
     }
 }
@@ -568,6 +606,7 @@ fn compute_execution_hash(
     error: &str,
     timed_out: bool,
     executor: &str,
+    sandbox_enforcement: &str,
     executed_at_unix_ms: i64,
 ) -> String {
     let mut hasher = Sha256::new();
@@ -580,6 +619,7 @@ fn compute_execution_hash(
     hash_len_prefixed_str(&mut hasher, error);
     hasher.update([u8::from(timed_out)]);
     hash_len_prefixed_str(&mut hasher, executor);
+    hash_len_prefixed_str(&mut hasher, sandbox_enforcement);
     hasher.update(executed_at_unix_ms.to_be_bytes());
     format!("{:x}", hasher.finalize())
 }
@@ -603,7 +643,7 @@ mod tests {
         decide_tool_call, denied_execution_outcome, execute_tool_call, tool_policy_snapshot,
         tool_requires_approval, ToolCallConfig,
     };
-    use crate::sandbox_runner::SandboxProcessRunnerPolicy;
+    use crate::sandbox_runner::{EgressEnforcementMode, SandboxProcessRunnerPolicy};
     use crate::wasm_plugin_runner::WasmPluginRunnerPolicy;
 
     fn default_process_runner_policy() -> SandboxProcessRunnerPolicy {
@@ -611,6 +651,8 @@ mod tests {
             enabled: false,
             workspace_root: std::env::current_dir().unwrap_or_else(|_| ".".into()),
             allowed_executables: Vec::new(),
+            allow_interpreters: false,
+            egress_enforcement_mode: EgressEnforcementMode::Strict,
             allowed_egress_hosts: Vec::new(),
             allowed_dns_suffixes: Vec::new(),
             cpu_time_limit_ms: 2_000,
@@ -829,6 +871,8 @@ mod tests {
                 enabled: true,
                 workspace_root: std::env::current_dir().expect("current_dir should resolve"),
                 allowed_executables: vec!["uname".to_owned()],
+                allow_interpreters: false,
+                egress_enforcement_mode: EgressEnforcementMode::Strict,
                 allowed_egress_hosts: Vec::new(),
                 allowed_dns_suffixes: Vec::new(),
                 cpu_time_limit_ms: 2_000,
@@ -848,6 +892,7 @@ mod tests {
 
         assert!(outcome.success, "sandbox process runner should execute allowlisted command");
         assert_eq!(outcome.attestation.executor, "sandbox_tier_b");
+        assert_eq!(outcome.attestation.sandbox_enforcement, "strict");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -861,6 +906,8 @@ mod tests {
                 enabled: true,
                 workspace_root: std::env::current_dir().expect("current_dir should resolve"),
                 allowed_executables: vec!["uname".to_owned()],
+                allow_interpreters: false,
+                egress_enforcement_mode: EgressEnforcementMode::Strict,
                 allowed_egress_hosts: Vec::new(),
                 allowed_dns_suffixes: Vec::new(),
                 cpu_time_limit_ms: 2_000,
@@ -880,6 +927,7 @@ mod tests {
 
         assert!(!outcome.success, "sandbox runner must block traversal path");
         assert_eq!(outcome.attestation.executor, "sandbox_tier_b");
+        assert_eq!(outcome.attestation.sandbox_enforcement, "strict");
         assert!(outcome.error.contains("path traversal"));
     }
 
@@ -1011,6 +1059,7 @@ mod tests {
         assert!(!outcome.success);
         assert!(outcome.error.contains("denied"));
         assert_eq!(outcome.attestation.executor, "policy");
+        assert_eq!(outcome.attestation.sandbox_enforcement, "none");
     }
 
     #[test]
@@ -1034,6 +1083,7 @@ mod tests {
             "B|C",
             false,
             "builtin",
+            "none",
             1_735_689_600_000,
         );
         let hash_two = super::compute_execution_hash(
@@ -1045,6 +1095,7 @@ mod tests {
             "C",
             false,
             "builtin",
+            "none",
             1_735_689_600_000,
         );
         assert_ne!(hash_one, hash_two, "distinct field tuples must hash differently");

@@ -13,6 +13,7 @@ use palyra_common::{
 };
 
 use crate::model_provider::{ModelProviderConfig, ModelProviderKind};
+use crate::sandbox_runner::EgressEnforcementMode;
 
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 7142;
@@ -40,6 +41,9 @@ const DEFAULT_TOOL_CALL_MAX_CALLS_PER_RUN: u32 = 4;
 const DEFAULT_TOOL_CALL_EXECUTION_TIMEOUT_MS: u64 = 750;
 const DEFAULT_PROCESS_RUNNER_ENABLED: bool = false;
 const DEFAULT_PROCESS_RUNNER_WORKSPACE_ROOT: &str = ".";
+const DEFAULT_PROCESS_RUNNER_ALLOW_INTERPRETERS: bool = false;
+const DEFAULT_PROCESS_RUNNER_EGRESS_ENFORCEMENT_MODE: EgressEnforcementMode =
+    EgressEnforcementMode::Strict;
 const DEFAULT_PROCESS_RUNNER_CPU_TIME_LIMIT_MS: u64 = 2_000;
 const DEFAULT_PROCESS_RUNNER_MEMORY_LIMIT_BYTES: u64 = 256 * 1024 * 1024;
 const DEFAULT_PROCESS_RUNNER_MAX_OUTPUT_BYTES: u64 = 64 * 1024;
@@ -126,6 +130,8 @@ pub struct ProcessRunnerConfig {
     pub enabled: bool,
     pub workspace_root: PathBuf,
     pub allowed_executables: Vec<String>,
+    pub allow_interpreters: bool,
+    pub egress_enforcement_mode: EgressEnforcementMode,
     pub allowed_egress_hosts: Vec<String>,
     pub allowed_dns_suffixes: Vec<String>,
     pub cpu_time_limit_ms: u64,
@@ -262,6 +268,8 @@ impl Default for ProcessRunnerConfig {
             enabled: DEFAULT_PROCESS_RUNNER_ENABLED,
             workspace_root: PathBuf::from(DEFAULT_PROCESS_RUNNER_WORKSPACE_ROOT),
             allowed_executables: Vec::new(),
+            allow_interpreters: DEFAULT_PROCESS_RUNNER_ALLOW_INTERPRETERS,
+            egress_enforcement_mode: DEFAULT_PROCESS_RUNNER_EGRESS_ENFORCEMENT_MODE,
             allowed_egress_hosts: Vec::new(),
             allowed_dns_suffixes: Vec::new(),
             cpu_time_limit_ms: DEFAULT_PROCESS_RUNNER_CPU_TIME_LIMIT_MS,
@@ -479,6 +487,16 @@ pub fn load_config() -> Result<LoadedConfig> {
                         parse_process_executable_allowlist(
                             allowed_executables.join(",").as_str(),
                             "tool_call.process_runner.allowed_executables",
+                        )?;
+                }
+                if let Some(allow_interpreters) = file_process_runner.allow_interpreters {
+                    tool_call.process_runner.allow_interpreters = allow_interpreters;
+                }
+                if let Some(egress_enforcement_mode) = file_process_runner.egress_enforcement_mode {
+                    tool_call.process_runner.egress_enforcement_mode =
+                        parse_process_runner_egress_enforcement_mode(
+                            egress_enforcement_mode.as_str(),
+                            "tool_call.process_runner.egress_enforcement_mode",
                         )?;
                 }
                 if let Some(allowed_egress_hosts) = file_process_runner.allowed_egress_hosts {
@@ -1068,6 +1086,18 @@ fn parse_process_executable_allowlist(raw: &str, source_name: &str) -> Result<Ve
     parse_identifier_allowlist(raw, source_name, "executable name")
 }
 
+fn parse_process_runner_egress_enforcement_mode(
+    raw: &str,
+    source_name: &str,
+) -> Result<EgressEnforcementMode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "none" => Ok(EgressEnforcementMode::None),
+        "preflight" => Ok(EgressEnforcementMode::Preflight),
+        "strict" => Ok(EgressEnforcementMode::Strict),
+        _ => anyhow::bail!("{source_name} must be one of: none, preflight, strict"),
+    }
+}
+
 fn parse_identifier_allowlist(raw: &str, source_name: &str, label: &str) -> Result<Vec<String>> {
     let mut allowlist = Vec::new();
     for candidate in raw.split(',').map(str::trim).filter(|value| !value.is_empty()) {
@@ -1219,12 +1249,13 @@ mod tests {
     use super::{
         parse_default_memory_ttl_ms, parse_dns_suffix_allowlist, parse_host_allowlist,
         parse_journal_db_path, parse_openai_base_url, parse_positive_usize,
-        parse_process_executable_allowlist, parse_root_file_config, parse_storage_prefix_allowlist,
-        parse_tool_allowlist, parse_vault_dir, AdminConfig, GatewayConfig, GatewayTlsConfig,
-        IdentityConfig, MemoryConfig, ModelProviderConfig, OrchestratorConfig, StorageConfig,
-        ToolCallConfig,
+        parse_process_executable_allowlist, parse_process_runner_egress_enforcement_mode,
+        parse_root_file_config, parse_storage_prefix_allowlist, parse_tool_allowlist,
+        parse_vault_dir, AdminConfig, GatewayConfig, GatewayTlsConfig, IdentityConfig,
+        MemoryConfig, ModelProviderConfig, OrchestratorConfig, StorageConfig, ToolCallConfig,
     };
     use crate::model_provider::ModelProviderKind;
+    use crate::sandbox_runner::EgressEnforcementMode;
     use palyra_common::daemon_config_schema::RootFileConfig;
 
     #[test]
@@ -1295,6 +1326,15 @@ mod tests {
         assert!(
             config.process_runner.allowed_executables.is_empty(),
             "sandbox process runner executable allowlist must default empty"
+        );
+        assert!(
+            !config.process_runner.allow_interpreters,
+            "interpreter execution must default to explicit opt-in"
+        );
+        assert_eq!(
+            config.process_runner.egress_enforcement_mode,
+            EgressEnforcementMode::Strict,
+            "process runner egress enforcement must default to strict"
         );
         assert!(!config.wasm_runtime.enabled, "wasm plugin runtime must default to disabled");
         assert_eq!(config.wasm_runtime.max_module_size_bytes, 256 * 1024);
@@ -1525,6 +1565,43 @@ mod tests {
         )
         .expect("allowlist should parse");
         assert_eq!(parsed, vec!["rustc".to_owned(), "cargo".to_owned()]);
+    }
+
+    #[test]
+    fn parse_process_runner_egress_enforcement_mode_accepts_supported_values() {
+        assert_eq!(
+            parse_process_runner_egress_enforcement_mode(
+                "none",
+                "tool_call.process_runner.egress_enforcement_mode",
+            )
+            .expect("none mode should parse"),
+            EgressEnforcementMode::None
+        );
+        assert_eq!(
+            parse_process_runner_egress_enforcement_mode(
+                "preflight",
+                "tool_call.process_runner.egress_enforcement_mode",
+            )
+            .expect("preflight mode should parse"),
+            EgressEnforcementMode::Preflight
+        );
+        assert_eq!(
+            parse_process_runner_egress_enforcement_mode(
+                "strict",
+                "tool_call.process_runner.egress_enforcement_mode",
+            )
+            .expect("strict mode should parse"),
+            EgressEnforcementMode::Strict
+        );
+    }
+
+    #[test]
+    fn parse_process_runner_egress_enforcement_mode_rejects_unknown_values() {
+        let result = parse_process_runner_egress_enforcement_mode(
+            "best_effort",
+            "tool_call.process_runner.egress_enforcement_mode",
+        );
+        assert!(result.is_err(), "unsupported egress enforcement mode must fail parsing");
     }
 
     #[test]

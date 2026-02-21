@@ -151,6 +151,8 @@ pub struct FileProcessRunnerConfig {
     pub enabled: Option<bool>,
     pub workspace_root: Option<String>,
     pub allowed_executables: Option<Vec<String>>,
+    pub allow_interpreters: Option<bool>,
+    pub egress_enforcement_mode: Option<String>,
     pub allowed_egress_hosts: Option<Vec<String>>,
     pub allowed_dns_suffixes: Option<Vec<String>>,
     pub cpu_time_limit_ms: Option<u64>,
