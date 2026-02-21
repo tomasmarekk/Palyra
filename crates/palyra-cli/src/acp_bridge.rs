@@ -589,30 +589,7 @@ impl acp::Agent for PalyraAcpAgent {
     ) -> acp::Result<acp::ListSessionsResponse> {
         let response = self.list_gateway_sessions(arguments.cursor).await?;
         let state = self.lock_state()?;
-        let sessions = response
-            .sessions
-            .into_iter()
-            .map(|session| {
-                let session_key = if session.session_key.trim().is_empty() {
-                    session
-                        .session_id
-                        .as_ref()
-                        .map(|value| value.ulid.clone())
-                        .unwrap_or_else(|| format!("session-{}", ulid::Ulid::new()))
-                } else {
-                    session.session_key
-                };
-                let cwd = state
-                    .sessions
-                    .get(&session_key)
-                    .map(|binding| binding.cwd.clone())
-                    .unwrap_or_else(|| self.default_cwd.clone());
-                acp::SessionInfo::new(acp::SessionId::new(session_key), cwd)
-                    .title(non_empty(Some(session.session_label)))
-            })
-            .collect::<Vec<_>>();
-        Ok(acp::ListSessionsResponse::new(sessions)
-            .next_cursor(non_empty(Some(response.next_after_session_key))))
+        Ok(map_list_sessions_response(response, &state.sessions, &self.default_cwd))
     }
 }
 
@@ -828,6 +805,36 @@ fn map_permission_outcome(
     }
 }
 
+fn map_list_sessions_response(
+    response: gateway_v1::ListSessionsResponse,
+    session_bindings: &HashMap<String, SessionBinding>,
+    default_cwd: &PathBuf,
+) -> acp::ListSessionsResponse {
+    let sessions = response
+        .sessions
+        .into_iter()
+        .map(|session| {
+            let session_key = if session.session_key.trim().is_empty() {
+                session
+                    .session_id
+                    .as_ref()
+                    .map(|value| value.ulid.clone())
+                    .unwrap_or_else(|| format!("session-{}", ulid::Ulid::new()))
+            } else {
+                session.session_key
+            };
+            let cwd = session_bindings
+                .get(&session_key)
+                .map(|binding| binding.cwd.clone())
+                .unwrap_or_else(|| default_cwd.clone());
+            acp::SessionInfo::new(acp::SessionId::new(session_key), cwd)
+                .title(non_empty(Some(session.session_label)))
+        })
+        .collect::<Vec<_>>();
+    acp::ListSessionsResponse::new(sessions)
+        .next_cursor(non_empty(Some(response.next_after_session_key)))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_tool_approval_stream_request(
     session_id_ulid: &str,
@@ -880,8 +887,16 @@ fn non_empty(value: Option<String>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{acp, AgentConnection, BridgeState, ClientBridgeRequest, PalyraAcpAgent};
+    use super::{
+        acp, build_tool_permission_request, map_list_sessions_response, map_permission_outcome,
+        AgentConnection, BridgeState, ClientBridgeRequest, PalyraAcpAgent, SessionBinding,
+        PERMISSION_ALLOW_ALWAYS, PERMISSION_ALLOW_ONCE, PERMISSION_REJECT_ALWAYS,
+        PERMISSION_REJECT_ONCE,
+    };
+    use crate::proto::palyra::{common::v1 as common_v1, gateway::v1 as gateway_v1};
+    use serde_json::json;
     use std::{
+        collections::HashMap,
         path::PathBuf,
         sync::{Arc, Mutex},
     };
@@ -931,5 +946,172 @@ mod tests {
         .expect("initialize must succeed");
 
         assert_eq!(response.protocol_version, requested_version);
+        assert!(response.agent_capabilities.load_session);
+        assert!(response.agent_capabilities.session_capabilities.list.is_some());
+    }
+
+    #[test]
+    fn build_tool_permission_request_maps_prompt_payload_and_options() {
+        let session_id = acp::SessionId::new("session-alpha");
+        let approval = common_v1::ToolApprovalRequest {
+            proposal_id: Some(common_v1::CanonicalId {
+                ulid: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            }),
+            tool_name: "palyra.http.fetch".to_owned(),
+            input_json: br#"{"url":"https://example.test"}"#.to_vec(),
+            approval_required: true,
+            approval_id: Some(common_v1::CanonicalId {
+                ulid: "01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned(),
+            }),
+            prompt: Some(common_v1::ApprovalPrompt {
+                title: "  Approve outbound request  ".to_owned(),
+                risk_level: 3,
+                subject_id: "network:egress".to_owned(),
+                summary: "HTTP call to external API".to_owned(),
+                options: Vec::new(),
+                timeout_seconds: 30,
+                details_json: br#"{"host":"example.test","method":"GET"}"#.to_vec(),
+                policy_explanation: "external egress requires operator approval".to_owned(),
+            }),
+            request_summary: "GET https://example.test".to_owned(),
+        };
+
+        let request = build_tool_permission_request(&session_id, &approval)
+            .expect("permission request mapping should succeed")
+            .expect("proposal id should produce a permission request");
+
+        assert_eq!(request.session_id, session_id);
+        assert_eq!(request.tool_call.tool_call_id.0.as_ref(), "01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        assert_eq!(request.tool_call.fields.title.as_deref(), Some("Approve outbound request"));
+        assert_eq!(request.tool_call.fields.kind, Some(acp::ToolKind::Execute));
+        assert_eq!(request.tool_call.fields.status, Some(acp::ToolCallStatus::Pending));
+        let raw_input = request
+            .tool_call
+            .fields
+            .raw_input
+            .as_ref()
+            .expect("prompt payload should include raw input details");
+        assert_eq!(raw_input["tool_name"], json!("palyra.http.fetch"));
+        assert_eq!(raw_input["request_summary"], json!("GET https://example.test"));
+        assert_eq!(raw_input["prompt"]["subject_id"], json!("network:egress"));
+        assert_eq!(
+            raw_input["prompt"]["policy_explanation"],
+            json!("external egress requires operator approval")
+        );
+        assert_eq!(raw_input["prompt"]["details_json"]["host"], json!("example.test"));
+        assert_eq!(raw_input["prompt"]["details_json"]["method"], json!("GET"));
+
+        let option_contract = request
+            .options
+            .iter()
+            .map(|option| (option.option_id.0.as_ref(), option.name.as_str(), option.kind))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            option_contract,
+            vec![
+                (PERMISSION_ALLOW_ONCE, "Allow once", acp::PermissionOptionKind::AllowOnce,),
+                (PERMISSION_ALLOW_ALWAYS, "Allow always", acp::PermissionOptionKind::AllowAlways,),
+                (PERMISSION_REJECT_ONCE, "Reject once", acp::PermissionOptionKind::RejectOnce,),
+                (
+                    PERMISSION_REJECT_ALWAYS,
+                    "Reject always",
+                    acp::PermissionOptionKind::RejectAlways,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_tool_permission_request_without_proposal_id_returns_none() {
+        let request = build_tool_permission_request(
+            &acp::SessionId::new("session-alpha"),
+            &common_v1::ToolApprovalRequest { proposal_id: None, ..Default::default() },
+        )
+        .expect("missing proposal id should not fail");
+
+        assert!(request.is_none());
+    }
+
+    #[test]
+    fn map_permission_outcome_preserves_openclaw_permission_semantics() {
+        let once_scope = common_v1::ApprovalDecisionScope::Once as i32;
+        let session_scope = common_v1::ApprovalDecisionScope::Session as i32;
+        let cases = vec![
+            (PERMISSION_ALLOW_ONCE, true, "approved:allow-once", once_scope),
+            (PERMISSION_ALLOW_ALWAYS, true, "approved:allow-always", session_scope),
+            (PERMISSION_REJECT_ONCE, false, "denied:reject-once", once_scope),
+            (PERMISSION_REJECT_ALWAYS, false, "denied:reject-always", session_scope),
+            ("unsupported-option", false, "denied:unsupported-option", once_scope),
+        ];
+
+        for (option_id, expected_approved, expected_reason, expected_scope) in cases {
+            let response =
+                acp::RequestPermissionResponse::new(acp::RequestPermissionOutcome::Selected(
+                    acp::SelectedPermissionOutcome::new(option_id),
+                ));
+            let mapped = map_permission_outcome(response);
+            assert_eq!(mapped.0, expected_approved);
+            assert_eq!(mapped.1, expected_reason);
+            assert_eq!(mapped.2, expected_scope);
+            assert_eq!(mapped.3, None);
+        }
+
+        let cancelled = map_permission_outcome(acp::RequestPermissionResponse::new(
+            acp::RequestPermissionOutcome::Cancelled,
+        ));
+        assert_eq!(cancelled, (false, "cancelled_by_client".to_owned(), once_scope, None,));
+    }
+
+    #[test]
+    fn map_list_sessions_response_uses_session_key_fallback_and_binding_cwd() {
+        let default_cwd = PathBuf::from("C:/workspace/default");
+        let mut session_bindings = HashMap::new();
+        session_bindings.insert(
+            "session-alpha".to_owned(),
+            SessionBinding {
+                gateway_session_id_ulid: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),
+                session_key: "session-alpha".to_owned(),
+                session_label: Some("Project Alpha".to_owned()),
+                cwd: PathBuf::from("C:/workspace/alpha"),
+            },
+        );
+        let response = gateway_v1::ListSessionsResponse {
+            v: 1,
+            sessions: vec![
+                gateway_v1::SessionSummary {
+                    session_id: Some(common_v1::CanonicalId {
+                        ulid: "01ARZ3NDEKTSV4RRFFQ69G5FAY".to_owned(),
+                    }),
+                    session_key: "session-alpha".to_owned(),
+                    session_label: "  Project Alpha  ".to_owned(),
+                    created_at_unix_ms: 0,
+                    updated_at_unix_ms: 0,
+                    last_run_id: None,
+                },
+                gateway_v1::SessionSummary {
+                    session_id: Some(common_v1::CanonicalId {
+                        ulid: "01ARZ3NDEKTSV4RRFFQ69G5FAZ".to_owned(),
+                    }),
+                    session_key: String::new(),
+                    session_label: "  ".to_owned(),
+                    created_at_unix_ms: 0,
+                    updated_at_unix_ms: 0,
+                    last_run_id: None,
+                },
+            ],
+            next_after_session_key: "  cursor-2  ".to_owned(),
+        };
+
+        let mapped = map_list_sessions_response(response, &session_bindings, &default_cwd);
+        assert_eq!(mapped.next_cursor.as_deref(), Some("cursor-2"));
+        assert_eq!(mapped.sessions.len(), 2);
+
+        assert_eq!(mapped.sessions[0].session_id.0.as_ref(), "session-alpha");
+        assert_eq!(mapped.sessions[0].cwd, PathBuf::from("C:/workspace/alpha"));
+        assert_eq!(mapped.sessions[0].title.as_deref(), Some("Project Alpha"));
+
+        assert_eq!(mapped.sessions[1].session_id.0.as_ref(), "01ARZ3NDEKTSV4RRFFQ69G5FAZ");
+        assert_eq!(mapped.sessions[1].cwd, default_cwd);
+        assert_eq!(mapped.sessions[1].title, None);
     }
 }
