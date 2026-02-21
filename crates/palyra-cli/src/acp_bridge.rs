@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -808,7 +808,7 @@ fn map_permission_outcome(
 fn map_list_sessions_response(
     response: gateway_v1::ListSessionsResponse,
     session_bindings: &HashMap<String, SessionBinding>,
-    default_cwd: &PathBuf,
+    default_cwd: &Path,
 ) -> acp::ListSessionsResponse {
     let sessions = response
         .sessions
@@ -826,7 +826,7 @@ fn map_list_sessions_response(
             let cwd = session_bindings
                 .get(&session_key)
                 .map(|binding| binding.cwd.clone())
-                .unwrap_or_else(|| default_cwd.clone());
+                .unwrap_or_else(|| default_cwd.to_path_buf());
             acp::SessionInfo::new(acp::SessionId::new(session_key), cwd)
                 .title(non_empty(Some(session.session_label)))
         })
