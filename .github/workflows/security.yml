@@ -39,8 +39,8 @@ jobs:
         if: ${{ hashFiles('apps/web/package-lock.json') != '' }}
         run: |
           mkdir -p security-artifacts
-          npm --prefix apps/web audit --json --omit=dev > security-artifacts/npm-audit-runtime.json || true
-          npm --prefix apps/web audit --json > security-artifacts/npm-audit-full.json || true
+          npm --prefix apps/web audit --json --omit=dev > security-artifacts/npm-audit-runtime.json
+          npm --prefix apps/web audit --json > security-artifacts/npm-audit-full.json
 
       - name: Validate dev-only npm advisories allowlist
         if: ${{ hashFiles('apps/web/package-lock.json') != '' }}
