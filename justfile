@@ -4,11 +4,17 @@ fmt:
 fmt-check:
     cargo fmt --all --check
 
-validate-env:
+doctor:
+    @echo "Running strict environment checks via 'palyra doctor --strict'..."
+    @echo "Required checks must pass. Optional checks are informational."
     cargo run -p palyra-cli --bin palyra -- doctor --strict
+    @echo "Doctor passed. Next step: 'just dev'."
+
+validate-env:
+    just doctor
 
 dev:
-    just validate-env
+    just doctor
     cargo build --workspace --locked
     @echo "Bootstrap complete. Run 'just test' to verify workspace tests."
 
