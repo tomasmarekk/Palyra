@@ -10,7 +10,10 @@ use std::{
 
 use axum::http::{header::AUTHORIZATION, HeaderMap};
 use palyra_common::{build_metadata, validate_canonical_id, CANONICAL_PROTOCOL_MAJOR};
-use palyra_policy::{evaluate_with_config, PolicyDecision, PolicyEvaluationConfig, PolicyRequest};
+use palyra_policy::{
+    evaluate_with_config, evaluate_with_context, PolicyDecision, PolicyEvaluationConfig,
+    PolicyRequest, PolicyRequestContext,
+};
 #[cfg(test)]
 use palyra_vault::{
     BackendPreference as VaultBackendPreference, VaultConfig as VaultConfigOptions,
@@ -49,7 +52,7 @@ use crate::{
     tool_protocol::{
         decide_tool_call, denied_execution_outcome, execute_tool_call, tool_policy_snapshot,
         tool_requires_approval, ToolAttestation, ToolCallConfig, ToolCallPolicySnapshot,
-        ToolDecision, ToolExecutionOutcome,
+        ToolDecision, ToolExecutionOutcome, ToolRequestContext,
     },
 };
 
@@ -4124,7 +4127,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                                 if let Some(skill_context) = skill_context.as_ref() {
                                     skill_gate_decision = match evaluate_skill_execution_gate(
                                         &state_for_stream,
-                                        context_for_stream.principal.as_str(),
+                                        &context_for_stream,
                                         skill_context,
                                     )
                                     .await
@@ -4484,10 +4487,20 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                             let decision = if let Some(skill_gate_decision) = skill_gate_decision {
                                 skill_gate_decision
                             } else {
+                                let policy_request_context = ToolRequestContext {
+                                    principal: context_for_stream.principal.clone(),
+                                    device_id: Some(context_for_stream.device_id.clone()),
+                                    channel: context_for_stream.channel.clone(),
+                                    session_id: active_session_id.clone(),
+                                    run_id: Some(run_id.clone()),
+                                    skill_id: skill_context
+                                        .as_ref()
+                                        .map(|context| context.skill_id.clone()),
+                                };
                                 let decision = decide_tool_call(
                                     &state_for_stream.config.tool_call,
                                     &mut remaining_tool_budget,
-                                    context_for_stream.principal.as_str(),
+                                    &policy_request_context,
                                     tool_name.as_str(),
                                     approval_outcome
                                         .as_ref()
@@ -7282,7 +7295,7 @@ fn parse_tool_skill_context(
 #[allow(clippy::result_large_err)]
 async fn evaluate_skill_execution_gate(
     runtime_state: &Arc<GatewayRuntimeState>,
-    principal: &str,
+    request_context: &RequestContext,
     context: &ToolSkillContext,
 ) -> Result<Option<ToolDecision>, Status> {
     let status_record = if let Some(version) = context.version.as_deref() {
@@ -7317,18 +7330,21 @@ async fn evaluate_skill_execution_gate(
         }));
     }
 
-    let evaluation = evaluate_with_config(
+    let evaluation = evaluate_with_context(
         &PolicyRequest {
-            principal: principal.to_owned(),
+            principal: request_context.principal.clone(),
             action: "skill.execute".to_owned(),
             resource: format!("skill:{}", context.skill_id),
         },
+        &PolicyRequestContext {
+            device_id: Some(request_context.device_id.clone()),
+            channel: request_context.channel.clone(),
+            skill_id: Some(context.skill_id.clone()),
+            ..PolicyRequestContext::default()
+        },
         &PolicyEvaluationConfig {
-            allowlisted_tools: Vec::new(),
-            allow_sensitive_tools: false,
-            sensitive_tool_names: Vec::new(),
             allowlisted_skills: vec![status_record.skill_id.clone()],
-            sensitive_actions: Vec::new(),
+            ..PolicyEvaluationConfig::default()
         },
     )
     .map_err(|error| Status::internal(format!("failed to evaluate skill policy: {error}")))?;

@@ -1,6 +1,9 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use palyra_policy::{evaluate_with_config, PolicyDecision, PolicyEvaluationConfig, PolicyRequest};
+use palyra_policy::{
+    evaluate_with_context, PolicyDecision, PolicyEvaluationConfig, PolicyRequest,
+    PolicyRequestContext,
+};
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -30,12 +33,34 @@ pub struct ToolDecision {
     pub policy_enforced: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolRequestContext {
+    pub principal: String,
+    pub device_id: Option<String>,
+    pub channel: Option<String>,
+    pub session_id: Option<String>,
+    pub run_id: Option<String>,
+    pub skill_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolCapability {
     ProcessExec,
     Network,
     SecretsRead,
     FilesystemWrite,
+}
+
+impl ToolCapability {
+    #[must_use]
+    const fn policy_name(self) -> &'static str {
+        match self {
+            Self::ProcessExec => "process_exec",
+            Self::Network => "network",
+            Self::SecretsRead => "secrets_read",
+            Self::FilesystemWrite => "filesystem_write",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +139,8 @@ const MAX_SLEEP_TOOL_INPUT_BYTES: usize = 8 * 1024;
 const MAX_MEMORY_SEARCH_TOOL_INPUT_BYTES: usize = 64 * 1024;
 const MAX_PROCESS_RUNNER_TOOL_INPUT_BYTES: usize = 128 * 1024;
 const MAX_WASM_PLUGIN_TOOL_INPUT_BYTES: usize = 448 * 1024;
+const SENSITIVE_CAPABILITY_POLICY_NAMES: &[&str] =
+    &["process_exec", "network", "secrets_read", "filesystem_write"];
 
 pub fn tool_policy_snapshot(config: &ToolCallConfig) -> ToolCallPolicySnapshot {
     ToolCallPolicySnapshot {
@@ -155,7 +182,7 @@ pub fn tool_policy_snapshot(config: &ToolCallConfig) -> ToolCallPolicySnapshot {
 pub fn decide_tool_call(
     config: &ToolCallConfig,
     remaining_budget: &mut u32,
-    principal: &str,
+    request_context: &ToolRequestContext,
     tool_name: &str,
     allow_sensitive_tools: bool,
 ) -> ToolDecision {
@@ -170,28 +197,41 @@ pub fn decide_tool_call(
     }
 
     let policy_request = PolicyRequest {
-        principal: principal.to_owned(),
+        principal: request_context.principal.clone(),
         action: "tool.execute".to_owned(),
         resource: format!("tool:{tool_name}"),
+    };
+    let policy_request_context = PolicyRequestContext {
+        device_id: request_context.device_id.clone(),
+        channel: request_context.channel.clone(),
+        session_id: request_context.session_id.clone(),
+        run_id: request_context.run_id.clone(),
+        tool_name: Some(tool_name.to_ascii_lowercase()),
+        skill_id: request_context.skill_id.clone(),
+        capabilities: tool_policy_capability_names(tool_name),
     };
     let policy_config = PolicyEvaluationConfig {
         allowlisted_tools: config.allowed_tools.clone(),
         allow_sensitive_tools,
         sensitive_tool_names: sensitive_allowlisted_tool_names(config.allowed_tools.as_slice()),
-        allowlisted_skills: Vec::new(),
-        sensitive_actions: Vec::new(),
+        sensitive_capability_names: SENSITIVE_CAPABILITY_POLICY_NAMES
+            .iter()
+            .map(|value| value.to_string())
+            .collect(),
+        ..PolicyEvaluationConfig::default()
     };
-    let policy_evaluation = match evaluate_with_config(&policy_request, &policy_config) {
-        Ok(evaluation) => evaluation,
-        Err(error) => {
-            return ToolDecision {
-                allowed: false,
-                reason: format!("policy evaluation failed safely: {error}"),
-                approval_required,
-                policy_enforced: true,
-            };
-        }
-    };
+    let policy_evaluation =
+        match evaluate_with_context(&policy_request, &policy_request_context, &policy_config) {
+            Ok(evaluation) => evaluation,
+            Err(error) => {
+                return ToolDecision {
+                    allowed: false,
+                    reason: format!("policy evaluation failed safely: {error}"),
+                    approval_required,
+                    policy_enforced: true,
+                };
+            }
+        };
     if let PolicyDecision::DenyByDefault { reason } = policy_evaluation.decision {
         return ToolDecision {
             allowed: false,
@@ -265,6 +305,20 @@ pub fn tool_requires_approval(tool_name: &str) -> bool {
                     | ToolCapability::FilesystemWrite
             )
         })
+}
+
+fn tool_policy_capability_names(tool_name: &str) -> Vec<String> {
+    let Some(metadata) = tool_metadata(tool_name) else {
+        return Vec::new();
+    };
+    let mut capabilities = metadata
+        .capabilities
+        .iter()
+        .map(|capability| capability.policy_name().to_owned())
+        .collect::<Vec<_>>();
+    capabilities.sort();
+    capabilities.dedup();
+    capabilities
 }
 
 fn sensitive_allowlisted_tool_names(allowlisted_tools: &[String]) -> Vec<String> {
@@ -690,7 +744,7 @@ fn current_unix_ms() -> i64 {
 mod tests {
     use super::{
         decide_tool_call, denied_execution_outcome, execute_tool_call, tool_policy_snapshot,
-        tool_requires_approval, ToolCallConfig,
+        tool_requires_approval, ToolCallConfig, ToolRequestContext,
     };
     use crate::sandbox_runner::{EgressEnforcementMode, SandboxProcessRunnerPolicy};
     use crate::wasm_plugin_runner::WasmPluginRunnerPolicy;
@@ -736,6 +790,17 @@ mod tests {
         }
     }
 
+    fn tool_request_context(principal: &str) -> ToolRequestContext {
+        ToolRequestContext {
+            principal: principal.to_owned(),
+            device_id: Some("device:test".to_owned()),
+            channel: Some("cli".to_owned()),
+            session_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned()),
+            run_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned()),
+            skill_id: None,
+        }
+    }
+
     #[test]
     fn decide_tool_call_enforces_deny_by_default_policy() {
         let config = ToolCallConfig {
@@ -746,7 +811,9 @@ mod tests {
             wasm_runtime: default_wasm_runtime_policy(),
         };
         let mut budget = 2;
-        let decision = decide_tool_call(&config, &mut budget, "user:ops", "palyra.echo", false);
+        let request_context = tool_request_context("user:ops");
+        let decision =
+            decide_tool_call(&config, &mut budget, &request_context, "palyra.echo", false);
         assert!(!decision.allowed);
         assert_eq!(budget, 2, "denied decisions must not consume budget");
         assert!(decision.reason.contains("denied by default"));
@@ -756,15 +823,17 @@ mod tests {
     fn decide_tool_call_consumes_budget_for_allowed_tools() {
         let config = allowlisted_config();
         let mut budget = config.max_calls_per_run;
-        let first = decide_tool_call(&config, &mut budget, "user:ops", "palyra.echo", false);
+        let request_context = tool_request_context("user:ops");
+        let first = decide_tool_call(&config, &mut budget, &request_context, "palyra.echo", false);
         assert!(first.allowed);
         assert!(!first.approval_required, "safe tools should not require approval by default");
         assert_eq!(budget, 1);
-        let second = decide_tool_call(&config, &mut budget, "user:ops", "palyra.sleep", false);
+        let second =
+            decide_tool_call(&config, &mut budget, &request_context, "palyra.sleep", false);
         assert!(second.allowed);
         assert!(!second.approval_required, "safe tools should not require approval by default");
         assert_eq!(budget, 0);
-        let third = decide_tool_call(&config, &mut budget, "user:ops", "palyra.echo", false);
+        let third = decide_tool_call(&config, &mut budget, &request_context, "palyra.echo", false);
         assert!(!third.allowed, "third call should be denied by budget");
     }
 
@@ -778,8 +847,9 @@ mod tests {
             wasm_runtime: default_wasm_runtime_policy(),
         };
         let mut budget = 1;
+        let request_context = tool_request_context("user:ops");
         let decision =
-            decide_tool_call(&config, &mut budget, "user:ops", "palyra.memory.search", false);
+            decide_tool_call(&config, &mut budget, &request_context, "palyra.memory.search", false);
         assert!(decision.allowed, "allowlisted memory search tool should be executable");
         assert!(
             !decision.approval_required,
@@ -798,7 +868,9 @@ mod tests {
             wasm_runtime: default_wasm_runtime_policy(),
         };
         let mut budget = config.max_calls_per_run;
-        let decision = decide_tool_call(&config, &mut budget, "user:ops", "custom.noop", true);
+        let request_context = tool_request_context("user:ops");
+        let decision =
+            decide_tool_call(&config, &mut budget, &request_context, "custom.noop", true);
         assert!(!decision.allowed, "unsupported runtime tool must be denied");
         assert_eq!(budget, 2, "denied decisions must not consume budget");
         assert!(decision.reason.contains("unsupported by runtime executor"));
@@ -814,9 +886,10 @@ mod tests {
             wasm_runtime: default_wasm_runtime_policy(),
         };
         let mut budget = config.max_calls_per_run;
+        let request_context = tool_request_context("user:ops");
 
         let decision =
-            decide_tool_call(&config, &mut budget, "user:ops", "palyra.process.run", false);
+            decide_tool_call(&config, &mut budget, &request_context, "palyra.process.run", false);
 
         assert!(
             !decision.allowed,
@@ -843,9 +916,10 @@ mod tests {
             wasm_runtime: default_wasm_runtime_policy(),
         };
         let mut budget = config.max_calls_per_run;
+        let request_context = tool_request_context("user:ops");
 
         let decision =
-            decide_tool_call(&config, &mut budget, "user:ops", "palyra.process.run", true);
+            decide_tool_call(&config, &mut budget, &request_context, "palyra.process.run", true);
 
         assert!(decision.allowed, "allowlisted process runner tool should pass policy gate");
         assert!(

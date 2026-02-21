@@ -8,7 +8,10 @@ use std::{
 };
 
 use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
-use palyra_policy::{evaluate_with_config, PolicyDecision, PolicyEvaluationConfig, PolicyRequest};
+use palyra_policy::{
+    evaluate_with_context, PolicyDecision, PolicyEvaluationConfig, PolicyRequest,
+    PolicyRequestContext,
+};
 use serde_json::{json, Value};
 use tokio::sync::Notify;
 use tokio_stream::StreamExt;
@@ -539,11 +542,15 @@ async fn dispatch_job(
     wake_signal: Arc<Notify>,
     manual_trigger: bool,
 ) -> Result<DispatchOutcome, Status> {
-    let policy = evaluate_with_config(
+    let policy = evaluate_with_context(
         &PolicyRequest {
             principal: job.owner_principal.clone(),
             action: "cron.run".to_owned(),
             resource: format!("cron:{}", job.job_id),
+        },
+        &PolicyRequestContext {
+            channel: Some(job.channel.clone()),
+            ..PolicyRequestContext::default()
         },
         &PolicyEvaluationConfig::default(),
     )
