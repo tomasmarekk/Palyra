@@ -106,6 +106,7 @@ const CANCELLED_REASON: &str = "cancelled by request";
 const APPROVAL_CHANNEL_UNAVAILABLE_REASON: &str =
     "approval required but no interactive approval channel is available for this run";
 const APPROVAL_DENIED_REASON: &str = "tool execution denied by explicit client approval response";
+const APPROVAL_DECISION_CACHE_CAPACITY: usize = 1_024;
 const MAX_MODEL_TOKEN_TAPE_EVENTS_PER_RUN: usize = 1_024;
 const MAX_CRON_JOB_NAME_BYTES: usize = 128;
 const MAX_CRON_PROMPT_BYTES: usize = 16 * 1024;
@@ -186,6 +187,16 @@ struct ToolApprovalOutcome {
 }
 
 #[derive(Debug, Clone)]
+struct CachedToolApprovalDecision {
+    approval_id: String,
+    approved: bool,
+    reason: String,
+    decision: ApprovalDecision,
+    decision_scope: ApprovalDecisionScope,
+    expires_at_unix_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
 struct PendingToolApproval {
     approval_id: String,
     request_summary: String,
@@ -238,6 +249,7 @@ pub struct GatewayRuntimeState {
     vault: Arc<Vault>,
     memory_config: RwLock<MemoryRuntimeConfig>,
     memory_search_cache: Mutex<HashMap<String, Vec<MemorySearchHit>>>,
+    tool_approval_cache: Mutex<HashMap<String, CachedToolApprovalDecision>>,
     vault_rate_limit: Mutex<HashMap<String, VaultRateLimitEntry>>,
 }
 
@@ -606,6 +618,7 @@ impl GatewayRuntimeState {
             vault,
             memory_config: RwLock::new(MemoryRuntimeConfig::default()),
             memory_search_cache: Mutex::new(HashMap::new()),
+            tool_approval_cache: Mutex::new(HashMap::new()),
             vault_rate_limit: Mutex::new(HashMap::new()),
         }))
     }
@@ -1744,6 +1757,122 @@ impl GatewayRuntimeState {
         }
     }
 
+    fn clear_tool_approval_cache_for_session(&self, context: &RequestContext, session_id: &str) {
+        let key_prefix = tool_approval_cache_key_prefix(context, session_id);
+        match self.tool_approval_cache.lock() {
+            Ok(mut cache) => {
+                cache.retain(|key, _| !key.starts_with(key_prefix.as_str()));
+            }
+            Err(poisoned) => {
+                warn!("tool approval cache lock poisoned while clearing session cache");
+                let mut cache = poisoned.into_inner();
+                cache.retain(|key, _| !key.starts_with(key_prefix.as_str()));
+            }
+        }
+    }
+
+    fn resolve_cached_tool_approval(
+        &self,
+        context: &RequestContext,
+        session_id: &str,
+        subject_id: &str,
+    ) -> Option<ToolApprovalOutcome> {
+        let now_unix_ms = current_unix_ms();
+        let cache_key = tool_approval_cache_key(context, session_id, subject_id);
+        let resolve_from_cache =
+            |cache: &mut HashMap<String, CachedToolApprovalDecision>| -> Option<ToolApprovalOutcome> {
+                cache.retain(|_, entry| match entry.expires_at_unix_ms {
+                    Some(expires_at_unix_ms) => expires_at_unix_ms > now_unix_ms,
+                    None => true,
+                });
+                let cached = cache.get(cache_key.as_str())?.clone();
+                let remaining_ttl_ms = cached
+                    .expires_at_unix_ms
+                    .map(|expires_at_unix_ms| expires_at_unix_ms.saturating_sub(now_unix_ms))
+                    .filter(|remaining| *remaining > 0);
+                Some(ToolApprovalOutcome {
+                    approval_id: cached.approval_id,
+                    approved: cached.approved,
+                    reason: format!(
+                        "cached_approval(scope={}): {}",
+                        cached.decision_scope.as_str(),
+                        cached.reason
+                    ),
+                    decision: cached.decision,
+                    decision_scope: cached.decision_scope,
+                    decision_scope_ttl_ms: remaining_ttl_ms,
+                })
+            };
+        match self.tool_approval_cache.lock() {
+            Ok(mut cache) => resolve_from_cache(&mut cache),
+            Err(poisoned) => {
+                warn!("tool approval cache lock poisoned while resolving cached decision");
+                let mut cache = poisoned.into_inner();
+                resolve_from_cache(&mut cache)
+            }
+        }
+    }
+
+    fn remember_tool_approval(
+        &self,
+        context: &RequestContext,
+        session_id: &str,
+        subject_id: &str,
+        outcome: &ToolApprovalOutcome,
+    ) {
+        if !matches!(outcome.decision, ApprovalDecision::Allow | ApprovalDecision::Deny) {
+            return;
+        }
+        let now_unix_ms = current_unix_ms();
+        let expires_at_unix_ms = match outcome.decision_scope {
+            ApprovalDecisionScope::Once => return,
+            ApprovalDecisionScope::Session => outcome
+                .decision_scope_ttl_ms
+                .filter(|ttl_ms| *ttl_ms > 0)
+                .map(|ttl_ms| now_unix_ms.saturating_add(ttl_ms)),
+            ApprovalDecisionScope::Timeboxed => {
+                let Some(ttl_ms) = outcome.decision_scope_ttl_ms.filter(|ttl_ms| *ttl_ms > 0)
+                else {
+                    warn!(
+                        approval_id = %outcome.approval_id,
+                        "ignoring timeboxed approval memory entry without positive ttl"
+                    );
+                    return;
+                };
+                Some(now_unix_ms.saturating_add(ttl_ms))
+            }
+        };
+        let cache_key = tool_approval_cache_key(context, session_id, subject_id);
+        let cache_entry = CachedToolApprovalDecision {
+            approval_id: outcome.approval_id.clone(),
+            approved: outcome.approved,
+            reason: outcome.reason.clone(),
+            decision: outcome.decision,
+            decision_scope: outcome.decision_scope,
+            expires_at_unix_ms,
+        };
+        let remember_in_cache = |cache: &mut HashMap<String, CachedToolApprovalDecision>| {
+            cache.retain(|_, entry| match entry.expires_at_unix_ms {
+                Some(entry_expires_at_unix_ms) => entry_expires_at_unix_ms > now_unix_ms,
+                None => true,
+            });
+            if cache.len() >= APPROVAL_DECISION_CACHE_CAPACITY {
+                if let Some(first_key) = cache.keys().next().cloned() {
+                    cache.remove(first_key.as_str());
+                }
+            }
+            cache.insert(cache_key.clone(), cache_entry.clone());
+        };
+        match self.tool_approval_cache.lock() {
+            Ok(mut cache) => remember_in_cache(&mut cache),
+            Err(poisoned) => {
+                warn!("tool approval cache lock poisoned while recording decision");
+                let mut cache = poisoned.into_inner();
+                remember_in_cache(&mut cache);
+            }
+        }
+    }
+
     #[allow(clippy::result_large_err)]
     pub async fn ingest_memory_item(
         self: &Arc<Self>,
@@ -2127,6 +2256,31 @@ fn memory_search_cache_key(request: &MemorySearchRequest) -> String {
         "sources": request.sources.iter().map(|source| source.as_str()).collect::<Vec<_>>(),
     })
     .to_string()
+}
+
+fn build_tool_approval_subject_id(
+    tool_name: &str,
+    skill_context: Option<&ToolSkillContext>,
+) -> String {
+    if let Some(skill_context) = skill_context {
+        format!("tool:{tool_name}|skill:{}", skill_context.skill_id)
+    } else {
+        format!("tool:{tool_name}")
+    }
+}
+
+fn tool_approval_cache_key_prefix(context: &RequestContext, session_id: &str) -> String {
+    format!(
+        "principal={}|device_id={}|channel={}|session={}|",
+        context.principal,
+        context.device_id,
+        context.channel.as_deref().unwrap_or_default(),
+        session_id
+    )
+}
+
+fn tool_approval_cache_key(context: &RequestContext, session_id: &str, subject_id: &str) -> String {
+    format!("{}subject={subject_id}", tool_approval_cache_key_prefix(context, session_id))
 }
 
 #[allow(clippy::result_large_err)]
@@ -3428,6 +3582,12 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                             return;
                         }
                     };
+                    if message.reset_session {
+                        state_for_stream.clear_tool_approval_cache_for_session(
+                            &context_for_stream,
+                            session_id.as_str(),
+                        );
+                    }
                     if resolved_session.session.session_id != session_id {
                         let status = Status::failed_precondition(
                             "resolved session_id does not match RunStream session_id",
@@ -3989,6 +4149,10 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                                     decision.allowed && tool_requires_approval(tool_name.as_str())
                                 })
                                 .unwrap_or_else(|| tool_requires_approval(tool_name.as_str()));
+                            let approval_subject_id = build_tool_approval_subject_id(
+                                tool_name.as_str(),
+                                skill_context.as_ref(),
+                            );
                             state_for_stream
                                 .counters
                                 .tool_proposals
@@ -4017,169 +4181,41 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                                 let _ = sender.send(Err(error)).await;
                                 return;
                             }
-
-                            let approval_outcome = if proposal_approval_required {
-                                let pending_approval = build_pending_tool_approval(
-                                    tool_name.as_str(),
-                                    skill_context.as_ref(),
-                                    input_json.as_slice(),
-                                    &state_for_stream.config.tool_call,
-                                );
-                                if let Err(error) = state_for_stream
-                                    .create_approval_record(ApprovalCreateRequest {
-                                        approval_id: pending_approval.approval_id.clone(),
-                                        session_id: session_id.clone(),
-                                        run_id: run_id.clone(),
-                                        principal: context_for_stream.principal.clone(),
-                                        device_id: context_for_stream.device_id.clone(),
-                                        channel: context_for_stream.channel.clone(),
-                                        subject_type: ApprovalSubjectType::Tool,
-                                        subject_id: pending_approval.prompt.subject_id.clone(),
-                                        request_summary: pending_approval.request_summary.clone(),
-                                        policy_snapshot: pending_approval.policy_snapshot.clone(),
-                                        prompt: pending_approval.prompt.clone(),
-                                    })
-                                    .await
-                                {
-                                    finalize_run_failure(
-                                        &sender,
-                                        &state_for_stream,
-                                        &mut run_state,
-                                        active_run_id.as_deref(),
-                                        &mut tape_seq,
-                                        error.message(),
-                                    )
-                                    .await;
-                                    let _ = sender.send(Err(error)).await;
-                                    return;
-                                }
-                                info!(
-                                    run_id = %run_id,
-                                    proposal_id = %proposal_id,
-                                    approval_id = %pending_approval.approval_id,
-                                    subject_id = %pending_approval.prompt.subject_id,
-                                    "approval requested"
-                                );
-
-                                if let Err(error) = send_tool_approval_request_with_tape(
-                                    &sender,
-                                    &state_for_stream,
-                                    run_id.as_str(),
-                                    &mut tape_seq,
-                                    proposal_id.as_str(),
-                                    pending_approval.approval_id.as_str(),
-                                    tool_name.as_str(),
-                                    input_json.as_slice(),
-                                    true,
-                                    pending_approval.request_summary.as_str(),
-                                    &pending_approval.prompt,
-                                )
-                                .await
-                                {
-                                    best_effort_mark_approval_error(
-                                        &state_for_stream,
-                                        pending_approval.approval_id.as_str(),
-                                        format!(
-                                            "approval_request_dispatch_error: {}",
-                                            error.message()
-                                        ),
-                                    )
-                                    .await;
-                                    finalize_run_failure(
-                                        &sender,
-                                        &state_for_stream,
-                                        &mut run_state,
-                                        active_run_id.as_deref(),
-                                        &mut tape_seq,
-                                        error.message(),
-                                    )
-                                    .await;
-                                    let _ = sender.send(Err(error)).await;
-                                    return;
-                                }
-                                if let Err(error) = record_approval_requested_journal_event(
-                                    &state_for_stream,
+                            let mut cached_approval_outcome = if proposal_approval_required {
+                                state_for_stream.resolve_cached_tool_approval(
                                     &context_for_stream,
                                     session_id.as_str(),
-                                    run_id.as_str(),
-                                    proposal_id.as_str(),
-                                    pending_approval.approval_id.as_str(),
-                                    tool_name.as_str(),
-                                    pending_approval.prompt.subject_id.as_str(),
-                                    pending_approval.request_summary.as_str(),
-                                    &pending_approval.policy_snapshot,
-                                    &pending_approval.prompt,
+                                    approval_subject_id.as_str(),
                                 )
-                                .await
-                                {
-                                    best_effort_mark_approval_error(
-                                        &state_for_stream,
-                                        pending_approval.approval_id.as_str(),
-                                        format!(
-                                            "approval_request_journal_error: {}",
-                                            error.message()
-                                        ),
-                                    )
-                                    .await;
-                                    finalize_run_failure(
+                            } else {
+                                None
+                            };
+
+                            let approval_outcome = if proposal_approval_required {
+                                if let Some(cached_outcome) = cached_approval_outcome.take() {
+                                    info!(
+                                        run_id = %run_id,
+                                        proposal_id = %proposal_id,
+                                        approval_id = %cached_outcome.approval_id,
+                                        subject_id = %approval_subject_id,
+                                        decision = %cached_outcome.decision.as_str(),
+                                        decision_scope = %cached_outcome.decision_scope.as_str(),
+                                        "reusing cached tool approval decision"
+                                    );
+                                    if let Err(error) = send_tool_approval_response_with_tape(
                                         &sender,
                                         &state_for_stream,
-                                        &mut run_state,
-                                        active_run_id.as_deref(),
-                                        &mut tape_seq,
-                                        error.message(),
-                                    )
-                                    .await;
-                                    let _ = sender.send(Err(error)).await;
-                                    return;
-                                }
-
-                                let response = match timeout(
-                                    TOOL_APPROVAL_RESPONSE_TIMEOUT,
-                                    await_tool_approval_response(
-                                        &mut stream,
-                                        session_id.as_str(),
                                         run_id.as_str(),
+                                        &mut tape_seq,
                                         proposal_id.as_str(),
-                                        pending_approval.approval_id.as_str(),
-                                    ),
-                                )
-                                .await
-                                {
-                                    Ok(Ok(value)) => value,
-                                    Ok(Err(error)) => ToolApprovalOutcome {
-                                        approval_id: pending_approval.approval_id.clone(),
-                                        approved: false,
-                                        reason: format!(
-                                            "approval_response_error: {}",
-                                            error.message()
-                                        ),
-                                        decision: ApprovalDecision::Error,
-                                        decision_scope: ApprovalDecisionScope::Once,
-                                        decision_scope_ttl_ms: None,
-                                    },
-                                    Err(_) => ToolApprovalOutcome {
-                                        approval_id: pending_approval.approval_id.clone(),
-                                        approved: false,
-                                        reason: "approval_response_timeout".to_owned(),
-                                        decision: ApprovalDecision::Timeout,
-                                        decision_scope: ApprovalDecisionScope::Once,
-                                        decision_scope_ttl_ms: None,
-                                    },
-                                };
-
-                                let resolved = match state_for_stream
-                                    .resolve_approval_record(ApprovalResolveRequest {
-                                        approval_id: pending_approval.approval_id.clone(),
-                                        decision: response.decision,
-                                        decision_scope: response.decision_scope,
-                                        decision_reason: response.reason.clone(),
-                                        decision_scope_ttl_ms: response.decision_scope_ttl_ms,
-                                    })
+                                        cached_outcome.approval_id.as_str(),
+                                        cached_outcome.approved,
+                                        cached_outcome.reason.as_str(),
+                                        cached_outcome.decision_scope,
+                                        cached_outcome.decision_scope_ttl_ms,
+                                    )
                                     .await
-                                {
-                                    Ok(value) => value,
-                                    Err(error) => {
+                                    {
                                         finalize_run_failure(
                                             &sender,
                                             &state_for_stream,
@@ -4192,69 +4228,255 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                                         let _ = sender.send(Err(error)).await;
                                         return;
                                     }
-                                };
-                                info!(
-                                    run_id = %run_id,
-                                    proposal_id = %proposal_id,
-                                    approval_id = %resolved.approval_id,
-                                    decision = %response.decision.as_str(),
-                                    decision_scope = %response.decision_scope.as_str(),
-                                    "approval resolved"
-                                );
-                                if let Err(error) = record_approval_resolved_journal_event(
-                                    &state_for_stream,
-                                    &context_for_stream,
-                                    session_id.as_str(),
-                                    run_id.as_str(),
-                                    proposal_id.as_str(),
-                                    response.approval_id.as_str(),
-                                    response.decision,
-                                    response.decision_scope,
-                                    response.decision_scope_ttl_ms,
-                                    response.reason.as_str(),
-                                )
-                                .await
-                                {
-                                    finalize_run_failure(
-                                        &sender,
-                                        &state_for_stream,
-                                        &mut run_state,
-                                        active_run_id.as_deref(),
-                                        &mut tape_seq,
-                                        error.message(),
-                                    )
-                                    .await;
-                                    let _ = sender.send(Err(error)).await;
-                                    return;
-                                }
+                                    Some(cached_outcome)
+                                } else {
+                                    let pending_approval = build_pending_tool_approval(
+                                        tool_name.as_str(),
+                                        skill_context.as_ref(),
+                                        input_json.as_slice(),
+                                        &state_for_stream.config.tool_call,
+                                    );
+                                    if let Err(error) = state_for_stream
+                                        .create_approval_record(ApprovalCreateRequest {
+                                            approval_id: pending_approval.approval_id.clone(),
+                                            session_id: session_id.clone(),
+                                            run_id: run_id.clone(),
+                                            principal: context_for_stream.principal.clone(),
+                                            device_id: context_for_stream.device_id.clone(),
+                                            channel: context_for_stream.channel.clone(),
+                                            subject_type: ApprovalSubjectType::Tool,
+                                            subject_id: pending_approval.prompt.subject_id.clone(),
+                                            request_summary: pending_approval
+                                                .request_summary
+                                                .clone(),
+                                            policy_snapshot: pending_approval
+                                                .policy_snapshot
+                                                .clone(),
+                                            prompt: pending_approval.prompt.clone(),
+                                        })
+                                        .await
+                                    {
+                                        finalize_run_failure(
+                                            &sender,
+                                            &state_for_stream,
+                                            &mut run_state,
+                                            active_run_id.as_deref(),
+                                            &mut tape_seq,
+                                            error.message(),
+                                        )
+                                        .await;
+                                        let _ = sender.send(Err(error)).await;
+                                        return;
+                                    }
+                                    info!(
+                                        run_id = %run_id,
+                                        proposal_id = %proposal_id,
+                                        approval_id = %pending_approval.approval_id,
+                                        subject_id = %pending_approval.prompt.subject_id,
+                                        "approval requested"
+                                    );
 
-                                if let Err(error) = send_tool_approval_response_with_tape(
-                                    &sender,
-                                    &state_for_stream,
-                                    run_id.as_str(),
-                                    &mut tape_seq,
-                                    proposal_id.as_str(),
-                                    response.approval_id.as_str(),
-                                    response.approved,
-                                    response.reason.as_str(),
-                                    response.decision_scope,
-                                    response.decision_scope_ttl_ms,
-                                )
-                                .await
-                                {
-                                    finalize_run_failure(
+                                    if let Err(error) = send_tool_approval_request_with_tape(
                                         &sender,
                                         &state_for_stream,
-                                        &mut run_state,
-                                        active_run_id.as_deref(),
+                                        run_id.as_str(),
                                         &mut tape_seq,
-                                        error.message(),
+                                        proposal_id.as_str(),
+                                        pending_approval.approval_id.as_str(),
+                                        tool_name.as_str(),
+                                        input_json.as_slice(),
+                                        true,
+                                        pending_approval.request_summary.as_str(),
+                                        &pending_approval.prompt,
                                     )
-                                    .await;
-                                    let _ = sender.send(Err(error)).await;
-                                    return;
+                                    .await
+                                    {
+                                        best_effort_mark_approval_error(
+                                            &state_for_stream,
+                                            pending_approval.approval_id.as_str(),
+                                            format!(
+                                                "approval_request_dispatch_error: {}",
+                                                error.message()
+                                            ),
+                                        )
+                                        .await;
+                                        finalize_run_failure(
+                                            &sender,
+                                            &state_for_stream,
+                                            &mut run_state,
+                                            active_run_id.as_deref(),
+                                            &mut tape_seq,
+                                            error.message(),
+                                        )
+                                        .await;
+                                        let _ = sender.send(Err(error)).await;
+                                        return;
+                                    }
+                                    if let Err(error) = record_approval_requested_journal_event(
+                                        &state_for_stream,
+                                        &context_for_stream,
+                                        session_id.as_str(),
+                                        run_id.as_str(),
+                                        proposal_id.as_str(),
+                                        pending_approval.approval_id.as_str(),
+                                        tool_name.as_str(),
+                                        pending_approval.prompt.subject_id.as_str(),
+                                        pending_approval.request_summary.as_str(),
+                                        &pending_approval.policy_snapshot,
+                                        &pending_approval.prompt,
+                                    )
+                                    .await
+                                    {
+                                        best_effort_mark_approval_error(
+                                            &state_for_stream,
+                                            pending_approval.approval_id.as_str(),
+                                            format!(
+                                                "approval_request_journal_error: {}",
+                                                error.message()
+                                            ),
+                                        )
+                                        .await;
+                                        finalize_run_failure(
+                                            &sender,
+                                            &state_for_stream,
+                                            &mut run_state,
+                                            active_run_id.as_deref(),
+                                            &mut tape_seq,
+                                            error.message(),
+                                        )
+                                        .await;
+                                        let _ = sender.send(Err(error)).await;
+                                        return;
+                                    }
+
+                                    let response = match timeout(
+                                        TOOL_APPROVAL_RESPONSE_TIMEOUT,
+                                        await_tool_approval_response(
+                                            &mut stream,
+                                            session_id.as_str(),
+                                            run_id.as_str(),
+                                            proposal_id.as_str(),
+                                            pending_approval.approval_id.as_str(),
+                                        ),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Ok(value)) => value,
+                                        Ok(Err(error)) => ToolApprovalOutcome {
+                                            approval_id: pending_approval.approval_id.clone(),
+                                            approved: false,
+                                            reason: format!(
+                                                "approval_response_error: {}",
+                                                error.message()
+                                            ),
+                                            decision: ApprovalDecision::Error,
+                                            decision_scope: ApprovalDecisionScope::Once,
+                                            decision_scope_ttl_ms: None,
+                                        },
+                                        Err(_) => ToolApprovalOutcome {
+                                            approval_id: pending_approval.approval_id.clone(),
+                                            approved: false,
+                                            reason: "approval_response_timeout".to_owned(),
+                                            decision: ApprovalDecision::Timeout,
+                                            decision_scope: ApprovalDecisionScope::Once,
+                                            decision_scope_ttl_ms: None,
+                                        },
+                                    };
+
+                                    let resolved = match state_for_stream
+                                        .resolve_approval_record(ApprovalResolveRequest {
+                                            approval_id: pending_approval.approval_id.clone(),
+                                            decision: response.decision,
+                                            decision_scope: response.decision_scope,
+                                            decision_reason: response.reason.clone(),
+                                            decision_scope_ttl_ms: response.decision_scope_ttl_ms,
+                                        })
+                                        .await
+                                    {
+                                        Ok(value) => value,
+                                        Err(error) => {
+                                            finalize_run_failure(
+                                                &sender,
+                                                &state_for_stream,
+                                                &mut run_state,
+                                                active_run_id.as_deref(),
+                                                &mut tape_seq,
+                                                error.message(),
+                                            )
+                                            .await;
+                                            let _ = sender.send(Err(error)).await;
+                                            return;
+                                        }
+                                    };
+                                    info!(
+                                        run_id = %run_id,
+                                        proposal_id = %proposal_id,
+                                        approval_id = %resolved.approval_id,
+                                        decision = %response.decision.as_str(),
+                                        decision_scope = %response.decision_scope.as_str(),
+                                        "approval resolved"
+                                    );
+                                    if let Err(error) = record_approval_resolved_journal_event(
+                                        &state_for_stream,
+                                        &context_for_stream,
+                                        session_id.as_str(),
+                                        run_id.as_str(),
+                                        proposal_id.as_str(),
+                                        response.approval_id.as_str(),
+                                        response.decision,
+                                        response.decision_scope,
+                                        response.decision_scope_ttl_ms,
+                                        response.reason.as_str(),
+                                    )
+                                    .await
+                                    {
+                                        finalize_run_failure(
+                                            &sender,
+                                            &state_for_stream,
+                                            &mut run_state,
+                                            active_run_id.as_deref(),
+                                            &mut tape_seq,
+                                            error.message(),
+                                        )
+                                        .await;
+                                        let _ = sender.send(Err(error)).await;
+                                        return;
+                                    }
+
+                                    if let Err(error) = send_tool_approval_response_with_tape(
+                                        &sender,
+                                        &state_for_stream,
+                                        run_id.as_str(),
+                                        &mut tape_seq,
+                                        proposal_id.as_str(),
+                                        response.approval_id.as_str(),
+                                        response.approved,
+                                        response.reason.as_str(),
+                                        response.decision_scope,
+                                        response.decision_scope_ttl_ms,
+                                    )
+                                    .await
+                                    {
+                                        finalize_run_failure(
+                                            &sender,
+                                            &state_for_stream,
+                                            &mut run_state,
+                                            active_run_id.as_deref(),
+                                            &mut tape_seq,
+                                            error.message(),
+                                        )
+                                        .await;
+                                        let _ = sender.send(Err(error)).await;
+                                        return;
+                                    }
+                                    state_for_stream.remember_tool_approval(
+                                        &context_for_stream,
+                                        session_id.as_str(),
+                                        approval_subject_id.as_str(),
+                                        &response,
+                                    );
+                                    Some(response)
                                 }
-                                Some(response)
                             } else {
                                 None
                             };
@@ -7131,11 +7353,7 @@ fn build_pending_tool_approval(
     input_json: &[u8],
     config: &ToolCallConfig,
 ) -> PendingToolApproval {
-    let subject_id = if let Some(skill_context) = skill_context {
-        format!("tool:{tool_name}|skill:{}", skill_context.skill_id)
-    } else {
-        format!("tool:{tool_name}")
-    };
+    let subject_id = build_tool_approval_subject_id(tool_name, skill_context);
     let request_summary = build_tool_request_summary(tool_name, skill_context, input_json);
     let policy_snapshot = build_tool_policy_snapshot(config, tool_name);
     let details = serde_json::from_slice::<Value>(input_json)
@@ -8244,6 +8462,87 @@ mod tests {
         assert!(
             enforced.reason.contains("explicit approval granted"),
             "allow reason should preserve approval context"
+        );
+    }
+
+    #[test]
+    fn tool_approval_cache_does_not_store_once_scope_entries() {
+        let state = build_test_runtime_state(false);
+        let context = RequestContext {
+            principal: "user:ops".to_owned(),
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            channel: Some("cli".to_owned()),
+        };
+        let outcome = ToolApprovalOutcome {
+            approval_id: "01ARZ3NDEKTSV4RRFFQ69G5FB0".to_owned(),
+            approved: true,
+            reason: "allow_once".to_owned(),
+            decision: ApprovalDecision::Allow,
+            decision_scope: ApprovalDecisionScope::Once,
+            decision_scope_ttl_ms: None,
+        };
+        state.remember_tool_approval(&context, "session-1", "tool:custom.noop", &outcome);
+        let cached = state.resolve_cached_tool_approval(&context, "session-1", "tool:custom.noop");
+        assert!(cached.is_none(), "allow-once decisions must not be remembered in cache");
+    }
+
+    #[test]
+    fn tool_approval_cache_reuses_session_scope_and_clears_on_session_reset() {
+        let state = build_test_runtime_state(false);
+        let context = RequestContext {
+            principal: "user:ops".to_owned(),
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            channel: Some("cli".to_owned()),
+        };
+        let outcome = ToolApprovalOutcome {
+            approval_id: "01ARZ3NDEKTSV4RRFFQ69G5FB1".to_owned(),
+            approved: false,
+            reason: "deny_session".to_owned(),
+            decision: ApprovalDecision::Deny,
+            decision_scope: ApprovalDecisionScope::Session,
+            decision_scope_ttl_ms: None,
+        };
+        state.remember_tool_approval(&context, "session-1", "tool:custom.noop", &outcome);
+        let cached_before_reset =
+            state.resolve_cached_tool_approval(&context, "session-1", "tool:custom.noop");
+        assert!(
+            cached_before_reset.is_some(),
+            "session-scoped approval decision should be reused until session reset"
+        );
+        state.clear_tool_approval_cache_for_session(&context, "session-1");
+        let cached_after_reset =
+            state.resolve_cached_tool_approval(&context, "session-1", "tool:custom.noop");
+        assert!(
+            cached_after_reset.is_none(),
+            "session reset should invalidate cached approval decisions"
+        );
+    }
+
+    #[test]
+    fn tool_approval_cache_expires_timeboxed_scope_entries() {
+        let state = build_test_runtime_state(false);
+        let context = RequestContext {
+            principal: "user:ops".to_owned(),
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            channel: Some("cli".to_owned()),
+        };
+        let outcome = ToolApprovalOutcome {
+            approval_id: "01ARZ3NDEKTSV4RRFFQ69G5FB2".to_owned(),
+            approved: true,
+            reason: "allow_timeboxed".to_owned(),
+            decision: ApprovalDecision::Allow,
+            decision_scope: ApprovalDecisionScope::Timeboxed,
+            decision_scope_ttl_ms: Some(200),
+        };
+        state.remember_tool_approval(&context, "session-1", "tool:custom.noop", &outcome);
+        assert!(
+            state.resolve_cached_tool_approval(&context, "session-1", "tool:custom.noop").is_some(),
+            "timeboxed approval should be immediately reusable before ttl expires"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        assert!(
+            state.resolve_cached_tool_approval(&context, "session-1", "tool:custom.noop").is_none(),
+            "timeboxed approval should expire when ttl elapses"
         );
     }
 

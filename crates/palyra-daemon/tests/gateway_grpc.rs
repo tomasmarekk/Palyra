@@ -29,6 +29,7 @@ const DEVICE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const SESSION_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
 const RUN_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAX";
 const RUN_ID_ALT: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAZ";
+const RUN_ID_THIRD: &str = "01ARZ3NDEKTSV4RRFFQ69G5FB0";
 const ENVELOPE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAY";
 const OPENAI_API_KEY: &str = "sk-openai-integration-test";
 const MAX_TEST_CRON_JITTER_MS: u64 = 60_000;
@@ -2301,6 +2302,231 @@ async fn grpc_run_stream_denies_allowlisted_unsupported_tool() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn grpc_run_stream_reuses_timeboxed_approval_until_ttl_expiry() -> Result<()> {
+    let response_body = openai_tool_call_response(
+        "custom.noop",
+        &serde_json::json!({
+            "payload": "approval-cache-timeboxed"
+        }),
+    )?;
+    let (openai_base_url, _request_count, server_handle) = spawn_scripted_openai_server(vec![
+        ScriptedOpenAiResponse::immediate(200, response_body.clone()),
+        ScriptedOpenAiResponse::immediate(200, response_body.clone()),
+        ScriptedOpenAiResponse::immediate(200, response_body),
+    ])?;
+    let (child, admin_port, grpc_port, _journal_db_path) =
+        spawn_palyrad_with_openai_provider_and_tool_policy(
+            openai_base_url.as_str(),
+            OPENAI_API_KEY,
+            "custom.noop",
+            4,
+            250,
+        )?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+
+    let (first_sender, first_receiver) = tokio_mpsc::channel(4);
+    first_sender
+        .send(sample_run_stream_request_with_ids(
+            SESSION_ID,
+            RUN_ID,
+            "timeboxed-approval-seed".to_owned(),
+        ))
+        .await
+        .context("failed to send first timeboxed stream request")?;
+    let mut first_stream_request = tonic::Request::new(ReceiverStream::new(first_receiver));
+    authorize_metadata(first_stream_request.metadata_mut())?;
+    let mut first_response_stream = client
+        .run_stream(first_stream_request)
+        .await
+        .context("failed to call first RunStream for timeboxed approval")?
+        .into_inner();
+
+    let mut saw_first_approval_request = false;
+    let mut saw_first_failed_result = false;
+    loop {
+        let next_event = tokio::time::timeout(Duration::from_secs(5), first_response_stream.next())
+            .await
+            .context("first timeboxed stream stalled")?;
+        let Some(event) = next_event else {
+            break;
+        };
+        let event = event.context("failed to read first timeboxed stream event")?;
+        if let Some(body) = event.body {
+            match body {
+                common_v1::run_stream_event::Body::ToolApprovalRequest(approval_request) => {
+                    let proposal_id = approval_request
+                        .proposal_id
+                        .as_ref()
+                        .map(|proposal_id| proposal_id.ulid.as_str())
+                        .context("first timeboxed approval request missing proposal_id")?;
+                    first_sender
+                        .send(sample_tool_approval_response_request_for_run_with_scope(
+                            RUN_ID,
+                            proposal_id,
+                            true,
+                            "allow_timeboxed",
+                            common_v1::ApprovalDecisionScope::Timeboxed as i32,
+                            2_000,
+                        ))
+                        .await
+                        .context("failed to send first timeboxed approval response")?;
+                    saw_first_approval_request = true;
+                }
+                common_v1::run_stream_event::Body::ToolResult(result) => {
+                    if !result.success {
+                        saw_first_failed_result = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if saw_first_approval_request && saw_first_failed_result {
+            break;
+        }
+    }
+    assert!(saw_first_approval_request, "first run should request explicit approval");
+    assert!(
+        saw_first_failed_result,
+        "first run should produce failed tool result for unsupported tool"
+    );
+
+    let mut second_stream_request =
+        tonic::Request::new(tokio_stream::iter(vec![sample_run_stream_request_with_ids(
+            SESSION_ID,
+            RUN_ID_ALT,
+            "timeboxed-cache-hit".to_owned(),
+        )]));
+    authorize_metadata(second_stream_request.metadata_mut())?;
+    let mut second_response_stream = client
+        .run_stream(second_stream_request)
+        .await
+        .context("failed to call second RunStream for timeboxed approval")?
+        .into_inner();
+
+    let mut saw_second_approval_request = false;
+    let mut saw_second_failed_result = false;
+    loop {
+        let next_event =
+            tokio::time::timeout(Duration::from_secs(5), second_response_stream.next())
+                .await
+                .context("second timeboxed stream stalled")?;
+        let Some(event) = next_event else {
+            break;
+        };
+        let event = event.context("failed to read second timeboxed stream event")?;
+        if let Some(body) = event.body {
+            match body {
+                common_v1::run_stream_event::Body::ToolApprovalRequest(_) => {
+                    saw_second_approval_request = true;
+                    break;
+                }
+                common_v1::run_stream_event::Body::ToolResult(result) => {
+                    if !result.success {
+                        saw_second_failed_result = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if saw_second_failed_result {
+            break;
+        }
+    }
+    assert!(
+        !saw_second_approval_request,
+        "timeboxed approval should be reused while ttl is still active"
+    );
+    assert!(
+        saw_second_failed_result,
+        "second run should still execute and fail unsupported tool without reprompt"
+    );
+
+    tokio::time::sleep(Duration::from_millis(2_200)).await;
+
+    let (third_sender, third_receiver) = tokio_mpsc::channel(4);
+    third_sender
+        .send(sample_run_stream_request_with_ids(
+            SESSION_ID,
+            RUN_ID_THIRD,
+            "timeboxed-cache-expired".to_owned(),
+        ))
+        .await
+        .context("failed to send third timeboxed stream request")?;
+    let mut third_stream_request = tonic::Request::new(ReceiverStream::new(third_receiver));
+    authorize_metadata(third_stream_request.metadata_mut())?;
+    let mut third_response_stream = client
+        .run_stream(third_stream_request)
+        .await
+        .context("failed to call third RunStream for timeboxed approval")?
+        .into_inner();
+
+    let mut saw_third_approval_request = false;
+    let mut saw_third_failed_result = false;
+    loop {
+        let next_event = tokio::time::timeout(Duration::from_secs(5), third_response_stream.next())
+            .await
+            .context("third timeboxed stream stalled")?;
+        let Some(event) = next_event else {
+            break;
+        };
+        let event = event.context("failed to read third timeboxed stream event")?;
+        if let Some(body) = event.body {
+            match body {
+                common_v1::run_stream_event::Body::ToolApprovalRequest(approval_request) => {
+                    let proposal_id = approval_request
+                        .proposal_id
+                        .as_ref()
+                        .map(|proposal_id| proposal_id.ulid.as_str())
+                        .context("third timeboxed approval request missing proposal_id")?;
+                    third_sender
+                        .send(sample_tool_approval_response_request_for_run_with_scope(
+                            RUN_ID_THIRD,
+                            proposal_id,
+                            true,
+                            "allow_once_after_ttl_expiry",
+                            common_v1::ApprovalDecisionScope::Once as i32,
+                            0,
+                        ))
+                        .await
+                        .context("failed to send third approval response after ttl expiry")?;
+                    saw_third_approval_request = true;
+                }
+                common_v1::run_stream_event::Body::ToolResult(result) => {
+                    if !result.success {
+                        saw_third_failed_result = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if saw_third_approval_request && saw_third_failed_result {
+            break;
+        }
+    }
+    assert!(
+        saw_third_approval_request,
+        "approval should be requested again after timeboxed ttl expires"
+    );
+    assert!(saw_third_failed_result, "third run should complete after approval re-prompt");
+
+    let status_snapshot = admin_get_json_async(admin_port, "/admin/v1/status".to_owned()).await?;
+    assert_eq!(
+        status_snapshot.pointer("/counters/approvals_tool_requested").and_then(Value::as_u64),
+        Some(2),
+        "approval should be requested only for first and third run (cache hit on second run)"
+    );
+
+    server_handle.join().expect("scripted openai server thread should exit");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn grpc_approvals_service_persists_and_exports_denied_tool_approval() -> Result<()> {
     let (openai_base_url, _request_count, server_handle) =
         spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::immediate(
@@ -4319,10 +4545,44 @@ fn sample_tool_approval_response_request(
     approved: bool,
     reason: &str,
 ) -> common_v1::RunStreamRequest {
+    sample_tool_approval_response_request_with_scope(
+        proposal_id,
+        approved,
+        reason,
+        common_v1::ApprovalDecisionScope::Once as i32,
+        0,
+    )
+}
+
+fn sample_tool_approval_response_request_with_scope(
+    proposal_id: &str,
+    approved: bool,
+    reason: &str,
+    decision_scope: i32,
+    decision_scope_ttl_ms: i64,
+) -> common_v1::RunStreamRequest {
+    sample_tool_approval_response_request_for_run_with_scope(
+        RUN_ID,
+        proposal_id,
+        approved,
+        reason,
+        decision_scope,
+        decision_scope_ttl_ms,
+    )
+}
+
+fn sample_tool_approval_response_request_for_run_with_scope(
+    run_id: &str,
+    proposal_id: &str,
+    approved: bool,
+    reason: &str,
+    decision_scope: i32,
+    decision_scope_ttl_ms: i64,
+) -> common_v1::RunStreamRequest {
     common_v1::RunStreamRequest {
         v: 1,
         session_id: Some(common_v1::CanonicalId { ulid: SESSION_ID.to_owned() }),
-        run_id: Some(common_v1::CanonicalId { ulid: RUN_ID.to_owned() }),
+        run_id: Some(common_v1::CanonicalId { ulid: run_id.to_owned() }),
         input: None,
         allow_sensitive_tools: false,
         session_key: String::new(),
@@ -4334,8 +4594,8 @@ fn sample_tool_approval_response_request(
             approved,
             reason: reason.to_owned(),
             approval_id: None,
-            decision_scope: common_v1::ApprovalDecisionScope::Once as i32,
-            decision_scope_ttl_ms: 0,
+            decision_scope,
+            decision_scope_ttl_ms,
         }),
     }
 }
