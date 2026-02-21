@@ -2587,8 +2587,8 @@ async fn grpc_run_stream_executes_sandbox_process_runner_within_workspace_scope(
                 execution_timeout_ms: 2_000,
                 workspace_root: workspace_root.as_path(),
                 allowed_executables: "uname",
-                allowed_egress_hosts: "allowed.example",
-                allowed_dns_suffixes: ".corp.local",
+                allowed_egress_hosts: "",
+                allowed_dns_suffixes: "",
             },
         )?;
     let _config_guard = TempFileGuard::new(config_path);
