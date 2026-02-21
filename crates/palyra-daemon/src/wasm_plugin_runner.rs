@@ -13,6 +13,7 @@ use serde_json::json;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WasmPluginRunnerPolicy {
     pub enabled: bool,
+    pub allow_inline_modules: bool,
     pub max_module_size_bytes: u64,
     pub fuel_budget: u64,
     pub max_memory_bytes: u64,
@@ -52,6 +53,8 @@ struct WasmPluginRunInput {
     skill_id: Option<String>,
     #[serde(default)]
     skill_version: Option<String>,
+    #[serde(default)]
+    dev: bool,
     module_wat: Option<String>,
     module_base64: Option<String>,
     entrypoint: Option<String>,
@@ -231,6 +234,14 @@ fn decode_module_bytes(
     policy: &WasmPluginRunnerPolicy,
     input: &WasmPluginRunInput,
 ) -> Result<Vec<u8>, WasmPluginRunError> {
+    if inline_module_payload_present(input) && !policy.allow_inline_modules && !input.dev {
+        return Err(WasmPluginRunError {
+            kind: WasmPluginRunErrorKind::InvalidInput,
+            message: "palyra.plugin.run inline module payloads are disabled by runtime policy; set tool_call.wasm_runtime.allow_inline_modules=true or pass dev=true"
+                .to_owned(),
+        });
+    }
+
     let module_bytes = match (input.module_wat.as_ref(), input.module_base64.as_ref()) {
         (Some(_), Some(_)) => {
             return Err(WasmPluginRunError {
@@ -272,6 +283,10 @@ fn decode_module_bytes(
         });
     }
     Ok(module_bytes)
+}
+
+fn inline_module_payload_present(input: &WasmPluginRunInput) -> bool {
+    input.module_wat.is_some() || input.module_base64.is_some()
 }
 
 fn parse_entrypoint(entrypoint: Option<&str>) -> Result<String, WasmPluginRunError> {
@@ -446,6 +461,7 @@ mod tests {
     fn test_policy() -> WasmPluginRunnerPolicy {
         WasmPluginRunnerPolicy {
             enabled: true,
+            allow_inline_modules: true,
             max_module_size_bytes: 256 * 1024,
             fuel_budget: 10_000_000,
             max_memory_bytes: 64 * 1024 * 1024,
@@ -469,6 +485,42 @@ mod tests {
         )
         .expect_err("disabled runner must fail closed");
         assert_eq!(error.kind, WasmPluginRunErrorKind::Disabled);
+    }
+
+    #[test]
+    fn run_wasm_plugin_denies_inline_module_payloads_without_opt_in() {
+        let mut policy = test_policy();
+        policy.allow_inline_modules = false;
+        let error = run_wasm_plugin(
+            &policy,
+            br#"{"module_wat":"(module (func (export \"run\") (result i32) i32.const 1))"}"#,
+            Duration::from_secs(2),
+        )
+        .expect_err("inline module payloads must default to deny-by-default");
+        assert_eq!(error.kind, WasmPluginRunErrorKind::InvalidInput);
+        assert!(
+            error.message.contains("allow_inline_modules=true"),
+            "error should explain explicit runtime opt-in path: {}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn run_wasm_plugin_allows_inline_module_payload_with_dev_override() {
+        let mut policy = test_policy();
+        policy.allow_inline_modules = false;
+        let success = run_wasm_plugin(
+            &policy,
+            br#"{
+                "dev": true,
+                "module_wat":"(module (func (export \"run\") (result i32) i32.const 1))"
+            }"#,
+            Duration::from_secs(2),
+        )
+        .expect("dev override should allow inline module payload");
+        let output: Value =
+            serde_json::from_slice(&success.output_json).expect("output_json should parse");
+        assert_eq!(output.get("exit_code").and_then(Value::as_i64), Some(1));
     }
 
     #[test]

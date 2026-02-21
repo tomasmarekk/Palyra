@@ -168,6 +168,7 @@ pub struct FileProcessRunnerConfig {
 #[serde(deny_unknown_fields)]
 pub struct FileWasmRuntimeConfig {
     pub enabled: Option<bool>,
+    pub allow_inline_modules: Option<bool>,
     pub max_module_size_bytes: Option<u64>,
     pub fuel_budget: Option<u64>,
     pub max_memory_bytes: Option<u64>,

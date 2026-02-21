@@ -256,6 +256,7 @@ async fn main() -> Result<()> {
                 },
                 wasm_runtime: wasm_plugin_runner::WasmPluginRunnerPolicy {
                     enabled: loaded.tool_call.wasm_runtime.enabled,
+                    allow_inline_modules: loaded.tool_call.wasm_runtime.allow_inline_modules,
                     max_module_size_bytes: loaded.tool_call.wasm_runtime.max_module_size_bytes,
                     fuel_budget: loaded.tool_call.wasm_runtime.fuel_budget,
                     max_memory_bytes: loaded.tool_call.wasm_runtime.max_memory_bytes,
@@ -356,6 +357,8 @@ async fn main() -> Result<()> {
         tool_call_process_runner_memory_limit_bytes = loaded.tool_call.process_runner.memory_limit_bytes,
         tool_call_process_runner_max_output_bytes = loaded.tool_call.process_runner.max_output_bytes,
         tool_call_wasm_runtime_enabled = loaded.tool_call.wasm_runtime.enabled,
+        tool_call_wasm_runtime_allow_inline_modules =
+            loaded.tool_call.wasm_runtime.allow_inline_modules,
         tool_call_wasm_runtime_max_module_size_bytes = loaded.tool_call.wasm_runtime.max_module_size_bytes,
         tool_call_wasm_runtime_fuel_budget = loaded.tool_call.wasm_runtime.fuel_budget,
         tool_call_wasm_runtime_max_memory_bytes = loaded.tool_call.wasm_runtime.max_memory_bytes,
