@@ -40,5 +40,5 @@ fuel_budget = 5000000
 max_memory_bytes = 33554432
 
 [compat]
-min_protocol_major = 1
-min_runtime_version = "0.1.0"
+required_protocol_major = 1
+min_palyra_version = "0.1.0"

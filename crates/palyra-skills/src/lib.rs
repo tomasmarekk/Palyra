@@ -200,8 +200,10 @@ impl Default for SkillQuotaConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SkillCompat {
-    pub min_protocol_major: u32,
-    pub min_runtime_version: String,
+    #[serde(alias = "min_protocol_major")]
+    pub required_protocol_major: u32,
+    #[serde(alias = "min_runtime_version")]
+    pub min_palyra_version: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -1135,7 +1137,7 @@ fn validate_manifest(manifest: &SkillManifest) -> Result<(), SkillPackagingError
     let publisher = normalize_identifier(manifest.publisher.as_str(), "publisher")?;
     normalize_identifier(manifest.skill_id.as_str(), "skill_id")?;
     parse_semver(manifest.version.as_str(), "version")?;
-    parse_semver(manifest.compat.min_runtime_version.as_str(), "compat.min_runtime_version")?;
+    parse_semver(manifest.compat.min_palyra_version.as_str(), "compat.min_palyra_version")?;
     if manifest.name.trim().is_empty() {
         return Err(SkillPackagingError::ManifestValidation("name cannot be empty".to_owned()));
     }
@@ -1224,19 +1226,18 @@ fn validate_manifest(manifest: &SkillManifest) -> Result<(), SkillPackagingError
 }
 
 fn assert_runtime_compatibility(compat: &SkillCompat) -> Result<(), SkillPackagingError> {
-    if compat.min_protocol_major > CANONICAL_PROTOCOL_MAJOR {
+    if compat.required_protocol_major > CANONICAL_PROTOCOL_MAJOR {
         return Err(SkillPackagingError::UnsupportedProtocolMajor {
-            requested: compat.min_protocol_major,
+            requested: compat.required_protocol_major,
             current: CANONICAL_PROTOCOL_MAJOR,
         });
     }
-    let requested =
-        parse_semver(compat.min_runtime_version.as_str(), "compat.min_runtime_version")?;
+    let requested = parse_semver(compat.min_palyra_version.as_str(), "compat.min_palyra_version")?;
     let current_raw = build_metadata().version.to_owned();
     let current = parse_semver(current_raw.as_str(), "runtime version")?;
     if requested > current {
         return Err(SkillPackagingError::UnsupportedRuntimeVersion {
-            requested: compat.min_runtime_version.clone(),
+            requested: compat.min_palyra_version.clone(),
             current: current_raw,
         });
     }
@@ -1643,7 +1644,7 @@ mod tests {
         parse_manifest_toml, policy_requests_from_manifest, verify_skill_artifact, ArtifactFile,
         SkillArtifactBuildRequest, SkillAuditCheckStatus, SkillPackagingError,
         SkillSecurityAuditPolicy, SkillTrustStore, TrustDecision, MAX_ARTIFACT_BYTES, MAX_ENTRIES,
-        SBOM_PATH, SIGNATURE_PATH,
+        SBOM_PATH, SIGNATURE_PATH, SKILL_MANIFEST_PATH,
     };
     use base64::Engine as _;
 
@@ -1691,11 +1692,47 @@ fuel_budget = 5000000
 max_memory_bytes = 33554432
 
 [compat]
-min_protocol_major = 1
-min_runtime_version = "0.1.0"
+required_protocol_major = 1
+min_palyra_version = "0.1.0"
 "#
         .trim()
         .to_owned()
+    }
+
+    #[test]
+    fn manifest_compat_aliases_accept_legacy_field_names() {
+        let legacy_manifest = sample_manifest()
+            .replace("required_protocol_major", "min_protocol_major")
+            .replace("min_palyra_version", "min_runtime_version");
+        let parsed = parse_manifest_toml(legacy_manifest.as_str())
+            .expect("legacy compat fields should still parse");
+        assert_eq!(parsed.compat.required_protocol_major, 1);
+        assert_eq!(parsed.compat.min_palyra_version, "0.1.0");
+    }
+
+    #[test]
+    fn manifest_serialization_uses_new_compat_field_names() {
+        let output = build_signed_skill_artifact(sample_request()).expect("artifact should build");
+        let mut entries = super::decode_zip(output.artifact_bytes.as_slice()).expect("zip decode");
+        let manifest_bytes =
+            entries.remove(SKILL_MANIFEST_PATH).expect("manifest entry should exist");
+        let manifest_toml = String::from_utf8(manifest_bytes).expect("manifest should be utf8");
+        assert!(
+            manifest_toml.contains("required_protocol_major = 1"),
+            "manifest should serialize new required_protocol_major field"
+        );
+        assert!(
+            manifest_toml.contains("min_palyra_version = \"0.1.0\""),
+            "manifest should serialize new min_palyra_version field"
+        );
+        assert!(
+            !manifest_toml.contains("min_protocol_major"),
+            "manifest serialization should avoid legacy compat field name"
+        );
+        assert!(
+            !manifest_toml.contains("min_runtime_version"),
+            "manifest serialization should avoid legacy compat field name"
+        );
     }
 
     fn sample_sbom() -> Vec<u8> {
