@@ -107,6 +107,12 @@ const EMPTY_TOOL_CAPABILITIES: &[ToolCapability] = &[];
 const PROCESS_RUNNER_CAPABILITIES: &[ToolCapability] = &[ToolCapability::ProcessExec];
 const WASM_PLUGIN_CAPABILITIES: &[ToolCapability] =
     &[ToolCapability::Network, ToolCapability::SecretsRead, ToolCapability::FilesystemWrite];
+const TOOL_INPUT_TOO_LARGE_ERROR_CODE: &str = "quota/tool_input_too_large";
+const MAX_ECHO_TOOL_INPUT_BYTES: usize = 16 * 1024;
+const MAX_SLEEP_TOOL_INPUT_BYTES: usize = 8 * 1024;
+const MAX_MEMORY_SEARCH_TOOL_INPUT_BYTES: usize = 64 * 1024;
+const MAX_PROCESS_RUNNER_TOOL_INPUT_BYTES: usize = 128 * 1024;
+const MAX_WASM_PLUGIN_TOOL_INPUT_BYTES: usize = 448 * 1024;
 
 pub fn tool_policy_snapshot(config: &ToolCallConfig) -> ToolCallPolicySnapshot {
     ToolCallPolicySnapshot {
@@ -308,6 +314,10 @@ pub async fn execute_tool_call(
     tool_name: &str,
     input_json: &[u8],
 ) -> ToolExecutionOutcome {
+    if let Some(raw) = reject_oversized_tool_input(config, tool_name, input_json) {
+        return build_execution_outcome(proposal_id, tool_name, input_json, raw);
+    }
+
     let raw = if tool_name == "palyra.plugin.run" {
         run_allowlisted_tool(config, tool_name, input_json).await
     } else {
@@ -322,11 +332,7 @@ pub async fn execute_tool_call(
                 error: format!("tool execution timed out after {}ms", config.execution_timeout_ms),
                 timed_out: true,
                 executor: tool_executor_name(tool_name).to_owned(),
-                sandbox_enforcement: if tool_name == "palyra.process.run" {
-                    config.process_runner.egress_enforcement_mode.as_str().to_owned()
-                } else {
-                    "none".to_owned()
-                },
+                sandbox_enforcement: sandbox_enforcement_for_tool(config, tool_name),
             },
         }
     };
@@ -454,6 +460,47 @@ fn tool_executor_name(tool_name: &str) -> &'static str {
     } else {
         "builtin"
     }
+}
+
+fn tool_input_limit_bytes(tool_name: &str) -> usize {
+    match tool_name {
+        "palyra.echo" => MAX_ECHO_TOOL_INPUT_BYTES,
+        "palyra.sleep" => MAX_SLEEP_TOOL_INPUT_BYTES,
+        "palyra.memory.search" => MAX_MEMORY_SEARCH_TOOL_INPUT_BYTES,
+        "palyra.process.run" => MAX_PROCESS_RUNNER_TOOL_INPUT_BYTES,
+        "palyra.plugin.run" => MAX_WASM_PLUGIN_TOOL_INPUT_BYTES,
+        _ => MAX_MEMORY_SEARCH_TOOL_INPUT_BYTES,
+    }
+}
+
+fn sandbox_enforcement_for_tool(config: &ToolCallConfig, tool_name: &str) -> String {
+    if tool_name == "palyra.process.run" {
+        config.process_runner.egress_enforcement_mode.as_str().to_owned()
+    } else {
+        "none".to_owned()
+    }
+}
+
+fn reject_oversized_tool_input(
+    config: &ToolCallConfig,
+    tool_name: &str,
+    input_json: &[u8],
+) -> Option<ToolExecutionRawResult> {
+    let max_input_bytes = tool_input_limit_bytes(tool_name);
+    if input_json.len() <= max_input_bytes {
+        return None;
+    }
+    Some(ToolExecutionRawResult {
+        success: false,
+        output_json: b"{}".to_vec(),
+        error: format!(
+            "{TOOL_INPUT_TOO_LARGE_ERROR_CODE}: tool={tool_name} input_bytes={} limit_bytes={max_input_bytes}",
+            input_json.len()
+        ),
+        timed_out: false,
+        executor: tool_executor_name(tool_name).to_owned(),
+        sandbox_enforcement: sandbox_enforcement_for_tool(config, tool_name),
+    })
 }
 
 async fn execute_process_runner_tool(
@@ -835,6 +882,63 @@ mod tests {
             serde_json::json!({ "echo": "hello" })
         );
         assert!(!outcome.attestation.execution_sha256.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn execute_tool_call_rejects_oversized_echo_input_with_quota_error() {
+        let config = allowlisted_config();
+        let input = serde_json::to_vec(&serde_json::json!({
+            "text": "ok",
+            "padding": "a".repeat(super::MAX_ECHO_TOOL_INPUT_BYTES),
+        }))
+        .expect("oversized payload should serialize");
+        let outcome = execute_tool_call(
+            &config,
+            "01ARZ3NDEKTSV4RRFFQ69G5FA2",
+            "palyra.echo",
+            input.as_slice(),
+        )
+        .await;
+        assert!(!outcome.success, "oversized tool input must fail");
+        assert!(
+            outcome.error.contains("quota/tool_input_too_large"),
+            "quota failure reason should include stable code: {}",
+            outcome.error
+        );
+        assert_eq!(outcome.attestation.executor, "builtin");
+        assert!(!outcome.attestation.timed_out, "quota rejection must not be timeout");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn execute_tool_call_rejects_oversized_process_runner_input_with_attestation() {
+        let config = ToolCallConfig {
+            allowed_tools: vec!["palyra.process.run".to_owned()],
+            max_calls_per_run: 1,
+            execution_timeout_ms: 250,
+            process_runner: default_process_runner_policy(),
+            wasm_runtime: default_wasm_runtime_policy(),
+        };
+        let input = serde_json::to_vec(&serde_json::json!({
+            "command": "uname",
+            "args": [],
+            "padding": "a".repeat(super::MAX_PROCESS_RUNNER_TOOL_INPUT_BYTES),
+        }))
+        .expect("oversized payload should serialize");
+        let outcome = execute_tool_call(
+            &config,
+            "01ARZ3NDEKTSV4RRFFQ69G5FA3",
+            "palyra.process.run",
+            input.as_slice(),
+        )
+        .await;
+        assert!(!outcome.success, "oversized tool input must fail");
+        assert!(
+            outcome.error.contains("quota/tool_input_too_large"),
+            "quota failure reason should include stable code: {}",
+            outcome.error
+        );
+        assert_eq!(outcome.attestation.executor, "sandbox_tier_b");
+        assert_eq!(outcome.attestation.sandbox_enforcement, "strict");
     }
 
     #[tokio::test(flavor = "multi_thread")]

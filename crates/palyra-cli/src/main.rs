@@ -2661,6 +2661,14 @@ fn run_policy(command: PolicyCommand) -> Result<()> {
     }
 }
 
+fn format_config_get_display_value(key: &str, value: &toml::Value, show_secrets: bool) -> String {
+    if show_secrets || !is_secret_config_path(key) {
+        format_toml_value(value)
+    } else {
+        format_toml_value(&toml::Value::String(REDACTED_CONFIG_VALUE.to_owned()))
+    }
+}
+
 fn run_config(command: ConfigCommand) -> Result<()> {
     match command {
         ConfigCommand::Validate { path } => {
@@ -2706,11 +2714,7 @@ fn run_config(command: ConfigCommand) -> Result<()> {
             let value = get_value_at_path(&document, key.as_str())
                 .with_context(|| format!("invalid config key path: {}", key))?
                 .with_context(|| format!("config key not found: {}", key))?;
-            let display_value = if show_secrets || !is_secret_config_path(key.as_str()) {
-                format_toml_value(value)
-            } else {
-                format_toml_value(&toml::Value::String(REDACTED_CONFIG_VALUE.to_owned()))
-            };
+            let display_value = format_config_get_display_value(key.as_str(), value, show_secrets);
             println!(
                 "config.get key={} value={} source={} show_secrets={show_secrets}",
                 key, display_value, path
@@ -6128,6 +6132,27 @@ mod cli_v1_tests {
         assert_eq!(normalize_prompt_secret_value("secret\r\n"), "secret");
         assert_eq!(normalize_prompt_secret_value("secret\n"), "secret");
         assert_eq!(normalize_prompt_secret_value("sec ret"), "sec ret");
+    }
+
+    #[test]
+    fn config_get_masks_secret_values_when_show_secrets_is_disabled() {
+        let value = toml::Value::String("vault://global/openai".to_owned());
+        let rendered = super::format_config_get_display_value(
+            "model_provider.openai_api_key_vault_ref",
+            &value,
+            false,
+        );
+        assert!(
+            rendered.contains(super::REDACTED_CONFIG_VALUE),
+            "secret value should be redacted in config.get output"
+        );
+    }
+
+    #[test]
+    fn config_get_keeps_non_secret_values_visible() {
+        let value = toml::Value::Integer(7443);
+        let rendered = super::format_config_get_display_value("gateway.grpc_port", &value, false);
+        assert_eq!(rendered, "7443");
     }
 
     #[cfg(not(windows))]

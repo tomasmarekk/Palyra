@@ -3,8 +3,12 @@ use toml::Value;
 
 const REDACTED_CONFIG_VALUE: &str = "<redacted>";
 
-pub const SECRET_CONFIG_PATHS: &[&str] =
-    &["admin.auth_token", "model_provider.openai_api_key", "gateway.admin_token"];
+pub const SECRET_CONFIG_PATHS: &[&str] = &[
+    "admin.auth_token",
+    "model_provider.openai_api_key",
+    "model_provider.openai_api_key_vault_ref",
+    "gateway.admin_token",
+];
 
 #[must_use]
 pub fn is_secret_config_path(path: &str) -> bool {
@@ -206,6 +210,8 @@ mod tests {
     fn secret_config_path_matching_is_case_insensitive() {
         assert!(is_secret_config_path("model_provider.openai_api_key"));
         assert!(is_secret_config_path("model_provider.OPENAI_API_KEY"));
+        assert!(is_secret_config_path("model_provider.openai_api_key_vault_ref"));
+        assert!(is_secret_config_path("gateway.admin_token"));
         assert!(is_secret_config_path(" admin.auth_token "));
         assert!(!is_secret_config_path("daemon.port"));
     }
@@ -219,6 +225,9 @@ mod tests {
             auth_token = "token-value"
             [model_provider]
             openai_api_key = "sk-secret"
+            openai_api_key_vault_ref = "vault://global/openai_api_key"
+            [gateway]
+            admin_token = "legacy-token"
             "#,
         )
         .expect("config document should parse");
@@ -236,6 +245,20 @@ mod tests {
             document
                 .get("model_provider")
                 .and_then(|provider| provider.get("openai_api_key"))
+                .and_then(toml::Value::as_str),
+            Some("<redacted>")
+        );
+        assert_eq!(
+            document
+                .get("model_provider")
+                .and_then(|provider| provider.get("openai_api_key_vault_ref"))
+                .and_then(toml::Value::as_str),
+            Some("<redacted>")
+        );
+        assert_eq!(
+            document
+                .get("gateway")
+                .and_then(|gateway| gateway.get("admin_token"))
                 .and_then(toml::Value::as_str),
             Some("<redacted>")
         );
