@@ -4965,16 +4965,33 @@ fn fetch_remote_registry_entries(
     trust_store: &mut SkillTrustStore,
     allow_untrusted: bool,
 ) -> Result<Vec<RemoteRegistryResolvedEntry>> {
+    let client = build_registry_http_client(registry_ca_cert)?;
+    fetch_remote_registry_entries_with_fetcher(
+        registry_url,
+        trust_store,
+        allow_untrusted,
+        |page_url| fetch_limited_bytes(&client, page_url.as_str(), MAX_REGISTRY_INDEX_BYTES),
+    )
+}
+
+fn fetch_remote_registry_entries_with_fetcher<F>(
+    registry_url: &str,
+    trust_store: &mut SkillTrustStore,
+    allow_untrusted: bool,
+    mut fetch_payload: F,
+) -> Result<Vec<RemoteRegistryResolvedEntry>>
+where
+    F: FnMut(&Url) -> Result<Vec<u8>>,
+{
     let mut page_url = parse_https_url(registry_url, "--registry-url")?;
     let registry_origin = page_url.clone();
-    let client = build_registry_http_client(registry_ca_cert)?;
     let mut visited_pages = HashSet::<String>::new();
     let mut merged = Vec::<RemoteRegistryResolvedEntry>::new();
     for _ in 0..MAX_REGISTRY_PAGES {
         if !visited_pages.insert(page_url.to_string()) {
             anyhow::bail!("remote registry pagination loop detected at {}", page_url);
         }
-        let payload = fetch_limited_bytes(&client, page_url.as_str(), MAX_REGISTRY_INDEX_BYTES)
+        let payload = fetch_payload(&page_url)
             .with_context(|| format!("failed to fetch remote registry index {}", page_url))?;
         let index = parse_and_verify_signed_remote_registry_index(
             payload.as_slice(),
@@ -6054,8 +6071,9 @@ struct SkillStatusResponse {
 mod cli_v1_tests {
     use super::{
         compare_semver_versions, ensure_remote_registry_same_origin, fetch_limited_bytes,
-        is_retryable_grpc_error, normalize_client_socket, normalize_installed_skills_index,
-        normalize_prompt_secret_value, normalize_relative_registry_path, parse_acp_shim_input_line,
+        fetch_remote_registry_entries_with_fetcher, is_retryable_grpc_error,
+        normalize_client_socket, normalize_installed_skills_index, normalize_prompt_secret_value,
+        normalize_relative_registry_path, parse_acp_shim_input_line,
         parse_and_verify_signed_remote_registry_index, registry_key_id_for, sha256_hex,
         validate_registry_index, write_file_atomically, InstalledSkillRecord, InstalledSkillSource,
         InstalledSkillsIndex, RegistrySignature, SignedSkillRegistryIndex, SkillRegistryEntry,
@@ -6066,6 +6084,7 @@ mod cli_v1_tests {
     use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
     use palyra_skills::SkillTrustStore;
     use reqwest::Url;
+    use std::collections::HashMap;
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener};
     use std::path::Path;
@@ -6094,6 +6113,58 @@ mod cli_v1_tests {
             let _ = stream.flush();
         });
         (format!("http://{address}/registry/index.json"), handle)
+    }
+
+    fn trust_store_with_registry_key(publisher: &str, signing_key: &SigningKey) -> SkillTrustStore {
+        let verifying_key = VerifyingKey::from(signing_key);
+        let mut key_hex = String::with_capacity(64);
+        for byte in verifying_key.as_bytes() {
+            key_hex.push_str(format!("{byte:02x}").as_str());
+        }
+        let mut store = SkillTrustStore::default();
+        store.add_trusted_key(publisher, key_hex.as_str()).expect("trusted key should be accepted");
+        store
+    }
+
+    fn sign_registry_index(
+        signing_key: &SigningKey,
+        publisher: &str,
+        index: SkillRegistryIndex,
+    ) -> Vec<u8> {
+        let verifying_key = VerifyingKey::from(signing_key);
+        let payload_sha256 =
+            sha256_hex(serde_json::to_vec(&index).expect("index should serialize").as_slice());
+        let signature = signing_key.sign(payload_sha256.as_bytes());
+        serde_json::to_vec(&SignedSkillRegistryIndex {
+            schema_version: REGISTRY_SIGNED_INDEX_SCHEMA_VERSION,
+            index,
+            signature: RegistrySignature {
+                algorithm: REGISTRY_SIGNATURE_ALGORITHM.to_owned(),
+                publisher: publisher.to_owned(),
+                key_id: registry_key_id_for(&verifying_key),
+                public_key_base64: BASE64_STANDARD.encode(verifying_key.as_bytes()),
+                payload_sha256,
+                signature_base64: BASE64_STANDARD.encode(signature.to_bytes()),
+                signed_at_unix_ms: 1_730_000_000_123,
+            },
+        })
+        .expect("signed registry index should serialize")
+    }
+
+    fn test_registry_entry(
+        skill_id: &str,
+        version: &str,
+        artifact: &str,
+        sha_seed: char,
+    ) -> SkillRegistryEntry {
+        SkillRegistryEntry {
+            skill_id: skill_id.to_owned(),
+            version: version.to_owned(),
+            publisher: "acme".to_owned(),
+            artifact: artifact.to_owned(),
+            artifact_sha256: sha_seed.to_string().repeat(64),
+            artifact_bytes: Some(128),
+        }
     }
 
     #[test]
@@ -6175,6 +6246,168 @@ mod cli_v1_tests {
         let result =
             ensure_remote_registry_same_origin(&registry_origin, &candidate, "artifact URL");
         assert!(result.is_ok(), "same-origin artifact URL should be accepted");
+    }
+
+    #[test]
+    fn remote_registry_fetch_detects_pagination_loops() {
+        let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let publisher = "acme-registry";
+        let mut trust_store = trust_store_with_registry_key(publisher, &signing_key);
+
+        let root_url = "https://registry.example/catalog/index.json";
+        let page_two_url = "https://registry.example/catalog/page-2.json";
+
+        let page_one_payload = sign_registry_index(
+            &signing_key,
+            publisher,
+            SkillRegistryIndex {
+                schema_version: REGISTRY_INDEX_SCHEMA_VERSION,
+                generated_at_unix_ms: 1_730_000_000_000,
+                entries: vec![test_registry_entry(
+                    "acme.echo_http",
+                    "1.0.0",
+                    "../artifacts/acme.echo_http-v1.palyra-skill",
+                    '1',
+                )],
+                next_page: Some("page-2.json".to_owned()),
+            },
+        );
+        let page_two_payload = sign_registry_index(
+            &signing_key,
+            publisher,
+            SkillRegistryIndex {
+                schema_version: REGISTRY_INDEX_SCHEMA_VERSION,
+                generated_at_unix_ms: 1_730_000_000_100,
+                entries: vec![test_registry_entry(
+                    "acme.echo_http",
+                    "1.1.0",
+                    "../artifacts/acme.echo_http-v1_1.palyra-skill",
+                    '2',
+                )],
+                next_page: Some("index.json".to_owned()),
+            },
+        );
+        let mut payloads = HashMap::<String, Vec<u8>>::from([
+            (root_url.to_owned(), page_one_payload),
+            (page_two_url.to_owned(), page_two_payload),
+        ]);
+        let mut fetch_count = 0usize;
+
+        let error = fetch_remote_registry_entries_with_fetcher(
+            root_url,
+            &mut trust_store,
+            false,
+            |page_url| {
+                fetch_count += 1;
+                payloads
+                    .remove(page_url.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("missing fixture for {}", page_url))
+            },
+        )
+        .expect_err("pagination loops must be rejected");
+
+        assert!(
+            error.to_string().contains("pagination loop detected"),
+            "error should mention pagination loop detection: {error}"
+        );
+        assert_eq!(fetch_count, 2, "fetch should stop before re-fetching looped page");
+    }
+
+    #[test]
+    fn remote_registry_fetch_rejects_cross_origin_next_page() {
+        let signing_key = SigningKey::from_bytes(&[8_u8; 32]);
+        let publisher = "acme-registry";
+        let mut trust_store = trust_store_with_registry_key(publisher, &signing_key);
+
+        let root_url = "https://registry.example/catalog/index.json";
+        let page_one_payload = sign_registry_index(
+            &signing_key,
+            publisher,
+            SkillRegistryIndex {
+                schema_version: REGISTRY_INDEX_SCHEMA_VERSION,
+                generated_at_unix_ms: 1_730_000_000_000,
+                entries: vec![test_registry_entry(
+                    "acme.echo_http",
+                    "1.0.0",
+                    "../artifacts/acme.echo_http-v1.palyra-skill",
+                    '3',
+                )],
+                next_page: Some("https://evil.example/catalog/page-2.json".to_owned()),
+            },
+        );
+        let mut payloads =
+            HashMap::<String, Vec<u8>>::from([(root_url.to_owned(), page_one_payload)]);
+        let mut fetched_urls = Vec::<String>::new();
+
+        let error = fetch_remote_registry_entries_with_fetcher(
+            root_url,
+            &mut trust_store,
+            false,
+            |page_url| {
+                fetched_urls.push(page_url.to_string());
+                payloads
+                    .remove(page_url.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("missing fixture for {}", page_url))
+            },
+        )
+        .expect_err("cross-origin pagination targets must be rejected");
+
+        assert!(
+            error.to_string().contains("next_page URL"),
+            "error should identify next_page validation: {error}"
+        );
+        assert!(
+            error.to_string().contains("must stay on origin"),
+            "error should mention same-origin enforcement: {error}"
+        );
+        assert_eq!(fetched_urls.len(), 1, "only the first page should be fetched");
+    }
+
+    #[test]
+    fn remote_registry_fetch_rejects_cross_origin_artifact_url() {
+        let signing_key = SigningKey::from_bytes(&[9_u8; 32]);
+        let publisher = "acme-registry";
+        let mut trust_store = trust_store_with_registry_key(publisher, &signing_key);
+
+        let root_url = "https://registry.example/catalog/index.json";
+        let page_one_payload = sign_registry_index(
+            &signing_key,
+            publisher,
+            SkillRegistryIndex {
+                schema_version: REGISTRY_INDEX_SCHEMA_VERSION,
+                generated_at_unix_ms: 1_730_000_000_000,
+                entries: vec![test_registry_entry(
+                    "acme.echo_http",
+                    "1.0.0",
+                    "https://evil.example/artifacts/acme.echo_http-v1.palyra-skill",
+                    '4',
+                )],
+                next_page: None,
+            },
+        );
+        let mut payloads =
+            HashMap::<String, Vec<u8>>::from([(root_url.to_owned(), page_one_payload)]);
+
+        let error = fetch_remote_registry_entries_with_fetcher(
+            root_url,
+            &mut trust_store,
+            false,
+            |page_url| {
+                payloads
+                    .remove(page_url.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("missing fixture for {}", page_url))
+            },
+        )
+        .expect_err("cross-origin artifact URLs must be rejected");
+
+        assert!(
+            error.to_string().contains("artifact URL"),
+            "error should identify artifact URL validation: {error}"
+        );
+        assert!(
+            error.to_string().contains("must stay on origin"),
+            "error should mention same-origin enforcement: {error}"
+        );
     }
 
     #[test]
