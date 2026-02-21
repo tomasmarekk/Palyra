@@ -161,6 +161,7 @@ pub fn decide_tool_call(
         allow_sensitive_tools,
         sensitive_tool_names: sensitive_allowlisted_tool_names(config.allowed_tools.as_slice()),
         allowlisted_skills: Vec::new(),
+        sensitive_actions: Vec::new(),
     };
     let policy_evaluation = match evaluate_with_config(&policy_request, &policy_config) {
         Ok(evaluation) => evaluation,

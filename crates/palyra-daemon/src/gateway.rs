@@ -6927,6 +6927,7 @@ async fn evaluate_skill_execution_gate(
             allow_sensitive_tools: false,
             sensitive_tool_names: Vec::new(),
             allowlisted_skills: vec![status_record.skill_id.clone()],
+            sensitive_actions: Vec::new(),
         },
     )
     .map_err(|error| Status::internal(format!("failed to evaluate skill policy: {error}")))?;

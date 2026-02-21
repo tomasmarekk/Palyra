@@ -17,6 +17,7 @@ pub struct PolicyEvaluationConfig {
     pub allowlisted_skills: Vec<String>,
     pub allow_sensitive_tools: bool,
     pub sensitive_tool_names: Vec<String>,
+    pub sensitive_actions: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,8 +155,8 @@ pub fn evaluate_with_config(
     let is_sensitive_action = is_sensitive_action(
         normalized_action.as_str(),
         requested_tool.as_deref(),
-        request,
         config.sensitive_tool_names.as_slice(),
+        config.sensitive_actions.as_slice(),
     );
 
     let context = Context::from_json_value(
@@ -353,16 +354,16 @@ fn is_allowlisted_skill(requested_skill: Option<&str>, allowlisted_skills: &[Str
 fn is_sensitive_action(
     normalized_action: &str,
     requested_tool: Option<&str>,
-    request: &PolicyRequest,
     sensitive_tool_names: &[String],
+    sensitive_actions: &[String],
 ) -> bool {
-    if normalized_action.starts_with("vault.") {
-        return false;
+    if is_sensitive_action_name(normalized_action, sensitive_actions) {
+        return true;
     }
     if normalized_action == "tool.execute" {
         return is_sensitive_tool_name(requested_tool, sensitive_tool_names);
     }
-    is_sensitive_action_heuristic(request)
+    false
 }
 
 fn is_sensitive_tool_name(requested_tool: Option<&str>, sensitive_tool_names: &[String]) -> bool {
@@ -374,21 +375,17 @@ fn is_sensitive_tool_name(requested_tool: Option<&str>, sensitive_tool_names: &[
         .any(|sensitive_tool| sensitive_tool.eq_ignore_ascii_case(requested_tool))
 }
 
-fn is_sensitive_action_heuristic(request: &PolicyRequest) -> bool {
-    let action = request.action.to_ascii_lowercase();
-    let resource = request.resource.to_ascii_lowercase();
-    ["shell", "delete", "payment"]
+fn is_sensitive_action_name(normalized_action: &str, sensitive_actions: &[String]) -> bool {
+    sensitive_actions
         .iter()
-        .any(|keyword| action.contains(keyword) || resource.contains(keyword))
-        || resource.contains("secrets")
-        || resource.contains("credential")
+        .any(|sensitive_action| sensitive_action.eq_ignore_ascii_case(normalized_action))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         evaluate, evaluate_with_config, PolicyDecision, PolicyEvaluationConfig, PolicyRequest,
-        POLICY_DENY_REASON, SENSITIVE_DENY_REASON, SKILL_POLICY_DENY_REASON,
+        BASELINE_DENY_REASON, POLICY_DENY_REASON, SENSITIVE_DENY_REASON, SKILL_POLICY_DENY_REASON,
     };
 
     #[test]
@@ -438,6 +435,7 @@ mod tests {
             allowlisted_skills: Vec::new(),
             allow_sensitive_tools: false,
             sensitive_tool_names: vec!["palyra.process.run".to_owned()],
+            sensitive_actions: Vec::new(),
         };
 
         let evaluation = evaluate_with_config(&request, &config).expect("evaluation");
@@ -481,6 +479,24 @@ mod tests {
     }
 
     #[test]
+    fn cron_delete_action_is_not_implicitly_sensitive() {
+        let request = PolicyRequest {
+            principal: "user:ops".to_owned(),
+            action: "cron.delete".to_owned(),
+            resource: "cron:job".to_owned(),
+        };
+
+        let evaluation =
+            evaluate_with_config(&request, &PolicyEvaluationConfig::default()).expect("evaluation");
+
+        assert_eq!(evaluation.decision, PolicyDecision::Allow);
+        assert!(
+            !evaluation.explanation.is_sensitive_action,
+            "cron delete should not be marked sensitive without explicit configuration"
+        );
+    }
+
+    #[test]
     fn memory_actions_are_explicitly_allowed() {
         let request = PolicyRequest {
             principal: "user:ops".to_owned(),
@@ -517,6 +533,48 @@ mod tests {
     }
 
     #[test]
+    fn explicit_sensitive_actions_require_explicit_approval() {
+        let request = PolicyRequest {
+            principal: "user:ops".to_owned(),
+            action: "vault.delete".to_owned(),
+            resource: "secrets:global:openai_api_key".to_owned(),
+        };
+        let config = PolicyEvaluationConfig {
+            sensitive_actions: vec!["vault.delete".to_owned()],
+            ..PolicyEvaluationConfig::default()
+        };
+
+        let evaluation = evaluate_with_config(&request, &config).expect("evaluation");
+
+        assert_eq!(
+            evaluation.decision,
+            PolicyDecision::DenyByDefault { reason: SENSITIVE_DENY_REASON.to_owned() }
+        );
+        assert!(evaluation.explanation.is_sensitive_action);
+    }
+
+    #[test]
+    fn unknown_delete_actions_are_not_keyword_sensitive_by_default() {
+        let request = PolicyRequest {
+            principal: "user:ops".to_owned(),
+            action: "custom.delete".to_owned(),
+            resource: "custom:resource".to_owned(),
+        };
+
+        let evaluation =
+            evaluate_with_config(&request, &PolicyEvaluationConfig::default()).expect("evaluation");
+
+        assert_eq!(
+            evaluation.decision,
+            PolicyDecision::DenyByDefault { reason: BASELINE_DENY_REASON.to_owned() }
+        );
+        assert!(
+            !evaluation.explanation.is_sensitive_action,
+            "delete keyword should not auto-classify unknown actions as sensitive"
+        );
+    }
+
+    #[test]
     fn tool_execute_is_allowed_only_when_allowlisted() {
         let request = PolicyRequest {
             principal: "user:bootstrap".to_owned(),
@@ -535,6 +593,7 @@ mod tests {
             allow_sensitive_tools: false,
             sensitive_tool_names: Vec::new(),
             allowlisted_skills: Vec::new(),
+            sensitive_actions: Vec::new(),
         };
         let allowed = evaluate_with_config(&request, &allowed_config).expect("evaluation");
         assert_eq!(allowed.decision, PolicyDecision::Allow);
@@ -560,6 +619,7 @@ mod tests {
             allow_sensitive_tools: false,
             allowlisted_tools: Vec::new(),
             sensitive_tool_names: Vec::new(),
+            sensitive_actions: Vec::new(),
         };
         let allowed = evaluate_with_config(&request, &allowed_config).expect("evaluation");
         assert_eq!(allowed.decision, PolicyDecision::Allow);
