@@ -7577,6 +7577,7 @@ mod tests {
                     },
                     wasm_runtime: crate::wasm_plugin_runner::WasmPluginRunnerPolicy {
                         enabled: false,
+                        allow_inline_modules: false,
                         max_module_size_bytes: 256 * 1024,
                         fuel_budget: 10_000_000,
                         max_memory_bytes: 64 * 1024 * 1024,

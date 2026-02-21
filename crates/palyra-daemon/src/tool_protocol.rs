@@ -88,6 +88,7 @@ pub struct ProcessRunnerPolicySnapshot {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct WasmRuntimePolicySnapshot {
     pub enabled: bool,
+    pub allow_inline_modules: bool,
     pub max_module_size_bytes: u64,
     pub fuel_budget: u64,
     pub max_memory_bytes: u64,
@@ -137,6 +138,7 @@ pub fn tool_policy_snapshot(config: &ToolCallConfig) -> ToolCallPolicySnapshot {
         },
         wasm_runtime: WasmRuntimePolicySnapshot {
             enabled: config.wasm_runtime.enabled,
+            allow_inline_modules: config.wasm_runtime.allow_inline_modules,
             max_module_size_bytes: config.wasm_runtime.max_module_size_bytes,
             fuel_budget: config.wasm_runtime.fuel_budget,
             max_memory_bytes: config.wasm_runtime.max_memory_bytes,
@@ -711,6 +713,7 @@ mod tests {
     fn default_wasm_runtime_policy() -> WasmPluginRunnerPolicy {
         WasmPluginRunnerPolicy {
             enabled: false,
+            allow_inline_modules: false,
             max_module_size_bytes: 256 * 1024,
             fuel_budget: 10_000_000,
             max_memory_bytes: 64 * 1024 * 1024,
@@ -1044,6 +1047,7 @@ mod tests {
             process_runner: default_process_runner_policy(),
             wasm_runtime: WasmPluginRunnerPolicy {
                 enabled: true,
+                allow_inline_modules: true,
                 max_module_size_bytes: 256 * 1024,
                 fuel_budget: 10_000_000,
                 max_memory_bytes: 64 * 1024 * 1024,
@@ -1085,6 +1089,7 @@ mod tests {
             process_runner: default_process_runner_policy(),
             wasm_runtime: WasmPluginRunnerPolicy {
                 enabled: true,
+                allow_inline_modules: true,
                 max_module_size_bytes: 256 * 1024,
                 fuel_budget: 1_000_000_000,
                 max_memory_bytes: 64 * 1024 * 1024,
@@ -1124,6 +1129,7 @@ mod tests {
             process_runner: default_process_runner_policy(),
             wasm_runtime: WasmPluginRunnerPolicy {
                 enabled: true,
+                allow_inline_modules: true,
                 max_module_size_bytes: 256 * 1024,
                 fuel_budget: 10_000_000,
                 max_memory_bytes: 64 * 1024 * 1024,

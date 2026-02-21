@@ -48,6 +48,7 @@ const DEFAULT_PROCESS_RUNNER_CPU_TIME_LIMIT_MS: u64 = 2_000;
 const DEFAULT_PROCESS_RUNNER_MEMORY_LIMIT_BYTES: u64 = 256 * 1024 * 1024;
 const DEFAULT_PROCESS_RUNNER_MAX_OUTPUT_BYTES: u64 = 64 * 1024;
 const DEFAULT_WASM_RUNTIME_ENABLED: bool = false;
+const DEFAULT_WASM_RUNTIME_ALLOW_INLINE_MODULES: bool = false;
 const DEFAULT_WASM_RUNTIME_MAX_MODULE_SIZE_BYTES: u64 = 256 * 1024;
 const DEFAULT_WASM_RUNTIME_FUEL_BUDGET: u64 = 10_000_000;
 const DEFAULT_WASM_RUNTIME_MAX_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
@@ -142,6 +143,7 @@ pub struct ProcessRunnerConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WasmRuntimeConfig {
     pub enabled: bool,
+    pub allow_inline_modules: bool,
     pub max_module_size_bytes: u64,
     pub fuel_budget: u64,
     pub max_memory_bytes: u64,
@@ -283,6 +285,7 @@ impl Default for WasmRuntimeConfig {
     fn default() -> Self {
         Self {
             enabled: DEFAULT_WASM_RUNTIME_ENABLED,
+            allow_inline_modules: DEFAULT_WASM_RUNTIME_ALLOW_INLINE_MODULES,
             max_module_size_bytes: DEFAULT_WASM_RUNTIME_MAX_MODULE_SIZE_BYTES,
             fuel_budget: DEFAULT_WASM_RUNTIME_FUEL_BUDGET,
             max_memory_bytes: DEFAULT_WASM_RUNTIME_MAX_MEMORY_BYTES,
@@ -533,6 +536,9 @@ pub fn load_config() -> Result<LoadedConfig> {
             if let Some(file_wasm_runtime) = file_tool_call.wasm_runtime {
                 if let Some(enabled) = file_wasm_runtime.enabled {
                     tool_call.wasm_runtime.enabled = enabled;
+                }
+                if let Some(allow_inline_modules) = file_wasm_runtime.allow_inline_modules {
+                    tool_call.wasm_runtime.allow_inline_modules = allow_inline_modules;
                 }
                 if let Some(max_module_size_bytes) = file_wasm_runtime.max_module_size_bytes {
                     tool_call.wasm_runtime.max_module_size_bytes = parse_positive_u64(
@@ -1337,11 +1343,29 @@ mod tests {
             "process runner egress enforcement must default to strict"
         );
         assert!(!config.wasm_runtime.enabled, "wasm plugin runtime must default to disabled");
+        assert!(
+            !config.wasm_runtime.allow_inline_modules,
+            "inline wasm module payloads must default to explicit opt-in"
+        );
         assert_eq!(config.wasm_runtime.max_module_size_bytes, 256 * 1024);
         assert!(
             config.wasm_runtime.allowed_http_hosts.is_empty(),
             "wasm runtime http allowlist must default empty"
         );
+    }
+
+    #[test]
+    fn wasm_runtime_config_parses_allow_inline_modules_override() {
+        let (parsed, _) = parse_root_file_config(
+            r#"
+            [tool_call.wasm_runtime]
+            allow_inline_modules = true
+            "#,
+        )
+        .expect("wasm runtime override should parse");
+        let tool_call = parsed.tool_call.expect("tool_call section should be present");
+        let wasm_runtime = tool_call.wasm_runtime.expect("wasm_runtime section should be present");
+        assert_eq!(wasm_runtime.allow_inline_modules, Some(true));
     }
 
     #[test]
