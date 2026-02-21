@@ -1,4 +1,8 @@
-use std::{net::SocketAddr, sync::Arc, time::SystemTime};
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::Arc,
+    time::SystemTime,
+};
 
 use anyhow::{Context, Result};
 use palyra_identity::{
@@ -13,6 +17,11 @@ use tokio::{
     sync::oneshot,
 };
 use tokio_rustls::{TlsAcceptor, TlsConnector};
+use x509_parser::{
+    extensions::GeneralName,
+    pem::parse_x509_pem,
+    prelude::{FromDer, X509Certificate},
+};
 
 async fn spawn_mtls_echo_server(
     config: rustls::ServerConfig,
@@ -61,6 +70,44 @@ async fn send_ping(address: SocketAddr, config: rustls::ClientConfig) -> Result<
         anyhow::bail!("unexpected server response");
     }
     Ok(())
+}
+
+fn parse_ip_san(raw: &[u8]) -> Option<IpAddr> {
+    match raw.len() {
+        4 => Some(IpAddr::V4(Ipv4Addr::new(raw[0], raw[1], raw[2], raw[3]))),
+        _ => None,
+    }
+}
+
+#[test]
+fn gateway_server_certificate_includes_custom_ip_san() {
+    let mut manager = IdentityManager::with_memory_store().expect("identity manager should build");
+    let issued = manager
+        .issue_gateway_server_certificate_with_sans(
+            "palyrad-node-rpc",
+            &["node1.lan".to_owned()],
+            &[IpAddr::V4(Ipv4Addr::new(192, 168, 50, 10))],
+        )
+        .expect("server certificate should be issued with SAN overrides");
+
+    let (_, pem) =
+        parse_x509_pem(issued.certificate_pem.as_bytes()).expect("certificate PEM should parse");
+    let (_, cert) = X509Certificate::from_der(&pem.contents).expect("certificate DER should parse");
+    let san_extension = cert
+        .subject_alternative_name()
+        .expect("SAN extension should parse")
+        .expect("SAN extension should exist");
+
+    let mut has_expected_ip = false;
+    for general_name in &san_extension.value.general_names {
+        if let GeneralName::IPAddress(raw) = general_name {
+            if parse_ip_san(raw) == Some(IpAddr::V4(Ipv4Addr::new(192, 168, 50, 10))) {
+                has_expected_ip = true;
+                break;
+            }
+        }
+    }
+    assert!(has_expected_ip, "custom IP SAN should be present in issued certificate");
 }
 
 #[tokio::test]

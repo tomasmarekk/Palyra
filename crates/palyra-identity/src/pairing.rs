@@ -1,7 +1,8 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     io::Write,
+    net::IpAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
     thread,
@@ -163,6 +164,8 @@ const PAIRED_DEVICES_STATE_KEY: &str = "identity/pairing/paired_devices.json";
 const REVOKED_DEVICES_STATE_KEY: &str = "identity/pairing/revoked_devices.json";
 const REVOKED_CERTIFICATES_STATE_KEY: &str = "identity/pairing/revoked_certificates.json";
 const MAX_ACTIVE_PAIRING_SESSIONS: usize = 10_000;
+const DEFAULT_PAIRING_START_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+const DEFAULT_PAIRING_MAX_STARTS_PER_WINDOW: usize = 1_024;
 const IDENTITY_STATE_LOCK_FILENAME: &str = ".identity-state.lock";
 const IDENTITY_STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(3);
 const IDENTITY_STATE_LOCK_RETRY: Duration = Duration::from_millis(20);
@@ -188,6 +191,9 @@ struct StateMutationGuard {
 pub struct IdentityManager {
     store: Arc<dyn SecretStore>,
     pairing_window: Duration,
+    pairing_start_rate_limit_window: Duration,
+    pairing_max_starts_per_window: usize,
+    recent_pairing_starts: VecDeque<u64>,
     certificate_validity: Duration,
     rotation_threshold: Duration,
     active_sessions: HashMap<String, ActivePairingSession>,
@@ -206,6 +212,9 @@ impl IdentityManager {
         let mut manager = Self {
             store,
             pairing_window: DEFAULT_PAIRING_WINDOW,
+            pairing_start_rate_limit_window: DEFAULT_PAIRING_START_RATE_LIMIT_WINDOW,
+            pairing_max_starts_per_window: DEFAULT_PAIRING_MAX_STARTS_PER_WINDOW,
+            recent_pairing_starts: VecDeque::new(),
             certificate_validity: DEFAULT_CERT_VALIDITY,
             rotation_threshold: DEFAULT_ROTATION_THRESHOLD,
             active_sessions: HashMap::new(),
@@ -228,6 +237,12 @@ impl IdentityManager {
 
     pub fn set_pairing_window(&mut self, value: Duration) {
         self.pairing_window = value;
+    }
+
+    pub fn set_pairing_start_rate_limit(&mut self, max_starts_per_window: usize, window: Duration) {
+        self.pairing_max_starts_per_window = max_starts_per_window.max(1);
+        self.pairing_start_rate_limit_window =
+            if window.is_zero() { Duration::from_millis(1) } else { window };
     }
 
     pub fn set_certificate_validity(&mut self, value: Duration) {
@@ -324,8 +339,22 @@ impl IdentityManager {
         &mut self,
         common_name: &str,
     ) -> IdentityResult<IssuedCertificate> {
+        self.issue_gateway_server_certificate_with_sans(common_name, &[], &[])
+    }
+
+    pub fn issue_gateway_server_certificate_with_sans(
+        &mut self,
+        common_name: &str,
+        additional_dns_names: &[String],
+        additional_ip_addresses: &[IpAddr],
+    ) -> IdentityResult<IssuedCertificate> {
         self.mutate_persisted_state(|manager| {
-            manager.ca.issue_server_certificate(common_name, manager.certificate_validity)
+            manager.ca.issue_server_certificate_with_sans(
+                common_name,
+                manager.certificate_validity,
+                additional_dns_names,
+                additional_ip_addresses,
+            )
         })
     }
 
@@ -342,13 +371,32 @@ impl IdentityManager {
         Ok(())
     }
 
+    fn prune_pairing_start_history(&mut self, now_ms: u64) {
+        let window_ms = duration_to_millis_u64(self.pairing_start_rate_limit_window);
+        while let Some(issued_at_ms) = self.recent_pairing_starts.front().copied() {
+            if now_ms.saturating_sub(issued_at_ms) >= window_ms {
+                self.recent_pairing_starts.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
     pub fn start_pairing(
         &mut self,
         client_kind: PairingClientKind,
         method: PairingMethod,
         now: SystemTime,
     ) -> IdentityResult<PairingSession> {
+        let now_ms = unix_ms(now)?;
         self.prune_expired_sessions(now, None)?;
+        self.prune_pairing_start_history(now_ms);
+        if self.recent_pairing_starts.len() >= self.pairing_max_starts_per_window {
+            return Err(IdentityError::PairingSessionRateLimited {
+                max: self.pairing_max_starts_per_window,
+                window_ms: duration_to_millis_u64(self.pairing_start_rate_limit_window),
+            });
+        }
         if self.active_sessions.len() >= MAX_ACTIVE_PAIRING_SESSIONS {
             return Err(IdentityError::PairingSessionCapacityExceeded {
                 limit: MAX_ACTIVE_PAIRING_SESSIONS,
@@ -381,6 +429,7 @@ impl IdentityManager {
             session_id,
             ActivePairingSession { public: session.clone(), gateway_ephemeral_secret },
         );
+        self.recent_pairing_starts.push_back(now_ms);
         Ok(session)
     }
 
@@ -884,6 +933,10 @@ pub fn should_rotate_certificate(
     Ok(certificate.expires_at_unix_ms <= now_ms.saturating_add(threshold_ms))
 }
 
+fn duration_to_millis_u64(value: Duration) -> u64 {
+    value.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
 fn validate_pairing_method(method: &PairingMethod) -> IdentityResult<()> {
     match method {
         PairingMethod::Pin { code } => {
@@ -1373,6 +1426,48 @@ mod tests {
                 )
                 .expect("session should be created while under cap");
         }
+    }
+
+    #[test]
+    fn start_pairing_enforces_burst_rate_limit_and_recovers_after_window() {
+        let mut manager = IdentityManager::with_memory_store().expect("manager should initialize");
+        manager.set_pairing_start_rate_limit(2, Duration::from_secs(30));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+
+        manager
+            .start_pairing(
+                PairingClientKind::Node,
+                PairingMethod::Pin { code: "123456".to_owned() },
+                now,
+            )
+            .expect("first session should be created");
+        manager
+            .start_pairing(
+                PairingClientKind::Node,
+                PairingMethod::Pin { code: "123456".to_owned() },
+                now + Duration::from_secs(1),
+            )
+            .expect("second session should be created");
+
+        let throttled = manager.start_pairing(
+            PairingClientKind::Node,
+            PairingMethod::Pin { code: "123456".to_owned() },
+            now + Duration::from_secs(2),
+        );
+        assert!(matches!(
+            throttled,
+            Err(IdentityError::PairingSessionRateLimited { max: 2, window_ms: 30_000 })
+        ));
+
+        let recovered = manager.start_pairing(
+            PairingClientKind::Node,
+            PairingMethod::Pin { code: "123456".to_owned() },
+            now + Duration::from_secs(32),
+        );
+        assert!(
+            recovered.is_ok(),
+            "rate limiter should recover deterministically once the window elapses"
+        );
     }
 
     #[test]
