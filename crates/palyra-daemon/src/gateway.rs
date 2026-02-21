@@ -210,6 +210,7 @@ pub struct GatewayJournalConfigSnapshot {
 pub struct GatewayAuthConfig {
     pub require_auth: bool,
     pub admin_token: Option<String>,
+    pub bound_principal: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -7347,7 +7348,11 @@ pub fn authorize_headers(headers: &HeaderMap, auth: &GatewayAuthConfig) -> Resul
         extract_bearer_token(headers.get(AUTHORIZATION).and_then(|value| value.to_str().ok()))
             .ok_or(AuthError::InvalidAuthorizationHeader)?;
     if constant_time_eq(token.as_bytes(), candidate.as_bytes()) {
-        Ok(())
+        let principal = require_context_value(
+            &|name| headers.get(name).and_then(|value| value.to_str().ok()).map(ToOwned::to_owned),
+            HEADER_PRINCIPAL,
+        )?;
+        enforce_token_principal_binding(principal.as_str(), auth)
     } else {
         Err(AuthError::InvalidToken)
     }
@@ -7374,9 +7379,28 @@ fn authorize_metadata(
         }
     }
 
-    request_context_from_header_resolver(|name| {
+    let context = request_context_from_header_resolver(|name| {
         metadata.get(name).and_then(|value| value.to_str().ok()).map(ToOwned::to_owned)
-    })
+    })?;
+    enforce_token_principal_binding(context.principal.as_str(), auth)?;
+    Ok(context)
+}
+
+fn enforce_token_principal_binding(
+    principal: &str,
+    auth: &GatewayAuthConfig,
+) -> Result<(), AuthError> {
+    if !auth.require_auth {
+        return Ok(());
+    }
+    let Some(expected_principal) = auth.bound_principal.as_ref() else {
+        return Ok(());
+    };
+    if principal == expected_principal {
+        Ok(())
+    } else {
+        Err(AuthError::InvalidToken)
+    }
 }
 
 fn request_context_from_header_resolver<F>(resolver: F) -> Result<RequestContext, AuthError>
@@ -7610,7 +7634,11 @@ mod tests {
 
     #[test]
     fn authorize_headers_rejects_missing_token_when_required() {
-        let auth = GatewayAuthConfig { require_auth: true, admin_token: Some("secret".to_owned()) };
+        let auth = GatewayAuthConfig {
+            require_auth: true,
+            admin_token: Some("secret".to_owned()),
+            bound_principal: Some("user:ops".to_owned()),
+        };
         let headers = HeaderMap::new();
         let result = authorize_headers(&headers, &auth);
         assert_eq!(result, Err(AuthError::InvalidAuthorizationHeader));
@@ -7618,20 +7646,44 @@ mod tests {
 
     #[test]
     fn authorize_headers_accepts_matching_bearer_token() {
-        let auth = GatewayAuthConfig { require_auth: true, admin_token: Some("secret".to_owned()) };
+        let auth = GatewayAuthConfig {
+            require_auth: true,
+            admin_token: Some("secret".to_owned()),
+            bound_principal: Some("user:ops".to_owned()),
+        };
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer secret"));
+        headers.insert(HEADER_PRINCIPAL, HeaderValue::from_static("user:ops"));
         let result = authorize_headers(&headers, &auth);
         assert!(result.is_ok(), "matching bearer token should be accepted");
     }
 
     #[test]
     fn authorize_headers_accepts_case_insensitive_bearer_scheme() {
-        let auth = GatewayAuthConfig { require_auth: true, admin_token: Some("secret".to_owned()) };
+        let auth = GatewayAuthConfig {
+            require_auth: true,
+            admin_token: Some("secret".to_owned()),
+            bound_principal: Some("user:ops".to_owned()),
+        };
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, HeaderValue::from_static("bEaReR secret"));
+        headers.insert(HEADER_PRINCIPAL, HeaderValue::from_static("user:ops"));
         let result = authorize_headers(&headers, &auth);
         assert!(result.is_ok(), "bearer auth scheme should be parsed case-insensitively");
+    }
+
+    #[test]
+    fn authorize_headers_rejects_principal_mismatch_with_bound_principal() {
+        let auth = GatewayAuthConfig {
+            require_auth: true,
+            admin_token: Some("secret".to_owned()),
+            bound_principal: Some("user:ops".to_owned()),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer secret"));
+        headers.insert(HEADER_PRINCIPAL, HeaderValue::from_static("user:finance"));
+        let result = authorize_headers(&headers, &auth);
+        assert_eq!(result, Err(AuthError::InvalidToken));
     }
 
     #[test]
@@ -7915,7 +7967,11 @@ mod tests {
                 device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
                 channel: Some("cli".to_owned()),
             },
-            &GatewayAuthConfig { require_auth: true, admin_token: Some("token".to_owned()) },
+            &GatewayAuthConfig {
+                require_auth: true,
+                admin_token: Some("token".to_owned()),
+                bound_principal: Some("user:ops".to_owned()),
+            },
         );
         assert_eq!(
             status.counters.journal_events, 1,

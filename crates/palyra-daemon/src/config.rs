@@ -151,6 +151,7 @@ pub struct WasmRuntimeConfig {
 pub struct AdminConfig {
     pub require_auth: bool,
     pub auth_token: Option<String>,
+    pub bound_principal: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -289,7 +290,7 @@ impl Default for WasmRuntimeConfig {
 
 impl Default for AdminConfig {
     fn default() -> Self {
-        Self { require_auth: DEFAULT_ADMIN_REQUIRE_AUTH, auth_token: None }
+        Self { require_auth: DEFAULT_ADMIN_REQUIRE_AUTH, auth_token: None, bound_principal: None }
     }
 }
 
@@ -577,6 +578,11 @@ pub fn load_config() -> Result<LoadedConfig> {
             if let Some(auth_token) = file_admin.auth_token {
                 admin.auth_token =
                     if auth_token.trim().is_empty() { None } else { Some(auth_token) };
+            }
+            if let Some(bound_principal) = file_admin.bound_principal {
+                let trimmed = bound_principal.trim();
+                admin.bound_principal =
+                    if trimmed.is_empty() { None } else { Some(trimmed.to_owned()) };
             }
         }
         if let Some(file_identity) = parsed.identity {
@@ -877,6 +883,12 @@ pub fn load_config() -> Result<LoadedConfig> {
     if let Ok(admin_token) = env::var("PALYRA_ADMIN_TOKEN") {
         admin.auth_token = if admin_token.trim().is_empty() { None } else { Some(admin_token) };
         source.push_str(" +env(PALYRA_ADMIN_TOKEN)");
+    }
+
+    if let Ok(bound_principal) = env::var("PALYRA_ADMIN_BOUND_PRINCIPAL") {
+        let trimmed = bound_principal.trim();
+        admin.bound_principal = if trimmed.is_empty() { None } else { Some(trimmed.to_owned()) };
+        source.push_str(" +env(PALYRA_ADMIN_BOUND_PRINCIPAL)");
     }
 
     if let Ok(allow_insecure) = env::var("PALYRA_ALLOW_INSECURE_NODE_RPC_WITHOUT_MTLS") {
@@ -1311,6 +1323,10 @@ mod tests {
         let config = AdminConfig::default();
         assert!(config.require_auth, "admin auth should default to required");
         assert!(config.auth_token.is_none(), "admin token should default to missing");
+        assert!(
+            config.bound_principal.is_none(),
+            "admin token principal binding should default to missing until explicitly configured"
+        );
     }
 
     #[test]

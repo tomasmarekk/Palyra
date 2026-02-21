@@ -178,6 +178,7 @@ pub struct FileWasmRuntimeConfig {
 pub struct FileAdminConfig {
     pub require_auth: Option<bool>,
     pub auth_token: Option<String>,
+    pub bound_principal: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]

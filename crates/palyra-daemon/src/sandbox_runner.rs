@@ -130,6 +130,7 @@ pub fn run_constrained_process(
 
         let requested_hosts = collect_requested_egress_hosts(&input)?;
         validate_egress_hosts(policy, requested_hosts.as_slice())?;
+        validate_runtime_egress_enforcement(policy)?;
 
         let per_call_timeout = input
             .timeout_ms
@@ -619,6 +620,18 @@ fn validate_egress_hosts(
     Ok(())
 }
 
+fn validate_runtime_egress_enforcement(
+    policy: &SandboxProcessRunnerPolicy,
+) -> Result<(), SandboxProcessRunError> {
+    if policy.allowed_egress_hosts.is_empty() && policy.allowed_dns_suffixes.is_empty() {
+        return Ok(());
+    }
+    Err(SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::EgressDenied,
+        message: "sandbox denied: runtime egress enforcement is unavailable; remove egress allowlists or disable process runner until an OS-level network sandbox backend is configured".to_owned(),
+    })
+}
+
 fn is_host_allowlisted(policy: &SandboxProcessRunnerPolicy, host: &str) -> bool {
     if policy.allowed_egress_hosts.iter().any(|allowed| allowed.eq_ignore_ascii_case(host)) {
         return true;
@@ -890,8 +903,8 @@ mod tests {
             enabled: true,
             workspace_root,
             allowed_executables,
-            allowed_egress_hosts: vec!["allowed.example".to_owned()],
-            allowed_dns_suffixes: vec![".corp.local".to_owned()],
+            allowed_egress_hosts: Vec::new(),
+            allowed_dns_suffixes: Vec::new(),
             cpu_time_limit_ms: 2_000,
             memory_limit_bytes: 128 * 1024 * 1024,
             max_output_bytes: 64 * 1024,
@@ -927,7 +940,8 @@ mod tests {
     #[cfg(unix)]
     fn run_constrained_process_rejects_non_allowlisted_egress_host() {
         let workspace = std::env::current_dir().expect("workspace current_dir should resolve");
-        let policy = sandbox_policy(workspace);
+        let mut policy = sandbox_policy(workspace);
+        policy.allowed_egress_hosts = vec!["allowed.example".to_owned()];
         let input = br#"{"command":"uname","args":["--version","https://blocked.example/path"]}"#;
         let error = run_constrained_process(&policy, input, Duration::from_millis(1_000))
             .expect_err("blocked host must be denied");
@@ -939,7 +953,8 @@ mod tests {
     #[cfg(unix)]
     fn run_constrained_process_rejects_non_allowlisted_egress_host_from_host_hint() {
         let workspace = std::env::current_dir().expect("workspace current_dir should resolve");
-        let policy = sandbox_policy(workspace);
+        let mut policy = sandbox_policy(workspace);
+        policy.allowed_egress_hosts = vec!["allowed.example".to_owned()];
         let input = br#"{"command":"uname","args":["--host=blocked.example"]}"#;
         let error = run_constrained_process(&policy, input, Duration::from_millis(1_000))
             .expect_err("host hint should be validated against egress allowlists");
@@ -1218,5 +1233,21 @@ mod tests {
         let error = run_constrained_process(&policy, input, Duration::from_millis(1_000))
             .expect_err("combined stdout+stderr output should hit global quota");
         assert_eq!(error.kind, SandboxProcessRunErrorKind::QuotaExceeded);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_constrained_process_fails_closed_without_runtime_egress_enforcement() {
+        let workspace = std::env::current_dir().expect("workspace current_dir should resolve");
+        let mut policy = sandbox_policy(workspace);
+        policy.allowed_egress_hosts = vec!["allowed.example".to_owned()];
+        let input = br#"{"command":"uname","args":[]}"#;
+        let error = run_constrained_process(&policy, input, Duration::from_millis(1_000))
+            .expect_err("runner must fail closed when runtime egress enforcement is unavailable");
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::EgressDenied);
+        assert!(
+            error.message.contains("runtime egress enforcement is unavailable"),
+            "error should explain fail-closed runtime egress requirement"
+        );
     }
 }
