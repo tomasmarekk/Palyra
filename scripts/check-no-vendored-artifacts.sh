@@ -13,17 +13,50 @@ if [[ -z "${tracked_files}" ]]; then
 fi
 
 forbidden_regex='(^|/)(node_modules|bower_components|\.pnpm-store|vendor)/(.*)?$'
+generated_sbom_regex='(^|/)sbom[^/]*\.json$'
+allowlisted_generated_files=(
+  "crates/palyra-skills/examples/echo-http/sbom.cdx.json"
+)
 
-if command -v rg >/dev/null 2>&1; then
-  matches="$(printf '%s\n' "${tracked_files}" | rg --line-number --color never "${forbidden_regex}" || true)"
-else
-  matches="$(printf '%s\n' "${tracked_files}" | grep -En "${forbidden_regex}" || true)"
-fi
+find_tracked_matches() {
+  local regex="$1"
+  if command -v rg >/dev/null 2>&1; then
+    printf '%s\n' "${tracked_files}" | rg --color never "${regex}" || true
+  else
+    printf '%s\n' "${tracked_files}" | grep -E "${regex}" || true
+  fi
+}
 
-if [[ -n "${matches//[[:space:]]/}" ]]; then
+vendored_matches="$(find_tracked_matches "${forbidden_regex}")"
+
+if [[ -n "${vendored_matches//[[:space:]]/}" ]]; then
   echo "Tracked vendored artifacts detected. Remove these paths from git:"
-  echo "${matches}"
+  echo "${vendored_matches}"
   exit 1
 fi
 
-echo "Vendored artifact guard passed."
+generated_sbom_matches="$(find_tracked_matches "${generated_sbom_regex}")"
+disallowed_generated_matches=""
+while IFS= read -r candidate; do
+  [[ -z "${candidate}" ]] && continue
+
+  allowlisted=0
+  for allowlisted_file in "${allowlisted_generated_files[@]}"; do
+    if [[ "${candidate}" == "${allowlisted_file}" ]]; then
+      allowlisted=1
+      break
+    fi
+  done
+
+  if [[ "${allowlisted}" -eq 0 ]]; then
+    disallowed_generated_matches+="${candidate}"$'\n'
+  fi
+done <<< "${generated_sbom_matches}"
+
+if [[ -n "${disallowed_generated_matches//[[:space:]]/}" ]]; then
+  echo "Tracked generated SBOM artifacts detected. Keep SBOM outputs untracked and use CI artifacts instead:"
+  echo "${disallowed_generated_matches}"
+  exit 1
+fi
+
+echo "Vendored/generated artifact guard passed."

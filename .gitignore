@@ -39,7 +39,8 @@ lcov.info
 *.tmp
 .tmp-proto-validate.*
 .tmp-rust-stubs.*
-**/sbom.json
+**/sbom*.json
+!crates/palyra-skills/examples/echo-http/sbom.cdx.json
 apps/web/node_modules/
 .palyra-doctor-write-check.tmp
 fuzz/artifacts/
