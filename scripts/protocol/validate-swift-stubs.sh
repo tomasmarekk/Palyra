@@ -14,5 +14,8 @@ if [ ! -f "$SWIFT_STUB" ]; then
   exit 1
 fi
 
-swiftc -parse "$SWIFT_STUB"
+tmp_dir="$(mktemp -d)"
+trap 'rm -rf "$tmp_dir"' EXIT
+
+swiftc -emit-module -module-name PalyraProtocolStubs "$SWIFT_STUB" -o "$tmp_dir/PalyraProtocolStubs.swiftmodule"
 echo "Swift protocol stubs compile validation passed."
