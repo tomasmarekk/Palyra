@@ -62,6 +62,7 @@ pub struct RootFileConfig {
     pub version: Option<u32>,
     pub daemon: Option<FileDaemonConfig>,
     pub gateway: Option<FileGatewayConfig>,
+    pub cron: Option<FileCronConfig>,
     pub orchestrator: Option<FileOrchestratorConfig>,
     pub memory: Option<FileMemoryConfig>,
     pub model_provider: Option<FileModelProviderConfig>,
@@ -100,6 +101,12 @@ pub struct FileGatewayTlsConfig {
     pub cert_path: Option<String>,
     pub key_path: Option<String>,
     pub client_ca_path: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileCronConfig {
+    pub timezone: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]

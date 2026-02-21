@@ -7,7 +7,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Datelike, Local, TimeZone, Timelike, Utc};
 use palyra_policy::{
     evaluate_with_context, PolicyDecision, PolicyEvaluationConfig, PolicyRequest,
     PolicyRequestContext,
@@ -39,6 +39,36 @@ const MAX_CRON_LOOKAHEAD_MINUTES: i64 = 60 * 24 * 370;
 const MAX_RETRY_ATTEMPTS: u32 = 16;
 const MAX_RETRY_BACKOFF_MS: u64 = 60_000;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CronTimezoneMode {
+    Utc,
+    Local,
+}
+
+impl CronTimezoneMode {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Utc => "utc",
+            Self::Local => "local",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "utc" => Some(Self::Utc),
+            "local" => Some(Self::Local),
+            _ => None,
+        }
+    }
+}
+
+impl Default for CronTimezoneMode {
+    fn default() -> Self {
+        Self::Utc
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ScheduleNormalization {
     pub schedule_type: CronScheduleType,
@@ -55,7 +85,7 @@ pub struct DispatchOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ParsedSchedule {
-    Cron { expression: String, matcher: CronMatcher },
+    Cron { expression: String, matcher: CronMatcher, timezone: CronTimezoneMode },
     Every { interval_ms: i64 },
     At { at_unix_ms: i64, timestamp_rfc3339: String },
 }
@@ -90,13 +120,17 @@ impl CronMatcher {
         })
     }
 
-    fn next_after(&self, after_unix_ms: i64) -> Option<i64> {
+    fn next_after(&self, after_unix_ms: i64, timezone: CronTimezoneMode) -> Option<i64> {
         let after_seconds = after_unix_ms.div_euclid(1_000);
         let mut cursor =
             Utc.timestamp_opt(after_seconds, 0).single()?.with_second(0)?.with_nanosecond(0)?
                 + chrono::Duration::minutes(1);
         for _ in 0..MAX_CRON_LOOKAHEAD_MINUTES {
-            if self.matches(cursor) {
+            let matches = match timezone {
+                CronTimezoneMode::Utc => self.matches(cursor),
+                CronTimezoneMode::Local => self.matches_local(cursor.with_timezone(&Local)),
+            };
+            if matches {
                 return Some(cursor.timestamp_millis());
             }
             cursor += chrono::Duration::minutes(1);
@@ -105,11 +139,33 @@ impl CronMatcher {
     }
 
     fn matches(&self, value: DateTime<Utc>) -> bool {
-        let minute = value.minute() as usize;
-        let hour = value.hour() as usize;
-        let day = value.day() as usize;
-        let month = value.month() as usize;
-        let weekday = value.weekday().num_days_from_sunday() as usize;
+        self.matches_components(
+            value.minute() as usize,
+            value.hour() as usize,
+            value.day() as usize,
+            value.month() as usize,
+            value.weekday().num_days_from_sunday() as usize,
+        )
+    }
+
+    fn matches_local(&self, value: DateTime<Local>) -> bool {
+        self.matches_components(
+            value.minute() as usize,
+            value.hour() as usize,
+            value.day() as usize,
+            value.month() as usize,
+            value.weekday().num_days_from_sunday() as usize,
+        )
+    }
+
+    fn matches_components(
+        &self,
+        minute: usize,
+        hour: usize,
+        day: usize,
+        month: usize,
+        weekday: usize,
+    ) -> bool {
         let day_of_month_match = self.day_of_month[day - 1];
         let weekday_match = self.weekdays[weekday];
         let day_selector_match = match (self.day_of_month_wildcard, self.weekdays_wildcard) {
@@ -191,7 +247,7 @@ fn parse_cron_value(
 impl ParsedSchedule {
     fn next_after(&self, after_unix_ms: i64) -> Option<i64> {
         match self {
-            Self::Cron { matcher, .. } => matcher.next_after(after_unix_ms),
+            Self::Cron { matcher, timezone, .. } => matcher.next_after(after_unix_ms, *timezone),
             Self::Every { interval_ms } => Some(after_unix_ms.saturating_add(*interval_ms)),
             Self::At { at_unix_ms, .. } => {
                 if *at_unix_ms > after_unix_ms {
@@ -207,6 +263,7 @@ impl ParsedSchedule {
 pub fn normalize_schedule(
     schedule: Option<cron_v1::Schedule>,
     now_unix_ms: i64,
+    timezone_mode: CronTimezoneMode,
 ) -> Result<ScheduleNormalization, Status> {
     let schedule = schedule.ok_or_else(|| Status::invalid_argument("schedule is required"))?;
     let schedule_type = cron_v1::ScheduleType::try_from(schedule.r#type)
@@ -225,10 +282,14 @@ pub fn normalize_schedule(
                 return Err(Status::invalid_argument("cron expression cannot be empty"));
             }
             let matcher = CronMatcher::parse(expression).map_err(Status::invalid_argument)?;
-            let next_run_at_unix_ms = matcher.next_after(now_unix_ms);
+            let next_run_at_unix_ms = matcher.next_after(now_unix_ms, timezone_mode);
             Ok(ScheduleNormalization {
                 schedule_type: CronScheduleType::Cron,
-                schedule_payload_json: json!({ "expression": expression }).to_string(),
+                schedule_payload_json: json!({
+                    "expression": expression,
+                    "timezone": timezone_mode.as_str(),
+                })
+                .to_string(),
                 next_run_at_unix_ms,
             })
         }
@@ -348,9 +409,15 @@ fn parse_schedule_payload(
                 .ok_or_else(|| Status::internal("cron schedule payload missing expression"))?
                 .trim()
                 .to_owned();
+            let timezone = match payload.get("timezone").and_then(Value::as_str) {
+                Some(raw) => CronTimezoneMode::from_str(raw).ok_or_else(|| {
+                    Status::internal(format!("invalid cron timezone mode: {raw}"))
+                })?,
+                None => CronTimezoneMode::Utc,
+            };
             let matcher = CronMatcher::parse(expression.as_str())
                 .map_err(|error| Status::internal(format!("invalid cron expression: {error}")))?;
-            Ok(ParsedSchedule::Cron { expression, matcher })
+            Ok(ParsedSchedule::Cron { expression, matcher, timezone })
         }
         CronScheduleType::Every => {
             let interval_ms = payload
@@ -534,6 +601,37 @@ async fn process_queued_jobs(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConcurrencyDecision {
+    SkipForbid,
+    QueueNew,
+    QueueAlreadyPresent,
+    SkipQueueFull,
+    Replace,
+}
+
+fn decide_concurrency_policy(
+    policy: CronConcurrencyPolicy,
+    queued_run: bool,
+    manual_trigger: bool,
+) -> ConcurrencyDecision {
+    match policy {
+        CronConcurrencyPolicy::Forbid => ConcurrencyDecision::SkipForbid,
+        CronConcurrencyPolicy::QueueOne => {
+            if queued_run {
+                if manual_trigger {
+                    ConcurrencyDecision::SkipQueueFull
+                } else {
+                    ConcurrencyDecision::QueueAlreadyPresent
+                }
+            } else {
+                ConcurrencyDecision::QueueNew
+            }
+        }
+        CronConcurrencyPolicy::Replace => ConcurrencyDecision::Replace,
+    }
+}
+
 async fn dispatch_job(
     state: Arc<GatewayRuntimeState>,
     auth: GatewayAuthConfig,
@@ -568,8 +666,8 @@ async fn dispatch_job(
 
     let active_run = state.active_cron_run_for_job(job.job_id.clone()).await?;
     if let Some(active) = active_run {
-        match job.concurrency_policy {
-            CronConcurrencyPolicy::Forbid => {
+        match decide_concurrency_policy(job.concurrency_policy, job.queued_run, manual_trigger) {
+            ConcurrencyDecision::SkipForbid => {
                 return register_terminal(
                     Arc::clone(&state),
                     &job.job_id,
@@ -579,25 +677,7 @@ async fn dispatch_job(
                 )
                 .await;
             }
-            CronConcurrencyPolicy::QueueOne => {
-                if job.queued_run {
-                    if !manual_trigger {
-                        return Ok(DispatchOutcome {
-                            run_id: None,
-                            status: CronRunStatus::Accepted,
-                            message: "run remains queued until active execution completes"
-                                .to_owned(),
-                        });
-                    }
-                    return register_terminal(
-                        Arc::clone(&state),
-                        &job.job_id,
-                        CronRunStatus::Skipped,
-                        "concurrency_queue_full",
-                        "queue(1) already has one pending run",
-                    )
-                    .await;
-                }
+            ConcurrencyDecision::QueueNew => {
                 state.set_cron_job_queue_state(job.job_id.clone(), true).await?;
                 return Ok(DispatchOutcome {
                     run_id: None,
@@ -605,7 +685,24 @@ async fn dispatch_job(
                     message: "run queued due to active execution".to_owned(),
                 });
             }
-            CronConcurrencyPolicy::Replace => {
+            ConcurrencyDecision::QueueAlreadyPresent => {
+                return Ok(DispatchOutcome {
+                    run_id: None,
+                    status: CronRunStatus::Accepted,
+                    message: "run remains queued until active execution completes".to_owned(),
+                });
+            }
+            ConcurrencyDecision::SkipQueueFull => {
+                return register_terminal(
+                    Arc::clone(&state),
+                    &job.job_id,
+                    CronRunStatus::Skipped,
+                    "concurrency_queue_full",
+                    "queue(1) already has one pending run",
+                )
+                .await;
+            }
+            ConcurrencyDecision::Replace => {
                 if let Some(orchestrator_run_id) = active.orchestrator_run_id {
                     let _ = state
                         .request_orchestrator_cancel(OrchestratorCancelRequest {
@@ -1061,7 +1158,10 @@ fn now_unix_ms() -> Result<i64, Status> {
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_next_run_after, normalize_schedule, CronMatcher};
+    use super::{
+        compute_next_run_after, decide_concurrency_policy, normalize_schedule, ConcurrencyDecision,
+        CronMatcher, CronTimezoneMode,
+    };
     use crate::gateway::proto::palyra::cron::v1 as cron_v1;
     use crate::journal::{
         CronConcurrencyPolicy, CronJobRecord, CronMisfirePolicy, CronRetryPolicy, CronScheduleType,
@@ -1073,7 +1173,7 @@ mod tests {
     fn cron_matcher_accepts_step_and_list_fields() {
         let matcher = CronMatcher::parse("*/15 9-17/2 * * 1,3,5").expect("cron should parse");
         let now = 1_730_000_000_000_i64;
-        let next = matcher.next_after(now).expect("next fire should exist");
+        let next = matcher.next_after(now, CronTimezoneMode::Utc).expect("next fire should exist");
         assert!(next > now, "next fire should be in the future");
     }
 
@@ -1137,7 +1237,7 @@ mod tests {
                 expression: "*/0 * * * *".to_owned(),
             })),
         };
-        let error = normalize_schedule(Some(schedule), 1_730_000_000_000)
+        let error = normalize_schedule(Some(schedule), 1_730_000_000_000, CronTimezoneMode::Utc)
             .expect_err("invalid expression must be rejected");
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
     }
@@ -1150,7 +1250,7 @@ mod tests {
                 timestamp_rfc3339: "2020-01-01T00:00:00Z".to_owned(),
             })),
         };
-        let error = normalize_schedule(Some(schedule), 1_730_000_000_000)
+        let error = normalize_schedule(Some(schedule), 1_730_000_000_000, CronTimezoneMode::Utc)
             .expect_err("past at schedule must be rejected");
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
     }
@@ -1192,5 +1292,175 @@ mod tests {
             .expect("skip policy should compute next run")
             .expect("every schedule should return next run");
         assert_eq!(skip_next, 4_000, "skip policy should advance past missed slots");
+    }
+
+    #[test]
+    fn normalize_schedule_stores_explicit_timezone_mode_for_cron_jobs() {
+        let schedule = cron_v1::Schedule {
+            r#type: cron_v1::ScheduleType::Cron as i32,
+            spec: Some(cron_v1::schedule::Spec::Cron(cron_v1::CronSchedule {
+                expression: "0 12 * * *".to_owned(),
+            })),
+        };
+
+        let normalized =
+            normalize_schedule(Some(schedule), 1_730_000_000_000, CronTimezoneMode::Local)
+                .expect("cron schedule should normalize");
+        let payload: serde_json::Value =
+            serde_json::from_str(normalized.schedule_payload_json.as_str())
+                .expect("schedule payload should be valid json");
+        assert_eq!(payload.get("timezone").and_then(serde_json::Value::as_str), Some("local"));
+    }
+
+    #[test]
+    fn compute_next_run_after_accepts_legacy_cron_payload_without_timezone() {
+        let job = CronJobRecord {
+            job_id: "01ARZ3NDEKTSV4RRFFQ69G5FB0".to_owned(),
+            name: "legacy-cron".to_owned(),
+            prompt: "test".to_owned(),
+            owner_principal: "user:ops".to_owned(),
+            channel: "system:cron".to_owned(),
+            session_key: None,
+            session_label: None,
+            schedule_type: CronScheduleType::Cron,
+            schedule_payload_json: json!({ "expression": "0 * * * *" }).to_string(),
+            enabled: true,
+            concurrency_policy: CronConcurrencyPolicy::Forbid,
+            retry_policy: CronRetryPolicy { max_attempts: 1, backoff_ms: 1 },
+            misfire_policy: CronMisfirePolicy::Skip,
+            jitter_ms: 0,
+            next_run_at_unix_ms: None,
+            last_run_at_unix_ms: None,
+            queued_run: false,
+            created_at_unix_ms: 0,
+            updated_at_unix_ms: 0,
+        };
+
+        let next = compute_next_run_after(&job, 1_730_000_000_000, 1_730_000_000_000)
+            .expect("compute should succeed");
+        assert!(next.is_some(), "legacy cron payload should keep UTC default behavior");
+    }
+
+    #[test]
+    fn compute_next_run_after_rejects_invalid_cron_timezone_payload() {
+        let job = CronJobRecord {
+            job_id: "01ARZ3NDEKTSV4RRFFQ69G5FB1".to_owned(),
+            name: "invalid-timezone".to_owned(),
+            prompt: "test".to_owned(),
+            owner_principal: "user:ops".to_owned(),
+            channel: "system:cron".to_owned(),
+            session_key: None,
+            session_label: None,
+            schedule_type: CronScheduleType::Cron,
+            schedule_payload_json: json!({
+                "expression": "0 * * * *",
+                "timezone": "europe/prague"
+            })
+            .to_string(),
+            enabled: true,
+            concurrency_policy: CronConcurrencyPolicy::Forbid,
+            retry_policy: CronRetryPolicy { max_attempts: 1, backoff_ms: 1 },
+            misfire_policy: CronMisfirePolicy::Skip,
+            jitter_ms: 0,
+            next_run_at_unix_ms: None,
+            last_run_at_unix_ms: None,
+            queued_run: false,
+            created_at_unix_ms: 0,
+            updated_at_unix_ms: 0,
+        };
+
+        let error = compute_next_run_after(&job, 1_730_000_000_000, 1_730_000_000_000)
+            .expect_err("invalid timezone payload should fail");
+        assert_eq!(error.code(), tonic::Code::Internal);
+    }
+
+    #[test]
+    fn compute_next_run_after_skip_policy_deterministically_skips_long_outage_backlog() {
+        let job = CronJobRecord {
+            job_id: "01ARZ3NDEKTSV4RRFFQ69G5FB2".to_owned(),
+            name: "misfire-long-outage".to_owned(),
+            prompt: "test".to_owned(),
+            owner_principal: "user:ops".to_owned(),
+            channel: "system:cron".to_owned(),
+            session_key: None,
+            session_label: None,
+            schedule_type: CronScheduleType::Every,
+            schedule_payload_json: json!({ "interval_ms": 60_000_i64 }).to_string(),
+            enabled: true,
+            concurrency_policy: CronConcurrencyPolicy::Forbid,
+            retry_policy: CronRetryPolicy { max_attempts: 1, backoff_ms: 1 },
+            misfire_policy: CronMisfirePolicy::Skip,
+            jitter_ms: 0,
+            next_run_at_unix_ms: None,
+            last_run_at_unix_ms: None,
+            queued_run: false,
+            created_at_unix_ms: 0,
+            updated_at_unix_ms: 0,
+        };
+
+        let next =
+            compute_next_run_after(&job, 0, 600_000).expect("skip policy should compute next run");
+        assert_eq!(
+            next,
+            Some(660_000),
+            "skip policy should jump to first future slot after prolonged downtime"
+        );
+    }
+
+    #[test]
+    fn compute_next_run_after_catchup_policy_keeps_oldest_missed_slot_after_long_outage() {
+        let job = CronJobRecord {
+            job_id: "01ARZ3NDEKTSV4RRFFQ69G5FB3".to_owned(),
+            name: "misfire-catchup-long-outage".to_owned(),
+            prompt: "test".to_owned(),
+            owner_principal: "user:ops".to_owned(),
+            channel: "system:cron".to_owned(),
+            session_key: None,
+            session_label: None,
+            schedule_type: CronScheduleType::Every,
+            schedule_payload_json: json!({ "interval_ms": 60_000_i64 }).to_string(),
+            enabled: true,
+            concurrency_policy: CronConcurrencyPolicy::Forbid,
+            retry_policy: CronRetryPolicy { max_attempts: 1, backoff_ms: 1 },
+            misfire_policy: CronMisfirePolicy::CatchUp,
+            jitter_ms: 0,
+            next_run_at_unix_ms: None,
+            last_run_at_unix_ms: None,
+            queued_run: false,
+            created_at_unix_ms: 0,
+            updated_at_unix_ms: 0,
+        };
+
+        let next = compute_next_run_after(&job, 0, 600_000)
+            .expect("catch-up policy should compute next run");
+        assert_eq!(
+            next,
+            Some(60_000),
+            "catch-up policy should replay the oldest missed slot first"
+        );
+    }
+
+    #[test]
+    fn concurrency_policy_matrix_is_deterministic() {
+        assert_eq!(
+            decide_concurrency_policy(CronConcurrencyPolicy::Forbid, false, false),
+            ConcurrencyDecision::SkipForbid
+        );
+        assert_eq!(
+            decide_concurrency_policy(CronConcurrencyPolicy::QueueOne, false, false),
+            ConcurrencyDecision::QueueNew
+        );
+        assert_eq!(
+            decide_concurrency_policy(CronConcurrencyPolicy::QueueOne, true, false),
+            ConcurrencyDecision::QueueAlreadyPresent
+        );
+        assert_eq!(
+            decide_concurrency_policy(CronConcurrencyPolicy::QueueOne, true, true),
+            ConcurrencyDecision::SkipQueueFull
+        );
+        assert_eq!(
+            decide_concurrency_policy(CronConcurrencyPolicy::Replace, false, false),
+            ConcurrencyDecision::Replace
+        );
     }
 }

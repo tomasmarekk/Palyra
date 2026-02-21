@@ -12,6 +12,7 @@ use palyra_common::{
     default_config_search_paths, default_identity_store_root, parse_config_path,
 };
 
+use crate::cron::CronTimezoneMode;
 use crate::model_provider::{
     validate_openai_base_url_network_policy, ModelProviderConfig, ModelProviderKind,
 };
@@ -28,6 +29,7 @@ const DEFAULT_GATEWAY_ALLOW_INSECURE_REMOTE: bool = false;
 const DEFAULT_GATEWAY_MAX_TAPE_ENTRIES_PER_RESPONSE: usize = 1_000;
 const DEFAULT_GATEWAY_MAX_TAPE_BYTES_PER_RESPONSE: usize = 2 * 1024 * 1024;
 const DEFAULT_GATEWAY_TLS_ENABLED: bool = false;
+const DEFAULT_CRON_TIMEZONE_MODE: CronTimezoneMode = CronTimezoneMode::Utc;
 const DEFAULT_ORCHESTRATOR_RUNLOOP_V1_ENABLED: bool = false;
 const DEFAULT_MEMORY_MAX_ITEM_BYTES: usize = 16 * 1024;
 const DEFAULT_MEMORY_MAX_ITEM_TOKENS: usize = 2_048;
@@ -63,6 +65,7 @@ pub struct LoadedConfig {
     pub migrated_from_version: Option<u32>,
     pub daemon: DaemonConfig,
     pub gateway: GatewayConfig,
+    pub cron: CronConfig,
     pub orchestrator: OrchestratorConfig,
     pub memory: MemoryConfig,
     pub model_provider: ModelProviderConfig,
@@ -98,6 +101,11 @@ pub struct GatewayTlsConfig {
     pub cert_path: Option<PathBuf>,
     pub key_path: Option<PathBuf>,
     pub client_ca_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CronConfig {
+    pub timezone: CronTimezoneMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,6 +236,12 @@ impl Default for GatewayTlsConfig {
     }
 }
 
+impl Default for CronConfig {
+    fn default() -> Self {
+        Self { timezone: DEFAULT_CRON_TIMEZONE_MODE }
+    }
+}
+
 impl Default for OrchestratorConfig {
     fn default() -> Self {
         Self { runloop_v1_enabled: DEFAULT_ORCHESTRATOR_RUNLOOP_V1_ENABLED }
@@ -310,6 +324,7 @@ impl Default for AdminConfig {
 pub fn load_config() -> Result<LoadedConfig> {
     let mut daemon = DaemonConfig::default();
     let mut gateway = GatewayConfig::default();
+    let mut cron = CronConfig::default();
     let mut orchestrator = OrchestratorConfig::default();
     let mut memory = MemoryConfig::default();
     let mut model_provider = ModelProviderConfig::default();
@@ -388,6 +403,11 @@ pub fn load_config() -> Result<LoadedConfig> {
                     gateway.tls.client_ca_path =
                         Some(parse_gateway_tls_path(client_ca_path.as_str())?);
                 }
+            }
+        }
+        if let Some(file_cron) = parsed.cron {
+            if let Some(timezone) = file_cron.timezone {
+                cron.timezone = parse_cron_timezone_mode(timezone.as_str(), "cron.timezone")?;
             }
         }
         if let Some(file_orchestrator) = parsed.orchestrator {
@@ -738,6 +758,11 @@ pub fn load_config() -> Result<LoadedConfig> {
         source.push_str(" +env(PALYRA_GATEWAY_TLS_CLIENT_CA_PATH)");
     }
 
+    if let Ok(cron_timezone) = env::var("PALYRA_CRON_TIMEZONE") {
+        cron.timezone = parse_cron_timezone_mode(cron_timezone.as_str(), "PALYRA_CRON_TIMEZONE")?;
+        source.push_str(" +env(PALYRA_CRON_TIMEZONE)");
+    }
+
     if let Ok(runloop_v1_enabled) = env::var("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED") {
         orchestrator.runloop_v1_enabled = runloop_v1_enabled
             .parse::<bool>()
@@ -979,6 +1004,7 @@ pub fn load_config() -> Result<LoadedConfig> {
         migrated_from_version,
         daemon,
         gateway,
+        cron,
         orchestrator,
         memory,
         model_provider,
@@ -1120,6 +1146,11 @@ fn parse_process_runner_egress_enforcement_mode(
         "strict" => Ok(EgressEnforcementMode::Strict),
         _ => anyhow::bail!("{source_name} must be one of: none, preflight, strict"),
     }
+}
+
+fn parse_cron_timezone_mode(raw: &str, source_name: &str) -> Result<CronTimezoneMode> {
+    CronTimezoneMode::from_str(raw)
+        .ok_or_else(|| anyhow::anyhow!("{source_name} must be one of: utc, local"))
 }
 
 fn parse_identifier_allowlist(raw: &str, source_name: &str, label: &str) -> Result<Vec<String>> {
@@ -1271,11 +1302,11 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        parse_default_memory_ttl_ms, parse_dns_suffix_allowlist, parse_host_allowlist,
-        parse_journal_db_path, parse_openai_base_url, parse_positive_usize,
+        parse_cron_timezone_mode, parse_default_memory_ttl_ms, parse_dns_suffix_allowlist,
+        parse_host_allowlist, parse_journal_db_path, parse_openai_base_url, parse_positive_usize,
         parse_process_executable_allowlist, parse_process_runner_egress_enforcement_mode,
         parse_root_file_config, parse_storage_prefix_allowlist, parse_tool_allowlist,
-        parse_vault_dir, AdminConfig, GatewayConfig, GatewayTlsConfig, IdentityConfig,
+        parse_vault_dir, AdminConfig, CronConfig, GatewayConfig, GatewayTlsConfig, IdentityConfig,
         MemoryConfig, ModelProviderConfig, OrchestratorConfig, StorageConfig, ToolCallConfig,
     };
     use crate::model_provider::ModelProviderKind;
@@ -1316,6 +1347,29 @@ mod tests {
         assert_eq!(config.max_tape_entries_per_response, 1_000);
         assert_eq!(config.max_tape_bytes_per_response, 2 * 1024 * 1024);
         assert_eq!(config.tls, GatewayTlsConfig::default());
+    }
+
+    #[test]
+    fn cron_config_defaults_to_utc_timezone() {
+        let config = CronConfig::default();
+        assert_eq!(
+            config.timezone,
+            crate::cron::CronTimezoneMode::Utc,
+            "cron scheduler should default to UTC for deterministic cross-host behavior"
+        );
+    }
+
+    #[test]
+    fn cron_config_parses_timezone_override() {
+        let (parsed, _) = parse_root_file_config(
+            r#"
+            [cron]
+            timezone = "local"
+            "#,
+        )
+        .expect("cron timezone override should parse");
+        let cron = parsed.cron.expect("cron section should be present");
+        assert_eq!(cron.timezone.as_deref(), Some("local"));
     }
 
     #[test]
@@ -1486,6 +1540,13 @@ mod tests {
         let result: Result<RootFileConfig, _> =
             toml::from_str("[orchestrator]\nrunloop_v1_enabled=true\nunexpected=true\n");
         assert!(result.is_err(), "unknown orchestrator keys must be rejected");
+    }
+
+    #[test]
+    fn config_rejects_unknown_cron_key() {
+        let result: Result<RootFileConfig, _> =
+            toml::from_str("[cron]\ntimezone='utc'\nunexpected=true\n");
+        assert!(result.is_err(), "unknown cron keys must be rejected");
     }
 
     #[test]
@@ -1661,6 +1722,24 @@ mod tests {
             "tool_call.process_runner.egress_enforcement_mode",
         );
         assert!(result.is_err(), "unsupported egress enforcement mode must fail parsing");
+    }
+
+    #[test]
+    fn parse_cron_timezone_mode_accepts_supported_values() {
+        assert_eq!(
+            parse_cron_timezone_mode("utc", "cron.timezone").expect("utc should parse"),
+            crate::cron::CronTimezoneMode::Utc
+        );
+        assert_eq!(
+            parse_cron_timezone_mode("local", "cron.timezone").expect("local should parse"),
+            crate::cron::CronTimezoneMode::Local
+        );
+    }
+
+    #[test]
+    fn parse_cron_timezone_mode_rejects_unknown_values() {
+        let result = parse_cron_timezone_mode("Europe/Prague", "cron.timezone");
+        assert!(result.is_err(), "unsupported cron timezone mode must be rejected");
     }
 
     #[test]

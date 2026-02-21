@@ -342,6 +342,7 @@ async fn main() -> Result<()> {
         gateway_tls_cert_path = ?loaded.gateway.tls.cert_path.as_ref().map(|path| path.display().to_string()),
         gateway_tls_key_path = ?loaded.gateway.tls.key_path.as_ref().map(|path| path.display().to_string()),
         gateway_tls_client_ca_path = ?loaded.gateway.tls.client_ca_path.as_ref().map(|path| path.display().to_string()),
+        cron_timezone_mode = loaded.cron.timezone.as_str(),
         orchestrator_runloop_v1_enabled = loaded.orchestrator.runloop_v1_enabled,
         memory_max_item_bytes = loaded.memory.max_item_bytes,
         memory_max_item_tokens = loaded.memory.max_item_tokens,
@@ -489,6 +490,7 @@ async fn main() -> Result<()> {
         auth.clone(),
         grpc_url,
         Arc::clone(&scheduler_wake),
+        loaded.cron.timezone,
     );
     let grpc_cron_server =
         gateway::proto::palyra::cron::v1::cron_service_server::CronServiceServer::new(cron_service)

@@ -30,7 +30,7 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use crate::{
-    cron::{normalize_schedule, schedule_to_proto, trigger_job_now},
+    cron::{normalize_schedule, schedule_to_proto, trigger_job_now, CronTimezoneMode},
     journal::{
         ApprovalCreateRequest, ApprovalDecision, ApprovalDecisionScope, ApprovalPolicySnapshot,
         ApprovalPromptOption, ApprovalPromptRecord, ApprovalRecord, ApprovalResolveRequest,
@@ -3117,6 +3117,7 @@ pub struct CronServiceImpl {
     auth: GatewayAuthConfig,
     grpc_url: String,
     scheduler_wake: Arc<Notify>,
+    cron_timezone_mode: CronTimezoneMode,
 }
 
 impl CronServiceImpl {
@@ -3126,8 +3127,9 @@ impl CronServiceImpl {
         auth: GatewayAuthConfig,
         grpc_url: String,
         scheduler_wake: Arc<Notify>,
+        cron_timezone_mode: CronTimezoneMode,
     ) -> Self {
-        Self { state, auth, grpc_url, scheduler_wake }
+        Self { state, auth, grpc_url, scheduler_wake, cron_timezone_mode }
     }
 
     #[allow(clippy::result_large_err)]
@@ -5040,7 +5042,7 @@ impl cron_v1::cron_service_server::CronService for CronServiceImpl {
         authorize_cron_action(context.principal.as_str(), "cron.create", "cron:job")?;
 
         let now_unix_ms = current_unix_ms_status()?;
-        let schedule = normalize_schedule(payload.schedule, now_unix_ms)?;
+        let schedule = normalize_schedule(payload.schedule, now_unix_ms, self.cron_timezone_mode)?;
         let name = validate_cron_job_name(payload.name)?;
         let prompt = validate_cron_job_prompt(payload.prompt)?;
         let owner_principal =
@@ -5125,7 +5127,11 @@ impl cron_v1::cron_service_server::CronService for CronServiceImpl {
             patch.session_label = Some(non_empty(session_label));
         }
         if payload.schedule.is_some() {
-            let schedule = normalize_schedule(payload.schedule, current_unix_ms_status()?)?;
+            let schedule = normalize_schedule(
+                payload.schedule,
+                current_unix_ms_status()?,
+                self.cron_timezone_mode,
+            )?;
             patch.schedule_type = Some(schedule.schedule_type);
             patch.schedule_payload_json = Some(schedule.schedule_payload_json);
             patch.next_run_at_unix_ms = Some(schedule.next_run_at_unix_ms);
