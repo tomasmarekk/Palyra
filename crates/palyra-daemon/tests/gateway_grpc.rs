@@ -3673,6 +3673,167 @@ async fn grpc_run_stream_admin_cancel_preempts_inflight_provider_call() -> Resul
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn grpc_run_stream_admin_cancel_preempts_inflight_tool_execution() -> Result<()> {
+    let response_body =
+        openai_tool_call_response("palyra.sleep", &serde_json::json!({ "duration_ms": 5_000 }))?;
+    let (openai_base_url, _request_count, server_handle) =
+        spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::immediate(200, response_body)])?;
+    let (child, admin_port, grpc_port, _journal_db_path) =
+        spawn_palyrad_with_openai_provider_and_tool_policy(
+            openai_base_url.as_str(),
+            OPENAI_API_KEY,
+            "palyra.sleep",
+            2,
+            10_000,
+        )?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+
+    let mut stream_request =
+        tonic::Request::new(tokio_stream::iter(vec![sample_run_stream_request_with_text(
+            "cancel should preempt in-flight sleep tool execution".to_owned(),
+        )]));
+    stream_request.metadata_mut().insert("authorization", format!("Bearer {ADMIN_TOKEN}").parse()?);
+    stream_request.metadata_mut().insert("x-palyra-principal", "user:ops".parse()?);
+    stream_request.metadata_mut().insert("x-palyra-device-id", DEVICE_ID.parse()?);
+    stream_request.metadata_mut().insert("x-palyra-channel", "cli".parse()?);
+
+    let mut response_stream =
+        client.run_stream(stream_request).await.context("failed to call RunStream")?.into_inner();
+
+    let mut saw_success_result = false;
+    loop {
+        let next_event = tokio::time::timeout(Duration::from_secs(5), response_stream.next())
+            .await
+            .context("run stream did not emit tool decision before timeout")?;
+        let Some(event) = next_event else {
+            anyhow::bail!("run stream ended before tool decision was emitted");
+        };
+        let event = event.context("failed to read RunStream event before cancellation")?;
+        if let Some(body) = event.body {
+            match body {
+                common_v1::run_stream_event::Body::ToolDecision(decision) => {
+                    if decision.kind == common_v1::tool_decision::DecisionKind::Allow as i32 {
+                        break;
+                    }
+                }
+                common_v1::run_stream_event::Body::ToolResult(result) => {
+                    if result.success {
+                        saw_success_result = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let cancel_started_at = Instant::now();
+    let cancel_snapshot = admin_post_json_async(
+        admin_port,
+        format!("/admin/v1/runs/{RUN_ID}/cancel"),
+        serde_json::json!({ "reason": "integration_cancel_during_tool_execution" }),
+    )
+    .await?;
+    assert_eq!(
+        cancel_snapshot.get("cancel_requested").and_then(Value::as_bool),
+        Some(true),
+        "admin cancel endpoint should persist cancel flag during tool execution"
+    );
+
+    let mut saw_failed = false;
+    let mut saw_done = false;
+    let failed_kind = common_v1::stream_status::StatusKind::Failed as i32;
+    let done_kind = common_v1::stream_status::StatusKind::Done as i32;
+    loop {
+        let next_event = tokio::time::timeout(Duration::from_secs(5), response_stream.next())
+            .await
+            .context("run stream did not terminate quickly after tool cancellation")?;
+        let Some(event) = next_event else {
+            break;
+        };
+        let event = event.context("failed to read RunStream event after cancellation")?;
+        if let Some(body) = event.body {
+            match body {
+                common_v1::run_stream_event::Body::Status(status) => {
+                    if status.kind == failed_kind {
+                        saw_failed = true;
+                        break;
+                    }
+                    if status.kind == done_kind {
+                        saw_done = true;
+                        break;
+                    }
+                }
+                common_v1::run_stream_event::Body::ToolResult(result) => {
+                    if result.success {
+                        saw_success_result = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    assert!(
+        cancel_started_at.elapsed() < Duration::from_secs(3),
+        "run cancellation should preempt in-flight tool execution without waiting for tool completion"
+    );
+    assert!(saw_failed, "cancelled run should emit failed status");
+    assert!(!saw_done, "cancelled run must not emit done status");
+    assert!(
+        !saw_success_result,
+        "preempted tool execution must not emit successful tool result after cancellation"
+    );
+
+    let run_snapshot = admin_get_json_async(admin_port, format!("/admin/v1/runs/{RUN_ID}")).await?;
+    assert_eq!(
+        run_snapshot.get("state").and_then(Value::as_str).context("run snapshot missing state")?,
+        "cancelled"
+    );
+    assert_eq!(
+        run_snapshot.get("cancel_requested").and_then(Value::as_bool),
+        Some(true),
+        "cancelled run should persist cancel_requested=true"
+    );
+
+    let tape_snapshot =
+        admin_get_json_async(admin_port, format!("/admin/v1/runs/{RUN_ID}/tape")).await?;
+    let events = tape_snapshot
+        .get("events")
+        .and_then(Value::as_array)
+        .context("run tape snapshot missing events")?;
+    let saw_cancelled_terminal_status = events.iter().any(|event| {
+        if event.get("event_type").and_then(Value::as_str) != Some("status") {
+            return false;
+        }
+        let Some(payload_json) = event.get("payload_json").and_then(Value::as_str) else {
+            return false;
+        };
+        let Ok(payload) = serde_json::from_str::<Value>(payload_json) else {
+            return false;
+        };
+        payload.get("kind").and_then(Value::as_str) == Some("failed")
+            && payload
+                .get("message")
+                .and_then(Value::as_str)
+                .map(|value| value.contains("cancelled by request"))
+                .unwrap_or(false)
+    });
+    assert!(
+        saw_cancelled_terminal_status,
+        "run tape must include cancelled terminal status event after tool-execution cancellation"
+    );
+
+    server_handle.join().expect("scripted openai server thread should exit");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn grpc_append_event_persists_redacted_payload_and_hash_chain() -> Result<()> {
     let (child, admin_port, grpc_port, journal_db_path) =
         spawn_palyrad_with_dynamic_ports_and_hash_chain(true)?;

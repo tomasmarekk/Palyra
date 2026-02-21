@@ -4402,24 +4402,102 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                                     .tool_execution_attempts
                                     .fetch_add(1, Ordering::Relaxed);
                                 let started_at = Instant::now();
-                                let outcome = if tool_name == "palyra.memory.search" {
-                                    execute_memory_search_tool(
-                                        &state_for_stream,
-                                        context_for_stream.principal.as_str(),
-                                        context_for_stream.channel.as_deref(),
-                                        session_id,
-                                        proposal_id.as_str(),
-                                        input_json.as_slice(),
-                                    )
-                                    .await
-                                } else {
-                                    execute_tool_call(
-                                        &state_for_stream.config.tool_call,
-                                        proposal_id.as_str(),
-                                        tool_name.as_str(),
-                                        input_json.as_slice(),
-                                    )
-                                    .await
+                                let mut cancel_poll = interval(Duration::from_millis(100));
+                                cancel_poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                                let mut execution_future = Box::pin(async {
+                                    if tool_name == "palyra.memory.search" {
+                                        execute_memory_search_tool(
+                                            &state_for_stream,
+                                            context_for_stream.principal.as_str(),
+                                            context_for_stream.channel.as_deref(),
+                                            session_id,
+                                            proposal_id.as_str(),
+                                            input_json.as_slice(),
+                                        )
+                                        .await
+                                    } else {
+                                        execute_tool_call(
+                                            &state_for_stream.config.tool_call,
+                                            proposal_id.as_str(),
+                                            tool_name.as_str(),
+                                            input_json.as_slice(),
+                                        )
+                                        .await
+                                    }
+                                });
+                                let outcome = loop {
+                                    tokio::select! {
+                                        result = &mut execution_future => {
+                                            break result;
+                                        }
+                                        _ = cancel_poll.tick() => {
+                                            match state_for_stream.is_orchestrator_cancel_requested(run_id.clone()).await {
+                                                Ok(true) => {
+                                                    if let Err(error) = run_state.transition(RunTransition::Cancel) {
+                                                        let status = Status::internal(error.to_string());
+                                                        finalize_run_failure(
+                                                            &sender,
+                                                            &state_for_stream,
+                                                            &mut run_state,
+                                                            active_run_id.as_deref(),
+                                                            &mut tape_seq,
+                                                            status.message(),
+                                                        )
+                                                        .await;
+                                                        let _ = sender.send(Err(status)).await;
+                                                        return;
+                                                    }
+                                                    if let Err(error) = state_for_stream
+                                                        .update_orchestrator_run_state(
+                                                            run_id.clone(),
+                                                            RunLifecycleState::Cancelled,
+                                                            Some(CANCELLED_REASON.to_owned()),
+                                                        )
+                                                        .await
+                                                    {
+                                                        finalize_run_failure(
+                                                            &sender,
+                                                            &state_for_stream,
+                                                            &mut run_state,
+                                                            active_run_id.as_deref(),
+                                                            &mut tape_seq,
+                                                            error.message(),
+                                                        )
+                                                        .await;
+                                                        let _ = sender.send(Err(error)).await;
+                                                        return;
+                                                    }
+                                                    if let Err(error) = send_status_with_tape(
+                                                        &sender,
+                                                        &state_for_stream,
+                                                        run_id.as_str(),
+                                                        &mut tape_seq,
+                                                        common_v1::stream_status::StatusKind::Failed,
+                                                        CANCELLED_REASON,
+                                                    )
+                                                    .await
+                                                    {
+                                                        let _ = sender.send(Err(error)).await;
+                                                    }
+                                                    return;
+                                                }
+                                                Ok(false) => {}
+                                                Err(error) => {
+                                                    finalize_run_failure(
+                                                        &sender,
+                                                        &state_for_stream,
+                                                        &mut run_state,
+                                                        active_run_id.as_deref(),
+                                                        &mut tape_seq,
+                                                        error.message(),
+                                                    )
+                                                    .await;
+                                                    let _ = sender.send(Err(error)).await;
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                    }
                                 };
                                 if started_at.elapsed().as_millis()
                                     > TOOL_EXECUTION_LATENCY_BUDGET_MS
