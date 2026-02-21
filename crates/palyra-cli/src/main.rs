@@ -49,8 +49,8 @@ use cli::{
     AgentCommand, ApprovalDecisionArg, ApprovalExportFormatArg, ApprovalsCommand, BrowserCommand,
     ChannelsCommand, Cli, Command as CliCommand, CompletionShell, ConfigCommand, CronCommand,
     CronConcurrencyPolicyArg, CronMisfirePolicyArg, CronScheduleTypeArg, DaemonCommand,
-    MemoryCommand, MemoryScopeArg, MemorySourceArg, OnboardingCommand, PolicyCommand,
-    ProtocolCommand, SecretsCommand, SkillsCommand, SkillsPackageCommand,
+    JournalCheckpointModeArg, MemoryCommand, MemoryScopeArg, MemorySourceArg, OnboardingCommand,
+    PolicyCommand, ProtocolCommand, SecretsCommand, SkillsCommand, SkillsPackageCommand,
 };
 #[cfg(not(windows))]
 use cli::{PairingClientKindArg, PairingCommand, PairingMethodArg};
@@ -87,6 +87,7 @@ use palyra_vault::{
 };
 use reqwest::blocking::Client;
 use reqwest::Url;
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -112,6 +113,7 @@ const DEFAULT_GATEWAY_QUIC_BIND_ADDR: &str = "127.0.0.1";
 const DEFAULT_GATEWAY_QUIC_PORT: u16 = 7444;
 const DEFAULT_GATEWAY_QUIC_ENABLED: bool = true;
 const DEFAULT_DAEMON_URL: &str = "http://127.0.0.1:7142";
+const DEFAULT_JOURNAL_DB_PATH: &str = "data/journal.sqlite3";
 const DEFAULT_BROWSER_URL: &str = "http://127.0.0.1:7143";
 const DEFAULT_CHANNEL: &str = "cli";
 const REDACTED_CONFIG_VALUE: &str = "<redacted>";
@@ -2477,6 +2479,49 @@ fn run_daemon(command: DaemonCommand) -> Result<()> {
             }
             std::io::stdout().flush().context("stdout flush failed")
         }
+        DaemonCommand::JournalVacuum { db_path } => {
+            let db_path = resolve_daemon_journal_db_path(db_path)?;
+            ensure_journal_db_exists(db_path.as_path())?;
+            let connection = Connection::open(db_path.as_path()).with_context(|| {
+                format!("failed to open journal database {}", db_path.display())
+            })?;
+            connection.execute_batch("PRAGMA busy_timeout = 5000; VACUUM;").with_context(|| {
+                format!("failed to run VACUUM on journal database {}", db_path.display())
+            })?;
+            println!("journal.vacuum db_path={} status=ok", db_path.display());
+            std::io::stdout().flush().context("stdout flush failed")
+        }
+        DaemonCommand::JournalCheckpoint { db_path, mode } => {
+            let db_path = resolve_daemon_journal_db_path(db_path)?;
+            ensure_journal_db_exists(db_path.as_path())?;
+            let connection = Connection::open(db_path.as_path()).with_context(|| {
+                format!("failed to open journal database {}", db_path.display())
+            })?;
+            connection.execute_batch("PRAGMA busy_timeout = 5000;").with_context(|| {
+                format!("failed to configure busy_timeout for {}", db_path.display())
+            })?;
+            let pragma_sql = format!("PRAGMA wal_checkpoint({});", checkpoint_mode_sql(mode));
+            let (busy, log_frames, checkpointed_frames): (i64, i64, i64) = connection
+                .query_row(pragma_sql.as_str(), [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .with_context(|| {
+                    format!(
+                        "failed to run wal_checkpoint({}) on journal database {}",
+                        checkpoint_mode_sql(mode),
+                        db_path.display()
+                    )
+                })?;
+            println!(
+                "journal.checkpoint db_path={} mode={} busy={} log_frames={} checkpointed_frames={}",
+                db_path.display(),
+                checkpoint_mode_label(mode),
+                busy,
+                log_frames,
+                checkpointed_frames
+            );
+            std::io::stdout().flush().context("stdout flush failed")
+        }
         DaemonCommand::RunStatus { url, token, principal, device_id, channel, run_id } => {
             validate_canonical_id(run_id.as_str())
                 .context("run_id must be a canonical ULID for daemon run-status")?;
@@ -2620,6 +2665,78 @@ fn run_daemon(command: DaemonCommand) -> Result<()> {
             );
             std::io::stdout().flush().context("stdout flush failed")
         }
+    }
+}
+
+fn resolve_daemon_journal_db_path(db_path_override: Option<String>) -> Result<PathBuf> {
+    if let Some(db_path_override) = db_path_override {
+        let trimmed = db_path_override.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!("journal database path cannot be empty");
+        }
+        return Ok(PathBuf::from(trimmed));
+    }
+
+    if let Ok(db_path_env) = env::var("PALYRA_JOURNAL_DB_PATH") {
+        let trimmed = db_path_env.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!("PALYRA_JOURNAL_DB_PATH cannot be empty");
+        }
+        return Ok(PathBuf::from(trimmed));
+    }
+
+    if let Some(config_path) = find_default_config_path() {
+        let config_path = PathBuf::from(config_path);
+        let (document, _) =
+            load_document_from_existing_path(config_path.as_path()).with_context(|| {
+                format!(
+                    "failed to parse {} while resolving journal database path",
+                    config_path.display()
+                )
+            })?;
+        let content =
+            toml::to_string(&document).context("failed to serialize daemon config document")?;
+        let parsed: RootFileConfig = toml::from_str(content.as_str())
+            .context("invalid daemon config schema while resolving journal database path")?;
+        if let Some(journal_db_path) = parsed
+            .storage
+            .and_then(|storage| storage.journal_db_path)
+            .map(|value| value.trim().to_owned())
+        {
+            if !journal_db_path.is_empty() {
+                return Ok(PathBuf::from(journal_db_path));
+            }
+        }
+    }
+
+    Ok(PathBuf::from(DEFAULT_JOURNAL_DB_PATH))
+}
+
+fn ensure_journal_db_exists(db_path: &Path) -> Result<()> {
+    if !db_path.exists() {
+        anyhow::bail!("journal database path does not exist: {}", db_path.display());
+    }
+    if !db_path.is_file() {
+        anyhow::bail!("journal database path must reference a file: {}", db_path.display());
+    }
+    Ok(())
+}
+
+const fn checkpoint_mode_sql(mode: JournalCheckpointModeArg) -> &'static str {
+    match mode {
+        JournalCheckpointModeArg::Passive => "PASSIVE",
+        JournalCheckpointModeArg::Full => "FULL",
+        JournalCheckpointModeArg::Restart => "RESTART",
+        JournalCheckpointModeArg::Truncate => "TRUNCATE",
+    }
+}
+
+const fn checkpoint_mode_label(mode: JournalCheckpointModeArg) -> &'static str {
+    match mode {
+        JournalCheckpointModeArg::Passive => "passive",
+        JournalCheckpointModeArg::Full => "full",
+        JournalCheckpointModeArg::Restart => "restart",
+        JournalCheckpointModeArg::Truncate => "truncate",
     }
 }
 

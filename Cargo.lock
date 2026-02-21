@@ -2345,6 +2345,7 @@ dependencies = [
  "protoc-bin-vendored",
  "reqwest",
  "rpassword",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",

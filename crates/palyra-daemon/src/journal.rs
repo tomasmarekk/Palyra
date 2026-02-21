@@ -4033,16 +4033,16 @@ mod tests {
     use crate::orchestrator::RunLifecycleState;
 
     use super::{
-        ApprovalCreateRequest, ApprovalDecision, ApprovalDecisionScope, ApprovalPolicySnapshot,
-        ApprovalPromptOption, ApprovalPromptRecord, ApprovalResolveRequest, ApprovalRiskLevel,
-        ApprovalSubjectType, ApprovalsListFilter, CronConcurrencyPolicy, CronJobCreateRequest,
-        CronJobsListFilter, CronMisfirePolicy, CronRetryPolicy, CronRunFinalizeRequest,
-        CronRunStartRequest, CronRunStatus, CronRunsListFilter, CronScheduleType,
-        JournalAppendRequest, JournalConfig, JournalError, JournalStore, MemoryItemCreateRequest,
-        MemoryItemsListFilter, MemoryPurgeRequest, MemorySearchRequest, MemorySource,
-        OrchestratorCancelRequest, OrchestratorRunStartRequest, OrchestratorSessionUpsertRequest,
-        OrchestratorTapeAppendRequest, OrchestratorUsageDelta, SkillExecutionStatus,
-        SkillStatusUpsertRequest,
+        build_fts_query, ApprovalCreateRequest, ApprovalDecision, ApprovalDecisionScope,
+        ApprovalPolicySnapshot, ApprovalPromptOption, ApprovalPromptRecord, ApprovalResolveRequest,
+        ApprovalRiskLevel, ApprovalSubjectType, ApprovalsListFilter, CronConcurrencyPolicy,
+        CronJobCreateRequest, CronJobsListFilter, CronMisfirePolicy, CronRetryPolicy,
+        CronRunFinalizeRequest, CronRunStartRequest, CronRunStatus, CronRunsListFilter,
+        CronScheduleType, JournalAppendRequest, JournalConfig, JournalError, JournalStore,
+        MemoryItemCreateRequest, MemoryItemsListFilter, MemoryPurgeRequest, MemorySearchRequest,
+        MemorySource, OrchestratorCancelRequest, OrchestratorRunStartRequest,
+        OrchestratorSessionUpsertRequest, OrchestratorTapeAppendRequest, OrchestratorUsageDelta,
+        SkillExecutionStatus, SkillStatusUpsertRequest,
     };
 
     static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -5099,6 +5099,68 @@ mod tests {
         assert!(
             hits.iter().any(|hit| hit.item.memory_id == "01ARZ3NDEKTSV4RRFFQ69G5FC1"),
             "search should return the matching memory item"
+        );
+    }
+
+    #[test]
+    fn build_fts_query_sanitizes_reserved_characters_and_operators() {
+        let query = r#""Deploy" OR release* NEAR(checklist,rollback) NOT path:/tmp"#;
+        let fts_query = build_fts_query(query);
+        assert_eq!(fts_query, "deploy or release near checklist rollback not path tmp");
+        assert!(
+            fts_query
+                .chars()
+                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == ' '),
+            "FTS query should only include normalized term characters"
+        );
+    }
+
+    #[test]
+    fn memory_search_handles_operator_like_query_tokens_without_sql_errors() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let session_id = "01ARZ3NDEKTSV4RRFFQ69G5FBQ";
+        store
+            .create_memory_item(&sample_memory_request(
+                "01ARZ3NDEKTSV4RRFFQ69G5FCF",
+                "user:ops",
+                Some("cli"),
+                Some(session_id),
+                MemorySource::Manual,
+                "deploy rollback checklist for release candidate",
+            ))
+            .expect("memory item should be created");
+
+        let operator_like_hits = store
+            .search_memory(&MemorySearchRequest {
+                principal: "user:ops".to_owned(),
+                channel: Some("cli".to_owned()),
+                session_id: Some(session_id.to_owned()),
+                query: r#""deploy" OR release* NEAR(checklist,rollback) NOT"#.to_owned(),
+                top_k: 5,
+                min_score: 0.0,
+                tags: Vec::new(),
+                sources: Vec::new(),
+            })
+            .expect("operator-like query should not fail search execution");
+        assert!(operator_like_hits.len() <= 5, "search results should remain bounded by top_k");
+
+        let symbol_only_hits = store
+            .search_memory(&MemorySearchRequest {
+                principal: "user:ops".to_owned(),
+                channel: Some("cli".to_owned()),
+                session_id: Some(session_id.to_owned()),
+                query: r#""***""#.to_owned(),
+                top_k: 5,
+                min_score: 0.0,
+                tags: Vec::new(),
+                sources: Vec::new(),
+            })
+            .expect("symbol-only query should degrade to empty result instead of failing");
+        assert!(
+            symbol_only_hits.is_empty(),
+            "symbol-only query should not produce invalid FTS queries or false-positive hits"
         );
     }
 

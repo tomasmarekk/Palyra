@@ -35,7 +35,7 @@ const DEFAULT_MEMORY_AUTO_INJECT_MAX_ITEMS: usize = 3;
 const DEFAULT_ADMIN_REQUIRE_AUTH: bool = true;
 const DEFAULT_ALLOW_INSECURE_NODE_RPC_WITHOUT_MTLS: bool = false;
 const DEFAULT_JOURNAL_DB_PATH: &str = "data/journal.sqlite3";
-const DEFAULT_JOURNAL_HASH_CHAIN_ENABLED: bool = false;
+const DEFAULT_JOURNAL_HASH_CHAIN_ENABLED: bool = true;
 const DEFAULT_MAX_JOURNAL_PAYLOAD_BYTES: usize = 256 * 1024;
 const DEFAULT_TOOL_CALL_MAX_CALLS_PER_RUN: u32 = 4;
 const DEFAULT_TOOL_CALL_EXECUTION_TIMEOUT_MS: u64 = 750;
@@ -1398,8 +1398,8 @@ mod tests {
         let config = StorageConfig::default();
         assert_eq!(config.journal_db_path, PathBuf::from("data/journal.sqlite3"));
         assert!(
-            !config.journal_hash_chain_enabled,
-            "hash chain must default to disabled until audit mode is explicitly enabled"
+            config.journal_hash_chain_enabled,
+            "hash chain must default to enabled for tamper-evident audit journaling"
         );
         assert_eq!(
             config.max_journal_payload_bytes,

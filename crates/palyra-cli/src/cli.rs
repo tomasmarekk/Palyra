@@ -487,6 +487,14 @@ pub enum CompletionShell {
     Elvish,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum JournalCheckpointModeArg {
+    Passive,
+    Full,
+    Restart,
+    Truncate,
+}
+
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum OnboardingCommand {
     Wizard {
@@ -532,6 +540,16 @@ pub enum DaemonCommand {
         channel: Option<String>,
         #[arg(long)]
         limit: Option<usize>,
+    },
+    JournalVacuum {
+        #[arg(long)]
+        db_path: Option<String>,
+    },
+    JournalCheckpoint {
+        #[arg(long)]
+        db_path: Option<String>,
+        #[arg(long, value_enum, default_value_t = JournalCheckpointModeArg::Truncate)]
+        mode: JournalCheckpointModeArg,
     },
     RunStatus {
         #[arg(long)]
@@ -927,8 +945,9 @@ mod tests {
         AgentCommand, ApprovalDecisionArg, ApprovalExportFormatArg, ApprovalsCommand,
         BrowserCommand, ChannelsCommand, Cli, Command, CompletionShell, ConfigCommand, CronCommand,
         CronConcurrencyPolicyArg, CronMisfirePolicyArg, CronScheduleTypeArg, DaemonCommand,
-        MemoryCommand, MemoryScopeArg, MemorySourceArg, OnboardingCommand, PolicyCommand,
-        ProtocolCommand, SecretsCommand, SkillsCommand, SkillsPackageCommand,
+        JournalCheckpointModeArg, MemoryCommand, MemoryScopeArg, MemorySourceArg,
+        OnboardingCommand, PolicyCommand, ProtocolCommand, SecretsCommand, SkillsCommand,
+        SkillsPackageCommand,
     };
     #[cfg(not(windows))]
     use super::{PairingClientKindArg, PairingCommand, PairingMethodArg};
@@ -1612,6 +1631,47 @@ mod tests {
                     device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
                     channel: Some("cli".to_owned()),
                     limit: Some(25),
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn parse_daemon_journal_vacuum_with_db_path() {
+        let parsed = Cli::parse_from([
+            "palyra",
+            "daemon",
+            "journal-vacuum",
+            "--db-path",
+            "data/journal.sqlite3",
+        ]);
+        assert_eq!(
+            parsed.command,
+            Command::Daemon {
+                command: DaemonCommand::JournalVacuum {
+                    db_path: Some("data/journal.sqlite3".to_owned())
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn parse_daemon_journal_checkpoint_with_mode() {
+        let parsed = Cli::parse_from([
+            "palyra",
+            "daemon",
+            "journal-checkpoint",
+            "--db-path",
+            "data/journal.sqlite3",
+            "--mode",
+            "restart",
+        ]);
+        assert_eq!(
+            parsed.command,
+            Command::Daemon {
+                command: DaemonCommand::JournalCheckpoint {
+                    db_path: Some("data/journal.sqlite3".to_owned()),
+                    mode: JournalCheckpointModeArg::Restart,
                 }
             }
         );
