@@ -22,12 +22,47 @@ const MAX_ARGS_COUNT: usize = 128;
 const MAX_ARG_LENGTH: usize = 4_096;
 const CAPTURE_POLL_INTERVAL_MS: u64 = 5;
 const CAPTURE_CHUNK_BYTES: usize = 4 * 1024;
+const INTERPRETER_EXECUTABLE_DENYLIST: &[&str] = &[
+    "bash",
+    "sh",
+    "zsh",
+    "fish",
+    "powershell",
+    "pwsh",
+    "cmd",
+    "python",
+    "python3",
+    "node",
+    "ruby",
+    "perl",
+    "deno",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EgressEnforcementMode {
+    None,
+    Preflight,
+    Strict,
+}
+
+impl EgressEnforcementMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Preflight => "preflight",
+            Self::Strict => "strict",
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxProcessRunnerPolicy {
     pub enabled: bool,
     pub workspace_root: PathBuf,
     pub allowed_executables: Vec<String>,
+    pub allow_interpreters: bool,
+    pub egress_enforcement_mode: EgressEnforcementMode,
     pub allowed_egress_hosts: Vec<String>,
     pub allowed_dns_suffixes: Vec<String>,
     pub cpu_time_limit_ms: u64,
@@ -118,6 +153,7 @@ pub fn run_constrained_process(
         let input = parse_process_runner_input(input_json)?;
         validate_input_shape(&input)?;
         validate_allowed_executable(policy, input.command.as_str())?;
+        validate_interpreter_argument_guardrails(input.command.as_str(), input.args.as_slice())?;
 
         let workspace_root = canonical_workspace_root(policy.workspace_root.as_path())?;
         let working_directory =
@@ -125,12 +161,16 @@ pub fn run_constrained_process(
         validate_argument_workspace_scope(
             workspace_root.as_path(),
             working_directory.as_path(),
+            input.command.as_str(),
             input.args.as_slice(),
         )?;
-
-        let requested_hosts = collect_requested_egress_hosts(&input)?;
-        validate_egress_hosts(policy, requested_hosts.as_slice())?;
-        validate_runtime_egress_enforcement(policy)?;
+        if !matches!(policy.egress_enforcement_mode, EgressEnforcementMode::None) {
+            let requested_hosts = collect_requested_egress_hosts(&input)?;
+            validate_egress_hosts(policy, requested_hosts.as_slice())?;
+        }
+        if matches!(policy.egress_enforcement_mode, EgressEnforcementMode::Strict) {
+            validate_runtime_egress_enforcement(policy)?;
+        }
 
         let per_call_timeout = input
             .timeout_ms
@@ -271,7 +311,82 @@ fn validate_allowed_executable(
             ),
         });
     }
+    if is_interpreter_executable(normalized.as_str()) && !policy.allow_interpreters {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
+            message: format!(
+                "sandbox denied: interpreter executable '{command}' requires explicit process runner allow_interpreters=true"
+            ),
+        });
+    }
     Ok(())
+}
+
+fn validate_interpreter_argument_guardrails(
+    command: &str,
+    args: &[String],
+) -> Result<(), SandboxProcessRunError> {
+    if !is_interpreter_executable(command.trim()) {
+        return Ok(());
+    }
+
+    if args.iter().any(|arg| is_blocked_eval_flag(arg.as_str())) {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
+            message: format!(
+                "sandbox denied: interpreter command '{}' cannot use shell-eval flags (-c/--command)",
+                command
+            ),
+        });
+    }
+
+    if let Some(argument) =
+        args.iter().find(|arg| contains_embedded_absolute_path(arg.as_str())).map(String::as_str)
+    {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
+            message: format!(
+                "sandbox denied: interpreter argument contains absolute path-like substring: '{argument}'"
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+fn is_interpreter_executable(command: &str) -> bool {
+    let normalized = command.trim().to_ascii_lowercase();
+    INTERPRETER_EXECUTABLE_DENYLIST.contains(&normalized.as_str())
+}
+
+fn is_blocked_eval_flag(arg: &str) -> bool {
+    let normalized = arg.trim().to_ascii_lowercase();
+    matches!(normalized.as_str(), "-c" | "/c" | "--command" | "-command" | "--eval")
+}
+
+fn contains_embedded_absolute_path(raw: &str) -> bool {
+    raw.split(|ch: char| {
+        ch.is_whitespace()
+            || matches!(ch, '"' | '\'' | '`' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}')
+    })
+    .any(token_looks_like_absolute_path)
+}
+
+fn token_looks_like_absolute_path(raw: &str) -> bool {
+    let token = raw.trim();
+    if token.is_empty() {
+        return false;
+    }
+
+    if token.starts_with("file://") || token.starts_with('/') || token.starts_with('\\') {
+        return true;
+    }
+
+    let bytes = token.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/')
 }
 
 fn canonical_workspace_root(root: &Path) -> Result<PathBuf, SandboxProcessRunError> {
@@ -315,8 +430,22 @@ fn resolve_working_directory(
 fn validate_argument_workspace_scope(
     workspace_root: &Path,
     cwd: &Path,
+    command: &str,
     args: &[String],
 ) -> Result<(), SandboxProcessRunError> {
+    if is_interpreter_executable(command) {
+        for arg in args {
+            if contains_embedded_absolute_path(arg.as_str()) {
+                return Err(SandboxProcessRunError {
+                    kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
+                    message: format!(
+                        "sandbox denied: interpreter argument contains absolute path-like substring: '{arg}'"
+                    ),
+                });
+            }
+        }
+    }
+
     for arg in args {
         if let Some(file_url_path) = parse_file_url_path(arg.as_str())? {
             let _ = resolve_scoped_path(workspace_root, cwd, file_url_path.as_str(), false)?;
@@ -891,8 +1020,8 @@ mod tests {
 
     use super::{
         canonical_workspace_root, collect_requested_egress_hosts, is_host_allowlisted,
-        run_constrained_process, validate_argument_workspace_scope, ProcessRunnerInput,
-        SandboxProcessRunErrorKind, SandboxProcessRunnerPolicy,
+        run_constrained_process, validate_argument_workspace_scope, EgressEnforcementMode,
+        ProcessRunnerInput, SandboxProcessRunErrorKind, SandboxProcessRunnerPolicy,
     };
 
     fn sandbox_policy_with_allowed_executables(
@@ -903,6 +1032,8 @@ mod tests {
             enabled: true,
             workspace_root,
             allowed_executables,
+            allow_interpreters: false,
+            egress_enforcement_mode: EgressEnforcementMode::Strict,
             allowed_egress_hosts: Vec::new(),
             allowed_dns_suffixes: Vec::new(),
             cpu_time_limit_ms: 2_000,
@@ -1050,6 +1181,7 @@ mod tests {
         let error = validate_argument_workspace_scope(
             canonical_workspace.as_path(),
             canonical_workspace.as_path(),
+            "uname",
             &args,
         )
         .expect_err("file URLs outside workspace must be denied");
@@ -1075,6 +1207,7 @@ mod tests {
         validate_argument_workspace_scope(
             canonical_workspace.as_path(),
             canonical_workspace.as_path(),
+            "uname",
             &args,
         )
         .expect("file URLs inside workspace should be allowed");
@@ -1095,6 +1228,7 @@ mod tests {
         let error = validate_argument_workspace_scope(
             canonical_workspace.as_path(),
             canonical_workspace.as_path(),
+            "uname",
             &args,
         )
         .expect_err("absolute path in flag assignment must be denied");
@@ -1116,6 +1250,7 @@ mod tests {
         validate_argument_workspace_scope(
             canonical_workspace.as_path(),
             canonical_workspace.as_path(),
+            "uname",
             &args,
         )
         .expect("workspace-relative path in flag assignment should be allowed");
@@ -1220,19 +1355,109 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn run_constrained_process_enforces_combined_output_quota() {
-        if Command::new("sh").arg("-c").arg("true").output().is_err() {
+        if Command::new("cat").arg("--version").output().is_err() {
             return;
         }
 
         let workspace = std::env::current_dir().expect("workspace current_dir should resolve");
-        let mut policy = sandbox_policy_with_allowed_executables(workspace, vec!["sh".to_owned()]);
+        let mut policy = sandbox_policy_with_allowed_executables(workspace, vec!["cat".to_owned()]);
         policy.max_output_bytes = 16;
-        let input =
-            br#"{"command":"sh","args":["-c","printf '1234567890'; printf 'abcdefghij' 1>&2"]}"#;
+        let input = br#"{"command":"cat","args":["README.md","missing-file-that-does-not-exist"]}"#;
 
         let error = run_constrained_process(&policy, input, Duration::from_millis(1_000))
             .expect_err("combined stdout+stderr output should hit global quota");
         assert_eq!(error.kind, SandboxProcessRunErrorKind::QuotaExceeded);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_constrained_process_denies_interpreters_without_explicit_opt_in() {
+        if Command::new("bash").arg("--version").output().is_err() {
+            return;
+        }
+        let workspace = std::env::current_dir().expect("workspace current_dir should resolve");
+        let policy = sandbox_policy_with_allowed_executables(workspace, vec!["bash".to_owned()]);
+        let input = br#"{"command":"bash","args":["--version"]}"#;
+        let error = run_constrained_process(&policy, input, Duration::from_millis(1_000))
+            .expect_err("interpreter execution must require explicit allow_interpreters opt-in");
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
+        assert!(error.message.contains("allow_interpreters=true"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_constrained_process_denies_interpreter_shell_eval_flags() {
+        if Command::new("bash").arg("--version").output().is_err() {
+            return;
+        }
+        let workspace = std::env::current_dir().expect("workspace current_dir should resolve");
+        let mut policy =
+            sandbox_policy_with_allowed_executables(workspace, vec!["bash".to_owned()]);
+        policy.allow_interpreters = true;
+        let input = br#"{"command":"bash","args":["-c","echo safe"]}"#;
+        let error = run_constrained_process(&policy, input, Duration::from_millis(1_000))
+            .expect_err("interpreter shell-eval flags must be rejected");
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
+        assert!(error.message.contains("shell-eval flags"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_constrained_process_denies_interpreter_embedded_absolute_paths() {
+        if Command::new("python3").arg("--version").output().is_err() {
+            return;
+        }
+        let workspace = std::env::current_dir().expect("workspace current_dir should resolve");
+        let mut policy =
+            sandbox_policy_with_allowed_executables(workspace, vec!["python3".to_owned()]);
+        policy.allow_interpreters = true;
+        let input = br#"{"command":"python3","args":["print(open('/etc/passwd').read())"]}"#;
+        let error = run_constrained_process(&policy, input, Duration::from_millis(1_000))
+            .expect_err("interpreter absolute path substring must be rejected");
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
+        assert!(error.message.contains("absolute path-like substring"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_constrained_process_skips_egress_validation_in_none_mode() {
+        if Command::new("echo").arg("ok").output().is_err() {
+            return;
+        }
+
+        let workspace = std::env::current_dir().expect("workspace current_dir should resolve");
+        let mut policy =
+            sandbox_policy_with_allowed_executables(workspace, vec!["echo".to_owned()]);
+        policy.egress_enforcement_mode = EgressEnforcementMode::None;
+        policy.allowed_egress_hosts = vec!["allowed.example".to_owned()];
+        let input = br#"{"command":"echo","args":["https://blocked.example/path"]}"#;
+
+        let result = run_constrained_process(&policy, input, Duration::from_millis(1_000))
+            .expect("none mode should skip argument-level egress validation");
+        let output: serde_json::Value =
+            serde_json::from_slice(&result.output_json).expect("output should parse");
+        assert_eq!(output.get("exit_code").and_then(serde_json::Value::as_i64), Some(0));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_constrained_process_allows_preflight_mode_without_runtime_network_backend() {
+        if Command::new("echo").arg("ok").output().is_err() {
+            return;
+        }
+
+        let workspace = std::env::current_dir().expect("workspace current_dir should resolve");
+        let mut policy =
+            sandbox_policy_with_allowed_executables(workspace, vec!["echo".to_owned()]);
+        policy.egress_enforcement_mode = EgressEnforcementMode::Preflight;
+        policy.allowed_egress_hosts = vec!["allowed.example".to_owned()];
+        let input = br#"{"command":"echo","args":["https://allowed.example/path"]}"#;
+
+        let result = run_constrained_process(&policy, input, Duration::from_millis(1_000))
+            .expect("preflight mode should not require unavailable strict runtime enforcement");
+        let output: serde_json::Value =
+            serde_json::from_slice(&result.output_json).expect("output should parse");
+        assert_eq!(output.get("exit_code").and_then(serde_json::Value::as_i64), Some(0));
     }
 
     #[test]

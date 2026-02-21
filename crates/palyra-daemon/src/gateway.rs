@@ -4412,6 +4412,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                                 execution_outcome.attestation.executed_at_unix_ms,
                                 execution_outcome.attestation.timed_out,
                                 execution_outcome.attestation.executor.as_str(),
+                                execution_outcome.attestation.sandbox_enforcement.as_str(),
                             )
                             .await
                             {
@@ -6076,6 +6077,7 @@ fn memory_tool_execution_outcome(
             executed_at_unix_ms,
             timed_out: false,
             executor: "memory_runtime".to_owned(),
+            sandbox_enforcement: "none".to_owned(),
         },
     }
 }
@@ -6614,6 +6616,7 @@ async fn send_tool_attestation_with_tape(
     executed_at_unix_ms: i64,
     timed_out: bool,
     executor: &str,
+    sandbox_enforcement: &str,
 ) -> Result<(), Status> {
     let event = tool_attestation_event(
         run_id.to_owned(),
@@ -6640,6 +6643,7 @@ async fn send_tool_attestation_with_tape(
                 executed_at_unix_ms,
                 timed_out,
                 executor,
+                sandbox_enforcement,
             ),
         })
         .await?;
@@ -7286,6 +7290,7 @@ fn tool_attestation_tape_payload(
     executed_at_unix_ms: i64,
     timed_out: bool,
     executor: &str,
+    sandbox_enforcement: &str,
 ) -> String {
     json!({
         "proposal_id": proposal_id,
@@ -7294,6 +7299,7 @@ fn tool_attestation_tape_payload(
         "executed_at_unix_ms": executed_at_unix_ms,
         "timed_out": timed_out,
         "executor": executor,
+        "sandbox_enforcement": sandbox_enforcement,
     })
     .to_string()
 }
@@ -7560,6 +7566,9 @@ mod tests {
                         enabled: false,
                         workspace_root: PathBuf::from("."),
                         allowed_executables: Vec::new(),
+                        allow_interpreters: false,
+                        egress_enforcement_mode:
+                            crate::sandbox_runner::EgressEnforcementMode::Strict,
                         allowed_egress_hosts: Vec::new(),
                         allowed_dns_suffixes: Vec::new(),
                         cpu_time_limit_ms: 2_000,

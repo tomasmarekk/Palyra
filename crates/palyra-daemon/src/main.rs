@@ -235,6 +235,11 @@ async fn main() -> Result<()> {
                         .process_runner
                         .allowed_executables
                         .clone(),
+                    allow_interpreters: loaded.tool_call.process_runner.allow_interpreters,
+                    egress_enforcement_mode: loaded
+                        .tool_call
+                        .process_runner
+                        .egress_enforcement_mode,
                     allowed_egress_hosts: loaded
                         .tool_call
                         .process_runner
@@ -342,6 +347,9 @@ async fn main() -> Result<()> {
         tool_call_process_runner_enabled = loaded.tool_call.process_runner.enabled,
         tool_call_process_runner_workspace_root = %loaded.tool_call.process_runner.workspace_root.display(),
         tool_call_process_runner_allowed_executables = ?loaded.tool_call.process_runner.allowed_executables,
+        tool_call_process_runner_allow_interpreters = loaded.tool_call.process_runner.allow_interpreters,
+        tool_call_process_runner_egress_enforcement_mode =
+            loaded.tool_call.process_runner.egress_enforcement_mode.as_str(),
         tool_call_process_runner_allowed_egress_hosts = ?loaded.tool_call.process_runner.allowed_egress_hosts,
         tool_call_process_runner_allowed_dns_suffixes = ?loaded.tool_call.process_runner.allowed_dns_suffixes,
         tool_call_process_runner_cpu_time_limit_ms = loaded.tool_call.process_runner.cpu_time_limit_ms,
