@@ -1,8 +1,11 @@
-use std::time::{Duration, SystemTime};
+use std::{
+    net::IpAddr,
+    time::{Duration, SystemTime},
+};
 
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType,
-    ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
+    ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, SanType,
 };
 
 use crate::{
@@ -85,10 +88,33 @@ impl CertificateAuthority {
         common_name: &str,
         validity: Duration,
     ) -> IdentityResult<IssuedCertificate> {
-        let mut params =
-            CertificateParams::new(vec!["localhost".to_owned(), common_name.to_owned()])
-                .map_err(|error| IdentityError::Cryptographic(error.to_string()))?;
+        self.issue_server_certificate_with_sans(common_name, validity, &[], &[])
+    }
+
+    pub fn issue_server_certificate_with_sans(
+        &mut self,
+        common_name: &str,
+        validity: Duration,
+        additional_dns_names: &[String],
+        additional_ip_addresses: &[IpAddr],
+    ) -> IdentityResult<IssuedCertificate> {
+        let mut dns_names = Vec::with_capacity(2 + additional_dns_names.len());
+        push_unique_dns_name(&mut dns_names, "localhost");
+        push_unique_dns_name(&mut dns_names, common_name);
+        for dns_name in additional_dns_names {
+            push_unique_dns_name(&mut dns_names, dns_name);
+        }
+
+        let mut params = CertificateParams::new(dns_names)
+            .map_err(|error| IdentityError::Cryptographic(error.to_string()))?;
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        for ip_address in additional_ip_addresses {
+            if !params.subject_alt_names.iter().any(
+                |entry| matches!(entry, SanType::IpAddress(existing) if existing == ip_address),
+            ) {
+                params.subject_alt_names.push(SanType::IpAddress(*ip_address));
+            }
+        }
         let mut distinguished_name = DistinguishedName::new();
         distinguished_name.push(DnType::CommonName, common_name);
         params.distinguished_name = distinguished_name;
@@ -154,11 +180,26 @@ impl CertificateAuthority {
     }
 }
 
+fn push_unique_dns_name(target: &mut Vec<String>, candidate: &str) {
+    let trimmed = candidate.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if target.iter().any(|existing| existing.eq_ignore_ascii_case(trimmed)) {
+        return;
+    }
+    target.push(trimmed.to_owned());
+}
+
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        net::{IpAddr, Ipv4Addr},
+        time::Duration,
+    };
 
     use x509_parser::{
+        extensions::GeneralName,
         pem::parse_x509_pem,
         prelude::{FromDer, X509Certificate},
     };
@@ -195,6 +236,70 @@ mod tests {
         assert!(
             (metadata_not_after - not_after).abs() <= 2,
             "metadata expires_at_unix_ms ({metadata_not_after}) should align with x509 not_after ({not_after})"
+        );
+    }
+
+    #[test]
+    fn server_certificate_supports_custom_dns_and_ip_sans() {
+        let mut ca = CertificateAuthority::new("Palyra Test CA").expect("CA should initialize");
+        let issued = ca
+            .issue_server_certificate_with_sans(
+                "palyrad-node-rpc",
+                Duration::from_secs(3_600),
+                &[
+                    "palyrad-node-rpc".to_owned(),
+                    "node1.lan".to_owned(),
+                    "NODE1.LAN".to_owned(),
+                    "  ".to_owned(),
+                ],
+                &[IpAddr::V4(Ipv4Addr::new(192, 168, 1, 24))],
+            )
+            .expect("certificate issuance with SAN overrides should succeed");
+
+        let (_, pem) = parse_x509_pem(issued.certificate_pem.as_bytes())
+            .expect("certificate PEM should parse");
+        let (_, cert) =
+            X509Certificate::from_der(&pem.contents).expect("certificate DER should parse");
+        let san_extension = cert
+            .subject_alternative_name()
+            .expect("SAN extension parse should succeed")
+            .expect("SAN extension should be present");
+
+        let mut dns_names = Vec::new();
+        let mut ip_addresses = Vec::new();
+        for general_name in &san_extension.value.general_names {
+            match general_name {
+                GeneralName::DNSName(value) => dns_names.push((*value).to_owned()),
+                GeneralName::IPAddress(raw) => {
+                    if raw.len() == 4 {
+                        ip_addresses
+                            .push(IpAddr::V4(Ipv4Addr::new(raw[0], raw[1], raw[2], raw[3])));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        assert!(
+            dns_names.iter().any(|value| value == "localhost"),
+            "default localhost SAN should be present"
+        );
+        assert!(
+            dns_names.iter().any(|value| value == "palyrad-node-rpc"),
+            "common name SAN should be present"
+        );
+        assert!(
+            dns_names.iter().any(|value| value == "node1.lan"),
+            "custom DNS SAN should be present"
+        );
+        assert_eq!(
+            dns_names.iter().filter(|value| value.eq_ignore_ascii_case("node1.lan")).count(),
+            1,
+            "custom DNS SAN should be deduplicated case-insensitively"
+        );
+        assert!(
+            ip_addresses.contains(&IpAddr::V4(Ipv4Addr::new(192, 168, 1, 24))),
+            "custom IP SAN should be present"
         );
     }
 }
