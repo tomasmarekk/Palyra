@@ -140,6 +140,46 @@ fn admin_policy_explain_requires_token_and_returns_decision_payload() -> Result<
 }
 
 #[test]
+fn admin_status_bruteforce_attempts_are_rate_limited() -> Result<()> {
+    let (child, admin_port) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("failed to build HTTP client")?;
+    let url = format!("http://127.0.0.1:{admin_port}/admin/v1/status");
+
+    let mut saw_rate_limit = false;
+    for attempt in 0..200 {
+        let response = client
+            .get(&url)
+            .header("Authorization", "Bearer invalid-admin-token")
+            .header("x-palyra-principal", "user:attacker")
+            .header("x-palyra-device-id", DEVICE_ID)
+            .header("x-palyra-channel", "cli")
+            .send()
+            .with_context(|| format!("failed to call admin status attempt {attempt}"))?;
+        if response.status().as_u16() == 429 {
+            saw_rate_limit = true;
+            break;
+        }
+        assert_eq!(
+            response.status().as_u16(),
+            401,
+            "invalid token should return unauthorized until rate-limit threshold is reached"
+        );
+    }
+
+    assert!(
+        saw_rate_limit,
+        "expected repeated invalid-token attempts to trigger HTTP 429 rate limiting"
+    );
+    Ok(())
+}
+
+#[test]
 fn admin_run_endpoints_require_token_and_report_not_found_for_unknown_run() -> Result<()> {
     let (child, admin_port) = spawn_palyrad_with_dynamic_ports()?;
     let mut daemon = ChildGuard::new(child);

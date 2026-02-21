@@ -10,17 +10,18 @@ mod tool_protocol;
 mod wasm_plugin_runner;
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
 use axum::{
-    extract::{Path, Query, State},
+    extract::{ConnectInfo, Path, Query, Request, State},
     http::{HeaderMap, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -61,6 +62,11 @@ const DANGEROUS_REMOTE_BIND_ACK_ENV: &str = "PALYRA_GATEWAY_DANGEROUS_REMOTE_BIN
 const SYSTEM_DAEMON_PRINCIPAL: &str = "system:daemon";
 const SYSTEM_VAULT_CHANNEL: &str = "system:vault";
 const SYSTEM_DAEMON_DEVICE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+const GRPC_MAX_DECODING_MESSAGE_SIZE_BYTES: usize = 4 * 1024 * 1024;
+const GRPC_MAX_ENCODING_MESSAGE_SIZE_BYTES: usize = 4 * 1024 * 1024;
+const ADMIN_RATE_LIMIT_WINDOW_MS: u64 = 1_000;
+const ADMIN_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW: u32 = 30;
+const ADMIN_RATE_LIMIT_MAX_IP_BUCKETS: usize = 4_096;
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "palyrad", about = "Palyra gateway skeleton daemon")]
@@ -82,6 +88,13 @@ struct AppState {
     started_at: Instant,
     runtime: Arc<GatewayRuntimeState>,
     auth: GatewayAuthConfig,
+    admin_rate_limit: Arc<Mutex<HashMap<IpAddr, AdminRateLimitEntry>>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AdminRateLimitEntry {
+    window_started_at: Instant,
+    requests_in_window: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -370,6 +383,10 @@ async fn main() -> Result<()> {
         tool_call_wasm_runtime_allowed_channels = ?loaded.tool_call.wasm_runtime.allowed_channels,
         admin_auth_required = loaded.admin.require_auth,
         admin_token_configured = loaded.admin.auth_token.is_some(),
+        admin_rate_limit_window_ms = ADMIN_RATE_LIMIT_WINDOW_MS,
+        admin_rate_limit_max_requests_per_window = ADMIN_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW,
+        grpc_max_decoding_message_size_bytes = GRPC_MAX_DECODING_MESSAGE_SIZE_BYTES,
+        grpc_max_encoding_message_size_bytes = GRPC_MAX_ENCODING_MESSAGE_SIZE_BYTES,
         node_rpc_mtls_required = !loaded.identity.allow_insecure_node_rpc_without_mtls,
         journal_db_path = %loaded.storage.journal_db_path.display(),
         journal_hash_chain_enabled = loaded.storage.journal_hash_chain_enabled,
@@ -381,9 +398,13 @@ async fn main() -> Result<()> {
     );
 
     let started_at = Instant::now();
-    let state = AppState { started_at, runtime: runtime.clone(), auth: auth.clone() };
-    let app = Router::new()
-        .route("/healthz", get(health_handler))
+    let state = AppState {
+        started_at,
+        runtime: runtime.clone(),
+        auth: auth.clone(),
+        admin_rate_limit: Arc::new(Mutex::new(HashMap::new())),
+    };
+    let admin_routes = Router::new()
         .route("/admin/v1/status", get(admin_status_handler))
         .route("/admin/v1/journal/recent", get(admin_journal_recent_handler))
         .route("/admin/v1/policy/explain", get(admin_policy_explain_handler))
@@ -392,7 +413,9 @@ async fn main() -> Result<()> {
         .route("/admin/v1/runs/{run_id}/cancel", post(admin_run_cancel_handler))
         .route("/admin/v1/skills/{skill_id}/quarantine", post(admin_skill_quarantine_handler))
         .route("/admin/v1/skills/{skill_id}/enable", post(admin_skill_enable_handler))
-        .with_state(state);
+        .route_layer(middleware::from_fn_with_state(state.clone(), admin_rate_limit_middleware));
+    let app =
+        Router::new().route("/healthz", get(health_handler)).merge(admin_routes).with_state(state);
 
     let admin_address = parse_daemon_bind_socket(&loaded.daemon.bind_addr, loaded.daemon.port)
         .context("invalid admin bind address or port")?;
@@ -457,7 +480,9 @@ async fn main() -> Result<()> {
     let grpc_gateway_server =
         gateway::proto::palyra::gateway::v1::gateway_service_server::GatewayServiceServer::new(
             gateway_service,
-        );
+        )
+        .max_decoding_message_size(GRPC_MAX_DECODING_MESSAGE_SIZE_BYTES)
+        .max_encoding_message_size(GRPC_MAX_ENCODING_MESSAGE_SIZE_BYTES);
     let cron_service = gateway::CronServiceImpl::new(
         runtime.clone(),
         auth.clone(),
@@ -465,22 +490,30 @@ async fn main() -> Result<()> {
         Arc::clone(&scheduler_wake),
     );
     let grpc_cron_server =
-        gateway::proto::palyra::cron::v1::cron_service_server::CronServiceServer::new(cron_service);
+        gateway::proto::palyra::cron::v1::cron_service_server::CronServiceServer::new(cron_service)
+            .max_decoding_message_size(GRPC_MAX_DECODING_MESSAGE_SIZE_BYTES)
+            .max_encoding_message_size(GRPC_MAX_ENCODING_MESSAGE_SIZE_BYTES);
     let approvals_service = gateway::ApprovalsServiceImpl::new(runtime.clone(), auth.clone());
     let grpc_approvals_server =
         gateway::proto::palyra::gateway::v1::approvals_service_server::ApprovalsServiceServer::new(
             approvals_service,
-        );
+        )
+        .max_decoding_message_size(GRPC_MAX_DECODING_MESSAGE_SIZE_BYTES)
+        .max_encoding_message_size(GRPC_MAX_ENCODING_MESSAGE_SIZE_BYTES);
     let memory_service = gateway::MemoryServiceImpl::new(runtime.clone(), auth.clone());
     let grpc_memory_server =
         gateway::proto::palyra::memory::v1::memory_service_server::MemoryServiceServer::new(
             memory_service,
-        );
+        )
+        .max_decoding_message_size(GRPC_MAX_DECODING_MESSAGE_SIZE_BYTES)
+        .max_encoding_message_size(GRPC_MAX_ENCODING_MESSAGE_SIZE_BYTES);
     let vault_service = gateway::VaultServiceImpl::new(runtime.clone(), auth.clone());
     let grpc_vault_server =
         gateway::proto::palyra::gateway::v1::vault_service_server::VaultServiceServer::new(
             vault_service,
-        );
+        )
+        .max_decoding_message_size(GRPC_MAX_DECODING_MESSAGE_SIZE_BYTES)
+        .max_encoding_message_size(GRPC_MAX_ENCODING_MESSAGE_SIZE_BYTES);
     let node_rpc_service = node_rpc::NodeRpcServiceImpl::new(
         identity_runtime.revoked_certificate_fingerprints.clone(),
         !loaded.identity.allow_insecure_node_rpc_without_mtls,
@@ -488,7 +521,9 @@ async fn main() -> Result<()> {
     let node_rpc_server =
         gateway::proto::palyra::node::v1::node_service_server::NodeServiceServer::new(
             node_rpc_service,
-        );
+        )
+        .max_decoding_message_size(GRPC_MAX_DECODING_MESSAGE_SIZE_BYTES)
+        .max_encoding_message_size(GRPC_MAX_ENCODING_MESSAGE_SIZE_BYTES);
     let mut grpc_server_builder = Server::builder();
     if loaded.gateway.tls.enabled {
         grpc_server_builder = grpc_server_builder
@@ -505,7 +540,7 @@ async fn main() -> Result<()> {
 
     tokio::try_join!(
         async move {
-            axum::serve(admin_listener, app)
+            axum::serve(admin_listener, app.into_make_service_with_connect_info::<SocketAddr>())
                 .with_graceful_shutdown(shutdown_signal())
                 .await
                 .context("palyrad admin server failed")
@@ -560,6 +595,63 @@ fn loopback_grpc_url(socket: SocketAddr, tls_enabled: bool) -> String {
 
 async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
     Json::<HealthResponse>(health_response("palyrad", state.started_at))
+}
+
+fn consume_admin_rate_limit(state: &AppState, remote_addr: SocketAddr) -> bool {
+    consume_admin_rate_limit_with_now(&state.admin_rate_limit, remote_addr.ip(), Instant::now())
+}
+
+fn consume_admin_rate_limit_with_now(
+    buckets: &Mutex<HashMap<IpAddr, AdminRateLimitEntry>>,
+    remote_ip: IpAddr,
+    now: Instant,
+) -> bool {
+    let mut buckets = match buckets.lock() {
+        Ok(guard) => guard,
+        Err(_) => return false,
+    };
+    if !buckets.contains_key(&remote_ip) && buckets.len() >= ADMIN_RATE_LIMIT_MAX_IP_BUCKETS {
+        buckets.retain(|_, entry| {
+            now.duration_since(entry.window_started_at).as_millis() as u64
+                <= ADMIN_RATE_LIMIT_WINDOW_MS
+        });
+        if buckets.len() >= ADMIN_RATE_LIMIT_MAX_IP_BUCKETS {
+            let evicted_ip =
+                buckets.iter().min_by_key(|(_, entry)| entry.window_started_at).map(|(ip, _)| *ip);
+            let Some(evicted_ip) = evicted_ip else {
+                return false;
+            };
+            buckets.remove(&evicted_ip);
+        }
+    }
+    let entry = buckets
+        .entry(remote_ip)
+        .or_insert(AdminRateLimitEntry { window_started_at: now, requests_in_window: 0 });
+    if now.duration_since(entry.window_started_at).as_millis() as u64 > ADMIN_RATE_LIMIT_WINDOW_MS {
+        entry.window_started_at = now;
+        entry.requests_in_window = 0;
+    }
+    if entry.requests_in_window >= ADMIN_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW {
+        return false;
+    }
+    entry.requests_in_window = entry.requests_in_window.saturating_add(1);
+    true
+}
+
+async fn admin_rate_limit_middleware(
+    State(state): State<AppState>,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !consume_admin_rate_limit(&state, remote_addr) {
+        state.runtime.record_denied();
+        return runtime_status_response(tonic::Status::resource_exhausted(format!(
+            "admin API rate limit exceeded for {}",
+            remote_addr.ip()
+        )));
+    }
+    next.run(request).await
 }
 
 async fn admin_status_handler(
@@ -1079,11 +1171,20 @@ fn dangerous_remote_bind_acknowledged() -> Result<bool> {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
+    use std::{
+        collections::HashMap,
+        net::IpAddr,
+        str::FromStr,
+        sync::Mutex,
+        time::{Duration, Instant},
+    };
+
     use axum::http::StatusCode;
 
     use super::{
-        enforce_remote_bind_guard, loopback_grpc_url, runtime_status_response,
-        validate_admin_auth_config,
+        consume_admin_rate_limit_with_now, enforce_remote_bind_guard, loopback_grpc_url,
+        runtime_status_response, validate_admin_auth_config, ADMIN_RATE_LIMIT_MAX_IP_BUCKETS,
+        ADMIN_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW,
     };
     use crate::gateway::GatewayAuthConfig;
 
@@ -1244,6 +1345,61 @@ mod tests {
             bound_principal: None,
         });
         assert!(result.is_ok(), "disabled auth should allow missing token");
+    }
+
+    #[test]
+    fn admin_rate_limit_rejects_after_window_budget_is_exhausted() {
+        let buckets = Mutex::new(HashMap::new());
+        let ip = IpAddr::from_str("127.0.0.1").expect("IP literal should parse");
+        let now = Instant::now();
+        for attempt in 0..ADMIN_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW {
+            let allowed = consume_admin_rate_limit_with_now(&buckets, ip, now);
+            assert!(allowed, "attempt {attempt} should remain within the request budget");
+        }
+        assert!(
+            !consume_admin_rate_limit_with_now(&buckets, ip, now),
+            "request after budget exhaustion should be rejected"
+        );
+    }
+
+    #[test]
+    fn admin_rate_limit_resets_budget_after_window_elapses() {
+        let buckets = Mutex::new(HashMap::new());
+        let ip = IpAddr::from_str("127.0.0.1").expect("IP literal should parse");
+        let now = Instant::now();
+        for _ in 0..ADMIN_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW {
+            let _ = consume_admin_rate_limit_with_now(&buckets, ip, now);
+        }
+        assert!(
+            !consume_admin_rate_limit_with_now(&buckets, ip, now),
+            "budget should be exhausted within the same window"
+        );
+        let advanced = now + Duration::from_millis(1_200);
+        assert!(
+            consume_admin_rate_limit_with_now(&buckets, ip, advanced),
+            "request should be allowed after the fixed window expires"
+        );
+    }
+
+    #[test]
+    fn admin_rate_limit_bucket_count_is_bounded() {
+        let buckets = Mutex::new(HashMap::new());
+        let now = Instant::now();
+        for offset in 0..ADMIN_RATE_LIMIT_MAX_IP_BUCKETS {
+            let ip = IpAddr::from([10, 0, (offset / 256) as u8, (offset % 256) as u8]);
+            let allowed = consume_admin_rate_limit_with_now(&buckets, ip, now);
+            assert!(allowed, "filling bucket {offset} should succeed");
+        }
+        let overflow_ip = IpAddr::from([10, 250, 0, 1]);
+        assert!(
+            consume_admin_rate_limit_with_now(&buckets, overflow_ip, now),
+            "overflow principal should still be accepted after oldest-bucket eviction"
+        );
+        let bucket_count = buckets.lock().expect("bucket mutex should be available").len();
+        assert_eq!(
+            bucket_count, ADMIN_RATE_LIMIT_MAX_IP_BUCKETS,
+            "bucket count must remain bounded to avoid unbounded memory growth"
+        );
     }
 }
 

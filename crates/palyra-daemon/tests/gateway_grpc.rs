@@ -31,6 +31,8 @@ const RUN_ID_ALT: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAZ";
 const ENVELOPE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAY";
 const OPENAI_API_KEY: &str = "sk-openai-integration-test";
 const MAX_TEST_CRON_JITTER_MS: u64 = 60_000;
+const GRPC_OVERSIZED_PAYLOAD_BYTES: usize = (4 * 1024 * 1024) + 8 * 1024;
+const TRANSPORT_LIMIT_TEST_JOURNAL_MAX_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 static TEMP_JOURNAL_COUNTER: AtomicU64 = AtomicU64::new(0);
 static TEMP_CONFIG_COUNTER: AtomicU64 = AtomicU64::new(0);
 static TEMP_IDENTITY_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -3675,6 +3677,41 @@ async fn grpc_append_event_duplicate_event_id_returns_already_exists() -> Result
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn grpc_append_event_rejects_transport_oversized_payload() -> Result<()> {
+    let (child, admin_port, grpc_port, _journal_db_path) =
+        spawn_palyrad_with_dynamic_ports_and_journal_payload_limit(
+            TRANSPORT_LIMIT_TEST_JOURNAL_MAX_PAYLOAD_BYTES,
+        )?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+
+    let oversized_payload = vec![b'x'; GRPC_OVERSIZED_PAYLOAD_BYTES];
+    let request = authorized_append_event_request(sample_journal_event(
+        "01ARZ3NDEKTSV4RRFFQ69G5FBA",
+        oversized_payload.as_slice(),
+    ))?;
+    let error = client
+        .append_event(request)
+        .await
+        .expect_err("oversized append payload should be rejected by transport decode limits");
+    assert_eq!(
+        error.code(),
+        Code::OutOfRange,
+        "oversized append payload should be rejected as an out-of-range request"
+    );
+    assert!(
+        error.message().contains("limit"),
+        "oversized gRPC rejection should explain configured message limit"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn grpc_append_event_rejects_mismatched_embedded_event_version() -> Result<()> {
     let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
     let mut daemon = ChildGuard::new(child);
@@ -4100,17 +4137,31 @@ fn load_golden_json(name: &str) -> Result<Value> {
 }
 
 fn spawn_palyrad_with_dynamic_ports() -> Result<(Child, u16, u16, PathBuf)> {
-    spawn_palyrad_with_dynamic_ports_and_hash_chain(false)
+    spawn_palyrad_with_dynamic_ports_options(false, None)
 }
 
 fn spawn_palyrad_with_dynamic_ports_and_hash_chain(
     hash_chain_enabled: bool,
 ) -> Result<(Child, u16, u16, PathBuf)> {
+    spawn_palyrad_with_dynamic_ports_options(hash_chain_enabled, None)
+}
+
+fn spawn_palyrad_with_dynamic_ports_and_journal_payload_limit(
+    max_journal_payload_bytes: usize,
+) -> Result<(Child, u16, u16, PathBuf)> {
+    spawn_palyrad_with_dynamic_ports_options(false, Some(max_journal_payload_bytes))
+}
+
+fn spawn_palyrad_with_dynamic_ports_options(
+    hash_chain_enabled: bool,
+    max_journal_payload_bytes: Option<usize>,
+) -> Result<(Child, u16, u16, PathBuf)> {
     let journal_db_path = unique_temp_journal_db_path();
     let identity_store_dir = unique_temp_identity_store_dir();
     let vault_dir = unique_temp_vault_dir();
     prepare_test_vault_dir(&vault_dir)?;
-    let mut child = Command::new(env!("CARGO_BIN_EXE_palyrad"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_palyrad"));
+    command
         .args([
             "--bind",
             "127.0.0.1",
@@ -4129,9 +4180,11 @@ fn spawn_palyrad_with_dynamic_ports_and_hash_chain(
         .env("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED", "true")
         .env("RUST_LOG", "info")
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("failed to start palyrad")?;
+        .stderr(Stdio::null());
+    if let Some(max_journal_payload_bytes) = max_journal_payload_bytes {
+        command.env("PALYRA_JOURNAL_MAX_PAYLOAD_BYTES", max_journal_payload_bytes.to_string());
+    }
+    let mut child = command.spawn().context("failed to start palyrad")?;
     let stdout = child.stdout.take().context("failed to capture palyrad stdout")?;
     let (admin_port, grpc_port) = wait_for_listen_ports(stdout, &mut child)?;
     Ok((child, admin_port, grpc_port, journal_db_path))
