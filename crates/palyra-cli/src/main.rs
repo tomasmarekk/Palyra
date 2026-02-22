@@ -26,6 +26,12 @@ pub mod proto {
                 tonic::include_proto!("palyra.memory.v1");
             }
         }
+
+        pub mod auth {
+            pub mod v1 {
+                tonic::include_proto!("palyra.auth.v1");
+            }
+        }
     }
 }
 
@@ -47,6 +53,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use clap::{CommandFactory, Parser};
 use cli::{
     AgentCommand, AgentsCommand, ApprovalDecisionArg, ApprovalExportFormatArg, ApprovalsCommand,
+    AuthCommand, AuthCredentialArg, AuthProfilesCommand, AuthProviderArg, AuthScopeArg,
     BrowserCommand, ChannelsCommand, Cli, Command as CliCommand, CompletionShell, ConfigCommand,
     CronCommand, CronConcurrencyPolicyArg, CronMisfirePolicyArg, CronScheduleTypeArg,
     DaemonCommand, JournalCheckpointModeArg, MemoryCommand, MemoryScopeArg, MemorySourceArg,
@@ -103,7 +110,7 @@ use tonic::Request;
 use ulid::Ulid;
 
 use crate::proto::palyra::{
-    common::v1 as common_v1, cron::v1 as cron_v1, gateway::v1 as gateway_v1,
+    auth::v1 as auth_v1, common::v1 as common_v1, cron::v1 as cron_v1, gateway::v1 as gateway_v1,
     memory::v1 as memory_v1,
 };
 
@@ -151,6 +158,7 @@ fn main() -> Result<()> {
         CliCommand::Cron { command } => run_cron(command),
         CliCommand::Memory { command } => run_memory(command),
         CliCommand::Approvals { command } => run_approvals(command),
+        CliCommand::Auth { command } => run_auth(command),
         CliCommand::Channels { command } => run_channels(command),
         CliCommand::Browser { command } => run_browser(command),
         CliCommand::Completion { shell } => run_completion(shell),
@@ -1367,6 +1375,461 @@ async fn run_approvals_async(command: ApprovalsCommand, connection: AgentConnect
     }
 
     std::io::stdout().flush().context("stdout flush failed")
+}
+
+fn run_auth(command: AuthCommand) -> Result<()> {
+    let connection = AgentConnection {
+        grpc_url: resolve_grpc_url(None)?,
+        token: env::var("PALYRA_ADMIN_TOKEN").ok(),
+        principal: "admin:local".to_owned(),
+        device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+        channel: DEFAULT_CHANNEL.to_owned(),
+    };
+    let runtime = build_runtime()?;
+    runtime.block_on(run_auth_async(command, connection))
+}
+
+async fn run_auth_async(command: AuthCommand, connection: AgentConnection) -> Result<()> {
+    let mut client =
+        auth_v1::auth_service_client::AuthServiceClient::connect(connection.grpc_url.clone())
+            .await
+            .with_context(|| {
+                format!("failed to connect auth gRPC endpoint {}", connection.grpc_url)
+            })?;
+
+    let AuthCommand::Profiles { command } = command;
+    match command {
+        AuthProfilesCommand::List {
+            after,
+            limit,
+            provider,
+            provider_name,
+            scope,
+            agent_id,
+            json,
+        } => {
+            let mut request = Request::new(auth_v1::ListAuthProfilesRequest {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                after_profile_id: after.unwrap_or_default(),
+                limit: limit.unwrap_or(100),
+                provider_kind: provider
+                    .map(auth_provider_arg_to_proto)
+                    .unwrap_or(auth_v1::AuthProviderKind::Unspecified as i32),
+                provider_custom_name: provider_name.unwrap_or_default(),
+                scope_kind: scope
+                    .map(auth_scope_arg_to_proto)
+                    .unwrap_or(auth_v1::AuthScopeKind::Unspecified as i32),
+                scope_agent_id: agent_id.unwrap_or_default(),
+            });
+            inject_run_stream_metadata(request.metadata_mut(), &connection)?;
+            let response =
+                client.list_profiles(request).await.context("failed to call auth ListProfiles")?;
+            let payload = response.into_inner();
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "profiles": payload.profiles.iter().map(auth_profile_to_json).collect::<Vec<_>>(),
+                        "next_after_profile_id": empty_to_none(payload.next_after_profile_id),
+                    }))?
+                );
+            } else {
+                println!(
+                    "auth.profiles.list count={} next_after={}",
+                    payload.profiles.len(),
+                    if payload.next_after_profile_id.is_empty() {
+                        "none"
+                    } else {
+                        payload.next_after_profile_id.as_str()
+                    }
+                );
+                for profile in &payload.profiles {
+                    println!(
+                        "auth.profile id={} provider={} scope={} credential={}",
+                        profile.profile_id,
+                        auth_provider_to_text(profile.provider.as_ref()),
+                        auth_scope_to_text(profile.scope.as_ref()),
+                        auth_profile_credential_type(profile)
+                    );
+                }
+            }
+        }
+        AuthProfilesCommand::Show { profile_id, json } => {
+            let mut request = Request::new(auth_v1::GetAuthProfileRequest {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                profile_id,
+            });
+            inject_run_stream_metadata(request.metadata_mut(), &connection)?;
+            let response =
+                client.get_profile(request).await.context("failed to call auth GetProfile")?;
+            let profile = response
+                .into_inner()
+                .profile
+                .context("auth GetProfile returned empty profile payload")?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&auth_profile_to_json(&profile))?);
+            } else {
+                println!(
+                    "auth.profiles.show id={} provider={} scope={} credential={} updated_at_ms={}",
+                    profile.profile_id,
+                    auth_provider_to_text(profile.provider.as_ref()),
+                    auth_scope_to_text(profile.scope.as_ref()),
+                    auth_profile_credential_type(&profile),
+                    profile.updated_at_unix_ms
+                );
+            }
+        }
+        AuthProfilesCommand::Set {
+            profile_id,
+            provider,
+            provider_name,
+            profile_name,
+            scope,
+            agent_id,
+            credential,
+            api_key_ref,
+            access_token_ref,
+            refresh_token_ref,
+            token_endpoint,
+            client_id,
+            client_secret_ref,
+            scope_value,
+            expires_at_unix_ms,
+            json,
+        } => {
+            let provider_message = auth_v1::AuthProvider {
+                kind: auth_provider_arg_to_proto(provider),
+                custom_name: provider_name.unwrap_or_default(),
+            };
+            let scope_message = match scope {
+                AuthScopeArg::Global => auth_v1::AuthScope {
+                    kind: auth_v1::AuthScopeKind::Global as i32,
+                    agent_id: String::new(),
+                },
+                AuthScopeArg::Agent => auth_v1::AuthScope {
+                    kind: auth_v1::AuthScopeKind::Agent as i32,
+                    agent_id: agent_id.context("--agent-id is required when --scope=agent")?,
+                },
+            };
+            let credential_message = match credential {
+                AuthCredentialArg::ApiKey => auth_v1::AuthCredential {
+                    kind: Some(auth_v1::auth_credential::Kind::ApiKey(auth_v1::ApiKeyCredential {
+                        api_key_vault_ref: api_key_ref
+                            .context("--api-key-ref is required when --credential=api-key")?,
+                    })),
+                },
+                AuthCredentialArg::Oauth => auth_v1::AuthCredential {
+                    kind: Some(auth_v1::auth_credential::Kind::Oauth(auth_v1::OAuthCredential {
+                        access_token_vault_ref: access_token_ref
+                            .context("--access-token-ref is required when --credential=oauth")?,
+                        refresh_token_vault_ref: refresh_token_ref
+                            .context("--refresh-token-ref is required when --credential=oauth")?,
+                        token_endpoint: token_endpoint
+                            .context("--token-endpoint is required when --credential=oauth")?,
+                        client_id: client_id.unwrap_or_default(),
+                        client_secret_vault_ref: client_secret_ref.unwrap_or_default(),
+                        scopes: scope_value,
+                        expires_at_unix_ms: expires_at_unix_ms.unwrap_or_default(),
+                        refresh_state: None,
+                    })),
+                },
+            };
+            let mut request = Request::new(auth_v1::SetAuthProfileRequest {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                profile: Some(auth_v1::AuthProfile {
+                    profile_id,
+                    provider: Some(provider_message),
+                    profile_name,
+                    scope: Some(scope_message),
+                    credential: Some(credential_message),
+                    created_at_unix_ms: 0,
+                    updated_at_unix_ms: 0,
+                }),
+            });
+            inject_run_stream_metadata(request.metadata_mut(), &connection)?;
+            let response =
+                client.set_profile(request).await.context("failed to call auth SetProfile")?;
+            let profile = response
+                .into_inner()
+                .profile
+                .context("auth SetProfile returned empty profile payload")?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&auth_profile_to_json(&profile))?);
+            } else {
+                println!(
+                    "auth.profiles.set id={} provider={} scope={} credential={}",
+                    profile.profile_id,
+                    auth_provider_to_text(profile.provider.as_ref()),
+                    auth_scope_to_text(profile.scope.as_ref()),
+                    auth_profile_credential_type(&profile)
+                );
+            }
+        }
+        AuthProfilesCommand::Delete { profile_id, json } => {
+            let mut request = Request::new(auth_v1::DeleteAuthProfileRequest {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                profile_id,
+            });
+            inject_run_stream_metadata(request.metadata_mut(), &connection)?;
+            let response = client
+                .delete_profile(request)
+                .await
+                .context("failed to call auth DeleteProfile")?;
+            let payload = response.into_inner();
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({ "deleted": payload.deleted }))?
+                );
+            } else {
+                println!("auth.profiles.delete deleted={}", payload.deleted);
+            }
+        }
+        AuthProfilesCommand::Health { agent_id, include_profiles, json } => {
+            let mut request = Request::new(auth_v1::GetAuthHealthRequest {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                agent_id: agent_id.unwrap_or_default(),
+                include_profiles,
+            });
+            inject_run_stream_metadata(request.metadata_mut(), &connection)?;
+            let response =
+                client.get_health(request).await.context("failed to call auth GetHealth")?;
+            let payload = response.into_inner();
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "summary": payload.summary.as_ref().map(auth_health_summary_to_json),
+                        "expiry_distribution": payload
+                            .expiry_distribution
+                            .as_ref()
+                            .map(auth_expiry_distribution_to_json),
+                        "refresh_metrics": payload.refresh_metrics.as_ref().map(auth_refresh_metrics_to_json),
+                        "profiles": payload.profiles.iter().map(auth_health_profile_to_json).collect::<Vec<_>>(),
+                    }))?
+                );
+            } else {
+                let summary = payload.summary.unwrap_or_default();
+                println!(
+                    "auth.profiles.health total={} ok={} expiring={} expired={} missing={} static={}",
+                    summary.total,
+                    summary.ok,
+                    summary.expiring,
+                    summary.expired,
+                    summary.missing,
+                    summary.static_count
+                );
+                let refresh = payload.refresh_metrics.unwrap_or_default();
+                println!(
+                    "auth.refresh attempts={} successes={} failures={}",
+                    refresh.attempts, refresh.successes, refresh.failures
+                );
+                if include_profiles {
+                    for profile in &payload.profiles {
+                        println!(
+                            "auth.health.profile id={} provider={} state={} reason={}",
+                            profile.profile_id,
+                            profile.provider,
+                            auth_health_state_to_text(profile.state),
+                            profile.reason
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    std::io::stdout().flush().context("stdout flush failed")
+}
+
+fn auth_provider_arg_to_proto(value: AuthProviderArg) -> i32 {
+    match value {
+        AuthProviderArg::Openai => auth_v1::AuthProviderKind::Openai as i32,
+        AuthProviderArg::Anthropic => auth_v1::AuthProviderKind::Anthropic as i32,
+        AuthProviderArg::Telegram => auth_v1::AuthProviderKind::Telegram as i32,
+        AuthProviderArg::Slack => auth_v1::AuthProviderKind::Slack as i32,
+        AuthProviderArg::Discord => auth_v1::AuthProviderKind::Discord as i32,
+        AuthProviderArg::Webhook => auth_v1::AuthProviderKind::Webhook as i32,
+        AuthProviderArg::Custom => auth_v1::AuthProviderKind::Custom as i32,
+    }
+}
+
+fn auth_scope_arg_to_proto(value: AuthScopeArg) -> i32 {
+    match value {
+        AuthScopeArg::Global => auth_v1::AuthScopeKind::Global as i32,
+        AuthScopeArg::Agent => auth_v1::AuthScopeKind::Agent as i32,
+    }
+}
+
+fn auth_provider_to_text(provider: Option<&auth_v1::AuthProvider>) -> String {
+    let Some(provider) = provider else {
+        return "unspecified".to_owned();
+    };
+    match auth_v1::AuthProviderKind::try_from(provider.kind)
+        .unwrap_or(auth_v1::AuthProviderKind::Unspecified)
+    {
+        auth_v1::AuthProviderKind::Openai => "openai".to_owned(),
+        auth_v1::AuthProviderKind::Anthropic => "anthropic".to_owned(),
+        auth_v1::AuthProviderKind::Telegram => "telegram".to_owned(),
+        auth_v1::AuthProviderKind::Slack => "slack".to_owned(),
+        auth_v1::AuthProviderKind::Discord => "discord".to_owned(),
+        auth_v1::AuthProviderKind::Webhook => "webhook".to_owned(),
+        auth_v1::AuthProviderKind::Custom => {
+            if provider.custom_name.trim().is_empty() {
+                "custom".to_owned()
+            } else {
+                provider.custom_name.to_ascii_lowercase()
+            }
+        }
+        auth_v1::AuthProviderKind::Unspecified => "unspecified".to_owned(),
+    }
+}
+
+fn auth_scope_to_text(scope: Option<&auth_v1::AuthScope>) -> String {
+    let Some(scope) = scope else {
+        return "unspecified".to_owned();
+    };
+    match auth_v1::AuthScopeKind::try_from(scope.kind)
+        .unwrap_or(auth_v1::AuthScopeKind::Unspecified)
+    {
+        auth_v1::AuthScopeKind::Global => "global".to_owned(),
+        auth_v1::AuthScopeKind::Agent => {
+            if scope.agent_id.trim().is_empty() {
+                "agent:<missing>".to_owned()
+            } else {
+                format!("agent:{}", scope.agent_id)
+            }
+        }
+        auth_v1::AuthScopeKind::Unspecified => "unspecified".to_owned(),
+    }
+}
+
+fn auth_profile_credential_type(profile: &auth_v1::AuthProfile) -> &'static str {
+    match profile.credential.as_ref().and_then(|credential| credential.kind.as_ref()) {
+        Some(auth_v1::auth_credential::Kind::ApiKey(_)) => "api_key",
+        Some(auth_v1::auth_credential::Kind::Oauth(_)) => "oauth",
+        None => "unspecified",
+    }
+}
+
+fn auth_profile_to_json(profile: &auth_v1::AuthProfile) -> serde_json::Value {
+    let credential = match profile.credential.as_ref().and_then(|value| value.kind.as_ref()) {
+        Some(auth_v1::auth_credential::Kind::ApiKey(api_key)) => json!({
+            "type": "api_key",
+            "api_key_vault_ref": api_key.api_key_vault_ref,
+        }),
+        Some(auth_v1::auth_credential::Kind::Oauth(oauth)) => json!({
+            "type": "oauth",
+            "access_token_vault_ref": oauth.access_token_vault_ref,
+            "refresh_token_vault_ref": oauth.refresh_token_vault_ref,
+            "token_endpoint": oauth.token_endpoint,
+            "client_id": empty_to_none(oauth.client_id.clone()),
+            "client_secret_vault_ref": empty_to_none(oauth.client_secret_vault_ref.clone()),
+            "scopes": oauth.scopes,
+            "expires_at_unix_ms": if oauth.expires_at_unix_ms > 0 {
+                Some(oauth.expires_at_unix_ms)
+            } else {
+                None
+            },
+            "refresh_state": oauth.refresh_state.as_ref().map(|state| json!({
+                "failure_count": state.failure_count,
+                "last_error": empty_to_none(state.last_error.clone()),
+                "last_attempt_unix_ms": if state.last_attempt_unix_ms > 0 {
+                    Some(state.last_attempt_unix_ms)
+                } else {
+                    None
+                },
+                "last_success_unix_ms": if state.last_success_unix_ms > 0 {
+                    Some(state.last_success_unix_ms)
+                } else {
+                    None
+                },
+                "next_allowed_refresh_unix_ms": if state.next_allowed_refresh_unix_ms > 0 {
+                    Some(state.next_allowed_refresh_unix_ms)
+                } else {
+                    None
+                },
+            })),
+        }),
+        None => json!({"type": "unspecified"}),
+    };
+    json!({
+        "profile_id": profile.profile_id,
+        "provider": auth_provider_to_text(profile.provider.as_ref()),
+        "profile_name": profile.profile_name,
+        "scope": auth_scope_to_text(profile.scope.as_ref()),
+        "credential": credential,
+        "created_at_unix_ms": profile.created_at_unix_ms,
+        "updated_at_unix_ms": profile.updated_at_unix_ms,
+    })
+}
+
+fn auth_health_state_to_text(value: i32) -> &'static str {
+    match auth_v1::AuthHealthState::try_from(value).unwrap_or(auth_v1::AuthHealthState::Unspecified)
+    {
+        auth_v1::AuthHealthState::Ok => "ok",
+        auth_v1::AuthHealthState::Expiring => "expiring",
+        auth_v1::AuthHealthState::Expired => "expired",
+        auth_v1::AuthHealthState::Missing => "missing",
+        auth_v1::AuthHealthState::Static => "static",
+        auth_v1::AuthHealthState::Unspecified => "unspecified",
+    }
+}
+
+fn auth_health_profile_to_json(value: &auth_v1::AuthProfileHealth) -> serde_json::Value {
+    json!({
+        "profile_id": value.profile_id,
+        "provider": value.provider,
+        "profile_name": value.profile_name,
+        "scope": value.scope,
+        "credential_type": value.credential_type,
+        "state": auth_health_state_to_text(value.state),
+        "reason": value.reason,
+        "expires_at_unix_ms": if value.expires_at_unix_ms > 0 {
+            Some(value.expires_at_unix_ms)
+        } else {
+            None
+        },
+    })
+}
+
+fn auth_health_summary_to_json(value: &auth_v1::AuthHealthSummary) -> serde_json::Value {
+    json!({
+        "total": value.total,
+        "ok": value.ok,
+        "expiring": value.expiring,
+        "expired": value.expired,
+        "missing": value.missing,
+        "static_count": value.static_count,
+    })
+}
+
+fn auth_expiry_distribution_to_json(value: &auth_v1::AuthExpiryDistribution) -> serde_json::Value {
+    json!({
+        "expired": value.expired,
+        "under_5m": value.under_5m,
+        "between_5m_15m": value.between_5m_15m,
+        "between_15m_60m": value.between_15m_60m,
+        "between_1h_24h": value.between_1h_24h,
+        "over_24h": value.over_24h,
+        "unknown": value.unknown,
+        "static_count": value.static_count,
+        "missing": value.missing,
+    })
+}
+
+fn auth_refresh_metrics_to_json(value: &auth_v1::AuthRefreshMetrics) -> serde_json::Value {
+    json!({
+        "attempts": value.attempts,
+        "successes": value.successes,
+        "failures": value.failures,
+        "by_provider": value.by_provider.iter().map(|entry| json!({
+            "provider": entry.provider,
+            "attempts": entry.attempts,
+            "successes": entry.successes,
+            "failures": entry.failures,
+        })).collect::<Vec<_>>(),
+    })
 }
 
 async fn update_cron_enabled(

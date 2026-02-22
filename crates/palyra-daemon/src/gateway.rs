@@ -9,6 +9,12 @@ use std::{
 };
 
 use axum::http::{header::AUTHORIZATION, HeaderMap};
+use palyra_auth::{
+    AuthCredential, AuthCredentialType, AuthExpiryDistribution, AuthHealthSummary,
+    AuthProfileError, AuthProfileHealthState, AuthProfileListFilter, AuthProfileRecord,
+    AuthProfileRegistry, AuthProfileScope, AuthProfileSetRequest, AuthProvider, AuthProviderKind,
+    AuthScopeFilter, OAuthRefreshAdapter, OAuthRefreshOutcome,
+};
 use palyra_common::{
     build_metadata, validate_canonical_id,
     workspace_patch::{
@@ -94,6 +100,12 @@ pub mod proto {
             }
         }
 
+        pub mod auth {
+            pub mod v1 {
+                tonic::include_proto!("palyra.auth.v1");
+            }
+        }
+
         pub mod node {
             pub mod v1 {
                 tonic::include_proto!("palyra.node.v1");
@@ -103,7 +115,7 @@ pub mod proto {
 }
 
 use proto::palyra::{
-    common::v1 as common_v1, cron::v1 as cron_v1, gateway::v1 as gateway_v1,
+    auth::v1 as auth_v1, common::v1 as common_v1, cron::v1 as cron_v1, gateway::v1 as gateway_v1,
     memory::v1 as memory_v1,
 };
 
@@ -468,6 +480,29 @@ pub struct AgentSessionBindingSnapshot {
     pub agent_id: String,
 }
 
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct AuthProviderRefreshMetricsSnapshot {
+    pub provider: String,
+    pub attempts: u64,
+    pub successes: u64,
+    pub failures: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct AuthRefreshMetricsSnapshot {
+    pub attempts: u64,
+    pub successes: u64,
+    pub failures: u64,
+    pub by_provider: Vec<AuthProviderRefreshMetricsSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct AuthAdminStatusSnapshot {
+    pub summary: AuthHealthSummary,
+    pub expiry_distribution: AuthExpiryDistribution,
+    pub refresh_metrics: AuthRefreshMetricsSnapshot,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct JournalRecentSnapshot {
     pub total_events: u64,
@@ -509,6 +544,123 @@ pub enum AuthError {
     EmptyContext(&'static str),
     #[error("request context device_id must be a canonical ULID")]
     InvalidDeviceId,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct AuthProviderRefreshCounters {
+    attempts: u64,
+    successes: u64,
+    failures: u64,
+}
+
+#[derive(Debug, Default)]
+struct AuthRefreshMetricsState {
+    attempts: AtomicU64,
+    successes: AtomicU64,
+    failures: AtomicU64,
+    by_provider: Mutex<HashMap<String, AuthProviderRefreshCounters>>,
+}
+
+impl AuthRefreshMetricsState {
+    fn record_outcome(&self, outcome: &OAuthRefreshOutcome) {
+        if !outcome.kind.attempted() {
+            return;
+        }
+        self.attempts.fetch_add(1, Ordering::Relaxed);
+        if outcome.kind.success() {
+            self.successes.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.failures.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Ok(mut guard) = self.by_provider.lock() {
+            let provider_key = outcome.provider.to_ascii_lowercase();
+            let entry = guard.entry(provider_key).or_default();
+            entry.attempts = entry.attempts.saturating_add(1);
+            if outcome.kind.success() {
+                entry.successes = entry.successes.saturating_add(1);
+            } else {
+                entry.failures = entry.failures.saturating_add(1);
+            }
+        }
+    }
+
+    fn snapshot(&self) -> AuthRefreshMetricsSnapshot {
+        let by_provider = if let Ok(guard) = self.by_provider.lock() {
+            let mut rows = guard
+                .iter()
+                .map(|(provider, counters)| AuthProviderRefreshMetricsSnapshot {
+                    provider: provider.clone(),
+                    attempts: counters.attempts,
+                    successes: counters.successes,
+                    failures: counters.failures,
+                })
+                .collect::<Vec<_>>();
+            rows.sort_by(|left, right| left.provider.cmp(&right.provider));
+            rows
+        } else {
+            Vec::new()
+        };
+        AuthRefreshMetricsSnapshot {
+            attempts: self.attempts.load(Ordering::Relaxed),
+            successes: self.successes.load(Ordering::Relaxed),
+            failures: self.failures.load(Ordering::Relaxed),
+            by_provider,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct AuthRuntimeState {
+    registry: Arc<AuthProfileRegistry>,
+    refresh_adapter: Arc<dyn OAuthRefreshAdapter>,
+    refresh_metrics: Arc<AuthRefreshMetricsState>,
+}
+
+impl AuthRuntimeState {
+    #[must_use]
+    pub fn new(
+        registry: Arc<AuthProfileRegistry>,
+        refresh_adapter: Arc<dyn OAuthRefreshAdapter>,
+    ) -> Self {
+        Self {
+            registry,
+            refresh_adapter,
+            refresh_metrics: Arc::new(AuthRefreshMetricsState::default()),
+        }
+    }
+
+    pub fn registry(&self) -> &AuthProfileRegistry {
+        self.registry.as_ref()
+    }
+
+    pub fn refresh_metrics_snapshot(&self) -> AuthRefreshMetricsSnapshot {
+        self.refresh_metrics.snapshot()
+    }
+
+    pub fn record_refresh_outcome(&self, outcome: &OAuthRefreshOutcome) {
+        self.refresh_metrics.record_outcome(outcome);
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn admin_status_snapshot(
+        self: &Arc<Self>,
+        runtime_state: Arc<GatewayRuntimeState>,
+    ) -> Result<AuthAdminStatusSnapshot, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let report = state
+                .registry
+                .health_report(runtime_state.vault.as_ref(), None)
+                .map_err(map_auth_profile_error)?;
+            Ok(AuthAdminStatusSnapshot {
+                summary: report.summary,
+                expiry_distribution: report.expiry_distribution,
+                refresh_metrics: state.refresh_metrics.snapshot(),
+            })
+        })
+        .await
+        .map_err(|_| Status::internal("auth status worker panicked"))?
+    }
 }
 
 impl RuntimeCounters {
@@ -2644,6 +2796,391 @@ fn authorize_agent_management_action(
     )))
 }
 
+#[allow(clippy::result_large_err)]
+fn authorize_auth_profile_action(
+    principal: &str,
+    action: &str,
+    resource: &str,
+) -> Result<(), Status> {
+    let evaluation = evaluate_with_config(
+        &PolicyRequest {
+            principal: principal.to_owned(),
+            action: action.to_owned(),
+            resource: resource.to_owned(),
+        },
+        &PolicyEvaluationConfig::default(),
+    )
+    .map_err(|error| {
+        Status::internal(format!("failed to evaluate auth profile policy: {error}"))
+    })?;
+    let normalized_principal = principal.to_ascii_lowercase();
+    if normalized_principal.starts_with("admin:") || normalized_principal.starts_with("system:") {
+        return Ok(());
+    }
+    let reason = match evaluation.decision {
+        PolicyDecision::Allow => {
+            "auth profile management requires admin/system principal prefix".to_owned()
+        }
+        PolicyDecision::DenyByDefault { reason } => reason,
+    };
+    Err(Status::permission_denied(format!(
+        "policy denied action '{action}' on '{resource}': {reason}"
+    )))
+}
+
+fn map_auth_profile_error(error: AuthProfileError) -> Status {
+    match error {
+        AuthProfileError::InvalidField { .. } | AuthProfileError::InvalidPath { .. } => {
+            Status::invalid_argument(error.to_string())
+        }
+        AuthProfileError::UnsupportedVersion(_) => Status::failed_precondition(error.to_string()),
+        AuthProfileError::ProfileNotFound(_) => Status::not_found(error.to_string()),
+        AuthProfileError::RegistryLimitExceeded => Status::resource_exhausted(error.to_string()),
+        AuthProfileError::ReadRegistry { .. }
+        | AuthProfileError::ParseRegistry { .. }
+        | AuthProfileError::WriteRegistry { .. }
+        | AuthProfileError::SerializeRegistry(_)
+        | AuthProfileError::LockPoisoned
+        | AuthProfileError::InvalidSystemTime(_) => Status::internal(error.to_string()),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn auth_list_filter_from_proto(
+    payload: auth_v1::ListAuthProfilesRequest,
+) -> Result<AuthProfileListFilter, Status> {
+    let provider_kind = auth_v1::AuthProviderKind::try_from(payload.provider_kind)
+        .unwrap_or(auth_v1::AuthProviderKind::Unspecified);
+    let provider = match provider_kind {
+        auth_v1::AuthProviderKind::Unspecified => None,
+        auth_v1::AuthProviderKind::Custom => {
+            let custom_name = payload.provider_custom_name.trim();
+            if custom_name.is_empty() {
+                return Err(Status::invalid_argument(
+                    "provider_custom_name is required when provider_kind=custom",
+                ));
+            }
+            Some(AuthProvider {
+                kind: AuthProviderKind::Custom,
+                custom_name: Some(custom_name.to_owned()),
+            })
+        }
+        _ => Some(AuthProvider {
+            kind: auth_provider_kind_from_proto(provider_kind)?,
+            custom_name: None,
+        }),
+    };
+    let scope_kind = auth_v1::AuthScopeKind::try_from(payload.scope_kind)
+        .unwrap_or(auth_v1::AuthScopeKind::Unspecified);
+    let scope = match scope_kind {
+        auth_v1::AuthScopeKind::Unspecified => None,
+        auth_v1::AuthScopeKind::Global => Some(AuthScopeFilter::Global),
+        auth_v1::AuthScopeKind::Agent => {
+            let agent_id = payload.scope_agent_id.trim();
+            if agent_id.is_empty() {
+                return Err(Status::invalid_argument(
+                    "scope_agent_id is required when scope_kind=agent",
+                ));
+            }
+            Some(AuthScopeFilter::Agent { agent_id: agent_id.to_owned() })
+        }
+    };
+    Ok(AuthProfileListFilter {
+        after_profile_id: non_empty(payload.after_profile_id),
+        limit: if payload.limit == 0 { None } else { Some(payload.limit as usize) },
+        provider,
+        scope,
+    })
+}
+
+#[allow(clippy::result_large_err)]
+fn auth_set_request_from_proto(
+    profile: auth_v1::AuthProfile,
+) -> Result<AuthProfileSetRequest, Status> {
+    let provider = auth_provider_from_proto(
+        profile.provider.ok_or_else(|| Status::invalid_argument("profile.provider is required"))?,
+    )?;
+    let scope = auth_scope_from_proto(
+        profile.scope.ok_or_else(|| Status::invalid_argument("profile.scope is required"))?,
+    )?;
+    let credential = auth_credential_from_proto(
+        profile
+            .credential
+            .ok_or_else(|| Status::invalid_argument("profile.credential is required"))?,
+    )?;
+    Ok(AuthProfileSetRequest {
+        profile_id: profile.profile_id,
+        provider,
+        profile_name: profile.profile_name,
+        scope,
+        credential,
+    })
+}
+
+#[allow(clippy::result_large_err)]
+fn auth_provider_from_proto(provider: auth_v1::AuthProvider) -> Result<AuthProvider, Status> {
+    let kind = auth_v1::AuthProviderKind::try_from(provider.kind)
+        .unwrap_or(auth_v1::AuthProviderKind::Unspecified);
+    if kind == auth_v1::AuthProviderKind::Unspecified {
+        return Err(Status::invalid_argument("profile.provider.kind must be specified"));
+    }
+    if kind == auth_v1::AuthProviderKind::Custom {
+        let custom_name = provider.custom_name.trim();
+        if custom_name.is_empty() {
+            return Err(Status::invalid_argument(
+                "profile.provider.custom_name is required for custom providers",
+            ));
+        }
+        return Ok(AuthProvider {
+            kind: AuthProviderKind::Custom,
+            custom_name: Some(custom_name.to_owned()),
+        });
+    }
+    Ok(AuthProvider { kind: auth_provider_kind_from_proto(kind)?, custom_name: None })
+}
+
+#[allow(clippy::result_large_err)]
+fn auth_scope_from_proto(scope: auth_v1::AuthScope) -> Result<AuthProfileScope, Status> {
+    match auth_v1::AuthScopeKind::try_from(scope.kind)
+        .unwrap_or(auth_v1::AuthScopeKind::Unspecified)
+    {
+        auth_v1::AuthScopeKind::Global => Ok(AuthProfileScope::Global),
+        auth_v1::AuthScopeKind::Agent => {
+            let agent_id = scope.agent_id.trim();
+            if agent_id.is_empty() {
+                return Err(Status::invalid_argument(
+                    "profile.scope.agent_id is required for agent scope",
+                ));
+            }
+            Ok(AuthProfileScope::Agent { agent_id: agent_id.to_owned() })
+        }
+        auth_v1::AuthScopeKind::Unspecified => {
+            Err(Status::invalid_argument("profile.scope.kind must be specified"))
+        }
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn auth_credential_from_proto(
+    credential: auth_v1::AuthCredential,
+) -> Result<AuthCredential, Status> {
+    match credential.kind {
+        Some(auth_v1::auth_credential::Kind::ApiKey(value)) => {
+            Ok(AuthCredential::ApiKey { api_key_vault_ref: value.api_key_vault_ref })
+        }
+        Some(auth_v1::auth_credential::Kind::Oauth(value)) => Ok(AuthCredential::Oauth {
+            access_token_vault_ref: value.access_token_vault_ref,
+            refresh_token_vault_ref: value.refresh_token_vault_ref,
+            token_endpoint: value.token_endpoint,
+            client_id: non_empty(value.client_id),
+            client_secret_vault_ref: non_empty(value.client_secret_vault_ref),
+            scopes: value.scopes,
+            expires_at_unix_ms: if value.expires_at_unix_ms > 0 {
+                Some(value.expires_at_unix_ms)
+            } else {
+                None
+            },
+            refresh_state: if let Some(refresh_state) = value.refresh_state {
+                palyra_auth::OAuthRefreshState {
+                    failure_count: refresh_state.failure_count,
+                    last_error: non_empty(refresh_state.last_error),
+                    last_attempt_unix_ms: if refresh_state.last_attempt_unix_ms > 0 {
+                        Some(refresh_state.last_attempt_unix_ms)
+                    } else {
+                        None
+                    },
+                    last_success_unix_ms: if refresh_state.last_success_unix_ms > 0 {
+                        Some(refresh_state.last_success_unix_ms)
+                    } else {
+                        None
+                    },
+                    next_allowed_refresh_unix_ms: if refresh_state.next_allowed_refresh_unix_ms > 0
+                    {
+                        Some(refresh_state.next_allowed_refresh_unix_ms)
+                    } else {
+                        None
+                    },
+                }
+            } else {
+                palyra_auth::OAuthRefreshState::default()
+            },
+        }),
+        None => Err(Status::invalid_argument("profile.credential.kind is required")),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn auth_provider_kind_from_proto(
+    kind: auth_v1::AuthProviderKind,
+) -> Result<AuthProviderKind, Status> {
+    match kind {
+        auth_v1::AuthProviderKind::Openai => Ok(AuthProviderKind::Openai),
+        auth_v1::AuthProviderKind::Anthropic => Ok(AuthProviderKind::Anthropic),
+        auth_v1::AuthProviderKind::Telegram => Ok(AuthProviderKind::Telegram),
+        auth_v1::AuthProviderKind::Slack => Ok(AuthProviderKind::Slack),
+        auth_v1::AuthProviderKind::Discord => Ok(AuthProviderKind::Discord),
+        auth_v1::AuthProviderKind::Webhook => Ok(AuthProviderKind::Webhook),
+        auth_v1::AuthProviderKind::Custom => Ok(AuthProviderKind::Custom),
+        auth_v1::AuthProviderKind::Unspecified => {
+            Err(Status::invalid_argument("provider kind must be specified"))
+        }
+    }
+}
+
+fn auth_profile_to_proto(profile: &AuthProfileRecord) -> auth_v1::AuthProfile {
+    auth_v1::AuthProfile {
+        profile_id: profile.profile_id.clone(),
+        provider: Some(auth_provider_to_proto(&profile.provider)),
+        profile_name: profile.profile_name.clone(),
+        scope: Some(auth_scope_to_proto(&profile.scope)),
+        credential: Some(auth_credential_to_proto(&profile.credential)),
+        created_at_unix_ms: profile.created_at_unix_ms,
+        updated_at_unix_ms: profile.updated_at_unix_ms,
+    }
+}
+
+fn auth_provider_to_proto(provider: &AuthProvider) -> auth_v1::AuthProvider {
+    auth_v1::AuthProvider {
+        kind: match provider.kind {
+            AuthProviderKind::Openai => auth_v1::AuthProviderKind::Openai as i32,
+            AuthProviderKind::Anthropic => auth_v1::AuthProviderKind::Anthropic as i32,
+            AuthProviderKind::Telegram => auth_v1::AuthProviderKind::Telegram as i32,
+            AuthProviderKind::Slack => auth_v1::AuthProviderKind::Slack as i32,
+            AuthProviderKind::Discord => auth_v1::AuthProviderKind::Discord as i32,
+            AuthProviderKind::Webhook => auth_v1::AuthProviderKind::Webhook as i32,
+            AuthProviderKind::Custom => auth_v1::AuthProviderKind::Custom as i32,
+        },
+        custom_name: provider.custom_name.clone().unwrap_or_default(),
+    }
+}
+
+fn auth_scope_to_proto(scope: &AuthProfileScope) -> auth_v1::AuthScope {
+    match scope {
+        AuthProfileScope::Global => auth_v1::AuthScope {
+            kind: auth_v1::AuthScopeKind::Global as i32,
+            agent_id: String::new(),
+        },
+        AuthProfileScope::Agent { agent_id } => auth_v1::AuthScope {
+            kind: auth_v1::AuthScopeKind::Agent as i32,
+            agent_id: agent_id.clone(),
+        },
+    }
+}
+
+fn auth_credential_to_proto(credential: &AuthCredential) -> auth_v1::AuthCredential {
+    match credential {
+        AuthCredential::ApiKey { api_key_vault_ref } => auth_v1::AuthCredential {
+            kind: Some(auth_v1::auth_credential::Kind::ApiKey(auth_v1::ApiKeyCredential {
+                api_key_vault_ref: api_key_vault_ref.clone(),
+            })),
+        },
+        AuthCredential::Oauth {
+            access_token_vault_ref,
+            refresh_token_vault_ref,
+            token_endpoint,
+            client_id,
+            client_secret_vault_ref,
+            scopes,
+            expires_at_unix_ms,
+            refresh_state,
+        } => auth_v1::AuthCredential {
+            kind: Some(auth_v1::auth_credential::Kind::Oauth(auth_v1::OAuthCredential {
+                access_token_vault_ref: access_token_vault_ref.clone(),
+                refresh_token_vault_ref: refresh_token_vault_ref.clone(),
+                token_endpoint: token_endpoint.clone(),
+                client_id: client_id.clone().unwrap_or_default(),
+                client_secret_vault_ref: client_secret_vault_ref.clone().unwrap_or_default(),
+                scopes: scopes.clone(),
+                expires_at_unix_ms: expires_at_unix_ms.unwrap_or_default(),
+                refresh_state: Some(auth_v1::OAuthRefreshState {
+                    failure_count: refresh_state.failure_count,
+                    last_error: refresh_state.last_error.clone().unwrap_or_default(),
+                    last_attempt_unix_ms: refresh_state.last_attempt_unix_ms.unwrap_or_default(),
+                    last_success_unix_ms: refresh_state.last_success_unix_ms.unwrap_or_default(),
+                    next_allowed_refresh_unix_ms: refresh_state
+                        .next_allowed_refresh_unix_ms
+                        .unwrap_or_default(),
+                }),
+            })),
+        },
+    }
+}
+
+fn auth_health_summary_to_proto(summary: &AuthHealthSummary) -> auth_v1::AuthHealthSummary {
+    auth_v1::AuthHealthSummary {
+        total: summary.total,
+        ok: summary.ok,
+        expiring: summary.expiring,
+        expired: summary.expired,
+        missing: summary.missing,
+        static_count: summary.static_count,
+    }
+}
+
+fn auth_expiry_distribution_to_proto(
+    distribution: &AuthExpiryDistribution,
+) -> auth_v1::AuthExpiryDistribution {
+    auth_v1::AuthExpiryDistribution {
+        expired: distribution.expired,
+        under_5m: distribution.under_5m,
+        between_5m_15m: distribution.between_5m_15m,
+        between_15m_60m: distribution.between_15m_60m,
+        between_1h_24h: distribution.between_1h_24h,
+        over_24h: distribution.over_24h,
+        unknown: distribution.unknown,
+        static_count: distribution.static_count,
+        missing: distribution.missing,
+    }
+}
+
+fn auth_health_profile_to_proto(
+    health: &palyra_auth::AuthProfileHealthRecord,
+) -> auth_v1::AuthProfileHealth {
+    auth_v1::AuthProfileHealth {
+        profile_id: health.profile_id.clone(),
+        provider: health.provider.clone(),
+        profile_name: health.profile_name.clone(),
+        scope: health.scope.clone(),
+        credential_type: match health.credential_type {
+            AuthCredentialType::ApiKey => "api_key".to_owned(),
+            AuthCredentialType::Oauth => "oauth".to_owned(),
+        },
+        state: auth_health_state_to_proto(health.state),
+        reason: health.reason.clone(),
+        expires_at_unix_ms: health.expires_at_unix_ms.unwrap_or_default(),
+    }
+}
+
+fn auth_health_state_to_proto(state: AuthProfileHealthState) -> i32 {
+    match state {
+        AuthProfileHealthState::Ok => auth_v1::AuthHealthState::Ok as i32,
+        AuthProfileHealthState::Expiring => auth_v1::AuthHealthState::Expiring as i32,
+        AuthProfileHealthState::Expired => auth_v1::AuthHealthState::Expired as i32,
+        AuthProfileHealthState::Missing => auth_v1::AuthHealthState::Missing as i32,
+        AuthProfileHealthState::Static => auth_v1::AuthHealthState::Static as i32,
+    }
+}
+
+fn auth_refresh_metrics_to_proto(
+    metrics: &AuthRefreshMetricsSnapshot,
+) -> auth_v1::AuthRefreshMetrics {
+    auth_v1::AuthRefreshMetrics {
+        attempts: metrics.attempts,
+        successes: metrics.successes,
+        failures: metrics.failures,
+        by_provider: metrics
+            .by_provider
+            .iter()
+            .map(|provider| auth_v1::ProviderRefreshMetric {
+                provider: provider.provider.clone(),
+                attempts: provider.attempts,
+                successes: provider.successes,
+                failures: provider.failures,
+            })
+            .collect(),
+    }
+}
+
 fn normalize_vault_ref_literal(scope: &VaultScope, key: &str) -> String {
     format!("{scope}/{key}").to_ascii_lowercase()
 }
@@ -3598,6 +4135,37 @@ impl VaultServiceImpl {
         authorize_metadata(metadata, &self.auth).map_err(|error| {
             self.state.record_denied();
             warn!(method, error = %error, "vault rpc authorization denied");
+            Status::permission_denied(error.to_string())
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct AuthServiceImpl {
+    state: Arc<GatewayRuntimeState>,
+    auth: GatewayAuthConfig,
+    auth_runtime: Arc<AuthRuntimeState>,
+}
+
+impl AuthServiceImpl {
+    #[must_use]
+    pub fn new(
+        state: Arc<GatewayRuntimeState>,
+        auth: GatewayAuthConfig,
+        auth_runtime: Arc<AuthRuntimeState>,
+    ) -> Self {
+        Self { state, auth, auth_runtime }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn authorize_rpc(
+        &self,
+        metadata: &MetadataMap,
+        method: &'static str,
+    ) -> Result<RequestContext, Status> {
+        authorize_metadata(metadata, &self.auth).map_err(|error| {
+            self.state.record_denied();
+            warn!(method, error = %error, "auth rpc authorization denied");
             Status::permission_denied(error.to_string())
         })
     }
@@ -6672,6 +7240,184 @@ impl gateway_v1::vault_service_server::VaultService for VaultServiceImpl {
     }
 }
 
+#[tonic::async_trait]
+impl auth_v1::auth_service_server::AuthService for AuthServiceImpl {
+    async fn list_profiles(
+        &self,
+        request: Request<auth_v1::ListAuthProfilesRequest>,
+    ) -> Result<Response<auth_v1::ListAuthProfilesResponse>, Status> {
+        let context = self.authorize_rpc(request.metadata(), "ListProfiles")?;
+        let payload = request.into_inner();
+        require_supported_version(payload.v)?;
+        authorize_auth_profile_action(
+            context.principal.as_str(),
+            "auth.profile.list",
+            "auth:profiles",
+        )?;
+        let filter = auth_list_filter_from_proto(payload)?;
+
+        let auth_runtime = Arc::clone(&self.auth_runtime);
+        let page = tokio::task::spawn_blocking(move || {
+            auth_runtime.registry().list_profiles(filter).map_err(map_auth_profile_error)
+        })
+        .await
+        .map_err(|_| Status::internal("auth list worker panicked"))??;
+
+        Ok(Response::new(auth_v1::ListAuthProfilesResponse {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            profiles: page.profiles.iter().map(auth_profile_to_proto).collect(),
+            next_after_profile_id: page.next_after_profile_id.unwrap_or_default(),
+        }))
+    }
+
+    async fn get_profile(
+        &self,
+        request: Request<auth_v1::GetAuthProfileRequest>,
+    ) -> Result<Response<auth_v1::GetAuthProfileResponse>, Status> {
+        let context = self.authorize_rpc(request.metadata(), "GetProfile")?;
+        let payload = request.into_inner();
+        require_supported_version(payload.v)?;
+        let profile_id = payload.profile_id.trim().to_owned();
+        if profile_id.is_empty() {
+            return Err(Status::invalid_argument("profile_id is required"));
+        }
+        authorize_auth_profile_action(
+            context.principal.as_str(),
+            "auth.profile.get",
+            format!("auth:profile:{profile_id}").as_str(),
+        )?;
+        let auth_runtime = Arc::clone(&self.auth_runtime);
+        let profile = tokio::task::spawn_blocking(move || {
+            auth_runtime.registry().get_profile(profile_id.as_str()).map_err(map_auth_profile_error)
+        })
+        .await
+        .map_err(|_| Status::internal("auth get worker panicked"))??;
+        let profile = profile.ok_or_else(|| Status::not_found("auth profile not found"))?;
+
+        Ok(Response::new(auth_v1::GetAuthProfileResponse {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            profile: Some(auth_profile_to_proto(&profile)),
+        }))
+    }
+
+    async fn set_profile(
+        &self,
+        request: Request<auth_v1::SetAuthProfileRequest>,
+    ) -> Result<Response<auth_v1::SetAuthProfileResponse>, Status> {
+        let context = self.authorize_rpc(request.metadata(), "SetProfile")?;
+        let payload = request.into_inner();
+        require_supported_version(payload.v)?;
+        let profile =
+            payload.profile.ok_or_else(|| Status::invalid_argument("profile is required"))?;
+        let set_request = auth_set_request_from_proto(profile)?;
+        authorize_auth_profile_action(
+            context.principal.as_str(),
+            "auth.profile.set",
+            format!("auth:profile:{}", set_request.profile_id).as_str(),
+        )?;
+        let auth_runtime = Arc::clone(&self.auth_runtime);
+        let saved = tokio::task::spawn_blocking(move || {
+            auth_runtime.registry().set_profile(set_request).map_err(map_auth_profile_error)
+        })
+        .await
+        .map_err(|_| Status::internal("auth set worker panicked"))??;
+        record_auth_profile_saved_journal_event(&self.state, &context, &saved).await?;
+
+        Ok(Response::new(auth_v1::SetAuthProfileResponse {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            profile: Some(auth_profile_to_proto(&saved)),
+        }))
+    }
+
+    async fn delete_profile(
+        &self,
+        request: Request<auth_v1::DeleteAuthProfileRequest>,
+    ) -> Result<Response<auth_v1::DeleteAuthProfileResponse>, Status> {
+        let context = self.authorize_rpc(request.metadata(), "DeleteProfile")?;
+        let payload = request.into_inner();
+        require_supported_version(payload.v)?;
+        let profile_id = payload.profile_id.trim().to_owned();
+        if profile_id.is_empty() {
+            return Err(Status::invalid_argument("profile_id is required"));
+        }
+        authorize_auth_profile_action(
+            context.principal.as_str(),
+            "auth.profile.delete",
+            format!("auth:profile:{profile_id}").as_str(),
+        )?;
+        let auth_runtime = Arc::clone(&self.auth_runtime);
+        let deleted = tokio::task::spawn_blocking(move || {
+            auth_runtime
+                .registry()
+                .delete_profile(profile_id.as_str())
+                .map_err(map_auth_profile_error)
+        })
+        .await
+        .map_err(|_| Status::internal("auth delete worker panicked"))??;
+
+        Ok(Response::new(auth_v1::DeleteAuthProfileResponse {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            deleted,
+        }))
+    }
+
+    async fn get_health(
+        &self,
+        request: Request<auth_v1::GetAuthHealthRequest>,
+    ) -> Result<Response<auth_v1::GetAuthHealthResponse>, Status> {
+        let context = self.authorize_rpc(request.metadata(), "GetHealth")?;
+        let payload = request.into_inner();
+        require_supported_version(payload.v)?;
+        authorize_auth_profile_action(
+            context.principal.as_str(),
+            "auth.profile.health",
+            "auth:health",
+        )?;
+        let agent_id_filter = non_empty(payload.agent_id);
+        let include_profiles = payload.include_profiles;
+        let auth_runtime = Arc::clone(&self.auth_runtime);
+        let vault = Arc::clone(&self.state.vault);
+        let (report, outcomes, refresh_metrics) = tokio::task::spawn_blocking(move || {
+            let outcomes = auth_runtime
+                .registry()
+                .refresh_due_oauth_profiles(
+                    vault.as_ref(),
+                    auth_runtime.refresh_adapter.as_ref(),
+                    agent_id_filter.as_deref(),
+                )
+                .map_err(map_auth_profile_error)?;
+            for outcome in &outcomes {
+                auth_runtime.record_refresh_outcome(outcome);
+            }
+            let report = auth_runtime
+                .registry()
+                .health_report(vault.as_ref(), agent_id_filter.as_deref())
+                .map_err(map_auth_profile_error)?;
+            Ok::<_, Status>((report, outcomes, auth_runtime.refresh_metrics_snapshot()))
+        })
+        .await
+        .map_err(|_| Status::internal("auth health worker panicked"))??;
+
+        for outcome in outcomes {
+            record_auth_refresh_journal_event(&self.state, &context, &outcome).await?;
+        }
+
+        Ok(Response::new(auth_v1::GetAuthHealthResponse {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            summary: Some(auth_health_summary_to_proto(&report.summary)),
+            expiry_distribution: Some(auth_expiry_distribution_to_proto(
+                &report.expiry_distribution,
+            )),
+            profiles: if include_profiles {
+                report.profiles.iter().map(auth_health_profile_to_proto).collect()
+            } else {
+                Vec::new()
+            },
+            refresh_metrics: Some(auth_refresh_metrics_to_proto(&refresh_metrics)),
+        }))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn ingest_memory_best_effort(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -8619,6 +9365,77 @@ async fn record_agent_journal_event(
             actor: common_v1::journal_event::EventActor::System as i32,
             timestamp_unix_ms: current_unix_ms(),
             payload_json: payload.to_string().into_bytes(),
+            principal: context.principal.clone(),
+            device_id: context.device_id.clone(),
+            channel: context.channel.clone(),
+        })
+        .await
+        .map(|_| ())
+}
+
+#[allow(clippy::result_large_err)]
+async fn record_auth_profile_saved_journal_event(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: &RequestContext,
+    profile: &AuthProfileRecord,
+) -> Result<(), Status> {
+    runtime_state
+        .record_journal_event(JournalAppendRequest {
+            event_id: Ulid::new().to_string(),
+            session_id: Ulid::new().to_string(),
+            run_id: Ulid::new().to_string(),
+            kind: common_v1::journal_event::EventKind::ToolExecuted as i32,
+            actor: common_v1::journal_event::EventActor::System as i32,
+            timestamp_unix_ms: current_unix_ms(),
+            payload_json: json!({
+                "event": "auth.profile.saved",
+                "profile_id": profile.profile_id,
+                "provider": profile.provider.label(),
+                "scope": profile.scope.scope_key(),
+                "credential_type": match profile.credential.credential_type() {
+                    AuthCredentialType::ApiKey => "api_key",
+                    AuthCredentialType::Oauth => "oauth",
+                },
+            })
+            .to_string()
+            .into_bytes(),
+            principal: context.principal.clone(),
+            device_id: context.device_id.clone(),
+            channel: context.channel.clone(),
+        })
+        .await
+        .map(|_| ())
+}
+
+#[allow(clippy::result_large_err)]
+async fn record_auth_refresh_journal_event(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: &RequestContext,
+    outcome: &OAuthRefreshOutcome,
+) -> Result<(), Status> {
+    if !outcome.kind.attempted() {
+        return Ok(());
+    }
+    let event_name =
+        if outcome.kind.success() { "auth.token.refreshed" } else { "auth.refresh.failed" };
+    runtime_state
+        .record_journal_event(JournalAppendRequest {
+            event_id: Ulid::new().to_string(),
+            session_id: Ulid::new().to_string(),
+            run_id: Ulid::new().to_string(),
+            kind: common_v1::journal_event::EventKind::ToolExecuted as i32,
+            actor: common_v1::journal_event::EventActor::System as i32,
+            timestamp_unix_ms: current_unix_ms(),
+            payload_json: json!({
+                "event": event_name,
+                "profile_id": outcome.profile_id,
+                "provider": outcome.provider,
+                "reason": outcome.reason,
+                "next_allowed_refresh_unix_ms": outcome.next_allowed_refresh_unix_ms,
+                "expires_at_unix_ms": outcome.expires_at_unix_ms,
+            })
+            .to_string()
+            .into_bytes(),
             principal: context.principal.clone(),
             device_id: context.device_id.clone(),
             channel: context.channel.clone(),

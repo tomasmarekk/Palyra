@@ -2312,6 +2312,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "palyra-auth"
+version = "0.1.0"
+dependencies = [
+ "palyra-common",
+ "palyra-vault",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml",
+]
+
+[[package]]
 name = "palyra-browserd"
 version = "0.1.0"
 dependencies = [
@@ -2336,6 +2350,7 @@ dependencies = [
  "clap_complete",
  "ed25519-dalek",
  "futures",
+ "palyra-auth",
  "palyra-common",
  "palyra-identity",
  "palyra-policy",
@@ -2382,6 +2397,7 @@ dependencies = [
  "clap",
  "hex",
  "libc",
+ "palyra-auth",
  "palyra-common",
  "palyra-identity",
  "palyra-plugins-runtime",

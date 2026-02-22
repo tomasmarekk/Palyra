@@ -4,6 +4,60 @@
 
 pub const PROTOCOL_MAJOR_VERSION: u32 = 1;
 
+pub mod palyra_auth_v1 {
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ApiKeyCredential;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct AuthCredential;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct AuthExpiryDistribution;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct AuthHealthSummary;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct AuthProfile;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct AuthProfileHealth;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct AuthProvider;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct AuthRefreshMetrics;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct AuthScope;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct DeleteAuthProfileRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct DeleteAuthProfileResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct GetAuthHealthRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct GetAuthHealthResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct GetAuthProfileRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct GetAuthProfileResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ListAuthProfilesRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ListAuthProfilesResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct OAuthCredential;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct OAuthRefreshState;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ProviderRefreshMetric;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct SetAuthProfileRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct SetAuthProfileResponse;
+    pub trait AuthServiceClient {
+        fn DeleteProfile(&self);
+        fn GetHealth(&self);
+        fn GetProfile(&self);
+        fn ListProfiles(&self);
+        fn SetProfile(&self);
+    }
+}
+
 pub mod palyra_browser_v1 {
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct ExecuteActionRequest;

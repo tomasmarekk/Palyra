@@ -1,0 +1,18 @@
+[package]
+name = "palyra-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+palyra-common = { version = "0.1.0", path = "../palyra-common" }
+palyra-vault = { version = "0.1.0", path = "../palyra-vault" }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

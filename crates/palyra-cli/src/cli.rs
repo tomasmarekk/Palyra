@@ -50,6 +50,10 @@ pub enum Command {
         #[command(subcommand)]
         command: ApprovalsCommand,
     },
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
     Channels {
         #[command(subcommand)]
         command: ChannelsCommand,
@@ -409,6 +413,86 @@ pub enum ApprovalsCommand {
     },
 }
 
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum AuthCommand {
+    Profiles {
+        #[command(subcommand)]
+        command: AuthProfilesCommand,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
+pub enum AuthProfilesCommand {
+    List {
+        #[arg(long)]
+        after: Option<String>,
+        #[arg(long)]
+        limit: Option<u32>,
+        #[arg(long, value_enum)]
+        provider: Option<AuthProviderArg>,
+        #[arg(long)]
+        provider_name: Option<String>,
+        #[arg(long, value_enum)]
+        scope: Option<AuthScopeArg>,
+        #[arg(long)]
+        agent_id: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Show {
+        profile_id: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Set {
+        profile_id: String,
+        #[arg(long, value_enum)]
+        provider: AuthProviderArg,
+        #[arg(long)]
+        provider_name: Option<String>,
+        #[arg(long)]
+        profile_name: String,
+        #[arg(long, value_enum, default_value_t = AuthScopeArg::Global)]
+        scope: AuthScopeArg,
+        #[arg(long)]
+        agent_id: Option<String>,
+        #[arg(long, value_enum)]
+        credential: AuthCredentialArg,
+        #[arg(long)]
+        api_key_ref: Option<String>,
+        #[arg(long)]
+        access_token_ref: Option<String>,
+        #[arg(long)]
+        refresh_token_ref: Option<String>,
+        #[arg(long)]
+        token_endpoint: Option<String>,
+        #[arg(long)]
+        client_id: Option<String>,
+        #[arg(long)]
+        client_secret_ref: Option<String>,
+        #[arg(long = "scope-value")]
+        scope_value: Vec<String>,
+        #[arg(long)]
+        expires_at_unix_ms: Option<i64>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Delete {
+        profile_id: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Health {
+        #[arg(long)]
+        agent_id: Option<String>,
+        #[arg(long, default_value_t = false)]
+        include_profiles: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ApprovalDecisionArg {
     Allow,
@@ -457,6 +541,29 @@ pub enum MemorySourceArg {
     Summary,
     Manual,
     Import,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum AuthProviderArg {
+    Openai,
+    Anthropic,
+    Telegram,
+    Slack,
+    Discord,
+    Webhook,
+    Custom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum AuthScopeArg {
+    Global,
+    Agent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum AuthCredentialArg {
+    ApiKey,
+    Oauth,
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
@@ -1008,7 +1115,8 @@ mod tests {
 
     use super::{
         AgentCommand, AgentsCommand, ApprovalDecisionArg, ApprovalExportFormatArg,
-        ApprovalsCommand, BrowserCommand, ChannelsCommand, Cli, Command, CompletionShell,
+        ApprovalsCommand, AuthCommand, AuthCredentialArg, AuthProfilesCommand, AuthProviderArg,
+        AuthScopeArg, BrowserCommand, ChannelsCommand, Cli, Command, CompletionShell,
         ConfigCommand, CronCommand, CronConcurrencyPolicyArg, CronMisfirePolicyArg,
         CronScheduleTypeArg, DaemonCommand, JournalCheckpointModeArg, MemoryCommand,
         MemoryScopeArg, MemorySourceArg, OnboardingCommand, PatchCommand, PolicyCommand,
@@ -1626,6 +1734,132 @@ mod tests {
                     principal: None,
                     decision: Some(ApprovalDecisionArg::Allow),
                 }
+            }
+        );
+    }
+
+    #[test]
+    fn parse_auth_profiles_list() {
+        let parsed = Cli::parse_from([
+            "palyra",
+            "auth",
+            "profiles",
+            "list",
+            "--after",
+            "openai-default",
+            "--limit",
+            "25",
+            "--provider",
+            "openai",
+            "--scope",
+            "agent",
+            "--agent-id",
+            "assistant",
+            "--json",
+        ]);
+        assert_eq!(
+            parsed.command,
+            Command::Auth {
+                command: AuthCommand::Profiles {
+                    command: AuthProfilesCommand::List {
+                        after: Some("openai-default".to_owned()),
+                        limit: Some(25),
+                        provider: Some(AuthProviderArg::Openai),
+                        provider_name: None,
+                        scope: Some(AuthScopeArg::Agent),
+                        agent_id: Some("assistant".to_owned()),
+                        json: true,
+                    },
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn parse_auth_profiles_set_oauth() {
+        let parsed = Cli::parse_from([
+            "palyra",
+            "auth",
+            "profiles",
+            "set",
+            "openai-default",
+            "--provider",
+            "openai",
+            "--profile-name",
+            "Default OpenAI",
+            "--scope",
+            "agent",
+            "--agent-id",
+            "assistant",
+            "--credential",
+            "oauth",
+            "--access-token-ref",
+            "global/openai_access",
+            "--refresh-token-ref",
+            "global/openai_refresh",
+            "--token-endpoint",
+            "https://example.com/oauth/token",
+            "--client-id",
+            "client-123",
+            "--client-secret-ref",
+            "global/openai_client_secret",
+            "--scope-value",
+            "chat:read",
+            "--scope-value",
+            "chat:write",
+            "--expires-at-unix-ms",
+            "1730000000000",
+            "--json",
+        ]);
+        assert_eq!(
+            parsed.command,
+            Command::Auth {
+                command: AuthCommand::Profiles {
+                    command: AuthProfilesCommand::Set {
+                        profile_id: "openai-default".to_owned(),
+                        provider: AuthProviderArg::Openai,
+                        provider_name: None,
+                        profile_name: "Default OpenAI".to_owned(),
+                        scope: AuthScopeArg::Agent,
+                        agent_id: Some("assistant".to_owned()),
+                        credential: AuthCredentialArg::Oauth,
+                        api_key_ref: None,
+                        access_token_ref: Some("global/openai_access".to_owned()),
+                        refresh_token_ref: Some("global/openai_refresh".to_owned()),
+                        token_endpoint: Some("https://example.com/oauth/token".to_owned()),
+                        client_id: Some("client-123".to_owned()),
+                        client_secret_ref: Some("global/openai_client_secret".to_owned()),
+                        scope_value: vec!["chat:read".to_owned(), "chat:write".to_owned()],
+                        expires_at_unix_ms: Some(1_730_000_000_000),
+                        json: true,
+                    },
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn parse_auth_profiles_health() {
+        let parsed = Cli::parse_from([
+            "palyra",
+            "auth",
+            "profiles",
+            "health",
+            "--agent-id",
+            "assistant",
+            "--include-profiles",
+            "--json",
+        ]);
+        assert_eq!(
+            parsed.command,
+            Command::Auth {
+                command: AuthCommand::Profiles {
+                    command: AuthProfilesCommand::Health {
+                        agent_id: Some("assistant".to_owned()),
+                        include_profiles: true,
+                        json: true,
+                    },
+                },
             }
         );
     }

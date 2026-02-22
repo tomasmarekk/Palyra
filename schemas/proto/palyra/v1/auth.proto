@@ -1,0 +1,237 @@
+syntax = "proto3";
+
+package palyra.auth.v1;
+
+service AuthService {
+  rpc ListProfiles(ListAuthProfilesRequest) returns (ListAuthProfilesResponse);
+  rpc GetProfile(GetAuthProfileRequest) returns (GetAuthProfileResponse);
+  rpc SetProfile(SetAuthProfileRequest) returns (SetAuthProfileResponse);
+  rpc DeleteProfile(DeleteAuthProfileRequest) returns (DeleteAuthProfileResponse);
+  rpc GetHealth(GetAuthHealthRequest) returns (GetAuthHealthResponse);
+}
+
+enum AuthProviderKind {
+  AUTH_PROVIDER_KIND_UNSPECIFIED = 0;
+  AUTH_PROVIDER_KIND_OPENAI = 1;
+  AUTH_PROVIDER_KIND_ANTHROPIC = 2;
+  AUTH_PROVIDER_KIND_TELEGRAM = 3;
+  AUTH_PROVIDER_KIND_SLACK = 4;
+  AUTH_PROVIDER_KIND_DISCORD = 5;
+  AUTH_PROVIDER_KIND_WEBHOOK = 6;
+  AUTH_PROVIDER_KIND_CUSTOM = 7;
+}
+
+message AuthProvider {
+  AuthProviderKind kind = 1;
+  string custom_name = 2;
+
+  reserved 3 to 10;
+}
+
+enum AuthScopeKind {
+  AUTH_SCOPE_KIND_UNSPECIFIED = 0;
+  AUTH_SCOPE_KIND_GLOBAL = 1;
+  AUTH_SCOPE_KIND_AGENT = 2;
+}
+
+message AuthScope {
+  AuthScopeKind kind = 1;
+  string agent_id = 2;
+
+  reserved 3 to 10;
+}
+
+message ApiKeyCredential {
+  string api_key_vault_ref = 1;
+
+  reserved 2 to 10;
+}
+
+message OAuthRefreshState {
+  uint32 failure_count = 1;
+  string last_error = 2;
+  int64 last_attempt_unix_ms = 3;
+  int64 last_success_unix_ms = 4;
+  int64 next_allowed_refresh_unix_ms = 5;
+
+  reserved 6 to 10;
+}
+
+message OAuthCredential {
+  string access_token_vault_ref = 1;
+  string refresh_token_vault_ref = 2;
+  string token_endpoint = 3;
+  string client_id = 4;
+  string client_secret_vault_ref = 5;
+  repeated string scopes = 6;
+  int64 expires_at_unix_ms = 7;
+  OAuthRefreshState refresh_state = 8;
+
+  reserved 9 to 16;
+}
+
+message AuthCredential {
+  oneof kind {
+    ApiKeyCredential api_key = 1;
+    OAuthCredential oauth = 2;
+  }
+
+  reserved 3 to 10;
+}
+
+message AuthProfile {
+  string profile_id = 1;
+  AuthProvider provider = 2;
+  string profile_name = 3;
+  AuthScope scope = 4;
+  AuthCredential credential = 5;
+  int64 created_at_unix_ms = 6;
+  int64 updated_at_unix_ms = 7;
+
+  reserved 8 to 16;
+}
+
+enum AuthHealthState {
+  AUTH_HEALTH_STATE_UNSPECIFIED = 0;
+  AUTH_HEALTH_STATE_OK = 1;
+  AUTH_HEALTH_STATE_EXPIRING = 2;
+  AUTH_HEALTH_STATE_EXPIRED = 3;
+  AUTH_HEALTH_STATE_MISSING = 4;
+  AUTH_HEALTH_STATE_STATIC = 5;
+}
+
+message AuthProfileHealth {
+  string profile_id = 1;
+  string provider = 2;
+  string profile_name = 3;
+  string scope = 4;
+  string credential_type = 5;
+  AuthHealthState state = 6;
+  string reason = 7;
+  int64 expires_at_unix_ms = 8;
+
+  reserved 9 to 16;
+}
+
+message AuthHealthSummary {
+  uint64 total = 1;
+  uint64 ok = 2;
+  uint64 expiring = 3;
+  uint64 expired = 4;
+  uint64 missing = 5;
+  uint64 static_count = 6;
+
+  reserved 7 to 12;
+}
+
+message AuthExpiryDistribution {
+  uint64 expired = 1;
+  uint64 under_5m = 2;
+  uint64 between_5m_15m = 3;
+  uint64 between_15m_60m = 4;
+  uint64 between_1h_24h = 5;
+  uint64 over_24h = 6;
+  uint64 unknown = 7;
+  uint64 static_count = 8;
+  uint64 missing = 9;
+
+  reserved 10 to 16;
+}
+
+message ProviderRefreshMetric {
+  string provider = 1;
+  uint64 attempts = 2;
+  uint64 successes = 3;
+  uint64 failures = 4;
+
+  reserved 5 to 10;
+}
+
+message AuthRefreshMetrics {
+  uint64 attempts = 1;
+  uint64 successes = 2;
+  uint64 failures = 3;
+  repeated ProviderRefreshMetric by_provider = 4;
+
+  reserved 5 to 10;
+}
+
+message ListAuthProfilesRequest {
+  uint32 v = 1;
+  string after_profile_id = 2;
+  uint32 limit = 3;
+  AuthProviderKind provider_kind = 4;
+  string provider_custom_name = 5;
+  AuthScopeKind scope_kind = 6;
+  string scope_agent_id = 7;
+
+  reserved 8 to 16;
+}
+
+message ListAuthProfilesResponse {
+  uint32 v = 1;
+  repeated AuthProfile profiles = 2;
+  string next_after_profile_id = 3;
+
+  reserved 4 to 10;
+}
+
+message GetAuthProfileRequest {
+  uint32 v = 1;
+  string profile_id = 2;
+
+  reserved 3 to 10;
+}
+
+message GetAuthProfileResponse {
+  uint32 v = 1;
+  AuthProfile profile = 2;
+
+  reserved 3 to 10;
+}
+
+message SetAuthProfileRequest {
+  uint32 v = 1;
+  AuthProfile profile = 2;
+
+  reserved 3 to 10;
+}
+
+message SetAuthProfileResponse {
+  uint32 v = 1;
+  AuthProfile profile = 2;
+
+  reserved 3 to 10;
+}
+
+message DeleteAuthProfileRequest {
+  uint32 v = 1;
+  string profile_id = 2;
+
+  reserved 3 to 10;
+}
+
+message DeleteAuthProfileResponse {
+  uint32 v = 1;
+  bool deleted = 2;
+
+  reserved 3 to 10;
+}
+
+message GetAuthHealthRequest {
+  uint32 v = 1;
+  string agent_id = 2;
+  bool include_profiles = 3;
+
+  reserved 4 to 10;
+}
+
+message GetAuthHealthResponse {
+  uint32 v = 1;
+  AuthHealthSummary summary = 2;
+  AuthExpiryDistribution expiry_distribution = 3;
+  repeated AuthProfileHealth profiles = 4;
+  AuthRefreshMetrics refresh_metrics = 5;
+
+  reserved 6 to 12;
+}

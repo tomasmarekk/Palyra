@@ -41,6 +41,7 @@ use journal::{
     SkillStatusUpsertRequest,
 };
 use model_provider::{build_model_provider, ModelProviderKind};
+use palyra_auth::{AuthProfileRegistry, HttpOAuthRefreshAdapter, OAuthRefreshAdapter};
 use palyra_common::default_identity_store_root;
 use palyra_common::{
     build_metadata, health_response, parse_daemon_bind_socket, validate_canonical_id,
@@ -51,7 +52,7 @@ use palyra_identity::{FilesystemSecretStore, SecretStore};
 use palyra_policy::{evaluate_with_config, PolicyDecision, PolicyEvaluationConfig, PolicyRequest};
 use palyra_vault::{Vault, VaultConfig as VaultConfigOptions, VaultRef};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::sync::Notify;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
@@ -88,6 +89,7 @@ struct Args {
 struct AppState {
     started_at: Instant,
     runtime: Arc<GatewayRuntimeState>,
+    auth_runtime: Arc<gateway::AuthRuntimeState>,
     auth: GatewayAuthConfig,
     admin_rate_limit: Arc<Mutex<HashMap<IpAddr, AdminRateLimitEntry>>>,
 }
@@ -227,6 +229,14 @@ async fn main() -> Result<()> {
         .context("failed to initialize model provider runtime")?;
     let agent_registry = agents::AgentRegistry::open(identity_runtime.store_root.as_path())
         .context("failed to initialize agent registry state")?;
+    let auth_registry = Arc::new(
+        AuthProfileRegistry::open(identity_runtime.store_root.as_path())
+            .context("failed to initialize auth profile registry state")?,
+    );
+    let auth_runtime = Arc::new(gateway::AuthRuntimeState::new(
+        Arc::clone(&auth_registry),
+        Arc::new(HttpOAuthRefreshAdapter::default()) as Arc<dyn OAuthRefreshAdapter>,
+    ));
     let runtime = GatewayRuntimeState::new_with_provider(
         GatewayRuntimeConfigSnapshot {
             grpc_bind_addr: loaded.gateway.grpc_bind_addr.clone(),
@@ -412,6 +422,7 @@ async fn main() -> Result<()> {
     let state = AppState {
         started_at,
         runtime: runtime.clone(),
+        auth_runtime: Arc::clone(&auth_runtime),
         auth: auth.clone(),
         admin_rate_limit: Arc::new(Mutex::new(HashMap::new())),
     };
@@ -526,6 +537,12 @@ async fn main() -> Result<()> {
         )
         .max_decoding_message_size(GRPC_MAX_DECODING_MESSAGE_SIZE_BYTES)
         .max_encoding_message_size(GRPC_MAX_ENCODING_MESSAGE_SIZE_BYTES);
+    let auth_service =
+        gateway::AuthServiceImpl::new(runtime.clone(), auth.clone(), Arc::clone(&auth_runtime));
+    let grpc_auth_server =
+        gateway::proto::palyra::auth::v1::auth_service_server::AuthServiceServer::new(auth_service)
+            .max_decoding_message_size(GRPC_MAX_DECODING_MESSAGE_SIZE_BYTES)
+            .max_encoding_message_size(GRPC_MAX_ENCODING_MESSAGE_SIZE_BYTES);
     let node_rpc_service = node_rpc::NodeRpcServiceImpl::new(
         identity_runtime.revoked_certificate_fingerprints.clone(),
         !loaded.identity.allow_insecure_node_rpc_without_mtls,
@@ -564,6 +581,7 @@ async fn main() -> Result<()> {
                 .add_service(grpc_approvals_server)
                 .add_service(grpc_memory_server)
                 .add_service(grpc_vault_server)
+                .add_service(grpc_auth_server)
                 .serve_with_incoming_shutdown(
                     TcpListenerStream::new(grpc_listener),
                     shutdown_signal(),
@@ -669,7 +687,7 @@ async fn admin_rate_limit_middleware(
 async fn admin_status_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Result<Json<gateway::GatewayStatusSnapshot>, Response> {
+) -> Result<Json<Value>, Response> {
     authorize_headers(&headers, &state.auth).map_err(|error| {
         state.runtime.record_denied();
         auth_error_response(error)
@@ -684,7 +702,25 @@ async fn admin_status_handler(
         .status_snapshot_async(context, state.auth.clone())
         .await
         .map_err(runtime_status_response)?;
-    Ok(Json(snapshot))
+    let auth_snapshot = state
+        .auth_runtime
+        .admin_status_snapshot(Arc::clone(&state.runtime))
+        .await
+        .map_err(runtime_status_response)?;
+    let mut payload = serde_json::to_value(snapshot).map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "failed to serialize admin status snapshot: {error}"
+        )))
+    })?;
+    let auth_payload = serde_json::to_value(auth_snapshot).map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "failed to serialize auth status snapshot: {error}"
+        )))
+    })?;
+    if let Value::Object(ref mut map) = payload {
+        map.insert("auth".to_owned(), auth_payload);
+    }
+    Ok(Json(payload))
 }
 
 async fn admin_journal_recent_handler(
