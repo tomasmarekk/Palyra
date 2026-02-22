@@ -3,38 +3,41 @@ updates:
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 10
+      interval: "monthly"
+    open-pull-requests-limit: 1
     labels:
       - "dependencies"
     commit-message:
       prefix: "build(deps)"
-    # Optional: reduce noise by grouping patch/minor updates (uncomment if desired)
-    # groups:
-    #   rust-deps:
-    #     patterns:
-    #       - "*"
+    groups:
+      cargo-rollup:
+        patterns:
+          - "*"
 
   - package-ecosystem: "npm"
     directory: "/apps/web"
     schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 10
+      interval: "monthly"
+    open-pull-requests-limit: 1
     labels:
       - "dependencies"
     commit-message:
       prefix: "build(deps)"
-    # groups:
-    #   web-deps:
-    #     patterns:
-    #       - "*"
+    groups:
+      web-rollup:
+        patterns:
+          - "*"
 
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 10
+      interval: "monthly"
+    open-pull-requests-limit: 1
     labels:
       - "dependencies"
     commit-message:
       prefix: "build(deps)"
+    groups:
+      gha-rollup:
+        patterns:
+          - "*"
