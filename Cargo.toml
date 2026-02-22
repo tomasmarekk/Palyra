@@ -16,7 +16,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
-license = "Apache-2.0"
+license = "MIT"
 version = "0.1.0"
 rust-version = "1.90"
 
