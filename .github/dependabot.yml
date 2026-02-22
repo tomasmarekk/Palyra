@@ -1,0 +1,40 @@
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "build(deps)"
+    # Optional: reduce noise by grouping patch/minor updates (uncomment if desired)
+    # groups:
+    #   rust-deps:
+    #     patterns:
+    #       - "*"
+
+  - package-ecosystem: "npm"
+    directory: "/apps/web"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "build(deps)"
+    # groups:
+    #   web-deps:
+    #     patterns:
+    #       - "*"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "build(deps)"
