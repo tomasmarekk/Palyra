@@ -285,6 +285,13 @@ fn onboarding_wizard_writes_config_file() -> Result<()> {
 
 fn spawn_palyrad_with_dynamic_ports() -> Result<(Child, u16, u16)> {
     let journal_db_path = unique_temp_journal_db_path();
+    let identity_store_dir = unique_temp_identity_store_dir();
+    std::fs::create_dir_all(&identity_store_dir).with_context(|| {
+        format!(
+            "failed to create temporary identity store directory {}",
+            identity_store_dir.display()
+        )
+    })?;
     let (admin_port, grpc_port) = reserve_daemon_port_block()?;
     let mut command = Command::new(resolve_palyrad_binary_path()?);
     command
@@ -302,6 +309,7 @@ fn spawn_palyrad_with_dynamic_ports() -> Result<(Child, u16, u16)> {
         .stderr(Stdio::piped())
         .env("PALYRA_ADMIN_TOKEN", ADMIN_TOKEN)
         .env("PALYRA_JOURNAL_DB_PATH", journal_db_path.to_string_lossy().to_string())
+        .env("PALYRA_GATEWAY_IDENTITY_STORE_DIR", identity_store_dir.to_string_lossy().to_string())
         .env("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED", "true")
         .env("RUST_LOG", "info");
 
@@ -314,6 +322,14 @@ fn spawn_palyrad_with_dynamic_ports() -> Result<(Child, u16, u16)> {
 fn unique_temp_journal_db_path() -> PathBuf {
     std::env::temp_dir().join(format!(
         "palyra-cli-v1-journal-{}-{}.sqlite3",
+        std::process::id(),
+        generate_canonical_ulid()
+    ))
+}
+
+fn unique_temp_identity_store_dir() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "palyra-cli-v1-identity-store-{}-{}",
         std::process::id(),
         generate_canonical_ulid()
     ))
