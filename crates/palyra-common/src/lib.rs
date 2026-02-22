@@ -518,6 +518,10 @@ mod tests {
             .as_millis() as u64
     }
 
+    fn test_nonce() -> String {
+        format!("{:016x}", now_unix_ms())
+    }
+
     fn build_webhook_payload(
         nonce: &str,
         timestamp_unix_ms: u64,
@@ -926,7 +930,8 @@ mod tests {
 
     #[test]
     fn verify_webhook_payload_rejects_missing_signature() {
-        let payload = build_webhook_payload("1234567890abcdef", now_unix_ms(), None);
+        let nonce = test_nonce();
+        let payload = build_webhook_payload(&nonce, now_unix_ms(), None);
         let nonce_store = InMemoryReplayNonceStore::default();
         let verifier = PrefixSignatureVerifier;
 
@@ -938,7 +943,8 @@ mod tests {
 
     #[test]
     fn verify_webhook_payload_rejects_invalid_signature() {
-        let payload = build_webhook_payload("1234567890abcdef", now_unix_ms(), Some("sig:invalid"));
+        let nonce = test_nonce();
+        let payload = build_webhook_payload(&nonce, now_unix_ms(), Some("sig:invalid"));
         let nonce_store = InMemoryReplayNonceStore::default();
         let verifier = PrefixSignatureVerifier;
 
@@ -950,8 +956,8 @@ mod tests {
 
     #[test]
     fn verify_webhook_payload_rejects_duplicate_nonce() {
-        let payload =
-            build_webhook_payload("1234567890abcdef", now_unix_ms(), Some("sig:test-valid"));
+        let nonce = test_nonce();
+        let payload = build_webhook_payload(&nonce, now_unix_ms(), Some("sig:test-valid"));
         let nonce_store = InMemoryReplayNonceStore::default();
         let verifier = PrefixSignatureVerifier;
 
@@ -963,8 +969,8 @@ mod tests {
 
     #[test]
     fn verify_webhook_payload_accepts_valid_signature_and_fresh_nonce() {
-        let payload =
-            build_webhook_payload("abcdef1234567890", now_unix_ms(), Some("sig:test-valid"));
+        let nonce = test_nonce();
+        let payload = build_webhook_payload(&nonce, now_unix_ms(), Some("sig:test-valid"));
         let nonce_store = InMemoryReplayNonceStore::default();
         let verifier = PrefixSignatureVerifier;
 
