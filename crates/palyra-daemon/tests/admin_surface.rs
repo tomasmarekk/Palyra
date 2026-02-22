@@ -17,6 +17,8 @@ use serde_json::Value;
 const ADMIN_TOKEN: &str = "test-admin-token";
 const DEVICE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const RUN_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAX";
+const PALYRAD_STARTUP_ATTEMPTS: usize = 3;
+const PALYRAD_STARTUP_RETRY_DELAY: Duration = Duration::from_millis(150);
 static TEMP_IDENTITY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[test]
@@ -322,6 +324,27 @@ fn admin_skill_quarantine_and_enable_require_override_acknowledgement() -> Resul
 }
 
 fn spawn_palyrad_with_dynamic_ports() -> Result<(Child, u16)> {
+    let mut last_error: Option<anyhow::Error> = None;
+    for attempt in 1..=PALYRAD_STARTUP_ATTEMPTS {
+        match spawn_palyrad_with_dynamic_ports_once() {
+            Ok(started) => return Ok(started),
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < PALYRAD_STARTUP_ATTEMPTS {
+                    thread::sleep(PALYRAD_STARTUP_RETRY_DELAY);
+                }
+            }
+        }
+    }
+    let Some(last_error) = last_error else {
+        anyhow::bail!("failed to spawn palyrad for admin surface tests");
+    };
+    Err(last_error).context(format!(
+        "failed to spawn palyrad after {PALYRAD_STARTUP_ATTEMPTS} startup attempts"
+    ))
+}
+
+fn spawn_palyrad_with_dynamic_ports_once() -> Result<(Child, u16)> {
     let journal_db_path = unique_temp_journal_db_path();
     let identity_store_dir = unique_temp_identity_store_dir();
     let vault_dir = unique_temp_vault_dir();
@@ -347,7 +370,14 @@ fn spawn_palyrad_with_dynamic_ports() -> Result<(Child, u16)> {
         .spawn()
         .context("failed to start palyrad")?;
     let stdout = child.stdout.take().context("failed to capture palyrad stdout")?;
-    let admin_port = wait_for_admin_port(stdout, &mut child)?;
+    let admin_port = match wait_for_admin_port(stdout, &mut child) {
+        Ok(port) => port,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error).context("failed to capture palyrad admin listen port");
+        }
+    };
     Ok((child, admin_port))
 }
 
