@@ -798,7 +798,7 @@ mod tests {
         let duplicate = registry.create_agent(AgentCreateRequest {
             agent_id: "review".to_owned(),
             display_name: "Review".to_owned(),
-            agent_dir: Some(".\\agents\\main".to_owned()),
+            agent_dir: Some("agents/./main".to_owned()),
             workspace_roots: vec!["workspace".to_owned()],
             default_model_profile: Some("gpt-4o-mini".to_owned()),
             default_tool_allowlist: Vec::new(),
