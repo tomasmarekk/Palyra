@@ -3,10 +3,11 @@ mod envelope;
 mod scope;
 
 #[cfg(windows)]
+use std::io::Read;
+#[cfg(windows)]
 use std::process::{Command, Stdio};
 use std::{
     fs,
-    io::Read,
     path::{Path, PathBuf},
     sync::Arc,
     thread,

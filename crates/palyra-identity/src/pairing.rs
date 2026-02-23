@@ -1,7 +1,9 @@
+#[cfg(windows)]
+use std::io::Read;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
-    io::{Read, Write},
+    io::Write,
     net::IpAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
