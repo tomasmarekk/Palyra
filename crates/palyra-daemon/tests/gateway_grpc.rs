@@ -5559,6 +5559,7 @@ fn write_process_runner_config(
         "\
 [tool_call.process_runner]
 enabled = true
+egress_enforcement_mode = \"preflight\"
 workspace_root = {workspace_root}
 allowed_executables = {allowed_executables}
 allowed_egress_hosts = {allowed_egress_hosts}
