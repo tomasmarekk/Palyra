@@ -8649,7 +8649,7 @@ async fn execute_workspace_patch_tool(
         MAX_PATCH_TOOL_PATTERN_BYTES,
     ) {
         Ok(Some(patterns)) => {
-            redaction_policy.redaction_patterns = patterns;
+            extend_patch_string_defaults(&mut redaction_policy.redaction_patterns, patterns);
         }
         Ok(None) => {}
         Err(message) => {
@@ -8669,7 +8669,7 @@ async fn execute_workspace_patch_tool(
         MAX_PATCH_TOOL_MARKER_BYTES,
     ) {
         Ok(Some(markers)) => {
-            redaction_policy.secret_file_markers = markers;
+            extend_patch_string_defaults(&mut redaction_policy.secret_file_markers, markers);
         }
         Ok(None) => {}
         Err(message) => {
@@ -8773,6 +8773,14 @@ async fn execute_workspace_patch_tool(
                 output_json,
                 format!("palyra.fs.apply_patch failed: {error}"),
             )
+        }
+    }
+}
+
+fn extend_patch_string_defaults(defaults: &mut Vec<String>, additions: Vec<String>) {
+    for addition in additions {
+        if !defaults.iter().any(|existing| existing == &addition) {
+            defaults.push(addition);
         }
     }
 }
@@ -10627,7 +10635,7 @@ mod tests {
         apply_tool_approval_outcome, authorize_approvals_action, authorize_headers,
         best_effort_mark_approval_error, constant_time_eq, enforce_memory_item_scope,
         enforce_vault_get_approval_policy, enforce_vault_scope_access, execute_memory_search_tool,
-        execute_workspace_patch_tool, parse_patch_string_array_field,
+        execute_workspace_patch_tool, extend_patch_string_defaults, parse_patch_string_array_field,
         principal_has_sensitive_service_role, request_context_from_headers,
         resolve_cron_job_channel_for_create, vault_get_requires_approval,
         workspace_patch_metrics_from_output, AuthError, GatewayAuthConfig,
@@ -11839,6 +11847,70 @@ mod tests {
         )
         .expect_err("oversized entry must fail");
         assert!(too_large_err.contains("must be <="));
+    }
+
+    #[test]
+    fn workspace_patch_redaction_policy_merge_preserves_defaults_for_empty_overrides() {
+        let mut policy = super::WorkspacePatchRedactionPolicy::default();
+        let original_patterns = policy.redaction_patterns.clone();
+        let original_markers = policy.secret_file_markers.clone();
+
+        extend_patch_string_defaults(&mut policy.redaction_patterns, Vec::new());
+        extend_patch_string_defaults(&mut policy.secret_file_markers, Vec::new());
+
+        assert_eq!(
+            policy.redaction_patterns, original_patterns,
+            "empty redaction pattern overrides must not disable default patterns"
+        );
+        assert_eq!(
+            policy.secret_file_markers, original_markers,
+            "empty secret marker overrides must not disable default markers"
+        );
+    }
+
+    #[test]
+    fn workspace_patch_redaction_policy_merge_adds_only_unique_values() {
+        let mut policy = super::WorkspacePatchRedactionPolicy::default();
+        let original_pattern_len = policy.redaction_patterns.len();
+        let original_marker_len = policy.secret_file_markers.len();
+
+        extend_patch_string_defaults(
+            &mut policy.redaction_patterns,
+            vec!["token".to_owned(), "custom-pattern".to_owned(), "custom-pattern".to_owned()],
+        );
+        extend_patch_string_defaults(
+            &mut policy.secret_file_markers,
+            vec![".env".to_owned(), "custom.marker".to_owned(), "custom.marker".to_owned()],
+        );
+
+        assert_eq!(
+            policy.redaction_patterns.len(),
+            original_pattern_len + 1,
+            "only one unique redaction pattern should be appended"
+        );
+        assert_eq!(
+            policy.secret_file_markers.len(),
+            original_marker_len + 1,
+            "only one unique secret marker should be appended"
+        );
+        assert_eq!(
+            policy
+                .redaction_patterns
+                .iter()
+                .filter(|value| value.as_str() == "custom-pattern")
+                .count(),
+            1,
+            "custom redaction pattern should appear once"
+        );
+        assert_eq!(
+            policy
+                .secret_file_markers
+                .iter()
+                .filter(|value| value.as_str() == "custom.marker")
+                .count(),
+            1,
+            "custom secret marker should appear once"
+        );
     }
 
     #[test]

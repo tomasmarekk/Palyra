@@ -188,8 +188,8 @@ struct PatchPlan {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PlannedAction {
-    Write { path: PathBuf, bytes: Vec<u8> },
-    Delete { path: PathBuf },
+    Write { path: PathBuf, root: PathBuf, bytes: Vec<u8> },
+    Delete { path: PathBuf, root: PathBuf },
 }
 
 #[derive(Debug)]
@@ -316,10 +316,41 @@ pub fn redact_patch_preview(
         if trimmed.is_empty() {
             continue;
         }
-        preview = preview.replace(trimmed, "[REDACTED]");
+        preview = replace_ascii_case_insensitive(preview.as_str(), trimmed, "[REDACTED]");
     }
 
     truncate_utf8(preview, max_preview_bytes)
+}
+
+fn replace_ascii_case_insensitive(haystack: &str, needle: &str, replacement: &str) -> String {
+    if needle.is_empty() {
+        return haystack.to_owned();
+    }
+    if !needle.is_ascii() {
+        return haystack.replace(needle, replacement);
+    }
+
+    let lowered_haystack = haystack.to_ascii_lowercase();
+    let lowered_needle = needle.to_ascii_lowercase();
+    let mut cursor = 0usize;
+    let mut replaced = false;
+    let mut output = String::with_capacity(haystack.len());
+
+    while let Some(relative_index) = lowered_haystack[cursor..].find(lowered_needle.as_str()) {
+        let start = cursor + relative_index;
+        let end = start + lowered_needle.len();
+        output.push_str(&haystack[cursor..start]);
+        output.push_str(replacement);
+        cursor = end;
+        replaced = true;
+    }
+
+    if !replaced {
+        return haystack.to_owned();
+    }
+
+    output.push_str(&haystack[cursor..]);
+    output
 }
 
 fn parse_patch_header_path(line: &str) -> Option<&str> {
@@ -526,7 +557,8 @@ fn build_patch_plan(
         match operation {
             PatchOperation::Add { path, lines } => {
                 let relative = parse_relative_patch_path(path)?;
-                let target = resolve_new_path(canonical_roots, &relative, None, path)?;
+                let (target, target_root_index) =
+                    resolve_new_path(canonical_roots, &relative, None, path)?;
                 if target.exists() {
                     return Err(WorkspacePatchError::FileAlreadyExists { path: path.to_owned() });
                 }
@@ -534,7 +566,11 @@ fn build_patch_plan(
                 ensure_file_size(path, after_bytes.len(), limits.max_file_bytes)?;
 
                 touched_paths.insert(target.clone());
-                actions.push(PlannedAction::Write { path: target, bytes: after_bytes.clone() });
+                actions.push(PlannedAction::Write {
+                    path: target,
+                    root: canonical_roots[target_root_index].clone(),
+                    bytes: after_bytes.clone(),
+                });
                 file_attestations.push(WorkspacePatchFileAttestation {
                     path: normalize_relative_path_display(&relative),
                     operation: "create".to_owned(),
@@ -547,10 +583,14 @@ fn build_patch_plan(
             }
             PatchOperation::Delete { path } => {
                 let relative = parse_relative_patch_path(path)?;
-                let (target, _) = resolve_existing_path(canonical_roots, &relative, path)?;
+                let (target, target_root_index) =
+                    resolve_existing_path(canonical_roots, &relative, path)?;
                 let before_bytes = read_file_capped(target.as_path(), path, limits.max_file_bytes)?;
                 touched_paths.insert(target.clone());
-                actions.push(PlannedAction::Delete { path: target });
+                actions.push(PlannedAction::Delete {
+                    path: target,
+                    root: canonical_roots[target_root_index].clone(),
+                });
                 file_attestations.push(WorkspacePatchFileAttestation {
                     path: normalize_relative_path_display(&relative),
                     operation: "delete".to_owned(),
@@ -574,10 +614,12 @@ fn build_patch_plan(
                 ensure_file_size(path, after_bytes.len(), limits.max_file_bytes)?;
 
                 let mut destination = source.clone();
+                let source_root = canonical_roots[source_root_index].clone();
+                let mut destination_root = source_root.clone();
                 let mut moved_from = None;
                 let output_path = if let Some(move_target) = move_to {
                     let move_relative = parse_relative_patch_path(move_target)?;
-                    let resolved_destination = resolve_new_path(
+                    let (resolved_destination, destination_root_index) = resolve_new_path(
                         canonical_roots,
                         &move_relative,
                         Some(source_root_index),
@@ -589,6 +631,7 @@ fn build_patch_plan(
                         });
                     }
                     destination = resolved_destination;
+                    destination_root = canonical_roots[destination_root_index].clone();
                     moved_from = Some(normalize_relative_path_display(&relative));
                     normalize_relative_path_display(&move_relative)
                 } else {
@@ -598,12 +641,13 @@ fn build_patch_plan(
                 touched_paths.insert(destination.clone());
                 actions.push(PlannedAction::Write {
                     path: destination.clone(),
+                    root: destination_root,
                     bytes: after_bytes.clone(),
                 });
 
                 if destination != source {
                     touched_paths.insert(source.clone());
-                    actions.push(PlannedAction::Delete { path: source });
+                    actions.push(PlannedAction::Delete { path: source, root: source_root });
                 }
 
                 file_attestations.push(WorkspacePatchFileAttestation {
@@ -690,7 +734,7 @@ fn resolve_new_path(
     relative: &Path,
     preferred_root_index: Option<usize>,
     path_label: &str,
-) -> Result<PathBuf, WorkspacePatchError> {
+) -> Result<(PathBuf, usize), WorkspacePatchError> {
     let index = preferred_root_index.unwrap_or(0);
     let root = canonical_roots
         .get(index)
@@ -700,7 +744,7 @@ fn resolve_new_path(
     if candidate.exists() {
         ensure_path_within_root(candidate.as_path(), root.as_path(), path_label)?;
     }
-    Ok(candidate)
+    Ok((candidate, index))
 }
 
 fn ensure_path_within_root(
@@ -873,12 +917,16 @@ fn execute_patch_plan(
 ) -> Result<(), PatchExecutionError> {
     let mut backups = HashMap::<PathBuf, Option<Vec<u8>>>::new();
     for action in actions {
-        let path = match action {
-            PlannedAction::Write { path, .. } | PlannedAction::Delete { path } => path,
+        let (path, root) = match action {
+            PlannedAction::Write { path, root, .. } | PlannedAction::Delete { path, root } => {
+                (path, root)
+            }
         };
         if backups.contains_key(path) {
             continue;
         }
+        revalidate_execution_target(path.as_path(), root.as_path())
+            .map_err(|error| PatchExecutionError { error, rollback_performed: false })?;
         if path.exists() {
             let bytes = read_file_capped(
                 path.as_path(),
@@ -895,10 +943,14 @@ fn execute_patch_plan(
     let mut applied_any = false;
     for action in actions {
         let result = match action {
-            PlannedAction::Write { path, bytes } => {
-                write_file_atomic(path.as_path(), bytes.as_slice())
+            PlannedAction::Write { path, root, bytes } => {
+                revalidate_execution_target(path.as_path(), root.as_path())
+                    .and_then(|_| write_file_atomic(path.as_path(), bytes.as_slice()))
             }
-            PlannedAction::Delete { path } => delete_file(path.as_path()),
+            PlannedAction::Delete { path, root } => {
+                revalidate_execution_target(path.as_path(), root.as_path())
+                    .and_then(|_| delete_file(path.as_path()))
+            }
         };
 
         if let Err(error) = result {
@@ -910,6 +962,24 @@ fn execute_patch_plan(
     }
 
     Ok(())
+}
+
+fn revalidate_execution_target(path: &Path, root: &Path) -> Result<(), WorkspacePatchError> {
+    let path_label = path.display().to_string();
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(WorkspacePatchError::PathOutsideWorkspace { path: path_label });
+            }
+            ensure_path_within_root(path, root, &path_label)
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            ensure_parent_within_root(path, root, &path_label)
+        }
+        Err(source) => {
+            Err(WorkspacePatchError::Io { operation: "symlink_metadata", path: path_label, source })
+        }
+    }
 }
 
 fn delete_file(path: &Path) -> Result<(), WorkspacePatchError> {
@@ -1213,6 +1283,23 @@ mod tests {
     }
 
     #[test]
+    fn redact_patch_preview_masks_case_insensitive_patterns() {
+        let preview = redact_patch_preview(
+            "*** Begin Patch\n*** Add File: note.txt\n+Authorization: Bearer token-value\n*** End Patch\n",
+            &WorkspacePatchRedactionPolicy::default(),
+            16 * 1024,
+        );
+        assert!(
+            !preview.contains("Authorization"),
+            "authorization pattern should be redacted case-insensitively"
+        );
+        assert!(
+            !preview.contains("Bearer "),
+            "bearer marker should be redacted case-insensitively"
+        );
+    }
+
+    #[test]
     fn patch_hash_is_stable() {
         let patch = "*** Begin Patch\n*** Add File: a.txt\n+hello\n*** End Patch\n";
         let first = compute_patch_sha256(patch);
@@ -1283,6 +1370,83 @@ mod tests {
             created.after_sha256.as_deref(),
             Some(expected_after_created_hash.as_str()),
             "after hash should reflect created file content"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_patch_plan_revalidates_paths_before_write_and_blocks_symlink_swap() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().expect("tempdir should be created");
+        let workspace = temp.path().join("workspace");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(workspace.join("nested"))
+            .expect("workspace nested directory should exist");
+        fs::create_dir_all(&outside).expect("outside directory should exist");
+
+        let patch = "*** Begin Patch\n*** Add File: nested/new.txt\n+inside\n*** End Patch\n";
+        let operations = parse_patch_document(patch).expect("patch should parse");
+        let canonical_roots = canonicalize_workspace_roots(std::slice::from_ref(&workspace))
+            .expect("roots should canonicalize");
+        let limits = default_limits();
+        let plan = build_patch_plan(operations.as_slice(), canonical_roots.as_slice(), &limits)
+            .expect("plan should be created");
+
+        fs::remove_dir(workspace.join("nested")).expect("nested directory should be removed");
+        symlink(&outside, workspace.join("nested")).expect("nested symlink should be created");
+
+        let execution = execute_patch_plan(plan.actions.as_slice(), &limits)
+            .expect_err("symlink swap must be rejected");
+        assert!(matches!(execution.error, WorkspacePatchError::PathOutsideWorkspace { .. }));
+        assert!(
+            !outside.join("new.txt").exists(),
+            "outside target must remain untouched after failed execution"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_patch_plan_revalidates_paths_before_delete_and_blocks_symlink_swap() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().expect("tempdir should be created");
+        let workspace = temp.path().join("workspace");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(workspace.join("nested"))
+            .expect("workspace nested directory should exist");
+        fs::create_dir_all(&outside).expect("outside directory should exist");
+
+        fs::write(workspace.join("nested").join("target.txt"), "inside\n")
+            .expect("inside file should exist");
+        fs::write(outside.join("target.txt"), "outside\n").expect("outside file should exist");
+
+        let patch = "*** Begin Patch\n*** Delete File: nested/target.txt\n*** End Patch\n";
+        let operations = parse_patch_document(patch).expect("patch should parse");
+        let canonical_roots = canonicalize_workspace_roots(std::slice::from_ref(&workspace))
+            .expect("roots should canonicalize");
+        let limits = default_limits();
+        let plan = build_patch_plan(operations.as_slice(), canonical_roots.as_slice(), &limits)
+            .expect("plan should be created");
+
+        fs::rename(workspace.join("nested"), workspace.join("nested_real"))
+            .expect("nested directory should be moved");
+        symlink(&outside, workspace.join("nested")).expect("nested symlink should be created");
+
+        let execution = execute_patch_plan(plan.actions.as_slice(), &limits)
+            .expect_err("symlink swap must be rejected");
+        assert!(matches!(execution.error, WorkspacePatchError::PathOutsideWorkspace { .. }));
+        assert_eq!(
+            fs::read_to_string(outside.join("target.txt"))
+                .expect("outside file should remain readable"),
+            "outside\n",
+            "outside file must remain unchanged"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("nested_real").join("target.txt"))
+                .expect("inside file should remain readable"),
+            "inside\n",
+            "original workspace file must remain unchanged"
         );
     }
 
