@@ -3,7 +3,7 @@ use std::{
     env, fs,
     path::{Component, Path, PathBuf},
     sync::Mutex,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use palyra_common::{default_state_root, validate_canonical_id};
@@ -18,6 +18,9 @@ const DEFAULT_MODEL_PROFILE: &str = "gpt-4o-mini";
 const MAX_AGENT_COUNT: usize = 1024;
 const MAX_WORKSPACE_ROOTS: usize = 32;
 const MAX_SESSION_BINDINGS: usize = 10_000;
+const REGISTRY_LOCK_MAX_ATTEMPTS: u32 = 40;
+const REGISTRY_LOCK_RETRY_DELAY_MS: u64 = 25;
+const REGISTRY_LOCK_STALE_AFTER_SECS: u64 = 30;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentRecord {
@@ -274,11 +277,12 @@ impl AgentRegistry {
         request: AgentCreateRequest,
     ) -> Result<AgentCreateOutcome, AgentRegistryError> {
         let mut guard = self.state.lock().map_err(|_| AgentRegistryError::LockPoisoned)?;
-        if guard.agents.len() >= MAX_AGENT_COUNT {
+        let mut next = guard.clone();
+        if next.agents.len() >= MAX_AGENT_COUNT {
             return Err(AgentRegistryError::RegistryLimitExceeded);
         }
         let agent_id = normalize_agent_id(request.agent_id.as_str())?;
-        if guard.agents.iter().any(|agent| agent.agent_id == agent_id) {
+        if next.agents.iter().any(|agent| agent.agent_id == agent_id) {
             return Err(AgentRegistryError::DuplicateAgentId(agent_id));
         }
         let display_name = normalize_required_text(request.display_name.as_str(), "display_name")?;
@@ -293,7 +297,7 @@ impl AgentRegistry {
             request.allow_absolute_paths,
         )?;
         let agent_dir_key = canonical_path_key(agent_dir.as_path());
-        for existing in &guard.agents {
+        for existing in &next.agents {
             if canonical_path_key(Path::new(existing.agent_dir.as_str())) == agent_dir_key {
                 return Err(AgentRegistryError::AgentDirCollision(existing.agent_id.clone()));
             }
@@ -318,19 +322,21 @@ impl AgentRegistry {
             created_at_unix_ms: now,
             updated_at_unix_ms: now,
         };
-        let previous_default_agent_id = guard.default_agent_id.clone();
-        guard.agents.push(record.clone());
-        guard.agents.sort_by(|left, right| left.agent_id.cmp(&right.agent_id));
+        let previous_default_agent_id = next.default_agent_id.clone();
+        next.agents.push(record.clone());
+        next.agents.sort_by(|left, right| left.agent_id.cmp(&right.agent_id));
 
         let mut default_changed = false;
-        if guard.default_agent_id.is_none() || request.set_default {
-            guard.default_agent_id = Some(agent_id);
-            default_changed = previous_default_agent_id != guard.default_agent_id;
+        if next.default_agent_id.is_none() || request.set_default {
+            next.default_agent_id = Some(agent_id);
+            default_changed = previous_default_agent_id != next.default_agent_id;
         }
-        persist_registry(self.registry_path.as_path(), &guard)?;
+        persist_registry(self.registry_path.as_path(), &next)?;
+        let default_agent_id = next.default_agent_id.clone();
+        *guard = next;
         Ok(AgentCreateOutcome {
             previous_default_agent_id,
-            default_agent_id: guard.default_agent_id.clone(),
+            default_agent_id,
             default_changed,
             agent: record,
         })
@@ -342,13 +348,15 @@ impl AgentRegistry {
     ) -> Result<AgentSetDefaultOutcome, AgentRegistryError> {
         let agent_id = normalize_agent_id(agent_id)?;
         let mut guard = self.state.lock().map_err(|_| AgentRegistryError::LockPoisoned)?;
-        if !guard.agents.iter().any(|agent| agent.agent_id == agent_id) {
+        let mut next = guard.clone();
+        if !next.agents.iter().any(|agent| agent.agent_id == agent_id) {
             return Err(AgentRegistryError::AgentNotFound(agent_id));
         }
-        let previous_default_agent_id = guard.default_agent_id.clone();
-        guard.default_agent_id = Some(agent_id.clone());
-        if previous_default_agent_id != guard.default_agent_id {
-            persist_registry(self.registry_path.as_path(), &guard)?;
+        let previous_default_agent_id = next.default_agent_id.clone();
+        next.default_agent_id = Some(agent_id.clone());
+        if previous_default_agent_id != next.default_agent_id {
+            persist_registry(self.registry_path.as_path(), &next)?;
+            *guard = next;
         }
         Ok(AgentSetDefaultOutcome { previous_default_agent_id, default_agent_id: agent_id })
     }
@@ -371,39 +379,38 @@ impl AgentRegistry {
         if guard.agents.is_empty() {
             return Err(AgentRegistryError::DefaultAgentNotConfigured);
         }
+        let mut next = guard.clone();
 
         let preferred_agent_id =
             request.preferred_agent_id.as_deref().map(normalize_agent_id).transpose()?;
         let mut source = AgentResolutionSource::Fallback;
         let resolved_agent_id = if let Some(preferred) = preferred_agent_id {
-            if !guard.agents.iter().any(|agent| agent.agent_id == preferred) {
+            if !next.agents.iter().any(|agent| agent.agent_id == preferred) {
                 return Err(AgentRegistryError::AgentNotFound(preferred));
             }
             preferred
         } else if let Some(session_id_value) = session_id.as_deref() {
-            if let Some(binding) = guard.session_bindings.iter().find(|binding| {
+            if let Some(binding) = next.session_bindings.iter().find(|binding| {
                 binding.principal == principal
                     && binding.channel == channel
                     && binding.session_id == session_id_value
             }) {
                 source = AgentResolutionSource::SessionBinding;
                 binding.agent_id.clone()
-            } else if let Some(default_agent_id) = guard.default_agent_id.clone() {
+            } else if let Some(default_agent_id) = next.default_agent_id.clone() {
                 source = AgentResolutionSource::Default;
                 default_agent_id
             } else {
-                guard
-                    .agents
+                next.agents
                     .first()
                     .map(|agent| agent.agent_id.clone())
                     .ok_or(AgentRegistryError::DefaultAgentNotConfigured)?
             }
-        } else if let Some(default_agent_id) = guard.default_agent_id.clone() {
+        } else if let Some(default_agent_id) = next.default_agent_id.clone() {
             source = AgentResolutionSource::Default;
             default_agent_id
         } else {
-            guard
-                .agents
+            next.agents
                 .first()
                 .map(|agent| agent.agent_id.clone())
                 .ok_or(AgentRegistryError::DefaultAgentNotConfigured)?
@@ -413,7 +420,7 @@ impl AgentRegistry {
         if request.persist_session_binding {
             if let Some(session_id_value) = session_id {
                 let now = current_unix_ms()?;
-                if let Some(binding) = guard.session_bindings.iter_mut().find(|binding| {
+                if let Some(binding) = next.session_bindings.iter_mut().find(|binding| {
                     binding.principal == principal
                         && binding.channel == channel
                         && binding.session_id == session_id_value
@@ -424,7 +431,7 @@ impl AgentRegistry {
                         binding_created = true;
                     }
                 } else {
-                    guard.session_bindings.push(SessionAgentBinding {
+                    next.session_bindings.push(SessionAgentBinding {
                         principal: principal.clone(),
                         channel: channel.clone(),
                         session_id: session_id_value,
@@ -433,30 +440,27 @@ impl AgentRegistry {
                     });
                     binding_created = true;
                 }
-                if guard.session_bindings.len() > MAX_SESSION_BINDINGS {
-                    guard.session_bindings.sort_by(|left, right| {
+                if next.session_bindings.len() > MAX_SESSION_BINDINGS {
+                    next.session_bindings.sort_by(|left, right| {
                         right.updated_at_unix_ms.cmp(&left.updated_at_unix_ms)
                     });
-                    guard.session_bindings.truncate(MAX_SESSION_BINDINGS);
+                    next.session_bindings.truncate(MAX_SESSION_BINDINGS);
                 }
             }
         }
 
-        let agent = guard
+        let agent = next
             .agents
             .iter()
             .find(|candidate| candidate.agent_id == resolved_agent_id)
             .cloned()
             .ok_or_else(|| AgentRegistryError::AgentNotFound(resolved_agent_id.clone()))?;
+        let is_default = next.default_agent_id.as_deref() == Some(resolved_agent_id.as_str());
         if binding_created {
-            persist_registry(self.registry_path.as_path(), &guard)?;
+            persist_registry(self.registry_path.as_path(), &next)?;
+            *guard = next;
         }
-        Ok(AgentResolveOutcome {
-            is_default: guard.default_agent_id.as_deref() == Some(resolved_agent_id.as_str()),
-            agent,
-            source,
-            binding_created,
-        })
+        Ok(AgentResolveOutcome { is_default, agent, source, binding_created })
     }
 
     pub fn status_snapshot(&self) -> Result<AgentStatusSnapshot, AgentRegistryError> {
@@ -576,9 +580,102 @@ fn normalize_document(
 }
 
 fn persist_registry(path: &Path, document: &RegistryDocument) -> Result<(), AgentRegistryError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| AgentRegistryError::WriteRegistry {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    let _lock = acquire_registry_lock(path)
+        .map_err(|source| AgentRegistryError::WriteRegistry { path: path.to_path_buf(), source })?;
     let payload = toml::to_string_pretty(document)?;
-    fs::write(path, payload)
+    write_registry_atomically(path, payload.as_str())
         .map_err(|source| AgentRegistryError::WriteRegistry { path: path.to_path_buf(), source })
+}
+
+struct RegistryLock {
+    lock_path: PathBuf,
+}
+
+impl Drop for RegistryLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.lock_path);
+    }
+}
+
+fn acquire_registry_lock(path: &Path) -> Result<RegistryLock, std::io::Error> {
+    let lock_path = registry_lock_path(path);
+    let stale_after = Duration::from_secs(REGISTRY_LOCK_STALE_AFTER_SECS);
+    for attempt in 0..=REGISTRY_LOCK_MAX_ATTEMPTS {
+        match fs::OpenOptions::new().create_new(true).write(true).open(&lock_path) {
+            Ok(_) => return Ok(RegistryLock { lock_path }),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if reclaim_stale_registry_lock(lock_path.as_path(), stale_after) {
+                    continue;
+                }
+                if attempt == REGISTRY_LOCK_MAX_ATTEMPTS {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        format!(
+                            "timed out waiting for agent registry lock at {}",
+                            lock_path.display()
+                        ),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(REGISTRY_LOCK_RETRY_DELAY_MS));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::other("agent registry lock acquisition exhausted retry budget"))
+}
+
+fn registry_lock_path(path: &Path) -> PathBuf {
+    let mut lock_name = path.as_os_str().to_os_string();
+    lock_name.push(".lock");
+    PathBuf::from(lock_name)
+}
+
+fn reclaim_stale_registry_lock(lock_path: &Path, stale_after: Duration) -> bool {
+    let metadata = match fs::metadata(lock_path) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let modified = match metadata.modified() {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let is_stale = SystemTime::now().duration_since(modified).unwrap_or_default() >= stale_after;
+    if !is_stale {
+        return false;
+    }
+    fs::remove_file(lock_path).is_ok()
+}
+
+fn write_registry_atomically(path: &Path, payload: &str) -> Result<(), std::io::Error> {
+    let timestamp_ns = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let mut temporary_name = path.as_os_str().to_os_string();
+    temporary_name.push(format!(".tmp.{}.{}", std::process::id(), timestamp_ns));
+    let temporary_path = PathBuf::from(temporary_name);
+
+    fs::write(&temporary_path, payload)?;
+    if let Err(rename_error) = fs::rename(&temporary_path, path) {
+        if !path.exists() || !path.is_file() {
+            let _ = fs::remove_file(&temporary_path);
+            return Err(rename_error);
+        }
+        let mut rollback_name = path.as_os_str().to_os_string();
+        rollback_name.push(format!(".swap.{}.{}", std::process::id(), timestamp_ns));
+        let rollback_path = PathBuf::from(rollback_name);
+        fs::rename(path, &rollback_path)?;
+        if let Err(install_error) = fs::rename(&temporary_path, path) {
+            let _ = fs::rename(&rollback_path, path);
+            let _ = fs::remove_file(&temporary_path);
+            return Err(install_error);
+        }
+        let _ = fs::remove_file(&rollback_path);
+    }
+    Ok(())
 }
 
 fn resolve_agent_dir(
@@ -768,12 +865,20 @@ fn current_unix_ms() -> Result<i64, AgentRegistryError> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
     use tempfile::tempdir;
 
     use super::{
         AgentCreateRequest, AgentRegistry, AgentRegistryError, AgentResolutionSource,
         AgentResolveRequest,
     };
+
+    fn agent_registry_lock_path(identity_root: &Path) -> PathBuf {
+        let state_root = identity_root.parent().unwrap_or(identity_root);
+        state_root.join("agents.toml.lock")
+    }
 
     #[test]
     fn create_agent_rejects_canonicalized_agent_dir_collision() {
@@ -851,6 +956,57 @@ mod tests {
             .expect("second resolve should succeed");
         assert_eq!(second.source, AgentResolutionSource::SessionBinding);
         assert!(!second.binding_created);
+    }
+
+    #[test]
+    fn create_agent_keeps_in_memory_state_when_registry_write_fails() {
+        let temp = tempdir().expect("tempdir should be created");
+        let identity_root = temp.path().join("identity");
+        let registry =
+            AgentRegistry::open(identity_root.as_path()).expect("registry should initialize");
+        registry
+            .create_agent(AgentCreateRequest {
+                agent_id: "main".to_owned(),
+                display_name: "Main".to_owned(),
+                agent_dir: Some("agents/main".to_owned()),
+                workspace_roots: vec!["workspace".to_owned()],
+                default_model_profile: Some("gpt-4o-mini".to_owned()),
+                default_tool_allowlist: Vec::new(),
+                default_skill_allowlist: Vec::new(),
+                set_default: true,
+                allow_absolute_paths: false,
+            })
+            .expect("first create should succeed");
+
+        let lock_path = agent_registry_lock_path(identity_root.as_path());
+        fs::write(&lock_path, "busy").expect("lock file should be created");
+        let error = registry
+            .create_agent(AgentCreateRequest {
+                agent_id: "review".to_owned(),
+                display_name: "Review".to_owned(),
+                agent_dir: Some("agents/review".to_owned()),
+                workspace_roots: vec!["workspace".to_owned()],
+                default_model_profile: Some("gpt-4o-mini".to_owned()),
+                default_tool_allowlist: Vec::new(),
+                default_skill_allowlist: Vec::new(),
+                set_default: false,
+                allow_absolute_paths: false,
+            })
+            .expect_err("persist lock should force write failure");
+        assert!(
+            matches!(error, AgentRegistryError::WriteRegistry { .. }),
+            "create_agent should fail with write-registry error when lock is held"
+        );
+        fs::remove_file(&lock_path).expect("lock file should be removed");
+
+        let page = registry.list_agents(None, Some(10)).expect("list should succeed");
+        assert_eq!(
+            page.agents.len(),
+            1,
+            "in-memory registry must not include agent when persistence failed"
+        );
+        assert_eq!(page.agents[0].agent_id, "main");
+        assert_eq!(page.default_agent_id.as_deref(), Some("main"));
     }
 
     #[test]

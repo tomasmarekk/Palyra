@@ -22,6 +22,9 @@ const MAX_PROFILE_PAGE_LIMIT: usize = 500;
 const DEFAULT_EXPIRING_WINDOW_MS: i64 = 15 * 60 * 1_000;
 const DEFAULT_REFRESH_WINDOW_MS: i64 = 5 * 60 * 1_000;
 const DEFAULT_REFRESH_TIMEOUT_SECS: u64 = 10;
+const REGISTRY_LOCK_MAX_ATTEMPTS: u32 = 40;
+const REGISTRY_LOCK_RETRY_DELAY_MS: u64 = 25;
+const REGISTRY_LOCK_STALE_AFTER_SECS: u64 = 30;
 
 #[derive(Debug, Error)]
 pub enum AuthProfileError {
@@ -563,6 +566,7 @@ impl AuthProfileRegistry {
         let now = unix_ms_now()?;
 
         let mut guard = self.state.lock().map_err(|_| AuthProfileError::LockPoisoned)?;
+        let mut next = guard.clone();
         let mut record = AuthProfileRecord {
             profile_id: normalized.profile_id,
             provider: normalized.provider,
@@ -573,29 +577,32 @@ impl AuthProfileRegistry {
             updated_at_unix_ms: now,
         };
         if let Some(existing) =
-            guard.profiles.iter_mut().find(|profile| profile.profile_id == record.profile_id)
+            next.profiles.iter_mut().find(|profile| profile.profile_id == record.profile_id)
         {
             record.created_at_unix_ms = existing.created_at_unix_ms;
             *existing = record.clone();
         } else {
-            if guard.profiles.len() >= MAX_PROFILE_COUNT {
+            if next.profiles.len() >= MAX_PROFILE_COUNT {
                 return Err(AuthProfileError::RegistryLimitExceeded);
             }
-            guard.profiles.push(record.clone());
+            next.profiles.push(record.clone());
         }
-        guard.profiles.sort_by(|left, right| left.profile_id.cmp(&right.profile_id));
-        persist_registry(self.registry_path.as_path(), &guard)?;
+        next.profiles.sort_by(|left, right| left.profile_id.cmp(&right.profile_id));
+        persist_registry(self.registry_path.as_path(), &next)?;
+        *guard = next;
         Ok(record)
     }
 
     pub fn delete_profile(&self, profile_id: &str) -> Result<bool, AuthProfileError> {
         let profile_id = normalize_profile_id(profile_id)?;
         let mut guard = self.state.lock().map_err(|_| AuthProfileError::LockPoisoned)?;
-        let before = guard.profiles.len();
-        guard.profiles.retain(|profile| profile.profile_id != profile_id);
-        let deleted = guard.profiles.len() != before;
+        let mut next = guard.clone();
+        let before = next.profiles.len();
+        next.profiles.retain(|profile| profile.profile_id != profile_id);
+        let deleted = next.profiles.len() != before;
         if deleted {
-            persist_registry(self.registry_path.as_path(), &guard)?;
+            persist_registry(self.registry_path.as_path(), &next)?;
+            *guard = next;
         }
         Ok(deleted)
     }
@@ -877,8 +884,9 @@ impl AuthProfileRegistry {
                     })
                     .or(snapshot.expires_at_unix_ms);
                 let mut guard = self.state.lock().map_err(|_| AuthProfileError::LockPoisoned)?;
+                let mut next = guard.clone();
                 let (profile_id, provider, expires_at_unix_ms) = {
-                    let profile = guard
+                    let profile = next
                         .profiles
                         .iter_mut()
                         .find(|profile| profile.profile_id == snapshot.profile_id)
@@ -910,7 +918,8 @@ impl AuthProfileRegistry {
                         next_profile_updated_at(profile.updated_at_unix_ms, now_unix_ms);
                     (profile_id, provider, *expires_at_unix_ms)
                 };
-                persist_registry(self.registry_path.as_path(), &guard)?;
+                persist_registry(self.registry_path.as_path(), &next)?;
+                *guard = next;
                 Ok(OAuthRefreshOutcome {
                     profile_id,
                     provider,
@@ -933,7 +942,8 @@ impl AuthProfileRegistry {
         reason: String,
     ) -> Result<OAuthRefreshOutcome, AuthProfileError> {
         let mut guard = self.state.lock().map_err(|_| AuthProfileError::LockPoisoned)?;
-        let profile = guard
+        let mut next = guard.clone();
+        let profile = next
             .profiles
             .iter_mut()
             .find(|profile| profile.profile_id == snapshot.profile_id)
@@ -978,7 +988,8 @@ impl AuthProfileRegistry {
         profile.updated_at_unix_ms =
             next_profile_updated_at(profile.updated_at_unix_ms, now_unix_ms);
 
-        persist_registry(self.registry_path.as_path(), &guard)?;
+        persist_registry(self.registry_path.as_path(), &next)?;
+        *guard = next;
 
         Ok(OAuthRefreshOutcome {
             profile_id,
@@ -1610,9 +1621,96 @@ fn persist_registry(path: &Path, document: &RegistryDocument) -> Result<(), Auth
             source,
         })?;
     }
-    let serialized = toml::to_string_pretty(document)?;
-    fs::write(path, serialized)
+    let _lock = acquire_registry_lock(path)
         .map_err(|source| AuthProfileError::WriteRegistry { path: path.to_path_buf(), source })?;
+    let serialized = toml::to_string_pretty(document)?;
+    write_registry_atomically(path, serialized.as_str())
+        .map_err(|source| AuthProfileError::WriteRegistry { path: path.to_path_buf(), source })?;
+    Ok(())
+}
+
+struct RegistryLock {
+    lock_path: PathBuf,
+}
+
+impl Drop for RegistryLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.lock_path);
+    }
+}
+
+fn acquire_registry_lock(path: &Path) -> Result<RegistryLock, std::io::Error> {
+    let lock_path = registry_lock_path(path);
+    let stale_after = Duration::from_secs(REGISTRY_LOCK_STALE_AFTER_SECS);
+    for attempt in 0..=REGISTRY_LOCK_MAX_ATTEMPTS {
+        match fs::OpenOptions::new().create_new(true).write(true).open(&lock_path) {
+            Ok(_) => return Ok(RegistryLock { lock_path }),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if reclaim_stale_registry_lock(lock_path.as_path(), stale_after) {
+                    continue;
+                }
+                if attempt == REGISTRY_LOCK_MAX_ATTEMPTS {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        format!(
+                            "timed out waiting for auth profile registry lock at {}",
+                            lock_path.display()
+                        ),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(REGISTRY_LOCK_RETRY_DELAY_MS));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::other("auth profile registry lock acquisition exhausted retry budget"))
+}
+
+fn registry_lock_path(path: &Path) -> PathBuf {
+    let mut lock_name = path.as_os_str().to_os_string();
+    lock_name.push(".lock");
+    PathBuf::from(lock_name)
+}
+
+fn reclaim_stale_registry_lock(lock_path: &Path, stale_after: Duration) -> bool {
+    let metadata = match fs::metadata(lock_path) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let modified = match metadata.modified() {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let is_stale = SystemTime::now().duration_since(modified).unwrap_or_default() >= stale_after;
+    if !is_stale {
+        return false;
+    }
+    fs::remove_file(lock_path).is_ok()
+}
+
+fn write_registry_atomically(path: &Path, payload: &str) -> Result<(), std::io::Error> {
+    let timestamp_ns = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let mut temporary_name = path.as_os_str().to_os_string();
+    temporary_name.push(format!(".tmp.{}.{}", std::process::id(), timestamp_ns));
+    let temporary_path = PathBuf::from(temporary_name);
+
+    fs::write(&temporary_path, payload)?;
+    if let Err(rename_error) = fs::rename(&temporary_path, path) {
+        if !path.exists() || !path.is_file() {
+            let _ = fs::remove_file(&temporary_path);
+            return Err(rename_error);
+        }
+        let mut rollback_name = path.as_os_str().to_os_string();
+        rollback_name.push(format!(".swap.{}.{}", std::process::id(), timestamp_ns));
+        let rollback_path = PathBuf::from(rollback_name);
+        fs::rename(path, &rollback_path)?;
+        if let Err(install_error) = fs::rename(&temporary_path, path) {
+            let _ = fs::rename(&rollback_path, path);
+            let _ = fs::remove_file(&temporary_path);
+            return Err(install_error);
+        }
+        let _ = fs::remove_file(&rollback_path);
+    }
     Ok(())
 }
 
@@ -1634,9 +1732,10 @@ mod tests {
     use palyra_vault::{
         BackendPreference as VaultBackendPreference, VaultConfig as VaultConfigOptions,
     };
+    use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Barrier, Mutex,
@@ -1692,6 +1791,11 @@ mod tests {
             ..VaultConfigOptions::default()
         })
         .expect("test vault should initialize")
+    }
+
+    fn auth_registry_lock_path(identity_root: &Path) -> PathBuf {
+        let state_root = identity_root.parent().unwrap_or(identity_root);
+        state_root.join("auth_profiles.toml.lock")
     }
 
     fn sample_oauth_profile_request(
@@ -1888,6 +1992,48 @@ mod tests {
             *calls.lock().expect("call counter should be available"),
             0,
             "adapter must not be called when cooldown is active"
+        );
+    }
+
+    #[test]
+    fn set_profile_keeps_in_memory_state_when_registry_write_fails() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let identity_root = tempdir.path().join("identity");
+        let registry =
+            AuthProfileRegistry::open(identity_root.as_path()).expect("registry should initialize");
+
+        registry
+            .set_profile(sample_oauth_profile_request(
+                "https://example.test/token".to_owned(),
+                None,
+                OAuthRefreshState::default(),
+            ))
+            .expect("initial profile write should succeed");
+
+        let lock_path = auth_registry_lock_path(identity_root.as_path());
+        fs::write(&lock_path, "busy").expect("lock file should be created");
+        let mut updated_request = sample_oauth_profile_request(
+            "https://example.test/token".to_owned(),
+            None,
+            OAuthRefreshState::default(),
+        );
+        updated_request.profile_name = "updated-profile".to_owned();
+        let error = registry
+            .set_profile(updated_request)
+            .expect_err("persist lock should force write failure");
+        assert!(
+            matches!(error, AuthProfileError::WriteRegistry { .. }),
+            "set_profile should fail with write-registry error when lock is held"
+        );
+        fs::remove_file(&lock_path).expect("lock file should be removed");
+
+        let stored = registry
+            .get_profile("openai-default")
+            .expect("profile lookup should succeed")
+            .expect("profile should still exist");
+        assert_eq!(
+            stored.profile_name, "default",
+            "in-memory state must remain unchanged when persist fails"
         );
     }
 
