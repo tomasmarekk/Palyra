@@ -2895,6 +2895,23 @@ fn authorize_vault_action(principal: &str, action: &str, resource: &str) -> Resu
     }
 }
 
+#[derive(Clone, Copy)]
+enum SensitiveServiceRole {
+    AdminOnly,
+    AdminOrSystem,
+}
+
+fn principal_has_sensitive_service_role(principal: &str, role: SensitiveServiceRole) -> bool {
+    let normalized_principal = principal.to_ascii_lowercase();
+    match role {
+        SensitiveServiceRole::AdminOnly => normalized_principal.starts_with("admin:"),
+        SensitiveServiceRole::AdminOrSystem => {
+            normalized_principal.starts_with("admin:")
+                || normalized_principal.starts_with("system:")
+        }
+    }
+}
+
 #[allow(clippy::result_large_err)]
 fn authorize_agent_management_action(
     principal: &str,
@@ -2910,7 +2927,7 @@ fn authorize_agent_management_action(
         &PolicyEvaluationConfig::default(),
     )
     .map_err(|error| Status::internal(format!("failed to evaluate agent policy: {error}")))?;
-    if principal.to_ascii_lowercase().starts_with("admin:") {
+    if principal_has_sensitive_service_role(principal, SensitiveServiceRole::AdminOnly) {
         return Ok(());
     }
     let reason = match evaluation.decision {
@@ -2941,14 +2958,36 @@ fn authorize_auth_profile_action(
     .map_err(|error| {
         Status::internal(format!("failed to evaluate auth profile policy: {error}"))
     })?;
-    let normalized_principal = principal.to_ascii_lowercase();
-    if normalized_principal.starts_with("admin:") || normalized_principal.starts_with("system:") {
+    if principal_has_sensitive_service_role(principal, SensitiveServiceRole::AdminOrSystem) {
         return Ok(());
     }
     let reason = match evaluation.decision {
         PolicyDecision::Allow => {
             "auth profile management requires admin/system principal prefix".to_owned()
         }
+        PolicyDecision::DenyByDefault { reason } => reason,
+    };
+    Err(Status::permission_denied(format!(
+        "policy denied action '{action}' on '{resource}': {reason}"
+    )))
+}
+
+#[allow(clippy::result_large_err)]
+fn authorize_approvals_action(principal: &str, action: &str, resource: &str) -> Result<(), Status> {
+    let evaluation = evaluate_with_config(
+        &PolicyRequest {
+            principal: principal.to_owned(),
+            action: action.to_owned(),
+            resource: resource.to_owned(),
+        },
+        &PolicyEvaluationConfig::default(),
+    )
+    .map_err(|error| Status::internal(format!("failed to evaluate approvals policy: {error}")))?;
+    if principal_has_sensitive_service_role(principal, SensitiveServiceRole::AdminOrSystem) {
+        return Ok(());
+    }
+    let reason = match evaluation.decision {
+        PolicyDecision::Allow => "approvals APIs require admin/system principal prefix".to_owned(),
         PolicyDecision::DenyByDefault { reason } => reason,
     };
     Err(Status::permission_denied(format!(
@@ -3666,10 +3705,20 @@ fn enforce_memory_item_scope(
     if item.principal != principal {
         return Err(Status::permission_denied("memory item principal does not match context"));
     }
-    if let (Some(context_channel), Some(item_channel)) = (channel, item.channel.as_deref()) {
-        if context_channel != item_channel {
-            return Err(Status::permission_denied("memory item channel does not match context"));
+    match (channel, item.channel.as_deref()) {
+        (Some(context_channel), Some(item_channel)) => {
+            if context_channel != item_channel {
+                return Err(Status::permission_denied(
+                    "memory item channel does not match context",
+                ));
+            }
         }
+        (None, Some(_)) => {
+            return Err(Status::permission_denied(
+                "memory item is channel-scoped and requires authenticated channel context",
+            ));
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -7221,7 +7270,12 @@ impl gateway_v1::approvals_service_server::ApprovalsService for ApprovalsService
         &self,
         request: Request<gateway_v1::ListApprovalsRequest>,
     ) -> Result<Response<gateway_v1::ListApprovalsResponse>, Status> {
-        let _context = self.authorize_rpc(request.metadata(), "ListApprovals")?;
+        let context = self.authorize_rpc(request.metadata(), "ListApprovals")?;
+        authorize_approvals_action(
+            context.principal.as_str(),
+            "approvals.list",
+            "approvals:records",
+        )?;
         let payload = request.into_inner();
         require_supported_version(payload.v)?;
         let decision = approval_decision_from_proto(payload.decision);
@@ -7262,7 +7316,12 @@ impl gateway_v1::approvals_service_server::ApprovalsService for ApprovalsService
         &self,
         request: Request<gateway_v1::GetApprovalRequest>,
     ) -> Result<Response<gateway_v1::GetApprovalResponse>, Status> {
-        let _context = self.authorize_rpc(request.metadata(), "GetApproval")?;
+        let context = self.authorize_rpc(request.metadata(), "GetApproval")?;
+        authorize_approvals_action(
+            context.principal.as_str(),
+            "approvals.get",
+            "approvals:record",
+        )?;
         let payload = request.into_inner();
         require_supported_version(payload.v)?;
         let approval_id = canonical_id(payload.approval_id, "approval_id")?;
@@ -7279,7 +7338,12 @@ impl gateway_v1::approvals_service_server::ApprovalsService for ApprovalsService
         &self,
         request: Request<gateway_v1::ExportApprovalsRequest>,
     ) -> Result<Response<Self::ExportApprovalsStream>, Status> {
-        let _context = self.authorize_rpc(request.metadata(), "ExportApprovals")?;
+        let context = self.authorize_rpc(request.metadata(), "ExportApprovals")?;
+        authorize_approvals_action(
+            context.principal.as_str(),
+            "approvals.export",
+            "approvals:records",
+        )?;
         let payload = request.into_inner();
         require_supported_version(payload.v)?;
         let decision = approval_decision_from_proto(payload.decision);
@@ -10552,19 +10616,23 @@ mod tests {
     use crate::journal::{
         ApprovalCreateRequest, ApprovalDecision, ApprovalDecisionScope, ApprovalPolicySnapshot,
         ApprovalPromptOption, ApprovalPromptRecord, ApprovalRiskLevel, ApprovalSubjectType,
-        JournalAppendRequest, JournalConfig, JournalStore, OrchestratorRunStartRequest,
-        OrchestratorSessionUpsertRequest, OrchestratorTapeAppendRequest,
+        JournalAppendRequest, JournalConfig, JournalStore, MemoryItemRecord, MemorySource,
+        OrchestratorRunStartRequest, OrchestratorSessionUpsertRequest,
+        OrchestratorTapeAppendRequest,
     };
+    use tonic::Code;
     use ulid::Ulid;
 
     use super::{
-        apply_tool_approval_outcome, authorize_headers, best_effort_mark_approval_error,
-        constant_time_eq, enforce_vault_get_approval_policy, enforce_vault_scope_access,
-        execute_memory_search_tool, execute_workspace_patch_tool, parse_patch_string_array_field,
-        request_context_from_headers, resolve_cron_job_channel_for_create,
-        vault_get_requires_approval, workspace_patch_metrics_from_output, AuthError,
-        GatewayAuthConfig, GatewayJournalConfigSnapshot, GatewayRuntimeConfigSnapshot,
-        GatewayRuntimeState, MemoryRuntimeConfig, ProviderRequest, RequestContext,
+        apply_tool_approval_outcome, authorize_approvals_action, authorize_headers,
+        best_effort_mark_approval_error, constant_time_eq, enforce_memory_item_scope,
+        enforce_vault_get_approval_policy, enforce_vault_scope_access, execute_memory_search_tool,
+        execute_workspace_patch_tool, parse_patch_string_array_field,
+        principal_has_sensitive_service_role, request_context_from_headers,
+        resolve_cron_job_channel_for_create, vault_get_requires_approval,
+        workspace_patch_metrics_from_output, AuthError, GatewayAuthConfig,
+        GatewayJournalConfigSnapshot, GatewayRuntimeConfigSnapshot, GatewayRuntimeState,
+        MemoryRuntimeConfig, ProviderRequest, RequestContext, SensitiveServiceRole,
         ToolApprovalOutcome, HEADER_CHANNEL, HEADER_DEVICE_ID, HEADER_PRINCIPAL,
         MAX_APPROVAL_PAGE_LIMIT, VAULT_RATE_LIMIT_MAX_PRINCIPAL_BUCKETS,
         VAULT_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW,
@@ -10737,6 +10805,81 @@ mod tests {
         headers.insert(HEADER_PRINCIPAL, HeaderValue::from_static("user:ops"));
         let result = authorize_headers(&headers, &auth);
         assert!(result.is_ok(), "bearer auth scheme should be parsed case-insensitively");
+    }
+
+    fn test_memory_item(channel: Option<&str>) -> MemoryItemRecord {
+        MemoryItemRecord {
+            memory_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            principal: "user:ops".to_owned(),
+            channel: channel.map(str::to_owned),
+            session_id: None,
+            source: MemorySource::Manual,
+            content_text: "test memory".to_owned(),
+            content_hash: "sha256:test".to_owned(),
+            tags: vec!["test".to_owned()],
+            confidence: None,
+            ttl_unix_ms: None,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+        }
+    }
+
+    #[test]
+    fn sensitive_service_role_guard_matches_expected_principals() {
+        assert!(
+            principal_has_sensitive_service_role("admin:ops", SensitiveServiceRole::AdminOnly),
+            "admin principal should satisfy admin-only guard"
+        );
+        assert!(
+            !principal_has_sensitive_service_role("system:cron", SensitiveServiceRole::AdminOnly),
+            "system principal should not satisfy admin-only guard"
+        );
+        assert!(
+            principal_has_sensitive_service_role(
+                "system:cron",
+                SensitiveServiceRole::AdminOrSystem
+            ),
+            "system principal should satisfy admin-or-system guard"
+        );
+        assert!(
+            !principal_has_sensitive_service_role("user:ops", SensitiveServiceRole::AdminOrSystem),
+            "regular user principal should not satisfy elevated guard"
+        );
+    }
+
+    #[test]
+    fn approvals_authorization_requires_admin_or_system_principal() {
+        let denied = authorize_approvals_action("user:ops", "approvals.list", "approvals:records")
+            .expect_err("non-admin principal should be denied");
+        assert_eq!(denied.code(), Code::PermissionDenied);
+        assert!(
+            authorize_approvals_action("admin:ops", "approvals.list", "approvals:records").is_ok(),
+            "admin principal should pass approvals guard"
+        );
+        assert!(
+            authorize_approvals_action("system:cron", "approvals.list", "approvals:records")
+                .is_ok(),
+            "system principal should pass approvals guard"
+        );
+    }
+
+    #[test]
+    fn memory_scope_requires_channel_context_for_channel_scoped_item() {
+        let item = test_memory_item(Some("discord"));
+        let denied = enforce_memory_item_scope(&item, "user:ops", None)
+            .expect_err("channel-scoped memory should require channel context");
+        assert_eq!(denied.code(), Code::PermissionDenied);
+        assert_eq!(
+            denied.message(),
+            "memory item is channel-scoped and requires authenticated channel context"
+        );
+    }
+
+    #[test]
+    fn memory_scope_allows_global_item_without_channel_context() {
+        let item = test_memory_item(None);
+        enforce_memory_item_scope(&item, "user:ops", None)
+            .expect("global memory item should be accessible without channel context");
     }
 
     #[test]

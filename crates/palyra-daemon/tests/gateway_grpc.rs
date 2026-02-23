@@ -3111,7 +3111,7 @@ async fn grpc_approvals_service_persists_and_exports_denied_tool_approval() -> R
         decision: gateway_v1::ApprovalDecision::Deny as i32,
         subject_type: gateway_v1::ApprovalSubjectType::Tool as i32,
     });
-    authorize_metadata(list_request.metadata_mut())?;
+    authorize_metadata_with_principal(list_request.metadata_mut(), "admin:ops")?;
     let list_response = approvals_client
         .list_approvals(list_request)
         .await
@@ -3144,7 +3144,7 @@ async fn grpc_approvals_service_persists_and_exports_denied_tool_approval() -> R
         v: 1,
         approval_id: Some(common_v1::CanonicalId { ulid: approval_id.clone() }),
     });
-    authorize_metadata(get_request.metadata_mut())?;
+    authorize_metadata_with_principal(get_request.metadata_mut(), "admin:ops")?;
     let get_response = approvals_client
         .get_approval(get_request)
         .await
@@ -3167,7 +3167,7 @@ async fn grpc_approvals_service_persists_and_exports_denied_tool_approval() -> R
         decision: gateway_v1::ApprovalDecision::Deny as i32,
         subject_type: gateway_v1::ApprovalSubjectType::Tool as i32,
     });
-    authorize_metadata(export_request.metadata_mut())?;
+    authorize_metadata_with_principal(export_request.metadata_mut(), "admin:ops")?;
     let mut export_stream = approvals_client
         .export_approvals(export_request)
         .await
@@ -3307,7 +3307,7 @@ async fn grpc_approvals_service_persists_and_exports_denied_tool_approval() -> R
         decision: gateway_v1::ApprovalDecision::Deny as i32,
         subject_type: gateway_v1::ApprovalSubjectType::Tool as i32,
     });
-    authorize_metadata(export_json_request.metadata_mut())?;
+    authorize_metadata_with_principal(export_json_request.metadata_mut(), "admin:ops")?;
     let mut export_json_stream = approvals_client
         .export_approvals(export_json_request)
         .await
@@ -3361,7 +3361,7 @@ async fn grpc_approvals_service_persists_and_exports_denied_tool_approval() -> R
         decision: gateway_v1::ApprovalDecision::Deny as i32,
         subject_type: gateway_v1::ApprovalSubjectType::Tool as i32,
     });
-    authorize_metadata(export_json_empty_request.metadata_mut())?;
+    authorize_metadata_with_principal(export_json_empty_request.metadata_mut(), "admin:ops")?;
     let mut export_json_empty_stream = approvals_client
         .export_approvals(export_json_empty_request)
         .await
