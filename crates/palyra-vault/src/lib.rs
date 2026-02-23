@@ -456,9 +456,19 @@ fn maybe_reclaim_stale_lock_with_policy(
     now: SystemTime,
     stale_age: Duration,
 ) -> Result<bool, VaultError> {
-    let metadata = fs::metadata(lock_path).map_err(|error| {
-        VaultError::Io(format!("failed to inspect metadata lock {}: {error}", lock_path.display()))
-    })?;
+    let metadata = match fs::metadata(lock_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Another process released the lock between `create_new` failure and inspection.
+            return Ok(true);
+        }
+        Err(error) => {
+            return Err(VaultError::Io(format!(
+                "failed to inspect metadata lock {}: {error}",
+                lock_path.display()
+            )));
+        }
+    };
     let modified = metadata.modified().map_err(|error| {
         VaultError::Io(format!(
             "failed to inspect metadata lock timestamp {}: {error}",
@@ -475,13 +485,14 @@ fn maybe_reclaim_stale_lock_with_policy(
             }
         }
     }
-    fs::remove_file(lock_path).map_err(|error| {
-        VaultError::Io(format!(
+    match fs::remove_file(lock_path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(VaultError::Io(format!(
             "failed to reclaim stale metadata lock {}: {error}",
             lock_path.display()
-        ))
-    })?;
-    Ok(true)
+        ))),
+    }
 }
 
 fn parse_metadata_lock_marker(raw: &str) -> Option<MetadataLockMarker> {
@@ -1161,6 +1172,19 @@ mod tests {
         )?;
         assert!(reclaimed, "dead owner lock should be reclaimed");
         assert!(!lock_path.exists(), "reclaimed lock file should be removed");
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_lock_reclaim_treats_missing_lock_as_released() -> Result<()> {
+        let temp = tempdir()?;
+        let lock_path = temp.path().join(super::METADATA_LOCK_FILE);
+        let reclaimed = maybe_reclaim_stale_lock_with_policy(
+            &lock_path,
+            std::time::SystemTime::now(),
+            Duration::ZERO,
+        )?;
+        assert!(reclaimed, "missing lock should be treated as already released for retry loops");
         Ok(())
     }
 

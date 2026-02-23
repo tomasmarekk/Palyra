@@ -288,6 +288,11 @@ impl MacosKeychainBackend {
 }
 
 #[cfg(target_os = "macos")]
+fn keychain_add_args<'a>(object_id: &'a str) -> [&'a str; 7] {
+    ["add-generic-password", "-U", "-a", object_id, "-s", KEYCHAIN_SERVICE_NAME, "-w"]
+}
+
+#[cfg(target_os = "macos")]
 impl BlobBackend for MacosKeychainBackend {
     fn kind(&self) -> BackendKind {
         BackendKind::MacosKeychain
@@ -295,21 +300,28 @@ impl BlobBackend for MacosKeychainBackend {
 
     fn put_blob(&self, object_id: &str, payload: &[u8]) -> Result<(), VaultError> {
         let encoded = STANDARD_NO_PAD.encode(payload);
-        let output = Command::new("security")
-            .args([
-                "add-generic-password",
-                "-U",
-                "-a",
-                object_id,
-                "-s",
-                KEYCHAIN_SERVICE_NAME,
-                "-w",
-                encoded.as_str(),
-            ])
-            .output()
+        let mut child = Command::new("security")
+            .args(keychain_add_args(object_id))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .map_err(|error| {
                 VaultError::Io(format!("failed to execute security add-generic-password: {error}"))
             })?;
+        {
+            let mut stdin = child.stdin.take().ok_or_else(|| {
+                VaultError::Io("security add-generic-password did not expose stdin".to_owned())
+            })?;
+            stdin.write_all(encoded.as_bytes()).map_err(|error| {
+                VaultError::Io(format!(
+                    "failed to write security add-generic-password payload: {error}"
+                ))
+            })?;
+        }
+        let output = child.wait_with_output().map_err(|error| {
+            VaultError::Io(format!("failed waiting for security add-generic-password: {error}"))
+        })?;
         if !output.status.success() {
             return Err(VaultError::Io(format!(
                 "security add-generic-password failed: {}",
@@ -367,6 +379,25 @@ impl BlobBackend for MacosKeychainBackend {
             "security delete-generic-password failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         )))
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests {
+    use super::keychain_add_args;
+
+    #[test]
+    fn keychain_add_args_keep_password_out_of_argv() {
+        let args = keychain_add_args("obj_123");
+        assert_eq!(args[0], "add-generic-password");
+        assert_eq!(args[3], "obj_123");
+        let password_flag_index =
+            args.iter().position(|arg| *arg == "-w").expect("password flag should exist");
+        assert_eq!(
+            password_flag_index,
+            args.len() - 1,
+            "password must be supplied via stdin, not argv"
+        );
     }
 }
 
