@@ -973,7 +973,12 @@ fn revalidate_execution_target(path: &Path, root: &Path) -> Result<(), Workspace
             }
             ensure_path_within_root(path, root, &path_label)
         }
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+        Err(source)
+            if matches!(
+                source.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
             ensure_parent_within_root(path, root, &path_label)
         }
         Err(source) => {
