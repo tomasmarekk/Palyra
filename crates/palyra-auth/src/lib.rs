@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
     env, fs,
+    net::IpAddr,
     path::{Component, Path, PathBuf},
     sync::Mutex,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -338,6 +339,7 @@ impl OAuthRefreshAdapter for HttpOAuthRefreshAdapter {
     ) -> Result<OAuthRefreshResponse, OAuthRefreshError> {
         let client = Client::builder()
             .timeout(self.timeout)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|error| OAuthRefreshError::Transport(error.to_string()))?;
         let mut form_fields = vec![
@@ -798,6 +800,7 @@ impl AuthProfileRegistry {
                 scopes: scopes.clone(),
                 expires_at_unix_ms: *expires_at_unix_ms,
                 failure_count: refresh_state.failure_count,
+                observed_updated_at_unix_ms: profile.updated_at_unix_ms,
             }
         };
 
@@ -815,7 +818,16 @@ impl AuthProfileRegistry {
 
         let client_secret =
             if let Some(client_secret_ref) = snapshot.client_secret_vault_ref.as_deref() {
-                load_secret_utf8(vault, client_secret_ref).ok()
+                match load_secret_utf8(vault, client_secret_ref) {
+                    Ok(secret) => Some(secret),
+                    Err(_) => {
+                        return self.persist_refresh_failure(
+                            snapshot,
+                            now_unix_ms,
+                            "client secret reference is missing or unreadable".to_owned(),
+                        );
+                    }
+                }
             } else {
                 None
             };
@@ -830,19 +842,6 @@ impl AuthProfileRegistry {
         });
         match response {
             Ok(payload) => {
-                if persist_secret_utf8(
-                    vault,
-                    snapshot.access_token_vault_ref.as_str(),
-                    payload.access_token.as_str(),
-                )
-                .is_err()
-                {
-                    return self.persist_refresh_failure(
-                        snapshot,
-                        now_unix_ms,
-                        "failed to persist refreshed access token into vault".to_owned(),
-                    );
-                }
                 if let Some(refresh_token) = payload.refresh_token.as_deref() {
                     if persist_secret_utf8(
                         vault,
@@ -857,6 +856,19 @@ impl AuthProfileRegistry {
                             "failed to persist rotated refresh token into vault".to_owned(),
                         );
                     }
+                }
+                if persist_secret_utf8(
+                    vault,
+                    snapshot.access_token_vault_ref.as_str(),
+                    payload.access_token.as_str(),
+                )
+                .is_err()
+                {
+                    return self.persist_refresh_failure(
+                        snapshot,
+                        now_unix_ms,
+                        "failed to persist refreshed access token into vault".to_owned(),
+                    );
                 }
                 let computed_expires_at = payload
                     .expires_in_seconds
@@ -894,7 +906,8 @@ impl AuthProfileRegistry {
                     refresh_state.last_attempt_unix_ms = Some(now_unix_ms);
                     refresh_state.last_success_unix_ms = Some(now_unix_ms);
                     refresh_state.next_allowed_refresh_unix_ms = None;
-                    profile.updated_at_unix_ms = now_unix_ms;
+                    profile.updated_at_unix_ms =
+                        next_profile_updated_at(profile.updated_at_unix_ms, now_unix_ms);
                     (profile_id, provider, *expires_at_unix_ms)
                 };
                 persist_registry(self.registry_path.as_path(), &guard)?;
@@ -920,14 +933,14 @@ impl AuthProfileRegistry {
         reason: String,
     ) -> Result<OAuthRefreshOutcome, AuthProfileError> {
         let mut guard = self.state.lock().map_err(|_| AuthProfileError::LockPoisoned)?;
-        let (profile_id, provider, next_allowed, expires_at_unix_ms) = {
-            let profile = guard
-                .profiles
-                .iter_mut()
-                .find(|profile| profile.profile_id == snapshot.profile_id)
-                .ok_or_else(|| AuthProfileError::ProfileNotFound(snapshot.profile_id.clone()))?;
-            let provider = profile.provider.label();
-            let profile_id = profile.profile_id.clone();
+        let profile = guard
+            .profiles
+            .iter_mut()
+            .find(|profile| profile.profile_id == snapshot.profile_id)
+            .ok_or_else(|| AuthProfileError::ProfileNotFound(snapshot.profile_id.clone()))?;
+        let provider = profile.provider.label();
+        let profile_id = profile.profile_id.clone();
+        let (next_allowed, expires_at_unix_ms) = {
             let AuthCredential::Oauth { refresh_state, expires_at_unix_ms, .. } =
                 &mut profile.credential
             else {
@@ -941,6 +954,17 @@ impl AuthProfileRegistry {
                     expires_at_unix_ms: None,
                 });
             };
+            if profile.updated_at_unix_ms != snapshot.observed_updated_at_unix_ms {
+                return Ok(OAuthRefreshOutcome {
+                    profile_id,
+                    provider,
+                    kind: OAuthRefreshOutcomeKind::SkippedCooldown,
+                    reason: "stale refresh failure ignored because profile state changed"
+                        .to_owned(),
+                    next_allowed_refresh_unix_ms: refresh_state.next_allowed_refresh_unix_ms,
+                    expires_at_unix_ms: *expires_at_unix_ms,
+                });
+            }
             let failure_count = snapshot.failure_count.saturating_add(1);
             let backoff_ms = compute_backoff_ms(&snapshot.provider, failure_count);
             let next_allowed = now_unix_ms.saturating_add(backoff_ms as i64);
@@ -949,9 +973,10 @@ impl AuthProfileRegistry {
             refresh_state.last_error = Some(reason.clone());
             refresh_state.last_attempt_unix_ms = Some(now_unix_ms);
             refresh_state.next_allowed_refresh_unix_ms = Some(next_allowed);
-            profile.updated_at_unix_ms = now_unix_ms;
-            (profile_id, provider, next_allowed, *expires_at_unix_ms)
+            (next_allowed, *expires_at_unix_ms)
         };
+        profile.updated_at_unix_ms =
+            next_profile_updated_at(profile.updated_at_unix_ms, now_unix_ms);
 
         persist_registry(self.registry_path.as_path(), &guard)?;
 
@@ -978,6 +1003,7 @@ struct OAuthRefreshSnapshot {
     scopes: Vec<String>,
     expires_at_unix_ms: Option<i64>,
     failure_count: u32,
+    observed_updated_at_unix_ms: i64,
 }
 
 fn sanitize_refresh_error(error: &OAuthRefreshError) -> String {
@@ -1456,7 +1482,11 @@ fn normalize_optional_text(value: Option<String>, max_len: usize) -> Option<Stri
         if trimmed.is_empty() {
             None
         } else if trimmed.len() > max_len {
-            Some(trimmed[..max_len].to_owned())
+            let mut end = max_len.min(trimmed.len());
+            while end > 0 && !trimmed.is_char_boundary(end) {
+                end = end.saturating_sub(1);
+            }
+            Some(trimmed[..end].to_owned())
         } else {
             Some(trimmed.to_owned())
         }
@@ -1498,13 +1528,45 @@ fn normalize_token_endpoint(raw: &str) -> Result<String, AuthProfileError> {
         field: "oauth.token_endpoint",
         message: format!("invalid URL: {error}"),
     })?;
-    if parsed.scheme() != "https" && parsed.scheme() != "http" {
+    if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(AuthProfileError::InvalidField {
             field: "oauth.token_endpoint",
-            message: "URL scheme must be http or https".to_owned(),
+            message: "URL must not include username/password components".to_owned(),
         });
     }
+    match parsed.scheme() {
+        "https" => {}
+        "http" => {
+            if !is_loopback_endpoint(&parsed) {
+                return Err(AuthProfileError::InvalidField {
+                    field: "oauth.token_endpoint",
+                    message: "http URL is allowed only for loopback hosts".to_owned(),
+                });
+            }
+        }
+        _ => {
+            return Err(AuthProfileError::InvalidField {
+                field: "oauth.token_endpoint",
+                message: "URL scheme must be https, or http for loopback hosts".to_owned(),
+            });
+        }
+    }
     Ok(parsed.to_string())
+}
+
+fn is_loopback_endpoint(parsed: &Url) -> bool {
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let normalized_host = host.trim_start_matches('[').trim_end_matches(']');
+    if normalized_host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    normalized_host.parse::<IpAddr>().is_ok_and(|address| address.is_loopback())
+}
+
+fn next_profile_updated_at(previous_updated_at_unix_ms: i64, now_unix_ms: i64) -> i64 {
+    previous_updated_at_unix_ms.saturating_add(1).max(now_unix_ms)
 }
 
 fn normalize_scopes(input: Vec<String>) -> Vec<String> {
@@ -1562,11 +1624,11 @@ fn unix_ms_now() -> Result<i64, AuthProfileError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_backoff_ms, load_secret_utf8, persist_secret_utf8, AuthCredential,
-        AuthProfileError, AuthProfileRegistry, AuthProfileScope, AuthProfileSetRequest,
-        AuthProvider, AuthProviderKind, HttpOAuthRefreshAdapter, OAuthRefreshAdapter,
-        OAuthRefreshError, OAuthRefreshOutcomeKind, OAuthRefreshRequest, OAuthRefreshResponse,
-        OAuthRefreshState,
+        compute_backoff_ms, load_secret_utf8, normalize_optional_text, normalize_token_endpoint,
+        persist_secret_utf8, AuthCredential, AuthProfileError, AuthProfileRegistry,
+        AuthProfileScope, AuthProfileSetRequest, AuthProvider, AuthProviderKind,
+        HttpOAuthRefreshAdapter, OAuthRefreshAdapter, OAuthRefreshError, OAuthRefreshOutcomeKind,
+        OAuthRefreshRequest, OAuthRefreshResponse, OAuthRefreshState,
     };
     use palyra_vault::Vault;
     use palyra_vault::{
@@ -1575,7 +1637,10 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::path::Path;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Barrier, Mutex,
+    };
     use std::thread;
     use std::time::Duration;
 
@@ -1592,6 +1657,30 @@ mod tests {
             let mut guard = self.call_count.lock().expect("test mutex should be available");
             *guard = guard.saturating_add(1);
             self.response.clone()
+        }
+    }
+
+    struct RacingRefreshAdapter {
+        barrier: Arc<Barrier>,
+        call_count: Arc<AtomicUsize>,
+    }
+
+    impl OAuthRefreshAdapter for RacingRefreshAdapter {
+        fn refresh_access_token(
+            &self,
+            _request: &OAuthRefreshRequest,
+        ) -> Result<OAuthRefreshResponse, OAuthRefreshError> {
+            let call_index = self.call_count.fetch_add(1, Ordering::SeqCst);
+            self.barrier.wait();
+            if call_index == 0 {
+                return Ok(OAuthRefreshResponse {
+                    access_token: "race-access-token".to_owned(),
+                    refresh_token: None,
+                    expires_in_seconds: Some(60),
+                });
+            }
+            thread::sleep(Duration::from_millis(750));
+            Err(OAuthRefreshError::Transport("simulated transport fault".to_owned()))
         }
     }
 
@@ -1650,6 +1739,24 @@ mod tests {
         (format!("http://{address}/oauth/token"), handle)
     }
 
+    fn spawn_redirect_server(location: String) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
+        let address = listener.local_addr().expect("test server should resolve local addr");
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("test server should accept request");
+            let mut request_buffer = [0_u8; 2048];
+            let _ = stream.read(&mut request_buffer);
+            let response = format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("test server should write redirect response");
+            stream.flush().expect("test server should flush redirect response");
+        });
+        (format!("http://{address}/oauth/token"), handle)
+    }
+
     #[test]
     fn compute_backoff_grows_exponentially_and_caps_per_provider() {
         let provider = AuthProvider::known(AuthProviderKind::Openai);
@@ -1657,6 +1764,81 @@ mod tests {
         assert_eq!(compute_backoff_ms(&provider, 2), 30_000);
         assert_eq!(compute_backoff_ms(&provider, 3), 60_000);
         assert_eq!(compute_backoff_ms(&provider, 20), 300_000);
+    }
+
+    #[test]
+    fn normalize_optional_text_truncates_on_utf8_boundary() {
+        let normalized = normalize_optional_text(Some("A🙂B".to_owned()), 3)
+            .expect("non-empty input should remain present");
+        assert_eq!(normalized, "A");
+    }
+
+    #[test]
+    fn normalize_token_endpoint_rejects_non_loopback_http_hosts() {
+        let error = normalize_token_endpoint("http://example.test/oauth/token")
+            .expect_err("non-loopback http endpoint must be rejected");
+        assert!(matches!(
+            error,
+            AuthProfileError::InvalidField { field, message }
+                if field == "oauth.token_endpoint"
+                    && message.contains("loopback")
+        ));
+    }
+
+    #[test]
+    fn normalize_token_endpoint_allows_loopback_http_hosts() {
+        let ipv4 = normalize_token_endpoint("http://127.0.0.1:8080/oauth/token")
+            .expect("loopback ipv4 endpoint should be accepted");
+        let host = normalize_token_endpoint("http://localhost:8080/oauth/token")
+            .expect("localhost endpoint should be accepted");
+        let ipv6 = normalize_token_endpoint("http://[::1]:8080/oauth/token")
+            .expect("loopback ipv6 endpoint should be accepted");
+        assert_eq!(ipv4, "http://127.0.0.1:8080/oauth/token");
+        assert_eq!(host, "http://localhost:8080/oauth/token");
+        assert_eq!(ipv6, "http://[::1]:8080/oauth/token");
+    }
+
+    #[test]
+    fn normalize_token_endpoint_rejects_userinfo_components() {
+        let username_error = normalize_token_endpoint("https://user@example.test/oauth/token")
+            .expect_err("username in URL should be rejected");
+        let password_error =
+            normalize_token_endpoint("https://user:secret@example.test/oauth/token")
+                .expect_err("username/password in URL should be rejected");
+        assert!(matches!(
+            username_error,
+            AuthProfileError::InvalidField { field, message }
+                if field == "oauth.token_endpoint"
+                    && message.contains("username/password")
+        ));
+        assert!(matches!(
+            password_error,
+            AuthProfileError::InvalidField { field, message }
+                if field == "oauth.token_endpoint"
+                    && message.contains("username/password")
+        ));
+    }
+
+    #[test]
+    fn oauth_refresh_adapter_does_not_follow_redirects() {
+        let (token_endpoint, redirect_thread) =
+            spawn_redirect_server("http://127.0.0.1:0/oauth/token".to_owned());
+        let adapter = HttpOAuthRefreshAdapter::with_timeout(Duration::from_secs(2))
+            .expect("HTTP adapter should initialize");
+        let request = OAuthRefreshRequest {
+            provider: AuthProvider::known(AuthProviderKind::Openai),
+            token_endpoint,
+            client_id: Some("test-client".to_owned()),
+            client_secret: Some("test-secret".to_owned()),
+            refresh_token: "refresh-token".to_owned(),
+            scopes: vec!["chat:read".to_owned()],
+        };
+        let result = adapter.refresh_access_token(&request);
+        assert!(matches!(
+            result,
+            Err(OAuthRefreshError::HttpStatus { status }) if status == 307
+        ));
+        redirect_thread.join().expect("redirect test server thread should exit cleanly");
     }
 
     #[test]
@@ -1751,6 +1933,143 @@ mod tests {
         assert_eq!(access, "access-new");
         assert_eq!(refresh, "refresh-new");
         server_thread.join().expect("test server thread should exit cleanly");
+    }
+
+    #[test]
+    fn refresh_fails_when_client_secret_reference_is_missing() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let identity_root = tempdir.path().join("identity");
+        let vault_root = tempdir.path().join("vault");
+        let registry =
+            AuthProfileRegistry::open(identity_root.as_path()).expect("registry should initialize");
+        let vault = open_test_vault(vault_root.as_path(), identity_root.as_path());
+        persist_secret_utf8(&vault, "global/auth_openai_access", "access-old")
+            .expect("access secret should persist");
+        persist_secret_utf8(&vault, "global/auth_openai_refresh", "refresh-static")
+            .expect("refresh secret should persist");
+
+        let now = 1_730_000_000_000_i64;
+        registry
+            .set_profile(sample_oauth_profile_request(
+                "https://example.test/token".to_owned(),
+                Some(now.saturating_sub(1_000)),
+                OAuthRefreshState::default(),
+            ))
+            .expect("profile should persist");
+
+        let call_count = Arc::new(Mutex::new(0_u64));
+        let adapter = StubRefreshAdapter {
+            response: Ok(OAuthRefreshResponse {
+                access_token: "unused-access".to_owned(),
+                refresh_token: None,
+                expires_in_seconds: Some(120),
+            }),
+            call_count: Arc::clone(&call_count),
+        };
+
+        let outcome = registry
+            .refresh_oauth_profile_with_clock("openai-default", &vault, &adapter, now)
+            .expect("missing client secret should produce persisted failure");
+        assert_eq!(outcome.kind, OAuthRefreshOutcomeKind::Failed);
+        assert_eq!(
+            outcome.reason, "client secret reference is missing or unreadable",
+            "failure reason should explain missing secret reference"
+        );
+        assert_eq!(
+            *call_count.lock().expect("call counter should be available"),
+            0,
+            "adapter must not be called when configured client secret cannot be loaded"
+        );
+    }
+
+    #[test]
+    fn concurrent_refresh_stale_failure_does_not_override_success_state() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let identity_root = tempdir.path().join("identity");
+        let vault_root = tempdir.path().join("vault");
+        let registry = Arc::new(
+            AuthProfileRegistry::open(identity_root.as_path()).expect("registry should initialize"),
+        );
+        let vault = Arc::new(open_test_vault(vault_root.as_path(), identity_root.as_path()));
+        persist_secret_utf8(vault.as_ref(), "global/auth_openai_access", "access-old")
+            .expect("access secret should persist");
+        persist_secret_utf8(vault.as_ref(), "global/auth_openai_refresh", "refresh-old")
+            .expect("refresh secret should persist");
+        persist_secret_utf8(vault.as_ref(), "global/auth_openai_client_secret", "client-secret")
+            .expect("client secret should persist");
+
+        let now = 1_730_000_000_000_i64;
+        registry
+            .set_profile(sample_oauth_profile_request(
+                "https://example.test/token".to_owned(),
+                Some(now.saturating_sub(1_000)),
+                OAuthRefreshState::default(),
+            ))
+            .expect("profile should persist");
+
+        let adapter = Arc::new(RacingRefreshAdapter {
+            barrier: Arc::new(Barrier::new(2)),
+            call_count: Arc::new(AtomicUsize::new(0)),
+        });
+        let registry_left = Arc::clone(&registry);
+        let vault_left = Arc::clone(&vault);
+        let adapter_left = Arc::clone(&adapter);
+        let worker_left = thread::spawn(move || {
+            registry_left.refresh_oauth_profile_with_clock(
+                "openai-default",
+                vault_left.as_ref(),
+                adapter_left.as_ref(),
+                now,
+            )
+        });
+        let registry_right = Arc::clone(&registry);
+        let vault_right = Arc::clone(&vault);
+        let adapter_right = Arc::clone(&adapter);
+        let worker_right = thread::spawn(move || {
+            registry_right.refresh_oauth_profile_with_clock(
+                "openai-default",
+                vault_right.as_ref(),
+                adapter_right.as_ref(),
+                now,
+            )
+        });
+
+        let left_outcome = worker_left
+            .join()
+            .expect("left worker thread should join")
+            .expect("left refresh call should complete");
+        let right_outcome = worker_right
+            .join()
+            .expect("right worker thread should join")
+            .expect("right refresh call should complete");
+        let kinds = [left_outcome.kind, right_outcome.kind];
+        assert!(
+            kinds.contains(&OAuthRefreshOutcomeKind::Succeeded),
+            "one concurrent refresh should succeed"
+        );
+        assert!(
+            kinds.contains(&OAuthRefreshOutcomeKind::SkippedCooldown),
+            "stale failure result should be ignored instead of overwriting success"
+        );
+
+        let profile = registry
+            .get_profile("openai-default")
+            .expect("profile lookup should succeed")
+            .expect("profile should exist");
+        let AuthCredential::Oauth { refresh_state, .. } = profile.credential else {
+            panic!("profile should keep oauth credential type");
+        };
+        assert_eq!(
+            refresh_state.failure_count, 0,
+            "stale concurrent failure must not increment failure count"
+        );
+        assert!(
+            refresh_state.last_error.is_none(),
+            "stale concurrent failure must not write last_error"
+        );
+        let access = load_secret_utf8(vault.as_ref(), "global/auth_openai_access")
+            .expect("access token should be readable");
+        assert_eq!(access, "race-access-token");
     }
 
     #[test]
