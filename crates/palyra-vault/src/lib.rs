@@ -3,9 +3,10 @@ mod envelope;
 mod scope;
 
 #[cfg(windows)]
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::{
     fs,
+    io::Read,
     path::{Path, PathBuf},
     sync::Arc,
     thread,
@@ -30,6 +31,10 @@ const METADATA_VERSION: u32 = 1;
 const METADATA_LOCK_TIMEOUT: Duration = Duration::from_secs(3);
 const METADATA_LOCK_RETRY: Duration = Duration::from_millis(20);
 const METADATA_LOCK_STALE_AGE: Duration = Duration::from_secs(30);
+#[cfg(windows)]
+const WINDOWS_TASKLIST_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(windows)]
+const WINDOWS_TASKLIST_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 const KEY_DERIVATION_SALT: &[u8] = b"palyra.vault.kek.v1";
 const KEY_DERIVATION_INFO: &[u8] = b"envelope:kek";
@@ -171,20 +176,21 @@ impl Vault {
 
         let _lock = self.acquire_metadata_lock()?;
         let mut index = self.read_metadata()?;
+        let existing_entry_index =
+            index.entries.iter().position(|entry| entry.scope == *scope && entry.key == key);
+        let previous_blob = if existing_entry_index.is_some() {
+            Some(self.backend.get_blob(object_id.as_str())?)
+        } else {
+            None
+        };
         self.backend.put_blob(object_id.as_str(), payload.as_slice())?;
 
-        let mut found = None;
-        for entry in &mut index.entries {
-            if entry.scope == *scope && entry.key == key {
-                entry.updated_at_unix_ms = now;
-                entry.value_bytes = value.len();
-                entry.object_id = object_id.clone();
-                found = Some(entry.clone());
-                break;
-            }
-        }
-        let entry = if let Some(existing) = found {
-            existing
+        let entry = if let Some(existing_index) = existing_entry_index {
+            let existing = &mut index.entries[existing_index];
+            existing.updated_at_unix_ms = now;
+            existing.value_bytes = value.len();
+            existing.object_id = object_id.clone();
+            existing.clone()
         } else {
             let created = MetadataEntry {
                 scope: scope.clone(),
@@ -198,7 +204,12 @@ impl Vault {
             created
         };
         if let Err(write_error) = self.write_metadata(&index) {
-            if let Err(rollback_error) = self.backend.delete_blob(object_id.as_str()) {
+            let rollback_result = if let Some(previous_blob) = previous_blob.as_ref() {
+                self.backend.put_blob(object_id.as_str(), previous_blob.as_slice())
+            } else {
+                self.backend.delete_blob(object_id.as_str())
+            };
+            if let Err(rollback_error) = rollback_result {
                 return Err(VaultError::Io(format!(
                     "failed to persist metadata after blob write and failed to rollback blob: write_error={write_error}; rollback_error={rollback_error}"
                 )));
@@ -509,19 +520,65 @@ fn metadata_lock_owner_is_alive(pid: u32) -> bool {
 
 #[cfg(windows)]
 fn metadata_lock_owner_is_alive(pid: u32) -> bool {
-    let output = Command::new("tasklist")
-        .arg("/FI")
-        .arg(format!("PID eq {pid}"))
-        .args(["/FO", "CSV", "/NH"])
-        .output();
+    let output = run_tasklist_for_pid(pid, WINDOWS_TASKLIST_TIMEOUT);
     let Ok(output) = output else {
-        return true;
+        return false;
     };
     if !output.status.success() {
-        return true;
+        return false;
     }
     let pid_marker = format!(",\"{pid}\"");
     String::from_utf8_lossy(&output.stdout).lines().any(|line| line.contains(&pid_marker))
+}
+
+#[cfg(windows)]
+fn run_tasklist_for_pid(pid: u32, timeout: Duration) -> std::io::Result<std::process::Output> {
+    let mut child = Command::new("tasklist")
+        .arg("/FI")
+        .arg(format!("PID eq {pid}"))
+        .args(["/FO", "CSV", "/NH"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    wait_for_child_output_with_timeout(&mut child, timeout)
+}
+
+#[cfg(windows)]
+fn wait_for_child_output_with_timeout(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> std::io::Result<std::process::Output> {
+    let started_at = std::time::Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return collect_child_output(child, status);
+        }
+        if started_at.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("subprocess exceeded timeout of {}ms", timeout.as_millis()),
+            ));
+        }
+        thread::sleep(WINDOWS_TASKLIST_POLL_INTERVAL);
+    }
+}
+
+#[cfg(windows)]
+fn collect_child_output(
+    child: &mut std::process::Child,
+    status: std::process::ExitStatus,
+) -> std::io::Result<std::process::Output> {
+    let mut stdout = Vec::new();
+    if let Some(stdout_pipe) = child.stdout.as_mut() {
+        stdout_pipe.read_to_end(&mut stdout)?;
+    }
+    let mut stderr = Vec::new();
+    if let Some(stderr_pipe) = child.stderr.as_mut() {
+        stderr_pipe.read_to_end(&mut stderr)?;
+    }
+    Ok(std::process::Output { status, stdout, stderr })
 }
 
 #[cfg(all(not(unix), not(windows)))]
@@ -1004,6 +1061,73 @@ mod tests {
             .map_err(|_| VaultError::Io("metadata-failure backend mutex poisoned".to_owned()))?
             .len();
         assert_eq!(object_count, 0, "blob rollback should remove orphaned payload");
+        Ok(())
+    }
+
+    #[test]
+    fn vault_put_secret_restores_previous_blob_when_metadata_write_fails() -> Result<()> {
+        let temp = tempdir()?;
+        let vault_root = temp.path().join("vault");
+        ensure_owner_only_dir(&vault_root)?;
+        let objects = Arc::new(Mutex::new(HashMap::new()));
+        let vault = Vault {
+            root: vault_root.clone(),
+            backend: Box::new(MetadataWriteFailureBackend {
+                root: vault_root,
+                objects: Arc::clone(&objects),
+            }),
+            max_secret_bytes: 1024,
+            kek: derive_kek_from_seed_material(b"palyra.vault.tests.update_rollback")?,
+        };
+        vault.ensure_metadata_exists()?;
+
+        let scope = VaultScope::Principal { principal_id: "user:ops".to_owned() };
+        let key = "api_key";
+        let original_value = b"original-secret";
+        let object_id = super::object_id_for(&scope, key);
+        let original_payload = serde_json::to_vec(&super::seal(
+            original_value,
+            &vault.kek,
+            super::build_aad(&scope, key).as_slice(),
+        )?)
+        .map_err(|error| {
+            VaultError::Io(format!("failed to serialize original envelope payload: {error}"))
+        })?;
+        let expected_restored_payload = original_payload.clone();
+        objects
+            .lock()
+            .map_err(|_| VaultError::Io("metadata-failure backend mutex poisoned".to_owned()))?
+            .insert(object_id.clone(), original_payload);
+        let now = super::current_unix_ms()?;
+        vault.write_metadata(&super::MetadataFile {
+            version: super::METADATA_VERSION,
+            entries: vec![super::MetadataEntry {
+                scope: scope.clone(),
+                key: key.to_owned(),
+                object_id: object_id.clone(),
+                created_at_unix_ms: now,
+                updated_at_unix_ms: now,
+                value_bytes: original_value.len(),
+            }],
+        })?;
+
+        let error = vault
+            .put_secret(&scope, key, b"updated-secret")
+            .expect_err("update should fail when metadata persistence is sabotaged");
+        assert!(
+            matches!(error, VaultError::Io(message) if message.contains("failed to persist metadata after blob write")),
+            "put error should preserve metadata failure context"
+        );
+        let restored = objects
+            .lock()
+            .map_err(|_| VaultError::Io("metadata-failure backend mutex poisoned".to_owned()))?
+            .get(&object_id)
+            .cloned()
+            .ok_or(VaultError::NotFound)?;
+        assert_eq!(
+            restored, expected_restored_payload,
+            "update rollback should restore previous encrypted blob payload"
+        );
         Ok(())
     }
 

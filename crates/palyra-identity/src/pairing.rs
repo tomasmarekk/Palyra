@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
-    io::Write,
+    io::{Read, Write},
     net::IpAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
@@ -819,19 +819,65 @@ fn process_is_alive(pid: u32) -> bool {
 
 #[cfg(windows)]
 fn process_is_alive(pid: u32) -> bool {
-    let output = std::process::Command::new("tasklist")
-        .arg("/FI")
-        .arg(format!("PID eq {pid}"))
-        .args(["/FO", "CSV", "/NH"])
-        .output();
+    let output = run_tasklist_for_pid(pid, Duration::from_secs(2));
     let Ok(output) = output else {
-        return true;
+        return false;
     };
     if !output.status.success() {
-        return true;
+        return false;
     }
     let pid_marker = format!(",\"{pid}\"");
     String::from_utf8_lossy(&output.stdout).lines().any(|line| line.contains(&pid_marker))
+}
+
+#[cfg(windows)]
+fn run_tasklist_for_pid(pid: u32, timeout: Duration) -> std::io::Result<std::process::Output> {
+    let mut child = std::process::Command::new("tasklist")
+        .arg("/FI")
+        .arg(format!("PID eq {pid}"))
+        .args(["/FO", "CSV", "/NH"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    wait_for_child_output_with_timeout(&mut child, timeout)
+}
+
+#[cfg(windows)]
+fn wait_for_child_output_with_timeout(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> std::io::Result<std::process::Output> {
+    let started_at = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return collect_child_output(child, status);
+        }
+        if started_at.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("subprocess exceeded timeout of {}ms", timeout.as_millis()),
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(windows)]
+fn collect_child_output(
+    child: &mut std::process::Child,
+    status: std::process::ExitStatus,
+) -> std::io::Result<std::process::Output> {
+    let mut stdout = Vec::new();
+    if let Some(stdout_pipe) = child.stdout.as_mut() {
+        stdout_pipe.read_to_end(&mut stdout)?;
+    }
+    let mut stderr = Vec::new();
+    if let Some(stderr_pipe) = child.stderr.as_mut() {
+        stderr_pipe.read_to_end(&mut stderr)?;
+    }
+    Ok(std::process::Output { status, stdout, stderr })
 }
 
 #[cfg(all(not(unix), not(windows)))]
