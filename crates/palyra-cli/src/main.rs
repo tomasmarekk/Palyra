@@ -203,6 +203,11 @@ fn run_doctor(strict: bool) -> Result<()> {
         },
         DoctorCheck { key: "repo_scaffold_ok", ok: required_directories_ok(), required: true },
         DoctorCheck {
+            key: "process_runner_tier_b_egress_allowlists_preflight_only",
+            ok: process_runner_tier_b_allowlist_config_ok(),
+            required: false,
+        },
+        DoctorCheck {
             key: "gitleaks_installed",
             ok: command_available("gitleaks", &["--version"]),
             required: false,
@@ -6792,6 +6797,66 @@ fn required_directories_ok() -> bool {
     .all(|path| Path::new(path).exists())
 }
 
+fn process_runner_tier_b_allowlist_config_ok() -> bool {
+    process_runner_tier_b_allowlist_config_ok_impl().unwrap_or(true)
+}
+
+fn process_runner_tier_b_allowlist_config_ok_impl() -> Result<bool> {
+    let Some(config_path) = doctor_config_path() else {
+        return Ok(true);
+    };
+    if !config_path.exists() {
+        return Ok(true);
+    }
+
+    let content = fs::read_to_string(config_path.as_path())
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    let (document, _) = parse_document_with_migration(content.as_str())
+        .context("failed to migrate doctor config document")?;
+    let migrated =
+        toml::to_string(&document).context("failed to serialize doctor config document")?;
+    let parsed: RootFileConfig =
+        toml::from_str(migrated.as_str()).context("invalid doctor daemon config schema")?;
+    Ok(process_runner_tier_b_allowlist_preflight_only(&parsed))
+}
+
+fn doctor_config_path() -> Option<PathBuf> {
+    match env::var("PALYRA_CONFIG") {
+        Ok(explicit) => {
+            let trimmed = explicit.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            parse_config_path(trimmed).ok()
+        }
+        Err(env::VarError::NotPresent) => find_default_config_path().map(PathBuf::from),
+        Err(env::VarError::NotUnicode(_)) => None,
+    }
+}
+
+fn process_runner_tier_b_allowlist_preflight_only(parsed: &RootFileConfig) -> bool {
+    let Some(process_runner) =
+        parsed.tool_call.as_ref().and_then(|tool_call| tool_call.process_runner.as_ref())
+    else {
+        return true;
+    };
+    let tier = process_runner.tier.as_deref().unwrap_or("b").trim().to_ascii_lowercase();
+    if tier != "b" && tier != "tier_b" {
+        return true;
+    }
+    let has_host_allowlists = process_runner
+        .allowed_egress_hosts
+        .as_ref()
+        .map(|hosts| !hosts.is_empty())
+        .unwrap_or(false)
+        || process_runner
+            .allowed_dns_suffixes
+            .as_ref()
+            .map(|suffixes| !suffixes.is_empty())
+            .unwrap_or(false);
+    !has_host_allowlists
+}
+
 fn command_available(command: &str, args: &[&str]) -> bool {
     Command::new(command).args(args).output().map(|output| output.status.success()).unwrap_or(false)
 }
@@ -6941,12 +7006,14 @@ mod cli_v1_tests {
         fetch_remote_registry_entries_with_fetcher, is_retryable_grpc_error,
         normalize_client_socket, normalize_installed_skills_index, normalize_prompt_secret_value,
         normalize_relative_registry_path, parse_acp_shim_input_line,
-        parse_and_verify_signed_remote_registry_index, registry_key_id_for, sha256_hex,
+        parse_and_verify_signed_remote_registry_index,
+        process_runner_tier_b_allowlist_preflight_only, registry_key_id_for, sha256_hex,
         trust_store_integrity_vault_key, validate_registry_index,
         verify_or_initialize_trust_store_integrity, write_file_atomically, InstalledSkillRecord,
-        InstalledSkillSource, InstalledSkillsIndex, RegistrySignature, SignedSkillRegistryIndex,
-        SkillRegistryEntry, SkillRegistryIndex, REGISTRY_INDEX_SCHEMA_VERSION,
-        REGISTRY_SIGNATURE_ALGORITHM, REGISTRY_SIGNED_INDEX_SCHEMA_VERSION,
+        InstalledSkillSource, InstalledSkillsIndex, RegistrySignature, RootFileConfig,
+        SignedSkillRegistryIndex, SkillRegistryEntry, SkillRegistryIndex,
+        REGISTRY_INDEX_SCHEMA_VERSION, REGISTRY_SIGNATURE_ALGORITHM,
+        REGISTRY_SIGNED_INDEX_SCHEMA_VERSION,
     };
     use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
     use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
@@ -7450,6 +7517,38 @@ mod cli_v1_tests {
         assert_eq!(normalize_prompt_secret_value("secret\r\n"), "secret");
         assert_eq!(normalize_prompt_secret_value("secret\n"), "secret");
         assert_eq!(normalize_prompt_secret_value("sec ret"), "sec ret");
+    }
+
+    #[test]
+    fn process_runner_tier_b_allowlists_report_preflight_only_warning() {
+        let parsed: RootFileConfig = toml::from_str(
+            r#"
+[tool_call.process_runner]
+tier = "b"
+allowed_egress_hosts = ["api.example.com"]
+"#,
+        )
+        .expect("fixture config should parse");
+        assert!(
+            !process_runner_tier_b_allowlist_preflight_only(&parsed),
+            "tier-b with host allowlists should report preflight-only warning"
+        );
+    }
+
+    #[test]
+    fn process_runner_tier_c_allowlists_do_not_report_preflight_only_warning() {
+        let parsed: RootFileConfig = toml::from_str(
+            r#"
+[tool_call.process_runner]
+tier = "c"
+allowed_egress_hosts = ["api.example.com"]
+"#,
+        )
+        .expect("fixture config should parse");
+        assert!(
+            process_runner_tier_b_allowlist_preflight_only(&parsed),
+            "tier-c policy should not trigger tier-b preflight-only warning"
+        );
     }
 
     #[test]
