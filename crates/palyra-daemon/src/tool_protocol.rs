@@ -490,6 +490,14 @@ async fn run_allowlisted_tool(
                 sandbox_enforcement: "none".to_owned(),
             },
         },
+        "palyra.memory.search" => ToolExecutionRawResult {
+            success: false,
+            output_json: b"{}".to_vec(),
+            error: "palyra.memory.search requires gateway memory runtime context".to_owned(),
+            timed_out: false,
+            executor: "gateway_runtime".to_owned(),
+            sandbox_enforcement: "none".to_owned(),
+        },
         "palyra.process.run" => execute_process_runner_tool(config, input_json).await,
         "palyra.fs.apply_patch" => ToolExecutionRawResult {
             success: false,
@@ -1031,6 +1039,33 @@ mod tests {
             serde_json::json!({ "echo": "hello" })
         );
         assert!(!outcome.attestation.execution_sha256.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn execute_tool_call_memory_search_requires_gateway_runtime_context() {
+        let config = ToolCallConfig {
+            allowed_tools: vec!["palyra.memory.search".to_owned()],
+            max_calls_per_run: 1,
+            execution_timeout_ms: 250,
+            process_runner: default_process_runner_policy(),
+            wasm_runtime: default_wasm_runtime_policy(),
+        };
+        let outcome = execute_tool_call(
+            &config,
+            "01ARZ3NDEKTSV4RRFFQ69G5FA9",
+            "palyra.memory.search",
+            br#"{"query":"incident summary"}"#,
+        )
+        .await;
+
+        assert!(!outcome.success, "generic tool executor should not run gateway memory search");
+        assert!(
+            outcome.error.contains("requires gateway memory runtime context"),
+            "delegated executor error should be explicit: {}",
+            outcome.error
+        );
+        assert_eq!(outcome.attestation.executor, "gateway_runtime");
+        assert!(!outcome.attestation.timed_out, "delegation error must not be timeout");
     }
 
     #[tokio::test(flavor = "multi_thread")]

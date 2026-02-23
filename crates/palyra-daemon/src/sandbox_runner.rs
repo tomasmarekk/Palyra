@@ -240,12 +240,14 @@ pub fn run_constrained_process(
         });
     }
     if !capture.exit_status.success() {
+        let stderr_bytes = capture.stderr.bytes.len();
         return Err(SandboxProcessRunError {
             kind: SandboxProcessRunErrorKind::RuntimeFailure,
             message: format!(
-                "sandbox process exited unsuccessfully (code={}) stderr={}",
+                "sandbox process exited unsuccessfully (code={}, stderr_bytes={}, stderr_truncated={})",
                 capture.exit_status.code().unwrap_or(-1),
-                String::from_utf8_lossy(&capture.stderr.bytes)
+                stderr_bytes,
+                capture.stderr.truncated
             ),
         });
     }
@@ -1478,6 +1480,37 @@ mod tests {
         let error = run_constrained_process(&policy, input, Duration::from_millis(1_000))
             .expect_err("combined stdout+stderr output should hit global quota");
         assert_eq!(error.kind, SandboxProcessRunErrorKind::QuotaExceeded);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_constrained_process_runtime_failure_redacts_child_stderr_payload() {
+        if Command::new("cat").arg("--version").output().is_err() {
+            return;
+        }
+
+        let workspace = std::env::current_dir().expect("workspace current_dir should resolve");
+        let policy = sandbox_policy_with_allowed_executables(workspace, vec!["cat".to_owned()]);
+        let secret_marker = "token=abc123";
+        let input = serde_json::to_vec(&serde_json::json!({
+            "command": "cat",
+            "args": [secret_marker],
+        }))
+        .expect("input should serialize");
+
+        let error =
+            run_constrained_process(&policy, input.as_slice(), Duration::from_millis(1_000))
+                .expect_err("missing file should report runtime failure");
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::RuntimeFailure);
+        assert!(
+            error.message.contains("code=") && error.message.contains("stderr_bytes="),
+            "runtime failure should remain diagnosable without raw stderr: {}",
+            error.message
+        );
+        assert!(
+            !error.message.contains(secret_marker),
+            "runtime failure message must not leak raw stderr payload"
+        );
     }
 
     #[test]
