@@ -213,6 +213,7 @@ impl ChannelRouter {
             });
         }
         let channel = normalized_channel.expect("checked above");
+        self.dequeue_retry(channel.as_str(), message.envelope_id.as_str());
         let rule = self.resolve_rule(channel.as_str());
         if !rule.enabled {
             return RouteOutcome::Rejected(RouteRejection {
@@ -311,11 +312,20 @@ impl ChannelRouter {
             Err(queue_depth) => {
                 if queue_depth <= self.config.max_retry_queue_depth_per_channel {
                     let reason = "backpressure_queue_full".to_owned();
-                    self.enqueue_retry(message, channel.as_str(), reason.clone());
-                    return RouteOutcome::Queued(RouteQueued {
-                        reason,
-                        retry_after_ms: self.config.retry_backoff_ms,
-                        queue_depth,
+                    if self.enqueue_retry(message, channel.as_str(), reason.clone()) {
+                        return RouteOutcome::Queued(RouteQueued {
+                            reason,
+                            retry_after_ms: self.config.retry_backoff_ms,
+                            queue_depth,
+                        });
+                    }
+                    return RouteOutcome::Rejected(RouteRejection {
+                        reason: "backpressure_retry_enqueue_failed".to_owned(),
+                        quarantined: self.quarantine_message(
+                            message,
+                            "backpressure_retry_enqueue_failed",
+                            message.retry_attempt,
+                        ),
                     });
                 }
                 return RouteOutcome::Rejected(RouteRejection {
@@ -383,8 +393,16 @@ impl ChannelRouter {
             );
             return RetryDisposition::Quarantined;
         }
-        self.enqueue_retry(message, message.channel.as_str(), reason.to_owned());
-        RetryDisposition::Queued
+        if self.enqueue_retry(message, message.channel.as_str(), reason.to_owned()) {
+            RetryDisposition::Queued
+        } else {
+            let _ = self.quarantine_message(
+                message,
+                format!("retry_enqueue_failed:{reason}").as_str(),
+                message.retry_attempt,
+            );
+            RetryDisposition::Quarantined
+        }
     }
 
     #[must_use]
@@ -465,13 +483,22 @@ impl ChannelRouter {
         })
     }
 
-    fn enqueue_retry(&self, message: &InboundMessage, channel: &str, reason: String) {
+    fn enqueue_retry(&self, message: &InboundMessage, channel: &str, reason: String) -> bool {
         let Ok(mut guard) = self.state.lock() else {
-            return;
+            return false;
         };
         let state = guard.entry(channel.to_owned()).or_default();
+        if let Some(existing) =
+            state.retry_queue.iter_mut().find(|entry| entry.envelope_id == message.envelope_id)
+        {
+            existing.retry_attempt = message.retry_attempt.saturating_add(1);
+            existing.reason = reason;
+            existing.retry_after_ms = self.config.retry_backoff_ms;
+            existing.queued_at_unix_ms = current_unix_ms();
+            return true;
+        }
         if state.retry_queue.len() >= self.config.max_retry_queue_depth_per_channel {
-            return;
+            return false;
         }
         state.retry_queue.push_back(RetryQueueEntry {
             envelope_id: message.envelope_id.clone(),
@@ -481,6 +508,17 @@ impl ChannelRouter {
             retry_after_ms: self.config.retry_backoff_ms,
             queued_at_unix_ms: current_unix_ms(),
         });
+        true
+    }
+
+    fn dequeue_retry(&self, channel: &str, envelope_id: &str) {
+        let Ok(mut guard) = self.state.lock() else {
+            return;
+        };
+        let Some(state) = guard.get_mut(channel) else {
+            return;
+        };
+        state.retry_queue.retain(|entry| entry.envelope_id != envelope_id);
     }
 
     fn quarantine_message(
@@ -556,7 +594,17 @@ fn has_mention_match(text: &str, mention_patterns: &[String]) -> bool {
         if normalized_pattern == "*" {
             return !normalized_text.trim().is_empty();
         }
-        normalized_text.contains(normalized_pattern.as_str())
+        contains_boundary_delimited_pattern(normalized_text.as_str(), normalized_pattern.as_str())
+    })
+}
+
+fn contains_boundary_delimited_pattern(text: &str, pattern: &str) -> bool {
+    text.match_indices(pattern).any(|(start, _)| {
+        let left_boundary =
+            start == 0 || !text.as_bytes()[start.saturating_sub(1)].is_ascii_alphanumeric();
+        let end = start.saturating_add(pattern.len());
+        let right_boundary = end >= text.len() || !text.as_bytes()[end].is_ascii_alphanumeric();
+        left_boundary && right_boundary
     })
 }
 
@@ -657,6 +705,12 @@ mod tests {
         }
     }
 
+    fn inbound_with_id(envelope_id: &str, text: &str) -> InboundMessage {
+        let mut message = inbound(text);
+        message.envelope_id = envelope_id.to_owned();
+        message
+    }
+
     #[test]
     fn mention_match_is_required_when_dm_policy_is_disabled() {
         let router = ChannelRouter::new(baseline_config());
@@ -682,6 +736,17 @@ mod tests {
         assert_eq!(routed.plan.session_key, "channel:slack:conversation:c01team");
         assert_eq!(routed.plan.response_prefix.as_deref(), Some("[bot] "));
         routed.lease.release();
+    }
+
+    #[test]
+    fn mention_substring_inside_email_does_not_trigger_route() {
+        let router = ChannelRouter::new(baseline_config());
+        let outcome = router.begin_route(&inbound("contact alpha@palyra.io for updates"));
+        assert!(matches!(
+            outcome,
+            RouteOutcome::Rejected(ref rejection)
+                if rejection.reason == "no_matching_mention_or_dm_policy"
+        ));
     }
 
     #[test]
@@ -714,16 +779,19 @@ mod tests {
         let mut config = baseline_config();
         config.max_retry_queue_depth_per_channel = 1;
         let router = ChannelRouter::new(config);
-        let first = router.begin_route(&inbound("@palyra first"));
+        let first =
+            router.begin_route(&inbound_with_id("01ARZ3NDEKTSV4RRFFQ69G5FAC", "@palyra first"));
         let RouteOutcome::Routed(first_routed) = first else {
             panic!("first route should acquire sole concurrency slot");
         };
 
-        let second = router.begin_route(&inbound("@palyra second"));
+        let second =
+            router.begin_route(&inbound_with_id("01ARZ3NDEKTSV4RRFFQ69G5FAD", "@palyra second"));
         assert!(matches!(second, RouteOutcome::Queued(_)));
         assert_eq!(router.channel_queue_depth("slack"), 1);
 
-        let third = router.begin_route(&inbound("@palyra third"));
+        let third =
+            router.begin_route(&inbound_with_id("01ARZ3NDEKTSV4RRFFQ69G5FAE", "@palyra third"));
         assert!(matches!(
             third,
             RouteOutcome::Rejected(ref rejection)
@@ -745,6 +813,48 @@ mod tests {
         let exhausted = InboundMessage { retry_attempt: 2, ..message };
         let disposition = router.record_processing_failure(&exhausted, "provider_error");
         assert!(matches!(disposition, RetryDisposition::Quarantined));
+        assert_eq!(router.quarantine_len("slack"), 1);
+    }
+
+    #[test]
+    fn retry_queue_entry_is_drained_when_same_message_routes_again() {
+        let router = ChannelRouter::new(baseline_config());
+        let message = inbound("@palyra retry me");
+        let queued = router.record_processing_failure(&message, "provider_error");
+        assert!(matches!(queued, RetryDisposition::Queued));
+        assert_eq!(router.channel_queue_depth("slack"), 1);
+
+        let outcome = router.begin_route(&message);
+        let RouteOutcome::Routed(routed) = outcome else {
+            panic!("retried message should route");
+        };
+        assert_eq!(
+            router.channel_queue_depth("slack"),
+            0,
+            "retry queue must be drained when message is retried"
+        );
+        routed.lease.release();
+    }
+
+    #[test]
+    fn processing_failure_quarantines_when_retry_queue_is_full() {
+        let mut config = baseline_config();
+        config.max_retry_queue_depth_per_channel = 1;
+        let router = ChannelRouter::new(config);
+        let first = inbound_with_id("01ARZ3NDEKTSV4RRFFQ69G5FAA", "@palyra retry one");
+        let second = inbound_with_id("01ARZ3NDEKTSV4RRFFQ69G5FAB", "@palyra retry two");
+
+        let first_result = router.record_processing_failure(&first, "provider_error");
+        assert!(matches!(first_result, RetryDisposition::Queued));
+        assert_eq!(router.channel_queue_depth("slack"), 1);
+
+        let second_result = router.record_processing_failure(&second, "provider_error");
+        assert!(matches!(second_result, RetryDisposition::Quarantined));
+        assert_eq!(
+            router.channel_queue_depth("slack"),
+            1,
+            "queue depth should stay capped when additional retry cannot be enqueued"
+        );
         assert_eq!(router.quarantine_len("slack"), 1);
     }
 }
