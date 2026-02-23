@@ -1386,17 +1386,18 @@ mod tests {
         fs::create_dir_all(&outside).expect("outside directory should exist");
 
         let patch = "*** Begin Patch\n*** Add File: nested/new.txt\n+inside\n*** End Patch\n";
-        let operations = parse_patch_document(patch).expect("patch should parse");
-        let canonical_roots = canonicalize_workspace_roots(std::slice::from_ref(&workspace))
+        let operations = super::parse_patch_document(patch).expect("patch should parse");
+        let canonical_roots = super::canonicalize_workspace_roots(std::slice::from_ref(&workspace))
             .expect("roots should canonicalize");
         let limits = default_limits();
-        let plan = build_patch_plan(operations.as_slice(), canonical_roots.as_slice(), &limits)
-            .expect("plan should be created");
+        let plan =
+            super::build_patch_plan(operations.as_slice(), canonical_roots.as_slice(), &limits)
+                .expect("plan should be created");
 
         fs::remove_dir(workspace.join("nested")).expect("nested directory should be removed");
         symlink(&outside, workspace.join("nested")).expect("nested symlink should be created");
 
-        let execution = execute_patch_plan(plan.actions.as_slice(), &limits)
+        let execution = super::execute_patch_plan(plan.actions.as_slice(), &limits)
             .expect_err("symlink swap must be rejected");
         assert!(matches!(execution.error, WorkspacePatchError::PathOutsideWorkspace { .. }));
         assert!(
@@ -1422,18 +1423,19 @@ mod tests {
         fs::write(outside.join("target.txt"), "outside\n").expect("outside file should exist");
 
         let patch = "*** Begin Patch\n*** Delete File: nested/target.txt\n*** End Patch\n";
-        let operations = parse_patch_document(patch).expect("patch should parse");
-        let canonical_roots = canonicalize_workspace_roots(std::slice::from_ref(&workspace))
+        let operations = super::parse_patch_document(patch).expect("patch should parse");
+        let canonical_roots = super::canonicalize_workspace_roots(std::slice::from_ref(&workspace))
             .expect("roots should canonicalize");
         let limits = default_limits();
-        let plan = build_patch_plan(operations.as_slice(), canonical_roots.as_slice(), &limits)
-            .expect("plan should be created");
+        let plan =
+            super::build_patch_plan(operations.as_slice(), canonical_roots.as_slice(), &limits)
+                .expect("plan should be created");
 
         fs::rename(workspace.join("nested"), workspace.join("nested_real"))
             .expect("nested directory should be moved");
         symlink(&outside, workspace.join("nested")).expect("nested symlink should be created");
 
-        let execution = execute_patch_plan(plan.actions.as_slice(), &limits)
+        let execution = super::execute_patch_plan(plan.actions.as_slice(), &limits)
             .expect_err("symlink swap must be rejected");
         assert!(matches!(execution.error, WorkspacePatchError::PathOutsideWorkspace { .. }));
         assert_eq!(
