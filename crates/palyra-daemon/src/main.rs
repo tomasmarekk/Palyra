@@ -261,6 +261,7 @@ async fn main() -> Result<()> {
                 execution_timeout_ms: loaded.tool_call.execution_timeout_ms,
                 process_runner: sandbox_runner::SandboxProcessRunnerPolicy {
                     enabled: loaded.tool_call.process_runner.enabled,
+                    tier: loaded.tool_call.process_runner.tier,
                     workspace_root: loaded.tool_call.process_runner.workspace_root.clone(),
                     allowed_executables: loaded
                         .tool_call
@@ -382,6 +383,7 @@ async fn main() -> Result<()> {
         tool_call_max_calls_per_run = loaded.tool_call.max_calls_per_run,
         tool_call_execution_timeout_ms = loaded.tool_call.execution_timeout_ms,
         tool_call_process_runner_enabled = loaded.tool_call.process_runner.enabled,
+        tool_call_process_runner_tier = loaded.tool_call.process_runner.tier.as_str(),
         tool_call_process_runner_workspace_root = %loaded.tool_call.process_runner.workspace_root.display(),
         tool_call_process_runner_allowed_executables = ?loaded.tool_call.process_runner.allowed_executables,
         tool_call_process_runner_allow_interpreters = loaded.tool_call.process_runner.allow_interpreters,

@@ -21,6 +21,7 @@ palyra-identity = { version = "0.1.0", path = "../palyra-identity" }
 palyra-policy = { version = "0.1.0", path = "../palyra-policy" }
 palyra-plugins-runtime = { version = "0.1.0", path = "../palyra-plugins/runtime" }
 palyra-plugins-sdk = { version = "0.1.0", path = "../palyra-plugins/sdk" }
+palyra-sandbox = { version = "0.1.0", path = "../palyra-sandbox" }
 palyra-skills = { version = "0.1.0", path = "../palyra-skills" }
 palyra-vault = { version = "0.1.0", path = "../palyra-vault" }
 prost.workspace = true

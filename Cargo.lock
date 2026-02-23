@@ -2403,6 +2403,7 @@ dependencies = [
  "palyra-plugins-runtime",
  "palyra-plugins-sdk",
  "palyra-policy",
+ "palyra-sandbox",
  "palyra-skills",
  "palyra-vault",
  "prost",
@@ -2472,6 +2473,13 @@ dependencies = [
  "cedar-policy",
  "criterion",
  "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "palyra-sandbox"
+version = "0.1.0"
+dependencies = [
  "thiserror 2.0.18",
 ]
 

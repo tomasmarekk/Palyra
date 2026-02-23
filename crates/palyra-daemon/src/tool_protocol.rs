@@ -11,8 +11,8 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::sandbox_runner::{
-    run_constrained_process, EgressEnforcementMode, SandboxProcessRunErrorKind,
-    SandboxProcessRunnerPolicy,
+    process_runner_executor_name, run_constrained_process, EgressEnforcementMode,
+    SandboxProcessRunErrorKind, SandboxProcessRunnerPolicy,
 };
 use crate::wasm_plugin_runner::{run_wasm_plugin, WasmPluginRunErrorKind, WasmPluginRunnerPolicy};
 
@@ -99,6 +99,7 @@ pub struct ToolCallPolicySnapshot {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ProcessRunnerPolicySnapshot {
     pub enabled: bool,
+    pub tier: String,
     pub workspace_root: String,
     pub allowed_executables: Vec<String>,
     pub allow_interpreters: bool,
@@ -151,6 +152,7 @@ pub fn tool_policy_snapshot(config: &ToolCallConfig) -> ToolCallPolicySnapshot {
         execution_timeout_ms: config.execution_timeout_ms,
         process_runner: ProcessRunnerPolicySnapshot {
             enabled: config.process_runner.enabled,
+            tier: config.process_runner.tier.as_str().to_owned(),
             workspace_root: config.process_runner.workspace_root.to_string_lossy().into_owned(),
             allowed_executables: config.process_runner.allowed_executables.clone(),
             allow_interpreters: config.process_runner.allow_interpreters,
@@ -393,7 +395,7 @@ pub async fn execute_tool_call(
                 output_json: b"{}".to_vec(),
                 error: format!("tool execution timed out after {}ms", config.execution_timeout_ms),
                 timed_out: true,
-                executor: tool_executor_name(tool_name).to_owned(),
+                executor: tool_executor_name(config, tool_name),
                 sandbox_enforcement: sandbox_enforcement_for_tool(config, tool_name),
             },
         }
@@ -521,17 +523,17 @@ fn is_runtime_supported_tool(tool_name: &str) -> bool {
     )
 }
 
-fn tool_executor_name(tool_name: &str) -> &'static str {
+fn tool_executor_name(config: &ToolCallConfig, tool_name: &str) -> String {
     if tool_name == "palyra.process.run" {
-        "sandbox_tier_b"
+        process_runner_executor_name(&config.process_runner)
     } else if tool_name == "palyra.fs.apply_patch" {
-        "workspace_patch"
+        "workspace_patch".to_owned()
     } else if tool_name == "palyra.memory.search" {
-        "gateway_runtime"
+        "gateway_runtime".to_owned()
     } else if tool_name == "palyra.plugin.run" {
-        "sandbox_tier_a"
+        "sandbox_tier_a".to_owned()
     } else {
-        "builtin"
+        "builtin".to_owned()
     }
 }
 
@@ -574,7 +576,7 @@ fn reject_oversized_tool_input(
             input_json.len()
         ),
         timed_out: false,
-        executor: tool_executor_name(tool_name).to_owned(),
+        executor: tool_executor_name(config, tool_name),
         sandbox_enforcement: sandbox_enforcement_for_tool(config, tool_name),
     })
 }
@@ -584,6 +586,7 @@ async fn execute_process_runner_tool(
     input_json: &[u8],
 ) -> ToolExecutionRawResult {
     let policy = config.process_runner.clone();
+    let executor = process_runner_executor_name(&policy);
     if matches!(policy.egress_enforcement_mode, EgressEnforcementMode::Preflight) {
         warn!(
             allowed_egress_hosts = ?policy.allowed_egress_hosts,
@@ -604,7 +607,7 @@ async fn execute_process_runner_tool(
             output_json: success.output_json,
             error: String::new(),
             timed_out: false,
-            executor: "sandbox_tier_b".to_owned(),
+            executor: executor.clone(),
             sandbox_enforcement: sandbox_enforcement.clone(),
         },
         Ok(Err(error)) => {
@@ -619,7 +622,7 @@ async fn execute_process_runner_tool(
                 output_json: b"{}".to_vec(),
                 error: error.message,
                 timed_out: matches!(error.kind, SandboxProcessRunErrorKind::TimedOut),
-                executor: "sandbox_tier_b".to_owned(),
+                executor: executor.clone(),
                 sandbox_enforcement: sandbox_enforcement.clone(),
             }
         }
@@ -628,7 +631,7 @@ async fn execute_process_runner_tool(
             output_json: b"{}".to_vec(),
             error: format!("sandbox process runner worker failed: {join_error}"),
             timed_out: false,
-            executor: "sandbox_tier_b".to_owned(),
+            executor,
             sandbox_enforcement,
         },
     }
@@ -766,12 +769,15 @@ mod tests {
         decide_tool_call, denied_execution_outcome, execute_tool_call, tool_policy_snapshot,
         tool_requires_approval, ToolCallConfig, ToolRequestContext,
     };
-    use crate::sandbox_runner::{EgressEnforcementMode, SandboxProcessRunnerPolicy};
+    use crate::sandbox_runner::{
+        EgressEnforcementMode, SandboxProcessRunnerPolicy, SandboxProcessRunnerTier,
+    };
     use crate::wasm_plugin_runner::WasmPluginRunnerPolicy;
 
     fn default_process_runner_policy() -> SandboxProcessRunnerPolicy {
         SandboxProcessRunnerPolicy {
             enabled: false,
+            tier: SandboxProcessRunnerTier::B,
             workspace_root: std::env::current_dir().unwrap_or_else(|_| ".".into()),
             allowed_executables: Vec::new(),
             allow_interpreters: false,
@@ -1085,6 +1091,47 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn execute_tool_call_uses_tier_c_executor_label_for_process_runner() {
+        let config = ToolCallConfig {
+            allowed_tools: vec!["palyra.process.run".to_owned()],
+            max_calls_per_run: 1,
+            execution_timeout_ms: 250,
+            process_runner: SandboxProcessRunnerPolicy {
+                enabled: true,
+                tier: SandboxProcessRunnerTier::C,
+                workspace_root: std::env::current_dir().unwrap_or_else(|_| ".".into()),
+                allowed_executables: vec!["uname".to_owned()],
+                allow_interpreters: false,
+                egress_enforcement_mode: EgressEnforcementMode::Strict,
+                allowed_egress_hosts: Vec::new(),
+                allowed_dns_suffixes: Vec::new(),
+                cpu_time_limit_ms: 2_000,
+                memory_limit_bytes: 128 * 1024 * 1024,
+                max_output_bytes: 64 * 1024,
+            },
+            wasm_runtime: default_wasm_runtime_policy(),
+        };
+        let input = serde_json::to_vec(&serde_json::json!({
+            "command": "uname",
+            "args": [],
+            "padding": "a".repeat(super::MAX_PROCESS_RUNNER_TOOL_INPUT_BYTES),
+        }))
+        .expect("oversized payload should serialize");
+        let outcome = execute_tool_call(
+            &config,
+            "01ARZ3NDEKTSV4RRFFQ69G5FA3",
+            "palyra.process.run",
+            input.as_slice(),
+        )
+        .await;
+        assert!(!outcome.success, "oversized tool input must fail");
+        assert!(
+            outcome.attestation.executor.starts_with("sandbox_tier_c_"),
+            "tier-c process runner should expose tier-c executor label"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn execute_tool_call_enforces_timeout() {
         let config = ToolCallConfig {
             allowed_tools: vec!["palyra.sleep".to_owned()],
@@ -1116,6 +1163,7 @@ mod tests {
             execution_timeout_ms: 2_000,
             process_runner: SandboxProcessRunnerPolicy {
                 enabled: true,
+                tier: SandboxProcessRunnerTier::B,
                 workspace_root: std::env::current_dir().expect("current_dir should resolve"),
                 allowed_executables: vec!["uname".to_owned()],
                 allow_interpreters: false,
@@ -1151,6 +1199,7 @@ mod tests {
             execution_timeout_ms: 2_000,
             process_runner: SandboxProcessRunnerPolicy {
                 enabled: true,
+                tier: SandboxProcessRunnerTier::B,
                 workspace_root: std::env::current_dir().expect("current_dir should resolve"),
                 allowed_executables: vec!["uname".to_owned()],
                 allow_interpreters: false,

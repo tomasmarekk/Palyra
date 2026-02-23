@@ -3,6 +3,7 @@ members = [
   "crates/palyra-common",
   "crates/palyra-auth",
   "crates/palyra-daemon",
+  "crates/palyra-sandbox",
   "crates/palyra-cli",
   "crates/palyra-browserd",
   "crates/palyra-policy",

@@ -180,6 +180,7 @@ const APPROVAL_REQUEST_SUMMARY_MAX_BYTES: usize = 1024;
 const TOOL_APPROVAL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 const SKILL_EXECUTION_DENY_REASON_PREFIX: &str = "skill execution blocked by security gate";
 const WORKSPACE_PATCH_TOOL_NAME: &str = "palyra.fs.apply_patch";
+const PROCESS_RUNNER_TOOL_NAME: &str = "palyra.process.run";
 
 #[derive(Debug, Clone)]
 pub struct GatewayRuntimeConfigSnapshot {
@@ -323,6 +324,15 @@ struct RuntimeCounters {
     tool_execution_failures: AtomicU64,
     tool_execution_timeouts: AtomicU64,
     tool_attestations_emitted: AtomicU64,
+    sandbox_launches: AtomicU64,
+    sandbox_policy_denies: AtomicU64,
+    sandbox_escape_attempts_blocked_workspace: AtomicU64,
+    sandbox_escape_attempts_blocked_egress: AtomicU64,
+    sandbox_escape_attempts_blocked_executable: AtomicU64,
+    sandbox_backend_selected_tier_b: AtomicU64,
+    sandbox_backend_selected_tier_c_linux_bubblewrap: AtomicU64,
+    sandbox_backend_selected_tier_c_macos_sandbox_exec: AtomicU64,
+    sandbox_backend_selected_tier_c_windows_job_object: AtomicU64,
     patches_applied: AtomicU64,
     patches_rejected: AtomicU64,
     patch_files_touched: AtomicU64,
@@ -444,6 +454,15 @@ pub struct CountersSnapshot {
     pub tool_execution_failures: u64,
     pub tool_execution_timeouts: u64,
     pub tool_attestations_emitted: u64,
+    pub sandbox_launches: u64,
+    pub sandbox_policy_denies: u64,
+    pub sandbox_escape_attempts_blocked_workspace: u64,
+    pub sandbox_escape_attempts_blocked_egress: u64,
+    pub sandbox_escape_attempts_blocked_executable: u64,
+    pub sandbox_backend_selected_tier_b: u64,
+    pub sandbox_backend_selected_tier_c_linux_bubblewrap: u64,
+    pub sandbox_backend_selected_tier_c_macos_sandbox_exec: u64,
+    pub sandbox_backend_selected_tier_c_windows_job_object: u64,
     pub patches_applied: u64,
     pub patches_rejected: u64,
     pub patch_files_touched: u64,
@@ -715,6 +734,29 @@ impl RuntimeCounters {
             tool_execution_failures: self.tool_execution_failures.load(Ordering::Relaxed),
             tool_execution_timeouts: self.tool_execution_timeouts.load(Ordering::Relaxed),
             tool_attestations_emitted: self.tool_attestations_emitted.load(Ordering::Relaxed),
+            sandbox_launches: self.sandbox_launches.load(Ordering::Relaxed),
+            sandbox_policy_denies: self.sandbox_policy_denies.load(Ordering::Relaxed),
+            sandbox_escape_attempts_blocked_workspace: self
+                .sandbox_escape_attempts_blocked_workspace
+                .load(Ordering::Relaxed),
+            sandbox_escape_attempts_blocked_egress: self
+                .sandbox_escape_attempts_blocked_egress
+                .load(Ordering::Relaxed),
+            sandbox_escape_attempts_blocked_executable: self
+                .sandbox_escape_attempts_blocked_executable
+                .load(Ordering::Relaxed),
+            sandbox_backend_selected_tier_b: self
+                .sandbox_backend_selected_tier_b
+                .load(Ordering::Relaxed),
+            sandbox_backend_selected_tier_c_linux_bubblewrap: self
+                .sandbox_backend_selected_tier_c_linux_bubblewrap
+                .load(Ordering::Relaxed),
+            sandbox_backend_selected_tier_c_macos_sandbox_exec: self
+                .sandbox_backend_selected_tier_c_macos_sandbox_exec
+                .load(Ordering::Relaxed),
+            sandbox_backend_selected_tier_c_windows_job_object: self
+                .sandbox_backend_selected_tier_c_windows_job_object
+                .load(Ordering::Relaxed),
             patches_applied: self.patches_applied.load(Ordering::Relaxed),
             patches_rejected: self.patches_rejected.load(Ordering::Relaxed),
             patch_files_touched: self.patch_files_touched.load(Ordering::Relaxed),
@@ -837,6 +879,15 @@ impl GatewayRuntimeState {
                 tool_execution_failures: AtomicU64::new(0),
                 tool_execution_timeouts: AtomicU64::new(0),
                 tool_attestations_emitted: AtomicU64::new(0),
+                sandbox_launches: AtomicU64::new(0),
+                sandbox_policy_denies: AtomicU64::new(0),
+                sandbox_escape_attempts_blocked_workspace: AtomicU64::new(0),
+                sandbox_escape_attempts_blocked_egress: AtomicU64::new(0),
+                sandbox_escape_attempts_blocked_executable: AtomicU64::new(0),
+                sandbox_backend_selected_tier_b: AtomicU64::new(0),
+                sandbox_backend_selected_tier_c_linux_bubblewrap: AtomicU64::new(0),
+                sandbox_backend_selected_tier_c_macos_sandbox_exec: AtomicU64::new(0),
+                sandbox_backend_selected_tier_c_windows_job_object: AtomicU64::new(0),
                 patches_applied: AtomicU64::new(0),
                 patches_rejected: AtomicU64::new(0),
                 patch_files_touched: AtomicU64::new(0),
@@ -6290,6 +6341,12 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                                     .tool_decisions_denied
                                     .fetch_add(1, Ordering::Relaxed);
                                 state_for_stream.record_denied();
+                                if tool_name == PROCESS_RUNNER_TOOL_NAME {
+                                    state_for_stream
+                                        .counters
+                                        .sandbox_policy_denies
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
                             }
 
                             if let Err(error) = send_tool_decision_with_tape(
@@ -6573,6 +6630,13 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                                         .patch_rollbacks
                                         .fetch_add(1, Ordering::Relaxed);
                                 }
+                            }
+                            if tool_name == PROCESS_RUNNER_TOOL_NAME {
+                                record_process_runner_execution_metrics(
+                                    &state_for_stream.counters,
+                                    decision.allowed,
+                                    &execution_outcome,
+                                );
                             }
 
                             if let Err(error) = send_tool_result_with_tape(
@@ -9656,7 +9720,7 @@ fn build_pending_tool_approval(
         .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(input_json).to_string() }));
     let prompt = ApprovalPromptRecord {
         title: format!("Approve {}", tool_name),
-        risk_level: ApprovalRiskLevel::High,
+        risk_level: approval_risk_for_tool(tool_name, input_json, config),
         subject_id: subject_id.clone(),
         summary: format!("Tool `{tool_name}` requested explicit approval"),
         options: default_approval_prompt_options(),
@@ -9678,6 +9742,43 @@ fn build_pending_tool_approval(
         policy_snapshot,
         prompt,
     }
+}
+
+fn approval_risk_for_tool(
+    tool_name: &str,
+    input_json: &[u8],
+    config: &ToolCallConfig,
+) -> ApprovalRiskLevel {
+    if tool_name != PROCESS_RUNNER_TOOL_NAME {
+        return ApprovalRiskLevel::High;
+    }
+    if !matches!(config.process_runner.tier, crate::sandbox_runner::SandboxProcessRunnerTier::C) {
+        return ApprovalRiskLevel::High;
+    }
+    if process_runner_command_is_read_only(input_json) {
+        ApprovalRiskLevel::Medium
+    } else {
+        ApprovalRiskLevel::High
+    }
+}
+
+fn process_runner_command_is_read_only(input_json: &[u8]) -> bool {
+    const READ_ONLY_COMMANDS: &[&str] = &[
+        "cat", "find", "grep", "head", "id", "ls", "pwd", "rg", "stat", "tail", "uname", "wc",
+        "whoami",
+    ];
+
+    let parsed = match serde_json::from_slice::<Value>(input_json) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let Some(payload) = parsed.as_object() else {
+        return false;
+    };
+    let Some(command) = payload.get("command").and_then(Value::as_str).map(str::trim) else {
+        return false;
+    };
+    READ_ONLY_COMMANDS.iter().any(|candidate| candidate.eq_ignore_ascii_case(command))
 }
 
 #[allow(clippy::result_large_err)]
@@ -10092,6 +10193,89 @@ fn workspace_patch_metrics_from_output(output_json: &[u8]) -> (usize, bool) {
     (files_touched, rollback_performed)
 }
 
+fn record_process_runner_execution_metrics(
+    counters: &RuntimeCounters,
+    decision_allowed: bool,
+    outcome: &ToolExecutionOutcome,
+) {
+    if !decision_allowed {
+        return;
+    }
+
+    counters.sandbox_launches.fetch_add(1, Ordering::Relaxed);
+    match outcome.attestation.executor.as_str() {
+        "sandbox_tier_b" => {
+            counters.sandbox_backend_selected_tier_b.fetch_add(1, Ordering::Relaxed);
+        }
+        "sandbox_tier_c_linux_bubblewrap" => {
+            counters
+                .sandbox_backend_selected_tier_c_linux_bubblewrap
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        "sandbox_tier_c_macos_sandbox_exec" => {
+            counters
+                .sandbox_backend_selected_tier_c_macos_sandbox_exec
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        "sandbox_tier_c_windows_job_object" => {
+            counters
+                .sandbox_backend_selected_tier_c_windows_job_object
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+
+    if !outcome.success {
+        if outcome.error.contains("sandbox denied") {
+            counters.sandbox_policy_denies.fetch_add(1, Ordering::Relaxed);
+        }
+        match classify_sandbox_escape_attempt(outcome.error.as_str()) {
+            Some(SandboxEscapeAttemptType::Workspace) => {
+                counters.sandbox_escape_attempts_blocked_workspace.fetch_add(1, Ordering::Relaxed);
+            }
+            Some(SandboxEscapeAttemptType::Egress) => {
+                counters.sandbox_escape_attempts_blocked_egress.fetch_add(1, Ordering::Relaxed);
+            }
+            Some(SandboxEscapeAttemptType::Executable) => {
+                counters.sandbox_escape_attempts_blocked_executable.fetch_add(1, Ordering::Relaxed);
+            }
+            None => {}
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SandboxEscapeAttemptType {
+    Workspace,
+    Egress,
+    Executable,
+}
+
+fn classify_sandbox_escape_attempt(error: &str) -> Option<SandboxEscapeAttemptType> {
+    let normalized = error.to_ascii_lowercase();
+    if normalized.contains("path traversal")
+        || normalized.contains("workspace scope")
+        || normalized.contains("escapes workspace")
+        || normalized.contains("absolute path")
+    {
+        return Some(SandboxEscapeAttemptType::Workspace);
+    }
+    if normalized.contains("egress")
+        || normalized.contains("host-level egress")
+        || normalized.contains("network isolation")
+    {
+        return Some(SandboxEscapeAttemptType::Egress);
+    }
+    if normalized.contains("not allowlisted")
+        || normalized.contains("allow_interpreters")
+        || normalized.contains("bare executable")
+        || normalized.contains("shell-eval")
+    {
+        return Some(SandboxEscapeAttemptType::Executable);
+    }
+    None
+}
+
 fn tool_result_tape_payload(
     proposal_id: &str,
     success: bool,
@@ -10434,6 +10618,7 @@ mod tests {
                     execution_timeout_ms: 250,
                     process_runner: crate::sandbox_runner::SandboxProcessRunnerPolicy {
                         enabled: false,
+                        tier: crate::sandbox_runner::SandboxProcessRunnerTier::B,
                         workspace_root: PathBuf::from("."),
                         allowed_executables: Vec::new(),
                         allow_interpreters: false,
@@ -11525,5 +11710,113 @@ mod tests {
             workspace_patch_metrics_from_output(b"{\"files_touched\":\"invalid\"}"),
             (0, false)
         );
+    }
+
+    #[test]
+    fn classify_sandbox_escape_attempt_identifies_expected_categories() {
+        assert_eq!(
+            super::classify_sandbox_escape_attempt(
+                "sandbox denied: path traversal is blocked for '../outside.txt'"
+            ),
+            Some(super::SandboxEscapeAttemptType::Workspace)
+        );
+        assert_eq!(
+            super::classify_sandbox_escape_attempt(
+                "sandbox denied: egress host 'blocked.example' is not allowlisted"
+            ),
+            Some(super::SandboxEscapeAttemptType::Egress)
+        );
+        assert_eq!(
+            super::classify_sandbox_escape_attempt(
+                "sandbox denied: executable 'cargo' is not allowlisted for process runner"
+            ),
+            Some(super::SandboxEscapeAttemptType::Executable)
+        );
+        assert_eq!(
+            super::classify_sandbox_escape_attempt("sandbox process exited unsuccessfully"),
+            None
+        );
+    }
+
+    #[test]
+    fn approval_risk_for_tier_c_read_only_process_command_is_reduced() {
+        let config = crate::tool_protocol::ToolCallConfig {
+            allowed_tools: vec![super::PROCESS_RUNNER_TOOL_NAME.to_owned()],
+            max_calls_per_run: 1,
+            execution_timeout_ms: 250,
+            process_runner: crate::sandbox_runner::SandboxProcessRunnerPolicy {
+                enabled: true,
+                tier: crate::sandbox_runner::SandboxProcessRunnerTier::C,
+                workspace_root: PathBuf::from("."),
+                allowed_executables: vec!["uname".to_owned()],
+                allow_interpreters: false,
+                egress_enforcement_mode: crate::sandbox_runner::EgressEnforcementMode::Strict,
+                allowed_egress_hosts: Vec::new(),
+                allowed_dns_suffixes: Vec::new(),
+                cpu_time_limit_ms: 2_000,
+                memory_limit_bytes: 128 * 1024 * 1024,
+                max_output_bytes: 64 * 1024,
+            },
+            wasm_runtime: crate::wasm_plugin_runner::WasmPluginRunnerPolicy {
+                enabled: false,
+                allow_inline_modules: false,
+                max_module_size_bytes: 256 * 1024,
+                fuel_budget: 10_000_000,
+                max_memory_bytes: 64 * 1024 * 1024,
+                max_table_elements: 100_000,
+                max_instances: 256,
+                allowed_http_hosts: Vec::new(),
+                allowed_secrets: Vec::new(),
+                allowed_storage_prefixes: Vec::new(),
+                allowed_channels: Vec::new(),
+            },
+        };
+        let risk = super::approval_risk_for_tool(
+            super::PROCESS_RUNNER_TOOL_NAME,
+            br#"{"command":"uname","args":["-a"]}"#,
+            &config,
+        );
+        assert_eq!(risk, ApprovalRiskLevel::Medium);
+    }
+
+    #[test]
+    fn approval_risk_for_tier_b_process_command_remains_high() {
+        let config = crate::tool_protocol::ToolCallConfig {
+            allowed_tools: vec![super::PROCESS_RUNNER_TOOL_NAME.to_owned()],
+            max_calls_per_run: 1,
+            execution_timeout_ms: 250,
+            process_runner: crate::sandbox_runner::SandboxProcessRunnerPolicy {
+                enabled: true,
+                tier: crate::sandbox_runner::SandboxProcessRunnerTier::B,
+                workspace_root: PathBuf::from("."),
+                allowed_executables: vec!["uname".to_owned()],
+                allow_interpreters: false,
+                egress_enforcement_mode: crate::sandbox_runner::EgressEnforcementMode::Strict,
+                allowed_egress_hosts: Vec::new(),
+                allowed_dns_suffixes: Vec::new(),
+                cpu_time_limit_ms: 2_000,
+                memory_limit_bytes: 128 * 1024 * 1024,
+                max_output_bytes: 64 * 1024,
+            },
+            wasm_runtime: crate::wasm_plugin_runner::WasmPluginRunnerPolicy {
+                enabled: false,
+                allow_inline_modules: false,
+                max_module_size_bytes: 256 * 1024,
+                fuel_budget: 10_000_000,
+                max_memory_bytes: 64 * 1024 * 1024,
+                max_table_elements: 100_000,
+                max_instances: 256,
+                allowed_http_hosts: Vec::new(),
+                allowed_secrets: Vec::new(),
+                allowed_storage_prefixes: Vec::new(),
+                allowed_channels: Vec::new(),
+            },
+        };
+        let risk = super::approval_risk_for_tool(
+            super::PROCESS_RUNNER_TOOL_NAME,
+            br#"{"command":"uname","args":["-a"]}"#,
+            &config,
+        );
+        assert_eq!(risk, ApprovalRiskLevel::High);
     }
 }

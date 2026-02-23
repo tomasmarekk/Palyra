@@ -18,7 +18,7 @@ use crate::cron::CronTimezoneMode;
 use crate::model_provider::{
     validate_openai_base_url_network_policy, ModelProviderConfig, ModelProviderKind,
 };
-use crate::sandbox_runner::EgressEnforcementMode;
+use crate::sandbox_runner::{EgressEnforcementMode, SandboxProcessRunnerTier};
 
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 7142;
@@ -47,6 +47,7 @@ const DEFAULT_MAX_JOURNAL_PAYLOAD_BYTES: usize = 256 * 1024;
 const DEFAULT_TOOL_CALL_MAX_CALLS_PER_RUN: u32 = 4;
 const DEFAULT_TOOL_CALL_EXECUTION_TIMEOUT_MS: u64 = 750;
 const DEFAULT_PROCESS_RUNNER_ENABLED: bool = false;
+const DEFAULT_PROCESS_RUNNER_TIER: SandboxProcessRunnerTier = SandboxProcessRunnerTier::B;
 const DEFAULT_PROCESS_RUNNER_WORKSPACE_ROOT: &str = ".";
 const DEFAULT_PROCESS_RUNNER_ALLOW_INTERPRETERS: bool = false;
 const DEFAULT_PROCESS_RUNNER_EGRESS_ENFORCEMENT_MODE: EgressEnforcementMode =
@@ -144,6 +145,7 @@ pub struct ToolCallConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessRunnerConfig {
     pub enabled: bool,
+    pub tier: SandboxProcessRunnerTier,
     pub workspace_root: PathBuf,
     pub allowed_executables: Vec<String>,
     pub allow_interpreters: bool,
@@ -293,6 +295,7 @@ impl Default for ProcessRunnerConfig {
     fn default() -> Self {
         Self {
             enabled: DEFAULT_PROCESS_RUNNER_ENABLED,
+            tier: DEFAULT_PROCESS_RUNNER_TIER,
             workspace_root: PathBuf::from(DEFAULT_PROCESS_RUNNER_WORKSPACE_ROOT),
             allowed_executables: Vec::new(),
             allow_interpreters: DEFAULT_PROCESS_RUNNER_ALLOW_INTERPRETERS,
@@ -523,6 +526,10 @@ pub fn load_config() -> Result<LoadedConfig> {
             if let Some(file_process_runner) = file_tool_call.process_runner {
                 if let Some(enabled) = file_process_runner.enabled {
                     tool_call.process_runner.enabled = enabled;
+                }
+                if let Some(tier) = file_process_runner.tier {
+                    tool_call.process_runner.tier =
+                        parse_process_runner_tier(tier.as_str(), "tool_call.process_runner.tier")?;
                 }
                 if let Some(workspace_root) = file_process_runner.workspace_root {
                     tool_call.process_runner.workspace_root =
@@ -1303,6 +1310,14 @@ fn parse_process_executable_allowlist(raw: &str, source_name: &str) -> Result<Ve
     parse_identifier_allowlist(raw, source_name, "executable name")
 }
 
+fn parse_process_runner_tier(raw: &str, source_name: &str) -> Result<SandboxProcessRunnerTier> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "b" | "tier_b" => Ok(SandboxProcessRunnerTier::B),
+        "c" | "tier_c" => Ok(SandboxProcessRunnerTier::C),
+        _ => anyhow::bail!("{source_name} must be one of: b, c"),
+    }
+}
+
 fn parse_process_runner_egress_enforcement_mode(
     raw: &str,
     source_name: &str,
@@ -1619,15 +1634,15 @@ mod tests {
         parse_broadcast_strategy, parse_cron_timezone_mode, parse_default_memory_ttl_ms,
         parse_dns_suffix_allowlist, parse_host_allowlist, parse_journal_db_path,
         parse_openai_base_url, parse_positive_usize, parse_process_executable_allowlist,
-        parse_process_runner_egress_enforcement_mode, parse_root_file_config,
-        parse_storage_prefix_allowlist, parse_tool_allowlist, parse_vault_dir,
-        parse_vault_ref_allowlist, AdminConfig, ChannelRouterConfig, CronConfig, GatewayConfig,
-        GatewayTlsConfig, IdentityConfig, MemoryConfig, ModelProviderConfig, OrchestratorConfig,
-        StorageConfig, ToolCallConfig,
+        parse_process_runner_egress_enforcement_mode, parse_process_runner_tier,
+        parse_root_file_config, parse_storage_prefix_allowlist, parse_tool_allowlist,
+        parse_vault_dir, parse_vault_ref_allowlist, AdminConfig, ChannelRouterConfig, CronConfig,
+        GatewayConfig, GatewayTlsConfig, IdentityConfig, MemoryConfig, ModelProviderConfig,
+        OrchestratorConfig, StorageConfig, ToolCallConfig,
     };
     use crate::channel_router::BroadcastStrategy;
     use crate::model_provider::ModelProviderKind;
-    use crate::sandbox_runner::EgressEnforcementMode;
+    use crate::sandbox_runner::{EgressEnforcementMode, SandboxProcessRunnerTier};
     use palyra_common::daemon_config_schema::RootFileConfig;
 
     #[test]
@@ -1823,6 +1838,11 @@ mod tests {
         assert_eq!(config.max_calls_per_run, 4);
         assert_eq!(config.execution_timeout_ms, 750);
         assert!(!config.process_runner.enabled, "sandbox process runner must default to disabled");
+        assert_eq!(
+            config.process_runner.tier,
+            SandboxProcessRunnerTier::B,
+            "process runner tier must default to tier b until operator opts into tier c"
+        );
         assert!(
             config.process_runner.allowed_executables.is_empty(),
             "sandbox process runner executable allowlist must default empty"
@@ -1860,6 +1880,21 @@ mod tests {
         let tool_call = parsed.tool_call.expect("tool_call section should be present");
         let wasm_runtime = tool_call.wasm_runtime.expect("wasm_runtime section should be present");
         assert_eq!(wasm_runtime.allow_inline_modules, Some(true));
+    }
+
+    #[test]
+    fn process_runner_config_parses_tier_override() {
+        let (parsed, _) = parse_root_file_config(
+            r#"
+            [tool_call.process_runner]
+            tier = "c"
+            "#,
+        )
+        .expect("process runner tier override should parse");
+        let tool_call = parsed.tool_call.expect("tool_call section should be present");
+        let process_runner =
+            tool_call.process_runner.expect("process_runner section should be present");
+        assert_eq!(process_runner.tier.as_deref(), Some("c"));
     }
 
     #[test]
@@ -2155,6 +2190,36 @@ mod tests {
         )
         .expect("allowlist should parse");
         assert_eq!(parsed, vec!["rustc".to_owned(), "cargo".to_owned()]);
+    }
+
+    #[test]
+    fn parse_process_runner_tier_accepts_supported_values() {
+        assert_eq!(
+            parse_process_runner_tier("b", "tool_call.process_runner.tier")
+                .expect("tier b should parse"),
+            SandboxProcessRunnerTier::B
+        );
+        assert_eq!(
+            parse_process_runner_tier("tier_b", "tool_call.process_runner.tier")
+                .expect("tier_b alias should parse"),
+            SandboxProcessRunnerTier::B
+        );
+        assert_eq!(
+            parse_process_runner_tier("c", "tool_call.process_runner.tier")
+                .expect("tier c should parse"),
+            SandboxProcessRunnerTier::C
+        );
+        assert_eq!(
+            parse_process_runner_tier("tier_c", "tool_call.process_runner.tier")
+                .expect("tier_c alias should parse"),
+            SandboxProcessRunnerTier::C
+        );
+    }
+
+    #[test]
+    fn parse_process_runner_tier_rejects_unknown_values() {
+        let result = parse_process_runner_tier("strict", "tool_call.process_runner.tier");
+        assert!(result.is_err(), "unsupported process runner tier must fail parsing");
     }
 
     #[test]

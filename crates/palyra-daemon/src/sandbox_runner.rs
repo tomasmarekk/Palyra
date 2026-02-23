@@ -13,8 +13,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+use palyra_sandbox::{
+    build_tier_c_command_plan, current_backend_capabilities, current_backend_executor,
+    current_backend_kind, TierCBackendError, TierCCommandRequest, TierCPolicy,
+};
 use serde::Deserialize;
-#[cfg(unix)]
 use serde_json::json;
 
 const MAX_COMMAND_LENGTH: usize = 256;
@@ -56,9 +59,26 @@ impl EgressEnforcementMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxProcessRunnerTier {
+    B,
+    C,
+}
+
+impl SandboxProcessRunnerTier {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::B => "b",
+            Self::C => "c",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxProcessRunnerPolicy {
     pub enabled: bool,
+    pub tier: SandboxProcessRunnerTier,
     pub workspace_root: PathBuf,
     pub allowed_executables: Vec<String>,
     pub allow_interpreters: bool,
@@ -84,7 +104,6 @@ pub struct SandboxProcessRunError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SandboxProcessRunErrorKind {
     Disabled,
-    #[cfg(not(unix))]
     UnsupportedPlatform,
     InvalidInput,
     WorkspaceScopeDenied,
@@ -93,6 +112,15 @@ pub enum SandboxProcessRunErrorKind {
     TimedOut,
     SpawnFailed,
     RuntimeFailure,
+}
+
+#[must_use]
+pub fn process_runner_executor_name(policy: &SandboxProcessRunnerPolicy) -> String {
+    if matches!(policy.tier, SandboxProcessRunnerTier::C) {
+        current_backend_executor().to_owned()
+    } else {
+        "sandbox_tier_b".to_owned()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -138,105 +166,111 @@ pub fn run_constrained_process(
         });
     }
 
-    #[cfg(not(unix))]
-    {
-        let _ = (policy, input_json, execution_timeout);
-        Err(SandboxProcessRunError {
+    if matches!(policy.tier, SandboxProcessRunnerTier::B) && !cfg!(unix) {
+        return Err(SandboxProcessRunError {
             kind: SandboxProcessRunErrorKind::UnsupportedPlatform,
-            message: "sandbox process runner requires unix resource controls for CPU/memory quotas"
+            message: "sandbox tier-b process runner requires unix resource controls for CPU/memory quotas"
                 .to_owned(),
-        })
+        });
     }
 
-    #[cfg(unix)]
-    {
-        let input = parse_process_runner_input(input_json)?;
-        validate_input_shape(&input)?;
-        validate_allowed_executable(policy, input.command.as_str())?;
-        validate_interpreter_argument_guardrails(input.command.as_str(), input.args.as_slice())?;
+    let input = parse_process_runner_input(input_json)?;
+    validate_input_shape(&input)?;
+    validate_allowed_executable(policy, input.command.as_str())?;
+    validate_interpreter_argument_guardrails(input.command.as_str(), input.args.as_slice())?;
 
-        let workspace_root = canonical_workspace_root(policy.workspace_root.as_path())?;
-        let working_directory =
-            resolve_working_directory(workspace_root.as_path(), input.cwd.as_deref())?;
-        validate_argument_workspace_scope(
-            workspace_root.as_path(),
-            working_directory.as_path(),
-            input.command.as_str(),
-            input.args.as_slice(),
-        )?;
-        if !matches!(policy.egress_enforcement_mode, EgressEnforcementMode::None) {
-            let requested_hosts = collect_requested_egress_hosts(&input)?;
-            validate_egress_hosts(policy, requested_hosts.as_slice())?;
-        }
-        if matches!(policy.egress_enforcement_mode, EgressEnforcementMode::Strict) {
-            validate_runtime_egress_enforcement(policy)?;
-        }
+    let workspace_root = canonical_workspace_root(policy.workspace_root.as_path())?;
+    let working_directory =
+        resolve_working_directory(workspace_root.as_path(), input.cwd.as_deref())?;
+    validate_argument_workspace_scope(
+        workspace_root.as_path(),
+        working_directory.as_path(),
+        input.command.as_str(),
+        input.args.as_slice(),
+    )?;
+    if !matches!(policy.egress_enforcement_mode, EgressEnforcementMode::None) {
+        let requested_hosts = collect_requested_egress_hosts(&input)?;
+        validate_egress_hosts(policy, requested_hosts.as_slice())?;
+    }
+    if matches!(policy.egress_enforcement_mode, EgressEnforcementMode::Strict) {
+        validate_runtime_egress_enforcement(policy)?;
+    }
 
-        let per_call_timeout = input
-            .timeout_ms
-            .map(Duration::from_millis)
-            .unwrap_or(execution_timeout)
-            .min(execution_timeout);
+    let per_call_timeout = input
+        .timeout_ms
+        .map(Duration::from_millis)
+        .unwrap_or(execution_timeout)
+        .min(execution_timeout);
 
-        let capture =
-            execute_process(policy, &input, working_directory.as_path(), per_call_timeout)?;
-        if capture.timed_out {
-            return Err(SandboxProcessRunError {
-                kind: SandboxProcessRunErrorKind::TimedOut,
-                message: format!(
-                    "sandbox process timed out after {}ms and was terminated",
-                    per_call_timeout.as_millis()
-                ),
-            });
-        }
-        if capture.quota_exceeded {
-            return Err(SandboxProcessRunError {
-                kind: SandboxProcessRunErrorKind::QuotaExceeded,
-                message: format!(
-                    "sandbox process exceeded output quota (max_output_bytes={}) and was terminated",
-                    policy.max_output_bytes
-                ),
-            });
-        }
-        if let Some(error) = capture.stdout.read_error.as_ref() {
-            return Err(SandboxProcessRunError {
-                kind: SandboxProcessRunErrorKind::RuntimeFailure,
-                message: format!("sandbox process stdout read failed: {error}"),
-            });
-        }
-        if let Some(error) = capture.stderr.read_error.as_ref() {
-            return Err(SandboxProcessRunError {
-                kind: SandboxProcessRunErrorKind::RuntimeFailure,
-                message: format!("sandbox process stderr read failed: {error}"),
-            });
-        }
-        if !capture.exit_status.success() {
-            return Err(SandboxProcessRunError {
-                kind: SandboxProcessRunErrorKind::RuntimeFailure,
-                message: format!(
-                    "sandbox process exited unsuccessfully (code={}) stderr={}",
-                    capture.exit_status.code().unwrap_or(-1),
-                    String::from_utf8_lossy(&capture.stderr.bytes)
-                ),
-            });
-        }
-
-        let stdout = String::from_utf8_lossy(&capture.stdout.bytes).to_string();
-        let stderr = String::from_utf8_lossy(&capture.stderr.bytes).to_string();
-        let output_json = serde_json::to_vec(&json!({
-            "exit_code": capture.exit_status.code().unwrap_or(0),
-            "stdout": stdout,
-            "stderr": stderr,
-            "stdout_truncated": capture.stdout.truncated,
-            "stderr_truncated": capture.stderr.truncated,
-            "duration_ms": capture.duration_ms,
-        }))
-        .map_err(|error| SandboxProcessRunError {
+    let capture = execute_process(
+        policy,
+        &input,
+        workspace_root.as_path(),
+        working_directory.as_path(),
+        per_call_timeout,
+    )?;
+    if capture.timed_out {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::TimedOut,
+            message: format!(
+                "sandbox process timed out after {}ms and was terminated",
+                per_call_timeout.as_millis()
+            ),
+        });
+    }
+    if capture.quota_exceeded {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::QuotaExceeded,
+            message: format!(
+                "sandbox process exceeded output quota (max_output_bytes={}) and was terminated",
+                policy.max_output_bytes
+            ),
+        });
+    }
+    if let Some(error) = capture.stdout.read_error.as_ref() {
+        return Err(SandboxProcessRunError {
             kind: SandboxProcessRunErrorKind::RuntimeFailure,
-            message: format!("failed to serialize sandbox process output JSON: {error}"),
-        })?;
-        Ok(SandboxProcessRunSuccess { output_json })
+            message: format!("sandbox process stdout read failed: {error}"),
+        });
     }
+    if let Some(error) = capture.stderr.read_error.as_ref() {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+            message: format!("sandbox process stderr read failed: {error}"),
+        });
+    }
+    if !capture.exit_status.success() {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+            message: format!(
+                "sandbox process exited unsuccessfully (code={}) stderr={}",
+                capture.exit_status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&capture.stderr.bytes)
+            ),
+        });
+    }
+
+    let stdout = String::from_utf8_lossy(&capture.stdout.bytes).to_string();
+    let stderr = String::from_utf8_lossy(&capture.stderr.bytes).to_string();
+    let output_json = serde_json::to_vec(&json!({
+        "exit_code": capture.exit_status.code().unwrap_or(0),
+        "stdout": stdout,
+        "stderr": stderr,
+        "stdout_truncated": capture.stdout.truncated,
+        "stderr_truncated": capture.stderr.truncated,
+        "duration_ms": capture.duration_ms,
+        "tier": policy.tier.as_str(),
+        "sandbox_backend": if matches!(policy.tier, SandboxProcessRunnerTier::C) {
+            current_backend_kind().as_str()
+        } else {
+            "tier_b_in_process"
+        },
+    }))
+    .map_err(|error| SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::RuntimeFailure,
+        message: format!("failed to serialize sandbox process output JSON: {error}"),
+    })?;
+    Ok(SandboxProcessRunSuccess { output_json })
 }
 
 fn parse_process_runner_input(
@@ -752,13 +786,38 @@ fn validate_egress_hosts(
 fn validate_runtime_egress_enforcement(
     policy: &SandboxProcessRunnerPolicy,
 ) -> Result<(), SandboxProcessRunError> {
-    if policy.allowed_egress_hosts.is_empty() && policy.allowed_dns_suffixes.is_empty() {
-        return Ok(());
+    if matches!(policy.tier, SandboxProcessRunnerTier::B) {
+        if policy.allowed_egress_hosts.is_empty() && policy.allowed_dns_suffixes.is_empty() {
+            return Ok(());
+        }
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::EgressDenied,
+            message: "sandbox denied: runtime egress enforcement is unavailable in tier-b mode; remove egress allowlists, switch to preflight mode, or opt into tier-c backend".to_owned(),
+        });
     }
-    Err(SandboxProcessRunError {
-        kind: SandboxProcessRunErrorKind::EgressDenied,
-        message: "sandbox denied: runtime egress enforcement is unavailable; remove egress allowlists or disable process runner until an OS-level network sandbox backend is configured".to_owned(),
-    })
+
+    let capabilities = current_backend_capabilities();
+    if !capabilities.runtime_network_isolation {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::EgressDenied,
+            message: format!(
+                "sandbox denied: tier-c backend '{}' cannot enforce runtime network isolation",
+                current_backend_kind().as_str()
+            ),
+        });
+    }
+    if (!policy.allowed_egress_hosts.is_empty() || !policy.allowed_dns_suffixes.is_empty())
+        && !capabilities.host_allowlists
+    {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::EgressDenied,
+            message: format!(
+                "sandbox denied: tier-c backend '{}' cannot enforce host-level egress allowlists",
+                current_backend_kind().as_str()
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn is_host_allowlisted(policy: &SandboxProcessRunnerPolicy, host: &str) -> bool {
@@ -779,20 +838,12 @@ fn is_host_allowlisted(policy: &SandboxProcessRunnerPolicy, host: &str) -> bool 
 fn execute_process(
     policy: &SandboxProcessRunnerPolicy,
     input: &ProcessRunnerInput,
+    workspace_root: &Path,
     cwd: &Path,
     timeout: Duration,
 ) -> Result<ProcessExecutionCapture, SandboxProcessRunError> {
-    let mut command = Command::new(input.command.as_str());
-    command
-        .args(input.args.as_slice())
-        .current_dir(cwd)
-        .env_clear()
-        .env("PATH", sandbox_process_path())
-        .env("LANG", "C")
-        .env("LC_ALL", "C")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let mut command = build_process_command(policy, input, workspace_root, cwd)?;
+    command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     attach_resource_limits_unix(&mut command, policy);
 
     let mut child = command.spawn().map_err(|error| SandboxProcessRunError {
@@ -801,6 +852,64 @@ fn execute_process(
     })?;
 
     capture_child_output(&mut child, timeout, policy.max_output_bytes as usize)
+}
+
+fn build_process_command(
+    policy: &SandboxProcessRunnerPolicy,
+    input: &ProcessRunnerInput,
+    workspace_root: &Path,
+    cwd: &Path,
+) -> Result<Command, SandboxProcessRunError> {
+    if matches!(policy.tier, SandboxProcessRunnerTier::C) {
+        let tier_c_policy = TierCPolicy {
+            workspace_root: workspace_root.to_path_buf(),
+            cwd: cwd.to_path_buf(),
+            enforce_network_isolation: matches!(
+                policy.egress_enforcement_mode,
+                EgressEnforcementMode::Strict
+            ),
+            allowed_egress_hosts: policy.allowed_egress_hosts.clone(),
+            allowed_dns_suffixes: policy.allowed_dns_suffixes.clone(),
+        };
+        let tier_c_request =
+            TierCCommandRequest { command: input.command.clone(), args: input.args.clone() };
+        let plan = build_tier_c_command_plan(&tier_c_policy, &tier_c_request)
+            .map_err(map_tier_c_backend_error)?;
+        let mut command = Command::new(plan.program);
+        command
+            .args(plan.args)
+            .current_dir(cwd)
+            .env_clear()
+            .env("PATH", sandbox_process_path())
+            .env("LANG", "C")
+            .env("LC_ALL", "C");
+        return Ok(command);
+    }
+
+    let mut command = Command::new(input.command.as_str());
+    command
+        .args(input.args.as_slice())
+        .current_dir(cwd)
+        .env_clear()
+        .env("PATH", sandbox_process_path())
+        .env("LANG", "C")
+        .env("LC_ALL", "C");
+    Ok(command)
+}
+
+fn map_tier_c_backend_error(error: TierCBackendError) -> SandboxProcessRunError {
+    match error {
+        TierCBackendError::HostAllowlistUnsupported { .. }
+        | TierCBackendError::NetworkIsolationUnsupported { .. } => SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::EgressDenied,
+            message: format!("sandbox denied: {error}"),
+        },
+        TierCBackendError::BackendBinaryMissing { .. }
+        | TierCBackendError::BackendUnavailable { .. } => SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::SpawnFailed,
+            message: format!("sandbox denied: {error}"),
+        },
+    }
 }
 
 fn sandbox_process_path() -> &'static str {
@@ -1022,6 +1131,7 @@ mod tests {
         canonical_workspace_root, collect_requested_egress_hosts, is_host_allowlisted,
         run_constrained_process, validate_argument_workspace_scope, EgressEnforcementMode,
         ProcessRunnerInput, SandboxProcessRunErrorKind, SandboxProcessRunnerPolicy,
+        SandboxProcessRunnerTier,
     };
 
     fn sandbox_policy_with_allowed_executables(
@@ -1030,6 +1140,7 @@ mod tests {
     ) -> SandboxProcessRunnerPolicy {
         SandboxProcessRunnerPolicy {
             enabled: true,
+            tier: SandboxProcessRunnerTier::B,
             workspace_root,
             allowed_executables,
             allow_interpreters: false,
@@ -1473,6 +1584,91 @@ mod tests {
         assert!(
             error.message.contains("runtime egress enforcement is unavailable"),
             "error should explain fail-closed runtime egress requirement"
+        );
+    }
+
+    #[test]
+    fn process_runner_executor_name_tracks_selected_tier() {
+        let workspace = std::env::current_dir().expect("workspace current_dir should resolve");
+        let mut policy = sandbox_policy(workspace);
+        assert_eq!(
+            super::process_runner_executor_name(&policy),
+            "sandbox_tier_b",
+            "tier-b executions should use stable tier-b executor label"
+        );
+        policy.tier = SandboxProcessRunnerTier::C;
+        assert!(
+            super::process_runner_executor_name(&policy).starts_with("sandbox_tier_c_"),
+            "tier-c executions should expose backend-specific tier-c executor label"
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn run_constrained_process_tier_c_executes_when_backend_binary_is_available() {
+        if Command::new("uname").output().is_err() {
+            return;
+        }
+        let workspace = std::env::current_dir().expect("workspace current_dir should resolve");
+        let mut policy = sandbox_policy(workspace);
+        policy.tier = SandboxProcessRunnerTier::C;
+        policy.egress_enforcement_mode = EgressEnforcementMode::Preflight;
+        let input = br#"{"command":"uname","args":[]}"#;
+        let outcome = run_constrained_process(&policy, input, Duration::from_millis(2_000));
+        let result = match outcome {
+            Ok(result) => result,
+            Err(error) => {
+                if matches!(error.kind, SandboxProcessRunErrorKind::SpawnFailed)
+                    && error.message.contains("requires binary")
+                {
+                    return;
+                }
+                panic!("unexpected tier-c execution failure: {}", error.message);
+            }
+        };
+        let output: serde_json::Value =
+            serde_json::from_slice(&result.output_json).expect("tier-c output should parse");
+        assert_eq!(output.get("tier").and_then(serde_json::Value::as_str), Some("c"));
+        assert!(
+            output
+                .get("sandbox_backend")
+                .and_then(serde_json::Value::as_str)
+                .map(|value| !value.is_empty())
+                .unwrap_or(false),
+            "tier-c output should include backend metadata"
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn tier_c_strict_mode_rejects_host_allowlists_when_backend_cannot_enforce_them() {
+        let workspace = std::env::current_dir().expect("workspace current_dir should resolve");
+        let mut policy = sandbox_policy(workspace);
+        policy.tier = SandboxProcessRunnerTier::C;
+        policy.allowed_egress_hosts = vec!["allowed.example".to_owned()];
+        let input = br#"{"command":"uname","args":[]}"#;
+        let error = run_constrained_process(&policy, input, Duration::from_millis(1_000))
+            .expect_err("tier-c strict mode must fail closed for unsupported host allowlists");
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::EgressDenied);
+        assert!(
+            error.message.contains("cannot enforce host-level egress allowlists"),
+            "tier-c strict denial should explain unsupported host-level enforcement"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn tier_c_strict_mode_fails_closed_without_runtime_network_isolation_backend() {
+        let workspace = std::env::current_dir().expect("workspace current_dir should resolve");
+        let mut policy = sandbox_policy(workspace);
+        policy.tier = SandboxProcessRunnerTier::C;
+        let input = br#"{"command":"uname","args":[]}"#;
+        let error = run_constrained_process(&policy, input, Duration::from_millis(1_000))
+            .expect_err("tier-c strict mode must fail closed when backend lacks network isolation");
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::EgressDenied);
+        assert!(
+            error.message.contains("cannot enforce runtime network isolation"),
+            "denial should explain tier-c runtime network enforcement requirement"
         );
     }
 }
