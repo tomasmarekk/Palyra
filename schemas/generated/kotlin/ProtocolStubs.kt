@@ -34,8 +34,11 @@ object PalyraAuthV1 {
 }
 
 object PalyraBrowserV1 {
+    data class BrowserActionLogEntry(val placeholder: Int = 0)
     data class BrowserHealthRequest(val placeholder: Int = 0)
     data class BrowserHealthResponse(val placeholder: Int = 0)
+    data class ClickRequest(val placeholder: Int = 0)
+    data class ClickResponse(val placeholder: Int = 0)
     data class CloseSessionRequest(val placeholder: Int = 0)
     data class CloseSessionResponse(val placeholder: Int = 0)
     data class CreateSessionRequest(val placeholder: Int = 0)
@@ -46,14 +49,24 @@ object PalyraBrowserV1 {
     data class NavigateResponse(val placeholder: Int = 0)
     data class ScreenshotRequest(val placeholder: Int = 0)
     data class ScreenshotResponse(val placeholder: Int = 0)
+    data class ScrollRequest(val placeholder: Int = 0)
+    data class ScrollResponse(val placeholder: Int = 0)
     data class SessionBudget(val placeholder: Int = 0)
+    data class TypeRequest(val placeholder: Int = 0)
+    data class TypeResponse(val placeholder: Int = 0)
+    data class WaitForRequest(val placeholder: Int = 0)
+    data class WaitForResponse(val placeholder: Int = 0)
     interface BrowserServiceClient {
+        fun click()
         fun closeSession()
         fun createSession()
         fun getTitle()
         fun health()
         fun navigate()
         fun screenshot()
+        fun scroll()
+        fun type()
+        fun waitFor()
     }
 }
 

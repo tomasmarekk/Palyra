@@ -199,6 +199,10 @@ const HTTP_FETCH_TOOL_NAME: &str = "palyra.http.fetch";
 const BROWSER_SESSION_CREATE_TOOL_NAME: &str = "palyra.browser.session.create";
 const BROWSER_SESSION_CLOSE_TOOL_NAME: &str = "palyra.browser.session.close";
 const BROWSER_NAVIGATE_TOOL_NAME: &str = "palyra.browser.navigate";
+const BROWSER_CLICK_TOOL_NAME: &str = "palyra.browser.click";
+const BROWSER_TYPE_TOOL_NAME: &str = "palyra.browser.type";
+const BROWSER_SCROLL_TOOL_NAME: &str = "palyra.browser.scroll";
+const BROWSER_WAIT_FOR_TOOL_NAME: &str = "palyra.browser.wait_for";
 const BROWSER_TITLE_TOOL_NAME: &str = "palyra.browser.title";
 const BROWSER_SCREENSHOT_TOOL_NAME: &str = "palyra.browser.screenshot";
 
@@ -9369,6 +9373,30 @@ async fn execute_browser_tool(
                         .get("max_response_bytes")
                         .and_then(Value::as_u64)
                         .unwrap_or(0),
+                    max_action_timeout_ms: value
+                        .get("max_action_timeout_ms")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                    max_type_input_bytes: value
+                        .get("max_type_input_bytes")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                    max_actions_per_session: value
+                        .get("max_actions_per_session")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                    max_actions_per_window: value
+                        .get("max_actions_per_window")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                    action_rate_window_ms: value
+                        .get("action_rate_window_ms")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                    max_action_log_entries: value
+                        .get("max_action_log_entries")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
                 }
             });
             let mut request = Request::new(browser_v1::CreateSessionRequest {
@@ -9377,6 +9405,23 @@ async fn execute_browser_tool(
                 idle_ttl_ms,
                 budget,
                 allow_private_targets,
+                allow_downloads: payload
+                    .get("allow_downloads")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                action_allowed_domains: payload
+                    .get("action_allowed_domains")
+                    .and_then(Value::as_array)
+                    .map(|entries| {
+                        entries
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default(),
             });
             if let Err(error) = attach_browser_auth_metadata(
                 &mut request,
@@ -9401,7 +9446,15 @@ async fn execute_browser_tool(
                             "max_session_lifetime_ms": value.max_session_lifetime_ms,
                             "max_screenshot_bytes": value.max_screenshot_bytes,
                             "max_response_bytes": value.max_response_bytes,
+                            "max_action_timeout_ms": value.max_action_timeout_ms,
+                            "max_type_input_bytes": value.max_type_input_bytes,
+                            "max_actions_per_session": value.max_actions_per_session,
+                            "max_actions_per_window": value.max_actions_per_window,
+                            "action_rate_window_ms": value.action_rate_window_ms,
+                            "max_action_log_entries": value.max_action_log_entries,
                         })),
+                        "downloads_enabled": response.downloads_enabled,
+                        "action_allowed_domains": response.action_allowed_domains,
                     });
                     (
                         true,
@@ -9556,6 +9609,318 @@ async fn execute_browser_tool(
                     false,
                     b"{}".to_vec(),
                     format!("palyra.browser.navigate failed: {}", sanitize_status_message(&error)),
+                ),
+            }
+        }
+        BROWSER_CLICK_TOOL_NAME => {
+            let session_id = match parse_browser_tool_session_id(&payload) {
+                Ok(value) => value,
+                Err(error) => {
+                    return browser_tool_execution_outcome(
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        error,
+                    );
+                }
+            };
+            let Some(selector) = payload.get("selector").and_then(Value::as_str).map(str::trim)
+            else {
+                return browser_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    "palyra.browser.click requires non-empty string field 'selector'".to_owned(),
+                );
+            };
+            if selector.is_empty() {
+                return browser_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    "palyra.browser.click requires non-empty string field 'selector'".to_owned(),
+                );
+            }
+            let mut request = Request::new(browser_v1::ClickRequest {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                session_id: Some(common_v1::CanonicalId { ulid: session_id }),
+                selector: selector.to_owned(),
+                max_retries: payload.get("max_retries").and_then(Value::as_u64).unwrap_or(0) as u32,
+                timeout_ms: payload.get("timeout_ms").and_then(Value::as_u64).unwrap_or(0),
+                capture_failure_screenshot: payload
+                    .get("capture_failure_screenshot")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
+                max_failure_screenshot_bytes: payload
+                    .get("max_failure_screenshot_bytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(runtime_state.config.browser_service.max_screenshot_bytes as u64),
+            });
+            if let Err(error) = attach_browser_auth_metadata(
+                &mut request,
+                runtime_state.config.browser_service.auth_token.as_deref(),
+            ) {
+                return browser_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    error,
+                );
+            }
+            match client.click(request).await {
+                Ok(response) => {
+                    let response = response.into_inner();
+                    let output = json!({
+                        "success": response.success,
+                        "error": response.error,
+                        "action_log": response.action_log.map(browser_action_log_to_json),
+                        "failure_screenshot_mime_type": response.failure_screenshot_mime_type,
+                        "failure_screenshot_base64": base64::engine::general_purpose::STANDARD
+                            .encode(response.failure_screenshot_bytes.as_slice()),
+                    });
+                    (
+                        response.success,
+                        serde_json::to_vec(&output).unwrap_or_else(|_| b"{}".to_vec()),
+                        if response.success { String::new() } else { response.error },
+                    )
+                }
+                Err(error) => (
+                    false,
+                    b"{}".to_vec(),
+                    format!("palyra.browser.click failed: {}", sanitize_status_message(&error)),
+                ),
+            }
+        }
+        BROWSER_TYPE_TOOL_NAME => {
+            let session_id = match parse_browser_tool_session_id(&payload) {
+                Ok(value) => value,
+                Err(error) => {
+                    return browser_tool_execution_outcome(
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        error,
+                    );
+                }
+            };
+            let Some(selector) = payload.get("selector").and_then(Value::as_str).map(str::trim)
+            else {
+                return browser_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    "palyra.browser.type requires non-empty string field 'selector'".to_owned(),
+                );
+            };
+            if selector.is_empty() {
+                return browser_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    "palyra.browser.type requires non-empty string field 'selector'".to_owned(),
+                );
+            }
+            let text = payload.get("text").and_then(Value::as_str).unwrap_or_default();
+            let mut request = Request::new(browser_v1::TypeRequest {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                session_id: Some(common_v1::CanonicalId { ulid: session_id }),
+                selector: selector.to_owned(),
+                text: text.to_owned(),
+                clear_existing: payload
+                    .get("clear_existing")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                timeout_ms: payload.get("timeout_ms").and_then(Value::as_u64).unwrap_or(0),
+                capture_failure_screenshot: payload
+                    .get("capture_failure_screenshot")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
+                max_failure_screenshot_bytes: payload
+                    .get("max_failure_screenshot_bytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(runtime_state.config.browser_service.max_screenshot_bytes as u64),
+            });
+            if let Err(error) = attach_browser_auth_metadata(
+                &mut request,
+                runtime_state.config.browser_service.auth_token.as_deref(),
+            ) {
+                return browser_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    error,
+                );
+            }
+            match client.r#type(request).await {
+                Ok(response) => {
+                    let response = response.into_inner();
+                    let output = json!({
+                        "success": response.success,
+                        "typed_bytes": response.typed_bytes,
+                        "error": response.error,
+                        "action_log": response.action_log.map(browser_action_log_to_json),
+                        "failure_screenshot_mime_type": response.failure_screenshot_mime_type,
+                        "failure_screenshot_base64": base64::engine::general_purpose::STANDARD
+                            .encode(response.failure_screenshot_bytes.as_slice()),
+                    });
+                    (
+                        response.success,
+                        serde_json::to_vec(&output).unwrap_or_else(|_| b"{}".to_vec()),
+                        if response.success { String::new() } else { response.error },
+                    )
+                }
+                Err(error) => (
+                    false,
+                    b"{}".to_vec(),
+                    format!("palyra.browser.type failed: {}", sanitize_status_message(&error)),
+                ),
+            }
+        }
+        BROWSER_SCROLL_TOOL_NAME => {
+            let session_id = match parse_browser_tool_session_id(&payload) {
+                Ok(value) => value,
+                Err(error) => {
+                    return browser_tool_execution_outcome(
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        error,
+                    );
+                }
+            };
+            let mut request = Request::new(browser_v1::ScrollRequest {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                session_id: Some(common_v1::CanonicalId { ulid: session_id }),
+                delta_x: payload.get("delta_x").and_then(Value::as_i64).unwrap_or(0),
+                delta_y: payload.get("delta_y").and_then(Value::as_i64).unwrap_or(0),
+                capture_failure_screenshot: payload
+                    .get("capture_failure_screenshot")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
+                max_failure_screenshot_bytes: payload
+                    .get("max_failure_screenshot_bytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(runtime_state.config.browser_service.max_screenshot_bytes as u64),
+            });
+            if let Err(error) = attach_browser_auth_metadata(
+                &mut request,
+                runtime_state.config.browser_service.auth_token.as_deref(),
+            ) {
+                return browser_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    error,
+                );
+            }
+            match client.scroll(request).await {
+                Ok(response) => {
+                    let response = response.into_inner();
+                    let output = json!({
+                        "success": response.success,
+                        "scroll_x": response.scroll_x,
+                        "scroll_y": response.scroll_y,
+                        "error": response.error,
+                        "action_log": response.action_log.map(browser_action_log_to_json),
+                        "failure_screenshot_mime_type": response.failure_screenshot_mime_type,
+                        "failure_screenshot_base64": base64::engine::general_purpose::STANDARD
+                            .encode(response.failure_screenshot_bytes.as_slice()),
+                    });
+                    (
+                        response.success,
+                        serde_json::to_vec(&output).unwrap_or_else(|_| b"{}".to_vec()),
+                        if response.success { String::new() } else { response.error },
+                    )
+                }
+                Err(error) => (
+                    false,
+                    b"{}".to_vec(),
+                    format!("palyra.browser.scroll failed: {}", sanitize_status_message(&error)),
+                ),
+            }
+        }
+        BROWSER_WAIT_FOR_TOOL_NAME => {
+            let session_id = match parse_browser_tool_session_id(&payload) {
+                Ok(value) => value,
+                Err(error) => {
+                    return browser_tool_execution_outcome(
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        error,
+                    );
+                }
+            };
+            let mut request = Request::new(browser_v1::WaitForRequest {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                session_id: Some(common_v1::CanonicalId { ulid: session_id }),
+                selector: payload
+                    .get("selector")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                text: payload.get("text").and_then(Value::as_str).unwrap_or_default().to_owned(),
+                timeout_ms: payload.get("timeout_ms").and_then(Value::as_u64).unwrap_or(0),
+                poll_interval_ms: payload
+                    .get("poll_interval_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                capture_failure_screenshot: payload
+                    .get("capture_failure_screenshot")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
+                max_failure_screenshot_bytes: payload
+                    .get("max_failure_screenshot_bytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(runtime_state.config.browser_service.max_screenshot_bytes as u64),
+            });
+            if let Err(error) = attach_browser_auth_metadata(
+                &mut request,
+                runtime_state.config.browser_service.auth_token.as_deref(),
+            ) {
+                return browser_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    error,
+                );
+            }
+            match client.wait_for(request).await {
+                Ok(response) => {
+                    let response = response.into_inner();
+                    let output = json!({
+                        "success": response.success,
+                        "waited_ms": response.waited_ms,
+                        "error": response.error,
+                        "matched_selector": response.matched_selector,
+                        "matched_text": response.matched_text,
+                        "action_log": response.action_log.map(browser_action_log_to_json),
+                        "failure_screenshot_mime_type": response.failure_screenshot_mime_type,
+                        "failure_screenshot_base64": base64::engine::general_purpose::STANDARD
+                            .encode(response.failure_screenshot_bytes.as_slice()),
+                    });
+                    (
+                        response.success,
+                        serde_json::to_vec(&output).unwrap_or_else(|_| b"{}".to_vec()),
+                        if response.success { String::new() } else { response.error },
+                    )
+                }
+                Err(error) => (
+                    false,
+                    b"{}".to_vec(),
+                    format!("palyra.browser.wait_for failed: {}", sanitize_status_message(&error)),
                 ),
             }
         }
@@ -9726,6 +10091,21 @@ fn attach_browser_auth_metadata<T>(
 
 fn sanitize_status_message(status: &Status) -> String {
     truncate_with_ellipsis(status.message().to_owned(), 512)
+}
+
+fn browser_action_log_to_json(entry: browser_v1::BrowserActionLogEntry) -> Value {
+    json!({
+        "action_id": entry.action_id,
+        "action_name": entry.action_name,
+        "selector": entry.selector,
+        "success": entry.success,
+        "outcome": entry.outcome,
+        "error": entry.error,
+        "started_at_unix_ms": entry.started_at_unix_ms,
+        "completed_at_unix_ms": entry.completed_at_unix_ms,
+        "attempts": entry.attempts,
+        "page_url": entry.page_url,
+    })
 }
 
 fn browser_tool_execution_outcome(

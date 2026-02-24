@@ -77,10 +77,19 @@ public enum PalyraAuthV1 {
 }
 
 public enum PalyraBrowserV1 {
+    public struct BrowserActionLogEntry: Equatable {
+        public init() {}
+    }
     public struct BrowserHealthRequest: Equatable {
         public init() {}
     }
     public struct BrowserHealthResponse: Equatable {
+        public init() {}
+    }
+    public struct ClickRequest: Equatable {
+        public init() {}
+    }
+    public struct ClickResponse: Equatable {
         public init() {}
     }
     public struct CloseSessionRequest: Equatable {
@@ -113,16 +122,38 @@ public enum PalyraBrowserV1 {
     public struct ScreenshotResponse: Equatable {
         public init() {}
     }
+    public struct ScrollRequest: Equatable {
+        public init() {}
+    }
+    public struct ScrollResponse: Equatable {
+        public init() {}
+    }
     public struct SessionBudget: Equatable {
         public init() {}
     }
+    public struct TypeRequest: Equatable {
+        public init() {}
+    }
+    public struct TypeResponse: Equatable {
+        public init() {}
+    }
+    public struct WaitForRequest: Equatable {
+        public init() {}
+    }
+    public struct WaitForResponse: Equatable {
+        public init() {}
+    }
     public protocol BrowserServiceClient {
+        func click()
         func closeSession()
         func createSession()
         func getTitle()
         func health()
         func navigate()
         func screenshot()
+        func scroll()
+        func type()
+        func waitFor()
     }
 }
 

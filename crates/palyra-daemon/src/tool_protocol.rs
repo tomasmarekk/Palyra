@@ -306,6 +306,18 @@ pub fn tool_metadata(tool_name: &str) -> Option<ToolMetadata> {
         "palyra.browser.navigate" => {
             Some(ToolMetadata { capabilities: NETWORK_TOOL_CAPABILITIES, default_sensitive: true })
         }
+        "palyra.browser.click" => {
+            Some(ToolMetadata { capabilities: NETWORK_TOOL_CAPABILITIES, default_sensitive: true })
+        }
+        "palyra.browser.type" => {
+            Some(ToolMetadata { capabilities: NETWORK_TOOL_CAPABILITIES, default_sensitive: true })
+        }
+        "palyra.browser.scroll" => {
+            Some(ToolMetadata { capabilities: NETWORK_TOOL_CAPABILITIES, default_sensitive: true })
+        }
+        "palyra.browser.wait_for" => {
+            Some(ToolMetadata { capabilities: NETWORK_TOOL_CAPABILITIES, default_sensitive: true })
+        }
         "palyra.browser.title" => {
             Some(ToolMetadata { capabilities: NETWORK_TOOL_CAPABILITIES, default_sensitive: true })
         }
@@ -539,6 +551,10 @@ async fn run_allowlisted_tool(
         "palyra.browser.session.create"
         | "palyra.browser.session.close"
         | "palyra.browser.navigate"
+        | "palyra.browser.click"
+        | "palyra.browser.type"
+        | "palyra.browser.scroll"
+        | "palyra.browser.wait_for"
         | "palyra.browser.title"
         | "palyra.browser.screenshot" => ToolExecutionRawResult {
             success: false,
@@ -572,6 +588,10 @@ fn is_runtime_supported_tool(tool_name: &str) -> bool {
             | "palyra.browser.session.create"
             | "palyra.browser.session.close"
             | "palyra.browser.navigate"
+            | "palyra.browser.click"
+            | "palyra.browser.type"
+            | "palyra.browser.scroll"
+            | "palyra.browser.wait_for"
             | "palyra.browser.title"
             | "palyra.browser.screenshot"
             | "palyra.plugin.run"
@@ -607,6 +627,10 @@ fn tool_input_limit_bytes(tool_name: &str) -> usize {
         "palyra.browser.session.create"
         | "palyra.browser.session.close"
         | "palyra.browser.navigate"
+        | "palyra.browser.click"
+        | "palyra.browser.type"
+        | "palyra.browser.scroll"
+        | "palyra.browser.wait_for"
         | "palyra.browser.title"
         | "palyra.browser.screenshot" => MAX_BROWSER_TOOL_INPUT_BYTES,
         "palyra.plugin.run" => MAX_WASM_PLUGIN_TOOL_INPUT_BYTES,
@@ -1079,6 +1103,10 @@ mod tests {
         assert!(tool_requires_approval("palyra.fs.apply_patch"));
         assert!(tool_requires_approval("palyra.browser.session.create"));
         assert!(tool_requires_approval("palyra.browser.navigate"));
+        assert!(tool_requires_approval("palyra.browser.click"));
+        assert!(tool_requires_approval("palyra.browser.type"));
+        assert!(tool_requires_approval("palyra.browser.scroll"));
+        assert!(tool_requires_approval("palyra.browser.wait_for"));
         assert!(tool_requires_approval("palyra.browser.title"));
         assert!(tool_requires_approval("palyra.browser.screenshot"));
         assert!(tool_requires_approval("palyra.plugin.run"));

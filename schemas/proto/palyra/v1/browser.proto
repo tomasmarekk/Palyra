@@ -9,6 +9,10 @@ service BrowserService {
   rpc CreateSession(CreateSessionRequest) returns (CreateSessionResponse);
   rpc CloseSession(CloseSessionRequest) returns (CloseSessionResponse);
   rpc Navigate(NavigateRequest) returns (NavigateResponse);
+  rpc Click(ClickRequest) returns (ClickResponse);
+  rpc Type(TypeRequest) returns (TypeResponse);
+  rpc Scroll(ScrollRequest) returns (ScrollResponse);
+  rpc WaitFor(WaitForRequest) returns (WaitForResponse);
   rpc GetTitle(GetTitleRequest) returns (GetTitleResponse);
   rpc Screenshot(ScreenshotRequest) returns (ScreenshotResponse);
 }
@@ -31,8 +35,14 @@ message SessionBudget {
   uint64 max_session_lifetime_ms = 2;
   uint64 max_screenshot_bytes = 3;
   uint64 max_response_bytes = 4;
+  uint64 max_action_timeout_ms = 5;
+  uint64 max_type_input_bytes = 6;
+  uint64 max_actions_per_session = 7;
+  uint64 max_actions_per_window = 8;
+  uint64 action_rate_window_ms = 9;
+  uint64 max_action_log_entries = 10;
 
-  reserved 5 to 12;
+  reserved 11 to 12;
 }
 
 message CreateSessionRequest {
@@ -41,8 +51,10 @@ message CreateSessionRequest {
   uint64 idle_ttl_ms = 3;
   SessionBudget budget = 4;
   bool allow_private_targets = 5;
+  bool allow_downloads = 6;
+  repeated string action_allowed_domains = 7;
 
-  reserved 6 to 14;
+  reserved 8 to 14;
 }
 
 message CreateSessionResponse {
@@ -50,8 +62,10 @@ message CreateSessionResponse {
   palyra.common.v1.CanonicalId session_id = 2;
   uint64 created_at_unix_ms = 3;
   SessionBudget effective_budget = 4;
+  bool downloads_enabled = 5;
+  repeated string action_allowed_domains = 6;
 
-  reserved 5 to 12;
+  reserved 7 to 12;
 }
 
 message CloseSessionRequest {
@@ -92,6 +106,121 @@ message NavigateResponse {
   string error = 8;
 
   reserved 9 to 14;
+}
+
+message BrowserActionLogEntry {
+  uint32 v = 1;
+  string action_id = 2;
+  string action_name = 3;
+  string selector = 4;
+  bool success = 5;
+  string outcome = 6;
+  string error = 7;
+  uint64 started_at_unix_ms = 8;
+  uint64 completed_at_unix_ms = 9;
+  uint32 attempts = 10;
+  string page_url = 11;
+
+  reserved 12 to 16;
+}
+
+message ClickRequest {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId session_id = 2;
+  string selector = 3;
+  uint32 max_retries = 4;
+  uint64 timeout_ms = 5;
+  bool capture_failure_screenshot = 6;
+  uint64 max_failure_screenshot_bytes = 7;
+
+  reserved 8 to 14;
+}
+
+message ClickResponse {
+  uint32 v = 1;
+  bool success = 2;
+  string error = 3;
+  BrowserActionLogEntry action_log = 4;
+  bytes failure_screenshot_bytes = 5;
+  string failure_screenshot_mime_type = 6;
+
+  reserved 7 to 12;
+}
+
+message TypeRequest {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId session_id = 2;
+  string selector = 3;
+  string text = 4;
+  bool clear_existing = 5;
+  uint64 timeout_ms = 6;
+  bool capture_failure_screenshot = 7;
+  uint64 max_failure_screenshot_bytes = 8;
+
+  reserved 9 to 16;
+}
+
+message TypeResponse {
+  uint32 v = 1;
+  bool success = 2;
+  uint64 typed_bytes = 3;
+  string error = 4;
+  BrowserActionLogEntry action_log = 5;
+  bytes failure_screenshot_bytes = 6;
+  string failure_screenshot_mime_type = 7;
+
+  reserved 8 to 14;
+}
+
+message ScrollRequest {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId session_id = 2;
+  int64 delta_x = 3;
+  int64 delta_y = 4;
+  bool capture_failure_screenshot = 5;
+  uint64 max_failure_screenshot_bytes = 6;
+
+  reserved 7 to 14;
+}
+
+message ScrollResponse {
+  uint32 v = 1;
+  bool success = 2;
+  int64 scroll_x = 3;
+  int64 scroll_y = 4;
+  string error = 5;
+  BrowserActionLogEntry action_log = 6;
+  bytes failure_screenshot_bytes = 7;
+  string failure_screenshot_mime_type = 8;
+
+  reserved 9 to 14;
+}
+
+message WaitForRequest {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId session_id = 2;
+  string selector = 3;
+  string text = 4;
+  uint64 timeout_ms = 5;
+  uint64 poll_interval_ms = 6;
+  bool capture_failure_screenshot = 7;
+  uint64 max_failure_screenshot_bytes = 8;
+
+  reserved 9 to 16;
+}
+
+message WaitForResponse {
+  uint32 v = 1;
+  bool success = 2;
+  uint64 waited_ms = 3;
+  string error = 4;
+  BrowserActionLogEntry action_log = 5;
+  bytes failure_screenshot_bytes = 6;
+  string failure_screenshot_mime_type = 7;
+  string matched_selector = 8;
+  string matched_text = 9;
+
+  reserved 10 to 16;
 }
 
 message GetTitleRequest {
