@@ -153,7 +153,9 @@ fn spawn_palyrad_with_dynamic_port_and_env(extra_env: &[(&str, &str)]) -> Result
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .env("RUST_LOG", "info")
-            .env("PALYRA_ADMIN_TOKEN", "test-admin-token");
+            .env("PALYRA_ADMIN_TOKEN", "test-admin-token")
+            .env("PALYRA_GATEWAY_QUIC_BIND_ADDR", "127.0.0.1")
+            .env("PALYRA_GATEWAY_QUIC_PORT", "0");
         for (key, value) in extra_env {
             command.env(key, value);
         }

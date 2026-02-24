@@ -308,6 +308,8 @@ fn spawn_palyrad_with_dynamic_ports() -> Result<(Child, u16, u16)> {
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .env("PALYRA_ADMIN_TOKEN", ADMIN_TOKEN)
+        .env("PALYRA_GATEWAY_QUIC_BIND_ADDR", "127.0.0.1")
+        .env("PALYRA_GATEWAY_QUIC_PORT", "0")
         .env("PALYRA_JOURNAL_DB_PATH", journal_db_path.to_string_lossy().to_string())
         .env("PALYRA_GATEWAY_IDENTITY_STORE_DIR", identity_store_dir.to_string_lossy().to_string())
         .env("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED", "true")
