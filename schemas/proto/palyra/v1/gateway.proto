@@ -34,6 +34,13 @@ service VaultService {
   rpc ListSecrets(ListSecretsRequest) returns (ListSecretsResponse);
 }
 
+service CanvasService {
+  rpc CreateCanvas(CreateCanvasRequest) returns (CreateCanvasResponse);
+  rpc UpdateCanvas(UpdateCanvasRequest) returns (UpdateCanvasResponse);
+  rpc CloseCanvas(CloseCanvasRequest) returns (CloseCanvasResponse);
+  rpc GetCanvas(GetCanvasRequest) returns (GetCanvasResponse);
+}
+
 enum ApprovalSubjectType {
   APPROVAL_SUBJECT_TYPE_UNSPECIFIED = 0;
   APPROVAL_SUBJECT_TYPE_TOOL = 1;
@@ -213,6 +220,112 @@ message ListSecretsRequest {
 message ListSecretsResponse {
   uint32 v = 1;
   repeated VaultSecretMetadata secrets = 2;
+
+  reserved 3 to 10;
+}
+
+message CanvasAsset {
+  string path = 1;
+  string content_type = 2;
+  bytes body = 3;
+
+  reserved 4 to 10;
+}
+
+message CanvasBundle {
+  string bundle_id = 1;
+  string entrypoint_path = 2;
+  repeated CanvasAsset assets = 3;
+  string sha256 = 4;
+  string signature = 5;
+
+  reserved 6 to 12;
+}
+
+message Canvas {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId canvas_id = 2;
+  palyra.common.v1.CanonicalId session_id = 3;
+  string principal = 4;
+  uint64 state_version = 5;
+  bytes state_json = 6;
+  CanvasBundle bundle = 7;
+  repeated string allowed_parent_origins = 8;
+  int64 created_at_unix_ms = 9;
+  int64 updated_at_unix_ms = 10;
+  int64 expires_at_unix_ms = 11;
+  bool closed = 12;
+  string close_reason = 13;
+
+  reserved 14 to 24;
+}
+
+message CreateCanvasRequest {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId canvas_id = 2;
+  palyra.common.v1.CanonicalId session_id = 3;
+  bytes initial_state_json = 4;
+  uint64 initial_state_version = 5;
+  CanvasBundle bundle = 6;
+  repeated string allowed_parent_origins = 7;
+  uint32 auth_token_ttl_seconds = 8;
+
+  reserved 9 to 16;
+}
+
+message CreateCanvasResponse {
+  uint32 v = 1;
+  Canvas canvas = 2;
+  string frame_url = 3;
+  string runtime_url = 4;
+  string auth_token = 5;
+
+  reserved 6 to 12;
+}
+
+message UpdateCanvasRequest {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId canvas_id = 2;
+  bytes state_json = 3;
+  uint64 expected_state_version = 4;
+
+  reserved 5 to 12;
+}
+
+message UpdateCanvasResponse {
+  uint32 v = 1;
+  Canvas canvas = 2;
+
+  reserved 3 to 10;
+}
+
+message CloseCanvasRequest {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId canvas_id = 2;
+  string reason = 3;
+
+  reserved 4 to 10;
+}
+
+message CloseCanvasResponse {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId canvas_id = 2;
+  bool closed = 3;
+  string close_reason = 4;
+
+  reserved 5 to 10;
+}
+
+message GetCanvasRequest {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId canvas_id = 2;
+
+  reserved 3 to 10;
+}
+
+message GetCanvasResponse {
+  uint32 v = 1;
+  Canvas canvas = 2;
 
   reserved 3 to 10;
 }

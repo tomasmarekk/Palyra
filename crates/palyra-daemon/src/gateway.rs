@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap, VecDeque},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::PathBuf,
     sync::{
@@ -10,7 +10,7 @@ use std::{
 };
 
 use axum::http::{header::AUTHORIZATION, HeaderMap};
-use base64::Engine as _;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use palyra_auth::{
     AuthCredential, AuthCredentialType, AuthExpiryDistribution, AuthHealthSummary,
     AuthProfileError, AuthProfileHealthState, AuthProfileListFilter, AuthProfileRecord,
@@ -35,7 +35,7 @@ use palyra_vault::{
 };
 use palyra_vault::{SecretMetadata as VaultSecretMetadata, Vault, VaultError, VaultScope};
 use reqwest::{redirect::Policy, Url};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, Notify};
@@ -174,6 +174,14 @@ const MAX_HTTP_FETCH_BODY_BYTES: usize = 512 * 1024;
 const MAX_HTTP_FETCH_REDIRECTS: usize = 10;
 const MAX_HTTP_FETCH_CACHE_KEY_BYTES: usize = 4 * 1024;
 const MAX_BROWSER_TOOL_INPUT_BYTES: usize = 128 * 1024;
+const MAX_CANVAS_ID_BYTES: usize = 64;
+const MAX_CANVAS_BUNDLE_ID_BYTES: usize = 128;
+const MAX_CANVAS_ASSET_PATH_BYTES: usize = 256;
+const MAX_CANVAS_ASSET_CONTENT_TYPE_BYTES: usize = 128;
+const MAX_CANVAS_ALLOWED_PARENT_ORIGINS: usize = 16;
+const MAX_CANVAS_ORIGIN_BYTES: usize = 256;
+const MAX_CANVAS_TOKEN_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
+const MIN_CANVAS_TOKEN_TTL_MS: u64 = 30 * 1_000;
 const MAX_PATCH_TOOL_REDACTION_PATTERNS: usize = 64;
 const MAX_PATCH_TOOL_SECRET_FILE_MARKERS: usize = 64;
 const MAX_PATCH_TOOL_PATTERN_BYTES: usize = 256;
@@ -232,6 +240,7 @@ pub struct GatewayRuntimeConfigSnapshot {
     pub tool_call: ToolCallConfig,
     pub http_fetch: HttpFetchRuntimeConfig,
     pub browser_service: BrowserServiceRuntimeConfig,
+    pub canvas_host: CanvasHostRuntimeConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -267,6 +276,17 @@ pub struct BrowserServiceRuntimeConfig {
     pub request_timeout_ms: u64,
     pub max_screenshot_bytes: usize,
     pub max_title_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CanvasHostRuntimeConfig {
+    pub enabled: bool,
+    pub public_base_url: String,
+    pub token_ttl_ms: u64,
+    pub max_state_bytes: usize,
+    pub max_bundle_bytes: usize,
+    pub max_assets_per_bundle: usize,
+    pub max_updates_per_minute: usize,
 }
 
 impl Default for MemoryRuntimeConfig {
@@ -321,6 +341,83 @@ struct ToolSkillContext {
     version: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct CanvasAssetRecord {
+    content_type: String,
+    body: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct CanvasBundleRecord {
+    bundle_id: String,
+    entrypoint_path: String,
+    assets: HashMap<String, CanvasAssetRecord>,
+    sha256: String,
+    signature: String,
+}
+
+#[derive(Debug, Clone)]
+struct CanvasRecord {
+    canvas_id: String,
+    session_id: String,
+    principal: String,
+    state_version: u64,
+    state_json: Vec<u8>,
+    bundle: CanvasBundleRecord,
+    allowed_parent_origins: Vec<String>,
+    created_at_unix_ms: i64,
+    updated_at_unix_ms: i64,
+    expires_at_unix_ms: i64,
+    closed: bool,
+    close_reason: Option<String>,
+    update_timestamps_unix_ms: VecDeque<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CanvasFrameDocument {
+    pub canvas_id: String,
+    pub html: String,
+    pub csp: String,
+    pub expires_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct CanvasAssetResponse {
+    pub content_type: String,
+    pub body: Vec<u8>,
+    pub csp: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CanvasStateResponse {
+    pub canvas_id: String,
+    pub state_version: u64,
+    pub state: Value,
+    pub closed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub close_reason: Option<String>,
+    pub expires_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CanvasRuntimeDescriptor {
+    pub canvas_id: String,
+    pub frame_url: String,
+    pub runtime_url: String,
+    pub auth_token: String,
+    pub expires_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CanvasTokenPayload {
+    canvas_id: String,
+    principal: String,
+    session_id: String,
+    issued_at_unix_ms: i64,
+    expires_at_unix_ms: i64,
+    nonce: String,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct VaultRateLimitEntry {
     window_started_at: Instant,
@@ -363,6 +460,8 @@ pub struct GatewayRuntimeState {
     http_fetch_cache: Mutex<HashMap<String, CachedHttpFetchEntry>>,
     tool_approval_cache: Mutex<HashMap<String, CachedToolApprovalDecision>>,
     vault_rate_limit: Mutex<HashMap<String, VaultRateLimitEntry>>,
+    canvas_records: Mutex<HashMap<String, CanvasRecord>>,
+    canvas_signing_secret: [u8; 32],
     agent_registry: AgentRegistry,
     channel_router: ChannelRouter,
 }
@@ -443,6 +542,10 @@ struct RuntimeCounters {
     channel_messages_quarantined: AtomicU64,
     channel_router_queue_depth: AtomicU64,
     channel_reply_failures: AtomicU64,
+    canvas_created: AtomicU64,
+    canvas_updated: AtomicU64,
+    canvas_closed: AtomicU64,
+    canvas_denied: AtomicU64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -573,6 +676,10 @@ pub struct CountersSnapshot {
     pub channel_messages_quarantined: u64,
     pub channel_router_queue_depth: u64,
     pub channel_reply_failures: u64,
+    pub canvas_created: u64,
+    pub canvas_updated: u64,
+    pub canvas_closed: u64,
+    pub canvas_denied: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -873,6 +980,10 @@ impl RuntimeCounters {
             channel_messages_quarantined: self.channel_messages_quarantined.load(Ordering::Relaxed),
             channel_router_queue_depth: self.channel_router_queue_depth.load(Ordering::Relaxed),
             channel_reply_failures: self.channel_reply_failures.load(Ordering::Relaxed),
+            canvas_created: self.canvas_created.load(Ordering::Relaxed),
+            canvas_updated: self.canvas_updated.load(Ordering::Relaxed),
+            canvas_closed: self.canvas_closed.load(Ordering::Relaxed),
+            canvas_denied: self.canvas_denied.load(Ordering::Relaxed),
         }
     }
 }
@@ -998,6 +1109,10 @@ impl GatewayRuntimeState {
                 channel_messages_quarantined: AtomicU64::new(0),
                 channel_router_queue_depth: AtomicU64::new(0),
                 channel_reply_failures: AtomicU64::new(0),
+                canvas_created: AtomicU64::new(0),
+                canvas_updated: AtomicU64::new(0),
+                canvas_closed: AtomicU64::new(0),
+                canvas_denied: AtomicU64::new(0),
             },
             journal_store,
             revoked_certificate_count,
@@ -1008,6 +1123,8 @@ impl GatewayRuntimeState {
             http_fetch_cache: Mutex::new(HashMap::new()),
             tool_approval_cache: Mutex::new(HashMap::new()),
             vault_rate_limit: Mutex::new(HashMap::new()),
+            canvas_records: Mutex::new(HashMap::new()),
+            canvas_signing_secret: generate_canvas_signing_secret(),
             agent_registry,
             channel_router,
         }))
@@ -1019,6 +1136,608 @@ impl GatewayRuntimeState {
 
     pub fn record_admin_status_request(&self) {
         self.counters.admin_status_requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn ensure_canvas_host_enabled(&self) -> Result<(), Status> {
+        if self.config.canvas_host.enabled {
+            Ok(())
+        } else {
+            Err(Status::failed_precondition("canvas host is disabled (canvas_host.enabled=false)"))
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    #[allow(clippy::too_many_arguments)]
+    fn create_canvas(
+        &self,
+        context: &RequestContext,
+        requested_canvas_id: Option<String>,
+        session_id: String,
+        initial_state_json: &[u8],
+        initial_state_version: u64,
+        bundle: gateway_v1::CanvasBundle,
+        allowed_parent_origins: Vec<String>,
+        requested_token_ttl_seconds: Option<u32>,
+    ) -> Result<(CanvasRecord, CanvasRuntimeDescriptor), Status> {
+        self.ensure_canvas_host_enabled()?;
+        if initial_state_json.len() > self.config.canvas_host.max_state_bytes {
+            return Err(Status::resource_exhausted(format!(
+                "canvas state payload exceeds limit ({} > {})",
+                initial_state_json.len(),
+                self.config.canvas_host.max_state_bytes
+            )));
+        }
+        let _validated_initial_state = serde_json::from_slice::<Value>(initial_state_json)
+            .map_err(|error| {
+                Status::invalid_argument(format!("initial_state_json must be valid JSON: {error}"))
+            })?;
+        let now_unix_ms = unix_ms_now_for_status()?;
+        let canvas_id = match requested_canvas_id {
+            Some(value) => normalize_canvas_identifier(value.as_str(), "canvas_id")?,
+            None => Ulid::new().to_string(),
+        };
+        let state_version = if initial_state_version == 0 { 1 } else { initial_state_version };
+        let allowed_parent_origins =
+            parse_canvas_allowed_parent_origins(allowed_parent_origins.as_slice())?;
+        let mut bundle = self.parse_canvas_bundle(bundle)?;
+        let token_ttl_ms =
+            self.resolve_canvas_token_ttl_ms(requested_token_ttl_seconds.unwrap_or_default())?;
+        let expires_at_unix_ms = now_unix_ms.saturating_add(token_ttl_ms as i64);
+        bundle.signature = self.sign_canvas_bundle(
+            canvas_id.as_str(),
+            bundle.sha256.as_str(),
+            context.principal.as_str(),
+            session_id.as_str(),
+        );
+
+        let mut records = self
+            .canvas_records
+            .lock()
+            .map_err(|_| Status::internal("canvas registry lock poisoned"))?;
+        if records.contains_key(canvas_id.as_str()) {
+            return Err(Status::already_exists(format!("canvas already exists: {canvas_id}")));
+        }
+
+        let record = CanvasRecord {
+            canvas_id: canvas_id.clone(),
+            session_id: session_id.clone(),
+            principal: context.principal.clone(),
+            state_version,
+            state_json: initial_state_json.to_vec(),
+            bundle,
+            allowed_parent_origins,
+            created_at_unix_ms: now_unix_ms,
+            updated_at_unix_ms: now_unix_ms,
+            expires_at_unix_ms,
+            closed: false,
+            close_reason: None,
+            update_timestamps_unix_ms: VecDeque::new(),
+        };
+        records.insert(canvas_id.clone(), record.clone());
+        self.counters.canvas_created.fetch_add(1, Ordering::Relaxed);
+
+        let auth_token = self.issue_canvas_token(
+            canvas_id.as_str(),
+            context.principal.as_str(),
+            session_id.as_str(),
+            now_unix_ms,
+            expires_at_unix_ms,
+        )?;
+        let descriptor = CanvasRuntimeDescriptor {
+            canvas_id: canvas_id.clone(),
+            frame_url: format!(
+                "{}/canvas/v1/frame/{}",
+                self.config.canvas_host.public_base_url, canvas_id
+            ),
+            runtime_url: format!(
+                "{}/canvas/v1/runtime.js",
+                self.config.canvas_host.public_base_url
+            ),
+            auth_token,
+            expires_at_unix_ms,
+        };
+        Ok((record, descriptor))
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn update_canvas_state(
+        &self,
+        context: &RequestContext,
+        canvas_id: &str,
+        state_json: &[u8],
+        expected_state_version: Option<u64>,
+    ) -> Result<CanvasRecord, Status> {
+        self.ensure_canvas_host_enabled()?;
+        if state_json.len() > self.config.canvas_host.max_state_bytes {
+            return Err(Status::resource_exhausted(format!(
+                "canvas state payload exceeds limit ({} > {})",
+                state_json.len(),
+                self.config.canvas_host.max_state_bytes
+            )));
+        }
+        let _validated_state = serde_json::from_slice::<Value>(state_json).map_err(|error| {
+            Status::invalid_argument(format!("state_json must be valid JSON: {error}"))
+        })?;
+        let normalized_canvas_id = normalize_canvas_identifier(canvas_id, "canvas_id")?;
+        let now_unix_ms = unix_ms_now_for_status()?;
+        let mut records = self
+            .canvas_records
+            .lock()
+            .map_err(|_| Status::internal("canvas registry lock poisoned"))?;
+        let Some(record) = records.get_mut(normalized_canvas_id.as_str()) else {
+            return Err(Status::not_found(format!("canvas not found: {normalized_canvas_id}")));
+        };
+        if record.principal != context.principal {
+            self.counters.canvas_denied.fetch_add(1, Ordering::Relaxed);
+            return Err(Status::permission_denied("canvas access denied: principal mismatch"));
+        }
+        if record.closed {
+            return Err(Status::failed_precondition("canvas is closed and cannot be updated"));
+        }
+        if record.expires_at_unix_ms <= now_unix_ms {
+            self.counters.canvas_denied.fetch_add(1, Ordering::Relaxed);
+            return Err(Status::permission_denied("canvas token/session expired"));
+        }
+        if let Some(expected_state_version) = expected_state_version {
+            if expected_state_version > 0 && record.state_version != expected_state_version {
+                return Err(Status::failed_precondition(format!(
+                    "canvas version mismatch (expected {}, current {})",
+                    expected_state_version, record.state_version
+                )));
+            }
+        }
+        while record
+            .update_timestamps_unix_ms
+            .front()
+            .is_some_and(|value| now_unix_ms.saturating_sub(*value) > 60_000)
+        {
+            let _ = record.update_timestamps_unix_ms.pop_front();
+        }
+        if record.update_timestamps_unix_ms.len() >= self.config.canvas_host.max_updates_per_minute
+        {
+            return Err(Status::resource_exhausted(format!(
+                "canvas update rate limit exceeded (>{} updates/minute)",
+                self.config.canvas_host.max_updates_per_minute
+            )));
+        }
+        record.update_timestamps_unix_ms.push_back(now_unix_ms);
+        record.state_version = record.state_version.saturating_add(1);
+        record.state_json = state_json.to_vec();
+        record.updated_at_unix_ms = now_unix_ms;
+        self.counters.canvas_updated.fetch_add(1, Ordering::Relaxed);
+        Ok(record.clone())
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn close_canvas(
+        &self,
+        context: &RequestContext,
+        canvas_id: &str,
+        reason: Option<String>,
+    ) -> Result<CanvasRecord, Status> {
+        self.ensure_canvas_host_enabled()?;
+        let normalized_canvas_id = normalize_canvas_identifier(canvas_id, "canvas_id")?;
+        let now_unix_ms = unix_ms_now_for_status()?;
+        let mut records = self
+            .canvas_records
+            .lock()
+            .map_err(|_| Status::internal("canvas registry lock poisoned"))?;
+        let Some(record) = records.get_mut(normalized_canvas_id.as_str()) else {
+            return Err(Status::not_found(format!("canvas not found: {normalized_canvas_id}")));
+        };
+        if record.principal != context.principal {
+            self.counters.canvas_denied.fetch_add(1, Ordering::Relaxed);
+            return Err(Status::permission_denied("canvas access denied: principal mismatch"));
+        }
+        if !record.closed {
+            record.closed = true;
+            record.close_reason =
+                reason.and_then(non_empty).or_else(|| Some("closed_by_operator".to_owned()));
+            record.updated_at_unix_ms = now_unix_ms;
+            self.counters.canvas_closed.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(record.clone())
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn get_canvas(
+        &self,
+        context: &RequestContext,
+        canvas_id: &str,
+    ) -> Result<CanvasRecord, Status> {
+        self.ensure_canvas_host_enabled()?;
+        let normalized_canvas_id = normalize_canvas_identifier(canvas_id, "canvas_id")?;
+        let records = self
+            .canvas_records
+            .lock()
+            .map_err(|_| Status::internal("canvas registry lock poisoned"))?;
+        let Some(record) = records.get(normalized_canvas_id.as_str()) else {
+            return Err(Status::not_found(format!("canvas not found: {normalized_canvas_id}")));
+        };
+        if record.principal != context.principal {
+            self.counters.canvas_denied.fetch_add(1, Ordering::Relaxed);
+            return Err(Status::permission_denied("canvas access denied: principal mismatch"));
+        }
+        Ok(record.clone())
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub fn canvas_frame_document(
+        &self,
+        canvas_id: &str,
+        token: &str,
+    ) -> Result<CanvasFrameDocument, Status> {
+        let record = self.authorize_canvas_http_request(canvas_id, token)?;
+        let csp = build_canvas_csp_header(record.allowed_parent_origins.as_slice());
+        let encoded_canvas_id = url_encode_component(record.canvas_id.as_str());
+        let encoded_entrypoint = url_encode_path_component(record.bundle.entrypoint_path.as_str());
+        let encoded_token = url_encode_component(token);
+        let mut origins_meta = String::new();
+        for origin in record.allowed_parent_origins.iter() {
+            origins_meta.push_str("<meta name=\"palyra-canvas-origin\" content=\"");
+            origins_meta.push_str(escape_html_attribute(origin).as_str());
+            origins_meta.push_str("\" />\n");
+        }
+        let html = format!(
+            concat!(
+                "<!doctype html>\n",
+                "<html lang=\"en\">\n",
+                "<head>\n",
+                "<meta charset=\"utf-8\" />\n",
+                "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n",
+                "<title>Palyra Canvas</title>\n",
+                "{origins_meta}",
+                "<link rel=\"stylesheet\" href=\"/canvas/v1/runtime.css?canvas_id={canvas_id}&token={token}\" />\n",
+                "</head>\n",
+                "<body>\n",
+                "<main id=\"palyra-canvas-root\" data-canvas-id=\"{canvas_id}\"></main>\n",
+                "<pre id=\"palyra-canvas-state\" hidden></pre>\n",
+                "<script src=\"/canvas/v1/runtime.js?canvas_id={canvas_id}&token={token}\" defer></script>\n",
+                "<script src=\"/canvas/v1/bundle/{canvas_id}/{entrypoint}?token={token}\" defer></script>\n",
+                "</body>\n",
+                "</html>\n"
+            ),
+            origins_meta = origins_meta,
+            canvas_id = encoded_canvas_id,
+            entrypoint = encoded_entrypoint,
+            token = encoded_token
+        );
+        Ok(CanvasFrameDocument {
+            canvas_id: record.canvas_id,
+            html,
+            csp,
+            expires_at_unix_ms: record.expires_at_unix_ms,
+        })
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub fn canvas_runtime_script(
+        &self,
+        canvas_id: &str,
+        token: &str,
+    ) -> Result<CanvasAssetResponse, Status> {
+        let record = self.authorize_canvas_http_request(canvas_id, token)?;
+        let script = format!(
+            concat!(
+                "(function () {{\n",
+                "  'use strict';\n",
+                "  const root = document.getElementById('palyra-canvas-root');\n",
+                "  const statePreview = document.getElementById('palyra-canvas-state');\n",
+                "  const params = new URLSearchParams(window.location.search);\n",
+                "  const canvasId = params.get('canvas_id') || {canvas_id_json};\n",
+                "  const token = params.get('token') || '';\n",
+                "  const allowedOrigins = new Set(Array.from(document.querySelectorAll('meta[name=\"palyra-canvas-origin\"]')).map((node) => node.content));\n",
+                "  let stateVersion = 0;\n",
+                "  function renderState(state) {{\n",
+                "    if (statePreview) {{\n",
+                "      statePreview.hidden = false;\n",
+                "      statePreview.textContent = JSON.stringify(state, null, 2);\n",
+                "    }}\n",
+                "    window.dispatchEvent(new CustomEvent('palyra:canvas-state', {{ detail: state }}));\n",
+                "  }}\n",
+                "  async function pollState() {{\n",
+                "    if (!canvasId || !token) return;\n",
+                "    const url = new URL('/canvas/v1/state/' + encodeURIComponent(canvasId), window.location.origin);\n",
+                "    url.searchParams.set('token', token);\n",
+                "    url.searchParams.set('after_version', String(stateVersion));\n",
+                "    const response = await fetch(url.toString(), {{ method: 'GET', cache: 'no-store', credentials: 'omit' }});\n",
+                "    if (response.status === 204) return;\n",
+                "    if (!response.ok) return;\n",
+                "    const payload = await response.json();\n",
+                "    if (typeof payload.state_version !== 'number') return;\n",
+                "    if (payload.state_version <= stateVersion) return;\n",
+                "    stateVersion = payload.state_version;\n",
+                "    renderState(payload.state);\n",
+                "  }}\n",
+                "  window.addEventListener('message', (event) => {{\n",
+                "    if (!allowedOrigins.has(event.origin)) return;\n",
+                "    const message = event.data;\n",
+                "    if (!message || typeof message !== 'object') return;\n",
+                "    if (message.type !== 'palyra.canvas.state') return;\n",
+                "    if (message.token !== token) return;\n",
+                "    if (typeof message.version !== 'number' || message.version <= stateVersion) return;\n",
+                "    stateVersion = message.version;\n",
+                "    renderState(message.state);\n",
+                "  }});\n",
+                "  if (window.parent && window.parent !== window) {{\n",
+                "    for (const origin of allowedOrigins) {{\n",
+                "      window.parent.postMessage({{ type: 'palyra.canvas.ready', canvas_id: canvasId }}, origin);\n",
+                "    }}\n",
+                "  }}\n",
+                "  setInterval(() => {{ void pollState(); }}, 750);\n",
+                "  void pollState();\n",
+                "  if (root) {{\n",
+                "    root.setAttribute('data-canvas-ready', 'true');\n",
+                "  }}\n",
+                "}})();\n"
+            ),
+            canvas_id_json = serde_json::to_string(&record.canvas_id).map_err(|error| {
+                Status::internal(format!("failed to encode canvas runtime identifier: {error}"))
+            })?
+        );
+        Ok(CanvasAssetResponse {
+            content_type: "application/javascript; charset=utf-8".to_owned(),
+            body: script.into_bytes(),
+            csp: build_canvas_csp_header(record.allowed_parent_origins.as_slice()),
+        })
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub fn canvas_runtime_stylesheet(
+        &self,
+        canvas_id: &str,
+        token: &str,
+    ) -> Result<CanvasAssetResponse, Status> {
+        let record = self.authorize_canvas_http_request(canvas_id, token)?;
+        let stylesheet = concat!(
+            ":root { color-scheme: light; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }\n",
+            "html, body { margin: 0; padding: 0; background: #f5f7fb; color: #111827; }\n",
+            "#palyra-canvas-root { min-height: 2rem; }\n",
+            "#palyra-canvas-state { margin: 0; padding: 1rem; white-space: pre-wrap; word-break: break-word; }\n"
+        );
+        Ok(CanvasAssetResponse {
+            content_type: "text/css; charset=utf-8".to_owned(),
+            body: stylesheet.as_bytes().to_vec(),
+            csp: build_canvas_csp_header(record.allowed_parent_origins.as_slice()),
+        })
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub fn canvas_bundle_asset(
+        &self,
+        canvas_id: &str,
+        asset_path: &str,
+        token: &str,
+    ) -> Result<CanvasAssetResponse, Status> {
+        let record = self.authorize_canvas_http_request(canvas_id, token)?;
+        let normalized_asset_path = normalize_canvas_asset_path(asset_path, "asset_path")?;
+        let Some(asset) = record.bundle.assets.get(normalized_asset_path.as_str()) else {
+            return Err(Status::not_found(format!(
+                "canvas asset not found: {}",
+                normalized_asset_path
+            )));
+        };
+        Ok(CanvasAssetResponse {
+            content_type: asset.content_type.clone(),
+            body: asset.body.clone(),
+            csp: build_canvas_csp_header(record.allowed_parent_origins.as_slice()),
+        })
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub fn canvas_state(
+        &self,
+        canvas_id: &str,
+        token: &str,
+        after_version: Option<u64>,
+    ) -> Result<Option<CanvasStateResponse>, Status> {
+        let record = self.authorize_canvas_http_request(canvas_id, token)?;
+        if after_version.is_some_and(|value| value >= record.state_version) {
+            return Ok(None);
+        }
+        let state = serde_json::from_slice::<Value>(&record.state_json).map_err(|error| {
+            Status::internal(format!("persisted canvas state JSON is invalid: {error}"))
+        })?;
+        Ok(Some(CanvasStateResponse {
+            canvas_id: record.canvas_id,
+            state_version: record.state_version,
+            state,
+            closed: record.closed,
+            close_reason: record.close_reason,
+            expires_at_unix_ms: record.expires_at_unix_ms,
+        }))
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn authorize_canvas_http_request(
+        &self,
+        canvas_id: &str,
+        token: &str,
+    ) -> Result<CanvasRecord, Status> {
+        self.ensure_canvas_host_enabled()?;
+        let normalized_canvas_id = normalize_canvas_identifier(canvas_id, "canvas_id")?;
+        let token_payload = self.verify_canvas_token(token)?;
+        if token_payload.canvas_id != normalized_canvas_id {
+            self.counters.canvas_denied.fetch_add(1, Ordering::Relaxed);
+            return Err(Status::permission_denied("canvas token does not match canvas id"));
+        }
+        let now_unix_ms = unix_ms_now_for_status()?;
+        if token_payload.expires_at_unix_ms <= now_unix_ms {
+            self.counters.canvas_denied.fetch_add(1, Ordering::Relaxed);
+            return Err(Status::permission_denied("canvas token expired"));
+        }
+
+        let records = self
+            .canvas_records
+            .lock()
+            .map_err(|_| Status::internal("canvas registry lock poisoned"))?;
+        let Some(record) = records.get(normalized_canvas_id.as_str()) else {
+            return Err(Status::not_found(format!("canvas not found: {normalized_canvas_id}")));
+        };
+        if record.expires_at_unix_ms <= now_unix_ms {
+            self.counters.canvas_denied.fetch_add(1, Ordering::Relaxed);
+            return Err(Status::permission_denied("canvas session expired"));
+        }
+        if record.principal != token_payload.principal
+            || record.session_id != token_payload.session_id
+        {
+            self.counters.canvas_denied.fetch_add(1, Ordering::Relaxed);
+            return Err(Status::permission_denied("canvas token scope mismatch"));
+        }
+        Ok(record.clone())
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn parse_canvas_bundle(
+        &self,
+        bundle: gateway_v1::CanvasBundle,
+    ) -> Result<CanvasBundleRecord, Status> {
+        let bundle_id = normalize_canvas_bundle_identifier(bundle.bundle_id.as_str())?;
+        let entrypoint_path =
+            normalize_canvas_asset_path(bundle.entrypoint_path.as_str(), "bundle.entrypoint_path")?;
+        if bundle.assets.is_empty() {
+            return Err(Status::invalid_argument("bundle.assets must include at least one asset"));
+        }
+        if bundle.assets.len() > self.config.canvas_host.max_assets_per_bundle {
+            return Err(Status::resource_exhausted(format!(
+                "bundle.assets exceeds limit ({} > {})",
+                bundle.assets.len(),
+                self.config.canvas_host.max_assets_per_bundle
+            )));
+        }
+        let mut assets = HashMap::new();
+        let mut total_bytes = 0usize;
+        for (index, asset) in bundle.assets.iter().enumerate() {
+            let source = format!("bundle.assets[{index}]");
+            let normalized_path =
+                normalize_canvas_asset_path(asset.path.as_str(), source.as_str())?;
+            if assets.contains_key(normalized_path.as_str()) {
+                return Err(Status::invalid_argument(format!(
+                    "{source}.path duplicates asset path '{normalized_path}'"
+                )));
+            }
+            let content_type =
+                normalize_canvas_asset_content_type(asset.content_type.as_str(), source.as_str())?;
+            total_bytes = total_bytes.saturating_add(asset.body.len());
+            if total_bytes > self.config.canvas_host.max_bundle_bytes {
+                return Err(Status::resource_exhausted(format!(
+                    "bundle byte size exceeds limit ({} > {})",
+                    total_bytes, self.config.canvas_host.max_bundle_bytes
+                )));
+            }
+            assets.insert(
+                normalized_path,
+                CanvasAssetRecord { content_type, body: asset.body.clone() },
+            );
+        }
+        let Some(entrypoint_asset) = assets.get(entrypoint_path.as_str()) else {
+            return Err(Status::invalid_argument(
+                "bundle.entrypoint_path must reference an existing asset",
+            ));
+        };
+        if !is_canvas_javascript_content_type(entrypoint_asset.content_type.as_str()) {
+            return Err(Status::failed_precondition(
+                "bundle.entrypoint_path asset must use javascript content type",
+            ));
+        }
+        let sha256 = compute_canvas_bundle_sha256(&assets);
+        Ok(CanvasBundleRecord {
+            bundle_id,
+            entrypoint_path,
+            assets,
+            sha256,
+            signature: String::new(),
+        })
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn resolve_canvas_token_ttl_ms(&self, requested_ttl_seconds: u32) -> Result<u64, Status> {
+        let requested_ttl_ms = if requested_ttl_seconds == 0 {
+            self.config.canvas_host.token_ttl_ms
+        } else {
+            u64::from(requested_ttl_seconds).saturating_mul(1_000)
+        };
+        let bounded = requested_ttl_ms.clamp(MIN_CANVAS_TOKEN_TTL_MS, MAX_CANVAS_TOKEN_TTL_MS);
+        if bounded == 0 {
+            return Err(Status::invalid_argument("canvas auth token ttl must be positive"));
+        }
+        Ok(bounded)
+    }
+
+    fn sign_canvas_bundle(
+        &self,
+        canvas_id: &str,
+        bundle_sha256: &str,
+        principal: &str,
+        session_id: &str,
+    ) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(self.canvas_signing_secret);
+        hasher.update(b"\n");
+        hasher.update(canvas_id.as_bytes());
+        hasher.update(b"\n");
+        hasher.update(bundle_sha256.as_bytes());
+        hasher.update(b"\n");
+        hasher.update(principal.as_bytes());
+        hasher.update(b"\n");
+        hasher.update(session_id.as_bytes());
+        URL_SAFE_NO_PAD.encode(hasher.finalize())
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn issue_canvas_token(
+        &self,
+        canvas_id: &str,
+        principal: &str,
+        session_id: &str,
+        issued_at_unix_ms: i64,
+        expires_at_unix_ms: i64,
+    ) -> Result<String, Status> {
+        let payload = CanvasTokenPayload {
+            canvas_id: canvas_id.to_owned(),
+            principal: principal.to_owned(),
+            session_id: session_id.to_owned(),
+            issued_at_unix_ms,
+            expires_at_unix_ms,
+            nonce: Ulid::new().to_string(),
+        };
+        let payload_json = serde_json::to_vec(&payload).map_err(|error| {
+            Status::internal(format!("failed to serialize canvas token payload: {error}"))
+        })?;
+        let payload_b64 = URL_SAFE_NO_PAD.encode(payload_json);
+        let mut hasher = Sha256::new();
+        hasher.update(self.canvas_signing_secret);
+        hasher.update(b".");
+        hasher.update(payload_b64.as_bytes());
+        let signature = URL_SAFE_NO_PAD.encode(hasher.finalize());
+        Ok(format!("{payload_b64}.{signature}"))
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn verify_canvas_token(&self, token: &str) -> Result<CanvasTokenPayload, Status> {
+        if token.trim().is_empty() {
+            return Err(Status::invalid_argument("canvas token is required"));
+        }
+        let Some((payload_b64, signature_b64)) = token.split_once('.') else {
+            return Err(Status::invalid_argument("canvas token format is invalid"));
+        };
+        let mut hasher = Sha256::new();
+        hasher.update(self.canvas_signing_secret);
+        hasher.update(b".");
+        hasher.update(payload_b64.as_bytes());
+        let expected_signature = URL_SAFE_NO_PAD.encode(hasher.finalize());
+        if !constant_time_eq(expected_signature.as_bytes(), signature_b64.as_bytes()) {
+            return Err(Status::permission_denied("canvas token signature is invalid"));
+        }
+        let payload_json = URL_SAFE_NO_PAD.decode(payload_b64).map_err(|error| {
+            Status::invalid_argument(format!("canvas token payload encoding is invalid: {error}"))
+        })?;
+        let payload =
+            serde_json::from_slice::<CanvasTokenPayload>(&payload_json).map_err(|error| {
+                Status::invalid_argument(format!("canvas token payload is invalid JSON: {error}"))
+            })?;
+        Ok(payload)
     }
 
     #[allow(clippy::result_large_err)]
@@ -4097,6 +4816,43 @@ fn approval_record_message(record: &ApprovalRecord) -> gateway_v1::ApprovalRecor
     }
 }
 
+fn canvas_bundle_message(bundle: &CanvasBundleRecord) -> gateway_v1::CanvasBundle {
+    let mut assets = bundle.assets.iter().collect::<Vec<_>>();
+    assets.sort_by(|left, right| left.0.cmp(right.0));
+    gateway_v1::CanvasBundle {
+        bundle_id: bundle.bundle_id.clone(),
+        entrypoint_path: bundle.entrypoint_path.clone(),
+        assets: assets
+            .into_iter()
+            .map(|(path, asset)| gateway_v1::CanvasAsset {
+                path: path.clone(),
+                content_type: asset.content_type.clone(),
+                body: asset.body.clone(),
+            })
+            .collect(),
+        sha256: bundle.sha256.clone(),
+        signature: bundle.signature.clone(),
+    }
+}
+
+fn canvas_message(record: &CanvasRecord) -> gateway_v1::Canvas {
+    gateway_v1::Canvas {
+        v: CANONICAL_PROTOCOL_MAJOR,
+        canvas_id: Some(common_v1::CanonicalId { ulid: record.canvas_id.clone() }),
+        session_id: Some(common_v1::CanonicalId { ulid: record.session_id.clone() }),
+        principal: record.principal.clone(),
+        state_version: record.state_version,
+        state_json: record.state_json.clone(),
+        bundle: Some(canvas_bundle_message(&record.bundle)),
+        allowed_parent_origins: record.allowed_parent_origins.clone(),
+        created_at_unix_ms: record.created_at_unix_ms,
+        updated_at_unix_ms: record.updated_at_unix_ms,
+        expires_at_unix_ms: record.expires_at_unix_ms,
+        closed: record.closed,
+        close_reason: record.close_reason.clone().unwrap_or_default(),
+    }
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -4414,6 +5170,134 @@ impl AuthServiceImpl {
             warn!(method, error = %error, "auth rpc authorization denied");
             Status::permission_denied(error.to_string())
         })
+    }
+}
+
+#[derive(Clone)]
+pub struct CanvasServiceImpl {
+    state: Arc<GatewayRuntimeState>,
+    auth: GatewayAuthConfig,
+}
+
+impl CanvasServiceImpl {
+    #[must_use]
+    pub fn new(state: Arc<GatewayRuntimeState>, auth: GatewayAuthConfig) -> Self {
+        Self { state, auth }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn authorize_rpc(
+        &self,
+        metadata: &MetadataMap,
+        method: &'static str,
+    ) -> Result<RequestContext, Status> {
+        authorize_metadata(metadata, &self.auth).map_err(|error| {
+            self.state.record_denied();
+            warn!(method, error = %error, "canvas rpc authorization denied");
+            Status::permission_denied(error.to_string())
+        })
+    }
+}
+
+#[tonic::async_trait]
+impl gateway_v1::canvas_service_server::CanvasService for CanvasServiceImpl {
+    async fn create_canvas(
+        &self,
+        request: Request<gateway_v1::CreateCanvasRequest>,
+    ) -> Result<Response<gateway_v1::CreateCanvasResponse>, Status> {
+        let context = self.authorize_rpc(request.metadata(), "CreateCanvas")?;
+        let payload = request.into_inner();
+        if payload.v != CANONICAL_PROTOCOL_MAJOR {
+            return Err(Status::failed_precondition("unsupported protocol major version"));
+        }
+        let requested_canvas_id = optional_canonical_id(payload.canvas_id, "canvas_id")?;
+        let session_id = canonical_id(payload.session_id, "session_id")?;
+        let bundle =
+            payload.bundle.ok_or_else(|| Status::invalid_argument("bundle is required"))?;
+        let (record, descriptor) = self.state.create_canvas(
+            &context,
+            requested_canvas_id,
+            session_id,
+            payload.initial_state_json.as_slice(),
+            payload.initial_state_version,
+            bundle,
+            payload.allowed_parent_origins,
+            if payload.auth_token_ttl_seconds == 0 {
+                None
+            } else {
+                Some(payload.auth_token_ttl_seconds)
+            },
+        )?;
+        Ok(Response::new(gateway_v1::CreateCanvasResponse {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            canvas: Some(canvas_message(&record)),
+            frame_url: descriptor.frame_url,
+            runtime_url: descriptor.runtime_url,
+            auth_token: descriptor.auth_token,
+        }))
+    }
+
+    async fn update_canvas(
+        &self,
+        request: Request<gateway_v1::UpdateCanvasRequest>,
+    ) -> Result<Response<gateway_v1::UpdateCanvasResponse>, Status> {
+        let context = self.authorize_rpc(request.metadata(), "UpdateCanvas")?;
+        let payload = request.into_inner();
+        if payload.v != CANONICAL_PROTOCOL_MAJOR {
+            return Err(Status::failed_precondition("unsupported protocol major version"));
+        }
+        let canvas_id = canonical_id(payload.canvas_id, "canvas_id")?;
+        let record = self.state.update_canvas_state(
+            &context,
+            canvas_id.as_str(),
+            payload.state_json.as_slice(),
+            if payload.expected_state_version == 0 {
+                None
+            } else {
+                Some(payload.expected_state_version)
+            },
+        )?;
+        Ok(Response::new(gateway_v1::UpdateCanvasResponse {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            canvas: Some(canvas_message(&record)),
+        }))
+    }
+
+    async fn close_canvas(
+        &self,
+        request: Request<gateway_v1::CloseCanvasRequest>,
+    ) -> Result<Response<gateway_v1::CloseCanvasResponse>, Status> {
+        let context = self.authorize_rpc(request.metadata(), "CloseCanvas")?;
+        let payload = request.into_inner();
+        if payload.v != CANONICAL_PROTOCOL_MAJOR {
+            return Err(Status::failed_precondition("unsupported protocol major version"));
+        }
+        let canvas_id = canonical_id(payload.canvas_id, "canvas_id")?;
+        let record =
+            self.state.close_canvas(&context, canvas_id.as_str(), non_empty(payload.reason))?;
+        Ok(Response::new(gateway_v1::CloseCanvasResponse {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            canvas_id: Some(common_v1::CanonicalId { ulid: record.canvas_id }),
+            closed: record.closed,
+            close_reason: record.close_reason.unwrap_or_default(),
+        }))
+    }
+
+    async fn get_canvas(
+        &self,
+        request: Request<gateway_v1::GetCanvasRequest>,
+    ) -> Result<Response<gateway_v1::GetCanvasResponse>, Status> {
+        let context = self.authorize_rpc(request.metadata(), "GetCanvas")?;
+        let payload = request.into_inner();
+        if payload.v != CANONICAL_PROTOCOL_MAJOR {
+            return Err(Status::failed_precondition("unsupported protocol major version"));
+        }
+        let canvas_id = canonical_id(payload.canvas_id, "canvas_id")?;
+        let record = self.state.get_canvas(&context, canvas_id.as_str())?;
+        Ok(Response::new(gateway_v1::GetCanvasResponse {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            canvas: Some(canvas_message(&record)),
+        }))
     }
 }
 
@@ -12754,6 +13638,254 @@ const fn status_kind_name(kind: common_v1::stream_status::StatusKind) -> &'stati
 }
 
 #[allow(clippy::result_large_err)]
+fn unix_ms_now_for_status() -> Result<i64, Status> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| Status::internal(format!("failed to read system clock: {error}")))?;
+    Ok(i64::try_from(now.as_millis()).unwrap_or(i64::MAX))
+}
+
+fn generate_canvas_signing_secret() -> [u8; 32] {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let mut hasher = Sha256::new();
+    hasher.update(Ulid::new().to_string().as_bytes());
+    hasher.update(now.to_string().as_bytes());
+    let digest = hasher.finalize();
+    let mut secret = [0_u8; 32];
+    secret.copy_from_slice(&digest[..32]);
+    secret
+}
+
+#[allow(clippy::result_large_err)]
+fn normalize_canvas_identifier(raw: &str, field_name: &'static str) -> Result<String, Status> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(Status::invalid_argument(format!("{field_name} cannot be empty")));
+    }
+    if trimmed.len() > MAX_CANVAS_ID_BYTES {
+        return Err(Status::invalid_argument(format!(
+            "{field_name} exceeds maximum bytes ({} > {MAX_CANVAS_ID_BYTES})",
+            trimmed.len()
+        )));
+    }
+    validate_canonical_id(trimmed).map_err(|_| {
+        Status::invalid_argument(format!("{field_name} must be a canonical ULID identifier"))
+    })?;
+    Ok(trimmed.to_owned())
+}
+
+#[allow(clippy::result_large_err)]
+fn normalize_canvas_bundle_identifier(raw: &str) -> Result<String, Status> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(format!("bundle-{}", Ulid::new().to_string().to_ascii_lowercase()));
+    }
+    if trimmed.len() > MAX_CANVAS_BUNDLE_ID_BYTES {
+        return Err(Status::invalid_argument(format!(
+            "bundle.bundle_id exceeds maximum bytes ({} > {MAX_CANVAS_BUNDLE_ID_BYTES})",
+            trimmed.len()
+        )));
+    }
+    if !trimmed.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-')) {
+        return Err(Status::invalid_argument("bundle.bundle_id contains unsupported characters"));
+    }
+    Ok(trimmed.to_ascii_lowercase())
+}
+
+#[allow(clippy::result_large_err)]
+fn normalize_canvas_asset_path(raw: &str, field_name: &str) -> Result<String, Status> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(Status::invalid_argument(format!("{field_name} cannot be empty")));
+    }
+    if trimmed.len() > MAX_CANVAS_ASSET_PATH_BYTES {
+        return Err(Status::invalid_argument(format!(
+            "{field_name} exceeds maximum bytes ({} > {MAX_CANVAS_ASSET_PATH_BYTES})",
+            trimmed.len()
+        )));
+    }
+    if trimmed.starts_with('/') || trimmed.starts_with('\\') || trimmed.contains('\\') {
+        return Err(Status::invalid_argument(format!(
+            "{field_name} must be a relative forward-slash path"
+        )));
+    }
+    if trimmed.contains("..") {
+        return Err(Status::invalid_argument(format!(
+            "{field_name} cannot contain parent traversal"
+        )));
+    }
+    if !trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '-' | '_' | '.' | '~'))
+    {
+        return Err(Status::invalid_argument(format!(
+            "{field_name} contains unsupported characters"
+        )));
+    }
+    if trimmed.split('/').any(|segment| segment.is_empty() || segment == "." || segment == "..") {
+        return Err(Status::invalid_argument(format!(
+            "{field_name} contains invalid path segment"
+        )));
+    }
+    Ok(trimmed.to_owned())
+}
+
+#[allow(clippy::result_large_err)]
+fn normalize_canvas_asset_content_type(raw: &str, field_name: &str) -> Result<String, Status> {
+    let trimmed = raw.trim().to_ascii_lowercase();
+    if trimmed.is_empty() {
+        return Err(Status::invalid_argument(format!("{field_name}.content_type cannot be empty")));
+    }
+    if trimmed.len() > MAX_CANVAS_ASSET_CONTENT_TYPE_BYTES {
+        return Err(Status::invalid_argument(format!(
+            "{field_name}.content_type exceeds maximum bytes ({} > {MAX_CANVAS_ASSET_CONTENT_TYPE_BYTES})",
+            trimmed.len()
+        )));
+    }
+    if trimmed.contains(';') || trimmed.contains(char::is_whitespace) {
+        return Err(Status::invalid_argument(format!(
+            "{field_name}.content_type must not include parameters or whitespace"
+        )));
+    }
+    if !matches!(
+        trimmed.as_str(),
+        "application/javascript"
+            | "text/javascript"
+            | "text/css"
+            | "application/json"
+            | "text/plain"
+            | "image/svg+xml"
+    ) {
+        return Err(Status::failed_precondition(format!(
+            "{field_name}.content_type '{trimmed}' is not allowed by canvas host policy"
+        )));
+    }
+    Ok(trimmed)
+}
+
+fn is_canvas_javascript_content_type(content_type: &str) -> bool {
+    matches!(content_type, "application/javascript" | "text/javascript")
+}
+
+fn compute_canvas_bundle_sha256(assets: &HashMap<String, CanvasAssetRecord>) -> String {
+    let mut ordered = BTreeMap::new();
+    for (path, asset) in assets.iter() {
+        ordered.insert(path, asset);
+    }
+    let mut hasher = Sha256::new();
+    for (path, asset) in ordered {
+        hasher.update(path.as_bytes());
+        hasher.update(b"\n");
+        hasher.update(asset.content_type.as_bytes());
+        hasher.update(b"\n");
+        hasher.update(asset.body.as_slice());
+        hasher.update(b"\n--\n");
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+#[allow(clippy::result_large_err)]
+fn parse_canvas_allowed_parent_origins(origins: &[String]) -> Result<Vec<String>, Status> {
+    if origins.is_empty() {
+        return Err(Status::invalid_argument(
+            "allowed_parent_origins must include at least one origin",
+        ));
+    }
+    if origins.len() > MAX_CANVAS_ALLOWED_PARENT_ORIGINS {
+        return Err(Status::invalid_argument(format!(
+            "allowed_parent_origins exceeds limit ({} > {MAX_CANVAS_ALLOWED_PARENT_ORIGINS})",
+            origins.len()
+        )));
+    }
+    let mut normalized = Vec::new();
+    for (index, origin) in origins.iter().enumerate() {
+        let source = format!("allowed_parent_origins[{index}]");
+        let parsed = normalize_canvas_origin(origin.as_str(), source.as_str())?;
+        if !normalized.iter().any(|existing| existing == &parsed) {
+            normalized.push(parsed);
+        }
+    }
+    Ok(normalized)
+}
+
+#[allow(clippy::result_large_err)]
+fn normalize_canvas_origin(raw: &str, field_name: &str) -> Result<String, Status> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(Status::invalid_argument(format!("{field_name} cannot be empty")));
+    }
+    if trimmed.len() > MAX_CANVAS_ORIGIN_BYTES {
+        return Err(Status::invalid_argument(format!(
+            "{field_name} exceeds maximum bytes ({} > {MAX_CANVAS_ORIGIN_BYTES})",
+            trimmed.len()
+        )));
+    }
+    let parsed = Url::parse(trimmed).map_err(|error| {
+        Status::invalid_argument(format!("{field_name} must be a valid URL: {error}"))
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(Status::invalid_argument(format!(
+            "{field_name} must use http or https scheme"
+        )));
+    }
+    if parsed.host_str().is_none() {
+        return Err(Status::invalid_argument(format!("{field_name} must include host")));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(Status::invalid_argument(format!("{field_name} must not include credentials")));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(Status::invalid_argument(format!(
+            "{field_name} must not include query or fragment"
+        )));
+    }
+    if parsed.path() != "/" && !parsed.path().is_empty() {
+        return Err(Status::invalid_argument(format!(
+            "{field_name} must not include path segments"
+        )));
+    }
+    Ok(parsed.origin().ascii_serialization())
+}
+
+fn build_canvas_csp_header(allowed_parent_origins: &[String]) -> String {
+    let frame_ancestors = if allowed_parent_origins.is_empty() {
+        "'none'".to_owned()
+    } else {
+        allowed_parent_origins.join(" ")
+    };
+    format!(
+        "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors {frame_ancestors}; sandbox allow-scripts"
+    )
+}
+
+fn url_encode_component(raw: &str) -> String {
+    percent_encode_canvas(raw, false)
+}
+
+fn url_encode_path_component(raw: &str) -> String {
+    percent_encode_canvas(raw, true)
+}
+
+fn percent_encode_canvas(raw: &str, allow_slash: bool) -> String {
+    let mut encoded = String::with_capacity(raw.len());
+    for byte in raw.bytes() {
+        let is_unreserved =
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~');
+        if is_unreserved || (allow_slash && byte == b'/') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push_str(format!("{byte:02X}").as_str());
+        }
+    }
+    encoded
+}
+
+fn escape_html_attribute(raw: &str) -> String {
+    raw.replace('&', "&amp;").replace('"', "&quot;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+#[allow(clippy::result_large_err)]
 fn canonical_id(
     value: Option<common_v1::CanonicalId>,
     field_name: &'static str,
@@ -13145,6 +14277,15 @@ mod tests {
                     request_timeout_ms: 15_000,
                     max_screenshot_bytes: 256 * 1024,
                     max_title_bytes: 4 * 1024,
+                },
+                canvas_host: super::CanvasHostRuntimeConfig {
+                    enabled: true,
+                    public_base_url: "http://127.0.0.1:7142".to_owned(),
+                    token_ttl_ms: 15 * 60 * 1_000,
+                    max_state_bytes: 64 * 1024,
+                    max_bundle_bytes: 512 * 1024,
+                    max_assets_per_bundle: 32,
+                    max_updates_per_minute: 120,
                 },
             },
             GatewayJournalConfigSnapshot { db_path, hash_chain_enabled },
@@ -14554,5 +15695,209 @@ mod tests {
             &config,
         );
         assert_eq!(risk, ApprovalRiskLevel::High);
+    }
+
+    fn canvas_test_context() -> super::RequestContext {
+        super::RequestContext {
+            principal: "user:ops".to_owned(),
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            channel: Some("cli".to_owned()),
+        }
+    }
+
+    fn canvas_test_bundle(entrypoint_source: &[u8]) -> super::gateway_v1::CanvasBundle {
+        super::gateway_v1::CanvasBundle {
+            bundle_id: "demo".to_owned(),
+            entrypoint_path: "app.js".to_owned(),
+            assets: vec![super::gateway_v1::CanvasAsset {
+                path: "app.js".to_owned(),
+                content_type: "application/javascript".to_owned(),
+                body: entrypoint_source.to_vec(),
+            }],
+            sha256: String::new(),
+            signature: String::new(),
+        }
+    }
+
+    #[test]
+    fn canvas_lifecycle_supports_secure_render_and_state_updates() {
+        let state = build_test_runtime_state(false);
+        let context = canvas_test_context();
+        let malicious_state = br#"{"content":"<img src=x onerror=alert('xss')>"}"#;
+        let (created, descriptor) = state
+            .create_canvas(
+                &context,
+                None,
+                "01ARZ3NDEKTSV4RRFFQ69G5FAA".to_owned(),
+                malicious_state,
+                1,
+                canvas_test_bundle(br#"window.addEventListener('palyra:canvas-state', () => {});"#),
+                vec!["https://console.example.com".to_owned()],
+                Some(600),
+            )
+            .expect("canvas create should succeed");
+
+        let frame = state
+            .canvas_frame_document(created.canvas_id.as_str(), descriptor.auth_token.as_str())
+            .expect("frame render should succeed");
+        assert!(
+            frame.csp.contains("sandbox allow-scripts"),
+            "canvas frame must enforce CSP sandbox restrictions"
+        );
+        assert!(
+            frame.csp.contains("frame-ancestors https://console.example.com"),
+            "canvas frame must enforce strict frame-ancestors origin policy"
+        );
+        assert!(
+            !frame.html.contains("<img src=x onerror=alert('xss')>"),
+            "frame template must not render state payload as raw HTML"
+        );
+        let runtime_script = state
+            .canvas_runtime_script(created.canvas_id.as_str(), descriptor.auth_token.as_str())
+            .expect("runtime script render should succeed");
+        let runtime_body =
+            String::from_utf8(runtime_script.body).expect("runtime JS should be utf8");
+        assert!(
+            runtime_body.contains("textContent = JSON.stringify"),
+            "runtime script must render state via textContent to avoid script execution"
+        );
+        assert!(
+            !runtime_body.contains("innerHTML"),
+            "runtime script must not use innerHTML for untrusted state"
+        );
+
+        let updated = state
+            .update_canvas_state(
+                &context,
+                created.canvas_id.as_str(),
+                br#"{"content":"updated"}"#,
+                Some(created.state_version),
+            )
+            .expect("canvas update should succeed");
+        assert_eq!(
+            updated.state_version,
+            created.state_version + 1,
+            "canvas update should advance state version"
+        );
+        let refreshed = state
+            .canvas_state(
+                updated.canvas_id.as_str(),
+                descriptor.auth_token.as_str(),
+                Some(created.state_version),
+            )
+            .expect("state lookup should succeed")
+            .expect("state lookup should return newer state");
+        assert_eq!(
+            refreshed.state.get("content").and_then(Value::as_str),
+            Some("updated"),
+            "refreshed state should expose latest JSON payload"
+        );
+        assert!(
+            state
+                .canvas_state(
+                    updated.canvas_id.as_str(),
+                    descriptor.auth_token.as_str(),
+                    Some(updated.state_version),
+                )
+                .expect("state poll should succeed")
+                .is_none(),
+            "state polling should return no payload when caller already has latest version"
+        );
+
+        let closed = state
+            .close_canvas(&context, updated.canvas_id.as_str(), Some("operator_close".to_owned()))
+            .expect("canvas close should succeed");
+        assert!(closed.closed, "canvas close should mark canvas as closed");
+        let close_update_error = state
+            .update_canvas_state(
+                &context,
+                updated.canvas_id.as_str(),
+                br#"{"content":"late"}"#,
+                None,
+            )
+            .expect_err("closed canvas should reject updates");
+        assert_eq!(close_update_error.code(), Code::FailedPrecondition);
+    }
+
+    #[test]
+    fn canvas_rejects_out_of_bounds_payloads() {
+        let state = build_test_runtime_state(false);
+        let context = canvas_test_context();
+        let oversized_state = vec![b'a'; state.config.canvas_host.max_state_bytes + 1];
+        let create_error = state
+            .create_canvas(
+                &context,
+                None,
+                "01ARZ3NDEKTSV4RRFFQ69G5FAB".to_owned(),
+                oversized_state.as_slice(),
+                1,
+                canvas_test_bundle(br#"console.log("ok");"#),
+                vec!["https://console.example.com".to_owned()],
+                Some(600),
+            )
+            .expect_err("oversized create payload should fail");
+        assert_eq!(create_error.code(), Code::ResourceExhausted);
+
+        let (created, _descriptor) = state
+            .create_canvas(
+                &context,
+                None,
+                "01ARZ3NDEKTSV4RRFFQ69G5FAC".to_owned(),
+                br#"{"content":"ok"}"#,
+                1,
+                canvas_test_bundle(br#"console.log("ok");"#),
+                vec!["https://console.example.com".to_owned()],
+                Some(600),
+            )
+            .expect("baseline canvas create should succeed");
+        let oversized_update = vec![b'a'; state.config.canvas_host.max_state_bytes + 1];
+        let update_error = state
+            .update_canvas_state(
+                &context,
+                created.canvas_id.as_str(),
+                oversized_update.as_slice(),
+                None,
+            )
+            .expect_err("oversized update payload should fail");
+        assert_eq!(update_error.code(), Code::ResourceExhausted);
+    }
+
+    #[test]
+    fn canvas_rejects_oversized_bundle_and_missing_origin_allowlist() {
+        let state = build_test_runtime_state(false);
+        let context = canvas_test_context();
+        let mut oversized_bundle = canvas_test_bundle(br#"console.log("ok");"#);
+        oversized_bundle.assets = vec![super::gateway_v1::CanvasAsset {
+            path: "app.js".to_owned(),
+            content_type: "application/javascript".to_owned(),
+            body: vec![b'a'; state.config.canvas_host.max_bundle_bytes + 1],
+        }];
+        let oversized_bundle_error = state
+            .create_canvas(
+                &context,
+                None,
+                "01ARZ3NDEKTSV4RRFFQ69G5FAD".to_owned(),
+                br#"{"content":"ok"}"#,
+                1,
+                oversized_bundle,
+                vec!["https://console.example.com".to_owned()],
+                Some(600),
+            )
+            .expect_err("oversized bundle should fail");
+        assert_eq!(oversized_bundle_error.code(), Code::ResourceExhausted);
+
+        let missing_origin_error = state
+            .create_canvas(
+                &context,
+                None,
+                "01ARZ3NDEKTSV4RRFFQ69G5FAE".to_owned(),
+                br#"{"content":"ok"}"#,
+                1,
+                canvas_test_bundle(br#"console.log("ok");"#),
+                Vec::new(),
+                Some(600),
+            )
+            .expect_err("missing origin allowlist should fail");
+        assert_eq!(missing_origin_error.code(), Code::InvalidArgument);
     }
 }

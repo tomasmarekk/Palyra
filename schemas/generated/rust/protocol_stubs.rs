@@ -290,9 +290,23 @@ pub mod palyra_gateway_v1 {
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct ApprovalRecord;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct Canvas;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct CanvasAsset;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct CanvasBundle;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct CloseCanvasRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct CloseCanvasResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct CreateAgentRequest;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct CreateAgentResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct CreateCanvasRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct CreateCanvasResponse;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct DeleteSecretRequest;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -309,6 +323,10 @@ pub mod palyra_gateway_v1 {
     pub struct GetApprovalRequest;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct GetApprovalResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct GetCanvasRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct GetCanvasResponse;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct GetSecretRequest;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -358,11 +376,21 @@ pub mod palyra_gateway_v1 {
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct SetDefaultAgentResponse;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct UpdateCanvasRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct UpdateCanvasResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct VaultSecretMetadata;
     pub trait ApprovalsServiceClient {
         fn ExportApprovals(&self);
         fn GetApproval(&self);
         fn ListApprovals(&self);
+    }
+    pub trait CanvasServiceClient {
+        fn CloseCanvas(&self);
+        fn CreateCanvas(&self);
+        fn GetCanvas(&self);
+        fn UpdateCanvas(&self);
     }
     pub trait GatewayServiceClient {
         fn AbortRun(&self);

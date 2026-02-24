@@ -23,7 +23,10 @@ use std::{
 use anyhow::{Context, Result};
 use axum::{
     extract::{ConnectInfo, Path, Query, Request, State},
-    http::{HeaderMap, StatusCode},
+    http::{
+        header::{CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE},
+        HeaderMap, HeaderName, HeaderValue, StatusCode,
+    },
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -33,9 +36,9 @@ use clap::Parser;
 use config::load_config;
 use cron::spawn_scheduler_loop;
 use gateway::{
-    authorize_headers, request_context_from_headers, AuthError, GatewayAuthConfig,
-    GatewayJournalConfigSnapshot, GatewayRuntimeConfigSnapshot, GatewayRuntimeState,
-    MemoryRuntimeConfig,
+    authorize_headers, request_context_from_headers, AuthError, CanvasAssetResponse,
+    GatewayAuthConfig, GatewayJournalConfigSnapshot, GatewayRuntimeConfigSnapshot,
+    GatewayRuntimeState, MemoryRuntimeConfig,
 };
 use journal::{
     JournalAppendRequest, JournalConfig, JournalStore, OrchestratorCancelRequest,
@@ -141,6 +144,23 @@ struct SkillStatusResponse {
     reason: Option<String>,
     detected_at_ms: i64,
     operator_principal: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CanvasTokenQuery {
+    token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CanvasRuntimeQuery {
+    canvas_id: String,
+    token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CanvasStateQuery {
+    token: String,
+    after_version: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -348,6 +368,19 @@ async fn main() -> Result<()> {
                 max_title_bytes: usize::try_from(loaded.tool_call.browser_service.max_title_bytes)
                     .unwrap_or(usize::MAX),
             },
+            canvas_host: gateway::CanvasHostRuntimeConfig {
+                enabled: loaded.canvas_host.enabled,
+                public_base_url: loaded.canvas_host.public_base_url.clone(),
+                token_ttl_ms: loaded.canvas_host.token_ttl_ms,
+                max_state_bytes: usize::try_from(loaded.canvas_host.max_state_bytes)
+                    .unwrap_or(usize::MAX),
+                max_bundle_bytes: usize::try_from(loaded.canvas_host.max_bundle_bytes)
+                    .unwrap_or(usize::MAX),
+                max_assets_per_bundle: usize::try_from(loaded.canvas_host.max_assets_per_bundle)
+                    .unwrap_or(usize::MAX),
+                max_updates_per_minute: usize::try_from(loaded.canvas_host.max_updates_per_minute)
+                    .unwrap_or(usize::MAX),
+            },
         },
         GatewayJournalConfigSnapshot {
             db_path: loaded.storage.journal_db_path.clone(),
@@ -471,6 +504,13 @@ async fn main() -> Result<()> {
         tool_call_browser_service_max_screenshot_bytes =
             loaded.tool_call.browser_service.max_screenshot_bytes,
         tool_call_browser_service_max_title_bytes = loaded.tool_call.browser_service.max_title_bytes,
+        canvas_host_enabled = loaded.canvas_host.enabled,
+        canvas_host_public_base_url = %loaded.canvas_host.public_base_url,
+        canvas_host_token_ttl_ms = loaded.canvas_host.token_ttl_ms,
+        canvas_host_max_state_bytes = loaded.canvas_host.max_state_bytes,
+        canvas_host_max_bundle_bytes = loaded.canvas_host.max_bundle_bytes,
+        canvas_host_max_assets_per_bundle = loaded.canvas_host.max_assets_per_bundle,
+        canvas_host_max_updates_per_minute = loaded.canvas_host.max_updates_per_minute,
         channel_router_enabled = loaded.channel_router.enabled,
         channel_router_max_message_bytes = loaded.channel_router.max_message_bytes,
         channel_router_max_retry_queue_depth_per_channel =
@@ -526,8 +566,15 @@ async fn main() -> Result<()> {
         .route("/admin/v1/skills/{skill_id}/quarantine", post(admin_skill_quarantine_handler))
         .route("/admin/v1/skills/{skill_id}/enable", post(admin_skill_enable_handler))
         .route_layer(middleware::from_fn_with_state(state.clone(), admin_rate_limit_middleware));
-    let app =
-        Router::new().route("/healthz", get(health_handler)).merge(admin_routes).with_state(state);
+    let app = Router::new()
+        .route("/healthz", get(health_handler))
+        .route("/canvas/v1/frame/{canvas_id}", get(canvas_frame_handler))
+        .route("/canvas/v1/runtime.js", get(canvas_runtime_js_handler))
+        .route("/canvas/v1/runtime.css", get(canvas_runtime_css_handler))
+        .route("/canvas/v1/bundle/{canvas_id}/{*asset_path}", get(canvas_bundle_asset_handler))
+        .route("/canvas/v1/state/{canvas_id}", get(canvas_state_handler))
+        .merge(admin_routes)
+        .with_state(state);
 
     let admin_address = parse_daemon_bind_socket(&loaded.daemon.bind_addr, loaded.daemon.port)
         .context("invalid admin bind address or port")?;
@@ -635,6 +682,13 @@ async fn main() -> Result<()> {
         gateway::proto::palyra::auth::v1::auth_service_server::AuthServiceServer::new(auth_service)
             .max_decoding_message_size(GRPC_MAX_DECODING_MESSAGE_SIZE_BYTES)
             .max_encoding_message_size(GRPC_MAX_ENCODING_MESSAGE_SIZE_BYTES);
+    let canvas_service = gateway::CanvasServiceImpl::new(runtime.clone(), auth.clone());
+    let grpc_canvas_server =
+        gateway::proto::palyra::gateway::v1::canvas_service_server::CanvasServiceServer::new(
+            canvas_service,
+        )
+        .max_decoding_message_size(GRPC_MAX_DECODING_MESSAGE_SIZE_BYTES)
+        .max_encoding_message_size(GRPC_MAX_ENCODING_MESSAGE_SIZE_BYTES);
     let node_rpc_service = node_rpc::NodeRpcServiceImpl::new(
         identity_runtime.revoked_certificate_fingerprints.clone(),
         node_rpc_mtls_required,
@@ -694,6 +748,7 @@ async fn main() -> Result<()> {
             .add_service(grpc_memory_server)
             .add_service(grpc_vault_server)
             .add_service(grpc_auth_server)
+            .add_service(grpc_canvas_server)
             .serve_with_incoming_shutdown(TcpListenerStream::new(grpc_listener), shutdown_signal())
             .await
             .context("palyrad gRPC server failed")
@@ -742,6 +797,113 @@ fn loopback_grpc_url(socket: SocketAddr, tls_enabled: bool) -> String {
 
 async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
     Json::<HealthResponse>(health_response("palyrad", state.started_at))
+}
+
+async fn canvas_frame_handler(
+    State(state): State<AppState>,
+    Path(canvas_id): Path<String>,
+    Query(query): Query<CanvasTokenQuery>,
+) -> Result<Response, Response> {
+    let frame = state
+        .runtime
+        .canvas_frame_document(canvas_id.as_str(), query.token.as_str())
+        .map_err(runtime_status_response)?;
+    let mut response = frame.html.into_response();
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
+    apply_canvas_security_headers(response.headers_mut(), frame.csp.as_str())?;
+    Ok(response)
+}
+
+async fn canvas_runtime_js_handler(
+    State(state): State<AppState>,
+    Query(query): Query<CanvasRuntimeQuery>,
+) -> Result<Response, Response> {
+    let asset = state
+        .runtime
+        .canvas_runtime_script(query.canvas_id.as_str(), query.token.as_str())
+        .map_err(runtime_status_response)?;
+    canvas_asset_response(asset)
+}
+
+async fn canvas_runtime_css_handler(
+    State(state): State<AppState>,
+    Query(query): Query<CanvasRuntimeQuery>,
+) -> Result<Response, Response> {
+    let asset = state
+        .runtime
+        .canvas_runtime_stylesheet(query.canvas_id.as_str(), query.token.as_str())
+        .map_err(runtime_status_response)?;
+    canvas_asset_response(asset)
+}
+
+async fn canvas_bundle_asset_handler(
+    State(state): State<AppState>,
+    Path((canvas_id, asset_path)): Path<(String, String)>,
+    Query(query): Query<CanvasTokenQuery>,
+) -> Result<Response, Response> {
+    let normalized_asset_path = asset_path.trim_start_matches('/').to_owned();
+    let asset = state
+        .runtime
+        .canvas_bundle_asset(
+            canvas_id.as_str(),
+            normalized_asset_path.as_str(),
+            query.token.as_str(),
+        )
+        .map_err(runtime_status_response)?;
+    canvas_asset_response(asset)
+}
+
+async fn canvas_state_handler(
+    State(state): State<AppState>,
+    Path(canvas_id): Path<String>,
+    Query(query): Query<CanvasStateQuery>,
+) -> Result<Response, Response> {
+    let payload = state
+        .runtime
+        .canvas_state(canvas_id.as_str(), query.token.as_str(), query.after_version)
+        .map_err(runtime_status_response)?;
+    if let Some(payload) = payload {
+        let mut response = Json(payload).into_response();
+        response.headers_mut().insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        response.headers_mut().insert(
+            HeaderName::from_static("x-content-type-options"),
+            HeaderValue::from_static("nosniff"),
+        );
+        Ok(response)
+    } else {
+        Ok(StatusCode::NO_CONTENT.into_response())
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn canvas_asset_response(asset: CanvasAssetResponse) -> Result<Response, Response> {
+    let mut response = asset.body.into_response();
+    let content_type = HeaderValue::from_str(asset.content_type.as_str()).map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "failed to encode canvas content-type header: {error}"
+        )))
+    })?;
+    response.headers_mut().insert(CONTENT_TYPE, content_type);
+    apply_canvas_security_headers(response.headers_mut(), asset.csp.as_str())?;
+    Ok(response)
+}
+
+#[allow(clippy::result_large_err)]
+fn apply_canvas_security_headers(headers: &mut HeaderMap, csp: &str) -> Result<(), Response> {
+    let csp_header = HeaderValue::from_str(csp).map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "failed to encode canvas csp header: {error}"
+        )))
+    })?;
+    headers.insert(CONTENT_SECURITY_POLICY, csp_header);
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    Ok(())
 }
 
 fn consume_admin_rate_limit(state: &AppState, remote_addr: SocketAddr) -> bool {

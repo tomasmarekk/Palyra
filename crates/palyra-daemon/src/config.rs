@@ -81,6 +81,13 @@ const DEFAULT_BROWSER_SERVICE_CONNECT_TIMEOUT_MS: u64 = 1_500;
 const DEFAULT_BROWSER_SERVICE_REQUEST_TIMEOUT_MS: u64 = 15_000;
 const DEFAULT_BROWSER_SERVICE_MAX_SCREENSHOT_BYTES: u64 = 256 * 1024;
 const DEFAULT_BROWSER_SERVICE_MAX_TITLE_BYTES: u64 = 4 * 1024;
+const DEFAULT_CANVAS_HOST_ENABLED: bool = false;
+const DEFAULT_CANVAS_HOST_PUBLIC_BASE_URL: &str = "http://127.0.0.1:7142";
+const DEFAULT_CANVAS_HOST_TOKEN_TTL_MS: u64 = 15 * 60 * 1_000;
+const DEFAULT_CANVAS_HOST_MAX_STATE_BYTES: u64 = 64 * 1024;
+const DEFAULT_CANVAS_HOST_MAX_BUNDLE_BYTES: u64 = 512 * 1024;
+const DEFAULT_CANVAS_HOST_MAX_ASSETS_PER_BUNDLE: u32 = 32;
+const DEFAULT_CANVAS_HOST_MAX_UPDATES_PER_MINUTE: u32 = 120;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadedConfig {
     pub source: String,
@@ -94,6 +101,7 @@ pub struct LoadedConfig {
     pub model_provider: ModelProviderConfig,
     pub tool_call: ToolCallConfig,
     pub channel_router: ChannelRouterConfig,
+    pub canvas_host: CanvasHostConfig,
     pub admin: AdminConfig,
     pub identity: IdentityConfig,
     pub storage: StorageConfig,
@@ -217,6 +225,17 @@ pub struct BrowserServiceConfig {
     pub request_timeout_ms: u64,
     pub max_screenshot_bytes: u64,
     pub max_title_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanvasHostConfig {
+    pub enabled: bool,
+    pub public_base_url: String,
+    pub token_ttl_ms: u64,
+    pub max_state_bytes: u64,
+    pub max_bundle_bytes: u64,
+    pub max_assets_per_bundle: u32,
+    pub max_updates_per_minute: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -414,6 +433,20 @@ impl Default for BrowserServiceConfig {
     }
 }
 
+impl Default for CanvasHostConfig {
+    fn default() -> Self {
+        Self {
+            enabled: DEFAULT_CANVAS_HOST_ENABLED,
+            public_base_url: DEFAULT_CANVAS_HOST_PUBLIC_BASE_URL.to_owned(),
+            token_ttl_ms: DEFAULT_CANVAS_HOST_TOKEN_TTL_MS,
+            max_state_bytes: DEFAULT_CANVAS_HOST_MAX_STATE_BYTES,
+            max_bundle_bytes: DEFAULT_CANVAS_HOST_MAX_BUNDLE_BYTES,
+            max_assets_per_bundle: DEFAULT_CANVAS_HOST_MAX_ASSETS_PER_BUNDLE,
+            max_updates_per_minute: DEFAULT_CANVAS_HOST_MAX_UPDATES_PER_MINUTE,
+        }
+    }
+}
+
 impl Default for AdminConfig {
     fn default() -> Self {
         Self { require_auth: DEFAULT_ADMIN_REQUIRE_AUTH, auth_token: None, bound_principal: None }
@@ -429,6 +462,7 @@ pub fn load_config() -> Result<LoadedConfig> {
     let mut model_provider = ModelProviderConfig::default();
     let mut tool_call = ToolCallConfig::default();
     let mut channel_router = ChannelRouterConfig::default();
+    let mut canvas_host = CanvasHostConfig::default();
     let mut admin = AdminConfig::default();
     let mut identity = IdentityConfig::default();
     let mut storage = StorageConfig::default();
@@ -897,6 +931,39 @@ pub fn load_config() -> Result<LoadedConfig> {
                     }
                     channel_router.channels = parsed_channels;
                 }
+            }
+        }
+        if let Some(file_canvas_host) = parsed.canvas_host {
+            if let Some(enabled) = file_canvas_host.enabled {
+                canvas_host.enabled = enabled;
+            }
+            if let Some(public_base_url) = file_canvas_host.public_base_url {
+                canvas_host.public_base_url = parse_canvas_host_public_base_url(
+                    public_base_url.as_str(),
+                    "canvas_host.public_base_url",
+                )?;
+            }
+            if let Some(token_ttl_ms) = file_canvas_host.token_ttl_ms {
+                canvas_host.token_ttl_ms =
+                    parse_positive_u64(token_ttl_ms, "canvas_host.token_ttl_ms")?;
+            }
+            if let Some(max_state_bytes) = file_canvas_host.max_state_bytes {
+                canvas_host.max_state_bytes =
+                    parse_positive_u64(max_state_bytes, "canvas_host.max_state_bytes")?;
+            }
+            if let Some(max_bundle_bytes) = file_canvas_host.max_bundle_bytes {
+                canvas_host.max_bundle_bytes =
+                    parse_positive_u64(max_bundle_bytes, "canvas_host.max_bundle_bytes")?;
+            }
+            if let Some(max_assets_per_bundle) = file_canvas_host.max_assets_per_bundle {
+                canvas_host.max_assets_per_bundle =
+                    parse_positive_u32(max_assets_per_bundle, "canvas_host.max_assets_per_bundle")?;
+            }
+            if let Some(max_updates_per_minute) = file_canvas_host.max_updates_per_minute {
+                canvas_host.max_updates_per_minute = parse_positive_u32(
+                    max_updates_per_minute,
+                    "canvas_host.max_updates_per_minute",
+                )?;
             }
         }
         if let Some(file_admin) = parsed.admin {
@@ -1413,6 +1480,71 @@ pub fn load_config() -> Result<LoadedConfig> {
         source.push_str(" +env(PALYRA_CHANNEL_ROUTER_RETRY_BACKOFF_MS)");
     }
 
+    if let Ok(canvas_host_enabled) = env::var("PALYRA_CANVAS_HOST_ENABLED") {
+        canvas_host.enabled = canvas_host_enabled
+            .parse::<bool>()
+            .context("PALYRA_CANVAS_HOST_ENABLED must be true or false")?;
+        source.push_str(" +env(PALYRA_CANVAS_HOST_ENABLED)");
+    }
+
+    if let Ok(public_base_url) = env::var("PALYRA_CANVAS_HOST_PUBLIC_BASE_URL") {
+        canvas_host.public_base_url = parse_canvas_host_public_base_url(
+            public_base_url.as_str(),
+            "PALYRA_CANVAS_HOST_PUBLIC_BASE_URL",
+        )?;
+        source.push_str(" +env(PALYRA_CANVAS_HOST_PUBLIC_BASE_URL)");
+    }
+
+    if let Ok(token_ttl_ms) = env::var("PALYRA_CANVAS_HOST_TOKEN_TTL_MS") {
+        canvas_host.token_ttl_ms = parse_positive_u64(
+            token_ttl_ms
+                .parse::<u64>()
+                .context("PALYRA_CANVAS_HOST_TOKEN_TTL_MS must be a valid u64")?,
+            "PALYRA_CANVAS_HOST_TOKEN_TTL_MS",
+        )?;
+        source.push_str(" +env(PALYRA_CANVAS_HOST_TOKEN_TTL_MS)");
+    }
+
+    if let Ok(max_state_bytes) = env::var("PALYRA_CANVAS_HOST_MAX_STATE_BYTES") {
+        canvas_host.max_state_bytes = parse_positive_u64(
+            max_state_bytes
+                .parse::<u64>()
+                .context("PALYRA_CANVAS_HOST_MAX_STATE_BYTES must be a valid u64")?,
+            "PALYRA_CANVAS_HOST_MAX_STATE_BYTES",
+        )?;
+        source.push_str(" +env(PALYRA_CANVAS_HOST_MAX_STATE_BYTES)");
+    }
+
+    if let Ok(max_bundle_bytes) = env::var("PALYRA_CANVAS_HOST_MAX_BUNDLE_BYTES") {
+        canvas_host.max_bundle_bytes = parse_positive_u64(
+            max_bundle_bytes
+                .parse::<u64>()
+                .context("PALYRA_CANVAS_HOST_MAX_BUNDLE_BYTES must be a valid u64")?,
+            "PALYRA_CANVAS_HOST_MAX_BUNDLE_BYTES",
+        )?;
+        source.push_str(" +env(PALYRA_CANVAS_HOST_MAX_BUNDLE_BYTES)");
+    }
+
+    if let Ok(max_assets_per_bundle) = env::var("PALYRA_CANVAS_HOST_MAX_ASSETS_PER_BUNDLE") {
+        canvas_host.max_assets_per_bundle = parse_positive_u32(
+            max_assets_per_bundle
+                .parse::<u32>()
+                .context("PALYRA_CANVAS_HOST_MAX_ASSETS_PER_BUNDLE must be a valid u32")?,
+            "PALYRA_CANVAS_HOST_MAX_ASSETS_PER_BUNDLE",
+        )?;
+        source.push_str(" +env(PALYRA_CANVAS_HOST_MAX_ASSETS_PER_BUNDLE)");
+    }
+
+    if let Ok(max_updates_per_minute) = env::var("PALYRA_CANVAS_HOST_MAX_UPDATES_PER_MINUTE") {
+        canvas_host.max_updates_per_minute = parse_positive_u32(
+            max_updates_per_minute
+                .parse::<u32>()
+                .context("PALYRA_CANVAS_HOST_MAX_UPDATES_PER_MINUTE must be a valid u32")?,
+            "PALYRA_CANVAS_HOST_MAX_UPDATES_PER_MINUTE",
+        )?;
+        source.push_str(" +env(PALYRA_CANVAS_HOST_MAX_UPDATES_PER_MINUTE)");
+    }
+
     if let Ok(require_auth) = env::var("PALYRA_ADMIN_REQUIRE_AUTH") {
         admin.require_auth = require_auth
             .parse::<bool>()
@@ -1489,6 +1621,7 @@ pub fn load_config() -> Result<LoadedConfig> {
         model_provider,
         tool_call,
         channel_router,
+        canvas_host,
         admin,
         identity,
         storage,
@@ -1828,6 +1961,27 @@ fn parse_browser_service_endpoint(raw: &str, source_name: &str) -> Result<String
     Ok(parsed.as_str().trim_end_matches('/').to_owned())
 }
 
+fn parse_canvas_host_public_base_url(raw: &str, source_name: &str) -> Result<String> {
+    if raw.trim().is_empty() {
+        anyhow::bail!("{source_name} cannot be empty");
+    }
+    let parsed = reqwest::Url::parse(raw.trim())
+        .with_context(|| format!("{source_name} must be a valid absolute URL"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        anyhow::bail!("{source_name} must use http or https scheme");
+    }
+    if parsed.host_str().is_none() {
+        anyhow::bail!("{source_name} must include a host");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        anyhow::bail!("{source_name} must not embed credentials");
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        anyhow::bail!("{source_name} must not include query or fragment");
+    }
+    Ok(parsed.as_str().trim_end_matches('/').to_owned())
+}
+
 fn parse_channel_identifier(raw: &str, source_name: &str) -> Result<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -2033,16 +2187,17 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        parse_broadcast_strategy, parse_browser_service_endpoint, parse_content_type_allowlist,
-        parse_cron_timezone_mode, parse_default_memory_ttl_ms, parse_dns_suffix_allowlist,
-        parse_host_allowlist, parse_http_header_allowlist, parse_journal_db_path,
-        parse_openai_base_url, parse_positive_usize, parse_process_executable_allowlist,
+        parse_broadcast_strategy, parse_browser_service_endpoint,
+        parse_canvas_host_public_base_url, parse_content_type_allowlist, parse_cron_timezone_mode,
+        parse_default_memory_ttl_ms, parse_dns_suffix_allowlist, parse_host_allowlist,
+        parse_http_header_allowlist, parse_journal_db_path, parse_openai_base_url,
+        parse_positive_usize, parse_process_executable_allowlist,
         parse_process_runner_egress_enforcement_mode, parse_process_runner_tier,
         parse_root_file_config, parse_storage_prefix_allowlist, parse_tool_allowlist,
         parse_vault_dir, parse_vault_ref_allowlist, AdminConfig, BrowserServiceConfig,
-        ChannelRouterConfig, CronConfig, GatewayConfig, GatewayTlsConfig, HttpFetchConfig,
-        IdentityConfig, MemoryConfig, ModelProviderConfig, OrchestratorConfig, StorageConfig,
-        ToolCallConfig,
+        CanvasHostConfig, ChannelRouterConfig, CronConfig, GatewayConfig, GatewayTlsConfig,
+        HttpFetchConfig, IdentityConfig, MemoryConfig, ModelProviderConfig, OrchestratorConfig,
+        StorageConfig, ToolCallConfig,
     };
     use crate::channel_router::BroadcastStrategy;
     use crate::model_provider::ModelProviderKind;
@@ -2314,6 +2469,46 @@ mod tests {
     }
 
     #[test]
+    fn canvas_host_config_defaults_to_disabled_with_bounded_limits() {
+        let config = CanvasHostConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.public_base_url, "http://127.0.0.1:7142");
+        assert_eq!(config.token_ttl_ms, 15 * 60 * 1_000);
+        assert_eq!(config.max_state_bytes, 64 * 1024);
+        assert_eq!(config.max_bundle_bytes, 512 * 1024);
+        assert_eq!(config.max_assets_per_bundle, 32);
+        assert_eq!(config.max_updates_per_minute, 120);
+    }
+
+    #[test]
+    fn canvas_host_config_parses_overrides() {
+        let (parsed, _) = parse_root_file_config(
+            r#"
+            [canvas_host]
+            enabled = true
+            public_base_url = "https://console.example.com/palyra"
+            token_ttl_ms = 120000
+            max_state_bytes = 8192
+            max_bundle_bytes = 131072
+            max_assets_per_bundle = 8
+            max_updates_per_minute = 30
+            "#,
+        )
+        .expect("canvas_host override should parse");
+        let canvas_host = parsed.canvas_host.expect("canvas_host section should be present");
+        assert_eq!(canvas_host.enabled, Some(true));
+        assert_eq!(
+            canvas_host.public_base_url,
+            Some("https://console.example.com/palyra".to_owned())
+        );
+        assert_eq!(canvas_host.token_ttl_ms, Some(120_000));
+        assert_eq!(canvas_host.max_state_bytes, Some(8_192));
+        assert_eq!(canvas_host.max_bundle_bytes, Some(131_072));
+        assert_eq!(canvas_host.max_assets_per_bundle, Some(8));
+        assert_eq!(canvas_host.max_updates_per_minute, Some(30));
+    }
+
+    #[test]
     fn wasm_runtime_config_parses_allow_inline_modules_override() {
         let (parsed, _) = parse_root_file_config(
             r#"
@@ -2578,6 +2773,13 @@ mod tests {
             result.is_err(),
             "unknown channel_router.routing.channels[*] keys must be rejected"
         );
+    }
+
+    #[test]
+    fn config_rejects_unknown_canvas_host_key() {
+        let result: Result<RootFileConfig, _> =
+            toml::from_str("[canvas_host]\nenabled=true\nunexpected=true\n");
+        assert!(result.is_err(), "unknown canvas_host keys must be rejected");
     }
 
     #[test]
@@ -2867,6 +3069,32 @@ mod tests {
         )
         .expect("valid endpoint should parse");
         assert_eq!(parsed, "https://browserd.internal:7443");
+    }
+
+    #[test]
+    fn parse_canvas_host_public_base_url_requires_http_or_https_without_query_or_fragment() {
+        assert!(
+            parse_canvas_host_public_base_url(
+                "grpc://127.0.0.1:7142",
+                "canvas_host.public_base_url",
+            )
+            .is_err(),
+            "unsupported scheme must fail"
+        );
+        assert!(
+            parse_canvas_host_public_base_url(
+                "https://console.example.com/base?debug=true",
+                "canvas_host.public_base_url",
+            )
+            .is_err(),
+            "query component must fail"
+        );
+        let parsed = parse_canvas_host_public_base_url(
+            "https://console.example.com/base/",
+            "canvas_host.public_base_url",
+        )
+        .expect("valid base URL should parse");
+        assert_eq!(parsed, "https://console.example.com/base");
     }
 
     #[test]

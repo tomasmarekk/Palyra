@@ -69,6 +69,7 @@ pub struct RootFileConfig {
     pub model_provider: Option<FileModelProviderConfig>,
     pub tool_call: Option<FileToolCallConfig>,
     pub channel_router: Option<FileChannelRouterConfig>,
+    pub canvas_host: Option<FileCanvasHostConfig>,
     pub admin: Option<FileAdminConfig>,
     pub identity: Option<FileIdentityConfig>,
     pub storage: Option<FileStorageConfig>,
@@ -200,6 +201,18 @@ pub struct FileChannelRouterConfig {
     pub retry_backoff_ms: Option<u64>,
     pub default_response_prefix: Option<String>,
     pub routing: Option<FileChannelRoutingConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileCanvasHostConfig {
+    pub enabled: Option<bool>,
+    pub public_base_url: Option<String>,
+    pub token_ttl_ms: Option<u64>,
+    pub max_state_bytes: Option<u64>,
+    pub max_bundle_bytes: Option<u64>,
+    pub max_assets_per_bundle: Option<u32>,
+    pub max_updates_per_minute: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]

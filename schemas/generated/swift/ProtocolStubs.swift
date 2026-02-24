@@ -402,10 +402,31 @@ public enum PalyraGatewayV1 {
     public struct ApprovalRecord: Equatable {
         public init() {}
     }
+    public struct Canvas: Equatable {
+        public init() {}
+    }
+    public struct CanvasAsset: Equatable {
+        public init() {}
+    }
+    public struct CanvasBundle: Equatable {
+        public init() {}
+    }
+    public struct CloseCanvasRequest: Equatable {
+        public init() {}
+    }
+    public struct CloseCanvasResponse: Equatable {
+        public init() {}
+    }
     public struct CreateAgentRequest: Equatable {
         public init() {}
     }
     public struct CreateAgentResponse: Equatable {
+        public init() {}
+    }
+    public struct CreateCanvasRequest: Equatable {
+        public init() {}
+    }
+    public struct CreateCanvasResponse: Equatable {
         public init() {}
     }
     public struct DeleteSecretRequest: Equatable {
@@ -430,6 +451,12 @@ public enum PalyraGatewayV1 {
         public init() {}
     }
     public struct GetApprovalResponse: Equatable {
+        public init() {}
+    }
+    public struct GetCanvasRequest: Equatable {
+        public init() {}
+    }
+    public struct GetCanvasResponse: Equatable {
         public init() {}
     }
     public struct GetSecretRequest: Equatable {
@@ -504,6 +531,12 @@ public enum PalyraGatewayV1 {
     public struct SetDefaultAgentResponse: Equatable {
         public init() {}
     }
+    public struct UpdateCanvasRequest: Equatable {
+        public init() {}
+    }
+    public struct UpdateCanvasResponse: Equatable {
+        public init() {}
+    }
     public struct VaultSecretMetadata: Equatable {
         public init() {}
     }
@@ -511,6 +544,12 @@ public enum PalyraGatewayV1 {
         func exportApprovals()
         func getApproval()
         func listApprovals()
+    }
+    public protocol CanvasServiceClient {
+        func closeCanvas()
+        func createCanvas()
+        func getCanvas()
+        func updateCanvas()
     }
     public protocol GatewayServiceClient {
         func abortRun()
