@@ -7,6 +7,7 @@ mod journal;
 mod model_provider;
 mod node_rpc;
 mod orchestrator;
+mod quic_runtime;
 mod sandbox_runner;
 mod tool_protocol;
 mod wasm_plugin_runner;
@@ -51,6 +52,7 @@ use palyra_common::{
 use palyra_identity::IdentityManager;
 use palyra_identity::{FilesystemSecretStore, SecretStore};
 use palyra_policy::{evaluate_with_config, PolicyDecision, PolicyEvaluationConfig, PolicyRequest};
+use palyra_transport_quic::QuicTransportLimits;
 use palyra_vault::{Vault, VaultConfig as VaultConfigOptions, VaultRef};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -204,6 +206,7 @@ async fn main() -> Result<()> {
         !loaded.tool_call.process_runner.allowed_egress_hosts.is_empty()
             || !loaded.tool_call.process_runner.allowed_dns_suffixes.is_empty(),
     )?;
+    let node_rpc_mtls_required = !loaded.identity.allow_insecure_node_rpc_without_mtls;
 
     let identity_runtime = load_identity_runtime(loaded.gateway.identity_store_dir.clone())
         .context("failed to initialize gateway identity runtime")?;
@@ -253,7 +256,7 @@ async fn main() -> Result<()> {
             quic_port: loaded.gateway.quic_port,
             quic_enabled: loaded.gateway.quic_enabled,
             orchestrator_runloop_v1_enabled: loaded.orchestrator.runloop_v1_enabled,
-            node_rpc_mtls_required: !loaded.identity.allow_insecure_node_rpc_without_mtls,
+            node_rpc_mtls_required,
             admin_auth_required: loaded.admin.require_auth,
             vault_get_approval_required_refs: loaded
                 .gateway
@@ -440,7 +443,7 @@ async fn main() -> Result<()> {
         admin_rate_limit_max_requests_per_window = ADMIN_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW,
         grpc_max_decoding_message_size_bytes = GRPC_MAX_DECODING_MESSAGE_SIZE_BYTES,
         grpc_max_encoding_message_size_bytes = GRPC_MAX_ENCODING_MESSAGE_SIZE_BYTES,
-        node_rpc_mtls_required = !loaded.identity.allow_insecure_node_rpc_without_mtls,
+        node_rpc_mtls_required,
         journal_db_path = %loaded.storage.journal_db_path.display(),
         journal_hash_chain_enabled = loaded.storage.journal_hash_chain_enabled,
         journal_max_payload_bytes = loaded.storage.max_journal_payload_bytes,
@@ -476,12 +479,21 @@ async fn main() -> Result<()> {
     let grpc_address =
         parse_daemon_bind_socket(&loaded.gateway.grpc_bind_addr, loaded.gateway.grpc_port)
             .context("invalid gRPC bind address or port")?;
+    let quic_address = if loaded.gateway.quic_enabled {
+        Some(
+            parse_daemon_bind_socket(&loaded.gateway.quic_bind_addr, loaded.gateway.quic_port)
+                .context("invalid QUIC bind address or port")?,
+        )
+    } else {
+        None
+    };
     enforce_remote_bind_guard(
         admin_address,
         grpc_address,
+        quic_address,
         loaded.gateway.allow_insecure_remote,
         loaded.gateway.tls.enabled,
-        !loaded.identity.allow_insecure_node_rpc_without_mtls,
+        node_rpc_mtls_required,
         dangerous_remote_bind_acknowledged()?,
     )?;
 
@@ -510,16 +522,9 @@ async fn main() -> Result<()> {
     info!(grpc_listen_addr = %grpc_bound, "gateway gRPC listening");
     info!(
         node_rpc_listen_addr = %node_rpc_bound,
-        node_rpc_mtls_required = !loaded.identity.allow_insecure_node_rpc_without_mtls,
+        node_rpc_mtls_required,
         "node RPC listener initialized"
     );
-    if loaded.gateway.quic_enabled {
-        info!(
-            quic_bind_addr = %loaded.gateway.quic_bind_addr,
-            quic_port = loaded.gateway.quic_port,
-            "gateway QUIC transport configured for upcoming runtime integration"
-        );
-    }
 
     let scheduler_wake = Arc::new(Notify::new());
     let grpc_url = loopback_grpc_url(grpc_bound, loaded.gateway.tls.enabled);
@@ -577,7 +582,7 @@ async fn main() -> Result<()> {
             .max_encoding_message_size(GRPC_MAX_ENCODING_MESSAGE_SIZE_BYTES);
     let node_rpc_service = node_rpc::NodeRpcServiceImpl::new(
         identity_runtime.revoked_certificate_fingerprints.clone(),
-        !loaded.identity.allow_insecure_node_rpc_without_mtls,
+        node_rpc_mtls_required,
     );
     let node_rpc_server =
         gateway::proto::palyra::node::v1::node_service_server::NodeServiceServer::new(
@@ -593,45 +598,70 @@ async fn main() -> Result<()> {
     }
     let mut node_rpc_server_builder = Server::builder();
     node_rpc_server_builder = node_rpc_server_builder
-        .tls_config(build_node_rpc_tls_config(
-            &identity_runtime,
-            !loaded.identity.allow_insecure_node_rpc_without_mtls,
-        ))
+        .tls_config(build_node_rpc_tls_config(&identity_runtime, node_rpc_mtls_required))
         .context("failed to apply node RPC TLS configuration")?;
 
-    tokio::try_join!(
-        async move {
-            axum::serve(admin_listener, app.into_make_service_with_connect_info::<SocketAddr>())
-                .with_graceful_shutdown(shutdown_signal())
+    let quic_endpoint = if let Some(quic_address) = quic_address {
+        let endpoint = quic_runtime::bind_endpoint(
+            quic_address,
+            &quic_runtime::QuicRuntimeTlsMaterial {
+                ca_cert_pem: identity_runtime.gateway_ca_certificate_pem.clone(),
+                cert_pem: identity_runtime.node_server_certificate.certificate_pem.clone(),
+                key_pem: identity_runtime.node_server_certificate.private_key_pem.clone(),
+                require_client_auth: node_rpc_mtls_required,
+            },
+            &QuicTransportLimits::default(),
+        )
+        .context("failed to bind palyrad QUIC listener")?;
+        let quic_bound =
+            endpoint.local_addr().context("failed to resolve palyrad QUIC listen address")?;
+        info!(
+            quic_listen_addr = %quic_bound,
+            node_rpc_mtls_required,
+            "gateway QUIC listener initialized"
+        );
+        Some(endpoint)
+    } else {
+        None
+    };
+
+    let admin_server = async move {
+        axum::serve(admin_listener, app.into_make_service_with_connect_info::<SocketAddr>())
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+            .context("palyrad admin server failed")
+    };
+    let grpc_server = async move {
+        grpc_server_builder
+            .add_service(grpc_gateway_server)
+            .add_service(grpc_cron_server)
+            .add_service(grpc_approvals_server)
+            .add_service(grpc_memory_server)
+            .add_service(grpc_vault_server)
+            .add_service(grpc_auth_server)
+            .serve_with_incoming_shutdown(TcpListenerStream::new(grpc_listener), shutdown_signal())
+            .await
+            .context("palyrad gRPC server failed")
+    };
+    let node_rpc_server = async move {
+        node_rpc_server_builder
+            .add_service(node_rpc_server)
+            .serve_with_incoming_shutdown(
+                TcpListenerStream::new(node_rpc_listener),
+                shutdown_signal(),
+            )
+            .await
+            .context("palyrad node RPC server failed")
+    };
+    if let Some(quic_endpoint) = quic_endpoint {
+        tokio::try_join!(admin_server, grpc_server, node_rpc_server, async move {
+            quic_runtime::serve(quic_endpoint, node_rpc_mtls_required)
                 .await
-                .context("palyrad admin server failed")
-        },
-        async move {
-            grpc_server_builder
-                .add_service(grpc_gateway_server)
-                .add_service(grpc_cron_server)
-                .add_service(grpc_approvals_server)
-                .add_service(grpc_memory_server)
-                .add_service(grpc_vault_server)
-                .add_service(grpc_auth_server)
-                .serve_with_incoming_shutdown(
-                    TcpListenerStream::new(grpc_listener),
-                    shutdown_signal(),
-                )
-                .await
-                .context("palyrad gRPC server failed")
-        },
-        async move {
-            node_rpc_server_builder
-                .add_service(node_rpc_server)
-                .serve_with_incoming_shutdown(
-                    TcpListenerStream::new(node_rpc_listener),
-                    shutdown_signal(),
-                )
-                .await
-                .context("palyrad node RPC server failed")
-        },
-    )?;
+                .context("palyrad QUIC server failed")
+        },)?;
+    } else {
+        tokio::try_join!(admin_server, grpc_server, node_rpc_server)?;
+    }
 
     Ok(())
 }
@@ -1229,6 +1259,7 @@ fn build_node_rpc_tls_config(
 fn enforce_remote_bind_guard(
     admin_address: SocketAddr,
     grpc_address: SocketAddr,
+    quic_address: Option<SocketAddr>,
     allow_insecure_remote: bool,
     gateway_tls_enabled: bool,
     node_rpc_mtls_required: bool,
@@ -1236,20 +1267,26 @@ fn enforce_remote_bind_guard(
 ) -> Result<()> {
     let admin_remote = !admin_address.ip().is_loopback();
     let grpc_remote = !grpc_address.ip().is_loopback();
-    if (admin_remote || grpc_remote) && !allow_insecure_remote {
+    let quic_remote = quic_address.is_some_and(|address| !address.ip().is_loopback());
+    let quic_display =
+        quic_address.map(|address| address.to_string()).unwrap_or_else(|| "disabled".to_owned());
+    if (admin_remote || grpc_remote || quic_remote) && !allow_insecure_remote {
         anyhow::bail!(
-            "refusing non-loopback bind without explicit insecure opt-in: admin={} grpc={} (set gateway.allow_insecure_remote=true or PALYRA_GATEWAY_ALLOW_INSECURE_REMOTE=true to override)",
-            admin_address,
-            grpc_address
-        );
-    }
-    let requires_danger_ack =
-        admin_remote || (grpc_remote && (!gateway_tls_enabled || !node_rpc_mtls_required));
-    if requires_danger_ack && !dangerous_remote_bind_acknowledged {
-        anyhow::bail!(
-            "refusing insecure remote bind without explicit danger acknowledgement: admin={} grpc={} gateway_tls_enabled={} node_rpc_mtls_required={} (set {}=true to acknowledge risk, or keep admin loopback and enable gateway TLS and node RPC mTLS)",
+            "refusing non-loopback bind without explicit insecure opt-in: admin={} grpc={} quic={} (set gateway.allow_insecure_remote=true or PALYRA_GATEWAY_ALLOW_INSECURE_REMOTE=true to override)",
             admin_address,
             grpc_address,
+            quic_display,
+        );
+    }
+    let requires_danger_ack = admin_remote
+        || (grpc_remote && (!gateway_tls_enabled || !node_rpc_mtls_required))
+        || (quic_remote && !node_rpc_mtls_required);
+    if requires_danger_ack && !dangerous_remote_bind_acknowledged {
+        anyhow::bail!(
+            "refusing insecure remote bind without explicit danger acknowledgement: admin={} grpc={} quic={} gateway_tls_enabled={} node_rpc_mtls_required={} (set {}=true to acknowledge risk, or keep admin loopback and enable gateway TLS + node RPC mTLS)",
+            admin_address,
+            grpc_address,
+            quic_display,
             gateway_tls_enabled,
             node_rpc_mtls_required,
             DANGEROUS_REMOTE_BIND_ACK_ENV,
@@ -1297,6 +1334,7 @@ mod tests {
         let result = enforce_remote_bind_guard(
             "127.0.0.1:7142".parse().expect("loopback endpoint should parse"),
             "127.0.0.1:7443".parse().expect("loopback endpoint should parse"),
+            None,
             false,
             false,
             true,
@@ -1310,6 +1348,7 @@ mod tests {
         let result = enforce_remote_bind_guard(
             "0.0.0.0:7142".parse().expect("remote endpoint should parse"),
             "127.0.0.1:7443".parse().expect("loopback endpoint should parse"),
+            None,
             false,
             false,
             true,
@@ -1323,6 +1362,7 @@ mod tests {
         let result = enforce_remote_bind_guard(
             "127.0.0.1:7142".parse().expect("loopback endpoint should parse"),
             "0.0.0.0:7443".parse().expect("remote endpoint should parse"),
+            None,
             true,
             true,
             true,
@@ -1339,6 +1379,7 @@ mod tests {
         let result = enforce_remote_bind_guard(
             "127.0.0.1:7142".parse().expect("loopback endpoint should parse"),
             "0.0.0.0:7443".parse().expect("remote endpoint should parse"),
+            None,
             true,
             false,
             true,
@@ -1355,6 +1396,7 @@ mod tests {
         let result = enforce_remote_bind_guard(
             "127.0.0.1:7142".parse().expect("loopback endpoint should parse"),
             "0.0.0.0:7443".parse().expect("remote endpoint should parse"),
+            None,
             true,
             false,
             true,
@@ -1368,6 +1410,7 @@ mod tests {
         let result = enforce_remote_bind_guard(
             "0.0.0.0:7142".parse().expect("remote endpoint should parse"),
             "0.0.0.0:7443".parse().expect("remote endpoint should parse"),
+            None,
             true,
             true,
             true,
@@ -1394,6 +1437,7 @@ mod tests {
         let result = enforce_remote_bind_guard(
             "127.0.0.1:7142".parse().expect("loopback endpoint should parse"),
             "0.0.0.0:7443".parse().expect("remote endpoint should parse"),
+            None,
             true,
             true,
             false,
@@ -1410,6 +1454,7 @@ mod tests {
         let result = enforce_remote_bind_guard(
             "127.0.0.1:7142".parse().expect("loopback endpoint should parse"),
             "0.0.0.0:7443".parse().expect("remote endpoint should parse"),
+            None,
             true,
             true,
             false,
@@ -1418,6 +1463,37 @@ mod tests {
         assert!(
             result.is_ok(),
             "danger acknowledgement should allow remote gRPC bind when node RPC mTLS is disabled"
+        );
+    }
+
+    #[test]
+    fn remote_bind_guard_rejects_quic_remote_without_opt_in() {
+        let result = enforce_remote_bind_guard(
+            "127.0.0.1:7142".parse().expect("loopback endpoint should parse"),
+            "127.0.0.1:7443".parse().expect("loopback endpoint should parse"),
+            Some("0.0.0.0:7444".parse().expect("remote QUIC endpoint should parse")),
+            false,
+            true,
+            true,
+            false,
+        );
+        assert!(result.is_err(), "remote QUIC bind should require explicit insecure opt-in");
+    }
+
+    #[test]
+    fn remote_bind_guard_requires_danger_ack_for_remote_quic_when_node_rpc_mtls_disabled() {
+        let result = enforce_remote_bind_guard(
+            "127.0.0.1:7142".parse().expect("loopback endpoint should parse"),
+            "127.0.0.1:7443".parse().expect("loopback endpoint should parse"),
+            Some("0.0.0.0:7444".parse().expect("remote QUIC endpoint should parse")),
+            true,
+            true,
+            false,
+            false,
+        );
+        assert!(
+            result.is_err(),
+            "remote QUIC bind should require danger acknowledgement when node RPC mTLS is disabled"
         );
     }
 

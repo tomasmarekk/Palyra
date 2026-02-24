@@ -3,6 +3,7 @@ members = [
   "crates/palyra-common",
   "crates/palyra-auth",
   "crates/palyra-daemon",
+  "crates/palyra-transport-quic",
   "crates/palyra-sandbox",
   "crates/palyra-cli",
   "crates/palyra-browserd",
@@ -45,6 +46,7 @@ rand = "0.8.5"
 reqwest = { version = "0.12.12", default-features = false, features = ["blocking", "json", "native-tls"] }
 rpassword = "7.3.1"
 rcgen = { version = "0.13.1", features = ["x509-parser"] }
+quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 rustls = { version = "0.23.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 serde = { version = "1.0.218", features = ["derive"] }
