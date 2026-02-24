@@ -39,6 +39,8 @@ service CanvasService {
   rpc UpdateCanvas(UpdateCanvasRequest) returns (UpdateCanvasResponse);
   rpc CloseCanvas(CloseCanvasRequest) returns (CloseCanvasResponse);
   rpc GetCanvas(GetCanvasRequest) returns (GetCanvasResponse);
+  rpc SubscribeCanvasUpdates(SubscribeCanvasUpdatesRequest)
+      returns (stream SubscribeCanvasUpdatesResponse);
 }
 
 enum ApprovalSubjectType {
@@ -256,6 +258,7 @@ message Canvas {
   int64 expires_at_unix_ms = 11;
   bool closed = 12;
   string close_reason = 13;
+  uint64 state_schema_version = 25;
 
   reserved 14 to 24;
 }
@@ -269,6 +272,7 @@ message CreateCanvasRequest {
   CanvasBundle bundle = 6;
   repeated string allowed_parent_origins = 7;
   uint32 auth_token_ttl_seconds = 8;
+  uint64 state_schema_version = 17;
 
   reserved 9 to 16;
 }
@@ -288,6 +292,8 @@ message UpdateCanvasRequest {
   palyra.common.v1.CanonicalId canvas_id = 2;
   bytes state_json = 3;
   uint64 expected_state_version = 4;
+  bytes patch_json = 13;
+  uint64 expected_state_schema_version = 14;
 
   reserved 5 to 12;
 }
@@ -328,6 +334,30 @@ message GetCanvasResponse {
   Canvas canvas = 2;
 
   reserved 3 to 10;
+}
+
+message SubscribeCanvasUpdatesRequest {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId canvas_id = 2;
+  uint64 after_state_version = 3;
+  bool include_snapshot_state = 4;
+
+  reserved 5 to 10;
+}
+
+message SubscribeCanvasUpdatesResponse {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId canvas_id = 2;
+  uint64 state_version = 3;
+  uint64 base_state_version = 4;
+  uint64 state_schema_version = 5;
+  bytes patch_json = 6;
+  bytes state_json = 7;
+  bool closed = 8;
+  string close_reason = 9;
+  int64 applied_at_unix_ms = 10;
+
+  reserved 11 to 16;
 }
 
 message HealthRequest {

@@ -5,6 +5,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use palyra_a2ui::{apply_patch_document, parse_patch_document};
 use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -35,6 +36,7 @@ const MAX_APPROVALS_LIST_LIMIT: usize = 500;
 const MAX_APPROVALS_QUERY_LIMIT: usize = MAX_APPROVALS_LIST_LIMIT + 1;
 const MAX_MEMORY_ITEMS_LIST_LIMIT: usize = 500;
 const MAX_MEMORY_SEARCH_CANDIDATES: usize = 256;
+const MAX_CANVAS_PATCHES_QUERY_LIMIT: usize = 1_000;
 const DEFAULT_MEMORY_VECTOR_DIMS: usize = 64;
 const DEFAULT_MEMORY_EMBEDDING_MODEL: &str = "hash-embedding-v1";
 
@@ -705,6 +707,74 @@ pub struct SkillStatusRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanvasStateTransitionRequest {
+    pub canvas_id: String,
+    pub session_id: String,
+    pub principal: String,
+    pub state_version: u64,
+    pub base_state_version: u64,
+    pub state_schema_version: u64,
+    pub state_json: String,
+    pub patch_json: String,
+    pub bundle_json: String,
+    pub allowed_parent_origins_json: String,
+    pub created_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+    pub expires_at_unix_ms: i64,
+    pub closed: bool,
+    pub close_reason: Option<String>,
+    pub actor_principal: String,
+    pub actor_device_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CanvasStateSnapshotRecord {
+    pub canvas_id: String,
+    pub session_id: String,
+    pub principal: String,
+    pub state_version: u64,
+    pub state_schema_version: u64,
+    pub state_json: String,
+    pub bundle_json: String,
+    pub allowed_parent_origins_json: String,
+    pub created_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+    pub expires_at_unix_ms: i64,
+    pub closed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub close_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CanvasStatePatchRecord {
+    pub seq: i64,
+    pub canvas_id: String,
+    pub state_version: u64,
+    pub base_state_version: u64,
+    pub state_schema_version: u64,
+    pub patch_json: String,
+    pub resulting_state_json: String,
+    pub closed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub close_reason: Option<String>,
+    pub actor_principal: String,
+    pub actor_device_id: String,
+    pub applied_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CanvasStateReplayRecord {
+    pub canvas_id: String,
+    pub state_version: u64,
+    pub state_schema_version: u64,
+    pub state_json: String,
+    pub closed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub close_reason: Option<String>,
+    pub patches_applied: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalConfig {
     pub db_path: PathBuf,
     pub hash_chain_enabled: bool,
@@ -891,6 +961,8 @@ pub enum JournalError {
     DuplicateCronRunId { run_id: String },
     #[error("memory item already exists: {memory_id}")]
     DuplicateMemoryId { memory_id: String },
+    #[error("canvas state already exists for canvas {canvas_id} at version {state_version}")]
+    DuplicateCanvasStateVersion { canvas_id: String, state_version: u64 },
     #[error("cron job not found: {job_id}")]
     CronJobNotFound { job_id: String },
     #[error("cron run not found: {run_id}")]
@@ -899,6 +971,8 @@ pub enum JournalError {
     MemoryNotFound { memory_id: String },
     #[error("approval record not found: {approval_id}")]
     ApprovalNotFound { approval_id: String },
+    #[error("canvas state not found: {canvas_id}")]
+    CanvasStateNotFound { canvas_id: String },
     #[error("orchestrator run not found: {run_id}")]
     RunNotFound { run_id: String },
     #[error("orchestrator session identity mismatch for session: {session_id}")]
@@ -907,6 +981,8 @@ pub enum JournalError {
     SessionNotFound { selector: String },
     #[error("invalid orchestrator session selector: {reason}")]
     InvalidSessionSelector { reason: String },
+    #[error("invalid canvas replay state for {canvas_id}: {reason}")]
+    InvalidCanvasReplay { canvas_id: String, reason: String },
     #[error("{payload_kind} payload exceeds max bytes ({actual_bytes} > {max_bytes})")]
     PayloadTooLarge { payload_kind: &'static str, actual_bytes: usize, max_bytes: usize },
     #[error("journal max payload bytes must be greater than 0")]
@@ -1207,6 +1283,57 @@ const MIGRATIONS: &[Migration] = &[
                 ON skill_status(skill_id, detected_at_ms DESC, version DESC);
             CREATE INDEX IF NOT EXISTS idx_skill_status_state
                 ON skill_status(status, detected_at_ms DESC);
+        "#,
+    },
+    Migration {
+        version: 8,
+        name: "create_canvas_state_tables",
+        sql: r#"
+            CREATE TABLE IF NOT EXISTS canvas_state_snapshots (
+                canvas_ulid TEXT PRIMARY KEY,
+                session_ulid TEXT NOT NULL,
+                principal TEXT NOT NULL,
+                state_version INTEGER NOT NULL,
+                state_schema_version INTEGER NOT NULL,
+                state_json TEXT NOT NULL,
+                bundle_json TEXT NOT NULL,
+                allowed_parent_origins_json TEXT NOT NULL,
+                created_at_unix_ms INTEGER NOT NULL,
+                updated_at_unix_ms INTEGER NOT NULL,
+                expires_at_unix_ms INTEGER NOT NULL,
+                closed INTEGER NOT NULL,
+                close_reason TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_canvas_state_snapshots_scope
+                ON canvas_state_snapshots(principal, session_ulid, updated_at_unix_ms DESC);
+
+            CREATE TABLE IF NOT EXISTS canvas_state_patches (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                canvas_ulid TEXT NOT NULL,
+                state_version INTEGER NOT NULL,
+                base_state_version INTEGER NOT NULL,
+                state_schema_version INTEGER NOT NULL,
+                patch_json TEXT NOT NULL,
+                resulting_state_json TEXT NOT NULL,
+                closed INTEGER NOT NULL,
+                close_reason TEXT,
+                actor_principal TEXT NOT NULL,
+                actor_device_id TEXT NOT NULL,
+                applied_at_unix_ms INTEGER NOT NULL,
+                UNIQUE(canvas_ulid, state_version)
+            );
+            CREATE INDEX IF NOT EXISTS idx_canvas_state_patches_canvas_version
+                ON canvas_state_patches(canvas_ulid, state_version ASC);
+            CREATE TRIGGER IF NOT EXISTS trg_canvas_state_patches_prevent_update
+            BEFORE UPDATE ON canvas_state_patches
+            BEGIN
+                SELECT RAISE(ABORT, 'canvas_state_patches is append-only');
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_canvas_state_patches_prevent_delete
+            BEFORE DELETE ON canvas_state_patches
+            BEGIN
+                SELECT RAISE(ABORT, 'canvas_state_patches is append-only');
+            END;
         "#,
     },
 ];
@@ -2673,6 +2800,350 @@ impl JournalStore {
         load_latest_skill_status_by_id(&guard, skill_id)
     }
 
+    pub fn record_canvas_state_transition(
+        &self,
+        request: &CanvasStateTransitionRequest,
+    ) -> Result<CanvasStateSnapshotRecord, JournalError> {
+        if request.state_version == 0 {
+            return Err(JournalError::InvalidCanvasReplay {
+                canvas_id: request.canvas_id.clone(),
+                reason: "state_version must be greater than 0".to_owned(),
+            });
+        }
+        if request.state_schema_version == 0 {
+            return Err(JournalError::InvalidCanvasReplay {
+                canvas_id: request.canvas_id.clone(),
+                reason: "state_schema_version must be greater than 0".to_owned(),
+            });
+        }
+        if request.state_version <= request.base_state_version {
+            return Err(JournalError::InvalidCanvasReplay {
+                canvas_id: request.canvas_id.clone(),
+                reason: format!(
+                    "state_version {} must be greater than base_state_version {}",
+                    request.state_version, request.base_state_version
+                ),
+            });
+        }
+        if request.state_json.len() > self.config.max_payload_bytes {
+            return Err(JournalError::PayloadTooLarge {
+                payload_kind: "canvas_state",
+                actual_bytes: request.state_json.len(),
+                max_bytes: self.config.max_payload_bytes,
+            });
+        }
+        if request.patch_json.len() > self.config.max_payload_bytes {
+            return Err(JournalError::PayloadTooLarge {
+                payload_kind: "canvas_patch",
+                actual_bytes: request.patch_json.len(),
+                max_bytes: self.config.max_payload_bytes,
+            });
+        }
+        if request.bundle_json.len() > self.config.max_payload_bytes {
+            return Err(JournalError::PayloadTooLarge {
+                payload_kind: "canvas_bundle",
+                actual_bytes: request.bundle_json.len(),
+                max_bytes: self.config.max_payload_bytes,
+            });
+        }
+        if request.allowed_parent_origins_json.len() > self.config.max_payload_bytes {
+            return Err(JournalError::PayloadTooLarge {
+                payload_kind: "canvas_allowed_parent_origins",
+                actual_bytes: request.allowed_parent_origins_json.len(),
+                max_bytes: self.config.max_payload_bytes,
+            });
+        }
+
+        let close_reason = request
+            .close_reason
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction()?;
+        match transaction.execute(
+            r#"
+                INSERT INTO canvas_state_patches (
+                    canvas_ulid,
+                    state_version,
+                    base_state_version,
+                    state_schema_version,
+                    patch_json,
+                    resulting_state_json,
+                    closed,
+                    close_reason,
+                    actor_principal,
+                    actor_device_id,
+                    applied_at_unix_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            "#,
+            params![
+                request.canvas_id.as_str(),
+                request.state_version as i64,
+                request.base_state_version as i64,
+                request.state_schema_version as i64,
+                request.patch_json.as_str(),
+                request.state_json.as_str(),
+                i64::from(request.closed),
+                close_reason.as_deref(),
+                request.actor_principal.as_str(),
+                request.actor_device_id.as_str(),
+                request.updated_at_unix_ms,
+            ],
+        ) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(error, message))
+                if error.code == ErrorCode::ConstraintViolation
+                    && (error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+                        || error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                        || message
+                            .as_deref()
+                            .map(|value| value.contains("canvas_state_patches.canvas_ulid"))
+                            .unwrap_or(false)) =>
+            {
+                return Err(JournalError::DuplicateCanvasStateVersion {
+                    canvas_id: request.canvas_id.clone(),
+                    state_version: request.state_version,
+                });
+            }
+            Err(error) => return Err(error.into()),
+        }
+
+        transaction.execute(
+            r#"
+                INSERT INTO canvas_state_snapshots (
+                    canvas_ulid,
+                    session_ulid,
+                    principal,
+                    state_version,
+                    state_schema_version,
+                    state_json,
+                    bundle_json,
+                    allowed_parent_origins_json,
+                    created_at_unix_ms,
+                    updated_at_unix_ms,
+                    expires_at_unix_ms,
+                    closed,
+                    close_reason
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                ON CONFLICT(canvas_ulid) DO UPDATE SET
+                    session_ulid = excluded.session_ulid,
+                    principal = excluded.principal,
+                    state_version = excluded.state_version,
+                    state_schema_version = excluded.state_schema_version,
+                    state_json = excluded.state_json,
+                    bundle_json = excluded.bundle_json,
+                    allowed_parent_origins_json = excluded.allowed_parent_origins_json,
+                    created_at_unix_ms = excluded.created_at_unix_ms,
+                    updated_at_unix_ms = excluded.updated_at_unix_ms,
+                    expires_at_unix_ms = excluded.expires_at_unix_ms,
+                    closed = excluded.closed,
+                    close_reason = excluded.close_reason
+            "#,
+            params![
+                request.canvas_id.as_str(),
+                request.session_id.as_str(),
+                request.principal.as_str(),
+                request.state_version as i64,
+                request.state_schema_version as i64,
+                request.state_json.as_str(),
+                request.bundle_json.as_str(),
+                request.allowed_parent_origins_json.as_str(),
+                request.created_at_unix_ms,
+                request.updated_at_unix_ms,
+                request.expires_at_unix_ms,
+                i64::from(request.closed),
+                close_reason.as_deref(),
+            ],
+        )?;
+        transaction.commit()?;
+        drop(guard);
+        self.canvas_state_snapshot(request.canvas_id.as_str())?.ok_or_else(|| {
+            JournalError::CanvasStateNotFound { canvas_id: request.canvas_id.clone() }
+        })
+    }
+
+    pub fn canvas_state_snapshot(
+        &self,
+        canvas_id: &str,
+    ) -> Result<Option<CanvasStateSnapshotRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        load_canvas_state_snapshot_by_id(&guard, canvas_id)
+    }
+
+    pub fn list_canvas_state_snapshots(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<CanvasStateSnapshotRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let limit = limit.clamp(1, MAX_CANVAS_PATCHES_QUERY_LIMIT) as i64;
+        let mut statement = guard.prepare(
+            r#"
+                SELECT
+                    canvas_ulid,
+                    session_ulid,
+                    principal,
+                    state_version,
+                    state_schema_version,
+                    state_json,
+                    bundle_json,
+                    allowed_parent_origins_json,
+                    created_at_unix_ms,
+                    updated_at_unix_ms,
+                    expires_at_unix_ms,
+                    closed,
+                    close_reason
+                FROM canvas_state_snapshots
+                ORDER BY updated_at_unix_ms DESC, canvas_ulid ASC
+                LIMIT ?1
+            "#,
+        )?;
+        let mut rows = statement.query(params![limit])?;
+        let mut records = Vec::new();
+        while let Some(row) = rows.next()? {
+            records.push(map_canvas_state_snapshot_row(row)?);
+        }
+        Ok(records)
+    }
+
+    pub fn list_canvas_state_patches(
+        &self,
+        canvas_id: &str,
+        after_state_version: u64,
+        limit: usize,
+    ) -> Result<Vec<CanvasStatePatchRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let limit = limit.clamp(1, MAX_CANVAS_PATCHES_QUERY_LIMIT) as i64;
+        let mut statement = guard.prepare(
+            r#"
+                SELECT
+                    seq,
+                    canvas_ulid,
+                    state_version,
+                    base_state_version,
+                    state_schema_version,
+                    patch_json,
+                    resulting_state_json,
+                    closed,
+                    close_reason,
+                    actor_principal,
+                    actor_device_id,
+                    applied_at_unix_ms
+                FROM canvas_state_patches
+                WHERE canvas_ulid = ?1
+                  AND state_version > ?2
+                ORDER BY state_version ASC
+                LIMIT ?3
+            "#,
+        )?;
+        let mut rows = statement.query(params![canvas_id, after_state_version as i64, limit])?;
+        let mut records = Vec::new();
+        while let Some(row) = rows.next()? {
+            records.push(map_canvas_state_patch_row(row)?);
+        }
+        Ok(records)
+    }
+
+    pub fn replay_canvas_state(
+        &self,
+        canvas_id: &str,
+    ) -> Result<Option<CanvasStateReplayRecord>, JournalError> {
+        let mut next_after = 0_u64;
+        let mut patches = Vec::new();
+        loop {
+            let batch = self.list_canvas_state_patches(
+                canvas_id,
+                next_after,
+                MAX_CANVAS_PATCHES_QUERY_LIMIT,
+            )?;
+            if batch.is_empty() {
+                break;
+            }
+            next_after = batch.last().map(|record| record.state_version).unwrap_or(next_after);
+            patches.extend(batch);
+            if patches.len() % MAX_CANVAS_PATCHES_QUERY_LIMIT != 0 {
+                break;
+            }
+        }
+        if patches.is_empty() {
+            return Ok(None);
+        }
+
+        let mut current_state = Value::Null;
+        let mut current_state_version = 0_u64;
+        let mut current_state_schema_version = 1_u64;
+        let mut closed = false;
+        let mut close_reason = None;
+
+        for patch_record in &patches {
+            if patch_record.base_state_version != current_state_version {
+                return Err(JournalError::InvalidCanvasReplay {
+                    canvas_id: canvas_id.to_owned(),
+                    reason: format!(
+                        "patch version {} expected base {}, got {}",
+                        patch_record.state_version,
+                        current_state_version,
+                        patch_record.base_state_version
+                    ),
+                });
+            }
+            let patch_document =
+                parse_patch_document(patch_record.patch_json.as_bytes()).map_err(|error| {
+                    JournalError::InvalidCanvasReplay {
+                        canvas_id: canvas_id.to_owned(),
+                        reason: format!(
+                            "failed to parse patch for state_version {}: {error}",
+                            patch_record.state_version
+                        ),
+                    }
+                })?;
+            current_state =
+                apply_patch_document(&current_state, &patch_document).map_err(|error| {
+                    JournalError::InvalidCanvasReplay {
+                        canvas_id: canvas_id.to_owned(),
+                        reason: format!(
+                            "failed to apply patch for state_version {}: {error}",
+                            patch_record.state_version
+                        ),
+                    }
+                })?;
+            let expected_state: Value = serde_json::from_str(
+                patch_record.resulting_state_json.as_str(),
+            )
+            .map_err(|error| JournalError::InvalidCanvasReplay {
+                canvas_id: canvas_id.to_owned(),
+                reason: format!(
+                    "invalid resulting state JSON at version {}: {error}",
+                    patch_record.state_version
+                ),
+            })?;
+            if current_state != expected_state {
+                return Err(JournalError::InvalidCanvasReplay {
+                    canvas_id: canvas_id.to_owned(),
+                    reason: format!(
+                        "patched state mismatch at version {}",
+                        patch_record.state_version
+                    ),
+                });
+            }
+            current_state_version = patch_record.state_version;
+            current_state_schema_version = patch_record.state_schema_version;
+            closed = patch_record.closed;
+            close_reason = patch_record.close_reason.clone();
+        }
+
+        Ok(Some(CanvasStateReplayRecord {
+            canvas_id: canvas_id.to_owned(),
+            state_version: current_state_version,
+            state_schema_version: current_state_schema_version,
+            state_json: serde_json::to_string(&current_state)?,
+            closed,
+            close_reason,
+            patches_applied: patches.len(),
+        }))
+    }
+
     pub fn create_memory_item(
         &self,
         request: &MemoryItemCreateRequest,
@@ -3527,6 +3998,80 @@ fn load_approval_by_id(
     statement.query_row(params![approval_id], map_approval_row).optional().map_err(Into::into)
 }
 
+fn map_canvas_state_snapshot_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<CanvasStateSnapshotRecord, rusqlite::Error> {
+    Ok(CanvasStateSnapshotRecord {
+        canvas_id: row.get(0)?,
+        session_id: row.get(1)?,
+        principal: row.get(2)?,
+        state_version: integer_to_u64(row, 3, "canvas_state_snapshots.state_version")?,
+        state_schema_version: integer_to_u64(
+            row,
+            4,
+            "canvas_state_snapshots.state_schema_version",
+        )?,
+        state_json: row.get(5)?,
+        bundle_json: row.get(6)?,
+        allowed_parent_origins_json: row.get(7)?,
+        created_at_unix_ms: row.get(8)?,
+        updated_at_unix_ms: row.get(9)?,
+        expires_at_unix_ms: row.get(10)?,
+        closed: row.get::<_, i64>(11)? == 1,
+        close_reason: row.get(12)?,
+    })
+}
+
+fn load_canvas_state_snapshot_by_id(
+    connection: &Connection,
+    canvas_id: &str,
+) -> Result<Option<CanvasStateSnapshotRecord>, JournalError> {
+    let mut statement = connection.prepare(
+        r#"
+            SELECT
+                canvas_ulid,
+                session_ulid,
+                principal,
+                state_version,
+                state_schema_version,
+                state_json,
+                bundle_json,
+                allowed_parent_origins_json,
+                created_at_unix_ms,
+                updated_at_unix_ms,
+                expires_at_unix_ms,
+                closed,
+                close_reason
+            FROM canvas_state_snapshots
+            WHERE canvas_ulid = ?1
+            LIMIT 1
+        "#,
+    )?;
+    statement
+        .query_row(params![canvas_id], map_canvas_state_snapshot_row)
+        .optional()
+        .map_err(Into::into)
+}
+
+fn map_canvas_state_patch_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<CanvasStatePatchRecord, rusqlite::Error> {
+    Ok(CanvasStatePatchRecord {
+        seq: row.get(0)?,
+        canvas_id: row.get(1)?,
+        state_version: integer_to_u64(row, 2, "canvas_state_patches.state_version")?,
+        base_state_version: integer_to_u64(row, 3, "canvas_state_patches.base_state_version")?,
+        state_schema_version: integer_to_u64(row, 4, "canvas_state_patches.state_schema_version")?,
+        patch_json: row.get(5)?,
+        resulting_state_json: row.get(6)?,
+        closed: row.get::<_, i64>(7)? == 1,
+        close_reason: row.get(8)?,
+        actor_principal: row.get(9)?,
+        actor_device_id: row.get(10)?,
+        applied_at_unix_ms: row.get(11)?,
+    })
+}
+
 fn map_skill_status_row(row: &rusqlite::Row<'_>) -> Result<SkillStatusRecord, rusqlite::Error> {
     let status_raw: String = row.get(2)?;
     let status = SkillExecutionStatus::from_str(status_raw.as_str()).ok_or_else(|| {
@@ -3601,6 +4146,24 @@ fn load_latest_skill_status_by_id(
         "#,
     )?;
     statement.query_row(params![skill_id], map_skill_status_row).optional().map_err(Into::into)
+}
+
+fn integer_to_u64(
+    row: &rusqlite::Row<'_>,
+    column: usize,
+    field_name: &'static str,
+) -> Result<u64, rusqlite::Error> {
+    let raw: i64 = row.get(column)?;
+    u64::try_from(raw).map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Integer,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{field_name} is negative"),
+            )),
+        )
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -4104,11 +4667,11 @@ mod tests {
     use super::{
         build_fts_query, ApprovalCreateRequest, ApprovalDecision, ApprovalDecisionScope,
         ApprovalPolicySnapshot, ApprovalPromptOption, ApprovalPromptRecord, ApprovalResolveRequest,
-        ApprovalRiskLevel, ApprovalSubjectType, ApprovalsListFilter, CronConcurrencyPolicy,
-        CronJobCreateRequest, CronJobsListFilter, CronMisfirePolicy, CronRetryPolicy,
-        CronRunFinalizeRequest, CronRunStartRequest, CronRunStatus, CronRunsListFilter,
-        CronScheduleType, JournalAppendRequest, JournalConfig, JournalError, JournalStore,
-        MemoryEmbeddingProvider, MemoryItemCreateRequest, MemoryItemsListFilter,
+        ApprovalRiskLevel, ApprovalSubjectType, ApprovalsListFilter, CanvasStateTransitionRequest,
+        CronConcurrencyPolicy, CronJobCreateRequest, CronJobsListFilter, CronMisfirePolicy,
+        CronRetryPolicy, CronRunFinalizeRequest, CronRunStartRequest, CronRunStatus,
+        CronRunsListFilter, CronScheduleType, JournalAppendRequest, JournalConfig, JournalError,
+        JournalStore, MemoryEmbeddingProvider, MemoryItemCreateRequest, MemoryItemsListFilter,
         MemoryPurgeRequest, MemorySearchRequest, MemorySource, OrchestratorCancelRequest,
         OrchestratorRunStartRequest, OrchestratorSessionUpsertRequest,
         OrchestratorTapeAppendRequest, OrchestratorUsageDelta, SkillExecutionStatus,
@@ -4259,6 +4822,35 @@ mod tests {
         }
     }
 
+    fn sample_canvas_transition_request(
+        canvas_id: &str,
+        state_version: u64,
+        base_state_version: u64,
+        state_json: &str,
+        patch_json: &str,
+        closed: bool,
+    ) -> CanvasStateTransitionRequest {
+        CanvasStateTransitionRequest {
+            canvas_id: canvas_id.to_owned(),
+            session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAA".to_owned(),
+            principal: "user:ops".to_owned(),
+            state_version,
+            base_state_version,
+            state_schema_version: 1,
+            state_json: state_json.to_owned(),
+            patch_json: patch_json.to_owned(),
+            bundle_json: r#"{"bundle_id":"demo","entrypoint_path":"app.js","assets":{"app.js":{"content_type":"application/javascript","body":[99,111,110,115,111,108,101,46,108,111,103,40,34,111,107,34,41,59]}},"sha256":"demo","signature":"sig"}"#.to_owned(),
+            allowed_parent_origins_json: r#"["https://console.example.com"]"#.to_owned(),
+            created_at_unix_ms: 1_730_000_000_000,
+            updated_at_unix_ms: 1_730_000_000_000 + (state_version as i64 * 100),
+            expires_at_unix_ms: 1_730_000_360_000,
+            closed,
+            close_reason: if closed { Some("operator_close".to_owned()) } else { None },
+            actor_principal: "user:ops".to_owned(),
+            actor_device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+        }
+    }
+
     fn temp_db_path() -> PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -4329,6 +4921,13 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("schema migrations should be queryable");
+        let migration_v8: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = ?1",
+                params![8],
+                |row| row.get(0),
+            )
+            .expect("schema migrations should be queryable");
         assert_eq!(migration_v1, 1, "migration v1 should be recorded exactly once");
         assert_eq!(migration_v2, 1, "migration v2 should be recorded exactly once");
         assert_eq!(migration_v3, 1, "migration v3 should be recorded exactly once");
@@ -4336,6 +4935,7 @@ mod tests {
         assert_eq!(migration_v5, 1, "migration v5 should be recorded exactly once");
         assert_eq!(migration_v6, 1, "migration v6 should be recorded exactly once");
         assert_eq!(migration_v7, 1, "migration v7 should be recorded exactly once");
+        assert_eq!(migration_v8, 1, "migration v8 should be recorded exactly once");
     }
 
     #[test]
@@ -5146,6 +5746,126 @@ mod tests {
             latest_case_variant.version, "1.1.0",
             "latest lookup should be case-insensitive for skill_id"
         );
+    }
+
+    #[test]
+    fn canvas_state_transitions_persist_and_replay_deterministically() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let canvas_id = "01ARZ3NDEKTSV4RRFFQ69G5FC9";
+
+        let first = sample_canvas_transition_request(
+            canvas_id,
+            1,
+            0,
+            r#"{"counter":1,"items":[]}"#,
+            r#"{"v":1,"ops":[{"op":"replace","path":"","value":{"counter":1,"items":[]}}]}"#,
+            false,
+        );
+        store
+            .record_canvas_state_transition(&first)
+            .expect("initial canvas transition should persist");
+
+        let second = sample_canvas_transition_request(
+            canvas_id,
+            2,
+            1,
+            r#"{"counter":2,"items":["a"]}"#,
+            r#"{"v":1,"ops":[{"op":"replace","path":"/counter","value":2},{"op":"add","path":"/items/0","value":"a"}]}"#,
+            false,
+        );
+        store
+            .record_canvas_state_transition(&second)
+            .expect("second canvas transition should persist");
+
+        let third = sample_canvas_transition_request(
+            canvas_id,
+            3,
+            2,
+            r#"{"counter":2,"items":["a"]}"#,
+            r#"{"v":1,"ops":[{"op":"replace","path":"","value":{"counter":2,"items":["a"]}}]}"#,
+            true,
+        );
+        let latest =
+            store.record_canvas_state_transition(&third).expect("close transition should persist");
+        assert_eq!(latest.state_version, 3);
+        assert!(latest.closed, "latest snapshot should reflect closed flag");
+
+        let replayed = store
+            .replay_canvas_state(canvas_id)
+            .expect("replay should succeed")
+            .expect("replay must return a final state");
+        assert_eq!(replayed.state_version, 3);
+        assert_eq!(replayed.state_schema_version, 1);
+        assert_eq!(replayed.state_json, r#"{"counter":2,"items":["a"]}"#);
+        assert!(replayed.closed, "replayed state should preserve closed flag");
+        assert_eq!(replayed.patches_applied, 3);
+
+        let patches = store
+            .list_canvas_state_patches(canvas_id, 1, 10)
+            .expect("patch listing should succeed");
+        assert_eq!(patches.len(), 2, "after state version filter should apply");
+        assert_eq!(patches[0].state_version, 2);
+        assert_eq!(patches[1].state_version, 3);
+    }
+
+    #[test]
+    fn canvas_state_transition_rejects_duplicate_state_version() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let canvas_id = "01ARZ3NDEKTSV4RRFFQ69G5FD0";
+        let request = sample_canvas_transition_request(
+            canvas_id,
+            1,
+            0,
+            r#"{"status":"ok"}"#,
+            r#"{"v":1,"ops":[{"op":"replace","path":"","value":{"status":"ok"}}]}"#,
+            false,
+        );
+        store.record_canvas_state_transition(&request).expect("first transition should succeed");
+        let duplicate = store
+            .record_canvas_state_transition(&request)
+            .expect_err("duplicate state version should fail");
+        assert!(matches!(
+            duplicate,
+            JournalError::DuplicateCanvasStateVersion {
+                ref canvas_id,
+                state_version
+            } if canvas_id == "01ARZ3NDEKTSV4RRFFQ69G5FD0" && state_version == 1
+        ));
+    }
+
+    #[test]
+    fn canvas_state_transition_rejects_oversized_payload() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(JournalConfig {
+            db_path,
+            hash_chain_enabled: false,
+            max_payload_bytes: 96,
+        })
+        .expect("journal store should open");
+        let oversized = format!("\"{}\"", "a".repeat(256));
+        let request = sample_canvas_transition_request(
+            "01ARZ3NDEKTSV4RRFFQ69G5FD1",
+            1,
+            0,
+            oversized.as_str(),
+            r#"{"v":1,"ops":[{"op":"replace","path":"","value":"ok"}]}"#,
+            false,
+        );
+        let error = store
+            .record_canvas_state_transition(&request)
+            .expect_err("oversized state payload should fail");
+        assert!(matches!(
+            error,
+            JournalError::PayloadTooLarge {
+                payload_kind,
+                actual_bytes: _,
+                max_bytes: 96
+            } if payload_kind == "canvas_state"
+        ));
     }
 
     #[test]

@@ -24,7 +24,79 @@
     },
     "patch": {
       "type": "object",
-      "maxProperties": 256
+      "additionalProperties": false,
+      "required": [
+        "v",
+        "ops"
+      ],
+      "properties": {
+        "v": {
+          "const": 1
+        },
+        "ops": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 512,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "op",
+              "path"
+            ],
+            "properties": {
+              "op": {
+                "type": "string",
+                "enum": [
+                  "add",
+                  "replace",
+                  "remove"
+                ]
+              },
+              "path": {
+                "type": "string",
+                "maxLength": 512
+              },
+              "value": {}
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "op": {
+                      "const": "remove"
+                    }
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "value"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "op": {
+                      "enum": [
+                        "add",
+                        "replace"
+                      ]
+                    }
+                  }
+                },
+                "then": {
+                  "required": [
+                    "value"
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      }
     },
     "limits": {
       "type": "object",
