@@ -531,6 +531,12 @@ public enum PalyraGatewayV1 {
     public struct SetDefaultAgentResponse: Equatable {
         public init() {}
     }
+    public struct SubscribeCanvasUpdatesRequest: Equatable {
+        public init() {}
+    }
+    public struct SubscribeCanvasUpdatesResponse: Equatable {
+        public init() {}
+    }
     public struct UpdateCanvasRequest: Equatable {
         public init() {}
     }
@@ -549,6 +555,7 @@ public enum PalyraGatewayV1 {
         func closeCanvas()
         func createCanvas()
         func getCanvas()
+        func subscribeCanvasUpdates()
         func updateCanvas()
     }
     public protocol GatewayServiceClient {

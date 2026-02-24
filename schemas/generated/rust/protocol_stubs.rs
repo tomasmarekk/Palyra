@@ -376,6 +376,10 @@ pub mod palyra_gateway_v1 {
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct SetDefaultAgentResponse;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct SubscribeCanvasUpdatesRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct SubscribeCanvasUpdatesResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct UpdateCanvasRequest;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct UpdateCanvasResponse;
@@ -390,6 +394,7 @@ pub mod palyra_gateway_v1 {
         fn CloseCanvas(&self);
         fn CreateCanvas(&self);
         fn GetCanvas(&self);
+        fn SubscribeCanvasUpdates(&self);
         fn UpdateCanvas(&self);
     }
     pub trait GatewayServiceClient {

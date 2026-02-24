@@ -2418,6 +2418,7 @@ dependencies = [
  "clap",
  "hex",
  "libc",
+ "palyra-a2ui",
  "palyra-auth",
  "palyra-common",
  "palyra-identity",

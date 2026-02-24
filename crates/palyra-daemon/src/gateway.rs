@@ -11,6 +11,9 @@ use std::{
 
 use axum::http::{header::AUTHORIZATION, HeaderMap};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use palyra_a2ui::{
+    apply_patch_document, build_replace_root_patch, parse_patch_document, patch_document_to_bytes,
+};
 use palyra_auth::{
     AuthCredential, AuthCredentialType, AuthExpiryDistribution, AuthHealthSummary,
     AuthProfileError, AuthProfileHealthState, AuthProfileListFilter, AuthProfileRecord,
@@ -59,7 +62,8 @@ use crate::{
     journal::{
         ApprovalCreateRequest, ApprovalDecision, ApprovalDecisionScope, ApprovalPolicySnapshot,
         ApprovalPromptOption, ApprovalPromptRecord, ApprovalRecord, ApprovalResolveRequest,
-        ApprovalRiskLevel, ApprovalSubjectType, ApprovalsListFilter, CronConcurrencyPolicy,
+        ApprovalRiskLevel, ApprovalSubjectType, ApprovalsListFilter, CanvasStatePatchRecord,
+        CanvasStateSnapshotRecord, CanvasStateTransitionRequest, CronConcurrencyPolicy,
         CronJobCreateRequest, CronJobRecord, CronJobUpdatePatch, CronJobsListFilter,
         CronRunFinalizeRequest, CronRunRecord, CronRunStartRequest, CronRunStatus,
         CronRunsListFilter, JournalAppendRequest, JournalError, JournalEventRecord, JournalStore,
@@ -182,6 +186,9 @@ const MAX_CANVAS_ALLOWED_PARENT_ORIGINS: usize = 16;
 const MAX_CANVAS_ORIGIN_BYTES: usize = 256;
 const MAX_CANVAS_TOKEN_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
 const MIN_CANVAS_TOKEN_TTL_MS: u64 = 30 * 1_000;
+const MAX_CANVAS_RECOVERY_SNAPSHOTS: usize = 10_000;
+const MAX_CANVAS_STREAM_PATCH_BATCH: usize = 64;
+const CANVAS_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_PATCH_TOOL_REDACTION_PATTERNS: usize = 64;
 const MAX_PATCH_TOOL_SECRET_FILE_MARKERS: usize = 64;
 const MAX_PATCH_TOOL_PATTERN_BYTES: usize = 256;
@@ -341,13 +348,13 @@ struct ToolSkillContext {
     version: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct CanvasAssetRecord {
     content_type: String,
     body: Vec<u8>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct CanvasBundleRecord {
     bundle_id: String,
     entrypoint_path: String,
@@ -362,6 +369,7 @@ struct CanvasRecord {
     session_id: String,
     principal: String,
     state_version: u64,
+    state_schema_version: u64,
     state_json: Vec<u8>,
     bundle: CanvasBundleRecord,
     allowed_parent_origins: Vec<String>,
@@ -392,6 +400,7 @@ pub struct CanvasAssetResponse {
 pub struct CanvasStateResponse {
     pub canvas_id: String,
     pub state_version: u64,
+    pub state_schema_version: u64,
     pub state: Value,
     pub closed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1024,6 +1033,39 @@ impl GatewayRuntimeState {
     ) -> Result<Arc<Self>, JournalError> {
         let build = build_metadata();
         let existing_events = journal_store.total_events()? as u64;
+        let canvas_snapshots =
+            journal_store.list_canvas_state_snapshots(MAX_CANVAS_RECOVERY_SNAPSHOTS)?;
+        for snapshot in &canvas_snapshots {
+            let replayed = journal_store.replay_canvas_state(snapshot.canvas_id.as_str())?.ok_or(
+                JournalError::InvalidCanvasReplay {
+                    canvas_id: snapshot.canvas_id.clone(),
+                    reason: "snapshot exists but replay produced no state".to_owned(),
+                },
+            )?;
+            let replay_state: Value =
+                serde_json::from_str(replayed.state_json.as_str()).map_err(|error| {
+                    JournalError::InvalidCanvasReplay {
+                        canvas_id: snapshot.canvas_id.clone(),
+                        reason: format!("replay state JSON is invalid: {error}"),
+                    }
+                })?;
+            let snapshot_state: Value = serde_json::from_str(snapshot.state_json.as_str())
+                .map_err(|error| JournalError::InvalidCanvasReplay {
+                    canvas_id: snapshot.canvas_id.clone(),
+                    reason: format!("snapshot state JSON is invalid: {error}"),
+                })?;
+            if replayed.state_version != snapshot.state_version
+                || replayed.state_schema_version != snapshot.state_schema_version
+                || replay_state != snapshot_state
+            {
+                return Err(JournalError::InvalidCanvasReplay {
+                    canvas_id: snapshot.canvas_id.clone(),
+                    reason: "replay outcome does not match latest snapshot".to_owned(),
+                });
+            }
+        }
+        let recovered_canvas_records =
+            load_canvas_records_from_snapshots(canvas_snapshots.as_slice())?;
         let channel_router = ChannelRouter::new(config.channel_router.clone());
         Ok(Arc::new(Self {
             started_at: Instant::now(),
@@ -1123,7 +1165,7 @@ impl GatewayRuntimeState {
             http_fetch_cache: Mutex::new(HashMap::new()),
             tool_approval_cache: Mutex::new(HashMap::new()),
             vault_rate_limit: Mutex::new(HashMap::new()),
-            canvas_records: Mutex::new(HashMap::new()),
+            canvas_records: Mutex::new(recovered_canvas_records),
             canvas_signing_secret: generate_canvas_signing_secret(),
             agent_registry,
             channel_router,
@@ -1156,6 +1198,7 @@ impl GatewayRuntimeState {
         session_id: String,
         initial_state_json: &[u8],
         initial_state_version: u64,
+        requested_state_schema_version: Option<u64>,
         bundle: gateway_v1::CanvasBundle,
         allowed_parent_origins: Vec<String>,
         requested_token_ttl_seconds: Option<u32>,
@@ -1168,10 +1211,23 @@ impl GatewayRuntimeState {
                 self.config.canvas_host.max_state_bytes
             )));
         }
-        let _validated_initial_state = serde_json::from_slice::<Value>(initial_state_json)
-            .map_err(|error| {
+        let validated_initial_state =
+            serde_json::from_slice::<Value>(initial_state_json).map_err(|error| {
                 Status::invalid_argument(format!("initial_state_json must be valid JSON: {error}"))
             })?;
+        let state_schema_version = resolve_canvas_state_schema_version(
+            requested_state_schema_version,
+            &validated_initial_state,
+            None,
+        )?;
+        let canonical_initial_state_json =
+            serde_json::to_vec(&validated_initial_state).map_err(|error| {
+                Status::internal(format!("failed to encode initial state JSON: {error}"))
+            })?;
+        let initial_patch = build_replace_root_patch(&validated_initial_state);
+        let initial_patch_json = patch_document_to_bytes(&initial_patch).map_err(|error| {
+            Status::internal(format!("failed to encode initial canvas patch payload: {error}"))
+        })?;
         let now_unix_ms = unix_ms_now_for_status()?;
         let canvas_id = match requested_canvas_id {
             Some(value) => normalize_canvas_identifier(value.as_str(), "canvas_id")?,
@@ -1204,7 +1260,8 @@ impl GatewayRuntimeState {
             session_id: session_id.clone(),
             principal: context.principal.clone(),
             state_version,
-            state_json: initial_state_json.to_vec(),
+            state_schema_version,
+            state_json: canonical_initial_state_json.clone(),
             bundle,
             allowed_parent_origins,
             created_at_unix_ms: now_unix_ms,
@@ -1214,6 +1271,39 @@ impl GatewayRuntimeState {
             close_reason: None,
             update_timestamps_unix_ms: VecDeque::new(),
         };
+        let transition = CanvasStateTransitionRequest {
+            canvas_id: record.canvas_id.clone(),
+            session_id: record.session_id.clone(),
+            principal: record.principal.clone(),
+            state_version: record.state_version,
+            base_state_version: 0,
+            state_schema_version: record.state_schema_version,
+            state_json: String::from_utf8(record.state_json.clone()).map_err(|error| {
+                Status::internal(format!("failed to encode initial state JSON as UTF-8: {error}"))
+            })?,
+            patch_json: String::from_utf8(initial_patch_json).map_err(|error| {
+                Status::internal(format!("failed to encode initial patch JSON as UTF-8: {error}"))
+            })?,
+            bundle_json: serde_json::to_string(&record.bundle).map_err(|error| {
+                Status::internal(format!("failed to encode canvas bundle for persistence: {error}"))
+            })?,
+            allowed_parent_origins_json: serde_json::to_string(&record.allowed_parent_origins)
+                .map_err(|error| {
+                    Status::internal(format!(
+                        "failed to encode canvas origin allowlist for persistence: {error}"
+                    ))
+                })?,
+            created_at_unix_ms: record.created_at_unix_ms,
+            updated_at_unix_ms: record.updated_at_unix_ms,
+            expires_at_unix_ms: record.expires_at_unix_ms,
+            closed: record.closed,
+            close_reason: record.close_reason.clone(),
+            actor_principal: context.principal.clone(),
+            actor_device_id: context.device_id.clone(),
+        };
+        self.journal_store
+            .record_canvas_state_transition(&transition)
+            .map_err(|error| map_canvas_store_error("record_canvas_state_transition", error))?;
         records.insert(canvas_id.clone(), record.clone());
         self.counters.canvas_created.fetch_add(1, Ordering::Relaxed);
 
@@ -1245,20 +1335,42 @@ impl GatewayRuntimeState {
         &self,
         context: &RequestContext,
         canvas_id: &str,
-        state_json: &[u8],
+        state_json: Option<&[u8]>,
+        patch_json: Option<&[u8]>,
         expected_state_version: Option<u64>,
+        expected_state_schema_version: Option<u64>,
     ) -> Result<CanvasRecord, Status> {
         self.ensure_canvas_host_enabled()?;
-        if state_json.len() > self.config.canvas_host.max_state_bytes {
-            return Err(Status::resource_exhausted(format!(
-                "canvas state payload exceeds limit ({} > {})",
-                state_json.len(),
-                self.config.canvas_host.max_state_bytes
-            )));
+        let has_state_payload = state_json.is_some_and(|payload| !payload.is_empty());
+        let has_patch_payload = patch_json.is_some_and(|payload| !payload.is_empty());
+        if !has_state_payload && !has_patch_payload {
+            return Err(Status::invalid_argument(
+                "canvas update requires non-empty state_json or patch_json payload",
+            ));
         }
-        let _validated_state = serde_json::from_slice::<Value>(state_json).map_err(|error| {
-            Status::invalid_argument(format!("state_json must be valid JSON: {error}"))
-        })?;
+        if has_state_payload && has_patch_payload {
+            return Err(Status::invalid_argument(
+                "canvas update accepts either state_json or patch_json, not both",
+            ));
+        }
+        if let Some(payload) = state_json {
+            if payload.len() > self.config.canvas_host.max_state_bytes {
+                return Err(Status::resource_exhausted(format!(
+                    "canvas state payload exceeds limit ({} > {})",
+                    payload.len(),
+                    self.config.canvas_host.max_state_bytes
+                )));
+            }
+        }
+        if let Some(payload) = patch_json {
+            if payload.len() > self.config.canvas_host.max_state_bytes {
+                return Err(Status::resource_exhausted(format!(
+                    "canvas patch payload exceeds limit ({} > {})",
+                    payload.len(),
+                    self.config.canvas_host.max_state_bytes
+                )));
+            }
+        }
         let normalized_canvas_id = normalize_canvas_identifier(canvas_id, "canvas_id")?;
         let now_unix_ms = unix_ms_now_for_status()?;
         let mut records = self
@@ -1287,6 +1399,58 @@ impl GatewayRuntimeState {
                 )));
             }
         }
+        if let Some(expected_state_schema_version) = expected_state_schema_version {
+            if expected_state_schema_version > 0
+                && record.state_schema_version != expected_state_schema_version
+            {
+                return Err(Status::failed_precondition(format!(
+                    "canvas schema mismatch (expected {}, current {})",
+                    expected_state_schema_version, record.state_schema_version
+                )));
+            }
+        }
+
+        let current_state: Value =
+            serde_json::from_slice(record.state_json.as_slice()).map_err(|error| {
+                Status::internal(format!("persisted canvas state JSON is invalid: {error}"))
+            })?;
+        let (next_state, patch_document) = if let Some(payload) = state_json {
+            let next_state = serde_json::from_slice::<Value>(payload).map_err(|error| {
+                Status::invalid_argument(format!("state_json must be valid JSON: {error}"))
+            })?;
+            (next_state.clone(), build_replace_root_patch(&next_state))
+        } else {
+            let payload = patch_json.ok_or_else(|| {
+                Status::invalid_argument("canvas patch update requires non-empty patch_json")
+            })?;
+            let patch_document = parse_patch_document(payload).map_err(|error| {
+                Status::invalid_argument(format!("patch_json is invalid: {error}"))
+            })?;
+            let next_state =
+                apply_patch_document(&current_state, &patch_document).map_err(|error| {
+                    Status::failed_precondition(format!("patch application failed: {error}"))
+                })?;
+            (next_state, patch_document)
+        };
+        let next_state_schema_version = resolve_canvas_state_schema_version(
+            None,
+            &next_state,
+            Some(record.state_schema_version),
+        )?;
+        let canonical_next_state_json = serde_json::to_vec(&next_state).map_err(|error| {
+            Status::internal(format!("failed to encode next state JSON: {error}"))
+        })?;
+        if canonical_next_state_json.len() > self.config.canvas_host.max_state_bytes {
+            return Err(Status::resource_exhausted(format!(
+                "canvas state payload exceeds limit after patch apply ({} > {})",
+                canonical_next_state_json.len(),
+                self.config.canvas_host.max_state_bytes
+            )));
+        }
+        let canonical_patch_json = patch_document_to_bytes(&patch_document)
+            .map_err(|error| Status::internal(format!("failed to encode patch JSON: {error}")))?;
+        let next_state_version = record.state_version.saturating_add(1);
+
         while record
             .update_timestamps_unix_ms
             .front()
@@ -1301,9 +1465,44 @@ impl GatewayRuntimeState {
                 self.config.canvas_host.max_updates_per_minute
             )));
         }
+        let transition = CanvasStateTransitionRequest {
+            canvas_id: record.canvas_id.clone(),
+            session_id: record.session_id.clone(),
+            principal: record.principal.clone(),
+            state_version: next_state_version,
+            base_state_version: record.state_version,
+            state_schema_version: next_state_schema_version,
+            state_json: String::from_utf8(canonical_next_state_json.clone()).map_err(|error| {
+                Status::internal(format!("failed to encode state JSON as UTF-8: {error}"))
+            })?,
+            patch_json: String::from_utf8(canonical_patch_json).map_err(|error| {
+                Status::internal(format!("failed to encode patch JSON as UTF-8: {error}"))
+            })?,
+            bundle_json: serde_json::to_string(&record.bundle).map_err(|error| {
+                Status::internal(format!("failed to encode canvas bundle for persistence: {error}"))
+            })?,
+            allowed_parent_origins_json: serde_json::to_string(&record.allowed_parent_origins)
+                .map_err(|error| {
+                    Status::internal(format!(
+                        "failed to encode canvas origin allowlist for persistence: {error}"
+                    ))
+                })?,
+            created_at_unix_ms: record.created_at_unix_ms,
+            updated_at_unix_ms: now_unix_ms,
+            expires_at_unix_ms: record.expires_at_unix_ms,
+            closed: record.closed,
+            close_reason: record.close_reason.clone(),
+            actor_principal: context.principal.clone(),
+            actor_device_id: context.device_id.clone(),
+        };
+        self.journal_store
+            .record_canvas_state_transition(&transition)
+            .map_err(|error| map_canvas_store_error("record_canvas_state_transition", error))?;
+
         record.update_timestamps_unix_ms.push_back(now_unix_ms);
-        record.state_version = record.state_version.saturating_add(1);
-        record.state_json = state_json.to_vec();
+        record.state_version = next_state_version;
+        record.state_schema_version = next_state_schema_version;
+        record.state_json = canonical_next_state_json;
         record.updated_at_unix_ms = now_unix_ms;
         self.counters.canvas_updated.fetch_add(1, Ordering::Relaxed);
         Ok(record.clone())
@@ -1331,9 +1530,55 @@ impl GatewayRuntimeState {
             return Err(Status::permission_denied("canvas access denied: principal mismatch"));
         }
         if !record.closed {
-            record.closed = true;
-            record.close_reason =
+            let resolved_reason =
                 reason.and_then(non_empty).or_else(|| Some("closed_by_operator".to_owned()));
+            let current_state: Value = serde_json::from_slice(record.state_json.as_slice())
+                .map_err(|error| {
+                    Status::internal(format!("persisted canvas state JSON is invalid: {error}"))
+                })?;
+            let close_patch = build_replace_root_patch(&current_state);
+            let close_patch_json = patch_document_to_bytes(&close_patch).map_err(|error| {
+                Status::internal(format!("failed to encode close patch: {error}"))
+            })?;
+            let next_state_version = record.state_version.saturating_add(1);
+            let transition = CanvasStateTransitionRequest {
+                canvas_id: record.canvas_id.clone(),
+                session_id: record.session_id.clone(),
+                principal: record.principal.clone(),
+                state_version: next_state_version,
+                base_state_version: record.state_version,
+                state_schema_version: record.state_schema_version,
+                state_json: String::from_utf8(record.state_json.clone()).map_err(|error| {
+                    Status::internal(format!("failed to encode close state as UTF-8: {error}"))
+                })?,
+                patch_json: String::from_utf8(close_patch_json).map_err(|error| {
+                    Status::internal(format!("failed to encode close patch as UTF-8: {error}"))
+                })?,
+                bundle_json: serde_json::to_string(&record.bundle).map_err(|error| {
+                    Status::internal(format!(
+                        "failed to encode canvas bundle for persistence: {error}"
+                    ))
+                })?,
+                allowed_parent_origins_json: serde_json::to_string(&record.allowed_parent_origins)
+                    .map_err(|error| {
+                        Status::internal(format!(
+                            "failed to encode canvas origin allowlist for persistence: {error}"
+                        ))
+                    })?,
+                created_at_unix_ms: record.created_at_unix_ms,
+                updated_at_unix_ms: now_unix_ms,
+                expires_at_unix_ms: record.expires_at_unix_ms,
+                closed: true,
+                close_reason: resolved_reason.clone(),
+                actor_principal: context.principal.clone(),
+                actor_device_id: context.device_id.clone(),
+            };
+            self.journal_store
+                .record_canvas_state_transition(&transition)
+                .map_err(|error| map_canvas_store_error("record_canvas_state_transition", error))?;
+            record.state_version = next_state_version;
+            record.close_reason = resolved_reason;
+            record.closed = true;
             record.updated_at_unix_ms = now_unix_ms;
             self.counters.canvas_closed.fetch_add(1, Ordering::Relaxed);
         }
@@ -1360,6 +1605,21 @@ impl GatewayRuntimeState {
             return Err(Status::permission_denied("canvas access denied: principal mismatch"));
         }
         Ok(record.clone())
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn list_canvas_state_patches(
+        &self,
+        context: &RequestContext,
+        canvas_id: &str,
+        after_state_version: u64,
+        limit: usize,
+    ) -> Result<Vec<CanvasStatePatchRecord>, Status> {
+        let record = self.get_canvas(context, canvas_id)?;
+        let limited = limit.clamp(1, MAX_CANVAS_STREAM_PATCH_BATCH);
+        self.journal_store
+            .list_canvas_state_patches(record.canvas_id.as_str(), after_state_version, limited)
+            .map_err(|error| map_canvas_store_error("list_canvas_state_patches", error))
     }
 
     #[allow(clippy::result_large_err)]
@@ -1542,6 +1802,7 @@ impl GatewayRuntimeState {
         Ok(Some(CanvasStateResponse {
             canvas_id: record.canvas_id,
             state_version: record.state_version,
+            state_schema_version: record.state_schema_version,
             state,
             closed: record.closed,
             close_reason: record.close_reason,
@@ -3478,6 +3739,28 @@ fn map_skill_store_error(operation: &str, error: JournalError) -> Status {
     }
 }
 
+fn map_canvas_store_error(operation: &str, error: JournalError) -> Status {
+    match error {
+        JournalError::DuplicateCanvasStateVersion { canvas_id, state_version } => {
+            Status::already_exists(format!(
+                "canvas state already exists for canvas {canvas_id} at version {state_version}"
+            ))
+        }
+        JournalError::CanvasStateNotFound { canvas_id } => {
+            Status::not_found(format!("canvas state not found: {canvas_id}"))
+        }
+        JournalError::InvalidCanvasReplay { canvas_id, reason } => Status::failed_precondition(
+            format!("invalid canvas replay state for {canvas_id}: {reason}"),
+        ),
+        JournalError::PayloadTooLarge { payload_kind, actual_bytes, max_bytes } => {
+            Status::invalid_argument(format!(
+                "{payload_kind} payload exceeds maximum size ({actual_bytes} > {max_bytes})"
+            ))
+        }
+        other => Status::internal(format!("{operation} failed: {other}")),
+    }
+}
+
 fn map_vault_error(operation: &str, error: VaultError) -> Status {
     match error {
         VaultError::NotFound => Status::not_found("secret not found"),
@@ -4850,6 +5133,29 @@ fn canvas_message(record: &CanvasRecord) -> gateway_v1::Canvas {
         expires_at_unix_ms: record.expires_at_unix_ms,
         closed: record.closed,
         close_reason: record.close_reason.clone().unwrap_or_default(),
+        state_schema_version: record.state_schema_version,
+    }
+}
+
+fn canvas_patch_update_message(
+    patch: &CanvasStatePatchRecord,
+    include_snapshot_state: bool,
+) -> gateway_v1::SubscribeCanvasUpdatesResponse {
+    gateway_v1::SubscribeCanvasUpdatesResponse {
+        v: CANONICAL_PROTOCOL_MAJOR,
+        canvas_id: Some(common_v1::CanonicalId { ulid: patch.canvas_id.clone() }),
+        state_version: patch.state_version,
+        base_state_version: patch.base_state_version,
+        state_schema_version: patch.state_schema_version,
+        patch_json: patch.patch_json.as_bytes().to_vec(),
+        state_json: if include_snapshot_state {
+            patch.resulting_state_json.as_bytes().to_vec()
+        } else {
+            Vec::new()
+        },
+        closed: patch.closed,
+        close_reason: patch.close_reason.clone().unwrap_or_default(),
+        applied_at_unix_ms: patch.applied_at_unix_ms,
     }
 }
 
@@ -5201,6 +5507,9 @@ impl CanvasServiceImpl {
 
 #[tonic::async_trait]
 impl gateway_v1::canvas_service_server::CanvasService for CanvasServiceImpl {
+    type SubscribeCanvasUpdatesStream =
+        ReceiverStream<Result<gateway_v1::SubscribeCanvasUpdatesResponse, Status>>;
+
     async fn create_canvas(
         &self,
         request: Request<gateway_v1::CreateCanvasRequest>,
@@ -5220,6 +5529,11 @@ impl gateway_v1::canvas_service_server::CanvasService for CanvasServiceImpl {
             session_id,
             payload.initial_state_json.as_slice(),
             payload.initial_state_version,
+            if payload.state_schema_version == 0 {
+                None
+            } else {
+                Some(payload.state_schema_version)
+            },
             bundle,
             payload.allowed_parent_origins,
             if payload.auth_token_ttl_seconds == 0 {
@@ -5250,11 +5564,17 @@ impl gateway_v1::canvas_service_server::CanvasService for CanvasServiceImpl {
         let record = self.state.update_canvas_state(
             &context,
             canvas_id.as_str(),
-            payload.state_json.as_slice(),
+            if payload.state_json.is_empty() { None } else { Some(payload.state_json.as_slice()) },
+            if payload.patch_json.is_empty() { None } else { Some(payload.patch_json.as_slice()) },
             if payload.expected_state_version == 0 {
                 None
             } else {
                 Some(payload.expected_state_version)
+            },
+            if payload.expected_state_schema_version == 0 {
+                None
+            } else {
+                Some(payload.expected_state_schema_version)
             },
         )?;
         Ok(Response::new(gateway_v1::UpdateCanvasResponse {
@@ -5298,6 +5618,77 @@ impl gateway_v1::canvas_service_server::CanvasService for CanvasServiceImpl {
             v: CANONICAL_PROTOCOL_MAJOR,
             canvas: Some(canvas_message(&record)),
         }))
+    }
+
+    async fn subscribe_canvas_updates(
+        &self,
+        request: Request<gateway_v1::SubscribeCanvasUpdatesRequest>,
+    ) -> Result<Response<Self::SubscribeCanvasUpdatesStream>, Status> {
+        let context = self.authorize_rpc(request.metadata(), "SubscribeCanvasUpdates")?;
+        let payload = request.into_inner();
+        if payload.v != CANONICAL_PROTOCOL_MAJOR {
+            return Err(Status::failed_precondition("unsupported protocol major version"));
+        }
+        let canvas_id = canonical_id(payload.canvas_id, "canvas_id")?;
+        let include_snapshot_state = payload.include_snapshot_state;
+
+        let _existing_canvas = self.state.get_canvas(&context, canvas_id.as_str())?;
+        let state = Arc::clone(&self.state);
+        let context_for_stream = context.clone();
+        let canvas_id_for_stream = canvas_id.clone();
+        let mut after_state_version = payload.after_state_version;
+        let (tx, rx) = mpsc::channel::<Result<gateway_v1::SubscribeCanvasUpdatesResponse, Status>>(
+            MAX_CANVAS_STREAM_PATCH_BATCH,
+        );
+
+        tokio::spawn(async move {
+            loop {
+                let patches = match state.list_canvas_state_patches(
+                    &context_for_stream,
+                    canvas_id_for_stream.as_str(),
+                    after_state_version,
+                    MAX_CANVAS_STREAM_PATCH_BATCH,
+                ) {
+                    Ok(records) => records,
+                    Err(error) => {
+                        let _ = tx.send(Err(error)).await;
+                        break;
+                    }
+                };
+                if patches.is_empty() {
+                    match state.get_canvas(&context_for_stream, canvas_id_for_stream.as_str()) {
+                        Ok(record)
+                            if record.closed && after_state_version >= record.state_version =>
+                        {
+                            return;
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            let _ = tx.send(Err(error)).await;
+                            return;
+                        }
+                    }
+                    tokio::time::sleep(CANVAS_STREAM_POLL_INTERVAL).await;
+                    continue;
+                }
+
+                for patch in patches {
+                    after_state_version = patch.state_version;
+                    if tx
+                        .send(Ok(canvas_patch_update_message(&patch, include_snapshot_state)))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    if patch.closed {
+                        return;
+                    }
+                }
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 }
 
@@ -13645,6 +14036,97 @@ fn unix_ms_now_for_status() -> Result<i64, Status> {
     Ok(i64::try_from(now.as_millis()).unwrap_or(i64::MAX))
 }
 
+#[allow(clippy::result_large_err)]
+fn resolve_canvas_state_schema_version(
+    requested_state_schema_version: Option<u64>,
+    state: &Value,
+    fallback_state_schema_version: Option<u64>,
+) -> Result<u64, Status> {
+    if let Some(value) = requested_state_schema_version {
+        if value == 0 {
+            return Err(Status::invalid_argument("state_schema_version must be greater than 0"));
+        }
+    }
+    let embedded_state_schema_version =
+        state.as_object().and_then(|value| value.get("schema_version")).and_then(Value::as_u64);
+    if let Some(value) = embedded_state_schema_version {
+        if value == 0 {
+            return Err(Status::invalid_argument("embedded schema_version must be greater than 0"));
+        }
+    }
+    if let (Some(requested), Some(embedded)) =
+        (requested_state_schema_version, embedded_state_schema_version)
+    {
+        if requested != embedded {
+            return Err(Status::invalid_argument(format!(
+                "state_schema_version mismatch between request ({requested}) and state payload ({embedded})"
+            )));
+        }
+    }
+    Ok(requested_state_schema_version
+        .or(embedded_state_schema_version)
+        .or(fallback_state_schema_version)
+        .unwrap_or(1))
+}
+
+fn load_canvas_records_from_snapshots(
+    snapshots: &[CanvasStateSnapshotRecord],
+) -> Result<HashMap<String, CanvasRecord>, JournalError> {
+    let mut records = HashMap::with_capacity(snapshots.len());
+    for snapshot in snapshots {
+        serde_json::from_str::<Value>(snapshot.state_json.as_str()).map_err(|error| {
+            JournalError::InvalidCanvasReplay {
+                canvas_id: snapshot.canvas_id.clone(),
+                reason: format!("snapshot state_json is invalid: {error}"),
+            }
+        })?;
+        let bundle: CanvasBundleRecord = serde_json::from_str(snapshot.bundle_json.as_str())
+            .map_err(|error| JournalError::InvalidCanvasReplay {
+                canvas_id: snapshot.canvas_id.clone(),
+                reason: format!("snapshot bundle_json is invalid: {error}"),
+            })?;
+        let allowed_parent_origins: Vec<String> = serde_json::from_str(
+            snapshot.allowed_parent_origins_json.as_str(),
+        )
+        .map_err(|error| JournalError::InvalidCanvasReplay {
+            canvas_id: snapshot.canvas_id.clone(),
+            reason: format!("snapshot allowed_parent_origins_json is invalid: {error}"),
+        })?;
+        if snapshot.state_version == 0 {
+            return Err(JournalError::InvalidCanvasReplay {
+                canvas_id: snapshot.canvas_id.clone(),
+                reason: "snapshot state_version must be greater than 0".to_owned(),
+            });
+        }
+        if snapshot.state_schema_version == 0 {
+            return Err(JournalError::InvalidCanvasReplay {
+                canvas_id: snapshot.canvas_id.clone(),
+                reason: "snapshot state_schema_version must be greater than 0".to_owned(),
+            });
+        }
+        records.insert(
+            snapshot.canvas_id.clone(),
+            CanvasRecord {
+                canvas_id: snapshot.canvas_id.clone(),
+                session_id: snapshot.session_id.clone(),
+                principal: snapshot.principal.clone(),
+                state_version: snapshot.state_version,
+                state_schema_version: snapshot.state_schema_version,
+                state_json: snapshot.state_json.as_bytes().to_vec(),
+                bundle,
+                allowed_parent_origins,
+                created_at_unix_ms: snapshot.created_at_unix_ms,
+                updated_at_unix_ms: snapshot.updated_at_unix_ms,
+                expires_at_unix_ms: snapshot.expires_at_unix_ms,
+                closed: snapshot.closed,
+                close_reason: snapshot.close_reason.clone(),
+                update_timestamps_unix_ms: VecDeque::new(),
+            },
+        );
+    }
+    Ok(records)
+}
+
 fn generate_canvas_signing_secret() -> [u8; 32] {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
     let mut hasher = Sha256::new();
@@ -15731,6 +16213,7 @@ mod tests {
                 "01ARZ3NDEKTSV4RRFFQ69G5FAA".to_owned(),
                 malicious_state,
                 1,
+                None,
                 canvas_test_bundle(br#"window.addEventListener('palyra:canvas-state', () => {});"#),
                 vec!["https://console.example.com".to_owned()],
                 Some(600),
@@ -15770,8 +16253,10 @@ mod tests {
             .update_canvas_state(
                 &context,
                 created.canvas_id.as_str(),
-                br#"{"content":"updated"}"#,
+                Some(br#"{"content":"updated"}"#.as_slice()),
+                None,
                 Some(created.state_version),
+                None,
             )
             .expect("canvas update should succeed");
         assert_eq!(
@@ -15812,7 +16297,9 @@ mod tests {
             .update_canvas_state(
                 &context,
                 updated.canvas_id.as_str(),
-                br#"{"content":"late"}"#,
+                Some(br#"{"content":"late"}"#.as_slice()),
+                None,
+                None,
                 None,
             )
             .expect_err("closed canvas should reject updates");
@@ -15831,6 +16318,7 @@ mod tests {
                 "01ARZ3NDEKTSV4RRFFQ69G5FAB".to_owned(),
                 oversized_state.as_slice(),
                 1,
+                None,
                 canvas_test_bundle(br#"console.log("ok");"#),
                 vec!["https://console.example.com".to_owned()],
                 Some(600),
@@ -15845,6 +16333,7 @@ mod tests {
                 "01ARZ3NDEKTSV4RRFFQ69G5FAC".to_owned(),
                 br#"{"content":"ok"}"#,
                 1,
+                None,
                 canvas_test_bundle(br#"console.log("ok");"#),
                 vec!["https://console.example.com".to_owned()],
                 Some(600),
@@ -15855,7 +16344,9 @@ mod tests {
             .update_canvas_state(
                 &context,
                 created.canvas_id.as_str(),
-                oversized_update.as_slice(),
+                Some(oversized_update.as_slice()),
+                None,
+                None,
                 None,
             )
             .expect_err("oversized update payload should fail");
@@ -15879,6 +16370,7 @@ mod tests {
                 "01ARZ3NDEKTSV4RRFFQ69G5FAD".to_owned(),
                 br#"{"content":"ok"}"#,
                 1,
+                None,
                 oversized_bundle,
                 vec!["https://console.example.com".to_owned()],
                 Some(600),
@@ -15893,11 +16385,119 @@ mod tests {
                 "01ARZ3NDEKTSV4RRFFQ69G5FAE".to_owned(),
                 br#"{"content":"ok"}"#,
                 1,
+                None,
                 canvas_test_bundle(br#"console.log("ok");"#),
                 Vec::new(),
                 Some(600),
             )
             .expect_err("missing origin allowlist should fail");
         assert_eq!(missing_origin_error.code(), Code::InvalidArgument);
+    }
+
+    #[test]
+    fn canvas_patch_updates_are_replayable_and_deterministic() {
+        let state = build_test_runtime_state(false);
+        let context = canvas_test_context();
+        let (created, _descriptor) = state
+            .create_canvas(
+                &context,
+                None,
+                "01ARZ3NDEKTSV4RRFFQ69G5FAF".to_owned(),
+                br#"{"counter":1,"items":[]}"#,
+                1,
+                None,
+                canvas_test_bundle(br#"console.log("ok");"#),
+                vec!["https://console.example.com".to_owned()],
+                Some(600),
+            )
+            .expect("canvas create should succeed");
+
+        let patched = state
+            .update_canvas_state(
+                &context,
+                created.canvas_id.as_str(),
+                None,
+                Some(
+                    br#"{"v":1,"ops":[{"op":"replace","path":"/counter","value":2},{"op":"add","path":"/items/0","value":"alpha"}]}"#
+                        .as_slice(),
+                ),
+                Some(created.state_version),
+                Some(created.state_schema_version),
+            )
+            .expect("patch update should succeed");
+        assert_eq!(patched.state_version, created.state_version + 1);
+
+        let replayed = state
+            .journal_store
+            .replay_canvas_state(created.canvas_id.as_str())
+            .expect("canvas replay should succeed")
+            .expect("canvas replay should return state");
+        assert_eq!(
+            replayed.state_json, r#"{"counter":2,"items":["alpha"]}"#,
+            "replay should reconstruct deterministic final state"
+        );
+        assert_eq!(replayed.state_version, patched.state_version);
+    }
+
+    #[test]
+    fn canvas_update_rejects_version_conflict() {
+        let state = build_test_runtime_state(false);
+        let context = canvas_test_context();
+        let (created, _descriptor) = state
+            .create_canvas(
+                &context,
+                None,
+                "01ARZ3NDEKTSV4RRFFQ69G5FAG".to_owned(),
+                br#"{"content":"ok"}"#,
+                1,
+                None,
+                canvas_test_bundle(br#"console.log("ok");"#),
+                vec!["https://console.example.com".to_owned()],
+                Some(600),
+            )
+            .expect("canvas create should succeed");
+
+        let conflict = state
+            .update_canvas_state(
+                &context,
+                created.canvas_id.as_str(),
+                Some(br#"{"content":"next"}"#.as_slice()),
+                None,
+                Some(created.state_version + 7),
+                None,
+            )
+            .expect_err("stale expected state version should be rejected");
+        assert_eq!(conflict.code(), Code::FailedPrecondition);
+    }
+
+    #[test]
+    fn canvas_update_rejects_oversized_patch_payload() {
+        let state = build_test_runtime_state(false);
+        let context = canvas_test_context();
+        let (created, _descriptor) = state
+            .create_canvas(
+                &context,
+                None,
+                "01ARZ3NDEKTSV4RRFFQ69G5FAH".to_owned(),
+                br#"{"content":"ok"}"#,
+                1,
+                None,
+                canvas_test_bundle(br#"console.log("ok");"#),
+                vec!["https://console.example.com".to_owned()],
+                Some(600),
+            )
+            .expect("canvas create should succeed");
+        let oversized_patch = vec![b'a'; state.config.canvas_host.max_state_bytes + 1];
+        let error = state
+            .update_canvas_state(
+                &context,
+                created.canvas_id.as_str(),
+                None,
+                Some(oversized_patch.as_slice()),
+                Some(created.state_version),
+                Some(created.state_schema_version),
+            )
+            .expect_err("oversized patch payload must be rejected");
+        assert_eq!(error.code(), Code::ResourceExhausted);
     }
 }

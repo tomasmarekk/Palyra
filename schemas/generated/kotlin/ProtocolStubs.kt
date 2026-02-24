@@ -212,6 +212,8 @@ object PalyraGatewayV1 {
     data class SessionSummary(val placeholder: Int = 0)
     data class SetDefaultAgentRequest(val placeholder: Int = 0)
     data class SetDefaultAgentResponse(val placeholder: Int = 0)
+    data class SubscribeCanvasUpdatesRequest(val placeholder: Int = 0)
+    data class SubscribeCanvasUpdatesResponse(val placeholder: Int = 0)
     data class UpdateCanvasRequest(val placeholder: Int = 0)
     data class UpdateCanvasResponse(val placeholder: Int = 0)
     data class VaultSecretMetadata(val placeholder: Int = 0)
@@ -224,6 +226,7 @@ object PalyraGatewayV1 {
         fun closeCanvas()
         fun createCanvas()
         fun getCanvas()
+        fun subscribeCanvasUpdates()
         fun updateCanvas()
     }
     interface GatewayServiceClient {
