@@ -8,6 +8,7 @@ pub const SECRET_CONFIG_PATHS: &[&str] = &[
     "model_provider.openai_api_key",
     "model_provider.openai_api_key_vault_ref",
     "gateway.admin_token",
+    "tool_call.browser_service.auth_token",
 ];
 
 #[must_use]
@@ -157,6 +158,36 @@ pub struct FileToolCallConfig {
     pub execution_timeout_ms: Option<u64>,
     pub process_runner: Option<FileProcessRunnerConfig>,
     pub wasm_runtime: Option<FileWasmRuntimeConfig>,
+    pub http_fetch: Option<FileHttpFetchConfig>,
+    pub browser_service: Option<FileBrowserServiceConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileHttpFetchConfig {
+    pub allow_private_targets: Option<bool>,
+    pub connect_timeout_ms: Option<u64>,
+    pub request_timeout_ms: Option<u64>,
+    pub max_response_bytes: Option<u64>,
+    pub allow_redirects: Option<bool>,
+    pub max_redirects: Option<u32>,
+    pub allowed_content_types: Option<Vec<String>>,
+    pub allowed_request_headers: Option<Vec<String>>,
+    pub cache_enabled: Option<bool>,
+    pub cache_ttl_ms: Option<u64>,
+    pub max_cache_entries: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileBrowserServiceConfig {
+    pub enabled: Option<bool>,
+    pub endpoint: Option<String>,
+    pub auth_token: Option<String>,
+    pub connect_timeout_ms: Option<u64>,
+    pub request_timeout_ms: Option<u64>,
+    pub max_screenshot_bytes: Option<u64>,
+    pub max_title_bytes: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -264,6 +295,7 @@ mod tests {
         assert!(is_secret_config_path("model_provider.OPENAI_API_KEY"));
         assert!(is_secret_config_path("model_provider.openai_api_key_vault_ref"));
         assert!(is_secret_config_path("gateway.admin_token"));
+        assert!(is_secret_config_path("tool_call.browser_service.auth_token"));
         assert!(is_secret_config_path(" admin.auth_token "));
         assert!(!is_secret_config_path("daemon.port"));
     }
@@ -280,6 +312,8 @@ mod tests {
             openai_api_key_vault_ref = "vault://global/openai_api_key"
             [gateway]
             admin_token = "legacy-token"
+            [tool_call.browser_service]
+            auth_token = "browserd-token"
             "#,
         )
         .expect("config document should parse");
@@ -311,6 +345,14 @@ mod tests {
             document
                 .get("gateway")
                 .and_then(|gateway| gateway.get("admin_token"))
+                .and_then(toml::Value::as_str),
+            Some("<redacted>")
+        );
+        assert_eq!(
+            document
+                .get("tool_call")
+                .and_then(|tool_call| tool_call.get("browser_service"))
+                .and_then(|browser_service| browser_service.get("auth_token"))
                 .and_then(toml::Value::as_str),
             Some("<redacted>")
         );

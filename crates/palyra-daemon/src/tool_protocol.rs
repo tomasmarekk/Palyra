@@ -133,14 +133,17 @@ const TOOL_MAX_SLEEP_MS: u64 = 5_000;
 const EMPTY_TOOL_CAPABILITIES: &[ToolCapability] = &[];
 const PROCESS_RUNNER_CAPABILITIES: &[ToolCapability] = &[ToolCapability::ProcessExec];
 const WORKSPACE_PATCH_CAPABILITIES: &[ToolCapability] = &[ToolCapability::FilesystemWrite];
+const NETWORK_TOOL_CAPABILITIES: &[ToolCapability] = &[ToolCapability::Network];
 const WASM_PLUGIN_CAPABILITIES: &[ToolCapability] =
     &[ToolCapability::Network, ToolCapability::SecretsRead, ToolCapability::FilesystemWrite];
 const TOOL_INPUT_TOO_LARGE_ERROR_CODE: &str = "quota/tool_input_too_large";
 const MAX_ECHO_TOOL_INPUT_BYTES: usize = 16 * 1024;
 const MAX_SLEEP_TOOL_INPUT_BYTES: usize = 8 * 1024;
 const MAX_MEMORY_SEARCH_TOOL_INPUT_BYTES: usize = 64 * 1024;
+const MAX_HTTP_FETCH_TOOL_INPUT_BYTES: usize = 64 * 1024;
 const MAX_PROCESS_RUNNER_TOOL_INPUT_BYTES: usize = 128 * 1024;
 const MAX_WORKSPACE_PATCH_TOOL_INPUT_BYTES: usize = 256 * 1024;
+const MAX_BROWSER_TOOL_INPUT_BYTES: usize = 128 * 1024;
 const MAX_WASM_PLUGIN_TOOL_INPUT_BYTES: usize = 448 * 1024;
 const SENSITIVE_CAPABILITY_POLICY_NAMES: &[&str] =
     &["process_exec", "network", "secrets_read", "filesystem_write"];
@@ -283,6 +286,9 @@ pub fn tool_metadata(tool_name: &str) -> Option<ToolMetadata> {
         "palyra.memory.search" => {
             Some(ToolMetadata { capabilities: EMPTY_TOOL_CAPABILITIES, default_sensitive: false })
         }
+        "palyra.http.fetch" => {
+            Some(ToolMetadata { capabilities: NETWORK_TOOL_CAPABILITIES, default_sensitive: true })
+        }
         "palyra.process.run" => Some(ToolMetadata {
             capabilities: PROCESS_RUNNER_CAPABILITIES,
             default_sensitive: true,
@@ -291,6 +297,21 @@ pub fn tool_metadata(tool_name: &str) -> Option<ToolMetadata> {
             capabilities: WORKSPACE_PATCH_CAPABILITIES,
             default_sensitive: true,
         }),
+        "palyra.browser.session.create" => {
+            Some(ToolMetadata { capabilities: NETWORK_TOOL_CAPABILITIES, default_sensitive: true })
+        }
+        "palyra.browser.session.close" => {
+            Some(ToolMetadata { capabilities: NETWORK_TOOL_CAPABILITIES, default_sensitive: true })
+        }
+        "palyra.browser.navigate" => {
+            Some(ToolMetadata { capabilities: NETWORK_TOOL_CAPABILITIES, default_sensitive: true })
+        }
+        "palyra.browser.title" => {
+            Some(ToolMetadata { capabilities: NETWORK_TOOL_CAPABILITIES, default_sensitive: true })
+        }
+        "palyra.browser.screenshot" => {
+            Some(ToolMetadata { capabilities: NETWORK_TOOL_CAPABILITIES, default_sensitive: true })
+        }
         "palyra.plugin.run" => {
             Some(ToolMetadata { capabilities: WASM_PLUGIN_CAPABILITIES, default_sensitive: true })
         }
@@ -498,6 +519,14 @@ async fn run_allowlisted_tool(
             executor: "gateway_runtime".to_owned(),
             sandbox_enforcement: "none".to_owned(),
         },
+        "palyra.http.fetch" => ToolExecutionRawResult {
+            success: false,
+            output_json: b"{}".to_vec(),
+            error: "palyra.http.fetch requires gateway HTTP fetch runtime context".to_owned(),
+            timed_out: false,
+            executor: "gateway_http_fetch".to_owned(),
+            sandbox_enforcement: "ssrf_guard".to_owned(),
+        },
         "palyra.process.run" => execute_process_runner_tool(config, input_json).await,
         "palyra.fs.apply_patch" => ToolExecutionRawResult {
             success: false,
@@ -506,6 +535,18 @@ async fn run_allowlisted_tool(
             timed_out: false,
             executor: "workspace_patch".to_owned(),
             sandbox_enforcement: "workspace_roots".to_owned(),
+        },
+        "palyra.browser.session.create"
+        | "palyra.browser.session.close"
+        | "palyra.browser.navigate"
+        | "palyra.browser.title"
+        | "palyra.browser.screenshot" => ToolExecutionRawResult {
+            success: false,
+            output_json: b"{}".to_vec(),
+            error: "palyra.browser.* requires gateway browser broker runtime context".to_owned(),
+            timed_out: false,
+            executor: "browser_broker".to_owned(),
+            sandbox_enforcement: "browser_service".to_owned(),
         },
         "palyra.plugin.run" => execute_wasm_plugin_tool(config, input_json).await,
         _ => ToolExecutionRawResult {
@@ -525,8 +566,14 @@ fn is_runtime_supported_tool(tool_name: &str) -> bool {
         "palyra.echo"
             | "palyra.sleep"
             | "palyra.memory.search"
+            | "palyra.http.fetch"
             | "palyra.process.run"
             | "palyra.fs.apply_patch"
+            | "palyra.browser.session.create"
+            | "palyra.browser.session.close"
+            | "palyra.browser.navigate"
+            | "palyra.browser.title"
+            | "palyra.browser.screenshot"
             | "palyra.plugin.run"
     )
 }
@@ -536,6 +583,10 @@ fn tool_executor_name(config: &ToolCallConfig, tool_name: &str) -> String {
         process_runner_executor_name(&config.process_runner)
     } else if tool_name == "palyra.fs.apply_patch" {
         "workspace_patch".to_owned()
+    } else if tool_name == "palyra.http.fetch" {
+        "gateway_http_fetch".to_owned()
+    } else if tool_name.starts_with("palyra.browser.") {
+        "browser_broker".to_owned()
     } else if tool_name == "palyra.memory.search" {
         "gateway_runtime".to_owned()
     } else if tool_name == "palyra.plugin.run" {
@@ -550,8 +601,14 @@ fn tool_input_limit_bytes(tool_name: &str) -> usize {
         "palyra.echo" => MAX_ECHO_TOOL_INPUT_BYTES,
         "palyra.sleep" => MAX_SLEEP_TOOL_INPUT_BYTES,
         "palyra.memory.search" => MAX_MEMORY_SEARCH_TOOL_INPUT_BYTES,
+        "palyra.http.fetch" => MAX_HTTP_FETCH_TOOL_INPUT_BYTES,
         "palyra.process.run" => MAX_PROCESS_RUNNER_TOOL_INPUT_BYTES,
         "palyra.fs.apply_patch" => MAX_WORKSPACE_PATCH_TOOL_INPUT_BYTES,
+        "palyra.browser.session.create"
+        | "palyra.browser.session.close"
+        | "palyra.browser.navigate"
+        | "palyra.browser.title"
+        | "palyra.browser.screenshot" => MAX_BROWSER_TOOL_INPUT_BYTES,
         "palyra.plugin.run" => MAX_WASM_PLUGIN_TOOL_INPUT_BYTES,
         _ => MAX_MEMORY_SEARCH_TOOL_INPUT_BYTES,
     }
@@ -562,6 +619,10 @@ fn sandbox_enforcement_for_tool(config: &ToolCallConfig, tool_name: &str) -> Str
         config.process_runner.egress_enforcement_mode.as_str().to_owned()
     } else if tool_name == "palyra.fs.apply_patch" {
         "workspace_roots".to_owned()
+    } else if tool_name == "palyra.http.fetch" {
+        "ssrf_guard".to_owned()
+    } else if tool_name.starts_with("palyra.browser.") {
+        "browser_service".to_owned()
     } else {
         "none".to_owned()
     }
@@ -1013,8 +1074,13 @@ mod tests {
         assert!(!tool_requires_approval("palyra.echo"));
         assert!(!tool_requires_approval("palyra.sleep"));
         assert!(!tool_requires_approval("palyra.memory.search"));
+        assert!(tool_requires_approval("palyra.http.fetch"));
         assert!(tool_requires_approval("palyra.process.run"));
         assert!(tool_requires_approval("palyra.fs.apply_patch"));
+        assert!(tool_requires_approval("palyra.browser.session.create"));
+        assert!(tool_requires_approval("palyra.browser.navigate"));
+        assert!(tool_requires_approval("palyra.browser.title"));
+        assert!(tool_requires_approval("palyra.browser.screenshot"));
         assert!(tool_requires_approval("palyra.plugin.run"));
         assert!(
             tool_requires_approval("custom.unknown"),
@@ -1065,6 +1131,58 @@ mod tests {
             outcome.error
         );
         assert_eq!(outcome.attestation.executor, "gateway_runtime");
+        assert!(!outcome.attestation.timed_out, "delegation error must not be timeout");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn execute_tool_call_http_fetch_requires_gateway_runtime_context() {
+        let config = ToolCallConfig {
+            allowed_tools: vec!["palyra.http.fetch".to_owned()],
+            max_calls_per_run: 1,
+            execution_timeout_ms: 250,
+            process_runner: default_process_runner_policy(),
+            wasm_runtime: default_wasm_runtime_policy(),
+        };
+        let outcome = execute_tool_call(
+            &config,
+            "01ARZ3NDEKTSV4RRFFQ69G5FAA",
+            "palyra.http.fetch",
+            br#"{"url":"https://example.com"}"#,
+        )
+        .await;
+        assert!(!outcome.success, "generic tool executor should not run gateway HTTP fetch");
+        assert!(
+            outcome.error.contains("requires gateway HTTP fetch runtime context"),
+            "delegated executor error should be explicit: {}",
+            outcome.error
+        );
+        assert_eq!(outcome.attestation.executor, "gateway_http_fetch");
+        assert!(!outcome.attestation.timed_out, "delegation error must not be timeout");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn execute_tool_call_browser_tools_require_gateway_runtime_context() {
+        let config = ToolCallConfig {
+            allowed_tools: vec!["palyra.browser.navigate".to_owned()],
+            max_calls_per_run: 1,
+            execution_timeout_ms: 250,
+            process_runner: default_process_runner_policy(),
+            wasm_runtime: default_wasm_runtime_policy(),
+        };
+        let outcome = execute_tool_call(
+            &config,
+            "01ARZ3NDEKTSV4RRFFQ69G5FAB",
+            "palyra.browser.navigate",
+            br#"{"session_id":"01ARZ3NDEKTSV4RRFFQ69G5FAA","url":"https://example.com"}"#,
+        )
+        .await;
+        assert!(!outcome.success, "generic tool executor should not run browser broker flow");
+        assert!(
+            outcome.error.contains("requires gateway browser broker runtime context"),
+            "delegated executor error should be explicit: {}",
+            outcome.error
+        );
+        assert_eq!(outcome.attestation.executor, "browser_broker");
         assert!(!outcome.attestation.timed_out, "delegation error must not be timeout");
     }
 

@@ -315,6 +315,39 @@ async fn main() -> Result<()> {
                     allowed_channels: loaded.tool_call.wasm_runtime.allowed_channels.clone(),
                 },
             },
+            http_fetch: gateway::HttpFetchRuntimeConfig {
+                allow_private_targets: loaded.tool_call.http_fetch.allow_private_targets,
+                connect_timeout_ms: loaded.tool_call.http_fetch.connect_timeout_ms,
+                request_timeout_ms: loaded.tool_call.http_fetch.request_timeout_ms,
+                max_response_bytes: usize::try_from(loaded.tool_call.http_fetch.max_response_bytes)
+                    .unwrap_or(usize::MAX),
+                allow_redirects: loaded.tool_call.http_fetch.allow_redirects,
+                max_redirects: usize::try_from(loaded.tool_call.http_fetch.max_redirects)
+                    .unwrap_or(usize::MAX),
+                allowed_content_types: loaded.tool_call.http_fetch.allowed_content_types.clone(),
+                allowed_request_headers: loaded
+                    .tool_call
+                    .http_fetch
+                    .allowed_request_headers
+                    .clone(),
+                cache_enabled: loaded.tool_call.http_fetch.cache_enabled,
+                cache_ttl_ms: loaded.tool_call.http_fetch.cache_ttl_ms,
+                max_cache_entries: usize::try_from(loaded.tool_call.http_fetch.max_cache_entries)
+                    .unwrap_or(usize::MAX),
+            },
+            browser_service: gateway::BrowserServiceRuntimeConfig {
+                enabled: loaded.tool_call.browser_service.enabled,
+                endpoint: loaded.tool_call.browser_service.endpoint.clone(),
+                auth_token: loaded.tool_call.browser_service.auth_token.clone(),
+                connect_timeout_ms: loaded.tool_call.browser_service.connect_timeout_ms,
+                request_timeout_ms: loaded.tool_call.browser_service.request_timeout_ms,
+                max_screenshot_bytes: usize::try_from(
+                    loaded.tool_call.browser_service.max_screenshot_bytes,
+                )
+                .unwrap_or(usize::MAX),
+                max_title_bytes: usize::try_from(loaded.tool_call.browser_service.max_title_bytes)
+                    .unwrap_or(usize::MAX),
+            },
         },
         GatewayJournalConfigSnapshot {
             db_path: loaded.storage.journal_db_path.clone(),
@@ -416,6 +449,28 @@ async fn main() -> Result<()> {
         tool_call_wasm_runtime_allowed_secrets = ?loaded.tool_call.wasm_runtime.allowed_secrets,
         tool_call_wasm_runtime_allowed_storage_prefixes = ?loaded.tool_call.wasm_runtime.allowed_storage_prefixes,
         tool_call_wasm_runtime_allowed_channels = ?loaded.tool_call.wasm_runtime.allowed_channels,
+        tool_call_http_fetch_allow_private_targets = loaded.tool_call.http_fetch.allow_private_targets,
+        tool_call_http_fetch_connect_timeout_ms = loaded.tool_call.http_fetch.connect_timeout_ms,
+        tool_call_http_fetch_request_timeout_ms = loaded.tool_call.http_fetch.request_timeout_ms,
+        tool_call_http_fetch_max_response_bytes = loaded.tool_call.http_fetch.max_response_bytes,
+        tool_call_http_fetch_allow_redirects = loaded.tool_call.http_fetch.allow_redirects,
+        tool_call_http_fetch_max_redirects = loaded.tool_call.http_fetch.max_redirects,
+        tool_call_http_fetch_allowed_content_types = ?loaded.tool_call.http_fetch.allowed_content_types,
+        tool_call_http_fetch_allowed_headers = ?loaded.tool_call.http_fetch.allowed_request_headers,
+        tool_call_http_fetch_cache_enabled = loaded.tool_call.http_fetch.cache_enabled,
+        tool_call_http_fetch_cache_ttl_ms = loaded.tool_call.http_fetch.cache_ttl_ms,
+        tool_call_http_fetch_max_cache_entries = loaded.tool_call.http_fetch.max_cache_entries,
+        tool_call_browser_service_enabled = loaded.tool_call.browser_service.enabled,
+        tool_call_browser_service_endpoint = %loaded.tool_call.browser_service.endpoint,
+        tool_call_browser_service_auth_token_configured =
+            loaded.tool_call.browser_service.auth_token.is_some(),
+        tool_call_browser_service_connect_timeout_ms =
+            loaded.tool_call.browser_service.connect_timeout_ms,
+        tool_call_browser_service_request_timeout_ms =
+            loaded.tool_call.browser_service.request_timeout_ms,
+        tool_call_browser_service_max_screenshot_bytes =
+            loaded.tool_call.browser_service.max_screenshot_bytes,
+        tool_call_browser_service_max_title_bytes = loaded.tool_call.browser_service.max_title_bytes,
         channel_router_enabled = loaded.channel_router.enabled,
         channel_router_max_message_bytes = loaded.channel_router.max_message_bytes,
         channel_router_max_retry_queue_depth_per_channel =

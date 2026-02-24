@@ -34,16 +34,26 @@ object PalyraAuthV1 {
 }
 
 object PalyraBrowserV1 {
-    data class ExecuteActionRequest(val placeholder: Int = 0)
-    data class ExecuteActionResponse(val placeholder: Int = 0)
-    data class ObserveEvent(val placeholder: Int = 0)
-    data class ObserveRequest(val placeholder: Int = 0)
-    data class StartProfileRequest(val placeholder: Int = 0)
-    data class StartProfileResponse(val placeholder: Int = 0)
+    data class BrowserHealthRequest(val placeholder: Int = 0)
+    data class BrowserHealthResponse(val placeholder: Int = 0)
+    data class CloseSessionRequest(val placeholder: Int = 0)
+    data class CloseSessionResponse(val placeholder: Int = 0)
+    data class CreateSessionRequest(val placeholder: Int = 0)
+    data class CreateSessionResponse(val placeholder: Int = 0)
+    data class GetTitleRequest(val placeholder: Int = 0)
+    data class GetTitleResponse(val placeholder: Int = 0)
+    data class NavigateRequest(val placeholder: Int = 0)
+    data class NavigateResponse(val placeholder: Int = 0)
+    data class ScreenshotRequest(val placeholder: Int = 0)
+    data class ScreenshotResponse(val placeholder: Int = 0)
+    data class SessionBudget(val placeholder: Int = 0)
     interface BrowserServiceClient {
-        fun executeAction()
-        fun observe()
-        fun startProfile()
+        fun closeSession()
+        fun createSession()
+        fun getTitle()
+        fun health()
+        fun navigate()
+        fun screenshot()
     }
 }
 

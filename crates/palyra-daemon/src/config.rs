@@ -62,6 +62,25 @@ const DEFAULT_WASM_RUNTIME_FUEL_BUDGET: u64 = 10_000_000;
 const DEFAULT_WASM_RUNTIME_MAX_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_WASM_RUNTIME_MAX_TABLE_ELEMENTS: u64 = 100_000;
 const DEFAULT_WASM_RUNTIME_MAX_INSTANCES: u64 = 256;
+const DEFAULT_HTTP_FETCH_ALLOW_PRIVATE_TARGETS: bool = false;
+const DEFAULT_HTTP_FETCH_CONNECT_TIMEOUT_MS: u64 = 1_500;
+const DEFAULT_HTTP_FETCH_REQUEST_TIMEOUT_MS: u64 = 10_000;
+const DEFAULT_HTTP_FETCH_MAX_RESPONSE_BYTES: u64 = 512 * 1024;
+const DEFAULT_HTTP_FETCH_ALLOW_REDIRECTS: bool = true;
+const DEFAULT_HTTP_FETCH_MAX_REDIRECTS: u32 = 3;
+const DEFAULT_HTTP_FETCH_ALLOWED_CONTENT_TYPES: &[&str] =
+    &["text/html", "text/plain", "application/json"];
+const DEFAULT_HTTP_FETCH_ALLOWED_REQUEST_HEADERS: &[&str] =
+    &["accept", "accept-language", "if-none-match", "if-modified-since", "user-agent"];
+const DEFAULT_HTTP_FETCH_CACHE_ENABLED: bool = true;
+const DEFAULT_HTTP_FETCH_CACHE_TTL_MS: u64 = 30_000;
+const DEFAULT_HTTP_FETCH_MAX_CACHE_ENTRIES: u64 = 256;
+const DEFAULT_BROWSER_SERVICE_ENABLED: bool = false;
+const DEFAULT_BROWSER_SERVICE_ENDPOINT: &str = "http://127.0.0.1:7543";
+const DEFAULT_BROWSER_SERVICE_CONNECT_TIMEOUT_MS: u64 = 1_500;
+const DEFAULT_BROWSER_SERVICE_REQUEST_TIMEOUT_MS: u64 = 15_000;
+const DEFAULT_BROWSER_SERVICE_MAX_SCREENSHOT_BYTES: u64 = 256 * 1024;
+const DEFAULT_BROWSER_SERVICE_MAX_TITLE_BYTES: u64 = 4 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadedConfig {
     pub source: String,
@@ -140,6 +159,8 @@ pub struct ToolCallConfig {
     pub execution_timeout_ms: u64,
     pub process_runner: ProcessRunnerConfig,
     pub wasm_runtime: WasmRuntimeConfig,
+    pub http_fetch: HttpFetchConfig,
+    pub browser_service: BrowserServiceConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,6 +191,32 @@ pub struct WasmRuntimeConfig {
     pub allowed_secrets: Vec<String>,
     pub allowed_storage_prefixes: Vec<String>,
     pub allowed_channels: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpFetchConfig {
+    pub allow_private_targets: bool,
+    pub connect_timeout_ms: u64,
+    pub request_timeout_ms: u64,
+    pub max_response_bytes: u64,
+    pub allow_redirects: bool,
+    pub max_redirects: u32,
+    pub allowed_content_types: Vec<String>,
+    pub allowed_request_headers: Vec<String>,
+    pub cache_enabled: bool,
+    pub cache_ttl_ms: u64,
+    pub max_cache_entries: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserServiceConfig {
+    pub enabled: bool,
+    pub endpoint: String,
+    pub auth_token: Option<String>,
+    pub connect_timeout_ms: u64,
+    pub request_timeout_ms: u64,
+    pub max_screenshot_bytes: u64,
+    pub max_title_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -287,6 +334,8 @@ impl Default for ToolCallConfig {
             execution_timeout_ms: DEFAULT_TOOL_CALL_EXECUTION_TIMEOUT_MS,
             process_runner: ProcessRunnerConfig::default(),
             wasm_runtime: WasmRuntimeConfig::default(),
+            http_fetch: HttpFetchConfig::default(),
+            browser_service: BrowserServiceConfig::default(),
         }
     }
 }
@@ -323,6 +372,44 @@ impl Default for WasmRuntimeConfig {
             allowed_secrets: Vec::new(),
             allowed_storage_prefixes: Vec::new(),
             allowed_channels: Vec::new(),
+        }
+    }
+}
+
+impl Default for HttpFetchConfig {
+    fn default() -> Self {
+        Self {
+            allow_private_targets: DEFAULT_HTTP_FETCH_ALLOW_PRIVATE_TARGETS,
+            connect_timeout_ms: DEFAULT_HTTP_FETCH_CONNECT_TIMEOUT_MS,
+            request_timeout_ms: DEFAULT_HTTP_FETCH_REQUEST_TIMEOUT_MS,
+            max_response_bytes: DEFAULT_HTTP_FETCH_MAX_RESPONSE_BYTES,
+            allow_redirects: DEFAULT_HTTP_FETCH_ALLOW_REDIRECTS,
+            max_redirects: DEFAULT_HTTP_FETCH_MAX_REDIRECTS,
+            allowed_content_types: DEFAULT_HTTP_FETCH_ALLOWED_CONTENT_TYPES
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
+            allowed_request_headers: DEFAULT_HTTP_FETCH_ALLOWED_REQUEST_HEADERS
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
+            cache_enabled: DEFAULT_HTTP_FETCH_CACHE_ENABLED,
+            cache_ttl_ms: DEFAULT_HTTP_FETCH_CACHE_TTL_MS,
+            max_cache_entries: DEFAULT_HTTP_FETCH_MAX_CACHE_ENTRIES,
+        }
+    }
+}
+
+impl Default for BrowserServiceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: DEFAULT_BROWSER_SERVICE_ENABLED,
+            endpoint: DEFAULT_BROWSER_SERVICE_ENDPOINT.to_owned(),
+            auth_token: None,
+            connect_timeout_ms: DEFAULT_BROWSER_SERVICE_CONNECT_TIMEOUT_MS,
+            request_timeout_ms: DEFAULT_BROWSER_SERVICE_REQUEST_TIMEOUT_MS,
+            max_screenshot_bytes: DEFAULT_BROWSER_SERVICE_MAX_SCREENSHOT_BYTES,
+            max_title_bytes: DEFAULT_BROWSER_SERVICE_MAX_TITLE_BYTES,
         }
     }
 }
@@ -641,6 +728,101 @@ pub fn load_config() -> Result<LoadedConfig> {
                         allowed_channels.join(",").as_str(),
                         "tool_call.wasm_runtime.allowed_channels",
                         "channel handle",
+                    )?;
+                }
+            }
+            if let Some(file_http_fetch) = file_tool_call.http_fetch {
+                if let Some(allow_private_targets) = file_http_fetch.allow_private_targets {
+                    tool_call.http_fetch.allow_private_targets = allow_private_targets;
+                }
+                if let Some(connect_timeout_ms) = file_http_fetch.connect_timeout_ms {
+                    tool_call.http_fetch.connect_timeout_ms = parse_positive_u64(
+                        connect_timeout_ms,
+                        "tool_call.http_fetch.connect_timeout_ms",
+                    )?;
+                }
+                if let Some(request_timeout_ms) = file_http_fetch.request_timeout_ms {
+                    tool_call.http_fetch.request_timeout_ms = parse_positive_u64(
+                        request_timeout_ms,
+                        "tool_call.http_fetch.request_timeout_ms",
+                    )?;
+                }
+                if let Some(max_response_bytes) = file_http_fetch.max_response_bytes {
+                    tool_call.http_fetch.max_response_bytes = parse_positive_u64(
+                        max_response_bytes,
+                        "tool_call.http_fetch.max_response_bytes",
+                    )?;
+                }
+                if let Some(allow_redirects) = file_http_fetch.allow_redirects {
+                    tool_call.http_fetch.allow_redirects = allow_redirects;
+                }
+                if let Some(max_redirects) = file_http_fetch.max_redirects {
+                    tool_call.http_fetch.max_redirects =
+                        parse_positive_u32(max_redirects, "tool_call.http_fetch.max_redirects")?;
+                }
+                if let Some(allowed_content_types) = file_http_fetch.allowed_content_types {
+                    tool_call.http_fetch.allowed_content_types = parse_content_type_allowlist(
+                        allowed_content_types.join(",").as_str(),
+                        "tool_call.http_fetch.allowed_content_types",
+                    )?;
+                }
+                if let Some(allowed_request_headers) = file_http_fetch.allowed_request_headers {
+                    tool_call.http_fetch.allowed_request_headers = parse_http_header_allowlist(
+                        allowed_request_headers.join(",").as_str(),
+                        "tool_call.http_fetch.allowed_request_headers",
+                    )?;
+                }
+                if let Some(cache_enabled) = file_http_fetch.cache_enabled {
+                    tool_call.http_fetch.cache_enabled = cache_enabled;
+                }
+                if let Some(cache_ttl_ms) = file_http_fetch.cache_ttl_ms {
+                    tool_call.http_fetch.cache_ttl_ms =
+                        parse_positive_u64(cache_ttl_ms, "tool_call.http_fetch.cache_ttl_ms")?;
+                }
+                if let Some(max_cache_entries) = file_http_fetch.max_cache_entries {
+                    tool_call.http_fetch.max_cache_entries = parse_positive_u64(
+                        max_cache_entries,
+                        "tool_call.http_fetch.max_cache_entries",
+                    )?;
+                }
+            }
+            if let Some(file_browser_service) = file_tool_call.browser_service {
+                if let Some(enabled) = file_browser_service.enabled {
+                    tool_call.browser_service.enabled = enabled;
+                }
+                if let Some(endpoint) = file_browser_service.endpoint {
+                    tool_call.browser_service.endpoint = parse_browser_service_endpoint(
+                        endpoint.as_str(),
+                        "tool_call.browser_service.endpoint",
+                    )?;
+                }
+                if let Some(auth_token) = file_browser_service.auth_token {
+                    let trimmed = auth_token.trim();
+                    tool_call.browser_service.auth_token =
+                        if trimmed.is_empty() { None } else { Some(trimmed.to_owned()) };
+                }
+                if let Some(connect_timeout_ms) = file_browser_service.connect_timeout_ms {
+                    tool_call.browser_service.connect_timeout_ms = parse_positive_u64(
+                        connect_timeout_ms,
+                        "tool_call.browser_service.connect_timeout_ms",
+                    )?;
+                }
+                if let Some(request_timeout_ms) = file_browser_service.request_timeout_ms {
+                    tool_call.browser_service.request_timeout_ms = parse_positive_u64(
+                        request_timeout_ms,
+                        "tool_call.browser_service.request_timeout_ms",
+                    )?;
+                }
+                if let Some(max_screenshot_bytes) = file_browser_service.max_screenshot_bytes {
+                    tool_call.browser_service.max_screenshot_bytes = parse_positive_u64(
+                        max_screenshot_bytes,
+                        "tool_call.browser_service.max_screenshot_bytes",
+                    )?;
+                }
+                if let Some(max_title_bytes) = file_browser_service.max_title_bytes {
+                    tool_call.browser_service.max_title_bytes = parse_positive_u64(
+                        max_title_bytes,
+                        "tool_call.browser_service.max_title_bytes",
                     )?;
                 }
             }
@@ -1040,6 +1222,147 @@ pub fn load_config() -> Result<LoadedConfig> {
         )?;
         source.push_str(" +env(PALYRA_TOOL_CALL_TIMEOUT_MS)");
     }
+    if let Ok(allow_private_targets) = env::var("PALYRA_HTTP_FETCH_ALLOW_PRIVATE_TARGETS") {
+        tool_call.http_fetch.allow_private_targets = allow_private_targets
+            .parse::<bool>()
+            .context("PALYRA_HTTP_FETCH_ALLOW_PRIVATE_TARGETS must be true or false")?;
+        source.push_str(" +env(PALYRA_HTTP_FETCH_ALLOW_PRIVATE_TARGETS)");
+    }
+    if let Ok(connect_timeout_ms) = env::var("PALYRA_HTTP_FETCH_CONNECT_TIMEOUT_MS") {
+        tool_call.http_fetch.connect_timeout_ms = parse_positive_u64(
+            connect_timeout_ms
+                .parse::<u64>()
+                .context("PALYRA_HTTP_FETCH_CONNECT_TIMEOUT_MS must be a valid u64")?,
+            "PALYRA_HTTP_FETCH_CONNECT_TIMEOUT_MS",
+        )?;
+        source.push_str(" +env(PALYRA_HTTP_FETCH_CONNECT_TIMEOUT_MS)");
+    }
+    if let Ok(request_timeout_ms) = env::var("PALYRA_HTTP_FETCH_REQUEST_TIMEOUT_MS") {
+        tool_call.http_fetch.request_timeout_ms = parse_positive_u64(
+            request_timeout_ms
+                .parse::<u64>()
+                .context("PALYRA_HTTP_FETCH_REQUEST_TIMEOUT_MS must be a valid u64")?,
+            "PALYRA_HTTP_FETCH_REQUEST_TIMEOUT_MS",
+        )?;
+        source.push_str(" +env(PALYRA_HTTP_FETCH_REQUEST_TIMEOUT_MS)");
+    }
+    if let Ok(max_response_bytes) = env::var("PALYRA_HTTP_FETCH_MAX_RESPONSE_BYTES") {
+        tool_call.http_fetch.max_response_bytes = parse_positive_u64(
+            max_response_bytes
+                .parse::<u64>()
+                .context("PALYRA_HTTP_FETCH_MAX_RESPONSE_BYTES must be a valid u64")?,
+            "PALYRA_HTTP_FETCH_MAX_RESPONSE_BYTES",
+        )?;
+        source.push_str(" +env(PALYRA_HTTP_FETCH_MAX_RESPONSE_BYTES)");
+    }
+    if let Ok(allow_redirects) = env::var("PALYRA_HTTP_FETCH_ALLOW_REDIRECTS") {
+        tool_call.http_fetch.allow_redirects = allow_redirects
+            .parse::<bool>()
+            .context("PALYRA_HTTP_FETCH_ALLOW_REDIRECTS must be true or false")?;
+        source.push_str(" +env(PALYRA_HTTP_FETCH_ALLOW_REDIRECTS)");
+    }
+    if let Ok(max_redirects) = env::var("PALYRA_HTTP_FETCH_MAX_REDIRECTS") {
+        tool_call.http_fetch.max_redirects = parse_positive_u32(
+            max_redirects
+                .parse::<u32>()
+                .context("PALYRA_HTTP_FETCH_MAX_REDIRECTS must be a valid u32")?,
+            "PALYRA_HTTP_FETCH_MAX_REDIRECTS",
+        )?;
+        source.push_str(" +env(PALYRA_HTTP_FETCH_MAX_REDIRECTS)");
+    }
+    if let Ok(allowed_content_types) = env::var("PALYRA_HTTP_FETCH_ALLOWED_CONTENT_TYPES") {
+        tool_call.http_fetch.allowed_content_types = parse_content_type_allowlist(
+            allowed_content_types.as_str(),
+            "PALYRA_HTTP_FETCH_ALLOWED_CONTENT_TYPES",
+        )?;
+        source.push_str(" +env(PALYRA_HTTP_FETCH_ALLOWED_CONTENT_TYPES)");
+    }
+    if let Ok(allowed_headers) = env::var("PALYRA_HTTP_FETCH_ALLOWED_HEADERS") {
+        tool_call.http_fetch.allowed_request_headers = parse_http_header_allowlist(
+            allowed_headers.as_str(),
+            "PALYRA_HTTP_FETCH_ALLOWED_HEADERS",
+        )?;
+        source.push_str(" +env(PALYRA_HTTP_FETCH_ALLOWED_HEADERS)");
+    }
+    if let Ok(cache_enabled) = env::var("PALYRA_HTTP_FETCH_CACHE_ENABLED") {
+        tool_call.http_fetch.cache_enabled = cache_enabled
+            .parse::<bool>()
+            .context("PALYRA_HTTP_FETCH_CACHE_ENABLED must be true or false")?;
+        source.push_str(" +env(PALYRA_HTTP_FETCH_CACHE_ENABLED)");
+    }
+    if let Ok(cache_ttl_ms) = env::var("PALYRA_HTTP_FETCH_CACHE_TTL_MS") {
+        tool_call.http_fetch.cache_ttl_ms = parse_positive_u64(
+            cache_ttl_ms
+                .parse::<u64>()
+                .context("PALYRA_HTTP_FETCH_CACHE_TTL_MS must be a valid u64")?,
+            "PALYRA_HTTP_FETCH_CACHE_TTL_MS",
+        )?;
+        source.push_str(" +env(PALYRA_HTTP_FETCH_CACHE_TTL_MS)");
+    }
+    if let Ok(max_cache_entries) = env::var("PALYRA_HTTP_FETCH_MAX_CACHE_ENTRIES") {
+        tool_call.http_fetch.max_cache_entries = parse_positive_u64(
+            max_cache_entries
+                .parse::<u64>()
+                .context("PALYRA_HTTP_FETCH_MAX_CACHE_ENTRIES must be a valid u64")?,
+            "PALYRA_HTTP_FETCH_MAX_CACHE_ENTRIES",
+        )?;
+        source.push_str(" +env(PALYRA_HTTP_FETCH_MAX_CACHE_ENTRIES)");
+    }
+    if let Ok(browser_service_enabled) = env::var("PALYRA_BROWSER_SERVICE_ENABLED") {
+        tool_call.browser_service.enabled = browser_service_enabled
+            .parse::<bool>()
+            .context("PALYRA_BROWSER_SERVICE_ENABLED must be true or false")?;
+        source.push_str(" +env(PALYRA_BROWSER_SERVICE_ENABLED)");
+    }
+    if let Ok(browser_service_endpoint) = env::var("PALYRA_BROWSER_SERVICE_ENDPOINT") {
+        tool_call.browser_service.endpoint = parse_browser_service_endpoint(
+            browser_service_endpoint.as_str(),
+            "PALYRA_BROWSER_SERVICE_ENDPOINT",
+        )?;
+        source.push_str(" +env(PALYRA_BROWSER_SERVICE_ENDPOINT)");
+    }
+    if let Ok(browser_service_auth_token) = env::var("PALYRA_BROWSER_SERVICE_AUTH_TOKEN") {
+        let trimmed = browser_service_auth_token.trim();
+        tool_call.browser_service.auth_token =
+            if trimmed.is_empty() { None } else { Some(trimmed.to_owned()) };
+        source.push_str(" +env(PALYRA_BROWSER_SERVICE_AUTH_TOKEN)");
+    }
+    if let Ok(connect_timeout_ms) = env::var("PALYRA_BROWSER_SERVICE_CONNECT_TIMEOUT_MS") {
+        tool_call.browser_service.connect_timeout_ms = parse_positive_u64(
+            connect_timeout_ms
+                .parse::<u64>()
+                .context("PALYRA_BROWSER_SERVICE_CONNECT_TIMEOUT_MS must be a valid u64")?,
+            "PALYRA_BROWSER_SERVICE_CONNECT_TIMEOUT_MS",
+        )?;
+        source.push_str(" +env(PALYRA_BROWSER_SERVICE_CONNECT_TIMEOUT_MS)");
+    }
+    if let Ok(request_timeout_ms) = env::var("PALYRA_BROWSER_SERVICE_REQUEST_TIMEOUT_MS") {
+        tool_call.browser_service.request_timeout_ms = parse_positive_u64(
+            request_timeout_ms
+                .parse::<u64>()
+                .context("PALYRA_BROWSER_SERVICE_REQUEST_TIMEOUT_MS must be a valid u64")?,
+            "PALYRA_BROWSER_SERVICE_REQUEST_TIMEOUT_MS",
+        )?;
+        source.push_str(" +env(PALYRA_BROWSER_SERVICE_REQUEST_TIMEOUT_MS)");
+    }
+    if let Ok(max_screenshot_bytes) = env::var("PALYRA_BROWSER_SERVICE_MAX_SCREENSHOT_BYTES") {
+        tool_call.browser_service.max_screenshot_bytes = parse_positive_u64(
+            max_screenshot_bytes
+                .parse::<u64>()
+                .context("PALYRA_BROWSER_SERVICE_MAX_SCREENSHOT_BYTES must be a valid u64")?,
+            "PALYRA_BROWSER_SERVICE_MAX_SCREENSHOT_BYTES",
+        )?;
+        source.push_str(" +env(PALYRA_BROWSER_SERVICE_MAX_SCREENSHOT_BYTES)");
+    }
+    if let Ok(max_title_bytes) = env::var("PALYRA_BROWSER_SERVICE_MAX_TITLE_BYTES") {
+        tool_call.browser_service.max_title_bytes = parse_positive_u64(
+            max_title_bytes
+                .parse::<u64>()
+                .context("PALYRA_BROWSER_SERVICE_MAX_TITLE_BYTES must be a valid u64")?,
+            "PALYRA_BROWSER_SERVICE_MAX_TITLE_BYTES",
+        )?;
+        source.push_str(" +env(PALYRA_BROWSER_SERVICE_MAX_TITLE_BYTES)");
+    }
 
     if let Ok(channel_router_enabled) = env::var("PALYRA_CHANNEL_ROUTER_ENABLED") {
         channel_router.enabled = channel_router_enabled
@@ -1384,6 +1707,61 @@ fn parse_dns_suffix_allowlist(raw: &str, source_name: &str) -> Result<Vec<String
     Ok(allowlist)
 }
 
+fn parse_content_type_allowlist(raw: &str, source_name: &str) -> Result<Vec<String>> {
+    let mut allowlist = Vec::new();
+    for candidate in raw.split(',').map(str::trim).filter(|value| !value.is_empty()) {
+        let normalized = candidate.to_ascii_lowercase();
+        if normalized.len() > 128 {
+            anyhow::bail!("{source_name} contains oversized content type '{candidate}'");
+        }
+        if !normalized.contains('/') || normalized.starts_with('/') || normalized.ends_with('/') {
+            anyhow::bail!("{source_name} contains invalid content type '{candidate}'");
+        }
+        if normalized.contains(';') || normalized.chars().any(|ch| ch.is_ascii_whitespace()) {
+            anyhow::bail!(
+                "{source_name} content type entries must not include parameters or whitespace"
+            );
+        }
+        if !normalized.chars().all(|ch| {
+            ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '/' | '+' | '.' | '-')
+        }) {
+            anyhow::bail!("{source_name} contains invalid content type '{candidate}'");
+        }
+        if !allowlist.iter().any(|existing| existing == &normalized) {
+            allowlist.push(normalized);
+        }
+    }
+    if allowlist.is_empty() {
+        anyhow::bail!("{source_name} must include at least one content type");
+    }
+    Ok(allowlist)
+}
+
+fn parse_http_header_allowlist(raw: &str, source_name: &str) -> Result<Vec<String>> {
+    let mut allowlist = Vec::new();
+    for candidate in raw.split(',').map(str::trim).filter(|value| !value.is_empty()) {
+        let normalized = candidate.to_ascii_lowercase();
+        if normalized.len() > 128 {
+            anyhow::bail!("{source_name} contains oversized header name '{candidate}'");
+        }
+        if normalized.starts_with('-')
+            || normalized.ends_with('-')
+            || !normalized
+                .chars()
+                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+        {
+            anyhow::bail!("{source_name} contains invalid header name '{candidate}'");
+        }
+        if !allowlist.iter().any(|existing| existing == &normalized) {
+            allowlist.push(normalized);
+        }
+    }
+    if allowlist.is_empty() {
+        anyhow::bail!("{source_name} must include at least one header name");
+    }
+    Ok(allowlist)
+}
+
 fn parse_storage_prefix_allowlist(raw: &str, source_name: &str) -> Result<Vec<String>> {
     let mut allowlist = Vec::new();
     for candidate in raw.split(',').map(str::trim).filter(|value| !value.is_empty()) {
@@ -1424,6 +1802,30 @@ fn parse_optional_text_field(
         anyhow::bail!("{source_name} exceeds maximum bytes ({} > {max_bytes})", trimmed.len());
     }
     Ok(Some(trimmed.to_owned()))
+}
+
+fn parse_browser_service_endpoint(raw: &str, source_name: &str) -> Result<String> {
+    if raw.trim().is_empty() {
+        anyhow::bail!("{source_name} cannot be empty");
+    }
+    let parsed = reqwest::Url::parse(raw.trim())
+        .with_context(|| format!("{source_name} must be a valid absolute URL"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        anyhow::bail!("{source_name} must use http or https scheme");
+    }
+    if parsed.host_str().is_none() {
+        anyhow::bail!("{source_name} must include a host");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        anyhow::bail!("{source_name} must not embed credentials");
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        anyhow::bail!("{source_name} must not include query or fragment");
+    }
+    if parsed.path() != "/" && !parsed.path().is_empty() {
+        anyhow::bail!("{source_name} must not include a path");
+    }
+    Ok(parsed.as_str().trim_end_matches('/').to_owned())
 }
 
 fn parse_channel_identifier(raw: &str, source_name: &str) -> Result<String> {
@@ -1631,14 +2033,16 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        parse_broadcast_strategy, parse_cron_timezone_mode, parse_default_memory_ttl_ms,
-        parse_dns_suffix_allowlist, parse_host_allowlist, parse_journal_db_path,
+        parse_broadcast_strategy, parse_browser_service_endpoint, parse_content_type_allowlist,
+        parse_cron_timezone_mode, parse_default_memory_ttl_ms, parse_dns_suffix_allowlist,
+        parse_host_allowlist, parse_http_header_allowlist, parse_journal_db_path,
         parse_openai_base_url, parse_positive_usize, parse_process_executable_allowlist,
         parse_process_runner_egress_enforcement_mode, parse_process_runner_tier,
         parse_root_file_config, parse_storage_prefix_allowlist, parse_tool_allowlist,
-        parse_vault_dir, parse_vault_ref_allowlist, AdminConfig, ChannelRouterConfig, CronConfig,
-        GatewayConfig, GatewayTlsConfig, IdentityConfig, MemoryConfig, ModelProviderConfig,
-        OrchestratorConfig, StorageConfig, ToolCallConfig,
+        parse_vault_dir, parse_vault_ref_allowlist, AdminConfig, BrowserServiceConfig,
+        ChannelRouterConfig, CronConfig, GatewayConfig, GatewayTlsConfig, HttpFetchConfig,
+        IdentityConfig, MemoryConfig, ModelProviderConfig, OrchestratorConfig, StorageConfig,
+        ToolCallConfig,
     };
     use crate::channel_router::BroadcastStrategy;
     use crate::model_provider::ModelProviderKind;
@@ -1866,6 +2270,47 @@ mod tests {
             config.wasm_runtime.allowed_http_hosts.is_empty(),
             "wasm runtime http allowlist must default empty"
         );
+        assert!(
+            !config.http_fetch.allow_private_targets,
+            "http fetch must default to private-target denial"
+        );
+        assert_eq!(config.http_fetch.max_response_bytes, 512 * 1024);
+        assert_eq!(config.http_fetch.max_redirects, 3);
+        assert!(
+            config.http_fetch.allowed_content_types.iter().any(|value| value == "text/html"),
+            "http fetch default content-type allowlist should include text/html"
+        );
+        assert!(
+            !config.browser_service.enabled,
+            "browser service broker must default to explicit opt-in"
+        );
+        assert_eq!(config.browser_service.endpoint, "http://127.0.0.1:7543");
+    }
+
+    #[test]
+    fn http_fetch_config_defaults_enforce_safe_limits() {
+        let config = HttpFetchConfig::default();
+        assert!(!config.allow_private_targets);
+        assert_eq!(config.connect_timeout_ms, 1_500);
+        assert_eq!(config.request_timeout_ms, 10_000);
+        assert_eq!(config.max_response_bytes, 512 * 1024);
+        assert!(config.allow_redirects);
+        assert_eq!(config.max_redirects, 3);
+        assert!(config.cache_enabled);
+        assert_eq!(config.cache_ttl_ms, 30_000);
+        assert_eq!(config.max_cache_entries, 256);
+    }
+
+    #[test]
+    fn browser_service_config_defaults_are_local_and_bounded() {
+        let config = BrowserServiceConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.endpoint, "http://127.0.0.1:7543");
+        assert!(config.auth_token.is_none());
+        assert_eq!(config.connect_timeout_ms, 1_500);
+        assert_eq!(config.request_timeout_ms, 15_000);
+        assert_eq!(config.max_screenshot_bytes, 256 * 1024);
+        assert_eq!(config.max_title_bytes, 4 * 1024);
     }
 
     #[test]
@@ -1895,6 +2340,45 @@ mod tests {
         let process_runner =
             tool_call.process_runner.expect("process_runner section should be present");
         assert_eq!(process_runner.tier.as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn tool_call_config_parses_http_fetch_and_browser_service_overrides() {
+        let (parsed, _) = parse_root_file_config(
+            r#"
+            [tool_call.http_fetch]
+            request_timeout_ms = 22000
+            max_response_bytes = 12345
+            allowed_content_types = ["application/json"]
+            allowed_request_headers = ["accept"]
+            cache_enabled = false
+
+            [tool_call.browser_service]
+            enabled = true
+            endpoint = "http://127.0.0.1:7543"
+            connect_timeout_ms = 2000
+            request_timeout_ms = 18000
+            max_screenshot_bytes = 131072
+            max_title_bytes = 2048
+            "#,
+        )
+        .expect("http fetch + browser service override should parse");
+        let tool_call = parsed.tool_call.expect("tool_call section should be present");
+        let http_fetch = tool_call.http_fetch.expect("http_fetch section should be present");
+        assert_eq!(http_fetch.request_timeout_ms, Some(22_000));
+        assert_eq!(http_fetch.max_response_bytes, Some(12_345));
+        assert_eq!(http_fetch.allowed_content_types, Some(vec!["application/json".to_owned()]));
+        assert_eq!(http_fetch.allowed_request_headers, Some(vec!["accept".to_owned()]));
+        assert_eq!(http_fetch.cache_enabled, Some(false));
+
+        let browser_service =
+            tool_call.browser_service.expect("browser_service section should be present");
+        assert_eq!(browser_service.enabled, Some(true));
+        assert_eq!(browser_service.endpoint, Some("http://127.0.0.1:7543".to_owned()));
+        assert_eq!(browser_service.connect_timeout_ms, Some(2_000));
+        assert_eq!(browser_service.request_timeout_ms, Some(18_000));
+        assert_eq!(browser_service.max_screenshot_bytes, Some(131_072));
+        assert_eq!(browser_service.max_title_bytes, Some(2_048));
     }
 
     #[test]
@@ -2053,6 +2537,21 @@ mod tests {
         let result: Result<RootFileConfig, _> =
             toml::from_str("[tool_call.wasm_runtime]\nenabled=true\nunexpected=true\n");
         assert!(result.is_err(), "unknown wasm runtime keys must be rejected");
+    }
+
+    #[test]
+    fn config_rejects_unknown_http_fetch_key() {
+        let result: Result<RootFileConfig, _> = toml::from_str(
+            "[tool_call.http_fetch]\nallow_private_targets=false\nunexpected=true\n",
+        );
+        assert!(result.is_err(), "unknown http fetch keys must be rejected");
+    }
+
+    #[test]
+    fn config_rejects_unknown_browser_service_key() {
+        let result: Result<RootFileConfig, _> =
+            toml::from_str("[tool_call.browser_service]\nenabled=true\nunexpected=true\n");
+        assert!(result.is_err(), "unknown browser service keys must be rejected");
     }
 
     #[test]
@@ -2304,6 +2803,70 @@ mod tests {
             "tool_call.process_runner.allowed_dns_suffixes",
         );
         assert!(result.is_err(), "dns suffix allowlist must reject malformed entries");
+    }
+
+    #[test]
+    fn parse_content_type_allowlist_normalizes_and_deduplicates_values() {
+        let parsed = parse_content_type_allowlist(
+            "TEXT/HTML, application/json,text/html",
+            "tool_call.http_fetch.allowed_content_types",
+        )
+        .expect("content-type allowlist should parse");
+        assert_eq!(parsed, vec!["text/html".to_owned(), "application/json".to_owned()]);
+    }
+
+    #[test]
+    fn parse_content_type_allowlist_rejects_parameters_and_whitespace() {
+        let result = parse_content_type_allowlist(
+            "text/html; charset=utf-8",
+            "tool_call.http_fetch.allowed_content_types",
+        );
+        assert!(result.is_err(), "content-type allowlist must reject parameters");
+    }
+
+    #[test]
+    fn parse_http_header_allowlist_normalizes_and_deduplicates_values() {
+        let parsed = parse_http_header_allowlist(
+            "User-Agent,accept,user-agent",
+            "tool_call.http_fetch.allowed_request_headers",
+        )
+        .expect("header allowlist should parse");
+        assert_eq!(parsed, vec!["user-agent".to_owned(), "accept".to_owned()]);
+    }
+
+    #[test]
+    fn parse_http_header_allowlist_rejects_invalid_header_names() {
+        let result = parse_http_header_allowlist(
+            "x-custom, bad header",
+            "tool_call.http_fetch.allowed_request_headers",
+        );
+        assert!(result.is_err(), "header allowlist must reject invalid header names");
+    }
+
+    #[test]
+    fn parse_browser_service_endpoint_requires_http_or_https_without_path() {
+        assert!(
+            parse_browser_service_endpoint(
+                "grpc://127.0.0.1:7543",
+                "tool_call.browser_service.endpoint",
+            )
+            .is_err(),
+            "unsupported scheme must fail"
+        );
+        assert!(
+            parse_browser_service_endpoint(
+                "http://127.0.0.1:7543/browser",
+                "tool_call.browser_service.endpoint",
+            )
+            .is_err(),
+            "path segments must fail"
+        );
+        let parsed = parse_browser_service_endpoint(
+            "https://browserd.internal:7443/",
+            "tool_call.browser_service.endpoint",
+        )
+        .expect("valid endpoint should parse");
+        assert_eq!(parsed, "https://browserd.internal:7443");
     }
 
     #[test]

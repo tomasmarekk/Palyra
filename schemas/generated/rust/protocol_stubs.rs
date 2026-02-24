@@ -60,21 +60,38 @@ pub mod palyra_auth_v1 {
 
 pub mod palyra_browser_v1 {
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
-    pub struct ExecuteActionRequest;
+    pub struct BrowserHealthRequest;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
-    pub struct ExecuteActionResponse;
+    pub struct BrowserHealthResponse;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
-    pub struct ObserveEvent;
+    pub struct CloseSessionRequest;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
-    pub struct ObserveRequest;
+    pub struct CloseSessionResponse;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
-    pub struct StartProfileRequest;
+    pub struct CreateSessionRequest;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
-    pub struct StartProfileResponse;
+    pub struct CreateSessionResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct GetTitleRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct GetTitleResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct NavigateRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct NavigateResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ScreenshotRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ScreenshotResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct SessionBudget;
     pub trait BrowserServiceClient {
-        fn ExecuteAction(&self);
-        fn Observe(&self);
-        fn StartProfile(&self);
+        fn CloseSession(&self);
+        fn CreateSession(&self);
+        fn GetTitle(&self);
+        fn Health(&self);
+        fn Navigate(&self);
+        fn Screenshot(&self);
     }
 }
 

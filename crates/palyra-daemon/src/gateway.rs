@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -9,6 +10,7 @@ use std::{
 };
 
 use axum::http::{header::AUTHORIZATION, HeaderMap};
+use base64::Engine as _;
 use palyra_auth::{
     AuthCredential, AuthCredentialType, AuthExpiryDistribution, AuthHealthSummary,
     AuthProfileError, AuthProfileHealthState, AuthProfileListFilter, AuthProfileRecord,
@@ -32,6 +34,7 @@ use palyra_vault::{
     BackendPreference as VaultBackendPreference, VaultConfig as VaultConfigOptions,
 };
 use palyra_vault::{SecretMetadata as VaultSecretMetadata, Vault, VaultError, VaultScope};
+use reqwest::{redirect::Policy, Url};
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -115,12 +118,18 @@ pub mod proto {
                 tonic::include_proto!("palyra.node.v1");
             }
         }
+
+        pub mod browser {
+            pub mod v1 {
+                tonic::include_proto!("palyra.browser.v1");
+            }
+        }
     }
 }
 
 use proto::palyra::{
-    auth::v1 as auth_v1, common::v1 as common_v1, cron::v1 as cron_v1, gateway::v1 as gateway_v1,
-    memory::v1 as memory_v1,
+    auth::v1 as auth_v1, browser::v1 as browser_v1, common::v1 as common_v1, cron::v1 as cron_v1,
+    gateway::v1 as gateway_v1, memory::v1 as memory_v1,
 };
 
 pub const HEADER_PRINCIPAL: &str = "x-palyra-principal";
@@ -160,6 +169,11 @@ const MAX_MEMORY_ITEM_TOKENS: usize = 2_048;
 const MAX_MEMORY_TOOL_QUERY_BYTES: usize = 4 * 1024;
 const MAX_MEMORY_TOOL_TAGS: usize = 32;
 const MAX_WORKSPACE_PATCH_TOOL_INPUT_BYTES: usize = 256 * 1024;
+const MAX_HTTP_FETCH_TOOL_INPUT_BYTES: usize = 64 * 1024;
+const MAX_HTTP_FETCH_BODY_BYTES: usize = 512 * 1024;
+const MAX_HTTP_FETCH_REDIRECTS: usize = 10;
+const MAX_HTTP_FETCH_CACHE_KEY_BYTES: usize = 4 * 1024;
+const MAX_BROWSER_TOOL_INPUT_BYTES: usize = 128 * 1024;
 const MAX_PATCH_TOOL_REDACTION_PATTERNS: usize = 64;
 const MAX_PATCH_TOOL_SECRET_FILE_MARKERS: usize = 64;
 const MAX_PATCH_TOOL_PATTERN_BYTES: usize = 256;
@@ -181,6 +195,12 @@ const TOOL_APPROVAL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 const SKILL_EXECUTION_DENY_REASON_PREFIX: &str = "skill execution blocked by security gate";
 const WORKSPACE_PATCH_TOOL_NAME: &str = "palyra.fs.apply_patch";
 const PROCESS_RUNNER_TOOL_NAME: &str = "palyra.process.run";
+const HTTP_FETCH_TOOL_NAME: &str = "palyra.http.fetch";
+const BROWSER_SESSION_CREATE_TOOL_NAME: &str = "palyra.browser.session.create";
+const BROWSER_SESSION_CLOSE_TOOL_NAME: &str = "palyra.browser.session.close";
+const BROWSER_NAVIGATE_TOOL_NAME: &str = "palyra.browser.navigate";
+const BROWSER_TITLE_TOOL_NAME: &str = "palyra.browser.title";
+const BROWSER_SCREENSHOT_TOOL_NAME: &str = "palyra.browser.screenshot";
 
 #[derive(Debug, Clone)]
 pub struct GatewayRuntimeConfigSnapshot {
@@ -197,6 +217,8 @@ pub struct GatewayRuntimeConfigSnapshot {
     pub max_tape_bytes_per_response: usize,
     pub channel_router: ChannelRouterConfig,
     pub tool_call: ToolCallConfig,
+    pub http_fetch: HttpFetchRuntimeConfig,
+    pub browser_service: BrowserServiceRuntimeConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -206,6 +228,32 @@ pub struct MemoryRuntimeConfig {
     pub auto_inject_enabled: bool,
     pub auto_inject_max_items: usize,
     pub default_ttl_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HttpFetchRuntimeConfig {
+    pub allow_private_targets: bool,
+    pub connect_timeout_ms: u64,
+    pub request_timeout_ms: u64,
+    pub max_response_bytes: usize,
+    pub allow_redirects: bool,
+    pub max_redirects: usize,
+    pub allowed_content_types: Vec<String>,
+    pub allowed_request_headers: Vec<String>,
+    pub cache_enabled: bool,
+    pub cache_ttl_ms: u64,
+    pub max_cache_entries: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BrowserServiceRuntimeConfig {
+    pub enabled: bool,
+    pub endpoint: String,
+    pub auth_token: Option<String>,
+    pub connect_timeout_ms: u64,
+    pub request_timeout_ms: u64,
+    pub max_screenshot_bytes: usize,
+    pub max_title_bytes: usize,
 }
 
 impl Default for MemoryRuntimeConfig {
@@ -238,6 +286,12 @@ struct CachedToolApprovalDecision {
     decision: ApprovalDecision,
     decision_scope: ApprovalDecisionScope,
     expires_at_unix_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedHttpFetchEntry {
+    expires_at_unix_ms: i64,
+    output_json: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -293,6 +347,7 @@ pub struct GatewayRuntimeState {
     vault: Arc<Vault>,
     memory_config: RwLock<MemoryRuntimeConfig>,
     memory_search_cache: Mutex<HashMap<String, Vec<MemorySearchHit>>>,
+    http_fetch_cache: Mutex<HashMap<String, CachedHttpFetchEntry>>,
     tool_approval_cache: Mutex<HashMap<String, CachedToolApprovalDecision>>,
     vault_rate_limit: Mutex<HashMap<String, VaultRateLimitEntry>>,
     agent_registry: AgentRegistry,
@@ -937,6 +992,7 @@ impl GatewayRuntimeState {
             vault,
             memory_config: RwLock::new(MemoryRuntimeConfig::default()),
             memory_search_cache: Mutex::new(HashMap::new()),
+            http_fetch_cache: Mutex::new(HashMap::new()),
             tool_approval_cache: Mutex::new(HashMap::new()),
             vault_rate_limit: Mutex::new(HashMap::new()),
             agent_registry,
@@ -6522,6 +6578,22 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                                             input_json.as_slice(),
                                         )
                                         .await
+                                    } else if tool_name == HTTP_FETCH_TOOL_NAME {
+                                        execute_http_fetch_tool(
+                                            &state_for_stream,
+                                            proposal_id.as_str(),
+                                            input_json.as_slice(),
+                                        )
+                                        .await
+                                    } else if tool_name.starts_with("palyra.browser.") {
+                                        execute_browser_tool(
+                                            &state_for_stream,
+                                            context_for_stream.principal.as_str(),
+                                            tool_name.as_str(),
+                                            proposal_id.as_str(),
+                                            input_json.as_slice(),
+                                        )
+                                        .await
                                     } else if tool_name == WORKSPACE_PATCH_TOOL_NAME {
                                         execute_workspace_patch_tool(
                                             &state_for_stream,
@@ -8572,6 +8644,1127 @@ async fn execute_memory_search_tool(
     }
 }
 
+async fn execute_http_fetch_tool(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    proposal_id: &str,
+    input_json: &[u8],
+) -> ToolExecutionOutcome {
+    if input_json.len() > MAX_HTTP_FETCH_TOOL_INPUT_BYTES {
+        return http_fetch_tool_execution_outcome(
+            proposal_id,
+            input_json,
+            false,
+            b"{}".to_vec(),
+            format!("palyra.http.fetch input exceeds {MAX_HTTP_FETCH_TOOL_INPUT_BYTES} bytes"),
+        );
+    }
+
+    let payload = match serde_json::from_slice::<Value>(input_json) {
+        Ok(Value::Object(map)) => map,
+        Ok(_) => {
+            return http_fetch_tool_execution_outcome(
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                "palyra.http.fetch requires JSON object input".to_owned(),
+            );
+        }
+        Err(error) => {
+            return http_fetch_tool_execution_outcome(
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                format!("palyra.http.fetch invalid JSON input: {error}"),
+            );
+        }
+    };
+
+    let url_raw = match payload.get("url").and_then(Value::as_str).map(str::trim) {
+        Some(value) if !value.is_empty() => value.to_owned(),
+        _ => {
+            return http_fetch_tool_execution_outcome(
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                "palyra.http.fetch requires non-empty string field 'url'".to_owned(),
+            );
+        }
+    };
+    let method = payload
+        .get("method")
+        .and_then(Value::as_str)
+        .map(|value| value.trim().to_ascii_uppercase())
+        .unwrap_or_else(|| "GET".to_owned());
+    if !matches!(method.as_str(), "GET" | "HEAD" | "POST") {
+        return http_fetch_tool_execution_outcome(
+            proposal_id,
+            input_json,
+            false,
+            b"{}".to_vec(),
+            "palyra.http.fetch method must be one of: GET|HEAD|POST".to_owned(),
+        );
+    }
+
+    let body = match payload.get("body") {
+        Some(Value::String(value)) => value.clone(),
+        Some(_) => {
+            return http_fetch_tool_execution_outcome(
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                "palyra.http.fetch body must be a string".to_owned(),
+            );
+        }
+        None => String::new(),
+    };
+
+    let request_headers = match payload.get("headers") {
+        Some(Value::Object(values)) => {
+            let mut headers = Vec::new();
+            for (name, value) in values {
+                let Value::String(raw_value) = value else {
+                    return http_fetch_tool_execution_outcome(
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        format!("palyra.http.fetch header '{name}' must be a string"),
+                    );
+                };
+                let normalized_name = name.trim().to_ascii_lowercase();
+                if normalized_name.is_empty() {
+                    return http_fetch_tool_execution_outcome(
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        "palyra.http.fetch header names cannot be empty".to_owned(),
+                    );
+                }
+                if !runtime_state
+                    .config
+                    .http_fetch
+                    .allowed_request_headers
+                    .iter()
+                    .any(|allowed| allowed == &normalized_name)
+                {
+                    return http_fetch_tool_execution_outcome(
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        format!(
+                            "palyra.http.fetch header '{normalized_name}' is not allowed by policy"
+                        ),
+                    );
+                }
+                headers.push((normalized_name, raw_value.clone()));
+            }
+            headers
+        }
+        Some(_) => {
+            return http_fetch_tool_execution_outcome(
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                "palyra.http.fetch headers must be an object map".to_owned(),
+            );
+        }
+        None => Vec::new(),
+    };
+
+    let allow_redirects = payload
+        .get("allow_redirects")
+        .and_then(Value::as_bool)
+        .unwrap_or(runtime_state.config.http_fetch.allow_redirects);
+    let max_redirects = payload
+        .get("max_redirects")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+        .unwrap_or(runtime_state.config.http_fetch.max_redirects)
+        .clamp(1, MAX_HTTP_FETCH_REDIRECTS);
+    let allow_private_targets =
+        payload.get("allow_private_targets").and_then(Value::as_bool).unwrap_or(false)
+            || runtime_state.config.http_fetch.allow_private_targets;
+    let max_response_bytes = payload
+        .get("max_response_bytes")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+        .unwrap_or(runtime_state.config.http_fetch.max_response_bytes)
+        .clamp(1, MAX_HTTP_FETCH_BODY_BYTES);
+    let cache_enabled = payload
+        .get("cache")
+        .and_then(Value::as_bool)
+        .unwrap_or(runtime_state.config.http_fetch.cache_enabled)
+        && matches!(method.as_str(), "GET" | "HEAD");
+    let cache_ttl_ms = payload
+        .get("cache_ttl_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(runtime_state.config.http_fetch.cache_ttl_ms)
+        .max(1);
+    let allowed_content_types = match payload.get("allowed_content_types") {
+        Some(Value::Array(values)) => {
+            let mut parsed = Vec::new();
+            for value in values {
+                let Some(content_type) = value.as_str() else {
+                    return http_fetch_tool_execution_outcome(
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        "palyra.http.fetch allowed_content_types must be strings".to_owned(),
+                    );
+                };
+                let normalized =
+                    content_type.split(';').next().unwrap_or_default().trim().to_ascii_lowercase();
+                if normalized.is_empty() {
+                    continue;
+                }
+                if !runtime_state
+                    .config
+                    .http_fetch
+                    .allowed_content_types
+                    .iter()
+                    .any(|allowed| allowed == &normalized)
+                {
+                    return http_fetch_tool_execution_outcome(
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        format!(
+                            "palyra.http.fetch content type '{normalized}' is not allowed by policy"
+                        ),
+                    );
+                }
+                if !parsed.iter().any(|existing| existing == &normalized) {
+                    parsed.push(normalized);
+                }
+            }
+            if parsed.is_empty() {
+                runtime_state.config.http_fetch.allowed_content_types.clone()
+            } else {
+                parsed
+            }
+        }
+        Some(_) => {
+            return http_fetch_tool_execution_outcome(
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                "palyra.http.fetch allowed_content_types must be an array of strings".to_owned(),
+            );
+        }
+        None => runtime_state.config.http_fetch.allowed_content_types.clone(),
+    };
+
+    let url = match Url::parse(url_raw.as_str()) {
+        Ok(value) => value,
+        Err(error) => {
+            return http_fetch_tool_execution_outcome(
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                format!("palyra.http.fetch URL is invalid: {error}"),
+            );
+        }
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return http_fetch_tool_execution_outcome(
+            proposal_id,
+            input_json,
+            false,
+            b"{}".to_vec(),
+            format!("palyra.http.fetch blocked URL scheme '{}'", url.scheme()),
+        );
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return http_fetch_tool_execution_outcome(
+            proposal_id,
+            input_json,
+            false,
+            b"{}".to_vec(),
+            "palyra.http.fetch URL credentials are not allowed".to_owned(),
+        );
+    }
+
+    let cache_key = http_fetch_cache_key(
+        method.as_str(),
+        url.as_str(),
+        request_headers.as_slice(),
+        body.as_str(),
+    );
+    if cache_enabled {
+        let now = current_unix_ms();
+        if let Ok(mut cache) = runtime_state.http_fetch_cache.lock() {
+            cache.retain(|_, entry| entry.expires_at_unix_ms > now);
+            if let Some(cached) = cache.get(cache_key.as_str()) {
+                return http_fetch_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    true,
+                    cached.output_json.clone(),
+                    String::new(),
+                );
+            }
+        }
+    }
+
+    let started_at = Instant::now();
+    let mut current_url = url;
+    let mut redirects_followed = 0_usize;
+    loop {
+        let resolved_addrs =
+            match resolve_fetch_target_addresses(&current_url, allow_private_targets).await {
+                Ok(value) => value,
+                Err(error) => {
+                    return http_fetch_tool_execution_outcome(
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        format!("palyra.http.fetch target blocked: {error}"),
+                    );
+                }
+            };
+
+        let host = current_url.host_str().unwrap_or_default().to_owned();
+        let mut client_builder = reqwest::Client::builder()
+            .redirect(Policy::none())
+            .connect_timeout(Duration::from_millis(
+                runtime_state.config.http_fetch.connect_timeout_ms,
+            ))
+            .timeout(Duration::from_millis(runtime_state.config.http_fetch.request_timeout_ms));
+        if !host.is_empty() && host.parse::<IpAddr>().is_err() {
+            for address in resolved_addrs {
+                client_builder = client_builder.resolve(host.as_str(), address);
+            }
+        }
+        let client = match client_builder.build() {
+            Ok(value) => value,
+            Err(error) => {
+                return http_fetch_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    format!("palyra.http.fetch failed to build HTTP client: {error}"),
+                );
+            }
+        };
+
+        let method_value = match method.parse::<reqwest::Method>() {
+            Ok(value) => value,
+            Err(error) => {
+                return http_fetch_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    format!("palyra.http.fetch invalid method: {error}"),
+                );
+            }
+        };
+        let mut request = client.request(method_value, current_url.clone());
+        for (name, value) in request_headers.as_slice() {
+            request = request.header(name, value);
+        }
+        if method == "POST" && !body.is_empty() {
+            request = request.body(body.clone());
+        }
+        let mut response = match request.send().await {
+            Ok(value) => value,
+            Err(error) => {
+                return http_fetch_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    format!("palyra.http.fetch request failed: {error}"),
+                );
+            }
+        };
+
+        if response.status().is_redirection() {
+            if !allow_redirects {
+                return http_fetch_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    "palyra.http.fetch redirect blocked by policy".to_owned(),
+                );
+            }
+            if redirects_followed >= max_redirects {
+                return http_fetch_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    format!("palyra.http.fetch redirect limit exceeded ({max_redirects})"),
+                );
+            }
+            let Some(location) = response.headers().get(reqwest::header::LOCATION) else {
+                return http_fetch_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    "palyra.http.fetch redirect response missing Location header".to_owned(),
+                );
+            };
+            let location_str = match location.to_str() {
+                Ok(value) => value,
+                Err(_) => {
+                    return http_fetch_tool_execution_outcome(
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        "palyra.http.fetch redirect Location header is invalid UTF-8".to_owned(),
+                    );
+                }
+            };
+            current_url = match current_url.join(location_str) {
+                Ok(value) => value,
+                Err(error) => {
+                    return http_fetch_tool_execution_outcome(
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        format!("palyra.http.fetch redirect URL is invalid: {error}"),
+                    );
+                }
+            };
+            redirects_followed = redirects_followed.saturating_add(1);
+            continue;
+        }
+
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.split(';').next().unwrap_or_default().trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        if !content_type.is_empty()
+            && !allowed_content_types.iter().any(|allowed| allowed == &content_type)
+        {
+            return http_fetch_tool_execution_outcome(
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                format!("palyra.http.fetch content type '{content_type}' is blocked by policy"),
+            );
+        }
+
+        let mut body_bytes = Vec::new();
+        if method != "HEAD" {
+            loop {
+                let chunk = match response.chunk().await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return http_fetch_tool_execution_outcome(
+                            proposal_id,
+                            input_json,
+                            false,
+                            b"{}".to_vec(),
+                            format!("palyra.http.fetch failed to stream response body: {error}"),
+                        );
+                    }
+                };
+                let Some(chunk) = chunk else {
+                    break;
+                };
+                if body_bytes.len().saturating_add(chunk.len()) > max_response_bytes {
+                    return http_fetch_tool_execution_outcome(
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        format!(
+                            "palyra.http.fetch response exceeds max_response_bytes ({max_response_bytes})"
+                        ),
+                    );
+                }
+                body_bytes.extend_from_slice(chunk.as_ref());
+            }
+        }
+
+        let status_code = response.status().as_u16();
+        let success = response.status().is_success();
+        let output_json = json!({
+            "url": current_url.as_str(),
+            "method": method,
+            "status_code": status_code,
+            "redirects_followed": redirects_followed,
+            "content_type": content_type,
+            "body_bytes": body_bytes.len(),
+            "body_text": String::from_utf8_lossy(body_bytes.as_slice()).to_string(),
+            "latency_ms": started_at.elapsed().as_millis() as u64,
+            "request_headers": redacted_http_headers(request_headers.as_slice()),
+        });
+        let serialized = serde_json::to_vec(&output_json).unwrap_or_else(|_| b"{}".to_vec());
+        if cache_enabled && success {
+            if let Ok(mut cache) = runtime_state.http_fetch_cache.lock() {
+                let now = current_unix_ms();
+                cache.retain(|_, entry| entry.expires_at_unix_ms > now);
+                while cache.len() >= runtime_state.config.http_fetch.max_cache_entries {
+                    let Some(first_key) = cache.keys().next().cloned() else {
+                        break;
+                    };
+                    cache.remove(first_key.as_str());
+                }
+                cache.insert(
+                    cache_key.clone(),
+                    CachedHttpFetchEntry {
+                        expires_at_unix_ms: now.saturating_add(cache_ttl_ms as i64),
+                        output_json: serialized.clone(),
+                    },
+                );
+            }
+        }
+        return http_fetch_tool_execution_outcome(
+            proposal_id,
+            input_json,
+            success,
+            serialized,
+            if success {
+                String::new()
+            } else {
+                format!("palyra.http.fetch returned HTTP {status_code}")
+            },
+        );
+    }
+}
+
+fn http_fetch_cache_key(
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: &str,
+) -> String {
+    let mut normalized_headers =
+        headers.iter().map(|(name, value)| format!("{name}:{value}")).collect::<Vec<_>>();
+    normalized_headers.sort();
+    let mut key =
+        format!("{method}|{url}|{}|{}", normalized_headers.join("&"), sha256_hex(body.as_bytes()));
+    if key.len() > MAX_HTTP_FETCH_CACHE_KEY_BYTES {
+        key = format!("sha256:{}", sha256_hex(key.as_bytes()));
+    }
+    key
+}
+
+async fn resolve_fetch_target_addresses(
+    url: &Url,
+    allow_private_targets: bool,
+) -> Result<Vec<SocketAddr>, String> {
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(format!("blocked URL scheme '{}'", url.scheme()));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("URL credentials are not allowed".to_owned());
+    }
+    let host = url.host_str().ok_or_else(|| "URL host is required".to_owned())?;
+    let port =
+        url.port_or_known_default().ok_or_else(|| "URL port could not be resolved".to_owned())?;
+
+    let addrs = if let Ok(ip) = host.parse::<IpAddr>() {
+        vec![SocketAddr::new(ip, port)]
+    } else {
+        let resolved = tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|error| format!("DNS resolution failed for host '{host}': {error}"))?;
+        resolved.collect::<Vec<_>>()
+    };
+    if addrs.is_empty() {
+        return Err(format!("DNS resolution returned no addresses for host '{host}'"));
+    }
+    validate_resolved_fetch_addresses(addrs.as_slice(), allow_private_targets)?;
+    Ok(addrs)
+}
+
+fn validate_resolved_fetch_addresses(
+    addrs: &[SocketAddr],
+    allow_private_targets: bool,
+) -> Result<(), String> {
+    if addrs.is_empty() {
+        return Err("DNS resolution returned no addresses".to_owned());
+    }
+    if !allow_private_targets && addrs.iter().any(|address| is_private_or_local_ip(address.ip())) {
+        return Err("target resolves to private/local address and is blocked by policy".to_owned());
+    }
+    Ok(())
+}
+
+fn is_private_or_local_ip(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(ipv4) => is_private_or_local_ipv4(ipv4),
+        IpAddr::V6(ipv6) => is_private_or_local_ipv6(ipv6),
+    }
+}
+
+fn is_private_or_local_ipv4(address: Ipv4Addr) -> bool {
+    address.is_private()
+        || address.is_loopback()
+        || address.is_link_local()
+        || address.is_unspecified()
+}
+
+fn is_private_or_local_ipv6(address: Ipv6Addr) -> bool {
+    if let Some(mapped_ipv4) = address.to_ipv4_mapped() {
+        return is_private_or_local_ipv4(mapped_ipv4);
+    }
+    address.is_loopback()
+        || address.is_unicast_link_local()
+        || address.is_unique_local()
+        || address.is_unspecified()
+}
+
+fn redacted_http_headers(headers: &[(String, String)]) -> Vec<serde_json::Value> {
+    headers
+        .iter()
+        .map(|(name, value)| {
+            let sensitive = name.contains("authorization")
+                || name.contains("cookie")
+                || name.contains("token")
+                || name.contains("api-key")
+                || name.contains("apikey");
+            json!({
+                "name": name,
+                "value": if sensitive { "<redacted>" } else { value.as_str() }
+            })
+        })
+        .collect()
+}
+
+fn http_fetch_tool_execution_outcome(
+    proposal_id: &str,
+    input_json: &[u8],
+    success: bool,
+    output_json: Vec<u8>,
+    error: String,
+) -> ToolExecutionOutcome {
+    let executed_at_unix_ms = current_unix_ms();
+    let mut hasher = Sha256::new();
+    hasher.update(b"palyra.http.fetch.attestation.v1");
+    hasher.update((proposal_id.len() as u64).to_be_bytes());
+    hasher.update(proposal_id.as_bytes());
+    hasher.update((input_json.len() as u64).to_be_bytes());
+    hasher.update(input_json);
+    hasher.update([u8::from(success)]);
+    hasher.update((output_json.len() as u64).to_be_bytes());
+    hasher.update(output_json.as_slice());
+    hasher.update((error.len() as u64).to_be_bytes());
+    hasher.update(error.as_bytes());
+    hasher.update(executed_at_unix_ms.to_be_bytes());
+    let execution_sha256 = format!("{:x}", hasher.finalize());
+
+    ToolExecutionOutcome {
+        success,
+        output_json,
+        error,
+        attestation: ToolAttestation {
+            attestation_id: Ulid::new().to_string(),
+            execution_sha256,
+            executed_at_unix_ms,
+            timed_out: false,
+            executor: "gateway_http_fetch".to_owned(),
+            sandbox_enforcement: "ssrf_guard".to_owned(),
+        },
+    }
+}
+
+async fn execute_browser_tool(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    principal: &str,
+    tool_name: &str,
+    proposal_id: &str,
+    input_json: &[u8],
+) -> ToolExecutionOutcome {
+    if input_json.len() > MAX_BROWSER_TOOL_INPUT_BYTES {
+        return browser_tool_execution_outcome(
+            proposal_id,
+            input_json,
+            false,
+            b"{}".to_vec(),
+            format!("palyra.browser.* input exceeds {MAX_BROWSER_TOOL_INPUT_BYTES} bytes"),
+        );
+    }
+    if !runtime_state.config.browser_service.enabled {
+        return browser_tool_execution_outcome(
+            proposal_id,
+            input_json,
+            false,
+            b"{}".to_vec(),
+            "palyra.browser.* is disabled by runtime config (tool_call.browser_service.enabled=false)"
+                .to_owned(),
+        );
+    }
+
+    let payload = match serde_json::from_slice::<Value>(input_json) {
+        Ok(Value::Object(map)) => map,
+        Ok(_) => {
+            return browser_tool_execution_outcome(
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                "palyra.browser.* requires JSON object input".to_owned(),
+            );
+        }
+        Err(error) => {
+            return browser_tool_execution_outcome(
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                format!("palyra.browser.* invalid JSON input: {error}"),
+            );
+        }
+    };
+
+    let mut client =
+        match connect_browser_service(runtime_state.config.browser_service.clone()).await {
+            Ok(value) => value,
+            Err(error) => {
+                return browser_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    error,
+                );
+            }
+        };
+
+    let outcome = match tool_name {
+        BROWSER_SESSION_CREATE_TOOL_NAME => {
+            let idle_ttl_ms = payload.get("idle_ttl_ms").and_then(Value::as_u64).unwrap_or(0);
+            let allow_private_targets =
+                payload.get("allow_private_targets").and_then(Value::as_bool).unwrap_or(false);
+            let budget = payload.get("budget").and_then(Value::as_object).map(|value| {
+                browser_v1::SessionBudget {
+                    max_navigation_timeout_ms: value
+                        .get("max_navigation_timeout_ms")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                    max_session_lifetime_ms: value
+                        .get("max_session_lifetime_ms")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                    max_screenshot_bytes: value
+                        .get("max_screenshot_bytes")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                    max_response_bytes: value
+                        .get("max_response_bytes")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                }
+            });
+            let mut request = Request::new(browser_v1::CreateSessionRequest {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                principal: principal.to_owned(),
+                idle_ttl_ms,
+                budget,
+                allow_private_targets,
+            });
+            if let Err(error) = attach_browser_auth_metadata(
+                &mut request,
+                runtime_state.config.browser_service.auth_token.as_deref(),
+            ) {
+                return browser_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    error,
+                );
+            }
+            match client.create_session(request).await {
+                Ok(response) => {
+                    let response = response.into_inner();
+                    let output = json!({
+                        "session_id": response.session_id.map(|value| value.ulid),
+                        "created_at_unix_ms": response.created_at_unix_ms,
+                        "effective_budget": response.effective_budget.map(|value| json!({
+                            "max_navigation_timeout_ms": value.max_navigation_timeout_ms,
+                            "max_session_lifetime_ms": value.max_session_lifetime_ms,
+                            "max_screenshot_bytes": value.max_screenshot_bytes,
+                            "max_response_bytes": value.max_response_bytes,
+                        })),
+                    });
+                    (
+                        true,
+                        serde_json::to_vec(&output).unwrap_or_else(|_| b"{}".to_vec()),
+                        String::new(),
+                    )
+                }
+                Err(error) => (
+                    false,
+                    b"{}".to_vec(),
+                    format!(
+                        "palyra.browser.session.create failed: {}",
+                        sanitize_status_message(&error)
+                    ),
+                ),
+            }
+        }
+        BROWSER_SESSION_CLOSE_TOOL_NAME => {
+            let session_id = match parse_browser_tool_session_id(&payload) {
+                Ok(value) => value,
+                Err(error) => {
+                    return browser_tool_execution_outcome(
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        error,
+                    );
+                }
+            };
+            let mut request = Request::new(browser_v1::CloseSessionRequest {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                session_id: Some(common_v1::CanonicalId { ulid: session_id }),
+            });
+            if let Err(error) = attach_browser_auth_metadata(
+                &mut request,
+                runtime_state.config.browser_service.auth_token.as_deref(),
+            ) {
+                return browser_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    error,
+                );
+            }
+            match client.close_session(request).await {
+                Ok(response) => {
+                    let response = response.into_inner();
+                    let output = json!({
+                        "closed": response.closed,
+                        "reason": response.reason,
+                    });
+                    (
+                        response.closed,
+                        serde_json::to_vec(&output).unwrap_or_else(|_| b"{}".to_vec()),
+                        if response.closed {
+                            String::new()
+                        } else {
+                            "browser session was not closed".to_owned()
+                        },
+                    )
+                }
+                Err(error) => (
+                    false,
+                    b"{}".to_vec(),
+                    format!(
+                        "palyra.browser.session.close failed: {}",
+                        sanitize_status_message(&error)
+                    ),
+                ),
+            }
+        }
+        BROWSER_NAVIGATE_TOOL_NAME => {
+            let session_id = match parse_browser_tool_session_id(&payload) {
+                Ok(value) => value,
+                Err(error) => {
+                    return browser_tool_execution_outcome(
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        error,
+                    );
+                }
+            };
+            let Some(url) = payload.get("url").and_then(Value::as_str).map(str::trim) else {
+                return browser_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    "palyra.browser.navigate requires non-empty string field 'url'".to_owned(),
+                );
+            };
+            if url.is_empty() {
+                return browser_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    "palyra.browser.navigate requires non-empty string field 'url'".to_owned(),
+                );
+            }
+            let mut request = Request::new(browser_v1::NavigateRequest {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                session_id: Some(common_v1::CanonicalId { ulid: session_id }),
+                url: url.to_owned(),
+                timeout_ms: payload.get("timeout_ms").and_then(Value::as_u64).unwrap_or(0),
+                allow_redirects: payload
+                    .get("allow_redirects")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
+                max_redirects: payload.get("max_redirects").and_then(Value::as_u64).unwrap_or(3)
+                    as u32,
+                allow_private_targets: payload
+                    .get("allow_private_targets")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            });
+            if let Err(error) = attach_browser_auth_metadata(
+                &mut request,
+                runtime_state.config.browser_service.auth_token.as_deref(),
+            ) {
+                return browser_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    error,
+                );
+            }
+            match client.navigate(request).await {
+                Ok(response) => {
+                    let response = response.into_inner();
+                    let output = json!({
+                        "success": response.success,
+                        "final_url": response.final_url,
+                        "status_code": response.status_code,
+                        "title": response.title,
+                        "body_bytes": response.body_bytes,
+                        "latency_ms": response.latency_ms,
+                        "error": response.error,
+                    });
+                    (
+                        response.success,
+                        serde_json::to_vec(&output).unwrap_or_else(|_| b"{}".to_vec()),
+                        if response.success { String::new() } else { response.error },
+                    )
+                }
+                Err(error) => (
+                    false,
+                    b"{}".to_vec(),
+                    format!("palyra.browser.navigate failed: {}", sanitize_status_message(&error)),
+                ),
+            }
+        }
+        BROWSER_TITLE_TOOL_NAME => {
+            let session_id = match parse_browser_tool_session_id(&payload) {
+                Ok(value) => value,
+                Err(error) => {
+                    return browser_tool_execution_outcome(
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        error,
+                    );
+                }
+            };
+            let mut request = Request::new(browser_v1::GetTitleRequest {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                session_id: Some(common_v1::CanonicalId { ulid: session_id }),
+                max_title_bytes: payload
+                    .get("max_title_bytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(runtime_state.config.browser_service.max_title_bytes as u64),
+            });
+            if let Err(error) = attach_browser_auth_metadata(
+                &mut request,
+                runtime_state.config.browser_service.auth_token.as_deref(),
+            ) {
+                return browser_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    error,
+                );
+            }
+            match client.get_title(request).await {
+                Ok(response) => {
+                    let response = response.into_inner();
+                    let output = json!({
+                        "success": response.success,
+                        "title": response.title,
+                        "error": response.error,
+                    });
+                    (
+                        response.success,
+                        serde_json::to_vec(&output).unwrap_or_else(|_| b"{}".to_vec()),
+                        if response.success { String::new() } else { response.error },
+                    )
+                }
+                Err(error) => (
+                    false,
+                    b"{}".to_vec(),
+                    format!("palyra.browser.title failed: {}", sanitize_status_message(&error)),
+                ),
+            }
+        }
+        BROWSER_SCREENSHOT_TOOL_NAME => {
+            let session_id = match parse_browser_tool_session_id(&payload) {
+                Ok(value) => value,
+                Err(error) => {
+                    return browser_tool_execution_outcome(
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        error,
+                    );
+                }
+            };
+            let mut request = Request::new(browser_v1::ScreenshotRequest {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                session_id: Some(common_v1::CanonicalId { ulid: session_id }),
+                max_bytes: payload
+                    .get("max_bytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(runtime_state.config.browser_service.max_screenshot_bytes as u64),
+                format: payload.get("format").and_then(Value::as_str).unwrap_or("png").to_owned(),
+            });
+            if let Err(error) = attach_browser_auth_metadata(
+                &mut request,
+                runtime_state.config.browser_service.auth_token.as_deref(),
+            ) {
+                return browser_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    error,
+                );
+            }
+            match client.screenshot(request).await {
+                Ok(response) => {
+                    let response = response.into_inner();
+                    let output = json!({
+                        "success": response.success,
+                        "mime_type": response.mime_type,
+                        "image_base64": base64::engine::general_purpose::STANDARD
+                            .encode(response.image_bytes.as_slice()),
+                        "error": response.error,
+                    });
+                    (
+                        response.success,
+                        serde_json::to_vec(&output).unwrap_or_else(|_| b"{}".to_vec()),
+                        if response.success { String::new() } else { response.error },
+                    )
+                }
+                Err(error) => (
+                    false,
+                    b"{}".to_vec(),
+                    format!(
+                        "palyra.browser.screenshot failed: {}",
+                        sanitize_status_message(&error)
+                    ),
+                ),
+            }
+        }
+        _ => (false, b"{}".to_vec(), "palyra.browser.* unsupported tool name".to_owned()),
+    };
+
+    browser_tool_execution_outcome(proposal_id, input_json, outcome.0, outcome.1, outcome.2)
+}
+
+async fn connect_browser_service(
+    config: BrowserServiceRuntimeConfig,
+) -> Result<
+    browser_v1::browser_service_client::BrowserServiceClient<tonic::transport::Channel>,
+    String,
+> {
+    let endpoint = tonic::transport::Endpoint::from_shared(config.endpoint.clone())
+        .map_err(|error| {
+            format!("invalid browser service endpoint '{}': {error}", config.endpoint)
+        })?
+        .connect_timeout(Duration::from_millis(config.connect_timeout_ms))
+        .timeout(Duration::from_millis(config.request_timeout_ms));
+    let channel = endpoint.connect().await.map_err(|error| {
+        format!("failed to connect to browser service '{}': {error}", config.endpoint)
+    })?;
+    Ok(browser_v1::browser_service_client::BrowserServiceClient::new(channel))
+}
+
+fn parse_browser_tool_session_id(
+    payload: &serde_json::Map<String, Value>,
+) -> Result<String, String> {
+    let Some(session_id) = payload.get("session_id").and_then(Value::as_str).map(str::trim) else {
+        return Err("palyra.browser.* requires non-empty string field 'session_id'".to_owned());
+    };
+    if session_id.is_empty() {
+        return Err("palyra.browser.* requires non-empty string field 'session_id'".to_owned());
+    }
+    validate_canonical_id(session_id)
+        .map_err(|error| format!("palyra.browser.* session_id is invalid: {error}"))?;
+    Ok(session_id.to_owned())
+}
+
+fn attach_browser_auth_metadata<T>(
+    request: &mut Request<T>,
+    auth_token: Option<&str>,
+) -> Result<(), String> {
+    let Some(token) = auth_token.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    let value = tonic::metadata::MetadataValue::try_from(format!("Bearer {token}"))
+        .map_err(|error| format!("invalid browser service auth token metadata: {error}"))?;
+    request.metadata_mut().insert("authorization", value);
+    Ok(())
+}
+
+fn sanitize_status_message(status: &Status) -> String {
+    truncate_with_ellipsis(status.message().to_owned(), 512)
+}
+
+fn browser_tool_execution_outcome(
+    proposal_id: &str,
+    input_json: &[u8],
+    success: bool,
+    output_json: Vec<u8>,
+    error: String,
+) -> ToolExecutionOutcome {
+    let executed_at_unix_ms = current_unix_ms();
+    let mut hasher = Sha256::new();
+    hasher.update(b"palyra.browser.tool.attestation.v1");
+    hasher.update((proposal_id.len() as u64).to_be_bytes());
+    hasher.update(proposal_id.as_bytes());
+    hasher.update((input_json.len() as u64).to_be_bytes());
+    hasher.update(input_json);
+    hasher.update([u8::from(success)]);
+    hasher.update((output_json.len() as u64).to_be_bytes());
+    hasher.update(output_json.as_slice());
+    hasher.update((error.len() as u64).to_be_bytes());
+    hasher.update(error.as_bytes());
+    hasher.update(executed_at_unix_ms.to_be_bytes());
+    let execution_sha256 = format!("{:x}", hasher.finalize());
+
+    ToolExecutionOutcome {
+        success,
+        output_json,
+        error,
+        attestation: ToolAttestation {
+            attestation_id: Ulid::new().to_string(),
+            execution_sha256,
+            executed_at_unix_ms,
+            timed_out: false,
+            executor: "browser_broker".to_owned(),
+            sandbox_enforcement: "browser_service".to_owned(),
+        },
+    }
+}
+
 async fn execute_workspace_patch_tool(
     runtime_state: &Arc<GatewayRuntimeState>,
     principal: &str,
@@ -10612,9 +11805,12 @@ fn non_empty(input: String) -> Option<String> {
 mod tests {
     use std::{
         fs,
+        io::{Read, Write},
+        net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream},
         path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
-        time::{SystemTime, UNIX_EPOCH},
+        thread,
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     use axum::http::{header::AUTHORIZATION, HeaderMap, HeaderValue};
@@ -10634,10 +11830,11 @@ mod tests {
     use super::{
         apply_tool_approval_outcome, authorize_approvals_action, authorize_headers,
         best_effort_mark_approval_error, constant_time_eq, enforce_memory_item_scope,
-        enforce_vault_get_approval_policy, enforce_vault_scope_access, execute_memory_search_tool,
-        execute_workspace_patch_tool, extend_patch_string_defaults, parse_patch_string_array_field,
-        principal_has_sensitive_service_role, request_context_from_headers,
-        resolve_cron_job_channel_for_create, vault_get_requires_approval,
+        enforce_vault_get_approval_policy, enforce_vault_scope_access, execute_http_fetch_tool,
+        execute_memory_search_tool, execute_workspace_patch_tool, extend_patch_string_defaults,
+        parse_patch_string_array_field, principal_has_sensitive_service_role,
+        request_context_from_headers, resolve_cron_job_channel_for_create,
+        validate_resolved_fetch_addresses, vault_get_requires_approval,
         workspace_patch_metrics_from_output, AuthError, GatewayAuthConfig,
         GatewayJournalConfigSnapshot, GatewayRuntimeConfigSnapshot, GatewayRuntimeState,
         MemoryRuntimeConfig, ProviderRequest, RequestContext, SensitiveServiceRole,
@@ -10656,6 +11853,52 @@ mod tests {
         let counter = TEMP_JOURNAL_COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir()
             .join(format!("palyra-gateway-unit-{nonce}-{}-{counter}.sqlite3", std::process::id()))
+    }
+
+    fn read_http_request(stream: &mut TcpStream) {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("request read timeout should be configured");
+        let mut buffer = [0_u8; 1024];
+        let _ = stream.read(&mut buffer);
+    }
+
+    fn spawn_redirect_loop_http_server(
+        expected_requests: usize,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("redirect test listener should bind");
+        let address = listener.local_addr().expect("redirect test listener address should resolve");
+        let handle = thread::spawn(move || {
+            for _ in 0..expected_requests {
+                let (mut stream, _) =
+                    listener.accept().expect("redirect test listener should accept request");
+                read_http_request(&mut stream);
+                let response = "HTTP/1.1 302 Found\r\nLocation: /loop\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                stream.write_all(response.as_bytes()).expect("redirect test response should write");
+                stream.flush().expect("redirect test response should flush");
+            }
+        });
+        (format!("http://{address}/loop"), handle)
+    }
+
+    fn spawn_static_http_server(body: &str) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("static test listener should bind");
+        let address = listener.local_addr().expect("static test listener address should resolve");
+        let response_body = body.to_owned();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) =
+                listener.accept().expect("static test listener should accept request");
+            read_http_request(&mut stream);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream.write_all(response.as_bytes()).expect("static test response should write");
+            stream.flush().expect("static test response should flush");
+        });
+        (format!("http://{address}/"), handle)
     }
 
     fn build_test_runtime_state(hash_chain_enabled: bool) -> std::sync::Arc<GatewayRuntimeState> {
@@ -10720,6 +11963,38 @@ mod tests {
                         allowed_channels: Vec::new(),
                     },
                 },
+                http_fetch: super::HttpFetchRuntimeConfig {
+                    allow_private_targets: false,
+                    connect_timeout_ms: 1_500,
+                    request_timeout_ms: 10_000,
+                    max_response_bytes: 512 * 1024,
+                    allow_redirects: true,
+                    max_redirects: 3,
+                    allowed_content_types: vec![
+                        "text/html".to_owned(),
+                        "text/plain".to_owned(),
+                        "application/json".to_owned(),
+                    ],
+                    allowed_request_headers: vec![
+                        "accept".to_owned(),
+                        "accept-language".to_owned(),
+                        "if-none-match".to_owned(),
+                        "if-modified-since".to_owned(),
+                        "user-agent".to_owned(),
+                    ],
+                    cache_enabled: true,
+                    cache_ttl_ms: 30_000,
+                    max_cache_entries: 256,
+                },
+                browser_service: super::BrowserServiceRuntimeConfig {
+                    enabled: false,
+                    endpoint: "http://127.0.0.1:7543".to_owned(),
+                    auth_token: None,
+                    connect_timeout_ms: 1_500,
+                    request_timeout_ms: 15_000,
+                    max_screenshot_bytes: 256 * 1024,
+                    max_title_bytes: 4 * 1024,
+                },
             },
             GatewayJournalConfigSnapshot { db_path, hash_chain_enabled },
             journal_store,
@@ -10773,6 +12048,101 @@ mod tests {
                 policy_explanation: "Policy requires explicit approval".to_owned(),
             },
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_fetch_rejects_blocked_scheme() {
+        let state = build_test_runtime_state(false);
+        let input = serde_json::to_vec(&json!({
+            "url": "file:///tmp/secret.txt"
+        }))
+        .expect("input should serialize");
+        let outcome =
+            execute_http_fetch_tool(&state, "proposal-http-fetch-1", input.as_slice()).await;
+        assert!(!outcome.success, "blocked scheme should be rejected");
+        assert!(
+            outcome.error.contains("blocked URL scheme"),
+            "error should explain blocked scheme: {}",
+            outcome.error
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_fetch_rejects_private_targets_by_default() {
+        let state = build_test_runtime_state(false);
+        let input = serde_json::to_vec(&json!({
+            "url": "http://127.0.0.1:8080/"
+        }))
+        .expect("input should serialize");
+        let outcome =
+            execute_http_fetch_tool(&state, "proposal-http-fetch-2", input.as_slice()).await;
+        assert!(!outcome.success, "private targets must be denied by default");
+        assert!(
+            outcome.error.contains("target blocked") && outcome.error.contains("private/local"),
+            "error should explain private target block: {}",
+            outcome.error
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_fetch_detects_redirect_loop_limit() {
+        let state = build_test_runtime_state(false);
+        let (url, handle) = spawn_redirect_loop_http_server(3);
+        let input = serde_json::to_vec(&json!({
+            "url": url,
+            "allow_private_targets": true,
+            "allow_redirects": true,
+            "max_redirects": 2
+        }))
+        .expect("input should serialize");
+        let outcome =
+            execute_http_fetch_tool(&state, "proposal-http-fetch-3", input.as_slice()).await;
+        assert!(!outcome.success, "redirect loops should be bounded");
+        assert!(
+            outcome.error.contains("redirect limit exceeded (2)"),
+            "error should include redirect limit context: {}",
+            outcome.error
+        );
+        handle.join().expect("redirect loop server should process expected request count");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_fetch_enforces_response_size_cutoff() {
+        let state = build_test_runtime_state(false);
+        let (url, handle) = spawn_static_http_server(&"X".repeat(256));
+        let input = serde_json::to_vec(&json!({
+            "url": url,
+            "allow_private_targets": true,
+            "max_response_bytes": 64
+        }))
+        .expect("input should serialize");
+        let outcome =
+            execute_http_fetch_tool(&state, "proposal-http-fetch-4", input.as_slice()).await;
+        assert!(!outcome.success, "oversized response should be rejected");
+        assert!(
+            outcome.error.contains("max_response_bytes (64)"),
+            "error should include cutoff details: {}",
+            outcome.error
+        );
+        handle.join().expect("static server should complete after single request");
+    }
+
+    #[test]
+    fn http_fetch_rebinding_simulation_rejects_mixed_public_private_answers() {
+        let addresses = vec![
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 443),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 443),
+        ];
+        let blocked = validate_resolved_fetch_addresses(addresses.as_slice(), false);
+        assert!(
+            blocked.is_err(),
+            "mixed public/private DNS answers must be denied to prevent rebinding"
+        );
+        let allowed = validate_resolved_fetch_addresses(addresses.as_slice(), true);
+        assert!(
+            allowed.is_ok(),
+            "explicit private-target override should permit mixed DNS answers"
+        );
     }
 
     #[test]

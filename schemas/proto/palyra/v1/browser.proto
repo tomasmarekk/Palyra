@@ -5,61 +5,127 @@ package palyra.browser.v1;
 import "palyra/v1/common.proto";
 
 service BrowserService {
-  rpc StartProfile(StartProfileRequest) returns (StartProfileResponse);
-  rpc ExecuteAction(ExecuteActionRequest) returns (ExecuteActionResponse);
-  rpc Observe(stream ObserveRequest) returns (stream ObserveEvent);
+  rpc Health(BrowserHealthRequest) returns (BrowserHealthResponse);
+  rpc CreateSession(CreateSessionRequest) returns (CreateSessionResponse);
+  rpc CloseSession(CloseSessionRequest) returns (CloseSessionResponse);
+  rpc Navigate(NavigateRequest) returns (NavigateResponse);
+  rpc GetTitle(GetTitleRequest) returns (GetTitleResponse);
+  rpc Screenshot(ScreenshotRequest) returns (ScreenshotResponse);
 }
 
-message StartProfileRequest {
+message BrowserHealthRequest {
   uint32 v = 1;
-  palyra.common.v1.CanonicalId profile_id = 2;
-  string user_data_path = 3;
-  uint64 max_payload_bytes = 4;
+  reserved 2 to 10;
+}
+
+message BrowserHealthResponse {
+  uint32 v = 1;
+  string status = 2;
+  uint64 uptime_seconds = 3;
+  uint32 active_sessions = 4;
+  reserved 5 to 12;
+}
+
+message SessionBudget {
+  uint64 max_navigation_timeout_ms = 1;
+  uint64 max_session_lifetime_ms = 2;
+  uint64 max_screenshot_bytes = 3;
+  uint64 max_response_bytes = 4;
 
   reserved 5 to 12;
 }
 
-message StartProfileResponse {
+message CreateSessionRequest {
   uint32 v = 1;
-  palyra.common.v1.CanonicalId profile_id = 2;
-  bool started = 3;
-  string websocket_url = 4;
-
-  reserved 5 to 12;
-}
-
-message ExecuteActionRequest {
-  uint32 v = 1;
-  palyra.common.v1.CanonicalId profile_id = 2;
-  string action = 3;
-  bytes input_json = 4;
-  uint64 max_payload_bytes = 5;
+  string principal = 2;
+  uint64 idle_ttl_ms = 3;
+  SessionBudget budget = 4;
+  bool allow_private_targets = 5;
 
   reserved 6 to 14;
 }
 
-message ExecuteActionResponse {
+message CreateSessionResponse {
   uint32 v = 1;
-  bool success = 2;
-  bytes output_json = 3;
-  string error = 4;
+  palyra.common.v1.CanonicalId session_id = 2;
+  uint64 created_at_unix_ms = 3;
+  SessionBudget effective_budget = 4;
 
   reserved 5 to 12;
 }
 
-message ObserveRequest {
+message CloseSessionRequest {
   uint32 v = 1;
-  palyra.common.v1.CanonicalId profile_id = 2;
-  repeated string topics = 3;
+  palyra.common.v1.CanonicalId session_id = 2;
+
+  reserved 3 to 10;
+}
+
+message CloseSessionResponse {
+  uint32 v = 1;
+  bool closed = 2;
+  string reason = 3;
+
+  reserved 4 to 12;
+}
+
+message NavigateRequest {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId session_id = 2;
+  string url = 3;
+  uint64 timeout_ms = 4;
+  bool allow_redirects = 5;
+  uint32 max_redirects = 6;
+  bool allow_private_targets = 7;
+
+  reserved 8 to 14;
+}
+
+message NavigateResponse {
+  uint32 v = 1;
+  bool success = 2;
+  string final_url = 3;
+  uint32 status_code = 4;
+  string title = 5;
+  uint64 body_bytes = 6;
+  uint64 latency_ms = 7;
+  string error = 8;
+
+  reserved 9 to 14;
+}
+
+message GetTitleRequest {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId session_id = 2;
+  uint64 max_title_bytes = 3;
 
   reserved 4 to 10;
 }
 
-message ObserveEvent {
+message GetTitleResponse {
   uint32 v = 1;
-  palyra.common.v1.CanonicalId profile_id = 2;
-  string topic = 3;
-  bytes payload_json = 4;
+  bool success = 2;
+  string title = 3;
+  string error = 4;
+
+  reserved 5 to 10;
+}
+
+message ScreenshotRequest {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId session_id = 2;
+  uint64 max_bytes = 3;
+  string format = 4;
 
   reserved 5 to 12;
+}
+
+message ScreenshotResponse {
+  uint32 v = 1;
+  bool success = 2;
+  bytes image_bytes = 3;
+  string mime_type = 4;
+  string error = 5;
+
+  reserved 6 to 12;
 }

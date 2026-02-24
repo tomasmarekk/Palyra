@@ -77,28 +77,52 @@ public enum PalyraAuthV1 {
 }
 
 public enum PalyraBrowserV1 {
-    public struct ExecuteActionRequest: Equatable {
+    public struct BrowserHealthRequest: Equatable {
         public init() {}
     }
-    public struct ExecuteActionResponse: Equatable {
+    public struct BrowserHealthResponse: Equatable {
         public init() {}
     }
-    public struct ObserveEvent: Equatable {
+    public struct CloseSessionRequest: Equatable {
         public init() {}
     }
-    public struct ObserveRequest: Equatable {
+    public struct CloseSessionResponse: Equatable {
         public init() {}
     }
-    public struct StartProfileRequest: Equatable {
+    public struct CreateSessionRequest: Equatable {
         public init() {}
     }
-    public struct StartProfileResponse: Equatable {
+    public struct CreateSessionResponse: Equatable {
+        public init() {}
+    }
+    public struct GetTitleRequest: Equatable {
+        public init() {}
+    }
+    public struct GetTitleResponse: Equatable {
+        public init() {}
+    }
+    public struct NavigateRequest: Equatable {
+        public init() {}
+    }
+    public struct NavigateResponse: Equatable {
+        public init() {}
+    }
+    public struct ScreenshotRequest: Equatable {
+        public init() {}
+    }
+    public struct ScreenshotResponse: Equatable {
+        public init() {}
+    }
+    public struct SessionBudget: Equatable {
         public init() {}
     }
     public protocol BrowserServiceClient {
-        func executeAction()
-        func observe()
-        func startProfile()
+        func closeSession()
+        func createSession()
+        func getTitle()
+        func health()
+        func navigate()
+        func screenshot()
     }
 }
 

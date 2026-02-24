@@ -2343,9 +2343,17 @@ dependencies = [
  "axum 0.8.8",
  "clap",
  "palyra-common",
+ "prost",
+ "protoc-bin-vendored",
+ "reqwest",
+ "serde_json",
  "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-build",
  "tracing",
  "tracing-subscriber",
+ "ulid",
 ]
 
 [[package]]
