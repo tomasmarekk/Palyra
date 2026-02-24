@@ -63,6 +63,6 @@ toml = "0.8.20"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }
 ulid = "1.2.0"
-wasmtime = { version = "41.0.3", default-features = false, features = ["cranelift", "runtime", "wat"] }
+wasmtime = { version = "41.0.4", default-features = false, features = ["cranelift", "runtime", "wat"] }
 x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
 zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
