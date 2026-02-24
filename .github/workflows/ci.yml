@@ -75,8 +75,22 @@ jobs:
 
       - name: Install protocol tooling
         run: |
+          missing_packages=()
+          if ! command -v protoc >/dev/null 2>&1; then
+            missing_packages+=(protobuf-compiler)
+          fi
+          if ! command -v javac >/dev/null 2>&1; then
+            missing_packages+=(default-jdk)
+          fi
+          if ! command -v kotlinc >/dev/null 2>&1; then
+            missing_packages+=(kotlin)
+          fi
+          if [ "${#missing_packages[@]}" -eq 0 ]; then
+            echo "Protocol tooling already available on runner."
+            exit 0
+          fi
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler default-jdk kotlin
+          sudo apt-get install -y "${missing_packages[@]}"
 
       - name: Validate protobuf schemas
         run: bash scripts/protocol/validate-proto.sh
