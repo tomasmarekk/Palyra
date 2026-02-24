@@ -86,6 +86,9 @@ public enum PalyraBrowserV1 {
     public struct BrowserHealthResponse: Equatable {
         public init() {}
     }
+    public struct BrowserTab: Equatable {
+        public init() {}
+    }
     public struct ClickRequest: Equatable {
         public init() {}
     }
@@ -98,16 +101,34 @@ public enum PalyraBrowserV1 {
     public struct CloseSessionResponse: Equatable {
         public init() {}
     }
+    public struct CloseTabRequest: Equatable {
+        public init() {}
+    }
+    public struct CloseTabResponse: Equatable {
+        public init() {}
+    }
     public struct CreateSessionRequest: Equatable {
         public init() {}
     }
     public struct CreateSessionResponse: Equatable {
         public init() {}
     }
+    public struct GetPermissionsRequest: Equatable {
+        public init() {}
+    }
+    public struct GetPermissionsResponse: Equatable {
+        public init() {}
+    }
     public struct GetTitleRequest: Equatable {
         public init() {}
     }
     public struct GetTitleResponse: Equatable {
+        public init() {}
+    }
+    public struct ListTabsRequest: Equatable {
+        public init() {}
+    }
+    public struct ListTabsResponse: Equatable {
         public init() {}
     }
     public struct NavigateRequest: Equatable {
@@ -134,6 +155,18 @@ public enum PalyraBrowserV1 {
     public struct ObserveResponse: Equatable {
         public init() {}
     }
+    public struct OpenTabRequest: Equatable {
+        public init() {}
+    }
+    public struct OpenTabResponse: Equatable {
+        public init() {}
+    }
+    public struct ResetStateRequest: Equatable {
+        public init() {}
+    }
+    public struct ResetStateResponse: Equatable {
+        public init() {}
+    }
     public struct ScreenshotRequest: Equatable {
         public init() {}
     }
@@ -147,6 +180,21 @@ public enum PalyraBrowserV1 {
         public init() {}
     }
     public struct SessionBudget: Equatable {
+        public init() {}
+    }
+    public struct SessionPermissions: Equatable {
+        public init() {}
+    }
+    public struct SetPermissionsRequest: Equatable {
+        public init() {}
+    }
+    public struct SetPermissionsResponse: Equatable {
+        public init() {}
+    }
+    public struct SwitchTabRequest: Equatable {
+        public init() {}
+    }
+    public struct SwitchTabResponse: Equatable {
         public init() {}
     }
     public struct TypeRequest: Equatable {
@@ -164,14 +212,21 @@ public enum PalyraBrowserV1 {
     public protocol BrowserServiceClient {
         func click()
         func closeSession()
+        func closeTab()
         func createSession()
+        func getPermissions()
         func getTitle()
         func health()
+        func listTabs()
         func navigate()
         func networkLog()
         func observe()
+        func openTab()
+        func resetState()
         func screenshot()
         func scroll()
+        func setPermissions()
+        func switchTab()
         func type()
         func waitFor()
     }

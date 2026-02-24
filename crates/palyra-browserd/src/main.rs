@@ -1,23 +1,31 @@
 use std::{
     collections::{HashMap, VecDeque},
+    fs,
     net::IpAddr,
+    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
 use axum::{extract::State, response::IntoResponse, routing::get, Json, Router};
+use base64::Engine as _;
 use clap::Parser;
 use palyra_common::{
     build_metadata, health_response, parse_daemon_bind_socket, validate_canonical_id,
     HealthResponse, CANONICAL_PROTOCOL_MAJOR,
 };
 use reqwest::{redirect::Policy, Url};
+use ring::{
+    aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305},
+    rand::{SecureRandom, SystemRandom},
+};
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio::time::{interval, MissedTickBehavior};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{transport::Server, Request, Response, Status};
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use ulid::Ulid;
 
@@ -63,6 +71,15 @@ const MAX_NETWORK_LOG_URL_BYTES: usize = 2 * 1024;
 const DEFAULT_ACTION_RETRY_INTERVAL_MS: u64 = 100;
 const CLEANUP_INTERVAL_MS: u64 = 15_000;
 const AUTHORIZATION_HEADER: &str = "authorization";
+const STATE_DIR_ENV: &str = "PALYRA_BROWSERD_STATE_DIR";
+const STATE_KEY_ENV: &str = "PALYRA_BROWSERD_STATE_ENCRYPTION_KEY";
+const DEFAULT_STATE_DIR_NAME: &str = "palyra-browserd-state";
+const STATE_FILE_MAGIC: &[u8; 4] = b"PBS1";
+const STATE_NONCE_LEN: usize = 12;
+const STATE_KEY_LEN: usize = 32;
+const STATE_TMP_EXTENSION: &str = "tmp";
+const COOKIE_HEADER: &str = "cookie";
+const SET_COOKIE_HEADER: &str = "set-cookie";
 const ONE_BY_ONE_PNG: &[u8] = &[
     137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0,
     0, 0, 31, 21, 196, 137, 0, 0, 0, 10, 73, 68, 65, 84, 120, 156, 99, 96, 0, 0, 0, 2, 0, 1, 229,
@@ -117,28 +134,64 @@ struct SessionBudget {
     max_network_log_bytes: u64,
 }
 
-#[derive(Debug, Clone)]
-struct BrowserSessionRecord {
-    last_active: Instant,
-    created_at: Instant,
-    idle_ttl: Duration,
-    budget: SessionBudget,
-    allow_private_targets: bool,
-    allow_downloads: bool,
-    action_allowed_domains: Vec<String>,
-    last_title: String,
-    last_url: Option<String>,
-    last_page_body: String,
-    scroll_x: i64,
-    scroll_y: i64,
-    typed_inputs: HashMap<String, String>,
-    action_count: u64,
-    action_window: VecDeque<Instant>,
-    action_log: VecDeque<BrowserActionLogEntryInternal>,
-    network_log: VecDeque<NetworkLogEntryInternal>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+enum PermissionSettingInternal {
+    #[default]
+    Deny,
+    Allow,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SessionPermissionsInternal {
+    camera: PermissionSettingInternal,
+    microphone: PermissionSettingInternal,
+    location: PermissionSettingInternal,
+}
+
+impl Default for SessionPermissionsInternal {
+    fn default() -> Self {
+        Self {
+            camera: PermissionSettingInternal::Deny,
+            microphone: PermissionSettingInternal::Deny,
+            location: PermissionSettingInternal::Deny,
+        }
+    }
+}
+
+impl SessionPermissionsInternal {
+    fn to_proto(&self) -> browser_v1::SessionPermissions {
+        browser_v1::SessionPermissions {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            camera: permission_setting_to_proto(self.camera),
+            microphone: permission_setting_to_proto(self.microphone),
+            location: permission_setting_to_proto(self.location),
+        }
+    }
+
+    fn apply_update(
+        &mut self,
+        camera: i32,
+        microphone: i32,
+        location: i32,
+        reset_to_default: bool,
+    ) {
+        if reset_to_default {
+            *self = Self::default();
+            return;
+        }
+        if let Some(value) = permission_setting_from_proto(camera) {
+            self.camera = value;
+        }
+        if let Some(value) = permission_setting_from_proto(microphone) {
+            self.microphone = value;
+        }
+        if let Some(value) = permission_setting_from_proto(location) {
+            self.location = value;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct BrowserActionLogEntryInternal {
     action_id: String,
     action_name: String,
@@ -152,13 +205,13 @@ struct BrowserActionLogEntryInternal {
     page_url: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct NetworkLogHeaderInternal {
     name: String,
     value: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct NetworkLogEntryInternal {
     request_url: String,
     status_code: u16,
@@ -168,6 +221,231 @@ struct NetworkLogEntryInternal {
     headers: Vec<NetworkLogHeaderInternal>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BrowserTabRecord {
+    tab_id: String,
+    last_title: String,
+    last_url: Option<String>,
+    last_page_body: String,
+    scroll_x: i64,
+    scroll_y: i64,
+    typed_inputs: HashMap<String, String>,
+    network_log: VecDeque<NetworkLogEntryInternal>,
+}
+
+impl BrowserTabRecord {
+    fn new(tab_id: String) -> Self {
+        Self {
+            tab_id,
+            last_title: String::new(),
+            last_url: None,
+            last_page_body: String::new(),
+            scroll_x: 0,
+            scroll_y: 0,
+            typed_inputs: HashMap::new(),
+            network_log: VecDeque::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct SessionPersistenceState {
+    enabled: bool,
+    persistence_id: Option<String>,
+    state_restored: bool,
+}
+
+#[derive(Debug, Clone)]
+struct BrowserSessionInit {
+    principal: String,
+    channel: Option<String>,
+    now: Instant,
+    idle_ttl: Duration,
+    budget: SessionBudget,
+    allow_private_targets: bool,
+    allow_downloads: bool,
+    action_allowed_domains: Vec<String>,
+    persistence: SessionPersistenceState,
+}
+
+#[derive(Debug, Clone)]
+struct BrowserSessionRecord {
+    principal: String,
+    channel: Option<String>,
+    last_active: Instant,
+    created_at: Instant,
+    idle_ttl: Duration,
+    budget: SessionBudget,
+    allow_private_targets: bool,
+    allow_downloads: bool,
+    action_allowed_domains: Vec<String>,
+    action_count: u64,
+    action_window: VecDeque<Instant>,
+    action_log: VecDeque<BrowserActionLogEntryInternal>,
+    tabs: HashMap<String, BrowserTabRecord>,
+    tab_order: Vec<String>,
+    active_tab_id: String,
+    permissions: SessionPermissionsInternal,
+    cookie_jar: HashMap<String, HashMap<String, String>>,
+    storage_entries: HashMap<String, HashMap<String, String>>,
+    persistence: SessionPersistenceState,
+}
+
+impl BrowserSessionRecord {
+    fn with_defaults(init: BrowserSessionInit) -> Self {
+        let initial_tab_id = Ulid::new().to_string();
+        let mut tabs = HashMap::new();
+        tabs.insert(initial_tab_id.clone(), BrowserTabRecord::new(initial_tab_id.clone()));
+        Self {
+            principal: init.principal,
+            channel: init.channel,
+            last_active: init.now,
+            created_at: init.now,
+            idle_ttl: init.idle_ttl,
+            budget: init.budget,
+            allow_private_targets: init.allow_private_targets,
+            allow_downloads: init.allow_downloads,
+            action_allowed_domains: init.action_allowed_domains,
+            action_count: 0,
+            action_window: VecDeque::new(),
+            action_log: VecDeque::new(),
+            tabs,
+            tab_order: vec![initial_tab_id.clone()],
+            active_tab_id: initial_tab_id,
+            permissions: SessionPermissionsInternal::default(),
+            cookie_jar: HashMap::new(),
+            storage_entries: HashMap::new(),
+            persistence: init.persistence,
+        }
+    }
+
+    fn active_tab(&self) -> Option<&BrowserTabRecord> {
+        self.tabs.get(self.active_tab_id.as_str())
+    }
+
+    fn active_tab_mut(&mut self) -> Option<&mut BrowserTabRecord> {
+        self.tabs.get_mut(self.active_tab_id.as_str())
+    }
+
+    fn create_tab(&mut self) -> String {
+        let tab_id = Ulid::new().to_string();
+        self.tabs.insert(tab_id.clone(), BrowserTabRecord::new(tab_id.clone()));
+        self.tab_order.push(tab_id.clone());
+        tab_id
+    }
+
+    fn tab_to_proto(&self, tab_id: &str) -> Option<browser_v1::BrowserTab> {
+        self.tabs.get(tab_id).map(|tab| browser_v1::BrowserTab {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            tab_id: Some(proto::palyra::common::v1::CanonicalId { ulid: tab.tab_id.clone() }),
+            url: normalize_url_with_redaction(tab.last_url.as_deref().unwrap_or_default()),
+            title: truncate_utf8_bytes(
+                tab.last_title.as_str(),
+                self.budget.max_title_bytes as usize,
+            ),
+            active: tab_id == self.active_tab_id,
+        })
+    }
+
+    fn list_tabs(&self) -> Vec<browser_v1::BrowserTab> {
+        self.tab_order.iter().filter_map(|tab_id| self.tab_to_proto(tab_id)).collect()
+    }
+
+    fn close_tab(&mut self, tab_id: &str) -> Result<(String, Option<String>), String> {
+        if self.tabs.len() <= 1 {
+            return Err("cannot close the last remaining tab".to_owned());
+        }
+        if self.tabs.remove(tab_id).is_none() {
+            return Err("tab_not_found".to_owned());
+        }
+        self.tab_order.retain(|value| value != tab_id);
+        let mut switched_to = None;
+        if self.active_tab_id == tab_id {
+            if let Some(next_tab_id) = self.tab_order.first() {
+                self.active_tab_id = next_tab_id.clone();
+                switched_to = Some(next_tab_id.clone());
+            } else {
+                let created = self.create_tab();
+                self.active_tab_id = created.clone();
+                switched_to = Some(created);
+            }
+        }
+        Ok((tab_id.to_owned(), switched_to))
+    }
+
+    fn apply_snapshot(&mut self, snapshot: PersistedSessionSnapshot) {
+        let mut tabs = HashMap::new();
+        for mut tab in snapshot.tabs {
+            if validate_canonical_id(tab.tab_id.as_str()).is_ok() {
+                tab.network_log = tab
+                    .network_log
+                    .into_iter()
+                    .take(self.budget.max_network_log_entries)
+                    .collect::<VecDeque<_>>();
+                while tab
+                    .network_log
+                    .iter()
+                    .map(estimate_network_log_entry_internal_bytes)
+                    .sum::<usize>()
+                    > self.budget.max_network_log_bytes as usize
+                {
+                    if tab.network_log.pop_front().is_none() {
+                        break;
+                    }
+                }
+                tabs.insert(tab.tab_id.clone(), tab);
+            }
+        }
+        if tabs.is_empty() {
+            let initial_tab_id = Ulid::new().to_string();
+            tabs.insert(initial_tab_id.clone(), BrowserTabRecord::new(initial_tab_id.clone()));
+            self.tab_order = vec![initial_tab_id.clone()];
+            self.active_tab_id = initial_tab_id;
+        } else {
+            let mut tab_order = snapshot
+                .tab_order
+                .into_iter()
+                .filter(|tab_id| tabs.contains_key(tab_id.as_str()))
+                .collect::<Vec<_>>();
+            for tab_id in tabs.keys() {
+                if !tab_order.iter().any(|existing| existing == tab_id) {
+                    tab_order.push(tab_id.clone());
+                }
+            }
+            self.active_tab_id = if tabs.contains_key(snapshot.active_tab_id.as_str()) {
+                snapshot.active_tab_id
+            } else {
+                tab_order.first().cloned().unwrap_or_else(|| Ulid::new().to_string())
+            };
+            self.tab_order = tab_order;
+        }
+        self.tabs = tabs;
+        self.permissions = snapshot.permissions;
+        self.cookie_jar = snapshot.cookie_jar;
+        self.storage_entries = snapshot.storage_entries;
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedSessionSnapshot {
+    v: u32,
+    principal: String,
+    channel: Option<String>,
+    tabs: Vec<BrowserTabRecord>,
+    tab_order: Vec<String>,
+    active_tab_id: String,
+    permissions: SessionPermissionsInternal,
+    cookie_jar: HashMap<String, HashMap<String, String>>,
+    storage_entries: HashMap<String, HashMap<String, String>>,
+    saved_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct PersistedStateStore {
+    root_dir: PathBuf,
+    key: [u8; STATE_KEY_LEN],
+}
+
 #[derive(Debug)]
 struct BrowserRuntimeState {
     started_at: Instant,
@@ -175,6 +453,7 @@ struct BrowserRuntimeState {
     default_idle_ttl: Duration,
     default_budget: SessionBudget,
     max_sessions: usize,
+    state_store: Option<PersistedStateStore>,
     sessions: Mutex<HashMap<String, BrowserSessionRecord>>,
 }
 
@@ -183,6 +462,7 @@ impl BrowserRuntimeState {
         if args.session_idle_ttl_ms == 0 || args.max_sessions == 0 {
             anyhow::bail!("session_idle_ttl_ms and max_sessions must be greater than zero");
         }
+        let state_store = build_state_store_from_env()?;
         Ok(Self {
             started_at: Instant::now(),
             auth_token: args
@@ -216,6 +496,7 @@ impl BrowserRuntimeState {
                 max_network_log_bytes: DEFAULT_MAX_NETWORK_LOG_BYTES,
             },
             max_sessions: args.max_sessions,
+            state_store,
             sessions: Mutex::new(HashMap::new()),
         })
     }
@@ -268,13 +549,39 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
     ) -> Result<Response<browser_v1::CreateSessionResponse>, Status> {
         self.runtime.authorize(request.metadata()).await?;
         let payload = request.into_inner();
-        if payload.principal.trim().is_empty() {
+        let principal = payload.principal.trim();
+        if principal.is_empty() {
             return Err(Status::invalid_argument("principal is required"));
         }
-        let mut sessions = self.runtime.sessions.lock().await;
-        if sessions.len() >= self.runtime.max_sessions {
-            return Err(Status::resource_exhausted("browser session capacity reached"));
-        }
+        let channel = normalize_optional_string(payload.channel.as_str());
+        let persistence_id = if payload.persistence_enabled {
+            let Some(value) = sanitize_persistence_id(payload.persistence_id.as_str()) else {
+                return Err(Status::invalid_argument(
+                    "persistence_enabled=true requires non-empty persistence_id",
+                ));
+            };
+            Some(value)
+        } else {
+            None
+        };
+        let restored_snapshot = if payload.persistence_enabled {
+            let Some(store) = self.runtime.state_store.as_ref() else {
+                return Err(Status::failed_precondition(
+                    "state persistence requires PALYRA_BROWSERD_STATE_ENCRYPTION_KEY",
+                ));
+            };
+            let Some(state_id) = persistence_id.as_ref() else {
+                return Err(Status::invalid_argument(
+                    "persistence_enabled=true requires non-empty persistence_id",
+                ));
+            };
+            store.load_snapshot(state_id.as_str()).map_err(|error| {
+                Status::internal(format!("failed to load persisted state: {error}"))
+            })?
+        } else {
+            None
+        };
+
         let session_id = Ulid::new().to_string();
         let now = Instant::now();
         let idle_ttl = if payload.idle_ttl_ms == 0 {
@@ -373,28 +680,55 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         };
         let action_allowed_domains =
             normalize_action_allowed_domains(payload.action_allowed_domains.as_slice());
-        sessions.insert(
-            session_id.clone(),
-            BrowserSessionRecord {
-                last_active: now,
-                created_at: now,
-                idle_ttl,
-                budget: budget.clone(),
-                allow_private_targets: payload.allow_private_targets,
-                allow_downloads: payload.allow_downloads,
-                action_allowed_domains: action_allowed_domains.clone(),
-                last_title: String::new(),
-                last_url: None,
-                last_page_body: String::new(),
-                scroll_x: 0,
-                scroll_y: 0,
-                typed_inputs: HashMap::new(),
-                action_count: 0,
-                action_window: VecDeque::new(),
-                action_log: VecDeque::new(),
-                network_log: VecDeque::new(),
+        let mut session = BrowserSessionRecord::with_defaults(BrowserSessionInit {
+            principal: principal.to_owned(),
+            channel: channel.clone(),
+            now,
+            idle_ttl,
+            budget: budget.clone(),
+            allow_private_targets: payload.allow_private_targets,
+            allow_downloads: payload.allow_downloads,
+            action_allowed_domains: action_allowed_domains.clone(),
+            persistence: SessionPersistenceState {
+                enabled: payload.persistence_enabled,
+                persistence_id: persistence_id.clone(),
+                state_restored: false,
             },
-        );
+        });
+        if let Some(snapshot) = restored_snapshot {
+            if snapshot.principal != principal {
+                return Err(Status::permission_denied(
+                    "persisted state principal does not match session principal",
+                ));
+            }
+            if normalize_optional_string(snapshot.channel.as_deref().unwrap_or_default()) != channel
+            {
+                return Err(Status::permission_denied(
+                    "persisted state channel does not match session channel",
+                ));
+            }
+            session.apply_snapshot(snapshot);
+            session.persistence.state_restored = true;
+        }
+        let state_restored = session.persistence.state_restored;
+        let persist_on_create = payload.persistence_enabled;
+        let mut session_for_persist = None;
+        {
+            let mut sessions = self.runtime.sessions.lock().await;
+            if sessions.len() >= self.runtime.max_sessions {
+                return Err(Status::resource_exhausted("browser session capacity reached"));
+            }
+            sessions.insert(session_id.clone(), session.clone());
+            if persist_on_create {
+                session_for_persist = Some(session);
+            }
+        }
+        if let (Some(store), Some(record)) =
+            (self.runtime.state_store.as_ref(), session_for_persist)
+        {
+            persist_session_snapshot(store, &record)
+                .map_err(|error| Status::internal(format!("failed to persist state: {error}")))?;
+        }
 
         Ok(Response::new(browser_v1::CreateSessionResponse {
             v: CANONICAL_PROTOCOL_MAJOR,
@@ -418,6 +752,9 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             }),
             downloads_enabled: payload.allow_downloads,
             action_allowed_domains,
+            persistence_enabled: payload.persistence_enabled,
+            persistence_id: persistence_id.unwrap_or_default(),
+            state_restored,
         }))
     }
 
@@ -429,6 +766,15 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         let session_id = parse_session_id_from_proto(request.into_inner().session_id)
             .map_err(Status::invalid_argument)?;
         let removed = self.runtime.sessions.lock().await.remove(session_id.as_str());
+        if let (Some(store), Some(record)) = (self.runtime.state_store.as_ref(), removed.as_ref()) {
+            if record.persistence.enabled {
+                persist_session_snapshot(store, record).map_err(|error| {
+                    Status::internal(format!(
+                        "failed to persist state while closing session: {error}"
+                    ))
+                })?;
+            }
+        }
         Ok(Response::new(browser_v1::CloseSessionResponse {
             v: CANONICAL_PROTOCOL_MAJOR,
             closed: removed.is_some(),
@@ -452,7 +798,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         if url.is_empty() {
             return Err(Status::invalid_argument("navigate requires non-empty url"));
         }
-        let (timeout_ms, max_response_bytes, allow_private_targets) = {
+        let (timeout_ms, max_response_bytes, allow_private_targets, cookie_header) = {
             let mut sessions = self.runtime.sessions.lock().await;
             let Some(session) = sessions.get_mut(session_id.as_str()) else {
                 return Err(Status::not_found("browser session not found"));
@@ -460,10 +806,12 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             session.last_active = Instant::now();
             let timeout_ms =
                 payload.timeout_ms.max(1).min(session.budget.max_navigation_timeout_ms);
+            let cookie_header = cookie_header_for_url(session, url.as_str());
             (
                 timeout_ms,
                 session.budget.max_response_bytes,
                 payload.allow_private_targets || session.allow_private_targets,
+                cookie_header,
             )
         };
 
@@ -474,22 +822,46 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             if payload.max_redirects == 0 { 3 } else { payload.max_redirects },
             allow_private_targets,
             max_response_bytes,
+            cookie_header.as_deref(),
         )
         .await;
         let network_log_entries = outcome.network_log.clone();
+        let cookie_updates = outcome.cookie_updates.clone();
+        let mut session_for_persist = None;
 
         let mut sessions = self.runtime.sessions.lock().await;
         if let Some(session) = sessions.get_mut(session_id.as_str()) {
-            if outcome.success {
-                session.last_title = outcome.title.clone();
-                session.last_url = Some(outcome.final_url.clone());
-                session.last_page_body = outcome.page_body.clone();
-                session.scroll_x = 0;
-                session.scroll_y = 0;
-                session.typed_inputs.clear();
+            let max_network_log_entries = session.budget.max_network_log_entries;
+            let max_network_log_bytes = session.budget.max_network_log_bytes;
+            if let Some(tab) = session.active_tab_mut() {
+                if outcome.success {
+                    tab.last_title = outcome.title.clone();
+                    tab.last_url = Some(outcome.final_url.clone());
+                    tab.last_page_body = outcome.page_body.clone();
+                    tab.scroll_x = 0;
+                    tab.scroll_y = 0;
+                    tab.typed_inputs.clear();
+                }
+                append_network_log_entries(
+                    tab,
+                    network_log_entries.as_slice(),
+                    max_network_log_entries,
+                    max_network_log_bytes,
+                );
             }
-            append_network_log_entries(session, network_log_entries.as_slice());
+            apply_cookie_updates(session, cookie_updates.as_slice());
             session.last_active = Instant::now();
+            if session.persistence.enabled {
+                session_for_persist = Some(session.clone());
+            }
+        }
+        drop(sessions);
+        if let (Some(store), Some(record)) =
+            (self.runtime.state_store.as_ref(), session_for_persist)
+        {
+            persist_session_snapshot(store, &record).map_err(|error| {
+                Status::internal(format!("failed to persist state after navigate: {error}"))
+            })?;
         }
 
         Ok(Response::new(browser_v1::NavigateResponse {
@@ -593,6 +965,12 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                 },
             )
             .await;
+        let session_for_persist = {
+            let sessions = self.runtime.sessions.lock().await;
+            sessions.get(session_id.as_str()).filter(|session| session.persistence.enabled).cloned()
+        };
+        persist_session_after_mutation(self.runtime.as_ref(), session_for_persist, "click")
+            .map_err(map_persist_error_to_status)?;
 
         Ok(Response::new(browser_v1::ClickResponse {
             v: CANONICAL_PROTOCOL_MAJOR,
@@ -705,11 +1083,24 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         if success {
             let mut sessions = self.runtime.sessions.lock().await;
             if let Some(session) = sessions.get_mut(session_id.as_str()) {
-                let field = session.typed_inputs.entry(selector.to_owned()).or_default();
-                if payload.clear_existing {
-                    *field = text.clone();
-                } else {
-                    field.push_str(text.as_str());
+                let mut origin = None;
+                if let Some(tab) = session.active_tab_mut() {
+                    let field = tab.typed_inputs.entry(selector.to_owned()).or_default();
+                    if payload.clear_existing {
+                        *field = text.clone();
+                    } else {
+                        field.push_str(text.as_str());
+                    }
+                    origin = tab.last_url.as_deref().and_then(url_origin_key);
+                }
+                if let Some(origin_key) = origin {
+                    let storage = session.storage_entries.entry(origin_key).or_default();
+                    if payload.clear_existing {
+                        storage.insert(selector.to_owned(), text.clone());
+                    } else {
+                        let entry = storage.entry(selector.to_owned()).or_default();
+                        entry.push_str(text.as_str());
+                    }
                 }
             }
         }
@@ -731,6 +1122,12 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                 },
             )
             .await;
+        let session_for_persist = {
+            let sessions = self.runtime.sessions.lock().await;
+            sessions.get(session_id.as_str()).filter(|session| session.persistence.enabled).cloned()
+        };
+        persist_session_after_mutation(self.runtime.as_ref(), session_for_persist, "type")
+            .map_err(map_persist_error_to_status)?;
 
         Ok(Response::new(browser_v1::TypeResponse {
             v: CANONICAL_PROTOCOL_MAJOR,
@@ -779,10 +1176,12 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         {
             let mut sessions = self.runtime.sessions.lock().await;
             if let Some(session) = sessions.get_mut(session_id.as_str()) {
-                session.scroll_x = session.scroll_x.saturating_add(payload.delta_x);
-                session.scroll_y = session.scroll_y.saturating_add(payload.delta_y);
-                scroll_x = session.scroll_x;
-                scroll_y = session.scroll_y;
+                if let Some(tab) = session.active_tab_mut() {
+                    tab.scroll_x = tab.scroll_x.saturating_add(payload.delta_x);
+                    tab.scroll_y = tab.scroll_y.saturating_add(payload.delta_y);
+                    scroll_x = tab.scroll_x;
+                    scroll_y = tab.scroll_y;
+                }
             }
         }
 
@@ -803,6 +1202,12 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                 },
             )
             .await;
+        let session_for_persist = {
+            let sessions = self.runtime.sessions.lock().await;
+            sessions.get(session_id.as_str()).filter(|session| session.persistence.enabled).cloned()
+        };
+        persist_session_after_mutation(self.runtime.as_ref(), session_for_persist, "scroll")
+            .map_err(map_persist_error_to_status)?;
 
         Ok(Response::new(browser_v1::ScrollResponse {
             v: CANONICAL_PROTOCOL_MAJOR,
@@ -907,6 +1312,12 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                 },
             )
             .await;
+        let session_for_persist = {
+            let sessions = self.runtime.sessions.lock().await;
+            sessions.get(session_id.as_str()).filter(|session| session.persistence.enabled).cloned()
+        };
+        persist_session_after_mutation(self.runtime.as_ref(), session_for_persist, "wait_for")
+            .map_err(map_persist_error_to_status)?;
 
         Ok(Response::new(browser_v1::WaitForResponse {
             v: CANONICAL_PROTOCOL_MAJOR,
@@ -943,10 +1354,18 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             }));
         };
         session.last_active = Instant::now();
+        let Some(tab) = session.active_tab() else {
+            return Ok(Response::new(browser_v1::GetTitleResponse {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                success: false,
+                title: String::new(),
+                error: "active_tab_not_found".to_owned(),
+            }));
+        };
         Ok(Response::new(browser_v1::GetTitleResponse {
             v: CANONICAL_PROTOCOL_MAJOR,
             success: true,
-            title: truncate_utf8_bytes(session.last_title.as_str(), max_title_bytes),
+            title: truncate_utf8_bytes(tab.last_title.as_str(), max_title_bytes),
             error: String::new(),
         }))
     }
@@ -1037,7 +1456,21 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             }));
         };
         session.last_active = Instant::now();
-        if session.last_page_body.trim().is_empty() {
+        let Some(tab) = session.active_tab() else {
+            return Ok(Response::new(browser_v1::ObserveResponse {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                success: false,
+                dom_snapshot: String::new(),
+                accessibility_tree: String::new(),
+                visible_text: String::new(),
+                dom_truncated: false,
+                accessibility_tree_truncated: false,
+                visible_text_truncated: false,
+                page_url: String::new(),
+                error: "active_tab_not_found".to_owned(),
+            }));
+        };
+        if tab.last_page_body.trim().is_empty() {
             return Ok(Response::new(browser_v1::ObserveResponse {
                 v: CANONICAL_PROTOCOL_MAJOR,
                 success: false,
@@ -1065,20 +1498,20 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                 as usize;
 
         let (dom_snapshot, dom_truncated) = if include_dom_snapshot {
-            build_dom_snapshot(session.last_page_body.as_str(), max_dom_snapshot_bytes)
+            build_dom_snapshot(tab.last_page_body.as_str(), max_dom_snapshot_bytes)
         } else {
             (String::new(), false)
         };
         let (accessibility_tree, accessibility_tree_truncated) = if include_accessibility_tree {
             build_accessibility_tree_snapshot(
-                session.last_page_body.as_str(),
+                tab.last_page_body.as_str(),
                 max_accessibility_tree_bytes,
             )
         } else {
             (String::new(), false)
         };
         let (visible_text, visible_text_truncated) = if include_visible_text {
-            build_visible_text_snapshot(session.last_page_body.as_str(), max_visible_text_bytes)
+            build_visible_text_snapshot(tab.last_page_body.as_str(), max_visible_text_bytes)
         } else {
             (String::new(), false)
         };
@@ -1092,7 +1525,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             dom_truncated,
             accessibility_tree_truncated,
             visible_text_truncated,
-            page_url: normalize_url_with_redaction(session.last_url.as_deref().unwrap_or_default()),
+            page_url: normalize_url_with_redaction(tab.last_url.as_deref().unwrap_or_default()),
             error: String::new(),
         }))
     }
@@ -1116,6 +1549,15 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             }));
         };
         session.last_active = Instant::now();
+        let Some(tab) = session.active_tab() else {
+            return Ok(Response::new(browser_v1::NetworkLogResponse {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                success: false,
+                entries: Vec::new(),
+                truncated: false,
+                error: "active_tab_not_found".to_owned(),
+            }));
+        };
         let limit = if payload.limit == 0 {
             session.budget.max_network_log_entries
         } else {
@@ -1126,9 +1568,9 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         let max_payload_bytes =
             payload.max_payload_bytes.max(1).min(session.budget.max_network_log_bytes) as usize;
 
-        let start = session.network_log.len().saturating_sub(limit);
+        let start = tab.network_log.len().saturating_sub(limit);
         let mut truncated = start > 0;
-        let mut entries = session
+        let mut entries = tab
             .network_log
             .iter()
             .skip(start)
@@ -1145,6 +1587,421 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             error: String::new(),
         }))
     }
+
+    async fn reset_state(
+        &self,
+        request: Request<browser_v1::ResetStateRequest>,
+    ) -> Result<Response<browser_v1::ResetStateResponse>, Status> {
+        self.runtime.authorize(request.metadata()).await?;
+        let mut payload = request.into_inner();
+        let session_id = parse_session_id_from_proto(payload.session_id.take())
+            .map_err(Status::invalid_argument)?;
+        let default_reset = !payload.clear_cookies
+            && !payload.clear_storage
+            && !payload.reset_tabs
+            && !payload.reset_permissions;
+        let clear_cookies = payload.clear_cookies || default_reset;
+        let clear_storage = payload.clear_storage || default_reset;
+        let mut session_for_persist = None;
+
+        let response = {
+            let mut sessions = self.runtime.sessions.lock().await;
+            let Some(session) = sessions.get_mut(session_id.as_str()) else {
+                return Ok(Response::new(browser_v1::ResetStateResponse {
+                    v: CANONICAL_PROTOCOL_MAJOR,
+                    success: false,
+                    cookies_cleared: 0,
+                    storage_entries_cleared: 0,
+                    tabs_closed: 0,
+                    permissions: Some(SessionPermissionsInternal::default().to_proto()),
+                    error: "session_not_found".to_owned(),
+                }));
+            };
+            session.last_active = Instant::now();
+            let mut cookies_cleared = 0_u32;
+            let mut storage_entries_cleared = 0_u32;
+            let mut tabs_closed = 0_u32;
+            if clear_cookies {
+                cookies_cleared =
+                    session.cookie_jar.values().map(|cookies| cookies.len() as u32).sum::<u32>();
+                session.cookie_jar.clear();
+            }
+            if clear_storage {
+                storage_entries_cleared = session
+                    .storage_entries
+                    .values()
+                    .map(|entries| entries.len() as u32)
+                    .sum::<u32>();
+                session.storage_entries.clear();
+                if let Some(tab) = session.active_tab_mut() {
+                    tab.typed_inputs.clear();
+                }
+            }
+            if payload.reset_tabs && !session.tab_order.is_empty() {
+                tabs_closed = session.tab_order.len().saturating_sub(1) as u32;
+                let active_tab_id = session.active_tab_id.clone();
+                session.tabs.clear();
+                session
+                    .tabs
+                    .insert(active_tab_id.clone(), BrowserTabRecord::new(active_tab_id.clone()));
+                session.tab_order = vec![active_tab_id];
+            }
+            if payload.reset_permissions {
+                session.permissions = SessionPermissionsInternal::default();
+            }
+            if session.persistence.enabled {
+                session_for_persist = Some(session.clone());
+            }
+            browser_v1::ResetStateResponse {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                success: true,
+                cookies_cleared,
+                storage_entries_cleared,
+                tabs_closed,
+                permissions: Some(session.permissions.to_proto()),
+                error: String::new(),
+            }
+        };
+        persist_session_after_mutation(self.runtime.as_ref(), session_for_persist, "reset_state")
+            .map_err(map_persist_error_to_status)?;
+        Ok(Response::new(response))
+    }
+
+    async fn list_tabs(
+        &self,
+        request: Request<browser_v1::ListTabsRequest>,
+    ) -> Result<Response<browser_v1::ListTabsResponse>, Status> {
+        self.runtime.authorize(request.metadata()).await?;
+        let mut payload = request.into_inner();
+        let session_id = parse_session_id_from_proto(payload.session_id.take())
+            .map_err(Status::invalid_argument)?;
+        let mut sessions = self.runtime.sessions.lock().await;
+        let Some(session) = sessions.get_mut(session_id.as_str()) else {
+            return Ok(Response::new(browser_v1::ListTabsResponse {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                success: false,
+                tabs: Vec::new(),
+                active_tab_id: None,
+                error: "session_not_found".to_owned(),
+            }));
+        };
+        session.last_active = Instant::now();
+        Ok(Response::new(browser_v1::ListTabsResponse {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            success: true,
+            tabs: session.list_tabs(),
+            active_tab_id: Some(proto::palyra::common::v1::CanonicalId {
+                ulid: session.active_tab_id.clone(),
+            }),
+            error: String::new(),
+        }))
+    }
+
+    async fn open_tab(
+        &self,
+        request: Request<browser_v1::OpenTabRequest>,
+    ) -> Result<Response<browser_v1::OpenTabResponse>, Status> {
+        self.runtime.authorize(request.metadata()).await?;
+        let mut payload = request.into_inner();
+        let session_id = parse_session_id_from_proto(payload.session_id.take())
+            .map_err(Status::invalid_argument)?;
+        let url = payload.url.trim().to_owned();
+        let (created_tab_id, timeout_ms, max_response_bytes, allow_private_targets, cookie_header) = {
+            let mut sessions = self.runtime.sessions.lock().await;
+            let Some(session) = sessions.get_mut(session_id.as_str()) else {
+                return Ok(Response::new(browser_v1::OpenTabResponse {
+                    v: CANONICAL_PROTOCOL_MAJOR,
+                    success: false,
+                    tab: None,
+                    navigated: false,
+                    status_code: 0,
+                    error: "session_not_found".to_owned(),
+                }));
+            };
+            session.last_active = Instant::now();
+            let created_tab_id = session.create_tab();
+            if payload.activate {
+                session.active_tab_id = created_tab_id.clone();
+            }
+            let timeout_ms =
+                payload.timeout_ms.max(1).min(session.budget.max_navigation_timeout_ms);
+            let max_response_bytes = session.budget.max_response_bytes;
+            let allow_private_targets =
+                payload.allow_private_targets || session.allow_private_targets;
+            let cookie_header = cookie_header_for_url(session, url.as_str());
+            (created_tab_id, timeout_ms, max_response_bytes, allow_private_targets, cookie_header)
+        };
+        let mut session_for_persist = None;
+
+        let mut navigated = false;
+        let mut status_code = 0_u32;
+        let mut success = true;
+        let mut error = String::new();
+        if !url.is_empty() {
+            navigated = true;
+            let outcome = navigate_with_guards(
+                url.as_str(),
+                timeout_ms,
+                payload.allow_redirects,
+                if payload.max_redirects == 0 { 3 } else { payload.max_redirects },
+                allow_private_targets,
+                max_response_bytes,
+                cookie_header.as_deref(),
+            )
+            .await;
+            status_code = outcome.status_code as u32;
+            success = outcome.success;
+            if !success {
+                error = outcome.error.clone();
+            }
+            let network_log_entries = outcome.network_log.clone();
+            let cookie_updates = outcome.cookie_updates.clone();
+            let mut sessions = self.runtime.sessions.lock().await;
+            if let Some(session) = sessions.get_mut(session_id.as_str()) {
+                let max_network_log_entries = session.budget.max_network_log_entries;
+                let max_network_log_bytes = session.budget.max_network_log_bytes;
+                if let Some(tab) = session.tabs.get_mut(created_tab_id.as_str()) {
+                    if outcome.success {
+                        tab.last_title = outcome.title;
+                        tab.last_url = Some(outcome.final_url);
+                        tab.last_page_body = outcome.page_body;
+                        tab.scroll_x = 0;
+                        tab.scroll_y = 0;
+                        tab.typed_inputs.clear();
+                    }
+                    append_network_log_entries(
+                        tab,
+                        network_log_entries.as_slice(),
+                        max_network_log_entries,
+                        max_network_log_bytes,
+                    );
+                }
+                apply_cookie_updates(session, cookie_updates.as_slice());
+                if session.persistence.enabled {
+                    session_for_persist = Some(session.clone());
+                }
+            }
+        } else {
+            let mut sessions = self.runtime.sessions.lock().await;
+            if let Some(session) = sessions.get_mut(session_id.as_str()) {
+                if session.persistence.enabled {
+                    session_for_persist = Some(session.clone());
+                }
+            }
+        }
+        persist_session_after_mutation(self.runtime.as_ref(), session_for_persist, "open_tab")
+            .map_err(map_persist_error_to_status)?;
+
+        let mut sessions = self.runtime.sessions.lock().await;
+        let Some(session) = sessions.get_mut(session_id.as_str()) else {
+            return Ok(Response::new(browser_v1::OpenTabResponse {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                success: false,
+                tab: None,
+                navigated,
+                status_code,
+                error: "session_not_found".to_owned(),
+            }));
+        };
+        let tab = session.tab_to_proto(created_tab_id.as_str());
+        Ok(Response::new(browser_v1::OpenTabResponse {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            success,
+            tab,
+            navigated,
+            status_code,
+            error,
+        }))
+    }
+
+    async fn switch_tab(
+        &self,
+        request: Request<browser_v1::SwitchTabRequest>,
+    ) -> Result<Response<browser_v1::SwitchTabResponse>, Status> {
+        self.runtime.authorize(request.metadata()).await?;
+        let mut payload = request.into_inner();
+        let session_id = parse_session_id_from_proto(payload.session_id.take())
+            .map_err(Status::invalid_argument)?;
+        let tab_id =
+            parse_tab_id_from_proto(payload.tab_id.take()).map_err(Status::invalid_argument)?;
+        let mut session_for_persist = None;
+        let response = {
+            let mut sessions = self.runtime.sessions.lock().await;
+            let Some(session) = sessions.get_mut(session_id.as_str()) else {
+                return Ok(Response::new(browser_v1::SwitchTabResponse {
+                    v: CANONICAL_PROTOCOL_MAJOR,
+                    success: false,
+                    active_tab: None,
+                    error: "session_not_found".to_owned(),
+                }));
+            };
+            session.last_active = Instant::now();
+            if !session.tabs.contains_key(tab_id.as_str()) {
+                browser_v1::SwitchTabResponse {
+                    v: CANONICAL_PROTOCOL_MAJOR,
+                    success: false,
+                    active_tab: None,
+                    error: "tab_not_found".to_owned(),
+                }
+            } else {
+                session.active_tab_id = tab_id;
+                if session.persistence.enabled {
+                    session_for_persist = Some(session.clone());
+                }
+                browser_v1::SwitchTabResponse {
+                    v: CANONICAL_PROTOCOL_MAJOR,
+                    success: true,
+                    active_tab: session.tab_to_proto(session.active_tab_id.as_str()),
+                    error: String::new(),
+                }
+            }
+        };
+        persist_session_after_mutation(self.runtime.as_ref(), session_for_persist, "switch_tab")
+            .map_err(map_persist_error_to_status)?;
+        Ok(Response::new(response))
+    }
+
+    async fn close_tab(
+        &self,
+        request: Request<browser_v1::CloseTabRequest>,
+    ) -> Result<Response<browser_v1::CloseTabResponse>, Status> {
+        self.runtime.authorize(request.metadata()).await?;
+        let mut payload = request.into_inner();
+        let session_id = parse_session_id_from_proto(payload.session_id.take())
+            .map_err(Status::invalid_argument)?;
+        let requested_tab_id = match payload.tab_id.take() {
+            Some(value) if !value.ulid.trim().is_empty() => {
+                parse_tab_id(Some(value.ulid.trim())).map_err(Status::invalid_argument)?
+            }
+            _ => String::new(),
+        };
+        let mut session_for_persist = None;
+        let response = {
+            let mut sessions = self.runtime.sessions.lock().await;
+            let Some(session) = sessions.get_mut(session_id.as_str()) else {
+                return Ok(Response::new(browser_v1::CloseTabResponse {
+                    v: CANONICAL_PROTOCOL_MAJOR,
+                    success: false,
+                    closed_tab_id: None,
+                    active_tab: None,
+                    tabs_remaining: 0,
+                    error: "session_not_found".to_owned(),
+                }));
+            };
+            session.last_active = Instant::now();
+            let tab_id_to_close = if requested_tab_id.is_empty() {
+                session.active_tab_id.clone()
+            } else {
+                requested_tab_id.clone()
+            };
+            match session.close_tab(tab_id_to_close.as_str()) {
+                Ok((closed_tab_id, _)) => {
+                    if session.persistence.enabled {
+                        session_for_persist = Some(session.clone());
+                    }
+                    browser_v1::CloseTabResponse {
+                        v: CANONICAL_PROTOCOL_MAJOR,
+                        success: true,
+                        closed_tab_id: Some(proto::palyra::common::v1::CanonicalId {
+                            ulid: closed_tab_id,
+                        }),
+                        active_tab: session.tab_to_proto(session.active_tab_id.as_str()),
+                        tabs_remaining: session.tabs.len() as u32,
+                        error: String::new(),
+                    }
+                }
+                Err(error) => browser_v1::CloseTabResponse {
+                    v: CANONICAL_PROTOCOL_MAJOR,
+                    success: false,
+                    closed_tab_id: None,
+                    active_tab: session.tab_to_proto(session.active_tab_id.as_str()),
+                    tabs_remaining: session.tabs.len() as u32,
+                    error,
+                },
+            }
+        };
+        persist_session_after_mutation(self.runtime.as_ref(), session_for_persist, "close_tab")
+            .map_err(map_persist_error_to_status)?;
+        Ok(Response::new(response))
+    }
+
+    async fn get_permissions(
+        &self,
+        request: Request<browser_v1::GetPermissionsRequest>,
+    ) -> Result<Response<browser_v1::GetPermissionsResponse>, Status> {
+        self.runtime.authorize(request.metadata()).await?;
+        let mut payload = request.into_inner();
+        let session_id = parse_session_id_from_proto(payload.session_id.take())
+            .map_err(Status::invalid_argument)?;
+        let mut sessions = self.runtime.sessions.lock().await;
+        let Some(session) = sessions.get_mut(session_id.as_str()) else {
+            return Ok(Response::new(browser_v1::GetPermissionsResponse {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                success: false,
+                permissions: Some(SessionPermissionsInternal::default().to_proto()),
+                error: "session_not_found".to_owned(),
+            }));
+        };
+        session.last_active = Instant::now();
+        Ok(Response::new(browser_v1::GetPermissionsResponse {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            success: true,
+            permissions: Some(session.permissions.to_proto()),
+            error: String::new(),
+        }))
+    }
+
+    async fn set_permissions(
+        &self,
+        request: Request<browser_v1::SetPermissionsRequest>,
+    ) -> Result<Response<browser_v1::SetPermissionsResponse>, Status> {
+        self.runtime.authorize(request.metadata()).await?;
+        let mut payload = request.into_inner();
+        let session_id = parse_session_id_from_proto(payload.session_id.take())
+            .map_err(Status::invalid_argument)?;
+        let mut session_for_persist = None;
+        let response = {
+            let mut sessions = self.runtime.sessions.lock().await;
+            let Some(session) = sessions.get_mut(session_id.as_str()) else {
+                return Ok(Response::new(browser_v1::SetPermissionsResponse {
+                    v: CANONICAL_PROTOCOL_MAJOR,
+                    success: false,
+                    permissions: Some(SessionPermissionsInternal::default().to_proto()),
+                    error: "session_not_found".to_owned(),
+                }));
+            };
+            session.last_active = Instant::now();
+            session.permissions.apply_update(
+                payload.camera,
+                payload.microphone,
+                payload.location,
+                payload.reset_to_default,
+            );
+            if session.persistence.enabled {
+                session_for_persist = Some(session.clone());
+            }
+            browser_v1::SetPermissionsResponse {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                success: true,
+                permissions: Some(session.permissions.to_proto()),
+                error: String::new(),
+            }
+        };
+        persist_session_after_mutation(
+            self.runtime.as_ref(),
+            session_for_persist,
+            "set_permissions",
+        )
+        .map_err(map_persist_error_to_status)?;
+        Ok(Response::new(response))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CookieUpdate {
+    domain: String,
+    name: String,
+    value: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1158,6 +2015,7 @@ struct NavigateOutcome {
     latency_ms: u64,
     error: String,
     network_log: Vec<NetworkLogEntryInternal>,
+    cookie_updates: Vec<CookieUpdate>,
 }
 
 #[tokio::main]
@@ -1178,6 +2036,7 @@ async fn main() -> Result<()> {
         grpc_bind_addr = %args.grpc_bind,
         grpc_port = args.grpc_port,
         auth_enabled = runtime.auth_token.is_some(),
+        state_persistence_enabled = runtime.state_store.is_some(),
         "browser service startup"
     );
 
@@ -1234,13 +2093,47 @@ fn spawn_cleanup_loop(runtime: Arc<BrowserRuntimeState>) {
         loop {
             ticker.tick().await;
             let now = Instant::now();
-            runtime.sessions.lock().await.retain(|_, session| {
-                let idle_alive =
-                    now.saturating_duration_since(session.last_active) <= session.idle_ttl;
-                let lifetime_alive = now.saturating_duration_since(session.created_at)
-                    <= Duration::from_millis(session.budget.max_session_lifetime_ms);
-                idle_alive && lifetime_alive
-            });
+            let expired_ids = {
+                let sessions = runtime.sessions.lock().await;
+                sessions
+                    .iter()
+                    .filter_map(|(session_id, session)| {
+                        let idle_alive =
+                            now.saturating_duration_since(session.last_active) <= session.idle_ttl;
+                        let lifetime_alive = now.saturating_duration_since(session.created_at)
+                            <= Duration::from_millis(session.budget.max_session_lifetime_ms);
+                        if idle_alive && lifetime_alive {
+                            None
+                        } else {
+                            Some(session_id.clone())
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            };
+            if expired_ids.is_empty() {
+                continue;
+            }
+            let removed_sessions = {
+                let mut sessions = runtime.sessions.lock().await;
+                expired_ids
+                    .into_iter()
+                    .filter_map(|session_id| sessions.remove(session_id.as_str()))
+                    .collect::<Vec<_>>()
+            };
+            if let Some(store) = runtime.state_store.as_ref() {
+                for session in removed_sessions {
+                    if session.persistence.enabled {
+                        if let Err(error) = persist_session_snapshot(store, &session) {
+                            warn!(
+                                principal = session.principal,
+                                channel = ?session.channel,
+                                error = %error,
+                                "failed to persist state while expiring session"
+                            );
+                        }
+                    }
+                }
+            }
         }
     });
 }
@@ -1259,9 +2152,11 @@ async fn navigate_with_guards(
     max_redirects: u32,
     allow_private_targets: bool,
     max_response_bytes: u64,
+    cookie_header: Option<&str>,
 ) -> NavigateOutcome {
     let started_at = Instant::now();
     let mut network_log = Vec::new();
+    let mut cookie_updates = Vec::new();
     let mut current_url = match Url::parse(raw_url) {
         Ok(value) => value,
         Err(error) => {
@@ -1275,6 +2170,7 @@ async fn navigate_with_guards(
                 latency_ms: started_at.elapsed().as_millis() as u64,
                 error: format!("invalid URL: {error}"),
                 network_log,
+                cookie_updates,
             }
         }
     };
@@ -1295,6 +2191,7 @@ async fn navigate_with_guards(
                 latency_ms: started_at.elapsed().as_millis() as u64,
                 error: format!("failed to build HTTP client: {error}"),
                 network_log,
+                cookie_updates,
             }
         }
     };
@@ -1313,11 +2210,16 @@ async fn navigate_with_guards(
                 latency_ms: started_at.elapsed().as_millis() as u64,
                 error,
                 network_log,
+                cookie_updates,
             };
         }
 
         let request_started = Instant::now();
-        let response = match client.get(current_url.clone()).send().await {
+        let mut request_builder = client.get(current_url.clone());
+        if let Some(value) = cookie_header.filter(|value| !value.trim().is_empty()) {
+            request_builder = request_builder.header(COOKIE_HEADER, value);
+        }
+        let response = match request_builder.send().await {
             Ok(value) => value,
             Err(error) => {
                 return NavigateOutcome {
@@ -1330,9 +2232,19 @@ async fn navigate_with_guards(
                     latency_ms: started_at.elapsed().as_millis() as u64,
                     error: format!("request failed: {error}"),
                     network_log,
+                    cookie_updates,
                 }
             }
         };
+        if let Some(domain) = current_url.host_str() {
+            for raw_set_cookie in response.headers().get_all(SET_COOKIE_HEADER).iter() {
+                if let Ok(value) = raw_set_cookie.to_str() {
+                    if let Some(update) = parse_set_cookie_update(domain, value) {
+                        cookie_updates.push(update);
+                    }
+                }
+            }
+        }
         let request_latency_ms = request_started.elapsed().as_millis() as u64;
         network_log.push(NetworkLogEntryInternal {
             request_url: normalize_url_with_redaction(current_url.as_str()),
@@ -1355,6 +2267,7 @@ async fn navigate_with_guards(
                     latency_ms: started_at.elapsed().as_millis() as u64,
                     error: "redirect response blocked by policy".to_owned(),
                     network_log,
+                    cookie_updates,
                 };
             }
             if redirects >= redirect_limit {
@@ -1368,6 +2281,7 @@ async fn navigate_with_guards(
                     latency_ms: started_at.elapsed().as_millis() as u64,
                     error: format!("redirect limit exceeded ({redirect_limit})"),
                     network_log,
+                    cookie_updates,
                 };
             }
             let Some(location) = response.headers().get(reqwest::header::LOCATION) else {
@@ -1381,6 +2295,7 @@ async fn navigate_with_guards(
                     latency_ms: started_at.elapsed().as_millis() as u64,
                     error: "redirect missing Location header".to_owned(),
                     network_log,
+                    cookie_updates,
                 };
             };
             let Ok(location_str) = location.to_str() else {
@@ -1394,6 +2309,7 @@ async fn navigate_with_guards(
                     latency_ms: started_at.elapsed().as_millis() as u64,
                     error: "redirect location header contains invalid UTF-8".to_owned(),
                     network_log,
+                    cookie_updates,
                 };
             };
             current_url = match current_url.join(location_str) {
@@ -1409,6 +2325,7 @@ async fn navigate_with_guards(
                         latency_ms: started_at.elapsed().as_millis() as u64,
                         error: format!("invalid redirect target: {error}"),
                         network_log,
+                        cookie_updates,
                     }
                 }
             };
@@ -1430,6 +2347,7 @@ async fn navigate_with_guards(
                     latency_ms: started_at.elapsed().as_millis() as u64,
                     error: format!("failed to read response body: {error}"),
                     network_log,
+                    cookie_updates,
                 }
             }
         };
@@ -1448,6 +2366,7 @@ async fn navigate_with_guards(
                     body.len()
                 ),
                 network_log,
+                cookie_updates,
             };
         }
 
@@ -1467,6 +2386,7 @@ async fn navigate_with_guards(
                 String::new()
             },
             network_log,
+            cookie_updates,
         };
     }
 }
@@ -1535,19 +2455,21 @@ fn truncate_utf8_bytes_with_flag(raw: &str, max_bytes: usize) -> (String, bool) 
 }
 
 fn append_network_log_entries(
-    session: &mut BrowserSessionRecord,
+    tab: &mut BrowserTabRecord,
     entries: &[NetworkLogEntryInternal],
+    max_entries: usize,
+    max_bytes: u64,
 ) {
     for entry in entries {
-        session.network_log.push_back(entry.clone());
+        tab.network_log.push_back(entry.clone());
     }
-    while session.network_log.len() > session.budget.max_network_log_entries {
-        session.network_log.pop_front();
+    while tab.network_log.len() > max_entries {
+        tab.network_log.pop_front();
     }
-    while session.network_log.iter().map(estimate_network_log_entry_internal_bytes).sum::<usize>()
-        > session.budget.max_network_log_bytes as usize
+    while tab.network_log.iter().map(estimate_network_log_entry_internal_bytes).sum::<usize>()
+        > max_bytes as usize
     {
-        if session.network_log.pop_front().is_none() {
+        if tab.network_log.pop_front().is_none() {
             break;
         }
     }
@@ -2086,11 +3008,343 @@ fn parse_session_id_from_proto(
     }
 }
 
+fn parse_tab_id(raw: Option<&str>) -> Result<String, String> {
+    let value = raw.unwrap_or_default().trim();
+    if value.is_empty() {
+        return Err("tab_id is required".to_owned());
+    }
+    validate_canonical_id(value).map_err(|error| format!("invalid tab_id: {error}"))?;
+    Ok(value.to_owned())
+}
+
+fn parse_tab_id_from_proto(
+    raw: Option<proto::palyra::common::v1::CanonicalId>,
+) -> Result<String, String> {
+    match raw {
+        Some(value) => parse_tab_id(Some(value.ulid.as_str())),
+        None => parse_tab_id(None),
+    }
+}
+
 fn current_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn normalize_optional_string(raw: &str) -> Option<String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_owned())
+    }
+}
+
+fn sanitize_persistence_id(raw: &str) -> Option<String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if value.len() > 128 {
+        return None;
+    }
+    if value.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        Some(value.to_owned())
+    } else {
+        None
+    }
+}
+
+fn build_state_store_from_env() -> Result<Option<PersistedStateStore>> {
+    let key_raw = match std::env::var(STATE_KEY_ENV) {
+        Ok(value) => value.trim().to_owned(),
+        Err(_) => return Ok(None),
+    };
+    if key_raw.is_empty() {
+        return Ok(None);
+    }
+    let key = decode_state_key(key_raw.as_str())?;
+    let state_dir = std::env::var(STATE_DIR_ENV)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join(DEFAULT_STATE_DIR_NAME));
+    Ok(Some(PersistedStateStore::new(state_dir, key)?))
+}
+
+fn decode_state_key(raw: &str) -> Result<[u8; STATE_KEY_LEN]> {
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(raw)
+        .context("failed to decode PALYRA_BROWSERD_STATE_ENCRYPTION_KEY as base64")?;
+    if decoded.len() != STATE_KEY_LEN {
+        anyhow::bail!(
+            "PALYRA_BROWSERD_STATE_ENCRYPTION_KEY must decode to exactly {STATE_KEY_LEN} bytes"
+        );
+    }
+    let mut key = [0_u8; STATE_KEY_LEN];
+    key.copy_from_slice(decoded.as_slice());
+    Ok(key)
+}
+
+impl PersistedStateStore {
+    fn new(root_dir: PathBuf, key: [u8; STATE_KEY_LEN]) -> Result<Self> {
+        fs::create_dir_all(root_dir.as_path()).with_context(|| {
+            format!("failed to create browser state dir '{}'", root_dir.display())
+        })?;
+        let store = Self { root_dir, key };
+        store.cleanup_tmp_files()?;
+        Ok(store)
+    }
+
+    fn snapshot_path(&self, state_id: &str) -> PathBuf {
+        self.root_dir.join(format!("{state_id}.enc"))
+    }
+
+    fn tmp_snapshot_path(&self, state_id: &str) -> PathBuf {
+        self.root_dir.join(format!("{state_id}.{}.{}", Ulid::new(), STATE_TMP_EXTENSION))
+    }
+
+    fn cleanup_tmp_files(&self) -> Result<()> {
+        let entries = match fs::read_dir(self.root_dir.as_path()) {
+            Ok(value) => value,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to enumerate browser state dir '{}' for tmp cleanup",
+                        self.root_dir.display()
+                    )
+                })
+            }
+        };
+        for entry in entries {
+            let entry = entry.with_context(|| {
+                format!("failed to read browser state entry in '{}'", self.root_dir.display())
+            })?;
+            let path = entry.path();
+            if path
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(|value| value.eq_ignore_ascii_case(STATE_TMP_EXTENSION))
+                .unwrap_or(false)
+            {
+                let _ = fs::remove_file(path.as_path());
+            }
+        }
+        Ok(())
+    }
+
+    fn load_snapshot(&self, state_id: &str) -> Result<Option<PersistedSessionSnapshot>> {
+        let path = self.snapshot_path(state_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(path.as_path()).with_context(|| {
+            format!("failed to read persisted browser state '{}'", path.display())
+        })?;
+        let decrypted = decrypt_state_blob(&self.key, bytes.as_slice()).with_context(|| {
+            format!("failed to decrypt persisted browser state '{}'", path.display())
+        })?;
+        let snapshot: PersistedSessionSnapshot = serde_json::from_slice(decrypted.as_slice())
+            .with_context(|| {
+                format!("failed to deserialize persisted browser state '{}'", path.display())
+            })?;
+        Ok(Some(snapshot))
+    }
+
+    fn save_snapshot(&self, state_id: &str, snapshot: &PersistedSessionSnapshot) -> Result<()> {
+        let serialized =
+            serde_json::to_vec(snapshot).context("failed to serialize persisted browser state")?;
+        let encrypted = encrypt_state_blob(&self.key, serialized.as_slice())
+            .context("failed to encrypt state")?;
+        let target_path = self.snapshot_path(state_id);
+        let tmp_path = self.tmp_snapshot_path(state_id);
+        fs::write(tmp_path.as_path(), encrypted).with_context(|| {
+            format!("failed to write tmp browser state '{}'", tmp_path.display())
+        })?;
+        fs::rename(tmp_path.as_path(), target_path.as_path()).with_context(|| {
+            format!(
+                "failed to atomically move tmp state '{}' into '{}'",
+                tmp_path.display(),
+                target_path.display()
+            )
+        })?;
+        Ok(())
+    }
+}
+
+fn encrypt_state_blob(key: &[u8; STATE_KEY_LEN], plaintext: &[u8]) -> Result<Vec<u8>> {
+    let unbound_key = UnboundKey::new(&CHACHA20_POLY1305, key)
+        .map_err(|_| anyhow::anyhow!("failed to initialize state cipher key"))?;
+    let key = LessSafeKey::new(unbound_key);
+    let mut nonce_bytes = [0_u8; STATE_NONCE_LEN];
+    SystemRandom::new()
+        .fill(&mut nonce_bytes)
+        .map_err(|_| anyhow::anyhow!("failed to generate state encryption nonce"))?;
+    let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+    let mut in_out = plaintext.to_vec();
+    key.seal_in_place_append_tag(nonce, Aad::empty(), &mut in_out)
+        .map_err(|_| anyhow::anyhow!("failed to seal state payload"))?;
+    let mut output = Vec::with_capacity(STATE_FILE_MAGIC.len() + STATE_NONCE_LEN + in_out.len());
+    output.extend_from_slice(STATE_FILE_MAGIC);
+    output.extend_from_slice(&nonce_bytes);
+    output.extend_from_slice(in_out.as_slice());
+    Ok(output)
+}
+
+fn decrypt_state_blob(key: &[u8; STATE_KEY_LEN], encrypted: &[u8]) -> Result<Vec<u8>> {
+    if encrypted.len() < STATE_FILE_MAGIC.len() + STATE_NONCE_LEN {
+        anyhow::bail!("state payload is too short");
+    }
+    if &encrypted[..STATE_FILE_MAGIC.len()] != STATE_FILE_MAGIC {
+        anyhow::bail!("state payload magic header is invalid");
+    }
+    let mut nonce_bytes = [0_u8; STATE_NONCE_LEN];
+    nonce_bytes.copy_from_slice(
+        &encrypted[STATE_FILE_MAGIC.len()..STATE_FILE_MAGIC.len() + STATE_NONCE_LEN],
+    );
+    let mut in_out = encrypted[STATE_FILE_MAGIC.len() + STATE_NONCE_LEN..].to_vec();
+    let unbound_key = UnboundKey::new(&CHACHA20_POLY1305, key)
+        .map_err(|_| anyhow::anyhow!("failed to initialize state cipher key"))?;
+    let key = LessSafeKey::new(unbound_key);
+    let plaintext = key
+        .open_in_place(Nonce::assume_unique_for_key(nonce_bytes), Aad::empty(), &mut in_out)
+        .map_err(|_| anyhow::anyhow!("failed to open state payload"))?;
+    Ok(plaintext.to_vec())
+}
+
+fn permission_setting_to_proto(value: PermissionSettingInternal) -> i32 {
+    match value {
+        PermissionSettingInternal::Deny => 1,
+        PermissionSettingInternal::Allow => 2,
+    }
+}
+
+fn permission_setting_from_proto(value: i32) -> Option<PermissionSettingInternal> {
+    match value {
+        1 => Some(PermissionSettingInternal::Deny),
+        2 => Some(PermissionSettingInternal::Allow),
+        _ => None,
+    }
+}
+
+fn persist_session_snapshot(
+    store: &PersistedStateStore,
+    session: &BrowserSessionRecord,
+) -> Result<()> {
+    if !session.persistence.enabled {
+        return Ok(());
+    }
+    let Some(persistence_id) = session.persistence.persistence_id.as_ref() else {
+        anyhow::bail!("state persistence is enabled but persistence_id is missing");
+    };
+    let mut tabs = session
+        .tab_order
+        .iter()
+        .filter_map(|tab_id| session.tabs.get(tab_id.as_str()).cloned())
+        .collect::<Vec<_>>();
+    for (tab_id, tab) in &session.tabs {
+        if !tabs.iter().any(|entry| entry.tab_id == *tab_id) {
+            tabs.push(tab.clone());
+        }
+    }
+    let snapshot = PersistedSessionSnapshot {
+        v: CANONICAL_PROTOCOL_MAJOR,
+        principal: session.principal.clone(),
+        channel: session.channel.clone(),
+        tabs,
+        tab_order: session.tab_order.clone(),
+        active_tab_id: session.active_tab_id.clone(),
+        permissions: session.permissions.clone(),
+        cookie_jar: session.cookie_jar.clone(),
+        storage_entries: session.storage_entries.clone(),
+        saved_at_unix_ms: current_unix_ms(),
+    };
+    store.save_snapshot(persistence_id.as_str(), &snapshot)
+}
+
+fn persist_session_after_mutation(
+    runtime: &BrowserRuntimeState,
+    session_for_persist: Option<BrowserSessionRecord>,
+    operation: &str,
+) -> Result<()> {
+    if let (Some(store), Some(session)) = (runtime.state_store.as_ref(), session_for_persist) {
+        if session.persistence.enabled {
+            persist_session_snapshot(store, &session)
+                .with_context(|| format!("failed to persist state after {operation}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn map_persist_error_to_status(error: anyhow::Error) -> Status {
+    Status::internal(error.to_string())
+}
+
+fn cookie_header_for_url(session: &BrowserSessionRecord, raw_url: &str) -> Option<String> {
+    let domain = Url::parse(raw_url).ok()?.host_str()?.to_ascii_lowercase();
+    let cookies = session.cookie_jar.get(domain.as_str())?;
+    if cookies.is_empty() {
+        return None;
+    }
+    let mut pairs =
+        cookies.iter().map(|(name, value)| format!("{name}={value}")).collect::<Vec<_>>();
+    pairs.sort();
+    Some(pairs.join("; "))
+}
+
+fn parse_set_cookie_update(domain: &str, raw_set_cookie: &str) -> Option<CookieUpdate> {
+    let normalized_domain = domain.trim().trim_matches('.').to_ascii_lowercase();
+    if normalized_domain.is_empty() {
+        return None;
+    }
+    let first_pair = raw_set_cookie.split(';').next()?.trim();
+    let (name, value) = first_pair.split_once('=')?;
+    let name = name.trim().to_ascii_lowercase();
+    if name.is_empty() {
+        return None;
+    }
+    Some(CookieUpdate {
+        domain: normalized_domain,
+        name,
+        value: truncate_utf8_bytes(value.trim(), 1024),
+    })
+}
+
+fn apply_cookie_updates(session: &mut BrowserSessionRecord, updates: &[CookieUpdate]) {
+    for update in updates {
+        if update.domain.is_empty() || update.name.is_empty() {
+            continue;
+        }
+        if update.value.is_empty() {
+            if let Some(domain_cookies) = session.cookie_jar.get_mut(update.domain.as_str()) {
+                domain_cookies.remove(update.name.as_str());
+                if domain_cookies.is_empty() {
+                    session.cookie_jar.remove(update.domain.as_str());
+                }
+            }
+            continue;
+        }
+        let domain_cookies = session.cookie_jar.entry(update.domain.clone()).or_default();
+        domain_cookies.insert(update.name.clone(), update.value.clone());
+    }
+}
+
+fn url_origin_key(raw_url: &str) -> Option<String> {
+    let url = Url::parse(raw_url).ok()?;
+    let host = url.host_str()?.to_ascii_lowercase();
+    let mut origin = format!("{}://{host}", url.scheme());
+    if let Some(port) = url.port() {
+        if !is_default_port(url.scheme(), port) {
+            origin.push(':');
+            origin.push_str(port.to_string().as_str());
+        }
+    }
+    Some(origin)
 }
 
 #[derive(Debug, Clone)]
@@ -2124,7 +3378,11 @@ async fn consume_action_budget_and_snapshot(
     };
     session.last_active = Instant::now();
     enforce_action_domain_allowlist(session)?;
-    if require_page_body && session.last_page_body.trim().is_empty() {
+    let page_body = session
+        .active_tab()
+        .map(|tab| tab.last_page_body.clone())
+        .ok_or_else(|| "active_tab_not_found".to_owned())?;
+    if require_page_body && page_body.trim().is_empty() {
         return Err("navigate must succeed before performing this browser action".to_owned());
     }
 
@@ -2154,7 +3412,7 @@ async fn consume_action_budget_and_snapshot(
 
     Ok(ActionSessionSnapshot {
         budget: session.budget.clone(),
-        page_body: session.last_page_body.clone(),
+        page_body,
         allow_downloads: session.allow_downloads,
     })
 }
@@ -2163,7 +3421,7 @@ fn enforce_action_domain_allowlist(session: &BrowserSessionRecord) -> Result<(),
     if session.action_allowed_domains.is_empty() {
         return Ok(());
     }
-    let Some(current_url) = session.last_url.as_deref() else {
+    let Some(current_url) = session.active_tab().and_then(|tab| tab.last_url.as_deref()) else {
         return Err(
             "action domain allowlist is configured but session has no active URL".to_owned()
         );
@@ -2236,7 +3494,7 @@ async fn finalize_session_action(
         started_at_unix_ms: request.started_at_unix_ms,
         completed_at_unix_ms: current_unix_ms(),
         attempts: request.attempts,
-        page_url: session.last_url.clone().unwrap_or_default(),
+        page_url: session.active_tab().and_then(|tab| tab.last_url.clone()).unwrap_or_default(),
     };
     session.last_active = Instant::now();
     session.action_log.push_back(entry.clone());
@@ -2413,7 +3671,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn navigate_with_guards_blocks_file_scheme() {
         let outcome =
-            navigate_with_guards("file:///tmp/index.html", 1_000, true, 3, false, 1024).await;
+            navigate_with_guards("file:///tmp/index.html", 1_000, true, 3, false, 1024, None).await;
         assert!(!outcome.success, "file scheme must be blocked");
         assert!(
             outcome.error.contains("blocked URL scheme"),
@@ -2428,7 +3686,7 @@ mod tests {
             200,
             "<html><head><title>Oversized</title></head><body>very large</body></html>",
         );
-        let outcome = navigate_with_guards(url.as_str(), 2_000, true, 3, true, 16).await;
+        let outcome = navigate_with_guards(url.as_str(), 2_000, true, 3, true, 16, None).await;
         assert!(!outcome.success, "oversized payload must fail");
         assert!(
             outcome.error.contains("max_response_bytes"),
@@ -2441,7 +3699,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn navigate_with_guards_blocks_private_target_by_default() {
         let outcome =
-            navigate_with_guards("http://127.0.0.1:8080/", 1_000, true, 3, false, 1024).await;
+            navigate_with_guards("http://127.0.0.1:8080/", 1_000, true, 3, false, 1024, None).await;
         assert!(!outcome.success, "private targets should be blocked by default");
         assert!(
             outcome.error.contains("private/local"),
@@ -2484,6 +3742,9 @@ mod tests {
                 allow_private_targets: true,
                 allow_downloads: false,
                 action_allowed_domains: Vec::new(),
+                persistence_enabled: false,
+                persistence_id: String::new(),
+                channel: String::new(),
             }))
             .await
             .expect("create_session should succeed")
@@ -2561,6 +3822,9 @@ mod tests {
                 allow_private_targets: true,
                 allow_downloads: false,
                 action_allowed_domains: Vec::new(),
+                persistence_enabled: false,
+                persistence_id: String::new(),
+                channel: String::new(),
             }))
             .await
             .expect("create_session should succeed")
@@ -2697,6 +3961,9 @@ mod tests {
                 allow_private_targets: true,
                 allow_downloads: false,
                 action_allowed_domains: Vec::new(),
+                persistence_enabled: false,
+                persistence_id: String::new(),
+                channel: String::new(),
             }))
             .await
             .expect("create_session should succeed")
@@ -2780,6 +4047,9 @@ mod tests {
                 allow_private_targets: true,
                 allow_downloads: false,
                 action_allowed_domains: Vec::new(),
+                persistence_enabled: false,
+                persistence_id: String::new(),
+                channel: String::new(),
             }))
             .await
             .expect("create_session should succeed")
@@ -2866,6 +4136,9 @@ mod tests {
                 allow_private_targets: true,
                 allow_downloads: false,
                 action_allowed_domains: Vec::new(),
+                persistence_enabled: false,
+                persistence_id: String::new(),
+                channel: String::new(),
             }))
             .await
             .expect("create_session should succeed")
@@ -2976,6 +4249,9 @@ mod tests {
                 allow_private_targets: true,
                 allow_downloads: false,
                 action_allowed_domains: Vec::new(),
+                persistence_enabled: false,
+                persistence_id: String::new(),
+                channel: String::new(),
             }))
             .await
             .expect("create_session should succeed")
@@ -3079,6 +4355,9 @@ mod tests {
                 allow_private_targets: true,
                 allow_downloads: false,
                 action_allowed_domains: Vec::new(),
+                persistence_enabled: false,
+                persistence_id: String::new(),
+                channel: String::new(),
             }))
             .await
             .expect("create_session should succeed")
@@ -3166,13 +4445,341 @@ mod tests {
         handle.join().expect("test server thread should exit");
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn browser_service_reset_state_clears_cookie_jar_for_fixture_domain() {
+        let (url, handle) = spawn_cookie_state_http_server();
+        let runtime = std::sync::Arc::new(
+            BrowserRuntimeState::new(&Args {
+                bind: "127.0.0.1".to_owned(),
+                port: 7143,
+                grpc_bind: "127.0.0.1".to_owned(),
+                grpc_port: 7543,
+                auth_token: None,
+                session_idle_ttl_ms: 60_000,
+                max_sessions: 16,
+                max_navigation_timeout_ms: 10_000,
+                max_session_lifetime_ms: 60_000,
+                max_screenshot_bytes: 128 * 1024,
+                max_response_bytes: 128 * 1024,
+                max_title_bytes: 4 * 1024,
+            })
+            .expect("runtime should initialize"),
+        );
+        let service = BrowserServiceImpl { runtime };
+        let created = service
+            .create_session(Request::new(browser_v1::CreateSessionRequest {
+                v: 1,
+                principal: "user:ops".to_owned(),
+                idle_ttl_ms: 10_000,
+                budget: None,
+                allow_private_targets: true,
+                allow_downloads: false,
+                action_allowed_domains: Vec::new(),
+                persistence_enabled: false,
+                persistence_id: String::new(),
+                channel: String::new(),
+            }))
+            .await
+            .expect("create_session should succeed")
+            .into_inner();
+        let session_id = created
+            .session_id
+            .as_ref()
+            .map(|value| value.ulid.clone())
+            .expect("session id should be present");
+
+        let first = service
+            .navigate(Request::new(browser_v1::NavigateRequest {
+                v: 1,
+                session_id: Some(proto::palyra::common::v1::CanonicalId {
+                    ulid: session_id.clone(),
+                }),
+                url: url.clone(),
+                timeout_ms: 2_000,
+                allow_redirects: true,
+                max_redirects: 3,
+                allow_private_targets: true,
+            }))
+            .await
+            .expect("first navigate should execute")
+            .into_inner();
+        assert!(first.success, "first navigation should succeed");
+
+        let second = service
+            .navigate(Request::new(browser_v1::NavigateRequest {
+                v: 1,
+                session_id: Some(proto::palyra::common::v1::CanonicalId {
+                    ulid: session_id.clone(),
+                }),
+                url: url.clone(),
+                timeout_ms: 2_000,
+                allow_redirects: true,
+                max_redirects: 3,
+                allow_private_targets: true,
+            }))
+            .await
+            .expect("second navigate should execute")
+            .into_inner();
+        assert!(second.success, "second navigation should replay cookie and succeed");
+
+        let reset = service
+            .reset_state(Request::new(browser_v1::ResetStateRequest {
+                v: 1,
+                session_id: Some(proto::palyra::common::v1::CanonicalId {
+                    ulid: session_id.clone(),
+                }),
+                clear_cookies: true,
+                clear_storage: false,
+                reset_tabs: false,
+                reset_permissions: false,
+            }))
+            .await
+            .expect("reset_state should execute")
+            .into_inner();
+        assert!(reset.success, "reset_state should succeed");
+        assert!(reset.cookies_cleared >= 1, "at least one cookie should be removed during reset");
+
+        let third = service
+            .navigate(Request::new(browser_v1::NavigateRequest {
+                v: 1,
+                session_id: Some(proto::palyra::common::v1::CanonicalId { ulid: session_id }),
+                url,
+                timeout_ms: 2_000,
+                allow_redirects: true,
+                max_redirects: 3,
+                allow_private_targets: true,
+            }))
+            .await
+            .expect("third navigate should execute")
+            .into_inner();
+        assert!(
+            !third.success && third.status_code == 401,
+            "third navigation should fail after reset because cookie was cleared"
+        );
+
+        handle.join().expect("test server thread should exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn browser_service_permissions_default_to_deny() {
+        let runtime = std::sync::Arc::new(
+            BrowserRuntimeState::new(&Args {
+                bind: "127.0.0.1".to_owned(),
+                port: 7143,
+                grpc_bind: "127.0.0.1".to_owned(),
+                grpc_port: 7543,
+                auth_token: None,
+                session_idle_ttl_ms: 60_000,
+                max_sessions: 16,
+                max_navigation_timeout_ms: 10_000,
+                max_session_lifetime_ms: 60_000,
+                max_screenshot_bytes: 128 * 1024,
+                max_response_bytes: 128 * 1024,
+                max_title_bytes: 4 * 1024,
+            })
+            .expect("runtime should initialize"),
+        );
+        let service = BrowserServiceImpl { runtime };
+        let created = service
+            .create_session(Request::new(browser_v1::CreateSessionRequest {
+                v: 1,
+                principal: "user:ops".to_owned(),
+                idle_ttl_ms: 10_000,
+                budget: None,
+                allow_private_targets: true,
+                allow_downloads: false,
+                action_allowed_domains: Vec::new(),
+                persistence_enabled: false,
+                persistence_id: String::new(),
+                channel: String::new(),
+            }))
+            .await
+            .expect("create_session should succeed")
+            .into_inner();
+        let session_id = created
+            .session_id
+            .as_ref()
+            .map(|value| value.ulid.clone())
+            .expect("session id should be present");
+        let permissions = service
+            .get_permissions(Request::new(browser_v1::GetPermissionsRequest {
+                v: 1,
+                session_id: Some(proto::palyra::common::v1::CanonicalId { ulid: session_id }),
+            }))
+            .await
+            .expect("get_permissions should execute")
+            .into_inner();
+        assert!(permissions.success, "permission query should succeed");
+        let effective = permissions.permissions.expect("permissions should be returned");
+        assert_eq!(effective.camera, 1, "camera permission should default to deny");
+        assert_eq!(effective.microphone, 1, "microphone permission should default to deny");
+        assert_eq!(effective.location, 1, "location permission should default to deny");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn browser_service_tabs_keep_independent_state() {
+        let (url, handle) = spawn_static_http_server(
+            200,
+            "<html><head><title>Secondary Tab</title></head><body>tab-two</body></html>",
+        );
+        let runtime = std::sync::Arc::new(
+            BrowserRuntimeState::new(&Args {
+                bind: "127.0.0.1".to_owned(),
+                port: 7143,
+                grpc_bind: "127.0.0.1".to_owned(),
+                grpc_port: 7543,
+                auth_token: None,
+                session_idle_ttl_ms: 60_000,
+                max_sessions: 16,
+                max_navigation_timeout_ms: 10_000,
+                max_session_lifetime_ms: 60_000,
+                max_screenshot_bytes: 128 * 1024,
+                max_response_bytes: 128 * 1024,
+                max_title_bytes: 4 * 1024,
+            })
+            .expect("runtime should initialize"),
+        );
+        let service = BrowserServiceImpl { runtime };
+        let created = service
+            .create_session(Request::new(browser_v1::CreateSessionRequest {
+                v: 1,
+                principal: "user:ops".to_owned(),
+                idle_ttl_ms: 10_000,
+                budget: None,
+                allow_private_targets: true,
+                allow_downloads: false,
+                action_allowed_domains: Vec::new(),
+                persistence_enabled: false,
+                persistence_id: String::new(),
+                channel: String::new(),
+            }))
+            .await
+            .expect("create_session should succeed")
+            .into_inner();
+        let session_id = created
+            .session_id
+            .as_ref()
+            .map(|value| value.ulid.clone())
+            .expect("session id should be present");
+
+        let initial_tabs = service
+            .list_tabs(Request::new(browser_v1::ListTabsRequest {
+                v: 1,
+                session_id: Some(proto::palyra::common::v1::CanonicalId {
+                    ulid: session_id.clone(),
+                }),
+            }))
+            .await
+            .expect("list_tabs should execute")
+            .into_inner();
+        assert!(initial_tabs.success, "list_tabs should succeed");
+        let first_tab_id = initial_tabs
+            .tabs
+            .iter()
+            .find_map(|tab| tab.tab_id.as_ref().map(|value| value.ulid.clone()))
+            .expect("first tab should be present");
+
+        let opened = service
+            .open_tab(Request::new(browser_v1::OpenTabRequest {
+                v: 1,
+                session_id: Some(proto::palyra::common::v1::CanonicalId {
+                    ulid: session_id.clone(),
+                }),
+                url: url.clone(),
+                activate: true,
+                timeout_ms: 2_000,
+                allow_redirects: true,
+                max_redirects: 3,
+                allow_private_targets: true,
+            }))
+            .await
+            .expect("open_tab should execute")
+            .into_inner();
+        assert!(opened.success, "open_tab should succeed");
+        let second_tab_id = opened
+            .tab
+            .as_ref()
+            .and_then(|tab| tab.tab_id.as_ref())
+            .map(|value| value.ulid.clone())
+            .expect("opened tab id should be present");
+
+        let active_title = service
+            .get_title(Request::new(browser_v1::GetTitleRequest {
+                v: 1,
+                session_id: Some(proto::palyra::common::v1::CanonicalId {
+                    ulid: session_id.clone(),
+                }),
+                max_title_bytes: 1024,
+            }))
+            .await
+            .expect("get_title should execute")
+            .into_inner();
+        assert_eq!(active_title.title, "Secondary Tab");
+
+        let switched = service
+            .switch_tab(Request::new(browser_v1::SwitchTabRequest {
+                v: 1,
+                session_id: Some(proto::palyra::common::v1::CanonicalId {
+                    ulid: session_id.clone(),
+                }),
+                tab_id: Some(proto::palyra::common::v1::CanonicalId { ulid: first_tab_id }),
+            }))
+            .await
+            .expect("switch_tab should execute")
+            .into_inner();
+        assert!(switched.success, "switch_tab should succeed");
+
+        let first_tab_title = service
+            .get_title(Request::new(browser_v1::GetTitleRequest {
+                v: 1,
+                session_id: Some(proto::palyra::common::v1::CanonicalId {
+                    ulid: session_id.clone(),
+                }),
+                max_title_bytes: 1024,
+            }))
+            .await
+            .expect("get_title on first tab should execute")
+            .into_inner();
+        assert!(
+            first_tab_title.title.is_empty(),
+            "first tab should keep independent state and remain blank"
+        );
+
+        let switched_back = service
+            .switch_tab(Request::new(browser_v1::SwitchTabRequest {
+                v: 1,
+                session_id: Some(proto::palyra::common::v1::CanonicalId {
+                    ulid: session_id.clone(),
+                }),
+                tab_id: Some(proto::palyra::common::v1::CanonicalId { ulid: second_tab_id }),
+            }))
+            .await
+            .expect("switch_tab back should execute")
+            .into_inner();
+        assert!(switched_back.success, "switch back should succeed");
+        let second_tab_title = service
+            .get_title(Request::new(browser_v1::GetTitleRequest {
+                v: 1,
+                session_id: Some(proto::palyra::common::v1::CanonicalId {
+                    ulid: session_id.clone(),
+                }),
+                max_title_bytes: 1024,
+            }))
+            .await
+            .expect("get_title on second tab should execute")
+            .into_inner();
+        assert_eq!(second_tab_title.title, "Secondary Tab");
+
+        handle.join().expect("test server thread should exit");
+    }
+
     fn spawn_static_http_server(status_code: u16, body: &str) -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
         let address = listener.local_addr().expect("listener local address should resolve");
         let body = body.to_owned();
         let handle = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("listener should accept request");
-            read_http_request(&mut stream);
+            let _ = read_http_request(&mut stream);
             let response = format!(
                 "HTTP/1.1 {status_code} OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
@@ -3197,7 +4804,7 @@ mod tests {
             .collect::<Vec<_>>();
         let handle = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("listener should accept request");
-            read_http_request(&mut stream);
+            let _ = read_http_request(&mut stream);
             let mut response = format!(
                 "HTTP/1.1 {status_code} OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n",
                 body.len()
@@ -3213,11 +4820,65 @@ mod tests {
         (format!("http://{address}/"), handle)
     }
 
-    fn read_http_request(stream: &mut TcpStream) {
+    fn spawn_cookie_state_http_server() -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let address = listener.local_addr().expect("listener local address should resolve");
+        let handle = thread::spawn(move || {
+            for index in 0..3 {
+                let (mut stream, _) = listener.accept().expect("listener should accept request");
+                let request = read_http_request(&mut stream);
+                let has_cookie = request.to_ascii_lowercase().contains("cookie: session=abc123");
+                let (status_code, body, headers) = match index {
+                    0 => (200, "seed", vec!["Set-Cookie: session=abc123; Path=/"]),
+                    1 => {
+                        if has_cookie {
+                            (200, "cookie_replayed", Vec::new())
+                        } else {
+                            (401, "cookie_missing", Vec::new())
+                        }
+                    }
+                    _ => {
+                        if has_cookie {
+                            (200, "cookie_still_present", Vec::new())
+                        } else {
+                            (401, "cookie_cleared", Vec::new())
+                        }
+                    }
+                };
+                let mut response = format!(
+                    "HTTP/1.1 {status_code} OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n",
+                    body.len()
+                );
+                for header in headers {
+                    response.push_str(format!("{header}\r\n").as_str());
+                }
+                response.push_str("Connection: close\r\n\r\n");
+                response.push_str(body);
+                stream.write_all(response.as_bytes()).expect("server should write response");
+                stream.flush().expect("server should flush response");
+            }
+        });
+        (format!("http://{address}/"), handle)
+    }
+
+    fn read_http_request(stream: &mut TcpStream) -> String {
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("read timeout should be configured");
+        let mut output = Vec::new();
         let mut buffer = [0_u8; 1024];
-        let _ = stream.read(&mut buffer);
+        loop {
+            match stream.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => {
+                    output.extend_from_slice(&buffer[..read]);
+                    if output.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        String::from_utf8_lossy(output.as_slice()).to_string()
     }
 }

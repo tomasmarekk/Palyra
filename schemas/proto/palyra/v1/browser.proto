@@ -17,6 +17,13 @@ service BrowserService {
   rpc Screenshot(ScreenshotRequest) returns (ScreenshotResponse);
   rpc Observe(ObserveRequest) returns (ObserveResponse);
   rpc NetworkLog(NetworkLogRequest) returns (NetworkLogResponse);
+  rpc ResetState(ResetStateRequest) returns (ResetStateResponse);
+  rpc ListTabs(ListTabsRequest) returns (ListTabsResponse);
+  rpc OpenTab(OpenTabRequest) returns (OpenTabResponse);
+  rpc SwitchTab(SwitchTabRequest) returns (SwitchTabResponse);
+  rpc CloseTab(CloseTabRequest) returns (CloseTabResponse);
+  rpc GetPermissions(GetPermissionsRequest) returns (GetPermissionsResponse);
+  rpc SetPermissions(SetPermissionsRequest) returns (SetPermissionsResponse);
 }
 
 message BrowserHealthRequest {
@@ -59,6 +66,9 @@ message CreateSessionRequest {
   bool allow_private_targets = 5;
   bool allow_downloads = 6;
   repeated string action_allowed_domains = 7;
+  bool persistence_enabled = 15;
+  string persistence_id = 16;
+  string channel = 17;
 
   reserved 8 to 14;
 }
@@ -70,6 +80,9 @@ message CreateSessionResponse {
   SessionBudget effective_budget = 4;
   bool downloads_enabled = 5;
   repeated string action_allowed_domains = 6;
+  bool persistence_enabled = 13;
+  string persistence_id = 14;
+  bool state_restored = 15;
 
   reserved 7 to 12;
 }
@@ -331,4 +344,165 @@ message NetworkLogResponse {
   string error = 5;
 
   reserved 6 to 12;
+}
+
+enum PermissionSetting {
+  PERMISSION_SETTING_UNSPECIFIED = 0;
+  PERMISSION_SETTING_DENY = 1;
+  PERMISSION_SETTING_ALLOW = 2;
+}
+
+message SessionPermissions {
+  uint32 v = 1;
+  PermissionSetting camera = 2;
+  PermissionSetting microphone = 3;
+  PermissionSetting location = 4;
+
+  reserved 5 to 12;
+}
+
+message BrowserTab {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId tab_id = 2;
+  string url = 3;
+  string title = 4;
+  bool active = 5;
+
+  reserved 6 to 12;
+}
+
+message ResetStateRequest {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId session_id = 2;
+  bool clear_cookies = 3;
+  bool clear_storage = 4;
+  bool reset_tabs = 5;
+  bool reset_permissions = 6;
+
+  reserved 7 to 14;
+}
+
+message ResetStateResponse {
+  uint32 v = 1;
+  bool success = 2;
+  uint32 cookies_cleared = 3;
+  uint32 storage_entries_cleared = 4;
+  uint32 tabs_closed = 5;
+  SessionPermissions permissions = 6;
+  string error = 7;
+
+  reserved 8 to 14;
+}
+
+message ListTabsRequest {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId session_id = 2;
+
+  reserved 3 to 10;
+}
+
+message ListTabsResponse {
+  uint32 v = 1;
+  bool success = 2;
+  repeated BrowserTab tabs = 3;
+  palyra.common.v1.CanonicalId active_tab_id = 4;
+  string error = 5;
+
+  reserved 6 to 12;
+}
+
+message OpenTabRequest {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId session_id = 2;
+  string url = 3;
+  bool activate = 4;
+  uint64 timeout_ms = 5;
+  bool allow_redirects = 6;
+  uint32 max_redirects = 7;
+  bool allow_private_targets = 8;
+
+  reserved 9 to 14;
+}
+
+message OpenTabResponse {
+  uint32 v = 1;
+  bool success = 2;
+  BrowserTab tab = 3;
+  bool navigated = 4;
+  uint32 status_code = 5;
+  string error = 6;
+
+  reserved 7 to 14;
+}
+
+message SwitchTabRequest {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId session_id = 2;
+  palyra.common.v1.CanonicalId tab_id = 3;
+
+  reserved 4 to 10;
+}
+
+message SwitchTabResponse {
+  uint32 v = 1;
+  bool success = 2;
+  BrowserTab active_tab = 3;
+  string error = 4;
+
+  reserved 5 to 12;
+}
+
+message CloseTabRequest {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId session_id = 2;
+  palyra.common.v1.CanonicalId tab_id = 3;
+
+  reserved 4 to 10;
+}
+
+message CloseTabResponse {
+  uint32 v = 1;
+  bool success = 2;
+  palyra.common.v1.CanonicalId closed_tab_id = 3;
+  BrowserTab active_tab = 4;
+  uint32 tabs_remaining = 5;
+  string error = 6;
+
+  reserved 7 to 14;
+}
+
+message GetPermissionsRequest {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId session_id = 2;
+
+  reserved 3 to 10;
+}
+
+message GetPermissionsResponse {
+  uint32 v = 1;
+  bool success = 2;
+  SessionPermissions permissions = 3;
+  string error = 4;
+
+  reserved 5 to 12;
+}
+
+message SetPermissionsRequest {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId session_id = 2;
+  PermissionSetting camera = 3;
+  PermissionSetting microphone = 4;
+  PermissionSetting location = 5;
+  bool reset_to_default = 6;
+
+  reserved 7 to 14;
+}
+
+message SetPermissionsResponse {
+  uint32 v = 1;
+  bool success = 2;
+  SessionPermissions permissions = 3;
+  string error = 4;
+
+  reserved 5 to 12;
 }

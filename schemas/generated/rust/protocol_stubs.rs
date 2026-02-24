@@ -66,6 +66,8 @@ pub mod palyra_browser_v1 {
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct BrowserHealthResponse;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct BrowserTab;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct ClickRequest;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct ClickResponse;
@@ -74,13 +76,25 @@ pub mod palyra_browser_v1 {
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct CloseSessionResponse;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct CloseTabRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct CloseTabResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct CreateSessionRequest;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct CreateSessionResponse;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct GetPermissionsRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct GetPermissionsResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct GetTitleRequest;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct GetTitleResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ListTabsRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ListTabsResponse;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct NavigateRequest;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -98,6 +112,14 @@ pub mod palyra_browser_v1 {
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct ObserveResponse;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct OpenTabRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct OpenTabResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ResetStateRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ResetStateResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct ScreenshotRequest;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct ScreenshotResponse;
@@ -107,6 +129,16 @@ pub mod palyra_browser_v1 {
     pub struct ScrollResponse;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct SessionBudget;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct SessionPermissions;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct SetPermissionsRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct SetPermissionsResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct SwitchTabRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct SwitchTabResponse;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct TypeRequest;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -118,14 +150,21 @@ pub mod palyra_browser_v1 {
     pub trait BrowserServiceClient {
         fn Click(&self);
         fn CloseSession(&self);
+        fn CloseTab(&self);
         fn CreateSession(&self);
+        fn GetPermissions(&self);
         fn GetTitle(&self);
         fn Health(&self);
+        fn ListTabs(&self);
         fn Navigate(&self);
         fn NetworkLog(&self);
         fn Observe(&self);
+        fn OpenTab(&self);
+        fn ResetState(&self);
         fn Screenshot(&self);
         fn Scroll(&self);
+        fn SetPermissions(&self);
+        fn SwitchTab(&self);
         fn Type(&self);
         fn WaitFor(&self);
     }

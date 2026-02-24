@@ -207,6 +207,13 @@ const BROWSER_TITLE_TOOL_NAME: &str = "palyra.browser.title";
 const BROWSER_SCREENSHOT_TOOL_NAME: &str = "palyra.browser.screenshot";
 const BROWSER_OBSERVE_TOOL_NAME: &str = "palyra.browser.observe";
 const BROWSER_NETWORK_LOG_TOOL_NAME: &str = "palyra.browser.network_log";
+const BROWSER_RESET_STATE_TOOL_NAME: &str = "palyra.browser.reset_state";
+const BROWSER_TABS_LIST_TOOL_NAME: &str = "palyra.browser.tabs.list";
+const BROWSER_TABS_OPEN_TOOL_NAME: &str = "palyra.browser.tabs.open";
+const BROWSER_TABS_SWITCH_TOOL_NAME: &str = "palyra.browser.tabs.switch";
+const BROWSER_TABS_CLOSE_TOOL_NAME: &str = "palyra.browser.tabs.close";
+const BROWSER_PERMISSIONS_GET_TOOL_NAME: &str = "palyra.browser.permissions.get";
+const BROWSER_PERMISSIONS_SET_TOOL_NAME: &str = "palyra.browser.permissions.set";
 
 #[derive(Debug, Clone)]
 pub struct GatewayRuntimeConfigSnapshot {
@@ -6595,6 +6602,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                                         execute_browser_tool(
                                             &state_for_stream,
                                             context_for_stream.principal.as_str(),
+                                            context_for_stream.channel.as_deref(),
                                             tool_name.as_str(),
                                             proposal_id.as_str(),
                                             input_json.as_slice(),
@@ -9292,6 +9300,7 @@ fn http_fetch_tool_execution_outcome(
 async fn execute_browser_tool(
     runtime_state: &Arc<GatewayRuntimeState>,
     principal: &str,
+    channel: Option<&str>,
     tool_name: &str,
     proposal_id: &str,
     input_json: &[u8],
@@ -9440,6 +9449,17 @@ async fn execute_browser_tool(
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default(),
+                persistence_enabled: payload
+                    .get("persistence_enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                persistence_id: payload
+                    .get("persistence_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .unwrap_or_default()
+                    .to_owned(),
+                channel: channel.unwrap_or_default().to_owned(),
             });
             if let Err(error) = attach_browser_auth_metadata(
                 &mut request,
@@ -9479,6 +9499,9 @@ async fn execute_browser_tool(
                         })),
                         "downloads_enabled": response.downloads_enabled,
                         "action_allowed_domains": response.action_allowed_domains,
+                        "persistence_enabled": response.persistence_enabled,
+                        "persistence_id": response.persistence_id,
+                        "state_restored": response.state_restored,
                     });
                     (
                         true,
@@ -10209,6 +10232,493 @@ async fn execute_browser_tool(
                 ),
             }
         }
+        BROWSER_RESET_STATE_TOOL_NAME => {
+            let session_id = match parse_browser_tool_session_id(&payload) {
+                Ok(value) => value,
+                Err(error) => {
+                    return browser_tool_execution_outcome(
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        error,
+                    );
+                }
+            };
+            let mut request = Request::new(browser_v1::ResetStateRequest {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                session_id: Some(common_v1::CanonicalId { ulid: session_id }),
+                clear_cookies: payload
+                    .get("clear_cookies")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                clear_storage: payload
+                    .get("clear_storage")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                reset_tabs: payload.get("reset_tabs").and_then(Value::as_bool).unwrap_or(false),
+                reset_permissions: payload
+                    .get("reset_permissions")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            });
+            if let Err(error) = attach_browser_auth_metadata(
+                &mut request,
+                runtime_state.config.browser_service.auth_token.as_deref(),
+            ) {
+                return browser_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    error,
+                );
+            }
+            match client.reset_state(request).await {
+                Ok(response) => {
+                    let response = response.into_inner();
+                    let output = json!({
+                        "success": response.success,
+                        "cookies_cleared": response.cookies_cleared,
+                        "storage_entries_cleared": response.storage_entries_cleared,
+                        "tabs_closed": response.tabs_closed,
+                        "permissions": response.permissions.map(browser_permissions_to_json),
+                        "error": response.error,
+                    });
+                    (
+                        response.success,
+                        serde_json::to_vec(&output).unwrap_or_else(|_| b"{}".to_vec()),
+                        if response.success { String::new() } else { response.error },
+                    )
+                }
+                Err(error) => (
+                    false,
+                    b"{}".to_vec(),
+                    format!(
+                        "palyra.browser.reset_state failed: {}",
+                        sanitize_status_message(&error)
+                    ),
+                ),
+            }
+        }
+        BROWSER_TABS_LIST_TOOL_NAME => {
+            let session_id = match parse_browser_tool_session_id(&payload) {
+                Ok(value) => value,
+                Err(error) => {
+                    return browser_tool_execution_outcome(
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        error,
+                    );
+                }
+            };
+            let mut request = Request::new(browser_v1::ListTabsRequest {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                session_id: Some(common_v1::CanonicalId { ulid: session_id }),
+            });
+            if let Err(error) = attach_browser_auth_metadata(
+                &mut request,
+                runtime_state.config.browser_service.auth_token.as_deref(),
+            ) {
+                return browser_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    error,
+                );
+            }
+            match client.list_tabs(request).await {
+                Ok(response) => {
+                    let response = response.into_inner();
+                    let output = json!({
+                        "success": response.success,
+                        "tabs": response.tabs.into_iter().map(browser_tab_to_json).collect::<Vec<_>>(),
+                        "active_tab_id": response.active_tab_id.map(|value| value.ulid),
+                        "error": response.error,
+                    });
+                    (
+                        response.success,
+                        serde_json::to_vec(&output).unwrap_or_else(|_| b"{}".to_vec()),
+                        if response.success { String::new() } else { response.error },
+                    )
+                }
+                Err(error) => (
+                    false,
+                    b"{}".to_vec(),
+                    format!("palyra.browser.tabs.list failed: {}", sanitize_status_message(&error)),
+                ),
+            }
+        }
+        BROWSER_TABS_OPEN_TOOL_NAME => {
+            let session_id = match parse_browser_tool_session_id(&payload) {
+                Ok(value) => value,
+                Err(error) => {
+                    return browser_tool_execution_outcome(
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        error,
+                    );
+                }
+            };
+            let mut request = Request::new(browser_v1::OpenTabRequest {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                session_id: Some(common_v1::CanonicalId { ulid: session_id }),
+                url: payload.get("url").and_then(Value::as_str).unwrap_or_default().to_owned(),
+                activate: payload.get("activate").and_then(Value::as_bool).unwrap_or(true),
+                timeout_ms: payload.get("timeout_ms").and_then(Value::as_u64).unwrap_or(0),
+                allow_redirects: payload
+                    .get("allow_redirects")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
+                max_redirects: payload.get("max_redirects").and_then(Value::as_u64).unwrap_or(3)
+                    as u32,
+                allow_private_targets: payload
+                    .get("allow_private_targets")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            });
+            if let Err(error) = attach_browser_auth_metadata(
+                &mut request,
+                runtime_state.config.browser_service.auth_token.as_deref(),
+            ) {
+                return browser_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    error,
+                );
+            }
+            match client.open_tab(request).await {
+                Ok(response) => {
+                    let response = response.into_inner();
+                    let output = json!({
+                        "success": response.success,
+                        "tab": response.tab.map(browser_tab_to_json),
+                        "navigated": response.navigated,
+                        "status_code": response.status_code,
+                        "error": response.error,
+                    });
+                    (
+                        response.success,
+                        serde_json::to_vec(&output).unwrap_or_else(|_| b"{}".to_vec()),
+                        if response.success { String::new() } else { response.error },
+                    )
+                }
+                Err(error) => (
+                    false,
+                    b"{}".to_vec(),
+                    format!("palyra.browser.tabs.open failed: {}", sanitize_status_message(&error)),
+                ),
+            }
+        }
+        BROWSER_TABS_SWITCH_TOOL_NAME => {
+            let session_id = match parse_browser_tool_session_id(&payload) {
+                Ok(value) => value,
+                Err(error) => {
+                    return browser_tool_execution_outcome(
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        error,
+                    );
+                }
+            };
+            let tab_id = match parse_browser_tool_tab_id(&payload) {
+                Ok(value) => value,
+                Err(error) => {
+                    return browser_tool_execution_outcome(
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        error,
+                    );
+                }
+            };
+            let mut request = Request::new(browser_v1::SwitchTabRequest {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                session_id: Some(common_v1::CanonicalId { ulid: session_id }),
+                tab_id: Some(common_v1::CanonicalId { ulid: tab_id }),
+            });
+            if let Err(error) = attach_browser_auth_metadata(
+                &mut request,
+                runtime_state.config.browser_service.auth_token.as_deref(),
+            ) {
+                return browser_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    error,
+                );
+            }
+            match client.switch_tab(request).await {
+                Ok(response) => {
+                    let response = response.into_inner();
+                    let output = json!({
+                        "success": response.success,
+                        "active_tab": response.active_tab.map(browser_tab_to_json),
+                        "error": response.error,
+                    });
+                    (
+                        response.success,
+                        serde_json::to_vec(&output).unwrap_or_else(|_| b"{}".to_vec()),
+                        if response.success { String::new() } else { response.error },
+                    )
+                }
+                Err(error) => (
+                    false,
+                    b"{}".to_vec(),
+                    format!(
+                        "palyra.browser.tabs.switch failed: {}",
+                        sanitize_status_message(&error)
+                    ),
+                ),
+            }
+        }
+        BROWSER_TABS_CLOSE_TOOL_NAME => {
+            let session_id = match parse_browser_tool_session_id(&payload) {
+                Ok(value) => value,
+                Err(error) => {
+                    return browser_tool_execution_outcome(
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        error,
+                    );
+                }
+            };
+            let tab_id = match payload.get("tab_id") {
+                Some(Value::String(raw)) => {
+                    let trimmed = raw.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        match validate_canonical_id(trimmed) {
+                            Ok(_) => Some(common_v1::CanonicalId { ulid: trimmed.to_owned() }),
+                            Err(error) => {
+                                return browser_tool_execution_outcome(
+                                    proposal_id,
+                                    input_json,
+                                    false,
+                                    b"{}".to_vec(),
+                                    format!("palyra.browser.tabs.close tab_id is invalid: {error}"),
+                                );
+                            }
+                        }
+                    }
+                }
+                Some(_) => {
+                    return browser_tool_execution_outcome(
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        "palyra.browser.tabs.close field 'tab_id' must be a string".to_owned(),
+                    );
+                }
+                None => None,
+            };
+            let mut request = Request::new(browser_v1::CloseTabRequest {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                session_id: Some(common_v1::CanonicalId { ulid: session_id }),
+                tab_id,
+            });
+            if let Err(error) = attach_browser_auth_metadata(
+                &mut request,
+                runtime_state.config.browser_service.auth_token.as_deref(),
+            ) {
+                return browser_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    error,
+                );
+            }
+            match client.close_tab(request).await {
+                Ok(response) => {
+                    let response = response.into_inner();
+                    let output = json!({
+                        "success": response.success,
+                        "closed_tab_id": response.closed_tab_id.map(|value| value.ulid),
+                        "active_tab": response.active_tab.map(browser_tab_to_json),
+                        "tabs_remaining": response.tabs_remaining,
+                        "error": response.error,
+                    });
+                    (
+                        response.success,
+                        serde_json::to_vec(&output).unwrap_or_else(|_| b"{}".to_vec()),
+                        if response.success { String::new() } else { response.error },
+                    )
+                }
+                Err(error) => (
+                    false,
+                    b"{}".to_vec(),
+                    format!(
+                        "palyra.browser.tabs.close failed: {}",
+                        sanitize_status_message(&error)
+                    ),
+                ),
+            }
+        }
+        BROWSER_PERMISSIONS_GET_TOOL_NAME => {
+            let session_id = match parse_browser_tool_session_id(&payload) {
+                Ok(value) => value,
+                Err(error) => {
+                    return browser_tool_execution_outcome(
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        error,
+                    );
+                }
+            };
+            let mut request = Request::new(browser_v1::GetPermissionsRequest {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                session_id: Some(common_v1::CanonicalId { ulid: session_id }),
+            });
+            if let Err(error) = attach_browser_auth_metadata(
+                &mut request,
+                runtime_state.config.browser_service.auth_token.as_deref(),
+            ) {
+                return browser_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    error,
+                );
+            }
+            match client.get_permissions(request).await {
+                Ok(response) => {
+                    let response = response.into_inner();
+                    let output = json!({
+                        "success": response.success,
+                        "permissions": response.permissions.map(browser_permissions_to_json),
+                        "error": response.error,
+                    });
+                    (
+                        response.success,
+                        serde_json::to_vec(&output).unwrap_or_else(|_| b"{}".to_vec()),
+                        if response.success { String::new() } else { response.error },
+                    )
+                }
+                Err(error) => (
+                    false,
+                    b"{}".to_vec(),
+                    format!(
+                        "palyra.browser.permissions.get failed: {}",
+                        sanitize_status_message(&error)
+                    ),
+                ),
+            }
+        }
+        BROWSER_PERMISSIONS_SET_TOOL_NAME => {
+            let session_id = match parse_browser_tool_session_id(&payload) {
+                Ok(value) => value,
+                Err(error) => {
+                    return browser_tool_execution_outcome(
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        error,
+                    );
+                }
+            };
+            let camera = match parse_browser_permission_setting(&payload, "camera") {
+                Ok(value) => value,
+                Err(error) => {
+                    return browser_tool_execution_outcome(
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        error,
+                    );
+                }
+            };
+            let microphone = match parse_browser_permission_setting(&payload, "microphone") {
+                Ok(value) => value,
+                Err(error) => {
+                    return browser_tool_execution_outcome(
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        error,
+                    );
+                }
+            };
+            let location = match parse_browser_permission_setting(&payload, "location") {
+                Ok(value) => value,
+                Err(error) => {
+                    return browser_tool_execution_outcome(
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        error,
+                    );
+                }
+            };
+            let mut request = Request::new(browser_v1::SetPermissionsRequest {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                session_id: Some(common_v1::CanonicalId { ulid: session_id }),
+                camera,
+                microphone,
+                location,
+                reset_to_default: payload
+                    .get("reset_to_default")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            });
+            if let Err(error) = attach_browser_auth_metadata(
+                &mut request,
+                runtime_state.config.browser_service.auth_token.as_deref(),
+            ) {
+                return browser_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    error,
+                );
+            }
+            match client.set_permissions(request).await {
+                Ok(response) => {
+                    let response = response.into_inner();
+                    let output = json!({
+                        "success": response.success,
+                        "permissions": response.permissions.map(browser_permissions_to_json),
+                        "error": response.error,
+                    });
+                    (
+                        response.success,
+                        serde_json::to_vec(&output).unwrap_or_else(|_| b"{}".to_vec()),
+                        if response.success { String::new() } else { response.error },
+                    )
+                }
+                Err(error) => (
+                    false,
+                    b"{}".to_vec(),
+                    format!(
+                        "palyra.browser.permissions.set failed: {}",
+                        sanitize_status_message(&error)
+                    ),
+                ),
+            }
+        }
         _ => (false, b"{}".to_vec(), "palyra.browser.* unsupported tool name".to_owned()),
     };
 
@@ -10245,6 +10755,50 @@ fn parse_browser_tool_session_id(
     validate_canonical_id(session_id)
         .map_err(|error| format!("palyra.browser.* session_id is invalid: {error}"))?;
     Ok(session_id.to_owned())
+}
+
+fn parse_browser_tool_tab_id(payload: &serde_json::Map<String, Value>) -> Result<String, String> {
+    let Some(tab_id) = payload.get("tab_id").and_then(Value::as_str).map(str::trim) else {
+        return Err("palyra.browser.tabs.* requires non-empty string field 'tab_id'".to_owned());
+    };
+    if tab_id.is_empty() {
+        return Err("palyra.browser.tabs.* requires non-empty string field 'tab_id'".to_owned());
+    }
+    validate_canonical_id(tab_id)
+        .map_err(|error| format!("palyra.browser.tabs.* tab_id is invalid: {error}"))?;
+    Ok(tab_id.to_owned())
+}
+
+fn parse_browser_permission_setting(
+    payload: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<i32, String> {
+    let Some(value) = payload.get(field) else {
+        return Ok(0);
+    };
+    match value {
+        Value::Number(number) => number
+            .as_i64()
+            .filter(|candidate| (0..=2).contains(candidate))
+            .map(|candidate| candidate as i32)
+            .ok_or_else(|| {
+                format!("palyra.browser.permissions.set field '{field}' must be 0, 1, or 2")
+            }),
+        Value::String(raw) => {
+            let normalized = raw.trim().to_ascii_lowercase();
+            match normalized.as_str() {
+                "" | "unspecified" => Ok(0),
+                "deny" => Ok(1),
+                "allow" => Ok(2),
+                _ => Err(format!(
+                    "palyra.browser.permissions.set field '{field}' must be one of: allow|deny|unspecified"
+                )),
+            }
+        }
+        _ => Err(format!(
+            "palyra.browser.permissions.set field '{field}' must be a string or integer"
+        )),
+    }
 }
 
 fn attach_browser_auth_metadata<T>(
@@ -10297,6 +10851,31 @@ fn browser_network_log_entry_to_json(entry: browser_v1::NetworkLogEntry) -> Valu
         "latency_ms": entry.latency_ms,
         "captured_at_unix_ms": entry.captured_at_unix_ms,
         "headers": headers,
+    })
+}
+
+fn browser_tab_to_json(tab: browser_v1::BrowserTab) -> Value {
+    json!({
+        "tab_id": tab.tab_id.map(|value| value.ulid),
+        "url": tab.url,
+        "title": tab.title,
+        "active": tab.active,
+    })
+}
+
+fn browser_permission_setting_label(value: i32) -> &'static str {
+    match value {
+        1 => "deny",
+        2 => "allow",
+        _ => "unspecified",
+    }
+}
+
+fn browser_permissions_to_json(permissions: browser_v1::SessionPermissions) -> Value {
+    json!({
+        "camera": browser_permission_setting_label(permissions.camera),
+        "microphone": browser_permission_setting_label(permissions.microphone),
+        "location": browser_permission_setting_label(permissions.location),
     })
 }
 
