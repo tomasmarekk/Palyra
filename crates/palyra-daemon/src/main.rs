@@ -3047,7 +3047,23 @@ fn auth_error_response(error: AuthError) -> Response {
             StatusCode::BAD_REQUEST
         }
     };
-    (status, Json(ErrorBody { error: error.to_string() })).into_response()
+    let sanitized_error = sanitize_http_error_message(error.to_string().as_str());
+    (status, Json(ErrorBody { error: sanitized_error })).into_response()
+}
+
+fn sanitize_http_error_message(raw: &str) -> String {
+    if raw.trim().is_empty() {
+        return String::new();
+    }
+    let payload = json!({ "error": raw });
+    match crate::journal::redact_payload_json(payload.to_string().as_bytes())
+        .ok()
+        .and_then(|redacted| serde_json::from_str::<Value>(&redacted).ok())
+        .and_then(|parsed| parsed.get("error").and_then(Value::as_str).map(str::to_owned))
+    {
+        Some(value) => value,
+        None => crate::model_provider::sanitize_remote_error(raw),
+    }
 }
 
 fn runtime_status_response(status: tonic::Status) -> Response {
@@ -3059,7 +3075,8 @@ fn runtime_status_response(status: tonic::Status) -> Response {
         tonic::Code::ResourceExhausted => StatusCode::TOO_MANY_REQUESTS,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
-    (http_status, Json(ErrorBody { error: status.message().to_owned() })).into_response()
+    let sanitized_error = sanitize_http_error_message(status.message());
+    (http_status, Json(ErrorBody { error: sanitized_error })).into_response()
 }
 
 fn validate_admin_auth_config(auth: &GatewayAuthConfig) -> Result<()> {
@@ -3296,7 +3313,7 @@ mod tests {
     use super::{
         consume_admin_rate_limit_with_now, consume_canvas_rate_limit_with_now,
         enforce_remote_bind_guard, loopback_grpc_url, runtime_status_response,
-        validate_admin_auth_config, validate_canvas_http_canvas_id,
+        sanitize_http_error_message, validate_admin_auth_config, validate_canvas_http_canvas_id,
         validate_canvas_http_token_query, validate_process_runner_backend_policy,
         ADMIN_RATE_LIMIT_MAX_IP_BUCKETS, ADMIN_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW,
         CANVAS_HTTP_MAX_TOKEN_BYTES, CANVAS_RATE_LIMIT_MAX_IP_BUCKETS,
@@ -3477,6 +3494,23 @@ mod tests {
     fn runtime_status_response_maps_resource_exhausted_to_too_many_requests() {
         let response = runtime_status_response(tonic::Status::resource_exhausted("rate limited"));
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn sanitize_http_error_message_redacts_secret_like_values() {
+        let sanitized = sanitize_http_error_message(
+            "provider failed: bearer topsecret token=abc123 cookie: sessionid=xyz",
+        );
+        assert!(
+            sanitized.contains("<redacted>"),
+            "sanitized error text should include redaction marker"
+        );
+        assert!(
+            !sanitized.contains("topsecret")
+                && !sanitized.contains("token=abc123")
+                && !sanitized.contains("sessionid=xyz"),
+            "sanitized error text must not leak secret-like values: {sanitized}"
+        );
     }
 
     #[test]
