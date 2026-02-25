@@ -41,6 +41,7 @@ static TEMP_JOURNAL_COUNTER: AtomicU64 = AtomicU64::new(0);
 static TEMP_CONFIG_COUNTER: AtomicU64 = AtomicU64::new(0);
 static TEMP_IDENTITY_COUNTER: AtomicU64 = AtomicU64::new(0);
 static TEMP_VAULT_COUNTER: AtomicU64 = AtomicU64::new(0);
+static TEMP_AGENTS_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub mod proto {
     pub mod palyra {
@@ -89,6 +90,18 @@ impl FakeChannelAdapter {
         text: &str,
         is_direct_message: bool,
     ) -> Result<gateway_v1::RouteMessageResponse> {
+        self.inject_message_with_flags(client, text, is_direct_message, false).await
+    }
+
+    async fn inject_message_with_flags(
+        &self,
+        client: &mut gateway_v1::gateway_service_client::GatewayServiceClient<
+            tonic::transport::Channel,
+        >,
+        text: &str,
+        is_direct_message: bool,
+        request_broadcast: bool,
+    ) -> Result<gateway_v1::RouteMessageResponse> {
         let mut request = tonic::Request::new(gateway_v1::RouteMessageRequest {
             v: 1,
             envelope: Some(common_v1::MessageEnvelope {
@@ -110,7 +123,7 @@ impl FakeChannelAdapter {
                 ..Default::default()
             }),
             is_direct_message,
-            request_broadcast: false,
+            request_broadcast,
             adapter_message_id: "msg-1".to_owned(),
             adapter_thread_id: "thread-1".to_owned(),
             retry_attempt: 0,
@@ -318,6 +331,107 @@ async fn grpc_route_message_rejects_without_mention_and_records_reason() -> Resu
             .iter()
             .any(|payload| payload.get("event").and_then(Value::as_str) == Some("message.routed")),
         "rejected message must not emit message.routed journal event"
+    );
+
+    server_handle.join().expect("scripted openai server thread should exit");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_route_message_accepts_direct_messages_without_mentions() -> Result<()> {
+    let (openai_base_url, request_count, server_handle) =
+        spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::immediate(
+            200,
+            r#"{"choices":[{"message":{"content":"dm response"}}]}"#.to_owned(),
+        )])?;
+    let (child, admin_port, grpc_port, _journal_db_path, config_path) =
+        spawn_palyrad_with_openai_provider_and_channel_router(
+            openai_base_url.as_str(),
+            OPENAI_API_KEY,
+        )?;
+    let _config_guard = TempFileGuard::new(config_path);
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+    let adapter = FakeChannelAdapter::default();
+    let response =
+        adapter.inject_message(&mut client, "plain dm request without mention", true).await?;
+    assert!(response.accepted, "direct messages should route when dm policy allows it");
+    assert!(!response.queued_for_retry);
+    assert_eq!(response.decision_reason, "routed");
+    assert_eq!(
+        response.outputs.len(),
+        1,
+        "routed direct messages should emit one outbound payload"
+    );
+    assert!(
+        !response.outputs[0].broadcast,
+        "direct message reply should not be marked as broadcast"
+    );
+    assert_eq!(
+        request_count.load(Ordering::Relaxed),
+        1,
+        "accepted direct message should invoke model provider"
+    );
+
+    server_handle.join().expect("scripted openai server thread should exit");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_route_message_rejects_broadcast_without_mention_even_for_dm() -> Result<()> {
+    let (openai_base_url, request_count, server_handle) = spawn_scripted_openai_server(Vec::new())?;
+    let (child, admin_port, grpc_port, journal_db_path, config_path) =
+        spawn_palyrad_with_openai_provider_and_channel_router(
+            openai_base_url.as_str(),
+            OPENAI_API_KEY,
+        )?;
+    let _config_guard = TempFileGuard::new(config_path);
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+    let adapter = FakeChannelAdapter::default();
+    let response = adapter
+        .inject_message_with_flags(&mut client, "broadcast request without mention", true, true)
+        .await?;
+    assert!(!response.accepted, "broadcast without mention should be rejected by policy");
+    assert!(!response.queued_for_retry);
+    assert_eq!(response.decision_reason, "broadcast_requires_mention_match");
+    assert!(response.outputs.is_empty(), "rejected route should not emit outbound payloads");
+    assert_eq!(
+        request_count.load(Ordering::Relaxed),
+        0,
+        "rejected broadcast should not invoke model provider"
+    );
+
+    let status_snapshot = admin_get_json_async(admin_port, "/admin/v1/status".to_owned()).await?;
+    assert_eq!(
+        status_snapshot.pointer("/counters/channel_messages_rejected").and_then(Value::as_u64),
+        Some(1),
+        "rejected counter should increment for denied broadcast requests"
+    );
+    assert_eq!(
+        status_snapshot.pointer("/counters/channel_messages_routed").and_then(Value::as_u64),
+        Some(0),
+        "routed counter should remain zero for denied broadcast requests"
+    );
+
+    let message_events = load_message_router_journal_events(&journal_db_path)?;
+    assert!(
+        message_events.iter().any(|payload| {
+            payload.get("event").and_then(Value::as_str) == Some("message.rejected")
+                && payload.get("reason").and_then(Value::as_str)
+                    == Some("broadcast_requires_mention_match")
+        }),
+        "router flow should persist rejection reason for denied broadcast requests"
     );
 
     server_handle.join().expect("scripted openai server thread should exit");
@@ -593,6 +707,180 @@ async fn grpc_agents_create_set_default_and_resolve_roundtrip() -> Result<()> {
             .is_some_and(|bindings| !bindings.is_empty()),
         "admin status should expose redacted session->agent bindings"
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_agents_persist_across_restart_and_reject_workspace_escape() -> Result<()> {
+    let journal_db_path = unique_temp_journal_db_path();
+    let agents_registry_path = unique_temp_agents_registry_path();
+    if let Some(parent) = agents_registry_path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create parent directory for agents registry {}",
+                agents_registry_path.display()
+            )
+        })?;
+    }
+
+    let (child, admin_port, grpc_port) = spawn_palyrad_with_existing_journal_and_agents_registry(
+        &journal_db_path,
+        &agents_registry_path,
+    )?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+
+    let mut create_main = tonic::Request::new(gateway_v1::CreateAgentRequest {
+        v: 1,
+        agent_id: "main".to_owned(),
+        display_name: "Main".to_owned(),
+        agent_dir: String::new(),
+        workspace_roots: vec!["workspace".to_owned()],
+        default_model_profile: "gpt-4o-mini".to_owned(),
+        default_tool_allowlist: vec!["palyra.echo".to_owned()],
+        default_skill_allowlist: vec!["acme.echo".to_owned()],
+        set_default: true,
+        allow_absolute_paths: false,
+    });
+    authorize_metadata_with_principal(create_main.metadata_mut(), "admin:ops")?;
+    client.create_agent(create_main).await.context("failed to create main agent before restart")?;
+
+    let mut create_review = tonic::Request::new(gateway_v1::CreateAgentRequest {
+        v: 1,
+        agent_id: "review".to_owned(),
+        display_name: "Reviewer".to_owned(),
+        agent_dir: String::new(),
+        workspace_roots: vec!["workspace".to_owned()],
+        default_model_profile: "gpt-4o-mini".to_owned(),
+        default_tool_allowlist: vec!["palyra.echo".to_owned()],
+        default_skill_allowlist: vec!["acme.review".to_owned()],
+        set_default: false,
+        allow_absolute_paths: false,
+    });
+    authorize_metadata_with_principal(create_review.metadata_mut(), "admin:ops")?;
+    client
+        .create_agent(create_review)
+        .await
+        .context("failed to create review agent before restart")?;
+
+    let mut set_default = tonic::Request::new(gateway_v1::SetDefaultAgentRequest {
+        v: 1,
+        agent_id: "review".to_owned(),
+    });
+    authorize_metadata_with_principal(set_default.metadata_mut(), "admin:ops")?;
+    client
+        .set_default_agent(set_default)
+        .await
+        .context("failed to set default agent before restart")?;
+
+    let session_id = "01ARZ3NDEKTSV4RRFFQ69G5FB2".to_owned();
+    let mut resolve_before_restart =
+        tonic::Request::new(gateway_v1::ResolveAgentForContextRequest {
+            v: 1,
+            principal: "admin:ops".to_owned(),
+            channel: "cli".to_owned(),
+            session_id: Some(common_v1::CanonicalId { ulid: session_id.clone() }),
+            preferred_agent_id: String::new(),
+            persist_session_binding: true,
+        });
+    authorize_metadata_with_principal(resolve_before_restart.metadata_mut(), "admin:ops")?;
+    let first_resolution = client
+        .resolve_agent_for_context(resolve_before_restart)
+        .await
+        .context("failed to resolve agent before restart")?
+        .into_inner();
+    assert_eq!(
+        first_resolution.source,
+        gateway_v1::AgentResolutionSource::Default as i32,
+        "first resolve should use configured default agent"
+    );
+    assert!(first_resolution.binding_created, "first resolve should persist session binding");
+
+    daemon.child_mut().kill().context("failed to stop daemon before restart")?;
+    daemon.child_mut().wait().context("failed to wait for daemon shutdown")?;
+    drop(daemon);
+
+    let (child, restarted_admin_port, restarted_grpc_port) =
+        spawn_palyrad_with_existing_journal_and_agents_registry(
+            &journal_db_path,
+            &agents_registry_path,
+        )?;
+    let mut restarted = ChildGuard::new(child);
+    wait_for_health(restarted_admin_port, restarted.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{restarted_grpc_port}");
+    let mut restarted_client =
+        gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+            .await
+            .context("failed to connect gRPC client after restart")?;
+
+    let mut list_request = tonic::Request::new(gateway_v1::ListAgentsRequest {
+        v: 1,
+        limit: 10,
+        after_agent_id: String::new(),
+    });
+    authorize_metadata_with_principal(list_request.metadata_mut(), "admin:ops")?;
+    let listed = restarted_client
+        .list_agents(list_request)
+        .await
+        .context("failed to list agents after restart")?
+        .into_inner();
+    assert_eq!(listed.default_agent_id, "review", "default agent should survive restart");
+    assert!(
+        listed.agents.iter().any(|agent| agent.agent_id == "main")
+            && listed.agents.iter().any(|agent| agent.agent_id == "review"),
+        "created agents should survive restart"
+    );
+
+    let mut resolve_after_restart =
+        tonic::Request::new(gateway_v1::ResolveAgentForContextRequest {
+            v: 1,
+            principal: "admin:ops".to_owned(),
+            channel: "cli".to_owned(),
+            session_id: Some(common_v1::CanonicalId { ulid: session_id }),
+            preferred_agent_id: String::new(),
+            persist_session_binding: true,
+        });
+    authorize_metadata_with_principal(resolve_after_restart.metadata_mut(), "admin:ops")?;
+    let second_resolution = restarted_client
+        .resolve_agent_for_context(resolve_after_restart)
+        .await
+        .context("failed to resolve agent after restart")?
+        .into_inner();
+    assert_eq!(
+        second_resolution.source,
+        gateway_v1::AgentResolutionSource::SessionBinding as i32,
+        "persisted session binding should survive restart"
+    );
+    assert!(
+        !second_resolution.binding_created,
+        "session binding should not be recreated after restart"
+    );
+
+    let mut invalid_create = tonic::Request::new(gateway_v1::CreateAgentRequest {
+        v: 1,
+        agent_id: "escape-check".to_owned(),
+        display_name: "Escape".to_owned(),
+        agent_dir: String::new(),
+        workspace_roots: vec!["../outside".to_owned()],
+        default_model_profile: "gpt-4o-mini".to_owned(),
+        default_tool_allowlist: vec!["palyra.echo".to_owned()],
+        default_skill_allowlist: vec!["acme.echo".to_owned()],
+        set_default: false,
+        allow_absolute_paths: false,
+    });
+    authorize_metadata_with_principal(invalid_create.metadata_mut(), "admin:ops")?;
+    let invalid = restarted_client
+        .create_agent(invalid_create)
+        .await
+        .expect_err("workspace escape must be rejected");
+    assert_eq!(invalid.code(), Code::InvalidArgument);
+
     Ok(())
 }
 
@@ -5272,6 +5560,50 @@ fn spawn_palyrad_with_existing_journal(journal_db_path: PathBuf) -> Result<(Chil
     Ok((child, admin_port, grpc_port))
 }
 
+fn spawn_palyrad_with_existing_journal_and_agents_registry(
+    journal_db_path: &PathBuf,
+    agents_registry_path: &PathBuf,
+) -> Result<(Child, u16, u16)> {
+    let identity_store_dir = unique_temp_identity_store_dir();
+    let vault_dir = unique_temp_vault_dir();
+    prepare_test_vault_dir(&vault_dir)?;
+    if let Some(parent) = agents_registry_path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create parent directory for agents registry {}",
+                agents_registry_path.display()
+            )
+        })?;
+    }
+    let mut child = Command::new(env!("CARGO_BIN_EXE_palyrad"))
+        .args([
+            "--bind",
+            "127.0.0.1",
+            "--port",
+            "0",
+            "--grpc-bind",
+            "127.0.0.1",
+            "--grpc-port",
+            "0",
+        ])
+        .env("PALYRA_ADMIN_TOKEN", ADMIN_TOKEN)
+        .env("PALYRA_GATEWAY_QUIC_BIND_ADDR", "127.0.0.1")
+        .env("PALYRA_GATEWAY_QUIC_PORT", "0")
+        .env("PALYRA_JOURNAL_DB_PATH", journal_db_path.to_string_lossy().to_string())
+        .env("PALYRA_AGENTS_REGISTRY_PATH", agents_registry_path.to_string_lossy().to_string())
+        .env("PALYRA_GATEWAY_IDENTITY_STORE_DIR", identity_store_dir.to_string_lossy().to_string())
+        .env("PALYRA_VAULT_DIR", vault_dir.to_string_lossy().to_string())
+        .env("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED", "true")
+        .env("RUST_LOG", "info")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to start palyrad with explicit agents registry path")?;
+    let stdout = child.stdout.take().context("failed to capture palyrad stdout")?;
+    let (admin_port, grpc_port) = wait_for_listen_ports(stdout, &mut child)?;
+    Ok((child, admin_port, grpc_port))
+}
+
 fn spawn_palyrad_with_openai_provider(
     openai_base_url: &str,
     openai_api_key: &str,
@@ -5810,6 +6142,17 @@ fn unique_temp_vault_dir() -> PathBuf {
     let counter = TEMP_VAULT_COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir()
         .join(format!("palyra-gateway-vault-{nonce}-{}-{counter}", std::process::id()))
+}
+
+fn unique_temp_agents_registry_path() -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_nanos();
+    let counter = TEMP_AGENTS_COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir()
+        .join(format!("palyra-gateway-agents-{nonce}-{}-{counter}", std::process::id()))
+        .join("agents.toml")
 }
 
 fn prepare_test_vault_dir(vault_dir: &PathBuf) -> Result<()> {

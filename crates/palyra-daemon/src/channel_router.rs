@@ -761,6 +761,25 @@ mod tests {
     }
 
     #[test]
+    fn default_broadcast_strategy_denies_broadcast_requests() {
+        let mut config = baseline_config();
+        config.default_channel_enabled = true;
+        config.default_allow_direct_messages = true;
+        config.channels.clear();
+        let router = ChannelRouter::new(config);
+        let mut message = inbound("plain dm broadcast request");
+        message.channel = "teams".to_owned();
+        message.is_direct_message = true;
+        message.requested_broadcast = true;
+        let outcome = router.begin_route(&message);
+        assert!(matches!(
+            outcome,
+            RouteOutcome::Rejected(ref rejection)
+                if rejection.reason == "broadcast_denied_by_policy"
+        ));
+    }
+
+    #[test]
     fn sender_isolation_changes_session_key() {
         let mut config = baseline_config();
         config.channels[0].isolate_session_by_sender = true;
