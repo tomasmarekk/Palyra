@@ -201,6 +201,7 @@ fn admin_run_endpoints_require_token_and_report_not_found_for_unknown_run() -> R
     let missing_auth =
         client.get(&status_url).send().context("failed to call admin run status without auth")?;
     assert_eq!(missing_auth.status().as_u16(), 401, "missing auth must be rejected");
+    assert_admin_console_security_headers(missing_auth.headers())?;
 
     let unknown_run = client
         .get(&status_url)
@@ -381,6 +382,7 @@ fn console_session_and_csrf_guards_are_enforced() -> Result<()> {
         403,
         "console logout should reject missing csrf token"
     );
+    assert_admin_console_security_headers(logout_without_csrf.headers())?;
 
     let logout_with_csrf = client
         .post(format!("http://127.0.0.1:{admin_port}/console/v1/auth/logout"))
