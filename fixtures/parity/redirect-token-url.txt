@@ -1,0 +1,1 @@
+https://example.com/redirect?token=secret&safe=1

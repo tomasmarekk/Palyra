@@ -3690,6 +3690,13 @@ mod tests {
     use std::time::Duration;
     use tonic::Request;
 
+    const PARITY_DOWNLOAD_TRIGGER_HTML: &str =
+        include_str!("../../../fixtures/parity/download-trigger.html");
+    const PARITY_NETWORK_LOG_HTML: &str = include_str!("../../../fixtures/parity/network-log.html");
+    const PARITY_REDIRECT_TOKEN_URL: &str =
+        include_str!("../../../fixtures/parity/redirect-token-url.txt");
+    const PARITY_TRICKY_DOM_HTML: &str = include_str!("../../../fixtures/parity/tricky-dom.html");
+
     #[tokio::test(flavor = "multi_thread")]
     async fn navigate_with_guards_blocks_file_scheme() {
         let outcome =
@@ -4070,10 +4077,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn browser_service_blocks_download_click_when_disabled() {
-        let (url, handle) = spawn_static_http_server(
-            200,
-            "<html><body><a id=\"download-link\" href=\"/report.csv\" download>Download</a></body></html>",
-        );
+        let (url, handle) = spawn_static_http_server(200, PARITY_DOWNLOAD_TRIGGER_HTML);
         let runtime = std::sync::Arc::new(
             BrowserRuntimeState::new(&Args {
                 bind: "127.0.0.1".to_owned(),
@@ -4159,10 +4163,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn browser_service_observe_returns_stable_sanitized_snapshot() {
-        let (url, handle) = spawn_static_http_server(
-            200,
-            "<html><head><title>Observe Fixture</title></head><body><main><h1>Portal</h1><form id=\"login\" action=\"/submit?token=secret&safe=ok\"><input id=\"email\" name=\"email\" type=\"email\" /><button id=\"send\" aria-label=\"Send\">Send</button></form><a id=\"docs\" href=\"https://example.com/docs?access_token=secret&lang=en\">Docs</a><script>window.token='abc'</script></main></body></html>",
-        );
+        let (url, handle) = spawn_static_http_server(200, PARITY_TRICKY_DOM_HTML);
         let runtime = std::sync::Arc::new(
             BrowserRuntimeState::new(&Args {
                 bind: "127.0.0.1".to_owned(),
@@ -4375,11 +4376,11 @@ mod tests {
     async fn browser_service_network_log_redacts_sensitive_values() {
         let (url, handle) = spawn_static_http_server_with_headers(
             200,
-            "<html><body>network log fixture</body></html>",
+            PARITY_NETWORK_LOG_HTML,
             &[
                 ("Set-Cookie", "session=abc123; HttpOnly"),
                 ("X-Api-Key", "secret-key"),
-                ("Location", "https://example.com/redirect?token=secret&safe=1"),
+                ("Location", PARITY_REDIRECT_TOKEN_URL.trim()),
             ],
         );
         let runtime = std::sync::Arc::new(
