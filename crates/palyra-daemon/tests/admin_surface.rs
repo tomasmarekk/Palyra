@@ -599,6 +599,67 @@ fn console_memory_purge_requires_session_and_csrf() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn console_login_rejects_oversized_request_body() -> Result<()> {
+    let (child, admin_port) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("failed to build HTTP client")?;
+    let oversized_principal = format!("admin:{}", "a".repeat(80 * 1024));
+
+    let response = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/auth/login"))
+        .json(&serde_json::json!({
+            "admin_token": ADMIN_TOKEN,
+            "principal": oversized_principal,
+            "device_id": DEVICE_ID,
+            "channel": "web",
+        }))
+        .send()
+        .context("failed to call console login with oversized request body")?;
+    assert_eq!(
+        response.status().as_u16(),
+        413,
+        "console login should reject oversized request bodies with payload-too-large status"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn admin_run_cancel_rejects_oversized_request_body() -> Result<()> {
+    let (child, admin_port) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("failed to build HTTP client")?;
+    let oversized_reason = "a".repeat(80 * 1024);
+
+    let response = client
+        .post(format!("http://127.0.0.1:{admin_port}/admin/v1/runs/{RUN_ID}/cancel"))
+        .header("Authorization", format!("Bearer {ADMIN_TOKEN}"))
+        .header("x-palyra-principal", "admin:ops")
+        .header("x-palyra-device-id", DEVICE_ID)
+        .header("x-palyra-channel", "cli")
+        .json(&serde_json::json!({ "reason": oversized_reason }))
+        .send()
+        .context("failed to call admin run cancel with oversized request body")?;
+    assert_eq!(
+        response.status().as_u16(),
+        413,
+        "admin run cancel should reject oversized request bodies with payload-too-large status"
+    );
+
+    Ok(())
+}
+
 fn spawn_palyrad_with_dynamic_ports() -> Result<(Child, u16)> {
     let mut last_error: Option<anyhow::Error> = None;
     for attempt in 1..=PALYRAD_STARTUP_ATTEMPTS {
