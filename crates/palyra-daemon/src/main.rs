@@ -14,8 +14,9 @@ mod wasm_plugin_runner;
 
 use std::{
     collections::{HashMap, HashSet},
+    fs,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    path::PathBuf,
+    path::{Path as FsPath, PathBuf},
     sync::{Arc, Mutex},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
@@ -24,7 +25,9 @@ use anyhow::{Context, Result};
 use axum::{
     extract::{ConnectInfo, Path, Query, Request, State},
     http::{
-        header::{CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE},
+        header::{
+            AUTHORIZATION, CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, COOKIE, SET_COOKIE,
+        },
         HeaderMap, HeaderName, HeaderValue, StatusCode,
     },
     middleware::{self, Next},
@@ -41,9 +44,10 @@ use gateway::{
     GatewayRuntimeState, MemoryRuntimeConfig,
 };
 use journal::{
-    JournalAppendRequest, JournalConfig, JournalStore, OrchestratorCancelRequest,
-    OrchestratorRunStatusSnapshot, SkillExecutionStatus, SkillStatusRecord,
-    SkillStatusUpsertRequest,
+    ApprovalDecision, ApprovalDecisionScope, ApprovalSubjectType, CronJobUpdatePatch,
+    JournalAppendRequest, JournalConfig, JournalStore, MemoryPurgeRequest,
+    OrchestratorCancelRequest, OrchestratorRunStatusSnapshot, SkillExecutionStatus,
+    SkillStatusRecord, SkillStatusUpsertRequest,
 };
 use model_provider::{build_model_provider, ModelProviderKind};
 use palyra_auth::{AuthProfileRegistry, HttpOAuthRefreshAdapter, OAuthRefreshAdapter};
@@ -55,16 +59,27 @@ use palyra_common::{
 use palyra_identity::IdentityManager;
 use palyra_identity::{FilesystemSecretStore, SecretStore};
 use palyra_policy::{evaluate_with_config, PolicyDecision, PolicyEvaluationConfig, PolicyRequest};
+use palyra_skills::{
+    audit_skill_artifact_security, inspect_skill_artifact, verify_skill_artifact,
+    SkillSecurityAuditPolicy, SkillTrustStore,
+};
 use palyra_transport_quic::QuicTransportLimits;
 use palyra_vault::{Vault, VaultConfig as VaultConfigOptions, VaultRef};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 use tokio_stream::wrappers::TcpListenerStream;
-use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
+use tonic::{
+    metadata::MetadataValue,
+    transport::{Certificate, Identity, Server, ServerTlsConfig},
+    Request as TonicRequest,
+};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 use ulid::Ulid;
+
+use crate::gateway::proto::palyra::{common::v1 as common_v1, cron::v1 as cron_v1};
 
 const DANGEROUS_REMOTE_BIND_ACK_ENV: &str = "PALYRA_GATEWAY_DANGEROUS_REMOTE_BIND_ACK";
 const SYSTEM_DAEMON_PRINCIPAL: &str = "system:daemon";
@@ -75,6 +90,13 @@ const GRPC_MAX_ENCODING_MESSAGE_SIZE_BYTES: usize = 4 * 1024 * 1024;
 const ADMIN_RATE_LIMIT_WINDOW_MS: u64 = 1_000;
 const ADMIN_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW: u32 = 30;
 const ADMIN_RATE_LIMIT_MAX_IP_BUCKETS: usize = 4_096;
+const CONSOLE_SESSION_COOKIE_NAME: &str = "palyra_console_session";
+const CONSOLE_CSRF_HEADER_NAME: &str = "x-palyra-csrf-token";
+const CONSOLE_SESSION_TTL_SECONDS: u64 = 30 * 60;
+const CONSOLE_MAX_ACTIVE_SESSIONS: usize = 1_024;
+const SKILLS_LAYOUT_VERSION: u32 = 1;
+const SKILLS_INDEX_FILE_NAME: &str = "installed-index.json";
+const SKILL_ARTIFACT_FILE_NAME: &str = "artifact.palyra-skill";
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "palyrad", about = "Palyra gateway skeleton daemon")]
@@ -98,6 +120,10 @@ struct AppState {
     auth_runtime: Arc<gateway::AuthRuntimeState>,
     auth: GatewayAuthConfig,
     admin_rate_limit: Arc<Mutex<HashMap<IpAddr, AdminRateLimitEntry>>>,
+    cron_timezone_mode: cron::CronTimezoneMode,
+    grpc_url: String,
+    scheduler_wake: Arc<Notify>,
+    console_sessions: Arc<Mutex<HashMap<String, ConsoleSession>>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -144,6 +170,188 @@ struct SkillStatusResponse {
     reason: Option<String>,
     detected_at_ms: i64,
     operator_principal: String,
+}
+
+#[derive(Debug, Clone)]
+struct ConsoleSession {
+    session_id: String,
+    csrf_token: String,
+    context: gateway::RequestContext,
+    issued_at_unix_ms: i64,
+    expires_at_unix_ms: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct ConsoleSessionResponse {
+    principal: String,
+    device_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    channel: Option<String>,
+    csrf_token: String,
+    issued_at_unix_ms: i64,
+    expires_at_unix_ms: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleLoginRequest {
+    admin_token: Option<String>,
+    principal: String,
+    device_id: String,
+    channel: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleApprovalsQuery {
+    after_approval_id: Option<String>,
+    limit: Option<usize>,
+    since_unix_ms: Option<i64>,
+    until_unix_ms: Option<i64>,
+    subject_id: Option<String>,
+    principal: Option<String>,
+    decision: Option<String>,
+    subject_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleApprovalDecisionRequest {
+    approved: bool,
+    reason: Option<String>,
+    decision_scope: Option<String>,
+    decision_scope_ttl_ms: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleCronCreateRequest {
+    name: String,
+    prompt: String,
+    #[serde(default)]
+    owner_principal: Option<String>,
+    #[serde(default)]
+    channel: Option<String>,
+    #[serde(default)]
+    session_key: Option<String>,
+    #[serde(default)]
+    session_label: Option<String>,
+    schedule_type: String,
+    #[serde(default)]
+    cron_expression: Option<String>,
+    #[serde(default)]
+    every_interval_ms: Option<u64>,
+    #[serde(default)]
+    at_timestamp_rfc3339: Option<String>,
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    jitter_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleCronEnabledRequest {
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleMemorySearchQuery {
+    query: String,
+    top_k: Option<usize>,
+    min_score: Option<f64>,
+    #[serde(default)]
+    tags_csv: Option<String>,
+    #[serde(default)]
+    sources_csv: Option<String>,
+    #[serde(default)]
+    channel: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleMemoryPurgeRequest {
+    #[serde(default)]
+    channel: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    purge_all_principal: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleSkillsListQuery {
+    skill_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleSkillInstallRequest {
+    artifact_path: String,
+    #[serde(default)]
+    allow_tofu: Option<bool>,
+    #[serde(default)]
+    allow_untrusted: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleSkillActionRequest {
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    allow_tofu: Option<bool>,
+    #[serde(default)]
+    quarantine_on_fail: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleAuditEventsQuery {
+    limit: Option<usize>,
+    kind: Option<i32>,
+    principal: Option<String>,
+    channel: Option<String>,
+    contains: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InstalledSkillsIndex {
+    schema_version: u32,
+    updated_at_unix_ms: i64,
+    #[serde(default)]
+    entries: Vec<InstalledSkillRecord>,
+}
+
+impl Default for InstalledSkillsIndex {
+    fn default() -> Self {
+        Self { schema_version: SKILLS_LAYOUT_VERSION, updated_at_unix_ms: 0, entries: Vec::new() }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InstalledSkillRecord {
+    skill_id: String,
+    version: String,
+    publisher: String,
+    current: bool,
+    installed_at_unix_ms: i64,
+    artifact_sha256: String,
+    payload_sha256: String,
+    signature_key_id: String,
+    trust_decision: String,
+    source: InstalledSkillSource,
+    #[serde(default)]
+    missing_secrets: Vec<MissingSkillSecret>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InstalledSkillSource {
+    kind: String,
+    reference: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct MissingSkillSecret {
+    scope: String,
+    key: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -548,34 +756,6 @@ async fn main() -> Result<()> {
         "gateway startup"
     );
 
-    let started_at = Instant::now();
-    let state = AppState {
-        started_at,
-        runtime: runtime.clone(),
-        auth_runtime: Arc::clone(&auth_runtime),
-        auth: auth.clone(),
-        admin_rate_limit: Arc::new(Mutex::new(HashMap::new())),
-    };
-    let admin_routes = Router::new()
-        .route("/admin/v1/status", get(admin_status_handler))
-        .route("/admin/v1/journal/recent", get(admin_journal_recent_handler))
-        .route("/admin/v1/policy/explain", get(admin_policy_explain_handler))
-        .route("/admin/v1/runs/{run_id}", get(admin_run_status_handler))
-        .route("/admin/v1/runs/{run_id}/tape", get(admin_run_tape_handler))
-        .route("/admin/v1/runs/{run_id}/cancel", post(admin_run_cancel_handler))
-        .route("/admin/v1/skills/{skill_id}/quarantine", post(admin_skill_quarantine_handler))
-        .route("/admin/v1/skills/{skill_id}/enable", post(admin_skill_enable_handler))
-        .route_layer(middleware::from_fn_with_state(state.clone(), admin_rate_limit_middleware));
-    let app = Router::new()
-        .route("/healthz", get(health_handler))
-        .route("/canvas/v1/frame/{canvas_id}", get(canvas_frame_handler))
-        .route("/canvas/v1/runtime.js", get(canvas_runtime_js_handler))
-        .route("/canvas/v1/runtime.css", get(canvas_runtime_css_handler))
-        .route("/canvas/v1/bundle/{canvas_id}/{*asset_path}", get(canvas_bundle_asset_handler))
-        .route("/canvas/v1/state/{canvas_id}", get(canvas_state_handler))
-        .merge(admin_routes)
-        .with_state(state);
-
     let admin_address = parse_daemon_bind_socket(&loaded.daemon.bind_addr, loaded.daemon.port)
         .context("invalid admin bind address or port")?;
     let grpc_address =
@@ -636,6 +816,64 @@ async fn main() -> Result<()> {
         grpc_url.clone(),
         Arc::clone(&scheduler_wake),
     );
+
+    let started_at = Instant::now();
+    let state = AppState {
+        started_at,
+        runtime: runtime.clone(),
+        auth_runtime: Arc::clone(&auth_runtime),
+        auth: auth.clone(),
+        admin_rate_limit: Arc::new(Mutex::new(HashMap::new())),
+        cron_timezone_mode: loaded.cron.timezone,
+        grpc_url: grpc_url.clone(),
+        scheduler_wake: Arc::clone(&scheduler_wake),
+        console_sessions: Arc::new(Mutex::new(HashMap::new())),
+    };
+    let admin_routes = Router::new()
+        .route("/admin/v1/status", get(admin_status_handler))
+        .route("/admin/v1/journal/recent", get(admin_journal_recent_handler))
+        .route("/admin/v1/policy/explain", get(admin_policy_explain_handler))
+        .route("/admin/v1/runs/{run_id}", get(admin_run_status_handler))
+        .route("/admin/v1/runs/{run_id}/tape", get(admin_run_tape_handler))
+        .route("/admin/v1/runs/{run_id}/cancel", post(admin_run_cancel_handler))
+        .route("/admin/v1/skills/{skill_id}/quarantine", post(admin_skill_quarantine_handler))
+        .route("/admin/v1/skills/{skill_id}/enable", post(admin_skill_enable_handler))
+        .route_layer(middleware::from_fn_with_state(state.clone(), admin_rate_limit_middleware));
+    let console_routes = Router::new()
+        .route("/console/v1/auth/login", post(console_login_handler))
+        .route("/console/v1/auth/logout", post(console_logout_handler))
+        .route("/console/v1/auth/session", get(console_session_handler))
+        .route("/console/v1/approvals", get(console_approvals_list_handler))
+        .route("/console/v1/approvals/{approval_id}", get(console_approval_get_handler))
+        .route(
+            "/console/v1/approvals/{approval_id}/decision",
+            post(console_approval_decision_handler),
+        )
+        .route("/console/v1/cron/jobs", get(console_cron_list_handler))
+        .route("/console/v1/cron/jobs", post(console_cron_create_handler))
+        .route("/console/v1/cron/jobs/{job_id}/enabled", post(console_cron_set_enabled_handler))
+        .route("/console/v1/cron/jobs/{job_id}/run-now", post(console_cron_run_now_handler))
+        .route("/console/v1/cron/jobs/{job_id}/runs", get(console_cron_runs_handler))
+        .route("/console/v1/memory/search", get(console_memory_search_handler))
+        .route("/console/v1/memory/purge", post(console_memory_purge_handler))
+        .route("/console/v1/skills", get(console_skills_list_handler))
+        .route("/console/v1/skills/install", post(console_skills_install_handler))
+        .route("/console/v1/skills/{skill_id}/verify", post(console_skills_verify_handler))
+        .route("/console/v1/skills/{skill_id}/audit", post(console_skills_audit_handler))
+        .route("/console/v1/skills/{skill_id}/quarantine", post(console_skill_quarantine_handler))
+        .route("/console/v1/skills/{skill_id}/enable", post(console_skill_enable_handler))
+        .route("/console/v1/audit/events", get(console_audit_events_handler))
+        .route_layer(middleware::from_fn_with_state(state.clone(), admin_rate_limit_middleware));
+    let app = Router::new()
+        .route("/healthz", get(health_handler))
+        .route("/canvas/v1/frame/{canvas_id}", get(canvas_frame_handler))
+        .route("/canvas/v1/runtime.js", get(canvas_runtime_js_handler))
+        .route("/canvas/v1/runtime.css", get(canvas_runtime_css_handler))
+        .route("/canvas/v1/bundle/{canvas_id}/{*asset_path}", get(canvas_bundle_asset_handler))
+        .route("/canvas/v1/state/{canvas_id}", get(canvas_state_handler))
+        .merge(admin_routes)
+        .merge(console_routes)
+        .with_state(state);
 
     let gateway_service = gateway::GatewayServiceImpl::new(runtime.clone(), auth.clone());
     let grpc_gateway_server =
@@ -1266,6 +1504,1392 @@ fn skill_status_response(record: SkillStatusRecord) -> SkillStatusResponse {
         reason: record.reason,
         detected_at_ms: record.detected_at_ms,
         operator_principal: record.operator_principal,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleCronListQuery {
+    after_job_id: Option<String>,
+    limit: Option<usize>,
+    enabled: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleCronRunsQuery {
+    after_run_id: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn console_login_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<ConsoleLoginRequest>,
+) -> Result<(HeaderMap, Json<ConsoleSessionResponse>), Response> {
+    let principal = payload.principal.trim();
+    let device_id = payload.device_id.trim();
+    if principal.is_empty() {
+        return Err(runtime_status_response(tonic::Status::invalid_argument(
+            "principal cannot be empty",
+        )));
+    }
+    if device_id.is_empty() {
+        return Err(runtime_status_response(tonic::Status::invalid_argument(
+            "device_id cannot be empty",
+        )));
+    }
+
+    let mut auth_headers = HeaderMap::new();
+    if let Some(token) = payload.admin_token.as_deref() {
+        let token = token.trim();
+        if token.is_empty() {
+            return Err(runtime_status_response(tonic::Status::invalid_argument(
+                "admin_token cannot be empty when provided",
+            )));
+        }
+        let authorization =
+            HeaderValue::from_str(format!("Bearer {token}").as_str()).map_err(|_| {
+                runtime_status_response(tonic::Status::invalid_argument(
+                    "admin_token contains unsupported characters",
+                ))
+            })?;
+        auth_headers.insert(AUTHORIZATION, authorization);
+    }
+    let principal_header = HeaderValue::from_str(principal).map_err(|_| {
+        runtime_status_response(tonic::Status::invalid_argument(
+            "principal contains unsupported characters",
+        ))
+    })?;
+    let device_header = HeaderValue::from_str(device_id).map_err(|_| {
+        runtime_status_response(tonic::Status::invalid_argument(
+            "device_id contains unsupported characters",
+        ))
+    })?;
+    auth_headers.insert(gateway::HEADER_PRINCIPAL, principal_header);
+    auth_headers.insert(gateway::HEADER_DEVICE_ID, device_header);
+    if let Some(channel) = payload.channel.as_deref() {
+        let channel = channel.trim();
+        if !channel.is_empty() {
+            let channel_header = HeaderValue::from_str(channel).map_err(|_| {
+                runtime_status_response(tonic::Status::invalid_argument(
+                    "channel contains unsupported characters",
+                ))
+            })?;
+            auth_headers.insert(gateway::HEADER_CHANNEL, channel_header);
+        }
+    }
+
+    authorize_headers(&auth_headers, &state.auth).map_err(auth_error_response)?;
+    let context = request_context_from_headers(&auth_headers).map_err(auth_error_response)?;
+    if !context.principal.starts_with("admin:") {
+        return Err(runtime_status_response(tonic::Status::permission_denied(
+            "web console login requires an admin:* principal",
+        )));
+    }
+
+    let now = unix_ms_now().map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "failed to read system clock: {error}"
+        )))
+    })?;
+    let expires_at_unix_ms =
+        now.saturating_add(i64::try_from(CONSOLE_SESSION_TTL_SECONDS).unwrap_or(i64::MAX) * 1_000);
+    let session = ConsoleSession {
+        session_id: Ulid::new().to_string(),
+        csrf_token: Ulid::new().to_string(),
+        context,
+        issued_at_unix_ms: now,
+        expires_at_unix_ms,
+    };
+
+    {
+        let mut sessions = lock_console_sessions(&state.console_sessions);
+        sessions.retain(|_, existing| existing.expires_at_unix_ms > now);
+        if sessions.len() >= CONSOLE_MAX_ACTIVE_SESSIONS {
+            let mut oldest: Option<(String, i64)> = None;
+            for (session_id, existing) in sessions.iter() {
+                if oldest
+                    .as_ref()
+                    .is_none_or(|(_, issued_at)| existing.issued_at_unix_ms < *issued_at)
+                {
+                    oldest = Some((session_id.clone(), existing.issued_at_unix_ms));
+                }
+            }
+            if let Some((session_id, _)) = oldest {
+                sessions.remove(session_id.as_str());
+            }
+        }
+        sessions.insert(session.session_id.clone(), session.clone());
+    }
+
+    let secure_cookie = request_uses_tls(&headers);
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        SET_COOKIE,
+        build_console_session_cookie(session.session_id.as_str(), secure_cookie)?,
+    );
+    Ok((response_headers, Json(build_console_session_response(&session))))
+}
+
+async fn console_logout_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<(HeaderMap, Json<Value>), Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    {
+        let mut sessions = lock_console_sessions(&state.console_sessions);
+        sessions.remove(session.session_id.as_str());
+    }
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(SET_COOKIE, clear_console_session_cookie(request_uses_tls(&headers))?);
+    Ok((response_headers, Json(json!({ "signed_out": true }))))
+}
+
+async fn console_session_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<ConsoleSessionResponse>, Response> {
+    let session = authorize_console_session(&state, &headers, false)?;
+    Ok(Json(build_console_session_response(&session)))
+}
+
+fn build_console_session_response(session: &ConsoleSession) -> ConsoleSessionResponse {
+    ConsoleSessionResponse {
+        principal: session.context.principal.clone(),
+        device_id: session.context.device_id.clone(),
+        channel: session.context.channel.clone(),
+        csrf_token: session.csrf_token.clone(),
+        issued_at_unix_ms: session.issued_at_unix_ms,
+        expires_at_unix_ms: session.expires_at_unix_ms,
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn authorize_console_session(
+    state: &AppState,
+    headers: &HeaderMap,
+    require_csrf: bool,
+) -> Result<ConsoleSession, Response> {
+    let session_id = cookie_value(headers, CONSOLE_SESSION_COOKIE_NAME).ok_or_else(|| {
+        runtime_status_response(tonic::Status::permission_denied(
+            "console session cookie is missing",
+        ))
+    })?;
+    let now = unix_ms_now().map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "failed to read system clock: {error}"
+        )))
+    })?;
+    let mut sessions = lock_console_sessions(&state.console_sessions);
+    sessions.retain(|_, session| session.expires_at_unix_ms > now);
+    let session = sessions.get_mut(session_id.as_str()).ok_or_else(|| {
+        runtime_status_response(tonic::Status::permission_denied(
+            "console session is missing or expired",
+        ))
+    })?;
+    if require_csrf {
+        let csrf_candidate = headers
+            .get(CONSOLE_CSRF_HEADER_NAME)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                runtime_status_response(tonic::Status::permission_denied(
+                    "missing CSRF token for console request",
+                ))
+            })?;
+        if csrf_candidate != session.csrf_token {
+            return Err(runtime_status_response(tonic::Status::permission_denied(
+                "CSRF token is invalid",
+            )));
+        }
+    }
+    session.expires_at_unix_ms =
+        now.saturating_add(i64::try_from(CONSOLE_SESSION_TTL_SECONDS).unwrap_or(i64::MAX) * 1_000);
+    Ok(session.clone())
+}
+
+fn lock_console_sessions<'a>(
+    sessions: &'a Arc<Mutex<HashMap<String, ConsoleSession>>>,
+) -> std::sync::MutexGuard<'a, HashMap<String, ConsoleSession>> {
+    match sessions.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::warn!("console session map lock poisoned; recovering");
+            poisoned.into_inner()
+        }
+    }
+}
+
+fn request_uses_tls(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim().eq_ignore_ascii_case("https"))
+        .unwrap_or(false)
+}
+
+#[allow(clippy::result_large_err)]
+fn build_console_session_cookie(session_id: &str, secure: bool) -> Result<HeaderValue, Response> {
+    let mut cookie = format!(
+        "{CONSOLE_SESSION_COOKIE_NAME}={session_id}; Max-Age={CONSOLE_SESSION_TTL_SECONDS}; Path=/; HttpOnly; SameSite=Strict"
+    );
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    HeaderValue::from_str(cookie.as_str()).map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "failed to encode Set-Cookie header: {error}"
+        )))
+    })
+}
+
+#[allow(clippy::result_large_err)]
+fn clear_console_session_cookie(secure: bool) -> Result<HeaderValue, Response> {
+    let mut cookie = format!(
+        "{CONSOLE_SESSION_COOKIE_NAME}=deleted; Max-Age=0; Path=/; HttpOnly; SameSite=Strict"
+    );
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    HeaderValue::from_str(cookie.as_str()).map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "failed to encode Set-Cookie header: {error}"
+        )))
+    })
+}
+
+fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    let raw = headers.get(COOKIE)?.to_str().ok()?;
+    for part in raw.split(';') {
+        let trimmed = part.trim();
+        let mut pair = trimmed.splitn(2, '=');
+        let key = pair.next()?.trim();
+        let value = pair.next().unwrap_or("").trim();
+        if key == name && !value.is_empty() {
+            return Some(value.to_owned());
+        }
+    }
+    None
+}
+
+async fn console_approvals_list_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ConsoleApprovalsQuery>,
+) -> Result<Json<Value>, Response> {
+    let _session = authorize_console_session(&state, &headers, false)?;
+    let decision = parse_console_approval_decision(query.decision.as_deref())?;
+    let subject_type = parse_console_approval_subject_type(query.subject_type.as_deref())?;
+    let (approvals, next_after_approval_id) = state
+        .runtime
+        .list_approval_records(
+            query.after_approval_id,
+            query.limit,
+            query.since_unix_ms,
+            query.until_unix_ms,
+            query.subject_id,
+            query.principal,
+            decision,
+            subject_type,
+        )
+        .await
+        .map_err(runtime_status_response)?;
+    Ok(Json(json!({
+        "approvals": approvals,
+        "next_after_approval_id": next_after_approval_id,
+    })))
+}
+
+async fn console_approval_get_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(approval_id): Path<String>,
+) -> Result<Json<Value>, Response> {
+    let _session = authorize_console_session(&state, &headers, false)?;
+    validate_canonical_id(approval_id.as_str()).map_err(|_| {
+        runtime_status_response(tonic::Status::invalid_argument(
+            "approval_id must be a canonical ULID",
+        ))
+    })?;
+    let record = state
+        .runtime
+        .approval_record(approval_id.clone())
+        .await
+        .map_err(runtime_status_response)?
+        .ok_or_else(|| {
+            runtime_status_response(tonic::Status::not_found(format!(
+                "approval record not found: {approval_id}"
+            )))
+        })?;
+    Ok(Json(json!({ "approval": record })))
+}
+
+async fn console_approval_decision_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(approval_id): Path<String>,
+    Json(payload): Json<ConsoleApprovalDecisionRequest>,
+) -> Result<Json<Value>, Response> {
+    let _session = authorize_console_session(&state, &headers, true)?;
+    validate_canonical_id(approval_id.as_str()).map_err(|_| {
+        runtime_status_response(tonic::Status::invalid_argument(
+            "approval_id must be a canonical ULID",
+        ))
+    })?;
+    let decision_scope = parse_console_decision_scope(payload.decision_scope.as_deref())?;
+    let reason = payload
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            if payload.approved {
+                "approved_by_console".to_owned()
+            } else {
+                "denied_by_console".to_owned()
+            }
+        });
+    let resolved = state
+        .runtime
+        .resolve_approval_record(journal::ApprovalResolveRequest {
+            approval_id,
+            decision: if payload.approved {
+                ApprovalDecision::Allow
+            } else {
+                ApprovalDecision::Deny
+            },
+            decision_scope,
+            decision_reason: reason,
+            decision_scope_ttl_ms: payload.decision_scope_ttl_ms,
+        })
+        .await
+        .map_err(runtime_status_response)?;
+    Ok(Json(json!({ "approval": resolved })))
+}
+
+#[allow(clippy::result_large_err)]
+fn parse_console_approval_decision(
+    value: Option<&str>,
+) -> Result<Option<ApprovalDecision>, Response> {
+    let Some(raw) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    match raw.to_ascii_lowercase().as_str() {
+        "allow" => Ok(Some(ApprovalDecision::Allow)),
+        "deny" => Ok(Some(ApprovalDecision::Deny)),
+        "timeout" => Ok(Some(ApprovalDecision::Timeout)),
+        "error" => Ok(Some(ApprovalDecision::Error)),
+        _ => Err(runtime_status_response(tonic::Status::invalid_argument(
+            "decision must be one of allow|deny|timeout|error",
+        ))),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn parse_console_approval_subject_type(
+    value: Option<&str>,
+) -> Result<Option<ApprovalSubjectType>, Response> {
+    let Some(raw) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    match raw.to_ascii_lowercase().as_str() {
+        "tool" => Ok(Some(ApprovalSubjectType::Tool)),
+        "channel_send" => Ok(Some(ApprovalSubjectType::ChannelSend)),
+        "secret_access" => Ok(Some(ApprovalSubjectType::SecretAccess)),
+        "browser_action" => Ok(Some(ApprovalSubjectType::BrowserAction)),
+        "node_capability" => Ok(Some(ApprovalSubjectType::NodeCapability)),
+        _ => Err(runtime_status_response(tonic::Status::invalid_argument(
+            "subject_type must be one of tool|channel_send|secret_access|browser_action|node_capability",
+        ))),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn parse_console_decision_scope(value: Option<&str>) -> Result<ApprovalDecisionScope, Response> {
+    let Some(raw) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(ApprovalDecisionScope::Once);
+    };
+    match raw.to_ascii_lowercase().as_str() {
+        "once" => Ok(ApprovalDecisionScope::Once),
+        "session" => Ok(ApprovalDecisionScope::Session),
+        "timeboxed" => Ok(ApprovalDecisionScope::Timeboxed),
+        _ => Err(runtime_status_response(tonic::Status::invalid_argument(
+            "decision_scope must be one of once|session|timeboxed",
+        ))),
+    }
+}
+
+async fn console_cron_list_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ConsoleCronListQuery>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, false)?;
+    let (jobs, next_after_job_id) = state
+        .runtime
+        .list_cron_jobs(
+            query.after_job_id,
+            query.limit,
+            query.enabled,
+            Some(session.context.principal),
+            session.context.channel,
+        )
+        .await
+        .map_err(runtime_status_response)?;
+    Ok(Json(json!({
+        "jobs": jobs,
+        "next_after_job_id": next_after_job_id,
+    })))
+}
+
+async fn console_cron_create_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<ConsoleCronCreateRequest>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    let name = payload.name.trim();
+    if name.is_empty() {
+        return Err(runtime_status_response(tonic::Status::invalid_argument(
+            "name cannot be empty",
+        )));
+    }
+    let prompt = payload.prompt.trim();
+    if prompt.is_empty() {
+        return Err(runtime_status_response(tonic::Status::invalid_argument(
+            "prompt cannot be empty",
+        )));
+    }
+    let owner_principal = match payload.owner_principal.as_deref().map(str::trim) {
+        Some("") | None => session.context.principal.clone(),
+        Some(owner_principal) if owner_principal == session.context.principal => {
+            owner_principal.to_owned()
+        }
+        Some(_) => {
+            return Err(runtime_status_response(tonic::Status::permission_denied(
+                "owner_principal must match authenticated session principal",
+            )))
+        }
+    };
+    let channel = payload
+        .channel
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| session.context.channel.clone())
+        .unwrap_or_default();
+    let session_key = payload
+        .session_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_default();
+    let session_label = payload
+        .session_label
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_default();
+    let schedule = build_console_schedule(payload.schedule_type.as_str(), &payload)?;
+    let mut request = TonicRequest::new(cron_v1::CreateJobRequest {
+        v: palyra_common::CANONICAL_PROTOCOL_MAJOR,
+        name: name.to_owned(),
+        prompt: prompt.to_owned(),
+        owner_principal,
+        channel,
+        session_key,
+        session_label,
+        schedule: Some(schedule),
+        enabled: payload.enabled.unwrap_or(true),
+        concurrency_policy: cron_v1::ConcurrencyPolicy::Forbid as i32,
+        retry_policy: Some(cron_v1::RetryPolicy { max_attempts: 1, backoff_ms: 1_000 }),
+        misfire_policy: cron_v1::MisfirePolicy::Skip as i32,
+        jitter_ms: payload.jitter_ms.unwrap_or(0),
+    });
+    apply_console_rpc_context(&state, &session, request.metadata_mut())?;
+    let service = build_console_cron_service(&state);
+    let response =
+        <gateway::CronServiceImpl as cron_v1::cron_service_server::CronService>::create_job(
+            &service, request,
+        )
+        .await
+        .map_err(runtime_status_response)?;
+    let job_id =
+        response.into_inner().job.and_then(|job| job.job_id).map(|value| value.ulid).ok_or_else(
+            || {
+                runtime_status_response(tonic::Status::internal(
+                    "cron create response did not include job_id",
+                ))
+            },
+        )?;
+    let job =
+        state.runtime.cron_job(job_id.clone()).await.map_err(runtime_status_response)?.ok_or_else(
+            || {
+                runtime_status_response(tonic::Status::internal(format!(
+                    "created cron job not found: {job_id}"
+                )))
+            },
+        )?;
+    Ok(Json(json!({ "job": job })))
+}
+
+async fn console_cron_set_enabled_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+    Json(payload): Json<ConsoleCronEnabledRequest>,
+) -> Result<Json<Value>, Response> {
+    let _session = authorize_console_session(&state, &headers, true)?;
+    validate_canonical_id(job_id.as_str()).map_err(|_| {
+        runtime_status_response(tonic::Status::invalid_argument("job_id must be a canonical ULID"))
+    })?;
+    let updated = state
+        .runtime
+        .update_cron_job(
+            job_id.clone(),
+            CronJobUpdatePatch { enabled: Some(payload.enabled), ..CronJobUpdatePatch::default() },
+        )
+        .await
+        .map_err(runtime_status_response)?;
+    state.scheduler_wake.notify_one();
+    Ok(Json(json!({ "job": updated })))
+}
+
+async fn console_cron_run_now_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    validate_canonical_id(job_id.as_str()).map_err(|_| {
+        runtime_status_response(tonic::Status::invalid_argument("job_id must be a canonical ULID"))
+    })?;
+    let mut request = TonicRequest::new(cron_v1::RunJobNowRequest {
+        v: palyra_common::CANONICAL_PROTOCOL_MAJOR,
+        job_id: Some(common_v1::CanonicalId { ulid: job_id }),
+    });
+    apply_console_rpc_context(&state, &session, request.metadata_mut())?;
+    let service = build_console_cron_service(&state);
+    let response =
+        <gateway::CronServiceImpl as cron_v1::cron_service_server::CronService>::run_job_now(
+            &service, request,
+        )
+        .await
+        .map_err(runtime_status_response)?
+        .into_inner();
+    let status = cron_v1::JobRunStatus::try_from(response.status)
+        .unwrap_or(cron_v1::JobRunStatus::Unspecified)
+        .as_str_name()
+        .to_ascii_lowercase();
+    Ok(Json(json!({
+        "run_id": response.run_id.map(|value| value.ulid),
+        "status": status,
+        "message": response.message,
+    })))
+}
+
+async fn console_cron_runs_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+    Query(query): Query<ConsoleCronRunsQuery>,
+) -> Result<Json<Value>, Response> {
+    let _session = authorize_console_session(&state, &headers, false)?;
+    validate_canonical_id(job_id.as_str()).map_err(|_| {
+        runtime_status_response(tonic::Status::invalid_argument("job_id must be a canonical ULID"))
+    })?;
+    let (runs, next_after_run_id) = state
+        .runtime
+        .list_cron_runs(Some(job_id), query.after_run_id, query.limit)
+        .await
+        .map_err(runtime_status_response)?;
+    Ok(Json(json!({
+        "runs": runs,
+        "next_after_run_id": next_after_run_id,
+    })))
+}
+
+#[allow(clippy::result_large_err)]
+fn build_console_schedule(
+    schedule_type_raw: &str,
+    payload: &ConsoleCronCreateRequest,
+) -> Result<cron_v1::Schedule, Response> {
+    match schedule_type_raw.trim().to_ascii_lowercase().as_str() {
+        "cron" => {
+            let expression = payload
+                .cron_expression
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    runtime_status_response(tonic::Status::invalid_argument(
+                        "cron_expression is required for schedule_type=cron",
+                    ))
+                })?;
+            Ok(cron_v1::Schedule {
+                r#type: cron_v1::ScheduleType::Cron as i32,
+                spec: Some(cron_v1::schedule::Spec::Cron(cron_v1::CronSchedule {
+                    expression: expression.to_owned(),
+                })),
+            })
+        }
+        "every" => {
+            let interval_ms =
+                payload.every_interval_ms.filter(|value| *value > 0).ok_or_else(|| {
+                    runtime_status_response(tonic::Status::invalid_argument(
+                        "every_interval_ms must be greater than zero for schedule_type=every",
+                    ))
+                })?;
+            Ok(cron_v1::Schedule {
+                r#type: cron_v1::ScheduleType::Every as i32,
+                spec: Some(cron_v1::schedule::Spec::Every(cron_v1::EverySchedule { interval_ms })),
+            })
+        }
+        "at" => {
+            let timestamp = payload
+                .at_timestamp_rfc3339
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    runtime_status_response(tonic::Status::invalid_argument(
+                        "at_timestamp_rfc3339 is required for schedule_type=at",
+                    ))
+                })?;
+            Ok(cron_v1::Schedule {
+                r#type: cron_v1::ScheduleType::At as i32,
+                spec: Some(cron_v1::schedule::Spec::At(cron_v1::AtSchedule {
+                    timestamp_rfc3339: timestamp.to_owned(),
+                })),
+            })
+        }
+        _ => Err(runtime_status_response(tonic::Status::invalid_argument(
+            "schedule_type must be one of cron|every|at",
+        ))),
+    }
+}
+
+fn build_console_cron_service(state: &AppState) -> gateway::CronServiceImpl {
+    gateway::CronServiceImpl::new(
+        Arc::clone(&state.runtime),
+        state.auth.clone(),
+        state.grpc_url.clone(),
+        Arc::clone(&state.scheduler_wake),
+        state.cron_timezone_mode,
+    )
+}
+
+#[allow(clippy::result_large_err)]
+fn apply_console_rpc_context(
+    state: &AppState,
+    session: &ConsoleSession,
+    metadata: &mut tonic::metadata::MetadataMap,
+) -> Result<(), Response> {
+    if state.auth.require_auth {
+        let token = state.auth.admin_token.as_deref().ok_or_else(|| {
+            runtime_status_response(tonic::Status::failed_precondition(
+                "admin token is not configured for authenticated console RPC dispatch",
+            ))
+        })?;
+        let bearer = MetadataValue::try_from(format!("Bearer {token}").as_str()).map_err(|_| {
+            runtime_status_response(tonic::Status::internal(
+                "failed to encode authorization metadata",
+            ))
+        })?;
+        metadata.insert("authorization", bearer);
+    }
+    let principal = MetadataValue::try_from(session.context.principal.as_str()).map_err(|_| {
+        runtime_status_response(tonic::Status::internal("failed to encode principal metadata"))
+    })?;
+    metadata.insert(gateway::HEADER_PRINCIPAL, principal);
+    let device_id = MetadataValue::try_from(session.context.device_id.as_str()).map_err(|_| {
+        runtime_status_response(tonic::Status::internal("failed to encode device metadata"))
+    })?;
+    metadata.insert(gateway::HEADER_DEVICE_ID, device_id);
+    if let Some(channel) = session.context.channel.as_deref() {
+        let channel = MetadataValue::try_from(channel).map_err(|_| {
+            runtime_status_response(tonic::Status::internal("failed to encode channel metadata"))
+        })?;
+        metadata.insert(gateway::HEADER_CHANNEL, channel);
+    }
+    Ok(())
+}
+
+async fn console_memory_search_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ConsoleMemorySearchQuery>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, false)?;
+    let search_query = query.query.trim();
+    if search_query.is_empty() {
+        return Err(runtime_status_response(tonic::Status::invalid_argument(
+            "query cannot be empty",
+        )));
+    }
+    let min_score = query.min_score.unwrap_or(0.0);
+    if !min_score.is_finite() || !(0.0..=1.0).contains(&min_score) {
+        return Err(runtime_status_response(tonic::Status::invalid_argument(
+            "min_score must be in range 0.0..=1.0",
+        )));
+    }
+    let session_scope = query
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    if let Some(session_scope) = session_scope.as_deref() {
+        validate_canonical_id(session_scope).map_err(|_| {
+            runtime_status_response(tonic::Status::invalid_argument(
+                "session_id must be a canonical ULID",
+            ))
+        })?;
+    }
+
+    let sources = parse_memory_sources_csv(query.sources_csv.as_deref())?;
+    let hits = state
+        .runtime
+        .search_memory(journal::MemorySearchRequest {
+            principal: session.context.principal,
+            channel: query.channel.or(session.context.channel),
+            session_id: session_scope,
+            query: search_query.to_owned(),
+            top_k: query.top_k.unwrap_or(8).clamp(1, 50),
+            min_score,
+            tags: parse_csv_values(query.tags_csv.as_deref()),
+            sources,
+        })
+        .await
+        .map_err(runtime_status_response)?;
+    Ok(Json(json!({ "hits": hits })))
+}
+
+async fn console_memory_purge_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<ConsoleMemoryPurgeRequest>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    let session_scope = payload
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    if let Some(session_scope) = session_scope.as_deref() {
+        validate_canonical_id(session_scope).map_err(|_| {
+            runtime_status_response(tonic::Status::invalid_argument(
+                "session_id must be a canonical ULID",
+            ))
+        })?;
+    }
+    let purge_all_principal = payload.purge_all_principal.unwrap_or(false);
+    if !purge_all_principal
+        && payload.channel.as_deref().is_none_or(|value| value.trim().is_empty())
+        && session_scope.is_none()
+    {
+        return Err(runtime_status_response(tonic::Status::invalid_argument(
+            "purge request requires purge_all_principal=true or channel/session scope",
+        )));
+    }
+
+    let deleted_count = state
+        .runtime
+        .purge_memory(MemoryPurgeRequest {
+            principal: session.context.principal,
+            channel: payload.channel,
+            session_id: session_scope,
+            purge_all_principal,
+        })
+        .await
+        .map_err(runtime_status_response)?;
+    Ok(Json(json!({ "deleted_count": deleted_count })))
+}
+
+fn parse_csv_values(raw: Option<&str>) -> Vec<String> {
+    raw.map(|value| {
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>()
+    })
+    .unwrap_or_default()
+}
+
+#[allow(clippy::result_large_err)]
+fn parse_memory_sources_csv(raw: Option<&str>) -> Result<Vec<journal::MemorySource>, Response> {
+    let mut parsed = Vec::new();
+    for value in parse_csv_values(raw) {
+        let source = journal::MemorySource::from_str(value.as_str()).ok_or_else(|| {
+            runtime_status_response(tonic::Status::invalid_argument(format!(
+                "unsupported memory source value: {value}"
+            )))
+        })?;
+        parsed.push(source);
+    }
+    Ok(parsed)
+}
+
+async fn console_skills_list_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ConsoleSkillsListQuery>,
+) -> Result<Json<Value>, Response> {
+    let _session = authorize_console_session(&state, &headers, false)?;
+    let skills_root = resolve_skills_root()?;
+    let mut index = load_installed_skills_index(skills_root.as_path())?;
+    if let Some(skill_id) =
+        query.skill_id.as_deref().map(str::trim).filter(|value| !value.is_empty())
+    {
+        let skill_id = skill_id.to_ascii_lowercase();
+        index.entries.retain(|entry| entry.skill_id == skill_id);
+    }
+
+    let mut entries = Vec::with_capacity(index.entries.len());
+    for entry in index.entries {
+        let status = state
+            .runtime
+            .skill_status(entry.skill_id.clone(), entry.version.clone())
+            .await
+            .map_err(runtime_status_response)?;
+        entries.push(json!({
+            "record": entry,
+            "status": status,
+        }));
+    }
+    Ok(Json(json!({
+        "skills_root": skills_root,
+        "count": entries.len(),
+        "entries": entries,
+    })))
+}
+
+async fn console_skills_install_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<ConsoleSkillInstallRequest>,
+) -> Result<Json<Value>, Response> {
+    let _session = authorize_console_session(&state, &headers, true)?;
+    let artifact_path_raw = payload.artifact_path.trim();
+    if artifact_path_raw.is_empty() {
+        return Err(runtime_status_response(tonic::Status::invalid_argument(
+            "artifact_path cannot be empty",
+        )));
+    }
+    let artifact_path = PathBuf::from(artifact_path_raw);
+    let artifact_bytes = fs::read(artifact_path.as_path()).map_err(|error| {
+        runtime_status_response(tonic::Status::invalid_argument(format!(
+            "failed to read artifact {}: {error}",
+            artifact_path.display()
+        )))
+    })?;
+    let inspection = inspect_skill_artifact(artifact_bytes.as_slice()).map_err(|error| {
+        runtime_status_response(tonic::Status::invalid_argument(format!(
+            "skill artifact inspection failed: {error}"
+        )))
+    })?;
+
+    let skills_root = resolve_skills_root()?;
+    fs::create_dir_all(skills_root.as_path()).map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "failed to create skills root {}: {error}",
+            skills_root.display()
+        )))
+    })?;
+    let trust_store_path = resolve_skills_trust_store_path(skills_root.as_path());
+    let mut trust_store = load_trust_store(trust_store_path.as_path())?;
+    let allow_tofu = payload.allow_tofu.unwrap_or(true);
+    let verification =
+        match verify_skill_artifact(artifact_bytes.as_slice(), &mut trust_store, allow_tofu) {
+            Ok(report) => Some(report),
+            Err(error) if payload.allow_untrusted.unwrap_or(false) => {
+                tracing::warn!(
+                    error = %error,
+                    artifact_path = %artifact_path.display(),
+                    "console skill install proceeding with allow_untrusted override"
+                );
+                None
+            }
+            Err(error) => {
+                return Err(runtime_status_response(tonic::Status::invalid_argument(format!(
+                    "skill artifact verification failed: {error}"
+                ))));
+            }
+        };
+    save_trust_store(trust_store_path.as_path(), &trust_store)?;
+
+    let skill_id = inspection.manifest.skill_id.clone();
+    let version = inspection.manifest.version.clone();
+    let managed_artifact_path =
+        managed_skill_artifact_path(skills_root.as_path(), skill_id.as_str(), version.as_str());
+    if let Some(parent) = managed_artifact_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            runtime_status_response(tonic::Status::internal(format!(
+                "failed to create managed skill directory {}: {error}",
+                parent.display()
+            )))
+        })?;
+    }
+    fs::write(managed_artifact_path.as_path(), artifact_bytes.as_slice()).map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "failed to persist managed artifact {}: {error}",
+            managed_artifact_path.display()
+        )))
+    })?;
+
+    let mut index = load_installed_skills_index(skills_root.as_path())?;
+    index.entries.retain(|entry| !(entry.skill_id == skill_id && entry.version == version));
+    for entry in &mut index.entries {
+        if entry.skill_id == skill_id {
+            entry.current = false;
+        }
+    }
+    let record = InstalledSkillRecord {
+        skill_id: skill_id.clone(),
+        version: version.clone(),
+        publisher: inspection.manifest.publisher.clone(),
+        current: true,
+        installed_at_unix_ms: unix_ms_now().map_err(|error| {
+            runtime_status_response(tonic::Status::internal(format!(
+                "failed to read system clock: {error}"
+            )))
+        })?,
+        artifact_sha256: sha256_hex(artifact_bytes.as_slice()),
+        payload_sha256: verification
+            .as_ref()
+            .map(|report| report.payload_sha256.clone())
+            .unwrap_or_else(|| inspection.payload_sha256.clone()),
+        signature_key_id: inspection.signature.key_id.clone(),
+        trust_decision: verification
+            .as_ref()
+            .map(|report| trust_decision_label(report.trust_decision))
+            .unwrap_or_else(|| "untrusted_override".to_owned()),
+        source: InstalledSkillSource {
+            kind: "managed_artifact".to_owned(),
+            reference: artifact_path.to_string_lossy().into_owned(),
+        },
+        missing_secrets: Vec::new(),
+    };
+    index.entries.push(record.clone());
+    save_installed_skills_index(skills_root.as_path(), &index)?;
+    Ok(Json(json!({
+        "installed": true,
+        "record": record,
+        "skills_root": skills_root,
+        "trust_store": trust_store_path,
+    })))
+}
+
+async fn console_skills_verify_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(skill_id): Path<String>,
+    Json(payload): Json<ConsoleSkillActionRequest>,
+) -> Result<Json<Value>, Response> {
+    let _session = authorize_console_session(&state, &headers, true)?;
+    let skill_id = normalize_non_empty_field(skill_id, "skill_id")?;
+    let skills_root = resolve_skills_root()?;
+    let mut index = load_installed_skills_index(skills_root.as_path())?;
+    let version = resolve_skill_version(&index, skill_id.as_str(), payload.version.as_deref())?;
+    let artifact_path =
+        managed_skill_artifact_path(skills_root.as_path(), skill_id.as_str(), version.as_str());
+    let artifact_bytes = fs::read(artifact_path.as_path()).map_err(|error| {
+        runtime_status_response(tonic::Status::invalid_argument(format!(
+            "failed to read managed artifact {}: {error}",
+            artifact_path.display()
+        )))
+    })?;
+
+    let trust_store_path = resolve_skills_trust_store_path(skills_root.as_path());
+    let mut trust_store = load_trust_store(trust_store_path.as_path())?;
+    let report = verify_skill_artifact(
+        artifact_bytes.as_slice(),
+        &mut trust_store,
+        payload.allow_tofu.unwrap_or(false),
+    )
+    .map_err(|error| {
+        runtime_status_response(tonic::Status::invalid_argument(format!(
+            "skill verification failed: {error}"
+        )))
+    })?;
+    save_trust_store(trust_store_path.as_path(), &trust_store)?;
+    if let Some(entry) = index
+        .entries
+        .iter_mut()
+        .find(|entry| entry.skill_id == skill_id && entry.version == version)
+    {
+        entry.payload_sha256 = report.payload_sha256.clone();
+        entry.publisher = report.manifest.publisher.clone();
+        entry.trust_decision = trust_decision_label(report.trust_decision);
+    }
+    save_installed_skills_index(skills_root.as_path(), &index)?;
+    Ok(Json(json!({ "report": report })))
+}
+
+async fn console_skills_audit_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(skill_id): Path<String>,
+    Json(payload): Json<ConsoleSkillActionRequest>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    let skill_id = normalize_non_empty_field(skill_id, "skill_id")?;
+    let skills_root = resolve_skills_root()?;
+    let index = load_installed_skills_index(skills_root.as_path())?;
+    let version = resolve_skill_version(&index, skill_id.as_str(), payload.version.as_deref())?;
+    let artifact_path =
+        managed_skill_artifact_path(skills_root.as_path(), skill_id.as_str(), version.as_str());
+    let artifact_bytes = fs::read(artifact_path.as_path()).map_err(|error| {
+        runtime_status_response(tonic::Status::invalid_argument(format!(
+            "failed to read managed artifact {}: {error}",
+            artifact_path.display()
+        )))
+    })?;
+
+    let trust_store_path = resolve_skills_trust_store_path(skills_root.as_path());
+    let mut trust_store = load_trust_store(trust_store_path.as_path())?;
+    let report = audit_skill_artifact_security(
+        artifact_bytes.as_slice(),
+        &mut trust_store,
+        payload.allow_tofu.unwrap_or(false),
+        &SkillSecurityAuditPolicy::default(),
+    )
+    .map_err(|error| {
+        runtime_status_response(tonic::Status::invalid_argument(format!(
+            "skill security audit failed: {error}"
+        )))
+    })?;
+    save_trust_store(trust_store_path.as_path(), &trust_store)?;
+
+    let quarantined = if report.should_quarantine && payload.quarantine_on_fail.unwrap_or(true) {
+        let record = state
+            .runtime
+            .upsert_skill_status(SkillStatusUpsertRequest {
+                skill_id: report.skill_id.clone(),
+                version: report.version.clone(),
+                status: SkillExecutionStatus::Quarantined,
+                reason: Some(format!("console_audit: {}", report.quarantine_reasons.join(" | "))),
+                detected_at_ms: unix_ms_now().map_err(|error| {
+                    runtime_status_response(tonic::Status::internal(format!(
+                        "failed to read system clock: {error}"
+                    )))
+                })?,
+                operator_principal: session.context.principal.clone(),
+            })
+            .await
+            .map_err(runtime_status_response)?;
+        state
+            .runtime
+            .record_skill_status_event(&session.context, "skill.quarantined", &record)
+            .await
+            .map_err(runtime_status_response)?;
+        true
+    } else {
+        false
+    };
+    Ok(Json(json!({
+        "report": report,
+        "quarantined": quarantined,
+    })))
+}
+
+async fn console_skill_quarantine_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(skill_id): Path<String>,
+    Json(payload): Json<SkillStatusRequest>,
+) -> Result<Json<SkillStatusResponse>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    let skill_id = normalize_non_empty_field(skill_id, "skill_id")?;
+    let version = normalize_non_empty_field(payload.version, "version")?;
+    let record = state
+        .runtime
+        .upsert_skill_status(SkillStatusUpsertRequest {
+            skill_id,
+            version,
+            status: SkillExecutionStatus::Quarantined,
+            reason: payload.reason.and_then(trim_to_option),
+            detected_at_ms: unix_ms_now().map_err(|error| {
+                runtime_status_response(tonic::Status::internal(format!(
+                    "failed to read system clock: {error}"
+                )))
+            })?,
+            operator_principal: session.context.principal.clone(),
+        })
+        .await
+        .map_err(runtime_status_response)?;
+    state
+        .runtime
+        .record_skill_status_event(&session.context, "skill.quarantined", &record)
+        .await
+        .map_err(runtime_status_response)?;
+    Ok(Json(skill_status_response(record)))
+}
+
+async fn console_skill_enable_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(skill_id): Path<String>,
+    Json(payload): Json<SkillStatusRequest>,
+) -> Result<Json<SkillStatusResponse>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    if !payload.override_enabled.unwrap_or(false) {
+        return Err(runtime_status_response(tonic::Status::invalid_argument(
+            "enable requires explicit override=true acknowledgment",
+        )));
+    }
+    let skill_id = normalize_non_empty_field(skill_id, "skill_id")?;
+    let version = normalize_non_empty_field(payload.version, "version")?;
+    let record = state
+        .runtime
+        .upsert_skill_status(SkillStatusUpsertRequest {
+            skill_id,
+            version,
+            status: SkillExecutionStatus::Active,
+            reason: payload.reason.and_then(trim_to_option),
+            detected_at_ms: unix_ms_now().map_err(|error| {
+                runtime_status_response(tonic::Status::internal(format!(
+                    "failed to read system clock: {error}"
+                )))
+            })?,
+            operator_principal: session.context.principal.clone(),
+        })
+        .await
+        .map_err(runtime_status_response)?;
+    state
+        .runtime
+        .record_skill_status_event(&session.context, "skill.enabled", &record)
+        .await
+        .map_err(runtime_status_response)?;
+    Ok(Json(skill_status_response(record)))
+}
+
+async fn console_audit_events_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ConsoleAuditEventsQuery>,
+) -> Result<Json<Value>, Response> {
+    let _session = authorize_console_session(&state, &headers, false)?;
+    let limit = query.limit.unwrap_or(200).clamp(1, 2_000);
+    let snapshot =
+        state.runtime.recent_journal_snapshot(limit).await.map_err(runtime_status_response)?;
+    let contains = query
+        .contains
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase());
+    let events = snapshot
+        .events
+        .into_iter()
+        .filter(|event| query.kind.is_none_or(|kind| event.kind == kind))
+        .filter(|event| {
+            query
+                .principal
+                .as_deref()
+                .is_none_or(|principal| event.principal.eq_ignore_ascii_case(principal.trim()))
+        })
+        .filter(|event| {
+            query.channel.as_deref().is_none_or(|channel| {
+                event
+                    .channel
+                    .as_deref()
+                    .is_some_and(|value| value.eq_ignore_ascii_case(channel.trim()))
+            })
+        })
+        .filter(|event| {
+            contains.as_ref().is_none_or(|needle| {
+                event.payload_json.to_ascii_lowercase().contains(needle.as_str())
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({
+        "hash_chain_enabled": snapshot.hash_chain_enabled,
+        "total_events": snapshot.total_events,
+        "returned_events": events.len(),
+        "events": events,
+    })))
+}
+
+#[allow(clippy::result_large_err)]
+fn resolve_skills_root() -> Result<PathBuf, Response> {
+    let identity_root = default_identity_store_root().map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "failed to resolve default identity root: {error}"
+        )))
+    })?;
+    let state_root =
+        identity_root.parent().map(FsPath::to_path_buf).unwrap_or_else(|| identity_root.clone());
+    Ok(state_root.join("skills"))
+}
+
+fn resolve_skills_trust_store_path(skills_root: &FsPath) -> PathBuf {
+    match std::env::var("PALYRA_SKILLS_TRUST_STORE") {
+        Ok(raw) if !raw.trim().is_empty() => PathBuf::from(raw),
+        _ => skills_root.join("trust-store.json"),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn load_trust_store(path: &FsPath) -> Result<SkillTrustStore, Response> {
+    if !path.exists() {
+        return Ok(SkillTrustStore::default());
+    }
+    SkillTrustStore::load(path).map_err(|error| {
+        runtime_status_response(tonic::Status::invalid_argument(format!(
+            "failed to load trust store {}: {error}",
+            path.display()
+        )))
+    })
+}
+
+#[allow(clippy::result_large_err)]
+fn save_trust_store(path: &FsPath, store: &SkillTrustStore) -> Result<(), Response> {
+    store.save(path).map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "failed to persist trust store {}: {error}",
+            path.display()
+        )))
+    })
+}
+
+#[allow(clippy::result_large_err)]
+fn load_installed_skills_index(skills_root: &FsPath) -> Result<InstalledSkillsIndex, Response> {
+    let index_path = skills_root.join(SKILLS_INDEX_FILE_NAME);
+    if !index_path.exists() {
+        return Ok(InstalledSkillsIndex::default());
+    }
+    let payload = fs::read(index_path.as_path()).map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "failed to read installed skills index {}: {error}",
+            index_path.display()
+        )))
+    })?;
+    let mut index: InstalledSkillsIndex =
+        serde_json::from_slice(payload.as_slice()).map_err(|error| {
+            runtime_status_response(tonic::Status::invalid_argument(format!(
+                "failed to parse installed skills index {}: {error}",
+                index_path.display()
+            )))
+        })?;
+    if index.schema_version != SKILLS_LAYOUT_VERSION {
+        return Err(runtime_status_response(tonic::Status::invalid_argument(format!(
+            "unsupported installed skills index schema version {}",
+            index.schema_version
+        ))));
+    }
+    normalize_installed_skills_index(&mut index);
+    Ok(index)
+}
+
+#[allow(clippy::result_large_err)]
+fn save_installed_skills_index(
+    skills_root: &FsPath,
+    index: &InstalledSkillsIndex,
+) -> Result<(), Response> {
+    fs::create_dir_all(skills_root).map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "failed to create skills root {}: {error}",
+            skills_root.display()
+        )))
+    })?;
+    let mut normalized = index.clone();
+    normalized.schema_version = SKILLS_LAYOUT_VERSION;
+    normalized.updated_at_unix_ms = unix_ms_now().map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "failed to read system clock: {error}"
+        )))
+    })?;
+    normalize_installed_skills_index(&mut normalized);
+    let payload = serde_json::to_vec_pretty(&normalized).map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "failed to serialize installed skills index: {error}"
+        )))
+    })?;
+    fs::write(skills_root.join(SKILLS_INDEX_FILE_NAME), payload).map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "failed to write installed skills index {}: {error}",
+            skills_root.join(SKILLS_INDEX_FILE_NAME).display()
+        )))
+    })
+}
+
+fn normalize_installed_skills_index(index: &mut InstalledSkillsIndex) {
+    index.entries.sort_by(|left, right| {
+        left.skill_id
+            .cmp(&right.skill_id)
+            .then_with(|| left.version.cmp(&right.version))
+            .then_with(|| right.installed_at_unix_ms.cmp(&left.installed_at_unix_ms))
+    });
+    let mut current_by_skill = HashMap::<String, bool>::new();
+    for entry in &mut index.entries {
+        if current_by_skill.get(entry.skill_id.as_str()).copied().unwrap_or(false) {
+            entry.current = false;
+        } else if entry.current {
+            current_by_skill.insert(entry.skill_id.clone(), true);
+        }
+    }
+    for entry in &mut index.entries {
+        current_by_skill.entry(entry.skill_id.clone()).or_insert_with(|| {
+            entry.current = true;
+            true
+        });
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn resolve_skill_version(
+    index: &InstalledSkillsIndex,
+    skill_id: &str,
+    version: Option<&str>,
+) -> Result<String, Response> {
+    if let Some(version) = version.map(str::trim).filter(|value| !value.is_empty()) {
+        return Ok(version.to_owned());
+    }
+    let current = index
+        .entries
+        .iter()
+        .find(|entry| entry.skill_id == skill_id && entry.current)
+        .or_else(|| index.entries.iter().find(|entry| entry.skill_id == skill_id))
+        .ok_or_else(|| {
+            runtime_status_response(tonic::Status::not_found(format!(
+                "installed skill not found: {skill_id}"
+            )))
+        })?;
+    Ok(current.version.clone())
+}
+
+fn managed_skill_artifact_path(skills_root: &FsPath, skill_id: &str, version: &str) -> PathBuf {
+    skills_root.join(skill_id).join(version).join(SKILL_ARTIFACT_FILE_NAME)
+}
+
+fn trust_decision_label(decision: palyra_skills::TrustDecision) -> String {
+    match decision {
+        palyra_skills::TrustDecision::Allowlisted => "allowlisted".to_owned(),
+        palyra_skills::TrustDecision::TofuPinned => "tofu_pinned".to_owned(),
+        palyra_skills::TrustDecision::TofuNewlyPinned => "tofu_newly_pinned".to_owned(),
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+fn trim_to_option(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
     }
 }
 
