@@ -996,6 +996,63 @@ async fn grpc_canvas_http_surface_enforces_csp_and_escapes_state_payload() -> Re
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn grpc_canvas_http_surface_rejects_invalid_token_with_security_headers() -> Result<()> {
+    let (child, admin_port, grpc_port, _journal_db_path) =
+        spawn_palyrad_with_dynamic_ports_and_canvas_host()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut canvas_client =
+        gateway_v1::canvas_service_client::CanvasServiceClient::connect(endpoint)
+            .await
+            .context("failed to connect canvas gRPC client")?;
+
+    let mut create_request = tonic::Request::new(gateway_v1::CreateCanvasRequest {
+        v: 1,
+        canvas_id: Some(common_v1::CanonicalId { ulid: "01ARZ3NDEKTSV4RRFFQ69G5FB2".to_owned() }),
+        session_id: Some(common_v1::CanonicalId { ulid: SESSION_ID.to_owned() }),
+        initial_state_json: br#"{"content":"hello"}"#.to_vec(),
+        initial_state_version: 1,
+        bundle: Some(gateway_v1::CanvasBundle {
+            bundle_id: "demo".to_owned(),
+            entrypoint_path: "app.js".to_owned(),
+            assets: vec![gateway_v1::CanvasAsset {
+                path: "app.js".to_owned(),
+                content_type: "application/javascript".to_owned(),
+                body: br#"window.addEventListener('palyra:canvas-state', () => {});"#.to_vec(),
+            }],
+            sha256: String::new(),
+            signature: String::new(),
+        }),
+        allowed_parent_origins: vec!["https://console.example.com".to_owned()],
+        auth_token_ttl_seconds: 600,
+        state_schema_version: 1,
+    });
+    authorize_metadata(create_request.metadata_mut())?;
+    let create_response = canvas_client
+        .create_canvas(create_request)
+        .await
+        .context("failed to call CreateCanvas over gRPC")?
+        .into_inner();
+
+    let canvas_id = create_response
+        .canvas
+        .and_then(|canvas| canvas.canvas_id.map(|value| value.ulid))
+        .context("CreateCanvas response missing canonical canvas id")?;
+
+    let frame_path = format!("/canvas/v1/frame/{canvas_id}?token=invalid-token");
+    let (frame_status, frame_cache_control, frame_xcto, frame_referrer_policy, _frame_body) =
+        admin_get_text_with_base_security_headers_async(admin_port, frame_path).await?;
+    assert_eq!(frame_status, 400, "malformed canvas token must be rejected");
+    assert_eq!(frame_cache_control, "no-store");
+    assert_eq!(frame_xcto, "nosniff");
+    assert_eq!(frame_referrer_policy, "no-referrer");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn grpc_cron_create_run_now_and_list_runs_roundtrip() -> Result<()> {
     let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
     let mut daemon = ChildGuard::new(child);
@@ -5557,6 +5614,44 @@ async fn admin_get_text_with_security_headers_async(
             .context("canvas endpoint missing x-content-type-options header")?;
         let body = response.text().context("failed to read canvas endpoint body")?;
         Ok((status, csp, cache_control, x_content_type_options, body))
+    })
+    .await
+    .context("failed to join blocking canvas HTTP task")?
+}
+
+async fn admin_get_text_with_base_security_headers_async(
+    admin_port: u16,
+    path: String,
+) -> Result<(u16, String, String, String, String)> {
+    tokio::task::spawn_blocking(move || {
+        let endpoint = format!("http://127.0.0.1:{admin_port}{path}");
+        let client = Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .context("failed to build HTTP client for canvas endpoint checks")?;
+        let response =
+            client.get(endpoint).send().context("failed to call canvas endpoint over HTTP")?;
+        let status = response.status().as_u16();
+        let cache_control = response
+            .headers()
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+            .context("canvas endpoint missing cache-control header")?;
+        let x_content_type_options = response
+            .headers()
+            .get("x-content-type-options")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+            .context("canvas endpoint missing x-content-type-options header")?;
+        let referrer_policy = response
+            .headers()
+            .get("referrer-policy")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+            .context("canvas endpoint missing referrer-policy header")?;
+        let body = response.text().context("failed to read canvas endpoint body")?;
+        Ok((status, cache_control, x_content_type_options, referrer_policy, body))
     })
     .await
     .context("failed to join blocking canvas HTTP task")?

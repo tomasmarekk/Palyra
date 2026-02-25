@@ -869,13 +869,16 @@ async fn main() -> Result<()> {
         .layer(DefaultBodyLimit::max(HTTP_MAX_REQUEST_BODY_BYTES))
         .route_layer(middleware::from_fn_with_state(state.clone(), admin_rate_limit_middleware))
         .route_layer(middleware::from_fn(admin_console_security_headers_middleware));
-    let app = Router::new()
-        .route("/healthz", get(health_handler))
+    let canvas_routes = Router::new()
         .route("/canvas/v1/frame/{canvas_id}", get(canvas_frame_handler))
         .route("/canvas/v1/runtime.js", get(canvas_runtime_js_handler))
         .route("/canvas/v1/runtime.css", get(canvas_runtime_css_handler))
         .route("/canvas/v1/bundle/{canvas_id}/{*asset_path}", get(canvas_bundle_asset_handler))
         .route("/canvas/v1/state/{canvas_id}", get(canvas_state_handler))
+        .route_layer(middleware::from_fn(canvas_security_headers_middleware));
+    let app = Router::new()
+        .route("/healthz", get(health_handler))
+        .merge(canvas_routes)
         .merge(admin_routes)
         .merge(console_routes)
         .with_state(state);
@@ -1158,6 +1161,21 @@ async fn admin_console_security_headers_middleware(request: Request, next: Next)
         HeaderValue::from_static("nosniff"),
     );
     headers.insert(HeaderName::from_static("x-frame-options"), HeaderValue::from_static("DENY"));
+    headers.insert(
+        HeaderName::from_static("referrer-policy"),
+        HeaderValue::from_static("no-referrer"),
+    );
+    response
+}
+
+async fn canvas_security_headers_middleware(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
     headers.insert(
         HeaderName::from_static("referrer-policy"),
         HeaderValue::from_static("no-referrer"),
