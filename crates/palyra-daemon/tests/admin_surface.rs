@@ -36,6 +36,7 @@ fn admin_status_requires_token_and_context() -> Result<()> {
 
     let missing_auth = client.get(&url).send().context("failed to call admin status")?;
     assert_eq!(missing_auth.status().as_u16(), 401, "missing auth must be rejected");
+    assert_admin_console_security_headers(missing_auth.headers())?;
 
     let invalid_context = client
         .get(&url)
@@ -154,7 +155,7 @@ fn admin_status_bruteforce_attempts_are_rate_limited() -> Result<()> {
         .context("failed to build HTTP client")?;
     let url = format!("http://127.0.0.1:{admin_port}/admin/v1/status");
 
-    let mut saw_rate_limit = false;
+    let mut rate_limited_response = None;
     for attempt in 0..200 {
         let response = client
             .get(&url)
@@ -165,7 +166,7 @@ fn admin_status_bruteforce_attempts_are_rate_limited() -> Result<()> {
             .send()
             .with_context(|| format!("failed to call admin status attempt {attempt}"))?;
         if response.status().as_u16() == 429 {
-            saw_rate_limit = true;
+            rate_limited_response = Some(response);
             break;
         }
         assert_eq!(
@@ -175,10 +176,12 @@ fn admin_status_bruteforce_attempts_are_rate_limited() -> Result<()> {
         );
     }
 
-    assert!(
-        saw_rate_limit,
-        "expected repeated invalid-token attempts to trigger HTTP 429 rate limiting"
-    );
+    let rate_limited_response = rate_limited_response.ok_or_else(|| {
+        anyhow::anyhow!(
+            "expected repeated invalid-token attempts to trigger HTTP 429 rate limiting"
+        )
+    })?;
+    assert_admin_console_security_headers(rate_limited_response.headers())?;
     Ok(())
 }
 
