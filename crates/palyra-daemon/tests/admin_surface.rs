@@ -17,6 +17,7 @@ use serde_json::Value;
 const ADMIN_TOKEN: &str = "test-admin-token";
 const DEVICE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const RUN_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAX";
+const CONSOLE_ADMIN_PRINCIPAL: &str = "admin:web-console";
 const PALYRAD_STARTUP_ATTEMPTS: usize = 3;
 const PALYRAD_STARTUP_RETRY_DELAY: Duration = Duration::from_millis(150);
 static TEMP_IDENTITY_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -323,6 +324,230 @@ fn admin_skill_quarantine_and_enable_require_override_acknowledgement() -> Resul
     Ok(())
 }
 
+#[test]
+fn console_session_and_csrf_guards_are_enforced() -> Result<()> {
+    let (child, admin_port) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("failed to build HTTP client")?;
+
+    let rejected_login = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/auth/login"))
+        .json(&serde_json::json!({
+            "admin_token": ADMIN_TOKEN,
+            "principal": "user:ops",
+            "device_id": DEVICE_ID,
+            "channel": "web",
+        }))
+        .send()
+        .context("failed to call console login with non-admin principal")?;
+    assert_eq!(
+        rejected_login.status().as_u16(),
+        403,
+        "console login should reject non-admin principal"
+    );
+
+    let (cookie, csrf_token) = login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
+
+    let session_response = client
+        .get(format!("http://127.0.0.1:{admin_port}/console/v1/auth/session"))
+        .header("Cookie", cookie.clone())
+        .send()
+        .context("failed to call console session endpoint")?
+        .error_for_status()
+        .context("console session endpoint returned non-success status")?
+        .text()
+        .context("failed to read console session response body")?;
+    assert!(
+        session_response.contains(CONSOLE_ADMIN_PRINCIPAL),
+        "session payload should include authenticated principal"
+    );
+
+    let logout_without_csrf = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/auth/logout"))
+        .header("Cookie", cookie.clone())
+        .send()
+        .context("failed to call console logout without csrf")?;
+    assert_eq!(
+        logout_without_csrf.status().as_u16(),
+        403,
+        "console logout should reject missing csrf token"
+    );
+
+    let logout_with_csrf = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/auth/logout"))
+        .header("Cookie", cookie)
+        .header("x-palyra-csrf-token", csrf_token)
+        .send()
+        .context("failed to call console logout with csrf")?;
+    assert_eq!(
+        logout_with_csrf.status().as_u16(),
+        200,
+        "console logout should succeed with valid csrf token"
+    );
+    Ok(())
+}
+
+#[test]
+fn console_approvals_flow_requires_session_and_csrf() -> Result<()> {
+    let (child, admin_port) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("failed to build HTTP client")?;
+
+    let no_session = client
+        .get(format!("http://127.0.0.1:{admin_port}/console/v1/approvals"))
+        .send()
+        .context("failed to call console approvals without session")?;
+    assert_eq!(no_session.status().as_u16(), 403, "approvals endpoint must require session");
+
+    let (cookie, csrf_token) = login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
+    let approvals_response = client
+        .get(format!("http://127.0.0.1:{admin_port}/console/v1/approvals"))
+        .header("Cookie", cookie.clone())
+        .send()
+        .context("failed to call console approvals endpoint")?
+        .error_for_status()
+        .context("console approvals endpoint returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse approvals response json")?;
+    assert!(
+        approvals_response.get("approvals").and_then(Value::as_array).is_some(),
+        "approvals list response should include approvals array"
+    );
+
+    let unknown_approval_id = "01ARZ3NDEKTSV4RRFFQ69G5FBA";
+    let missing_csrf = client
+        .post(format!(
+            "http://127.0.0.1:{admin_port}/console/v1/approvals/{unknown_approval_id}/decision"
+        ))
+        .header("Cookie", cookie.clone())
+        .json(&serde_json::json!({
+            "approved": true,
+            "decision_scope": "once",
+            "reason": "operator approve",
+        }))
+        .send()
+        .context("failed to call approval decision without csrf token")?;
+    assert_eq!(missing_csrf.status().as_u16(), 403, "decision endpoint must enforce csrf token");
+
+    let decision_response = client
+        .post(format!(
+            "http://127.0.0.1:{admin_port}/console/v1/approvals/{unknown_approval_id}/decision"
+        ))
+        .header("Cookie", cookie)
+        .header("x-palyra-csrf-token", csrf_token)
+        .json(&serde_json::json!({
+            "approved": true,
+            "decision_scope": "once",
+            "reason": "operator approve",
+        }))
+        .send()
+        .context("failed to call approval decision endpoint")?;
+    assert_eq!(
+        decision_response.status().as_u16(),
+        404,
+        "decision endpoint should report not-found for unknown approval id"
+    );
+    Ok(())
+}
+
+#[test]
+fn console_cron_workflow_create_disable_and_list_runs() -> Result<()> {
+    let (child, admin_port) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("failed to build HTTP client")?;
+    let (cookie, csrf_token) = login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
+
+    let created_job = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/cron/jobs"))
+        .header("Cookie", cookie.clone())
+        .header("x-palyra-csrf-token", csrf_token.clone())
+        .json(&serde_json::json!({
+            "name": "web-console-job",
+            "prompt": "echo from web console",
+            "schedule_type": "every",
+            "every_interval_ms": 60000,
+            "enabled": true,
+            "channel": "web",
+        }))
+        .send()
+        .context("failed to create cron job from console endpoint")?
+        .error_for_status()
+        .context("console cron create returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse console cron create response json")?;
+    let job_id = created_job
+        .get("job")
+        .and_then(|job| job.get("job_id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("console cron create response did not include job.job_id"))?
+        .to_owned();
+
+    let jobs_list = client
+        .get(format!("http://127.0.0.1:{admin_port}/console/v1/cron/jobs"))
+        .header("Cookie", cookie.clone())
+        .send()
+        .context("failed to list cron jobs from console endpoint")?
+        .error_for_status()
+        .context("console cron list returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse console cron list response json")?;
+    let jobs = jobs_list
+        .get("jobs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("console cron list response missing jobs array"))?;
+    assert!(
+        jobs.iter().any(|job| job.get("job_id").and_then(Value::as_str) == Some(job_id.as_str())),
+        "created cron job should appear in list response"
+    );
+
+    let disable_response = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/cron/jobs/{job_id}/enabled"))
+        .header("Cookie", cookie.clone())
+        .header("x-palyra-csrf-token", csrf_token)
+        .json(&serde_json::json!({ "enabled": false }))
+        .send()
+        .context("failed to disable cron job from console endpoint")?
+        .error_for_status()
+        .context("console cron disable returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse console cron disable response json")?;
+    assert_eq!(
+        disable_response.get("job").and_then(|job| job.get("enabled")).and_then(Value::as_bool),
+        Some(false),
+        "console cron disable response should set enabled=false"
+    );
+
+    let runs_response = client
+        .get(format!("http://127.0.0.1:{admin_port}/console/v1/cron/jobs/{job_id}/runs"))
+        .header("Cookie", cookie)
+        .send()
+        .context("failed to fetch cron runs from console endpoint")?
+        .error_for_status()
+        .context("console cron runs endpoint returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse console cron runs response json")?;
+    assert!(
+        runs_response.get("runs").and_then(Value::as_array).is_some(),
+        "console cron runs response should include runs array"
+    );
+    Ok(())
+}
+
 fn spawn_palyrad_with_dynamic_ports() -> Result<(Child, u16)> {
     let mut last_error: Option<anyhow::Error> = None;
     for attempt in 1..=PALYRAD_STARTUP_ATTEMPTS {
@@ -342,6 +567,43 @@ fn spawn_palyrad_with_dynamic_ports() -> Result<(Child, u16)> {
     Err(last_error).context(format!(
         "failed to spawn palyrad after {PALYRAD_STARTUP_ATTEMPTS} startup attempts"
     ))
+}
+
+fn login_console_session(
+    client: &Client,
+    admin_port: u16,
+    principal: &str,
+) -> Result<(String, String)> {
+    let response = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/auth/login"))
+        .json(&serde_json::json!({
+            "admin_token": ADMIN_TOKEN,
+            "principal": principal,
+            "device_id": DEVICE_ID,
+            "channel": "web",
+        }))
+        .send()
+        .context("failed to call console login")?
+        .error_for_status()
+        .context("console login returned non-success status")?;
+    let set_cookie = response
+        .headers()
+        .get("set-cookie")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| anyhow::anyhow!("console login response missing set-cookie header"))?
+        .to_owned();
+    let cookie = set_cookie
+        .split(';')
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("console set-cookie header missing cookie pair"))?
+        .to_owned();
+    let body = response.json::<Value>().context("failed to parse console login response json")?;
+    let csrf_token = body
+        .get("csrf_token")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("console login response missing csrf_token"))?
+        .to_owned();
+    Ok((cookie, csrf_token))
 }
 
 fn spawn_palyrad_with_dynamic_ports_once() -> Result<(Child, u16)> {

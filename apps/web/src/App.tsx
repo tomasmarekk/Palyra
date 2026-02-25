@@ -1,140 +1,924 @@
-import { useMemo, useRef, useState } from "react";
 
-import {
-  A2uiRenderer,
-  createDemoDocument,
-  useA2uiRuntime,
-  type A2uiFormSubmitEvent,
-  type PatchDocument
-} from "./a2ui";
+import { useEffect, useMemo, useState } from "react";
 
-const LOAD_TEST_PATCH_COUNT = 220;
+import { ConsoleApiClient, type ConsoleSession, type JsonValue } from "./consoleApi";
+
+type Section = "approvals" | "cron" | "memory" | "skills" | "audit";
+type JsonObject = { [key: string]: JsonValue };
+type CronScheduleType = "cron" | "every" | "at";
+
+type LoginForm = {
+  adminToken: string;
+  principal: string;
+  deviceId: string;
+  channel: string;
+};
+
+type CronForm = {
+  name: string;
+  prompt: string;
+  scheduleType: CronScheduleType;
+  cronExpression: string;
+  everyIntervalMs: string;
+  atTimestampRfc3339: string;
+  enabled: boolean;
+  channel: string;
+};
+
+const SENSITIVE_KEY_PATTERN =
+  /(secret|token|password|cookie|authorization|credential|api[-_]?key|private[-_]?key|vault[-_]?ref)/i;
+const SENSITIVE_VALUE_PATTERN =
+  /^(Bearer\s+|sk-[a-z0-9]|ghp_[A-Za-z0-9]|xox[baprs]-|AIza[0-9A-Za-z\-_]{20,})/i;
+
+const DEFAULT_LOGIN_FORM: LoginForm = {
+  adminToken: "",
+  principal: "admin:web-console",
+  deviceId: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+  channel: "web"
+};
+
+const DEFAULT_CRON_FORM: CronForm = {
+  name: "",
+  prompt: "",
+  scheduleType: "every",
+  cronExpression: "",
+  everyIntervalMs: "60000",
+  atTimestampRfc3339: "",
+  enabled: true,
+  channel: ""
+};
 
 export function App() {
-  const initialDocument = useMemo(() => createDemoDocument(), []);
-  const patchSequenceRef = useRef(0);
-  const [runtimeNote, setRuntimeNote] = useState<string>("Ready.");
+  const api = useMemo(() => new ConsoleApiClient(""), []);
 
-  const runtime = useA2uiRuntime(initialDocument, {
-    budget: {
-      maxOpsPerTick: 64,
-      maxQueueDepth: 512,
-      maxApplyMsPerTick: 8
-    },
-    onBudgetYield: (result) => {
-      setRuntimeNote(
-        `Frame budget yield after ${result.appliedPatches} patches (${result.elapsedMs.toFixed(2)} ms).`
-      );
-    },
-    onPatchError: (error) => {
-      setRuntimeNote(`Patch queue rejected update: ${error.message}`);
+  const [booting, setBooting] = useState(true);
+  const [session, setSession] = useState<ConsoleSession | null>(null);
+  const [section, setSection] = useState<Section>("approvals");
+  const [revealSensitiveValues, setRevealSensitiveValues] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  const [loginBusy, setLoginBusy] = useState(false);
+  const [logoutBusy, setLogoutBusy] = useState(false);
+  const [loginForm, setLoginForm] = useState<LoginForm>(DEFAULT_LOGIN_FORM);
+
+  const [approvalsBusy, setApprovalsBusy] = useState(false);
+  const [approvals, setApprovals] = useState<JsonObject[]>([]);
+  const [approvalId, setApprovalId] = useState("");
+  const [approvalReason, setApprovalReason] = useState("");
+  const [approvalScope, setApprovalScope] = useState("once");
+
+  const [cronBusy, setCronBusy] = useState(false);
+  const [cronJobs, setCronJobs] = useState<JsonObject[]>([]);
+  const [cronRuns, setCronRuns] = useState<JsonObject[]>([]);
+  const [cronJobId, setCronJobId] = useState("");
+  const [cronForm, setCronForm] = useState<CronForm>(DEFAULT_CRON_FORM);
+
+  const [memoryBusy, setMemoryBusy] = useState(false);
+  const [memoryQuery, setMemoryQuery] = useState("");
+  const [memoryChannel, setMemoryChannel] = useState("");
+  const [memoryPurgeChannel, setMemoryPurgeChannel] = useState("");
+  const [memoryPurgeSessionId, setMemoryPurgeSessionId] = useState("");
+  const [memoryPurgeAll, setMemoryPurgeAll] = useState(false);
+  const [memoryHits, setMemoryHits] = useState<JsonObject[]>([]);
+
+  const [skillsBusy, setSkillsBusy] = useState(false);
+  const [skillsEntries, setSkillsEntries] = useState<JsonObject[]>([]);
+  const [skillArtifactPath, setSkillArtifactPath] = useState("");
+  const [skillAllowTofu, setSkillAllowTofu] = useState(true);
+  const [skillAllowUntrusted, setSkillAllowUntrusted] = useState(false);
+  const [skillReason, setSkillReason] = useState("");
+
+  const [auditBusy, setAuditBusy] = useState(false);
+  const [auditFilterContains, setAuditFilterContains] = useState("");
+  const [auditFilterPrincipal, setAuditFilterPrincipal] = useState("");
+  const [auditEvents, setAuditEvents] = useState<JsonObject[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const bootstrap = async () => {
+      setBooting(true);
+      try {
+        const current = await api.getSession();
+        if (cancelled) {
+          return;
+        }
+        setSession(current);
+        setLoginForm((previous) => ({
+          ...previous,
+          principal: current.principal,
+          deviceId: current.device_id,
+          channel: current.channel ?? previous.channel
+        }));
+      } catch {
+        if (!cancelled) {
+          setSession(null);
+        }
+      } finally {
+        if (!cancelled) {
+          setBooting(false);
+        }
+      }
+    };
+    void bootstrap();
+    return () => {
+      cancelled = true;
+    };
+  }, [api]);
+
+  useEffect(() => {
+    if (session === null) {
+      return;
     }
-  });
+    if (section === "approvals") {
+      void refreshApprovals();
+    }
+    if (section === "cron") {
+      void refreshCron();
+    }
+    if (section === "skills") {
+      void refreshSkills();
+    }
+    if (section === "audit") {
+      void refreshAudit();
+    }
+  }, [section, session]);
 
-  function handleFormSubmit(event: A2uiFormSubmitEvent): void {
-    setRuntimeNote(
-      `Form '${event.componentId}' submitted with ${Object.keys(event.values).length} fields.`
+  async function signIn(event: React.FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+    setError(null);
+    setNotice(null);
+    setLoginBusy(true);
+    try {
+      const next = await api.login({
+        admin_token: loginForm.adminToken,
+        principal: loginForm.principal.trim(),
+        device_id: loginForm.deviceId.trim(),
+        channel: emptyToUndefined(loginForm.channel)
+      });
+      setSession(next);
+      setNotice("Signed in.");
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setLoginBusy(false);
+    }
+  }
+
+  async function signOut(): Promise<void> {
+    setError(null);
+    setNotice(null);
+    setLogoutBusy(true);
+    try {
+      await api.logout();
+      setSession(null);
+      setNotice("Signed out.");
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setLogoutBusy(false);
+    }
+  }
+
+  async function refreshApprovals(): Promise<void> {
+    setApprovalsBusy(true);
+    setError(null);
+    try {
+      const response = await api.listApprovals();
+      setApprovals(toJsonObjectArray(response.approvals));
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setApprovalsBusy(false);
+    }
+  }
+
+  async function decideApproval(approved: boolean): Promise<void> {
+    if (approvalId.trim().length === 0) {
+      setError("Select an approval first.");
+      return;
+    }
+    setApprovalsBusy(true);
+    setError(null);
+    try {
+      await api.decideApproval(approvalId.trim(), {
+        approved,
+        reason: emptyToUndefined(approvalReason),
+        decision_scope: approvalScope === "session" || approvalScope === "timeboxed" ? approvalScope : "once"
+      });
+      setNotice(approved ? "Approval allowed." : "Approval denied.");
+      await refreshApprovals();
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setApprovalsBusy(false);
+    }
+  }
+
+  async function refreshCron(): Promise<void> {
+    setCronBusy(true);
+    setError(null);
+    try {
+      const response = await api.listCronJobs();
+      setCronJobs(toJsonObjectArray(response.jobs));
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setCronBusy(false);
+    }
+  }
+
+  async function createCronJob(event: React.FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+    setCronBusy(true);
+    setError(null);
+    try {
+      await api.createCronJob({
+        name: cronForm.name.trim(),
+        prompt: cronForm.prompt.trim(),
+        schedule_type: cronForm.scheduleType,
+        cron_expression: cronForm.scheduleType === "cron" ? emptyToUndefined(cronForm.cronExpression) : undefined,
+        every_interval_ms: cronForm.scheduleType === "every" ? parseInteger(cronForm.everyIntervalMs) ?? undefined : undefined,
+        at_timestamp_rfc3339: cronForm.scheduleType === "at" ? emptyToUndefined(cronForm.atTimestampRfc3339) : undefined,
+        enabled: cronForm.enabled,
+        channel: emptyToUndefined(cronForm.channel)
+      });
+      setCronForm(DEFAULT_CRON_FORM);
+      setNotice("Cron job created.");
+      await refreshCron();
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setCronBusy(false);
+    }
+  }
+  async function setCronEnabled(job: JsonObject, enabled: boolean): Promise<void> {
+    const jobId = readString(job, "job_id");
+    if (jobId === null) {
+      setError("Job payload missing job_id.");
+      return;
+    }
+    setCronBusy(true);
+    setError(null);
+    try {
+      await api.setCronJobEnabled(jobId, enabled);
+      setNotice(`Cron job ${enabled ? "enabled" : "disabled"}.`);
+      await refreshCron();
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setCronBusy(false);
+    }
+  }
+
+  async function runCronNow(job: JsonObject): Promise<void> {
+    const jobId = readString(job, "job_id");
+    if (jobId === null) {
+      setError("Job payload missing job_id.");
+      return;
+    }
+    setCronBusy(true);
+    setError(null);
+    try {
+      await api.runCronJobNow(jobId);
+      setCronJobId(jobId);
+      const runs = await api.listCronRuns(jobId);
+      setCronRuns(toJsonObjectArray(runs.runs));
+      setNotice("Run-now dispatched.");
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setCronBusy(false);
+    }
+  }
+
+  async function searchMemory(event: React.FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+    if (memoryQuery.trim().length === 0) {
+      setError("Memory query cannot be empty.");
+      return;
+    }
+    setMemoryBusy(true);
+    setError(null);
+    try {
+      const params = new URLSearchParams();
+      params.set("query", memoryQuery.trim());
+      if (memoryChannel.trim().length > 0) {
+        params.set("channel", memoryChannel.trim());
+      }
+      const response = await api.searchMemory(params);
+      setMemoryHits(toJsonObjectArray(response.hits));
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setMemoryBusy(false);
+    }
+  }
+
+  async function purgeMemory(): Promise<void> {
+    setMemoryBusy(true);
+    setError(null);
+    try {
+      const response = await api.purgeMemory({
+        channel: emptyToUndefined(memoryPurgeChannel),
+        session_id: emptyToUndefined(memoryPurgeSessionId),
+        purge_all_principal: memoryPurgeAll
+      });
+      setNotice(`Purged ${response.deleted_count} memory item(s).`);
+      setMemoryHits([]);
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setMemoryBusy(false);
+    }
+  }
+
+  async function refreshSkills(): Promise<void> {
+    setSkillsBusy(true);
+    setError(null);
+    try {
+      const response = await api.listSkills();
+      setSkillsEntries(toJsonObjectArray(response.entries));
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setSkillsBusy(false);
+    }
+  }
+
+  async function installSkill(event: React.FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+    if (skillArtifactPath.trim().length === 0) {
+      setError("Artifact path cannot be empty.");
+      return;
+    }
+    setSkillsBusy(true);
+    setError(null);
+    try {
+      await api.installSkill({
+        artifact_path: skillArtifactPath.trim(),
+        allow_tofu: skillAllowTofu,
+        allow_untrusted: skillAllowUntrusted
+      });
+      setSkillArtifactPath("");
+      setNotice("Skill installed.");
+      await refreshSkills();
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setSkillsBusy(false);
+    }
+  }
+
+  async function executeSkillAction(entry: JsonObject, action: "verify" | "audit" | "quarantine" | "enable"): Promise<void> {
+    const metadata = skillMetadata(entry);
+    if (metadata === null) {
+      setError("Skill entry is missing record metadata.");
+      return;
+    }
+
+    setSkillsBusy(true);
+    setError(null);
+    try {
+      if (action === "verify") {
+        await api.verifySkill(metadata.skillId, { version: metadata.version, allow_tofu: false });
+      }
+      if (action === "audit") {
+        await api.auditSkill(metadata.skillId, {
+          version: metadata.version,
+          allow_tofu: false,
+          quarantine_on_fail: true
+        });
+      }
+      if (action === "quarantine") {
+        await api.quarantineSkill({
+          skill_id: metadata.skillId,
+          version: metadata.version,
+          reason: emptyToUndefined(skillReason)
+        });
+      }
+      if (action === "enable") {
+        await api.enableSkill({
+          skill_id: metadata.skillId,
+          version: metadata.version,
+          reason: emptyToUndefined(skillReason)
+        });
+      }
+      setNotice(`Skill action '${action}' completed.`);
+      await refreshSkills();
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setSkillsBusy(false);
+    }
+  }
+
+  async function refreshAudit(): Promise<void> {
+    setAuditBusy(true);
+    setError(null);
+    try {
+      const params = new URLSearchParams();
+      if (auditFilterContains.trim().length > 0) {
+        params.set("contains", auditFilterContains.trim());
+      }
+      if (auditFilterPrincipal.trim().length > 0) {
+        params.set("principal", auditFilterPrincipal.trim());
+      }
+      const response = await api.listAuditEvents(params);
+      setAuditEvents(toJsonObjectArray(response.events));
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setAuditBusy(false);
+    }
+  }
+
+  if (booting) {
+    return (
+      <div className="console-root">
+        <main className="console-card console-card--center">
+          <p className="console-label">Palyra / M35</p>
+          <h1>Web Console</h1>
+          <p>Checking existing session...</p>
+        </main>
+      </div>
     );
   }
 
-  function applySinglePatch(): void {
-    patchSequenceRef.current += 1;
-    const tick = patchSequenceRef.current;
-    const patch: PatchDocument = {
-      v: 1,
-      ops: [
-        {
-          op: "replace",
-          path: "/components/0/props/value",
-          value: `Renderer online. Applied tick #${tick}.`
-        },
-        {
-          op: "replace",
-          path: "/components/3/props/rows/1/1",
-          value: String(runtime.pendingPatchCount)
-        },
-        {
-          op: "replace",
-          path: "/components/5/props/series/2/value",
-          value: 20 + (tick % 11)
-        }
-      ]
-    };
-    runtime.enqueuePatch(patch);
-    setRuntimeNote(`Queued interactive patch #${tick}.`);
+  if (session === null) {
+    return (
+      <div className="console-root">
+        <main className="console-card console-card--auth">
+          <p className="console-label">Palyra / M35</p>
+          <h1>Operator Console</h1>
+          <p className="console-copy">
+            Sign in with an `admin:*` principal. Session cookie + CSRF are required for privileged actions.
+          </p>
+          <form
+            className="console-form"
+            onSubmit={(event) => {
+              void signIn(event);
+            }}
+          >
+            <label>
+              Admin token
+              <input
+                type="password"
+                value={loginForm.adminToken}
+                onChange={(event) =>
+                  setLoginForm((previous) => ({ ...previous, adminToken: event.target.value }))
+                }
+              />
+            </label>
+            <label>
+              Principal
+              <input
+                value={loginForm.principal}
+                onChange={(event) =>
+                  setLoginForm((previous) => ({ ...previous, principal: event.target.value }))
+                }
+                required
+              />
+            </label>
+            <label>
+              Device ID
+              <input
+                value={loginForm.deviceId}
+                onChange={(event) =>
+                  setLoginForm((previous) => ({ ...previous, deviceId: event.target.value }))
+                }
+                required
+              />
+            </label>
+            <label>
+              Channel
+              <input
+                value={loginForm.channel}
+                onChange={(event) =>
+                  setLoginForm((previous) => ({ ...previous, channel: event.target.value }))
+                }
+              />
+            </label>
+            <button type="submit" disabled={loginBusy}>{loginBusy ? "Signing in..." : "Sign in"}</button>
+          </form>
+          {error !== null && <p className="console-banner console-banner--error">{error}</p>}
+        </main>
+      </div>
+    );
   }
-
-  function applyLoadPatchBurst(): void {
-    for (let index = 0; index < LOAD_TEST_PATCH_COUNT; index += 1) {
-      patchSequenceRef.current += 1;
-      const tick = patchSequenceRef.current;
-      runtime.enqueuePatch({
-        v: 1,
-        ops: [
-          {
-            op: "replace",
-            path: "/components/0/props/value",
-            value: `Renderer online. Burst tick #${tick}.`
-          },
-          {
-            op: "replace",
-            path: "/components/5/props/series/0/value",
-            value: 8 + (tick % 9)
-          }
-        ]
-      });
-    }
-    setRuntimeNote(`Queued ${LOAD_TEST_PATCH_COUNT} patches for load simulation.`);
-  }
-
-  function resetDemoDocument(): void {
-    runtime.replaceDocument(createDemoDocument());
-    patchSequenceRef.current = 0;
-    setRuntimeNote("Demo document reset.");
-  }
-
   return (
-    <div className="console-shell">
-      <header className="console-shell__header">
+    <div className="console-root">
+      <header className="console-topbar">
         <div>
-          <p className="console-shell__eyebrow">Palyra / M34</p>
-          <h1>A2UI Renderer Web v1</h1>
-          <p className="console-shell__subtitle">
-            Safe React renderer with incremental patch updates and explicit frame budgets.
+          <p className="console-label">Palyra / M35</p>
+          <h1>Web Console v1</h1>
+          <p className="console-copy">
+            Approvals, cron, memory, skills, and audit workflows without using CLI.
           </p>
         </div>
-        <div className="console-shell__actions">
-          <button type="button" onClick={applySinglePatch}>
-            Queue Patch
-          </button>
-          <button type="button" onClick={applyLoadPatchBurst}>
-            Load Burst
-          </button>
-          <button type="button" className="button--ghost" onClick={resetDemoDocument}>
-            Reset
+        <div className="console-session-box">
+          <p><strong>Principal:</strong> {session.principal}</p>
+          <p><strong>Device:</strong> {session.device_id}</p>
+          <p><strong>Channel:</strong> {session.channel ?? "-"}</p>
+          <p><strong>Expires:</strong> {new Date(session.expires_at_unix_ms).toLocaleString()}</p>
+          <button type="button" onClick={() => void signOut()} disabled={logoutBusy}>
+            {logoutBusy ? "Signing out..." : "Sign out"}
           </button>
         </div>
       </header>
 
-      <section className="console-shell__status" aria-live="polite">
-        <p>
-          <strong>Pending queue:</strong> {runtime.pendingPatchCount}
-        </p>
-        <p>
-          <strong>Runtime note:</strong> {runtimeNote}
-        </p>
+      <nav className="console-nav" aria-label="Console sections">
+        <button type="button" className={section === "approvals" ? "is-active" : ""} onClick={() => setSection("approvals")}>Approvals</button>
+        <button type="button" className={section === "cron" ? "is-active" : ""} onClick={() => setSection("cron")}>Cron</button>
+        <button type="button" className={section === "memory" ? "is-active" : ""} onClick={() => setSection("memory")}>Memory</button>
+        <button type="button" className={section === "skills" ? "is-active" : ""} onClick={() => setSection("skills")}>Skills</button>
+        <button type="button" className={section === "audit" ? "is-active" : ""} onClick={() => setSection("audit")}>Audit</button>
+      </nav>
+
+      {(error !== null || notice !== null) && (
+        <section className="console-banner-row" aria-live="polite">
+          {error !== null && <p className="console-banner console-banner--error">{error}</p>}
+          {notice !== null && <p className="console-banner console-banner--notice">{notice}</p>}
+        </section>
+      )}
+
+      <section className="console-guardrail">
+        <label className="console-checkbox-inline">
+          <input
+            type="checkbox"
+            checked={revealSensitiveValues}
+            onChange={(event) => setRevealSensitiveValues(event.target.checked)}
+          />
+          Reveal sensitive fields (default is redacted)
+        </label>
       </section>
 
-      <main className="console-shell__main">
-        <A2uiRenderer document={runtime.document} onFormSubmit={handleFormSubmit} />
-      </main>
+      {section === "approvals" && (
+        <main className="console-card">
+          <header className="console-card__header">
+            <h2>Approvals Inbox</h2>
+            <button type="button" onClick={() => void refreshApprovals()} disabled={approvalsBusy}>
+              {approvalsBusy ? "Refreshing..." : "Refresh"}
+            </button>
+          </header>
+          <div className="console-table-wrap">
+            <table className="console-table">
+              <thead>
+                <tr>
+                  <th>Approval ID</th>
+                  <th>Subject</th>
+                  <th>Decision</th>
+                  <th>Open</th>
+                </tr>
+              </thead>
+              <tbody>
+                {approvals.length === 0 && (
+                  <tr><td colSpan={4}>No approvals found.</td></tr>
+                )}
+                {approvals.map((approval) => {
+                  const itemId = readString(approval, "approval_id") ?? readString(approval, "id") ?? "(missing)";
+                  return (
+                    <tr key={itemId}>
+                      <td>{itemId}</td>
+                      <td>{readString(approval, "subject_type") ?? "-"}</td>
+                      <td>{readString(approval, "decision") ?? "pending"}</td>
+                      <td>
+                        <button type="button" onClick={() => setApprovalId(itemId)}>Select</button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          <section className="console-subpanel">
+            <h3>Decision</h3>
+            <div className="console-grid-3">
+              <label>
+                Approval ID
+                <input value={approvalId} onChange={(event) => setApprovalId(event.target.value)} />
+              </label>
+              <label>
+                Scope
+                <select value={approvalScope} onChange={(event) => setApprovalScope(event.target.value)}>
+                  <option value="once">once</option>
+                  <option value="session">session</option>
+                  <option value="timeboxed">timeboxed</option>
+                </select>
+              </label>
+              <label>
+                Reason
+                <input value={approvalReason} onChange={(event) => setApprovalReason(event.target.value)} />
+              </label>
+            </div>
+            <div className="console-inline-actions">
+              <button type="button" onClick={() => void decideApproval(true)} disabled={approvalsBusy}>Approve</button>
+              <button type="button" className="button--warn" onClick={() => void decideApproval(false)} disabled={approvalsBusy}>Deny</button>
+            </div>
+          </section>
+        </main>
+      )}
 
-      <footer className="console-shell__footer">
-        <p>
-          Security baseline: No HTML injection, no payload-defined event handlers, markdown links limited to
-          `http/https/mailto`.
-        </p>
-      </footer>
+      {section === "cron" && (
+        <main className="console-card">
+          <header className="console-card__header">
+            <h2>Cron Jobs</h2>
+            <button type="button" onClick={() => void refreshCron()} disabled={cronBusy}>{cronBusy ? "Refreshing..." : "Refresh"}</button>
+          </header>
+          <form
+            className="console-form"
+            onSubmit={(event) => {
+              void createCronJob(event);
+            }}
+          >
+            <div className="console-grid-2">
+              <label>
+                Name
+                <input value={cronForm.name} onChange={(event) => setCronForm((previous) => ({ ...previous, name: event.target.value }))} required />
+              </label>
+              <label>
+                Channel
+                <input value={cronForm.channel} onChange={(event) => setCronForm((previous) => ({ ...previous, channel: event.target.value }))} />
+              </label>
+            </div>
+            <label>
+              Prompt
+              <textarea rows={3} value={cronForm.prompt} onChange={(event) => setCronForm((previous) => ({ ...previous, prompt: event.target.value }))} required />
+            </label>
+            <div className="console-grid-4">
+              <label>
+                Schedule
+                <select value={cronForm.scheduleType} onChange={(event) => setCronForm((previous) => ({ ...previous, scheduleType: event.target.value as CronScheduleType }))}>
+                  <option value="every">every</option>
+                  <option value="cron">cron</option>
+                  <option value="at">at</option>
+                </select>
+              </label>
+              <label>
+                Every ms
+                <input value={cronForm.everyIntervalMs} onChange={(event) => setCronForm((previous) => ({ ...previous, everyIntervalMs: event.target.value }))} disabled={cronForm.scheduleType !== "every"} />
+              </label>
+              <label>
+                Cron expr
+                <input value={cronForm.cronExpression} onChange={(event) => setCronForm((previous) => ({ ...previous, cronExpression: event.target.value }))} disabled={cronForm.scheduleType !== "cron"} />
+              </label>
+              <label>
+                At RFC3339
+                <input value={cronForm.atTimestampRfc3339} onChange={(event) => setCronForm((previous) => ({ ...previous, atTimestampRfc3339: event.target.value }))} disabled={cronForm.scheduleType !== "at"} />
+              </label>
+            </div>
+            <button type="submit" disabled={cronBusy}>{cronBusy ? "Creating..." : "Create job"}</button>
+          </form>
+          <div className="console-table-wrap">
+            <table className="console-table">
+              <thead>
+                <tr>
+                  <th>Job ID</th><th>Name</th><th>Enabled</th><th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {cronJobs.length === 0 && <tr><td colSpan={4}>No cron jobs.</td></tr>}
+                {cronJobs.map((job) => {
+                  const itemId = readString(job, "job_id") ?? "(missing)";
+                  const enabled = readBool(job, "enabled");
+                  return (
+                    <tr key={itemId}>
+                      <td>{itemId}</td>
+                      <td>{readString(job, "name") ?? "-"}</td>
+                      <td>{enabled ? "yes" : "no"}</td>
+                      <td className="console-action-cell">
+                        <button type="button" onClick={() => void setCronEnabled(job, !enabled)}>{enabled ? "Disable" : "Enable"}</button>
+                        <button type="button" onClick={() => void runCronNow(job)}>Run now</button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          <section className="console-subpanel">
+            <h3>Run logs {cronJobId.length > 0 ? `for ${cronJobId}` : ""}</h3>
+            {cronRuns.length === 0 ? (
+              <p>No run logs loaded.</p>
+            ) : (
+              <pre>{toPrettyJson(cronRuns, revealSensitiveValues)}</pre>
+            )}
+          </section>
+        </main>
+      )}
+      {section === "memory" && (
+        <main className="console-card">
+          <header className="console-card__header">
+            <h2>Memory</h2>
+          </header>
+          <form
+            className="console-form"
+            onSubmit={(event) => {
+              void searchMemory(event);
+            }}
+          >
+            <div className="console-grid-2">
+              <label>
+                Query
+                <input value={memoryQuery} onChange={(event) => setMemoryQuery(event.target.value)} required />
+              </label>
+              <label>
+                Channel
+                <input value={memoryChannel} onChange={(event) => setMemoryChannel(event.target.value)} />
+              </label>
+            </div>
+            <button type="submit" disabled={memoryBusy}>{memoryBusy ? "Searching..." : "Search"}</button>
+          </form>
+          <section className="console-subpanel">
+            <h3>Results</h3>
+            {memoryHits.length === 0 ? <p>No memory hits.</p> : <pre>{toPrettyJson(memoryHits, revealSensitiveValues)}</pre>}
+          </section>
+          <section className="console-subpanel">
+            <h3>Purge</h3>
+            <div className="console-grid-3">
+              <label>
+                Channel
+                <input value={memoryPurgeChannel} onChange={(event) => setMemoryPurgeChannel(event.target.value)} />
+              </label>
+              <label>
+                Session ID
+                <input value={memoryPurgeSessionId} onChange={(event) => setMemoryPurgeSessionId(event.target.value)} />
+              </label>
+              <label className="console-checkbox-inline">
+                <input type="checkbox" checked={memoryPurgeAll} onChange={(event) => setMemoryPurgeAll(event.target.checked)} />
+                Purge all principal memory
+              </label>
+            </div>
+            <button type="button" className="button--warn" onClick={() => void purgeMemory()} disabled={memoryBusy}>
+              {memoryBusy ? "Purging..." : "Purge"}
+            </button>
+          </section>
+        </main>
+      )}
+
+      {section === "skills" && (
+        <main className="console-card">
+          <header className="console-card__header">
+            <h2>Skills</h2>
+            <button type="button" onClick={() => void refreshSkills()} disabled={skillsBusy}>{skillsBusy ? "Refreshing..." : "Refresh"}</button>
+          </header>
+          <form
+            className="console-form"
+            onSubmit={(event) => {
+              void installSkill(event);
+            }}
+          >
+            <label>
+              Artifact path
+              <input value={skillArtifactPath} onChange={(event) => setSkillArtifactPath(event.target.value)} placeholder="C:\\skills\\example.palyra-skill" required />
+            </label>
+            <div className="console-grid-3">
+              <label className="console-checkbox-inline">
+                <input type="checkbox" checked={skillAllowTofu} onChange={(event) => setSkillAllowTofu(event.target.checked)} />
+                Allow TOFU
+              </label>
+              <label className="console-checkbox-inline">
+                <input type="checkbox" checked={skillAllowUntrusted} onChange={(event) => setSkillAllowUntrusted(event.target.checked)} />
+                Allow untrusted override
+              </label>
+              <label>
+                Override reason
+                <input value={skillReason} onChange={(event) => setSkillReason(event.target.value)} />
+              </label>
+            </div>
+            <button type="submit" disabled={skillsBusy}>{skillsBusy ? "Installing..." : "Install"}</button>
+          </form>
+          {skillsEntries.length === 0 ? (
+            <p>No installed skill records.</p>
+          ) : (
+            <div className="console-stack">
+              {skillsEntries.map((entry, index) => {
+                const meta = skillMetadata(entry);
+                const label = meta === null ? `entry-${index}` : `${meta.skillId}@${meta.version}`;
+                return (
+                  <article key={label} className="console-item-card">
+                    <h3>{label}</h3>
+                    <div className="console-inline-actions">
+                      <button type="button" onClick={() => void executeSkillAction(entry, "verify")}>Verify</button>
+                      <button type="button" onClick={() => void executeSkillAction(entry, "audit")}>Audit</button>
+                      <button type="button" className="button--warn" onClick={() => void executeSkillAction(entry, "quarantine")}>Quarantine</button>
+                      <button type="button" onClick={() => void executeSkillAction(entry, "enable")}>Enable</button>
+                    </div>
+                    <pre>{toPrettyJson(entry, revealSensitiveValues)}</pre>
+                  </article>
+                );
+              })}
+            </div>
+          )}
+        </main>
+      )}
+
+      {section === "audit" && (
+        <main className="console-card">
+          <header className="console-card__header">
+            <h2>Audit Explorer</h2>
+            <button type="button" onClick={() => void refreshAudit()} disabled={auditBusy}>{auditBusy ? "Refreshing..." : "Refresh"}</button>
+          </header>
+          <div className="console-grid-2">
+            <label>
+              Principal filter
+              <input value={auditFilterPrincipal} onChange={(event) => setAuditFilterPrincipal(event.target.value)} />
+            </label>
+            <label>
+              Payload contains
+              <input value={auditFilterContains} onChange={(event) => setAuditFilterContains(event.target.value)} />
+            </label>
+          </div>
+          {auditEvents.length === 0 ? <p>No audit events loaded.</p> : <pre>{toPrettyJson(auditEvents, revealSensitiveValues)}</pre>}
+        </main>
+      )}
     </div>
   );
+}
+
+function toErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  return "Unexpected failure.";
+}
+
+function isJsonObject(value: JsonValue): value is JsonObject {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function toJsonObjectArray(values: JsonValue[]): JsonObject[] {
+  const rows: JsonObject[] = [];
+  for (const value of values) {
+    if (isJsonObject(value)) {
+      rows.push(value);
+    }
+  }
+  return rows;
+}
+
+function readString(record: JsonObject, key: string): string | null {
+  const value = record[key];
+  if (typeof value === "string") {
+    return value;
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  return null;
+}
+
+function readBool(record: JsonObject, key: string): boolean {
+  return record[key] === true;
+}
+
+function parseInteger(raw: string): number | null {
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) {
+    return null;
+  }
+  const parsed = Number.parseInt(trimmed, 10);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function emptyToUndefined(raw: string): string | undefined {
+  const trimmed = raw.trim();
+  return trimmed.length === 0 ? undefined : trimmed;
+}
+
+function skillMetadata(entry: JsonObject): { skillId: string; version: string } | null {
+  const record = entry.record;
+  if (!isJsonObject(record)) {
+    return null;
+  }
+  const skillId = readString(record, "skill_id");
+  const version = readString(record, "version");
+  if (skillId === null || version === null) {
+    return null;
+  }
+  return { skillId, version };
+}
+
+function redactValue(value: JsonValue, revealSensitive: boolean): JsonValue {
+  if (revealSensitive) {
+    return value;
+  }
+  if (typeof value === "string") {
+    return SENSITIVE_VALUE_PATTERN.test(value) ? "[redacted]" : value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((entry) => redactValue(entry, false));
+  }
+  if (isJsonObject(value)) {
+    const sanitized: JsonObject = {};
+    for (const [key, item] of Object.entries(value)) {
+      sanitized[key] = SENSITIVE_KEY_PATTERN.test(key) ? "[redacted]" : redactValue(item, false);
+    }
+    return sanitized;
+  }
+  return value;
+}
+
+function toPrettyJson(value: JsonValue, revealSensitive: boolean): string {
+  return JSON.stringify(redactValue(value, revealSensitive), null, 2);
 }
