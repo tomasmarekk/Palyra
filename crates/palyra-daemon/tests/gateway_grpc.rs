@@ -908,6 +908,94 @@ async fn grpc_agents_management_denies_non_admin_principal() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn grpc_canvas_http_surface_enforces_csp_and_escapes_state_payload() -> Result<()> {
+    let (child, admin_port, grpc_port, _journal_db_path) =
+        spawn_palyrad_with_dynamic_ports_and_canvas_host()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut canvas_client =
+        gateway_v1::canvas_service_client::CanvasServiceClient::connect(endpoint)
+            .await
+            .context("failed to connect canvas gRPC client")?;
+
+    let mut create_request = tonic::Request::new(gateway_v1::CreateCanvasRequest {
+        v: 1,
+        canvas_id: Some(common_v1::CanonicalId { ulid: "01ARZ3NDEKTSV4RRFFQ69G5FB1".to_owned() }),
+        session_id: Some(common_v1::CanonicalId { ulid: SESSION_ID.to_owned() }),
+        initial_state_json: br#"{"content":"<img src=x onerror=alert('xss')>"}"#.to_vec(),
+        initial_state_version: 1,
+        bundle: Some(gateway_v1::CanvasBundle {
+            bundle_id: "demo".to_owned(),
+            entrypoint_path: "app.js".to_owned(),
+            assets: vec![gateway_v1::CanvasAsset {
+                path: "app.js".to_owned(),
+                content_type: "application/javascript".to_owned(),
+                body: br#"window.addEventListener('palyra:canvas-state', () => {});"#.to_vec(),
+            }],
+            sha256: String::new(),
+            signature: String::new(),
+        }),
+        allowed_parent_origins: vec!["https://console.example.com".to_owned()],
+        auth_token_ttl_seconds: 600,
+        state_schema_version: 1,
+    });
+    authorize_metadata(create_request.metadata_mut())?;
+    let create_response = canvas_client
+        .create_canvas(create_request)
+        .await
+        .context("failed to call CreateCanvas over gRPC")?
+        .into_inner();
+
+    let auth_token = create_response.auth_token;
+    let canvas_id = create_response
+        .canvas
+        .and_then(|canvas| canvas.canvas_id.map(|value| value.ulid))
+        .context("CreateCanvas response missing canonical canvas id")?;
+
+    let frame_path = format!("/canvas/v1/frame/{canvas_id}?token={auth_token}");
+    let (frame_status, frame_csp, frame_cache_control, frame_xcto, frame_body) =
+        admin_get_text_with_security_headers_async(admin_port, frame_path).await?;
+    assert_eq!(frame_status, 200, "canvas frame endpoint should return success");
+    assert_eq!(frame_cache_control, "no-store");
+    assert_eq!(frame_xcto, "nosniff");
+    assert!(
+        frame_csp.contains("sandbox allow-scripts"),
+        "canvas frame must include sandbox restriction in CSP"
+    );
+    assert!(
+        frame_csp.contains("frame-ancestors https://console.example.com"),
+        "canvas frame must enforce strict frame-ancestors allowlist"
+    );
+    assert!(
+        !frame_body.contains("<img src=x onerror=alert('xss')>"),
+        "canvas frame HTML must not inline untrusted state payload as raw HTML"
+    );
+
+    let runtime_path = format!("/canvas/v1/runtime.js?canvas_id={canvas_id}&token={auth_token}");
+    let (runtime_status, runtime_csp, runtime_cache_control, runtime_xcto, runtime_body) =
+        admin_get_text_with_security_headers_async(admin_port, runtime_path).await?;
+    assert_eq!(runtime_status, 200, "canvas runtime endpoint should return success");
+    assert_eq!(runtime_cache_control, "no-store");
+    assert_eq!(runtime_xcto, "nosniff");
+    assert!(
+        runtime_csp.contains("sandbox allow-scripts"),
+        "canvas runtime endpoint must include sandbox CSP restrictions"
+    );
+    assert!(
+        runtime_body.contains("textContent = JSON.stringify"),
+        "runtime script must render state via textContent"
+    );
+    assert!(
+        !runtime_body.contains("innerHTML"),
+        "runtime script must not use innerHTML for untrusted state"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn grpc_cron_create_run_now_and_list_runs_roundtrip() -> Result<()> {
     let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
     let mut daemon = ChildGuard::new(child);
@@ -5436,6 +5524,44 @@ async fn admin_get_json_async(admin_port: u16, path: String) -> Result<Value> {
         .context("admin JSON worker panicked")?
 }
 
+async fn admin_get_text_with_security_headers_async(
+    admin_port: u16,
+    path: String,
+) -> Result<(u16, String, String, String, String)> {
+    tokio::task::spawn_blocking(move || {
+        let endpoint = format!("http://127.0.0.1:{admin_port}{path}");
+        let client = Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .context("failed to build HTTP client for canvas endpoint checks")?;
+        let response =
+            client.get(endpoint).send().context("failed to call canvas endpoint over HTTP")?;
+        let status = response.status().as_u16();
+        let csp = response
+            .headers()
+            .get("content-security-policy")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+            .context("canvas endpoint missing content-security-policy header")?;
+        let cache_control = response
+            .headers()
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+            .context("canvas endpoint missing cache-control header")?;
+        let x_content_type_options = response
+            .headers()
+            .get("x-content-type-options")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+            .context("canvas endpoint missing x-content-type-options header")?;
+        let body = response.text().context("failed to read canvas endpoint body")?;
+        Ok((status, csp, cache_control, x_content_type_options, body))
+    })
+    .await
+    .context("failed to join blocking canvas HTTP task")?
+}
+
 fn admin_post_json(admin_port: u16, path: &str, payload: Value) -> Result<Value> {
     let endpoint = format!("http://127.0.0.1:{admin_port}{path}");
     Client::builder()
@@ -5471,24 +5597,29 @@ fn load_golden_json(name: &str) -> Result<Value> {
 }
 
 fn spawn_palyrad_with_dynamic_ports() -> Result<(Child, u16, u16, PathBuf)> {
-    spawn_palyrad_with_dynamic_ports_options(false, None)
+    spawn_palyrad_with_dynamic_ports_options(false, None, false)
 }
 
 fn spawn_palyrad_with_dynamic_ports_and_hash_chain(
     hash_chain_enabled: bool,
 ) -> Result<(Child, u16, u16, PathBuf)> {
-    spawn_palyrad_with_dynamic_ports_options(hash_chain_enabled, None)
+    spawn_palyrad_with_dynamic_ports_options(hash_chain_enabled, None, false)
+}
+
+fn spawn_palyrad_with_dynamic_ports_and_canvas_host() -> Result<(Child, u16, u16, PathBuf)> {
+    spawn_palyrad_with_dynamic_ports_options(false, None, true)
 }
 
 fn spawn_palyrad_with_dynamic_ports_and_journal_payload_limit(
     max_journal_payload_bytes: usize,
 ) -> Result<(Child, u16, u16, PathBuf)> {
-    spawn_palyrad_with_dynamic_ports_options(false, Some(max_journal_payload_bytes))
+    spawn_palyrad_with_dynamic_ports_options(false, Some(max_journal_payload_bytes), false)
 }
 
 fn spawn_palyrad_with_dynamic_ports_options(
     hash_chain_enabled: bool,
     max_journal_payload_bytes: Option<usize>,
+    canvas_host_enabled: bool,
 ) -> Result<(Child, u16, u16, PathBuf)> {
     let journal_db_path = unique_temp_journal_db_path();
     let identity_store_dir = unique_temp_identity_store_dir();
@@ -5519,6 +5650,11 @@ fn spawn_palyrad_with_dynamic_ports_options(
         .stderr(Stdio::null());
     if let Some(max_journal_payload_bytes) = max_journal_payload_bytes {
         command.env("PALYRA_JOURNAL_MAX_PAYLOAD_BYTES", max_journal_payload_bytes.to_string());
+    }
+    if canvas_host_enabled {
+        command
+            .env("PALYRA_CANVAS_HOST_ENABLED", "true")
+            .env("PALYRA_CANVAS_HOST_PUBLIC_BASE_URL", "http://127.0.0.1:7142");
     }
     let mut child = command.spawn().context("failed to start palyrad")?;
     let stdout = child.stdout.take().context("failed to capture palyrad stdout")?;
