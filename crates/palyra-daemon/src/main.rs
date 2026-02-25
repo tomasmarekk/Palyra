@@ -23,7 +23,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use axum::{
-    extract::{ConnectInfo, Path, Query, Request, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State},
     http::{
         header::{
             AUTHORIZATION, CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, COOKIE, SET_COOKIE,
@@ -90,6 +90,7 @@ const GRPC_MAX_ENCODING_MESSAGE_SIZE_BYTES: usize = 4 * 1024 * 1024;
 const ADMIN_RATE_LIMIT_WINDOW_MS: u64 = 1_000;
 const ADMIN_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW: u32 = 30;
 const ADMIN_RATE_LIMIT_MAX_IP_BUCKETS: usize = 4_096;
+const HTTP_MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
 const CONSOLE_SESSION_COOKIE_NAME: &str = "palyra_console_session";
 const CONSOLE_CSRF_HEADER_NAME: &str = "x-palyra-csrf-token";
 const CONSOLE_SESSION_TTL_SECONDS: u64 = 30 * 60;
@@ -838,6 +839,7 @@ async fn main() -> Result<()> {
         .route("/admin/v1/runs/{run_id}/cancel", post(admin_run_cancel_handler))
         .route("/admin/v1/skills/{skill_id}/quarantine", post(admin_skill_quarantine_handler))
         .route("/admin/v1/skills/{skill_id}/enable", post(admin_skill_enable_handler))
+        .layer(DefaultBodyLimit::max(HTTP_MAX_REQUEST_BODY_BYTES))
         .route_layer(middleware::from_fn_with_state(state.clone(), admin_rate_limit_middleware));
     let console_routes = Router::new()
         .route("/console/v1/auth/login", post(console_login_handler))
@@ -863,6 +865,7 @@ async fn main() -> Result<()> {
         .route("/console/v1/skills/{skill_id}/quarantine", post(console_skill_quarantine_handler))
         .route("/console/v1/skills/{skill_id}/enable", post(console_skill_enable_handler))
         .route("/console/v1/audit/events", get(console_audit_events_handler))
+        .layer(DefaultBodyLimit::max(HTTP_MAX_REQUEST_BODY_BYTES))
         .route_layer(middleware::from_fn_with_state(state.clone(), admin_rate_limit_middleware));
     let app = Router::new()
         .route("/healthz", get(health_handler))
