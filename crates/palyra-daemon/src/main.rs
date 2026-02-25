@@ -93,6 +93,8 @@ const ADMIN_RATE_LIMIT_MAX_IP_BUCKETS: usize = 4_096;
 const CANVAS_RATE_LIMIT_WINDOW_MS: u64 = 1_000;
 const CANVAS_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW: u32 = 90;
 const CANVAS_RATE_LIMIT_MAX_IP_BUCKETS: usize = 4_096;
+const CANVAS_HTTP_MAX_TOKEN_BYTES: usize = 8 * 1024;
+const CANVAS_HTTP_MAX_CANVAS_ID_BYTES: usize = 64;
 const HTTP_MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
 const CONSOLE_SESSION_COOKIE_NAME: &str = "palyra_console_session";
 const CONSOLE_CSRF_HEADER_NAME: &str = "x-palyra-csrf-token";
@@ -1059,11 +1061,44 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
     Json::<HealthResponse>(health_response("palyrad", state.started_at))
 }
 
+#[allow(clippy::result_large_err)]
+fn validate_canvas_http_token_query(token: &str) -> Result<(), Response> {
+    if token.trim().is_empty() {
+        return Err(runtime_status_response(tonic::Status::invalid_argument(
+            "canvas token query parameter cannot be empty",
+        )));
+    }
+    if token.len() > CANVAS_HTTP_MAX_TOKEN_BYTES {
+        return Err(runtime_status_response(tonic::Status::invalid_argument(format!(
+            "canvas token query parameter exceeds byte limit ({} > {CANVAS_HTTP_MAX_TOKEN_BYTES})",
+            token.len()
+        ))));
+    }
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_canvas_http_canvas_id(canvas_id: &str) -> Result<(), Response> {
+    if canvas_id.len() > CANVAS_HTTP_MAX_CANVAS_ID_BYTES {
+        return Err(runtime_status_response(tonic::Status::invalid_argument(format!(
+            "canvas_id exceeds byte limit ({} > {CANVAS_HTTP_MAX_CANVAS_ID_BYTES})",
+            canvas_id.len()
+        ))));
+    }
+    validate_canonical_id(canvas_id).map_err(|_| {
+        runtime_status_response(tonic::Status::invalid_argument(
+            "canvas_id must be a canonical ULID",
+        ))
+    })
+}
+
 async fn canvas_frame_handler(
     State(state): State<AppState>,
     Path(canvas_id): Path<String>,
     Query(query): Query<CanvasTokenQuery>,
 ) -> Result<Response, Response> {
+    validate_canvas_http_canvas_id(canvas_id.as_str())?;
+    validate_canvas_http_token_query(query.token.as_str())?;
     let frame = state
         .runtime
         .canvas_frame_document(canvas_id.as_str(), query.token.as_str())
@@ -1080,6 +1115,8 @@ async fn canvas_runtime_js_handler(
     State(state): State<AppState>,
     Query(query): Query<CanvasRuntimeQuery>,
 ) -> Result<Response, Response> {
+    validate_canvas_http_canvas_id(query.canvas_id.as_str())?;
+    validate_canvas_http_token_query(query.token.as_str())?;
     let asset = state
         .runtime
         .canvas_runtime_script(query.canvas_id.as_str(), query.token.as_str())
@@ -1091,6 +1128,8 @@ async fn canvas_runtime_css_handler(
     State(state): State<AppState>,
     Query(query): Query<CanvasRuntimeQuery>,
 ) -> Result<Response, Response> {
+    validate_canvas_http_canvas_id(query.canvas_id.as_str())?;
+    validate_canvas_http_token_query(query.token.as_str())?;
     let asset = state
         .runtime
         .canvas_runtime_stylesheet(query.canvas_id.as_str(), query.token.as_str())
@@ -1103,6 +1142,8 @@ async fn canvas_bundle_asset_handler(
     Path((canvas_id, asset_path)): Path<(String, String)>,
     Query(query): Query<CanvasTokenQuery>,
 ) -> Result<Response, Response> {
+    validate_canvas_http_canvas_id(canvas_id.as_str())?;
+    validate_canvas_http_token_query(query.token.as_str())?;
     let normalized_asset_path = asset_path.trim_start_matches('/').to_owned();
     let asset = state
         .runtime
@@ -1120,6 +1161,8 @@ async fn canvas_state_handler(
     Path(canvas_id): Path<String>,
     Query(query): Query<CanvasStateQuery>,
 ) -> Result<Response, Response> {
+    validate_canvas_http_canvas_id(canvas_id.as_str())?;
+    validate_canvas_http_token_query(query.token.as_str())?;
     let payload = state
         .runtime
         .canvas_state(canvas_id.as_str(), query.token.as_str(), query.after_version)
@@ -3253,9 +3296,11 @@ mod tests {
     use super::{
         consume_admin_rate_limit_with_now, consume_canvas_rate_limit_with_now,
         enforce_remote_bind_guard, loopback_grpc_url, runtime_status_response,
-        validate_admin_auth_config, validate_process_runner_backend_policy,
+        validate_admin_auth_config, validate_canvas_http_canvas_id,
+        validate_canvas_http_token_query, validate_process_runner_backend_policy,
         ADMIN_RATE_LIMIT_MAX_IP_BUCKETS, ADMIN_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW,
-        CANVAS_RATE_LIMIT_MAX_IP_BUCKETS, CANVAS_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW,
+        CANVAS_HTTP_MAX_TOKEN_BYTES, CANVAS_RATE_LIMIT_MAX_IP_BUCKETS,
+        CANVAS_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW,
     };
     use crate::gateway::GatewayAuthConfig;
     use crate::sandbox_runner::{EgressEnforcementMode, SandboxProcessRunnerTier};
@@ -3566,6 +3611,27 @@ mod tests {
             bucket_count, CANVAS_RATE_LIMIT_MAX_IP_BUCKETS,
             "bucket count must remain bounded to avoid unbounded memory growth"
         );
+    }
+
+    #[test]
+    fn canvas_http_token_query_rejects_empty_and_oversized_values() {
+        let empty = validate_canvas_http_token_query("")
+            .expect_err("empty token query should fail closed at HTTP boundary");
+        assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
+
+        let oversized = "a".repeat(CANVAS_HTTP_MAX_TOKEN_BYTES.saturating_add(1));
+        let oversized_error = validate_canvas_http_token_query(oversized.as_str())
+            .expect_err("oversized token query should fail closed at HTTP boundary");
+        assert_eq!(oversized_error.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn canvas_http_canvas_id_validation_enforces_canonical_ulid_shape() {
+        validate_canvas_http_canvas_id("01ARZ3NDEKTSV4RRFFQ69G5FAV")
+            .expect("canonical ULID canvas id should be accepted");
+        let invalid = validate_canvas_http_canvas_id("not-a-canonical-id")
+            .expect_err("invalid canvas id should be rejected at HTTP boundary");
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
