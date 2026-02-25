@@ -548,6 +548,57 @@ fn console_cron_workflow_create_disable_and_list_runs() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn console_memory_purge_requires_session_and_csrf() -> Result<()> {
+    let (child, admin_port) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("failed to build HTTP client")?;
+
+    let no_session = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/memory/purge"))
+        .json(&serde_json::json!({ "purge_all_principal": true }))
+        .send()
+        .context("failed to call memory purge endpoint without session")?;
+    assert_eq!(no_session.status().as_u16(), 403, "memory purge endpoint must require session");
+
+    let (cookie, csrf_token) = login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
+
+    let missing_csrf = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/memory/purge"))
+        .header("Cookie", cookie.clone())
+        .json(&serde_json::json!({ "purge_all_principal": true }))
+        .send()
+        .context("failed to call memory purge endpoint without csrf token")?;
+    assert_eq!(
+        missing_csrf.status().as_u16(),
+        403,
+        "memory purge endpoint must enforce csrf token"
+    );
+
+    let purge_response = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/memory/purge"))
+        .header("Cookie", cookie)
+        .header("x-palyra-csrf-token", csrf_token)
+        .json(&serde_json::json!({ "purge_all_principal": true }))
+        .send()
+        .context("failed to call memory purge endpoint with csrf token")?
+        .error_for_status()
+        .context("memory purge endpoint returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse memory purge response json")?;
+    assert!(
+        purge_response.get("deleted_count").and_then(Value::as_u64).is_some(),
+        "memory purge response should include deleted_count"
+    );
+
+    Ok(())
+}
+
 fn spawn_palyrad_with_dynamic_ports() -> Result<(Child, u16)> {
     let mut last_error: Option<anyhow::Error> = None;
     for attempt in 1..=PALYRAD_STARTUP_ATTEMPTS {
