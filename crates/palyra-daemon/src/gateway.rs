@@ -14641,6 +14641,9 @@ mod tests {
     };
 
     static TEMP_JOURNAL_COUNTER: AtomicU64 = AtomicU64::new(0);
+    const PARITY_REDIRECT_CREDENTIALS_URL: &str =
+        include_str!("../../../fixtures/parity/redirect-credentials-url.txt");
+    const PARITY_TRICKY_DOM_HTML: &str = include_str!("../../../fixtures/parity/tricky-dom.html");
 
     fn unique_temp_journal_path() -> PathBuf {
         let nonce = SystemTime::now()
@@ -14912,7 +14915,7 @@ mod tests {
     async fn http_fetch_rejects_url_credentials() {
         let state = build_test_runtime_state(false);
         let input = serde_json::to_vec(&json!({
-            "url": "https://user:secret@example.test/private"
+            "url": PARITY_REDIRECT_CREDENTIALS_URL.trim()
         }))
         .expect("input should serialize");
         let outcome =
@@ -14929,7 +14932,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn http_fetch_rejects_redirect_hop_with_url_credentials() {
         let state = build_test_runtime_state(false);
-        let (url, handle) = spawn_redirect_http_server("http://user:secret@example.test/next");
+        let (url, handle) = spawn_redirect_http_server(PARITY_REDIRECT_CREDENTIALS_URL.trim());
         let input = serde_json::to_vec(&json!({
             "url": url,
             "allow_private_targets": true,
@@ -14949,6 +14952,36 @@ mod tests {
             outcome.error
         );
         handle.join().expect("redirect test server should complete after one request");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_fetch_parity_fixture_exposes_deterministic_body_text() {
+        let state = build_test_runtime_state(false);
+        let (url, handle) = spawn_static_http_server(PARITY_TRICKY_DOM_HTML);
+        let input = serde_json::to_vec(&json!({
+            "url": url,
+            "allow_private_targets": true
+        }))
+        .expect("input should serialize");
+        let outcome =
+            execute_http_fetch_tool(&state, "proposal-http-fetch-parity-fixture", input.as_slice())
+                .await;
+        assert!(outcome.success, "parity fixture HTML should be fetched successfully");
+        let payload: Value = serde_json::from_slice(outcome.output_json.as_slice())
+            .expect("http.fetch output JSON should parse");
+        let body_text = payload
+            .get("body_text")
+            .and_then(Value::as_str)
+            .expect("http.fetch output should include response body text");
+        assert!(
+            body_text.contains("Observe Fixture"),
+            "fixture body should include canonical title marker"
+        );
+        assert!(
+            body_text.contains("access_token=secret"),
+            "fixture body should include sensitive query token fixture payload"
+        );
+        handle.join().expect("static fixture server should complete after one request");
     }
 
     #[tokio::test(flavor = "multi_thread")]
