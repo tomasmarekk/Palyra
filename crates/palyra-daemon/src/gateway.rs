@@ -4794,6 +4794,27 @@ fn enforce_memory_item_scope(
     Ok(())
 }
 
+fn redact_memory_text_for_output(raw: &str) -> String {
+    if raw.is_empty() {
+        return String::new();
+    }
+
+    let payload = json!({ "value": raw });
+    let redacted_payload = match crate::journal::redact_payload_json(payload.to_string().as_bytes())
+    {
+        Ok(redacted) => redacted,
+        Err(_) => return raw.to_owned(),
+    };
+    match serde_json::from_str::<Value>(redacted_payload.as_str()) {
+        Ok(Value::Object(fields)) => fields
+            .get("value")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| raw.to_owned()),
+        _ => raw.to_owned(),
+    }
+}
+
 fn memory_item_message(item: &MemoryItemRecord) -> memory_v1::MemoryItem {
     memory_v1::MemoryItem {
         v: CANONICAL_PROTOCOL_MAJOR,
@@ -4805,7 +4826,7 @@ fn memory_item_message(item: &MemoryItemRecord) -> memory_v1::MemoryItem {
             .as_ref()
             .map(|value| common_v1::CanonicalId { ulid: value.clone() }),
         source: memory_source_to_proto(item.source),
-        content_text: item.content_text.clone(),
+        content_text: redact_memory_text_for_output(item.content_text.as_str()),
         content_hash: item.content_hash.clone(),
         tags: item.tags.clone(),
         confidence: item.confidence.unwrap_or_default(),
@@ -4821,7 +4842,7 @@ fn memory_search_hit_message(
 ) -> memory_v1::MemorySearchHit {
     memory_v1::MemorySearchHit {
         item: Some(memory_item_message(&hit.item)),
-        snippet: hit.snippet.clone(),
+        snippet: redact_memory_text_for_output(hit.snippet.as_str()),
         score: hit.score,
         breakdown: if include_score_breakdown {
             Some(memory_v1::MemoryScoreBreakdown {
@@ -9662,6 +9683,30 @@ fn memory_auto_inject_tape_payload(query: &str, hits: &[MemorySearchHit]) -> Str
     crate::journal::redact_payload_json(payload.as_bytes()).unwrap_or(payload)
 }
 
+fn memory_search_tool_output_payload(search_hits: &[MemorySearchHit]) -> Value {
+    json!({
+        "hits": search_hits.iter().map(|hit| {
+            json!({
+                "memory_id": hit.item.memory_id,
+                "source": hit.item.source.as_str(),
+                "snippet": redact_memory_text_for_output(hit.snippet.as_str()),
+                "score": hit.score,
+                "created_at_unix_ms": hit.item.created_at_unix_ms,
+                "content_text": redact_memory_text_for_output(hit.item.content_text.as_str()),
+                "content_hash": hit.item.content_hash,
+                "tags": hit.item.tags,
+                "confidence": hit.item.confidence,
+                "breakdown": {
+                    "lexical_score": hit.breakdown.lexical_score,
+                    "vector_score": hit.breakdown.vector_score,
+                    "recency_score": hit.breakdown.recency_score,
+                    "final_score": hit.breakdown.final_score,
+                }
+            })
+        }).collect::<Vec<_>>()
+    })
+}
+
 fn build_tool_result_memory_text(
     tool_name: &str,
     success: bool,
@@ -9899,27 +9944,7 @@ async fn execute_memory_search_tool(
         }
     };
 
-    let payload = json!({
-        "hits": search_hits.iter().map(|hit| {
-            json!({
-                "memory_id": hit.item.memory_id,
-                "source": hit.item.source.as_str(),
-                "snippet": hit.snippet,
-                "score": hit.score,
-                "created_at_unix_ms": hit.item.created_at_unix_ms,
-                "content_text": hit.item.content_text,
-                "content_hash": hit.item.content_hash,
-                "tags": hit.item.tags,
-                "confidence": hit.item.confidence,
-                "breakdown": {
-                    "lexical_score": hit.breakdown.lexical_score,
-                    "vector_score": hit.breakdown.vector_score,
-                    "recency_score": hit.breakdown.recency_score,
-                    "final_score": hit.breakdown.final_score,
-                }
-            })
-        }).collect::<Vec<_>>()
-    });
+    let payload = memory_search_tool_output_payload(search_hits.as_slice());
     match serde_json::to_vec(&payload) {
         Ok(output_json) => {
             memory_tool_execution_outcome(proposal_id, input_json, true, output_json, String::new())
@@ -15168,6 +15193,91 @@ mod tests {
                 && !payload.contains("access_token=supersecret")
                 && !payload.contains("token=abc123"),
             "secret-like values must be redacted before tape persistence: {payload}"
+        );
+    }
+
+    #[test]
+    fn memory_item_message_redacts_legacy_secret_like_content_text() {
+        let mut item = test_memory_item(None);
+        item.content_text =
+            "legacy payload bearer topsecret refresh_token=shh cookie: sessionid=abc".to_owned();
+        let message = super::memory_item_message(&item);
+        assert!(
+            message.content_text.contains("<redacted>"),
+            "memory item response should include redaction marker"
+        );
+        assert!(
+            !message.content_text.contains("topsecret")
+                && !message.content_text.contains("refresh_token=shh")
+                && !message.content_text.contains("sessionid=abc"),
+            "memory item response must not leak secret-like values: {}",
+            message.content_text
+        );
+    }
+
+    #[test]
+    fn memory_search_hit_message_redacts_legacy_secret_like_snippet() {
+        let hit = MemorySearchHit {
+            item: test_memory_item(None),
+            snippet: "url token=abc123 and api_key=qwerty must be hidden".to_owned(),
+            score: 0.42,
+            breakdown: MemoryScoreBreakdown {
+                lexical_score: 0.2,
+                vector_score: 0.1,
+                recency_score: 0.12,
+                final_score: 0.42,
+            },
+        };
+        let message = super::memory_search_hit_message(&hit, false);
+        assert!(
+            message.snippet.contains("<redacted>"),
+            "search hit snippet should include redaction marker"
+        );
+        assert!(
+            !message.snippet.contains("token=abc123")
+                && !message.snippet.contains("api_key=qwerty"),
+            "search hit snippet must not leak secret-like values: {}",
+            message.snippet
+        );
+    }
+
+    #[test]
+    fn redact_memory_text_for_output_keeps_non_secret_text_stable() {
+        let safe = "release train rollback checklist";
+        assert_eq!(
+            super::redact_memory_text_for_output(safe),
+            safe,
+            "safe memory text should remain unchanged"
+        );
+    }
+
+    #[test]
+    fn memory_search_tool_output_payload_redacts_secret_like_values() {
+        let mut item = test_memory_item(None);
+        item.content_text = "legacy row bearer topsecret token=abc123".to_owned();
+        let hit = MemorySearchHit {
+            item,
+            snippet: "url refresh_token=hidden should be redacted".to_owned(),
+            score: 0.66,
+            breakdown: MemoryScoreBreakdown {
+                lexical_score: 0.3,
+                vector_score: 0.2,
+                recency_score: 0.16,
+                final_score: 0.66,
+            },
+        };
+
+        let payload = super::memory_search_tool_output_payload(&[hit]);
+        let encoded = serde_json::to_string(&payload).expect("payload should serialize");
+        assert!(
+            encoded.contains("<redacted>"),
+            "tool output payload should include redaction marker"
+        );
+        assert!(
+            !encoded.contains("topsecret")
+                && !encoded.contains("token=abc123")
+                && !encoded.contains("refresh_token=hidden"),
+            "tool output payload must not leak secret-like values: {encoded}"
         );
     }
 
