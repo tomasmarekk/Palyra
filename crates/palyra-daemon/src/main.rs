@@ -840,8 +840,8 @@ async fn main() -> Result<()> {
         .route("/admin/v1/skills/{skill_id}/quarantine", post(admin_skill_quarantine_handler))
         .route("/admin/v1/skills/{skill_id}/enable", post(admin_skill_enable_handler))
         .layer(DefaultBodyLimit::max(HTTP_MAX_REQUEST_BODY_BYTES))
-        .route_layer(middleware::from_fn(admin_console_security_headers_middleware))
-        .route_layer(middleware::from_fn_with_state(state.clone(), admin_rate_limit_middleware));
+        .route_layer(middleware::from_fn_with_state(state.clone(), admin_rate_limit_middleware))
+        .route_layer(middleware::from_fn(admin_console_security_headers_middleware));
     let console_routes = Router::new()
         .route("/console/v1/auth/login", post(console_login_handler))
         .route("/console/v1/auth/logout", post(console_logout_handler))
@@ -867,8 +867,8 @@ async fn main() -> Result<()> {
         .route("/console/v1/skills/{skill_id}/enable", post(console_skill_enable_handler))
         .route("/console/v1/audit/events", get(console_audit_events_handler))
         .layer(DefaultBodyLimit::max(HTTP_MAX_REQUEST_BODY_BYTES))
-        .route_layer(middleware::from_fn(admin_console_security_headers_middleware))
-        .route_layer(middleware::from_fn_with_state(state.clone(), admin_rate_limit_middleware));
+        .route_layer(middleware::from_fn_with_state(state.clone(), admin_rate_limit_middleware))
+        .route_layer(middleware::from_fn(admin_console_security_headers_middleware));
     let app = Router::new()
         .route("/healthz", get(health_handler))
         .route("/canvas/v1/frame/{canvas_id}", get(canvas_frame_handler))
