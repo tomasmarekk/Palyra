@@ -1049,6 +1049,20 @@ async fn grpc_canvas_http_surface_rejects_invalid_token_with_security_headers() 
     assert_eq!(frame_xcto, "nosniff");
     assert_eq!(frame_referrer_policy, "no-referrer");
 
+    let oversized_token = "a".repeat(8 * 1024 + 1);
+    let oversized_frame_path = format!("/canvas/v1/frame/{canvas_id}?token={oversized_token}");
+    let (
+        oversized_status,
+        oversized_cache_control,
+        oversized_xcto,
+        oversized_referrer_policy,
+        _oversized_body,
+    ) = admin_get_text_with_base_security_headers_async(admin_port, oversized_frame_path).await?;
+    assert_eq!(oversized_status, 400, "oversized canvas token must be rejected");
+    assert_eq!(oversized_cache_control, "no-store");
+    assert_eq!(oversized_xcto, "nosniff");
+    assert_eq!(oversized_referrer_policy, "no-referrer");
+
     Ok(())
 }
 
