@@ -2,7 +2,7 @@ use std::{
     fs,
     io::{BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, ChildStdout, Command, Stdio},
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -17,8 +17,6 @@ use reqwest::blocking::Client;
 use rusqlite::{params, Connection};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-#[cfg(unix)]
-use std::path::Path;
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
@@ -5561,8 +5559,8 @@ fn spawn_palyrad_with_existing_journal(journal_db_path: PathBuf) -> Result<(Chil
 }
 
 fn spawn_palyrad_with_existing_journal_and_agents_registry(
-    journal_db_path: &PathBuf,
-    agents_registry_path: &PathBuf,
+    journal_db_path: &Path,
+    agents_registry_path: &Path,
 ) -> Result<(Child, u16, u16)> {
     let identity_store_dir = unique_temp_identity_store_dir();
     let vault_dir = unique_temp_vault_dir();
