@@ -2945,10 +2945,7 @@ fn console_run_stream_event_to_json(event: &common_v1::RunStreamEvent) -> Value 
             "event_type": "journal_event",
             "journal_event": {
                 "event_id": journal_event.event_id.as_ref().map(|value| value.ulid.clone()),
-                "session_id": journal_event
-                    .session_id
-                    .as_ref()
-                    .map(|_| "<redacted>".to_owned()),
+                "session_id": "<redacted>",
                 "run_id": journal_event.run_id.as_ref().map(|value| value.ulid.clone()),
                 "kind": journal_event_kind_label(journal_event.kind),
                 "actor": journal_event_actor_label(journal_event.actor),
