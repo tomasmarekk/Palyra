@@ -511,7 +511,7 @@ fn console_chat_endpoints_require_session_and_csrf() -> Result<()> {
         "chat session create endpoint must enforce csrf token"
     );
 
-    let create_response = client
+    client
         .post(format!("http://127.0.0.1:{admin_port}/console/v1/chat/sessions"))
         .header("Cookie", cookie.clone())
         .header("x-palyra-csrf-token", csrf_token.clone())
@@ -519,18 +519,14 @@ fn console_chat_endpoints_require_session_and_csrf() -> Result<()> {
         .send()
         .context("failed to create chat session with csrf token")?
         .error_for_status()
-        .context("chat session create endpoint returned non-success status")?
-        .json::<Value>()
-        .context("failed to parse chat session create response json")?;
-    let session_id = create_response
-        .get("session")
-        .and_then(|session| session.get("session_id"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("chat create response missing session.session_id"))?
-        .to_owned();
+        .context("chat session create endpoint returned non-success status")?;
+
+    let session_route_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 
     let rename_without_csrf = client
-        .post(format!("http://127.0.0.1:{admin_port}/console/v1/chat/sessions/{session_id}/rename"))
+        .post(format!(
+            "http://127.0.0.1:{admin_port}/console/v1/chat/sessions/{session_route_id}/rename"
+        ))
         .header("Cookie", cookie.clone())
         .json(&serde_json::json!({
             "session_label": "renamed",
@@ -544,7 +540,9 @@ fn console_chat_endpoints_require_session_and_csrf() -> Result<()> {
     );
 
     let reset_without_csrf = client
-        .post(format!("http://127.0.0.1:{admin_port}/console/v1/chat/sessions/{session_id}/reset"))
+        .post(format!(
+            "http://127.0.0.1:{admin_port}/console/v1/chat/sessions/{session_route_id}/reset"
+        ))
         .header("Cookie", cookie.clone())
         .send()
         .context("failed to reset chat session without csrf token")?;
@@ -556,7 +554,7 @@ fn console_chat_endpoints_require_session_and_csrf() -> Result<()> {
 
     let stream_without_csrf = client
         .post(format!(
-            "http://127.0.0.1:{admin_port}/console/v1/chat/sessions/{session_id}/messages/stream"
+            "http://127.0.0.1:{admin_port}/console/v1/chat/sessions/{session_route_id}/messages/stream"
         ))
         .header("Cookie", cookie.clone())
         .json(&serde_json::json!({
