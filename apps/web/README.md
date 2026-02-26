@@ -1,6 +1,6 @@
 # Web Console Runtime
 
-This package now hosts the Web Console runtime through M39 diagnostics/telemetry surfaces.
+This package now hosts the Web Console runtime.
 
 ## What ships in M39
 
