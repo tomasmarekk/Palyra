@@ -3,7 +3,7 @@ import { useEffect, useMemo, useState } from "react";
 
 import { ConsoleApiClient, type ConsoleSession, type JsonValue } from "./consoleApi";
 
-type Section = "approvals" | "cron" | "memory" | "skills" | "audit";
+type Section = "approvals" | "cron" | "memory" | "skills" | "browser" | "audit";
 type JsonObject = { [key: string]: JsonValue };
 type CronScheduleType = "cron" | "every" | "at";
 
@@ -94,6 +94,29 @@ export function App() {
   const [auditFilterPrincipal, setAuditFilterPrincipal] = useState("");
   const [auditEvents, setAuditEvents] = useState<JsonObject[]>([]);
 
+  const [browserBusy, setBrowserBusy] = useState(false);
+  const [browserPrincipal, setBrowserPrincipal] = useState("");
+  const [browserProfiles, setBrowserProfiles] = useState<JsonObject[]>([]);
+  const [browserActiveProfileId, setBrowserActiveProfileId] = useState("");
+  const [browserProfileName, setBrowserProfileName] = useState("");
+  const [browserProfileTheme, setBrowserProfileTheme] = useState("");
+  const [browserProfilePersistence, setBrowserProfilePersistence] = useState(true);
+  const [browserProfilePrivate, setBrowserProfilePrivate] = useState(false);
+  const [browserRenameProfileId, setBrowserRenameProfileId] = useState("");
+  const [browserRenameName, setBrowserRenameName] = useState("");
+  const [browserRelaySessionId, setBrowserRelaySessionId] = useState("");
+  const [browserRelayExtensionId, setBrowserRelayExtensionId] = useState("com.palyra.extension");
+  const [browserRelayTtlMs, setBrowserRelayTtlMs] = useState("300000");
+  const [browserRelayToken, setBrowserRelayToken] = useState("");
+  const [browserRelayTokenExpiry, setBrowserRelayTokenExpiry] = useState<number | null>(null);
+  const [browserRelayAction, setBrowserRelayAction] = useState<"open_tab" | "capture_selection" | "send_page_snapshot">("capture_selection");
+  const [browserRelayOpenTabUrl, setBrowserRelayOpenTabUrl] = useState("");
+  const [browserRelaySelector, setBrowserRelaySelector] = useState("body");
+  const [browserRelayResult, setBrowserRelayResult] = useState<JsonValue | null>(null);
+  const [browserDownloadsSessionId, setBrowserDownloadsSessionId] = useState("");
+  const [browserDownloadsQuarantinedOnly, setBrowserDownloadsQuarantinedOnly] = useState(false);
+  const [browserDownloads, setBrowserDownloads] = useState<JsonObject[]>([]);
+
   useEffect(() => {
     let cancelled = false;
     const bootstrap = async () => {
@@ -110,6 +133,7 @@ export function App() {
           deviceId: current.device_id,
           channel: current.channel ?? previous.channel
         }));
+        setBrowserPrincipal((previous) => (previous.trim().length === 0 ? current.principal : previous));
       } catch {
         if (!cancelled) {
           setSession(null);
@@ -138,6 +162,9 @@ export function App() {
     }
     if (section === "skills") {
       void refreshSkills();
+    }
+    if (section === "browser") {
+      void refreshBrowserProfiles();
     }
     if (section === "audit") {
       void refreshAudit();
@@ -413,6 +440,258 @@ export function App() {
     }
   }
 
+  async function refreshBrowserProfiles(): Promise<void> {
+    setBrowserBusy(true);
+    setError(null);
+    try {
+      const params = new URLSearchParams();
+      if (browserPrincipal.trim().length > 0) {
+        params.set("principal", browserPrincipal.trim());
+      }
+      const response = await api.listBrowserProfiles(params);
+      setBrowserProfiles(toJsonObjectArray(response.profiles));
+      setBrowserActiveProfileId(response.active_profile_id ?? "");
+      setBrowserPrincipal((previous) => {
+        if (previous.trim().length > 0) {
+          return previous;
+        }
+        return response.principal;
+      });
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setBrowserBusy(false);
+    }
+  }
+
+  async function createBrowserProfile(event: React.FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+    if (browserProfileName.trim().length === 0) {
+      setError("Profile name cannot be empty.");
+      return;
+    }
+    setBrowserBusy(true);
+    setError(null);
+    try {
+      await api.createBrowserProfile({
+        principal: emptyToUndefined(browserPrincipal),
+        name: browserProfileName.trim(),
+        theme_color: emptyToUndefined(browserProfileTheme),
+        persistence_enabled: browserProfilePersistence,
+        private_profile: browserProfilePrivate
+      });
+      setBrowserProfileName("");
+      setBrowserProfileTheme("");
+      setBrowserProfilePrivate(false);
+      setNotice("Browser profile created.");
+      await refreshBrowserProfiles();
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setBrowserBusy(false);
+    }
+  }
+
+  async function renameBrowserProfile(): Promise<void> {
+    if (browserRenameProfileId.trim().length === 0) {
+      setError("Select a browser profile to rename.");
+      return;
+    }
+    if (browserRenameName.trim().length === 0) {
+      setError("New profile name cannot be empty.");
+      return;
+    }
+    setBrowserBusy(true);
+    setError(null);
+    try {
+      await api.renameBrowserProfile(browserRenameProfileId.trim(), {
+        principal: emptyToUndefined(browserPrincipal),
+        name: browserRenameName.trim()
+      });
+      setNotice("Browser profile renamed.");
+      setBrowserRenameName("");
+      await refreshBrowserProfiles();
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setBrowserBusy(false);
+    }
+  }
+
+  async function activateBrowserProfile(profile: JsonObject): Promise<void> {
+    const profileId = readString(profile, "profile_id");
+    if (profileId === null) {
+      setError("Profile payload missing profile_id.");
+      return;
+    }
+    setBrowserBusy(true);
+    setError(null);
+    try {
+      await api.activateBrowserProfile(profileId, {
+        principal: emptyToUndefined(browserPrincipal)
+      });
+      setNotice("Browser profile activated.");
+      await refreshBrowserProfiles();
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setBrowserBusy(false);
+    }
+  }
+
+  async function deleteBrowserProfile(profile: JsonObject): Promise<void> {
+    const profileId = readString(profile, "profile_id");
+    if (profileId === null) {
+      setError("Profile payload missing profile_id.");
+      return;
+    }
+    setBrowserBusy(true);
+    setError(null);
+    try {
+      await api.deleteBrowserProfile(profileId, {
+        principal: emptyToUndefined(browserPrincipal)
+      });
+      setNotice("Browser profile deleted.");
+      await refreshBrowserProfiles();
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setBrowserBusy(false);
+    }
+  }
+
+  async function mintBrowserRelayToken(): Promise<void> {
+    if (browserRelaySessionId.trim().length === 0) {
+      setError("Relay token issuance requires session_id.");
+      return;
+    }
+    if (browserRelayExtensionId.trim().length === 0) {
+      setError("Relay token issuance requires extension_id.");
+      return;
+    }
+    setBrowserBusy(true);
+    setError(null);
+    try {
+      const response = await api.mintBrowserRelayToken({
+        session_id: browserRelaySessionId.trim(),
+        extension_id: browserRelayExtensionId.trim(),
+        ttl_ms: parseInteger(browserRelayTtlMs) ?? undefined
+      });
+      setBrowserRelayToken(response.relay_token);
+      setBrowserRelayTokenExpiry(response.expires_at_unix_ms);
+      setNotice("Browser relay token minted. Keep it private and short-lived.");
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setBrowserBusy(false);
+    }
+  }
+
+  async function dispatchBrowserRelayAction(): Promise<void> {
+    if (browserRelaySessionId.trim().length === 0) {
+      setError("Relay action requires session_id.");
+      return;
+    }
+    if (browserRelayExtensionId.trim().length === 0) {
+      setError("Relay action requires extension_id.");
+      return;
+    }
+    if (browserRelayAction === "open_tab" && browserRelayOpenTabUrl.trim().length === 0) {
+      setError("Open tab relay action requires URL.");
+      return;
+    }
+    if (browserRelayAction === "capture_selection" && browserRelaySelector.trim().length === 0) {
+      setError("Capture selection relay action requires selector.");
+      return;
+    }
+    setBrowserBusy(true);
+    setError(null);
+    try {
+      const payload: {
+        relay_token?: string;
+        session_id: string;
+        extension_id: string;
+        action: "open_tab" | "capture_selection" | "send_page_snapshot";
+        open_tab?: { url: string; activate?: boolean; timeout_ms?: number };
+        capture_selection?: { selector: string; max_selection_bytes?: number };
+        page_snapshot?: {
+          include_dom_snapshot?: boolean;
+          include_visible_text?: boolean;
+          max_dom_snapshot_bytes?: number;
+          max_visible_text_bytes?: number;
+        };
+        max_payload_bytes?: number;
+      } = {
+        relay_token: emptyToUndefined(browserRelayToken),
+        session_id: browserRelaySessionId.trim(),
+        extension_id: browserRelayExtensionId.trim(),
+        action: browserRelayAction,
+        max_payload_bytes: 16384
+      };
+
+      if (browserRelayAction === "open_tab") {
+        payload.open_tab = {
+          url: browserRelayOpenTabUrl.trim(),
+          activate: true,
+          timeout_ms: 6000
+        };
+      }
+      if (browserRelayAction === "capture_selection") {
+        payload.capture_selection = {
+          selector: browserRelaySelector.trim(),
+          max_selection_bytes: 2048
+        };
+      }
+      if (browserRelayAction === "send_page_snapshot") {
+        payload.page_snapshot = {
+          include_dom_snapshot: true,
+          include_visible_text: true,
+          max_dom_snapshot_bytes: 4096,
+          max_visible_text_bytes: 4096
+        };
+      }
+      const response = await api.relayBrowserAction(payload, browserRelayToken);
+      setBrowserRelayResult(response as JsonObject);
+      if (response.success) {
+        setNotice(`Relay action '${response.action}' completed.`);
+      } else {
+        setError(response.error.length > 0 ? response.error : "Relay action failed.");
+      }
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setBrowserBusy(false);
+    }
+  }
+
+  async function refreshBrowserDownloads(): Promise<void> {
+    if (browserDownloadsSessionId.trim().length === 0) {
+      setError("Downloads query requires session_id.");
+      return;
+    }
+    setBrowserBusy(true);
+    setError(null);
+    try {
+      const params = new URLSearchParams();
+      params.set("session_id", browserDownloadsSessionId.trim());
+      params.set("limit", "50");
+      if (browserDownloadsQuarantinedOnly) {
+        params.set("quarantined_only", "true");
+      }
+      const response = await api.listBrowserDownloads(params);
+      setBrowserDownloads(toJsonObjectArray(response.artifacts));
+      if (response.error.length > 0) {
+        setNotice(`Downloads listed with note: ${response.error}`);
+      } else {
+        setNotice("Downloads refreshed.");
+      }
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setBrowserBusy(false);
+    }
+  }
+
   async function refreshAudit(): Promise<void> {
     setAuditBusy(true);
     setError(null);
@@ -513,7 +792,7 @@ export function App() {
           <p className="console-label">Palyra / M35</p>
           <h1>Web Console v1</h1>
           <p className="console-copy">
-            Approvals, cron, memory, skills, and audit workflows without using CLI.
+            Approvals, cron, memory, skills, browser relay controls, and audit workflows without using CLI.
           </p>
         </div>
         <div className="console-session-box">
@@ -532,6 +811,7 @@ export function App() {
         <button type="button" className={section === "cron" ? "is-active" : ""} onClick={() => setSection("cron")}>Cron</button>
         <button type="button" className={section === "memory" ? "is-active" : ""} onClick={() => setSection("memory")}>Memory</button>
         <button type="button" className={section === "skills" ? "is-active" : ""} onClick={() => setSection("skills")}>Skills</button>
+        <button type="button" className={section === "browser" ? "is-active" : ""} onClick={() => setSection("browser")}>Browser</button>
         <button type="button" className={section === "audit" ? "is-active" : ""} onClick={() => setSection("audit")}>Audit</button>
       </nav>
 
@@ -810,6 +1090,203 @@ export function App() {
               })}
             </div>
           )}
+        </main>
+      )}
+
+      {section === "browser" && (
+        <main className="console-card">
+          <header className="console-card__header">
+            <h2>Browser Profiles + Relay</h2>
+            <button type="button" onClick={() => void refreshBrowserProfiles()} disabled={browserBusy}>
+              {browserBusy ? "Refreshing..." : "Refresh"}
+            </button>
+          </header>
+
+          <form
+            className="console-form"
+            onSubmit={(event) => {
+              void createBrowserProfile(event);
+            }}
+          >
+            <div className="console-grid-3">
+              <label>
+                Principal
+                <input value={browserPrincipal} onChange={(event) => setBrowserPrincipal(event.target.value)} />
+              </label>
+              <label>
+                Profile name
+                <input value={browserProfileName} onChange={(event) => setBrowserProfileName(event.target.value)} required />
+              </label>
+              <label>
+                Theme color
+                <input value={browserProfileTheme} onChange={(event) => setBrowserProfileTheme(event.target.value)} placeholder="#4f46e5" />
+              </label>
+            </div>
+            <div className="console-grid-3">
+              <label className="console-checkbox-inline">
+                <input type="checkbox" checked={browserProfilePersistence} onChange={(event) => setBrowserProfilePersistence(event.target.checked)} />
+                Persistence enabled
+              </label>
+              <label className="console-checkbox-inline">
+                <input type="checkbox" checked={browserProfilePrivate} onChange={(event) => setBrowserProfilePrivate(event.target.checked)} />
+                Private profile (never persists)
+              </label>
+              <button type="submit" disabled={browserBusy}>{browserBusy ? "Creating..." : "Create profile"}</button>
+            </div>
+          </form>
+
+          <div className="console-table-wrap">
+            <table className="console-table">
+              <thead>
+                <tr>
+                  <th>Profile ID</th>
+                  <th>Name</th>
+                  <th>Theme</th>
+                  <th>Persistence</th>
+                  <th>Private</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {browserProfiles.length === 0 && (
+                  <tr><td colSpan={6}>No browser profiles available.</td></tr>
+                )}
+                {browserProfiles.map((profile) => {
+                  const profileId = readString(profile, "profile_id") ?? "(missing)";
+                  const active = profileId === browserActiveProfileId || readBool(profile, "active");
+                  const persistence = readBool(profile, "persistence_enabled");
+                  const privateProfile = readBool(profile, "private_profile");
+                  return (
+                    <tr key={profileId}>
+                      <td>{profileId}</td>
+                      <td>{readString(profile, "name") ?? "-"}</td>
+                      <td>{readString(profile, "theme_color") ?? "-"}</td>
+                      <td>{persistence ? "yes" : "no"}</td>
+                      <td>{privateProfile ? "yes" : "no"}</td>
+                      <td className="console-action-cell">
+                        <button type="button" onClick={() => void activateBrowserProfile(profile)} disabled={browserBusy}>
+                          {active ? "Active" : "Set active"}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setBrowserRenameProfileId(profileId);
+                            setBrowserRenameName(readString(profile, "name") ?? "");
+                          }}
+                        >
+                          Rename
+                        </button>
+                        <button type="button" className="button--warn" onClick={() => void deleteBrowserProfile(profile)} disabled={browserBusy}>
+                          Delete
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+
+          <section className="console-subpanel">
+            <h3>Rename profile</h3>
+            <div className="console-grid-3">
+              <label>
+                Profile ID
+                <input value={browserRenameProfileId} onChange={(event) => setBrowserRenameProfileId(event.target.value)} />
+              </label>
+              <label>
+                New name
+                <input value={browserRenameName} onChange={(event) => setBrowserRenameName(event.target.value)} />
+              </label>
+              <button type="button" onClick={() => void renameBrowserProfile()} disabled={browserBusy}>
+                {browserBusy ? "Renaming..." : "Rename profile"}
+              </button>
+            </div>
+          </section>
+
+          <section className="console-subpanel">
+            <h3>Extension relay token</h3>
+            <p>
+              Relay token is short-lived and scoped to one browser session + extension ID. Treat token as secret.
+            </p>
+            <div className="console-grid-3">
+              <label>
+                Session ID
+                <input value={browserRelaySessionId} onChange={(event) => setBrowserRelaySessionId(event.target.value)} placeholder="01ARZ3NDEKTSV4RRFFQ69G5FAV" />
+              </label>
+              <label>
+                Extension ID
+                <input value={browserRelayExtensionId} onChange={(event) => setBrowserRelayExtensionId(event.target.value)} />
+              </label>
+              <label>
+                TTL ms
+                <input value={browserRelayTtlMs} onChange={(event) => setBrowserRelayTtlMs(event.target.value)} />
+              </label>
+            </div>
+            <div className="console-inline-actions">
+              <button type="button" onClick={() => void mintBrowserRelayToken()} disabled={browserBusy}>
+                {browserBusy ? "Minting..." : "Mint relay token"}
+              </button>
+            </div>
+            {browserRelayToken.length > 0 && (
+              <div className="console-stack">
+                <p><strong>Token expires:</strong> {browserRelayTokenExpiry === null ? "-" : new Date(browserRelayTokenExpiry).toLocaleString()}</p>
+                <pre>{toPrettyJson({ relay_token: browserRelayToken }, revealSensitiveValues)}</pre>
+              </div>
+            )}
+          </section>
+
+          <section className="console-subpanel">
+            <h3>Relay action dispatch</h3>
+            <div className="console-grid-3">
+              <label>
+                Action
+                <select value={browserRelayAction} onChange={(event) => setBrowserRelayAction(event.target.value as "open_tab" | "capture_selection" | "send_page_snapshot")}>
+                  <option value="capture_selection">capture_selection</option>
+                  <option value="open_tab">open_tab</option>
+                  <option value="send_page_snapshot">send_page_snapshot</option>
+                </select>
+              </label>
+              <label>
+                Open tab URL
+                <input value={browserRelayOpenTabUrl} onChange={(event) => setBrowserRelayOpenTabUrl(event.target.value)} disabled={browserRelayAction !== "open_tab"} />
+              </label>
+              <label>
+                Selector
+                <input value={browserRelaySelector} onChange={(event) => setBrowserRelaySelector(event.target.value)} disabled={browserRelayAction !== "capture_selection"} />
+              </label>
+            </div>
+            <div className="console-inline-actions">
+              <button type="button" onClick={() => void dispatchBrowserRelayAction()} disabled={browserBusy}>
+                {browserBusy ? "Dispatching..." : "Dispatch relay action"}
+              </button>
+            </div>
+            {browserRelayResult !== null && (
+              <pre>{toPrettyJson(browserRelayResult, revealSensitiveValues)}</pre>
+            )}
+          </section>
+
+          <section className="console-subpanel">
+            <h3>Download artifacts</h3>
+            <div className="console-grid-3">
+              <label>
+                Session ID
+                <input value={browserDownloadsSessionId} onChange={(event) => setBrowserDownloadsSessionId(event.target.value)} />
+              </label>
+              <label className="console-checkbox-inline">
+                <input type="checkbox" checked={browserDownloadsQuarantinedOnly} onChange={(event) => setBrowserDownloadsQuarantinedOnly(event.target.checked)} />
+                Quarantined only
+              </label>
+              <button type="button" onClick={() => void refreshBrowserDownloads()} disabled={browserBusy}>
+                {browserBusy ? "Loading..." : "Load downloads"}
+              </button>
+            </div>
+            {browserDownloads.length === 0 ? (
+              <p>No download artifacts loaded.</p>
+            ) : (
+              <pre>{toPrettyJson(browserDownloads, revealSensitiveValues)}</pre>
+            )}
+          </section>
         </main>
       )}
 

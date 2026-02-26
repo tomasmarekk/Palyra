@@ -3254,6 +3254,34 @@ impl GatewayRuntimeState {
         .map(|_| ())
     }
 
+    #[allow(clippy::result_large_err)]
+    pub async fn record_console_event(
+        self: &Arc<Self>,
+        context: &RequestContext,
+        event: &str,
+        details: Value,
+    ) -> Result<(), Status> {
+        self.record_journal_event(JournalAppendRequest {
+            event_id: Ulid::new().to_string(),
+            session_id: Ulid::new().to_string(),
+            run_id: Ulid::new().to_string(),
+            kind: common_v1::journal_event::EventKind::ToolExecuted as i32,
+            actor: common_v1::journal_event::EventActor::System as i32,
+            timestamp_unix_ms: current_unix_ms(),
+            payload_json: json!({
+                "event": event,
+                "details": details,
+            })
+            .to_string()
+            .into_bytes(),
+            principal: context.principal.clone(),
+            device_id: context.device_id.clone(),
+            channel: context.channel.clone(),
+        })
+        .await
+        .map(|_| ())
+    }
+
     pub fn configure_memory(&self, config: MemoryRuntimeConfig) {
         match self.memory_config.write() {
             Ok(mut guard) => {
@@ -10698,6 +10726,40 @@ async fn execute_browser_tool(
             let idle_ttl_ms = payload.get("idle_ttl_ms").and_then(Value::as_u64).unwrap_or(0);
             let allow_private_targets =
                 payload.get("allow_private_targets").and_then(Value::as_bool).unwrap_or(false);
+            let profile_id = match payload.get("profile_id") {
+                Some(Value::String(raw)) => {
+                    let trimmed = raw.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        match validate_canonical_id(trimmed) {
+                            Ok(_) => Some(common_v1::CanonicalId { ulid: trimmed.to_owned() }),
+                            Err(error) => {
+                                return browser_tool_execution_outcome(
+                                    proposal_id,
+                                    input_json,
+                                    false,
+                                    b"{}".to_vec(),
+                                    format!(
+                                        "palyra.browser.session.create profile_id is invalid: {error}"
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                }
+                Some(_) => {
+                    return browser_tool_execution_outcome(
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        "palyra.browser.session.create field 'profile_id' must be a string"
+                            .to_owned(),
+                    );
+                }
+                None => None,
+            };
             let budget = payload.get("budget").and_then(Value::as_object).map(|value| {
                 browser_v1::SessionBudget {
                     max_navigation_timeout_ms: value
@@ -10791,6 +10853,11 @@ async fn execute_browser_tool(
                     .map(str::trim)
                     .unwrap_or_default()
                     .to_owned(),
+                profile_id,
+                private_profile: payload
+                    .get("private_profile")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
                 channel: channel.unwrap_or_default().to_owned(),
             });
             if let Err(error) = attach_browser_auth_metadata(
@@ -10834,6 +10901,8 @@ async fn execute_browser_tool(
                         "persistence_enabled": response.persistence_enabled,
                         "persistence_id": response.persistence_id,
                         "state_restored": response.state_restored,
+                        "profile_id": response.profile_id.map(|value| value.ulid),
+                        "private_profile": response.private_profile,
                     });
                     (
                         true,

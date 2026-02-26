@@ -8,6 +8,11 @@ service BrowserService {
   rpc Health(BrowserHealthRequest) returns (BrowserHealthResponse);
   rpc CreateSession(CreateSessionRequest) returns (CreateSessionResponse);
   rpc CloseSession(CloseSessionRequest) returns (CloseSessionResponse);
+  rpc ListProfiles(ListProfilesRequest) returns (ListProfilesResponse);
+  rpc CreateProfile(CreateProfileRequest) returns (CreateProfileResponse);
+  rpc RenameProfile(RenameProfileRequest) returns (RenameProfileResponse);
+  rpc DeleteProfile(DeleteProfileRequest) returns (DeleteProfileResponse);
+  rpc SetActiveProfile(SetActiveProfileRequest) returns (SetActiveProfileResponse);
   rpc Navigate(NavigateRequest) returns (NavigateResponse);
   rpc Click(ClickRequest) returns (ClickResponse);
   rpc Type(TypeRequest) returns (TypeResponse);
@@ -24,6 +29,8 @@ service BrowserService {
   rpc CloseTab(CloseTabRequest) returns (CloseTabResponse);
   rpc GetPermissions(GetPermissionsRequest) returns (GetPermissionsResponse);
   rpc SetPermissions(SetPermissionsRequest) returns (SetPermissionsResponse);
+  rpc RelayAction(RelayActionRequest) returns (RelayActionResponse);
+  rpc ListDownloadArtifacts(ListDownloadArtifactsRequest) returns (ListDownloadArtifactsResponse);
 }
 
 message BrowserHealthRequest {
@@ -69,6 +76,8 @@ message CreateSessionRequest {
   bool persistence_enabled = 15;
   string persistence_id = 16;
   string channel = 17;
+  palyra.common.v1.CanonicalId profile_id = 18;
+  bool private_profile = 19;
 
   reserved 8 to 14;
 }
@@ -83,6 +92,8 @@ message CreateSessionResponse {
   bool persistence_enabled = 13;
   string persistence_id = 14;
   bool state_restored = 15;
+  palyra.common.v1.CanonicalId profile_id = 16;
+  bool private_profile = 17;
 
   reserved 7 to 12;
 }
@@ -162,6 +173,7 @@ message ClickResponse {
   BrowserActionLogEntry action_log = 4;
   bytes failure_screenshot_bytes = 5;
   string failure_screenshot_mime_type = 6;
+  DownloadArtifact artifact = 13;
 
   reserved 7 to 12;
 }
@@ -369,6 +381,215 @@ message BrowserTab {
   bool active = 5;
 
   reserved 6 to 12;
+}
+
+message BrowserProfile {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId profile_id = 2;
+  string principal = 3;
+  string name = 4;
+  string theme_color = 5;
+  uint64 created_at_unix_ms = 6;
+  uint64 updated_at_unix_ms = 7;
+  uint64 last_used_unix_ms = 8;
+  bool persistence_enabled = 9;
+  bool private_profile = 10;
+  bool active = 11;
+
+  reserved 12 to 16;
+}
+
+message ListProfilesRequest {
+  uint32 v = 1;
+  string principal = 2;
+
+  reserved 3 to 10;
+}
+
+message ListProfilesResponse {
+  uint32 v = 1;
+  repeated BrowserProfile profiles = 2;
+  palyra.common.v1.CanonicalId active_profile_id = 3;
+
+  reserved 4 to 10;
+}
+
+message CreateProfileRequest {
+  uint32 v = 1;
+  string principal = 2;
+  string name = 3;
+  string theme_color = 4;
+  bool persistence_enabled = 5;
+  bool private_profile = 6;
+
+  reserved 7 to 14;
+}
+
+message CreateProfileResponse {
+  uint32 v = 1;
+  BrowserProfile profile = 2;
+
+  reserved 3 to 10;
+}
+
+message RenameProfileRequest {
+  uint32 v = 1;
+  string principal = 2;
+  palyra.common.v1.CanonicalId profile_id = 3;
+  string name = 4;
+
+  reserved 5 to 12;
+}
+
+message RenameProfileResponse {
+  uint32 v = 1;
+  BrowserProfile profile = 2;
+
+  reserved 3 to 10;
+}
+
+message DeleteProfileRequest {
+  uint32 v = 1;
+  string principal = 2;
+  palyra.common.v1.CanonicalId profile_id = 3;
+
+  reserved 4 to 10;
+}
+
+message DeleteProfileResponse {
+  uint32 v = 1;
+  bool deleted = 2;
+  palyra.common.v1.CanonicalId active_profile_id = 3;
+
+  reserved 4 to 10;
+}
+
+message SetActiveProfileRequest {
+  uint32 v = 1;
+  string principal = 2;
+  palyra.common.v1.CanonicalId profile_id = 3;
+
+  reserved 4 to 10;
+}
+
+message SetActiveProfileResponse {
+  uint32 v = 1;
+  BrowserProfile profile = 2;
+
+  reserved 3 to 10;
+}
+
+enum RelayActionKind {
+  RELAY_ACTION_KIND_UNSPECIFIED = 0;
+  RELAY_ACTION_KIND_OPEN_TAB = 1;
+  RELAY_ACTION_KIND_CAPTURE_SELECTION = 2;
+  RELAY_ACTION_KIND_SEND_PAGE_SNAPSHOT = 3;
+}
+
+message RelayOpenTabPayload {
+  string url = 1;
+  bool activate = 2;
+  uint64 timeout_ms = 3;
+
+  reserved 4 to 10;
+}
+
+message RelayCaptureSelectionPayload {
+  string selector = 1;
+  uint64 max_selection_bytes = 2;
+
+  reserved 3 to 10;
+}
+
+message RelayPageSnapshotPayload {
+  bool include_dom_snapshot = 1;
+  bool include_visible_text = 2;
+  uint64 max_dom_snapshot_bytes = 3;
+  uint64 max_visible_text_bytes = 4;
+
+  reserved 5 to 12;
+}
+
+message RelayActionRequest {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId session_id = 2;
+  string extension_id = 3;
+  RelayActionKind action = 4;
+  oneof payload {
+    RelayOpenTabPayload open_tab = 5;
+    RelayCaptureSelectionPayload capture_selection = 6;
+    RelayPageSnapshotPayload page_snapshot = 7;
+  }
+  uint64 max_payload_bytes = 8;
+
+  reserved 9 to 14;
+}
+
+message RelaySelectionResult {
+  string selector = 1;
+  string selected_text = 2;
+  bool truncated = 3;
+
+  reserved 4 to 10;
+}
+
+message RelayPageSnapshotResult {
+  string dom_snapshot = 1;
+  string visible_text = 2;
+  bool dom_truncated = 3;
+  bool visible_text_truncated = 4;
+  string page_url = 5;
+
+  reserved 6 to 12;
+}
+
+message RelayActionResponse {
+  uint32 v = 1;
+  bool success = 2;
+  RelayActionKind action = 3;
+  string error = 4;
+  oneof result {
+    BrowserTab opened_tab = 5;
+    RelaySelectionResult selection = 6;
+    RelayPageSnapshotResult snapshot = 7;
+  }
+
+  reserved 8 to 14;
+}
+
+message DownloadArtifact {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId artifact_id = 2;
+  palyra.common.v1.CanonicalId session_id = 3;
+  palyra.common.v1.CanonicalId profile_id = 4;
+  string source_url = 5;
+  string file_name = 6;
+  string mime_type = 7;
+  uint64 size_bytes = 8;
+  string sha256 = 9;
+  uint64 created_at_unix_ms = 10;
+  bool quarantined = 11;
+  string quarantine_reason = 12;
+
+  reserved 13 to 18;
+}
+
+message ListDownloadArtifactsRequest {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId session_id = 2;
+  uint32 limit = 3;
+  bool quarantined_only = 4;
+
+  reserved 5 to 10;
+}
+
+message ListDownloadArtifactsResponse {
+  uint32 v = 1;
+  repeated DownloadArtifact artifacts = 2;
+  bool truncated = 3;
+  string error = 4;
+
+  reserved 5 to 10;
 }
 
 message ResetStateRequest {

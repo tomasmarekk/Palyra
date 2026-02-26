@@ -3,7 +3,7 @@ use std::{
     ffi::OsStr,
     fs,
     net::{IpAddr, SocketAddr, ToSocketAddrs},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -24,6 +24,7 @@ use palyra_common::{
 use reqwest::{redirect::Policy, Url};
 use ring::{
     aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305},
+    digest::{Context as DigestContext, SHA256},
     rand::{SecureRandom, SystemRandom},
 };
 use serde::{Deserialize, Serialize};
@@ -89,8 +90,36 @@ const STATE_FILE_MAGIC: &[u8; 4] = b"PBS1";
 const STATE_NONCE_LEN: usize = 12;
 const STATE_KEY_LEN: usize = 32;
 const STATE_TMP_EXTENSION: &str = "tmp";
+const STATE_PROFILE_DEK_NAMESPACE: &[u8] = b"palyra.browser.profile.dek.v1";
 const COOKIE_HEADER: &str = "cookie";
 const SET_COOKIE_HEADER: &str = "set-cookie";
+const PROFILE_REGISTRY_FILE_NAME: &str = "profiles.enc";
+const PROFILE_REGISTRY_SCHEMA_VERSION: u32 = 1;
+const PROFILE_RECORD_SCHEMA_VERSION: u32 = 1;
+const MAX_PROFILE_NAME_BYTES: usize = 96;
+const MAX_PROFILE_THEME_BYTES: usize = 24;
+const MAX_PROFILES_PER_PRINCIPAL: usize = 16;
+const MAX_PROFILE_REGISTRY_BYTES: usize = 512 * 1024;
+const PROFILE_RECORD_HASH_NAMESPACE: &[u8] = b"palyra.browser.profile.record.v1";
+const DOWNLOAD_MAX_TOTAL_BYTES_PER_SESSION: u64 = 32 * 1024 * 1024;
+const DOWNLOAD_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_DOWNLOAD_ARTIFACTS_PER_SESSION: usize = 128;
+const DOWNLOADS_DIR_ALLOWLIST: &str = "allowlist";
+const DOWNLOADS_DIR_QUARANTINE: &str = "quarantine";
+const DOWNLOAD_FILE_NAME_FALLBACK: &str = "download.bin";
+const DOWNLOAD_ALLOWED_EXTENSIONS: &[&str] = &["txt", "csv", "json", "pdf", "zip", "gz"];
+const DOWNLOAD_ALLOWED_MIME_TYPES: &[&str] = &[
+    "text/plain",
+    "text/csv",
+    "application/json",
+    "application/pdf",
+    "application/zip",
+    "application/gzip",
+    "application/x-gzip",
+];
+const MAX_RELAY_EXTENSION_ID_BYTES: usize = 96;
+const MAX_RELAY_SELECTION_BYTES: usize = 8 * 1024;
+const MAX_RELAY_PAYLOAD_BYTES: u64 = 32 * 1024;
 const ONE_BY_ONE_PNG: &[u8] = &[
     137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0,
     0, 0, 31, 21, 196, 137, 0, 0, 0, 10, 73, 68, 65, 84, 120, 156, 99, 96, 0, 0, 0, 2, 0, 1, 229,
@@ -298,6 +327,39 @@ struct SessionPersistenceState {
     state_restored: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BrowserProfileRecord {
+    profile_id: String,
+    principal: String,
+    name: String,
+    theme_color: Option<String>,
+    created_at_unix_ms: u64,
+    updated_at_unix_ms: u64,
+    last_used_unix_ms: u64,
+    persistence_enabled: bool,
+    private_profile: bool,
+    state_schema_version: u32,
+    state_hash_sha256: Option<String>,
+    record_hash_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BrowserProfileRegistryDocument {
+    v: u32,
+    profiles: Vec<BrowserProfileRecord>,
+    active_profile_by_principal: HashMap<String, String>,
+}
+
+impl Default for BrowserProfileRegistryDocument {
+    fn default() -> Self {
+        Self {
+            v: PROFILE_REGISTRY_SCHEMA_VERSION,
+            profiles: Vec::new(),
+            active_profile_by_principal: HashMap::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct BrowserSessionInit {
     principal: String,
@@ -308,6 +370,8 @@ struct BrowserSessionInit {
     allow_private_targets: bool,
     allow_downloads: bool,
     action_allowed_domains: Vec<String>,
+    profile_id: Option<String>,
+    private_profile: bool,
     persistence: SessionPersistenceState,
 }
 
@@ -322,6 +386,8 @@ struct BrowserSessionRecord {
     allow_private_targets: bool,
     allow_downloads: bool,
     action_allowed_domains: Vec<String>,
+    profile_id: Option<String>,
+    private_profile: bool,
     action_count: u64,
     action_window: VecDeque<Instant>,
     action_log: VecDeque<BrowserActionLogEntryInternal>,
@@ -349,6 +415,8 @@ impl BrowserSessionRecord {
             allow_private_targets: init.allow_private_targets,
             allow_downloads: init.allow_downloads,
             action_allowed_domains: init.action_allowed_domains,
+            profile_id: init.profile_id,
+            private_profile: init.private_profile,
             action_count: 0,
             action_window: VecDeque::new(),
             action_log: VecDeque::new(),
@@ -469,6 +537,49 @@ impl BrowserSessionRecord {
     }
 }
 
+#[derive(Debug, Clone)]
+struct DownloadArtifactRecord {
+    artifact_id: String,
+    session_id: String,
+    profile_id: Option<String>,
+    source_url: String,
+    file_name: String,
+    mime_type: String,
+    size_bytes: u64,
+    sha256: String,
+    created_at_unix_ms: u64,
+    quarantined: bool,
+    quarantine_reason: String,
+    storage_path: PathBuf,
+}
+
+#[derive(Debug)]
+struct DownloadSandboxSession {
+    root_dir: TempDir,
+    used_bytes: u64,
+    max_bytes: u64,
+    artifacts: VecDeque<DownloadArtifactRecord>,
+}
+
+impl DownloadSandboxSession {
+    fn new() -> Result<Self, String> {
+        let root_dir = tempfile::Builder::new()
+            .prefix("palyra-browserd-downloads-")
+            .tempdir()
+            .map_err(|error| format!("failed to allocate download sandbox: {error}"))?;
+        fs::create_dir_all(root_dir.path().join(DOWNLOADS_DIR_ALLOWLIST))
+            .map_err(|error| format!("failed to initialize download allowlist dir: {error}"))?;
+        fs::create_dir_all(root_dir.path().join(DOWNLOADS_DIR_QUARANTINE))
+            .map_err(|error| format!("failed to initialize download quarantine dir: {error}"))?;
+        Ok(Self {
+            root_dir,
+            used_bytes: 0,
+            max_bytes: DOWNLOAD_MAX_TOTAL_BYTES_PER_SESSION,
+            artifacts: VecDeque::new(),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedSessionSnapshot {
     v: u32,
@@ -504,8 +615,10 @@ struct BrowserRuntimeState {
     default_budget: SessionBudget,
     max_sessions: usize,
     state_store: Option<PersistedStateStore>,
+    profile_registry_lock: Mutex<()>,
     sessions: Mutex<HashMap<String, BrowserSessionRecord>>,
     chromium_sessions: Mutex<HashMap<String, ChromiumSessionState>>,
+    download_sessions: Mutex<HashMap<String, DownloadSandboxSession>>,
 }
 
 impl BrowserRuntimeState {
@@ -568,8 +681,10 @@ impl BrowserRuntimeState {
             },
             max_sessions: args.max_sessions,
             state_store,
+            profile_registry_lock: Mutex::new(()),
             sessions: Mutex::new(HashMap::new()),
             chromium_sessions: Mutex::new(HashMap::new()),
+            download_sessions: Mutex::new(HashMap::new()),
         })
     }
 
@@ -620,13 +735,25 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         request: Request<browser_v1::CreateSessionRequest>,
     ) -> Result<Response<browser_v1::CreateSessionResponse>, Status> {
         self.runtime.authorize(request.metadata()).await?;
-        let payload = request.into_inner();
+        let mut payload = request.into_inner();
         let principal = payload.principal.trim();
         if principal.is_empty() {
             return Err(Status::invalid_argument("principal is required"));
         }
         let channel = normalize_optional_string(payload.channel.as_str());
-        let persistence_id = if payload.persistence_enabled {
+        let requested_profile_id = parse_optional_profile_id_from_proto(payload.profile_id.take())
+            .map_err(Status::invalid_argument)?;
+        let mut profile = resolve_session_profile(
+            self.runtime.as_ref(),
+            principal,
+            requested_profile_id.as_deref(),
+        )
+        .await
+        .map_err(Status::internal)?;
+
+        let mut private_profile = payload.private_profile;
+        let mut persistence_enabled = payload.persistence_enabled;
+        let mut persistence_id = if payload.persistence_enabled {
             let Some(value) = sanitize_persistence_id(payload.persistence_id.as_str()) else {
                 return Err(Status::invalid_argument(
                     "persistence_enabled=true requires non-empty persistence_id",
@@ -636,7 +763,20 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         } else {
             None
         };
-        let restored_snapshot = if payload.persistence_enabled {
+        let mut profile_id = None;
+        if let Some(resolved_profile) = profile.as_ref() {
+            profile_id = Some(resolved_profile.profile_id.clone());
+            private_profile = private_profile || resolved_profile.private_profile;
+            if resolved_profile.persistence_enabled && !private_profile {
+                persistence_enabled = true;
+                persistence_id = Some(resolved_profile.profile_id.clone());
+            } else {
+                persistence_enabled = false;
+                persistence_id = None;
+            }
+        }
+
+        let restored_snapshot = if persistence_enabled {
             let Some(store) = self.runtime.state_store.as_ref() else {
                 return Err(Status::failed_precondition(
                     "state persistence requires PALYRA_BROWSERD_STATE_ENCRYPTION_KEY",
@@ -647,7 +787,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                     "persistence_enabled=true requires non-empty persistence_id",
                 ));
             };
-            store.load_snapshot(state_id.as_str()).map_err(|error| {
+            store.load_snapshot(state_id.as_str(), profile_id.as_deref()).map_err(|error| {
                 Status::internal(format!("failed to load persisted state: {error}"))
             })?
         } else {
@@ -761,8 +901,10 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             allow_private_targets: payload.allow_private_targets,
             allow_downloads: payload.allow_downloads,
             action_allowed_domains: action_allowed_domains.clone(),
+            profile_id: profile_id.clone(),
+            private_profile,
             persistence: SessionPersistenceState {
-                enabled: payload.persistence_enabled,
+                enabled: persistence_enabled,
                 persistence_id: persistence_id.clone(),
                 state_restored: false,
             },
@@ -782,8 +924,25 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             session.apply_snapshot(snapshot);
             session.persistence.state_restored = true;
         }
+        if let Some(record) = profile.as_mut() {
+            record.last_used_unix_ms = current_unix_ms();
+            record.updated_at_unix_ms = record.last_used_unix_ms;
+            refresh_profile_record_hash(record);
+            if let Some(store) = self.runtime.state_store.as_ref() {
+                upsert_profile_record(
+                    store,
+                    &self.runtime.profile_registry_lock,
+                    record.clone(),
+                    false,
+                )
+                .await
+                .map_err(|error| {
+                    Status::internal(format!("failed to update browser profile usage: {error}"))
+                })?;
+            }
+        }
         let state_restored = session.persistence.state_restored;
-        let persist_on_create = payload.persistence_enabled;
+        let persist_on_create = persistence_enabled;
         let mut session_for_persist = None;
         {
             let mut sessions = self.runtime.sessions.lock().await;
@@ -801,6 +960,10 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             persist_session_snapshot(store, &record)
                 .map_err(|error| Status::internal(format!("failed to persist state: {error}")))?;
         }
+        if payload.allow_downloads {
+            let sandbox = DownloadSandboxSession::new().map_err(Status::internal)?;
+            self.runtime.download_sessions.lock().await.insert(session_id.clone(), sandbox);
+        }
         if self.runtime.engine_mode == BrowserEngineMode::Chromium {
             let session_snapshot = {
                 let sessions = self.runtime.sessions.lock().await;
@@ -815,6 +978,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             .await
             {
                 self.runtime.sessions.lock().await.remove(session_id.as_str());
+                self.runtime.download_sessions.lock().await.remove(session_id.as_str());
                 return Err(Status::internal(format!(
                     "failed to initialize chromium session runtime: {error}"
                 )));
@@ -843,9 +1007,13 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             }),
             downloads_enabled: payload.allow_downloads,
             action_allowed_domains,
-            persistence_enabled: payload.persistence_enabled,
+            persistence_enabled,
             persistence_id: persistence_id.unwrap_or_default(),
             state_restored,
+            profile_id: profile_id
+                .clone()
+                .map(|value| proto::palyra::common::v1::CanonicalId { ulid: value }),
+            private_profile,
         }))
     }
 
@@ -858,6 +1026,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             .map_err(Status::invalid_argument)?;
         let removed = self.runtime.sessions.lock().await.remove(session_id.as_str());
         self.runtime.chromium_sessions.lock().await.remove(session_id.as_str());
+        self.runtime.download_sessions.lock().await.remove(session_id.as_str());
         if let (Some(store), Some(record)) = (self.runtime.state_store.as_ref(), removed.as_ref()) {
             if record.persistence.enabled {
                 persist_session_snapshot(store, record).map_err(|error| {
@@ -875,6 +1044,258 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             } else {
                 "session_not_found".to_owned()
             },
+        }))
+    }
+
+    async fn list_profiles(
+        &self,
+        request: Request<browser_v1::ListProfilesRequest>,
+    ) -> Result<Response<browser_v1::ListProfilesResponse>, Status> {
+        self.runtime.authorize(request.metadata()).await?;
+        let payload = request.into_inner();
+        let principal = normalize_profile_principal(payload.principal.as_str())
+            .map_err(Status::invalid_argument)?;
+        let Some(store) = self.runtime.state_store.as_ref() else {
+            return Err(Status::failed_precondition(
+                "browser profiles require PALYRA_BROWSERD_STATE_ENCRYPTION_KEY",
+            ));
+        };
+        let _guard = self.runtime.profile_registry_lock.lock().await;
+        let mut registry = store.load_profile_registry().map_err(|error| {
+            Status::internal(format!("failed to load browser profiles: {error}"))
+        })?;
+        let active_profile_id =
+            registry.active_profile_by_principal.get(principal.as_str()).cloned();
+        let mut profiles = registry
+            .profiles
+            .drain(..)
+            .filter(|profile| profile.principal == principal)
+            .collect::<Vec<_>>();
+        profiles.sort_by(|left, right| right.last_used_unix_ms.cmp(&left.last_used_unix_ms));
+        Ok(Response::new(browser_v1::ListProfilesResponse {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            profiles: profiles
+                .iter()
+                .map(|profile| {
+                    profile_record_to_proto(
+                        profile,
+                        active_profile_id
+                            .as_deref()
+                            .map(|value| value == profile.profile_id.as_str())
+                            .unwrap_or(false),
+                    )
+                })
+                .collect(),
+            active_profile_id: active_profile_id
+                .map(|value| proto::palyra::common::v1::CanonicalId { ulid: value }),
+        }))
+    }
+
+    async fn create_profile(
+        &self,
+        request: Request<browser_v1::CreateProfileRequest>,
+    ) -> Result<Response<browser_v1::CreateProfileResponse>, Status> {
+        self.runtime.authorize(request.metadata()).await?;
+        let payload = request.into_inner();
+        let principal = normalize_profile_principal(payload.principal.as_str())
+            .map_err(Status::invalid_argument)?;
+        let name =
+            normalize_profile_name(payload.name.as_str()).map_err(Status::invalid_argument)?;
+        let theme = normalize_profile_theme(payload.theme_color.as_str())
+            .map_err(Status::invalid_argument)?;
+        let Some(store) = self.runtime.state_store.as_ref() else {
+            return Err(Status::failed_precondition(
+                "browser profiles require PALYRA_BROWSERD_STATE_ENCRYPTION_KEY",
+            ));
+        };
+        let _guard = self.runtime.profile_registry_lock.lock().await;
+        let mut registry = store.load_profile_registry().map_err(|error| {
+            Status::internal(format!("failed to load browser profiles: {error}"))
+        })?;
+        prune_profiles_for_principal(&mut registry, principal.as_str());
+        let now = current_unix_ms();
+        let mut profile = BrowserProfileRecord {
+            profile_id: Ulid::new().to_string(),
+            principal: principal.clone(),
+            name,
+            theme_color: theme,
+            created_at_unix_ms: now,
+            updated_at_unix_ms: now,
+            last_used_unix_ms: now,
+            persistence_enabled: payload.persistence_enabled && !payload.private_profile,
+            private_profile: payload.private_profile,
+            state_schema_version: PROFILE_RECORD_SCHEMA_VERSION,
+            state_hash_sha256: None,
+            record_hash_sha256: String::new(),
+        };
+        refresh_profile_record_hash(&mut profile);
+        registry.profiles.push(profile.clone());
+        registry
+            .active_profile_by_principal
+            .entry(principal.clone())
+            .or_insert_with(|| profile.profile_id.clone());
+        prune_profile_registry(&mut registry);
+        store.save_profile_registry(&registry).map_err(|error| {
+            Status::internal(format!("failed to save browser profiles: {error}"))
+        })?;
+        let active = registry
+            .active_profile_by_principal
+            .get(principal.as_str())
+            .map(|value| value == &profile.profile_id)
+            .unwrap_or(false);
+        Ok(Response::new(browser_v1::CreateProfileResponse {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            profile: Some(profile_record_to_proto(&profile, active)),
+        }))
+    }
+
+    async fn rename_profile(
+        &self,
+        request: Request<browser_v1::RenameProfileRequest>,
+    ) -> Result<Response<browser_v1::RenameProfileResponse>, Status> {
+        self.runtime.authorize(request.metadata()).await?;
+        let mut payload = request.into_inner();
+        let principal = normalize_profile_principal(payload.principal.as_str())
+            .map_err(Status::invalid_argument)?;
+        let profile_id = parse_required_profile_id_from_proto(payload.profile_id.take())
+            .map_err(Status::invalid_argument)?;
+        let name =
+            normalize_profile_name(payload.name.as_str()).map_err(Status::invalid_argument)?;
+        let Some(store) = self.runtime.state_store.as_ref() else {
+            return Err(Status::failed_precondition(
+                "browser profiles require PALYRA_BROWSERD_STATE_ENCRYPTION_KEY",
+            ));
+        };
+        let _guard = self.runtime.profile_registry_lock.lock().await;
+        let mut registry = store.load_profile_registry().map_err(|error| {
+            Status::internal(format!("failed to load browser profiles: {error}"))
+        })?;
+        let Some(profile) = registry
+            .profiles
+            .iter_mut()
+            .find(|profile| profile.profile_id == profile_id && profile.principal == principal)
+        else {
+            return Err(Status::not_found("browser profile not found"));
+        };
+        profile.name = name;
+        profile.updated_at_unix_ms = current_unix_ms();
+        profile.last_used_unix_ms = profile.updated_at_unix_ms;
+        refresh_profile_record_hash(profile);
+        let active = registry
+            .active_profile_by_principal
+            .get(principal.as_str())
+            .map(|value| value == &profile_id)
+            .unwrap_or(false);
+        let output = profile_record_to_proto(profile, active);
+        store.save_profile_registry(&registry).map_err(|error| {
+            Status::internal(format!("failed to save browser profiles: {error}"))
+        })?;
+        Ok(Response::new(browser_v1::RenameProfileResponse {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            profile: Some(output),
+        }))
+    }
+
+    async fn delete_profile(
+        &self,
+        request: Request<browser_v1::DeleteProfileRequest>,
+    ) -> Result<Response<browser_v1::DeleteProfileResponse>, Status> {
+        self.runtime.authorize(request.metadata()).await?;
+        let mut payload = request.into_inner();
+        let principal = normalize_profile_principal(payload.principal.as_str())
+            .map_err(Status::invalid_argument)?;
+        let profile_id = parse_required_profile_id_from_proto(payload.profile_id.take())
+            .map_err(Status::invalid_argument)?;
+        let Some(store) = self.runtime.state_store.as_ref() else {
+            return Err(Status::failed_precondition(
+                "browser profiles require PALYRA_BROWSERD_STATE_ENCRYPTION_KEY",
+            ));
+        };
+        let _guard = self.runtime.profile_registry_lock.lock().await;
+        let mut registry = store.load_profile_registry().map_err(|error| {
+            Status::internal(format!("failed to load browser profiles: {error}"))
+        })?;
+        let before = registry.profiles.len();
+        registry.profiles.retain(|profile| {
+            !(profile.profile_id == profile_id && profile.principal == principal)
+        });
+        let deleted = registry.profiles.len() != before;
+        if deleted {
+            if registry
+                .active_profile_by_principal
+                .get(principal.as_str())
+                .map(|value| value == &profile_id)
+                .unwrap_or(false)
+            {
+                let replacement = registry
+                    .profiles
+                    .iter()
+                    .filter(|profile| profile.principal == principal)
+                    .max_by(|left, right| left.last_used_unix_ms.cmp(&right.last_used_unix_ms))
+                    .map(|profile| profile.profile_id.clone());
+                if let Some(value) = replacement {
+                    registry.active_profile_by_principal.insert(principal.clone(), value);
+                } else {
+                    registry.active_profile_by_principal.remove(principal.as_str());
+                }
+            }
+            prune_profile_registry(&mut registry);
+            store.save_profile_registry(&registry).map_err(|error| {
+                Status::internal(format!("failed to save browser profiles after delete: {error}"))
+            })?;
+            store.delete_snapshot(profile_id.as_str()).map_err(|error| {
+                Status::internal(format!("failed to delete browser profile snapshot: {error}"))
+            })?;
+        }
+        Ok(Response::new(browser_v1::DeleteProfileResponse {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            deleted,
+            active_profile_id: registry
+                .active_profile_by_principal
+                .get(principal.as_str())
+                .cloned()
+                .map(|value| proto::palyra::common::v1::CanonicalId { ulid: value }),
+        }))
+    }
+
+    async fn set_active_profile(
+        &self,
+        request: Request<browser_v1::SetActiveProfileRequest>,
+    ) -> Result<Response<browser_v1::SetActiveProfileResponse>, Status> {
+        self.runtime.authorize(request.metadata()).await?;
+        let mut payload = request.into_inner();
+        let principal = normalize_profile_principal(payload.principal.as_str())
+            .map_err(Status::invalid_argument)?;
+        let profile_id = parse_required_profile_id_from_proto(payload.profile_id.take())
+            .map_err(Status::invalid_argument)?;
+        let Some(store) = self.runtime.state_store.as_ref() else {
+            return Err(Status::failed_precondition(
+                "browser profiles require PALYRA_BROWSERD_STATE_ENCRYPTION_KEY",
+            ));
+        };
+        let _guard = self.runtime.profile_registry_lock.lock().await;
+        let mut registry = store.load_profile_registry().map_err(|error| {
+            Status::internal(format!("failed to load browser profiles: {error}"))
+        })?;
+        let Some(profile) = registry
+            .profiles
+            .iter_mut()
+            .find(|profile| profile.profile_id == profile_id && profile.principal == principal)
+        else {
+            return Err(Status::not_found("browser profile not found"));
+        };
+        profile.last_used_unix_ms = current_unix_ms();
+        profile.updated_at_unix_ms = profile.last_used_unix_ms;
+        refresh_profile_record_hash(profile);
+        let output = profile_record_to_proto(profile, true);
+        registry.active_profile_by_principal.insert(principal, profile_id);
+        prune_profile_registry(&mut registry);
+        store.save_profile_registry(&registry).map_err(|error| {
+            Status::internal(format!("failed to save browser profiles: {error}"))
+        })?;
+        Ok(Response::new(browser_v1::SetActiveProfileResponse {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            profile: Some(output),
         }))
     }
 
@@ -1024,6 +1445,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                     action_log: None,
                     failure_screenshot_bytes: Vec::new(),
                     failure_screenshot_mime_type: String::new(),
+                    artifact: None,
                 }));
             }
         };
@@ -1083,6 +1505,33 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                 (result.success, result.outcome, result.error, result.attempts)
             }
         };
+        let mut success = success;
+        let mut outcome = outcome;
+        let mut error = error;
+        let mut artifact = None;
+        if success && outcome == "download_allowed" {
+            match capture_download_artifact_for_click(
+                self.runtime.as_ref(),
+                session_id.as_str(),
+                selector,
+                &context,
+                timeout_ms,
+            )
+            .await
+            {
+                Ok(record) => {
+                    if record.quarantined {
+                        outcome = "download_quarantined".to_owned();
+                    }
+                    artifact = Some(download_artifact_to_proto(&record));
+                }
+                Err(download_error) => {
+                    success = false;
+                    outcome = "download_failed".to_owned();
+                    error = download_error;
+                }
+            }
+        }
 
         let (action_log, failure_screenshot_bytes, failure_screenshot_mime_type) =
             finalize_session_action(
@@ -1115,6 +1564,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             action_log,
             failure_screenshot_bytes,
             failure_screenshot_mime_type,
+            artifact,
         }))
     }
 
@@ -2361,6 +2811,249 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         .map_err(map_persist_error_to_status)?;
         Ok(Response::new(response))
     }
+
+    async fn relay_action(
+        &self,
+        request: Request<browser_v1::RelayActionRequest>,
+    ) -> Result<Response<browser_v1::RelayActionResponse>, Status> {
+        self.runtime.authorize(request.metadata()).await?;
+        let mut payload = request.into_inner();
+        let session_id = parse_session_id_from_proto(payload.session_id.take())
+            .map_err(Status::invalid_argument)?;
+        let extension_id = payload.extension_id.trim();
+        if extension_id.is_empty() {
+            return Err(Status::invalid_argument("extension_id is required"));
+        }
+        if extension_id.len() > MAX_RELAY_EXTENSION_ID_BYTES {
+            return Err(Status::invalid_argument(format!(
+                "extension_id exceeds {MAX_RELAY_EXTENSION_ID_BYTES} bytes"
+            )));
+        }
+        if !extension_id
+            .bytes()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, b'.' | b'-' | b'_'))
+        {
+            return Err(Status::invalid_argument("extension_id contains unsupported characters"));
+        }
+        if payload.max_payload_bytes > MAX_RELAY_PAYLOAD_BYTES {
+            return Err(Status::invalid_argument(format!(
+                "relay max_payload_bytes exceeds {} bytes",
+                MAX_RELAY_PAYLOAD_BYTES
+            )));
+        }
+
+        let action = browser_v1::RelayActionKind::try_from(payload.action)
+            .unwrap_or(browser_v1::RelayActionKind::Unspecified);
+        match action {
+            browser_v1::RelayActionKind::OpenTab => {
+                let Some(browser_v1::relay_action_request::Payload::OpenTab(open_tab)) =
+                    payload.payload.take()
+                else {
+                    return Ok(Response::new(browser_v1::RelayActionResponse {
+                        v: CANONICAL_PROTOCOL_MAJOR,
+                        success: false,
+                        action: browser_v1::RelayActionKind::OpenTab as i32,
+                        error: "relay open_tab payload is required".to_owned(),
+                        result: None,
+                    }));
+                };
+                let open_response = self
+                    .open_tab(Request::new(browser_v1::OpenTabRequest {
+                        v: CANONICAL_PROTOCOL_MAJOR,
+                        session_id: Some(proto::palyra::common::v1::CanonicalId {
+                            ulid: session_id.clone(),
+                        }),
+                        url: open_tab.url,
+                        activate: open_tab.activate,
+                        timeout_ms: open_tab.timeout_ms,
+                        allow_redirects: true,
+                        max_redirects: 3,
+                        allow_private_targets: false,
+                    }))
+                    .await?;
+                let output = open_response.into_inner();
+                Ok(Response::new(browser_v1::RelayActionResponse {
+                    v: CANONICAL_PROTOCOL_MAJOR,
+                    success: output.success,
+                    action: browser_v1::RelayActionKind::OpenTab as i32,
+                    error: output.error.clone(),
+                    result: output.tab.map(browser_v1::relay_action_response::Result::OpenedTab),
+                }))
+            }
+            browser_v1::RelayActionKind::CaptureSelection => {
+                let Some(browser_v1::relay_action_request::Payload::CaptureSelection(
+                    selection_payload,
+                )) = payload.payload.take()
+                else {
+                    return Ok(Response::new(browser_v1::RelayActionResponse {
+                        v: CANONICAL_PROTOCOL_MAJOR,
+                        success: false,
+                        action: browser_v1::RelayActionKind::CaptureSelection as i32,
+                        error: "relay capture_selection payload is required".to_owned(),
+                        result: None,
+                    }));
+                };
+                let selector = selection_payload.selector.trim();
+                if selector.is_empty() {
+                    return Ok(Response::new(browser_v1::RelayActionResponse {
+                        v: CANONICAL_PROTOCOL_MAJOR,
+                        success: false,
+                        action: browser_v1::RelayActionKind::CaptureSelection as i32,
+                        error: "relay capture_selection selector is required".to_owned(),
+                        result: None,
+                    }));
+                }
+                let max_selection_bytes = if selection_payload.max_selection_bytes == 0 {
+                    MAX_RELAY_SELECTION_BYTES
+                } else {
+                    selection_payload.max_selection_bytes.min(MAX_RELAY_SELECTION_BYTES as u64)
+                        as usize
+                };
+                let selected_text = {
+                    let mut sessions = self.runtime.sessions.lock().await;
+                    let Some(session) = sessions.get_mut(session_id.as_str()) else {
+                        return Ok(Response::new(browser_v1::RelayActionResponse {
+                            v: CANONICAL_PROTOCOL_MAJOR,
+                            success: false,
+                            action: browser_v1::RelayActionKind::CaptureSelection as i32,
+                            error: "session_not_found".to_owned(),
+                            result: None,
+                        }));
+                    };
+                    session.last_active = Instant::now();
+                    let Some(tag) = find_matching_html_tag(
+                        selector,
+                        session
+                            .active_tab()
+                            .map(|tab| tab.last_page_body.as_str())
+                            .unwrap_or_default(),
+                    ) else {
+                        return Ok(Response::new(browser_v1::RelayActionResponse {
+                            v: CANONICAL_PROTOCOL_MAJOR,
+                            success: false,
+                            action: browser_v1::RelayActionKind::CaptureSelection as i32,
+                            error: format!("selector '{selector}' was not found"),
+                            result: None,
+                        }));
+                    };
+                    truncate_utf8_bytes(tag.as_str(), max_selection_bytes)
+                };
+                let truncated = selected_text.len() >= max_selection_bytes;
+                Ok(Response::new(browser_v1::RelayActionResponse {
+                    v: CANONICAL_PROTOCOL_MAJOR,
+                    success: true,
+                    action: browser_v1::RelayActionKind::CaptureSelection as i32,
+                    error: String::new(),
+                    result: Some(browser_v1::relay_action_response::Result::Selection(
+                        browser_v1::RelaySelectionResult {
+                            selector: selector.to_owned(),
+                            selected_text,
+                            truncated,
+                        },
+                    )),
+                }))
+            }
+            browser_v1::RelayActionKind::SendPageSnapshot => {
+                let Some(browser_v1::relay_action_request::Payload::PageSnapshot(snapshot_payload)) =
+                    payload.payload.take()
+                else {
+                    return Ok(Response::new(browser_v1::RelayActionResponse {
+                        v: CANONICAL_PROTOCOL_MAJOR,
+                        success: false,
+                        action: browser_v1::RelayActionKind::SendPageSnapshot as i32,
+                        error: "relay page_snapshot payload is required".to_owned(),
+                        result: None,
+                    }));
+                };
+                let observe = self
+                    .observe(Request::new(browser_v1::ObserveRequest {
+                        v: CANONICAL_PROTOCOL_MAJOR,
+                        session_id: Some(proto::palyra::common::v1::CanonicalId {
+                            ulid: session_id.clone(),
+                        }),
+                        include_dom_snapshot: snapshot_payload.include_dom_snapshot,
+                        include_accessibility_tree: false,
+                        include_visible_text: snapshot_payload.include_visible_text,
+                        max_dom_snapshot_bytes: snapshot_payload.max_dom_snapshot_bytes,
+                        max_accessibility_tree_bytes: 0,
+                        max_visible_text_bytes: snapshot_payload.max_visible_text_bytes,
+                    }))
+                    .await?;
+                let observe = observe.into_inner();
+                Ok(Response::new(browser_v1::RelayActionResponse {
+                    v: CANONICAL_PROTOCOL_MAJOR,
+                    success: observe.success,
+                    action: browser_v1::RelayActionKind::SendPageSnapshot as i32,
+                    error: observe.error.clone(),
+                    result: if observe.success {
+                        Some(browser_v1::relay_action_response::Result::Snapshot(
+                            browser_v1::RelayPageSnapshotResult {
+                                dom_snapshot: observe.dom_snapshot,
+                                visible_text: observe.visible_text,
+                                dom_truncated: observe.dom_truncated,
+                                visible_text_truncated: observe.visible_text_truncated,
+                                page_url: observe.page_url,
+                            },
+                        ))
+                    } else {
+                        None
+                    },
+                }))
+            }
+            _ => Ok(Response::new(browser_v1::RelayActionResponse {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                success: false,
+                action: browser_v1::RelayActionKind::Unspecified as i32,
+                error: "unsupported relay action".to_owned(),
+                result: None,
+            })),
+        }
+    }
+
+    async fn list_download_artifacts(
+        &self,
+        request: Request<browser_v1::ListDownloadArtifactsRequest>,
+    ) -> Result<Response<browser_v1::ListDownloadArtifactsResponse>, Status> {
+        self.runtime.authorize(request.metadata()).await?;
+        let mut payload = request.into_inner();
+        let session_id = parse_session_id_from_proto(payload.session_id.take())
+            .map_err(Status::invalid_argument)?;
+        let limit = if payload.limit == 0 {
+            MAX_DOWNLOAD_ARTIFACTS_PER_SESSION
+        } else {
+            usize::try_from(payload.limit).unwrap_or(MAX_DOWNLOAD_ARTIFACTS_PER_SESSION)
+        }
+        .clamp(1, MAX_DOWNLOAD_ARTIFACTS_PER_SESSION);
+        let quarantined_only = payload.quarantined_only;
+        let guard = self.runtime.download_sessions.lock().await;
+        let Some(download_session) = guard.get(session_id.as_str()) else {
+            return Ok(Response::new(browser_v1::ListDownloadArtifactsResponse {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                artifacts: Vec::new(),
+                truncated: false,
+                error: "session_not_found".to_owned(),
+            }));
+        };
+        let filtered = download_session
+            .artifacts
+            .iter()
+            .filter(|artifact| !quarantined_only || artifact.quarantined)
+            .cloned()
+            .collect::<Vec<_>>();
+        let truncated = filtered.len() > limit;
+        let artifacts = filtered
+            .into_iter()
+            .rev()
+            .take(limit)
+            .map(|record| download_artifact_to_proto(&record))
+            .collect::<Vec<_>>();
+        Ok(Response::new(browser_v1::ListDownloadArtifactsResponse {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            artifacts,
+            truncated,
+            error: String::new(),
+        }))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2512,6 +3205,12 @@ fn spawn_cleanup_loop(runtime: Arc<BrowserRuntimeState>) {
                 let mut chromium_sessions = runtime.chromium_sessions.lock().await;
                 for session_id in &expired_ids {
                     chromium_sessions.remove(session_id.as_str());
+                }
+            }
+            {
+                let mut download_sessions = runtime.download_sessions.lock().await;
+                for session_id in &expired_ids {
+                    download_sessions.remove(session_id.as_str());
                 }
             }
             if let Some(store) = runtime.state_store.as_ref() {
@@ -4293,6 +4992,10 @@ impl PersistedStateStore {
         self.root_dir.join(format!("{state_id}.{}.{}", Ulid::new(), STATE_TMP_EXTENSION))
     }
 
+    fn profile_registry_path(&self) -> PathBuf {
+        self.root_dir.join(PROFILE_REGISTRY_FILE_NAME)
+    }
+
     fn cleanup_tmp_files(&self) -> Result<()> {
         let entries = match fs::read_dir(self.root_dir.as_path()) {
             Ok(value) => value,
@@ -4323,7 +5026,11 @@ impl PersistedStateStore {
         Ok(())
     }
 
-    fn load_snapshot(&self, state_id: &str) -> Result<Option<PersistedSessionSnapshot>> {
+    fn load_snapshot(
+        &self,
+        state_id: &str,
+        profile_id: Option<&str>,
+    ) -> Result<Option<PersistedSessionSnapshot>> {
         let path = self.snapshot_path(state_id);
         if !path.exists() {
             return Ok(None);
@@ -4331,7 +5038,8 @@ impl PersistedStateStore {
         let bytes = fs::read(path.as_path()).with_context(|| {
             format!("failed to read persisted browser state '{}'", path.display())
         })?;
-        let decrypted = decrypt_state_blob(&self.key, bytes.as_slice()).with_context(|| {
+        let key = derive_state_encryption_key(&self.key, profile_id);
+        let decrypted = decrypt_state_blob(&key, bytes.as_slice()).with_context(|| {
             format!("failed to decrypt persisted browser state '{}'", path.display())
         })?;
         let snapshot: PersistedSessionSnapshot = serde_json::from_slice(decrypted.as_slice())
@@ -4341,11 +5049,17 @@ impl PersistedStateStore {
         Ok(Some(snapshot))
     }
 
-    fn save_snapshot(&self, state_id: &str, snapshot: &PersistedSessionSnapshot) -> Result<()> {
+    fn save_snapshot(
+        &self,
+        state_id: &str,
+        profile_id: Option<&str>,
+        snapshot: &PersistedSessionSnapshot,
+    ) -> Result<()> {
         let serialized =
             serde_json::to_vec(snapshot).context("failed to serialize persisted browser state")?;
-        let encrypted = encrypt_state_blob(&self.key, serialized.as_slice())
-            .context("failed to encrypt state")?;
+        let key = derive_state_encryption_key(&self.key, profile_id);
+        let encrypted =
+            encrypt_state_blob(&key, serialized.as_slice()).context("failed to encrypt state")?;
         let target_path = self.snapshot_path(state_id);
         let tmp_path = self.tmp_snapshot_path(state_id);
         fs::write(tmp_path.as_path(), encrypted).with_context(|| {
@@ -4354,6 +5068,68 @@ impl PersistedStateStore {
         fs::rename(tmp_path.as_path(), target_path.as_path()).with_context(|| {
             format!(
                 "failed to atomically move tmp state '{}' into '{}'",
+                tmp_path.display(),
+                target_path.display()
+            )
+        })?;
+        Ok(())
+    }
+
+    fn delete_snapshot(&self, state_id: &str) -> Result<()> {
+        let path = self.snapshot_path(state_id);
+        if !path.exists() {
+            return Ok(());
+        }
+        fs::remove_file(path.as_path()).with_context(|| {
+            format!("failed to delete persisted browser state '{}'", path.display())
+        })?;
+        Ok(())
+    }
+
+    fn load_profile_registry(&self) -> Result<BrowserProfileRegistryDocument> {
+        let path = self.profile_registry_path();
+        if !path.exists() {
+            return Ok(BrowserProfileRegistryDocument::default());
+        }
+        let bytes = fs::read(path.as_path()).with_context(|| {
+            format!("failed to read browser profile registry '{}'", path.display())
+        })?;
+        let decrypted = decrypt_state_blob(&self.key, bytes.as_slice()).with_context(|| {
+            format!("failed to decrypt browser profile registry '{}'", path.display())
+        })?;
+        let mut registry: BrowserProfileRegistryDocument =
+            serde_json::from_slice(decrypted.as_slice()).with_context(|| {
+                format!("failed to deserialize browser profile registry '{}'", path.display())
+            })?;
+        normalize_profile_registry(&mut registry);
+        Ok(registry)
+    }
+
+    fn save_profile_registry(&self, registry: &BrowserProfileRegistryDocument) -> Result<()> {
+        let serialized = serde_json::to_vec(registry)
+            .context("failed to serialize browser profile registry document")?;
+        if serialized.len() > MAX_PROFILE_REGISTRY_BYTES {
+            anyhow::bail!(
+                "browser profile registry exceeds max bytes ({} > {})",
+                serialized.len(),
+                MAX_PROFILE_REGISTRY_BYTES
+            );
+        }
+        let encrypted = encrypt_state_blob(&self.key, serialized.as_slice())
+            .context("failed to encrypt browser profile registry")?;
+        let target_path = self.profile_registry_path();
+        let tmp_path = self.root_dir.join(format!(
+            "{}.{}.{}",
+            PROFILE_REGISTRY_FILE_NAME,
+            Ulid::new(),
+            STATE_TMP_EXTENSION
+        ));
+        fs::write(tmp_path.as_path(), encrypted).with_context(|| {
+            format!("failed to write tmp browser profile registry '{}'", tmp_path.display())
+        })?;
+        fs::rename(tmp_path.as_path(), target_path.as_path()).with_context(|| {
+            format!(
+                "failed to atomically move tmp browser profile registry '{}' into '{}'",
                 tmp_path.display(),
                 target_path.display()
             )
@@ -4400,6 +5176,312 @@ fn decrypt_state_blob(key: &[u8; STATE_KEY_LEN], encrypted: &[u8]) -> Result<Vec
         .open_in_place(Nonce::assume_unique_for_key(nonce_bytes), Aad::empty(), &mut in_out)
         .map_err(|_| anyhow::anyhow!("failed to open state payload"))?;
     Ok(plaintext.to_vec())
+}
+
+fn derive_state_encryption_key(
+    master_key: &[u8; STATE_KEY_LEN],
+    profile_id: Option<&str>,
+) -> [u8; STATE_KEY_LEN] {
+    let Some(profile_id) = profile_id else {
+        return *master_key;
+    };
+    let mut context = DigestContext::new(&SHA256);
+    context.update(STATE_PROFILE_DEK_NAMESPACE);
+    context.update(master_key);
+    context.update(profile_id.as_bytes());
+    let digest = context.finish();
+    let mut key = [0_u8; STATE_KEY_LEN];
+    key.copy_from_slice(digest.as_ref());
+    key
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut context = DigestContext::new(&SHA256);
+    context.update(bytes);
+    encode_hex(context.finish().as_ref())
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|value| format!("{value:02x}")).collect::<String>()
+}
+
+fn normalize_profile_registry(registry: &mut BrowserProfileRegistryDocument) {
+    registry.v = PROFILE_REGISTRY_SCHEMA_VERSION;
+    let mut deduped = HashMap::new();
+    for mut profile in registry.profiles.drain(..) {
+        if validate_canonical_id(profile.profile_id.as_str()).is_err() {
+            continue;
+        }
+        profile.principal = profile.principal.trim().to_owned();
+        if profile.principal.is_empty() {
+            continue;
+        }
+        if profile.name.trim().is_empty() {
+            continue;
+        }
+        if !profile_record_hash_matches(&profile) {
+            continue;
+        }
+        if profile.state_schema_version == 0 {
+            profile.state_schema_version = PROFILE_RECORD_SCHEMA_VERSION;
+        }
+        deduped.insert(profile.profile_id.clone(), profile);
+    }
+    registry.profiles = deduped.into_values().collect();
+    prune_profile_registry(registry);
+}
+
+fn prune_profile_registry(registry: &mut BrowserProfileRegistryDocument) {
+    let principals =
+        registry.profiles.iter().map(|profile| profile.principal.clone()).collect::<Vec<_>>();
+    for principal in principals {
+        prune_profiles_for_principal(registry, principal.as_str());
+    }
+    registry.active_profile_by_principal.retain(|principal, profile_id| {
+        registry
+            .profiles
+            .iter()
+            .any(|profile| profile.principal == *principal && profile.profile_id == *profile_id)
+    });
+
+    loop {
+        let serialized_len = serde_json::to_vec(registry).map(|value| value.len()).unwrap_or(0);
+        if serialized_len <= MAX_PROFILE_REGISTRY_BYTES {
+            break;
+        }
+        let removable = registry
+            .profiles
+            .iter()
+            .filter(|profile| !is_active_profile(registry, profile.profile_id.as_str()))
+            .min_by(|left, right| left.last_used_unix_ms.cmp(&right.last_used_unix_ms))
+            .map(|profile| profile.profile_id.clone());
+        let Some(profile_id) = removable else {
+            break;
+        };
+        registry.profiles.retain(|profile| profile.profile_id != profile_id);
+    }
+}
+
+fn prune_profiles_for_principal(registry: &mut BrowserProfileRegistryDocument, principal: &str) {
+    loop {
+        let principal_count =
+            registry.profiles.iter().filter(|profile| profile.principal == principal).count();
+        if principal_count <= MAX_PROFILES_PER_PRINCIPAL {
+            break;
+        }
+        let active_profile_id =
+            registry.active_profile_by_principal.get(principal).cloned().unwrap_or_default();
+        let removable = registry
+            .profiles
+            .iter()
+            .filter(|profile| {
+                profile.principal == principal && profile.profile_id != active_profile_id
+            })
+            .min_by(|left, right| left.last_used_unix_ms.cmp(&right.last_used_unix_ms))
+            .map(|profile| profile.profile_id.clone());
+        let Some(profile_id) = removable else {
+            break;
+        };
+        registry.profiles.retain(|profile| profile.profile_id != profile_id);
+    }
+}
+
+fn is_active_profile(registry: &BrowserProfileRegistryDocument, profile_id: &str) -> bool {
+    registry.active_profile_by_principal.values().any(|value| value == profile_id)
+}
+
+fn profile_record_hash(record: &BrowserProfileRecord) -> String {
+    let mut context = DigestContext::new(&SHA256);
+    context.update(PROFILE_RECORD_HASH_NAMESPACE);
+    context.update(record.profile_id.as_bytes());
+    context.update(record.principal.as_bytes());
+    context.update(record.name.as_bytes());
+    context.update(record.theme_color.clone().unwrap_or_default().as_bytes());
+    context.update(record.created_at_unix_ms.to_string().as_bytes());
+    context.update(record.updated_at_unix_ms.to_string().as_bytes());
+    context.update(record.last_used_unix_ms.to_string().as_bytes());
+    context.update(if record.persistence_enabled { b"1" } else { b"0" });
+    context.update(if record.private_profile { b"1" } else { b"0" });
+    context.update(record.state_schema_version.to_string().as_bytes());
+    context.update(record.state_hash_sha256.clone().unwrap_or_default().as_bytes());
+    encode_hex(context.finish().as_ref())
+}
+
+fn refresh_profile_record_hash(record: &mut BrowserProfileRecord) {
+    record.record_hash_sha256 = profile_record_hash(record);
+}
+
+fn profile_record_hash_matches(record: &BrowserProfileRecord) -> bool {
+    record.record_hash_sha256 == profile_record_hash(record)
+}
+
+fn normalize_profile_principal(raw: &str) -> Result<String, String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err("principal is required".to_owned());
+    }
+    if value.len() > 128 {
+        return Err("principal exceeds max bytes".to_owned());
+    }
+    Ok(value.to_owned())
+}
+
+fn normalize_profile_name(raw: &str) -> Result<String, String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err("profile name is required".to_owned());
+    }
+    if value.len() > MAX_PROFILE_NAME_BYTES {
+        return Err(format!("profile name exceeds {MAX_PROFILE_NAME_BYTES} bytes"));
+    }
+    Ok(value.to_owned())
+}
+
+fn normalize_profile_theme(raw: &str) -> Result<Option<String>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.len() > MAX_PROFILE_THEME_BYTES {
+        return Err(format!("profile theme exceeds {MAX_PROFILE_THEME_BYTES} bytes"));
+    }
+    if !trimmed
+        .bytes()
+        .all(|value| value.is_ascii_alphanumeric() || matches!(value, b'#' | b'-' | b'_'))
+    {
+        return Err("profile theme contains unsupported characters".to_owned());
+    }
+    Ok(Some(trimmed.to_owned()))
+}
+
+fn profile_record_to_proto(
+    record: &BrowserProfileRecord,
+    active: bool,
+) -> browser_v1::BrowserProfile {
+    browser_v1::BrowserProfile {
+        v: CANONICAL_PROTOCOL_MAJOR,
+        profile_id: Some(proto::palyra::common::v1::CanonicalId {
+            ulid: record.profile_id.clone(),
+        }),
+        principal: record.principal.clone(),
+        name: record.name.clone(),
+        theme_color: record.theme_color.clone().unwrap_or_default(),
+        created_at_unix_ms: record.created_at_unix_ms,
+        updated_at_unix_ms: record.updated_at_unix_ms,
+        last_used_unix_ms: record.last_used_unix_ms,
+        persistence_enabled: record.persistence_enabled,
+        private_profile: record.private_profile,
+        active,
+    }
+}
+
+fn parse_optional_profile_id_from_proto(
+    raw: Option<proto::palyra::common::v1::CanonicalId>,
+) -> Result<Option<String>, String> {
+    let Some(value) = raw else {
+        return Ok(None);
+    };
+    let trimmed = value.ulid.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    validate_canonical_id(trimmed).map_err(|error| format!("invalid profile_id: {error}"))?;
+    Ok(Some(trimmed.to_owned()))
+}
+
+fn parse_required_profile_id_from_proto(
+    raw: Option<proto::palyra::common::v1::CanonicalId>,
+) -> Result<String, String> {
+    let Some(value) = parse_optional_profile_id_from_proto(raw)? else {
+        return Err("profile_id is required".to_owned());
+    };
+    Ok(value)
+}
+
+async fn resolve_session_profile(
+    runtime: &BrowserRuntimeState,
+    principal: &str,
+    requested_profile_id: Option<&str>,
+) -> Result<Option<BrowserProfileRecord>, String> {
+    let Some(store) = runtime.state_store.as_ref() else {
+        if requested_profile_id.is_some() {
+            return Err(
+                "browser profiles require PALYRA_BROWSERD_STATE_ENCRYPTION_KEY to be configured"
+                    .to_owned(),
+            );
+        }
+        return Ok(None);
+    };
+    let principal = normalize_profile_principal(principal)?;
+    let _guard = runtime.profile_registry_lock.lock().await;
+    let mut registry = store.load_profile_registry().map_err(|error| error.to_string())?;
+    let selected_profile_id = if let Some(profile_id) = requested_profile_id {
+        profile_id.to_owned()
+    } else if let Some(active) = registry.active_profile_by_principal.get(principal.as_str()) {
+        active.clone()
+    } else {
+        return Ok(None);
+    };
+    let Some(profile) = registry.profiles.iter_mut().find(|profile| {
+        profile.profile_id == selected_profile_id && profile.principal == principal
+    }) else {
+        return Ok(None);
+    };
+    profile.last_used_unix_ms = current_unix_ms();
+    profile.updated_at_unix_ms = profile.last_used_unix_ms;
+    refresh_profile_record_hash(profile);
+    let resolved = profile.clone();
+    prune_profile_registry(&mut registry);
+    store.save_profile_registry(&registry).map_err(|error| error.to_string())?;
+    Ok(Some(resolved))
+}
+
+async fn upsert_profile_record(
+    store: &PersistedStateStore,
+    registry_lock: &Mutex<()>,
+    mut record: BrowserProfileRecord,
+    set_active_if_missing: bool,
+) -> Result<(), String> {
+    let _guard = registry_lock.lock().await;
+    let mut registry = store.load_profile_registry().map_err(|error| error.to_string())?;
+    record.updated_at_unix_ms = current_unix_ms();
+    record.last_used_unix_ms = record.updated_at_unix_ms;
+    refresh_profile_record_hash(&mut record);
+    if let Some(existing) =
+        registry.profiles.iter_mut().find(|profile| profile.profile_id == record.profile_id)
+    {
+        *existing = record.clone();
+    } else {
+        registry.profiles.push(record.clone());
+    }
+    if set_active_if_missing {
+        registry
+            .active_profile_by_principal
+            .entry(record.principal.clone())
+            .or_insert_with(|| record.profile_id.clone());
+    }
+    prune_profile_registry(&mut registry);
+    store.save_profile_registry(&registry).map_err(|error| error.to_string())
+}
+
+fn update_profile_state_metadata(
+    store: &PersistedStateStore,
+    profile_id: &str,
+    state_schema_version: u32,
+    state_hash_sha256: &str,
+) -> Result<()> {
+    let mut registry = store.load_profile_registry()?;
+    if let Some(profile) =
+        registry.profiles.iter_mut().find(|profile| profile.profile_id == profile_id)
+    {
+        profile.state_schema_version = state_schema_version;
+        profile.state_hash_sha256 = Some(state_hash_sha256.to_owned());
+        profile.updated_at_unix_ms = current_unix_ms();
+        refresh_profile_record_hash(profile);
+        prune_profile_registry(&mut registry);
+        store.save_profile_registry(&registry)?;
+    }
+    Ok(())
 }
 
 fn permission_setting_to_proto(value: PermissionSettingInternal) -> i32 {
@@ -4449,7 +5531,27 @@ fn persist_session_snapshot(
         storage_entries: session.storage_entries.clone(),
         saved_at_unix_ms: current_unix_ms(),
     };
-    store.save_snapshot(persistence_id.as_str(), &snapshot)
+    let snapshot_hash = sha256_hex(
+        serde_json::to_vec(&snapshot)
+            .context("failed to serialize browser state snapshot for profile hash")?
+            .as_slice(),
+    );
+    store.save_snapshot(persistence_id.as_str(), session.profile_id.as_deref(), &snapshot)?;
+    if let Some(profile_id) = session.profile_id.as_ref() {
+        if let Err(error) = update_profile_state_metadata(
+            store,
+            profile_id.as_str(),
+            PROFILE_RECORD_SCHEMA_VERSION,
+            snapshot_hash.as_str(),
+        ) {
+            warn!(
+                profile_id = profile_id.as_str(),
+                error = %error,
+                "failed to update browser profile state metadata after snapshot persist"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn persist_session_after_mutation(
@@ -4537,6 +5639,10 @@ struct ActionSessionSnapshot {
     budget: SessionBudget,
     page_body: String,
     allow_downloads: bool,
+    current_url: Option<String>,
+    allow_private_targets: bool,
+    profile_id: Option<String>,
+    private_profile: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4599,6 +5705,10 @@ async fn consume_action_budget_and_snapshot(
         budget: session.budget.clone(),
         page_body,
         allow_downloads: session.allow_downloads,
+        current_url: session.active_tab().and_then(|tab| tab.last_url.clone()),
+        allow_private_targets: session.allow_private_targets,
+        profile_id: session.profile_id.clone(),
+        private_profile: session.private_profile,
     })
 }
 
@@ -4839,12 +5949,302 @@ fn is_download_like_tag(tag: &str) -> bool {
     .any(|suffix| href.ends_with(suffix))
 }
 
+fn download_artifact_to_proto(record: &DownloadArtifactRecord) -> browser_v1::DownloadArtifact {
+    browser_v1::DownloadArtifact {
+        v: CANONICAL_PROTOCOL_MAJOR,
+        artifact_id: Some(proto::palyra::common::v1::CanonicalId {
+            ulid: record.artifact_id.clone(),
+        }),
+        session_id: Some(proto::palyra::common::v1::CanonicalId {
+            ulid: record.session_id.clone(),
+        }),
+        profile_id: record
+            .profile_id
+            .clone()
+            .map(|value| proto::palyra::common::v1::CanonicalId { ulid: value }),
+        source_url: normalize_url_with_redaction(record.source_url.as_str()),
+        file_name: record.file_name.clone(),
+        mime_type: record.mime_type.clone(),
+        size_bytes: record.size_bytes,
+        sha256: record.sha256.clone(),
+        created_at_unix_ms: record.created_at_unix_ms,
+        quarantined: record.quarantined,
+        quarantine_reason: record.quarantine_reason.clone(),
+    }
+}
+
+async fn capture_download_artifact_for_click(
+    runtime: &BrowserRuntimeState,
+    session_id: &str,
+    selector: &str,
+    context: &ActionSessionSnapshot,
+    timeout_ms: u64,
+) -> Result<DownloadArtifactRecord, String> {
+    let Some(tag) = find_matching_html_tag(selector, context.page_body.as_str()) else {
+        return Err("failed to resolve download source tag for click selector".to_owned());
+    };
+    let (source_url, file_name) =
+        resolve_download_target(tag.as_str(), context.current_url.as_deref())?;
+    fetch_download_artifact(
+        runtime,
+        session_id,
+        if context.private_profile { None } else { context.profile_id.as_deref() },
+        source_url.as_str(),
+        file_name.as_str(),
+        context.allow_private_targets,
+        timeout_ms,
+    )
+    .await
+}
+
+fn resolve_download_target(
+    tag: &str,
+    current_url: Option<&str>,
+) -> Result<(String, String), String> {
+    let tag_lower = tag.to_ascii_lowercase();
+    let href = extract_attr_value(tag_lower.as_str(), "href")
+        .ok_or_else(|| "download-like element is missing href".to_owned())?;
+    if href.trim().is_empty() {
+        return Err("download-like element has an empty href".to_owned());
+    }
+    let resolved_url = if let Ok(url) = Url::parse(href.as_str()) {
+        url.to_string()
+    } else {
+        let Some(base) = current_url else {
+            return Err("download URL is relative but current page URL is unavailable".to_owned());
+        };
+        let base_url =
+            Url::parse(base).map_err(|error| format!("invalid active page URL: {error}"))?;
+        base_url
+            .join(href.as_str())
+            .map_err(|error| format!("failed to resolve relative download URL: {error}"))?
+            .to_string()
+    };
+    let explicit_name = extract_attr_value(tag_lower.as_str(), "download").unwrap_or_default();
+    let file_name = if explicit_name.trim().is_empty() {
+        infer_download_file_name(resolved_url.as_str())
+    } else {
+        sanitize_download_file_name(explicit_name.as_str())
+    };
+    Ok((resolved_url, file_name))
+}
+
+fn infer_download_file_name(raw_url: &str) -> String {
+    let Some(url) = Url::parse(raw_url).ok() else {
+        return DOWNLOAD_FILE_NAME_FALLBACK.to_owned();
+    };
+    let Some(value) = url
+        .path_segments()
+        .and_then(|mut segments| segments.next_back())
+        .filter(|segment| !segment.trim().is_empty())
+    else {
+        return DOWNLOAD_FILE_NAME_FALLBACK.to_owned();
+    };
+    sanitize_download_file_name(value)
+}
+
+fn sanitize_download_file_name(raw: &str) -> String {
+    let mut sanitized = raw
+        .chars()
+        .map(|value| {
+            if value.is_ascii_alphanumeric() || matches!(value, '.' | '-' | '_') {
+                value
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    sanitized = sanitized.trim_matches('.').trim_matches('_').to_owned();
+    if sanitized.is_empty() {
+        return DOWNLOAD_FILE_NAME_FALLBACK.to_owned();
+    }
+    truncate_utf8_bytes(sanitized.as_str(), 96)
+}
+
+fn sniff_download_mime_type(
+    header_content_type: Option<&str>,
+    file_name: &str,
+    bytes: &[u8],
+) -> String {
+    if let Some(content_type) = header_content_type {
+        let normalized =
+            content_type.split(';').next().unwrap_or_default().trim().to_ascii_lowercase();
+        if !normalized.is_empty() {
+            return normalized;
+        }
+    }
+    if bytes.starts_with(b"%PDF-") {
+        return "application/pdf".to_owned();
+    }
+    if bytes.starts_with(&[0x50, 0x4B, 0x03, 0x04]) {
+        return "application/zip".to_owned();
+    }
+    if bytes.starts_with(&[0x1F, 0x8B]) {
+        return "application/gzip".to_owned();
+    }
+    let extension = Path::new(file_name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    match extension.as_str() {
+        "json" => "application/json".to_owned(),
+        "csv" => "text/csv".to_owned(),
+        "txt" => "text/plain".to_owned(),
+        "pdf" => "application/pdf".to_owned(),
+        "zip" => "application/zip".to_owned(),
+        "gz" => "application/gzip".to_owned(),
+        _ => "application/octet-stream".to_owned(),
+    }
+}
+
+fn extension_is_allowed(file_name: &str) -> bool {
+    let extension = Path::new(file_name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    DOWNLOAD_ALLOWED_EXTENSIONS.iter().any(|candidate| candidate == &extension)
+}
+
+fn mime_type_is_allowed(mime_type: &str) -> bool {
+    DOWNLOAD_ALLOWED_MIME_TYPES.contains(&mime_type)
+}
+
+async fn fetch_download_artifact(
+    runtime: &BrowserRuntimeState,
+    session_id: &str,
+    profile_id: Option<&str>,
+    source_url: &str,
+    file_name: &str,
+    allow_private_targets: bool,
+    timeout_ms: u64,
+) -> Result<DownloadArtifactRecord, String> {
+    let mut current_url =
+        Url::parse(source_url).map_err(|error| format!("invalid download URL: {error}"))?;
+    let client = reqwest::Client::builder()
+        .redirect(Policy::none())
+        .timeout(Duration::from_millis(timeout_ms.max(1)))
+        .build()
+        .map_err(|error| format!("failed to build download HTTP client: {error}"))?;
+    let mut redirects = 0_u32;
+    let response = loop {
+        validate_target_url(&current_url, allow_private_targets).await?;
+        let response = client
+            .get(current_url.clone())
+            .send()
+            .await
+            .map_err(|error| format!("download request failed: {error}"))?;
+        if response.status().is_redirection() {
+            if redirects >= 3 {
+                return Err("download redirect limit exceeded (3)".to_owned());
+            }
+            let Some(location) = response.headers().get(reqwest::header::LOCATION) else {
+                return Err("download redirect missing Location header".to_owned());
+            };
+            let location = location
+                .to_str()
+                .map_err(|_| "download redirect location header is invalid UTF-8".to_owned())?;
+            current_url = current_url
+                .join(location)
+                .map_err(|error| format!("invalid download redirect target: {error}"))?;
+            redirects = redirects.saturating_add(1);
+            continue;
+        }
+        break response;
+    };
+
+    if !response.status().is_success() {
+        return Err(format!("download request returned HTTP {}", response.status().as_u16()));
+    }
+    let header_content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let body = response
+        .bytes()
+        .await
+        .map_err(|error| format!("failed to read download response body: {error}"))?;
+    if (body.len() as u64) > DOWNLOAD_MAX_FILE_BYTES {
+        return Err(format!(
+            "download exceeds max file bytes ({} > {})",
+            body.len(),
+            DOWNLOAD_MAX_FILE_BYTES
+        ));
+    }
+    let mime_type =
+        sniff_download_mime_type(header_content_type.as_deref(), file_name, body.as_ref());
+    let mut quarantined = false;
+    let mut quarantine_reason = String::new();
+    if !extension_is_allowed(file_name) {
+        quarantined = true;
+        quarantine_reason = "extension_not_allowlisted".to_owned();
+    }
+    if !mime_type_is_allowed(mime_type.as_str()) {
+        quarantined = true;
+        quarantine_reason = if quarantine_reason.is_empty() {
+            "mime_type_not_allowlisted".to_owned()
+        } else {
+            format!("{quarantine_reason}|mime_type_not_allowlisted")
+        };
+    }
+
+    let artifact_id = Ulid::new().to_string();
+    let sanitized_name = sanitize_download_file_name(file_name);
+    let stored_name = format!("{}-{}", artifact_id, sanitized_name);
+    let mut guard = runtime.download_sessions.lock().await;
+    let Some(sandbox) = guard.get_mut(session_id) else {
+        return Err("download sandbox is not active for this session".to_owned());
+    };
+    if sandbox.used_bytes.saturating_add(body.len() as u64) > sandbox.max_bytes {
+        return Err(format!(
+            "download sandbox size limit exceeded ({} > {})",
+            sandbox.used_bytes.saturating_add(body.len() as u64),
+            sandbox.max_bytes
+        ));
+    }
+    while sandbox.artifacts.len() >= MAX_DOWNLOAD_ARTIFACTS_PER_SESSION {
+        if let Some(removed) = sandbox.artifacts.pop_front() {
+            let _ = fs::remove_file(removed.storage_path.as_path());
+            sandbox.used_bytes = sandbox.used_bytes.saturating_sub(removed.size_bytes);
+        }
+    }
+    let target_dir = if quarantined {
+        sandbox.root_dir.path().join(DOWNLOADS_DIR_QUARANTINE)
+    } else {
+        sandbox.root_dir.path().join(DOWNLOADS_DIR_ALLOWLIST)
+    };
+    let storage_path = target_dir.join(stored_name);
+    fs::write(storage_path.as_path(), body.as_ref()).map_err(|error| {
+        format!("failed to persist downloaded artifact to '{}' : {error}", storage_path.display())
+    })?;
+    sandbox.used_bytes = sandbox.used_bytes.saturating_add(body.len() as u64);
+    let artifact = DownloadArtifactRecord {
+        artifact_id,
+        session_id: session_id.to_owned(),
+        profile_id: profile_id.map(str::to_owned),
+        source_url: current_url.to_string(),
+        file_name: sanitized_name,
+        mime_type,
+        size_bytes: body.len() as u64,
+        sha256: sha256_hex(body.as_ref()),
+        created_at_unix_ms: current_unix_ms(),
+        quarantined,
+        quarantine_reason,
+        storage_path,
+    };
+    sandbox.artifacts.push_back(artifact.clone());
+    Ok(artifact)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         browser_v1, enforce_non_loopback_bind_auth, navigate_with_guards, parse_daemon_bind_socket,
-        Args, BrowserEngineMode, BrowserRuntimeState, BrowserServiceImpl, CHROMIUM_PATH_ENV,
-        DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS, DEFAULT_GRPC_PORT, ONE_BY_ONE_PNG,
+        Args, BrowserEngineMode, BrowserRuntimeState, BrowserServiceImpl, PersistedStateStore,
+        CHROMIUM_PATH_ENV, DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS, DEFAULT_GRPC_PORT,
+        MAX_RELAY_PAYLOAD_BYTES, ONE_BY_ONE_PNG, STATE_KEY_LEN,
     };
     use crate::proto;
     use crate::proto::palyra::browser::v1::browser_service_server::BrowserService;
@@ -4980,6 +6380,8 @@ mod tests {
                 action_allowed_domains: Vec::new(),
                 persistence_enabled: false,
                 persistence_id: String::new(),
+                profile_id: None,
+                private_profile: false,
                 channel: String::new(),
             }))
             .await
@@ -5067,6 +6469,8 @@ mod tests {
                 action_allowed_domains: Vec::new(),
                 persistence_enabled: false,
                 persistence_id: String::new(),
+                profile_id: None,
+                private_profile: false,
                 channel: String::new(),
             }))
             .await
@@ -5218,6 +6622,8 @@ mod tests {
                 action_allowed_domains: Vec::new(),
                 persistence_enabled: false,
                 persistence_id: String::new(),
+                profile_id: None,
+                private_profile: false,
                 channel: String::new(),
             }))
             .await
@@ -5360,6 +6766,8 @@ mod tests {
                 action_allowed_domains: Vec::new(),
                 persistence_enabled: false,
                 persistence_id: String::new(),
+                profile_id: None,
+                private_profile: false,
                 channel: String::new(),
             }))
             .await
@@ -5446,6 +6854,8 @@ mod tests {
                 action_allowed_domains: Vec::new(),
                 persistence_enabled: false,
                 persistence_id: String::new(),
+                profile_id: None,
+                private_profile: false,
                 channel: String::new(),
             }))
             .await
@@ -5535,6 +6945,8 @@ mod tests {
                 action_allowed_domains: Vec::new(),
                 persistence_enabled: false,
                 persistence_id: String::new(),
+                profile_id: None,
+                private_profile: false,
                 channel: String::new(),
             }))
             .await
@@ -5651,6 +7063,8 @@ mod tests {
                 action_allowed_domains: Vec::new(),
                 persistence_enabled: false,
                 persistence_id: String::new(),
+                profile_id: None,
+                private_profile: false,
                 channel: String::new(),
             }))
             .await
@@ -5760,6 +7174,8 @@ mod tests {
                 action_allowed_domains: Vec::new(),
                 persistence_enabled: false,
                 persistence_id: String::new(),
+                profile_id: None,
+                private_profile: false,
                 channel: String::new(),
             }))
             .await
@@ -5883,6 +7299,8 @@ mod tests {
                 action_allowed_domains: Vec::new(),
                 persistence_enabled: false,
                 persistence_id: String::new(),
+                profile_id: None,
+                private_profile: false,
                 channel: String::new(),
             }))
             .await
@@ -6000,6 +7418,8 @@ mod tests {
                 action_allowed_domains: Vec::new(),
                 persistence_enabled: false,
                 persistence_id: String::new(),
+                profile_id: None,
+                private_profile: false,
                 channel: String::new(),
             }))
             .await
@@ -6063,6 +7483,8 @@ mod tests {
                 action_allowed_domains: Vec::new(),
                 persistence_enabled: false,
                 persistence_id: String::new(),
+                profile_id: None,
+                private_profile: false,
                 channel: String::new(),
             }))
             .await
@@ -6185,6 +7607,465 @@ mod tests {
         handle.join().expect("test server thread should exit");
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn browser_service_profile_persistence_roundtrip_restores_state() {
+        let (url, handle) = spawn_static_http_server(
+            200,
+            "<html><head><title>Persisted Profile</title></head><body><p>persisted</p></body></html>",
+        );
+        let state_dir = tempfile::tempdir().expect("state temp dir should be available");
+        let mut runtime_state = BrowserRuntimeState::new(&Args {
+            bind: "127.0.0.1".to_owned(),
+            port: 7143,
+            grpc_bind: "127.0.0.1".to_owned(),
+            grpc_port: 7543,
+            auth_token: None,
+            session_idle_ttl_ms: 60_000,
+            max_sessions: 16,
+            max_navigation_timeout_ms: 10_000,
+            max_session_lifetime_ms: 60_000,
+            max_screenshot_bytes: 128 * 1024,
+            max_response_bytes: 128 * 1024,
+            max_title_bytes: 4 * 1024,
+            engine_mode: BrowserEngineMode::Simulated,
+            chromium_path: None,
+            chromium_startup_timeout_ms: DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS,
+        })
+        .expect("runtime should initialize");
+        runtime_state.state_store = Some(
+            PersistedStateStore::new(state_dir.path().join("state"), [7_u8; STATE_KEY_LEN])
+                .expect("state store should initialize"),
+        );
+        let runtime = std::sync::Arc::new(runtime_state);
+        let service = BrowserServiceImpl { runtime };
+
+        let profile = service
+            .create_profile(Request::new(browser_v1::CreateProfileRequest {
+                v: 1,
+                principal: "user:ops".to_owned(),
+                name: "Ops".to_owned(),
+                theme_color: "#1f2937".to_owned(),
+                persistence_enabled: true,
+                private_profile: false,
+            }))
+            .await
+            .expect("create_profile should succeed")
+            .into_inner()
+            .profile
+            .expect("profile should be present");
+        let profile_id = profile
+            .profile_id
+            .as_ref()
+            .map(|value| value.ulid.clone())
+            .expect("profile id should be present");
+
+        let first_session = service
+            .create_session(Request::new(browser_v1::CreateSessionRequest {
+                v: 1,
+                principal: "user:ops".to_owned(),
+                idle_ttl_ms: 10_000,
+                budget: None,
+                allow_private_targets: true,
+                allow_downloads: false,
+                action_allowed_domains: Vec::new(),
+                persistence_enabled: false,
+                persistence_id: String::new(),
+                profile_id: Some(proto::palyra::common::v1::CanonicalId {
+                    ulid: profile_id.clone(),
+                }),
+                private_profile: false,
+                channel: String::new(),
+            }))
+            .await
+            .expect("first create_session should succeed")
+            .into_inner();
+        let first_session_id = first_session
+            .session_id
+            .as_ref()
+            .map(|value| value.ulid.clone())
+            .expect("first session id should be present");
+        assert!(first_session.persistence_enabled, "profile should enable persistence");
+        assert_eq!(
+            first_session.profile_id.as_ref().map(|value| value.ulid.as_str()),
+            Some(profile_id.as_str())
+        );
+
+        let navigate = service
+            .navigate(Request::new(browser_v1::NavigateRequest {
+                v: 1,
+                session_id: Some(proto::palyra::common::v1::CanonicalId {
+                    ulid: first_session_id.clone(),
+                }),
+                url,
+                timeout_ms: 2_000,
+                allow_redirects: true,
+                max_redirects: 3,
+                allow_private_targets: true,
+            }))
+            .await
+            .expect("navigate should execute")
+            .into_inner();
+        assert!(navigate.success, "navigation should succeed");
+
+        let closed = service
+            .close_session(Request::new(browser_v1::CloseSessionRequest {
+                v: 1,
+                session_id: Some(proto::palyra::common::v1::CanonicalId { ulid: first_session_id }),
+            }))
+            .await
+            .expect("close_session should execute")
+            .into_inner();
+        assert!(closed.closed, "first session should close cleanly");
+
+        let second_session = service
+            .create_session(Request::new(browser_v1::CreateSessionRequest {
+                v: 1,
+                principal: "user:ops".to_owned(),
+                idle_ttl_ms: 10_000,
+                budget: None,
+                allow_private_targets: true,
+                allow_downloads: false,
+                action_allowed_domains: Vec::new(),
+                persistence_enabled: false,
+                persistence_id: String::new(),
+                profile_id: Some(proto::palyra::common::v1::CanonicalId {
+                    ulid: profile_id.clone(),
+                }),
+                private_profile: false,
+                channel: String::new(),
+            }))
+            .await
+            .expect("second create_session should succeed")
+            .into_inner();
+        let second_session_id = second_session
+            .session_id
+            .as_ref()
+            .map(|value| value.ulid.clone())
+            .expect("second session id should be present");
+        assert!(second_session.state_restored, "second session should restore persisted state");
+        assert_eq!(
+            second_session.profile_id.as_ref().map(|value| value.ulid.as_str()),
+            Some(profile_id.as_str())
+        );
+
+        let title = service
+            .get_title(Request::new(browser_v1::GetTitleRequest {
+                v: 1,
+                session_id: Some(proto::palyra::common::v1::CanonicalId {
+                    ulid: second_session_id,
+                }),
+                max_title_bytes: 1_024,
+            }))
+            .await
+            .expect("get_title should execute")
+            .into_inner();
+        assert!(title.success, "title lookup should succeed after restore");
+        assert_eq!(title.title, "Persisted Profile");
+
+        handle.join().expect("test server thread should exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn browser_service_relay_rejects_unsupported_action_kind() {
+        let runtime = std::sync::Arc::new(
+            BrowserRuntimeState::new(&Args {
+                bind: "127.0.0.1".to_owned(),
+                port: 7143,
+                grpc_bind: "127.0.0.1".to_owned(),
+                grpc_port: 7543,
+                auth_token: None,
+                session_idle_ttl_ms: 60_000,
+                max_sessions: 16,
+                max_navigation_timeout_ms: 10_000,
+                max_session_lifetime_ms: 60_000,
+                max_screenshot_bytes: 128 * 1024,
+                max_response_bytes: 128 * 1024,
+                max_title_bytes: 4 * 1024,
+                engine_mode: BrowserEngineMode::Simulated,
+                chromium_path: None,
+                chromium_startup_timeout_ms: DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS,
+            })
+            .expect("runtime should initialize"),
+        );
+        let service = BrowserServiceImpl { runtime };
+        let created = service
+            .create_session(Request::new(browser_v1::CreateSessionRequest {
+                v: 1,
+                principal: "user:ops".to_owned(),
+                idle_ttl_ms: 10_000,
+                budget: None,
+                allow_private_targets: true,
+                allow_downloads: false,
+                action_allowed_domains: Vec::new(),
+                persistence_enabled: false,
+                persistence_id: String::new(),
+                profile_id: None,
+                private_profile: false,
+                channel: String::new(),
+            }))
+            .await
+            .expect("create_session should succeed")
+            .into_inner();
+        let session_id = created
+            .session_id
+            .as_ref()
+            .map(|value| value.ulid.clone())
+            .expect("session id should be present");
+
+        let relay = service
+            .relay_action(Request::new(browser_v1::RelayActionRequest {
+                v: 1,
+                session_id: Some(proto::palyra::common::v1::CanonicalId { ulid: session_id }),
+                extension_id: "com.palyra.extension".to_owned(),
+                action: 999,
+                payload: None,
+                max_payload_bytes: 4_096,
+            }))
+            .await
+            .expect("relay action should return response")
+            .into_inner();
+        assert!(!relay.success, "unsupported relay action should fail closed");
+        assert!(
+            relay.error.contains("unsupported relay action"),
+            "error should explain unsupported action: {}",
+            relay.error
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn browser_service_relay_rejects_oversized_payload_budget() {
+        let runtime = std::sync::Arc::new(
+            BrowserRuntimeState::new(&Args {
+                bind: "127.0.0.1".to_owned(),
+                port: 7143,
+                grpc_bind: "127.0.0.1".to_owned(),
+                grpc_port: 7543,
+                auth_token: None,
+                session_idle_ttl_ms: 60_000,
+                max_sessions: 16,
+                max_navigation_timeout_ms: 10_000,
+                max_session_lifetime_ms: 60_000,
+                max_screenshot_bytes: 128 * 1024,
+                max_response_bytes: 128 * 1024,
+                max_title_bytes: 4 * 1024,
+                engine_mode: BrowserEngineMode::Simulated,
+                chromium_path: None,
+                chromium_startup_timeout_ms: DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS,
+            })
+            .expect("runtime should initialize"),
+        );
+        let service = BrowserServiceImpl { runtime };
+        let created = service
+            .create_session(Request::new(browser_v1::CreateSessionRequest {
+                v: 1,
+                principal: "user:ops".to_owned(),
+                idle_ttl_ms: 10_000,
+                budget: None,
+                allow_private_targets: true,
+                allow_downloads: false,
+                action_allowed_domains: Vec::new(),
+                persistence_enabled: false,
+                persistence_id: String::new(),
+                profile_id: None,
+                private_profile: false,
+                channel: String::new(),
+            }))
+            .await
+            .expect("create_session should succeed")
+            .into_inner();
+        let session_id = created
+            .session_id
+            .as_ref()
+            .map(|value| value.ulid.clone())
+            .expect("session id should be present");
+
+        let status = service
+            .relay_action(Request::new(browser_v1::RelayActionRequest {
+                v: 1,
+                session_id: Some(proto::palyra::common::v1::CanonicalId { ulid: session_id }),
+                extension_id: "com.palyra.extension".to_owned(),
+                action: browser_v1::RelayActionKind::CaptureSelection as i32,
+                payload: Some(browser_v1::relay_action_request::Payload::CaptureSelection(
+                    browser_v1::RelayCaptureSelectionPayload {
+                        selector: "body".to_owned(),
+                        max_selection_bytes: 512,
+                    },
+                )),
+                max_payload_bytes: MAX_RELAY_PAYLOAD_BYTES + 1,
+            }))
+            .await
+            .expect_err("oversized relay payload budget must be rejected");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            status.message().contains("max_payload_bytes exceeds"),
+            "error should explain relay payload bound: {}",
+            status.message()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn browser_service_download_allowlist_and_quarantine_artifacts() {
+        let runtime = std::sync::Arc::new(
+            BrowserRuntimeState::new(&Args {
+                bind: "127.0.0.1".to_owned(),
+                port: 7143,
+                grpc_bind: "127.0.0.1".to_owned(),
+                grpc_port: 7543,
+                auth_token: None,
+                session_idle_ttl_ms: 60_000,
+                max_sessions: 16,
+                max_navigation_timeout_ms: 10_000,
+                max_session_lifetime_ms: 60_000,
+                max_screenshot_bytes: 128 * 1024,
+                max_response_bytes: 256 * 1024,
+                max_title_bytes: 4 * 1024,
+                engine_mode: BrowserEngineMode::Simulated,
+                chromium_path: None,
+                chromium_startup_timeout_ms: DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS,
+            })
+            .expect("runtime should initialize"),
+        );
+        let service = BrowserServiceImpl { runtime };
+
+        let created = service
+            .create_session(Request::new(browser_v1::CreateSessionRequest {
+                v: 1,
+                principal: "user:ops".to_owned(),
+                idle_ttl_ms: 10_000,
+                budget: None,
+                allow_private_targets: true,
+                allow_downloads: true,
+                action_allowed_domains: Vec::new(),
+                persistence_enabled: false,
+                persistence_id: String::new(),
+                profile_id: None,
+                private_profile: false,
+                channel: String::new(),
+            }))
+            .await
+            .expect("create_session should succeed")
+            .into_inner();
+        let session_id = created
+            .session_id
+            .as_ref()
+            .map(|value| value.ulid.clone())
+            .expect("session id should be present");
+
+        let (allowlist_url, allowlist_handle) =
+            spawn_download_fixture_http_server("/report.csv", "text/csv", b"name,score\nalice,9\n");
+        let navigate_allowlist = service
+            .navigate(Request::new(browser_v1::NavigateRequest {
+                v: 1,
+                session_id: Some(proto::palyra::common::v1::CanonicalId {
+                    ulid: session_id.clone(),
+                }),
+                url: allowlist_url,
+                timeout_ms: 2_000,
+                allow_redirects: true,
+                max_redirects: 3,
+                allow_private_targets: true,
+            }))
+            .await
+            .expect("allowlist navigate should execute")
+            .into_inner();
+        assert!(navigate_allowlist.success, "allowlist fixture navigation should succeed");
+
+        let allowlisted_click = service
+            .click(Request::new(browser_v1::ClickRequest {
+                v: 1,
+                session_id: Some(proto::palyra::common::v1::CanonicalId {
+                    ulid: session_id.clone(),
+                }),
+                selector: "#download-link".to_owned(),
+                max_retries: 0,
+                timeout_ms: 1_500,
+                capture_failure_screenshot: true,
+                max_failure_screenshot_bytes: 2 * 1024,
+            }))
+            .await
+            .expect("allowlist click should execute")
+            .into_inner();
+        assert!(allowlisted_click.success, "allowlisted download click should succeed");
+        let allowlisted_artifact = allowlisted_click
+            .artifact
+            .expect("allowlisted download should return artifact metadata");
+        assert!(
+            !allowlisted_artifact.quarantined,
+            "allowlisted artifact should not be quarantined"
+        );
+        assert_eq!(allowlisted_artifact.file_name, "report.csv");
+        allowlist_handle.join().expect("allowlist server thread should exit");
+
+        let (quarantine_url, quarantine_handle) = spawn_download_fixture_http_server(
+            "/payload.exe",
+            "application/octet-stream",
+            b"MZ\x90\x00suspicious",
+        );
+        let navigate_quarantine = service
+            .navigate(Request::new(browser_v1::NavigateRequest {
+                v: 1,
+                session_id: Some(proto::palyra::common::v1::CanonicalId {
+                    ulid: session_id.clone(),
+                }),
+                url: quarantine_url,
+                timeout_ms: 2_000,
+                allow_redirects: true,
+                max_redirects: 3,
+                allow_private_targets: true,
+            }))
+            .await
+            .expect("quarantine navigate should execute")
+            .into_inner();
+        assert!(navigate_quarantine.success, "quarantine fixture navigation should succeed");
+
+        let quarantined_click = service
+            .click(Request::new(browser_v1::ClickRequest {
+                v: 1,
+                session_id: Some(proto::palyra::common::v1::CanonicalId {
+                    ulid: session_id.clone(),
+                }),
+                selector: "#download-link".to_owned(),
+                max_retries: 0,
+                timeout_ms: 1_500,
+                capture_failure_screenshot: true,
+                max_failure_screenshot_bytes: 2 * 1024,
+            }))
+            .await
+            .expect("quarantine click should execute")
+            .into_inner();
+        assert!(quarantined_click.success, "quarantined download still records click success");
+        assert_eq!(
+            quarantined_click.action_log.as_ref().map(|entry| entry.outcome.as_str()),
+            Some("download_quarantined")
+        );
+        let quarantined_artifact = quarantined_click
+            .artifact
+            .expect("quarantined download should return artifact metadata");
+        assert!(quarantined_artifact.quarantined, "suspicious file should be quarantined");
+        assert!(
+            quarantined_artifact.quarantine_reason.contains("extension_not_allowlisted"),
+            "quarantine reason should include extension allowlist signal: {}",
+            quarantined_artifact.quarantine_reason
+        );
+        quarantine_handle.join().expect("quarantine server thread should exit");
+
+        let listed = service
+            .list_download_artifacts(Request::new(browser_v1::ListDownloadArtifactsRequest {
+                v: 1,
+                session_id: Some(proto::palyra::common::v1::CanonicalId { ulid: session_id }),
+                limit: 10,
+                quarantined_only: false,
+            }))
+            .await
+            .expect("list_download_artifacts should execute")
+            .into_inner();
+        assert_eq!(listed.artifacts.len(), 2, "both artifacts should be registered");
+        assert!(
+            listed.artifacts.iter().any(|artifact| artifact.quarantined),
+            "download artifact list should include quarantined entries"
+        );
+    }
+
     fn spawn_static_http_server(status_code: u16, body: &str) -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
         let address = listener.local_addr().expect("listener local address should resolve");
@@ -6294,6 +8175,68 @@ mod tests {
             }
         });
         (format!("http://{address}/"), handle)
+    }
+
+    fn spawn_download_fixture_http_server(
+        file_path: &str,
+        file_content_type: &str,
+        file_body: &[u8],
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let address = listener.local_addr().expect("listener local address should resolve");
+        let file_path = file_path.to_owned();
+        let file_content_type = file_content_type.to_owned();
+        let file_body = file_body.to_vec();
+        let handle = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("listener should accept request");
+                let request = read_http_request(&mut stream);
+                let path = http_request_path(request.as_str());
+                if path == "/" {
+                    let body = format!(
+                        "<!doctype html><html><body><a id=\"download-link\" href=\"{file_path}\" download>Download</a></body></html>"
+                    );
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream
+                        .write_all(response.as_bytes())
+                        .expect("server should write HTML response");
+                    stream.flush().expect("server should flush HTML response");
+                    continue;
+                }
+                if path == file_path {
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {file_content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        file_body.len()
+                    );
+                    stream
+                        .write_all(headers.as_bytes())
+                        .expect("server should write file response headers");
+                    stream
+                        .write_all(file_body.as_slice())
+                        .expect("server should write file response body");
+                    stream.flush().expect("server should flush file response");
+                    continue;
+                }
+                let fallback = "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot_found";
+                stream
+                    .write_all(fallback.as_bytes())
+                    .expect("server should write fallback response");
+                stream.flush().expect("server should flush fallback response");
+            }
+        });
+        (format!("http://{address}/"), handle)
+    }
+
+    fn http_request_path(request: &str) -> String {
+        request
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| "/".to_owned())
     }
 
     fn read_http_request(stream: &mut TcpStream) -> String {

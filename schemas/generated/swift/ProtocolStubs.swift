@@ -86,6 +86,9 @@ public enum PalyraBrowserV1 {
     public struct BrowserHealthResponse: Equatable {
         public init() {}
     }
+    public struct BrowserProfile: Equatable {
+        public init() {}
+    }
     public struct BrowserTab: Equatable {
         public init() {}
     }
@@ -107,10 +110,25 @@ public enum PalyraBrowserV1 {
     public struct CloseTabResponse: Equatable {
         public init() {}
     }
+    public struct CreateProfileRequest: Equatable {
+        public init() {}
+    }
+    public struct CreateProfileResponse: Equatable {
+        public init() {}
+    }
     public struct CreateSessionRequest: Equatable {
         public init() {}
     }
     public struct CreateSessionResponse: Equatable {
+        public init() {}
+    }
+    public struct DeleteProfileRequest: Equatable {
+        public init() {}
+    }
+    public struct DeleteProfileResponse: Equatable {
+        public init() {}
+    }
+    public struct DownloadArtifact: Equatable {
         public init() {}
     }
     public struct GetPermissionsRequest: Equatable {
@@ -123,6 +141,18 @@ public enum PalyraBrowserV1 {
         public init() {}
     }
     public struct GetTitleResponse: Equatable {
+        public init() {}
+    }
+    public struct ListDownloadArtifactsRequest: Equatable {
+        public init() {}
+    }
+    public struct ListDownloadArtifactsResponse: Equatable {
+        public init() {}
+    }
+    public struct ListProfilesRequest: Equatable {
+        public init() {}
+    }
+    public struct ListProfilesResponse: Equatable {
         public init() {}
     }
     public struct ListTabsRequest: Equatable {
@@ -161,6 +191,33 @@ public enum PalyraBrowserV1 {
     public struct OpenTabResponse: Equatable {
         public init() {}
     }
+    public struct RelayActionRequest: Equatable {
+        public init() {}
+    }
+    public struct RelayActionResponse: Equatable {
+        public init() {}
+    }
+    public struct RelayCaptureSelectionPayload: Equatable {
+        public init() {}
+    }
+    public struct RelayOpenTabPayload: Equatable {
+        public init() {}
+    }
+    public struct RelayPageSnapshotPayload: Equatable {
+        public init() {}
+    }
+    public struct RelayPageSnapshotResult: Equatable {
+        public init() {}
+    }
+    public struct RelaySelectionResult: Equatable {
+        public init() {}
+    }
+    public struct RenameProfileRequest: Equatable {
+        public init() {}
+    }
+    public struct RenameProfileResponse: Equatable {
+        public init() {}
+    }
     public struct ResetStateRequest: Equatable {
         public init() {}
     }
@@ -183,6 +240,12 @@ public enum PalyraBrowserV1 {
         public init() {}
     }
     public struct SessionPermissions: Equatable {
+        public init() {}
+    }
+    public struct SetActiveProfileRequest: Equatable {
+        public init() {}
+    }
+    public struct SetActiveProfileResponse: Equatable {
         public init() {}
     }
     public struct SetPermissionsRequest: Equatable {
@@ -213,18 +276,25 @@ public enum PalyraBrowserV1 {
         func click()
         func closeSession()
         func closeTab()
+        func createProfile()
         func createSession()
+        func deleteProfile()
         func getPermissions()
         func getTitle()
         func health()
+        func listDownloadArtifacts()
+        func listProfiles()
         func listTabs()
         func navigate()
         func networkLog()
         func observe()
         func openTab()
+        func relayAction()
+        func renameProfile()
         func resetState()
         func screenshot()
         func scroll()
+        func setActiveProfile()
         func setPermissions()
         func switchTab()
         func type()
