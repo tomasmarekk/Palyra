@@ -5576,8 +5576,8 @@ mod tests {
         for index in 0..512 {
             let token = mint_console_secret_token();
             assert!(
-                seen.insert(token.clone()),
-                "unexpected duplicate console secret token at sample index {index}: {token}"
+                seen.insert(token),
+                "unexpected duplicate console secret token at sample index {index}"
             );
         }
     }
