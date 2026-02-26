@@ -3671,7 +3671,6 @@ fn console_browser_tab_to_json(tab: browser_v1::BrowserTab) -> Value {
 fn console_browser_download_artifact_to_json(artifact: browser_v1::DownloadArtifact) -> Value {
     json!({
         "artifact_id": artifact.artifact_id.map(|value| value.ulid),
-        "session_id": artifact.session_id.map(|value| value.ulid),
         "profile_id": artifact.profile_id.map(|value| value.ulid),
         "source_url": artifact.source_url,
         "file_name": artifact.file_name,

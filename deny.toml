@@ -16,6 +16,7 @@ allow = [
   "Apache-2.0",
   "Apache-2.0 WITH LLVM-exception",
   "MIT",
+  "LicenseRef-Palyra-Community-Source-1.0",
   "BSD-2-Clause",
   "BSD-3-Clause",
   "ISC",
@@ -29,6 +30,63 @@ exceptions = [
   # Transitive through auto_generate_cdp -> ureq; scoped to this crate.
   { crate = "webpki-roots", allow = ["CDLA-Permissive-2.0"] },
 ]
+
+[[licenses.clarify]]
+crate = "palyra-a2ui"
+expression = "LicenseRef-Palyra-Community-Source-1.0"
+license-files = [{ path = "../../LICENSE", hash = 0x18b96a4b }]
+[[licenses.clarify]]
+crate = "palyra-auth"
+expression = "LicenseRef-Palyra-Community-Source-1.0"
+license-files = [{ path = "../../LICENSE", hash = 0x18b96a4b }]
+[[licenses.clarify]]
+crate = "palyra-browserd"
+expression = "LicenseRef-Palyra-Community-Source-1.0"
+license-files = [{ path = "../../LICENSE", hash = 0x18b96a4b }]
+[[licenses.clarify]]
+crate = "palyra-cli"
+expression = "LicenseRef-Palyra-Community-Source-1.0"
+license-files = [{ path = "../../LICENSE", hash = 0x18b96a4b }]
+[[licenses.clarify]]
+crate = "palyra-common"
+expression = "LicenseRef-Palyra-Community-Source-1.0"
+license-files = [{ path = "../../LICENSE", hash = 0x18b96a4b }]
+[[licenses.clarify]]
+crate = "palyra-daemon"
+expression = "LicenseRef-Palyra-Community-Source-1.0"
+license-files = [{ path = "../../LICENSE", hash = 0x18b96a4b }]
+[[licenses.clarify]]
+crate = "palyra-identity"
+expression = "LicenseRef-Palyra-Community-Source-1.0"
+license-files = [{ path = "../../LICENSE", hash = 0x18b96a4b }]
+[[licenses.clarify]]
+crate = "palyra-plugins-runtime"
+expression = "LicenseRef-Palyra-Community-Source-1.0"
+license-files = [{ path = "../../../LICENSE", hash = 0x18b96a4b }]
+[[licenses.clarify]]
+crate = "palyra-plugins-sdk"
+expression = "LicenseRef-Palyra-Community-Source-1.0"
+license-files = [{ path = "../../../LICENSE", hash = 0x18b96a4b }]
+[[licenses.clarify]]
+crate = "palyra-policy"
+expression = "LicenseRef-Palyra-Community-Source-1.0"
+license-files = [{ path = "../../LICENSE", hash = 0x18b96a4b }]
+[[licenses.clarify]]
+crate = "palyra-sandbox"
+expression = "LicenseRef-Palyra-Community-Source-1.0"
+license-files = [{ path = "../../LICENSE", hash = 0x18b96a4b }]
+[[licenses.clarify]]
+crate = "palyra-skills"
+expression = "LicenseRef-Palyra-Community-Source-1.0"
+license-files = [{ path = "../../LICENSE", hash = 0x18b96a4b }]
+[[licenses.clarify]]
+crate = "palyra-transport-quic"
+expression = "LicenseRef-Palyra-Community-Source-1.0"
+license-files = [{ path = "../../LICENSE", hash = 0x18b96a4b }]
+[[licenses.clarify]]
+crate = "palyra-vault"
+expression = "LicenseRef-Palyra-Community-Source-1.0"
+license-files = [{ path = "../../LICENSE", hash = 0x18b96a4b }]
 
 [bans]
 multiple-versions = "warn"
