@@ -22,7 +22,13 @@ allow = [
   "Unicode-3.0",
   "Zlib",
 ]
-exceptions = []
+exceptions = [
+  # headless_chrome currently uses auto_generate_cdp only as a build dependency to
+  # generate CDP bindings during compilation; it is not linked into runtime binaries.
+  { crate = "auto_generate_cdp", allow = ["GPL-3.0-or-later"] },
+  # Transitive through auto_generate_cdp -> ureq; scoped to this crate.
+  { crate = "webpki-roots", allow = ["CDLA-Permissive-2.0"] },
+]
 
 [bans]
 multiple-versions = "warn"
