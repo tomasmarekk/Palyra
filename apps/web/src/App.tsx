@@ -2,8 +2,10 @@
 import { useEffect, useMemo, useState } from "react";
 
 import { ConsoleApiClient, type ConsoleSession, type JsonValue } from "./consoleApi";
+import { ChatConsolePanel } from "./chat/ChatConsolePanel";
 
-type Section = "approvals" | "cron" | "memory" | "skills" | "browser" | "audit";
+type Section = "chat" | "approvals" | "cron" | "memory" | "skills" | "browser" | "audit";
+type ThemeMode = "light" | "dark";
 type JsonObject = { [key: string]: JsonValue };
 type CronScheduleType = "cron" | "every" | "at";
 
@@ -54,6 +56,19 @@ export function App() {
   const [booting, setBooting] = useState(true);
   const [session, setSession] = useState<ConsoleSession | null>(null);
   const [section, setSection] = useState<Section>("approvals");
+  const [theme, setTheme] = useState<ThemeMode>(() => {
+    if (typeof window === "undefined") {
+      return "light";
+    }
+    const stored = window.localStorage.getItem("palyra.console.theme");
+    if (stored === "light" || stored === "dark") {
+      return stored;
+    }
+    if (window.matchMedia !== undefined && window.matchMedia("(prefers-color-scheme: dark)").matches) {
+      return "dark";
+    }
+    return "light";
+  });
   const [revealSensitiveValues, setRevealSensitiveValues] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -149,6 +164,13 @@ export function App() {
       cancelled = true;
     };
   }, [api]);
+
+  useEffect(() => {
+    document.documentElement.setAttribute("data-theme", theme);
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem("palyra.console.theme", theme);
+    }
+  }, [theme]);
 
   useEffect(() => {
     if (session === null) {
@@ -716,7 +738,7 @@ export function App() {
     return (
       <div className="console-root">
         <main className="console-card console-card--center">
-          <p className="console-label">Palyra / M35</p>
+          <p className="console-label">Palyra / M38</p>
           <h1>Web Console</h1>
           <p>Checking existing session...</p>
         </main>
@@ -728,7 +750,7 @@ export function App() {
     return (
       <div className="console-root">
         <main className="console-card console-card--auth">
-          <p className="console-label">Palyra / M35</p>
+          <p className="console-label">Palyra / M38</p>
           <h1>Operator Console</h1>
           <p className="console-copy">
             Sign in with an `admin:*` principal. Session cookie + CSRF are required for privileged actions.
@@ -789,10 +811,10 @@ export function App() {
     <div className="console-root">
       <header className="console-topbar">
         <div>
-          <p className="console-label">Palyra / M35</p>
+          <p className="console-label">Palyra / M38</p>
           <h1>Web Console v1</h1>
           <p className="console-copy">
-            Approvals, cron, memory, skills, browser relay controls, and audit workflows without using CLI.
+            Chat streaming, approvals, cron, memory, skills, browser relay controls, and audit workflows without using CLI.
           </p>
         </div>
         <div className="console-session-box">
@@ -800,6 +822,12 @@ export function App() {
           <p><strong>Device:</strong> {session.device_id}</p>
           <p><strong>Channel:</strong> {session.channel ?? "-"}</p>
           <p><strong>Expires:</strong> {new Date(session.expires_at_unix_ms).toLocaleString()}</p>
+          <button
+            type="button"
+            onClick={() => setTheme((current) => (current === "light" ? "dark" : "light"))}
+          >
+            Theme: {theme}
+          </button>
           <button type="button" onClick={() => void signOut()} disabled={logoutBusy}>
             {logoutBusy ? "Signing out..." : "Sign out"}
           </button>
@@ -807,6 +835,7 @@ export function App() {
       </header>
 
       <nav className="console-nav" aria-label="Console sections">
+        <button type="button" className={section === "chat" ? "is-active" : ""} onClick={() => setSection("chat")}>Chat</button>
         <button type="button" className={section === "approvals" ? "is-active" : ""} onClick={() => setSection("approvals")}>Approvals</button>
         <button type="button" className={section === "cron" ? "is-active" : ""} onClick={() => setSection("cron")}>Cron</button>
         <button type="button" className={section === "memory" ? "is-active" : ""} onClick={() => setSection("memory")}>Memory</button>
@@ -832,6 +861,15 @@ export function App() {
           Reveal sensitive fields (default is redacted)
         </label>
       </section>
+
+      {section === "chat" && (
+        <ChatConsolePanel
+          api={api}
+          revealSensitiveValues={revealSensitiveValues}
+          setError={setError}
+          setNotice={setNotice}
+        />
+      )}
 
       {section === "approvals" && (
         <main className="console-card">

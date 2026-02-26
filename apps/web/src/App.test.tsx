@@ -151,6 +151,213 @@ describe("M35 web console app", () => {
     expect(headers.get("x-palyra-csrf-token")).toBe("csrf-1");
     expect(requestBody(request?.body)).toContain("\"extension_id\":\"com.palyra.extension\"");
   });
+
+  it("streams chat transcript with inline approval controls and CSRF decision dispatch", async () => {
+    const fetchMock = createQueuedFetch([
+      jsonResponse({
+        principal: "admin:web-console",
+        device_id: "device-1",
+        channel: "web",
+        csrf_token: "csrf-1",
+        issued_at_unix_ms: 100,
+        expires_at_unix_ms: 300
+      }),
+      jsonResponse({ approvals: [] }),
+      jsonResponse({ sessions: [] }),
+      jsonResponse({
+        session: {
+          session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+          session_key: "web",
+          principal: "admin:web-console",
+          device_id: "device-1",
+          channel: "web",
+          created_at_unix_ms: 100,
+          updated_at_unix_ms: 100
+        },
+        created: true,
+        reset_applied: false
+      }),
+      ndjsonResponse([
+        {
+          type: "meta",
+          run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+          session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+        },
+        {
+          type: "event",
+          event: {
+            run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+            event_type: "model_token",
+            model_token: {
+              token: "hello from model",
+              is_final: false
+            }
+          }
+        },
+        {
+          type: "event",
+          event: {
+            run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+            event_type: "tool_approval_request",
+            tool_approval_request: {
+              proposal_id: "01ARZ3NDEKTSV4RRFFQ69G5FB0",
+              approval_id: "A1",
+              tool_name: "palyra.fs.apply_patch",
+              request_summary: "Needs approval"
+            }
+          }
+        },
+        {
+          type: "complete",
+          run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+          status: "done"
+        }
+      ]),
+      jsonResponse({
+        sessions: [
+          {
+            session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            session_key: "web",
+            principal: "admin:web-console",
+            device_id: "device-1",
+            channel: "web",
+            created_at_unix_ms: 100,
+            updated_at_unix_ms: 200,
+            last_run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX"
+          }
+        ]
+      }),
+      jsonResponse({ approval: { approval_id: "A1", decision: "allow" } })
+    ]);
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Chat" }));
+    expect(await screen.findByRole("heading", { name: "Chat Workspace" })).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Send" })).toBeEnabled();
+    });
+
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "run task" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(await screen.findByText("hello from model")).toBeInTheDocument();
+    expect(await screen.findByText("Needs approval")).toBeInTheDocument();
+
+    const approveButtons = screen.getAllByRole("button", { name: "Approve" });
+    fireEvent.click(approveButtons[0]);
+
+    await waitFor(() => {
+      expect(screen.getByText("Approval A1 allowed.")).toBeInTheDocument();
+    });
+
+    expect(requestUrl(fetchMock.mock.calls[4][0])).toBe(
+      "/console/v1/chat/sessions/01ARZ3NDEKTSV4RRFFQ69G5FAV/messages/stream"
+    );
+    expect(requestUrl(fetchMock.mock.calls[6][0])).toBe("/console/v1/approvals/A1/decision");
+    const decisionHeaders = new Headers(fetchMock.mock.calls[6][1]?.headers);
+    expect(decisionHeaders.get("x-palyra-csrf-token")).toBe("csrf-1");
+  });
+
+  it("escapes user/model/tool chat payloads and keeps canvas iframe sandboxed", async () => {
+    const fetchMock = createQueuedFetch([
+      jsonResponse({
+        principal: "admin:web-console",
+        device_id: "device-1",
+        channel: "web",
+        csrf_token: "csrf-1",
+        issued_at_unix_ms: 100,
+        expires_at_unix_ms: 300
+      }),
+      jsonResponse({ approvals: [] }),
+      jsonResponse({
+        sessions: [
+          {
+            session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            session_key: "web",
+            principal: "admin:web-console",
+            device_id: "device-1",
+            channel: "web",
+            created_at_unix_ms: 100,
+            updated_at_unix_ms: 100
+          }
+        ]
+      }),
+      ndjsonResponse([
+        {
+          type: "meta",
+          run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+          session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+        },
+        {
+          type: "event",
+          event: {
+            run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+            event_type: "model_token",
+            model_token: {
+              token: "<img src='x' onerror='alert(1)'>",
+              is_final: false
+            }
+          }
+        },
+        {
+          type: "event",
+          event: {
+            run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+            event_type: "tool_result",
+            tool_result: {
+              proposal_id: "01ARZ3NDEKTSV4RRFFQ69G5FB0",
+              success: true,
+              output_json: {
+                payload: "<script>alert(1)</script>",
+                frame_url: "/canvas/v1/frame/01ARZ3NDEKTSV4RRFFQ69G5FB1?token=test-token"
+              }
+            }
+          }
+        },
+        {
+          type: "complete",
+          run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+          status: "done"
+        }
+      ]),
+      jsonResponse({
+        sessions: [
+          {
+            session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            session_key: "web",
+            principal: "admin:web-console",
+            device_id: "device-1",
+            channel: "web",
+            created_at_unix_ms: 100,
+            updated_at_unix_ms: 200,
+            last_run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX"
+          }
+        ]
+      })
+    ]);
+    vi.stubGlobal("fetch", fetchMock);
+
+    const rendered = render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Chat" }));
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Send" })).toBeEnabled();
+    });
+
+    fireEvent.change(screen.getByLabelText("Message"), {
+      target: { value: "<img src='x' onerror='alert(1)'>" }
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(await screen.findByText("<img src='x' onerror='alert(1)'>")).toBeInTheDocument();
+    expect(await screen.findByText(/<script>alert\(1\)<\/script>/)).toBeInTheDocument();
+
+    const injectedImage = rendered.container.querySelector("img[src='x']");
+    expect(injectedImage).toBeNull();
+
+    const frame = await screen.findByTitle("Canvas 01ARZ3NDEKTSV4RRFFQ69G5FAX");
+    expect(frame).toHaveAttribute("sandbox", "allow-scripts allow-same-origin");
+  });
 });
 
 function createQueuedFetch(responses: Response[]) {
@@ -189,4 +396,14 @@ function requestBody(body: BodyInit | null | undefined): string {
     return body;
   }
   return "";
+}
+
+function ndjsonResponse(lines: unknown[]): Response {
+  const body = `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`;
+  return new Response(body, {
+    status: 200,
+    headers: {
+      "content-type": "application/x-ndjson"
+    }
+  });
 }
