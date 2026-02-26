@@ -69,6 +69,7 @@ use palyra_skills::{
 };
 use palyra_transport_quic::QuicTransportLimits;
 use palyra_vault::{Vault, VaultConfig as VaultConfigOptions, VaultRef};
+use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -206,7 +207,7 @@ struct SkillStatusResponse {
 
 #[derive(Debug, Clone)]
 struct ConsoleSession {
-    session_id: String,
+    session_token_hash_sha256: String,
     csrf_token: String,
     context: gateway::RequestContext,
     issued_at_unix_ms: i64,
@@ -1962,9 +1963,11 @@ async fn console_login_handler(
     })?;
     let expires_at_unix_ms =
         now.saturating_add(i64::try_from(CONSOLE_SESSION_TTL_SECONDS).unwrap_or(i64::MAX) * 1_000);
+    let session_token = mint_console_secret_token();
+    let csrf_token = mint_console_secret_token();
     let session = ConsoleSession {
-        session_id: Ulid::new().to_string(),
-        csrf_token: Ulid::new().to_string(),
+        session_token_hash_sha256: sha256_hex(session_token.as_bytes()),
+        csrf_token: csrf_token.clone(),
         context,
         issued_at_unix_ms: now,
         expires_at_unix_ms,
@@ -1975,28 +1978,26 @@ async fn console_login_handler(
         sessions.retain(|_, existing| existing.expires_at_unix_ms > now);
         if sessions.len() >= CONSOLE_MAX_ACTIVE_SESSIONS {
             let mut oldest: Option<(String, i64)> = None;
-            for (session_id, existing) in sessions.iter() {
+            for (session_hash, existing) in sessions.iter() {
                 if oldest
                     .as_ref()
                     .is_none_or(|(_, issued_at)| existing.issued_at_unix_ms < *issued_at)
                 {
-                    oldest = Some((session_id.clone(), existing.issued_at_unix_ms));
+                    oldest = Some((session_hash.clone(), existing.issued_at_unix_ms));
                 }
             }
-            if let Some((session_id, _)) = oldest {
-                sessions.remove(session_id.as_str());
+            if let Some((session_hash, _)) = oldest {
+                sessions.remove(session_hash.as_str());
             }
         }
-        sessions.insert(session.session_id.clone(), session.clone());
+        sessions.insert(session.session_token_hash_sha256.clone(), session.clone());
     }
 
     let secure_cookie = request_uses_tls(&headers);
     let mut response_headers = HeaderMap::new();
-    response_headers.insert(
-        SET_COOKIE,
-        build_console_session_cookie(session.session_id.as_str(), secure_cookie)?,
-    );
-    Ok((response_headers, Json(build_console_session_response(&session))))
+    response_headers
+        .insert(SET_COOKIE, build_console_session_cookie(session_token.as_str(), secure_cookie)?);
+    Ok((response_headers, Json(build_console_session_response(&session, csrf_token))))
 }
 
 async fn console_logout_handler(
@@ -2006,7 +2007,7 @@ async fn console_logout_handler(
     let session = authorize_console_session(&state, &headers, true)?;
     {
         let mut sessions = lock_console_sessions(&state.console_sessions);
-        sessions.remove(session.session_id.as_str());
+        sessions.remove(session.session_token_hash_sha256.as_str());
     }
     let mut response_headers = HeaderMap::new();
     response_headers.insert(SET_COOKIE, clear_console_session_cookie(request_uses_tls(&headers))?);
@@ -2018,7 +2019,7 @@ async fn console_session_handler(
     headers: HeaderMap,
 ) -> Result<Json<ConsoleSessionResponse>, Response> {
     let session = authorize_console_session(&state, &headers, false)?;
-    Ok(Json(build_console_session_response(&session)))
+    Ok(Json(build_console_session_response(&session, session.csrf_token.clone())))
 }
 
 async fn console_diagnostics_handler(
@@ -2240,12 +2241,15 @@ fn redact_console_diagnostics_value(value: &mut Value, key_context: Option<&str>
     }
 }
 
-fn build_console_session_response(session: &ConsoleSession) -> ConsoleSessionResponse {
+fn build_console_session_response(
+    session: &ConsoleSession,
+    csrf_token: String,
+) -> ConsoleSessionResponse {
     ConsoleSessionResponse {
         principal: session.context.principal.clone(),
         device_id: session.context.device_id.clone(),
         channel: session.context.channel.clone(),
-        csrf_token: session.csrf_token.clone(),
+        csrf_token,
         issued_at_unix_ms: session.issued_at_unix_ms,
         expires_at_unix_ms: session.expires_at_unix_ms,
     }
@@ -2257,11 +2261,12 @@ fn authorize_console_session(
     headers: &HeaderMap,
     require_csrf: bool,
 ) -> Result<ConsoleSession, Response> {
-    let session_id = cookie_value(headers, CONSOLE_SESSION_COOKIE_NAME).ok_or_else(|| {
+    let session_token = cookie_value(headers, CONSOLE_SESSION_COOKIE_NAME).ok_or_else(|| {
         runtime_status_response(tonic::Status::permission_denied(
             "console session cookie is missing",
         ))
     })?;
+    let session_token_hash_sha256 = sha256_hex(session_token.as_bytes());
     let now = unix_ms_now().map_err(|error| {
         runtime_status_response(tonic::Status::internal(format!(
             "failed to read system clock: {error}"
@@ -2269,7 +2274,13 @@ fn authorize_console_session(
     })?;
     let mut sessions = lock_console_sessions(&state.console_sessions);
     sessions.retain(|_, session| session.expires_at_unix_ms > now);
-    let session = sessions.get_mut(session_id.as_str()).ok_or_else(|| {
+    let session_key = find_hashed_secret_map_key(&sessions, session_token_hash_sha256.as_str())
+        .ok_or_else(|| {
+            runtime_status_response(tonic::Status::permission_denied(
+                "console session is missing or expired",
+            ))
+        })?;
+    let session = sessions.get_mut(session_key.as_str()).ok_or_else(|| {
         runtime_status_response(tonic::Status::permission_denied(
             "console session is missing or expired",
         ))
@@ -2285,7 +2296,7 @@ fn authorize_console_session(
                     "missing CSRF token for console request",
                 ))
             })?;
-        if csrf_candidate != session.csrf_token {
+        if !constant_time_eq_bytes(csrf_candidate.as_bytes(), session.csrf_token.as_bytes()) {
             return Err(runtime_status_response(tonic::Status::permission_denied(
                 "CSRF token is invalid",
             )));
@@ -4373,7 +4384,7 @@ async fn console_browser_relay_token_handler(
     {
         let mut relay_tokens = lock_relay_tokens(&state.relay_tokens);
         prune_console_relay_tokens(&mut relay_tokens, issued_at_unix_ms);
-        relay_tokens.insert(relay_token.clone(), record.clone());
+        relay_tokens.insert(token_hash_sha256.clone(), record.clone());
         prune_console_relay_tokens(&mut relay_tokens, issued_at_unix_ms);
     }
 
@@ -4433,10 +4444,18 @@ async fn console_browser_relay_action_handler(
             "failed to read system clock: {error}"
         )))
     })?;
+    let relay_token_hash_sha256 = sha256_hex(relay_token.as_bytes());
     let record = {
         let mut relay_tokens = lock_relay_tokens(&state.relay_tokens);
         prune_console_relay_tokens(&mut relay_tokens, now);
-        relay_tokens.get(relay_token.as_str()).cloned().ok_or_else(|| {
+        let relay_token_key =
+            find_hashed_secret_map_key(&relay_tokens, relay_token_hash_sha256.as_str())
+                .ok_or_else(|| {
+                    runtime_status_response(tonic::Status::permission_denied(
+                        "relay token is missing, invalid, or expired",
+                    ))
+                })?;
+        relay_tokens.get(relay_token_key.as_str()).cloned().ok_or_else(|| {
             runtime_status_response(tonic::Status::permission_denied(
                 "relay token is missing, invalid, or expired",
             ))
@@ -4646,12 +4665,14 @@ fn clamp_console_relay_token_ttl_ms(value: Option<u64>) -> u64 {
         .clamp(CONSOLE_RELAY_TOKEN_MIN_TTL_MS, CONSOLE_RELAY_TOKEN_MAX_TTL_MS)
 }
 
+fn mint_console_secret_token() -> String {
+    let mut token_bytes = [0_u8; 32];
+    OsRng.fill_bytes(&mut token_bytes);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token_bytes)
+}
+
 fn mint_console_relay_token() -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"palyra.console.browser.relay.token.v1");
-    hasher.update(Ulid::new().to_string().as_bytes());
-    hasher.update(Ulid::new().to_string().as_bytes());
-    hex::encode(hasher.finalize())
+    mint_console_secret_token()
 }
 
 fn lock_relay_tokens<'a>(
@@ -4664,6 +4685,30 @@ fn lock_relay_tokens<'a>(
             poisoned.into_inner()
         }
     }
+}
+
+fn constant_time_eq_bytes(left: &[u8], right: &[u8]) -> bool {
+    let max_len = left.len().max(right.len());
+    let mut difference = left.len() ^ right.len();
+    for index in 0..max_len {
+        let left_byte = left.get(index).copied().unwrap_or(0);
+        let right_byte = right.get(index).copied().unwrap_or(0);
+        difference |= usize::from(left_byte ^ right_byte);
+    }
+    difference == 0
+}
+
+fn find_hashed_secret_map_key<T>(
+    values: &HashMap<String, T>,
+    candidate_hash: &str,
+) -> Option<String> {
+    let mut matched: Option<String> = None;
+    for token_hash in values.keys() {
+        if constant_time_eq_bytes(token_hash.as_bytes(), candidate_hash.as_bytes()) {
+            matched = Some(token_hash.clone());
+        }
+    }
+    matched
 }
 
 fn prune_console_relay_tokens(tokens: &mut HashMap<String, ConsoleRelayToken>, now_unix_ms: i64) {
@@ -5259,7 +5304,7 @@ fn dangerous_remote_bind_acknowledged() -> Result<bool> {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use std::{
-        collections::HashMap,
+        collections::{HashMap, HashSet},
         net::IpAddr,
         str::FromStr,
         sync::Mutex,
@@ -5269,13 +5314,18 @@ mod tests {
     use axum::http::StatusCode;
 
     use super::{
+        clamp_console_relay_token_ttl_ms, constant_time_eq_bytes,
         consume_admin_rate_limit_with_now, consume_canvas_rate_limit_with_now,
-        enforce_remote_bind_guard, loopback_grpc_url, redact_console_diagnostics_value,
-        runtime_status_response, sanitize_http_error_message, validate_admin_auth_config,
-        validate_canvas_http_canvas_id, validate_canvas_http_token_query,
-        validate_process_runner_backend_policy, ADMIN_RATE_LIMIT_MAX_IP_BUCKETS,
+        enforce_remote_bind_guard, find_hashed_secret_map_key, loopback_grpc_url,
+        mint_console_relay_token, mint_console_secret_token, prune_console_relay_tokens,
+        redact_console_diagnostics_value, runtime_status_response, sanitize_http_error_message,
+        sha256_hex, validate_admin_auth_config, validate_canvas_http_canvas_id,
+        validate_canvas_http_token_query, validate_process_runner_backend_policy,
+        ConsoleRelayToken, ADMIN_RATE_LIMIT_MAX_IP_BUCKETS,
         ADMIN_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW, CANVAS_HTTP_MAX_TOKEN_BYTES,
         CANVAS_RATE_LIMIT_MAX_IP_BUCKETS, CANVAS_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW,
+        CONSOLE_RELAY_TOKEN_DEFAULT_TTL_MS, CONSOLE_RELAY_TOKEN_MAX_TTL_MS,
+        CONSOLE_RELAY_TOKEN_MIN_TTL_MS,
     };
     use crate::gateway::GatewayAuthConfig;
     use crate::sandbox_runner::{EgressEnforcementMode, SandboxProcessRunnerTier};
@@ -5502,6 +5552,143 @@ mod tests {
         assert!(
             !redacted_error.contains("abc123"),
             "error message should hide secret token values: {redacted_error}"
+        );
+    }
+
+    #[test]
+    fn console_secret_token_is_urlsafe_and_unpadded() {
+        let token = mint_console_secret_token();
+        assert_eq!(
+            token.len(),
+            43,
+            "32 random bytes encoded as base64url without padding should be 43 chars"
+        );
+        assert!(!token.contains('='), "console secret token should never include base64 padding");
+        assert!(
+            token.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+            "console secret token should remain URL-safe base64 alphabet"
+        );
+    }
+
+    #[test]
+    fn console_secret_token_generation_has_no_duplicates_in_small_batch() {
+        let mut seen = HashSet::new();
+        for index in 0..512 {
+            let token = mint_console_secret_token();
+            assert!(
+                seen.insert(token.clone()),
+                "unexpected duplicate console secret token at sample index {index}: {token}"
+            );
+        }
+    }
+
+    #[test]
+    fn console_relay_token_uses_same_secret_token_format() {
+        let token = mint_console_relay_token();
+        assert_eq!(token.len(), 43, "relay token should use 32-byte CSPRNG base64url encoding");
+        assert!(!token.contains('='), "relay token should never include base64 padding");
+    }
+
+    #[test]
+    fn constant_time_comparator_requires_exact_match() {
+        assert!(
+            constant_time_eq_bytes(b"same-value", b"same-value"),
+            "comparator should accept equal byte sequences"
+        );
+        assert!(
+            !constant_time_eq_bytes(b"same-value", b"same-valuf"),
+            "comparator should reject different byte sequences"
+        );
+        assert!(
+            !constant_time_eq_bytes(b"short", b"longer"),
+            "comparator should reject inputs with different lengths"
+        );
+    }
+
+    #[test]
+    fn hashed_secret_lookup_matches_only_exact_hash() {
+        let relay_token = mint_console_relay_token();
+        let relay_hash = sha256_hex(relay_token.as_bytes());
+        let mut tokens = HashMap::new();
+        tokens.insert(
+            relay_hash.clone(),
+            ConsoleRelayToken {
+                token_hash_sha256: relay_hash.clone(),
+                principal: "admin:ops".to_owned(),
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                channel: Some("web".to_owned()),
+                session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                extension_id: "ext-1".to_owned(),
+                issued_at_unix_ms: 1_000,
+                expires_at_unix_ms: 2_000,
+            },
+        );
+
+        let matched = find_hashed_secret_map_key(&tokens, relay_hash.as_str());
+        assert_eq!(matched.as_deref(), Some(relay_hash.as_str()));
+
+        let non_matching = find_hashed_secret_map_key(&tokens, "not-a-valid-sha256-hash");
+        assert!(non_matching.is_none(), "unexpected match for unrelated hash candidate");
+    }
+
+    #[test]
+    fn relay_token_pruning_evicts_expired_entries() {
+        let now = 1_000_i64;
+        let mut tokens = HashMap::new();
+        tokens.insert(
+            "expired".to_owned(),
+            ConsoleRelayToken {
+                token_hash_sha256: "expired".to_owned(),
+                principal: "admin:ops".to_owned(),
+                device_id: "dev".to_owned(),
+                channel: None,
+                session_id: "session-1".to_owned(),
+                extension_id: "ext".to_owned(),
+                issued_at_unix_ms: 500,
+                expires_at_unix_ms: now,
+            },
+        );
+        tokens.insert(
+            "active".to_owned(),
+            ConsoleRelayToken {
+                token_hash_sha256: "active".to_owned(),
+                principal: "admin:ops".to_owned(),
+                device_id: "dev".to_owned(),
+                channel: None,
+                session_id: "session-2".to_owned(),
+                extension_id: "ext".to_owned(),
+                issued_at_unix_ms: 900,
+                expires_at_unix_ms: now + 1,
+            },
+        );
+
+        prune_console_relay_tokens(&mut tokens, now);
+        assert!(
+            !tokens.contains_key("expired"),
+            "expired relay token record should be removed during prune"
+        );
+        assert!(
+            tokens.contains_key("active"),
+            "non-expired relay token record should remain after prune"
+        );
+    }
+
+    #[test]
+    fn relay_token_ttl_clamp_enforces_policy_bounds() {
+        assert_eq!(
+            clamp_console_relay_token_ttl_ms(None),
+            CONSOLE_RELAY_TOKEN_DEFAULT_TTL_MS,
+            "default relay token TTL should apply when caller does not provide value"
+        );
+        assert_eq!(
+            clamp_console_relay_token_ttl_ms(Some(1)),
+            CONSOLE_RELAY_TOKEN_MIN_TTL_MS,
+            "relay token TTL should clamp below minimum bound"
+        );
+        assert_eq!(
+            clamp_console_relay_token_ttl_ms(Some(CONSOLE_RELAY_TOKEN_MAX_TTL_MS + 1)),
+            CONSOLE_RELAY_TOKEN_MAX_TTL_MS,
+            "relay token TTL should clamp above maximum bound"
         );
     }
 
