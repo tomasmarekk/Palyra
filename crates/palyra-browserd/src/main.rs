@@ -1,7 +1,10 @@
+#[cfg(windows)]
+use std::process::Command;
 use std::{
     collections::{HashMap, VecDeque},
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     fs,
+    io::Write,
     net::{IpAddr, SocketAddr, ToSocketAddrs},
     path::{Path, PathBuf},
     sync::Arc,
@@ -81,10 +84,10 @@ const CLEANUP_INTERVAL_MS: u64 = 15_000;
 const AUTHORIZATION_HEADER: &str = "authorization";
 const STATE_DIR_ENV: &str = "PALYRA_BROWSERD_STATE_DIR";
 const STATE_KEY_ENV: &str = "PALYRA_BROWSERD_STATE_ENCRYPTION_KEY";
+const STATE_ROOT_ENV: &str = "PALYRA_STATE_ROOT";
 const CHROMIUM_PATH_ENV: &str = "PALYRA_BROWSERD_CHROMIUM_PATH";
 const CHROMIUM_ENGINE_MODE_ENV: &str = "PALYRA_BROWSERD_ENGINE_MODE";
 const CHROMIUM_STARTUP_TIMEOUT_ENV: &str = "PALYRA_BROWSERD_CHROMIUM_STARTUP_TIMEOUT_MS";
-const DEFAULT_STATE_DIR_NAME: &str = "palyra-browserd-state";
 const DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS: u64 = 20_000;
 const STATE_FILE_MAGIC: &[u8; 4] = b"PBS1";
 const STATE_NONCE_LEN: usize = 12;
@@ -120,6 +123,8 @@ const DOWNLOAD_ALLOWED_MIME_TYPES: &[&str] = &[
 const MAX_RELAY_EXTENSION_ID_BYTES: usize = 96;
 const MAX_RELAY_SELECTION_BYTES: usize = 8 * 1024;
 const MAX_RELAY_PAYLOAD_BYTES: u64 = 32 * 1024;
+#[cfg(windows)]
+const WINDOWS_SYSTEM_SID: &str = "S-1-5-18";
 const ONE_BY_ONE_PNG: &[u8] = &[
     137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0,
     0, 0, 31, 21, 196, 137, 0, 0, 0, 10, 73, 68, 65, 84, 120, 156, 99, 96, 0, 0, 0, 2, 0, 1, 229,
@@ -4955,9 +4960,206 @@ fn build_state_store_from_env() -> Result<Option<PersistedStateStore>> {
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join(DEFAULT_STATE_DIR_NAME));
+        .map(|value| normalize_configured_state_path(value.as_str(), STATE_DIR_ENV))
+        .transpose()?
+        .unwrap_or(default_browserd_state_dir()?);
     Ok(Some(PersistedStateStore::new(state_dir, key)?))
+}
+
+fn normalize_configured_state_path(raw: &str, field: &'static str) -> Result<PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("{field} cannot be empty");
+    }
+    let path = PathBuf::from(trimmed);
+    for component in path.components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            anyhow::bail!("{field} cannot contain '..' path segments");
+        }
+    }
+    Ok(path)
+}
+
+fn default_browserd_state_dir() -> Result<PathBuf> {
+    default_browserd_state_dir_from_env(
+        std::env::var_os(STATE_ROOT_ENV),
+        std::env::var_os("APPDATA"),
+        std::env::var_os("LOCALAPPDATA"),
+        std::env::var_os("XDG_STATE_HOME"),
+        std::env::var_os("HOME"),
+    )
+}
+
+fn default_browserd_state_dir_from_env(
+    state_root: Option<OsString>,
+    appdata: Option<OsString>,
+    local_appdata: Option<OsString>,
+    xdg_state_home: Option<OsString>,
+    home: Option<OsString>,
+) -> Result<PathBuf> {
+    if let Some(state_root_raw) = state_root {
+        let normalized = normalize_configured_state_path(
+            state_root_raw.to_string_lossy().as_ref(),
+            STATE_ROOT_ENV,
+        )?;
+        return Ok(normalized.join("browserd"));
+    }
+    #[cfg(windows)]
+    {
+        let _ = xdg_state_home;
+        let _ = home;
+        if let Some(appdata) = appdata {
+            return Ok(PathBuf::from(appdata).join("Palyra").join("browserd"));
+        }
+        if let Some(local_appdata) = local_appdata {
+            return Ok(PathBuf::from(local_appdata).join("Palyra").join("browserd"));
+        }
+        anyhow::bail!(
+            "failed to resolve browserd state dir: APPDATA/LOCALAPPDATA are unset and {STATE_ROOT_ENV} is not configured"
+        );
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = appdata;
+        let _ = local_appdata;
+        let _ = xdg_state_home;
+        let home = home.ok_or_else(|| {
+            anyhow::anyhow!(
+                "failed to resolve browserd state dir: HOME is unset and {STATE_ROOT_ENV} is not configured"
+            )
+        })?;
+        return Ok(PathBuf::from(home)
+            .join("Library")
+            .join("Application Support")
+            .join("Palyra")
+            .join("browserd"));
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    {
+        let _ = appdata;
+        let _ = local_appdata;
+        if let Some(xdg_state_home) = xdg_state_home {
+            return Ok(PathBuf::from(xdg_state_home).join("palyra").join("browserd"));
+        }
+        let home = home.ok_or_else(|| {
+            anyhow::anyhow!(
+                "failed to resolve browserd state dir: XDG_STATE_HOME/HOME are unset and {STATE_ROOT_ENV} is not configured"
+            )
+        })?;
+        Ok(PathBuf::from(home).join(".local").join("state").join("palyra").join("browserd"))
+    }
+}
+
+fn ensure_owner_only_dir(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)
+        .with_context(|| format!("failed to create browserd state dir '{}'", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).with_context(|| {
+            format!(
+                "failed to enforce owner-only directory permissions on browserd state dir '{}'",
+                path.display()
+            )
+        })?;
+    }
+    #[cfg(windows)]
+    {
+        let owner_sid = current_user_sid()?;
+        harden_windows_path_permissions(path, owner_sid.as_str(), true)?;
+    }
+    Ok(())
+}
+
+fn ensure_owner_only_file(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).with_context(|| {
+            format!(
+                "failed to enforce owner-only permissions on browserd state file '{}'",
+                path.display()
+            )
+        })?;
+    }
+    #[cfg(windows)]
+    {
+        let owner_sid = current_user_sid()?;
+        harden_windows_path_permissions(path, owner_sid.as_str(), false)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn current_user_sid() -> Result<String> {
+    let output = Command::new("whoami")
+        .args(["/user", "/fo", "csv", "/nh"])
+        .output()
+        .context("failed to execute whoami while resolving browserd state ACL SID")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "whoami returned non-success status {} while resolving browserd state ACL SID: stdout={} stderr={}",
+            output.status.code().map_or_else(|| "unknown".to_owned(), |code| code.to_string()),
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim(),
+        );
+    }
+    parse_whoami_sid_csv(String::from_utf8_lossy(&output.stdout).trim())
+        .ok_or_else(|| anyhow::anyhow!("failed to parse user SID from whoami output"))
+}
+
+#[cfg(windows)]
+fn parse_whoami_sid_csv(raw: &str) -> Option<String> {
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    for ch in raw.chars() {
+        match ch {
+            '"' => in_quotes = !in_quotes,
+            ',' if !in_quotes => {
+                fields.push(current.trim().to_owned());
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+    fields.push(current.trim().to_owned());
+    if fields.len() < 2 {
+        return None;
+    }
+    let sid = fields[1].trim().trim_matches('"').to_owned();
+    if sid.starts_with("S-1-") {
+        Some(sid)
+    } else {
+        None
+    }
+}
+
+#[cfg(windows)]
+fn harden_windows_path_permissions(path: &Path, owner_sid: &str, is_directory: bool) -> Result<()> {
+    let grant_mask = if is_directory { "(OI)(CI)F" } else { "F" };
+    let owner_grant = format!("*{owner_sid}:{grant_mask}");
+    let system_grant = format!("*{WINDOWS_SYSTEM_SID}:{grant_mask}");
+    let output = Command::new("icacls")
+        .arg(path)
+        .args(["/inheritance:r", "/grant:r"])
+        .arg(owner_grant)
+        .args(["/grant:r"])
+        .arg(system_grant)
+        .output()
+        .with_context(|| {
+            format!("failed to execute icacls for browserd state path '{}'", path.display())
+        })?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "icacls returned non-success status {} for '{}': stdout={} stderr={}",
+            output.status.code().map_or_else(|| "unknown".to_owned(), |code| code.to_string()),
+            path.display(),
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim(),
+        );
+    }
+    Ok(())
 }
 
 fn decode_state_key(raw: &str) -> Result<[u8; STATE_KEY_LEN]> {
@@ -4976,9 +5178,9 @@ fn decode_state_key(raw: &str) -> Result<[u8; STATE_KEY_LEN]> {
 
 impl PersistedStateStore {
     fn new(root_dir: PathBuf, key: [u8; STATE_KEY_LEN]) -> Result<Self> {
-        fs::create_dir_all(root_dir.as_path()).with_context(|| {
-            format!("failed to create browser state dir '{}'", root_dir.display())
-        })?;
+        ensure_path_is_not_symlink(root_dir.as_path(), "browserd state dir")?;
+        ensure_owner_only_dir(root_dir.as_path())?;
+        ensure_path_is_secure_directory(root_dir.as_path(), "browserd state dir")?;
         let store = Self { root_dir, key };
         store.cleanup_tmp_files()?;
         Ok(store)
@@ -5014,6 +5216,16 @@ impl PersistedStateStore {
                 format!("failed to read browser state entry in '{}'", self.root_dir.display())
             })?;
             let path = entry.path();
+            let file_type = entry.file_type().with_context(|| {
+                format!("failed to inspect browser state entry type for '{}'", path.display())
+            })?;
+            if file_type.is_symlink() {
+                anyhow::bail!(
+                    "browser state dir '{}' contains unexpected symlink entry '{}'",
+                    self.root_dir.display(),
+                    path.display()
+                );
+            }
             if path
                 .extension()
                 .and_then(|value| value.to_str())
@@ -5035,9 +5247,7 @@ impl PersistedStateStore {
         if !path.exists() {
             return Ok(None);
         }
-        let bytes = fs::read(path.as_path()).with_context(|| {
-            format!("failed to read persisted browser state '{}'", path.display())
-        })?;
+        let bytes = read_hardened_file(path.as_path(), "persisted browser state")?;
         let key = derive_state_encryption_key(&self.key, profile_id);
         let decrypted = decrypt_state_blob(&key, bytes.as_slice()).with_context(|| {
             format!("failed to decrypt persisted browser state '{}'", path.display())
@@ -5062,16 +5272,13 @@ impl PersistedStateStore {
             encrypt_state_blob(&key, serialized.as_slice()).context("failed to encrypt state")?;
         let target_path = self.snapshot_path(state_id);
         let tmp_path = self.tmp_snapshot_path(state_id);
-        fs::write(tmp_path.as_path(), encrypted).with_context(|| {
-            format!("failed to write tmp browser state '{}'", tmp_path.display())
-        })?;
-        fs::rename(tmp_path.as_path(), target_path.as_path()).with_context(|| {
-            format!(
-                "failed to atomically move tmp state '{}' into '{}'",
-                tmp_path.display(),
-                target_path.display()
-            )
-        })?;
+        write_hardened_file_atomic(
+            self.root_dir.as_path(),
+            target_path.as_path(),
+            tmp_path.as_path(),
+            encrypted.as_slice(),
+            "persisted browser state",
+        )?;
         Ok(())
     }
 
@@ -5080,6 +5287,7 @@ impl PersistedStateStore {
         if !path.exists() {
             return Ok(());
         }
+        ensure_path_is_not_symlink(path.as_path(), "persisted browser state")?;
         fs::remove_file(path.as_path()).with_context(|| {
             format!("failed to delete persisted browser state '{}'", path.display())
         })?;
@@ -5091,9 +5299,7 @@ impl PersistedStateStore {
         if !path.exists() {
             return Ok(BrowserProfileRegistryDocument::default());
         }
-        let bytes = fs::read(path.as_path()).with_context(|| {
-            format!("failed to read browser profile registry '{}'", path.display())
-        })?;
+        let bytes = read_hardened_file(path.as_path(), "browser profile registry")?;
         let decrypted = decrypt_state_blob(&self.key, bytes.as_slice()).with_context(|| {
             format!("failed to decrypt browser profile registry '{}'", path.display())
         })?;
@@ -5124,18 +5330,131 @@ impl PersistedStateStore {
             Ulid::new(),
             STATE_TMP_EXTENSION
         ));
-        fs::write(tmp_path.as_path(), encrypted).with_context(|| {
-            format!("failed to write tmp browser profile registry '{}'", tmp_path.display())
-        })?;
-        fs::rename(tmp_path.as_path(), target_path.as_path()).with_context(|| {
-            format!(
-                "failed to atomically move tmp browser profile registry '{}' into '{}'",
-                tmp_path.display(),
-                target_path.display()
-            )
-        })?;
+        write_hardened_file_atomic(
+            self.root_dir.as_path(),
+            target_path.as_path(),
+            tmp_path.as_path(),
+            encrypted.as_slice(),
+            "browser profile registry",
+        )?;
         Ok(())
     }
+}
+
+fn ensure_path_is_not_symlink(path: &Path, context: &str) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                anyhow::bail!("{context} '{}' must not be a symlink", path.display());
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!("failed to inspect {context} path '{}' for symlink checks", path.display())
+        }),
+    }
+}
+
+fn ensure_path_is_secure_directory(path: &Path, context: &str) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect {context} '{}'", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        anyhow::bail!("{context} '{}' must not be a symlink", path.display());
+    }
+    if !metadata.is_dir() {
+        anyhow::bail!("{context} '{}' must be a directory", path.display());
+    }
+    Ok(())
+}
+
+fn read_hardened_file(path: &Path, context: &str) -> Result<Vec<u8>> {
+    ensure_path_is_not_symlink(path, context)?;
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .with_context(|| format!("failed to open {context} '{}' for read", path.display()))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .with_context(|| format!("failed to read {context} '{}'", path.display()))?;
+        Ok(bytes)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::read(path).with_context(|| format!("failed to read {context} '{}'", path.display()))
+    }
+}
+
+fn write_hardened_file_atomic(
+    root_dir: &Path,
+    target_path: &Path,
+    tmp_path: &Path,
+    payload: &[u8],
+    context: &str,
+) -> Result<()> {
+    ensure_path_is_secure_directory(root_dir, "browserd state dir")?;
+    ensure_path_is_not_symlink(target_path, context)?;
+    ensure_path_is_not_symlink(tmp_path, "browserd temporary state file")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(tmp_path)
+            .with_context(|| format!("failed to create tmp {context} '{}'", tmp_path.display()))?;
+        file.write_all(payload)
+            .with_context(|| format!("failed to write tmp {context} '{}'", tmp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to fsync tmp {context} '{}'", tmp_path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let mut file =
+            fs::OpenOptions::new().create_new(true).write(true).open(tmp_path).with_context(
+                || format!("failed to create tmp {context} '{}'", tmp_path.display()),
+            )?;
+        file.write_all(payload)
+            .with_context(|| format!("failed to write tmp {context} '{}'", tmp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to fsync tmp {context} '{}'", tmp_path.display()))?;
+    }
+    ensure_owner_only_file(tmp_path)?;
+    fs::rename(tmp_path, target_path).with_context(|| {
+        format!(
+            "failed to atomically move tmp {context} '{}' into '{}'",
+            tmp_path.display(),
+            target_path.display()
+        )
+    })?;
+    ensure_owner_only_file(target_path)?;
+    sync_directory(root_dir)?;
+    Ok(())
+}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let directory = fs::File::open(path)
+            .with_context(|| format!("failed to open directory '{}' for fsync", path.display()))?;
+        directory
+            .sync_all()
+            .with_context(|| format!("failed to fsync directory '{}'", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }
 
 fn encrypt_state_blob(key: &[u8; STATE_KEY_LEN], plaintext: &[u8]) -> Result<Vec<u8>> {
@@ -6241,13 +6560,15 @@ async fn fetch_download_artifact(
 #[cfg(test)]
 mod tests {
     use super::{
-        browser_v1, enforce_non_loopback_bind_auth, navigate_with_guards, parse_daemon_bind_socket,
-        Args, BrowserEngineMode, BrowserRuntimeState, BrowserServiceImpl, PersistedStateStore,
-        CHROMIUM_PATH_ENV, DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS, DEFAULT_GRPC_PORT,
-        MAX_RELAY_PAYLOAD_BYTES, ONE_BY_ONE_PNG, STATE_KEY_LEN,
+        browser_v1, default_browserd_state_dir_from_env, enforce_non_loopback_bind_auth,
+        navigate_with_guards, parse_daemon_bind_socket, Args, BrowserEngineMode,
+        BrowserRuntimeState, BrowserServiceImpl, PersistedStateStore, CHROMIUM_PATH_ENV,
+        DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS, DEFAULT_GRPC_PORT, MAX_RELAY_PAYLOAD_BYTES,
+        ONE_BY_ONE_PNG, STATE_KEY_LEN,
     };
     use crate::proto;
     use crate::proto::palyra::browser::v1::browser_service_server::BrowserService;
+    use std::ffi::OsString;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
@@ -6267,6 +6588,163 @@ mod tests {
             .ok()
             .map(PathBuf::from)
             .or_else(|| headless_chrome::browser::default_executable().ok())
+    }
+
+    #[test]
+    fn default_browserd_state_dir_prefers_state_root_override() {
+        let resolved = default_browserd_state_dir_from_env(
+            Some(OsString::from("state-root")),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("state root override should resolve");
+        assert_eq!(
+            resolved,
+            PathBuf::from("state-root").join("browserd"),
+            "PALYRA_STATE_ROOT should take precedence for browserd defaults"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn default_browserd_state_dir_uses_appdata_on_windows() {
+        let resolved = default_browserd_state_dir_from_env(
+            None,
+            Some(OsString::from(r"C:\Users\Test\AppData\Roaming")),
+            Some(OsString::from(r"C:\Users\Test\AppData\Local")),
+            None,
+            None,
+        )
+        .expect("APPDATA fallback should resolve on windows");
+        assert_eq!(
+            resolved,
+            PathBuf::from(r"C:\Users\Test\AppData\Roaming").join("Palyra").join("browserd")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn default_browserd_state_dir_uses_macos_application_support() {
+        let resolved = default_browserd_state_dir_from_env(
+            None,
+            None,
+            None,
+            None,
+            Some(OsString::from("/Users/tester")),
+        )
+        .expect("HOME fallback should resolve on macOS");
+        assert_eq!(
+            resolved,
+            PathBuf::from("/Users/tester")
+                .join("Library")
+                .join("Application Support")
+                .join("Palyra")
+                .join("browserd")
+        );
+    }
+
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    #[test]
+    fn default_browserd_state_dir_uses_xdg_or_home_on_unix() {
+        let xdg = default_browserd_state_dir_from_env(
+            None,
+            None,
+            None,
+            Some(OsString::from("/tmp/xdg-state")),
+            Some(OsString::from("/home/tester")),
+        )
+        .expect("XDG_STATE_HOME fallback should resolve");
+        assert_eq!(xdg, PathBuf::from("/tmp/xdg-state").join("palyra").join("browserd"));
+
+        let home = default_browserd_state_dir_from_env(
+            None,
+            None,
+            None,
+            None,
+            Some(OsString::from("/home/tester")),
+        )
+        .expect("HOME fallback should resolve");
+        assert_eq!(
+            home,
+            PathBuf::from("/home/tester")
+                .join(".local")
+                .join("state")
+                .join("palyra")
+                .join("browserd")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_state_store_rejects_symlink_root_dir() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir should be available");
+        let actual = temp.path().join("actual-state");
+        let symlink_path = temp.path().join("state-link");
+        std::fs::create_dir_all(actual.as_path()).expect("actual state dir should be created");
+        symlink(actual.as_path(), symlink_path.as_path()).expect("state symlink should be created");
+
+        let error = PersistedStateStore::new(symlink_path, [7_u8; STATE_KEY_LEN])
+            .expect_err("symlink root should fail closed");
+        let message = error.to_string();
+        assert!(
+            message.contains("must not be a symlink"),
+            "error should explain symlink fail-closed policy: {message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_state_store_enforces_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir should be available");
+        let store = PersistedStateStore::new(temp.path().join("state"), [7_u8; STATE_KEY_LEN])
+            .expect("state store should initialize");
+        store
+            .save_profile_registry(&super::BrowserProfileRegistryDocument::default())
+            .expect("registry save should persist encrypted state");
+
+        let root_mode = std::fs::metadata(store.root_dir.as_path())
+            .expect("root metadata should load")
+            .permissions()
+            .mode()
+            & 0o777;
+        let registry_mode =
+            std::fs::metadata(store.root_dir.join(super::PROFILE_REGISTRY_FILE_NAME))
+                .expect("registry metadata should load")
+                .permissions()
+                .mode()
+                & 0o777;
+        assert_eq!(root_mode, 0o700, "state dir should be owner-only on unix");
+        assert_eq!(registry_mode, 0o600, "registry file should be owner-only on unix");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_state_store_rejects_symlink_profile_registry_file() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir should be available");
+        let store = PersistedStateStore::new(temp.path().join("state"), [7_u8; STATE_KEY_LEN])
+            .expect("state store should initialize");
+        let attacker_target = temp.path().join("attacker-profiles.enc");
+        std::fs::write(attacker_target.as_path(), b"attacker-controlled")
+            .expect("attacker target should be written");
+        let registry_path = store.root_dir.join(super::PROFILE_REGISTRY_FILE_NAME);
+        symlink(attacker_target.as_path(), registry_path.as_path())
+            .expect("registry symlink should be created");
+
+        let error =
+            store.load_profile_registry().expect_err("symlinked registry should fail closed");
+        let message = error.to_string();
+        assert!(
+            message.contains("must not be a symlink"),
+            "error should explain symlink rejection: {message}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
