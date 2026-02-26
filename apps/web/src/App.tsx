@@ -4,7 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import { ConsoleApiClient, type ConsoleSession, type JsonValue } from "./consoleApi";
 import { ChatConsolePanel } from "./chat/ChatConsolePanel";
 
-type Section = "chat" | "approvals" | "cron" | "memory" | "skills" | "browser" | "audit";
+type Section = "chat" | "approvals" | "cron" | "memory" | "skills" | "browser" | "audit" | "diagnostics";
 type ThemeMode = "light" | "dark";
 type JsonObject = { [key: string]: JsonValue };
 type CronScheduleType = "cron" | "every" | "at";
@@ -108,6 +108,8 @@ export function App() {
   const [auditFilterContains, setAuditFilterContains] = useState("");
   const [auditFilterPrincipal, setAuditFilterPrincipal] = useState("");
   const [auditEvents, setAuditEvents] = useState<JsonObject[]>([]);
+  const [diagnosticsBusy, setDiagnosticsBusy] = useState(false);
+  const [diagnosticsSnapshot, setDiagnosticsSnapshot] = useState<JsonObject | null>(null);
 
   const [browserBusy, setBrowserBusy] = useState(false);
   const [browserPrincipal, setBrowserPrincipal] = useState("");
@@ -190,6 +192,9 @@ export function App() {
     }
     if (section === "audit") {
       void refreshAudit();
+    }
+    if (section === "diagnostics") {
+      void refreshDiagnostics();
     }
   }, [section, session]);
 
@@ -734,11 +739,24 @@ export function App() {
     }
   }
 
+  async function refreshDiagnostics(): Promise<void> {
+    setDiagnosticsBusy(true);
+    setError(null);
+    try {
+      const response = await api.getDiagnostics();
+      setDiagnosticsSnapshot(response as unknown as JsonObject);
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setDiagnosticsBusy(false);
+    }
+  }
+
   if (booting) {
     return (
       <div className="console-root">
         <main className="console-card console-card--center">
-          <p className="console-label">Palyra / M38</p>
+          <p className="console-label">Palyra / M39</p>
           <h1>Web Console</h1>
           <p>Checking existing session...</p>
         </main>
@@ -750,7 +768,7 @@ export function App() {
     return (
       <div className="console-root">
         <main className="console-card console-card--auth">
-          <p className="console-label">Palyra / M38</p>
+          <p className="console-label">Palyra / M39</p>
           <h1>Operator Console</h1>
           <p className="console-copy">
             Sign in with an `admin:*` principal. Session cookie + CSRF are required for privileged actions.
@@ -811,7 +829,7 @@ export function App() {
     <div className="console-root">
       <header className="console-topbar">
         <div>
-          <p className="console-label">Palyra / M38</p>
+          <p className="console-label">Palyra / M39</p>
           <h1>Web Console v1</h1>
           <p className="console-copy">
             Chat streaming, approvals, cron, memory, skills, browser relay controls, and audit workflows without using CLI.
@@ -842,6 +860,7 @@ export function App() {
         <button type="button" className={section === "skills" ? "is-active" : ""} onClick={() => setSection("skills")}>Skills</button>
         <button type="button" className={section === "browser" ? "is-active" : ""} onClick={() => setSection("browser")}>Browser</button>
         <button type="button" className={section === "audit" ? "is-active" : ""} onClick={() => setSection("audit")}>Audit</button>
+        <button type="button" className={section === "diagnostics" ? "is-active" : ""} onClick={() => setSection("diagnostics")}>Diagnostics</button>
       </nav>
 
       {(error !== null || notice !== null) && (
@@ -1345,6 +1364,43 @@ export function App() {
             </label>
           </div>
           {auditEvents.length === 0 ? <p>No audit events loaded.</p> : <pre>{toPrettyJson(auditEvents, revealSensitiveValues)}</pre>}
+        </main>
+      )}
+
+      {section === "diagnostics" && (
+        <main className="console-card">
+          <header className="console-card__header">
+            <h2>Diagnostics</h2>
+            <button type="button" onClick={() => void refreshDiagnostics()} disabled={diagnosticsBusy}>
+              {diagnosticsBusy ? "Refreshing..." : "Refresh"}
+            </button>
+          </header>
+          {diagnosticsSnapshot === null ? (
+            <p>No diagnostics loaded.</p>
+          ) : (
+            <>
+              <section className="console-subpanel">
+                <h3>Model Provider + Rate Limits</h3>
+                <pre>
+                  {toPrettyJson(
+                    {
+                      model_provider: diagnosticsSnapshot["model_provider"] ?? null,
+                      rate_limits: diagnosticsSnapshot["rate_limits"] ?? null
+                    },
+                    revealSensitiveValues
+                  )}
+                </pre>
+              </section>
+              <section className="console-subpanel">
+                <h3>Auth Profile Health</h3>
+                <pre>{toPrettyJson(diagnosticsSnapshot["auth_profiles"] ?? null, revealSensitiveValues)}</pre>
+              </section>
+              <section className="console-subpanel">
+                <h3>Browserd Status</h3>
+                <pre>{toPrettyJson(diagnosticsSnapshot["browserd"] ?? null, revealSensitiveValues)}</pre>
+              </section>
+            </>
+          )}
         </main>
       )}
     </div>

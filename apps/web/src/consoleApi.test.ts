@@ -116,6 +116,47 @@ describe("ConsoleApiClient", () => {
     expect(headers.get("x-palyra-csrf-token")).toBeNull();
   });
 
+  it("loads diagnostics snapshot without requiring CSRF header", async () => {
+    const calls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
+    const responses = [
+      jsonResponse({
+        principal: "admin:web-console",
+        device_id: "device-1",
+        csrf_token: "csrf-1",
+        issued_at_unix_ms: 100,
+        expires_at_unix_ms: 200
+      }),
+      jsonResponse({
+        generated_at_unix_ms: 123,
+        model_provider: { kind: "openai-compatible" },
+        rate_limits: { admin_api_max_requests_per_window: 30 },
+        auth_profiles: { summary: { total_profiles: 1 } },
+        browserd: { enabled: true }
+      })
+    ];
+    const fetcher: typeof fetch = (input, init) => {
+      calls.push({ input, init });
+      const response = responses.shift();
+      if (response === undefined) {
+        throw new Error("No response queued for fetch mock.");
+      }
+      return Promise.resolve(response);
+    };
+    const client = new ConsoleApiClient("", fetcher);
+
+    await client.login({
+      admin_token: "token",
+      principal: "admin:web-console",
+      device_id: "device-1",
+      channel: "web"
+    });
+    await client.getDiagnostics();
+
+    expect(requestUrl(calls[1]?.input)).toBe("/console/v1/diagnostics");
+    const headers = new Headers(calls[1]?.init?.headers);
+    expect(headers.get("x-palyra-csrf-token")).toBeNull();
+  });
+
   it("lists chat sessions and streams NDJSON responses with CSRF", async () => {
     const calls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
     const responses = [

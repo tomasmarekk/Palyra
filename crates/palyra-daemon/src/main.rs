@@ -56,8 +56,9 @@ use model_provider::{build_model_provider, ModelProviderKind};
 use palyra_auth::{AuthProfileRegistry, HttpOAuthRefreshAdapter, OAuthRefreshAdapter};
 use palyra_common::default_identity_store_root;
 use palyra_common::{
-    build_metadata, health_response, parse_daemon_bind_socket, validate_canonical_id,
-    HealthResponse,
+    build_metadata, health_response, parse_daemon_bind_socket,
+    redaction::{is_sensitive_key as redaction_key_is_sensitive, redact_auth_error, redact_url},
+    validate_canonical_id, HealthResponse,
 };
 use palyra_identity::IdentityManager;
 use palyra_identity::{FilesystemSecretStore, SecretStore};
@@ -1041,6 +1042,7 @@ async fn main() -> Result<()> {
         .route("/console/v1/auth/login", post(console_login_handler))
         .route("/console/v1/auth/logout", post(console_logout_handler))
         .route("/console/v1/auth/session", get(console_session_handler))
+        .route("/console/v1/diagnostics", get(console_diagnostics_handler))
         .route("/console/v1/chat/sessions", get(console_chat_sessions_list_handler))
         .route("/console/v1/chat/sessions", post(console_chat_session_resolve_handler))
         .route(
@@ -2017,6 +2019,225 @@ async fn console_session_handler(
 ) -> Result<Json<ConsoleSessionResponse>, Response> {
     let session = authorize_console_session(&state, &headers, false)?;
     Ok(Json(build_console_session_response(&session)))
+}
+
+async fn console_diagnostics_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, false)?;
+    let status_snapshot = state
+        .runtime
+        .status_snapshot_async(session.context.clone(), state.auth.clone())
+        .await
+        .map_err(runtime_status_response)?;
+    let auth_snapshot = state
+        .auth_runtime
+        .admin_status_snapshot(Arc::clone(&state.runtime))
+        .await
+        .map_err(runtime_status_response)?;
+
+    let mut provider_payload =
+        serde_json::to_value(&status_snapshot.model_provider).map_err(|error| {
+            runtime_status_response(tonic::Status::internal(format!(
+                "failed to serialize diagnostics model provider payload: {error}"
+            )))
+        })?;
+    redact_console_diagnostics_value(&mut provider_payload, None);
+
+    let mut auth_payload = serde_json::to_value(&auth_snapshot).map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "failed to serialize diagnostics auth payload: {error}"
+        )))
+    })?;
+    redact_console_diagnostics_value(&mut auth_payload, None);
+
+    let browser_payload = collect_console_browser_diagnostics(&state).await;
+    let generated_at_unix_ms = unix_ms_now().map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "failed to read system clock: {error}"
+        )))
+    })?;
+
+    Ok(Json(json!({
+        "generated_at_unix_ms": generated_at_unix_ms,
+        "model_provider": provider_payload,
+        "rate_limits": {
+            "admin_api_window_ms": ADMIN_RATE_LIMIT_WINDOW_MS,
+            "admin_api_max_requests_per_window": ADMIN_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW,
+            "canvas_api_window_ms": CANVAS_RATE_LIMIT_WINDOW_MS,
+            "canvas_api_max_requests_per_window": CANVAS_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW,
+            "denied_requests_total": status_snapshot.counters.denied_requests,
+        },
+        "auth_profiles": auth_payload,
+        "browserd": browser_payload,
+    })))
+}
+
+async fn collect_console_browser_diagnostics(state: &AppState) -> Value {
+    let mut failure_messages = Vec::<String>::new();
+    let (relay_failures, relay_failure_messages) =
+        collect_console_browser_relay_failure_metrics(state).await;
+    failure_messages.extend(relay_failure_messages);
+
+    let mut recent_health_failures = 0_u64;
+    let mut health_payload = Value::Null;
+    if state.browser_service_config.enabled {
+        match build_console_browser_client(state).await {
+            Ok(mut client) => {
+                let mut request = TonicRequest::new(browser_v1::BrowserHealthRequest {
+                    v: palyra_common::CANONICAL_PROTOCOL_MAJOR,
+                });
+                match apply_browser_service_auth(state, request.metadata_mut()) {
+                    Ok(()) => match client.health(request).await {
+                        Ok(response) => {
+                            let response = response.into_inner();
+                            health_payload = json!({
+                                "status": response.status,
+                                "uptime_seconds": response.uptime_seconds,
+                                "active_sessions": response.active_sessions,
+                            });
+                        }
+                        Err(error) => {
+                            recent_health_failures = recent_health_failures.saturating_add(1);
+                            failure_messages
+                                .push(sanitize_http_error_message(error.to_string().as_str()));
+                        }
+                    },
+                    Err(response) => {
+                        recent_health_failures = recent_health_failures.saturating_add(1);
+                        failure_messages.push(format!(
+                            "failed to apply browser diagnostics auth metadata (http {})",
+                            response.status()
+                        ));
+                    }
+                }
+            }
+            Err(response) => {
+                recent_health_failures = recent_health_failures.saturating_add(1);
+                failure_messages.push(format!(
+                    "failed to connect browser service for diagnostics (http {})",
+                    response.status()
+                ));
+            }
+        }
+    }
+
+    while failure_messages.len() > 5 {
+        failure_messages.pop();
+    }
+
+    let mut payload = json!({
+        "enabled": state.browser_service_config.enabled,
+        "endpoint": state.browser_service_config.endpoint,
+        "sessions": {
+            "active": health_payload.get("active_sessions").and_then(Value::as_u64).unwrap_or(0),
+        },
+        "budgets": {
+            "connect_timeout_ms": state.browser_service_config.connect_timeout_ms,
+            "request_timeout_ms": state.browser_service_config.request_timeout_ms,
+            "max_screenshot_bytes": state.browser_service_config.max_screenshot_bytes,
+            "max_title_bytes": state.browser_service_config.max_title_bytes,
+        },
+        "health": health_payload,
+        "failures": {
+            "recent_relay_action_failures": relay_failures,
+            "recent_health_failures": recent_health_failures,
+            "samples": failure_messages,
+        },
+    });
+    redact_console_diagnostics_value(&mut payload, None);
+    payload
+}
+
+async fn collect_console_browser_relay_failure_metrics(state: &AppState) -> (u64, Vec<String>) {
+    let snapshot = match state.runtime.recent_journal_snapshot(256).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return (
+                0,
+                vec![sanitize_http_error_message(
+                    format!("failed to query recent browser relay diagnostics: {error}").as_str(),
+                )],
+            );
+        }
+    };
+
+    let mut failures = 0_u64;
+    let mut messages = Vec::<String>::new();
+    for event in snapshot.events {
+        let Ok(payload) = serde_json::from_str::<Value>(event.payload_json.as_str()) else {
+            continue;
+        };
+        if payload.get("event").and_then(Value::as_str) != Some("browser.relay.action") {
+            continue;
+        }
+        let success = payload.get("success").and_then(Value::as_bool).unwrap_or(false);
+        if success {
+            continue;
+        }
+        failures = failures.saturating_add(1);
+        if messages.len() >= 5 {
+            continue;
+        }
+        if let Some(error_message) = payload.get("error").and_then(Value::as_str) {
+            if !error_message.trim().is_empty() {
+                messages.push(sanitize_http_error_message(error_message));
+            }
+        }
+    }
+    (failures, messages)
+}
+
+fn redact_console_diagnostics_value(value: &mut Value, key_context: Option<&str>) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                if redaction_key_is_sensitive(key.as_str()) {
+                    *child = Value::String("<redacted>".to_owned());
+                    continue;
+                }
+                redact_console_diagnostics_value(child, Some(key.as_str()));
+            }
+        }
+        Value::Array(entries) => {
+            for entry in entries {
+                redact_console_diagnostics_value(entry, key_context);
+            }
+        }
+        Value::String(raw) => {
+            if key_context.is_some_and(redaction_key_is_sensitive) {
+                *raw = "<redacted>".to_owned();
+                return;
+            }
+            if key_context
+                .map(|key| {
+                    let lowered = key.to_ascii_lowercase();
+                    lowered.contains("url")
+                        || lowered.contains("uri")
+                        || lowered.contains("endpoint")
+                        || lowered.contains("location")
+                })
+                .unwrap_or(false)
+            {
+                *raw = redact_url(raw.as_str());
+                return;
+            }
+            if key_context
+                .map(|key| {
+                    let lowered = key.to_ascii_lowercase();
+                    lowered.contains("error")
+                        || lowered.contains("reason")
+                        || lowered.contains("message")
+                        || lowered.contains("detail")
+                })
+                .unwrap_or(false)
+            {
+                *raw = redact_auth_error(raw.as_str());
+            }
+        }
+        _ => {}
+    }
 }
 
 fn build_console_session_response(session: &ConsoleSession) -> ConsoleSessionResponse {
@@ -5049,12 +5270,12 @@ mod tests {
 
     use super::{
         consume_admin_rate_limit_with_now, consume_canvas_rate_limit_with_now,
-        enforce_remote_bind_guard, loopback_grpc_url, runtime_status_response,
-        sanitize_http_error_message, validate_admin_auth_config, validate_canvas_http_canvas_id,
-        validate_canvas_http_token_query, validate_process_runner_backend_policy,
-        ADMIN_RATE_LIMIT_MAX_IP_BUCKETS, ADMIN_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW,
-        CANVAS_HTTP_MAX_TOKEN_BYTES, CANVAS_RATE_LIMIT_MAX_IP_BUCKETS,
-        CANVAS_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW,
+        enforce_remote_bind_guard, loopback_grpc_url, redact_console_diagnostics_value,
+        runtime_status_response, sanitize_http_error_message, validate_admin_auth_config,
+        validate_canvas_http_canvas_id, validate_canvas_http_token_query,
+        validate_process_runner_backend_policy, ADMIN_RATE_LIMIT_MAX_IP_BUCKETS,
+        ADMIN_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW, CANVAS_HTTP_MAX_TOKEN_BYTES,
+        CANVAS_RATE_LIMIT_MAX_IP_BUCKETS, CANVAS_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW,
     };
     use crate::gateway::GatewayAuthConfig;
     use crate::sandbox_runner::{EgressEnforcementMode, SandboxProcessRunnerTier};
@@ -5247,6 +5468,40 @@ mod tests {
                 && !sanitized.contains("token=abc123")
                 && !sanitized.contains("sessionid=xyz"),
             "sanitized error text must not leak secret-like values: {sanitized}"
+        );
+    }
+
+    #[test]
+    fn diagnostics_redaction_masks_sensitive_keys_and_query_values() {
+        let mut payload = serde_json::json!({
+            "authorization": "Bearer topsecret",
+            "endpoint": "https://example.test/callback?access_token=alpha&mode=ok",
+            "error_message": "provider failure token=abc123",
+            "nested": {
+                "refresh_token": "beta"
+            }
+        });
+        redact_console_diagnostics_value(&mut payload, None);
+        assert_eq!(
+            payload.get("authorization").and_then(serde_json::Value::as_str),
+            Some("<redacted>")
+        );
+        assert_eq!(
+            payload.pointer("/nested/refresh_token").and_then(serde_json::Value::as_str),
+            Some("<redacted>")
+        );
+        assert_eq!(
+            payload.get("endpoint").and_then(serde_json::Value::as_str),
+            Some("https://example.test/callback?access_token=<redacted>&mode=ok")
+        );
+        let redacted_error = payload
+            .get("error_message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            !redacted_error.contains("abc123"),
+            "error message should hide secret token values: {redacted_error}"
         );
     }
 

@@ -1,8 +1,8 @@
 # Web Console Runtime
 
-This package now hosts the M35 Web Console v1 surface.
+This package now hosts the Web Console runtime through M39 diagnostics/telemetry surfaces.
 
-## What ships in M35
+## What ships in M39
 
 - Cookie-session web console with CSRF-protected mutating workflows.
 - Operator pages for:
@@ -10,7 +10,9 @@ This package now hosts the M35 Web Console v1 surface.
   - cron job create/list/enable-disable/run-now and run log inspection,
   - memory search and scoped purge,
   - skills install/verify/audit/quarantine/enable,
-  - audit event browsing with server-side filters.
+  - browser profile/relay/download controls,
+  - audit event browsing with server-side filters,
+  - diagnostics snapshot surface (model provider status + rate limits, auth profile health, browserd sessions/budgets/failures).
 - Sensitive-value safety baseline in UI:
   - sensitive keys are redacted by default,
   - explicit reveal toggle is required.

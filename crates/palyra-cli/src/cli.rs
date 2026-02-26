@@ -13,6 +13,8 @@ pub enum Command {
     Doctor {
         #[arg(long, default_value_t = false)]
         strict: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     Status {
         #[arg(long)]
@@ -73,6 +75,10 @@ pub enum Command {
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
+    },
+    SupportBundle {
+        #[command(subcommand)]
+        command: SupportBundleCommand,
     },
     Policy {
         #[command(subcommand)]
@@ -762,6 +768,20 @@ pub enum DaemonCommand {
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum SupportBundleCommand {
+    Export {
+        #[arg(long)]
+        output: Option<String>,
+        #[arg(long, default_value_t = 512 * 1024)]
+        max_bytes: usize,
+        #[arg(long, default_value_t = 64)]
+        journal_hash_limit: usize,
+        #[arg(long, default_value_t = 64)]
+        error_limit: usize,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum PolicyCommand {
     Explain {
         #[arg(long, default_value = "user:local")]
@@ -1120,7 +1140,7 @@ mod tests {
         ConfigCommand, CronCommand, CronConcurrencyPolicyArg, CronMisfirePolicyArg,
         CronScheduleTypeArg, DaemonCommand, JournalCheckpointModeArg, MemoryCommand,
         MemoryScopeArg, MemorySourceArg, OnboardingCommand, PatchCommand, PolicyCommand,
-        ProtocolCommand, SecretsCommand, SkillsCommand, SkillsPackageCommand,
+        ProtocolCommand, SecretsCommand, SkillsCommand, SkillsPackageCommand, SupportBundleCommand,
     };
     #[cfg(not(windows))]
     use super::{PairingClientKindArg, PairingCommand, PairingMethodArg};
@@ -1134,7 +1154,13 @@ mod tests {
     #[test]
     fn parse_doctor_strict() {
         let parsed = Cli::parse_from(["palyra", "doctor", "--strict"]);
-        assert_eq!(parsed.command, Command::Doctor { strict: true });
+        assert_eq!(parsed.command, Command::Doctor { strict: true, json: false });
+    }
+
+    #[test]
+    fn parse_doctor_json() {
+        let parsed = Cli::parse_from(["palyra", "doctor", "--json"]);
+        assert_eq!(parsed.command, Command::Doctor { strict: false, json: true });
     }
 
     #[test]
@@ -1932,6 +1958,34 @@ mod tests {
             parsed.command,
             Command::Daemon {
                 command: DaemonCommand::Status { url: Some("http://127.0.0.1:7142".to_owned()) }
+            }
+        );
+    }
+
+    #[test]
+    fn parse_support_bundle_export_with_overrides() {
+        let parsed = Cli::parse_from([
+            "palyra",
+            "support-bundle",
+            "export",
+            "--output",
+            "artifacts/support-bundle.json",
+            "--max-bytes",
+            "131072",
+            "--journal-hash-limit",
+            "48",
+            "--error-limit",
+            "20",
+        ]);
+        assert_eq!(
+            parsed.command,
+            Command::SupportBundle {
+                command: SupportBundleCommand::Export {
+                    output: Some("artifacts/support-bundle.json".to_owned()),
+                    max_bytes: 131_072,
+                    journal_hash_limit: 48,
+                    error_limit: 20,
+                },
             }
         );
     }

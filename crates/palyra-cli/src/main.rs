@@ -58,7 +58,7 @@ use cli::{
     CronCommand, CronConcurrencyPolicyArg, CronMisfirePolicyArg, CronScheduleTypeArg,
     DaemonCommand, JournalCheckpointModeArg, MemoryCommand, MemoryScopeArg, MemorySourceArg,
     OnboardingCommand, PatchCommand, PolicyCommand, ProtocolCommand, SecretsCommand, SkillsCommand,
-    SkillsPackageCommand,
+    SkillsPackageCommand, SupportBundleCommand,
 };
 #[cfg(not(windows))]
 use cli::{PairingClientKindArg, PairingCommand, PairingMethodArg};
@@ -73,6 +73,7 @@ use palyra_common::{
     },
     daemon_config_schema::{is_secret_config_path, redact_secret_config_values, RootFileConfig},
     default_config_search_paths, parse_config_path, parse_daemon_bind_socket,
+    redaction::{is_sensitive_key, redact_auth_error, redact_url, REDACTED},
     validate_canonical_id,
     workspace_patch::{
         apply_workspace_patch, compute_patch_sha256, redact_patch_preview, WorkspacePatchLimits,
@@ -101,7 +102,7 @@ use reqwest::blocking::Client;
 use reqwest::Url;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::runtime::Builder as RuntimeBuilder;
 use tokio::time::sleep;
@@ -128,6 +129,7 @@ const DEFAULT_DAEMON_URL: &str = "http://127.0.0.1:7142";
 const DEFAULT_JOURNAL_DB_PATH: &str = "data/journal.sqlite3";
 const DEFAULT_BROWSER_URL: &str = "http://127.0.0.1:7143";
 const DEFAULT_CHANNEL: &str = "cli";
+const DEFAULT_DEVICE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const REDACTED_CONFIG_VALUE: &str = "<redacted>";
 const SKILLS_LAYOUT_VERSION: u32 = 1;
 const SKILLS_INDEX_FILE_NAME: &str = "installed-index.json";
@@ -149,7 +151,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         CliCommand::Version => print_version(),
-        CliCommand::Doctor { strict } => run_doctor(strict),
+        CliCommand::Doctor { strict, json } => run_doctor(strict, json),
         CliCommand::Status { url, grpc_url, admin, token, principal, device_id, channel } => {
             run_status(url, grpc_url, admin, token, principal, device_id, channel)
         }
@@ -164,6 +166,7 @@ fn main() -> Result<()> {
         CliCommand::Completion { shell } => run_completion(shell),
         CliCommand::Onboarding { command } => run_onboarding(command),
         CliCommand::Daemon { command } => run_daemon(command),
+        CliCommand::SupportBundle { command } => run_support_bundle(command),
         CliCommand::Policy { command } => run_policy(command),
         CliCommand::Protocol { command } => run_protocol(command),
         CliCommand::Config { command } => run_config(command),
@@ -184,8 +187,57 @@ fn print_version() -> Result<()> {
     std::io::stdout().flush().context("stdout flush failed")
 }
 
-fn run_doctor(strict: bool) -> Result<()> {
-    let checks = [
+fn run_doctor(strict: bool, json: bool) -> Result<()> {
+    let checks = build_doctor_checks();
+    let report = build_doctor_report(checks.as_slice())?;
+
+    if json {
+        let encoded = serde_json::to_string_pretty(&report)
+            .context("failed to serialize doctor JSON report")?;
+        println!("{encoded}");
+    } else {
+        for check in &checks {
+            println!("doctor.{}={} required={}", check.key, check.ok, check.required);
+        }
+        println!(
+            "doctor.config path={} exists={} parsed={}",
+            report.config.path.as_deref().unwrap_or("none"),
+            report.config.exists,
+            report.config.parsed
+        );
+        println!(
+            "doctor.identity root={} exists={} writable={}",
+            report.identity.store_root.as_deref().unwrap_or("unavailable"),
+            report.identity.exists,
+            report.identity.writable
+        );
+        println!(
+            "doctor.connectivity daemon_url={} http_ok={} grpc_ok={} admin_ok={}",
+            report.connectivity.daemon_url,
+            report.connectivity.http.ok,
+            report.connectivity.grpc.ok,
+            report.provider_auth.fetched
+        );
+        println!(
+            "doctor.sandbox tier_b_preflight_only={} tier_c_strict_offline={} tier_c_windows_backend_supported={}",
+            report.sandbox.tier_b_egress_allowlists_preflight_only,
+            report.sandbox.tier_c_strict_offline_only,
+            report.sandbox.tier_c_windows_backend_supported
+        );
+    }
+
+    if strict {
+        let failing_required = checks.iter().find(|check| check.required && !check.ok);
+        if let Some(check) = failing_required {
+            anyhow::bail!("strict doctor failed: {}", check.key);
+        }
+    }
+
+    std::io::stdout().flush().context("stdout flush failed")
+}
+
+fn build_doctor_checks() -> Vec<DoctorCheck> {
+    vec![
         DoctorCheck {
             key: "toolchain_ok",
             ok: command_available("rustc", &["--version"]),
@@ -283,20 +335,746 @@ fn run_doctor(strict: bool) -> Result<()> {
             ok: command_available("detekt", &["--version"]),
             required: false,
         },
-    ];
+    ]
+}
 
-    for check in checks {
-        println!("doctor.{}={} required={}", check.key, check.ok, check.required);
+fn build_doctor_report(checks: &[DoctorCheck]) -> Result<DoctorReport> {
+    let generated_at_unix_ms = now_unix_ms_i64()?;
+    let config = collect_doctor_config_snapshot();
+    let identity = collect_doctor_identity_snapshot();
+    let (connectivity, admin_payload, admin_error) = collect_doctor_connectivity_snapshot();
+    let provider_auth = collect_doctor_provider_auth_snapshot(admin_payload, admin_error);
+
+    let required_checks_total = checks.iter().filter(|check| check.required).count();
+    let required_checks_ok = checks.iter().filter(|check| check.required && check.ok).count();
+    let required_checks_failed = required_checks_total.saturating_sub(required_checks_ok);
+
+    Ok(DoctorReport {
+        generated_at_unix_ms,
+        checks: checks.to_vec(),
+        summary: DoctorSummary {
+            required_checks_total,
+            required_checks_ok,
+            required_checks_failed,
+        },
+        config,
+        identity,
+        connectivity,
+        provider_auth,
+        sandbox: DoctorSandboxSnapshot {
+            tier_b_egress_allowlists_preflight_only: process_runner_tier_b_allowlist_config_ok(),
+            tier_c_strict_offline_only: process_runner_tier_c_strict_offline_config_ok(),
+            tier_c_windows_backend_supported: process_runner_tier_c_windows_backend_config_ok(),
+        },
+    })
+}
+
+fn collect_doctor_config_snapshot() -> DoctorConfigSnapshot {
+    let path = doctor_config_path().map(|value| value.to_string_lossy().into_owned());
+    let Some(path) = path else {
+        return DoctorConfigSnapshot { path: None, exists: false, parsed: false, error: None };
+    };
+    let path_ref = PathBuf::from(path.as_str());
+    if !path_ref.exists() {
+        return DoctorConfigSnapshot {
+            path: Some(path),
+            exists: false,
+            parsed: false,
+            error: Some("configured path does not exist".to_owned()),
+        };
     }
 
-    if strict {
-        let failing_required = checks.iter().find(|check| check.required && !check.ok);
-        if let Some(check) = failing_required {
-            anyhow::bail!("strict doctor failed: {}", check.key);
+    match read_doctor_root_file_config() {
+        Ok(Some(_)) => {
+            DoctorConfigSnapshot { path: Some(path), exists: true, parsed: true, error: None }
+        }
+        Ok(None) => DoctorConfigSnapshot {
+            path: Some(path),
+            exists: true,
+            parsed: false,
+            error: Some("config path resolved but no config was loaded".to_owned()),
+        },
+        Err(error) => DoctorConfigSnapshot {
+            path: Some(path),
+            exists: true,
+            parsed: false,
+            error: Some(sanitize_diagnostic_error(error.to_string().as_str())),
+        },
+    }
+}
+
+fn collect_doctor_identity_snapshot() -> DoctorIdentitySnapshot {
+    match default_identity_store_root() {
+        Ok(store_root) => {
+            let exists = store_root.exists();
+            let writable = is_directory_writable(store_root.as_path()).unwrap_or(false);
+            DoctorIdentitySnapshot {
+                store_root: Some(store_root.to_string_lossy().into_owned()),
+                exists,
+                writable,
+                error: None,
+            }
+        }
+        Err(error) => DoctorIdentitySnapshot {
+            store_root: None,
+            exists: false,
+            writable: false,
+            error: Some(sanitize_diagnostic_error(error.to_string().as_str())),
+        },
+    }
+}
+
+fn collect_doctor_connectivity_snapshot(
+) -> (DoctorConnectivitySnapshot, Option<Value>, Option<String>) {
+    let daemon_url = env::var("PALYRA_DAEMON_URL")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_DAEMON_URL.to_owned());
+    let status_url = format!("{}/healthz", daemon_url.trim_end_matches('/'));
+    let grpc_url = resolve_grpc_url(None).unwrap_or_else(|error| format!("unresolved:{error}"));
+
+    let mut http_probe = DoctorConnectivityProbe { ok: false, message: None };
+    let mut grpc_probe = DoctorConnectivityProbe { ok: false, message: None };
+    let mut admin_probe = DoctorConnectivityProbe { ok: false, message: None };
+    let mut admin_payload = None;
+    let mut admin_error = None;
+
+    let http_client = match Client::builder().timeout(Duration::from_secs(2)).build() {
+        Ok(client) => Some(client),
+        Err(error) => {
+            let message = sanitize_diagnostic_error(error.to_string().as_str());
+            http_probe.message = Some(format!("http client init failed: {message}"));
+            grpc_probe.message = Some(format!("http client init failed: {message}"));
+            admin_probe.message = Some(format!("http client init failed: {message}"));
+            None
+        }
+    };
+
+    if let Some(client) = http_client.as_ref() {
+        match fetch_health_with_retry(client, status_url.as_str()) {
+            Ok(_) => {
+                http_probe.ok = true;
+            }
+            Err(error) => {
+                http_probe.message = Some(sanitize_diagnostic_error(error.to_string().as_str()));
+            }
         }
     }
 
+    if grpc_url.starts_with("unresolved:") {
+        grpc_probe.message =
+            Some(sanitize_diagnostic_error(grpc_url.trim_start_matches("unresolved:")));
+    } else {
+        match build_runtime() {
+            Ok(runtime) => match runtime.block_on(fetch_grpc_health_with_retry(grpc_url.clone())) {
+                Ok(_) => {
+                    grpc_probe.ok = true;
+                }
+                Err(error) => {
+                    grpc_probe.message =
+                        Some(sanitize_diagnostic_error(error.to_string().as_str()));
+                }
+            },
+            Err(error) => {
+                grpc_probe.message = Some(sanitize_diagnostic_error(error.to_string().as_str()));
+            }
+        }
+    }
+
+    let admin_token = env::var("PALYRA_ADMIN_TOKEN")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    if let (Some(client), Some(token)) = (http_client.as_ref(), admin_token) {
+        let principal = resolve_doctor_admin_principal();
+        match fetch_admin_status_payload(
+            client,
+            daemon_url.as_str(),
+            Some(token),
+            principal,
+            DEFAULT_DEVICE_ID.to_owned(),
+            None,
+        ) {
+            Ok(mut payload) => {
+                redact_json_value_tree(&mut payload, None);
+                admin_probe.ok = true;
+                admin_payload = Some(payload);
+            }
+            Err(error) => {
+                let message = sanitize_diagnostic_error(error.to_string().as_str());
+                admin_probe.message = Some(message.clone());
+                admin_error = Some(message);
+            }
+        }
+    } else {
+        admin_probe.message = Some("skipped (PALYRA_ADMIN_TOKEN is not set)".to_owned());
+    }
+
+    (
+        DoctorConnectivitySnapshot {
+            daemon_url,
+            grpc_url: if grpc_url.starts_with("unresolved:") {
+                "unavailable".to_owned()
+            } else {
+                grpc_url
+            },
+            http: http_probe,
+            grpc: grpc_probe,
+            admin: admin_probe,
+        },
+        admin_payload,
+        admin_error,
+    )
+}
+
+fn collect_doctor_provider_auth_snapshot(
+    admin_payload: Option<Value>,
+    admin_error: Option<String>,
+) -> DoctorProviderAuthSnapshot {
+    let Some(payload) = admin_payload else {
+        return DoctorProviderAuthSnapshot {
+            fetched: false,
+            model_provider: None,
+            auth_summary: None,
+            error: admin_error,
+        };
+    };
+
+    let mut model_provider = payload.get("model_provider").cloned();
+    if let Some(model_provider_value) = model_provider.as_mut() {
+        redact_json_value_tree(model_provider_value, None);
+    }
+    let mut auth_summary = payload.pointer("/auth/summary").cloned();
+    if let Some(summary) = auth_summary.as_mut() {
+        redact_json_value_tree(summary, None);
+    }
+    DoctorProviderAuthSnapshot { fetched: true, model_provider, auth_summary, error: admin_error }
+}
+
+fn is_directory_writable(path: &Path) -> Result<bool> {
+    fs::create_dir_all(path)
+        .with_context(|| format!("failed to create directory {}", path.display()))?;
+    let probe = path.join(".palyra-write-check.tmp");
+    fs::write(probe.as_path(), "probe")
+        .with_context(|| format!("failed to write probe file {}", probe.display()))?;
+    fs::remove_file(probe.as_path())
+        .with_context(|| format!("failed to remove probe file {}", probe.display()))?;
+    Ok(true)
+}
+
+fn resolve_doctor_admin_principal() -> String {
+    env::var("PALYRA_ADMIN_BOUND_PRINCIPAL")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "admin:doctor".to_owned())
+}
+
+fn sanitize_diagnostic_error(raw: &str) -> String {
+    let mut sanitized = redact_auth_error(raw);
+    sanitized = redact_url_segments_in_text(sanitized.as_str());
+    truncate_utf8_chars(sanitized.as_str(), 1_024)
+}
+
+fn redact_url_segments_in_text(raw: &str) -> String {
+    let mut output = String::with_capacity(raw.len());
+    for (index, token) in raw.split_whitespace().enumerate() {
+        if index > 0 {
+            output.push(' ');
+        }
+        if token.contains("://") {
+            output.push_str(redact_url(token).as_str());
+        } else {
+            output.push_str(token);
+        }
+    }
+    output
+}
+
+fn redact_json_value_tree(value: &mut Value, key_context: Option<&str>) {
+    match value {
+        Value::Object(map) => {
+            for (key, entry) in map {
+                if is_sensitive_key(key.as_str()) {
+                    *entry = Value::String(REDACTED.to_owned());
+                    continue;
+                }
+                redact_json_value_tree(entry, Some(key.as_str()));
+            }
+        }
+        Value::Array(items) => {
+            for entry in items {
+                redact_json_value_tree(entry, key_context);
+            }
+        }
+        Value::String(raw) => {
+            if key_context.is_some_and(is_sensitive_key) {
+                *raw = REDACTED.to_owned();
+                return;
+            }
+            if key_context
+                .map(|key| key_contains_any(key, &["url", "uri", "endpoint", "location"]))
+                .unwrap_or(false)
+            {
+                *raw = redact_url(raw.as_str());
+                return;
+            }
+            if key_context
+                .map(|key| key_contains_any(key, &["error", "reason", "message", "detail"]))
+                .unwrap_or(false)
+            {
+                *raw = sanitize_diagnostic_error(raw.as_str());
+            }
+        }
+        _ => {}
+    }
+}
+
+fn key_contains_any(key: &str, needles: &[&str]) -> bool {
+    let lowered = key.to_ascii_lowercase();
+    needles.iter().any(|needle| lowered.contains(needle))
+}
+
+fn run_support_bundle(command: SupportBundleCommand) -> Result<()> {
+    match command {
+        SupportBundleCommand::Export { output, max_bytes, journal_hash_limit, error_limit } => {
+            run_support_bundle_export(output, max_bytes, journal_hash_limit, error_limit)
+        }
+    }
+}
+
+fn run_support_bundle_export(
+    output: Option<String>,
+    max_bytes: usize,
+    journal_hash_limit: usize,
+    error_limit: usize,
+) -> Result<()> {
+    if max_bytes < 2_048 {
+        anyhow::bail!("support-bundle max-bytes must be at least 2048");
+    }
+    let generated_at_unix_ms = now_unix_ms_i64()?;
+    let checks = build_doctor_checks();
+    let doctor = build_doctor_report(checks.as_slice())?;
+    let output_path = resolve_support_bundle_output_path(output, generated_at_unix_ms);
+
+    let build = build_metadata();
+    let mut bundle = SupportBundle {
+        schema_version: 1,
+        generated_at_unix_ms,
+        build: SupportBundleBuildSnapshot {
+            version: build.version.to_owned(),
+            git_hash: build.git_hash.to_owned(),
+            build_profile: build.build_profile.to_owned(),
+        },
+        platform: SupportBundlePlatformSnapshot {
+            os: std::env::consts::OS.to_owned(),
+            family: std::env::consts::FAMILY.to_owned(),
+            arch: std::env::consts::ARCH.to_owned(),
+        },
+        doctor,
+        config: build_support_bundle_config_snapshot(),
+        diagnostics: build_support_bundle_diagnostics_snapshot(),
+        journal: build_support_bundle_journal_snapshot(journal_hash_limit, error_limit),
+        truncated: false,
+        warnings: Vec::new(),
+    };
+
+    let encoded = encode_support_bundle_with_cap(&mut bundle, max_bytes)?;
+    if let Some(parent) = output_path.parent().filter(|value| !value.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).with_context(|| {
+            format!("failed to create support-bundle directory {}", parent.display())
+        })?;
+    }
+    fs::write(output_path.as_path(), encoded.as_slice())
+        .with_context(|| format!("failed to write support bundle {}", output_path.display()))?;
+    println!(
+        "support_bundle.export path={} bytes={} truncated={} warnings={}",
+        output_path.display(),
+        encoded.len(),
+        bundle.truncated,
+        bundle.warnings.len()
+    );
     std::io::stdout().flush().context("stdout flush failed")
+}
+
+fn resolve_support_bundle_output_path(
+    output: Option<String>,
+    generated_at_unix_ms: i64,
+) -> PathBuf {
+    if let Some(output) = output {
+        let trimmed = output.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    PathBuf::from(format!("support-bundle-{generated_at_unix_ms}.json"))
+}
+
+fn build_support_bundle_config_snapshot() -> SupportBundleConfigSnapshot {
+    let path = doctor_config_path().map(|value| value.to_string_lossy().into_owned());
+    let Some(path_value) = path.clone() else {
+        return SupportBundleConfigSnapshot { path, redacted_document: None, error: None };
+    };
+
+    let path_ref = PathBuf::from(path_value.as_str());
+    if !path_ref.exists() {
+        return SupportBundleConfigSnapshot {
+            path,
+            redacted_document: None,
+            error: Some("config path does not exist".to_owned()),
+        };
+    }
+
+    match load_document_from_existing_path(path_ref.as_path()) {
+        Ok((mut document, _)) => {
+            redact_secret_config_values(&mut document);
+            match serde_json::to_value(document) {
+                Ok(mut payload) => {
+                    redact_json_value_tree(&mut payload, None);
+                    SupportBundleConfigSnapshot {
+                        path,
+                        redacted_document: Some(payload),
+                        error: None,
+                    }
+                }
+                Err(error) => SupportBundleConfigSnapshot {
+                    path,
+                    redacted_document: None,
+                    error: Some(sanitize_diagnostic_error(error.to_string().as_str())),
+                },
+            }
+        }
+        Err(error) => SupportBundleConfigSnapshot {
+            path,
+            redacted_document: None,
+            error: Some(sanitize_diagnostic_error(error.to_string().as_str())),
+        },
+    }
+}
+
+fn build_support_bundle_diagnostics_snapshot() -> SupportBundleDiagnosticsSnapshot {
+    let token = env::var("PALYRA_ADMIN_TOKEN")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let Some(token) = token else {
+        return SupportBundleDiagnosticsSnapshot {
+            admin_status: None,
+            admin_status_error: Some("skipped (PALYRA_ADMIN_TOKEN is not set)".to_owned()),
+        };
+    };
+
+    let client = match Client::builder().timeout(Duration::from_secs(2)).build() {
+        Ok(client) => client,
+        Err(error) => {
+            return SupportBundleDiagnosticsSnapshot {
+                admin_status: None,
+                admin_status_error: Some(sanitize_diagnostic_error(error.to_string().as_str())),
+            };
+        }
+    };
+    let daemon_url = env::var("PALYRA_DAEMON_URL")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_DAEMON_URL.to_owned());
+    let principal = resolve_doctor_admin_principal();
+    match fetch_admin_status_payload(
+        &client,
+        daemon_url.as_str(),
+        Some(token),
+        principal,
+        DEFAULT_DEVICE_ID.to_owned(),
+        None,
+    ) {
+        Ok(mut payload) => {
+            redact_json_value_tree(&mut payload, None);
+            SupportBundleDiagnosticsSnapshot {
+                admin_status: Some(payload),
+                admin_status_error: None,
+            }
+        }
+        Err(error) => SupportBundleDiagnosticsSnapshot {
+            admin_status: None,
+            admin_status_error: Some(sanitize_diagnostic_error(error.to_string().as_str())),
+        },
+    }
+}
+
+fn build_support_bundle_journal_snapshot(
+    journal_hash_limit: usize,
+    error_limit: usize,
+) -> SupportBundleJournalSnapshot {
+    let path = match resolve_daemon_journal_db_path(None) {
+        Ok(path) => path,
+        Err(error) => {
+            return SupportBundleJournalSnapshot {
+                db_path: DEFAULT_JOURNAL_DB_PATH.to_owned(),
+                available: false,
+                hash_chain_enabled: false,
+                latest_hash: None,
+                recent_hashes: Vec::new(),
+                last_errors: Vec::new(),
+                error: Some(sanitize_diagnostic_error(error.to_string().as_str())),
+            };
+        }
+    };
+    let db_path = path.to_string_lossy().into_owned();
+    if !path.exists() || !path.is_file() {
+        return SupportBundleJournalSnapshot {
+            db_path,
+            available: false,
+            hash_chain_enabled: false,
+            latest_hash: None,
+            recent_hashes: Vec::new(),
+            last_errors: Vec::new(),
+            error: Some("journal database is unavailable".to_owned()),
+        };
+    }
+
+    let connection = match Connection::open(path.as_path()) {
+        Ok(connection) => connection,
+        Err(error) => {
+            return SupportBundleJournalSnapshot {
+                db_path,
+                available: false,
+                hash_chain_enabled: false,
+                latest_hash: None,
+                recent_hashes: Vec::new(),
+                last_errors: Vec::new(),
+                error: Some(sanitize_diagnostic_error(error.to_string().as_str())),
+            };
+        }
+    };
+
+    let latest_hash = read_latest_journal_hash(&connection).ok().flatten();
+    let recent_hashes =
+        read_recent_journal_hashes(&connection, journal_hash_limit).unwrap_or_default();
+    let last_errors =
+        read_recent_journal_errors(&connection, error_limit.clamp(1, 256)).unwrap_or_default();
+    SupportBundleJournalSnapshot {
+        db_path,
+        available: true,
+        hash_chain_enabled: latest_hash.is_some(),
+        latest_hash,
+        recent_hashes,
+        last_errors,
+        error: None,
+    }
+}
+
+fn read_latest_journal_hash(connection: &Connection) -> Result<Option<String>> {
+    let latest = connection
+        .query_row(
+            "SELECT hash FROM journal_events WHERE hash IS NOT NULL ORDER BY seq DESC LIMIT 1",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .or_else(|error| {
+            if matches!(error, rusqlite::Error::QueryReturnedNoRows) {
+                Ok(None)
+            } else {
+                Err(error)
+            }
+        })?;
+    Ok(latest)
+}
+
+fn read_recent_journal_hashes(connection: &Connection, limit: usize) -> Result<Vec<String>> {
+    let mut statement = connection.prepare(
+        "SELECT hash FROM journal_events WHERE hash IS NOT NULL ORDER BY seq DESC LIMIT ?1",
+    )?;
+    let rows = statement.query_map([limit.clamp(1, 512) as i64], |row| row.get::<_, String>(0))?;
+    let mut hashes = Vec::new();
+    for row in rows {
+        hashes.push(row?);
+    }
+    Ok(hashes)
+}
+
+fn read_recent_journal_errors(
+    connection: &Connection,
+    limit: usize,
+) -> Result<Vec<SupportBundleJournalErrorRecord>> {
+    let scan_limit = (limit.saturating_mul(24)).clamp(limit, 4096);
+    let mut statement = connection.prepare(
+        "SELECT event_ulid, kind, timestamp_unix_ms, payload_json
+         FROM journal_events
+         ORDER BY seq DESC
+         LIMIT ?1",
+    )?;
+    let mut rows = statement.query([scan_limit as i64])?;
+    let mut records = Vec::new();
+    while let Some(row) = rows.next()? {
+        let payload_json: String = row.get(3)?;
+        let Some(message) = extract_support_bundle_error_message(payload_json.as_str()) else {
+            continue;
+        };
+        records.push(SupportBundleJournalErrorRecord {
+            event_id: row.get(0)?,
+            kind: row.get(1)?,
+            timestamp_unix_ms: row.get(2)?,
+            message,
+        });
+        if records.len() >= limit {
+            break;
+        }
+    }
+    Ok(records)
+}
+
+fn extract_support_bundle_error_message(payload_json: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(payload_json).ok()?;
+    let mut candidates = Vec::<String>::new();
+    collect_error_strings(&value, None, &mut candidates);
+    let first = candidates.into_iter().find(|candidate| !candidate.trim().is_empty())?;
+    let sanitized = sanitize_diagnostic_error(first.as_str());
+    Some(truncate_utf8_chars(sanitized.as_str(), 512))
+}
+
+fn collect_error_strings(value: &Value, key_context: Option<&str>, output: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            for (key, entry) in map {
+                if entry.is_string()
+                    && key_contains_any(key.as_str(), &["error", "reason", "message", "failure"])
+                {
+                    if let Some(raw) = entry.as_str() {
+                        output.push(raw.to_owned());
+                    }
+                }
+                collect_error_strings(entry, Some(key.as_str()), output);
+            }
+        }
+        Value::Array(entries) => {
+            for entry in entries {
+                collect_error_strings(entry, key_context, output);
+            }
+        }
+        Value::String(raw) => {
+            if key_context
+                .map(|key| key_contains_any(key, &["error", "reason", "message", "failure"]))
+                .unwrap_or(false)
+            {
+                output.push(raw.clone());
+            }
+        }
+        _ => {}
+    }
+}
+
+fn encode_support_bundle_with_cap(bundle: &mut SupportBundle, max_bytes: usize) -> Result<Vec<u8>> {
+    let mut value = serde_json::to_value(&*bundle).context("failed to serialize support bundle")?;
+    let mut encoded =
+        serde_json::to_vec_pretty(&value).context("failed to encode support bundle")?;
+    if encoded.len() <= max_bytes {
+        return Ok(encoded);
+    }
+
+    bundle.truncated = true;
+    bundle
+        .warnings
+        .push(format!("support bundle exceeded {} bytes; trimming verbose sections", max_bytes));
+    if let Some(object) = value.as_object_mut() {
+        object.insert("truncated".to_owned(), Value::Bool(true));
+        object.insert(
+            "warnings".to_owned(),
+            serde_json::to_value(bundle.warnings.clone())
+                .context("failed to serialize support bundle warnings")?,
+        );
+        if let Some(config) = object.get_mut("config").and_then(Value::as_object_mut) {
+            config.remove("redacted_document");
+        }
+        if let Some(diagnostics) = object.get_mut("diagnostics").and_then(Value::as_object_mut) {
+            diagnostics.remove("admin_status");
+        }
+    }
+    encoded = serde_json::to_vec_pretty(&value).context("failed to re-encode support bundle")?;
+    if encoded.len() <= max_bytes {
+        return Ok(encoded);
+    }
+
+    trim_support_bundle_journal_for_cap(&mut value, max_bytes)?;
+    encoded =
+        serde_json::to_vec_pretty(&value).context("failed to encode trimmed support bundle")?;
+    if encoded.len() <= max_bytes {
+        return Ok(encoded);
+    }
+
+    if let Some(object) = value.as_object_mut() {
+        if let Some(doctor) = object.get_mut("doctor").and_then(Value::as_object_mut) {
+            doctor.remove("checks");
+        }
+    }
+    encoded =
+        serde_json::to_vec_pretty(&value).context("failed to encode minimally trimmed bundle")?;
+    if encoded.len() <= max_bytes {
+        return Ok(encoded);
+    }
+
+    let minimal = json!({
+        "schema_version": 1,
+        "generated_at_unix_ms": bundle.generated_at_unix_ms,
+        "build": bundle.build,
+        "platform": bundle.platform,
+        "truncated": true,
+        "warnings": bundle.warnings,
+        "error": "bundle exceeded size cap; emitted minimal summary",
+    });
+    let minimal_encoded =
+        serde_json::to_vec_pretty(&minimal).context("failed to encode minimal support bundle")?;
+    if minimal_encoded.len() > max_bytes {
+        anyhow::bail!(
+            "support bundle cap {} bytes is too small for minimal payload ({} bytes)",
+            max_bytes,
+            minimal_encoded.len()
+        );
+    }
+    Ok(minimal_encoded)
+}
+
+fn trim_support_bundle_journal_for_cap(bundle: &mut Value, max_bytes: usize) -> Result<()> {
+    loop {
+        let encoded =
+            serde_json::to_vec_pretty(bundle).context("failed to encode support bundle")?;
+        if encoded.len() <= max_bytes {
+            return Ok(());
+        }
+        let Some(journal) = bundle.get_mut("journal").and_then(Value::as_object_mut) else {
+            return Ok(());
+        };
+        let mut removed = false;
+        if let Some(errors) = journal.get_mut("last_errors").and_then(Value::as_array_mut) {
+            if !errors.is_empty() {
+                errors.pop();
+                removed = true;
+            }
+        }
+        if !removed {
+            if let Some(hashes) = journal.get_mut("recent_hashes").and_then(Value::as_array_mut) {
+                if !hashes.is_empty() {
+                    hashes.pop();
+                    removed = true;
+                }
+            }
+        }
+        if !removed {
+            return Ok(());
+        }
+    }
+}
+
+fn truncate_utf8_chars(raw: &str, max_chars: usize) -> String {
+    if raw.chars().count() <= max_chars {
+        return raw.to_owned();
+    }
+    let mut output = String::new();
+    for ch in raw.chars().take(max_chars) {
+        output.push(ch);
+    }
+    output.push_str("...");
+    output
 }
 
 fn run_status(
@@ -3042,14 +3820,14 @@ fn to_clap_shell(shell: CompletionShell) -> clap_complete::Shell {
     }
 }
 
-fn fetch_admin_status(
+fn fetch_admin_status_payload(
     client: &Client,
     base_url: &str,
     token: Option<String>,
     principal: String,
     device_id: String,
     channel: Option<String>,
-) -> Result<AdminStatusResponse> {
+) -> Result<Value> {
     let status_url = format!("{}/admin/v1/status", base_url.trim_end_matches('/'));
     let mut request = client
         .get(status_url)
@@ -3062,13 +3840,28 @@ fn fetch_admin_status(
         request = request.header("x-palyra-channel", channel);
     }
 
-    request
+    let mut payload: Value = request
         .send()
         .context("failed to call daemon admin status endpoint")?
         .error_for_status()
         .context("daemon admin status endpoint returned non-success status")?
         .json()
-        .context("failed to parse daemon admin status payload")
+        .context("failed to parse daemon admin status payload")?;
+    redact_json_value_tree(&mut payload, None);
+    Ok(payload)
+}
+
+fn fetch_admin_status(
+    client: &Client,
+    base_url: &str,
+    token: Option<String>,
+    principal: String,
+    device_id: String,
+    channel: Option<String>,
+) -> Result<AdminStatusResponse> {
+    let payload =
+        fetch_admin_status_payload(client, base_url, token, principal, device_id, channel)?;
+    serde_json::from_value(payload).context("failed to decode daemon admin status summary payload")
 }
 
 #[derive(Debug, Clone)]
@@ -6979,11 +7772,150 @@ fn fetch_health_with_retry(client: &Client, status_url: &str) -> Result<HealthRe
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Serialize)]
 struct DoctorCheck {
     key: &'static str,
     ok: bool,
     required: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorReport {
+    generated_at_unix_ms: i64,
+    checks: Vec<DoctorCheck>,
+    summary: DoctorSummary,
+    config: DoctorConfigSnapshot,
+    identity: DoctorIdentitySnapshot,
+    connectivity: DoctorConnectivitySnapshot,
+    provider_auth: DoctorProviderAuthSnapshot,
+    sandbox: DoctorSandboxSnapshot,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorSummary {
+    required_checks_total: usize,
+    required_checks_ok: usize,
+    required_checks_failed: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorConfigSnapshot {
+    path: Option<String>,
+    exists: bool,
+    parsed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorIdentitySnapshot {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    store_root: Option<String>,
+    exists: bool,
+    writable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorConnectivityProbe {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorConnectivitySnapshot {
+    daemon_url: String,
+    grpc_url: String,
+    http: DoctorConnectivityProbe,
+    grpc: DoctorConnectivityProbe,
+    admin: DoctorConnectivityProbe,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorProviderAuthSnapshot {
+    fetched: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_provider: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auth_summary: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorSandboxSnapshot {
+    tier_b_egress_allowlists_preflight_only: bool,
+    tier_c_strict_offline_only: bool,
+    tier_c_windows_backend_supported: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct SupportBundle {
+    schema_version: u32,
+    generated_at_unix_ms: i64,
+    build: SupportBundleBuildSnapshot,
+    platform: SupportBundlePlatformSnapshot,
+    doctor: DoctorReport,
+    config: SupportBundleConfigSnapshot,
+    diagnostics: SupportBundleDiagnosticsSnapshot,
+    journal: SupportBundleJournalSnapshot,
+    truncated: bool,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SupportBundleBuildSnapshot {
+    version: String,
+    git_hash: String,
+    build_profile: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SupportBundlePlatformSnapshot {
+    os: String,
+    family: String,
+    arch: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SupportBundleConfigSnapshot {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    redacted_document: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SupportBundleDiagnosticsSnapshot {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    admin_status: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    admin_status_error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SupportBundleJournalSnapshot {
+    db_path: String,
+    available: bool,
+    hash_chain_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latest_hash: Option<String>,
+    recent_hashes: Vec<String>,
+    last_errors: Vec<SupportBundleJournalErrorRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SupportBundleJournalErrorRecord {
+    event_id: String,
+    kind: i32,
+    timestamp_unix_ms: i64,
+    message: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -7842,6 +8774,162 @@ tier = "c"
             .map(|entry| entry.version.clone())
             .collect::<Vec<_>>();
         assert_eq!(current_versions, vec!["1.1.0".to_owned()]);
+    }
+}
+
+#[cfg(test)]
+mod diagnostics_bundle_tests {
+    use super::{
+        encode_support_bundle_with_cap, extract_support_bundle_error_message, DoctorConfigSnapshot,
+        DoctorConnectivityProbe, DoctorConnectivitySnapshot, DoctorIdentitySnapshot,
+        DoctorProviderAuthSnapshot, DoctorReport, DoctorSandboxSnapshot, DoctorSummary,
+        SupportBundle, SupportBundleBuildSnapshot, SupportBundleConfigSnapshot,
+        SupportBundleDiagnosticsSnapshot, SupportBundleJournalErrorRecord,
+        SupportBundleJournalSnapshot,
+    };
+    use serde_json::{json, Value};
+
+    fn minimal_doctor_report() -> DoctorReport {
+        DoctorReport {
+            generated_at_unix_ms: 1_730_000_000_000,
+            checks: Vec::new(),
+            summary: DoctorSummary {
+                required_checks_total: 2,
+                required_checks_ok: 2,
+                required_checks_failed: 0,
+            },
+            config: DoctorConfigSnapshot {
+                path: Some("palyra.toml".to_owned()),
+                exists: true,
+                parsed: true,
+                error: None,
+            },
+            identity: DoctorIdentitySnapshot {
+                store_root: Some("state/identity".to_owned()),
+                exists: true,
+                writable: true,
+                error: None,
+            },
+            connectivity: DoctorConnectivitySnapshot {
+                daemon_url: "http://127.0.0.1:7142".to_owned(),
+                grpc_url: "http://127.0.0.1:7443".to_owned(),
+                http: DoctorConnectivityProbe { ok: true, message: None },
+                grpc: DoctorConnectivityProbe { ok: true, message: None },
+                admin: DoctorConnectivityProbe { ok: true, message: None },
+            },
+            provider_auth: DoctorProviderAuthSnapshot {
+                fetched: true,
+                model_provider: Some(json!({ "kind": "openai-compatible" })),
+                auth_summary: Some(json!({ "total_profiles": 1 })),
+                error: None,
+            },
+            sandbox: DoctorSandboxSnapshot {
+                tier_b_egress_allowlists_preflight_only: true,
+                tier_c_strict_offline_only: true,
+                tier_c_windows_backend_supported: true,
+            },
+        }
+    }
+
+    fn oversized_bundle() -> SupportBundle {
+        let mut hashes = Vec::new();
+        for index in 0..128 {
+            hashes.push(format!("{index:064x}"));
+        }
+        let mut errors = Vec::new();
+        for index in 0..64 {
+            errors.push(SupportBundleJournalErrorRecord {
+                event_id: format!("01ARZ3NDEKTSV4RRFFQ69G{index:05}"),
+                kind: 2,
+                timestamp_unix_ms: 1_730_000_000_000 + index as i64,
+                message: format!("provider error token=<redacted> index={index}"),
+            });
+        }
+
+        SupportBundle {
+            schema_version: 1,
+            generated_at_unix_ms: 1_730_000_000_000,
+            build: SupportBundleBuildSnapshot {
+                version: "0.1.0".to_owned(),
+                git_hash: "deadbeef".to_owned(),
+                build_profile: "debug".to_owned(),
+            },
+            platform: super::SupportBundlePlatformSnapshot {
+                os: "linux".to_owned(),
+                family: "unix".to_owned(),
+                arch: "x86_64".to_owned(),
+            },
+            doctor: minimal_doctor_report(),
+            config: SupportBundleConfigSnapshot {
+                path: Some("palyra.toml".to_owned()),
+                redacted_document: Some(json!({
+                    "model_provider": {
+                        "openai_api_key": "<redacted>",
+                        "openai_api_key_vault_ref": "<redacted>",
+                        "huge": "x".repeat(24_000),
+                    }
+                })),
+                error: None,
+            },
+            diagnostics: SupportBundleDiagnosticsSnapshot {
+                admin_status: Some(json!({
+                    "model_provider": {
+                        "kind": "openai-compatible",
+                        "runtime_metrics": {
+                            "request_count": 12345
+                        }
+                    }
+                })),
+                admin_status_error: None,
+            },
+            journal: SupportBundleJournalSnapshot {
+                db_path: "data/journal.sqlite3".to_owned(),
+                available: true,
+                hash_chain_enabled: true,
+                latest_hash: Some("f".repeat(64)),
+                recent_hashes: hashes,
+                last_errors: errors,
+                error: None,
+            },
+            truncated: false,
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn support_bundle_error_extraction_redacts_secret_values() {
+        let payload = r#"{
+            "event":"auth.refresh.failed",
+            "error":"Bearer topsecret token=abc123",
+            "details":{"reason":"refresh_token=qwerty"}
+        }"#;
+        let extracted = extract_support_bundle_error_message(payload)
+            .expect("error payload should produce a support bundle error message");
+        assert!(
+            extracted.contains("<redacted>"),
+            "extracted error message should include redaction marker: {extracted}"
+        );
+        assert!(
+            !extracted.contains("topsecret")
+                && !extracted.contains("abc123")
+                && !extracted.contains("qwerty"),
+            "extracted error message must not leak raw secret values: {extracted}"
+        );
+    }
+
+    #[test]
+    fn support_bundle_size_cap_trims_payload() {
+        let mut bundle = oversized_bundle();
+        let encoded = encode_support_bundle_with_cap(&mut bundle, 4096)
+            .expect("support bundle should be encoded with cap");
+        assert!(encoded.len() <= 4096, "encoded bundle should fit within size cap");
+        let parsed: Value = serde_json::from_slice(encoded.as_slice())
+            .expect("trimmed support bundle must remain JSON");
+        assert_eq!(
+            parsed.get("truncated").and_then(Value::as_bool),
+            Some(true),
+            "trimmed support bundle should mark truncated=true"
+        );
     }
 }
 

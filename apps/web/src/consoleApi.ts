@@ -98,6 +98,14 @@ export interface ConsoleSession {
   expires_at_unix_ms: number;
 }
 
+export interface ConsoleDiagnosticsSnapshot {
+  generated_at_unix_ms: number;
+  model_provider: JsonValue;
+  rate_limits: JsonValue;
+  auth_profiles: JsonValue;
+  browserd: JsonValue;
+}
+
 interface ErrorEnvelope {
   error?: string;
 }
@@ -152,6 +160,10 @@ export class ConsoleApiClient {
       { csrf: true }
     );
     this.csrfToken = null;
+  }
+
+  async getDiagnostics(): Promise<ConsoleDiagnosticsSnapshot> {
+    return this.request("/console/v1/diagnostics");
   }
 
   async listApprovals(params?: URLSearchParams): Promise<{ approvals: JsonValue[] }> {

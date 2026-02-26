@@ -13,6 +13,7 @@ use thiserror::Error;
 pub mod config_system;
 pub mod daemon_config_schema;
 pub mod process_runner_input;
+pub mod redaction;
 pub mod workspace_patch;
 
 pub const CANONICAL_PROTOCOL_MAJOR: u32 = 1;

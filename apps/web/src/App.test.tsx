@@ -152,6 +152,34 @@ describe("M35 web console app", () => {
     expect(requestBody(request?.body)).toContain("\"extension_id\":\"com.palyra.extension\"");
   });
 
+  it("loads diagnostics snapshot in dedicated diagnostics section", async () => {
+    const fetchMock = createQueuedFetch([
+      jsonResponse({
+        principal: "admin:web-console",
+        device_id: "device-1",
+        channel: "web",
+        csrf_token: "csrf-1",
+        issued_at_unix_ms: 100,
+        expires_at_unix_ms: 300
+      }),
+      jsonResponse({ approvals: [] }),
+      jsonResponse({
+        generated_at_unix_ms: 123,
+        model_provider: { kind: "openai-compatible" },
+        rate_limits: { admin_api_max_requests_per_window: 30 },
+        auth_profiles: { summary: { total_profiles: 1 } },
+        browserd: { enabled: true, sessions: { active: 0 } }
+      })
+    ]);
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Diagnostics" }));
+    expect(await screen.findByRole("heading", { name: "Diagnostics" })).toBeInTheDocument();
+    expect(await screen.findByText("Model Provider + Rate Limits")).toBeInTheDocument();
+    expect(requestUrl(fetchMock.mock.calls[2][0])).toBe("/console/v1/diagnostics");
+  });
+
   it("streams chat transcript with inline approval controls and CSRF decision dispatch", async () => {
     const fetchMock = createQueuedFetch([
       jsonResponse({
