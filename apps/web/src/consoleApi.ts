@@ -252,6 +252,141 @@ export class ConsoleApiClient {
     return this.request(buildPathWithQuery("/console/v1/audit/events", params));
   }
 
+  async listBrowserProfiles(params?: URLSearchParams): Promise<{
+    principal: string;
+    active_profile_id?: string;
+    profiles: JsonValue[];
+  }> {
+    return this.request(buildPathWithQuery("/console/v1/browser/profiles", params));
+  }
+
+  async createBrowserProfile(payload: {
+    principal?: string;
+    name: string;
+    theme_color?: string;
+    persistence_enabled?: boolean;
+    private_profile?: boolean;
+  }): Promise<{ profile: JsonValue }> {
+    return this.request(
+      "/console/v1/browser/profiles/create",
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      },
+      { csrf: true }
+    );
+  }
+
+  async renameBrowserProfile(
+    profileId: string,
+    payload: { principal?: string; name: string }
+  ): Promise<{ profile: JsonValue }> {
+    return this.request(
+      `/console/v1/browser/profiles/${encodeURIComponent(profileId)}/rename`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      },
+      { csrf: true }
+    );
+  }
+
+  async deleteBrowserProfile(
+    profileId: string,
+    payload: { principal?: string } = {}
+  ): Promise<{ deleted: boolean; active_profile_id?: string }> {
+    return this.request(
+      `/console/v1/browser/profiles/${encodeURIComponent(profileId)}/delete`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      },
+      { csrf: true }
+    );
+  }
+
+  async activateBrowserProfile(
+    profileId: string,
+    payload: { principal?: string } = {}
+  ): Promise<{ profile: JsonValue }> {
+    return this.request(
+      `/console/v1/browser/profiles/${encodeURIComponent(profileId)}/activate`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      },
+      { csrf: true }
+    );
+  }
+
+  async listBrowserDownloads(params?: URLSearchParams): Promise<{
+    artifacts: JsonValue[];
+    truncated: boolean;
+    error: string;
+  }> {
+    return this.request(buildPathWithQuery("/console/v1/browser/downloads", params));
+  }
+
+  async mintBrowserRelayToken(payload: {
+    session_id: string;
+    extension_id: string;
+    ttl_ms?: number;
+  }): Promise<{
+    relay_token: string;
+    session_id: string;
+    extension_id: string;
+    issued_at_unix_ms: number;
+    expires_at_unix_ms: number;
+    token_ttl_ms: number;
+    warning: string;
+  }> {
+    return this.request(
+      "/console/v1/browser/relay/tokens",
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      },
+      { csrf: true }
+    );
+  }
+
+  async relayBrowserAction(
+    payload: {
+      relay_token?: string;
+      session_id: string;
+      extension_id: string;
+      action: "open_tab" | "capture_selection" | "send_page_snapshot";
+      open_tab?: { url: string; activate?: boolean; timeout_ms?: number };
+      capture_selection?: { selector: string; max_selection_bytes?: number };
+      page_snapshot?: {
+        include_dom_snapshot?: boolean;
+        include_visible_text?: boolean;
+        max_dom_snapshot_bytes?: number;
+        max_visible_text_bytes?: number;
+      };
+      max_payload_bytes?: number;
+    },
+    relayToken?: string
+  ): Promise<{
+    success: boolean;
+    action: string;
+    error: string;
+    result: JsonValue;
+  }> {
+    const headers = relayToken !== undefined && relayToken.trim().length > 0
+      ? { authorization: `Bearer ${relayToken.trim()}` }
+      : undefined;
+    return this.request(
+      "/console/v1/browser/relay/actions",
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload)
+      },
+      { csrf: false }
+    );
+  }
+
   private async request<T>(
     path: string,
     init: RequestInit = {},

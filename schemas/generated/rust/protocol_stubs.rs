@@ -66,6 +66,8 @@ pub mod palyra_browser_v1 {
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct BrowserHealthResponse;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct BrowserProfile;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct BrowserTab;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct ClickRequest;
@@ -80,9 +82,19 @@ pub mod palyra_browser_v1 {
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct CloseTabResponse;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct CreateProfileRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct CreateProfileResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct CreateSessionRequest;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct CreateSessionResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct DeleteProfileRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct DeleteProfileResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct DownloadArtifact;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct GetPermissionsRequest;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -91,6 +103,14 @@ pub mod palyra_browser_v1 {
     pub struct GetTitleRequest;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct GetTitleResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ListDownloadArtifactsRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ListDownloadArtifactsResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ListProfilesRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ListProfilesResponse;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct ListTabsRequest;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -116,6 +136,24 @@ pub mod palyra_browser_v1 {
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct OpenTabResponse;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct RelayActionRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct RelayActionResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct RelayCaptureSelectionPayload;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct RelayOpenTabPayload;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct RelayPageSnapshotPayload;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct RelayPageSnapshotResult;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct RelaySelectionResult;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct RenameProfileRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct RenameProfileResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct ResetStateRequest;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct ResetStateResponse;
@@ -131,6 +169,10 @@ pub mod palyra_browser_v1 {
     pub struct SessionBudget;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct SessionPermissions;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct SetActiveProfileRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct SetActiveProfileResponse;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct SetPermissionsRequest;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -151,18 +193,25 @@ pub mod palyra_browser_v1 {
         fn Click(&self);
         fn CloseSession(&self);
         fn CloseTab(&self);
+        fn CreateProfile(&self);
         fn CreateSession(&self);
+        fn DeleteProfile(&self);
         fn GetPermissions(&self);
         fn GetTitle(&self);
         fn Health(&self);
+        fn ListDownloadArtifacts(&self);
+        fn ListProfiles(&self);
         fn ListTabs(&self);
         fn Navigate(&self);
         fn NetworkLog(&self);
         fn Observe(&self);
         fn OpenTab(&self);
+        fn RelayAction(&self);
+        fn RenameProfile(&self);
         fn ResetState(&self);
         fn Screenshot(&self);
         fn Scroll(&self);
+        fn SetActiveProfile(&self);
         fn SetPermissions(&self);
         fn SwitchTab(&self);
         fn Type(&self);

@@ -103,6 +103,54 @@ describe("M35 web console app", () => {
     expect(toggleRequest?.method).toBe("POST");
     expect(requestBody(toggleRequest?.body)).toContain("\"enabled\":false");
   });
+
+  it("issues browser relay token from browser section with CSRF protection", async () => {
+    const fetchMock = createQueuedFetch([
+      jsonResponse({
+        principal: "admin:web-console",
+        device_id: "device-1",
+        channel: "web",
+        csrf_token: "csrf-1",
+        issued_at_unix_ms: 100,
+        expires_at_unix_ms: 300
+      }),
+      jsonResponse({ approvals: [] }),
+      jsonResponse({
+        principal: "admin:web-console",
+        active_profile_id: null,
+        profiles: []
+      }),
+      jsonResponse({
+        relay_token: "relay-token-abc",
+        session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        extension_id: "com.palyra.extension",
+        issued_at_unix_ms: 100,
+        expires_at_unix_ms: 500,
+        token_ttl_ms: 300000,
+        warning: "short-lived"
+      })
+    ]);
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Browser" }));
+    expect(await screen.findByRole("heading", { name: "Browser Profiles + Relay" })).toBeInTheDocument();
+
+    fireEvent.change(screen.getByPlaceholderText("01ARZ3NDEKTSV4RRFFQ69G5FAV"), {
+      target: { value: "01ARZ3NDEKTSV4RRFFQ69G5FAV" }
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Mint relay token" }));
+
+    await waitFor(() => {
+      expect(screen.getByText("Browser relay token minted. Keep it private and short-lived.")).toBeInTheDocument();
+    });
+
+    expect(requestUrl(fetchMock.mock.calls[3][0])).toBe("/console/v1/browser/relay/tokens");
+    const request = fetchMock.mock.calls[3][1];
+    const headers = new Headers(request?.headers);
+    expect(headers.get("x-palyra-csrf-token")).toBe("csrf-1");
+    expect(requestBody(request?.body)).toContain("\"extension_id\":\"com.palyra.extension\"");
+  });
 });
 
 function createQueuedFetch(responses: Response[]) {

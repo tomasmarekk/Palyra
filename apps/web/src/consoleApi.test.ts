@@ -75,6 +75,46 @@ describe("ConsoleApiClient", () => {
 
     await expect(client.getSession()).rejects.toThrow("permission denied");
   });
+
+  it("sends relay action with bearer token and no CSRF requirement", async () => {
+    const calls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
+    const fetcher: typeof fetch = (input, init) => {
+      calls.push({ input, init });
+      return Promise.resolve(
+        jsonResponse({
+          success: true,
+          action: "capture_selection",
+          error: "",
+          result: {
+            selection: {
+              selector: "body",
+              selected_text: "ok",
+              truncated: false
+            }
+          }
+        })
+      );
+    };
+    const client = new ConsoleApiClient("", fetcher);
+
+    await client.relayBrowserAction(
+      {
+        session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        extension_id: "com.palyra.extension",
+        action: "capture_selection",
+        capture_selection: {
+          selector: "body",
+          max_selection_bytes: 128
+        }
+      },
+      "relay-token-1"
+    );
+
+    expect(requestUrl(calls[0]?.input)).toBe("/console/v1/browser/relay/actions");
+    const headers = new Headers(calls[0]?.init?.headers);
+    expect(headers.get("authorization")).toBe("Bearer relay-token-1");
+    expect(headers.get("x-palyra-csrf-token")).toBeNull();
+  });
 });
 
 function jsonResponse(payload: unknown, status = 200): Response {
