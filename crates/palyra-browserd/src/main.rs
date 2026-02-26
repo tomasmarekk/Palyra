@@ -1,7 +1,8 @@
 use std::{
     collections::{HashMap, VecDeque},
+    ffi::OsStr,
     fs,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, SocketAddr, ToSocketAddrs},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -11,6 +12,11 @@ use anyhow::{Context, Result};
 use axum::{extract::State, response::IntoResponse, routing::get, Json, Router};
 use base64::Engine as _;
 use clap::Parser;
+use headless_chrome::{
+    browser::tab::RequestPausedDecision,
+    protocol::cdp::{Fetch, Network, Page},
+    Browser as HeadlessBrowser, LaunchOptionsBuilder, Tab as HeadlessTab,
+};
 use palyra_common::{
     build_metadata, health_response, parse_daemon_bind_socket, validate_canonical_id,
     HealthResponse, CANONICAL_PROTOCOL_MAJOR,
@@ -21,6 +27,7 @@ use ring::{
     rand::{SecureRandom, SystemRandom},
 };
 use serde::{Deserialize, Serialize};
+use tempfile::TempDir;
 use tokio::sync::Mutex;
 use tokio::time::{interval, MissedTickBehavior};
 use tokio_stream::wrappers::TcpListenerStream;
@@ -73,7 +80,11 @@ const CLEANUP_INTERVAL_MS: u64 = 15_000;
 const AUTHORIZATION_HEADER: &str = "authorization";
 const STATE_DIR_ENV: &str = "PALYRA_BROWSERD_STATE_DIR";
 const STATE_KEY_ENV: &str = "PALYRA_BROWSERD_STATE_ENCRYPTION_KEY";
+const CHROMIUM_PATH_ENV: &str = "PALYRA_BROWSERD_CHROMIUM_PATH";
+const CHROMIUM_ENGINE_MODE_ENV: &str = "PALYRA_BROWSERD_ENGINE_MODE";
+const CHROMIUM_STARTUP_TIMEOUT_ENV: &str = "PALYRA_BROWSERD_CHROMIUM_STARTUP_TIMEOUT_MS";
 const DEFAULT_STATE_DIR_NAME: &str = "palyra-browserd-state";
+const DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS: u64 = 20_000;
 const STATE_FILE_MAGIC: &[u8; 4] = b"PBS1";
 const STATE_NONCE_LEN: usize = 12;
 const STATE_KEY_LEN: usize = 32;
@@ -85,6 +96,32 @@ const ONE_BY_ONE_PNG: &[u8] = &[
     0, 0, 31, 21, 196, 137, 0, 0, 0, 10, 73, 68, 65, 84, 120, 156, 99, 96, 0, 0, 0, 2, 0, 1, 229,
     39, 212, 138, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
 ];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum BrowserEngineMode {
+    Chromium,
+    Simulated,
+}
+
+impl BrowserEngineMode {
+    fn from_env_or_default(default: Self) -> Self {
+        match std::env::var(CHROMIUM_ENGINE_MODE_ENV)
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("chromium") => Self::Chromium,
+            Some("simulated") => Self::Simulated,
+            _ => default,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ChromiumEngineConfig {
+    executable_path: Option<PathBuf>,
+    startup_timeout: Duration,
+}
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "palyra-browserd", about = "Palyra browser service v1")]
@@ -113,6 +150,12 @@ struct Args {
     max_response_bytes: u64,
     #[arg(long, default_value_t = DEFAULT_MAX_TITLE_BYTES)]
     max_title_bytes: u64,
+    #[arg(long, value_enum, default_value_t = BrowserEngineMode::Chromium)]
+    engine_mode: BrowserEngineMode,
+    #[arg(long)]
+    chromium_path: Option<PathBuf>,
+    #[arg(long, default_value_t = DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS)]
+    chromium_startup_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -446,23 +489,46 @@ struct PersistedStateStore {
     key: [u8; STATE_KEY_LEN],
 }
 
-#[derive(Debug)]
+struct ChromiumSessionState {
+    browser: Arc<HeadlessBrowser>,
+    tabs: HashMap<String, Arc<HeadlessTab>>,
+    _profile_dir: TempDir,
+}
+
 struct BrowserRuntimeState {
     started_at: Instant,
     auth_token: Option<String>,
+    engine_mode: BrowserEngineMode,
+    chromium: ChromiumEngineConfig,
     default_idle_ttl: Duration,
     default_budget: SessionBudget,
     max_sessions: usize,
     state_store: Option<PersistedStateStore>,
     sessions: Mutex<HashMap<String, BrowserSessionRecord>>,
+    chromium_sessions: Mutex<HashMap<String, ChromiumSessionState>>,
 }
 
 impl BrowserRuntimeState {
     fn new(args: &Args) -> Result<Self> {
-        if args.session_idle_ttl_ms == 0 || args.max_sessions == 0 {
-            anyhow::bail!("session_idle_ttl_ms and max_sessions must be greater than zero");
+        if args.session_idle_ttl_ms == 0
+            || args.max_sessions == 0
+            || args.chromium_startup_timeout_ms == 0
+        {
+            anyhow::bail!(
+                "session_idle_ttl_ms, max_sessions, and chromium_startup_timeout_ms must be greater than zero"
+            );
         }
         let state_store = build_state_store_from_env()?;
+        let engine_mode = BrowserEngineMode::from_env_or_default(args.engine_mode);
+        let chromium_path = args
+            .chromium_path
+            .clone()
+            .or_else(|| std::env::var(CHROMIUM_PATH_ENV).ok().map(PathBuf::from));
+        let chromium_startup_timeout = std::env::var(CHROMIUM_STARTUP_TIMEOUT_ENV)
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(args.chromium_startup_timeout_ms);
         Ok(Self {
             started_at: Instant::now(),
             auth_token: args
@@ -477,6 +543,11 @@ impl BrowserRuntimeState {
                         Some(trimmed.to_owned())
                     }
                 }),
+            engine_mode,
+            chromium: ChromiumEngineConfig {
+                executable_path: chromium_path,
+                startup_timeout: Duration::from_millis(chromium_startup_timeout),
+            },
             default_idle_ttl: Duration::from_millis(args.session_idle_ttl_ms),
             default_budget: SessionBudget {
                 max_navigation_timeout_ms: args.max_navigation_timeout_ms.max(1),
@@ -498,6 +569,7 @@ impl BrowserRuntimeState {
             max_sessions: args.max_sessions,
             state_store,
             sessions: Mutex::new(HashMap::new()),
+            chromium_sessions: Mutex::new(HashMap::new()),
         })
     }
 
@@ -729,6 +801,25 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             persist_session_snapshot(store, &record)
                 .map_err(|error| Status::internal(format!("failed to persist state: {error}")))?;
         }
+        if self.runtime.engine_mode == BrowserEngineMode::Chromium {
+            let session_snapshot = {
+                let sessions = self.runtime.sessions.lock().await;
+                sessions.get(session_id.as_str()).cloned()
+            }
+            .ok_or_else(|| Status::internal("session registration race during engine init"))?;
+            if let Err(error) = initialize_chromium_session_runtime(
+                self.runtime.as_ref(),
+                session_id.as_str(),
+                &session_snapshot,
+            )
+            .await
+            {
+                self.runtime.sessions.lock().await.remove(session_id.as_str());
+                return Err(Status::internal(format!(
+                    "failed to initialize chromium session runtime: {error}"
+                )));
+            }
+        }
 
         Ok(Response::new(browser_v1::CreateSessionResponse {
             v: CANONICAL_PROTOCOL_MAJOR,
@@ -766,6 +857,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         let session_id = parse_session_id_from_proto(request.into_inner().session_id)
             .map_err(Status::invalid_argument)?;
         let removed = self.runtime.sessions.lock().await.remove(session_id.as_str());
+        self.runtime.chromium_sessions.lock().await.remove(session_id.as_str());
         if let (Some(store), Some(record)) = (self.runtime.state_store.as_ref(), removed.as_ref()) {
             if record.persistence.enabled {
                 persist_session_snapshot(store, record).map_err(|error| {
@@ -815,16 +907,40 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             )
         };
 
-        let outcome = navigate_with_guards(
-            url.as_str(),
-            timeout_ms,
-            payload.allow_redirects,
-            if payload.max_redirects == 0 { 3 } else { payload.max_redirects },
-            allow_private_targets,
-            max_response_bytes,
-            cookie_header.as_deref(),
-        )
-        .await;
+        let outcome = match self.runtime.engine_mode {
+            BrowserEngineMode::Simulated => {
+                navigate_with_guards(
+                    url.as_str(),
+                    timeout_ms,
+                    payload.allow_redirects,
+                    if payload.max_redirects == 0 { 3 } else { payload.max_redirects },
+                    allow_private_targets,
+                    max_response_bytes,
+                    cookie_header.as_deref(),
+                )
+                .await
+            }
+            BrowserEngineMode::Chromium => {
+                navigate_with_chromium(
+                    self.runtime.as_ref(),
+                    session_id.as_str(),
+                    ChromiumNavigateParams {
+                        raw_url: url.clone(),
+                        timeout_ms,
+                        allow_redirects: payload.allow_redirects,
+                        max_redirects: if payload.max_redirects == 0 {
+                            3
+                        } else {
+                            payload.max_redirects
+                        },
+                        allow_private_targets,
+                        max_response_bytes,
+                        cookie_header: cookie_header.clone(),
+                    },
+                )
+                .await
+            }
+        };
         let network_log_entries = outcome.network_log.clone();
         let cookie_updates = outcome.cookie_updates.clone();
         let mut session_for_persist = None;
@@ -914,39 +1030,59 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
 
         let timeout_ms = payload.timeout_ms.max(1).min(context.budget.max_action_timeout_ms);
         let max_attempts = payload.max_retries.clamp(0, 16).saturating_add(1);
-        let started_at = Instant::now();
         let started_at_unix_ms = current_unix_ms();
-        let mut attempts = 0_u32;
-        let mut success = false;
-        let mut outcome = "selector_not_found".to_owned();
-        let mut error = format!("selector '{}' was not found", selector);
-        loop {
-            attempts = attempts.saturating_add(1);
-            if let Some(tag) = find_matching_html_tag(selector, context.page_body.as_str()) {
-                if is_download_like_tag(tag.as_str()) && !context.allow_downloads {
-                    outcome = "download_blocked".to_owned();
-                    error =
-                        "download-like click is blocked by session policy (allow_downloads=false)"
-                            .to_owned();
-                    break;
+        let (success, outcome, error, attempts) = match self.runtime.engine_mode {
+            BrowserEngineMode::Simulated => {
+                let started_at = Instant::now();
+                let mut attempts = 0_u32;
+                let mut success = false;
+                let mut outcome = "selector_not_found".to_owned();
+                let mut error = format!("selector '{}' was not found", selector);
+                loop {
+                    attempts = attempts.saturating_add(1);
+                    if let Some(tag) = find_matching_html_tag(selector, context.page_body.as_str())
+                    {
+                        if is_download_like_tag(tag.as_str()) && !context.allow_downloads {
+                            outcome = "download_blocked".to_owned();
+                            error =
+                                "download-like click is blocked by session policy (allow_downloads=false)"
+                                    .to_owned();
+                            break;
+                        }
+                        success = true;
+                        outcome = if is_download_like_tag(tag.as_str()) {
+                            "download_allowed".to_owned()
+                        } else {
+                            "clicked".to_owned()
+                        };
+                        error.clear();
+                        break;
+                    }
+                    if attempts >= max_attempts
+                        || started_at.elapsed() >= Duration::from_millis(timeout_ms)
+                    {
+                        break;
+                    }
+                    let remaining_ms =
+                        timeout_ms.saturating_sub(started_at.elapsed().as_millis() as u64);
+                    let sleep_ms = DEFAULT_ACTION_RETRY_INTERVAL_MS.min(remaining_ms.max(1));
+                    tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
                 }
-                success = true;
-                outcome = if is_download_like_tag(tag.as_str()) {
-                    "download_allowed".to_owned()
-                } else {
-                    "clicked".to_owned()
-                };
-                error.clear();
-                break;
+                (success, outcome, error, attempts)
             }
-            if attempts >= max_attempts || started_at.elapsed() >= Duration::from_millis(timeout_ms)
-            {
-                break;
+            BrowserEngineMode::Chromium => {
+                let result = click_with_chromium(
+                    self.runtime.as_ref(),
+                    session_id.as_str(),
+                    selector,
+                    timeout_ms,
+                    max_attempts,
+                    context.allow_downloads,
+                )
+                .await;
+                (result.success, result.outcome, result.error, result.attempts)
             }
-            let remaining_ms = timeout_ms.saturating_sub(started_at.elapsed().as_millis() as u64);
-            let sleep_ms = DEFAULT_ACTION_RETRY_INTERVAL_MS.min(remaining_ms.max(1));
-            tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
-        }
+        };
 
         let (action_log, failure_screenshot_bytes, failure_screenshot_mime_type) =
             finalize_session_action(
@@ -1052,33 +1188,54 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         }
 
         let timeout_ms = payload.timeout_ms.max(1).min(context.budget.max_action_timeout_ms);
-        let started_at = Instant::now();
         let started_at_unix_ms = current_unix_ms();
-        let mut attempts = 0_u32;
-        let mut success = false;
-        let mut outcome = "selector_not_found".to_owned();
-        let mut error = format!("selector '{}' was not found", selector);
-        loop {
-            attempts = attempts.saturating_add(1);
-            if let Some(tag) = find_matching_html_tag(selector, context.page_body.as_str()) {
-                if !is_typable_tag(tag.as_str()) {
-                    outcome = "selector_not_typable".to_owned();
-                    error =
-                        format!("selector '{}' does not target an input-like element", selector);
-                    break;
+        let (success, outcome, error, attempts) = match self.runtime.engine_mode {
+            BrowserEngineMode::Simulated => {
+                let started_at = Instant::now();
+                let mut attempts = 0_u32;
+                let mut success = false;
+                let mut outcome = "selector_not_found".to_owned();
+                let mut error = format!("selector '{}' was not found", selector);
+                loop {
+                    attempts = attempts.saturating_add(1);
+                    if let Some(tag) = find_matching_html_tag(selector, context.page_body.as_str())
+                    {
+                        if !is_typable_tag(tag.as_str()) {
+                            outcome = "selector_not_typable".to_owned();
+                            error = format!(
+                                "selector '{}' does not target an input-like element",
+                                selector
+                            );
+                            break;
+                        }
+                        success = true;
+                        outcome = "typed".to_owned();
+                        error.clear();
+                        break;
+                    }
+                    if started_at.elapsed() >= Duration::from_millis(timeout_ms) {
+                        break;
+                    }
+                    let remaining_ms =
+                        timeout_ms.saturating_sub(started_at.elapsed().as_millis() as u64);
+                    let sleep_ms = DEFAULT_ACTION_RETRY_INTERVAL_MS.min(remaining_ms.max(1));
+                    tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
                 }
-                success = true;
-                outcome = "typed".to_owned();
-                error.clear();
-                break;
+                (success, outcome, error, attempts)
             }
-            if started_at.elapsed() >= Duration::from_millis(timeout_ms) {
-                break;
+            BrowserEngineMode::Chromium => {
+                let result = type_with_chromium(
+                    self.runtime.as_ref(),
+                    session_id.as_str(),
+                    selector,
+                    text.as_str(),
+                    payload.clear_existing,
+                    timeout_ms,
+                )
+                .await;
+                (result.success, result.outcome, result.error, result.attempts)
             }
-            let remaining_ms = timeout_ms.saturating_sub(started_at.elapsed().as_millis() as u64);
-            let sleep_ms = DEFAULT_ACTION_RETRY_INTERVAL_MS.min(remaining_ms.max(1));
-            tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
-        }
+        };
 
         if success {
             let mut sessions = self.runtime.sessions.lock().await;
@@ -1171,19 +1328,34 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             }
         };
 
-        let mut scroll_x = 0_i64;
-        let mut scroll_y = 0_i64;
-        {
-            let mut sessions = self.runtime.sessions.lock().await;
-            if let Some(session) = sessions.get_mut(session_id.as_str()) {
-                if let Some(tab) = session.active_tab_mut() {
-                    tab.scroll_x = tab.scroll_x.saturating_add(payload.delta_x);
-                    tab.scroll_y = tab.scroll_y.saturating_add(payload.delta_y);
-                    scroll_x = tab.scroll_x;
-                    scroll_y = tab.scroll_y;
+        let (success, scroll_x, scroll_y, error) = match self.runtime.engine_mode {
+            BrowserEngineMode::Simulated => {
+                let mut scroll_x = 0_i64;
+                let mut scroll_y = 0_i64;
+                {
+                    let mut sessions = self.runtime.sessions.lock().await;
+                    if let Some(session) = sessions.get_mut(session_id.as_str()) {
+                        if let Some(tab) = session.active_tab_mut() {
+                            tab.scroll_x = tab.scroll_x.saturating_add(payload.delta_x);
+                            tab.scroll_y = tab.scroll_y.saturating_add(payload.delta_y);
+                            scroll_x = tab.scroll_x;
+                            scroll_y = tab.scroll_y;
+                        }
+                    }
                 }
+                (true, scroll_x, scroll_y, String::new())
             }
-        }
+            BrowserEngineMode::Chromium => {
+                let result = scroll_with_chromium(
+                    self.runtime.as_ref(),
+                    session_id.as_str(),
+                    payload.delta_x,
+                    payload.delta_y,
+                )
+                .await;
+                (result.success, result.scroll_x, result.scroll_y, result.error)
+            }
+        };
 
         let (action_log, failure_screenshot_bytes, failure_screenshot_mime_type) =
             finalize_session_action(
@@ -1192,9 +1364,9 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                 FinalizeActionRequest {
                     action_name: "scroll",
                     selector: "",
-                    success: true,
-                    outcome: "scrolled",
-                    error: "",
+                    success,
+                    outcome: if success { "scrolled" } else { "scroll_failed" },
+                    error: error.as_str(),
                     started_at_unix_ms: current_unix_ms(),
                     attempts: 1,
                     capture_failure_screenshot: payload.capture_failure_screenshot,
@@ -1211,10 +1383,10 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
 
         Ok(Response::new(browser_v1::ScrollResponse {
             v: CANONICAL_PROTOCOL_MAJOR,
-            success: true,
+            success,
             scroll_x,
             scroll_y,
-            error: String::new(),
+            error,
             action_log,
             failure_screenshot_bytes,
             failure_screenshot_mime_type,
@@ -1261,39 +1433,66 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
 
         let timeout_ms = payload.timeout_ms.max(1).min(context.budget.max_action_timeout_ms);
         let poll_interval_ms = payload.poll_interval_ms.clamp(25, 1_000);
-        let started = Instant::now();
         let started_at_unix_ms = current_unix_ms();
-        let mut attempts = 0_u32;
-        let mut matched_selector = String::new();
-        let mut matched_text = String::new();
-        let mut success = false;
-        loop {
-            attempts = attempts.saturating_add(1);
-            if !selector.is_empty()
-                && find_matching_html_tag(selector.as_str(), context.page_body.as_str()).is_some()
-            {
-                matched_selector = selector.clone();
-                success = true;
-                break;
-            }
-            if !text.trim().is_empty() && context.page_body.contains(text.as_str()) {
-                matched_text = text.clone();
-                success = true;
-                break;
-            }
-            if started.elapsed() >= Duration::from_millis(timeout_ms) {
-                break;
-            }
-            let remaining_ms = timeout_ms.saturating_sub(started.elapsed().as_millis() as u64);
-            let sleep_ms = poll_interval_ms.min(remaining_ms.max(1));
-            tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
-        }
-        let waited_ms = started.elapsed().as_millis() as u64;
-        let error = if success {
-            String::new()
-        } else {
-            "wait_for condition was not satisfied before timeout".to_owned()
-        };
+        let (success, matched_selector, matched_text, attempts, waited_ms, error) =
+            match self.runtime.engine_mode {
+                BrowserEngineMode::Simulated => {
+                    let started = Instant::now();
+                    let mut attempts = 0_u32;
+                    let mut matched_selector = String::new();
+                    let mut matched_text = String::new();
+                    let mut success = false;
+                    loop {
+                        attempts = attempts.saturating_add(1);
+                        if !selector.is_empty()
+                            && find_matching_html_tag(selector.as_str(), context.page_body.as_str())
+                                .is_some()
+                        {
+                            matched_selector = selector.clone();
+                            success = true;
+                            break;
+                        }
+                        if !text.trim().is_empty() && context.page_body.contains(text.as_str()) {
+                            matched_text = text.clone();
+                            success = true;
+                            break;
+                        }
+                        if started.elapsed() >= Duration::from_millis(timeout_ms) {
+                            break;
+                        }
+                        let remaining_ms =
+                            timeout_ms.saturating_sub(started.elapsed().as_millis() as u64);
+                        let sleep_ms = poll_interval_ms.min(remaining_ms.max(1));
+                        tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+                    }
+                    let waited_ms = started.elapsed().as_millis() as u64;
+                    let error = if success {
+                        String::new()
+                    } else {
+                        "wait_for condition was not satisfied before timeout".to_owned()
+                    };
+                    (success, matched_selector, matched_text, attempts, waited_ms, error)
+                }
+                BrowserEngineMode::Chromium => {
+                    let result = wait_for_with_chromium(
+                        self.runtime.as_ref(),
+                        session_id.as_str(),
+                        selector.as_str(),
+                        text.as_str(),
+                        timeout_ms,
+                        poll_interval_ms,
+                    )
+                    .await;
+                    (
+                        result.success,
+                        result.matched_selector,
+                        result.matched_text,
+                        result.attempts,
+                        result.waited_ms,
+                        result.error,
+                    )
+                }
+            };
 
         let (action_log, failure_screenshot_bytes, failure_screenshot_mime_type) =
             finalize_session_action(
@@ -1344,28 +1543,55 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             .ok()
             .filter(|value| *value > 0)
             .unwrap_or(self.runtime.default_budget.max_title_bytes as usize);
-        let mut sessions = self.runtime.sessions.lock().await;
-        let Some(session) = sessions.get_mut(session_id.as_str()) else {
-            return Ok(Response::new(browser_v1::GetTitleResponse {
-                v: CANONICAL_PROTOCOL_MAJOR,
-                success: false,
-                title: String::new(),
-                error: "session_not_found".to_owned(),
-            }));
+        let active_tab_id = {
+            let mut sessions = self.runtime.sessions.lock().await;
+            let Some(session) = sessions.get_mut(session_id.as_str()) else {
+                return Ok(Response::new(browser_v1::GetTitleResponse {
+                    v: CANONICAL_PROTOCOL_MAJOR,
+                    success: false,
+                    title: String::new(),
+                    error: "session_not_found".to_owned(),
+                }));
+            };
+            session.last_active = Instant::now();
+            let Some(tab) = session.active_tab() else {
+                return Ok(Response::new(browser_v1::GetTitleResponse {
+                    v: CANONICAL_PROTOCOL_MAJOR,
+                    success: false,
+                    title: String::new(),
+                    error: "active_tab_not_found".to_owned(),
+                }));
+            };
+            tab.tab_id.clone()
         };
-        session.last_active = Instant::now();
-        let Some(tab) = session.active_tab() else {
-            return Ok(Response::new(browser_v1::GetTitleResponse {
-                v: CANONICAL_PROTOCOL_MAJOR,
-                success: false,
-                title: String::new(),
-                error: "active_tab_not_found".to_owned(),
-            }));
+        if self.runtime.engine_mode == BrowserEngineMode::Chromium {
+            if let Ok(title) = chromium_get_title(
+                self.runtime.as_ref(),
+                session_id.as_str(),
+                active_tab_id.as_str(),
+            )
+            .await
+            {
+                let mut sessions = self.runtime.sessions.lock().await;
+                if let Some(session) = sessions.get_mut(session_id.as_str()) {
+                    if let Some(tab) = session.tabs.get_mut(active_tab_id.as_str()) {
+                        tab.last_title = title;
+                    }
+                }
+            }
+        }
+        let title = {
+            let sessions = self.runtime.sessions.lock().await;
+            sessions
+                .get(session_id.as_str())
+                .and_then(|session| session.tabs.get(active_tab_id.as_str()))
+                .map(|tab| tab.last_title.clone())
+                .unwrap_or_default()
         };
         Ok(Response::new(browser_v1::GetTitleResponse {
             v: CANONICAL_PROTOCOL_MAJOR,
             success: true,
-            title: truncate_utf8_bytes(tab.last_title.as_str(), max_title_bytes),
+            title: truncate_utf8_bytes(title.as_str(), max_title_bytes),
             error: String::new(),
         }))
     }
@@ -1381,19 +1607,37 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         if !payload.format.trim().is_empty() && !payload.format.trim().eq_ignore_ascii_case("png") {
             return Err(Status::invalid_argument("screenshot format must be empty or 'png'"));
         }
-        let mut sessions = self.runtime.sessions.lock().await;
-        let Some(session) = sessions.get_mut(session_id.as_str()) else {
-            return Ok(Response::new(browser_v1::ScreenshotResponse {
-                v: CANONICAL_PROTOCOL_MAJOR,
-                success: false,
-                image_bytes: Vec::new(),
-                mime_type: "image/png".to_owned(),
-                error: "session_not_found".to_owned(),
-            }));
+        let max_bytes = {
+            let mut sessions = self.runtime.sessions.lock().await;
+            let Some(session) = sessions.get_mut(session_id.as_str()) else {
+                return Ok(Response::new(browser_v1::ScreenshotResponse {
+                    v: CANONICAL_PROTOCOL_MAJOR,
+                    success: false,
+                    image_bytes: Vec::new(),
+                    mime_type: "image/png".to_owned(),
+                    error: "session_not_found".to_owned(),
+                }));
+            };
+            session.last_active = Instant::now();
+            payload.max_bytes.max(1).min(session.budget.max_screenshot_bytes)
         };
-        session.last_active = Instant::now();
-        let max_bytes = payload.max_bytes.max(1).min(session.budget.max_screenshot_bytes);
-        if (ONE_BY_ONE_PNG.len() as u64) > max_bytes {
+        let image_bytes = if self.runtime.engine_mode == BrowserEngineMode::Chromium {
+            match chromium_screenshot(self.runtime.as_ref(), session_id.as_str()).await {
+                Ok(value) => value,
+                Err(error) => {
+                    return Ok(Response::new(browser_v1::ScreenshotResponse {
+                        v: CANONICAL_PROTOCOL_MAJOR,
+                        success: false,
+                        image_bytes: Vec::new(),
+                        mime_type: "image/png".to_owned(),
+                        error,
+                    }));
+                }
+            }
+        } else {
+            ONE_BY_ONE_PNG.to_vec()
+        };
+        if (image_bytes.len() as u64) > max_bytes {
             return Ok(Response::new(browser_v1::ScreenshotResponse {
                 v: CANONICAL_PROTOCOL_MAJOR,
                 success: false,
@@ -1401,14 +1645,14 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                 mime_type: "image/png".to_owned(),
                 error: format!(
                     "screenshot output exceeds max_bytes ({} > {max_bytes})",
-                    ONE_BY_ONE_PNG.len()
+                    image_bytes.len()
                 ),
             }));
         }
         Ok(Response::new(browser_v1::ScreenshotResponse {
             v: CANONICAL_PROTOCOL_MAJOR,
             success: true,
-            image_bytes: ONE_BY_ONE_PNG.to_vec(),
+            image_bytes,
             mime_type: "image/png".to_owned(),
             error: String::new(),
         }))
@@ -1440,37 +1684,107 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         };
         let include_visible_text = payload.include_visible_text;
 
-        let mut sessions = self.runtime.sessions.lock().await;
-        let Some(session) = sessions.get_mut(session_id.as_str()) else {
-            return Ok(Response::new(browser_v1::ObserveResponse {
-                v: CANONICAL_PROTOCOL_MAJOR,
-                success: false,
-                dom_snapshot: String::new(),
-                accessibility_tree: String::new(),
-                visible_text: String::new(),
-                dom_truncated: false,
-                accessibility_tree_truncated: false,
-                visible_text_truncated: false,
-                page_url: String::new(),
-                error: "session_not_found".to_owned(),
-            }));
+        let (
+            active_tab_id,
+            max_dom_snapshot_bytes,
+            max_accessibility_tree_bytes,
+            max_visible_text_bytes,
+        ) = {
+            let mut sessions = self.runtime.sessions.lock().await;
+            let Some(session) = sessions.get_mut(session_id.as_str()) else {
+                return Ok(Response::new(browser_v1::ObserveResponse {
+                    v: CANONICAL_PROTOCOL_MAJOR,
+                    success: false,
+                    dom_snapshot: String::new(),
+                    accessibility_tree: String::new(),
+                    visible_text: String::new(),
+                    dom_truncated: false,
+                    accessibility_tree_truncated: false,
+                    visible_text_truncated: false,
+                    page_url: String::new(),
+                    error: "session_not_found".to_owned(),
+                }));
+            };
+            session.last_active = Instant::now();
+            let Some(tab) = session.active_tab() else {
+                return Ok(Response::new(browser_v1::ObserveResponse {
+                    v: CANONICAL_PROTOCOL_MAJOR,
+                    success: false,
+                    dom_snapshot: String::new(),
+                    accessibility_tree: String::new(),
+                    visible_text: String::new(),
+                    dom_truncated: false,
+                    accessibility_tree_truncated: false,
+                    visible_text_truncated: false,
+                    page_url: String::new(),
+                    error: "active_tab_not_found".to_owned(),
+                }));
+            };
+            (
+                tab.tab_id.clone(),
+                payload.max_dom_snapshot_bytes.max(1).min(session.budget.max_observe_snapshot_bytes)
+                    as usize,
+                payload
+                    .max_accessibility_tree_bytes
+                    .max(1)
+                    .min(session.budget.max_observe_snapshot_bytes) as usize,
+                payload.max_visible_text_bytes.max(1).min(session.budget.max_visible_text_bytes)
+                    as usize,
+            )
         };
-        session.last_active = Instant::now();
-        let Some(tab) = session.active_tab() else {
-            return Ok(Response::new(browser_v1::ObserveResponse {
-                v: CANONICAL_PROTOCOL_MAJOR,
-                success: false,
-                dom_snapshot: String::new(),
-                accessibility_tree: String::new(),
-                visible_text: String::new(),
-                dom_truncated: false,
-                accessibility_tree_truncated: false,
-                visible_text_truncated: false,
-                page_url: String::new(),
-                error: "active_tab_not_found".to_owned(),
-            }));
+
+        if self.runtime.engine_mode == BrowserEngineMode::Chromium {
+            if let Ok(snapshot) = chromium_observe_snapshot(
+                self.runtime.as_ref(),
+                session_id.as_str(),
+                active_tab_id.as_str(),
+            )
+            .await
+            {
+                let mut sessions = self.runtime.sessions.lock().await;
+                if let Some(session) = sessions.get_mut(session_id.as_str()) {
+                    if let Some(tab) = session.tabs.get_mut(active_tab_id.as_str()) {
+                        tab.last_page_body = snapshot.page_body;
+                        tab.last_title = snapshot.title;
+                        tab.last_url = Some(snapshot.page_url);
+                    }
+                }
+            }
+        }
+
+        let (page_body, page_url) = {
+            let sessions = self.runtime.sessions.lock().await;
+            let Some(session) = sessions.get(session_id.as_str()) else {
+                return Ok(Response::new(browser_v1::ObserveResponse {
+                    v: CANONICAL_PROTOCOL_MAJOR,
+                    success: false,
+                    dom_snapshot: String::new(),
+                    accessibility_tree: String::new(),
+                    visible_text: String::new(),
+                    dom_truncated: false,
+                    accessibility_tree_truncated: false,
+                    visible_text_truncated: false,
+                    page_url: String::new(),
+                    error: "session_not_found".to_owned(),
+                }));
+            };
+            let Some(tab) = session.tabs.get(active_tab_id.as_str()) else {
+                return Ok(Response::new(browser_v1::ObserveResponse {
+                    v: CANONICAL_PROTOCOL_MAJOR,
+                    success: false,
+                    dom_snapshot: String::new(),
+                    accessibility_tree: String::new(),
+                    visible_text: String::new(),
+                    dom_truncated: false,
+                    accessibility_tree_truncated: false,
+                    visible_text_truncated: false,
+                    page_url: String::new(),
+                    error: "active_tab_not_found".to_owned(),
+                }));
+            };
+            (tab.last_page_body.clone(), tab.last_url.clone().unwrap_or_default())
         };
-        if tab.last_page_body.trim().is_empty() {
+        if page_body.trim().is_empty() {
             return Ok(Response::new(browser_v1::ObserveResponse {
                 v: CANONICAL_PROTOCOL_MAJOR,
                 success: false,
@@ -1485,33 +1799,18 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             }));
         }
 
-        let max_dom_snapshot_bytes =
-            payload.max_dom_snapshot_bytes.max(1).min(session.budget.max_observe_snapshot_bytes)
-                as usize;
-        let max_accessibility_tree_bytes = payload
-            .max_accessibility_tree_bytes
-            .max(1)
-            .min(session.budget.max_observe_snapshot_bytes)
-            as usize;
-        let max_visible_text_bytes =
-            payload.max_visible_text_bytes.max(1).min(session.budget.max_visible_text_bytes)
-                as usize;
-
         let (dom_snapshot, dom_truncated) = if include_dom_snapshot {
-            build_dom_snapshot(tab.last_page_body.as_str(), max_dom_snapshot_bytes)
+            build_dom_snapshot(page_body.as_str(), max_dom_snapshot_bytes)
         } else {
             (String::new(), false)
         };
         let (accessibility_tree, accessibility_tree_truncated) = if include_accessibility_tree {
-            build_accessibility_tree_snapshot(
-                tab.last_page_body.as_str(),
-                max_accessibility_tree_bytes,
-            )
+            build_accessibility_tree_snapshot(page_body.as_str(), max_accessibility_tree_bytes)
         } else {
             (String::new(), false)
         };
         let (visible_text, visible_text_truncated) = if include_visible_text {
-            build_visible_text_snapshot(tab.last_page_body.as_str(), max_visible_text_bytes)
+            build_visible_text_snapshot(page_body.as_str(), max_visible_text_bytes)
         } else {
             (String::new(), false)
         };
@@ -1525,7 +1824,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             dom_truncated,
             accessibility_tree_truncated,
             visible_text_truncated,
-            page_url: normalize_url_with_redaction(tab.last_url.as_deref().unwrap_or_default()),
+            page_url: normalize_url_with_redaction(page_url.as_str()),
             error: String::new(),
         }))
     }
@@ -1732,6 +2031,38 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             (created_tab_id, timeout_ms, max_response_bytes, allow_private_targets, cookie_header)
         };
         let mut session_for_persist = None;
+        if self.runtime.engine_mode == BrowserEngineMode::Chromium {
+            if let Err(error) = chromium_open_tab_runtime(
+                self.runtime.as_ref(),
+                session_id.as_str(),
+                created_tab_id.as_str(),
+            )
+            .await
+            {
+                let mut sessions = self.runtime.sessions.lock().await;
+                if let Some(session) = sessions.get_mut(session_id.as_str()) {
+                    if session.tabs.remove(created_tab_id.as_str()).is_some() {
+                        session.tab_order.retain(|value| value != created_tab_id.as_str());
+                        if session.tab_order.is_empty() {
+                            let fallback_id = session.create_tab();
+                            session.active_tab_id = fallback_id;
+                        } else if session.active_tab_id == created_tab_id {
+                            if let Some(first) = session.tab_order.first() {
+                                session.active_tab_id = first.clone();
+                            }
+                        }
+                    }
+                }
+                return Ok(Response::new(browser_v1::OpenTabResponse {
+                    v: CANONICAL_PROTOCOL_MAJOR,
+                    success: false,
+                    tab: None,
+                    navigated: false,
+                    status_code: 0,
+                    error: format!("failed to create chromium tab runtime: {error}"),
+                }));
+            }
+        }
 
         let mut navigated = false;
         let mut status_code = 0_u32;
@@ -1739,16 +2070,41 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         let mut error = String::new();
         if !url.is_empty() {
             navigated = true;
-            let outcome = navigate_with_guards(
-                url.as_str(),
-                timeout_ms,
-                payload.allow_redirects,
-                if payload.max_redirects == 0 { 3 } else { payload.max_redirects },
-                allow_private_targets,
-                max_response_bytes,
-                cookie_header.as_deref(),
-            )
-            .await;
+            let outcome = match self.runtime.engine_mode {
+                BrowserEngineMode::Simulated => {
+                    navigate_with_guards(
+                        url.as_str(),
+                        timeout_ms,
+                        payload.allow_redirects,
+                        if payload.max_redirects == 0 { 3 } else { payload.max_redirects },
+                        allow_private_targets,
+                        max_response_bytes,
+                        cookie_header.as_deref(),
+                    )
+                    .await
+                }
+                BrowserEngineMode::Chromium => {
+                    navigate_tab_with_chromium(
+                        self.runtime.as_ref(),
+                        session_id.as_str(),
+                        created_tab_id.as_str(),
+                        &ChromiumNavigateParams {
+                            raw_url: url.clone(),
+                            timeout_ms,
+                            allow_redirects: payload.allow_redirects,
+                            max_redirects: if payload.max_redirects == 0 {
+                                3
+                            } else {
+                                payload.max_redirects
+                            },
+                            allow_private_targets,
+                            max_response_bytes,
+                            cookie_header: cookie_header.clone(),
+                        },
+                    )
+                    .await
+                }
+            };
             status_code = outcome.status_code as u32;
             success = outcome.success;
             if !success {
@@ -1920,6 +2276,16 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                 },
             }
         };
+        if self.runtime.engine_mode == BrowserEngineMode::Chromium && response.success {
+            if let Some(closed_tab_id) = response.closed_tab_id.as_ref() {
+                let _ = chromium_close_tab_runtime(
+                    self.runtime.as_ref(),
+                    session_id.as_str(),
+                    closed_tab_id.ulid.as_str(),
+                )
+                .await;
+            }
+        }
         persist_session_after_mutation(self.runtime.as_ref(), session_for_persist, "close_tab")
             .map_err(map_persist_error_to_status)?;
         Ok(Response::new(response))
@@ -2138,10 +2504,16 @@ fn spawn_cleanup_loop(runtime: Arc<BrowserRuntimeState>) {
             let removed_sessions = {
                 let mut sessions = runtime.sessions.lock().await;
                 expired_ids
-                    .into_iter()
+                    .iter()
                     .filter_map(|session_id| sessions.remove(session_id.as_str()))
                     .collect::<Vec<_>>()
             };
+            {
+                let mut chromium_sessions = runtime.chromium_sessions.lock().await;
+                for session_id in &expired_ids {
+                    chromium_sessions.remove(session_id.as_str());
+                }
+            }
             if let Some(store) = runtime.state_store.as_ref() {
                 for session in removed_sessions {
                     if session.persistence.enabled {
@@ -2165,6 +2537,797 @@ async fn shutdown_signal() {
         tracing::error!(error = %error, "failed to register Ctrl+C handler");
         std::future::pending::<()>().await;
     }
+}
+
+#[derive(Debug)]
+struct ChromiumActionOutcome {
+    success: bool,
+    outcome: String,
+    error: String,
+    attempts: u32,
+}
+
+#[derive(Debug)]
+struct ChromiumScrollOutcome {
+    success: bool,
+    scroll_x: i64,
+    scroll_y: i64,
+    error: String,
+}
+
+#[derive(Debug)]
+struct ChromiumWaitOutcome {
+    success: bool,
+    matched_selector: String,
+    matched_text: String,
+    attempts: u32,
+    waited_ms: u64,
+    error: String,
+}
+
+#[derive(Debug)]
+struct ChromiumObserveSnapshot {
+    page_body: String,
+    title: String,
+    page_url: String,
+}
+
+#[derive(Debug, Clone)]
+struct ChromiumNavigateParams {
+    raw_url: String,
+    timeout_ms: u64,
+    allow_redirects: bool,
+    max_redirects: u32,
+    allow_private_targets: bool,
+    max_response_bytes: u64,
+    cookie_header: Option<String>,
+}
+
+async fn run_chromium_blocking<T, F>(operation: &str, task: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    tokio::task::spawn_blocking(task)
+        .await
+        .map_err(|error| format!("{operation} task join failure: {error}"))?
+}
+
+fn build_chromium_launch_options(
+    chromium: &ChromiumEngineConfig,
+    profile_dir: &TempDir,
+) -> Result<headless_chrome::LaunchOptions<'static>, String> {
+    let chromium_path = chromium.executable_path.clone();
+    let mut builder = LaunchOptionsBuilder::default();
+    builder
+        .headless(true)
+        .sandbox(true)
+        .enable_gpu(false)
+        .ignore_certificate_errors(false)
+        .idle_browser_timeout(chromium.startup_timeout)
+        .user_data_dir(Some(profile_dir.path().to_path_buf()))
+        .args(vec![
+            OsStr::new("--disable-dev-shm-usage"),
+            OsStr::new("--disable-gpu"),
+            OsStr::new("--no-first-run"),
+            OsStr::new("--no-default-browser-check"),
+            OsStr::new("--window-size=1280,800"),
+            OsStr::new("--disable-blink-features=AutomationControlled"),
+        ]);
+    if let Some(path) = chromium_path {
+        builder.path(Some(path));
+    }
+    builder.build().map_err(|error| format!("failed to build Chromium launch options: {error}"))
+}
+
+fn configure_chromium_tab(
+    tab: &Arc<HeadlessTab>,
+    allow_private_targets: bool,
+    timeout: Duration,
+) -> Result<(), String> {
+    tab.set_default_timeout(timeout);
+    tab.enable_fetch(None, Some(false))
+        .map_err(|error| format!("failed to enable Chromium fetch interception: {error}"))?;
+    let request_interceptor =
+        Arc::new(move |_transport, _session_id, intercepted: Fetch::events::RequestPausedEvent| {
+            let request_url = intercepted.params.request.url.as_str();
+            if validate_target_url_blocking(request_url, allow_private_targets).is_ok() {
+                RequestPausedDecision::Continue(None)
+            } else {
+                RequestPausedDecision::Fail(Fetch::FailRequest {
+                    request_id: intercepted.params.request_id,
+                    error_reason: Network::ErrorReason::BlockedByClient,
+                })
+            }
+        });
+    tab.enable_request_interception(request_interceptor).map_err(|error| {
+        format!("failed to register Chromium request interception callback: {error}")
+    })?;
+    Ok(())
+}
+
+async fn initialize_chromium_session_runtime(
+    runtime: &BrowserRuntimeState,
+    session_id: &str,
+    session: &BrowserSessionRecord,
+) -> Result<(), String> {
+    let chromium = runtime.chromium.clone();
+    let allow_private_targets = session.allow_private_targets;
+    let navigation_timeout = Duration::from_millis(session.budget.max_navigation_timeout_ms.max(1));
+    let active_tab_id = session.active_tab_id.clone();
+    let mut tab_order = session.tab_order.clone();
+    if tab_order.is_empty() {
+        tab_order.push(active_tab_id.clone());
+    } else if !tab_order.iter().any(|tab_id| tab_id == &active_tab_id) {
+        tab_order.insert(0, active_tab_id.clone());
+    }
+    let chromium_session = run_chromium_blocking("chromium session initialization", move || {
+        let profile_dir = tempfile::Builder::new()
+            .prefix("palyra-browserd-session-")
+            .tempdir()
+            .map_err(|error| format!("failed to allocate Chromium profile dir: {error}"))?;
+        let launch_options = build_chromium_launch_options(&chromium, &profile_dir)?;
+        let browser = Arc::new(
+            HeadlessBrowser::new(launch_options)
+                .map_err(|error| format!("failed to launch Chromium browser process: {error}"))?,
+        );
+        let mut tabs = HashMap::new();
+        for tab_id in tab_order.iter() {
+            let tab = browser.new_tab().map_err(|error| {
+                format!("failed to create Chromium tab for session restore: {error}")
+            })?;
+            configure_chromium_tab(&tab, allow_private_targets, navigation_timeout)?;
+            tabs.insert(tab_id.clone(), tab);
+        }
+        Ok(ChromiumSessionState { browser, tabs, _profile_dir: profile_dir })
+    })
+    .await?;
+    runtime.chromium_sessions.lock().await.insert(session_id.to_owned(), chromium_session);
+    Ok(())
+}
+
+async fn chromium_open_tab_runtime(
+    runtime: &BrowserRuntimeState,
+    session_id: &str,
+    tab_id: &str,
+) -> Result<(), String> {
+    let (allow_private_targets, timeout_ms) = {
+        let sessions = runtime.sessions.lock().await;
+        let Some(session) = sessions.get(session_id) else {
+            return Err("session_not_found".to_owned());
+        };
+        (session.allow_private_targets, session.budget.max_navigation_timeout_ms.max(1))
+    };
+    let browser = {
+        let chromium_sessions = runtime.chromium_sessions.lock().await;
+        let Some(chromium_session) = chromium_sessions.get(session_id) else {
+            return Err("chromium_session_not_found".to_owned());
+        };
+        Arc::clone(&chromium_session.browser)
+    };
+    let tab = run_chromium_blocking("chromium open tab", move || {
+        let tab = browser
+            .new_tab()
+            .map_err(|error| format!("failed to allocate Chromium tab: {error}"))?;
+        configure_chromium_tab(&tab, allow_private_targets, Duration::from_millis(timeout_ms))?;
+        Ok(tab)
+    })
+    .await?;
+    let mut chromium_sessions = runtime.chromium_sessions.lock().await;
+    let Some(chromium_session) = chromium_sessions.get_mut(session_id) else {
+        return Err("chromium_session_not_found".to_owned());
+    };
+    chromium_session.tabs.insert(tab_id.to_owned(), tab);
+    Ok(())
+}
+
+async fn chromium_close_tab_runtime(
+    runtime: &BrowserRuntimeState,
+    session_id: &str,
+    tab_id: &str,
+) -> Result<(), String> {
+    let tab = {
+        let mut chromium_sessions = runtime.chromium_sessions.lock().await;
+        let Some(chromium_session) = chromium_sessions.get_mut(session_id) else {
+            return Err("chromium_session_not_found".to_owned());
+        };
+        chromium_session.tabs.remove(tab_id)
+    };
+    if let Some(tab) = tab {
+        let _ = run_chromium_blocking("chromium close tab", move || {
+            tab.close(true).map_err(|error| format!("failed to close Chromium tab: {error}"))?;
+            Ok(())
+        })
+        .await;
+    }
+    Ok(())
+}
+
+async fn chromium_tab_for_session(
+    runtime: &BrowserRuntimeState,
+    session_id: &str,
+    tab_id: &str,
+) -> Result<Arc<HeadlessTab>, String> {
+    let chromium_sessions = runtime.chromium_sessions.lock().await;
+    let Some(chromium_session) = chromium_sessions.get(session_id) else {
+        return Err("chromium_session_not_found".to_owned());
+    };
+    chromium_session.tabs.get(tab_id).cloned().ok_or_else(|| "chromium_tab_not_found".to_owned())
+}
+
+async fn chromium_active_tab_for_session(
+    runtime: &BrowserRuntimeState,
+    session_id: &str,
+) -> Result<(String, Arc<HeadlessTab>), String> {
+    let active_tab_id = {
+        let sessions = runtime.sessions.lock().await;
+        let Some(session) = sessions.get(session_id) else {
+            return Err("session_not_found".to_owned());
+        };
+        session.active_tab_id.clone()
+    };
+    let tab = chromium_tab_for_session(runtime, session_id, active_tab_id.as_str()).await?;
+    Ok((active_tab_id, tab))
+}
+
+async fn chromium_observe_snapshot(
+    runtime: &BrowserRuntimeState,
+    session_id: &str,
+    tab_id: &str,
+) -> Result<ChromiumObserveSnapshot, String> {
+    let tab = chromium_tab_for_session(runtime, session_id, tab_id).await?;
+    run_chromium_blocking("chromium observe snapshot", move || {
+        let page_body = tab
+            .get_content()
+            .map_err(|error| format!("failed to read Chromium DOM content: {error}"))?;
+        let title = tab.get_title().unwrap_or_default();
+        let page_url = tab.get_url();
+        Ok(ChromiumObserveSnapshot { page_body, title, page_url })
+    })
+    .await
+}
+
+async fn chromium_refresh_tab_snapshot(
+    runtime: &BrowserRuntimeState,
+    session_id: &str,
+    tab_id: &str,
+) -> Result<(), String> {
+    let snapshot = chromium_observe_snapshot(runtime, session_id, tab_id).await?;
+    let mut sessions = runtime.sessions.lock().await;
+    let Some(session) = sessions.get_mut(session_id) else {
+        return Err("session_not_found".to_owned());
+    };
+    let Some(tab) = session.tabs.get_mut(tab_id) else {
+        return Err("tab_not_found".to_owned());
+    };
+    tab.last_page_body = snapshot.page_body;
+    tab.last_title = snapshot.title;
+    tab.last_url = Some(snapshot.page_url);
+    Ok(())
+}
+
+async fn chromium_get_title(
+    runtime: &BrowserRuntimeState,
+    session_id: &str,
+    tab_id: &str,
+) -> Result<String, String> {
+    let tab = chromium_tab_for_session(runtime, session_id, tab_id).await?;
+    run_chromium_blocking("chromium get title", move || {
+        tab.get_title().map_err(|error| format!("failed to read Chromium page title: {error}"))
+    })
+    .await
+}
+
+async fn chromium_screenshot(
+    runtime: &BrowserRuntimeState,
+    session_id: &str,
+) -> Result<Vec<u8>, String> {
+    let (_tab_id, tab) = chromium_active_tab_for_session(runtime, session_id).await?;
+    run_chromium_blocking("chromium screenshot", move || {
+        tab.capture_screenshot(Page::CaptureScreenshotFormatOption::Png, None, None, true)
+            .map_err(|error| format!("failed to capture Chromium screenshot: {error}"))
+    })
+    .await
+}
+
+async fn navigate_with_chromium(
+    runtime: &BrowserRuntimeState,
+    session_id: &str,
+    params: ChromiumNavigateParams,
+) -> NavigateOutcome {
+    let (tab_id, _tab) = match chromium_active_tab_for_session(runtime, session_id).await {
+        Ok(value) => value,
+        Err(error) => {
+            return NavigateOutcome {
+                success: false,
+                final_url: String::new(),
+                status_code: 0,
+                title: String::new(),
+                page_body: String::new(),
+                body_bytes: 0,
+                latency_ms: 0,
+                error: format!("chromium runtime unavailable: {error}"),
+                network_log: Vec::new(),
+                cookie_updates: Vec::new(),
+            }
+        }
+    };
+    navigate_tab_with_chromium(runtime, session_id, tab_id.as_str(), &params).await
+}
+
+async fn navigate_tab_with_chromium(
+    runtime: &BrowserRuntimeState,
+    session_id: &str,
+    tab_id: &str,
+    params: &ChromiumNavigateParams,
+) -> NavigateOutcome {
+    let mut outcome = navigate_with_guards(
+        params.raw_url.as_str(),
+        params.timeout_ms,
+        params.allow_redirects,
+        params.max_redirects,
+        params.allow_private_targets,
+        params.max_response_bytes,
+        params.cookie_header.as_deref(),
+    )
+    .await;
+    if !outcome.success {
+        return outcome;
+    }
+    let tab = match chromium_tab_for_session(runtime, session_id, tab_id).await {
+        Ok(value) => value,
+        Err(error) => {
+            outcome.success = false;
+            outcome.error = format!("chromium tab runtime unavailable: {error}");
+            return outcome;
+        }
+    };
+    let target_url = outcome.final_url.clone();
+    let chromium_timeout_ms = params.timeout_ms;
+    let chromium_snapshot = run_chromium_blocking("chromium navigate", move || {
+        tab.set_default_timeout(Duration::from_millis(chromium_timeout_ms.max(1)));
+        tab.navigate_to(target_url.as_str())
+            .map_err(|error| format!("failed to issue Chromium navigation command: {error}"))?;
+        tab.wait_until_navigated()
+            .map_err(|error| format!("Chromium navigation timeout or failure: {error}"))?;
+        let page_body = tab.get_content().map_err(|error| {
+            format!("failed to read Chromium page HTML after navigation: {error}")
+        })?;
+        let title = tab.get_title().unwrap_or_default();
+        let page_url = tab.get_url();
+        Ok(ChromiumObserveSnapshot { page_body, title, page_url })
+    })
+    .await;
+    let snapshot = match chromium_snapshot {
+        Ok(value) => value,
+        Err(error) => {
+            outcome.success = false;
+            outcome.error = error;
+            return outcome;
+        }
+    };
+    let body_bytes = snapshot.page_body.len() as u64;
+    if body_bytes > params.max_response_bytes {
+        outcome.success = false;
+        outcome.error = format!(
+            "response exceeds max_response_bytes ({} > {})",
+            body_bytes, params.max_response_bytes
+        );
+        outcome.body_bytes = body_bytes;
+        outcome.page_body.clear();
+        outcome.title.clear();
+        return outcome;
+    }
+    outcome.final_url = snapshot.page_url;
+    outcome.title = snapshot.title;
+    outcome.page_body = snapshot.page_body;
+    outcome.body_bytes = body_bytes;
+    outcome
+}
+
+async fn click_with_chromium(
+    runtime: &BrowserRuntimeState,
+    session_id: &str,
+    selector: &str,
+    timeout_ms: u64,
+    max_attempts: u32,
+    allow_downloads: bool,
+) -> ChromiumActionOutcome {
+    enum ClickAttempt {
+        Clicked { download_like: bool },
+        DownloadBlocked,
+        NotFound,
+    }
+
+    let (tab_id, tab) = match chromium_active_tab_for_session(runtime, session_id).await {
+        Ok(value) => value,
+        Err(error) => {
+            return ChromiumActionOutcome {
+                success: false,
+                outcome: "chromium_runtime_missing".to_owned(),
+                error,
+                attempts: 1,
+            }
+        }
+    };
+    let started = Instant::now();
+    let mut attempts = 0_u32;
+    loop {
+        attempts = attempts.saturating_add(1);
+        let selector_for_attempt = selector.to_owned();
+        let tab_for_attempt = Arc::clone(&tab);
+        let attempt = run_chromium_blocking("chromium click", move || {
+            let page_body = tab_for_attempt
+                .get_content()
+                .map_err(|error| format!("failed to read Chromium DOM before click: {error}"))?;
+            if let Some(tag) =
+                find_matching_html_tag(selector_for_attempt.as_str(), page_body.as_str())
+            {
+                if is_download_like_tag(tag.as_str()) && !allow_downloads {
+                    return Ok(ClickAttempt::DownloadBlocked);
+                }
+                let element = tab_for_attempt.find_element(selector_for_attempt.as_str()).map_err(
+                    |error| {
+                        format!(
+                            "failed to resolve selector '{}' on Chromium page: {error}",
+                            selector_for_attempt
+                        )
+                    },
+                )?;
+                element.click().map_err(|error| {
+                    format!(
+                        "failed to click selector '{}' on Chromium page: {error}",
+                        selector_for_attempt
+                    )
+                })?;
+                Ok(ClickAttempt::Clicked { download_like: is_download_like_tag(tag.as_str()) })
+            } else {
+                Ok(ClickAttempt::NotFound)
+            }
+        })
+        .await;
+
+        match attempt {
+            Ok(ClickAttempt::Clicked { download_like }) => {
+                let _ = chromium_refresh_tab_snapshot(runtime, session_id, tab_id.as_str()).await;
+                return ChromiumActionOutcome {
+                    success: true,
+                    outcome: if download_like {
+                        "download_allowed".to_owned()
+                    } else {
+                        "clicked".to_owned()
+                    },
+                    error: String::new(),
+                    attempts,
+                };
+            }
+            Ok(ClickAttempt::DownloadBlocked) => {
+                return ChromiumActionOutcome {
+                    success: false,
+                    outcome: "download_blocked".to_owned(),
+                    error:
+                        "download-like click is blocked by session policy (allow_downloads=false)"
+                            .to_owned(),
+                    attempts,
+                };
+            }
+            Ok(ClickAttempt::NotFound) => {}
+            Err(error) => {
+                return ChromiumActionOutcome {
+                    success: false,
+                    outcome: "click_failed".to_owned(),
+                    error,
+                    attempts,
+                };
+            }
+        }
+
+        if attempts >= max_attempts || started.elapsed() >= Duration::from_millis(timeout_ms) {
+            break;
+        }
+        let remaining_ms = timeout_ms.saturating_sub(started.elapsed().as_millis() as u64);
+        let sleep_ms = DEFAULT_ACTION_RETRY_INTERVAL_MS.min(remaining_ms.max(1));
+        tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+    }
+    ChromiumActionOutcome {
+        success: false,
+        outcome: "selector_not_found".to_owned(),
+        error: format!("selector '{selector}' was not found"),
+        attempts,
+    }
+}
+
+async fn type_with_chromium(
+    runtime: &BrowserRuntimeState,
+    session_id: &str,
+    selector: &str,
+    text: &str,
+    clear_existing: bool,
+    timeout_ms: u64,
+) -> ChromiumActionOutcome {
+    enum TypeAttempt {
+        Typed,
+        NotFound,
+        NotTypable,
+    }
+
+    let (tab_id, tab) = match chromium_active_tab_for_session(runtime, session_id).await {
+        Ok(value) => value,
+        Err(error) => {
+            return ChromiumActionOutcome {
+                success: false,
+                outcome: "chromium_runtime_missing".to_owned(),
+                error,
+                attempts: 1,
+            }
+        }
+    };
+    let started = Instant::now();
+    let mut attempts = 0_u32;
+    loop {
+        attempts = attempts.saturating_add(1);
+        let selector_for_attempt = selector.to_owned();
+        let text_for_attempt = text.to_owned();
+        let tab_for_attempt = Arc::clone(&tab);
+        let clear_existing_for_attempt = clear_existing;
+        let attempt = run_chromium_blocking("chromium type", move || {
+            let page_body = tab_for_attempt
+                .get_content()
+                .map_err(|error| format!("failed to read Chromium DOM before type action: {error}"))?;
+            let Some(tag) = find_matching_html_tag(selector_for_attempt.as_str(), page_body.as_str()) else {
+                return Ok(TypeAttempt::NotFound);
+            };
+            if !is_typable_tag(tag.as_str()) {
+                return Ok(TypeAttempt::NotTypable);
+            }
+            let element = tab_for_attempt.find_element(selector_for_attempt.as_str()).map_err(
+                |error| format!("failed to resolve selector '{}' on Chromium page: {error}", selector_for_attempt),
+            )?;
+            if clear_existing_for_attempt {
+                let _ = element.call_js_fn(
+                    "function () { if (this && this.value !== undefined) { this.value = ''; } if (this && this.textContent !== undefined) { this.textContent = ''; } }",
+                    Vec::new(),
+                    false,
+                );
+            }
+            element
+                .click()
+                .map_err(|error| format!("failed to focus selector '{}' for type action: {error}", selector_for_attempt))?;
+            element
+                .type_into(text_for_attempt.as_str())
+                .map_err(|error| format!("failed to type into selector '{}' on Chromium page: {error}", selector_for_attempt))?;
+            Ok(TypeAttempt::Typed)
+        })
+        .await;
+
+        match attempt {
+            Ok(TypeAttempt::Typed) => {
+                let _ = chromium_refresh_tab_snapshot(runtime, session_id, tab_id.as_str()).await;
+                return ChromiumActionOutcome {
+                    success: true,
+                    outcome: "typed".to_owned(),
+                    error: String::new(),
+                    attempts,
+                };
+            }
+            Ok(TypeAttempt::NotTypable) => {
+                return ChromiumActionOutcome {
+                    success: false,
+                    outcome: "selector_not_typable".to_owned(),
+                    error: format!("selector '{selector}' does not target an input-like element"),
+                    attempts,
+                };
+            }
+            Ok(TypeAttempt::NotFound) => {}
+            Err(error) => {
+                return ChromiumActionOutcome {
+                    success: false,
+                    outcome: "type_failed".to_owned(),
+                    error,
+                    attempts,
+                };
+            }
+        }
+        if started.elapsed() >= Duration::from_millis(timeout_ms) {
+            break;
+        }
+        let remaining_ms = timeout_ms.saturating_sub(started.elapsed().as_millis() as u64);
+        let sleep_ms = DEFAULT_ACTION_RETRY_INTERVAL_MS.min(remaining_ms.max(1));
+        tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+    }
+    ChromiumActionOutcome {
+        success: false,
+        outcome: "selector_not_found".to_owned(),
+        error: format!("selector '{selector}' was not found"),
+        attempts,
+    }
+}
+
+async fn scroll_with_chromium(
+    runtime: &BrowserRuntimeState,
+    session_id: &str,
+    delta_x: i64,
+    delta_y: i64,
+) -> ChromiumScrollOutcome {
+    let (tab_id, tab) = match chromium_active_tab_for_session(runtime, session_id).await {
+        Ok(value) => value,
+        Err(error) => {
+            return ChromiumScrollOutcome { success: false, scroll_x: 0, scroll_y: 0, error }
+        }
+    };
+    let scroll_script = format!(
+        "(() => {{ window.scrollBy({delta_x}, {delta_y}); return {{ x: Math.trunc(window.scrollX || window.pageXOffset || 0), y: Math.trunc(window.scrollY || window.pageYOffset || 0) }}; }})()"
+    );
+    let positions = run_chromium_blocking("chromium scroll", move || {
+        let value = tab
+            .evaluate(scroll_script.as_str(), false)
+            .map_err(|error| format!("failed to execute Chromium scroll script: {error}"))?
+            .value
+            .unwrap_or(serde_json::Value::Null);
+        let x = value.get("x").and_then(serde_json::Value::as_i64).unwrap_or(0);
+        let y = value.get("y").and_then(serde_json::Value::as_i64).unwrap_or(0);
+        Ok((x, y))
+    })
+    .await;
+
+    match positions {
+        Ok((scroll_x, scroll_y)) => {
+            let mut sessions = runtime.sessions.lock().await;
+            if let Some(session) = sessions.get_mut(session_id) {
+                if let Some(tab_record) = session.tabs.get_mut(tab_id.as_str()) {
+                    tab_record.scroll_x = scroll_x;
+                    tab_record.scroll_y = scroll_y;
+                }
+            }
+            ChromiumScrollOutcome { success: true, scroll_x, scroll_y, error: String::new() }
+        }
+        Err(error) => ChromiumScrollOutcome { success: false, scroll_x: 0, scroll_y: 0, error },
+    }
+}
+
+async fn wait_for_with_chromium(
+    runtime: &BrowserRuntimeState,
+    session_id: &str,
+    selector: &str,
+    text: &str,
+    timeout_ms: u64,
+    poll_interval_ms: u64,
+) -> ChromiumWaitOutcome {
+    let (_tab_id, tab) = match chromium_active_tab_for_session(runtime, session_id).await {
+        Ok(value) => value,
+        Err(error) => {
+            return ChromiumWaitOutcome {
+                success: false,
+                matched_selector: String::new(),
+                matched_text: String::new(),
+                attempts: 1,
+                waited_ms: 0,
+                error,
+            }
+        }
+    };
+    let started = Instant::now();
+    let mut attempts = 0_u32;
+    let selector_owned = selector.to_owned();
+    let text_owned = text.to_owned();
+    loop {
+        attempts = attempts.saturating_add(1);
+        let tab_for_attempt = Arc::clone(&tab);
+        let selector_for_attempt = selector_owned.clone();
+        let text_for_attempt = text_owned.clone();
+        let check = run_chromium_blocking("chromium wait_for probe", move || {
+            let mut matched_selector = false;
+            let mut matched_text = false;
+            if !selector_for_attempt.is_empty() {
+                matched_selector = tab_for_attempt.find_element(selector_for_attempt.as_str()).is_ok();
+            }
+            if !text_for_attempt.trim().is_empty() {
+                let text_json = serde_json::to_string(text_for_attempt.as_str())
+                    .map_err(|error| format!("failed to encode wait_for text query: {error}"))?;
+                let script = format!(
+                    "(() => {{ const text = (document.body && document.body.innerText) ? document.body.innerText : ''; return text.includes({text_json}); }})()"
+                );
+                matched_text = tab_for_attempt
+                    .evaluate(script.as_str(), false)
+                    .map_err(|error| format!("failed to evaluate Chromium wait_for text probe: {error}"))?
+                    .value
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false);
+            }
+            Ok((matched_selector, matched_text))
+        })
+        .await;
+
+        match check {
+            Ok((selector_hit, text_hit)) => {
+                if selector_hit {
+                    return ChromiumWaitOutcome {
+                        success: true,
+                        matched_selector: selector_owned.clone(),
+                        matched_text: String::new(),
+                        attempts,
+                        waited_ms: started.elapsed().as_millis() as u64,
+                        error: String::new(),
+                    };
+                }
+                if text_hit {
+                    return ChromiumWaitOutcome {
+                        success: true,
+                        matched_selector: String::new(),
+                        matched_text: text_owned.clone(),
+                        attempts,
+                        waited_ms: started.elapsed().as_millis() as u64,
+                        error: String::new(),
+                    };
+                }
+            }
+            Err(error) => {
+                return ChromiumWaitOutcome {
+                    success: false,
+                    matched_selector: String::new(),
+                    matched_text: String::new(),
+                    attempts,
+                    waited_ms: started.elapsed().as_millis() as u64,
+                    error,
+                };
+            }
+        }
+        if started.elapsed() >= Duration::from_millis(timeout_ms) {
+            break;
+        }
+        let remaining_ms = timeout_ms.saturating_sub(started.elapsed().as_millis() as u64);
+        let sleep_ms = poll_interval_ms.min(remaining_ms.max(1));
+        tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+    }
+    ChromiumWaitOutcome {
+        success: false,
+        matched_selector: String::new(),
+        matched_text: String::new(),
+        attempts,
+        waited_ms: started.elapsed().as_millis() as u64,
+        error: "wait_for condition was not satisfied before timeout".to_owned(),
+    }
+}
+
+fn validate_target_url_blocking(raw_url: &str, allow_private_targets: bool) -> Result<(), String> {
+    if raw_url.eq_ignore_ascii_case("about:blank") {
+        return Ok(());
+    }
+    let url = Url::parse(raw_url).map_err(|error| format!("invalid URL: {error}"))?;
+    validate_target_url_parts_blocking(&url, allow_private_targets)
+}
+
+fn validate_target_url_parts_blocking(
+    url: &Url,
+    allow_private_targets: bool,
+) -> Result<(), String> {
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(format!("blocked URL scheme '{}'", url.scheme()));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("URL credentials are not allowed".to_owned());
+    }
+    let host = url.host_str().ok_or_else(|| "URL host is required".to_owned())?;
+    let port =
+        url.port_or_known_default().ok_or_else(|| "URL port could not be resolved".to_owned())?;
+
+    let addresses = if let Ok(address) = host.parse::<IpAddr>() {
+        vec![address]
+    } else {
+        (host, port)
+            .to_socket_addrs()
+            .map_err(|error| format!("DNS resolution failed for host '{host}': {error}"))?
+            .map(|socket| socket.ip())
+            .collect::<Vec<_>>()
+    };
+
+    if addresses.is_empty() {
+        return Err(format!("DNS resolution returned no addresses for host '{host}'"));
+    }
+    if !allow_private_targets && addresses.iter().any(|address| is_private_or_local_ip(*address)) {
+        return Err("target resolves to private/local address and is blocked by policy".to_owned());
+    }
+    Ok(())
 }
 
 async fn navigate_with_guards(
@@ -3680,12 +4843,14 @@ fn is_download_like_tag(tag: &str) -> bool {
 mod tests {
     use super::{
         browser_v1, enforce_non_loopback_bind_auth, navigate_with_guards, parse_daemon_bind_socket,
-        Args, BrowserRuntimeState, BrowserServiceImpl, DEFAULT_GRPC_PORT, ONE_BY_ONE_PNG,
+        Args, BrowserEngineMode, BrowserRuntimeState, BrowserServiceImpl, CHROMIUM_PATH_ENV,
+        DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS, DEFAULT_GRPC_PORT, ONE_BY_ONE_PNG,
     };
     use crate::proto;
     use crate::proto::palyra::browser::v1::browser_service_server::BrowserService;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::path::PathBuf;
     use std::thread;
     use std::time::Duration;
     use tonic::Request;
@@ -3696,6 +4861,13 @@ mod tests {
     const PARITY_REDIRECT_TOKEN_URL: &str =
         include_str!("../../../fixtures/parity/redirect-token-url.txt");
     const PARITY_TRICKY_DOM_HTML: &str = include_str!("../../../fixtures/parity/tricky-dom.html");
+
+    fn resolve_chromium_path_for_tests() -> Option<PathBuf> {
+        std::env::var(CHROMIUM_PATH_ENV)
+            .ok()
+            .map(PathBuf::from)
+            .or_else(|| headless_chrome::browser::default_executable().ok())
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn navigate_with_guards_blocks_file_scheme() {
@@ -3789,6 +4961,9 @@ mod tests {
                 max_screenshot_bytes: 128 * 1024,
                 max_response_bytes: 128 * 1024,
                 max_title_bytes: 4 * 1024,
+                engine_mode: BrowserEngineMode::Simulated,
+                chromium_path: None,
+                chromium_startup_timeout_ms: DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS,
             })
             .expect("runtime should initialize"),
         );
@@ -3851,6 +5026,161 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn browser_service_chromium_engine_executes_real_dom_actions() {
+        let Some(chromium_path) = resolve_chromium_path_for_tests() else {
+            return;
+        };
+        let (url, handle) = spawn_static_http_server_with_request_budget(
+            200,
+            "<html><head><title>Chromium Fixture</title><script>function markClicked(){document.getElementById('status').textContent='clicked';}</script></head><body><input id='name-input' /><button id='submit-btn' onclick='markClicked()'>Submit</button><div id='status'>idle</div></body></html>",
+            8,
+        );
+        let runtime = std::sync::Arc::new(
+            BrowserRuntimeState::new(&Args {
+                bind: "127.0.0.1".to_owned(),
+                port: 7143,
+                grpc_bind: "127.0.0.1".to_owned(),
+                grpc_port: 7543,
+                auth_token: None,
+                session_idle_ttl_ms: 60_000,
+                max_sessions: 16,
+                max_navigation_timeout_ms: 10_000,
+                max_session_lifetime_ms: 60_000,
+                max_screenshot_bytes: 256 * 1024,
+                max_response_bytes: 256 * 1024,
+                max_title_bytes: 4 * 1024,
+                engine_mode: BrowserEngineMode::Chromium,
+                chromium_path: Some(chromium_path),
+                chromium_startup_timeout_ms: DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS,
+            })
+            .expect("chromium runtime should initialize"),
+        );
+        let service = BrowserServiceImpl { runtime };
+        let created = service
+            .create_session(Request::new(browser_v1::CreateSessionRequest {
+                v: 1,
+                principal: "user:ops".to_owned(),
+                idle_ttl_ms: 10_000,
+                budget: None,
+                allow_private_targets: true,
+                allow_downloads: false,
+                action_allowed_domains: Vec::new(),
+                persistence_enabled: false,
+                persistence_id: String::new(),
+                channel: String::new(),
+            }))
+            .await
+            .expect("create_session should succeed for chromium mode")
+            .into_inner();
+        let session_id = created.session_id.expect("session id should exist");
+
+        let navigate = service
+            .navigate(Request::new(browser_v1::NavigateRequest {
+                v: 1,
+                session_id: Some(session_id.clone()),
+                url,
+                timeout_ms: 8_000,
+                allow_redirects: true,
+                max_redirects: 3,
+                allow_private_targets: true,
+            }))
+            .await
+            .expect("navigate should execute")
+            .into_inner();
+        assert!(navigate.success, "chromium navigate should succeed: {}", navigate.error);
+        assert_eq!(navigate.title, "Chromium Fixture");
+
+        let typed = service
+            .r#type(Request::new(browser_v1::TypeRequest {
+                v: 1,
+                session_id: Some(session_id.clone()),
+                selector: "#name-input".to_owned(),
+                text: "hello chromium".to_owned(),
+                clear_existing: true,
+                timeout_ms: 3_000,
+                capture_failure_screenshot: true,
+                max_failure_screenshot_bytes: 16 * 1024,
+            }))
+            .await
+            .expect("type should execute")
+            .into_inner();
+        assert!(typed.success, "chromium type should succeed: {}", typed.error);
+
+        let click = service
+            .click(Request::new(browser_v1::ClickRequest {
+                v: 1,
+                session_id: Some(session_id.clone()),
+                selector: "#submit-btn".to_owned(),
+                max_retries: 2,
+                timeout_ms: 3_000,
+                capture_failure_screenshot: true,
+                max_failure_screenshot_bytes: 16 * 1024,
+            }))
+            .await
+            .expect("click should execute")
+            .into_inner();
+        assert!(click.success, "chromium click should succeed: {}", click.error);
+
+        let waited = service
+            .wait_for(Request::new(browser_v1::WaitForRequest {
+                v: 1,
+                session_id: Some(session_id.clone()),
+                selector: String::new(),
+                text: "clicked".to_owned(),
+                timeout_ms: 5_000,
+                poll_interval_ms: 50,
+                capture_failure_screenshot: true,
+                max_failure_screenshot_bytes: 16 * 1024,
+            }))
+            .await
+            .expect("wait_for should execute")
+            .into_inner();
+        assert!(
+            waited.success,
+            "chromium wait_for should observe DOM change after click: {}",
+            waited.error
+        );
+
+        let screenshot = service
+            .screenshot(Request::new(browser_v1::ScreenshotRequest {
+                v: 1,
+                session_id: Some(session_id.clone()),
+                max_bytes: 220 * 1024,
+                format: "png".to_owned(),
+            }))
+            .await
+            .expect("screenshot should execute")
+            .into_inner();
+        assert!(screenshot.success, "chromium screenshot should succeed: {}", screenshot.error);
+        assert!(
+            screenshot.image_bytes.starts_with(&[137, 80, 78, 71]),
+            "chromium screenshot must return PNG payload"
+        );
+
+        let observed = service
+            .observe(Request::new(browser_v1::ObserveRequest {
+                v: 1,
+                session_id: Some(session_id),
+                include_dom_snapshot: true,
+                include_accessibility_tree: true,
+                include_visible_text: true,
+                max_dom_snapshot_bytes: 32 * 1024,
+                max_accessibility_tree_bytes: 32 * 1024,
+                max_visible_text_bytes: 8 * 1024,
+            }))
+            .await
+            .expect("observe should execute")
+            .into_inner();
+        assert!(observed.success, "chromium observe should succeed: {}", observed.error);
+        assert!(
+            observed.visible_text.contains("clicked"),
+            "observe visible text should reflect click side-effect from real DOM"
+        );
+
+        drop(handle);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn browser_service_click_type_and_wait_for_on_fixture_page() {
         let (url, handle) = spawn_static_http_server(
             200,
@@ -3870,6 +5200,9 @@ mod tests {
                 max_screenshot_bytes: 128 * 1024,
                 max_response_bytes: 128 * 1024,
                 max_title_bytes: 4 * 1024,
+                engine_mode: BrowserEngineMode::Simulated,
+                chromium_path: None,
+                chromium_startup_timeout_ms: DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS,
             })
             .expect("runtime should initialize"),
         );
@@ -3994,6 +5327,9 @@ mod tests {
                 max_screenshot_bytes: 128 * 1024,
                 max_response_bytes: 128 * 1024,
                 max_title_bytes: 4 * 1024,
+                engine_mode: BrowserEngineMode::Simulated,
+                chromium_path: None,
+                chromium_startup_timeout_ms: DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS,
             })
             .expect("runtime should initialize"),
         );
@@ -4092,6 +5428,9 @@ mod tests {
                 max_screenshot_bytes: 128 * 1024,
                 max_response_bytes: 128 * 1024,
                 max_title_bytes: 4 * 1024,
+                engine_mode: BrowserEngineMode::Simulated,
+                chromium_path: None,
+                chromium_startup_timeout_ms: DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS,
             })
             .expect("runtime should initialize"),
         );
@@ -4178,6 +5517,9 @@ mod tests {
                 max_screenshot_bytes: 128 * 1024,
                 max_response_bytes: 128 * 1024,
                 max_title_bytes: 4 * 1024,
+                engine_mode: BrowserEngineMode::Simulated,
+                chromium_path: None,
+                chromium_startup_timeout_ms: DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS,
             })
             .expect("runtime should initialize"),
         );
@@ -4291,6 +5633,9 @@ mod tests {
                 max_screenshot_bytes: 128 * 1024,
                 max_response_bytes: 256 * 1024,
                 max_title_bytes: 4 * 1024,
+                engine_mode: BrowserEngineMode::Simulated,
+                chromium_path: None,
+                chromium_startup_timeout_ms: DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS,
             })
             .expect("runtime should initialize"),
         );
@@ -4397,6 +5742,9 @@ mod tests {
                 max_screenshot_bytes: 128 * 1024,
                 max_response_bytes: 128 * 1024,
                 max_title_bytes: 4 * 1024,
+                engine_mode: BrowserEngineMode::Simulated,
+                chromium_path: None,
+                chromium_startup_timeout_ms: DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS,
             })
             .expect("runtime should initialize"),
         );
@@ -4517,6 +5865,9 @@ mod tests {
                 max_screenshot_bytes: 128 * 1024,
                 max_response_bytes: 128 * 1024,
                 max_title_bytes: 4 * 1024,
+                engine_mode: BrowserEngineMode::Simulated,
+                chromium_path: None,
+                chromium_startup_timeout_ms: DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS,
             })
             .expect("runtime should initialize"),
         );
@@ -4631,6 +5982,9 @@ mod tests {
                 max_screenshot_bytes: 128 * 1024,
                 max_response_bytes: 128 * 1024,
                 max_title_bytes: 4 * 1024,
+                engine_mode: BrowserEngineMode::Simulated,
+                chromium_path: None,
+                chromium_startup_timeout_ms: DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS,
             })
             .expect("runtime should initialize"),
         );
@@ -4691,6 +6045,9 @@ mod tests {
                 max_screenshot_bytes: 128 * 1024,
                 max_response_bytes: 128 * 1024,
                 max_title_bytes: 4 * 1024,
+                engine_mode: BrowserEngineMode::Simulated,
+                chromium_path: None,
+                chromium_startup_timeout_ms: DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS,
             })
             .expect("runtime should initialize"),
         );
@@ -4841,6 +6198,29 @@ mod tests {
             );
             stream.write_all(response.as_bytes()).expect("server should write response");
             stream.flush().expect("server should flush response");
+        });
+        (format!("http://{address}/"), handle)
+    }
+
+    fn spawn_static_http_server_with_request_budget(
+        status_code: u16,
+        body: &str,
+        max_requests: usize,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let address = listener.local_addr().expect("listener local address should resolve");
+        let body = body.to_owned();
+        let handle = thread::spawn(move || {
+            for _ in 0..max_requests {
+                let (mut stream, _) = listener.accept().expect("listener should accept request");
+                let _ = read_http_request(&mut stream);
+                let response = format!(
+                    "HTTP/1.1 {status_code} OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).expect("server should write response");
+                stream.flush().expect("server should flush response");
+            }
         });
         (format!("http://{address}/"), handle)
     }
