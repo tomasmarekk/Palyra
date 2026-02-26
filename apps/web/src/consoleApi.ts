@@ -6,6 +6,89 @@ export type JsonValue =
   | { [key: string]: JsonValue }
   | JsonValue[];
 
+export interface ChatSessionRecord {
+  session_id: string;
+  session_key: string;
+  session_label?: string;
+  principal: string;
+  device_id: string;
+  channel?: string;
+  created_at_unix_ms: number;
+  updated_at_unix_ms: number;
+  last_run_id?: string;
+}
+
+export interface ChatRunStatusRecord {
+  run_id: string;
+  session_id: string;
+  state: string;
+  cancel_requested: boolean;
+  cancel_reason?: string;
+  principal: string;
+  device_id: string;
+  channel?: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  created_at_unix_ms: number;
+  started_at_unix_ms: number;
+  completed_at_unix_ms?: number;
+  updated_at_unix_ms: number;
+  last_error?: string;
+  tape_events: number;
+}
+
+export interface ChatRunTapeRecord {
+  seq: number;
+  event_type: string;
+  payload_json: string;
+}
+
+export interface ChatRunTapeSnapshot {
+  run_id: string;
+  requested_after_seq?: number;
+  limit: number;
+  max_response_bytes: number;
+  returned_bytes: number;
+  next_after_seq?: number;
+  events: ChatRunTapeRecord[];
+}
+
+export interface ChatStreamMetaLine {
+  type: "meta";
+  run_id: string;
+  session_id: string;
+}
+
+export interface ChatStreamEventEnvelope {
+  run_id: string;
+  event_type: string;
+  [key: string]: JsonValue;
+}
+
+export interface ChatStreamEventLine {
+  type: "event";
+  event: ChatStreamEventEnvelope;
+}
+
+export interface ChatStreamErrorLine {
+  type: "error";
+  run_id?: string;
+  error: string;
+}
+
+export interface ChatStreamCompleteLine {
+  type: "complete";
+  run_id: string;
+  status: string;
+}
+
+export type ChatStreamLine =
+  | ChatStreamMetaLine
+  | ChatStreamEventLine
+  | ChatStreamErrorLine
+  | ChatStreamCompleteLine;
+
 export interface ConsoleSession {
   principal: string;
   device_id: string;
@@ -73,6 +156,115 @@ export class ConsoleApiClient {
 
   async listApprovals(params?: URLSearchParams): Promise<{ approvals: JsonValue[] }> {
     return this.request(buildPathWithQuery("/console/v1/approvals", params));
+  }
+
+  async listChatSessions(params?: URLSearchParams): Promise<{
+    sessions: ChatSessionRecord[];
+    next_after_session_key?: string;
+  }> {
+    return this.request(buildPathWithQuery("/console/v1/chat/sessions", params));
+  }
+
+  async resolveChatSession(payload: {
+    session_id?: string;
+    session_key?: string;
+    session_label?: string;
+    require_existing?: boolean;
+    reset_session?: boolean;
+  }): Promise<{ session: ChatSessionRecord; created: boolean; reset_applied: boolean }> {
+    return this.request(
+      "/console/v1/chat/sessions",
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      },
+      { csrf: true }
+    );
+  }
+
+  async renameChatSession(
+    sessionId: string,
+    payload: { session_label: string }
+  ): Promise<{ session: ChatSessionRecord; created: boolean; reset_applied: boolean }> {
+    return this.request(
+      `/console/v1/chat/sessions/${encodeURIComponent(sessionId)}/rename`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      },
+      { csrf: true }
+    );
+  }
+
+  async resetChatSession(
+    sessionId: string
+  ): Promise<{ session: ChatSessionRecord; created: boolean; reset_applied: boolean }> {
+    return this.request(
+      `/console/v1/chat/sessions/${encodeURIComponent(sessionId)}/reset`,
+      { method: "POST" },
+      { csrf: true }
+    );
+  }
+
+  async chatRunStatus(runId: string): Promise<{ run: ChatRunStatusRecord }> {
+    return this.request(`/console/v1/chat/runs/${encodeURIComponent(runId)}/status`);
+  }
+
+  async chatRunEvents(
+    runId: string,
+    params?: URLSearchParams
+  ): Promise<{ run: ChatRunStatusRecord; tape: ChatRunTapeSnapshot }> {
+    return this.request(
+      buildPathWithQuery(`/console/v1/chat/runs/${encodeURIComponent(runId)}/events`, params)
+    );
+  }
+
+  async streamChatMessage(
+    sessionId: string,
+    payload: {
+      text: string;
+      allow_sensitive_tools?: boolean;
+      session_label?: string;
+    },
+    options: {
+      signal?: AbortSignal;
+      onLine: (line: ChatStreamLine) => void;
+    }
+  ): Promise<void> {
+    const path = `/console/v1/chat/sessions/${encodeURIComponent(sessionId)}/messages/stream`;
+    const headers = new Headers();
+    headers.set("Content-Type", "application/json");
+    if (this.csrfToken === null) {
+      throw new Error("Missing CSRF token. Please sign in again.");
+    }
+    headers.set("x-palyra-csrf-token", this.csrfToken);
+    const response = await this.fetcher(`${this.basePath}${path}`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+      credentials: "include",
+      signal: options.signal
+    });
+    if (!response.ok) {
+      throw await buildRequestError(response);
+    }
+    if (response.body === null) {
+      throw new Error("Chat stream response body is missing.");
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffered = "";
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) {
+        break;
+      }
+      buffered += decoder.decode(chunk.value, { stream: true });
+      buffered = flushNdjsonBuffer(buffered, options.onLine);
+    }
+    buffered += decoder.decode();
+    flushNdjsonBuffer(buffered, options.onLine, true);
   }
 
   async getApproval(approvalId: string): Promise<{ approval: JsonValue }> {
@@ -433,4 +625,100 @@ function extractErrorMessage(payload: JsonValue, status: number): string {
     }
   }
   return `Request failed with HTTP ${status}.`;
+}
+
+async function buildRequestError(response: Response): Promise<Error> {
+  const contentType = response.headers.get("content-type") ?? "";
+  const payload = contentType.includes("application/json")
+    ? ((await response.json()) as JsonValue)
+    : ((await response.text()) as unknown as JsonValue);
+  return new Error(extractErrorMessage(payload, response.status));
+}
+
+function flushNdjsonBuffer(
+  buffer: string,
+  onLine: (line: ChatStreamLine) => void,
+  flushRemainder = false
+): string {
+  let remainder = buffer;
+  while (true) {
+    const newline = remainder.indexOf("\n");
+    if (newline === -1) {
+      break;
+    }
+    const line = remainder.slice(0, newline).trim();
+    remainder = remainder.slice(newline + 1);
+    if (line.length > 0) {
+      onLine(parseChatStreamLine(line));
+    }
+  }
+  if (flushRemainder) {
+    const tail = remainder.trim();
+    if (tail.length > 0) {
+      onLine(parseChatStreamLine(tail));
+    }
+    return "";
+  }
+  return remainder;
+}
+
+function parseChatStreamLine(line: string): ChatStreamLine {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    throw new Error("Chat stream emitted malformed JSON line.");
+  }
+  if (!isRecord(parsed) || typeof parsed.type !== "string") {
+    throw new Error("Chat stream emitted an invalid line envelope.");
+  }
+  if (parsed.type === "meta") {
+    if (typeof parsed.run_id !== "string" || typeof parsed.session_id !== "string") {
+      throw new Error("Chat stream meta line is missing run_id/session_id.");
+    }
+    return {
+      type: "meta",
+      run_id: parsed.run_id,
+      session_id: parsed.session_id
+    };
+  }
+  if (parsed.type === "event") {
+    if (!isRecord(parsed.event)) {
+      throw new Error("Chat stream event line is missing event payload.");
+    }
+    const eventType = parsed.event.event_type;
+    const runId = parsed.event.run_id;
+    if (typeof eventType !== "string" || typeof runId !== "string") {
+      throw new Error("Chat stream event payload is missing run_id/event_type.");
+    }
+    return {
+      type: "event",
+      event: parsed.event as ChatStreamEventEnvelope
+    };
+  }
+  if (parsed.type === "error") {
+    if (typeof parsed.error !== "string") {
+      throw new Error("Chat stream error line is missing error text.");
+    }
+    return {
+      type: "error",
+      run_id: typeof parsed.run_id === "string" ? parsed.run_id : undefined,
+      error: parsed.error
+    };
+  }
+  if (parsed.type === "complete") {
+    if (typeof parsed.run_id !== "string" || typeof parsed.status !== "string") {
+      throw new Error("Chat stream complete line is missing run_id/status.");
+    }
+    return {
+      type: "complete",
+      run_id: parsed.run_id,
+      status: parsed.status
+    };
+  }
+  throw new Error(`Unsupported chat stream line type '${parsed.type}'.`);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

@@ -467,6 +467,136 @@ fn console_approvals_flow_requires_session_and_csrf() -> Result<()> {
 }
 
 #[test]
+fn console_chat_endpoints_require_session_and_csrf() -> Result<()> {
+    let (child, admin_port) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("failed to build HTTP client")?;
+
+    let no_session = client
+        .get(format!("http://127.0.0.1:{admin_port}/console/v1/chat/sessions"))
+        .send()
+        .context("failed to call chat sessions endpoint without session")?;
+    assert_eq!(no_session.status().as_u16(), 403, "chat sessions endpoint must require session");
+
+    let (cookie, csrf_token) = login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
+
+    let sessions_response = client
+        .get(format!("http://127.0.0.1:{admin_port}/console/v1/chat/sessions"))
+        .header("Cookie", cookie.clone())
+        .send()
+        .context("failed to list chat sessions with session cookie")?
+        .error_for_status()
+        .context("chat sessions endpoint returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse chat sessions response json")?;
+    assert!(
+        sessions_response.get("sessions").and_then(Value::as_array).is_some(),
+        "chat sessions response should include sessions array"
+    );
+
+    let create_without_csrf = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/chat/sessions"))
+        .header("Cookie", cookie.clone())
+        .json(&serde_json::json!({}))
+        .send()
+        .context("failed to create chat session without csrf token")?;
+    assert_eq!(
+        create_without_csrf.status().as_u16(),
+        403,
+        "chat session create endpoint must enforce csrf token"
+    );
+
+    let create_response = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/chat/sessions"))
+        .header("Cookie", cookie.clone())
+        .header("x-palyra-csrf-token", csrf_token.clone())
+        .json(&serde_json::json!({}))
+        .send()
+        .context("failed to create chat session with csrf token")?
+        .error_for_status()
+        .context("chat session create endpoint returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse chat session create response json")?;
+    let session_id = create_response
+        .get("session")
+        .and_then(|session| session.get("session_id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("chat create response missing session.session_id"))?
+        .to_owned();
+
+    let rename_without_csrf = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/chat/sessions/{session_id}/rename"))
+        .header("Cookie", cookie.clone())
+        .json(&serde_json::json!({
+            "session_label": "renamed",
+        }))
+        .send()
+        .context("failed to rename chat session without csrf token")?;
+    assert_eq!(
+        rename_without_csrf.status().as_u16(),
+        403,
+        "chat session rename endpoint must enforce csrf token"
+    );
+
+    let reset_without_csrf = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/chat/sessions/{session_id}/reset"))
+        .header("Cookie", cookie.clone())
+        .send()
+        .context("failed to reset chat session without csrf token")?;
+    assert_eq!(
+        reset_without_csrf.status().as_u16(),
+        403,
+        "chat session reset endpoint must enforce csrf token"
+    );
+
+    let stream_without_csrf = client
+        .post(format!(
+            "http://127.0.0.1:{admin_port}/console/v1/chat/sessions/{session_id}/messages/stream"
+        ))
+        .header("Cookie", cookie.clone())
+        .json(&serde_json::json!({
+            "text": "hello",
+        }))
+        .send()
+        .context("failed to call chat stream endpoint without csrf token")?;
+    assert_eq!(
+        stream_without_csrf.status().as_u16(),
+        403,
+        "chat stream endpoint must enforce csrf token"
+    );
+
+    let unknown_run_id = "01ARZ3NDEKTSV4RRFFQ69G5FB9";
+    let run_status = client
+        .get(format!("http://127.0.0.1:{admin_port}/console/v1/chat/runs/{unknown_run_id}/status"))
+        .header("Cookie", cookie.clone())
+        .send()
+        .context("failed to fetch unknown chat run status")?;
+    assert_eq!(
+        run_status.status().as_u16(),
+        404,
+        "unknown chat run status should return not-found"
+    );
+
+    let run_events = client
+        .get(format!("http://127.0.0.1:{admin_port}/console/v1/chat/runs/{unknown_run_id}/events"))
+        .header("Cookie", cookie)
+        .send()
+        .context("failed to fetch unknown chat run events")?;
+    assert_eq!(
+        run_events.status().as_u16(),
+        404,
+        "unknown chat run events should return not-found"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn console_cron_workflow_create_disable_and_list_runs() -> Result<()> {
     let (child, admin_port) = spawn_palyrad_with_dynamic_ports()?;
     let mut daemon = ChildGuard::new(child);
