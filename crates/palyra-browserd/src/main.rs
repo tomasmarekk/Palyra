@@ -5,7 +5,7 @@ use std::{
     ffi::{OsStr, OsString},
     fs,
     io::Write,
-    net::{IpAddr, SocketAddr, ToSocketAddrs},
+    net::{SocketAddr, ToSocketAddrs},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -21,7 +21,7 @@ use headless_chrome::{
     Browser as HeadlessBrowser, LaunchOptionsBuilder, Tab as HeadlessTab,
 };
 use palyra_common::{
-    build_metadata, health_response, parse_daemon_bind_socket, validate_canonical_id,
+    build_metadata, health_response, netguard, parse_daemon_bind_socket, validate_canonical_id,
     HealthResponse, CANONICAL_PROTOCOL_MAJOR,
 };
 use reqwest::{redirect::Policy, Url};
@@ -4015,7 +4015,7 @@ fn validate_target_url_parts_blocking(
     let port =
         url.port_or_known_default().ok_or_else(|| "URL port could not be resolved".to_owned())?;
 
-    let addresses = if let Ok(address) = host.parse::<IpAddr>() {
+    let addresses = if let Some(address) = netguard::parse_host_ip_literal(host)? {
         vec![address]
     } else {
         (host, port)
@@ -4028,10 +4028,7 @@ fn validate_target_url_parts_blocking(
     if addresses.is_empty() {
         return Err(format!("DNS resolution returned no addresses for host '{host}'"));
     }
-    if !allow_private_targets && addresses.iter().any(|address| is_private_or_local_ip(*address)) {
-        return Err("target resolves to private/local address and is blocked by policy".to_owned());
-    }
-    Ok(())
+    netguard::validate_resolved_ip_addrs(addresses.as_slice(), allow_private_targets)
 }
 
 async fn navigate_with_guards(
@@ -4291,7 +4288,7 @@ async fn validate_target_url(url: &Url, allow_private_targets: bool) -> Result<(
     let port =
         url.port_or_known_default().ok_or_else(|| "URL port could not be resolved".to_owned())?;
 
-    let addresses = if let Ok(address) = host.parse::<IpAddr>() {
+    let addresses = if let Some(address) = netguard::parse_host_ip_literal(host)? {
         vec![address]
     } else {
         tokio::net::lookup_host((host, port))
@@ -4304,30 +4301,7 @@ async fn validate_target_url(url: &Url, allow_private_targets: bool) -> Result<(
     if addresses.is_empty() {
         return Err(format!("DNS resolution returned no addresses for host '{host}'"));
     }
-    if !allow_private_targets && addresses.iter().any(|address| is_private_or_local_ip(*address)) {
-        return Err("target resolves to private/local address and is blocked by policy".to_owned());
-    }
-    Ok(())
-}
-
-fn is_private_or_local_ip(address: IpAddr) -> bool {
-    match address {
-        IpAddr::V4(ipv4) => {
-            ipv4.is_private() || ipv4.is_loopback() || ipv4.is_link_local() || ipv4.is_unspecified()
-        }
-        IpAddr::V6(ipv6) => {
-            if let Some(mapped) = ipv6.to_ipv4_mapped() {
-                return mapped.is_private()
-                    || mapped.is_loopback()
-                    || mapped.is_link_local()
-                    || mapped.is_unspecified();
-            }
-            ipv6.is_loopback()
-                || ipv6.is_unicast_link_local()
-                || ipv6.is_unique_local()
-                || ipv6.is_unspecified()
-        }
-    }
+    netguard::validate_resolved_ip_addrs(addresses.as_slice(), allow_private_targets)
 }
 
 fn extract_html_title(body: &str) -> Option<&str> {
@@ -6561,10 +6535,10 @@ async fn fetch_download_artifact(
 mod tests {
     use super::{
         browser_v1, default_browserd_state_dir_from_env, enforce_non_loopback_bind_auth,
-        navigate_with_guards, parse_daemon_bind_socket, Args, BrowserEngineMode,
-        BrowserRuntimeState, BrowserServiceImpl, PersistedStateStore, CHROMIUM_PATH_ENV,
-        DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS, DEFAULT_GRPC_PORT, MAX_RELAY_PAYLOAD_BYTES,
-        ONE_BY_ONE_PNG, STATE_KEY_LEN,
+        navigate_with_guards, parse_daemon_bind_socket, validate_target_url_blocking, Args,
+        BrowserEngineMode, BrowserRuntimeState, BrowserServiceImpl, PersistedStateStore,
+        CHROMIUM_PATH_ENV, DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS, DEFAULT_GRPC_PORT,
+        MAX_RELAY_PAYLOAD_BYTES, ONE_BY_ONE_PNG, STATE_KEY_LEN,
     };
     use crate::proto;
     use crate::proto::palyra::browser::v1::browser_service_server::BrowserService;
@@ -6785,6 +6759,20 @@ mod tests {
             "error should explain private target block: {}",
             outcome.error
         );
+    }
+
+    #[test]
+    fn validate_target_url_blocking_rejects_non_canonical_ipv4_literals() {
+        for url in
+            ["http://2130706433/", "http://0x7f000001/", "http://0177.0.0.1/", "http://127.1/"]
+        {
+            let error =
+                validate_target_url_blocking(url, false).expect_err("non-canonical host must fail");
+            assert!(
+                error.contains("non-canonical IPv4 literal") || error.contains("private/local"),
+                "error should keep fail-closed host guard semantics for {url}: {error}"
+            );
+        }
     }
 
     #[test]

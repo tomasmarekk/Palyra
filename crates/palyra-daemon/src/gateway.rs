@@ -21,7 +21,7 @@ use palyra_auth::{
     AuthScopeFilter, OAuthRefreshAdapter, OAuthRefreshOutcome,
 };
 use palyra_common::{
-    build_metadata, validate_canonical_id,
+    build_metadata, netguard, validate_canonical_id,
     workspace_patch::{
         apply_workspace_patch, compute_patch_sha256, redact_patch_preview, WorkspacePatchLimits,
         WorkspacePatchRedactionPolicy, WorkspacePatchRequest,
@@ -10520,7 +10520,7 @@ async fn resolve_fetch_target_addresses(
     let port =
         url.port_or_known_default().ok_or_else(|| "URL port could not be resolved".to_owned())?;
 
-    let addrs = if let Ok(ip) = host.parse::<IpAddr>() {
+    let addrs = if let Some(ip) = netguard::parse_host_ip_literal(host)? {
         vec![SocketAddr::new(ip, port)]
     } else {
         let resolved = tokio::net::lookup_host((host, port))
@@ -10539,68 +10539,8 @@ fn validate_resolved_fetch_addresses(
     addrs: &[SocketAddr],
     allow_private_targets: bool,
 ) -> Result<(), String> {
-    if addrs.is_empty() {
-        return Err("DNS resolution returned no addresses".to_owned());
-    }
-    if !allow_private_targets && addrs.iter().any(|address| is_private_or_local_ip(address.ip())) {
-        return Err("target resolves to private/local address and is blocked by policy".to_owned());
-    }
-    Ok(())
-}
-
-fn is_private_or_local_ip(address: IpAddr) -> bool {
-    match address {
-        IpAddr::V4(ipv4) => is_private_or_local_ipv4(ipv4),
-        IpAddr::V6(ipv6) => is_private_or_local_ipv6(ipv6),
-    }
-}
-
-fn is_private_or_local_ipv4(address: Ipv4Addr) -> bool {
-    address.is_private()
-        || address.is_loopback()
-        || address.is_link_local()
-        || address.is_unspecified()
-        || address.is_multicast()
-        || is_special_ipv4_ssrf_range(address)
-}
-
-fn is_private_or_local_ipv6(address: Ipv6Addr) -> bool {
-    if let Some(mapped_ipv4) = address.to_ipv4_mapped() {
-        return is_private_or_local_ipv4(mapped_ipv4);
-    }
-    address.is_loopback()
-        || address.is_unicast_link_local()
-        || address.is_unique_local()
-        || address.is_unspecified()
-        || address.is_multicast()
-        || is_documentation_ipv6(address)
-        || is_site_local_ipv6(address)
-}
-
-fn is_special_ipv4_ssrf_range(address: Ipv4Addr) -> bool {
-    let octets = address.octets();
-    let first = octets[0];
-    let second = octets[1];
-    let third = octets[2];
-
-    first == 0
-        || (first == 100 && (64..=127).contains(&second))
-        || (first == 192 && second == 0 && third == 0)
-        || (first == 192 && second == 0 && third == 2)
-        || (first == 198 && second == 18)
-        || (first == 198 && second == 19)
-        || (first == 198 && second == 51 && third == 100)
-        || (first == 203 && second == 0 && third == 113)
-        || first >= 240
-}
-
-fn is_documentation_ipv6(address: Ipv6Addr) -> bool {
-    let segments = address.segments();
-    segments[0] == 0x2001 && segments[1] == 0x0db8
-}
-
-fn is_site_local_ipv6(address: Ipv6Addr) -> bool {
-    (address.segments()[0] & 0xffc0) == 0xfec0
+    let ips = addrs.iter().map(|address| address.ip()).collect::<Vec<_>>();
+    netguard::validate_resolved_ip_addrs(ips.as_slice(), allow_private_targets)
 }
 
 fn redacted_http_headers(headers: &[(String, String)]) -> Vec<serde_json::Value> {
@@ -14726,12 +14666,13 @@ mod tests {
         execute_memory_search_tool, execute_workspace_patch_tool, extend_patch_string_defaults,
         parse_patch_string_array_field, principal_has_sensitive_service_role,
         record_auth_refresh_journal_event, request_context_from_headers,
-        resolve_cron_job_channel_for_create, validate_resolved_fetch_addresses,
-        vault_get_requires_approval, workspace_patch_metrics_from_output, AuthError,
-        GatewayAuthConfig, GatewayJournalConfigSnapshot, GatewayRuntimeConfigSnapshot,
-        GatewayRuntimeState, MemoryRuntimeConfig, ProviderRequest, RequestContext,
-        SensitiveServiceRole, ToolApprovalOutcome, HEADER_CHANNEL, HEADER_DEVICE_ID,
-        HEADER_PRINCIPAL, MAX_APPROVAL_PAGE_LIMIT, VAULT_RATE_LIMIT_MAX_PRINCIPAL_BUCKETS,
+        resolve_cron_job_channel_for_create, resolve_fetch_target_addresses,
+        validate_resolved_fetch_addresses, vault_get_requires_approval,
+        workspace_patch_metrics_from_output, AuthError, GatewayAuthConfig,
+        GatewayJournalConfigSnapshot, GatewayRuntimeConfigSnapshot, GatewayRuntimeState,
+        MemoryRuntimeConfig, ProviderRequest, RequestContext, SensitiveServiceRole,
+        ToolApprovalOutcome, HEADER_CHANNEL, HEADER_DEVICE_ID, HEADER_PRINCIPAL,
+        MAX_APPROVAL_PAGE_LIMIT, VAULT_RATE_LIMIT_MAX_PRINCIPAL_BUCKETS,
         VAULT_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW,
     };
 
@@ -15145,10 +15086,12 @@ mod tests {
         let blocked = [
             Ipv4Addr::new(100, 64, 0, 1),
             Ipv4Addr::new(169, 254, 169, 254),
+            Ipv4Addr::new(192, 88, 99, 1),
             Ipv4Addr::new(198, 18, 0, 1),
             Ipv4Addr::new(192, 0, 2, 42),
             Ipv4Addr::new(198, 51, 100, 42),
             Ipv4Addr::new(203, 0, 113, 42),
+            Ipv4Addr::new(224, 0, 0, 1),
             Ipv4Addr::new(240, 1, 2, 3),
         ];
         for ip in blocked {
@@ -15166,6 +15109,8 @@ mod tests {
         let blocked = [
             Ipv6Addr::LOCALHOST,
             Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1),
+            Ipv6Addr::new(0x2002, 0, 0, 0, 0, 0, 0, 1),
+            Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 1),
             Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 1),
             Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1),
         ];
@@ -15177,6 +15122,18 @@ mod tests {
                 "address {ip} must be treated as non-public and denied by default"
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolve_fetch_target_addresses_rejects_non_canonical_ipv4_literals() {
+        let url = reqwest::Url::parse("http://2130706433/").expect("test URL should parse");
+        let error = resolve_fetch_target_addresses(&url, false)
+            .await
+            .expect_err("non-canonical host literals must fail closed");
+        assert!(
+            error.contains("non-canonical IPv4 literal") || error.contains("private/local"),
+            "error should keep fail-closed host guard semantics: {error}"
+        );
     }
 
     #[test]
