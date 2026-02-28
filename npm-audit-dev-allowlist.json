@@ -1,14 +1,5 @@
 {
   "version": 1,
-  "updated_at": "2026-02-19",
-  "entries": [
-    {
-      "id": "GHSA-3ppc-4f35-3m26",
-      "severity": "high",
-      "scope": "dev-only",
-      "owner": "@marektomas-cz",
-      "expires_on": "2026-04-30",
-      "reason": "Transitive via eslint/typescript-eslint toolchain; runtime dependencies are audited separately with a blocking gate."
-    }
-  ]
+  "updated_at": "2026-02-28",
+  "entries": []
 }
