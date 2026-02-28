@@ -3688,7 +3688,7 @@ async fn handle_chromium_session_socks5_client(
         .read_exact(methods.as_mut_slice())
         .await
         .map_err(|error| format!("failed to read SOCKS5 auth methods: {error}"))?;
-    let supports_no_auth = methods.iter().any(|method| *method == 0x00);
+    let supports_no_auth = methods.contains(&0x00);
     if !supports_no_auth {
         stream
             .write_all(&[0x05, 0xFF])
