@@ -4544,7 +4544,7 @@ fn dns_validation_metrics_snapshot() -> DnsValidationMetricsSnapshot {
 
 fn maybe_log_dns_validation_metrics() {
     let observations = DNS_VALIDATION_METRICS.observations.fetch_add(1, Ordering::Relaxed) + 1;
-    if observations % DNS_VALIDATION_METRICS_LOG_INTERVAL != 0 {
+    if !observations.is_multiple_of(DNS_VALIDATION_METRICS_LOG_INTERVAL) {
         return;
     }
     let snapshot = dns_validation_metrics_snapshot();
