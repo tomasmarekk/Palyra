@@ -35,8 +35,11 @@ use ring::{
 };
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
-use tokio::sync::Mutex;
 use tokio::time::{interval, MissedTickBehavior};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::{oneshot, Mutex},
+};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{transport::Server, Request, Response, Status};
 use tracing::{info, warn};
@@ -637,6 +640,7 @@ struct ChromiumSessionState {
     tabs: HashMap<String, Arc<HeadlessTab>>,
     security_incident: Arc<std::sync::Mutex<Option<String>>>,
     _profile_dir: TempDir,
+    _proxy: Option<ChromiumSessionProxy>,
 }
 
 #[derive(Debug, Clone)]
@@ -3538,11 +3542,243 @@ where
         .map_err(|error| format!("{operation} task join failure: {error}"))?
 }
 
-fn build_chromium_launch_options(
+#[derive(Debug)]
+struct ChromiumSessionProxy {
+    proxy_uri: String,
+    shutdown_tx: Option<oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ChromiumSessionProxy {
+    async fn spawn(allow_private_targets: bool) -> Result<Self, String> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|error| format!("failed to bind Chromium session SOCKS5 proxy: {error}"))?;
+        let local_addr = listener.local_addr().map_err(|error| {
+            format!("failed to resolve Chromium session SOCKS5 proxy addr: {error}")
+        })?;
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let task = tokio::spawn(run_chromium_session_socks5_proxy(
+            listener,
+            allow_private_targets,
+            shutdown_rx,
+        ));
+        Ok(Self {
+            proxy_uri: format!("socks5://{local_addr}"),
+            shutdown_tx: Some(shutdown_tx),
+            task,
+        })
+    }
+}
+
+impl Drop for ChromiumSessionProxy {
+    fn drop(&mut self) {
+        if let Some(shutdown_tx) = self.shutdown_tx.take() {
+            let _ = shutdown_tx.send(());
+        }
+        self.task.abort();
+    }
+}
+
+#[derive(Debug)]
+enum Socks5TargetHost {
+    Ip(IpAddr),
+    Domain(String),
+}
+
+async fn run_chromium_session_socks5_proxy(
+    listener: tokio::net::TcpListener,
+    allow_private_targets: bool,
+    mut shutdown_rx: oneshot::Receiver<()>,
+) {
+    loop {
+        tokio::select! {
+            _ = &mut shutdown_rx => {
+                break;
+            }
+            accepted = listener.accept() => {
+                match accepted {
+                    Ok((stream, client_addr)) => {
+                        tokio::spawn(async move {
+                            if let Err(error) = handle_chromium_session_socks5_client(stream, allow_private_targets).await {
+                                warn!(
+                                    client_addr = %client_addr,
+                                    error = error.as_str(),
+                                    "Chromium session SOCKS5 proxy request failed"
+                                );
+                            }
+                        });
+                    }
+                    Err(error) => {
+                        warn!(error = %error, "Chromium session SOCKS5 proxy accept failed");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn socks5_reply(status: u8) -> [u8; 10] {
+    [0x05, status, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+}
+
+async fn read_socks5_target_host(
+    stream: &mut tokio::net::TcpStream,
+    atyp: u8,
+) -> Result<Socks5TargetHost, String> {
+    match atyp {
+        0x01 => {
+            let mut octets = [0_u8; 4];
+            stream
+                .read_exact(&mut octets)
+                .await
+                .map_err(|error| format!("failed to read SOCKS5 IPv4 target: {error}"))?;
+            Ok(Socks5TargetHost::Ip(IpAddr::from(octets)))
+        }
+        0x04 => {
+            let mut octets = [0_u8; 16];
+            stream
+                .read_exact(&mut octets)
+                .await
+                .map_err(|error| format!("failed to read SOCKS5 IPv6 target: {error}"))?;
+            Ok(Socks5TargetHost::Ip(IpAddr::from(octets)))
+        }
+        0x03 => {
+            let mut length = [0_u8; 1];
+            stream
+                .read_exact(&mut length)
+                .await
+                .map_err(|error| format!("failed to read SOCKS5 domain length: {error}"))?;
+            let host_len = usize::from(length[0]);
+            if host_len == 0 {
+                return Err("SOCKS5 domain target must not be empty".to_owned());
+            }
+            let mut raw_host = vec![0_u8; host_len];
+            stream
+                .read_exact(raw_host.as_mut_slice())
+                .await
+                .map_err(|error| format!("failed to read SOCKS5 domain target: {error}"))?;
+            let host = String::from_utf8(raw_host)
+                .map_err(|error| format!("SOCKS5 domain target is not valid UTF-8: {error}"))?;
+            if host.trim().is_empty() {
+                return Err("SOCKS5 domain target must not be whitespace".to_owned());
+            }
+            Ok(Socks5TargetHost::Domain(host))
+        }
+        _ => Err(format!("unsupported SOCKS5 address type: {atyp}")),
+    }
+}
+
+async fn handle_chromium_session_socks5_client(
+    mut stream: tokio::net::TcpStream,
+    allow_private_targets: bool,
+) -> Result<(), String> {
+    let mut greeting = [0_u8; 2];
+    stream
+        .read_exact(&mut greeting)
+        .await
+        .map_err(|error| format!("failed to read SOCKS5 greeting header: {error}"))?;
+    if greeting[0] != 0x05 {
+        return Err(format!("unsupported SOCKS5 version: {}", greeting[0]));
+    }
+    let methods_len = usize::from(greeting[1]);
+    let mut methods = vec![0_u8; methods_len];
+    stream
+        .read_exact(methods.as_mut_slice())
+        .await
+        .map_err(|error| format!("failed to read SOCKS5 auth methods: {error}"))?;
+    let supports_no_auth = methods.iter().any(|method| *method == 0x00);
+    if !supports_no_auth {
+        stream
+            .write_all(&[0x05, 0xFF])
+            .await
+            .map_err(|error| format!("failed to reject unsupported SOCKS5 auth method: {error}"))?;
+        return Err("SOCKS5 client does not support no-auth mode".to_owned());
+    }
+    stream
+        .write_all(&[0x05, 0x00])
+        .await
+        .map_err(|error| format!("failed to acknowledge SOCKS5 auth method: {error}"))?;
+
+    let mut request_header = [0_u8; 4];
+    stream
+        .read_exact(&mut request_header)
+        .await
+        .map_err(|error| format!("failed to read SOCKS5 request header: {error}"))?;
+    if request_header[0] != 0x05 {
+        return Err(format!("SOCKS5 request used unsupported version {}", request_header[0]));
+    }
+    if request_header[1] != 0x01 {
+        let _ = stream.write_all(socks5_reply(0x07).as_slice()).await;
+        return Err(format!("SOCKS5 proxy supports CONNECT only (command {})", request_header[1]));
+    }
+
+    let target_host = read_socks5_target_host(&mut stream, request_header[3]).await?;
+    let mut raw_port = [0_u8; 2];
+    stream
+        .read_exact(&mut raw_port)
+        .await
+        .map_err(|error| format!("failed to read SOCKS5 target port: {error}"))?;
+    let target_port = u16::from_be_bytes(raw_port);
+
+    let (target_label, resolved) = match target_host {
+        Socks5TargetHost::Ip(ip) => {
+            let resolved = ResolvedHostAddresses::from_addresses(vec![ip])?;
+            (ip.to_string(), resolved)
+        }
+        Socks5TargetHost::Domain(host) => {
+            let resolved = resolve_host_addresses_async(host.as_str(), target_port).await?;
+            (host, resolved)
+        }
+    };
+
+    if let Err(error) =
+        enforce_resolved_host_policy(target_label.as_str(), resolved.clone(), allow_private_targets)
+    {
+        let _ = stream.write_all(socks5_reply(0x02).as_slice()).await;
+        return Err(error);
+    }
+
+    let connect_addr = SocketAddr::new(resolved.addresses[0], target_port);
+    let mut upstream = match tokio::net::TcpStream::connect(connect_addr).await {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = stream.write_all(socks5_reply(0x04).as_slice()).await;
+            return Err(format!(
+                "SOCKS5 proxy failed to connect to {}:{} via {}: {error}",
+                target_label, target_port, connect_addr
+            ));
+        }
+    };
+
+    stream
+        .write_all(socks5_reply(0x00).as_slice())
+        .await
+        .map_err(|error| format!("failed to acknowledge SOCKS5 CONNECT success: {error}"))?;
+    tokio::io::copy_bidirectional(&mut stream, &mut upstream)
+        .await
+        .map_err(|error| format!("SOCKS5 proxy stream relay failed: {error}"))?;
+    Ok(())
+}
+
+fn build_chromium_launch_options<'a>(
     chromium: &ChromiumEngineConfig,
     profile_dir: &TempDir,
-) -> Result<headless_chrome::LaunchOptions<'static>, String> {
+    proxy_server: Option<&'a str>,
+) -> Result<headless_chrome::LaunchOptions<'a>, String> {
     let chromium_path = chromium.executable_path.clone();
+    let mut chromium_args = vec![
+        OsStr::new("--disable-dev-shm-usage"),
+        OsStr::new("--disable-gpu"),
+        OsStr::new("--no-first-run"),
+        OsStr::new("--no-default-browser-check"),
+        OsStr::new("--window-size=1280,800"),
+        OsStr::new("--disable-blink-features=AutomationControlled"),
+    ];
+    if proxy_server.is_some() {
+        chromium_args.push(OsStr::new("--proxy-bypass-list=<-loopback>"));
+    }
     let mut builder = LaunchOptionsBuilder::default();
     builder
         .headless(true)
@@ -3551,14 +3787,8 @@ fn build_chromium_launch_options(
         .ignore_certificate_errors(false)
         .idle_browser_timeout(chromium.startup_timeout)
         .user_data_dir(Some(profile_dir.path().to_path_buf()))
-        .args(vec![
-            OsStr::new("--disable-dev-shm-usage"),
-            OsStr::new("--disable-gpu"),
-            OsStr::new("--no-first-run"),
-            OsStr::new("--no-default-browser-check"),
-            OsStr::new("--window-size=1280,800"),
-            OsStr::new("--disable-blink-features=AutomationControlled"),
-        ]);
+        .args(chromium_args)
+        .proxy_server(proxy_server);
     if let Some(path) = chromium_path {
         builder.path(Some(path));
     }
@@ -3662,33 +3892,50 @@ async fn initialize_chromium_session_runtime(
     } else if !tab_order.iter().any(|tab_id| tab_id == &active_tab_id) {
         tab_order.insert(0, active_tab_id.clone());
     }
+    let proxy = ChromiumSessionProxy::spawn(allow_private_targets).await?;
+    let proxy_uri = proxy.proxy_uri.clone();
     let security_incident = Arc::new(std::sync::Mutex::new(None::<String>));
-    let chromium_session = run_chromium_blocking("chromium session initialization", move || {
-        let profile_dir = tempfile::Builder::new()
-            .prefix("palyra-browserd-session-")
-            .tempdir()
-            .map_err(|error| format!("failed to allocate Chromium profile dir: {error}"))?;
-        let launch_options = build_chromium_launch_options(&chromium, &profile_dir)?;
-        let browser = Arc::new(
-            HeadlessBrowser::new(launch_options)
-                .map_err(|error| format!("failed to launch Chromium browser process: {error}"))?,
-        );
-        let mut tabs = HashMap::new();
-        for tab_id in tab_order.iter() {
-            let tab = browser.new_tab().map_err(|error| {
-                format!("failed to create Chromium tab for session restore: {error}")
-            })?;
-            configure_chromium_tab(
-                &tab,
-                allow_private_targets,
-                navigation_timeout,
-                Arc::clone(&security_incident),
-            )?;
-            tabs.insert(tab_id.clone(), tab);
-        }
-        Ok(ChromiumSessionState { browser, tabs, security_incident, _profile_dir: profile_dir })
-    })
-    .await?;
+    let mut chromium_session =
+        run_chromium_blocking("chromium session initialization", move || {
+            let profile_dir = tempfile::Builder::new()
+                .prefix("palyra-browserd-session-")
+                .tempdir()
+                .map_err(|error| format!("failed to allocate Chromium profile dir: {error}"))?;
+            let launch_options =
+                build_chromium_launch_options(&chromium, &profile_dir, Some(proxy_uri.as_str()))?;
+            let browser =
+                Arc::new(HeadlessBrowser::new(launch_options).map_err(|error| {
+                    format!("failed to launch Chromium browser process: {error}")
+                })?);
+            let mut tabs = HashMap::new();
+            for tab_id in tab_order.iter() {
+                let tab = browser.new_tab().map_err(|error| {
+                    format!("failed to create Chromium tab for session restore: {error}")
+                })?;
+                configure_chromium_tab(
+                    &tab,
+                    allow_private_targets,
+                    navigation_timeout,
+                    Arc::clone(&security_incident),
+                )?;
+                tabs.insert(tab_id.clone(), tab);
+            }
+            Ok(ChromiumSessionState {
+                browser,
+                tabs,
+                security_incident,
+                _profile_dir: profile_dir,
+                _proxy: None,
+            })
+        })
+        .await?;
+    info!(
+        session_id = session_id,
+        proxy_uri = proxy.proxy_uri.as_str(),
+        allow_private_targets,
+        "started per-session Chromium SOCKS5 proxy with NetGuard enforcement"
+    );
+    chromium_session._proxy = Some(proxy);
     runtime.chromium_sessions.lock().await.insert(session_id.to_owned(), chromium_session);
     Ok(())
 }
@@ -7205,11 +7452,11 @@ mod tests {
         store_dns_nxdomain_cache, store_dns_resolution_cache, update_profile_state_metadata,
         validate_restored_snapshot_against_profile, validate_target_url_blocking, Args,
         BrowserEngineMode, BrowserProfileRecord, BrowserRuntimeState, BrowserServiceImpl,
-        BrowserTabRecord, DnsCacheResolution, DnsValidationCache, PersistedSessionSnapshot,
-        PersistedStateStore, ResolvedHostAddresses, SessionPermissionsInternal,
-        CANONICAL_PROTOCOL_MAJOR, CHROMIUM_PATH_ENV, DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS,
-        DEFAULT_GRPC_PORT, MAX_RELAY_PAYLOAD_BYTES, ONE_BY_ONE_PNG, PROFILE_RECORD_SCHEMA_VERSION,
-        STATE_KEY_LEN,
+        BrowserTabRecord, ChromiumSessionProxy, DnsCacheResolution, DnsValidationCache,
+        PersistedSessionSnapshot, PersistedStateStore, ResolvedHostAddresses,
+        SessionPermissionsInternal, CANONICAL_PROTOCOL_MAJOR, CHROMIUM_PATH_ENV,
+        DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS, DEFAULT_GRPC_PORT, MAX_RELAY_PAYLOAD_BYTES,
+        ONE_BY_ONE_PNG, PROFILE_RECORD_SCHEMA_VERSION, STATE_KEY_LEN,
     };
     use crate::proto;
     use crate::proto::palyra::browser::v1::browser_service_server::BrowserService;
@@ -7221,6 +7468,7 @@ mod tests {
     use std::sync::{Arc, Mutex as StdMutex};
     use std::thread;
     use std::time::{Duration, Instant};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tonic::Request;
 
     const PARITY_DOWNLOAD_TRIGGER_HTML: &str =
@@ -7584,6 +7832,119 @@ mod tests {
             incident.lock().expect("guard should lock after private-target opt-in check").is_none(),
             "private-target opt-in should bypass remote IP guard incidents"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn chromium_session_proxy_blocks_private_targets_without_opt_in() {
+        let proxy = ChromiumSessionProxy::spawn(false)
+            .await
+            .expect("proxy should start for private-target deny policy");
+        let proxy_addr = proxy
+            .proxy_uri
+            .strip_prefix("socks5://")
+            .expect("proxy uri should use socks5 scheme")
+            .to_owned();
+        let mut stream = tokio::net::TcpStream::connect(proxy_addr.as_str())
+            .await
+            .expect("test client should connect to SOCKS5 proxy");
+
+        stream.write_all(&[0x05, 0x01, 0x00]).await.expect("proxy handshake should write greeting");
+        let mut method_reply = [0_u8; 2];
+        stream
+            .read_exact(&mut method_reply)
+            .await
+            .expect("proxy handshake should read selected method");
+        assert_eq!(method_reply, [0x05, 0x00], "proxy should accept SOCKS5 no-auth handshake");
+
+        stream
+            .write_all(&[0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0, 80])
+            .await
+            .expect("proxy request should send CONNECT target");
+        let mut connect_reply = [0_u8; 10];
+        stream
+            .read_exact(&mut connect_reply)
+            .await
+            .expect("proxy should return CONNECT policy decision");
+        assert_eq!(
+            connect_reply[1], 0x02,
+            "private localhost target must be denied when allow_private_targets=false"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn chromium_session_proxy_allows_private_targets_when_opted_in() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fixture listener should bind on loopback");
+        let target_port =
+            listener.local_addr().expect("fixture listener addr should resolve").port();
+        let fixture_server = tokio::spawn(async move {
+            let (mut inbound, _) =
+                listener.accept().await.expect("fixture server should accept proxied connection");
+            let mut request = [0_u8; 4];
+            inbound
+                .read_exact(&mut request)
+                .await
+                .expect("fixture server should read tunneled payload");
+            assert_eq!(&request, b"ping", "proxy tunnel should forward payload bytes");
+            inbound
+                .write_all(b"pong")
+                .await
+                .expect("fixture server should write tunneled response");
+        });
+
+        let proxy = ChromiumSessionProxy::spawn(true)
+            .await
+            .expect("proxy should start for private-target opt-in policy");
+        let proxy_addr = proxy
+            .proxy_uri
+            .strip_prefix("socks5://")
+            .expect("proxy uri should use socks5 scheme")
+            .to_owned();
+        let mut stream = tokio::net::TcpStream::connect(proxy_addr.as_str())
+            .await
+            .expect("test client should connect to SOCKS5 proxy");
+
+        stream.write_all(&[0x05, 0x01, 0x00]).await.expect("proxy handshake should write greeting");
+        let mut method_reply = [0_u8; 2];
+        stream
+            .read_exact(&mut method_reply)
+            .await
+            .expect("proxy handshake should read selected method");
+        assert_eq!(method_reply, [0x05, 0x00], "proxy should accept SOCKS5 no-auth handshake");
+
+        let target_port_bytes = target_port.to_be_bytes();
+        stream
+            .write_all(&[
+                0x05,
+                0x01,
+                0x00,
+                0x01,
+                127,
+                0,
+                0,
+                1,
+                target_port_bytes[0],
+                target_port_bytes[1],
+            ])
+            .await
+            .expect("proxy request should send CONNECT target");
+        let mut connect_reply = [0_u8; 10];
+        stream.read_exact(&mut connect_reply).await.expect("proxy should return CONNECT decision");
+        assert_eq!(
+            connect_reply[1], 0x00,
+            "opted-in session should allow loopback target through proxy"
+        );
+
+        stream.write_all(b"ping").await.expect("proxy tunnel should forward request payload");
+        let mut response = [0_u8; 4];
+        stream
+            .read_exact(&mut response)
+            .await
+            .expect("proxy tunnel should forward response payload");
+        assert_eq!(&response, b"pong");
+
+        fixture_server.await.expect("fixture server task should complete successfully");
     }
 
     #[test]
