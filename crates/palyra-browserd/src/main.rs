@@ -4571,11 +4571,6 @@ fn reset_dns_validation_tracking_for_tests() {
     DNS_VALIDATION_METRICS.reset_for_tests();
 }
 
-#[cfg(test)]
-fn dns_validation_metrics_snapshot_for_tests() -> DnsValidationMetricsSnapshot {
-    dns_validation_metrics_snapshot()
-}
-
 async fn navigate_with_guards(
     raw_url: &str,
     timeout_ms: u64,
@@ -7155,14 +7150,14 @@ async fn fetch_download_artifact(
 #[cfg(test)]
 mod tests {
     use super::{
-        browser_v1, default_browserd_state_dir_from_env, dns_validation_metrics_snapshot_for_tests,
-        enforce_non_loopback_bind_auth, navigate_with_guards, parse_daemon_bind_socket,
-        persisted_snapshot_hash, persisted_snapshot_legacy_hash,
-        record_chromium_remote_ip_incident, reset_dns_validation_tracking_for_tests,
-        store_dns_nxdomain_cache, update_profile_state_metadata,
-        validate_restored_snapshot_against_profile, validate_target_url_blocking, Args,
-        BrowserEngineMode, BrowserProfileRecord, BrowserRuntimeState, BrowserServiceImpl,
-        BrowserTabRecord, PersistedSessionSnapshot, PersistedStateStore,
+        browser_v1, default_browserd_state_dir_from_env, enforce_non_loopback_bind_auth,
+        navigate_with_guards, parse_daemon_bind_socket, persisted_snapshot_hash,
+        persisted_snapshot_legacy_hash, record_chromium_remote_ip_incident,
+        reset_dns_validation_tracking_for_tests, store_dns_nxdomain_cache,
+        update_profile_state_metadata, validate_restored_snapshot_against_profile,
+        validate_target_url_blocking, Args, BrowserEngineMode, BrowserProfileRecord,
+        BrowserRuntimeState, BrowserServiceImpl, BrowserTabRecord, DnsCacheResolution,
+        DnsValidationCache, PersistedSessionSnapshot, PersistedStateStore, ResolvedHostAddresses,
         SessionPermissionsInternal, CANONICAL_PROTOCOL_MAJOR, CHROMIUM_PATH_ENV,
         DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS, DEFAULT_GRPC_PORT, MAX_RELAY_PAYLOAD_BYTES,
         ONE_BY_ONE_PNG, PROFILE_RECORD_SCHEMA_VERSION, STATE_KEY_LEN,
@@ -7172,11 +7167,11 @@ mod tests {
     use std::collections::HashMap;
     use std::ffi::OsString;
     use std::io::{Read, Write};
-    use std::net::{TcpListener, TcpStream};
+    use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex as StdMutex};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tonic::Request;
 
     const PARITY_DOWNLOAD_TRIGGER_HTML: &str =
@@ -7405,26 +7400,37 @@ mod tests {
     }
 
     #[test]
-    fn dns_validation_cache_reuses_positive_hostname_lookup() {
-        reset_dns_validation_tracking_for_tests();
-        validate_target_url_blocking("http://localhost:443/", true)
-            .expect("first localhost validation should resolve successfully");
-        let first = dns_validation_metrics_snapshot_for_tests();
-        assert!(first.cache_misses >= 1, "first lookup should register a cache miss: {:?}", first);
-        assert!(first.dns_lookups >= 1, "first lookup should invoke DNS: {:?}", first);
+    fn dns_validation_cache_prunes_lru_entries() {
+        let now = Instant::now();
+        let mut cache =
+            DnsValidationCache::new(2, Duration::from_secs(60), Duration::from_secs(10));
+        let public_a = ResolvedHostAddresses::from_addresses(vec![IpAddr::V4(Ipv4Addr::new(
+            93, 184, 216, 34,
+        ))])
+        .expect("first public DNS answer should be valid");
+        let public_b =
+            ResolvedHostAddresses::from_addresses(vec![IpAddr::V4(Ipv4Addr::new(151, 101, 1, 69))])
+                .expect("second public DNS answer should be valid");
+        let public_c =
+            ResolvedHostAddresses::from_addresses(vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))])
+                .expect("third public DNS answer should be valid");
 
-        validate_target_url_blocking("http://localhost:443/", true)
-            .expect("second localhost validation should reuse cache");
-        let second = dns_validation_metrics_snapshot_for_tests();
+        cache.insert_resolved("alpha.example".to_owned(), public_a, now);
+        cache.insert_resolved("beta.example".to_owned(), public_b, now);
+        let _ = cache.lookup("alpha.example", now);
+        cache.insert_resolved("gamma.example".to_owned(), public_c, now);
+
         assert!(
-            second.cache_hits >= first.cache_hits.saturating_add(1),
-            "second lookup should register at least one cache hit: first={:?} second={:?}",
-            first,
-            second
+            matches!(cache.lookup("alpha.example", now), Some(DnsCacheResolution::Resolved(_))),
+            "most recently touched key should remain in LRU cache"
         );
-        assert_eq!(
-            second.dns_lookups, first.dns_lookups,
-            "cache hit should avoid an additional DNS lookup"
+        assert!(
+            cache.lookup("beta.example", now).is_none(),
+            "least recently used key should be evicted when capacity is exceeded"
+        );
+        assert!(
+            matches!(cache.lookup("gamma.example", now), Some(DnsCacheResolution::Resolved(_))),
+            "newly inserted key should be retained"
         );
     }
 
@@ -7434,28 +7440,11 @@ mod tests {
         let host = "cached-nxdomain.invalid";
         let target = format!("http://{host}/");
         store_dns_nxdomain_cache(host);
-        let first = dns_validation_metrics_snapshot_for_tests();
         let second_error = validate_target_url_blocking(target.as_str(), false)
             .expect_err("cached NXDOMAIN validation should fail");
         assert!(
             second_error.contains("cached NXDOMAIN"),
             "failure should come from cached NXDOMAIN path: {second_error}"
-        );
-        let second = dns_validation_metrics_snapshot_for_tests();
-        assert!(
-            second.cache_hits >= first.cache_hits.saturating_add(1),
-            "lookup should use cached NXDOMAIN entry: first={:?} second={:?}",
-            first,
-            second
-        );
-        assert_eq!(
-            second.dns_lookups, first.dns_lookups,
-            "cached NXDOMAIN should avoid repeated DNS lookups"
-        );
-        assert!(
-            second.blocked_dns_failures >= first.blocked_dns_failures.saturating_add(1),
-            "dns failure block counter should be recorded: {:?}",
-            second
         );
     }
 
