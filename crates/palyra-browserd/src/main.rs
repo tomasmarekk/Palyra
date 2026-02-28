@@ -7,7 +7,10 @@ use std::{
     io::Write,
     net::{IpAddr, SocketAddr, ToSocketAddrs},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, LazyLock,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -125,6 +128,10 @@ const MAX_RELAY_EXTENSION_ID_BYTES: usize = 96;
 const MAX_RELAY_SELECTION_BYTES: usize = 8 * 1024;
 const MAX_RELAY_PAYLOAD_BYTES: u64 = 32 * 1024;
 const CHROMIUM_REMOTE_IP_GUARD_HANDLER_NAME: &str = "palyra.security.remote_ip_guard";
+const DNS_VALIDATION_CACHE_MAX_ENTRIES: usize = 512;
+const DNS_VALIDATION_CACHE_TTL: Duration = Duration::from_secs(30);
+const DNS_VALIDATION_NEGATIVE_TTL: Duration = Duration::from_secs(10);
+const DNS_VALIDATION_METRICS_LOG_INTERVAL: u64 = 256;
 #[cfg(windows)]
 const WINDOWS_SYSTEM_SID: &str = "S-1-5-18";
 const ONE_BY_ONE_PNG: &[u8] = &[
@@ -631,6 +638,209 @@ struct ChromiumSessionState {
     security_incident: Arc<std::sync::Mutex<Option<String>>>,
     _profile_dir: TempDir,
 }
+
+#[derive(Debug, Clone)]
+struct ResolvedHostAddresses {
+    addresses: Vec<IpAddr>,
+    blocked_for_default_policy: bool,
+}
+
+impl ResolvedHostAddresses {
+    fn from_addresses(addresses: Vec<IpAddr>) -> Result<Self, String> {
+        if addresses.is_empty() {
+            return Err("DNS resolution returned no addresses".to_owned());
+        }
+        let blocked_for_default_policy =
+            addresses.iter().copied().any(netguard::is_private_or_local_ip);
+        Ok(Self { addresses, blocked_for_default_policy })
+    }
+}
+
+#[derive(Debug, Clone)]
+enum DnsCacheResolution {
+    Resolved(ResolvedHostAddresses),
+    NxDomain,
+}
+
+#[derive(Debug, Clone)]
+struct DnsValidationCacheEntry {
+    resolution: DnsCacheResolution,
+    expires_at: Instant,
+    last_access_tick: u64,
+}
+
+#[derive(Debug)]
+struct DnsValidationCache {
+    entries: HashMap<String, DnsValidationCacheEntry>,
+    max_entries: usize,
+    ttl: Duration,
+    negative_ttl: Duration,
+    next_access_tick: u64,
+}
+
+impl DnsValidationCache {
+    fn new(max_entries: usize, ttl: Duration, negative_ttl: Duration) -> Self {
+        Self {
+            entries: HashMap::new(),
+            max_entries: max_entries.max(1),
+            ttl: ttl.max(Duration::from_secs(1)),
+            negative_ttl: negative_ttl.max(Duration::from_secs(1)),
+            next_access_tick: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn lookup(&mut self, key: &str, now: Instant) -> Option<DnsCacheResolution> {
+        let mut should_remove = false;
+        let mut output = None;
+        let access_tick = self.next_access_tick();
+        if let Some(entry) = self.entries.get_mut(key) {
+            if now > entry.expires_at {
+                should_remove = true;
+            } else {
+                entry.last_access_tick = access_tick;
+                output = Some(entry.resolution.clone());
+            }
+        }
+        if should_remove {
+            self.entries.remove(key);
+        }
+        output
+    }
+
+    fn insert_resolved(&mut self, key: String, resolved: ResolvedHostAddresses, now: Instant) {
+        self.remove_expired(now);
+        let last_access_tick = self.next_access_tick();
+        self.entries.insert(
+            key,
+            DnsValidationCacheEntry {
+                resolution: DnsCacheResolution::Resolved(resolved),
+                expires_at: now + self.ttl,
+                last_access_tick,
+            },
+        );
+        self.prune_lru();
+    }
+
+    fn insert_nxdomain(&mut self, key: String, now: Instant) {
+        self.remove_expired(now);
+        let last_access_tick = self.next_access_tick();
+        self.entries.insert(
+            key,
+            DnsValidationCacheEntry {
+                resolution: DnsCacheResolution::NxDomain,
+                expires_at: now + self.negative_ttl,
+                last_access_tick,
+            },
+        );
+        self.prune_lru();
+    }
+
+    fn next_access_tick(&mut self) -> u64 {
+        self.next_access_tick = self.next_access_tick.saturating_add(1);
+        self.next_access_tick
+    }
+
+    fn remove_expired(&mut self, now: Instant) {
+        self.entries.retain(|_, entry| now <= entry.expires_at);
+    }
+
+    fn prune_lru(&mut self) {
+        while self.entries.len() > self.max_entries {
+            let Some((candidate, _)) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_access_tick)
+                .map(|(key, entry)| (key.clone(), entry.last_access_tick))
+            else {
+                break;
+            };
+            self.entries.remove(candidate.as_str());
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct DnsValidationMetrics {
+    cache_hits: AtomicU64,
+    cache_misses: AtomicU64,
+    dns_lookups: AtomicU64,
+    dns_lookup_latency_ms_total: AtomicU64,
+    blocked_total: AtomicU64,
+    blocked_private_targets: AtomicU64,
+    blocked_dns_failures: AtomicU64,
+    observations: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct DnsValidationMetricsSnapshot {
+    cache_hits: u64,
+    cache_misses: u64,
+    dns_lookups: u64,
+    dns_lookup_latency_ms_total: u64,
+    blocked_total: u64,
+    blocked_private_targets: u64,
+    blocked_dns_failures: u64,
+    cache_entries: usize,
+}
+
+impl DnsValidationMetricsSnapshot {
+    fn cache_hit_ratio(self) -> f64 {
+        let denominator = self.cache_hits.saturating_add(self.cache_misses);
+        if denominator == 0 {
+            return 0.0;
+        }
+        self.cache_hits as f64 / denominator as f64
+    }
+
+    fn lookup_avg_latency_ms(self) -> f64 {
+        if self.dns_lookups == 0 {
+            return 0.0;
+        }
+        self.dns_lookup_latency_ms_total as f64 / self.dns_lookups as f64
+    }
+}
+
+impl DnsValidationMetrics {
+    fn snapshot(&self, cache_entries: usize) -> DnsValidationMetricsSnapshot {
+        DnsValidationMetricsSnapshot {
+            cache_hits: self.cache_hits.load(Ordering::Relaxed),
+            cache_misses: self.cache_misses.load(Ordering::Relaxed),
+            dns_lookups: self.dns_lookups.load(Ordering::Relaxed),
+            dns_lookup_latency_ms_total: self.dns_lookup_latency_ms_total.load(Ordering::Relaxed),
+            blocked_total: self.blocked_total.load(Ordering::Relaxed),
+            blocked_private_targets: self.blocked_private_targets.load(Ordering::Relaxed),
+            blocked_dns_failures: self.blocked_dns_failures.load(Ordering::Relaxed),
+            cache_entries,
+        }
+    }
+
+    #[cfg(test)]
+    fn reset_for_tests(&self) {
+        self.cache_hits.store(0, Ordering::Relaxed);
+        self.cache_misses.store(0, Ordering::Relaxed);
+        self.dns_lookups.store(0, Ordering::Relaxed);
+        self.dns_lookup_latency_ms_total.store(0, Ordering::Relaxed);
+        self.blocked_total.store(0, Ordering::Relaxed);
+        self.blocked_private_targets.store(0, Ordering::Relaxed);
+        self.blocked_dns_failures.store(0, Ordering::Relaxed);
+        self.observations.store(0, Ordering::Relaxed);
+    }
+}
+
+static DNS_VALIDATION_CACHE: LazyLock<std::sync::Mutex<DnsValidationCache>> = LazyLock::new(|| {
+    std::sync::Mutex::new(DnsValidationCache::new(
+        DNS_VALIDATION_CACHE_MAX_ENTRIES,
+        DNS_VALIDATION_CACHE_TTL,
+        DNS_VALIDATION_NEGATIVE_TTL,
+    ))
+});
+
+static DNS_VALIDATION_METRICS: LazyLock<DnsValidationMetrics> =
+    LazyLock::new(DnsValidationMetrics::default);
 
 struct BrowserRuntimeState {
     started_at: Instant,
@@ -4138,6 +4348,70 @@ fn validate_target_url_parts_blocking(
     url: &Url,
     allow_private_targets: bool,
 ) -> Result<(), String> {
+    let result = (|| {
+        let (host, port) = extract_target_host_port(url)?;
+        let resolved = resolve_host_addresses_blocking(host, port)?;
+        enforce_resolved_host_policy(host, resolved, allow_private_targets)
+    })();
+    maybe_log_dns_validation_metrics();
+    result
+}
+
+fn lock_dns_validation_cache() -> std::sync::MutexGuard<'static, DnsValidationCache> {
+    DNS_VALIDATION_CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn normalize_dns_host_cache_key(host: &str) -> String {
+    host.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn is_nxdomain_lookup_error(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return true;
+    }
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("no such host")
+        || message.contains("host not found")
+        || message.contains("name or service not known")
+        || message.contains("nodename nor servname provided")
+}
+
+fn dns_resolution_error_for_host(host: &str, error: &std::io::Error) -> String {
+    format!("DNS resolution failed for host '{host}': {error}")
+}
+
+fn dns_cached_nxdomain_error_for_host(host: &str) -> String {
+    format!("DNS resolution failed for host '{host}': cached NXDOMAIN")
+}
+
+fn lookup_dns_resolution_cache(host: &str) -> Option<DnsCacheResolution> {
+    let key = normalize_dns_host_cache_key(host);
+    let now = Instant::now();
+    let mut cache = lock_dns_validation_cache();
+    let cached = cache.lookup(key.as_str(), now);
+    if cached.is_some() {
+        DNS_VALIDATION_METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
+    } else {
+        DNS_VALIDATION_METRICS.cache_misses.fetch_add(1, Ordering::Relaxed);
+    }
+    cached
+}
+
+fn store_dns_resolution_cache(host: &str, resolved: ResolvedHostAddresses) {
+    let key = normalize_dns_host_cache_key(host);
+    let now = Instant::now();
+    let mut cache = lock_dns_validation_cache();
+    cache.insert_resolved(key, resolved, now);
+}
+
+fn store_dns_nxdomain_cache(host: &str) {
+    let key = normalize_dns_host_cache_key(host);
+    let now = Instant::now();
+    let mut cache = lock_dns_validation_cache();
+    cache.insert_nxdomain(key, now);
+}
+
+fn extract_target_host_port(url: &Url) -> Result<(&str, u16), String> {
     if !matches!(url.scheme(), "http" | "https") {
         return Err(format!("blocked URL scheme '{}'", url.scheme()));
     }
@@ -4147,21 +4421,159 @@ fn validate_target_url_parts_blocking(
     let host = url.host_str().ok_or_else(|| "URL host is required".to_owned())?;
     let port =
         url.port_or_known_default().ok_or_else(|| "URL port could not be resolved".to_owned())?;
+    Ok((host, port))
+}
 
-    let addresses = if let Some(address) = netguard::parse_host_ip_literal(host)? {
-        vec![address]
-    } else {
-        (host, port)
-            .to_socket_addrs()
-            .map_err(|error| format!("DNS resolution failed for host '{host}': {error}"))?
-            .map(|socket| socket.ip())
-            .collect::<Vec<_>>()
-    };
+fn track_dns_lookup_latency(lookup_started: Instant) {
+    let lookup_latency_ms = lookup_started.elapsed().as_millis() as u64;
+    DNS_VALIDATION_METRICS.dns_lookups.fetch_add(1, Ordering::Relaxed);
+    DNS_VALIDATION_METRICS
+        .dns_lookup_latency_ms_total
+        .fetch_add(lookup_latency_ms, Ordering::Relaxed);
+}
 
-    if addresses.is_empty() {
-        return Err(format!("DNS resolution returned no addresses for host '{host}'"));
+fn resolve_host_addresses_blocking(host: &str, port: u16) -> Result<ResolvedHostAddresses, String> {
+    if let Some(address) = netguard::parse_host_ip_literal(host)? {
+        return ResolvedHostAddresses::from_addresses(vec![address]);
     }
-    netguard::validate_resolved_ip_addrs(addresses.as_slice(), allow_private_targets)
+
+    if let Some(cached) = lookup_dns_resolution_cache(host) {
+        return match cached {
+            DnsCacheResolution::Resolved(resolved) => Ok(resolved),
+            DnsCacheResolution::NxDomain => {
+                DNS_VALIDATION_METRICS.blocked_total.fetch_add(1, Ordering::Relaxed);
+                DNS_VALIDATION_METRICS.blocked_dns_failures.fetch_add(1, Ordering::Relaxed);
+                Err(dns_cached_nxdomain_error_for_host(host))
+            }
+        };
+    }
+
+    let lookup_started = Instant::now();
+    let addresses = (host, port)
+        .to_socket_addrs()
+        .map_err(|error| {
+            track_dns_lookup_latency(lookup_started);
+            if is_nxdomain_lookup_error(&error) {
+                store_dns_nxdomain_cache(host);
+            }
+            DNS_VALIDATION_METRICS.blocked_total.fetch_add(1, Ordering::Relaxed);
+            DNS_VALIDATION_METRICS.blocked_dns_failures.fetch_add(1, Ordering::Relaxed);
+            dns_resolution_error_for_host(host, &error)
+        })?
+        .map(|socket| socket.ip())
+        .collect::<Vec<_>>();
+    track_dns_lookup_latency(lookup_started);
+    let resolved = ResolvedHostAddresses::from_addresses(addresses).map_err(|error| {
+        DNS_VALIDATION_METRICS.blocked_total.fetch_add(1, Ordering::Relaxed);
+        DNS_VALIDATION_METRICS.blocked_dns_failures.fetch_add(1, Ordering::Relaxed);
+        format!("{error} for host '{host}'")
+    })?;
+    store_dns_resolution_cache(host, resolved.clone());
+    Ok(resolved)
+}
+
+async fn resolve_host_addresses_async(
+    host: &str,
+    port: u16,
+) -> Result<ResolvedHostAddresses, String> {
+    if let Some(address) = netguard::parse_host_ip_literal(host)? {
+        return ResolvedHostAddresses::from_addresses(vec![address]);
+    }
+
+    if let Some(cached) = lookup_dns_resolution_cache(host) {
+        return match cached {
+            DnsCacheResolution::Resolved(resolved) => Ok(resolved),
+            DnsCacheResolution::NxDomain => {
+                DNS_VALIDATION_METRICS.blocked_total.fetch_add(1, Ordering::Relaxed);
+                DNS_VALIDATION_METRICS.blocked_dns_failures.fetch_add(1, Ordering::Relaxed);
+                Err(dns_cached_nxdomain_error_for_host(host))
+            }
+        };
+    }
+
+    let lookup_started = Instant::now();
+    let addresses = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|error| {
+            track_dns_lookup_latency(lookup_started);
+            if is_nxdomain_lookup_error(&error) {
+                store_dns_nxdomain_cache(host);
+            }
+            DNS_VALIDATION_METRICS.blocked_total.fetch_add(1, Ordering::Relaxed);
+            DNS_VALIDATION_METRICS.blocked_dns_failures.fetch_add(1, Ordering::Relaxed);
+            dns_resolution_error_for_host(host, &error)
+        })?
+        .map(|socket| socket.ip())
+        .collect::<Vec<_>>();
+    track_dns_lookup_latency(lookup_started);
+    let resolved = ResolvedHostAddresses::from_addresses(addresses).map_err(|error| {
+        DNS_VALIDATION_METRICS.blocked_total.fetch_add(1, Ordering::Relaxed);
+        DNS_VALIDATION_METRICS.blocked_dns_failures.fetch_add(1, Ordering::Relaxed);
+        format!("{error} for host '{host}'")
+    })?;
+    store_dns_resolution_cache(host, resolved.clone());
+    Ok(resolved)
+}
+
+fn enforce_resolved_host_policy(
+    host: &str,
+    resolved: ResolvedHostAddresses,
+    allow_private_targets: bool,
+) -> Result<(), String> {
+    if !allow_private_targets && resolved.blocked_for_default_policy {
+        let preview = resolved
+            .addresses
+            .iter()
+            .take(4)
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        DNS_VALIDATION_METRICS.blocked_total.fetch_add(1, Ordering::Relaxed);
+        DNS_VALIDATION_METRICS.blocked_private_targets.fetch_add(1, Ordering::Relaxed);
+        return Err(format!(
+            "target resolves to private/local address and is blocked by policy (host '{host}', addresses [{preview}])"
+        ));
+    }
+    Ok(())
+}
+
+fn dns_validation_metrics_snapshot() -> DnsValidationMetricsSnapshot {
+    let cache_entries = lock_dns_validation_cache().len();
+    DNS_VALIDATION_METRICS.snapshot(cache_entries)
+}
+
+fn maybe_log_dns_validation_metrics() {
+    let observations = DNS_VALIDATION_METRICS.observations.fetch_add(1, Ordering::Relaxed) + 1;
+    if observations % DNS_VALIDATION_METRICS_LOG_INTERVAL != 0 {
+        return;
+    }
+    let snapshot = dns_validation_metrics_snapshot();
+    info!(
+        dns_cache_entries = snapshot.cache_entries,
+        dns_cache_hits = snapshot.cache_hits,
+        dns_cache_misses = snapshot.cache_misses,
+        dns_cache_hit_ratio = snapshot.cache_hit_ratio(),
+        dns_lookup_count = snapshot.dns_lookups,
+        dns_lookup_avg_latency_ms = snapshot.lookup_avg_latency_ms(),
+        dns_blocked_total = snapshot.blocked_total,
+        dns_blocked_private_targets = snapshot.blocked_private_targets,
+        dns_blocked_dns_failures = snapshot.blocked_dns_failures,
+        "browserd DNS validation metrics snapshot"
+    );
+}
+
+#[cfg(test)]
+fn reset_dns_validation_tracking_for_tests() {
+    let mut cache = lock_dns_validation_cache();
+    cache.entries.clear();
+    cache.next_access_tick = 0;
+    drop(cache);
+    DNS_VALIDATION_METRICS.reset_for_tests();
+}
+
+#[cfg(test)]
+fn dns_validation_metrics_snapshot_for_tests() -> DnsValidationMetricsSnapshot {
+    dns_validation_metrics_snapshot()
 }
 
 async fn navigate_with_guards(
@@ -4411,30 +4823,14 @@ async fn navigate_with_guards(
 }
 
 async fn validate_target_url(url: &Url, allow_private_targets: bool) -> Result<(), String> {
-    if !matches!(url.scheme(), "http" | "https") {
-        return Err(format!("blocked URL scheme '{}'", url.scheme()));
+    let result = async {
+        let (host, port) = extract_target_host_port(url)?;
+        let resolved = resolve_host_addresses_async(host, port).await?;
+        enforce_resolved_host_policy(host, resolved, allow_private_targets)
     }
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err("URL credentials are not allowed".to_owned());
-    }
-    let host = url.host_str().ok_or_else(|| "URL host is required".to_owned())?;
-    let port =
-        url.port_or_known_default().ok_or_else(|| "URL port could not be resolved".to_owned())?;
-
-    let addresses = if let Some(address) = netguard::parse_host_ip_literal(host)? {
-        vec![address]
-    } else {
-        tokio::net::lookup_host((host, port))
-            .await
-            .map_err(|error| format!("DNS resolution failed for host '{host}': {error}"))?
-            .map(|socket| socket.ip())
-            .collect::<Vec<_>>()
-    };
-
-    if addresses.is_empty() {
-        return Err(format!("DNS resolution returned no addresses for host '{host}'"));
-    }
-    netguard::validate_resolved_ip_addrs(addresses.as_slice(), allow_private_targets)
+    .await;
+    maybe_log_dns_validation_metrics();
+    result
 }
 
 fn extract_html_title(body: &str) -> Option<&str> {
@@ -6759,15 +7155,17 @@ async fn fetch_download_artifact(
 #[cfg(test)]
 mod tests {
     use super::{
-        browser_v1, default_browserd_state_dir_from_env, enforce_non_loopback_bind_auth,
-        navigate_with_guards, parse_daemon_bind_socket, persisted_snapshot_hash,
-        persisted_snapshot_legacy_hash, record_chromium_remote_ip_incident,
-        update_profile_state_metadata, validate_restored_snapshot_against_profile,
-        validate_target_url_blocking, Args, BrowserEngineMode, BrowserProfileRecord,
-        BrowserRuntimeState, BrowserServiceImpl, BrowserTabRecord, PersistedSessionSnapshot,
-        PersistedStateStore, SessionPermissionsInternal, CANONICAL_PROTOCOL_MAJOR,
-        CHROMIUM_PATH_ENV, DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS, DEFAULT_GRPC_PORT,
-        MAX_RELAY_PAYLOAD_BYTES, ONE_BY_ONE_PNG, PROFILE_RECORD_SCHEMA_VERSION, STATE_KEY_LEN,
+        browser_v1, default_browserd_state_dir_from_env, dns_validation_metrics_snapshot_for_tests,
+        enforce_non_loopback_bind_auth, navigate_with_guards, parse_daemon_bind_socket,
+        persisted_snapshot_hash, persisted_snapshot_legacy_hash,
+        record_chromium_remote_ip_incident, reset_dns_validation_tracking_for_tests,
+        store_dns_nxdomain_cache, update_profile_state_metadata,
+        validate_restored_snapshot_against_profile, validate_target_url_blocking, Args,
+        BrowserEngineMode, BrowserProfileRecord, BrowserRuntimeState, BrowserServiceImpl,
+        BrowserTabRecord, PersistedSessionSnapshot, PersistedStateStore,
+        SessionPermissionsInternal, CANONICAL_PROTOCOL_MAJOR, CHROMIUM_PATH_ENV,
+        DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS, DEFAULT_GRPC_PORT, MAX_RELAY_PAYLOAD_BYTES,
+        ONE_BY_ONE_PNG, PROFILE_RECORD_SCHEMA_VERSION, STATE_KEY_LEN,
     };
     use crate::proto;
     use crate::proto::palyra::browser::v1::browser_service_server::BrowserService;
@@ -7004,6 +7402,61 @@ mod tests {
                 "error should keep fail-closed host guard semantics for {url}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn dns_validation_cache_reuses_positive_hostname_lookup() {
+        reset_dns_validation_tracking_for_tests();
+        validate_target_url_blocking("http://localhost:443/", true)
+            .expect("first localhost validation should resolve successfully");
+        let first = dns_validation_metrics_snapshot_for_tests();
+        assert!(first.cache_misses >= 1, "first lookup should register a cache miss: {:?}", first);
+        assert!(first.dns_lookups >= 1, "first lookup should invoke DNS: {:?}", first);
+
+        validate_target_url_blocking("http://localhost:443/", true)
+            .expect("second localhost validation should reuse cache");
+        let second = dns_validation_metrics_snapshot_for_tests();
+        assert!(
+            second.cache_hits >= first.cache_hits.saturating_add(1),
+            "second lookup should register at least one cache hit: first={:?} second={:?}",
+            first,
+            second
+        );
+        assert_eq!(
+            second.dns_lookups, first.dns_lookups,
+            "cache hit should avoid an additional DNS lookup"
+        );
+    }
+
+    #[test]
+    fn dns_validation_cache_short_circuits_cached_nxdomain() {
+        reset_dns_validation_tracking_for_tests();
+        let host = "cached-nxdomain.invalid";
+        let target = format!("http://{host}/");
+        store_dns_nxdomain_cache(host);
+        let first = dns_validation_metrics_snapshot_for_tests();
+        let second_error = validate_target_url_blocking(target.as_str(), false)
+            .expect_err("cached NXDOMAIN validation should fail");
+        assert!(
+            second_error.contains("cached NXDOMAIN"),
+            "failure should come from cached NXDOMAIN path: {second_error}"
+        );
+        let second = dns_validation_metrics_snapshot_for_tests();
+        assert!(
+            second.cache_hits >= first.cache_hits.saturating_add(1),
+            "lookup should use cached NXDOMAIN entry: first={:?} second={:?}",
+            first,
+            second
+        );
+        assert_eq!(
+            second.dns_lookups, first.dns_lookups,
+            "cached NXDOMAIN should avoid repeated DNS lookups"
+        );
+        assert!(
+            second.blocked_dns_failures >= first.blocked_dns_failures.saturating_add(1),
+            "dns failure block counter should be recorded: {:?}",
+            second
+        );
     }
 
     #[test]
