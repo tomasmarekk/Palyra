@@ -5,7 +5,7 @@ use std::{
     ffi::{OsStr, OsString},
     fs,
     io::Write,
-    net::{SocketAddr, ToSocketAddrs},
+    net::{IpAddr, SocketAddr, ToSocketAddrs},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -124,6 +124,7 @@ const DOWNLOAD_ALLOWED_MIME_TYPES: &[&str] = &[
 const MAX_RELAY_EXTENSION_ID_BYTES: usize = 96;
 const MAX_RELAY_SELECTION_BYTES: usize = 8 * 1024;
 const MAX_RELAY_PAYLOAD_BYTES: u64 = 32 * 1024;
+const CHROMIUM_REMOTE_IP_GUARD_HANDLER_NAME: &str = "palyra.security.remote_ip_guard";
 #[cfg(windows)]
 const WINDOWS_SYSTEM_SID: &str = "S-1-5-18";
 const ONE_BY_ONE_PNG: &[u8] = &[
@@ -627,6 +628,7 @@ struct PersistedStateStore {
 struct ChromiumSessionState {
     browser: Arc<HeadlessBrowser>,
     tabs: HashMap<String, Arc<HeadlessTab>>,
+    security_incident: Arc<std::sync::Mutex<Option<String>>>,
     _profile_dir: TempDir,
 }
 
@@ -3353,10 +3355,43 @@ fn build_chromium_launch_options(
     builder.build().map_err(|error| format!("failed to build Chromium launch options: {error}"))
 }
 
+fn parse_chromium_remote_ip_literal(raw: &str) -> Option<IpAddr> {
+    let trimmed = raw.trim().trim_start_matches('[').trim_end_matches(']');
+    trimmed.parse::<IpAddr>().ok()
+}
+
+fn record_chromium_remote_ip_incident(
+    remote_ip: Option<&str>,
+    allow_private_targets: bool,
+    security_incident: &Arc<std::sync::Mutex<Option<String>>>,
+) {
+    if allow_private_targets {
+        return;
+    }
+    let Some(remote_ip_raw) = remote_ip else {
+        return;
+    };
+    let Some(parsed_remote_ip) = parse_chromium_remote_ip_literal(remote_ip_raw) else {
+        return;
+    };
+    if !netguard::is_private_or_local_ip(parsed_remote_ip) {
+        return;
+    }
+    if let Ok(mut guard) = security_incident.lock() {
+        if guard.is_none() {
+            *guard = Some(format!(
+                "remote response IP {} is private/local and violates browser session policy",
+                parsed_remote_ip
+            ));
+        }
+    }
+}
+
 fn configure_chromium_tab(
     tab: &Arc<HeadlessTab>,
     allow_private_targets: bool,
     timeout: Duration,
+    security_incident: Arc<std::sync::Mutex<Option<String>>>,
 ) -> Result<(), String> {
     tab.set_default_timeout(timeout);
     tab.enable_fetch(None, Some(false))
@@ -3376,6 +3411,18 @@ fn configure_chromium_tab(
     tab.enable_request_interception(request_interceptor).map_err(|error| {
         format!("failed to register Chromium request interception callback: {error}")
     })?;
+    let remote_ip_guard = Arc::clone(&security_incident);
+    tab.register_response_handling(
+        CHROMIUM_REMOTE_IP_GUARD_HANDLER_NAME,
+        Box::new(move |response, _fetch_body| {
+            record_chromium_remote_ip_incident(
+                response.response.remote_ip_address.as_deref(),
+                allow_private_targets,
+                &remote_ip_guard,
+            );
+        }),
+    )
+    .map_err(|error| format!("failed to register Chromium response guard callback: {error}"))?;
     Ok(())
 }
 
@@ -3394,6 +3441,7 @@ async fn initialize_chromium_session_runtime(
     } else if !tab_order.iter().any(|tab_id| tab_id == &active_tab_id) {
         tab_order.insert(0, active_tab_id.clone());
     }
+    let security_incident = Arc::new(std::sync::Mutex::new(None::<String>));
     let chromium_session = run_chromium_blocking("chromium session initialization", move || {
         let profile_dir = tempfile::Builder::new()
             .prefix("palyra-browserd-session-")
@@ -3409,10 +3457,15 @@ async fn initialize_chromium_session_runtime(
             let tab = browser.new_tab().map_err(|error| {
                 format!("failed to create Chromium tab for session restore: {error}")
             })?;
-            configure_chromium_tab(&tab, allow_private_targets, navigation_timeout)?;
+            configure_chromium_tab(
+                &tab,
+                allow_private_targets,
+                navigation_timeout,
+                Arc::clone(&security_incident),
+            )?;
             tabs.insert(tab_id.clone(), tab);
         }
-        Ok(ChromiumSessionState { browser, tabs, _profile_dir: profile_dir })
+        Ok(ChromiumSessionState { browser, tabs, security_incident, _profile_dir: profile_dir })
     })
     .await?;
     runtime.chromium_sessions.lock().await.insert(session_id.to_owned(), chromium_session);
@@ -3431,18 +3484,23 @@ async fn chromium_open_tab_runtime(
         };
         (session.allow_private_targets, session.budget.max_navigation_timeout_ms.max(1))
     };
-    let browser = {
+    let (browser, security_incident) = {
         let chromium_sessions = runtime.chromium_sessions.lock().await;
         let Some(chromium_session) = chromium_sessions.get(session_id) else {
             return Err("chromium_session_not_found".to_owned());
         };
-        Arc::clone(&chromium_session.browser)
+        (Arc::clone(&chromium_session.browser), Arc::clone(&chromium_session.security_incident))
     };
     let tab = run_chromium_blocking("chromium open tab", move || {
         let tab = browser
             .new_tab()
             .map_err(|error| format!("failed to allocate Chromium tab: {error}"))?;
-        configure_chromium_tab(&tab, allow_private_targets, Duration::from_millis(timeout_ms))?;
+        configure_chromium_tab(
+            &tab,
+            allow_private_targets,
+            Duration::from_millis(timeout_ms),
+            security_incident,
+        )?;
         Ok(tab)
     })
     .await?;
@@ -3474,6 +3532,36 @@ async fn chromium_close_tab_runtime(
         .await;
     }
     Ok(())
+}
+
+async fn enforce_chromium_remote_ip_guard(
+    runtime: &BrowserRuntimeState,
+    session_id: &str,
+) -> Result<(), String> {
+    let incident = {
+        let chromium_sessions = runtime.chromium_sessions.lock().await;
+        let Some(chromium_session) = chromium_sessions.get(session_id) else {
+            return Ok(());
+        };
+        let mut guard = chromium_session
+            .security_incident
+            .lock()
+            .map_err(|_| "failed to inspect Chromium security incident state".to_owned())?;
+        guard.take()
+    };
+    let Some(reason) = incident else {
+        return Ok(());
+    };
+
+    runtime.sessions.lock().await.remove(session_id);
+    runtime.chromium_sessions.lock().await.remove(session_id);
+    runtime.download_sessions.lock().await.remove(session_id);
+    warn!(
+        session_id = session_id,
+        reason = reason.as_str(),
+        "terminated browser session after Chromium remote IP guard incident"
+    );
+    Err(format!("chromium remote IP guard blocked request: {reason}"))
 }
 
 async fn chromium_tab_for_session(
@@ -3508,8 +3596,9 @@ async fn chromium_observe_snapshot(
     session_id: &str,
     tab_id: &str,
 ) -> Result<ChromiumObserveSnapshot, String> {
+    enforce_chromium_remote_ip_guard(runtime, session_id).await?;
     let tab = chromium_tab_for_session(runtime, session_id, tab_id).await?;
-    run_chromium_blocking("chromium observe snapshot", move || {
+    let snapshot = run_chromium_blocking("chromium observe snapshot", move || {
         let page_body = tab
             .get_content()
             .map_err(|error| format!("failed to read Chromium DOM content: {error}"))?;
@@ -3517,7 +3606,9 @@ async fn chromium_observe_snapshot(
         let page_url = tab.get_url();
         Ok(ChromiumObserveSnapshot { page_body, title, page_url })
     })
-    .await
+    .await?;
+    enforce_chromium_remote_ip_guard(runtime, session_id).await?;
+    Ok(snapshot)
 }
 
 async fn chromium_refresh_tab_snapshot(
@@ -3525,7 +3616,9 @@ async fn chromium_refresh_tab_snapshot(
     session_id: &str,
     tab_id: &str,
 ) -> Result<(), String> {
+    enforce_chromium_remote_ip_guard(runtime, session_id).await?;
     let snapshot = chromium_observe_snapshot(runtime, session_id, tab_id).await?;
+    enforce_chromium_remote_ip_guard(runtime, session_id).await?;
     let mut sessions = runtime.sessions.lock().await;
     let Some(session) = sessions.get_mut(session_id) else {
         return Err("session_not_found".to_owned());
@@ -3544,23 +3637,29 @@ async fn chromium_get_title(
     session_id: &str,
     tab_id: &str,
 ) -> Result<String, String> {
+    enforce_chromium_remote_ip_guard(runtime, session_id).await?;
     let tab = chromium_tab_for_session(runtime, session_id, tab_id).await?;
-    run_chromium_blocking("chromium get title", move || {
+    let title = run_chromium_blocking("chromium get title", move || {
         tab.get_title().map_err(|error| format!("failed to read Chromium page title: {error}"))
     })
-    .await
+    .await?;
+    enforce_chromium_remote_ip_guard(runtime, session_id).await?;
+    Ok(title)
 }
 
 async fn chromium_screenshot(
     runtime: &BrowserRuntimeState,
     session_id: &str,
 ) -> Result<Vec<u8>, String> {
+    enforce_chromium_remote_ip_guard(runtime, session_id).await?;
     let (_tab_id, tab) = chromium_active_tab_for_session(runtime, session_id).await?;
-    run_chromium_blocking("chromium screenshot", move || {
+    let screenshot = run_chromium_blocking("chromium screenshot", move || {
         tab.capture_screenshot(Page::CaptureScreenshotFormatOption::Png, None, None, true)
             .map_err(|error| format!("failed to capture Chromium screenshot: {error}"))
     })
-    .await
+    .await?;
+    enforce_chromium_remote_ip_guard(runtime, session_id).await?;
+    Ok(screenshot)
 }
 
 async fn navigate_with_chromium(
@@ -3639,6 +3738,11 @@ async fn navigate_tab_with_chromium(
             return outcome;
         }
     };
+    if let Err(error) = enforce_chromium_remote_ip_guard(runtime, session_id).await {
+        outcome.success = false;
+        outcome.error = error;
+        return outcome;
+    }
     let body_bytes = snapshot.page_body.len() as u64;
     if body_bytes > params.max_response_bytes {
         outcome.success = false;
@@ -6657,13 +6761,13 @@ mod tests {
     use super::{
         browser_v1, default_browserd_state_dir_from_env, enforce_non_loopback_bind_auth,
         navigate_with_guards, parse_daemon_bind_socket, persisted_snapshot_hash,
-        persisted_snapshot_legacy_hash, update_profile_state_metadata,
-        validate_restored_snapshot_against_profile, validate_target_url_blocking, Args,
-        BrowserEngineMode, BrowserProfileRecord, BrowserRuntimeState, BrowserServiceImpl,
-        BrowserTabRecord, PersistedSessionSnapshot, PersistedStateStore,
-        SessionPermissionsInternal, CANONICAL_PROTOCOL_MAJOR, CHROMIUM_PATH_ENV,
-        DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS, DEFAULT_GRPC_PORT, MAX_RELAY_PAYLOAD_BYTES,
-        ONE_BY_ONE_PNG, PROFILE_RECORD_SCHEMA_VERSION, STATE_KEY_LEN,
+        persisted_snapshot_legacy_hash, record_chromium_remote_ip_incident,
+        update_profile_state_metadata, validate_restored_snapshot_against_profile,
+        validate_target_url_blocking, Args, BrowserEngineMode, BrowserProfileRecord,
+        BrowserRuntimeState, BrowserServiceImpl, BrowserTabRecord, PersistedSessionSnapshot,
+        PersistedStateStore, SessionPermissionsInternal, CANONICAL_PROTOCOL_MAJOR,
+        CHROMIUM_PATH_ENV, DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS, DEFAULT_GRPC_PORT,
+        MAX_RELAY_PAYLOAD_BYTES, ONE_BY_ONE_PNG, PROFILE_RECORD_SCHEMA_VERSION, STATE_KEY_LEN,
     };
     use crate::proto;
     use crate::proto::palyra::browser::v1::browser_service_server::BrowserService;
@@ -6672,6 +6776,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex as StdMutex};
     use std::thread;
     use std::time::Duration;
     use tonic::Request;
@@ -6899,6 +7004,49 @@ mod tests {
                 "error should keep fail-closed host guard semantics for {url}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn chromium_remote_ip_guard_records_incident_for_private_addresses() {
+        let incident = Arc::new(StdMutex::new(None::<String>));
+        record_chromium_remote_ip_incident(Some("127.0.0.1"), false, &incident);
+        let message = incident
+            .lock()
+            .expect("guard should lock after IPv4 incident")
+            .clone()
+            .expect("private IPv4 response IP should record an incident");
+        assert!(
+            message.contains("127.0.0.1"),
+            "incident should include violating IPv4 address: {message}"
+        );
+
+        let incident = Arc::new(StdMutex::new(None::<String>));
+        record_chromium_remote_ip_incident(Some("[::1]"), false, &incident);
+        let message = incident
+            .lock()
+            .expect("guard should lock after IPv6 incident")
+            .clone()
+            .expect("private IPv6 response IP should record an incident");
+        assert!(
+            message.contains("::1"),
+            "incident should include violating IPv6 address: {message}"
+        );
+    }
+
+    #[test]
+    fn chromium_remote_ip_guard_ignores_public_and_opted_in_private_targets() {
+        let incident = Arc::new(StdMutex::new(None::<String>));
+        record_chromium_remote_ip_incident(Some("93.184.216.34"), false, &incident);
+        assert!(
+            incident.lock().expect("guard should lock after public response IP check").is_none(),
+            "public response IP should not produce a remote IP guard incident"
+        );
+
+        record_chromium_remote_ip_incident(Some("127.0.0.1"), true, &incident);
+        assert!(
+            incident.lock().expect("guard should lock after private-target opt-in check").is_none(),
+            "private-target opt-in should bypass remote IP guard incidents"
+        );
     }
 
     #[test]
