@@ -4673,6 +4673,22 @@ async fn navigate_with_guards(
                 }
             }
         };
+        if let Err(error) =
+            enforce_remote_response_ip_policy(response.remote_addr(), allow_private_targets)
+        {
+            return NavigateOutcome {
+                success: false,
+                final_url: current_url.to_string(),
+                status_code: 0,
+                title: String::new(),
+                page_body: String::new(),
+                body_bytes: 0,
+                latency_ms: started_at.elapsed().as_millis() as u64,
+                error,
+                network_log,
+                cookie_updates,
+            };
+        }
         if let Some(domain) = current_url.host_str() {
             for raw_set_cookie in response.headers().get_all(SET_COOKIE_HEADER).iter() {
                 if let Ok(value) = raw_set_cookie.to_str() {
@@ -4826,6 +4842,27 @@ async fn navigate_with_guards(
             cookie_updates,
         };
     }
+}
+
+fn enforce_remote_response_ip_policy(
+    remote_addr: Option<SocketAddr>,
+    allow_private_targets: bool,
+) -> Result<(), String> {
+    if allow_private_targets {
+        return Ok(());
+    }
+    let Some(remote_addr) = remote_addr else {
+        return Ok(());
+    };
+    let remote_ip = remote_addr.ip();
+    if !netguard::is_private_or_local_ip(remote_ip) {
+        return Ok(());
+    }
+    DNS_VALIDATION_METRICS.blocked_total.fetch_add(1, Ordering::Relaxed);
+    DNS_VALIDATION_METRICS.blocked_private_targets.fetch_add(1, Ordering::Relaxed);
+    Err(format!(
+        "remote response IP {remote_ip} is private/local and violates browser session policy"
+    ))
 }
 
 async fn validate_target_url(url: &Url, allow_private_targets: bool) -> Result<(), String> {
@@ -7165,7 +7202,7 @@ mod tests {
         enforce_non_loopback_bind_auth, navigate_with_guards, parse_daemon_bind_socket,
         persisted_snapshot_hash, persisted_snapshot_legacy_hash,
         record_chromium_remote_ip_incident, reset_dns_validation_tracking_for_tests,
-        store_dns_nxdomain_cache, update_profile_state_metadata,
+        store_dns_nxdomain_cache, store_dns_resolution_cache, update_profile_state_metadata,
         validate_restored_snapshot_against_profile, validate_target_url_blocking, Args,
         BrowserEngineMode, BrowserProfileRecord, BrowserRuntimeState, BrowserServiceImpl,
         BrowserTabRecord, DnsCacheResolution, DnsValidationCache, PersistedSessionSnapshot,
@@ -7395,6 +7432,36 @@ mod tests {
             "error should explain private target block: {}",
             outcome.error
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn navigate_with_guards_blocks_remote_private_ip_after_cached_dns_mismatch() {
+        reset_dns_validation_tracking_for_tests();
+        let (url, handle) = spawn_static_http_server(
+            200,
+            "<html><head><title>Mismatch</title></head><body>ok</body></html>",
+        );
+        let host = "localhost";
+        let target = url.replacen("127.0.0.1", host, 1);
+        store_dns_resolution_cache(
+            host,
+            ResolvedHostAddresses::from_addresses(vec![IpAddr::V4(Ipv4Addr::new(
+                93, 184, 216, 34,
+            ))])
+            .expect("cached public DNS answer should be valid"),
+        );
+
+        let outcome =
+            navigate_with_guards(target.as_str(), 2_000, true, 3, false, 8 * 1024, None).await;
+        assert!(!outcome.success, "remote private response IP must be blocked");
+        assert!(
+            outcome.error.contains("remote response IP") && outcome.error.contains("private/local"),
+            "error should explain remote response policy guard: {}",
+            outcome.error
+        );
+
+        handle.join().expect("test server thread should exit");
+        reset_dns_validation_tracking_for_tests();
     }
 
     #[test]
