@@ -933,7 +933,7 @@ impl BrowserRuntimeState {
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default();
         let expected = format!("Bearer {expected_token}");
-        if supplied.trim() != expected {
+        if !constant_time_eq_bytes(supplied.trim().as_bytes(), expected.as_bytes()) {
             return Err(Status::unauthenticated("missing or invalid browser service token"));
         }
         Ok(())
@@ -3568,6 +3568,17 @@ fn build_chromium_launch_options(
 fn parse_chromium_remote_ip_literal(raw: &str) -> Option<IpAddr> {
     let trimmed = raw.trim().trim_start_matches('[').trim_end_matches(']');
     trimmed.parse::<IpAddr>().ok()
+}
+
+fn constant_time_eq_bytes(left: &[u8], right: &[u8]) -> bool {
+    let max_len = left.len().max(right.len());
+    let mut difference = left.len() ^ right.len();
+    for index in 0..max_len {
+        let left_byte = left.get(index).copied().unwrap_or(0);
+        let right_byte = right.get(index).copied().unwrap_or(0);
+        difference |= usize::from(left_byte ^ right_byte);
+    }
+    difference == 0
 }
 
 fn record_chromium_remote_ip_incident(
@@ -7150,17 +7161,18 @@ async fn fetch_download_artifact(
 #[cfg(test)]
 mod tests {
     use super::{
-        browser_v1, default_browserd_state_dir_from_env, enforce_non_loopback_bind_auth,
-        navigate_with_guards, parse_daemon_bind_socket, persisted_snapshot_hash,
-        persisted_snapshot_legacy_hash, record_chromium_remote_ip_incident,
-        reset_dns_validation_tracking_for_tests, store_dns_nxdomain_cache,
-        update_profile_state_metadata, validate_restored_snapshot_against_profile,
-        validate_target_url_blocking, Args, BrowserEngineMode, BrowserProfileRecord,
-        BrowserRuntimeState, BrowserServiceImpl, BrowserTabRecord, DnsCacheResolution,
-        DnsValidationCache, PersistedSessionSnapshot, PersistedStateStore, ResolvedHostAddresses,
-        SessionPermissionsInternal, CANONICAL_PROTOCOL_MAJOR, CHROMIUM_PATH_ENV,
-        DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS, DEFAULT_GRPC_PORT, MAX_RELAY_PAYLOAD_BYTES,
-        ONE_BY_ONE_PNG, PROFILE_RECORD_SCHEMA_VERSION, STATE_KEY_LEN,
+        browser_v1, constant_time_eq_bytes, default_browserd_state_dir_from_env,
+        enforce_non_loopback_bind_auth, navigate_with_guards, parse_daemon_bind_socket,
+        persisted_snapshot_hash, persisted_snapshot_legacy_hash,
+        record_chromium_remote_ip_incident, reset_dns_validation_tracking_for_tests,
+        store_dns_nxdomain_cache, update_profile_state_metadata,
+        validate_restored_snapshot_against_profile, validate_target_url_blocking, Args,
+        BrowserEngineMode, BrowserProfileRecord, BrowserRuntimeState, BrowserServiceImpl,
+        BrowserTabRecord, DnsCacheResolution, DnsValidationCache, PersistedSessionSnapshot,
+        PersistedStateStore, ResolvedHostAddresses, SessionPermissionsInternal,
+        CANONICAL_PROTOCOL_MAJOR, CHROMIUM_PATH_ENV, DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS,
+        DEFAULT_GRPC_PORT, MAX_RELAY_PAYLOAD_BYTES, ONE_BY_ONE_PNG, PROFILE_RECORD_SCHEMA_VERSION,
+        STATE_KEY_LEN,
     };
     use crate::proto;
     use crate::proto::palyra::browser::v1::browser_service_server::BrowserService;
@@ -7445,6 +7457,22 @@ mod tests {
         assert!(
             second_error.contains("cached NXDOMAIN"),
             "failure should come from cached NXDOMAIN path: {second_error}"
+        );
+    }
+
+    #[test]
+    fn constant_time_eq_bytes_requires_exact_match() {
+        assert!(
+            constant_time_eq_bytes(b"Bearer same-token", b"Bearer same-token"),
+            "exactly matching tokens should compare as equal"
+        );
+        assert!(
+            !constant_time_eq_bytes(b"Bearer same-token", b"Bearer same-tokem"),
+            "single-byte difference should compare as non-equal"
+        );
+        assert!(
+            !constant_time_eq_bytes(b"Bearer short", b"Bearer much-longer"),
+            "different-length tokens should compare as non-equal"
         );
     }
 
