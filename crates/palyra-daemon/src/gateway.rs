@@ -5032,8 +5032,14 @@ fn map_provider_error(error: ProviderError) -> Status {
         ProviderError::MissingApiKey => {
             Status::failed_precondition("model provider API key is missing")
         }
+        ProviderError::MissingEmbeddingsModel => {
+            Status::failed_precondition("model provider embeddings model is missing")
+        }
         ProviderError::VisionUnsupported { provider } => {
             Status::failed_precondition(format!("provider '{provider}' does not support vision"))
+        }
+        ProviderError::InvalidEmbeddingsRequest { message } => {
+            Status::invalid_argument(format!("embeddings request invalid: {message}"))
         }
         ProviderError::RequestFailed { message, retryable, retry_count } => {
             let status_message = format!(

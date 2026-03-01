@@ -41,7 +41,7 @@ const DEFAULT_MEMORY_VECTOR_DIMS: usize = 64;
 const DEFAULT_MEMORY_EMBEDDING_MODEL: &str = "hash-embedding-v1";
 
 pub trait MemoryEmbeddingProvider: Send + Sync {
-    fn model_name(&self) -> &'static str;
+    fn model_name(&self) -> &str;
     fn dimensions(&self) -> usize;
     fn embed_text(&self, text: &str) -> Vec<f32>;
 }
@@ -57,8 +57,15 @@ impl Default for HashMemoryEmbeddingProvider {
     }
 }
 
+impl HashMemoryEmbeddingProvider {
+    #[must_use]
+    pub fn with_dimensions(dimensions: usize) -> Self {
+        Self { dimensions: dimensions.max(1) }
+    }
+}
+
 impl MemoryEmbeddingProvider for HashMemoryEmbeddingProvider {
-    fn model_name(&self) -> &'static str {
+    fn model_name(&self) -> &str {
         DEFAULT_MEMORY_EMBEDDING_MODEL
     }
 
@@ -1356,6 +1363,7 @@ impl fmt::Debug for JournalStore {
 }
 
 impl JournalStore {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn open(config: JournalConfig) -> Result<Self, JournalError> {
         Self::open_with_memory_embedding_provider(
             config,
