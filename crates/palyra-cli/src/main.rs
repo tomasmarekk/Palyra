@@ -225,6 +225,12 @@ fn run_doctor(strict: bool, json: bool) -> Result<()> {
             report.sandbox.tier_c_strict_offline_only,
             report.sandbox.tier_c_windows_backend_supported
         );
+        if checks.iter().any(|check| check.key == "memory_embeddings_model_configured" && !check.ok)
+        {
+            println!(
+                "doctor.hint.memory_embeddings_model=configure model_provider.openai_embeddings_model (or PALYRA_MODEL_PROVIDER_OPENAI_EMBEDDINGS_MODEL) for openai-compatible semantic memory embeddings"
+            );
+        }
     }
 
     if strict {
@@ -255,6 +261,11 @@ fn build_doctor_checks() -> Vec<DoctorCheck> {
             required: true,
         },
         DoctorCheck { key: "repo_scaffold_ok", ok: required_directories_ok(), required: true },
+        DoctorCheck {
+            key: "memory_embeddings_model_configured",
+            ok: memory_embeddings_model_config_ok(),
+            required: false,
+        },
         DoctorCheck {
             key: "process_runner_tier_b_egress_allowlists_preflight_only",
             ok: process_runner_tier_b_allowlist_config_ok(),
@@ -7769,6 +7780,7 @@ fn required_directories_ok() -> bool {
         "apps/ios",
         "apps/android",
         "apps/desktop",
+        "apps/browser-extension",
         "apps/web",
         "schemas/proto",
         "schemas/json",
@@ -7780,6 +7792,30 @@ fn required_directories_ok() -> bool {
     ]
     .iter()
     .all(|path| Path::new(path).exists())
+}
+
+fn memory_embeddings_model_config_ok() -> bool {
+    memory_embeddings_model_config_ok_impl().unwrap_or(true)
+}
+
+fn memory_embeddings_model_config_ok_impl() -> Result<bool> {
+    let Some(parsed) = read_doctor_root_file_config()? else {
+        return Ok(true);
+    };
+    Ok(memory_embeddings_model_configured(&parsed))
+}
+
+fn memory_embeddings_model_configured(parsed: &RootFileConfig) -> bool {
+    let Some(provider) = parsed.model_provider.as_ref() else {
+        return true;
+    };
+    let kind = provider.kind.as_deref().unwrap_or("deterministic").trim().to_ascii_lowercase();
+    let is_openai_compatible =
+        kind == "openai_compatible" || kind == "openai-compatible" || kind == "openai";
+    if !is_openai_compatible {
+        return true;
+    }
+    provider.openai_embeddings_model.as_ref().map(|value| !value.trim().is_empty()).unwrap_or(false)
 }
 
 fn process_runner_tier_b_allowlist_config_ok() -> bool {
@@ -8203,7 +8239,8 @@ mod cli_v1_tests {
         build_journal_checkpoint_attestation, compare_semver_versions,
         ensure_remote_registry_same_origin, fetch_limited_bytes,
         fetch_remote_registry_entries_with_fetcher, is_retryable_grpc_error,
-        normalize_client_socket, normalize_installed_skills_index, normalize_prompt_secret_value,
+        memory_embeddings_model_configured, normalize_client_socket,
+        normalize_installed_skills_index, normalize_prompt_secret_value,
         normalize_relative_registry_path, parse_acp_shim_input_line,
         parse_and_verify_signed_remote_registry_index,
         process_runner_tier_b_allowlist_preflight_only,
@@ -8845,6 +8882,37 @@ allowed_egress_hosts = ["api.example.com"]
         assert!(
             process_runner_tier_c_strict_offline_allowlists_empty(&parsed),
             "tier-c preflight mode should not trigger strict offline-only warning"
+        );
+    }
+
+    #[test]
+    fn memory_embeddings_model_check_requires_openai_model_when_openai_provider_is_selected() {
+        let parsed: RootFileConfig = toml::from_str(
+            r#"
+[model_provider]
+kind = "openai_compatible"
+"#,
+        )
+        .expect("fixture config should parse");
+        assert!(
+            !memory_embeddings_model_configured(&parsed),
+            "openai-compatible provider without embeddings model should fail doctor check"
+        );
+    }
+
+    #[test]
+    fn memory_embeddings_model_check_accepts_configured_model_for_openai_provider() {
+        let parsed: RootFileConfig = toml::from_str(
+            r#"
+[model_provider]
+kind = "openai_compatible"
+openai_embeddings_model = "text-embedding-3-small"
+"#,
+        )
+        .expect("fixture config should parse");
+        assert!(
+            memory_embeddings_model_configured(&parsed),
+            "doctor check should pass when embeddings model is configured"
         );
     }
 

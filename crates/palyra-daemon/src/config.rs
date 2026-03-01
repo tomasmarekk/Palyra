@@ -599,6 +599,16 @@ pub fn load_config() -> Result<LoadedConfig> {
             if let Some(openai_model) = file_model_provider.openai_model {
                 model_provider.openai_model = parse_openai_model(openai_model.as_str())?;
             }
+            if let Some(openai_embeddings_model) = file_model_provider.openai_embeddings_model {
+                model_provider.openai_embeddings_model =
+                    parse_optional_openai_embeddings_model(openai_embeddings_model.as_str())?;
+            }
+            if let Some(openai_embeddings_dims) = file_model_provider.openai_embeddings_dims {
+                model_provider.openai_embeddings_dims = Some(parse_openai_embeddings_dims(
+                    openai_embeddings_dims,
+                    "model_provider.openai_embeddings_dims",
+                )?);
+            }
             if let Some(openai_api_key) = file_model_provider.openai_api_key {
                 model_provider.openai_api_key =
                     if openai_api_key.trim().is_empty() { None } else { Some(openai_api_key) };
@@ -1230,6 +1240,20 @@ pub fn load_config() -> Result<LoadedConfig> {
     if let Ok(openai_model) = env::var("PALYRA_MODEL_PROVIDER_OPENAI_MODEL") {
         model_provider.openai_model = parse_openai_model(openai_model.as_str())?;
         source.push_str(" +env(PALYRA_MODEL_PROVIDER_OPENAI_MODEL)");
+    }
+    if let Ok(openai_embeddings_model) = env::var("PALYRA_MODEL_PROVIDER_OPENAI_EMBEDDINGS_MODEL") {
+        model_provider.openai_embeddings_model =
+            parse_optional_openai_embeddings_model(openai_embeddings_model.as_str())?;
+        source.push_str(" +env(PALYRA_MODEL_PROVIDER_OPENAI_EMBEDDINGS_MODEL)");
+    }
+    if let Ok(openai_embeddings_dims) = env::var("PALYRA_MODEL_PROVIDER_OPENAI_EMBEDDINGS_DIMS") {
+        model_provider.openai_embeddings_dims = Some(parse_openai_embeddings_dims(
+            openai_embeddings_dims
+                .parse::<u32>()
+                .context("PALYRA_MODEL_PROVIDER_OPENAI_EMBEDDINGS_DIMS must be a valid u32")?,
+            "PALYRA_MODEL_PROVIDER_OPENAI_EMBEDDINGS_DIMS",
+        )?);
+        source.push_str(" +env(PALYRA_MODEL_PROVIDER_OPENAI_EMBEDDINGS_DIMS)");
     }
 
     if let Ok(openai_api_key) = env::var("PALYRA_MODEL_PROVIDER_OPENAI_API_KEY") {
@@ -1868,6 +1892,18 @@ fn parse_openai_model(raw: &str) -> Result<String> {
     Ok(raw.trim().to_owned())
 }
 
+fn parse_optional_openai_embeddings_model(raw: &str) -> Result<Option<String>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(trimmed.to_owned()))
+}
+
+fn parse_openai_embeddings_dims(raw: u32, source_name: &str) -> Result<u32> {
+    parse_positive_u32(raw, source_name)
+}
+
 fn parse_vault_ref_allowlist(raw: &str, source_name: &str) -> Result<Vec<String>> {
     let mut refs = Vec::new();
     for candidate in raw.split(',').map(str::trim).filter(|value| !value.is_empty()) {
@@ -2319,7 +2355,8 @@ mod tests {
         parse_default_memory_ttl_ms, parse_dns_suffix_allowlist, parse_host_allowlist,
         parse_http_header_allowlist, parse_journal_db_path,
         parse_model_provider_auth_provider_kind, parse_openai_base_url,
-        parse_optional_auth_profile_id, parse_optional_browser_state_dir,
+        parse_openai_embeddings_dims, parse_optional_auth_profile_id,
+        parse_optional_browser_state_dir, parse_optional_openai_embeddings_model,
         parse_optional_vault_ref_field, parse_positive_usize, parse_process_executable_allowlist,
         parse_process_runner_egress_enforcement_mode, parse_process_runner_tier,
         parse_root_file_config, parse_storage_prefix_allowlist, parse_tool_allowlist,
@@ -2730,6 +2767,14 @@ mod tests {
             "model provider private-network base URLs must require explicit opt-in"
         );
         assert_eq!(config.openai_model, "gpt-4o-mini");
+        assert!(
+            config.openai_embeddings_model.is_none(),
+            "openai embeddings model should default to unset"
+        );
+        assert!(
+            config.openai_embeddings_dims.is_none(),
+            "openai embeddings dims should default to unset"
+        );
         assert!(config.openai_api_key.is_none(), "openai API key should default to unset");
         assert!(
             config.openai_api_key_vault_ref.is_none(),
@@ -2992,6 +3037,46 @@ mod tests {
         .expect("model provider private-base-url opt-in should parse");
         let model_provider = parsed.model_provider.expect("model_provider section should exist");
         assert_eq!(model_provider.allow_private_base_url, Some(true));
+    }
+
+    #[test]
+    fn model_provider_config_parses_embeddings_fields() {
+        let (parsed, _) = parse_root_file_config(
+            r#"
+            [model_provider]
+            kind = "openai_compatible"
+            openai_embeddings_model = "text-embedding-3-small"
+            openai_embeddings_dims = 1536
+            "#,
+        )
+        .expect("model provider embeddings fields should parse");
+        let model_provider = parsed.model_provider.expect("model_provider section should exist");
+        assert_eq!(
+            model_provider.openai_embeddings_model.as_deref(),
+            Some("text-embedding-3-small")
+        );
+        assert_eq!(model_provider.openai_embeddings_dims, Some(1536));
+    }
+
+    #[test]
+    fn parse_optional_openai_embeddings_model_trims_and_allows_clear() {
+        let parsed = parse_optional_openai_embeddings_model(" text-embedding-3-large ")
+            .expect("embeddings model should parse");
+        assert_eq!(parsed, Some("text-embedding-3-large".to_owned()));
+
+        let cleared = parse_optional_openai_embeddings_model("   ")
+            .expect("blank embeddings model should clear configuration");
+        assert!(cleared.is_none());
+    }
+
+    #[test]
+    fn parse_openai_embeddings_dims_rejects_zero() {
+        let error = parse_openai_embeddings_dims(0, "model_provider.openai_embeddings_dims")
+            .expect_err("zero embeddings dims must be rejected");
+        assert!(
+            error.to_string().contains("greater than 0"),
+            "error should explain positive dimensions requirement: {error}"
+        );
     }
 
     #[test]

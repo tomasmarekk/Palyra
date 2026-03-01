@@ -143,6 +143,8 @@ pub struct FileModelProviderConfig {
     pub openai_base_url: Option<String>,
     pub allow_private_base_url: Option<bool>,
     pub openai_model: Option<String>,
+    pub openai_embeddings_model: Option<String>,
+    pub openai_embeddings_dims: Option<u32>,
     pub openai_api_key: Option<String>,
     pub openai_api_key_vault_ref: Option<String>,
     pub auth_profile_id: Option<String>,

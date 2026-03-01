@@ -90,6 +90,8 @@ pub struct ModelProviderConfig {
     pub openai_base_url: String,
     pub allow_private_base_url: bool,
     pub openai_model: String,
+    pub openai_embeddings_model: Option<String>,
+    pub openai_embeddings_dims: Option<u32>,
     pub openai_api_key: Option<String>,
     pub openai_api_key_vault_ref: Option<String>,
     pub auth_profile_id: Option<String>,
@@ -109,6 +111,8 @@ impl Default for ModelProviderConfig {
             openai_base_url: "https://api.openai.com/v1".to_owned(),
             allow_private_base_url: false,
             openai_model: "gpt-4o-mini".to_owned(),
+            openai_embeddings_model: None,
+            openai_embeddings_dims: None,
             openai_api_key: None,
             openai_api_key_vault_ref: None,
             auth_profile_id: None,
@@ -225,6 +229,10 @@ pub struct ProviderStatusSnapshot {
     pub openai_base_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub openai_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub openai_embeddings_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub openai_embeddings_dims: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_profile_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -469,6 +477,8 @@ impl ModelProvider for DeterministicProvider {
             },
             openai_base_url: None,
             openai_model: None,
+            openai_embeddings_model: None,
+            openai_embeddings_dims: None,
             auth_profile_id: self.config.auth_profile_id.clone(),
             auth_profile_provider_kind: self
                 .config
@@ -842,6 +852,8 @@ impl ModelProvider for OpenAiCompatibleProvider {
             },
             openai_base_url: Some(self.config.openai_base_url.clone()),
             openai_model: Some(self.config.openai_model.clone()),
+            openai_embeddings_model: self.config.openai_embeddings_model.clone(),
+            openai_embeddings_dims: self.config.openai_embeddings_dims,
             auth_profile_id: self.config.auth_profile_id.clone(),
             auth_profile_provider_kind: self
                 .config
@@ -1111,6 +1123,8 @@ mod tests {
             openai_base_url: base_url,
             allow_private_base_url: true,
             openai_model: "gpt-4o-mini".to_owned(),
+            openai_embeddings_model: None,
+            openai_embeddings_dims: None,
             openai_api_key: Some("sk-test-secret".to_owned()),
             openai_api_key_vault_ref: None,
             auth_profile_id: None,
