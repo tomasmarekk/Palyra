@@ -62,7 +62,7 @@ use cli::{
 };
 #[cfg(not(windows))]
 use cli::{PairingClientKindArg, PairingCommand, PairingMethodArg};
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
 use palyra_common::default_identity_store_root;
 use palyra_common::{
     build_metadata,
@@ -81,12 +81,11 @@ use palyra_common::{
     },
     HealthResponse, CANONICAL_JSON_ENVELOPE_VERSION, CANONICAL_PROTOCOL_MAJOR,
 };
-#[cfg(not(windows))]
+use palyra_identity::DeviceIdentity;
 use palyra_identity::FilesystemSecretStore;
 #[cfg(not(windows))]
 use palyra_identity::{
-    DeviceIdentity, IdentityManager, PairingClientKind, PairingMethod, SecretStore,
-    DEFAULT_CERT_VALIDITY,
+    IdentityManager, PairingClientKind, PairingMethod, SecretStore, DEFAULT_CERT_VALIDITY,
 };
 use palyra_policy::{evaluate_with_config, PolicyDecision, PolicyEvaluationConfig, PolicyRequest};
 use palyra_skills::{
@@ -144,6 +143,8 @@ const MAX_REGISTRY_INDEX_BYTES: usize = 2 * 1024 * 1024;
 const MAX_REGISTRY_ENTRIES: usize = 10_000;
 const MAX_REGISTRY_PAGES: usize = 20;
 const REGISTRY_SIGNATURE_ALGORITHM: &str = "ed25519-sha256";
+const JOURNAL_CHECKPOINT_ATTESTATION_SCHEMA_VERSION: u32 = 1;
+const JOURNAL_CHECKPOINT_ATTESTATION_ALGORITHM: &str = "ed25519-sha256";
 const TRUST_STORE_INTEGRITY_VAULT_SCOPE: VaultScope = VaultScope::Global;
 const TRUST_STORE_INTEGRITY_VAULT_KEY_PREFIX: &str = "skills.trust_store.integrity.";
 
@@ -4005,7 +4006,15 @@ fn run_daemon(command: DaemonCommand) -> Result<()> {
             println!("journal.vacuum db_path={} status=ok", db_path.display());
             std::io::stdout().flush().context("stdout flush failed")
         }
-        DaemonCommand::JournalCheckpoint { db_path, mode } => {
+        DaemonCommand::JournalCheckpoint {
+            db_path,
+            mode,
+            sign,
+            device_id,
+            identity_store_dir,
+            attestation_out,
+            json,
+        } => {
             let db_path = resolve_daemon_journal_db_path(db_path)?;
             ensure_journal_db_exists(db_path.as_path())?;
             let connection = Connection::open(db_path.as_path()).with_context(|| {
@@ -4026,14 +4035,109 @@ fn run_daemon(command: DaemonCommand) -> Result<()> {
                         db_path.display()
                     )
                 })?;
-            println!(
-                "journal.checkpoint db_path={} mode={} busy={} log_frames={} checkpointed_frames={}",
-                db_path.display(),
-                checkpoint_mode_label(mode),
+
+            let checkpoint = JournalCheckpointOutput {
+                db_path: db_path.display().to_string(),
+                mode: checkpoint_mode_label(mode).to_owned(),
                 busy,
                 log_frames,
-                checkpointed_frames
-            );
+                checkpointed_frames,
+                attestation: None,
+            };
+
+            if sign {
+                validate_canonical_id(device_id.as_str())
+                    .context("--device-id must be a canonical ULID when --sign is set")?;
+                let latest_hash = read_latest_journal_hash(&connection)
+                    .context("failed to read latest hash-chain root from journal database")?
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "journal hash-chain root is unavailable; enable hash chain and ensure at least one hashed event is present before using --sign"
+                        )
+                    })?;
+                let identity_store_root = resolve_identity_store_root(identity_store_dir)?;
+                let identity_store = FilesystemSecretStore::new(identity_store_root.as_path())
+                    .with_context(|| {
+                        format!(
+                            "failed to initialize identity store at {}",
+                            identity_store_root.display()
+                        )
+                    })?;
+                let device_identity = DeviceIdentity::load(&identity_store, device_id.as_str())
+                    .map_err(|error| {
+                        anyhow!(
+                            "failed to load device identity {device_id} from {}: {error}",
+                            identity_store_root.display()
+                        )
+                    })?;
+                let attestation = build_journal_checkpoint_attestation(
+                    &device_identity,
+                    JournalCheckpointAttestationRequest {
+                        db_path: db_path.as_path(),
+                        mode,
+                        busy,
+                        log_frames,
+                        checkpointed_frames,
+                        latest_hash: latest_hash.as_str(),
+                        signed_at_unix_ms: unix_now_ms(),
+                    },
+                )
+                .context("failed to build journal checkpoint attestation")?;
+
+                if let Some(output_path) = attestation_out.as_ref() {
+                    let output_path = PathBuf::from(output_path);
+                    let encoded = serde_json::to_vec_pretty(&attestation)
+                        .context("failed to serialize journal checkpoint attestation JSON")?;
+                    write_file_atomically(output_path.as_path(), encoded.as_slice()).with_context(
+                        || {
+                            format!(
+                                "failed to write journal checkpoint attestation to {}",
+                                output_path.display()
+                            )
+                        },
+                    )?;
+                }
+
+                if json {
+                    let signed_output =
+                        JournalCheckpointOutput { attestation: Some(attestation), ..checkpoint };
+                    let encoded = serde_json::to_string_pretty(&signed_output)
+                        .context("failed to serialize journal checkpoint output as JSON")?;
+                    println!("{encoded}");
+                } else {
+                    println!(
+                        "journal.checkpoint db_path={} mode={} busy={} log_frames={} checkpointed_frames={}",
+                        checkpoint.db_path,
+                        checkpoint.mode,
+                        checkpoint.busy,
+                        checkpoint.log_frames,
+                        checkpoint.checkpointed_frames
+                    );
+                    println!(
+                        "journal.checkpoint.attestation device_id={} key_id={} algorithm={} latest_hash={} payload_sha256={} signature_base64={} attestation_out={}",
+                        attestation.payload.device_id,
+                        attestation.key_id,
+                        attestation.algorithm,
+                        attestation.payload.latest_hash,
+                        attestation.payload_sha256,
+                        attestation.signature_base64,
+                        attestation_out.as_deref().unwrap_or("none")
+                    );
+                }
+            } else if json {
+                let encoded = serde_json::to_string_pretty(&checkpoint)
+                    .context("failed to serialize journal checkpoint output as JSON")?;
+                println!("{encoded}");
+            } else {
+                println!(
+                    "journal.checkpoint db_path={} mode={} busy={} log_frames={} checkpointed_frames={}",
+                    checkpoint.db_path,
+                    checkpoint.mode,
+                    checkpoint.busy,
+                    checkpoint.log_frames,
+                    checkpoint.checkpointed_frames
+                );
+            }
             std::io::stdout().flush().context("stdout flush failed")
         }
         DaemonCommand::RunStatus { url, token, principal, device_id, channel, run_id } => {
@@ -4182,6 +4286,51 @@ fn run_daemon(command: DaemonCommand) -> Result<()> {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct JournalCheckpointOutput {
+    db_path: String,
+    mode: String,
+    busy: i64,
+    log_frames: i64,
+    checkpointed_frames: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attestation: Option<JournalCheckpointAttestation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct JournalCheckpointAttestation {
+    schema_version: u32,
+    algorithm: String,
+    key_id: String,
+    public_key_base64: String,
+    payload_sha256: String,
+    signature_base64: String,
+    payload: JournalCheckpointAttestationPayload,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct JournalCheckpointAttestationPayload {
+    db_path: String,
+    mode: String,
+    busy: i64,
+    log_frames: i64,
+    checkpointed_frames: i64,
+    latest_hash: String,
+    signed_at_unix_ms: i64,
+    device_id: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct JournalCheckpointAttestationRequest<'a> {
+    db_path: &'a Path,
+    mode: JournalCheckpointModeArg,
+    busy: i64,
+    log_frames: i64,
+    checkpointed_frames: i64,
+    latest_hash: &'a str,
+    signed_at_unix_ms: i64,
+}
+
 fn resolve_daemon_journal_db_path(db_path_override: Option<String>) -> Result<PathBuf> {
     if let Some(db_path_override) = db_path_override {
         let trimmed = db_path_override.trim();
@@ -4252,6 +4401,40 @@ const fn checkpoint_mode_label(mode: JournalCheckpointModeArg) -> &'static str {
         JournalCheckpointModeArg::Restart => "restart",
         JournalCheckpointModeArg::Truncate => "truncate",
     }
+}
+
+fn build_journal_checkpoint_attestation(
+    device_identity: &DeviceIdentity,
+    request: JournalCheckpointAttestationRequest<'_>,
+) -> Result<JournalCheckpointAttestation> {
+    let latest_hash = request.latest_hash.trim();
+    if latest_hash.is_empty() {
+        anyhow::bail!("journal checkpoint attestation requires a non-empty latest hash");
+    }
+    let payload = JournalCheckpointAttestationPayload {
+        db_path: request.db_path.display().to_string(),
+        mode: checkpoint_mode_label(request.mode).to_owned(),
+        busy: request.busy,
+        log_frames: request.log_frames,
+        checkpointed_frames: request.checkpointed_frames,
+        latest_hash: latest_hash.to_owned(),
+        signed_at_unix_ms: request.signed_at_unix_ms,
+        device_id: device_identity.device_id.clone(),
+    };
+    let payload_bytes = serde_json::to_vec(&payload)
+        .context("failed to serialize journal checkpoint attestation payload")?;
+    let payload_sha256 = sha256_hex(payload_bytes.as_slice());
+    let signature = device_identity.signing_key().sign(payload_bytes.as_slice());
+    let verifying_key = device_identity.verifying_key();
+    Ok(JournalCheckpointAttestation {
+        schema_version: JOURNAL_CHECKPOINT_ATTESTATION_SCHEMA_VERSION,
+        algorithm: JOURNAL_CHECKPOINT_ATTESTATION_ALGORITHM.to_owned(),
+        key_id: registry_key_id_for(&verifying_key),
+        public_key_base64: BASE64_STANDARD.encode(verifying_key.as_bytes()),
+        payload_sha256,
+        signature_base64: BASE64_STANDARD.encode(signature.to_bytes()),
+        payload,
+    })
 }
 
 fn run_policy(command: PolicyCommand) -> Result<()> {
@@ -7483,7 +7666,6 @@ fn run_pairing(command: PairingCommand) -> Result<()> {
     }
 }
 
-#[cfg(not(windows))]
 fn resolve_identity_store_root(store_dir: Option<String>) -> Result<PathBuf> {
     if let Some(path) = store_dir {
         return Ok(PathBuf::from(path));
@@ -8018,7 +8200,8 @@ struct SkillStatusResponse {
 #[cfg(test)]
 mod cli_v1_tests {
     use super::{
-        compare_semver_versions, ensure_remote_registry_same_origin, fetch_limited_bytes,
+        build_journal_checkpoint_attestation, compare_semver_versions,
+        ensure_remote_registry_same_origin, fetch_limited_bytes,
         fetch_remote_registry_entries_with_fetcher, is_retryable_grpc_error,
         normalize_client_socket, normalize_installed_skills_index, normalize_prompt_secret_value,
         normalize_relative_registry_path, parse_acp_shim_input_line,
@@ -8028,13 +8211,14 @@ mod cli_v1_tests {
         process_runner_tier_c_windows_backend_supported, registry_key_id_for, sha256_hex,
         trust_store_integrity_vault_key, validate_registry_index,
         verify_or_initialize_trust_store_integrity, write_file_atomically, InstalledSkillRecord,
-        InstalledSkillSource, InstalledSkillsIndex, RegistrySignature, RootFileConfig,
-        SignedSkillRegistryIndex, SkillRegistryEntry, SkillRegistryIndex,
-        REGISTRY_INDEX_SCHEMA_VERSION, REGISTRY_SIGNATURE_ALGORITHM,
-        REGISTRY_SIGNED_INDEX_SCHEMA_VERSION,
+        InstalledSkillSource, InstalledSkillsIndex, JournalCheckpointAttestationRequest,
+        JournalCheckpointModeArg, RegistrySignature, RootFileConfig, SignedSkillRegistryIndex,
+        SkillRegistryEntry, SkillRegistryIndex, REGISTRY_INDEX_SCHEMA_VERSION,
+        REGISTRY_SIGNATURE_ALGORITHM, REGISTRY_SIGNED_INDEX_SCHEMA_VERSION,
     };
     use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-    use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
+    use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+    use palyra_identity::DeviceIdentity;
     use palyra_skills::SkillTrustStore;
     use reqwest::Url;
     use std::collections::HashMap;
@@ -8205,6 +8389,67 @@ mod cli_v1_tests {
     fn semver_comparison_uses_numeric_ordering() {
         assert_eq!(compare_semver_versions("1.10.0", "1.2.99"), std::cmp::Ordering::Greater);
         assert_eq!(compare_semver_versions("1.2.0", "1.2.0"), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn journal_checkpoint_attestation_signature_verifies() {
+        let device_identity = DeviceIdentity::generate("01ARZ3NDEKTSV4RRFFQ69G5FAV")
+            .expect("device identity should generate");
+        let latest_hash = "a".repeat(64);
+        let attestation = build_journal_checkpoint_attestation(
+            &device_identity,
+            JournalCheckpointAttestationRequest {
+                db_path: Path::new("data/journal.sqlite3"),
+                mode: JournalCheckpointModeArg::Truncate,
+                busy: 0,
+                log_frames: 11,
+                checkpointed_frames: 11,
+                latest_hash: latest_hash.as_str(),
+                signed_at_unix_ms: 1_730_000_000_123,
+            },
+        )
+        .expect("journal checkpoint attestation should be built");
+        let payload_bytes =
+            serde_json::to_vec(&attestation.payload).expect("attestation payload should serialize");
+        assert_eq!(
+            attestation.payload_sha256,
+            sha256_hex(payload_bytes.as_slice()),
+            "payload hash must match serialized payload bytes"
+        );
+        assert_eq!(
+            attestation.key_id,
+            registry_key_id_for(&device_identity.verifying_key()),
+            "key identifier must derive from the device verifying key"
+        );
+        let signature_bytes = BASE64_STANDARD
+            .decode(attestation.signature_base64.as_bytes())
+            .expect("signature should decode from base64");
+        let signature_bytes: [u8; 64] =
+            signature_bytes.as_slice().try_into().expect("signature must be 64 bytes");
+        let signature = Signature::from_bytes(&signature_bytes);
+        device_identity
+            .verifying_key()
+            .verify(payload_bytes.as_slice(), &signature)
+            .expect("signature must verify against attestation payload");
+    }
+
+    #[test]
+    fn journal_checkpoint_attestation_rejects_empty_latest_hash() {
+        let device_identity = DeviceIdentity::generate("01ARZ3NDEKTSV4RRFFQ69G5FAV")
+            .expect("device identity should generate");
+        let result = build_journal_checkpoint_attestation(
+            &device_identity,
+            JournalCheckpointAttestationRequest {
+                db_path: Path::new("data/journal.sqlite3"),
+                mode: JournalCheckpointModeArg::Truncate,
+                busy: 0,
+                log_frames: 0,
+                checkpointed_frames: 0,
+                latest_hash: "   ",
+                signed_at_unix_ms: 1_730_000_000_123,
+            },
+        );
+        assert!(result.is_err(), "empty latest hash should fail closed");
     }
 
     #[test]

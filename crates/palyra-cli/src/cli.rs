@@ -716,6 +716,16 @@ pub enum DaemonCommand {
         db_path: Option<String>,
         #[arg(long, value_enum, default_value_t = JournalCheckpointModeArg::Truncate)]
         mode: JournalCheckpointModeArg,
+        #[arg(long, default_value_t = false)]
+        sign: bool,
+        #[arg(long, default_value = "01ARZ3NDEKTSV4RRFFQ69G5FAV")]
+        device_id: String,
+        #[arg(long)]
+        identity_store_dir: Option<String>,
+        #[arg(long)]
+        attestation_out: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     RunStatus {
         #[arg(long)]
@@ -2091,6 +2101,46 @@ mod tests {
                 command: DaemonCommand::JournalCheckpoint {
                     db_path: Some("data/journal.sqlite3".to_owned()),
                     mode: JournalCheckpointModeArg::Restart,
+                    sign: false,
+                    device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                    identity_store_dir: None,
+                    attestation_out: None,
+                    json: false,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn parse_daemon_journal_checkpoint_with_signature_options() {
+        let parsed = Cli::parse_from([
+            "palyra",
+            "daemon",
+            "journal-checkpoint",
+            "--db-path",
+            "data/journal.sqlite3",
+            "--mode",
+            "truncate",
+            "--sign",
+            "--device-id",
+            "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+            "--identity-store-dir",
+            "state/identity",
+            "--attestation-out",
+            "artifacts/journal-checkpoint.json",
+            "--json",
+        ]);
+        assert_eq!(
+            parsed.command,
+            Command::Daemon {
+                command: DaemonCommand::JournalCheckpoint {
+                    db_path: Some("data/journal.sqlite3".to_owned()),
+                    mode: JournalCheckpointModeArg::Truncate,
+                    sign: true,
+                    device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),
+                    identity_store_dir: Some("state/identity".to_owned()),
+                    attestation_out: Some("artifacts/journal-checkpoint.json".to_owned()),
+                    json: true,
                 }
             }
         );
