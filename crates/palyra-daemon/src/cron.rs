@@ -25,6 +25,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::{
+    config::MemoryRetentionConfig,
     gateway::{
         proto::palyra::{common::v1 as common_v1, cron::v1 as cron_v1, gateway::v1 as gateway_v1},
         GatewayAuthConfig, GatewayRuntimeState, RequestContext, HEADER_CHANNEL, HEADER_DEVICE_ID,
@@ -32,8 +33,9 @@ use crate::{
     },
     journal::{
         CronConcurrencyPolicy, CronJobRecord, CronMisfirePolicy, CronRunFinalizeRequest,
-        CronRunStartRequest, CronRunStatus, CronScheduleType, OrchestratorCancelRequest,
-        OrchestratorRunStatusSnapshot, SkillExecutionStatus, SkillStatusUpsertRequest,
+        CronRunStartRequest, CronRunStatus, CronScheduleType, MemoryRetentionPolicy,
+        OrchestratorCancelRequest, OrchestratorRunStatusSnapshot, SkillExecutionStatus,
+        SkillStatusUpsertRequest,
     },
 };
 
@@ -51,6 +53,7 @@ const SKILLS_TRUST_STORE_PATH_ENV: &str = "PALYRA_SKILLS_TRUST_STORE";
 const SKILL_REAUDIT_INTERVAL_ENV: &str = "PALYRA_SKILL_REAUDIT_INTERVAL_MS";
 const DEFAULT_SKILL_REAUDIT_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const SYSTEM_DAEMON_PRINCIPAL: &str = "system:daemon";
+pub const MEMORY_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CronTimezoneMode {
@@ -708,11 +711,87 @@ async fn run_periodic_skill_reaudit(
     Ok(())
 }
 
+fn compute_next_vacuum_due_at_unix_ms(
+    schedule: &str,
+    last_vacuum_at_unix_ms: Option<i64>,
+    now_unix_ms: i64,
+) -> Result<Option<i64>, Status> {
+    let matcher =
+        CronMatcher::parse(schedule).map_err(|error| Status::invalid_argument(error.to_owned()))?;
+    let reference_unix_ms =
+        last_vacuum_at_unix_ms.unwrap_or_else(|| now_unix_ms.saturating_sub(60_000));
+    Ok(matcher.next_after(reference_unix_ms, CronTimezoneMode::Utc))
+}
+
+#[allow(clippy::result_large_err)]
+async fn run_memory_maintenance_tick(
+    state: Arc<GatewayRuntimeState>,
+    retention: MemoryRetentionConfig,
+) -> Result<(), Status> {
+    let now_unix_ms = now_unix_ms()?;
+    let status = state.memory_maintenance_status().await?;
+    let next_vacuum_due_at_unix_ms = compute_next_vacuum_due_at_unix_ms(
+        retention.vacuum_schedule.as_str(),
+        status.last_vacuum_at_unix_ms,
+        now_unix_ms,
+    )?;
+    let next_maintenance_run_at_unix_ms = Some(now_unix_ms.saturating_add(
+        i64::try_from(MEMORY_MAINTENANCE_INTERVAL.as_millis()).unwrap_or(i64::MAX),
+    ));
+    let retention_policy = MemoryRetentionPolicy {
+        max_entries: retention.max_entries,
+        max_bytes: retention.max_bytes,
+        ttl_days: retention.ttl_days,
+    };
+    let outcome = state
+        .run_memory_maintenance(
+            now_unix_ms,
+            retention_policy,
+            next_vacuum_due_at_unix_ms,
+            next_maintenance_run_at_unix_ms,
+        )
+        .await?;
+    if outcome.deleted_total_count > 0 || outcome.vacuum_performed {
+        let context = RequestContext {
+            principal: SYSTEM_DAEMON_PRINCIPAL.to_owned(),
+            device_id: SCHEDULER_DEVICE_ID.to_owned(),
+            channel: Some(DEFAULT_CRON_CHANNEL.to_owned()),
+        };
+        let details = json!({
+            "ran_at_unix_ms": outcome.ran_at_unix_ms,
+            "deleted_expired_count": outcome.deleted_expired_count,
+            "deleted_capacity_count": outcome.deleted_capacity_count,
+            "deleted_total_count": outcome.deleted_total_count,
+            "entries_before": outcome.entries_before,
+            "entries_after": outcome.entries_after,
+            "approx_bytes_before": outcome.approx_bytes_before,
+            "approx_bytes_after": outcome.approx_bytes_after,
+            "vacuum_performed": outcome.vacuum_performed,
+            "last_vacuum_at_unix_ms": outcome.last_vacuum_at_unix_ms,
+            "next_vacuum_due_at_unix_ms": outcome.next_vacuum_due_at_unix_ms,
+            "next_maintenance_run_at_unix_ms": outcome.next_maintenance_run_at_unix_ms,
+            "retention": {
+                "max_entries": retention.max_entries,
+                "max_bytes": retention.max_bytes,
+                "ttl_days": retention.ttl_days,
+                "vacuum_schedule": retention.vacuum_schedule,
+            },
+        });
+        if let Err(error) =
+            state.record_console_event(&context, "memory.maintenance.run", details).await
+        {
+            warn!(error = %error, "failed to record memory maintenance audit event");
+        }
+    }
+    Ok(())
+}
+
 pub fn spawn_scheduler_loop(
     state: Arc<GatewayRuntimeState>,
     auth: GatewayAuthConfig,
     grpc_url: String,
     wake_signal: Arc<Notify>,
+    memory_retention: MemoryRetentionConfig,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let periodic_skill_reaudit = match resolve_periodic_skill_reaudit_config() {
@@ -723,6 +802,7 @@ pub fn spawn_scheduler_loop(
             }
         };
         let mut next_skill_reaudit_at = Instant::now();
+        let mut next_memory_maintenance_at = Instant::now();
         loop {
             if let Err(error) = process_due_jobs(
                 Arc::clone(&state),
@@ -754,6 +834,15 @@ pub fn spawn_scheduler_loop(
                     }
                     next_skill_reaudit_at = Instant::now() + config.interval;
                 }
+            }
+
+            if Instant::now() >= next_memory_maintenance_at {
+                if let Err(error) =
+                    run_memory_maintenance_tick(Arc::clone(&state), memory_retention.clone()).await
+                {
+                    warn!(error = %error, "scheduled memory maintenance tick failed");
+                }
+                next_memory_maintenance_at = Instant::now() + MEMORY_MAINTENANCE_INTERVAL;
             }
 
             let sleep_duration = match state.first_due_cron_job_time().await {

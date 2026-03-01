@@ -40,7 +40,7 @@ use axum::{
 use base64::Engine as _;
 use clap::Parser;
 use config::load_config;
-use cron::spawn_scheduler_loop;
+use cron::{spawn_scheduler_loop, MEMORY_MAINTENANCE_INTERVAL};
 use gateway::{
     authorize_headers, request_context_from_headers, AuthError, CanvasAssetResponse,
     GatewayAuthConfig, GatewayJournalConfigSnapshot, GatewayRuntimeConfigSnapshot,
@@ -1119,6 +1119,7 @@ async fn main() -> Result<()> {
         auth.clone(),
         grpc_url.clone(),
         Arc::clone(&scheduler_wake),
+        loaded.memory.retention.clone(),
     );
 
     let started_at = Instant::now();
@@ -1193,6 +1194,7 @@ async fn main() -> Result<()> {
         .route("/console/v1/cron/jobs/{job_id}/enabled", post(console_cron_set_enabled_handler))
         .route("/console/v1/cron/jobs/{job_id}/run-now", post(console_cron_run_now_handler))
         .route("/console/v1/cron/jobs/{job_id}/runs", get(console_cron_runs_handler))
+        .route("/console/v1/memory/status", get(console_memory_status_handler))
         .route("/console/v1/memory/search", get(console_memory_search_handler))
         .route("/console/v1/memory/purge", post(console_memory_purge_handler))
         .route("/console/v1/skills", get(console_skills_list_handler))
@@ -2176,6 +2178,9 @@ async fn console_diagnostics_handler(
     redact_console_diagnostics_value(&mut auth_payload, None);
 
     let browser_payload = collect_console_browser_diagnostics(&state).await;
+    let memory_status =
+        state.runtime.memory_maintenance_status().await.map_err(runtime_status_response)?;
+    let memory_runtime_config = state.runtime.memory_config_snapshot();
     let generated_at_unix_ms = unix_ms_now().map_err(|error| {
         runtime_status_response(tonic::Status::internal(format!(
             "failed to read system clock: {error}"
@@ -2194,6 +2199,23 @@ async fn console_diagnostics_handler(
         },
         "auth_profiles": auth_payload,
         "browserd": browser_payload,
+        "memory": {
+            "usage": memory_status.usage,
+            "retention": {
+                "max_entries": memory_runtime_config.retention_max_entries,
+                "max_bytes": memory_runtime_config.retention_max_bytes,
+                "ttl_days": memory_runtime_config.retention_ttl_days,
+                "vacuum_schedule": memory_runtime_config.retention_vacuum_schedule,
+            },
+            "maintenance": {
+                "interval_ms": i64::try_from(MEMORY_MAINTENANCE_INTERVAL.as_millis())
+                    .unwrap_or(i64::MAX),
+                "last_run": memory_status.last_run,
+                "last_vacuum_at_unix_ms": memory_status.last_vacuum_at_unix_ms,
+                "next_vacuum_due_at_unix_ms": memory_status.next_vacuum_due_at_unix_ms,
+                "next_run_at_unix_ms": memory_status.next_maintenance_run_at_unix_ms,
+            }
+        },
     })))
 }
 
@@ -3758,6 +3780,34 @@ fn apply_console_rpc_context(
         metadata.insert(gateway::HEADER_CHANNEL, channel);
     }
     Ok(())
+}
+
+async fn console_memory_status_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, Response> {
+    let _session = authorize_console_session(&state, &headers, false)?;
+    let maintenance_status =
+        state.runtime.memory_maintenance_status().await.map_err(runtime_status_response)?;
+    let memory_config = state.runtime.memory_config_snapshot();
+    let maintenance_interval_ms =
+        i64::try_from(MEMORY_MAINTENANCE_INTERVAL.as_millis()).unwrap_or(i64::MAX);
+    Ok(Json(json!({
+        "usage": maintenance_status.usage,
+        "retention": {
+            "max_entries": memory_config.retention_max_entries,
+            "max_bytes": memory_config.retention_max_bytes,
+            "ttl_days": memory_config.retention_ttl_days,
+            "vacuum_schedule": memory_config.retention_vacuum_schedule,
+        },
+        "maintenance": {
+            "interval_ms": maintenance_interval_ms,
+            "last_run": maintenance_status.last_run,
+            "last_vacuum_at_unix_ms": maintenance_status.last_vacuum_at_unix_ms,
+            "next_vacuum_due_at_unix_ms": maintenance_status.next_vacuum_due_at_unix_ms,
+            "next_run_at_unix_ms": maintenance_status.next_maintenance_run_at_unix_ms,
+        }
+    })))
 }
 
 async fn console_memory_search_handler(

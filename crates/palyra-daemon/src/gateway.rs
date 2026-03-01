@@ -67,9 +67,10 @@ use crate::{
         CronJobCreateRequest, CronJobRecord, CronJobUpdatePatch, CronJobsListFilter,
         CronRunFinalizeRequest, CronRunRecord, CronRunStartRequest, CronRunStatus,
         CronRunsListFilter, JournalAppendRequest, JournalError, JournalEventRecord, JournalStore,
-        MemoryItemCreateRequest, MemoryItemRecord, MemoryItemsListFilter, MemoryPurgeRequest,
-        MemorySearchHit, MemorySearchRequest, MemorySource, OrchestratorCancelRequest,
-        OrchestratorRunStartRequest, OrchestratorRunStatusSnapshot, OrchestratorSessionRecord,
+        MemoryItemCreateRequest, MemoryItemRecord, MemoryItemsListFilter, MemoryMaintenanceRequest,
+        MemoryMaintenanceStatus, MemoryPurgeRequest, MemoryRetentionPolicy, MemorySearchHit,
+        MemorySearchRequest, MemorySource, OrchestratorCancelRequest, OrchestratorRunStartRequest,
+        OrchestratorRunStatusSnapshot, OrchestratorSessionRecord,
         OrchestratorSessionResolveOutcome, OrchestratorSessionResolveRequest,
         OrchestratorTapeAppendRequest, OrchestratorTapeRecord, OrchestratorUsageDelta,
         SkillExecutionStatus, SkillStatusRecord, SkillStatusUpsertRequest,
@@ -3583,6 +3584,49 @@ impl GatewayRuntimeState {
             self.clear_memory_search_cache();
         }
         Ok(deleted)
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn memory_maintenance_status(
+        self: &Arc<Self>,
+    ) -> Result<MemoryMaintenanceStatus, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state
+                .journal_store
+                .memory_maintenance_status()
+                .map_err(|error| map_memory_store_error("load memory maintenance status", error))
+        })
+        .await
+        .map_err(|_| Status::internal("memory maintenance status worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn run_memory_maintenance(
+        self: &Arc<Self>,
+        now_unix_ms: i64,
+        retention: MemoryRetentionPolicy,
+        next_vacuum_due_at_unix_ms: Option<i64>,
+        next_maintenance_run_at_unix_ms: Option<i64>,
+    ) -> Result<crate::journal::MemoryMaintenanceOutcome, Status> {
+        let state = Arc::clone(self);
+        let outcome = tokio::task::spawn_blocking(move || {
+            state
+                .journal_store
+                .run_memory_maintenance(&MemoryMaintenanceRequest {
+                    now_unix_ms,
+                    retention,
+                    next_vacuum_due_at_unix_ms,
+                    next_maintenance_run_at_unix_ms,
+                })
+                .map_err(|error| map_memory_store_error("run memory maintenance", error))
+        })
+        .await
+        .map_err(|_| Status::internal("memory maintenance worker panicked"))??;
+        if outcome.deleted_total_count > 0 {
+            self.clear_memory_search_cache();
+        }
+        Ok(outcome)
     }
 
     #[allow(clippy::result_large_err)]

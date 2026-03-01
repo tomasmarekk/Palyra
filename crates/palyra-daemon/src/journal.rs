@@ -6,7 +6,7 @@ use std::{
 };
 
 use palyra_a2ui::{apply_patch_document, parse_patch_document};
-use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection, ErrorCode, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -39,6 +39,8 @@ const MAX_MEMORY_SEARCH_CANDIDATES: usize = 256;
 const MAX_CANVAS_PATCHES_QUERY_LIMIT: usize = 1_000;
 const DEFAULT_MEMORY_VECTOR_DIMS: usize = 64;
 const DEFAULT_MEMORY_EMBEDDING_MODEL: &str = "hash-embedding-v1";
+const MEMORY_RETENTION_DAY_MS: i64 = 24 * 60 * 60 * 1_000;
+const MEMORY_MAINTENANCE_STATE_SINGLETON_KEY: i64 = 1;
 
 pub trait MemoryEmbeddingProvider: Send + Sync {
     fn model_name(&self) -> &str;
@@ -451,6 +453,95 @@ pub struct MemorySearchHit {
     pub snippet: String,
     pub score: f64,
     pub breakdown: MemoryScoreBreakdown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryRetentionPolicy {
+    pub max_entries: Option<usize>,
+    pub max_bytes: Option<u64>,
+    pub ttl_days: Option<u32>,
+}
+
+impl MemoryRetentionPolicy {
+    #[must_use]
+    pub const fn is_enforced(self) -> bool {
+        self.max_entries.is_some() || self.max_bytes.is_some() || self.ttl_days.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct MemoryUsageSnapshot {
+    pub entries: u64,
+    pub approx_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct MemoryMaintenanceRunRecord {
+    pub ran_at_unix_ms: i64,
+    pub deleted_expired_count: u64,
+    pub deleted_capacity_count: u64,
+    pub deleted_total_count: u64,
+    pub entries_before: u64,
+    pub entries_after: u64,
+    pub approx_bytes_before: u64,
+    pub approx_bytes_after: u64,
+    pub vacuum_performed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct MemoryMaintenanceStatus {
+    pub usage: MemoryUsageSnapshot,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_run: Option<MemoryMaintenanceRunRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_vacuum_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_vacuum_due_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_maintenance_run_at_unix_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryMaintenanceRequest {
+    pub now_unix_ms: i64,
+    pub retention: MemoryRetentionPolicy,
+    pub next_vacuum_due_at_unix_ms: Option<i64>,
+    pub next_maintenance_run_at_unix_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct MemoryMaintenanceOutcome {
+    pub ran_at_unix_ms: i64,
+    pub deleted_expired_count: u64,
+    pub deleted_capacity_count: u64,
+    pub deleted_total_count: u64,
+    pub entries_before: u64,
+    pub entries_after: u64,
+    pub approx_bytes_before: u64,
+    pub approx_bytes_after: u64,
+    pub vacuum_performed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_vacuum_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_vacuum_due_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_maintenance_run_at_unix_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct MemoryMaintenanceStateRow {
+    last_run_at_unix_ms: Option<i64>,
+    last_vacuum_at_unix_ms: Option<i64>,
+    next_vacuum_due_at_unix_ms: Option<i64>,
+    next_maintenance_run_at_unix_ms: Option<i64>,
+    last_deleted_expired_count: u64,
+    last_deleted_capacity_count: u64,
+    last_deleted_total_count: u64,
+    last_entries_before: u64,
+    last_entries_after: u64,
+    last_bytes_before: u64,
+    last_bytes_after: u64,
+    last_vacuum_performed: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1341,6 +1432,29 @@ const MIGRATIONS: &[Migration] = &[
             BEGIN
                 SELECT RAISE(ABORT, 'canvas_state_patches is append-only');
             END;
+        "#,
+    },
+    Migration {
+        version: 9,
+        name: "create_memory_maintenance_state",
+        sql: r#"
+            CREATE TABLE IF NOT EXISTS memory_maintenance_state (
+                singleton_key INTEGER PRIMARY KEY CHECK (singleton_key = 1),
+                last_run_at_unix_ms INTEGER,
+                last_vacuum_at_unix_ms INTEGER,
+                next_vacuum_due_at_unix_ms INTEGER,
+                next_maintenance_run_at_unix_ms INTEGER,
+                last_deleted_expired_count INTEGER NOT NULL DEFAULT 0,
+                last_deleted_capacity_count INTEGER NOT NULL DEFAULT 0,
+                last_deleted_total_count INTEGER NOT NULL DEFAULT 0,
+                last_entries_before INTEGER NOT NULL DEFAULT 0,
+                last_entries_after INTEGER NOT NULL DEFAULT 0,
+                last_bytes_before INTEGER NOT NULL DEFAULT 0,
+                last_bytes_after INTEGER NOT NULL DEFAULT 0,
+                last_vacuum_performed INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT OR IGNORE INTO memory_maintenance_state(singleton_key)
+            VALUES (1);
         "#,
     },
 ];
@@ -3379,6 +3493,110 @@ impl JournalStore {
         Ok(deleted as u64)
     }
 
+    pub fn memory_maintenance_status(&self) -> Result<MemoryMaintenanceStatus, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let usage = query_memory_usage_snapshot(&guard)?;
+        let state = load_memory_maintenance_state(&guard)?.unwrap_or_default();
+        let last_run = state.last_run_at_unix_ms.map(|ran_at_unix_ms| MemoryMaintenanceRunRecord {
+            ran_at_unix_ms,
+            deleted_expired_count: state.last_deleted_expired_count,
+            deleted_capacity_count: state.last_deleted_capacity_count,
+            deleted_total_count: state.last_deleted_total_count,
+            entries_before: state.last_entries_before,
+            entries_after: state.last_entries_after,
+            approx_bytes_before: state.last_bytes_before,
+            approx_bytes_after: state.last_bytes_after,
+            vacuum_performed: state.last_vacuum_performed,
+        });
+        Ok(MemoryMaintenanceStatus {
+            usage,
+            last_run,
+            last_vacuum_at_unix_ms: state.last_vacuum_at_unix_ms,
+            next_vacuum_due_at_unix_ms: state.next_vacuum_due_at_unix_ms,
+            next_maintenance_run_at_unix_ms: state.next_maintenance_run_at_unix_ms,
+        })
+    }
+
+    pub fn run_memory_maintenance(
+        &self,
+        request: &MemoryMaintenanceRequest,
+    ) -> Result<MemoryMaintenanceOutcome, JournalError> {
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let usage_before = query_memory_usage_snapshot(&guard)?;
+        let previous_state = load_memory_maintenance_state(&guard)?.unwrap_or_default();
+
+        let mut deleted_expired_count = 0_u64;
+        let mut deleted_capacity_count = 0_u64;
+        if request.retention.is_enforced() {
+            let transaction = guard.transaction()?;
+            deleted_expired_count = deleted_expired_count.saturating_add(transaction.execute(
+                "DELETE FROM memory_items WHERE ttl_unix_ms IS NOT NULL AND ttl_unix_ms <= ?1",
+                params![request.now_unix_ms],
+            )? as u64);
+            if let Some(ttl_days) = request.retention.ttl_days {
+                let cutoff = request
+                    .now_unix_ms
+                    .saturating_sub(i64::from(ttl_days).saturating_mul(MEMORY_RETENTION_DAY_MS));
+                deleted_expired_count = deleted_expired_count.saturating_add(transaction.execute(
+                    "DELETE FROM memory_items WHERE created_at_unix_ms <= ?1",
+                    params![cutoff],
+                )?
+                    as u64);
+            }
+            if let Some(max_entries) = request.retention.max_entries {
+                deleted_capacity_count = deleted_capacity_count.saturating_add(
+                    evict_oldest_memory_items_by_entry_cap(&transaction, max_entries)?,
+                );
+            }
+            if let Some(max_bytes) = request.retention.max_bytes {
+                deleted_capacity_count = deleted_capacity_count.saturating_add(
+                    evict_oldest_memory_items_by_byte_cap(&transaction, max_bytes)?,
+                );
+            }
+            transaction.commit()?;
+        }
+
+        let mut last_vacuum_at_unix_ms = previous_state.last_vacuum_at_unix_ms;
+        let mut vacuum_performed = false;
+        if request.next_vacuum_due_at_unix_ms.is_some_and(|due_at| due_at <= request.now_unix_ms) {
+            guard.execute_batch("VACUUM;")?;
+            vacuum_performed = true;
+            last_vacuum_at_unix_ms = Some(request.now_unix_ms);
+        }
+
+        let usage_after = query_memory_usage_snapshot(&guard)?;
+        let deleted_total_count = deleted_expired_count.saturating_add(deleted_capacity_count);
+        upsert_memory_maintenance_state(
+            &guard,
+            request.now_unix_ms,
+            request.next_vacuum_due_at_unix_ms,
+            request.next_maintenance_run_at_unix_ms,
+            last_vacuum_at_unix_ms,
+            deleted_expired_count,
+            deleted_capacity_count,
+            deleted_total_count,
+            usage_before.entries,
+            usage_after.entries,
+            usage_before.approx_bytes,
+            usage_after.approx_bytes,
+            vacuum_performed,
+        )?;
+        Ok(MemoryMaintenanceOutcome {
+            ran_at_unix_ms: request.now_unix_ms,
+            deleted_expired_count,
+            deleted_capacity_count,
+            deleted_total_count,
+            entries_before: usage_before.entries,
+            entries_after: usage_after.entries,
+            approx_bytes_before: usage_before.approx_bytes,
+            approx_bytes_after: usage_after.approx_bytes,
+            vacuum_performed,
+            last_vacuum_at_unix_ms,
+            next_vacuum_due_at_unix_ms: request.next_vacuum_due_at_unix_ms,
+            next_maintenance_run_at_unix_ms: request.next_maintenance_run_at_unix_ms,
+        })
+    }
+
     pub fn search_memory(
         &self,
         request: &MemorySearchRequest,
@@ -4256,6 +4474,234 @@ fn load_memory_item_by_id(
         .map_err(Into::into)
 }
 
+fn query_memory_usage_snapshot(
+    connection: &Connection,
+) -> Result<MemoryUsageSnapshot, JournalError> {
+    let (entries_raw, bytes_raw): (i64, i64) = connection.query_row(
+        r#"
+            SELECT
+                COUNT(*),
+                COALESCE(
+                    SUM(
+                        COALESCE(length(memory.content_text), 0) +
+                        COALESCE(length(memory.content_hash), 0) +
+                        COALESCE(length(memory.tags_json), 0) +
+                        COALESCE(length(vectors.vector_blob), 0)
+                    ),
+                    0
+                )
+            FROM memory_items AS memory
+            LEFT JOIN memory_vectors AS vectors
+                ON vectors.memory_ulid = memory.memory_ulid
+        "#,
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok(MemoryUsageSnapshot {
+        entries: entries_raw.max(0) as u64,
+        approx_bytes: bytes_raw.max(0) as u64,
+    })
+}
+
+fn load_memory_maintenance_state(
+    connection: &Connection,
+) -> Result<Option<MemoryMaintenanceStateRow>, JournalError> {
+    connection
+        .query_row(
+            r#"
+                SELECT
+                    last_run_at_unix_ms,
+                    last_vacuum_at_unix_ms,
+                    next_vacuum_due_at_unix_ms,
+                    next_maintenance_run_at_unix_ms,
+                    last_deleted_expired_count,
+                    last_deleted_capacity_count,
+                    last_deleted_total_count,
+                    last_entries_before,
+                    last_entries_after,
+                    last_bytes_before,
+                    last_bytes_after,
+                    last_vacuum_performed
+                FROM memory_maintenance_state
+                WHERE singleton_key = ?1
+                LIMIT 1
+            "#,
+            params![MEMORY_MAINTENANCE_STATE_SINGLETON_KEY],
+            |row| {
+                Ok(MemoryMaintenanceStateRow {
+                    last_run_at_unix_ms: row.get(0)?,
+                    last_vacuum_at_unix_ms: row.get(1)?,
+                    next_vacuum_due_at_unix_ms: row.get(2)?,
+                    next_maintenance_run_at_unix_ms: row.get(3)?,
+                    last_deleted_expired_count: row.get::<_, i64>(4)?.max(0) as u64,
+                    last_deleted_capacity_count: row.get::<_, i64>(5)?.max(0) as u64,
+                    last_deleted_total_count: row.get::<_, i64>(6)?.max(0) as u64,
+                    last_entries_before: row.get::<_, i64>(7)?.max(0) as u64,
+                    last_entries_after: row.get::<_, i64>(8)?.max(0) as u64,
+                    last_bytes_before: row.get::<_, i64>(9)?.max(0) as u64,
+                    last_bytes_after: row.get::<_, i64>(10)?.max(0) as u64,
+                    last_vacuum_performed: row.get::<_, i64>(11)? != 0,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn upsert_memory_maintenance_state(
+    connection: &Connection,
+    ran_at_unix_ms: i64,
+    next_vacuum_due_at_unix_ms: Option<i64>,
+    next_maintenance_run_at_unix_ms: Option<i64>,
+    last_vacuum_at_unix_ms: Option<i64>,
+    deleted_expired_count: u64,
+    deleted_capacity_count: u64,
+    deleted_total_count: u64,
+    entries_before: u64,
+    entries_after: u64,
+    approx_bytes_before: u64,
+    approx_bytes_after: u64,
+    vacuum_performed: bool,
+) -> Result<(), JournalError> {
+    connection.execute(
+        r#"
+            INSERT INTO memory_maintenance_state (
+                singleton_key,
+                last_run_at_unix_ms,
+                last_vacuum_at_unix_ms,
+                next_vacuum_due_at_unix_ms,
+                next_maintenance_run_at_unix_ms,
+                last_deleted_expired_count,
+                last_deleted_capacity_count,
+                last_deleted_total_count,
+                last_entries_before,
+                last_entries_after,
+                last_bytes_before,
+                last_bytes_after,
+                last_vacuum_performed
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            ON CONFLICT(singleton_key) DO UPDATE SET
+                last_run_at_unix_ms = excluded.last_run_at_unix_ms,
+                last_vacuum_at_unix_ms = excluded.last_vacuum_at_unix_ms,
+                next_vacuum_due_at_unix_ms = excluded.next_vacuum_due_at_unix_ms,
+                next_maintenance_run_at_unix_ms = excluded.next_maintenance_run_at_unix_ms,
+                last_deleted_expired_count = excluded.last_deleted_expired_count,
+                last_deleted_capacity_count = excluded.last_deleted_capacity_count,
+                last_deleted_total_count = excluded.last_deleted_total_count,
+                last_entries_before = excluded.last_entries_before,
+                last_entries_after = excluded.last_entries_after,
+                last_bytes_before = excluded.last_bytes_before,
+                last_bytes_after = excluded.last_bytes_after,
+                last_vacuum_performed = excluded.last_vacuum_performed
+        "#,
+        params![
+            MEMORY_MAINTENANCE_STATE_SINGLETON_KEY,
+            ran_at_unix_ms,
+            last_vacuum_at_unix_ms,
+            next_vacuum_due_at_unix_ms,
+            next_maintenance_run_at_unix_ms,
+            deleted_expired_count as i64,
+            deleted_capacity_count as i64,
+            deleted_total_count as i64,
+            entries_before as i64,
+            entries_after as i64,
+            approx_bytes_before as i64,
+            approx_bytes_after as i64,
+            if vacuum_performed { 1_i64 } else { 0_i64 }
+        ],
+    )?;
+    Ok(())
+}
+
+fn evict_oldest_memory_items_by_entry_cap(
+    transaction: &Transaction<'_>,
+    max_entries: usize,
+) -> Result<u64, JournalError> {
+    let max_entries_i64 = i64::try_from(max_entries).unwrap_or(i64::MAX);
+    let current_entries: i64 =
+        transaction.query_row("SELECT COUNT(*) FROM memory_items", [], |row| row.get(0))?;
+    if current_entries <= max_entries_i64 {
+        return Ok(0);
+    }
+    let overflow = current_entries.saturating_sub(max_entries_i64);
+    let mut statement = transaction.prepare(
+        r#"
+            SELECT memory_ulid
+            FROM memory_items
+            ORDER BY created_at_unix_ms ASC, memory_ulid ASC
+            LIMIT ?1
+        "#,
+    )?;
+    let ids = statement
+        .query_map(params![overflow], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    delete_memory_items_by_ids(transaction, ids.as_slice())
+}
+
+fn evict_oldest_memory_items_by_byte_cap(
+    transaction: &Transaction<'_>,
+    max_bytes: u64,
+) -> Result<u64, JournalError> {
+    let mut statement = transaction.prepare(
+        r#"
+            SELECT
+                memory.memory_ulid,
+                (
+                    COALESCE(length(memory.content_text), 0) +
+                    COALESCE(length(memory.content_hash), 0) +
+                    COALESCE(length(memory.tags_json), 0) +
+                    COALESCE(length(vectors.vector_blob), 0)
+                ) AS approx_bytes
+            FROM memory_items AS memory
+            LEFT JOIN memory_vectors AS vectors
+                ON vectors.memory_ulid = memory.memory_ulid
+            ORDER BY memory.created_at_unix_ms ASC, memory.memory_ulid ASC
+        "#,
+    )?;
+    let mut rows = statement.query([])?;
+    let mut ordered = Vec::<(String, u64)>::new();
+    let mut total_bytes = 0_u64;
+    while let Some(row) = rows.next()? {
+        let memory_id: String = row.get(0)?;
+        let row_bytes = row.get::<_, i64>(1)?.max(0) as u64;
+        total_bytes = total_bytes.saturating_add(row_bytes);
+        ordered.push((memory_id, row_bytes));
+    }
+    if total_bytes <= max_bytes {
+        return Ok(0);
+    }
+    let mut bytes_to_remove = total_bytes.saturating_sub(max_bytes);
+    let mut ids_to_delete = Vec::<String>::new();
+    for (memory_id, row_bytes) in ordered {
+        ids_to_delete.push(memory_id);
+        bytes_to_remove = bytes_to_remove.saturating_sub(row_bytes.max(1));
+        if bytes_to_remove == 0 {
+            break;
+        }
+    }
+    delete_memory_items_by_ids(transaction, ids_to_delete.as_slice())
+}
+
+fn delete_memory_items_by_ids(
+    transaction: &Transaction<'_>,
+    ids: &[String],
+) -> Result<u64, JournalError> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let mut deleted = 0_u64;
+    for chunk in ids.chunks(250) {
+        let placeholders = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(",");
+        let sql = format!("DELETE FROM memory_items WHERE memory_ulid IN ({placeholders})");
+        deleted = deleted.saturating_add(
+            transaction.execute(sql.as_str(), params_from_iter(chunk.iter().map(String::as_str)))?
+                as u64,
+        );
+    }
+    Ok(deleted)
+}
+
 fn normalize_memory_text(raw: &str) -> String {
     let mut normalized = String::with_capacity(raw.len());
     let mut previous_was_whitespace = false;
@@ -4673,17 +5119,18 @@ mod tests {
     use crate::orchestrator::RunLifecycleState;
 
     use super::{
-        build_fts_query, ApprovalCreateRequest, ApprovalDecision, ApprovalDecisionScope,
-        ApprovalPolicySnapshot, ApprovalPromptOption, ApprovalPromptRecord, ApprovalResolveRequest,
-        ApprovalRiskLevel, ApprovalSubjectType, ApprovalsListFilter, CanvasStateTransitionRequest,
-        CronConcurrencyPolicy, CronJobCreateRequest, CronJobsListFilter, CronMisfirePolicy,
-        CronRetryPolicy, CronRunFinalizeRequest, CronRunStartRequest, CronRunStatus,
-        CronRunsListFilter, CronScheduleType, JournalAppendRequest, JournalConfig, JournalError,
-        JournalStore, MemoryEmbeddingProvider, MemoryItemCreateRequest, MemoryItemsListFilter,
-        MemoryPurgeRequest, MemorySearchRequest, MemorySource, OrchestratorCancelRequest,
-        OrchestratorRunStartRequest, OrchestratorSessionUpsertRequest,
+        build_fts_query, current_unix_ms, ApprovalCreateRequest, ApprovalDecision,
+        ApprovalDecisionScope, ApprovalPolicySnapshot, ApprovalPromptOption, ApprovalPromptRecord,
+        ApprovalResolveRequest, ApprovalRiskLevel, ApprovalSubjectType, ApprovalsListFilter,
+        CanvasStateTransitionRequest, CronConcurrencyPolicy, CronJobCreateRequest,
+        CronJobsListFilter, CronMisfirePolicy, CronRetryPolicy, CronRunFinalizeRequest,
+        CronRunStartRequest, CronRunStatus, CronRunsListFilter, CronScheduleType,
+        JournalAppendRequest, JournalConfig, JournalError, JournalStore, MemoryEmbeddingProvider,
+        MemoryItemCreateRequest, MemoryItemsListFilter, MemoryMaintenanceRequest,
+        MemoryPurgeRequest, MemoryRetentionPolicy, MemorySearchRequest, MemorySource,
+        OrchestratorCancelRequest, OrchestratorRunStartRequest, OrchestratorSessionUpsertRequest,
         OrchestratorTapeAppendRequest, OrchestratorUsageDelta, SkillExecutionStatus,
-        SkillStatusUpsertRequest,
+        SkillStatusUpsertRequest, MEMORY_RETENTION_DAY_MS,
     };
 
     static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -6370,6 +6817,160 @@ mod tests {
         assert!(
             remaining.is_some(),
             "channel-agnostic memory should remain after mismatched channel-filtered delete"
+        );
+    }
+
+    #[test]
+    fn memory_maintenance_reduces_synthetic_store_size_deterministically() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let session_id = "01ARZ3NDEKTSV4RRFFQ69G5FB0";
+        for index in 0..6 {
+            let memory_id = format!("01ARZ3NDEKTSV4RRFFQ69G5F{:02}", index + 50);
+            store
+                .create_memory_item(&sample_memory_request(
+                    memory_id.as_str(),
+                    "user:ops",
+                    Some("cli"),
+                    Some(session_id),
+                    MemorySource::Manual,
+                    format!("synthetic memory row {index} for deterministic retention trimming")
+                        .as_str(),
+                ))
+                .expect("memory item should be created");
+        }
+        let now = current_unix_ms().expect("system clock should be available");
+        let outcome = store
+            .run_memory_maintenance(&MemoryMaintenanceRequest {
+                now_unix_ms: now,
+                retention: MemoryRetentionPolicy {
+                    max_entries: Some(3),
+                    max_bytes: None,
+                    ttl_days: None,
+                },
+                next_vacuum_due_at_unix_ms: None,
+                next_maintenance_run_at_unix_ms: Some(now.saturating_add(300_000)),
+            })
+            .expect("maintenance should succeed");
+        assert_eq!(outcome.entries_before, 6, "synthetic test should start with six memory rows");
+        assert_eq!(outcome.entries_after, 3, "entry cap should deterministically trim rows");
+        assert!(
+            outcome.approx_bytes_after < outcome.approx_bytes_before,
+            "maintenance should reduce approximate memory footprint"
+        );
+        assert_eq!(
+            outcome.deleted_capacity_count, 3,
+            "capacity pass should evict oldest three rows"
+        );
+        assert_eq!(
+            outcome.deleted_expired_count, 0,
+            "ttl eviction should not run without ttl policy"
+        );
+    }
+
+    #[test]
+    fn memory_maintenance_ttl_days_eviction_updates_status_snapshot() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let memory_id = "01ARZ3NDEKTSV4RRFFQ69G5FE1";
+        store
+            .create_memory_item(&sample_memory_request(
+                memory_id,
+                "user:ops",
+                Some("cli"),
+                Some("01ARZ3NDEKTSV4RRFFQ69G5FB1"),
+                MemorySource::Manual,
+                "stale memory item for ttl-days retention",
+            ))
+            .expect("memory item should be created");
+        let now = current_unix_ms().expect("system clock should be available");
+        let stale_created_at = now.saturating_sub(14_i64.saturating_mul(MEMORY_RETENTION_DAY_MS));
+        {
+            let guard = store.connection.lock().expect("connection lock should not be poisoned");
+            guard
+                .execute(
+                    "UPDATE memory_items SET created_at_unix_ms = ?1, updated_at_unix_ms = ?1, ttl_unix_ms = NULL WHERE memory_ulid = ?2",
+                    params![stale_created_at, memory_id],
+                )
+                .expect("test fixture update should succeed");
+        }
+
+        let outcome = store
+            .run_memory_maintenance(&MemoryMaintenanceRequest {
+                now_unix_ms: now,
+                retention: MemoryRetentionPolicy {
+                    max_entries: None,
+                    max_bytes: None,
+                    ttl_days: Some(7),
+                },
+                next_vacuum_due_at_unix_ms: None,
+                next_maintenance_run_at_unix_ms: Some(now.saturating_add(300_000)),
+            })
+            .expect("maintenance should succeed");
+        assert_eq!(outcome.deleted_expired_count, 1, "ttl-days policy should remove stale row");
+        assert_eq!(outcome.entries_after, 0, "stale row should be evicted");
+
+        let status = store.memory_maintenance_status().expect("status snapshot should load");
+        let last_run = status.last_run.expect("maintenance status should include last run");
+        assert_eq!(last_run.deleted_expired_count, 1);
+        assert_eq!(status.usage.entries, 0, "usage snapshot should reflect ttl eviction");
+        assert_eq!(
+            status.next_maintenance_run_at_unix_ms,
+            Some(now.saturating_add(300_000)),
+            "status should expose next scheduled maintenance check"
+        );
+    }
+
+    #[test]
+    fn memory_maintenance_vacuum_runs_only_when_due() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        store
+            .create_memory_item(&sample_memory_request(
+                "01ARZ3NDEKTSV4RRFFQ69G5FE2",
+                "user:ops",
+                Some("cli"),
+                Some("01ARZ3NDEKTSV4RRFFQ69G5FB2"),
+                MemorySource::Manual,
+                "vacuum cadence probe row",
+            ))
+            .expect("memory item should be created");
+        let now = current_unix_ms().expect("system clock should be available");
+
+        let first = store
+            .run_memory_maintenance(&MemoryMaintenanceRequest {
+                now_unix_ms: now,
+                retention: MemoryRetentionPolicy {
+                    max_entries: None,
+                    max_bytes: None,
+                    ttl_days: None,
+                },
+                next_vacuum_due_at_unix_ms: Some(now.saturating_add(60_000)),
+                next_maintenance_run_at_unix_ms: None,
+            })
+            .expect("maintenance should succeed");
+        assert!(!first.vacuum_performed, "vacuum should stay disabled before due timestamp");
+
+        let second = store
+            .run_memory_maintenance(&MemoryMaintenanceRequest {
+                now_unix_ms: now.saturating_add(1_000),
+                retention: MemoryRetentionPolicy {
+                    max_entries: None,
+                    max_bytes: None,
+                    ttl_days: None,
+                },
+                next_vacuum_due_at_unix_ms: Some(now.saturating_add(1_000)),
+                next_maintenance_run_at_unix_ms: None,
+            })
+            .expect("maintenance should succeed");
+        assert!(second.vacuum_performed, "vacuum should run exactly when due");
+        assert_eq!(
+            second.last_vacuum_at_unix_ms,
+            Some(now.saturating_add(1_000)),
+            "maintenance outcome should record the last vacuum timestamp"
         );
     }
 

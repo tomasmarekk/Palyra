@@ -96,6 +96,8 @@ export function App() {
   const [memoryPurgeSessionId, setMemoryPurgeSessionId] = useState("");
   const [memoryPurgeAll, setMemoryPurgeAll] = useState(false);
   const [memoryHits, setMemoryHits] = useState<JsonObject[]>([]);
+  const [memoryStatusBusy, setMemoryStatusBusy] = useState(false);
+  const [memoryStatus, setMemoryStatus] = useState<JsonObject | null>(null);
 
   const [skillsBusy, setSkillsBusy] = useState(false);
   const [skillsEntries, setSkillsEntries] = useState<JsonObject[]>([]);
@@ -183,6 +185,9 @@ export function App() {
     }
     if (section === "cron") {
       void refreshCron();
+    }
+    if (section === "memory") {
+      void refreshMemoryStatus();
     }
     if (section === "skills") {
       void refreshSkills();
@@ -369,6 +374,23 @@ export function App() {
     }
   }
 
+  async function refreshMemoryStatus(): Promise<void> {
+    setMemoryStatusBusy(true);
+    setError(null);
+    try {
+      const response = await api.getMemoryStatus();
+      setMemoryStatus({
+        usage: response.usage,
+        retention: response.retention,
+        maintenance: response.maintenance
+      });
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setMemoryStatusBusy(false);
+    }
+  }
+
   async function purgeMemory(): Promise<void> {
     setMemoryBusy(true);
     setError(null);
@@ -380,6 +402,7 @@ export function App() {
       });
       setNotice(`Purged ${response.deleted_count} memory item(s).`);
       setMemoryHits([]);
+      await refreshMemoryStatus();
     } catch (failure) {
       setError(toErrorMessage(failure));
     } finally {
@@ -1047,7 +1070,18 @@ export function App() {
         <main className="console-card">
           <header className="console-card__header">
             <h2>Memory</h2>
+            <button type="button" onClick={() => void refreshMemoryStatus()} disabled={memoryStatusBusy}>
+              {memoryStatusBusy ? "Refreshing..." : "Refresh status"}
+            </button>
           </header>
+          <section className="console-subpanel">
+            <h3>Retention + Maintenance</h3>
+            {memoryStatus === null ? (
+              <p>No memory status loaded.</p>
+            ) : (
+              <pre>{toPrettyJson(memoryStatus, revealSensitiveValues)}</pre>
+            )}
+          </section>
           <form
             className="console-form"
             onSubmit={(event) => {
@@ -1398,6 +1432,10 @@ export function App() {
               <section className="console-subpanel">
                 <h3>Browserd Status</h3>
                 <pre>{toPrettyJson(diagnosticsSnapshot["browserd"] ?? null, revealSensitiveValues)}</pre>
+              </section>
+              <section className="console-subpanel">
+                <h3>Memory Runtime</h3>
+                <pre>{toPrettyJson(diagnosticsSnapshot["memory"] ?? null, revealSensitiveValues)}</pre>
               </section>
             </>
           )}

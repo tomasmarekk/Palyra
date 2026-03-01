@@ -104,6 +104,7 @@ export interface ConsoleDiagnosticsSnapshot {
   rate_limits: JsonValue;
   auth_profiles: JsonValue;
   browserd: JsonValue;
+  memory?: JsonValue;
 }
 
 interface ErrorEnvelope {
@@ -351,6 +352,14 @@ export class ConsoleApiClient {
 
   async searchMemory(params?: URLSearchParams): Promise<{ hits: JsonValue[] }> {
     return this.request(buildPathWithQuery("/console/v1/memory/search", params));
+  }
+
+  async getMemoryStatus(): Promise<{
+    usage: JsonValue;
+    retention: JsonValue;
+    maintenance: JsonValue;
+  }> {
+    return this.request("/console/v1/memory/status");
   }
 
   async purgeMemory(payload: {
