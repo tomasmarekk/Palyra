@@ -15,13 +15,13 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           fetch-depth: 0
 
       - name: Setup Node.js
         if: ${{ hashFiles('apps/web/package-lock.json') != '' }}
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238
         with:
           node-version: 20
           cache: npm
@@ -135,7 +135,7 @@ jobs:
         run: bash scripts/generate-attestation-placeholder.sh security-artifacts/attestation-placeholder.json
 
       - name: Upload security artifacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
         with:
           name: security-artifacts-${{ github.run_id }}
           path: security-artifacts/

@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
 
       - name: Check dependency graph availability
         id: dependency-graph
@@ -26,7 +26,7 @@ jobs:
 
       - name: Dependency review
         if: steps.dependency-graph.outputs.status == 'enabled'
-        uses: actions/dependency-review-action@3c4e3dcb1aa7874d2c16be7d79418e9b7efd6261
+        uses: actions/dependency-review-action@05fe4576374b728f0c523d6a13d64c25081e0803
 
       - name: Dependency review skipped
         if: steps.dependency-graph.outputs.status != 'enabled'
