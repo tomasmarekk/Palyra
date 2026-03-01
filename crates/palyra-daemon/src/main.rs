@@ -596,19 +596,17 @@ struct SecretAccessAuditRecord {
 
 struct ModelProviderMemoryEmbeddingAdapter {
     provider: Arc<dyn EmbeddingsProvider>,
-    fallback: HashMemoryEmbeddingProvider,
     model_name: String,
     dimensions: usize,
 }
 
 impl ModelProviderMemoryEmbeddingAdapter {
     fn new(provider: Arc<dyn EmbeddingsProvider>, model_name: String, dimensions: usize) -> Self {
-        Self {
-            provider,
-            fallback: HashMemoryEmbeddingProvider::with_dimensions(dimensions),
-            model_name,
-            dimensions: dimensions.max(1),
-        }
+        Self { provider, model_name, dimensions: dimensions.max(1) }
+    }
+
+    fn zero_vector(&self) -> Vec<f32> {
+        vec![0.0_f32; self.dimensions]
     }
 }
 
@@ -629,9 +627,9 @@ impl MemoryEmbeddingProvider for ModelProviderMemoryEmbeddingAdapter {
             }
             Err(_) => {
                 warn!(
-                    "tokio runtime unavailable for model-provider embeddings adapter; falling back to hash embeddings"
+                    "tokio runtime unavailable for model-provider embeddings adapter; using zero vector fallback"
                 );
-                return self.fallback.embed_text(text);
+                return self.zero_vector();
             }
         };
 
@@ -639,18 +637,18 @@ impl MemoryEmbeddingProvider for ModelProviderMemoryEmbeddingAdapter {
             Ok(response) => {
                 let Some(vector) = response.vectors.into_iter().next() else {
                     warn!(
-                        "model-provider embeddings response did not include vector payload; falling back to hash embeddings"
+                        "model-provider embeddings response did not include vector payload; using zero vector fallback"
                     );
-                    return self.fallback.embed_text(text);
+                    return self.zero_vector();
                 };
                 normalize_memory_embedding_vector(vector, self.dimensions)
             }
             Err(error) => {
                 warn!(
                     error = %error,
-                    "model-provider embeddings request failed; falling back to hash embeddings"
+                    "model-provider embeddings request failed; using zero vector fallback"
                 );
-                self.fallback.embed_text(text)
+                self.zero_vector()
             }
         }
     }
@@ -666,6 +664,68 @@ fn normalize_memory_embedding_vector(mut vector: Vec<f32>, expected_dims: usize)
         vector.truncate(expected_dims);
     }
     vector
+}
+
+fn parse_offline_env_flag(raw: &str) -> Result<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" | "" => Ok(false),
+        other => Err(anyhow::anyhow!(
+            "PALYRA_OFFLINE must be a boolean-like value (accepted: 1/0, true/false, yes/no, on/off), got '{other}'"
+        )),
+    }
+}
+
+fn offline_mode_enabled() -> Result<bool> {
+    match std::env::var("PALYRA_OFFLINE") {
+        Ok(raw) => parse_offline_env_flag(raw.as_str()),
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(anyhow::anyhow!("PALYRA_OFFLINE contains non-unicode data"))
+        }
+    }
+}
+
+fn build_memory_embedding_provider(
+    config: &ModelProviderConfig,
+    offline_mode: bool,
+) -> Result<Arc<dyn MemoryEmbeddingProvider>> {
+    if config.kind != ModelProviderKind::OpenAiCompatible {
+        return Ok(Arc::new(HashMemoryEmbeddingProvider::default()));
+    }
+
+    match (&config.openai_embeddings_model, config.openai_embeddings_dims) {
+        (Some(model_name), Some(dimensions)) => {
+            if offline_mode {
+                warn!(
+                    model = %model_name,
+                    dimensions,
+                    "PALYRA_OFFLINE is enabled; using hash embeddings fallback for memory vectors"
+                );
+                return Ok(Arc::new(HashMemoryEmbeddingProvider::with_dimensions(
+                    dimensions as usize,
+                )));
+            }
+            let embeddings_provider = build_embeddings_provider(config)
+                .context("failed to initialize model-provider embeddings runtime")?;
+            Ok(Arc::new(ModelProviderMemoryEmbeddingAdapter::new(
+                embeddings_provider,
+                model_name.clone(),
+                dimensions as usize,
+            )))
+        }
+        (Some(_), None) => Err(anyhow::anyhow!(
+            "openai embeddings model is configured but model_provider.openai_embeddings_dims is missing"
+        )),
+        (None, Some(dimensions)) => {
+            warn!(
+                dimensions,
+                "openai embeddings dimensions are configured without model; hash embeddings fallback remains active"
+            );
+            Ok(Arc::new(HashMemoryEmbeddingProvider::default()))
+        }
+        (None, None) => Ok(Arc::new(HashMemoryEmbeddingProvider::default())),
+    }
 }
 
 #[tokio::main]
@@ -706,30 +766,9 @@ async fn main() -> Result<()> {
         bound_principal: loaded.admin.bound_principal.clone(),
     };
     validate_admin_auth_config(&auth)?;
-    let memory_embedding_provider: Arc<dyn MemoryEmbeddingProvider> = if loaded.model_provider.kind
-        == ModelProviderKind::OpenAiCompatible
-    {
-        if let Some(model_name) = loaded.model_provider.openai_embeddings_model.clone() {
-            if let Some(dimensions) = loaded.model_provider.openai_embeddings_dims {
-                let embeddings_provider = build_embeddings_provider(&loaded.model_provider)
-                    .context("failed to initialize model-provider embeddings runtime")?;
-                Arc::new(ModelProviderMemoryEmbeddingAdapter::new(
-                    embeddings_provider,
-                    model_name,
-                    dimensions as usize,
-                ))
-            } else {
-                warn!(
-                        "openai embeddings model configured without explicit dimensions; falling back to hash embeddings"
-                    );
-                Arc::new(HashMemoryEmbeddingProvider::default())
-            }
-        } else {
-            Arc::new(HashMemoryEmbeddingProvider::default())
-        }
-    } else {
-        Arc::new(HashMemoryEmbeddingProvider::default())
-    };
+    let offline_mode = offline_mode_enabled()?;
+    let memory_embedding_provider =
+        build_memory_embedding_provider(&loaded.model_provider, offline_mode)?;
     let journal_store = JournalStore::open_with_memory_embedding_provider(
         JournalConfig {
             db_path: loaded.storage.journal_db_path.clone(),
@@ -5594,14 +5633,15 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        clamp_console_relay_token_ttl_ms, constant_time_eq_bytes,
+        build_memory_embedding_provider, clamp_console_relay_token_ttl_ms, constant_time_eq_bytes,
         consume_admin_rate_limit_with_now, consume_canvas_rate_limit_with_now,
         enforce_remote_bind_guard, find_hashed_secret_map_key, loopback_grpc_url,
-        mint_console_relay_token, mint_console_secret_token, prune_console_relay_tokens,
-        redact_console_diagnostics_value, resolve_model_provider_secret, runtime_status_response,
-        sanitize_http_error_message, sha256_hex, validate_admin_auth_config,
-        validate_canvas_http_canvas_id, validate_canvas_http_token_query,
-        validate_process_runner_backend_policy, ConsoleRelayToken, ADMIN_RATE_LIMIT_MAX_IP_BUCKETS,
+        mint_console_relay_token, mint_console_secret_token, parse_offline_env_flag,
+        prune_console_relay_tokens, redact_console_diagnostics_value,
+        resolve_model_provider_secret, runtime_status_response, sanitize_http_error_message,
+        sha256_hex, validate_admin_auth_config, validate_canvas_http_canvas_id,
+        validate_canvas_http_token_query, validate_process_runner_backend_policy,
+        ConsoleRelayToken, ADMIN_RATE_LIMIT_MAX_IP_BUCKETS,
         ADMIN_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW, CANVAS_HTTP_MAX_TOKEN_BYTES,
         CANVAS_RATE_LIMIT_MAX_IP_BUCKETS, CANVAS_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW,
         CONSOLE_RELAY_TOKEN_DEFAULT_TTL_MS, CONSOLE_RELAY_TOKEN_MAX_TTL_MS,
@@ -5636,6 +5676,54 @@ mod tests {
             kind: ModelProviderKind::OpenAiCompatible,
             ..ModelProviderConfig::default()
         }
+    }
+
+    #[test]
+    fn parse_offline_env_flag_accepts_common_boolean_values() {
+        assert!(parse_offline_env_flag("1").expect("1 should parse"));
+        assert!(parse_offline_env_flag(" true ").expect("true should parse"));
+        assert!(parse_offline_env_flag("YES").expect("yes should parse"));
+        assert!(!parse_offline_env_flag("0").expect("0 should parse"));
+        assert!(!parse_offline_env_flag("off").expect("off should parse"));
+        assert!(!parse_offline_env_flag("  ").expect("blank should parse as false"));
+    }
+
+    #[test]
+    fn parse_offline_env_flag_rejects_invalid_value() {
+        let error =
+            parse_offline_env_flag("sometimes").expect_err("invalid offline value should fail");
+        assert!(
+            error.to_string().contains("PALYRA_OFFLINE"),
+            "error should mention PALYRA_OFFLINE"
+        );
+    }
+
+    #[test]
+    fn build_memory_embedding_provider_requires_dims_when_model_is_configured() {
+        let mut config = openai_model_provider_config();
+        config.openai_embeddings_model = Some("text-embedding-3-small".to_owned());
+        config.openai_embeddings_dims = None;
+
+        let error = match build_memory_embedding_provider(&config, false) {
+            Ok(_) => panic!("configured model without dims should fail"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("openai_embeddings_dims"),
+            "error should explain missing dimensions requirement"
+        );
+    }
+
+    #[test]
+    fn build_memory_embedding_provider_uses_hash_fallback_in_explicit_offline_mode() {
+        let mut config = openai_model_provider_config();
+        config.openai_embeddings_model = Some("text-embedding-3-small".to_owned());
+        config.openai_embeddings_dims = Some(8);
+
+        let provider = build_memory_embedding_provider(&config, true)
+            .expect("offline mode should allow hash fallback");
+        assert_eq!(provider.model_name(), "hash-embedding-v1");
+        assert_eq!(provider.dimensions(), 8);
     }
 
     #[test]
