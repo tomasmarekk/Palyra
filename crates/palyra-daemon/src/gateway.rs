@@ -257,6 +257,10 @@ pub struct MemoryRuntimeConfig {
     pub auto_inject_enabled: bool,
     pub auto_inject_max_items: usize,
     pub default_ttl_ms: Option<i64>,
+    pub retention_max_entries: Option<usize>,
+    pub retention_max_bytes: Option<u64>,
+    pub retention_ttl_days: Option<u32>,
+    pub retention_vacuum_schedule: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -304,6 +308,10 @@ impl Default for MemoryRuntimeConfig {
             auto_inject_enabled: false,
             auto_inject_max_items: 3,
             default_ttl_ms: Some(30 * 24 * 60 * 60 * 1_000),
+            retention_max_entries: None,
+            retention_max_bytes: None,
+            retention_ttl_days: None,
+            retention_vacuum_schedule: "0 0 * * 0".to_owned(),
         }
     }
 }
@@ -15638,6 +15646,10 @@ mod tests {
             auto_inject_enabled: true,
             auto_inject_max_items: 2,
             default_ttl_ms: Some(60_000),
+            retention_max_entries: Some(1_000),
+            retention_max_bytes: Some(4_194_304),
+            retention_ttl_days: Some(30),
+            retention_vacuum_schedule: "0 2 * * 0".to_owned(),
         };
         state.configure_memory(expected.clone());
         assert_eq!(

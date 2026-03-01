@@ -795,6 +795,10 @@ async fn main() -> Result<()> {
         auto_inject_enabled: loaded.memory.auto_inject.enabled,
         auto_inject_max_items: loaded.memory.auto_inject.max_items,
         default_ttl_ms: loaded.memory.default_ttl_ms,
+        retention_max_entries: loaded.memory.retention.max_entries,
+        retention_max_bytes: loaded.memory.retention.max_bytes,
+        retention_ttl_days: loaded.memory.retention.ttl_days,
+        retention_vacuum_schedule: loaded.memory.retention.vacuum_schedule.clone(),
     });
 
     if args.journal_migrate_only {
