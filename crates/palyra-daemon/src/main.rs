@@ -48,13 +48,15 @@ use gateway::{
 };
 use journal::{
     ApprovalDecision, ApprovalDecisionScope, ApprovalSubjectType, CronJobUpdatePatch,
-    JournalAppendRequest, JournalConfig, JournalStore, MemoryPurgeRequest,
-    OrchestratorCancelRequest, OrchestratorRunStatusSnapshot, SkillExecutionStatus,
-    SkillStatusRecord, SkillStatusUpsertRequest,
+    HashMemoryEmbeddingProvider, JournalAppendRequest, JournalConfig, JournalStore,
+    MemoryEmbeddingProvider, MemoryPurgeRequest, OrchestratorCancelRequest,
+    OrchestratorRunStatusSnapshot, SkillExecutionStatus, SkillStatusRecord,
+    SkillStatusUpsertRequest,
 };
 use model_provider::{
-    build_model_provider, ModelProviderAuthProviderKind, ModelProviderConfig,
-    ModelProviderCredentialSource, ModelProviderKind,
+    build_embeddings_provider, build_model_provider, EmbeddingsProvider, EmbeddingsRequest,
+    ModelProviderAuthProviderKind, ModelProviderConfig, ModelProviderCredentialSource,
+    ModelProviderKind,
 };
 use palyra_auth::{
     AuthCredential, AuthProfileRegistry, AuthProviderKind, HttpOAuthRefreshAdapter,
@@ -89,7 +91,7 @@ use tonic::{
     transport::{Certificate, Identity, Server, ServerTlsConfig},
     Request as TonicRequest,
 };
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use ulid::Ulid;
 
@@ -592,6 +594,80 @@ struct SecretAccessAuditRecord {
     value_bytes: usize,
 }
 
+struct ModelProviderMemoryEmbeddingAdapter {
+    provider: Arc<dyn EmbeddingsProvider>,
+    fallback: HashMemoryEmbeddingProvider,
+    model_name: String,
+    dimensions: usize,
+}
+
+impl ModelProviderMemoryEmbeddingAdapter {
+    fn new(provider: Arc<dyn EmbeddingsProvider>, model_name: String, dimensions: usize) -> Self {
+        Self {
+            provider,
+            fallback: HashMemoryEmbeddingProvider::with_dimensions(dimensions),
+            model_name,
+            dimensions: dimensions.max(1),
+        }
+    }
+}
+
+impl MemoryEmbeddingProvider for ModelProviderMemoryEmbeddingAdapter {
+    fn model_name(&self) -> &str {
+        self.model_name.as_str()
+    }
+
+    fn dimensions(&self) -> usize {
+        self.dimensions
+    }
+
+    fn embed_text(&self, text: &str) -> Vec<f32> {
+        let request = EmbeddingsRequest { inputs: vec![text.to_owned()] };
+        let result = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                tokio::task::block_in_place(|| handle.block_on(self.provider.embed(request)))
+            }
+            Err(_) => {
+                warn!(
+                    "tokio runtime unavailable for model-provider embeddings adapter; falling back to hash embeddings"
+                );
+                return self.fallback.embed_text(text);
+            }
+        };
+
+        match result {
+            Ok(response) => {
+                let Some(vector) = response.vectors.into_iter().next() else {
+                    warn!(
+                        "model-provider embeddings response did not include vector payload; falling back to hash embeddings"
+                    );
+                    return self.fallback.embed_text(text);
+                };
+                normalize_memory_embedding_vector(vector, self.dimensions)
+            }
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "model-provider embeddings request failed; falling back to hash embeddings"
+                );
+                self.fallback.embed_text(text)
+            }
+        }
+    }
+}
+
+fn normalize_memory_embedding_vector(mut vector: Vec<f32>, expected_dims: usize) -> Vec<f32> {
+    if expected_dims == 0 {
+        return Vec::new();
+    }
+    if vector.len() < expected_dims {
+        vector.resize(expected_dims, 0.0);
+    } else if vector.len() > expected_dims {
+        vector.truncate(expected_dims);
+    }
+    vector
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
@@ -630,11 +706,38 @@ async fn main() -> Result<()> {
         bound_principal: loaded.admin.bound_principal.clone(),
     };
     validate_admin_auth_config(&auth)?;
-    let journal_store = JournalStore::open(JournalConfig {
-        db_path: loaded.storage.journal_db_path.clone(),
-        hash_chain_enabled: loaded.storage.journal_hash_chain_enabled,
-        max_payload_bytes: loaded.storage.max_journal_payload_bytes,
-    })
+    let memory_embedding_provider: Arc<dyn MemoryEmbeddingProvider> = if loaded.model_provider.kind
+        == ModelProviderKind::OpenAiCompatible
+    {
+        if let Some(model_name) = loaded.model_provider.openai_embeddings_model.clone() {
+            if let Some(dimensions) = loaded.model_provider.openai_embeddings_dims {
+                let embeddings_provider = build_embeddings_provider(&loaded.model_provider)
+                    .context("failed to initialize model-provider embeddings runtime")?;
+                Arc::new(ModelProviderMemoryEmbeddingAdapter::new(
+                    embeddings_provider,
+                    model_name,
+                    dimensions as usize,
+                ))
+            } else {
+                warn!(
+                        "openai embeddings model configured without explicit dimensions; falling back to hash embeddings"
+                    );
+                Arc::new(HashMemoryEmbeddingProvider::default())
+            }
+        } else {
+            Arc::new(HashMemoryEmbeddingProvider::default())
+        }
+    } else {
+        Arc::new(HashMemoryEmbeddingProvider::default())
+    };
+    let journal_store = JournalStore::open_with_memory_embedding_provider(
+        JournalConfig {
+            db_path: loaded.storage.journal_db_path.clone(),
+            hash_chain_enabled: loaded.storage.journal_hash_chain_enabled,
+            max_payload_bytes: loaded.storage.max_journal_payload_bytes,
+        },
+        memory_embedding_provider,
+    )
     .context("failed to initialize event journal storage")?;
     let vault = Arc::new(
         Vault::open_with_config(VaultConfigOptions {

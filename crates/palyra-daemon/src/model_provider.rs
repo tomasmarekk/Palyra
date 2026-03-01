@@ -1,5 +1,7 @@
 use std::{
+    collections::hash_map::DefaultHasher,
     future::Future,
+    hash::{Hash, Hasher},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs},
     pin::Pin,
     sync::{Arc, Mutex},
@@ -15,9 +17,14 @@ use ulid::Ulid;
 use crate::orchestrator::{estimate_token_count, split_model_tokens, MAX_MODEL_TOKENS_PER_EVENT};
 
 const OPENAI_CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
+const OPENAI_EMBEDDINGS_PATH: &str = "/embeddings";
 const OPENAI_RETRYABLE_STATUS_CODES: &[u16] = &[429, 500, 502, 503, 504];
 // Keep provider envelope above default wasm module quota (256KiB) including base64 and JSON overhead.
 const MAX_TOOL_ARGUMENT_BYTES: usize = 512 * 1024;
+const MAX_EMBEDDINGS_BATCH_SIZE: usize = 64;
+const MAX_EMBEDDINGS_INPUT_BYTES: usize = 256 * 1024;
+const MAX_SINGLE_EMBEDDING_INPUT_BYTES: usize = 64 * 1024;
+const DEFAULT_DETERMINISTIC_EMBEDDINGS_DIMS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelProviderKind {
@@ -148,6 +155,19 @@ pub struct ProviderResponse {
     pub retry_count: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingsRequest {
+    pub inputs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmbeddingsResponse {
+    pub model_name: String,
+    pub dimensions: usize,
+    pub vectors: Vec<Vec<f32>>,
+    pub retry_count: u32,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
     #[error("model provider circuit breaker is open; retry after {retry_after_ms}ms")]
@@ -156,8 +176,14 @@ pub enum ProviderError {
         "openai-compatible provider requires PALYRA_MODEL_PROVIDER_OPENAI_API_KEY, PALYRA_MODEL_PROVIDER_AUTH_PROFILE_ID, or model_provider.openai_api_key_vault_ref"
     )]
     MissingApiKey,
+    #[error(
+        "openai-compatible embeddings provider requires model_provider.openai_embeddings_model or PALYRA_MODEL_PROVIDER_OPENAI_EMBEDDINGS_MODEL"
+    )]
+    MissingEmbeddingsModel,
     #[error("provider '{provider}' does not support vision inputs")]
     VisionUnsupported { provider: String },
+    #[error("embeddings request is invalid: {message}")]
+    InvalidEmbeddingsRequest { message: String },
     #[error(
         "provider request failed after {retry_count} retries (retryable={retryable}): {message}"
     )]
@@ -253,7 +279,40 @@ pub trait ModelProvider: Send + Sync {
     fn status_snapshot(&self) -> ProviderStatusSnapshot;
 }
 
+pub trait EmbeddingsProvider: Send + Sync {
+    fn embed<'a>(
+        &'a self,
+        request: EmbeddingsRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<EmbeddingsResponse, ProviderError>> + Send + 'a>>;
+}
+
 pub fn build_model_provider(config: &ModelProviderConfig) -> Result<Arc<dyn ModelProvider>> {
+    validate_model_provider_config(config)?;
+
+    match config.kind {
+        ModelProviderKind::Deterministic => {
+            Ok(Arc::new(DeterministicProvider::new(config.clone())))
+        }
+        ModelProviderKind::OpenAiCompatible => Ok(Arc::new(OpenAiCompatibleProvider::new(config)?)),
+    }
+}
+
+pub fn build_embeddings_provider(
+    config: &ModelProviderConfig,
+) -> Result<Arc<dyn EmbeddingsProvider>> {
+    validate_model_provider_config(config)?;
+
+    match config.kind {
+        ModelProviderKind::Deterministic => {
+            Ok(Arc::new(DeterministicEmbeddingsProvider::new(config.clone())))
+        }
+        ModelProviderKind::OpenAiCompatible => {
+            Ok(Arc::new(OpenAiCompatibleEmbeddingsProvider::new(config)?))
+        }
+    }
+}
+
+fn validate_model_provider_config(config: &ModelProviderConfig) -> Result<()> {
     if config.request_timeout_ms == 0 {
         anyhow::bail!("model provider request timeout must be greater than 0ms");
     }
@@ -272,13 +331,7 @@ pub fn build_model_provider(config: &ModelProviderConfig) -> Result<Arc<dyn Mode
             config.allow_private_base_url,
         )?;
     }
-
-    match config.kind {
-        ModelProviderKind::Deterministic => {
-            Ok(Arc::new(DeterministicProvider::new(config.clone())))
-        }
-        ModelProviderKind::OpenAiCompatible => Ok(Arc::new(OpenAiCompatibleProvider::new(config)?)),
-    }
+    Ok(())
 }
 
 pub fn validate_openai_base_url_network_policy(
@@ -505,6 +558,44 @@ impl ModelProvider for DeterministicProvider {
 }
 
 #[derive(Debug)]
+struct DeterministicEmbeddingsProvider {
+    dimensions: usize,
+    model_name: String,
+}
+
+impl DeterministicEmbeddingsProvider {
+    fn new(config: ModelProviderConfig) -> Self {
+        let dimensions = config
+            .openai_embeddings_dims
+            .map_or(DEFAULT_DETERMINISTIC_EMBEDDINGS_DIMS, |value| value as usize);
+        let model_name =
+            config.openai_embeddings_model.unwrap_or_else(|| "hash-embedding-v1".to_owned());
+        Self { dimensions, model_name }
+    }
+}
+
+impl EmbeddingsProvider for DeterministicEmbeddingsProvider {
+    fn embed<'a>(
+        &'a self,
+        request: EmbeddingsRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<EmbeddingsResponse, ProviderError>> + Send + 'a>> {
+        Box::pin(async move {
+            let normalized_inputs = normalize_embeddings_inputs(&request)?;
+            let vectors = normalized_inputs
+                .iter()
+                .map(|input| hash_embed_text(input.as_str(), self.dimensions))
+                .collect::<Vec<_>>();
+            Ok(EmbeddingsResponse {
+                model_name: self.model_name.clone(),
+                dimensions: self.dimensions,
+                vectors,
+                retry_count: 0,
+            })
+        })
+    }
+}
+
+#[derive(Debug)]
 struct OpenAiCompatibleProvider {
     config: ModelProviderConfig,
     client: Client,
@@ -564,6 +655,225 @@ struct OpenAiToolFunction {
     name: String,
     #[serde(default)]
     arguments: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiEmbeddingsResponse {
+    #[serde(default)]
+    data: Vec<OpenAiEmbeddingVector>,
+    #[serde(default)]
+    model: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiEmbeddingVector {
+    #[serde(default)]
+    index: Option<usize>,
+    embedding: Vec<f32>,
+}
+
+#[derive(Debug)]
+struct OpenAiCompatibleEmbeddingsProvider {
+    config: ModelProviderConfig,
+    client: Client,
+}
+
+impl OpenAiCompatibleEmbeddingsProvider {
+    fn new(config: &ModelProviderConfig) -> Result<Self> {
+        if config.openai_embeddings_model.is_none() {
+            return Err(ProviderError::MissingEmbeddingsModel.into());
+        }
+        let client = Client::builder()
+            .timeout(Duration::from_millis(config.request_timeout_ms))
+            .build()
+            .context("failed to build openai-compatible embeddings HTTP client")?;
+        Ok(Self { config: config.clone(), client })
+    }
+
+    fn embeddings_endpoint(&self) -> String {
+        format!("{}{}", self.config.openai_base_url.trim_end_matches('/'), OPENAI_EMBEDDINGS_PATH)
+    }
+
+    fn backoff_for_retry(&self, retry_index: u32) -> Duration {
+        let exponent = retry_index.min(8);
+        let multiplier = 1_u64 << exponent;
+        Duration::from_millis(self.config.retry_backoff_ms.saturating_mul(multiplier))
+    }
+
+    async fn request_once(
+        &self,
+        api_key: &str,
+        inputs: &[String],
+    ) -> Result<EmbeddingsResponse, AttemptError> {
+        let model_name = self
+            .config
+            .openai_embeddings_model
+            .as_ref()
+            .ok_or(ProviderError::MissingEmbeddingsModel)
+            .map_err(|error| AttemptError::request_failed(error.to_string(), false))?;
+        let mut body = json!({
+            "model": model_name,
+            "input": inputs,
+        });
+        if let Some(dimensions) = self.config.openai_embeddings_dims {
+            body["dimensions"] = json!(dimensions);
+        }
+
+        let endpoint = self.embeddings_endpoint();
+        let response = self
+            .client
+            .post(endpoint)
+            .header("Authorization", format!("Bearer {api_key}"))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| {
+                AttemptError::request_failed(
+                    format!("openai-compatible embeddings request failed: {error}"),
+                    true,
+                )
+            })?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let retryable = OPENAI_RETRYABLE_STATUS_CODES.contains(&status);
+            let body_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<openai-compatible error body unavailable>".to_owned());
+            return Err(AttemptError::request_failed(
+                format!(
+                    "openai-compatible embeddings endpoint returned HTTP {status}: {}",
+                    sanitize_remote_error(&body_text)
+                ),
+                retryable,
+            ));
+        }
+
+        let parsed = response.json::<OpenAiEmbeddingsResponse>().await.map_err(|error| {
+            AttemptError::invalid_response(format!(
+                "openai-compatible embeddings response JSON parsing failed: {error}"
+            ))
+        })?;
+        if parsed.data.is_empty() {
+            return Err(AttemptError::invalid_response(
+                "openai-compatible embeddings response did not include vectors".to_owned(),
+            ));
+        }
+
+        let mut ordered_vectors: Vec<Option<Vec<f32>>> = vec![None; inputs.len()];
+        for (position, item) in parsed.data.into_iter().enumerate() {
+            let index = item.index.unwrap_or(position);
+            if index >= ordered_vectors.len() {
+                return Err(AttemptError::invalid_response(format!(
+                    "openai-compatible embeddings response contained out-of-range vector index {index}"
+                )));
+            }
+            if ordered_vectors[index].is_some() {
+                return Err(AttemptError::invalid_response(format!(
+                    "openai-compatible embeddings response duplicated vector index {index}"
+                )));
+            }
+            ordered_vectors[index] = Some(item.embedding);
+        }
+
+        let vectors = ordered_vectors
+            .into_iter()
+            .map(|vector| {
+                vector.ok_or_else(|| {
+                    AttemptError::invalid_response(
+                        "openai-compatible embeddings response omitted one or more vectors"
+                            .to_owned(),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let dimensions = vectors.first().map_or(0, |vector| vector.len());
+        if dimensions == 0 {
+            return Err(AttemptError::invalid_response(
+                "openai-compatible embeddings response vectors must be non-empty".to_owned(),
+            ));
+        }
+        if vectors.iter().any(|vector| vector.len() != dimensions) {
+            return Err(AttemptError::invalid_response(
+                "openai-compatible embeddings response returned inconsistent vector dimensions"
+                    .to_owned(),
+            ));
+        }
+        if let Some(expected_dimensions) = self.config.openai_embeddings_dims {
+            if dimensions != expected_dimensions as usize {
+                return Err(AttemptError::invalid_response(format!(
+                    "openai-compatible embeddings response returned dims {dimensions}, expected {}",
+                    expected_dimensions
+                )));
+            }
+        }
+        if vectors.len() != inputs.len() {
+            return Err(AttemptError::invalid_response(format!(
+                "openai-compatible embeddings response returned {} vectors for {} inputs",
+                vectors.len(),
+                inputs.len()
+            )));
+        }
+
+        Ok(EmbeddingsResponse {
+            model_name: parsed.model.unwrap_or_else(|| model_name.clone()),
+            dimensions,
+            vectors,
+            retry_count: 0,
+        })
+    }
+}
+
+impl EmbeddingsProvider for OpenAiCompatibleEmbeddingsProvider {
+    fn embed<'a>(
+        &'a self,
+        request: EmbeddingsRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<EmbeddingsResponse, ProviderError>> + Send + 'a>> {
+        Box::pin(async move {
+            let normalized_inputs = normalize_embeddings_inputs(&request)?;
+            let Some(api_key) = self.config.openai_api_key.as_ref() else {
+                return Err(ProviderError::MissingApiKey);
+            };
+            if self.config.openai_embeddings_model.is_none() {
+                return Err(ProviderError::MissingEmbeddingsModel);
+            }
+
+            let mut retry_count = 0_u32;
+            for attempt in 0..=self.config.max_retries {
+                match self.request_once(api_key.as_str(), normalized_inputs.as_slice()).await {
+                    Ok(mut response) => {
+                        response.retry_count = retry_count;
+                        return Ok(response);
+                    }
+                    Err(error) => {
+                        let can_retry = error.retryable && attempt < self.config.max_retries;
+                        if can_retry {
+                            tokio::time::sleep(self.backoff_for_retry(retry_count)).await;
+                            retry_count = retry_count.saturating_add(1);
+                            continue;
+                        }
+                        return Err(if error.invalid_response {
+                            ProviderError::InvalidResponse { message: error.message, retry_count }
+                        } else {
+                            ProviderError::RequestFailed {
+                                message: error.message,
+                                retryable: error.retryable,
+                                retry_count,
+                            }
+                        });
+                    }
+                }
+            }
+
+            Err(ProviderError::RequestFailed {
+                message: "openai-compatible embeddings execution exhausted retries".to_owned(),
+                retryable: true,
+                retry_count,
+            })
+        })
+    }
 }
 
 impl OpenAiCompatibleProvider {
@@ -945,6 +1255,86 @@ impl ProviderRuntimeMetrics {
     }
 }
 
+fn normalize_embeddings_inputs(request: &EmbeddingsRequest) -> Result<Vec<String>, ProviderError> {
+    if request.inputs.is_empty() {
+        return Err(ProviderError::InvalidEmbeddingsRequest {
+            message: "input batch must include at least one item".to_owned(),
+        });
+    }
+    if request.inputs.len() > MAX_EMBEDDINGS_BATCH_SIZE {
+        return Err(ProviderError::InvalidEmbeddingsRequest {
+            message: format!(
+                "input batch size {} exceeds limit {MAX_EMBEDDINGS_BATCH_SIZE}",
+                request.inputs.len()
+            ),
+        });
+    }
+
+    let mut normalized_inputs = Vec::with_capacity(request.inputs.len());
+    let mut total_bytes = 0_usize;
+    for (index, input) in request.inputs.iter().enumerate() {
+        let normalized = input.trim();
+        if normalized.is_empty() {
+            return Err(ProviderError::InvalidEmbeddingsRequest {
+                message: format!("input at index {index} must not be blank"),
+            });
+        }
+        let input_bytes = normalized.len();
+        if input_bytes > MAX_SINGLE_EMBEDDING_INPUT_BYTES {
+            return Err(ProviderError::InvalidEmbeddingsRequest {
+                message: format!(
+                    "input at index {index} is {input_bytes} bytes and exceeds limit {MAX_SINGLE_EMBEDDING_INPUT_BYTES}"
+                ),
+            });
+        }
+        total_bytes = total_bytes.saturating_add(input_bytes);
+        if total_bytes > MAX_EMBEDDINGS_INPUT_BYTES {
+            return Err(ProviderError::InvalidEmbeddingsRequest {
+                message: format!(
+                    "input batch is {total_bytes} bytes and exceeds limit {MAX_EMBEDDINGS_INPUT_BYTES}"
+                ),
+            });
+        }
+        normalized_inputs.push(normalized.to_owned());
+    }
+
+    Ok(normalized_inputs)
+}
+
+fn hash_embed_text(text: &str, dims: usize) -> Vec<f32> {
+    let mut vector = vec![0.0_f32; dims];
+    if dims == 0 {
+        return vector;
+    }
+
+    for (token_index, token) in text.split_whitespace().enumerate() {
+        let normalized = token.to_ascii_lowercase();
+        if normalized.is_empty() {
+            continue;
+        }
+        let mut hasher = DefaultHasher::new();
+        normalized.hash(&mut hasher);
+        token_index.hash(&mut hasher);
+        let digest = hasher.finish();
+        let index = (digest as usize) % dims;
+        let sign = if (digest >> 1) & 1 == 0 { 1.0_f32 } else { -1.0_f32 };
+        let magnitude = 1.0 + f32::from((digest as u8) % 64) / 64.0;
+        vector[index] += sign * magnitude;
+    }
+    normalize_vector(vector.as_mut_slice());
+    vector
+}
+
+fn normalize_vector(vector: &mut [f32]) {
+    let norm = vector.iter().map(|value| f64::from(*value).powi(2)).sum::<f64>().sqrt();
+    if norm <= f64::EPSILON {
+        return;
+    }
+    for value in vector {
+        *value = (f64::from(*value) / norm) as f32;
+    }
+}
+
 fn lock_runtime_metrics(
     metrics: &Mutex<ProviderRuntimeMetrics>,
 ) -> std::sync::MutexGuard<'_, ProviderRuntimeMetrics> {
@@ -1105,15 +1495,16 @@ mod tests {
         net::{IpAddr, Ipv4Addr, TcpListener, TcpStream},
         sync::{
             atomic::{AtomicUsize, Ordering},
-            Arc,
+            Arc, Mutex,
         },
         thread,
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use super::{
-        build_model_provider, extract_completion_text, normalize_tool_arguments,
-        sanitize_remote_error, validate_openai_base_url_network_policy_with_resolver,
+        build_embeddings_provider, build_model_provider, extract_completion_text,
+        normalize_tool_arguments, sanitize_remote_error,
+        validate_openai_base_url_network_policy_with_resolver, EmbeddingsRequest,
         ModelProviderConfig, ModelProviderKind, ProviderError, ProviderEvent, ProviderRequest,
     };
 
@@ -1247,6 +1638,134 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn openai_embeddings_provider_sends_expected_request_payload() {
+        let scripted = vec![(
+            200_u16,
+            r#"{"data":[{"index":0,"embedding":[0.1,0.2,0.3]},{"index":1,"embedding":[0.3,0.2,0.1]}],"model":"text-embedding-3-small"}"#
+                .to_owned(),
+        )];
+        let (base_url, request_count, request_log, handle) =
+            spawn_inspecting_scripted_server(scripted);
+        let mut config = openai_test_config(base_url);
+        config.openai_embeddings_model = Some("text-embedding-3-small".to_owned());
+        config.openai_embeddings_dims = Some(3);
+        let provider =
+            build_embeddings_provider(&config).expect("openai embeddings provider should build");
+
+        let response = provider
+            .embed(EmbeddingsRequest { inputs: vec!["alpha".to_owned(), "beta".to_owned()] })
+            .await
+            .expect("openai embeddings provider should succeed");
+        assert_eq!(response.model_name, "text-embedding-3-small");
+        assert_eq!(response.dimensions, 3);
+        assert_eq!(response.vectors.len(), 2);
+        assert_eq!(request_count.load(Ordering::Relaxed), 1);
+
+        let requests = request_log.lock().expect("request log lock should not be poisoned");
+        assert_eq!(requests.len(), 1, "one HTTP call should be recorded");
+        assert_eq!(requests[0].path, "/v1/embeddings");
+        let body_json = serde_json::from_str::<serde_json::Value>(requests[0].body.as_str())
+            .expect("embeddings request body should be valid JSON");
+        assert_eq!(
+            body_json["model"].as_str(),
+            Some("text-embedding-3-small"),
+            "request should include embeddings model id"
+        );
+        assert_eq!(
+            body_json["dimensions"].as_u64(),
+            Some(3),
+            "request should pass configured embedding dimensions"
+        );
+        assert_eq!(
+            body_json["input"].as_array().map(std::vec::Vec::len),
+            Some(2),
+            "request should forward both embedding inputs in one batch"
+        );
+        handle.join().expect("scripted server thread should exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn openai_embeddings_provider_applies_retry_backoff_before_retry() {
+        let scripted = vec![
+            (503_u16, r#"{"error":{"message":"temporary upstream error"}}"#.to_owned()),
+            (
+                200_u16,
+                r#"{"data":[{"index":0,"embedding":[0.9,0.1]}],"model":"text-embedding-3-small"}"#
+                    .to_owned(),
+            ),
+        ];
+        let (base_url, request_count, request_log, handle) =
+            spawn_inspecting_scripted_server(scripted);
+        let mut config = openai_test_config(base_url);
+        config.max_retries = 1;
+        config.retry_backoff_ms = 80;
+        config.openai_embeddings_model = Some("text-embedding-3-small".to_owned());
+        let provider =
+            build_embeddings_provider(&config).expect("openai embeddings provider should build");
+
+        let response = provider
+            .embed(EmbeddingsRequest { inputs: vec!["retry me".to_owned()] })
+            .await
+            .expect("embeddings call should succeed after one retry");
+        assert_eq!(response.retry_count, 1);
+        assert_eq!(request_count.load(Ordering::Relaxed), 2);
+
+        let requests = request_log.lock().expect("request log lock should not be poisoned");
+        assert_eq!(requests.len(), 2, "retry flow should record both requests");
+        let first = requests[0].received_at_ms;
+        let second = requests[1].received_at_ms;
+        assert!(
+            second.saturating_sub(first) >= 60,
+            "second request should be delayed by backoff (expected at least 60ms, got {}ms)",
+            second.saturating_sub(first)
+        );
+        handle.join().expect("scripted server thread should exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn openai_embeddings_provider_classifies_retryable_and_permanent_errors() {
+        let scripted_retryable =
+            vec![(503_u16, r#"{"error":{"message":"temporary upstream error"}}"#.to_owned())];
+        let (retryable_base_url, _, _, retryable_handle) =
+            spawn_inspecting_scripted_server(scripted_retryable);
+        let mut retryable_config = openai_test_config(retryable_base_url);
+        retryable_config.max_retries = 0;
+        retryable_config.openai_embeddings_model = Some("text-embedding-3-small".to_owned());
+        let retryable_provider = build_embeddings_provider(&retryable_config)
+            .expect("retryable embeddings provider should build");
+
+        let retryable_error = retryable_provider
+            .embed(EmbeddingsRequest { inputs: vec!["transient".to_owned()] })
+            .await
+            .expect_err("503 response should fail");
+        assert!(
+            matches!(retryable_error, ProviderError::RequestFailed { retryable: true, .. }),
+            "503 errors must be marked retryable"
+        );
+        retryable_handle.join().expect("scripted server thread should exit");
+
+        let scripted_permanent =
+            vec![(400_u16, r#"{"error":{"message":"invalid embeddings payload"}}"#.to_owned())];
+        let (permanent_base_url, _, _, permanent_handle) =
+            spawn_inspecting_scripted_server(scripted_permanent);
+        let mut permanent_config = openai_test_config(permanent_base_url);
+        permanent_config.max_retries = 0;
+        permanent_config.openai_embeddings_model = Some("text-embedding-3-small".to_owned());
+        let permanent_provider = build_embeddings_provider(&permanent_config)
+            .expect("permanent embeddings provider should build");
+
+        let permanent_error = permanent_provider
+            .embed(EmbeddingsRequest { inputs: vec!["permanent".to_owned()] })
+            .await
+            .expect_err("400 response should fail");
+        assert!(
+            matches!(permanent_error, ProviderError::RequestFailed { retryable: false, .. }),
+            "400 errors must be marked permanent"
+        );
+        permanent_handle.join().expect("scripted server thread should exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn openai_provider_opens_circuit_breaker_after_threshold_failures() {
         let scripted =
             vec![(503_u16, r#"{"error":{"message":"temporary upstream error"}}"#.to_owned())];
@@ -1352,6 +1871,37 @@ mod tests {
         config.allow_private_base_url = true;
         build_model_provider(&config)
             .expect("private-network base URL should build with explicit opt-in");
+    }
+
+    #[test]
+    fn openai_embeddings_provider_requires_model_configuration() {
+        let config = openai_test_config("http://127.0.0.1:0/v1".to_owned());
+        let error = match build_embeddings_provider(&config) {
+            Ok(_) => panic!("embeddings provider should require explicit model configuration"),
+            Err(error) => error,
+        };
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("openai_embeddings_model"),
+            "error should reference embeddings model configuration: {rendered}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn embeddings_provider_rejects_oversized_batch() {
+        let provider = build_embeddings_provider(&ModelProviderConfig::default())
+            .expect("deterministic embeddings provider should build from defaults");
+        let inputs = (0..=super::MAX_EMBEDDINGS_BATCH_SIZE)
+            .map(|index| format!("item-{index}"))
+            .collect::<Vec<_>>();
+        let error = provider
+            .embed(EmbeddingsRequest { inputs })
+            .await
+            .expect_err("oversized batch should fail");
+        assert!(
+            matches!(error, ProviderError::InvalidEmbeddingsRequest { .. }),
+            "oversized batch must return validation error"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1488,9 +2038,25 @@ mod tests {
         assert!(sanitized.contains("<redacted>"), "sanitized error should carry redaction markers");
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct CapturedHttpRequest {
+        path: String,
+        body: String,
+        received_at_ms: u64,
+    }
+
+    type InspectingServer =
+        (String, Arc<AtomicUsize>, Arc<Mutex<Vec<CapturedHttpRequest>>>, thread::JoinHandle<()>);
+
     fn spawn_scripted_server(
         responses: Vec<(u16, String)>,
     ) -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
+        let (base_url, request_count, _request_log, handle) =
+            spawn_inspecting_scripted_server(responses);
+        (base_url, request_count, handle)
+    }
+
+    fn spawn_inspecting_scripted_server(responses: Vec<(u16, String)>) -> InspectingServer {
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
         listener
             .set_nonblocking(false)
@@ -1498,11 +2064,19 @@ mod tests {
         let address = listener.local_addr().expect("listener should have local address");
         let request_count = Arc::new(AtomicUsize::new(0));
         let request_count_for_thread = Arc::clone(&request_count);
+        let request_log: Arc<Mutex<Vec<CapturedHttpRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        let request_log_for_thread = Arc::clone(&request_log);
         let handle = thread::spawn(move || {
+            let started_at = Instant::now();
             for (status_code, body) in responses {
                 let (mut stream, _) = listener.accept().expect("scripted server should accept");
                 request_count_for_thread.fetch_add(1, Ordering::Relaxed);
-                read_http_request(&mut stream);
+                let mut captured = read_http_request(&mut stream);
+                captured.received_at_ms = started_at.elapsed().as_millis() as u64;
+                request_log_for_thread
+                    .lock()
+                    .expect("request log lock should not be poisoned")
+                    .push(captured);
                 let status_text = match status_code {
                     200 => "OK",
                     429 => "Too Many Requests",
@@ -1522,15 +2096,21 @@ mod tests {
                 let _ = stream.flush();
             }
         });
-        (format!("http://{}/v1", address), request_count, handle)
+        (format!("http://{}/v1", address), request_count, request_log, handle)
     }
 
-    fn read_http_request(stream: &mut TcpStream) {
+    fn read_http_request(stream: &mut TcpStream) -> CapturedHttpRequest {
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("read timeout should be set for deterministic tests");
         let mut reader = BufReader::new(stream);
-        let mut headers = String::new();
+        let mut request_line = String::new();
+        let request_line_bytes = reader
+            .read_line(&mut request_line)
+            .expect("scripted server should read HTTP request line");
+        assert!(request_line_bytes > 0, "scripted openai request line must be present");
+        let path = request_line.split_ascii_whitespace().nth(1).unwrap_or_default().to_owned();
+
         let mut content_length = 0_usize;
         loop {
             let mut line = String::new();
@@ -1540,17 +2120,21 @@ mod tests {
                 break;
             }
             let line_trimmed = line.trim_end_matches(['\r', '\n']);
-            headers.push_str(line_trimmed);
-            headers.push('\n');
-            if let Some(value) = line_trimmed.strip_prefix("Content-Length:") {
-                content_length = value.trim().parse::<usize>().unwrap_or(0);
+            if let Some((name, value)) = line_trimmed.split_once(':') {
+                if name.trim().eq_ignore_ascii_case("content-length") {
+                    content_length = value.trim().parse::<usize>().unwrap_or(0);
+                }
             }
         }
 
+        let mut body_text = String::new();
         if content_length > 0 {
             let mut body = vec![0_u8; content_length];
             reader.read_exact(&mut body).expect("scripted server should read full request body");
             assert!(!body.is_empty(), "scripted openai requests must carry a non-empty JSON body");
+            body_text = String::from_utf8_lossy(body.as_slice()).into_owned();
         }
+
+        CapturedHttpRequest { path, body: body_text, received_at_ms: 0 }
     }
 }
