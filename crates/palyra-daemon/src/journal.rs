@@ -529,6 +529,25 @@ pub struct MemoryMaintenanceOutcome {
     pub next_maintenance_run_at_unix_ms: Option<i64>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct MemoryEmbeddingsBackfillOutcome {
+    pub ran_at_unix_ms: i64,
+    pub batch_size: usize,
+    pub scanned_count: u64,
+    pub updated_count: u64,
+    pub pending_count: u64,
+    pub target_model_id: String,
+    pub target_dims: usize,
+    pub target_version: i64,
+}
+
+impl MemoryEmbeddingsBackfillOutcome {
+    #[must_use]
+    pub const fn is_complete(&self) -> bool {
+        self.pending_count == 0
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct MemoryMaintenanceStateRow {
     last_run_at_unix_ms: Option<i64>,
@@ -3634,6 +3653,126 @@ impl JournalStore {
         })
     }
 
+    pub fn run_memory_embeddings_backfill(
+        &self,
+        batch_size: usize,
+    ) -> Result<MemoryEmbeddingsBackfillOutcome, JournalError> {
+        let ran_at_unix_ms = current_unix_ms()?;
+        self.purge_expired_memory_items(ran_at_unix_ms)?;
+        let target_model_id = self.memory_embedding_provider.model_name().to_owned();
+        let target_dims = self.memory_embedding_provider.dimensions();
+        let target_version = CURRENT_MEMORY_EMBEDDING_VERSION;
+        let effective_batch = batch_size.clamp(1, MAX_MEMORY_SEARCH_CANDIDATES);
+
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let pending_before = query_pending_memory_embeddings_count(
+            &guard,
+            target_model_id.as_str(),
+            target_dims,
+            target_version,
+        )?;
+        if pending_before == 0 {
+            return Ok(MemoryEmbeddingsBackfillOutcome {
+                ran_at_unix_ms,
+                batch_size: effective_batch,
+                scanned_count: 0,
+                updated_count: 0,
+                pending_count: 0,
+                target_model_id,
+                target_dims,
+                target_version,
+            });
+        }
+
+        let pending_batch = load_pending_memory_embeddings_batch(
+            &guard,
+            target_model_id.as_str(),
+            target_dims,
+            target_version,
+            effective_batch,
+        )?;
+        if pending_batch.is_empty() {
+            return Ok(MemoryEmbeddingsBackfillOutcome {
+                ran_at_unix_ms,
+                batch_size: effective_batch,
+                scanned_count: 0,
+                updated_count: 0,
+                pending_count: 0,
+                target_model_id,
+                target_dims,
+                target_version,
+            });
+        }
+
+        let mut updates = Vec::with_capacity(pending_batch.len());
+        for (memory_id, content_text) in &pending_batch {
+            let vector = normalize_embedding_dimensions(
+                self.memory_embedding_provider.embed_text(content_text.as_str()),
+                target_dims,
+            );
+            updates.push((memory_id.clone(), encode_vector_blob(vector.as_slice())));
+        }
+
+        let transaction = guard.transaction()?;
+        for (memory_id, vector_blob) in &updates {
+            transaction.execute(
+                r#"
+                    INSERT INTO memory_vectors (
+                        memory_ulid,
+                        embedding_model,
+                        dims,
+                        vector_blob,
+                        created_at_unix_ms,
+                        embedding_model_id,
+                        embedding_dims,
+                        embedding_version,
+                        embedding_vector,
+                        embedded_at_unix_ms
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                    ON CONFLICT(memory_ulid) DO UPDATE SET
+                        embedding_model = excluded.embedding_model,
+                        dims = excluded.dims,
+                        vector_blob = excluded.vector_blob,
+                        embedding_model_id = excluded.embedding_model_id,
+                        embedding_dims = excluded.embedding_dims,
+                        embedding_version = excluded.embedding_version,
+                        embedding_vector = excluded.embedding_vector,
+                        embedded_at_unix_ms = excluded.embedded_at_unix_ms
+                "#,
+                params![
+                    memory_id.as_str(),
+                    target_model_id.as_str(),
+                    target_dims as i64,
+                    vector_blob,
+                    ran_at_unix_ms,
+                    target_model_id.as_str(),
+                    target_dims as i64,
+                    target_version,
+                    vector_blob,
+                    ran_at_unix_ms,
+                ],
+            )?;
+        }
+        transaction.commit()?;
+
+        let pending_after = query_pending_memory_embeddings_count(
+            &guard,
+            target_model_id.as_str(),
+            target_dims,
+            target_version,
+        )?;
+        Ok(MemoryEmbeddingsBackfillOutcome {
+            ran_at_unix_ms,
+            batch_size: effective_batch,
+            scanned_count: pending_batch.len() as u64,
+            updated_count: updates.len() as u64,
+            pending_count: pending_after,
+            target_model_id,
+            target_dims,
+            target_version,
+        })
+    }
+
     pub fn search_memory(
         &self,
         request: &MemorySearchRequest,
@@ -4548,6 +4687,67 @@ fn query_memory_usage_snapshot(
         entries: entries_raw.max(0) as u64,
         approx_bytes: bytes_raw.max(0) as u64,
     })
+}
+
+fn query_pending_memory_embeddings_count(
+    connection: &Connection,
+    target_model_id: &str,
+    target_dims: usize,
+    target_version: i64,
+) -> Result<u64, JournalError> {
+    let pending_raw: i64 = connection.query_row(
+        r#"
+            SELECT COUNT(*)
+            FROM memory_items AS memory
+            LEFT JOIN memory_vectors AS vectors
+                ON vectors.memory_ulid = memory.memory_ulid
+            WHERE
+                vectors.memory_ulid IS NULL OR
+                COALESCE(vectors.embedding_model_id, vectors.embedding_model, '') != ?1 OR
+                COALESCE(vectors.embedding_dims, vectors.dims, 0) != ?2 OR
+                COALESCE(vectors.embedding_version, 0) != ?3
+        "#,
+        params![target_model_id, target_dims as i64, target_version],
+        |row| row.get(0),
+    )?;
+    Ok(pending_raw.max(0) as u64)
+}
+
+fn load_pending_memory_embeddings_batch(
+    connection: &Connection,
+    target_model_id: &str,
+    target_dims: usize,
+    target_version: i64,
+    batch_size: usize,
+) -> Result<Vec<(String, String)>, JournalError> {
+    let mut statement = connection.prepare(
+        r#"
+            SELECT
+                memory.memory_ulid,
+                memory.content_text
+            FROM memory_items AS memory
+            LEFT JOIN memory_vectors AS vectors
+                ON vectors.memory_ulid = memory.memory_ulid
+            WHERE
+                vectors.memory_ulid IS NULL OR
+                COALESCE(vectors.embedding_model_id, vectors.embedding_model, '') != ?1 OR
+                COALESCE(vectors.embedding_dims, vectors.dims, 0) != ?2 OR
+                COALESCE(vectors.embedding_version, 0) != ?3
+            ORDER BY memory.created_at_unix_ms ASC, memory.memory_ulid ASC
+            LIMIT ?4
+        "#,
+    )?;
+    let mut rows = statement.query(params![
+        target_model_id,
+        target_dims as i64,
+        target_version,
+        batch_size as i64
+    ])?;
+    let mut batch = Vec::new();
+    while let Some(row) = rows.next()? {
+        batch.push((row.get(0)?, row.get(1)?));
+    }
+    Ok(batch)
 }
 
 fn load_memory_maintenance_state(
@@ -7180,6 +7380,138 @@ mod tests {
             Some(now.saturating_add(1_000)),
             "maintenance outcome should record the last vacuum timestamp"
         );
+    }
+
+    #[test]
+    fn memory_embeddings_backfill_is_resumable_with_deterministic_batches() {
+        let db_path = temp_db_path();
+        let provider = Arc::new(FixedMemoryEmbeddingProvider {
+            model_name: "semantic-embed-v2",
+            dimensions: 4,
+            vector: vec![0.9, 0.1, 0.2, 0.3],
+        });
+        let store = JournalStore::open_with_memory_embedding_provider(
+            test_journal_config(db_path, false),
+            provider,
+        )
+        .expect("journal store should open with custom embedding provider");
+        let session_id = "01ARZ3NDEKTSV4RRFFQ69G5FB3";
+        for offset in 0..3 {
+            let memory_id = format!("01ARZ3NDEKTSV4RRFFQ69G5F{:02}", offset + 70);
+            store
+                .create_memory_item(&sample_memory_request(
+                    memory_id.as_str(),
+                    "user:ops",
+                    Some("cli"),
+                    Some(session_id),
+                    MemorySource::Manual,
+                    format!("backfill fixture row {offset}").as_str(),
+                ))
+                .expect("memory item should be created");
+        }
+        let legacy_blob = encode_vector_blob(&[0.1_f32, 0.2_f32, 0.3_f32, 0.4_f32]);
+        {
+            let guard = store.connection.lock().expect("connection lock should not be poisoned");
+            guard
+                .execute(
+                    r#"
+                        UPDATE memory_vectors
+                        SET
+                            embedding_model = 'legacy-hash-v1',
+                            dims = 4,
+                            vector_blob = ?1,
+                            embedding_model_id = 'legacy-hash-v1',
+                            embedding_dims = 4,
+                            embedding_version = 1,
+                            embedding_vector = ?1,
+                            embedded_at_unix_ms = created_at_unix_ms
+                    "#,
+                    params![legacy_blob],
+                )
+                .expect("legacy fixture update should succeed");
+        }
+
+        let first =
+            store.run_memory_embeddings_backfill(2).expect("first backfill batch should succeed");
+        assert_eq!(first.batch_size, 2);
+        assert_eq!(first.scanned_count, 2);
+        assert_eq!(first.updated_count, 2);
+        assert_eq!(first.pending_count, 1);
+        assert!(!first.is_complete(), "first batch should leave one row pending");
+
+        let second =
+            store.run_memory_embeddings_backfill(2).expect("second backfill batch should succeed");
+        assert_eq!(second.scanned_count, 1);
+        assert_eq!(second.updated_count, 1);
+        assert_eq!(second.pending_count, 0);
+        assert!(second.is_complete(), "second batch should complete the backlog");
+
+        let guard = store.connection.lock().expect("connection lock should not be poisoned");
+        let matched: i64 = guard
+            .query_row(
+                r#"
+                    SELECT COUNT(*)
+                    FROM memory_vectors
+                    WHERE
+                        embedding_model_id = ?1 AND
+                        embedding_dims = ?2 AND
+                        embedding_version = ?3
+                "#,
+                params!["semantic-embed-v2", 4_i64, CURRENT_MEMORY_EMBEDDING_VERSION],
+                |row| row.get(0),
+            )
+            .expect("vector metadata query should succeed");
+        drop(guard);
+        assert_eq!(matched, 3, "all rows should be re-embedded with current provenance");
+    }
+
+    #[test]
+    fn memory_embeddings_backfill_recreates_missing_vector_rows() {
+        let db_path = temp_db_path();
+        let provider = Arc::new(FixedMemoryEmbeddingProvider {
+            model_name: "semantic-embed-v3",
+            dimensions: 4,
+            vector: vec![0.4, 0.3, 0.2, 0.1],
+        });
+        let store = JournalStore::open_with_memory_embedding_provider(
+            test_journal_config(db_path, false),
+            provider,
+        )
+        .expect("journal store should open with custom embedding provider");
+        let memory_id = "01ARZ3NDEKTSV4RRFFQ69G5FE3";
+        store
+            .create_memory_item(&sample_memory_request(
+                memory_id,
+                "user:ops",
+                Some("cli"),
+                Some("01ARZ3NDEKTSV4RRFFQ69G5FB4"),
+                MemorySource::Manual,
+                "missing-vector backfill row",
+            ))
+            .expect("memory item should be created");
+        {
+            let guard = store.connection.lock().expect("connection lock should not be poisoned");
+            guard
+                .execute("DELETE FROM memory_vectors WHERE memory_ulid = ?1", params![memory_id])
+                .expect("fixture should delete vector row");
+        }
+
+        let outcome = store
+            .run_memory_embeddings_backfill(8)
+            .expect("backfill should recreate missing vectors");
+        assert_eq!(outcome.updated_count, 1);
+        assert_eq!(outcome.pending_count, 0);
+
+        let guard = store.connection.lock().expect("connection lock should not be poisoned");
+        let recreated: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM memory_vectors WHERE memory_ulid = ?1",
+                params![memory_id],
+                |row| row.get(0),
+            )
+            .expect("vector row count query should succeed");
+        drop(guard);
+        assert_eq!(recreated, 1, "backfill should recreate missing vector row");
     }
 
     #[test]

@@ -67,9 +67,10 @@ use crate::{
         CronJobCreateRequest, CronJobRecord, CronJobUpdatePatch, CronJobsListFilter,
         CronRunFinalizeRequest, CronRunRecord, CronRunStartRequest, CronRunStatus,
         CronRunsListFilter, JournalAppendRequest, JournalError, JournalEventRecord, JournalStore,
-        MemoryItemCreateRequest, MemoryItemRecord, MemoryItemsListFilter, MemoryMaintenanceRequest,
-        MemoryMaintenanceStatus, MemoryPurgeRequest, MemoryRetentionPolicy, MemorySearchHit,
-        MemorySearchRequest, MemorySource, OrchestratorCancelRequest, OrchestratorRunStartRequest,
+        MemoryEmbeddingsBackfillOutcome, MemoryItemCreateRequest, MemoryItemRecord,
+        MemoryItemsListFilter, MemoryMaintenanceRequest, MemoryMaintenanceStatus,
+        MemoryPurgeRequest, MemoryRetentionPolicy, MemorySearchHit, MemorySearchRequest,
+        MemorySource, OrchestratorCancelRequest, OrchestratorRunStartRequest,
         OrchestratorRunStatusSnapshot, OrchestratorSessionRecord,
         OrchestratorSessionResolveOutcome, OrchestratorSessionResolveRequest,
         OrchestratorTapeAppendRequest, OrchestratorTapeRecord, OrchestratorUsageDelta,
@@ -3624,6 +3625,26 @@ impl GatewayRuntimeState {
         .await
         .map_err(|_| Status::internal("memory maintenance worker panicked"))??;
         if outcome.deleted_total_count > 0 {
+            self.clear_memory_search_cache();
+        }
+        Ok(outcome)
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn run_memory_embeddings_backfill(
+        self: &Arc<Self>,
+        batch_size: usize,
+    ) -> Result<MemoryEmbeddingsBackfillOutcome, Status> {
+        let state = Arc::clone(self);
+        let outcome = tokio::task::spawn_blocking(move || {
+            state
+                .journal_store
+                .run_memory_embeddings_backfill(batch_size)
+                .map_err(|error| map_memory_store_error("run memory embeddings backfill", error))
+        })
+        .await
+        .map_err(|_| Status::internal("memory embeddings backfill worker panicked"))??;
+        if outcome.updated_count > 0 {
             self.clear_memory_search_cache();
         }
         Ok(outcome)
