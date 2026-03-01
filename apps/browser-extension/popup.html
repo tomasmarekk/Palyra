@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Palyra Relay Companion</title>
+    <style>
+      body {
+        font-family: "Segoe UI", "Arial", sans-serif;
+        margin: 0;
+        min-width: 360px;
+        background: #f5f7fb;
+        color: #112433;
+      }
+      main {
+        padding: 12px;
+      }
+      h1 {
+        margin: 0 0 6px;
+        font-size: 16px;
+      }
+      p {
+        margin: 0 0 12px;
+        font-size: 12px;
+      }
+      section {
+        background: #ffffff;
+        border: 1px solid #d3deea;
+        border-radius: 8px;
+        padding: 10px;
+        margin-bottom: 10px;
+      }
+      label {
+        display: block;
+        margin: 6px 0 2px;
+        font-size: 12px;
+        font-weight: 600;
+      }
+      input,
+      textarea {
+        width: 100%;
+        box-sizing: border-box;
+        border: 1px solid #b9cbde;
+        border-radius: 6px;
+        font-size: 12px;
+        padding: 6px;
+        background: #fdfefe;
+      }
+      textarea {
+        resize: vertical;
+        min-height: 48px;
+      }
+      .actions {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 6px;
+      }
+      button {
+        border: 0;
+        border-radius: 6px;
+        padding: 8px;
+        font-size: 12px;
+        cursor: pointer;
+        background: #1f6fb2;
+        color: #ffffff;
+      }
+      button.secondary {
+        background: #34506c;
+      }
+      pre {
+        margin: 8px 0 0;
+        max-height: 180px;
+        overflow: auto;
+        background: #0f1720;
+        color: #d9f2ff;
+        border-radius: 6px;
+        padding: 8px;
+        font-size: 11px;
+        white-space: pre-wrap;
+      }
+      #status {
+        margin-top: 8px;
+        font-size: 12px;
+      }
+      #status.error {
+        color: #9a1b24;
+      }
+      #status.ok {
+        color: #0f6f2f;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Palyra Relay Companion</h1>
+      <p>Local-only relay helper. The relay base URL must stay on loopback.</p>
+
+      <section>
+        <label for="relayBaseUrl">Relay Base URL</label>
+        <input id="relayBaseUrl" type="text" placeholder="http://127.0.0.1:7142" />
+
+        <label for="sessionId">Browser Session ID</label>
+        <input id="sessionId" type="text" placeholder="01ARZ3NDEKTSV4RRFFQ69G5FAV" />
+
+        <label for="relayToken">Relay Token</label>
+        <input id="relayToken" type="password" placeholder="Paste token minted by console" />
+
+        <label for="extensionId">Extension ID</label>
+        <input id="extensionId" type="text" />
+
+        <label for="openTabAllowlist">Open Tab Allowlist Prefixes (CSV or one per line)</label>
+        <textarea id="openTabAllowlist" placeholder="https://"></textarea>
+
+        <div class="actions" style="margin-top: 8px">
+          <button id="saveConfig">Save Config</button>
+          <button id="refreshConfig" class="secondary">Reload Config</button>
+        </div>
+      </section>
+
+      <section>
+        <label for="selector">Capture Selection Selector</label>
+        <input id="selector" type="text" placeholder="main" />
+
+        <label for="openTabUrl">Open Tab URL</label>
+        <input id="openTabUrl" type="text" placeholder="https://example.com" />
+
+        <div class="actions" style="margin-top: 8px">
+          <button id="captureContext">Capture URL + DOM</button>
+          <button id="captureScreenshot" class="secondary">Capture Screenshot</button>
+          <button id="relaySnapshot">Relay send_page_snapshot</button>
+          <button id="relaySelection" class="secondary">Relay capture_selection</button>
+          <button id="relayOpenTab">Relay open_tab</button>
+        </div>
+
+        <div id="status"></div>
+        <pre id="output"></pre>
+      </section>
+    </main>
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

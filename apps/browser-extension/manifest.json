@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "Palyra Relay Companion",
+  "description": "Local-only companion extension for Palyra relay actions and safe page captures.",
+  "version": "0.1.0",
+  "action": {
+    "default_title": "Palyra Relay Companion",
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "http://localhost/*",
+    "https://127.0.0.1/*",
+    "https://localhost/*"
+  ]
+}
