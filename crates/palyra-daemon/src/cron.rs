@@ -54,6 +54,8 @@ const SKILL_REAUDIT_INTERVAL_ENV: &str = "PALYRA_SKILL_REAUDIT_INTERVAL_MS";
 const DEFAULT_SKILL_REAUDIT_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const SYSTEM_DAEMON_PRINCIPAL: &str = "system:daemon";
 pub const MEMORY_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5 * 60);
+pub const MEMORY_EMBEDDINGS_BACKFILL_INTERVAL: Duration = Duration::from_secs(10 * 60);
+const MEMORY_EMBEDDINGS_BACKFILL_BATCH_SIZE: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CronTimezoneMode {
@@ -786,6 +788,38 @@ async fn run_memory_maintenance_tick(
     Ok(())
 }
 
+#[allow(clippy::result_large_err)]
+async fn run_memory_embeddings_backfill_tick(
+    state: Arc<GatewayRuntimeState>,
+) -> Result<(), Status> {
+    let outcome =
+        state.run_memory_embeddings_backfill(MEMORY_EMBEDDINGS_BACKFILL_BATCH_SIZE).await?;
+    if outcome.updated_count > 0 {
+        let context = RequestContext {
+            principal: SYSTEM_DAEMON_PRINCIPAL.to_owned(),
+            device_id: SCHEDULER_DEVICE_ID.to_owned(),
+            channel: Some(DEFAULT_CRON_CHANNEL.to_owned()),
+        };
+        let details = json!({
+            "ran_at_unix_ms": outcome.ran_at_unix_ms,
+            "batch_size": outcome.batch_size,
+            "scanned_count": outcome.scanned_count,
+            "updated_count": outcome.updated_count,
+            "pending_count": outcome.pending_count,
+            "complete": outcome.is_complete(),
+            "target_model_id": outcome.target_model_id,
+            "target_dims": outcome.target_dims,
+            "target_version": outcome.target_version,
+        });
+        if let Err(error) =
+            state.record_console_event(&context, "memory.embeddings.backfill.run", details).await
+        {
+            warn!(error = %error, "failed to record memory embeddings backfill audit event");
+        }
+    }
+    Ok(())
+}
+
 pub fn spawn_scheduler_loop(
     state: Arc<GatewayRuntimeState>,
     auth: GatewayAuthConfig,
@@ -803,6 +837,7 @@ pub fn spawn_scheduler_loop(
         };
         let mut next_skill_reaudit_at = Instant::now();
         let mut next_memory_maintenance_at = Instant::now();
+        let mut next_memory_embeddings_backfill_at = Instant::now();
         loop {
             if let Err(error) = process_due_jobs(
                 Arc::clone(&state),
@@ -843,6 +878,14 @@ pub fn spawn_scheduler_loop(
                     warn!(error = %error, "scheduled memory maintenance tick failed");
                 }
                 next_memory_maintenance_at = Instant::now() + MEMORY_MAINTENANCE_INTERVAL;
+            }
+
+            if Instant::now() >= next_memory_embeddings_backfill_at {
+                if let Err(error) = run_memory_embeddings_backfill_tick(Arc::clone(&state)).await {
+                    warn!(error = %error, "scheduled memory embeddings backfill tick failed");
+                }
+                next_memory_embeddings_backfill_at =
+                    Instant::now() + MEMORY_EMBEDDINGS_BACKFILL_INTERVAL;
             }
 
             let sleep_duration = match state.first_due_cron_job_time().await {
