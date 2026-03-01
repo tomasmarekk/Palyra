@@ -127,6 +127,7 @@ pub struct FileMemoryConfig {
     pub max_item_tokens: Option<u64>,
     pub default_ttl_ms: Option<i64>,
     pub auto_inject: Option<FileMemoryAutoInjectConfig>,
+    pub retention: Option<FileMemoryRetentionConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -134,6 +135,15 @@ pub struct FileMemoryConfig {
 pub struct FileMemoryAutoInjectConfig {
     pub enabled: Option<bool>,
     pub max_items: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileMemoryRetentionConfig {
+    pub max_entries: Option<u64>,
+    pub max_bytes: Option<u64>,
+    pub ttl_days: Option<u32>,
+    pub vacuum_schedule: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]

@@ -40,6 +40,7 @@ const DEFAULT_MEMORY_MAX_ITEM_TOKENS: usize = 2_048;
 const DEFAULT_MEMORY_DEFAULT_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
 const DEFAULT_MEMORY_AUTO_INJECT_ENABLED: bool = false;
 const DEFAULT_MEMORY_AUTO_INJECT_MAX_ITEMS: usize = 3;
+const DEFAULT_MEMORY_RETENTION_VACUUM_SCHEDULE: &str = "0 0 * * 0";
 const DEFAULT_ADMIN_REQUIRE_AUTH: bool = true;
 const DEFAULT_ALLOW_INSECURE_NODE_RPC_WITHOUT_MTLS: bool = false;
 const DEFAULT_JOURNAL_DB_PATH: &str = "data/journal.sqlite3";
@@ -153,12 +154,21 @@ pub struct MemoryConfig {
     pub max_item_tokens: usize,
     pub default_ttl_ms: Option<i64>,
     pub auto_inject: MemoryAutoInjectConfig,
+    pub retention: MemoryRetentionConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryAutoInjectConfig {
     pub enabled: bool,
     pub max_items: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryRetentionConfig {
+    pub max_entries: Option<usize>,
+    pub max_bytes: Option<u64>,
+    pub ttl_days: Option<u32>,
+    pub vacuum_schedule: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -335,6 +345,7 @@ impl Default for MemoryConfig {
             max_item_tokens: DEFAULT_MEMORY_MAX_ITEM_TOKENS,
             default_ttl_ms: Some(DEFAULT_MEMORY_DEFAULT_TTL_MS),
             auto_inject: MemoryAutoInjectConfig::default(),
+            retention: MemoryRetentionConfig::default(),
         }
     }
 }
@@ -344,6 +355,17 @@ impl Default for MemoryAutoInjectConfig {
         Self {
             enabled: DEFAULT_MEMORY_AUTO_INJECT_ENABLED,
             max_items: DEFAULT_MEMORY_AUTO_INJECT_MAX_ITEMS,
+        }
+    }
+}
+
+impl Default for MemoryRetentionConfig {
+    fn default() -> Self {
+        Self {
+            max_entries: None,
+            max_bytes: None,
+            ttl_days: None,
+            vacuum_schedule: DEFAULT_MEMORY_RETENTION_VACUUM_SCHEDULE.to_owned(),
         }
     }
 }
@@ -582,6 +604,26 @@ pub fn load_config() -> Result<LoadedConfig> {
                 if let Some(max_items) = file_auto_inject.max_items {
                     memory.auto_inject.max_items =
                         parse_positive_usize(max_items, "memory.auto_inject.max_items")?;
+                }
+            }
+            if let Some(file_retention) = file_memory.retention {
+                if let Some(max_entries) = file_retention.max_entries {
+                    memory.retention.max_entries =
+                        Some(parse_positive_usize(max_entries, "memory.retention.max_entries")?);
+                }
+                if let Some(max_bytes) = file_retention.max_bytes {
+                    memory.retention.max_bytes =
+                        Some(parse_positive_u64(max_bytes, "memory.retention.max_bytes")?);
+                }
+                if let Some(ttl_days) = file_retention.ttl_days {
+                    memory.retention.ttl_days =
+                        Some(parse_positive_u32(ttl_days, "memory.retention.ttl_days")?);
+                }
+                if let Some(vacuum_schedule) = file_retention.vacuum_schedule {
+                    memory.retention.vacuum_schedule = parse_memory_retention_vacuum_schedule(
+                        vacuum_schedule.as_str(),
+                        "memory.retention.vacuum_schedule",
+                    )?;
                 }
             }
         }
@@ -1217,6 +1259,40 @@ pub fn load_config() -> Result<LoadedConfig> {
             "PALYRA_MEMORY_AUTO_INJECT_MAX_ITEMS",
         )?;
         source.push_str(" +env(PALYRA_MEMORY_AUTO_INJECT_MAX_ITEMS)");
+    }
+    if let Ok(retention_max_entries) = env::var("PALYRA_MEMORY_RETENTION_MAX_ENTRIES") {
+        memory.retention.max_entries = Some(parse_positive_usize(
+            retention_max_entries
+                .parse::<u64>()
+                .context("PALYRA_MEMORY_RETENTION_MAX_ENTRIES must be a valid u64")?,
+            "PALYRA_MEMORY_RETENTION_MAX_ENTRIES",
+        )?);
+        source.push_str(" +env(PALYRA_MEMORY_RETENTION_MAX_ENTRIES)");
+    }
+    if let Ok(retention_max_bytes) = env::var("PALYRA_MEMORY_RETENTION_MAX_BYTES") {
+        memory.retention.max_bytes = Some(parse_positive_u64(
+            retention_max_bytes
+                .parse::<u64>()
+                .context("PALYRA_MEMORY_RETENTION_MAX_BYTES must be a valid u64")?,
+            "PALYRA_MEMORY_RETENTION_MAX_BYTES",
+        )?);
+        source.push_str(" +env(PALYRA_MEMORY_RETENTION_MAX_BYTES)");
+    }
+    if let Ok(retention_ttl_days) = env::var("PALYRA_MEMORY_RETENTION_TTL_DAYS") {
+        memory.retention.ttl_days = Some(parse_positive_u32(
+            retention_ttl_days
+                .parse::<u32>()
+                .context("PALYRA_MEMORY_RETENTION_TTL_DAYS must be a valid u32")?,
+            "PALYRA_MEMORY_RETENTION_TTL_DAYS",
+        )?);
+        source.push_str(" +env(PALYRA_MEMORY_RETENTION_TTL_DAYS)");
+    }
+    if let Ok(retention_vacuum_schedule) = env::var("PALYRA_MEMORY_RETENTION_VACUUM_SCHEDULE") {
+        memory.retention.vacuum_schedule = parse_memory_retention_vacuum_schedule(
+            retention_vacuum_schedule.as_str(),
+            "PALYRA_MEMORY_RETENTION_VACUUM_SCHEDULE",
+        )?;
+        source.push_str(" +env(PALYRA_MEMORY_RETENTION_VACUUM_SCHEDULE)");
     }
 
     if let Ok(kind) = env::var("PALYRA_MODEL_PROVIDER_KIND") {
@@ -2337,6 +2413,21 @@ fn parse_default_memory_ttl_ms(value: i64, name: &str) -> Result<Option<i64>> {
     Ok(Some(value))
 }
 
+fn parse_memory_retention_vacuum_schedule(raw: &str, name: &str) -> Result<String> {
+    let normalized = raw.split_whitespace().collect::<Vec<_>>();
+    if normalized.is_empty() {
+        anyhow::bail!("{name} must not be empty");
+    }
+    if normalized.len() < 5 || normalized.len() > 6 {
+        anyhow::bail!("{name} must be a cron expression with 5 or 6 fields");
+    }
+    let joined = normalized.join(" ");
+    if joined.len() > 128 {
+        anyhow::bail!("{name} must be <= 128 characters");
+    }
+    Ok(joined)
+}
+
 fn parse_retries(value: u32, name: &str) -> Result<u32> {
     const MAX_RETRIES: u32 = 10;
     if value > MAX_RETRIES {
@@ -2353,17 +2444,17 @@ mod tests {
         parse_broadcast_strategy, parse_browser_service_endpoint,
         parse_canvas_host_public_base_url, parse_content_type_allowlist, parse_cron_timezone_mode,
         parse_default_memory_ttl_ms, parse_dns_suffix_allowlist, parse_host_allowlist,
-        parse_http_header_allowlist, parse_journal_db_path,
+        parse_http_header_allowlist, parse_journal_db_path, parse_memory_retention_vacuum_schedule,
         parse_model_provider_auth_provider_kind, parse_openai_base_url,
         parse_openai_embeddings_dims, parse_optional_auth_profile_id,
         parse_optional_browser_state_dir, parse_optional_openai_embeddings_model,
-        parse_optional_vault_ref_field, parse_positive_usize, parse_process_executable_allowlist,
-        parse_process_runner_egress_enforcement_mode, parse_process_runner_tier,
-        parse_root_file_config, parse_storage_prefix_allowlist, parse_tool_allowlist,
-        parse_vault_dir, parse_vault_ref_allowlist, AdminConfig, BrowserServiceConfig,
-        CanvasHostConfig, ChannelRouterConfig, CronConfig, GatewayConfig, GatewayTlsConfig,
-        HttpFetchConfig, IdentityConfig, MemoryConfig, ModelProviderConfig, OrchestratorConfig,
-        StorageConfig, ToolCallConfig,
+        parse_optional_vault_ref_field, parse_positive_u32, parse_positive_usize,
+        parse_process_executable_allowlist, parse_process_runner_egress_enforcement_mode,
+        parse_process_runner_tier, parse_root_file_config, parse_storage_prefix_allowlist,
+        parse_tool_allowlist, parse_vault_dir, parse_vault_ref_allowlist, AdminConfig,
+        BrowserServiceConfig, CanvasHostConfig, ChannelRouterConfig, CronConfig, GatewayConfig,
+        GatewayTlsConfig, HttpFetchConfig, IdentityConfig, MemoryConfig, ModelProviderConfig,
+        OrchestratorConfig, StorageConfig, ToolCallConfig,
     };
     use crate::channel_router::BroadcastStrategy;
     use crate::model_provider::{ModelProviderAuthProviderKind, ModelProviderKind};
@@ -2473,6 +2564,39 @@ mod tests {
         assert_eq!(config.default_ttl_ms, Some(30 * 24 * 60 * 60 * 1_000));
         assert!(!config.auto_inject.enabled, "memory auto-inject must default to disabled");
         assert_eq!(config.auto_inject.max_items, 3);
+        assert!(
+            config.retention.max_entries.is_none(),
+            "retention max entries should default to unset"
+        );
+        assert!(
+            config.retention.max_bytes.is_none(),
+            "retention max bytes should default to unset"
+        );
+        assert!(config.retention.ttl_days.is_none(), "retention ttl days should default to unset");
+        assert_eq!(
+            config.retention.vacuum_schedule, "0 0 * * 0",
+            "retention vacuum schedule should default to weekly cadence"
+        );
+    }
+
+    #[test]
+    fn memory_config_parses_retention_fields() {
+        let (parsed, _) = parse_root_file_config(
+            r#"
+            [memory.retention]
+            max_entries = 5000
+            max_bytes = 10485760
+            ttl_days = 30
+            vacuum_schedule = "0 3 * * 0"
+            "#,
+        )
+        .expect("memory retention fields should parse");
+        let memory = parsed.memory.expect("memory section should exist");
+        let retention = memory.retention.expect("memory.retention section should exist");
+        assert_eq!(retention.max_entries, Some(5000));
+        assert_eq!(retention.max_bytes, Some(10485760));
+        assert_eq!(retention.ttl_days, Some(30));
+        assert_eq!(retention.vacuum_schedule.as_deref(), Some("0 3 * * 0"));
     }
 
     #[test]
@@ -2891,6 +3015,13 @@ mod tests {
         let result: Result<RootFileConfig, _> =
             toml::from_str("[memory.auto_inject]\nenabled=true\nunexpected=true\n");
         assert!(result.is_err(), "unknown memory.auto_inject keys must be rejected");
+    }
+
+    #[test]
+    fn config_rejects_unknown_memory_retention_key() {
+        let result: Result<RootFileConfig, _> =
+            toml::from_str("[memory.retention]\nmax_entries=100\nunexpected=true\n");
+        assert!(result.is_err(), "unknown memory.retention keys must be rejected");
     }
 
     #[test]
@@ -3438,6 +3569,12 @@ mod tests {
     }
 
     #[test]
+    fn parse_positive_u32_rejects_zero() {
+        let result = parse_positive_u32(0, "memory.retention.ttl_days");
+        assert!(result.is_err(), "zero should not be accepted for positive u32 fields");
+    }
+
+    #[test]
     fn parse_default_memory_ttl_zero_disables_default_ttl() {
         let parsed =
             parse_default_memory_ttl_ms(0, "memory.default_ttl_ms").expect("ttl should parse");
@@ -3448,5 +3585,26 @@ mod tests {
     fn parse_default_memory_ttl_rejects_negative_values() {
         let result = parse_default_memory_ttl_ms(-1, "memory.default_ttl_ms");
         assert!(result.is_err(), "negative ttl should be rejected");
+    }
+
+    #[test]
+    fn parse_memory_retention_vacuum_schedule_normalizes_whitespace() {
+        let parsed = parse_memory_retention_vacuum_schedule(
+            "  0   2   *  *   0  ",
+            "memory.retention.vacuum_schedule",
+        )
+        .expect("schedule should parse");
+        assert_eq!(parsed, "0 2 * * 0");
+    }
+
+    #[test]
+    fn parse_memory_retention_vacuum_schedule_rejects_invalid_field_count() {
+        let error =
+            parse_memory_retention_vacuum_schedule("* * * *", "memory.retention.vacuum_schedule")
+                .expect_err("invalid cron field count should fail");
+        assert!(
+            error.to_string().contains("5 or 6 fields"),
+            "error should explain expected cron field count: {error}"
+        );
     }
 }
