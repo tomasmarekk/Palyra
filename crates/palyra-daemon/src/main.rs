@@ -52,8 +52,14 @@ use journal::{
     OrchestratorCancelRequest, OrchestratorRunStatusSnapshot, SkillExecutionStatus,
     SkillStatusRecord, SkillStatusUpsertRequest,
 };
-use model_provider::{build_model_provider, ModelProviderKind};
-use palyra_auth::{AuthProfileRegistry, HttpOAuthRefreshAdapter, OAuthRefreshAdapter};
+use model_provider::{
+    build_model_provider, ModelProviderAuthProviderKind, ModelProviderConfig,
+    ModelProviderCredentialSource, ModelProviderKind,
+};
+use palyra_auth::{
+    AuthCredential, AuthProfileRegistry, AuthProviderKind, HttpOAuthRefreshAdapter,
+    OAuthRefreshAdapter,
+};
 use palyra_common::default_identity_store_root;
 use palyra_common::{
     build_metadata, health_response, parse_daemon_bind_socket,
@@ -638,9 +644,15 @@ async fn main() -> Result<()> {
         })
         .context("failed to initialize vault runtime")?,
     );
-    if let Some(access_audit) =
-        resolve_model_provider_secret_from_vault(&mut loaded, vault.as_ref())?
-    {
+    let auth_registry = Arc::new(
+        AuthProfileRegistry::open(identity_runtime.store_root.as_path())
+            .context("failed to initialize auth profile registry state")?,
+    );
+    if let Some(access_audit) = resolve_model_provider_secret(
+        &mut loaded.model_provider,
+        auth_registry.as_ref(),
+        vault.as_ref(),
+    )? {
         record_secret_access_journal_event(&journal_store, &access_audit)
             .context("failed to audit model provider secret access")?;
     }
@@ -648,10 +660,6 @@ async fn main() -> Result<()> {
         .context("failed to initialize model provider runtime")?;
     let agent_registry = agents::AgentRegistry::open(identity_runtime.store_root.as_path())
         .context("failed to initialize agent registry state")?;
-    let auth_registry = Arc::new(
-        AuthProfileRegistry::open(identity_runtime.store_root.as_path())
-            .context("failed to initialize auth profile registry state")?,
-    );
     let auth_runtime = Arc::new(gateway::AuthRuntimeState::new(
         Arc::clone(&auth_registry),
         Arc::new(HttpOAuthRefreshAdapter::default()) as Arc<dyn OAuthRefreshAdapter>,
@@ -842,6 +850,9 @@ async fn main() -> Result<()> {
         model_provider_api_key_configured = loaded.model_provider.openai_api_key.is_some(),
         model_provider_openai_api_key_vault_ref_configured =
             loaded.model_provider.openai_api_key_vault_ref.is_some(),
+        model_provider_auth_profile_id = ?loaded.model_provider.auth_profile_id,
+        model_provider_auth_profile_provider_kind = ?loaded.model_provider.auth_profile_provider_kind.map(|kind| kind.as_str()),
+        model_provider_credential_source = ?loaded.model_provider.credential_source.map(|source| source.as_str()),
         vault_backend = vault.backend_kind().as_str(),
         tool_call_allowed_tools = ?loaded.tool_call.allowed_tools,
         tool_call_max_calls_per_run = loaded.tool_call.max_calls_per_run,
@@ -5118,17 +5129,26 @@ fn validate_process_runner_backend_policy(
     Ok(())
 }
 
-fn resolve_model_provider_secret_from_vault(
-    loaded: &mut config::LoadedConfig,
+fn resolve_model_provider_secret(
+    model_provider: &mut ModelProviderConfig,
+    auth_registry: &AuthProfileRegistry,
     vault: &Vault,
 ) -> Result<Option<SecretAccessAuditRecord>> {
-    if loaded.model_provider.kind != ModelProviderKind::OpenAiCompatible {
+    if model_provider.kind != ModelProviderKind::OpenAiCompatible {
         return Ok(None);
     }
-    if loaded.model_provider.openai_api_key.is_some() {
+    if model_provider.openai_api_key.is_some() {
+        model_provider.credential_source = Some(ModelProviderCredentialSource::InlineConfig);
         return Ok(None);
     }
-    let Some(vault_ref_raw) = loaded.model_provider.openai_api_key_vault_ref.clone() else {
+    if model_provider.auth_profile_id.is_some() {
+        return resolve_model_provider_secret_from_auth_profile(
+            model_provider,
+            auth_registry,
+            vault,
+        );
+    }
+    let Some(vault_ref_raw) = model_provider.openai_api_key_vault_ref.clone() else {
         return Ok(None);
     };
     let vault_ref = VaultRef::parse(vault_ref_raw.as_str()).with_context(|| {
@@ -5148,11 +5168,103 @@ fn resolve_model_provider_secret_from_vault(
             vault_ref_raw
         );
     }
-    loaded.model_provider.openai_api_key = Some(decoded);
+    model_provider.openai_api_key = Some(decoded);
+    model_provider.credential_source = Some(ModelProviderCredentialSource::VaultRef);
     Ok(Some(SecretAccessAuditRecord {
         scope: vault_ref.scope.to_string(),
         key: vault_ref.key,
         action: "model_provider.openai_api_key.resolve".to_owned(),
+        value_bytes: value.len(),
+    }))
+}
+
+fn resolve_model_provider_secret_from_auth_profile(
+    model_provider: &mut ModelProviderConfig,
+    auth_registry: &AuthProfileRegistry,
+    vault: &Vault,
+) -> Result<Option<SecretAccessAuditRecord>> {
+    let Some(auth_profile_id) = model_provider.auth_profile_id.clone() else {
+        return Ok(None);
+    };
+    let profile = auth_registry
+        .get_profile(auth_profile_id.as_str())
+        .with_context(|| {
+            format!(
+                "failed to resolve auth profile '{}' for model provider runtime",
+                auth_profile_id
+            )
+        })?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "model provider auth profile '{}' was not found in auth registry",
+                auth_profile_id
+            )
+        })?;
+
+    let expected_provider =
+        model_provider.auth_profile_provider_kind.unwrap_or(ModelProviderAuthProviderKind::Openai);
+    if matches!(expected_provider, ModelProviderAuthProviderKind::Openai)
+        && !matches!(profile.provider.kind, AuthProviderKind::Openai)
+    {
+        anyhow::bail!(
+            "model provider auth profile '{}' provider mismatch: expected openai-compatible profile, got '{}'",
+            profile.profile_id,
+            profile.provider.label()
+        );
+    }
+
+    let (vault_ref_raw, action, credential_source) = match &profile.credential {
+        AuthCredential::ApiKey { api_key_vault_ref } => (
+            api_key_vault_ref.clone(),
+            "model_provider.auth_profile.api_key.resolve",
+            ModelProviderCredentialSource::AuthProfileApiKey,
+        ),
+        AuthCredential::Oauth { access_token_vault_ref, .. } => (
+            access_token_vault_ref.clone(),
+            "model_provider.auth_profile.oauth_access_token.resolve",
+            ModelProviderCredentialSource::AuthProfileOauthAccessToken,
+        ),
+    };
+    let vault_ref = VaultRef::parse(vault_ref_raw.as_str()).with_context(|| {
+        format!(
+            "invalid vault ref '{}' in model provider auth profile '{}'",
+            vault_ref_raw, profile.profile_id
+        )
+    })?;
+    let value = vault.get_secret(&vault_ref.scope, vault_ref.key.as_str()).with_context(|| {
+        format!(
+            "failed to load model provider credential from auth profile '{}' vault ref '{}'",
+            profile.profile_id, vault_ref_raw
+        )
+    })?;
+    if value.is_empty() {
+        anyhow::bail!(
+            "auth profile '{}' vault ref '{}' resolved to an empty secret value",
+            profile.profile_id,
+            vault_ref_raw
+        );
+    }
+    let decoded = String::from_utf8(value.clone()).with_context(|| {
+        format!(
+            "model provider credential from auth profile '{}' must be valid UTF-8 text",
+            profile.profile_id
+        )
+    })?;
+    if decoded.trim().is_empty() {
+        anyhow::bail!(
+            "model provider credential from auth profile '{}' vault ref '{}' cannot be whitespace only",
+            profile.profile_id,
+            vault_ref_raw
+        );
+    }
+
+    model_provider.openai_api_key = Some(decoded);
+    model_provider.auth_profile_id = Some(profile.profile_id);
+    model_provider.credential_source = Some(credential_source);
+    Ok(Some(SecretAccessAuditRecord {
+        scope: vault_ref.scope.to_string(),
+        key: vault_ref.key,
+        action: action.to_owned(),
         value_bytes: value.len(),
     }))
 }
@@ -5309,6 +5421,7 @@ fn dangerous_remote_bind_acknowledged() -> Result<bool> {
 mod tests {
     use std::{
         collections::{HashMap, HashSet},
+        fs,
         net::IpAddr,
         str::FromStr,
         sync::Mutex,
@@ -5316,23 +5429,57 @@ mod tests {
     };
 
     use axum::http::StatusCode;
+    use palyra_auth::{
+        AuthCredential, AuthProfileRegistry, AuthProfileScope, AuthProfileSetRequest, AuthProvider,
+        AuthProviderKind,
+    };
+    use palyra_vault::{BackendPreference, Vault, VaultConfig as VaultConfigOptions, VaultRef};
+    use tempfile::TempDir;
 
     use super::{
         clamp_console_relay_token_ttl_ms, constant_time_eq_bytes,
         consume_admin_rate_limit_with_now, consume_canvas_rate_limit_with_now,
         enforce_remote_bind_guard, find_hashed_secret_map_key, loopback_grpc_url,
         mint_console_relay_token, mint_console_secret_token, prune_console_relay_tokens,
-        redact_console_diagnostics_value, runtime_status_response, sanitize_http_error_message,
-        sha256_hex, validate_admin_auth_config, validate_canvas_http_canvas_id,
-        validate_canvas_http_token_query, validate_process_runner_backend_policy,
-        ConsoleRelayToken, ADMIN_RATE_LIMIT_MAX_IP_BUCKETS,
+        redact_console_diagnostics_value, resolve_model_provider_secret, runtime_status_response,
+        sanitize_http_error_message, sha256_hex, validate_admin_auth_config,
+        validate_canvas_http_canvas_id, validate_canvas_http_token_query,
+        validate_process_runner_backend_policy, ConsoleRelayToken, ADMIN_RATE_LIMIT_MAX_IP_BUCKETS,
         ADMIN_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW, CANVAS_HTTP_MAX_TOKEN_BYTES,
         CANVAS_RATE_LIMIT_MAX_IP_BUCKETS, CANVAS_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW,
         CONSOLE_RELAY_TOKEN_DEFAULT_TTL_MS, CONSOLE_RELAY_TOKEN_MAX_TTL_MS,
         CONSOLE_RELAY_TOKEN_MIN_TTL_MS,
     };
     use crate::gateway::GatewayAuthConfig;
+    use crate::model_provider::{
+        ModelProviderAuthProviderKind, ModelProviderConfig, ModelProviderCredentialSource,
+        ModelProviderKind,
+    };
     use crate::sandbox_runner::{EgressEnforcementMode, SandboxProcessRunnerTier};
+
+    fn setup_auth_registry_and_vault() -> (TempDir, AuthProfileRegistry, Vault) {
+        let tempdir = tempfile::tempdir().expect("temporary test directory should be created");
+        let identity_store_root = tempdir.path().join("identity");
+        fs::create_dir_all(&identity_store_root)
+            .expect("identity store root should be created for auth/vault tests");
+        let vault = Vault::open_with_config(VaultConfigOptions {
+            root: Some(tempdir.path().join("vault")),
+            identity_store_root: Some(identity_store_root.clone()),
+            backend_preference: BackendPreference::EncryptedFile,
+            ..VaultConfigOptions::default()
+        })
+        .expect("vault runtime should initialize");
+        let auth_registry = AuthProfileRegistry::open(identity_store_root.as_path())
+            .expect("auth profile registry should initialize");
+        (tempdir, auth_registry, vault)
+    }
+
+    fn openai_model_provider_config() -> ModelProviderConfig {
+        ModelProviderConfig {
+            kind: ModelProviderKind::OpenAiCompatible,
+            ..ModelProviderConfig::default()
+        }
+    }
 
     #[test]
     fn remote_bind_guard_allows_loopback_without_opt_in() {
@@ -5499,6 +5646,159 @@ mod tests {
         assert!(
             result.is_err(),
             "remote QUIC bind should require danger acknowledgement when node RPC mTLS is disabled"
+        );
+    }
+
+    #[test]
+    fn model_provider_secret_resolver_prefers_auth_profile_over_legacy_vault_ref() {
+        let (_tempdir, auth_registry, vault) = setup_auth_registry_and_vault();
+        let legacy_ref =
+            VaultRef::parse("global/openai_legacy_key").expect("legacy vault ref should parse");
+        vault
+            .put_secret(&legacy_ref.scope, legacy_ref.key.as_str(), b"sk-legacy")
+            .expect("legacy model provider key should be written");
+        let auth_ref =
+            VaultRef::parse("global/openai_auth_key").expect("auth profile vault ref should parse");
+        vault
+            .put_secret(&auth_ref.scope, auth_ref.key.as_str(), b"sk-auth-profile")
+            .expect("auth profile API key should be written");
+        auth_registry
+            .set_profile(AuthProfileSetRequest {
+                profile_id: "openai-default".to_owned(),
+                provider: AuthProvider::known(AuthProviderKind::Openai),
+                profile_name: "OpenAI Default".to_owned(),
+                scope: AuthProfileScope::Global,
+                credential: AuthCredential::ApiKey {
+                    api_key_vault_ref: "global/openai_auth_key".to_owned(),
+                },
+            })
+            .expect("auth profile should be persisted");
+
+        let mut model_provider = openai_model_provider_config();
+        model_provider.auth_profile_id = Some("openai-default".to_owned());
+        model_provider.auth_profile_provider_kind = Some(ModelProviderAuthProviderKind::Openai);
+        model_provider.openai_api_key_vault_ref = Some("global/openai_legacy_key".to_owned());
+
+        let audit = resolve_model_provider_secret(&mut model_provider, &auth_registry, &vault)
+            .expect("auth profile resolution should succeed")
+            .expect("audit record should be emitted for resolved secret");
+        assert_eq!(
+            model_provider.openai_api_key,
+            Some("sk-auth-profile".to_owned()),
+            "auth profile credential should override legacy model_provider vault ref"
+        );
+        assert_eq!(
+            model_provider.credential_source,
+            Some(ModelProviderCredentialSource::AuthProfileApiKey),
+            "credential source should reflect auth profile API key path"
+        );
+        assert_eq!(audit.scope, "global");
+        assert_eq!(audit.key, "openai_auth_key");
+        assert_eq!(audit.action, "model_provider.auth_profile.api_key.resolve");
+    }
+
+    #[test]
+    fn model_provider_secret_resolver_uses_legacy_vault_ref_when_auth_profile_is_unset() {
+        let (_tempdir, auth_registry, vault) = setup_auth_registry_and_vault();
+        let legacy_ref =
+            VaultRef::parse("global/openai_legacy_key").expect("legacy vault ref should parse");
+        vault
+            .put_secret(&legacy_ref.scope, legacy_ref.key.as_str(), b"sk-legacy")
+            .expect("legacy model provider key should be written");
+
+        let mut model_provider = openai_model_provider_config();
+        model_provider.openai_api_key_vault_ref = Some("global/openai_legacy_key".to_owned());
+
+        let audit = resolve_model_provider_secret(&mut model_provider, &auth_registry, &vault)
+            .expect("legacy vault-ref resolution should succeed")
+            .expect("audit record should be emitted for resolved secret");
+        assert_eq!(
+            model_provider.openai_api_key,
+            Some("sk-legacy".to_owned()),
+            "resolver should populate model provider API key from legacy vault ref"
+        );
+        assert_eq!(
+            model_provider.credential_source,
+            Some(ModelProviderCredentialSource::VaultRef),
+            "credential source should reflect legacy vault-ref path"
+        );
+        assert_eq!(audit.action, "model_provider.openai_api_key.resolve");
+    }
+
+    #[test]
+    fn model_provider_secret_resolver_rejects_auth_profile_provider_mismatch() {
+        let (_tempdir, auth_registry, vault) = setup_auth_registry_and_vault();
+        auth_registry
+            .set_profile(AuthProfileSetRequest {
+                profile_id: "anthropic-default".to_owned(),
+                provider: AuthProvider::known(AuthProviderKind::Anthropic),
+                profile_name: "Anthropic Default".to_owned(),
+                scope: AuthProfileScope::Global,
+                credential: AuthCredential::ApiKey {
+                    api_key_vault_ref: "global/anthropic_api_key".to_owned(),
+                },
+            })
+            .expect("anthropic profile should be persisted");
+
+        let mut model_provider = openai_model_provider_config();
+        model_provider.auth_profile_id = Some("anthropic-default".to_owned());
+        model_provider.auth_profile_provider_kind = Some(ModelProviderAuthProviderKind::Openai);
+
+        let error = resolve_model_provider_secret(&mut model_provider, &auth_registry, &vault)
+            .expect_err("provider mismatch should fail closed");
+        assert!(
+            error.to_string().contains("provider mismatch"),
+            "resolver should explain provider mismatch when auth profile kind is incompatible"
+        );
+    }
+
+    #[test]
+    fn model_provider_secret_resolver_loads_oauth_access_token_from_auth_profile() {
+        let (_tempdir, auth_registry, vault) = setup_auth_registry_and_vault();
+        let access_ref = VaultRef::parse("global/openai_access_token")
+            .expect("oauth access-token vault ref should parse");
+        vault
+            .put_secret(&access_ref.scope, access_ref.key.as_str(), b"oauth-access-token")
+            .expect("oauth access token should be written");
+        auth_registry
+            .set_profile(AuthProfileSetRequest {
+                profile_id: "openai-oauth".to_owned(),
+                provider: AuthProvider::known(AuthProviderKind::Openai),
+                profile_name: "OpenAI OAuth".to_owned(),
+                scope: AuthProfileScope::Global,
+                credential: AuthCredential::Oauth {
+                    access_token_vault_ref: "global/openai_access_token".to_owned(),
+                    refresh_token_vault_ref: "global/openai_refresh_token".to_owned(),
+                    token_endpoint: "https://oauth.example.com/token".to_owned(),
+                    client_id: None,
+                    client_secret_vault_ref: None,
+                    scopes: Vec::new(),
+                    expires_at_unix_ms: None,
+                    refresh_state: Default::default(),
+                },
+            })
+            .expect("openai oauth profile should be persisted");
+
+        let mut model_provider = openai_model_provider_config();
+        model_provider.auth_profile_id = Some("openai-oauth".to_owned());
+        model_provider.auth_profile_provider_kind = Some(ModelProviderAuthProviderKind::Openai);
+
+        let audit = resolve_model_provider_secret(&mut model_provider, &auth_registry, &vault)
+            .expect("oauth auth profile resolution should succeed")
+            .expect("audit record should be emitted for resolved oauth token");
+        assert_eq!(
+            model_provider.openai_api_key,
+            Some("oauth-access-token".to_owned()),
+            "resolver should hydrate provider API key from oauth access token vault ref"
+        );
+        assert_eq!(
+            model_provider.credential_source,
+            Some(ModelProviderCredentialSource::AuthProfileOauthAccessToken),
+            "credential source should identify oauth access-token path"
+        );
+        assert_eq!(
+            audit.action, "model_provider.auth_profile.oauth_access_token.resolve",
+            "audit action should capture oauth credential source"
         );
     }
 

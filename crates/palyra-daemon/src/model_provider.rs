@@ -43,6 +43,47 @@ impl ModelProviderKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelProviderAuthProviderKind {
+    Openai,
+}
+
+impl ModelProviderAuthProviderKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Openai => "openai",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "openai" | "openai_compatible" | "openai-compatible" => Ok(Self::Openai),
+            _ => anyhow::bail!("unsupported model provider auth provider kind: {value}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelProviderCredentialSource {
+    InlineConfig,
+    VaultRef,
+    AuthProfileApiKey,
+    AuthProfileOauthAccessToken,
+}
+
+impl ModelProviderCredentialSource {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InlineConfig => "inline_config",
+            Self::VaultRef => "vault_ref",
+            Self::AuthProfileApiKey => "auth_profile_api_key",
+            Self::AuthProfileOauthAccessToken => "auth_profile_oauth_access_token",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelProviderConfig {
     pub kind: ModelProviderKind,
@@ -51,6 +92,9 @@ pub struct ModelProviderConfig {
     pub openai_model: String,
     pub openai_api_key: Option<String>,
     pub openai_api_key_vault_ref: Option<String>,
+    pub auth_profile_id: Option<String>,
+    pub auth_profile_provider_kind: Option<ModelProviderAuthProviderKind>,
+    pub credential_source: Option<ModelProviderCredentialSource>,
     pub request_timeout_ms: u64,
     pub max_retries: u32,
     pub retry_backoff_ms: u64,
@@ -67,6 +111,9 @@ impl Default for ModelProviderConfig {
             openai_model: "gpt-4o-mini".to_owned(),
             openai_api_key: None,
             openai_api_key_vault_ref: None,
+            auth_profile_id: None,
+            auth_profile_provider_kind: None,
+            credential_source: None,
             request_timeout_ms: 15_000,
             max_retries: 2,
             retry_backoff_ms: 150,
@@ -102,7 +149,7 @@ pub enum ProviderError {
     #[error("model provider circuit breaker is open; retry after {retry_after_ms}ms")]
     CircuitOpen { retry_after_ms: u64 },
     #[error(
-        "openai-compatible provider requires PALYRA_MODEL_PROVIDER_OPENAI_API_KEY or model_provider.openai_api_key_vault_ref"
+        "openai-compatible provider requires PALYRA_MODEL_PROVIDER_OPENAI_API_KEY, PALYRA_MODEL_PROVIDER_AUTH_PROFILE_ID, or model_provider.openai_api_key_vault_ref"
     )]
     MissingApiKey,
     #[error("provider '{provider}' does not support vision inputs")]
@@ -178,6 +225,12 @@ pub struct ProviderStatusSnapshot {
     pub openai_base_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub openai_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_profile_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_profile_provider_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_source: Option<String>,
     pub api_key_configured: bool,
     pub retry_policy: ProviderRetryPolicySnapshot,
     pub circuit_breaker: ProviderCircuitBreakerSnapshot,
@@ -416,6 +469,15 @@ impl ModelProvider for DeterministicProvider {
             },
             openai_base_url: None,
             openai_model: None,
+            auth_profile_id: self.config.auth_profile_id.clone(),
+            auth_profile_provider_kind: self
+                .config
+                .auth_profile_provider_kind
+                .map(|kind| kind.as_str().to_owned()),
+            credential_source: self
+                .config
+                .credential_source
+                .map(|source| source.as_str().to_owned()),
             api_key_configured: false,
             retry_policy: ProviderRetryPolicySnapshot {
                 max_retries: self.config.max_retries,
@@ -780,6 +842,15 @@ impl ModelProvider for OpenAiCompatibleProvider {
             },
             openai_base_url: Some(self.config.openai_base_url.clone()),
             openai_model: Some(self.config.openai_model.clone()),
+            auth_profile_id: self.config.auth_profile_id.clone(),
+            auth_profile_provider_kind: self
+                .config
+                .auth_profile_provider_kind
+                .map(|kind| kind.as_str().to_owned()),
+            credential_source: self
+                .config
+                .credential_source
+                .map(|source| source.as_str().to_owned()),
             api_key_configured: self.config.openai_api_key.is_some(),
             retry_policy: ProviderRetryPolicySnapshot {
                 max_retries: self.config.max_retries,
@@ -1042,6 +1113,9 @@ mod tests {
             openai_model: "gpt-4o-mini".to_owned(),
             openai_api_key: Some("sk-test-secret".to_owned()),
             openai_api_key_vault_ref: None,
+            auth_profile_id: None,
+            auth_profile_provider_kind: None,
+            credential_source: None,
             request_timeout_ms: 5_000,
             max_retries: 2,
             retry_backoff_ms: 1,

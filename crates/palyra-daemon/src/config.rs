@@ -16,7 +16,8 @@ use palyra_vault::VaultRef;
 use crate::channel_router::{BroadcastStrategy, ChannelRouterConfig, ChannelRoutingRule};
 use crate::cron::CronTimezoneMode;
 use crate::model_provider::{
-    validate_openai_base_url_network_policy, ModelProviderConfig, ModelProviderKind,
+    validate_openai_base_url_network_policy, ModelProviderAuthProviderKind, ModelProviderConfig,
+    ModelProviderKind,
 };
 use crate::sandbox_runner::{EgressEnforcementMode, SandboxProcessRunnerTier};
 
@@ -609,6 +610,25 @@ pub fn load_config() -> Result<LoadedConfig> {
                     } else {
                         Some(openai_api_key_vault_ref)
                     };
+            }
+            if let Some(auth_profile_ref) = file_model_provider.auth_profile_ref {
+                model_provider.auth_profile_id = parse_optional_auth_profile_id(
+                    auth_profile_ref.as_str(),
+                    "model_provider.auth_profile_ref",
+                )?;
+            }
+            if let Some(auth_profile_id) = file_model_provider.auth_profile_id {
+                model_provider.auth_profile_id = parse_optional_auth_profile_id(
+                    auth_profile_id.as_str(),
+                    "model_provider.auth_profile_id",
+                )?;
+            }
+            if let Some(auth_provider_kind) = file_model_provider.auth_provider_kind {
+                model_provider.auth_profile_provider_kind =
+                    Some(parse_model_provider_auth_provider_kind(
+                        auth_provider_kind.as_str(),
+                        "model_provider.auth_provider_kind",
+                    )?);
             }
             if let Some(request_timeout_ms) = file_model_provider.request_timeout_ms {
                 model_provider.request_timeout_ms =
@@ -1227,6 +1247,27 @@ pub fn load_config() -> Result<LoadedConfig> {
         };
         source.push_str(" +env(PALYRA_MODEL_PROVIDER_OPENAI_API_KEY_VAULT_REF)");
     }
+    if let Ok(auth_profile_ref) = env::var("PALYRA_MODEL_PROVIDER_AUTH_PROFILE_REF") {
+        model_provider.auth_profile_id = parse_optional_auth_profile_id(
+            auth_profile_ref.as_str(),
+            "PALYRA_MODEL_PROVIDER_AUTH_PROFILE_REF",
+        )?;
+        source.push_str(" +env(PALYRA_MODEL_PROVIDER_AUTH_PROFILE_REF)");
+    }
+    if let Ok(auth_profile_id) = env::var("PALYRA_MODEL_PROVIDER_AUTH_PROFILE_ID") {
+        model_provider.auth_profile_id = parse_optional_auth_profile_id(
+            auth_profile_id.as_str(),
+            "PALYRA_MODEL_PROVIDER_AUTH_PROFILE_ID",
+        )?;
+        source.push_str(" +env(PALYRA_MODEL_PROVIDER_AUTH_PROFILE_ID)");
+    }
+    if let Ok(auth_provider_kind) = env::var("PALYRA_MODEL_PROVIDER_AUTH_PROVIDER_KIND") {
+        model_provider.auth_profile_provider_kind = Some(parse_model_provider_auth_provider_kind(
+            auth_provider_kind.as_str(),
+            "PALYRA_MODEL_PROVIDER_AUTH_PROVIDER_KIND",
+        )?);
+        source.push_str(" +env(PALYRA_MODEL_PROVIDER_AUTH_PROVIDER_KIND)");
+    }
 
     if let Ok(request_timeout_ms) = env::var("PALYRA_MODEL_PROVIDER_REQUEST_TIMEOUT_MS") {
         model_provider.request_timeout_ms = parse_positive_u64(
@@ -1634,6 +1675,11 @@ pub fn load_config() -> Result<LoadedConfig> {
             "gateway.tls.enabled=true requires both gateway.tls.cert_path and gateway.tls.key_path"
         );
     }
+    if model_provider.auth_profile_id.is_some()
+        && model_provider.auth_profile_provider_kind.is_none()
+    {
+        model_provider.auth_profile_provider_kind = Some(ModelProviderAuthProviderKind::Openai);
+    }
     if model_provider.kind == ModelProviderKind::OpenAiCompatible {
         validate_openai_base_url_network_policy(
             model_provider.openai_base_url.as_str(),
@@ -1734,6 +1780,32 @@ fn parse_optional_vault_ref_field(raw: &str, source_name: &str) -> Result<Option
         anyhow::bail!("{source_name} must contain exactly one <scope>/<key> entry");
     }
     Ok(refs.into_iter().next())
+}
+
+fn parse_optional_auth_profile_id(raw: &str, source_name: &str) -> Result<Option<String>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.len() > 128 {
+        anyhow::bail!("{source_name} exceeds maximum bytes ({} > 128)", trimmed.len());
+    }
+    let normalized = trimmed.to_ascii_lowercase();
+    if !normalized
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-'))
+    {
+        anyhow::bail!("{source_name} contains unsupported characters");
+    }
+    Ok(Some(normalized))
+}
+
+fn parse_model_provider_auth_provider_kind(
+    raw: &str,
+    source_name: &str,
+) -> Result<ModelProviderAuthProviderKind> {
+    ModelProviderAuthProviderKind::parse(raw)
+        .with_context(|| format!("{source_name} must be one of: openai, openai_compatible"))
 }
 
 fn parse_identity_store_dir(raw: &str) -> Result<PathBuf> {
@@ -2245,17 +2317,19 @@ mod tests {
         parse_broadcast_strategy, parse_browser_service_endpoint,
         parse_canvas_host_public_base_url, parse_content_type_allowlist, parse_cron_timezone_mode,
         parse_default_memory_ttl_ms, parse_dns_suffix_allowlist, parse_host_allowlist,
-        parse_http_header_allowlist, parse_journal_db_path, parse_openai_base_url,
-        parse_optional_browser_state_dir, parse_optional_vault_ref_field, parse_positive_usize,
-        parse_process_executable_allowlist, parse_process_runner_egress_enforcement_mode,
-        parse_process_runner_tier, parse_root_file_config, parse_storage_prefix_allowlist,
-        parse_tool_allowlist, parse_vault_dir, parse_vault_ref_allowlist, AdminConfig,
-        BrowserServiceConfig, CanvasHostConfig, ChannelRouterConfig, CronConfig, GatewayConfig,
-        GatewayTlsConfig, HttpFetchConfig, IdentityConfig, MemoryConfig, ModelProviderConfig,
-        OrchestratorConfig, StorageConfig, ToolCallConfig,
+        parse_http_header_allowlist, parse_journal_db_path,
+        parse_model_provider_auth_provider_kind, parse_openai_base_url,
+        parse_optional_auth_profile_id, parse_optional_browser_state_dir,
+        parse_optional_vault_ref_field, parse_positive_usize, parse_process_executable_allowlist,
+        parse_process_runner_egress_enforcement_mode, parse_process_runner_tier,
+        parse_root_file_config, parse_storage_prefix_allowlist, parse_tool_allowlist,
+        parse_vault_dir, parse_vault_ref_allowlist, AdminConfig, BrowserServiceConfig,
+        CanvasHostConfig, ChannelRouterConfig, CronConfig, GatewayConfig, GatewayTlsConfig,
+        HttpFetchConfig, IdentityConfig, MemoryConfig, ModelProviderConfig, OrchestratorConfig,
+        StorageConfig, ToolCallConfig,
     };
     use crate::channel_router::BroadcastStrategy;
-    use crate::model_provider::ModelProviderKind;
+    use crate::model_provider::{ModelProviderAuthProviderKind, ModelProviderKind};
     use crate::sandbox_runner::{EgressEnforcementMode, SandboxProcessRunnerTier};
     use palyra_common::daemon_config_schema::RootFileConfig;
 
@@ -2661,6 +2735,11 @@ mod tests {
             config.openai_api_key_vault_ref.is_none(),
             "openai API key vault ref should default to unset"
         );
+        assert!(config.auth_profile_id.is_none(), "auth profile id should default to unset");
+        assert!(
+            config.auth_profile_provider_kind.is_none(),
+            "auth provider kind should default to unset"
+        );
         assert_eq!(config.max_retries, 2);
     }
 
@@ -2913,6 +2992,48 @@ mod tests {
         .expect("model provider private-base-url opt-in should parse");
         let model_provider = parsed.model_provider.expect("model_provider section should exist");
         assert_eq!(model_provider.allow_private_base_url, Some(true));
+    }
+
+    #[test]
+    fn parse_optional_auth_profile_id_normalizes_and_validates_values() {
+        let parsed =
+            parse_optional_auth_profile_id(" OpenAI.Default_1 ", "model_provider.auth_profile_id")
+                .expect("auth profile id should parse");
+        assert_eq!(parsed, Some("openai.default_1".to_owned()));
+
+        let cleared = parse_optional_auth_profile_id("   ", "model_provider.auth_profile_id")
+            .expect("empty auth profile id should clear value");
+        assert!(cleared.is_none());
+
+        let invalid =
+            parse_optional_auth_profile_id("bad profile", "model_provider.auth_profile_id");
+        assert!(invalid.is_err(), "invalid auth profile id should fail validation");
+    }
+
+    #[test]
+    fn parse_model_provider_auth_provider_kind_accepts_aliases() {
+        assert_eq!(
+            parse_model_provider_auth_provider_kind("openai", "model_provider.auth_provider_kind",)
+                .expect("openai kind should parse"),
+            ModelProviderAuthProviderKind::Openai
+        );
+        assert_eq!(
+            parse_model_provider_auth_provider_kind(
+                "openai_compatible",
+                "model_provider.auth_provider_kind",
+            )
+            .expect("openai_compatible kind should parse"),
+            ModelProviderAuthProviderKind::Openai
+        );
+    }
+
+    #[test]
+    fn parse_model_provider_auth_provider_kind_rejects_unknown_values() {
+        let result = parse_model_provider_auth_provider_kind(
+            "anthropic",
+            "model_provider.auth_provider_kind",
+        );
+        assert!(result.is_err(), "unsupported auth provider kind should fail validation");
     }
 
     #[test]
