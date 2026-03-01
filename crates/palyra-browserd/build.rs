@@ -11,7 +11,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed={}", browser_proto.display());
     println!("cargo:rerun-if-changed={}", common_proto.display());
 
-    tonic_build::configure()
+    tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
         .compile_protos(&[browser_proto, common_proto], &[proto_root])?;

@@ -77,7 +77,6 @@ use palyra_skills::{
 };
 use palyra_transport_quic::QuicTransportLimits;
 use palyra_vault::{Vault, VaultConfig as VaultConfigOptions, VaultRef};
-use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -4877,8 +4876,7 @@ fn clamp_console_relay_token_ttl_ms(value: Option<u64>) -> u64 {
 }
 
 fn mint_console_secret_token() -> String {
-    let mut token_bytes = [0_u8; 32];
-    OsRng.fill_bytes(&mut token_bytes);
+    let token_bytes: [u8; 32] = rand::random();
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token_bytes)
 }
 

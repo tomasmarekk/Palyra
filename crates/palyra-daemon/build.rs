@@ -21,7 +21,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed={}", node_proto.display());
     println!("cargo:rerun-if-changed={}", browser_proto.display());
 
-    tonic_build::configure().build_server(true).build_client(true).compile_protos(
+    tonic_prost_build::configure().build_server(true).build_client(true).compile_protos(
         &[
             gateway_proto,
             cron_proto,
