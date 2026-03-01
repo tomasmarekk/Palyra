@@ -25,14 +25,14 @@ rust-version = "1.90"
 
 [workspace.dependencies]
 agent-client-protocol = { version = "0.9.4", features = ["unstable_session_list"] }
-anyhow = "1.0.96"
+anyhow = "1.0.102"
 async-trait = "0.1.89"
 axum = "0.8.1"
 base64 = "0.22.1"
-clap = { version = "4.5.31", features = ["derive"] }
+clap = { version = "4.5.60", features = ["derive"] }
 clap_complete = "4.5.31"
-chrono = "0.4.40"
-criterion = "0.5.1"
+chrono = "0.4.44"
+criterion = "0.8.2"
 ed25519-dalek = { version = "2.1.1", features = ["rand_core"] }
 futures = "0.3.31"
 headless_chrome = "1.0.21"
@@ -44,26 +44,26 @@ libc = "0.2.171"
 protoc-bin-vendored = "3.0.0"
 prost = "0.13.5"
 rand = "0.8.5"
-reqwest = { version = "0.12.12", default-features = false, features = ["blocking", "json", "native-tls"] }
+reqwest = { version = "0.13.2", default-features = false, features = ["blocking", "form", "json", "native-tls", "query"] }
 rpassword = "7.3.1"
-rcgen = { version = "0.13.1", features = ["x509-parser"] }
+rcgen = { version = "0.14.7", features = ["x509-parser"] }
 quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
-rusqlite = { version = "0.32.1", features = ["bundled"] }
-rustls = { version = "0.23.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
+rusqlite = { version = "0.38.0", features = ["bundled"] }
+rustls = { version = "0.23.37", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 serde = { version = "1.0.218", features = ["derive"] }
 serde_json = "1.0.140"
 sha2 = "0.10.8"
-tempfile = "3.17.1"
+tempfile = "3.26.0"
 thiserror = "2.0.11"
 tokio = { version = "1.43.0", features = ["macros", "rt-multi-thread", "signal", "time"] }
 tokio-stream = { version = "0.1.17", features = ["net"] }
 tokio-rustls = { version = "0.26.1", default-features = false, features = ["logging", "ring", "tls12"] }
 tonic = { version = "0.12.3", features = ["transport", "tls"] }
 tonic-build = "0.12.3"
-toml = "0.8.20"
+toml = "1.0.3"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }
 ulid = "1.2.0"
 wasmtime = { version = "41.0.4", default-features = false, features = ["cranelift", "runtime", "wat"] }
 x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
-zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
+zip = { version = "8.1.0", default-features = false, features = ["deflate"] }

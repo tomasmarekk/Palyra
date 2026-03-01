@@ -1,6 +1,6 @@
 use anyhow::Context;
 use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
-use rand::{rngs::OsRng, RngCore};
+use rand::random;
 use ring::aead::{Aad, LessSafeKey, Nonce, Tag, UnboundKey, CHACHA20_POLY1305};
 
 use crate::{SensitiveBytes, VaultError};
@@ -28,8 +28,7 @@ pub fn seal(
     kek: &[u8; DEK_BYTES],
     aad: &[u8],
 ) -> Result<EnvelopePayload, VaultError> {
-    let mut dek = [0_u8; DEK_BYTES];
-    OsRng.fill_bytes(&mut dek);
+    let mut dek = random::<[u8; DEK_BYTES]>();
     let (secret_nonce, secret_ciphertext, secret_mac) = seal_with_key(&dek, value, aad)?;
     let (dek_nonce, dek_ciphertext, dek_mac) = seal_with_key(kek, &dek, aad)?;
     dek.fill(0);
@@ -96,8 +95,7 @@ fn seal_with_key(
     let unbound_key = UnboundKey::new(&CHACHA20_POLY1305, key_bytes)
         .map_err(|_| VaultError::Crypto("failed to initialize AEAD key".to_owned()))?;
     let key = LessSafeKey::new(unbound_key);
-    let mut nonce = [0_u8; NONCE_BYTES];
-    OsRng.fill_bytes(&mut nonce);
+    let nonce = random::<[u8; NONCE_BYTES]>();
     let nonce_value = Nonce::assume_unique_for_key(nonce);
     let mut in_out = plaintext.to_vec();
     let tag = key

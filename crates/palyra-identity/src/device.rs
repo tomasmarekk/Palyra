@@ -4,7 +4,7 @@ use anyhow::Context;
 use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use palyra_common::validate_canonical_id;
-use rand::{rngs::OsRng, RngCore};
+use rand::random;
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
@@ -32,9 +32,8 @@ impl DeviceIdentity {
         validate_canonical_id(device_id)
             .map_err(|error| IdentityError::InvalidCanonicalDeviceId(error.to_string()))?;
 
-        let signing_key = SigningKey::generate(&mut OsRng);
-        let mut x25519_bytes = [0_u8; 32];
-        OsRng.fill_bytes(&mut x25519_bytes);
+        let signing_key = SigningKey::from_bytes(&random::<[u8; 32]>());
+        let x25519_bytes = random::<[u8; 32]>();
         let x25519_secret = StaticSecret::from(x25519_bytes);
 
         Ok(Self { device_id: device_id.to_owned(), signing_key, x25519_secret })

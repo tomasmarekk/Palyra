@@ -4,8 +4,8 @@ use std::{
 };
 
 use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType,
-    ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, SanType,
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
+    KeyPair, KeyUsagePurpose, SanType,
 };
 
 use crate::{
@@ -33,7 +33,6 @@ pub struct StoredCertificateAuthority {
 
 pub struct CertificateAuthority {
     pub certificate_pem: String,
-    certificate: Certificate,
     key_pair: KeyPair,
     sequence: u64,
 }
@@ -59,7 +58,7 @@ impl CertificateAuthority {
             .map_err(|error| IdentityError::Cryptographic(error.to_string()))?;
         let certificate_pem = certificate.pem();
 
-        Ok(Self { certificate_pem, certificate, key_pair, sequence: 0 })
+        Ok(Self { certificate_pem, key_pair, sequence: 0 })
     }
 
     pub fn issue_client_certificate(
@@ -122,17 +121,13 @@ impl CertificateAuthority {
     }
 
     pub fn from_stored(state: &StoredCertificateAuthority) -> IdentityResult<Self> {
-        let params = CertificateParams::from_ca_cert_pem(&state.certificate_pem)
-            .map_err(|error| IdentityError::Cryptographic(error.to_string()))?;
         let key_pair = KeyPair::from_pem(&state.private_key_pem)
             .map_err(|error| IdentityError::Cryptographic(error.to_string()))?;
-        let certificate = params
-            .self_signed(&key_pair)
+        rcgen::Issuer::from_ca_cert_pem(&state.certificate_pem, &key_pair)
             .map_err(|error| IdentityError::Cryptographic(error.to_string()))?;
 
         Ok(Self {
             certificate_pem: state.certificate_pem.clone(),
-            certificate,
             key_pair,
             sequence: state.sequence,
         })
@@ -159,8 +154,10 @@ impl CertificateAuthority {
         params.not_after = expires_at_time.into();
         let key_pair =
             KeyPair::generate().map_err(|error| IdentityError::Cryptographic(error.to_string()))?;
+        let issuer = rcgen::Issuer::from_ca_cert_pem(&self.certificate_pem, &self.key_pair)
+            .map_err(|error| IdentityError::Cryptographic(error.to_string()))?;
         let certificate = params
-            .signed_by(&key_pair, &self.certificate, &self.key_pair)
+            .signed_by(&key_pair, &issuer)
             .map_err(|error| IdentityError::Cryptographic(error.to_string()))?;
         let certificate_pem = certificate.pem();
         let private_key_pem = key_pair.serialize_pem();

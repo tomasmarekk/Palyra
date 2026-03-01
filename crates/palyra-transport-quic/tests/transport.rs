@@ -487,11 +487,10 @@ fn build_test_pki() -> TestPki {
 
 fn build_expired_server_cert(ca: &CertificateAuthority) -> (String, String) {
     let stored = ca.to_stored();
-    let ca_params = CertificateParams::from_ca_cert_pem(stored.certificate_pem.as_str())
-        .expect("stored CA params should parse");
     let ca_key =
         KeyPair::from_pem(stored.private_key_pem.as_str()).expect("stored CA key should parse");
-    let ca_certificate = ca_params.self_signed(&ca_key).expect("stored CA should self-sign");
+    let ca_issuer = rcgen::Issuer::from_ca_cert_pem(stored.certificate_pem.as_str(), &ca_key)
+        .expect("stored CA issuer should parse");
 
     let mut params =
         CertificateParams::new(vec!["localhost".to_owned()]).expect("server params should init");
@@ -504,6 +503,6 @@ fn build_expired_server_cert(ca: &CertificateAuthority) -> (String, String) {
 
     let expired_key = KeyPair::generate().expect("expired cert key should generate");
     let expired_cert =
-        params.signed_by(&expired_key, &ca_certificate, &ca_key).expect("expired cert should sign");
+        params.signed_by(&expired_key, &ca_issuer).expect("expired cert should sign");
     (expired_cert.pem(), expired_key.serialize_pem())
 }

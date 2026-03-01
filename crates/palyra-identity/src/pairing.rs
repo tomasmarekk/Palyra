@@ -14,7 +14,7 @@ use std::{
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
 use hkdf::Hkdf;
 use palyra_common::validate_canonical_id;
-use rand::{rngs::OsRng, RngCore};
+use rand::random;
 use rustls::pki_types::{pem::PemObject, CertificateDer};
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
@@ -408,13 +408,11 @@ impl IdentityManager {
         validate_pairing_method(&method)?;
 
         let session_id = ulid::Ulid::new().to_string();
-        let mut gateway_secret_bytes = [0_u8; 32];
-        OsRng.fill_bytes(&mut gateway_secret_bytes);
+        let gateway_secret_bytes = random::<[u8; 32]>();
         let gateway_ephemeral_secret = StaticSecret::from(gateway_secret_bytes);
         let gateway_ephemeral_public = X25519PublicKey::from(&gateway_ephemeral_secret).to_bytes();
 
-        let mut challenge = [0_u8; 32];
-        OsRng.fill_bytes(&mut challenge);
+        let challenge = random::<[u8; 32]>();
 
         let expires_at = now + self.pairing_window;
         let session = PairingSession {
