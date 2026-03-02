@@ -9,6 +9,7 @@ use serde_json::json;
 
 use crate::{
     protocol::{ConnectorKind, DeliveryOutcome, OutboundMessageRequest, RetryClass},
+    storage::ConnectorInstanceRecord,
     supervisor::{ConnectorAdapter, ConnectorAdapterError},
 };
 
@@ -35,6 +36,7 @@ impl ConnectorAdapter for EchoConnectorAdapter {
 
     async fn send_outbound(
         &self,
+        _instance: &ConnectorInstanceRecord,
         request: &OutboundMessageRequest,
     ) -> Result<DeliveryOutcome, ConnectorAdapterError> {
         if request.text.contains(CRASH_ONCE_MARKER) {
@@ -85,9 +87,33 @@ fn deterministic_hash<T: Hash>(value: T) -> u64 {
 mod tests {
     use super::EchoConnectorAdapter;
     use crate::{
-        protocol::{DeliveryOutcome, OutboundMessageRequest, RetryClass},
+        protocol::{
+            ConnectorLiveness, ConnectorReadiness, DeliveryOutcome, OutboundMessageRequest,
+            RetryClass,
+        },
+        storage::ConnectorInstanceRecord,
         supervisor::ConnectorAdapter,
     };
+
+    fn instance() -> ConnectorInstanceRecord {
+        ConnectorInstanceRecord {
+            connector_id: "echo:default".to_owned(),
+            kind: crate::protocol::ConnectorKind::Echo,
+            principal: "channel:echo:default".to_owned(),
+            auth_profile_ref: None,
+            token_vault_ref: None,
+            egress_allowlist: Vec::new(),
+            enabled: true,
+            readiness: ConnectorReadiness::Ready,
+            liveness: ConnectorLiveness::Running,
+            restart_count: 0,
+            last_error: None,
+            last_inbound_unix_ms: None,
+            last_outbound_unix_ms: None,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+        }
+    }
 
     fn request(text: &str) -> OutboundMessageRequest {
         OutboundMessageRequest {
@@ -108,9 +134,14 @@ mod tests {
     #[tokio::test]
     async fn preserves_idempotency_per_outbound_envelope() {
         let adapter = EchoConnectorAdapter::default();
-        let first = adapter.send_outbound(&request("ok")).await.expect("first send should pass");
-        let second =
-            adapter.send_outbound(&request("ok")).await.expect("second send should also pass");
+        let first = adapter
+            .send_outbound(&instance(), &request("ok"))
+            .await
+            .expect("first send should pass");
+        let second = adapter
+            .send_outbound(&instance(), &request("ok"))
+            .await
+            .expect("second send should also pass");
         let DeliveryOutcome::Delivered { native_message_id: first_id } = first else {
             panic!("first result should be delivered");
         };
@@ -125,11 +156,11 @@ mod tests {
     async fn simulates_restart_once_when_marker_present() {
         let adapter = EchoConnectorAdapter::default();
         let first = adapter
-            .send_outbound(&request("hello [connector-crash-once]"))
+            .send_outbound(&instance(), &request("hello [connector-crash-once]"))
             .await
             .expect("first send should return retry");
         let second = adapter
-            .send_outbound(&request("hello [connector-crash-once]"))
+            .send_outbound(&instance(), &request("hello [connector-crash-once]"))
             .await
             .expect("second send should recover");
 

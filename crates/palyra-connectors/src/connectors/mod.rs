@@ -16,7 +16,7 @@ pub use telegram::TelegramConnectorAdapter;
 pub fn default_adapters() -> Vec<Arc<dyn ConnectorAdapter>> {
     vec![
         Arc::new(EchoConnectorAdapter::default()),
-        Arc::new(DiscordConnectorAdapter),
+        Arc::new(DiscordConnectorAdapter::default()),
         Arc::new(SlackConnectorAdapter),
         Arc::new(TelegramConnectorAdapter),
     ]

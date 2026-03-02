@@ -8,9 +8,10 @@ use palyra_common::{validate_canonical_id, CANONICAL_PROTOCOL_MAJOR};
 use palyra_connectors::{
     connectors::default_adapters, ConnectorInstanceSpec, ConnectorKind, ConnectorRouter,
     ConnectorRouterError, ConnectorStatusSnapshot, ConnectorSupervisor, ConnectorSupervisorConfig,
-    ConnectorSupervisorError, InboundIngestOutcome, InboundMessageEvent, RouteInboundResult,
-    RoutedOutboundMessage,
+    ConnectorSupervisorError, InboundIngestOutcome, InboundMessageEvent, OutboundMessageRequest,
+    RouteInboundResult, RoutedOutboundMessage,
 };
+use serde_json::Value;
 use thiserror::Error;
 use tokio::time::{interval, MissedTickBehavior};
 use tonic::metadata::MetadataValue;
@@ -45,6 +46,26 @@ pub struct ChannelTestMessageRequest {
     pub simulate_crash_once: bool,
     pub is_direct_message: bool,
     pub requested_broadcast: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChannelDiscordTestSendRequest {
+    pub target: String,
+    pub text: String,
+    pub confirm: bool,
+    pub auto_reaction: Option<String>,
+    pub thread_id: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ChannelDiscordTestSendOutcome {
+    pub envelope_id: String,
+    pub connector_id: String,
+    pub target: String,
+    pub enqueued: bool,
+    pub delivered: usize,
+    pub retried: usize,
+    pub dead_lettered: usize,
 }
 
 pub struct ChannelPlatform {
@@ -83,6 +104,13 @@ impl ChannelPlatform {
         connector_id: &str,
     ) -> Result<ConnectorStatusSnapshot, ChannelPlatformError> {
         self.supervisor.status(connector_id).map_err(ChannelPlatformError::from)
+    }
+
+    pub fn runtime_snapshot(
+        &self,
+        connector_id: &str,
+    ) -> Result<Option<Value>, ChannelPlatformError> {
+        self.supervisor.runtime_snapshot(connector_id).map_err(ChannelPlatformError::from)
     }
 
     pub fn set_enabled(
@@ -151,6 +179,82 @@ impl ChannelPlatform {
         self.supervisor.ingest_inbound(event).await.map_err(ChannelPlatformError::from)
     }
 
+    pub async fn submit_discord_test_send(
+        &self,
+        connector_id: &str,
+        request: ChannelDiscordTestSendRequest,
+    ) -> Result<ChannelDiscordTestSendOutcome, ChannelPlatformError> {
+        let connector_id = connector_id.trim();
+        if connector_id.is_empty() {
+            return Err(ChannelPlatformError::InvalidInput(
+                "connector_id cannot be empty".to_owned(),
+            ));
+        }
+        if !request.confirm {
+            return Err(ChannelPlatformError::InvalidInput(
+                "discord test send requires explicit confirmation".to_owned(),
+            ));
+        }
+        let status = self.status(connector_id)?;
+        if status.kind != ConnectorKind::Discord {
+            return Err(ChannelPlatformError::InvalidInput(format!(
+                "discord test send is only supported for discord connectors (received kind={})",
+                status.kind.as_str()
+            )));
+        }
+
+        let text = request.text.trim();
+        if text.is_empty() {
+            return Err(ChannelPlatformError::InvalidInput(
+                "test-send text cannot be empty".to_owned(),
+            ));
+        }
+        let target = normalize_discord_target(request.target.as_str())?;
+        let thread_id = request
+            .thread_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let auto_reaction = request
+            .auto_reaction
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+
+        let outbound = OutboundMessageRequest {
+            envelope_id: Ulid::new().to_string(),
+            connector_id: connector_id.to_owned(),
+            conversation_id: target.clone(),
+            reply_thread_id: thread_id,
+            in_reply_to_message_id: None,
+            text: text.to_owned(),
+            broadcast: false,
+            auto_ack_text: None,
+            auto_reaction,
+            timeout_ms: 30_000,
+            max_payload_bytes: self.supervisor_config().max_outbound_body_bytes,
+        };
+        let enqueue = self.supervisor.enqueue_outbound(&outbound)?;
+        let drain = self
+            .supervisor
+            .drain_due_outbox_for_connector(
+                connector_id,
+                self.supervisor_config().immediate_drain_batch_size,
+            )
+            .await?;
+        Ok(ChannelDiscordTestSendOutcome {
+            envelope_id: outbound.envelope_id,
+            connector_id: connector_id.to_owned(),
+            target,
+            enqueued: enqueue.created,
+            delivered: drain.delivered,
+            retried: drain.retried,
+            dead_lettered: drain.dead_lettered,
+        })
+    }
+
     pub async fn drain_due(&self) -> Result<palyra_connectors::DrainOutcome, ChannelPlatformError> {
         self.supervisor
             .drain_due_outbox(self.supervisor_config().background_drain_batch_size)
@@ -208,7 +312,7 @@ fn default_connector_specs() -> Vec<ConnectorInstanceSpec> {
             kind: ConnectorKind::Discord,
             principal: "channel:discord:default".to_owned(),
             auth_profile_ref: Some("discord.default".to_owned()),
-            token_vault_ref: None,
+            token_vault_ref: Some("global/discord_bot_token".to_owned()),
             egress_allowlist: vec!["discord.com".to_owned(), "*.discord.com".to_owned()],
             enabled: false,
         },
@@ -352,6 +456,30 @@ fn non_empty(raw: String) -> Option<String> {
     } else {
         Some(trimmed.to_owned())
     }
+}
+
+#[allow(clippy::result_large_err)]
+fn normalize_discord_target(raw: &str) -> Result<String, ChannelPlatformError> {
+    let trimmed = raw.trim();
+    let normalized = trimmed
+        .strip_prefix("channel:")
+        .or_else(|| trimmed.strip_prefix("thread:"))
+        .map(str::trim)
+        .unwrap_or(trimmed);
+    if normalized.is_empty() {
+        return Err(ChannelPlatformError::InvalidInput(
+            "discord test target cannot be empty".to_owned(),
+        ));
+    }
+    if !normalized
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ':' | '.'))
+    {
+        return Err(ChannelPlatformError::InvalidInput(
+            "discord test target contains unsupported characters".to_owned(),
+        ));
+    }
+    Ok(normalized.to_owned())
 }
 
 fn unix_ms_now() -> i64 {

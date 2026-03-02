@@ -54,11 +54,11 @@ use clap::{CommandFactory, Parser};
 use cli::{
     AgentCommand, AgentsCommand, ApprovalDecisionArg, ApprovalExportFormatArg, ApprovalsCommand,
     AuthCommand, AuthCredentialArg, AuthProfilesCommand, AuthProviderArg, AuthScopeArg,
-    BrowserCommand, ChannelsCommand, Cli, Command as CliCommand, CompletionShell, ConfigCommand,
-    CronCommand, CronConcurrencyPolicyArg, CronMisfirePolicyArg, CronScheduleTypeArg,
-    DaemonCommand, JournalCheckpointModeArg, MemoryCommand, MemoryScopeArg, MemorySourceArg,
-    OnboardingCommand, PatchCommand, PolicyCommand, ProtocolCommand, SecretsCommand, SkillsCommand,
-    SkillsPackageCommand, SupportBundleCommand,
+    BrowserCommand, ChannelsCommand, ChannelsDiscordCommand, Cli, Command as CliCommand,
+    CompletionShell, ConfigCommand, CronCommand, CronConcurrencyPolicyArg, CronMisfirePolicyArg,
+    CronScheduleTypeArg, DaemonCommand, JournalCheckpointModeArg, MemoryCommand, MemoryScopeArg,
+    MemorySourceArg, OnboardingCommand, PatchCommand, PolicyCommand, ProtocolCommand,
+    SecretsCommand, SkillsCommand, SkillsPackageCommand, SupportBundleCommand,
 };
 #[cfg(not(windows))]
 use cli::{PairingClientKindArg, PairingCommand, PairingMethodArg};
@@ -3081,6 +3081,109 @@ fn agent_to_json(agent: &gateway_v1::Agent) -> serde_json::Value {
 
 fn run_channels(command: ChannelsCommand) -> Result<()> {
     match command {
+        ChannelsCommand::Discord { command } => match command {
+            ChannelsDiscordCommand::Status {
+                account_id,
+                url,
+                token,
+                principal,
+                device_id,
+                channel,
+                json,
+            } => {
+                let connector_id = discord_connector_id(account_id.as_str())?;
+                let base_url = resolve_channels_base_url(url);
+                let token = resolve_channels_token(token);
+                let endpoint = format!(
+                    "{}/admin/v1/channels/{}",
+                    base_url.trim_end_matches('/'),
+                    connector_id
+                );
+                let client = build_channels_client()?;
+                let response = send_channels_request(
+                    client.get(endpoint),
+                    token,
+                    principal,
+                    device_id,
+                    channel,
+                    "failed to call discord channels status endpoint",
+                )?;
+                emit_channels_status(response, json)?;
+            }
+            ChannelsDiscordCommand::TestSend {
+                account_id,
+                to,
+                text,
+                confirm,
+                auto_reaction,
+                thread_id,
+                url,
+                token,
+                principal,
+                device_id,
+                channel,
+                json,
+            } => {
+                if !confirm {
+                    anyhow::bail!("discord test-send requires explicit confirmation (--confirm)");
+                }
+                let connector_id = discord_connector_id(account_id.as_str())?;
+                let base_url = resolve_channels_base_url(url);
+                let token = resolve_channels_token(token);
+                let endpoint = format!(
+                    "{}/admin/v1/channels/{}/test-send",
+                    base_url.trim_end_matches('/'),
+                    connector_id
+                );
+                let client = build_channels_client()?;
+                let payload = json!({
+                    "target": to,
+                    "text": text,
+                    "confirm": true,
+                    "auto_reaction": auto_reaction,
+                    "thread_id": thread_id,
+                });
+                let response = send_channels_request(
+                    client.post(endpoint).json(&payload),
+                    token,
+                    principal,
+                    device_id,
+                    channel,
+                    "failed to call discord channels test-send endpoint",
+                )?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&response).context(
+                            "failed to encode discord channels test-send payload as JSON"
+                        )?
+                    );
+                } else {
+                    let delivered = response
+                        .get("dispatch")
+                        .and_then(Value::as_object)
+                        .and_then(|dispatch| dispatch.get("delivered"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    let retried = response
+                        .get("dispatch")
+                        .and_then(Value::as_object)
+                        .and_then(|dispatch| dispatch.get("retried"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    let dead_lettered = response
+                        .get("dispatch")
+                        .and_then(Value::as_object)
+                        .and_then(|dispatch| dispatch.get("dead_lettered"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    println!(
+                        "channels.discord.test_send connector_id={} delivered={} retried={} dead_lettered={}",
+                        connector_id, delivered, retried, dead_lettered
+                    );
+                }
+            }
+        },
         ChannelsCommand::List { url, token, principal, device_id, channel, json } => {
             let base_url = resolve_channels_base_url(url);
             let token = resolve_channels_token(token);
@@ -3295,6 +3398,17 @@ fn run_channels(command: ChannelsCommand) -> Result<()> {
         }
     }
     std::io::stdout().flush().context("stdout flush failed")
+}
+
+fn discord_connector_id(account_id: &str) -> Result<String> {
+    let normalized = account_id.trim();
+    if normalized.is_empty() {
+        anyhow::bail!("account_id cannot be empty");
+    }
+    if !normalized.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')) {
+        anyhow::bail!("account_id contains unsupported characters");
+    }
+    Ok(format!("discord:{normalized}"))
 }
 
 fn resolve_channels_base_url(url: Option<String>) -> String {

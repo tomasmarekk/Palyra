@@ -573,7 +573,57 @@ pub enum AuthCredentialArg {
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum ChannelsDiscordCommand {
+    Status {
+        #[arg(long, default_value = "default")]
+        account_id: String,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long, default_value = "user:local")]
+        principal: String,
+        #[arg(long, default_value = "01ARZ3NDEKTSV4RRFFQ69G5FAV")]
+        device_id: String,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    TestSend {
+        #[arg(long, default_value = "default")]
+        account_id: String,
+        #[arg(long)]
+        to: String,
+        #[arg(long, default_value = "palyra discord test message")]
+        text: String,
+        #[arg(long, default_value_t = false)]
+        confirm: bool,
+        #[arg(long)]
+        auto_reaction: Option<String>,
+        #[arg(long)]
+        thread_id: Option<String>,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long, default_value = "user:local")]
+        principal: String,
+        #[arg(long, default_value = "01ARZ3NDEKTSV4RRFFQ69G5FAV")]
+        device_id: String,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum ChannelsCommand {
+    Discord {
+        #[command(subcommand)]
+        command: ChannelsDiscordCommand,
+    },
     List {
         #[arg(long)]
         url: Option<String>,
@@ -1240,11 +1290,12 @@ mod tests {
     use super::{
         AgentCommand, AgentsCommand, ApprovalDecisionArg, ApprovalExportFormatArg,
         ApprovalsCommand, AuthCommand, AuthCredentialArg, AuthProfilesCommand, AuthProviderArg,
-        AuthScopeArg, BrowserCommand, ChannelsCommand, Cli, Command, CompletionShell,
-        ConfigCommand, CronCommand, CronConcurrencyPolicyArg, CronMisfirePolicyArg,
-        CronScheduleTypeArg, DaemonCommand, JournalCheckpointModeArg, MemoryCommand,
-        MemoryScopeArg, MemorySourceArg, OnboardingCommand, PatchCommand, PolicyCommand,
-        ProtocolCommand, SecretsCommand, SkillsCommand, SkillsPackageCommand, SupportBundleCommand,
+        AuthScopeArg, BrowserCommand, ChannelsCommand, ChannelsDiscordCommand, Cli, Command,
+        CompletionShell, ConfigCommand, CronCommand, CronConcurrencyPolicyArg,
+        CronMisfirePolicyArg, CronScheduleTypeArg, DaemonCommand, JournalCheckpointModeArg,
+        MemoryCommand, MemoryScopeArg, MemorySourceArg, OnboardingCommand, PatchCommand,
+        PolicyCommand, ProtocolCommand, SecretsCommand, SkillsCommand, SkillsPackageCommand,
+        SupportBundleCommand,
     };
     #[cfg(not(windows))]
     use super::{PairingClientKindArg, PairingCommand, PairingMethodArg};
@@ -2024,6 +2075,91 @@ mod tests {
                     device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
                     channel: Some("cli".to_owned()),
                     json: true,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn parse_channels_discord_status() {
+        let parsed = Cli::parse_from([
+            "palyra",
+            "channels",
+            "discord",
+            "status",
+            "--account-id",
+            "ops",
+            "--url",
+            "http://127.0.0.1:7142",
+            "--token",
+            "admin-token",
+            "--principal",
+            "admin:ops",
+            "--device-id",
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "--channel",
+            "cli",
+            "--json",
+        ]);
+        assert_eq!(
+            parsed.command,
+            Command::Channels {
+                command: ChannelsCommand::Discord {
+                    command: ChannelsDiscordCommand::Status {
+                        account_id: "ops".to_owned(),
+                        url: Some("http://127.0.0.1:7142".to_owned()),
+                        token: Some("admin-token".to_owned()),
+                        principal: "admin:ops".to_owned(),
+                        device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                        channel: Some("cli".to_owned()),
+                        json: true,
+                    },
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn parse_channels_discord_test_send() {
+        let parsed = Cli::parse_from([
+            "palyra",
+            "channels",
+            "discord",
+            "test-send",
+            "--account-id",
+            "default",
+            "--to",
+            "channel:123456",
+            "--text",
+            "hello",
+            "--confirm",
+            "--auto-reaction",
+            ":white_check_mark:",
+            "--thread-id",
+            "thread-1",
+            "--url",
+            "http://127.0.0.1:7142",
+            "--token",
+            "admin-token",
+        ]);
+        assert_eq!(
+            parsed.command,
+            Command::Channels {
+                command: ChannelsCommand::Discord {
+                    command: ChannelsDiscordCommand::TestSend {
+                        account_id: "default".to_owned(),
+                        to: "channel:123456".to_owned(),
+                        text: "hello".to_owned(),
+                        confirm: true,
+                        auto_reaction: Some(":white_check_mark:".to_owned()),
+                        thread_id: Some("thread-1".to_owned()),
+                        url: Some("http://127.0.0.1:7142".to_owned()),
+                        token: Some("admin-token".to_owned()),
+                        principal: "user:local".to_owned(),
+                        device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                        channel: None,
+                        json: false,
+                    },
                 }
             }
         );

@@ -364,6 +364,19 @@ struct ChannelTestRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct ChannelTestSendRequest {
+    target: String,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    confirm: Option<bool>,
+    #[serde(default)]
+    auto_reaction: Option<String>,
+    #[serde(default)]
+    thread_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ConsoleSkillsListQuery {
     skill_id: Option<String>,
 }
@@ -1236,6 +1249,7 @@ async fn main() -> Result<()> {
         .route("/admin/v1/channels/{connector_id}/enabled", post(admin_channel_set_enabled_handler))
         .route("/admin/v1/channels/{connector_id}/logs", get(admin_channel_logs_handler))
         .route("/admin/v1/channels/{connector_id}/test", post(admin_channel_test_handler))
+        .route("/admin/v1/channels/{connector_id}/test-send", post(admin_channel_test_send_handler))
         .route("/admin/v1/skills/{skill_id}/quarantine", post(admin_skill_quarantine_handler))
         .route("/admin/v1/skills/{skill_id}/enable", post(admin_skill_enable_handler))
         .layer(DefaultBodyLimit::max(HTTP_MAX_REQUEST_BODY_BYTES))
@@ -1284,6 +1298,10 @@ async fn main() -> Result<()> {
         )
         .route("/console/v1/channels/{connector_id}/logs", get(console_channel_logs_handler))
         .route("/console/v1/channels/{connector_id}/test", post(console_channel_test_handler))
+        .route(
+            "/console/v1/channels/{connector_id}/test-send",
+            post(console_channel_test_send_handler),
+        )
         .route("/console/v1/skills", get(console_skills_list_handler))
         .route("/console/v1/skills/install", post(console_skills_install_handler))
         .route("/console/v1/skills/{skill_id}/verify", post(console_skills_verify_handler))
@@ -2011,7 +2029,14 @@ async fn admin_channel_status_handler(
     let connector_id = normalize_non_empty_field(connector_id, "connector_id")?;
     let connector =
         state.channels.status(connector_id.as_str()).map_err(channel_platform_error_response)?;
-    Ok(Json(json!({ "connector": connector })))
+    let runtime = state
+        .channels
+        .runtime_snapshot(connector_id.as_str())
+        .map_err(channel_platform_error_response)?;
+    Ok(Json(json!({
+        "connector": connector,
+        "runtime": runtime,
+    })))
 }
 
 async fn admin_channel_set_enabled_handler(
@@ -2103,9 +2128,57 @@ async fn admin_channel_test_handler(
         .map_err(channel_platform_error_response)?;
     let status =
         state.channels.status(connector_id.as_str()).map_err(channel_platform_error_response)?;
+    let runtime = state
+        .channels
+        .runtime_snapshot(connector_id.as_str())
+        .map_err(channel_platform_error_response)?;
     Ok(Json(json!({
         "ingest": ingest,
         "status": status,
+        "runtime": runtime,
+    })))
+}
+
+async fn admin_channel_test_send_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(connector_id): Path<String>,
+    Json(payload): Json<ChannelTestSendRequest>,
+) -> Result<Json<Value>, Response> {
+    authorize_headers(&headers, &state.auth).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    let _context = request_context_from_headers(&headers).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    state.runtime.record_admin_status_request();
+    let connector_id = normalize_non_empty_field(connector_id, "connector_id")?;
+    let dispatch = state
+        .channels
+        .submit_discord_test_send(
+            connector_id.as_str(),
+            channels::ChannelDiscordTestSendRequest {
+                target: payload.target,
+                text: payload.text.unwrap_or_else(|| "palyra discord test message".to_owned()),
+                confirm: payload.confirm.unwrap_or(false),
+                auto_reaction: payload.auto_reaction,
+                thread_id: payload.thread_id,
+            },
+        )
+        .await
+        .map_err(channel_platform_error_response)?;
+    let status =
+        state.channels.status(connector_id.as_str()).map_err(channel_platform_error_response)?;
+    let runtime = state
+        .channels
+        .runtime_snapshot(connector_id.as_str())
+        .map_err(channel_platform_error_response)?;
+    Ok(Json(json!({
+        "dispatch": dispatch,
+        "status": status,
+        "runtime": runtime,
     })))
 }
 
@@ -4130,7 +4203,14 @@ async fn console_channel_status_handler(
     let connector_id = normalize_non_empty_field(connector_id, "connector_id")?;
     let connector =
         state.channels.status(connector_id.as_str()).map_err(channel_platform_error_response)?;
-    Ok(Json(json!({ "connector": connector })))
+    let runtime = state
+        .channels
+        .runtime_snapshot(connector_id.as_str())
+        .map_err(channel_platform_error_response)?;
+    Ok(Json(json!({
+        "connector": connector,
+        "runtime": runtime,
+    })))
 }
 
 async fn console_channel_set_enabled_handler(
@@ -4198,9 +4278,49 @@ async fn console_channel_test_handler(
         .map_err(channel_platform_error_response)?;
     let status =
         state.channels.status(connector_id.as_str()).map_err(channel_platform_error_response)?;
+    let runtime = state
+        .channels
+        .runtime_snapshot(connector_id.as_str())
+        .map_err(channel_platform_error_response)?;
     Ok(Json(json!({
         "ingest": ingest,
         "status": status,
+        "runtime": runtime,
+    })))
+}
+
+async fn console_channel_test_send_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(connector_id): Path<String>,
+    Json(payload): Json<ChannelTestSendRequest>,
+) -> Result<Json<Value>, Response> {
+    let _session = authorize_console_session(&state, &headers, true)?;
+    let connector_id = normalize_non_empty_field(connector_id, "connector_id")?;
+    let dispatch = state
+        .channels
+        .submit_discord_test_send(
+            connector_id.as_str(),
+            channels::ChannelDiscordTestSendRequest {
+                target: payload.target,
+                text: payload.text.unwrap_or_else(|| "palyra discord test message".to_owned()),
+                confirm: payload.confirm.unwrap_or(false),
+                auto_reaction: payload.auto_reaction,
+                thread_id: payload.thread_id,
+            },
+        )
+        .await
+        .map_err(channel_platform_error_response)?;
+    let status =
+        state.channels.status(connector_id.as_str()).map_err(channel_platform_error_response)?;
+    let runtime = state
+        .channels
+        .runtime_snapshot(connector_id.as_str())
+        .map_err(channel_platform_error_response)?;
+    Ok(Json(json!({
+        "dispatch": dispatch,
+        "status": status,
+        "runtime": runtime,
     })))
 }
 

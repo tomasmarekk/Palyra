@@ -6,7 +6,7 @@ use std::{
 
 use async_trait::async_trait;
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use thiserror::Error;
 
 use crate::{
@@ -15,7 +15,7 @@ use crate::{
         ConnectorStatusSnapshot, DeliveryOutcome, InboundMessageEvent, OutboundMessageRequest,
         RetryClass, RouteInboundResult,
     },
-    storage::{ConnectorStore, ConnectorStoreError, OutboxEntryRecord},
+    storage::{ConnectorStore, ConnectorStoreError, OutboxEnqueueOutcome, OutboxEntryRecord},
 };
 
 #[derive(Debug, Clone)]
@@ -100,8 +100,24 @@ pub trait ConnectorRouter: Send + Sync {
 pub trait ConnectorAdapter: Send + Sync {
     fn kind(&self) -> ConnectorKind;
 
+    fn split_outbound(
+        &self,
+        _instance: &crate::storage::ConnectorInstanceRecord,
+        request: &OutboundMessageRequest,
+    ) -> Result<Vec<OutboundMessageRequest>, ConnectorAdapterError> {
+        Ok(vec![request.clone()])
+    }
+
+    fn runtime_snapshot(
+        &self,
+        _instance: &crate::storage::ConnectorInstanceRecord,
+    ) -> Option<Value> {
+        None
+    }
+
     async fn send_outbound(
         &self,
+        instance: &crate::storage::ConnectorInstanceRecord,
         request: &OutboundMessageRequest,
     ) -> Result<DeliveryOutcome, ConnectorAdapterError>;
 }
@@ -237,6 +253,19 @@ impl ConnectorSupervisor {
         Ok(snapshots)
     }
 
+    pub fn runtime_snapshot(
+        &self,
+        connector_id: &str,
+    ) -> Result<Option<Value>, ConnectorSupervisorError> {
+        let Some(instance) = self.store.get_instance(connector_id)? else {
+            return Err(ConnectorSupervisorError::NotFound(connector_id.to_owned()));
+        };
+        let Some(adapter) = self.adapters.get(&instance.kind) else {
+            return Ok(None);
+        };
+        Ok(adapter.runtime_snapshot(&instance))
+    }
+
     pub fn list_logs(
         &self,
         connector_id: &str,
@@ -251,6 +280,36 @@ impl ConnectorSupervisor {
         limit: usize,
     ) -> Result<Vec<crate::storage::DeadLetterRecord>, ConnectorSupervisorError> {
         self.store.list_dead_letters(connector_id, limit).map_err(ConnectorSupervisorError::from)
+    }
+
+    pub fn enqueue_outbound(
+        &self,
+        request: &OutboundMessageRequest,
+    ) -> Result<OutboxEnqueueOutcome, ConnectorSupervisorError> {
+        request
+            .validate(self.config.max_outbound_body_bytes)
+            .map_err(|error| ConnectorSupervisorError::Validation(error.to_string()))?;
+        let now = unix_ms_now()?;
+        let Some(instance) = self.store.get_instance(request.connector_id.as_str())? else {
+            return Err(ConnectorSupervisorError::NotFound(request.connector_id.clone()));
+        };
+        let outcome =
+            self.store.enqueue_outbox_if_absent(request, self.config.max_retry_attempts, now)?;
+        if outcome.created {
+            self.store.record_event(
+                instance.connector_id.as_str(),
+                "outbox.enqueued",
+                "info",
+                "outbound message queued by direct enqueue operation",
+                Some(&json!({
+                    "envelope_id": request.envelope_id,
+                    "conversation_id": request.conversation_id,
+                    "text_bytes": request.text.len(),
+                })),
+                now,
+            )?;
+        }
+        Ok(outcome)
     }
 
     pub async fn ingest_inbound(
@@ -359,9 +418,8 @@ impl ConnectorSupervisor {
 
         let mut enqueued_outbound = 0usize;
         for (index, output) in routed.outputs.iter().enumerate() {
-            let outbound_envelope_id = format!("{}:{index}", event.envelope_id);
-            let request = OutboundMessageRequest {
-                envelope_id: outbound_envelope_id,
+            let base_request = OutboundMessageRequest {
+                envelope_id: format!("{}:{index}", event.envelope_id),
                 connector_id: instance.connector_id.clone(),
                 conversation_id: event.conversation_id.clone(),
                 reply_thread_id: output.thread_id.clone(),
@@ -373,27 +431,43 @@ impl ConnectorSupervisor {
                 timeout_ms: 30_000,
                 max_payload_bytes: self.config.max_outbound_body_bytes,
             };
-            request
+            base_request
                 .validate(self.config.max_outbound_body_bytes)
                 .map_err(|error| ConnectorSupervisorError::Validation(error.to_string()))?;
-            let enqueue = self.store.enqueue_outbox_if_absent(
-                &request,
-                self.config.max_retry_attempts,
-                now,
-            )?;
-            if enqueue.created {
-                enqueued_outbound = enqueued_outbound.saturating_add(1);
-                self.store.record_event(
-                    instance.connector_id.as_str(),
-                    "outbox.enqueued",
-                    "info",
-                    "outbound response queued for connector delivery",
-                    Some(&json!({
-                        "envelope_id": request.envelope_id,
-                        "text_bytes": request.text.len(),
-                    })),
+
+            let split_requests = if let Some(adapter) = self.adapters.get(&instance.kind) {
+                adapter
+                    .split_outbound(&instance, &base_request)
+                    .map_err(|error| ConnectorSupervisorError::Adapter(error.to_string()))?
+            } else {
+                vec![base_request]
+            };
+            if split_requests.is_empty() {
+                continue;
+            }
+            for request in split_requests {
+                request
+                    .validate(self.config.max_outbound_body_bytes)
+                    .map_err(|error| ConnectorSupervisorError::Validation(error.to_string()))?;
+                let enqueue = self.store.enqueue_outbox_if_absent(
+                    &request,
+                    self.config.max_retry_attempts,
                     now,
                 )?;
+                if enqueue.created {
+                    enqueued_outbound = enqueued_outbound.saturating_add(1);
+                    self.store.record_event(
+                        instance.connector_id.as_str(),
+                        "outbox.enqueued",
+                        "info",
+                        "outbound response queued for connector delivery",
+                        Some(&json!({
+                            "envelope_id": request.envelope_id,
+                            "text_bytes": request.text.len(),
+                        })),
+                        now,
+                    )?;
+                }
             }
         }
 
@@ -501,7 +575,7 @@ impl ConnectorSupervisor {
             return Ok(DispatchResult::DeadLettered);
         };
 
-        let delivery = match adapter.send_outbound(&entry.payload).await {
+        let delivery = match adapter.send_outbound(&instance, &entry.payload).await {
             Ok(outcome) => outcome,
             Err(error) => {
                 self.store.record_event(
@@ -728,6 +802,7 @@ mod tests {
 
         async fn send_outbound(
             &self,
+            _instance: &crate::storage::ConnectorInstanceRecord,
             request: &crate::protocol::OutboundMessageRequest,
         ) -> Result<DeliveryOutcome, ConnectorAdapterError> {
             let mut attempts = self.attempts.lock().map_err(|_| {

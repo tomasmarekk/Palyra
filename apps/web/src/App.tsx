@@ -112,6 +112,11 @@ export function App() {
   const [channelsTestCrashOnce, setChannelsTestCrashOnce] = useState(false);
   const [channelsTestDirectMessage, setChannelsTestDirectMessage] = useState(true);
   const [channelsTestBroadcast, setChannelsTestBroadcast] = useState(false);
+  const [channelsDiscordTarget, setChannelsDiscordTarget] = useState("channel:");
+  const [channelsDiscordText, setChannelsDiscordText] = useState("palyra discord test message");
+  const [channelsDiscordAutoReaction, setChannelsDiscordAutoReaction] = useState("");
+  const [channelsDiscordThreadId, setChannelsDiscordThreadId] = useState("");
+  const [channelsDiscordConfirm, setChannelsDiscordConfirm] = useState(false);
 
   const [memoryBusy, setMemoryBusy] = useState(false);
   const [memoryQuery, setMemoryQuery] = useState("");
@@ -520,6 +525,51 @@ export function App() {
         setNotice("Channel test dispatched.");
       }
       setChannelsTestCrashOnce(false);
+      await refreshChannelLogs(channelsSelectedConnectorId.trim());
+      await refreshChannels(channelsSelectedConnectorId.trim());
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setChannelsBusy(false);
+    }
+  }
+
+  async function submitChannelDiscordTestSend(
+    event: React.FormEvent<HTMLFormElement>
+  ): Promise<void> {
+    event.preventDefault();
+    if (channelsSelectedConnectorId.trim().length === 0) {
+      setError("Select a connector before dispatching Discord test send.");
+      return;
+    }
+    if (!channelsSelectedConnectorId.trim().startsWith("discord:")) {
+      setError("Discord test send is available only for Discord connectors.");
+      return;
+    }
+    if (channelsDiscordTarget.trim().length === 0) {
+      setError("Discord test target cannot be empty.");
+      return;
+    }
+    if (!channelsDiscordConfirm) {
+      setError("Discord test send requires explicit confirmation.");
+      return;
+    }
+
+    setChannelsBusy(true);
+    setError(null);
+    try {
+      const response = await api.sendChannelDiscordTestSend(channelsSelectedConnectorId.trim(), {
+        target: channelsDiscordTarget.trim(),
+        text: emptyToUndefined(channelsDiscordText),
+        confirm: true,
+        auto_reaction: emptyToUndefined(channelsDiscordAutoReaction),
+        thread_id: emptyToUndefined(channelsDiscordThreadId)
+      });
+      if (isJsonObject(response.status)) {
+        setChannelsSelectedStatus(response.status);
+      }
+      setNotice("Discord test send dispatched.");
+      setChannelsDiscordConfirm(false);
       await refreshChannelLogs(channelsSelectedConnectorId.trim());
       await refreshChannels(channelsSelectedConnectorId.trim());
     } catch (failure) {
@@ -1421,6 +1471,64 @@ export function App() {
               </button>
             </form>
           </section>
+
+          {channelsSelectedConnectorId.startsWith("discord:") && (
+            <section className="console-subpanel">
+              <h3>Discord test send</h3>
+              <form
+                className="console-form"
+                onSubmit={(event) => {
+                  void submitChannelDiscordTestSend(event);
+                }}
+              >
+                <div className="console-grid-3">
+                  <label>
+                    Target
+                    <input
+                      value={channelsDiscordTarget}
+                      onChange={(event) => setChannelsDiscordTarget(event.target.value)}
+                      placeholder="channel:1234567890"
+                      required
+                    />
+                  </label>
+                  <label>
+                    Thread ID (optional)
+                    <input
+                      value={channelsDiscordThreadId}
+                      onChange={(event) => setChannelsDiscordThreadId(event.target.value)}
+                    />
+                  </label>
+                  <label>
+                    Auto reaction (optional)
+                    <input
+                      value={channelsDiscordAutoReaction}
+                      onChange={(event) => setChannelsDiscordAutoReaction(event.target.value)}
+                      placeholder=":white_check_mark:"
+                    />
+                  </label>
+                </div>
+                <label>
+                  Message text
+                  <textarea
+                    rows={2}
+                    value={channelsDiscordText}
+                    onChange={(event) => setChannelsDiscordText(event.target.value)}
+                  />
+                </label>
+                <label className="console-checkbox-inline">
+                  <input
+                    type="checkbox"
+                    checked={channelsDiscordConfirm}
+                    onChange={(event) => setChannelsDiscordConfirm(event.target.checked)}
+                  />
+                  Confirm Discord outbound test send
+                </label>
+                <button type="submit" disabled={channelsBusy}>
+                  {channelsBusy ? "Sending..." : "Send Discord test"}
+                </button>
+              </form>
+            </section>
+          )}
 
           <section className="console-subpanel">
             <h3>Connector events</h3>

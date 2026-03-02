@@ -91,6 +91,7 @@ impl ConnectorAdapter for MockConnectorServer {
 
     async fn send_outbound(
         &self,
+        _instance: &palyra_connectors::ConnectorInstanceRecord,
         request: &palyra_connectors::OutboundMessageRequest,
     ) -> Result<DeliveryOutcome, ConnectorAdapterError> {
         let mut state = self.state.lock().map_err(|_| {

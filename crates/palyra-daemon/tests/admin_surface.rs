@@ -788,8 +788,8 @@ fn console_channels_endpoints_require_session_and_csrf() -> Result<()> {
 
     let test_response = client
         .post(format!("http://127.0.0.1:{admin_port}/console/v1/channels/{connector_id}/test"))
-        .header("Cookie", cookie)
-        .header("x-palyra-csrf-token", csrf_token)
+        .header("Cookie", cookie.clone())
+        .header("x-palyra-csrf-token", csrf_token.clone())
         .json(&serde_json::json!({
             "text": "hello from console test",
             "conversation_id": "test:conversation",
@@ -810,6 +810,50 @@ fn console_channels_endpoints_require_session_and_csrf() -> Result<()> {
     assert!(
         test_response.get("status").is_some(),
         "channels test response should include status payload"
+    );
+
+    let discord_connector_id = "discord:default";
+    let discord_test_send_without_csrf = client
+        .post(format!(
+            "http://127.0.0.1:{admin_port}/console/v1/channels/{discord_connector_id}/test-send"
+        ))
+        .header("Cookie", cookie.clone())
+        .json(&serde_json::json!({
+            "target": "channel:1234567890",
+            "confirm": true,
+        }))
+        .send()
+        .context("failed to call channels discord test-send endpoint without csrf token")?;
+    assert_eq!(
+        discord_test_send_without_csrf.status().as_u16(),
+        403,
+        "channels discord test-send endpoint must enforce csrf token"
+    );
+
+    let discord_test_send_response = client
+        .post(format!(
+            "http://127.0.0.1:{admin_port}/console/v1/channels/{discord_connector_id}/test-send"
+        ))
+        .header("Cookie", cookie)
+        .header("x-palyra-csrf-token", csrf_token)
+        .json(&serde_json::json!({
+            "target": "channel:1234567890",
+            "text": "hello discord",
+            "confirm": true,
+        }))
+        .send()
+        .context("failed to call channels discord test-send endpoint with csrf token")?
+        .error_for_status()
+        .context("channels discord test-send endpoint returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse channels discord test-send response json")?;
+    assert!(
+        discord_test_send_response.get("dispatch").is_some(),
+        "channels discord test-send response should include dispatch payload"
+    );
+    assert!(
+        discord_test_send_response.get("status").is_some(),
+        "channels discord test-send response should include status payload"
     );
 
     Ok(())

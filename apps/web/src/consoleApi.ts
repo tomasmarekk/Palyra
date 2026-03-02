@@ -403,6 +403,26 @@ export class ConsoleApiClient {
     );
   }
 
+  async sendChannelDiscordTestSend(
+    connectorId: string,
+    payload: {
+      target: string;
+      text?: string;
+      confirm: boolean;
+      auto_reaction?: string;
+      thread_id?: string;
+    }
+  ): Promise<{ dispatch: JsonValue; status: JsonValue; runtime?: JsonValue }> {
+    return this.request(
+      `/console/v1/channels/${encodeURIComponent(connectorId)}/test-send`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      },
+      { csrf: true }
+    );
+  }
+
   async searchMemory(params?: URLSearchParams): Promise<{ hits: JsonValue[] }> {
     return this.request(buildPathWithQuery("/console/v1/memory/search", params));
   }

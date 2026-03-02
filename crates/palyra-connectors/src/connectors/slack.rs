@@ -2,6 +2,7 @@ use async_trait::async_trait;
 
 use crate::{
     protocol::{ConnectorKind, DeliveryOutcome, OutboundMessageRequest},
+    storage::ConnectorInstanceRecord,
     supervisor::{ConnectorAdapter, ConnectorAdapterError},
 };
 
@@ -16,6 +17,7 @@ impl ConnectorAdapter for SlackConnectorAdapter {
 
     async fn send_outbound(
         &self,
+        _instance: &ConnectorInstanceRecord,
         _request: &OutboundMessageRequest,
     ) -> Result<DeliveryOutcome, ConnectorAdapterError> {
         Ok(DeliveryOutcome::PermanentFailure {
