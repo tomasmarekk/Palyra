@@ -8,7 +8,7 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
-palyra-common = { path = "../palyra-common" }
+palyra-common = { version = "0.1.0", path = "../palyra-common" }
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true

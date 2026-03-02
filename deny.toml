@@ -52,6 +52,10 @@ crate = "palyra-common"
 expression = "LicenseRef-Palyra-Community-Source-1.0"
 license-files = [{ path = "../../LICENSE", hash = 0x18b96a4b }]
 [[licenses.clarify]]
+crate = "palyra-connectors"
+expression = "LicenseRef-Palyra-Community-Source-1.0"
+license-files = [{ path = "../../LICENSE", hash = 0x18b96a4b }]
+[[licenses.clarify]]
 crate = "palyra-daemon"
 expression = "LicenseRef-Palyra-Community-Source-1.0"
 license-files = [{ path = "../../LICENSE", hash = 0x18b96a4b }]

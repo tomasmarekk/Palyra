@@ -1181,12 +1181,8 @@ async fn main() -> Result<()> {
 
     let scheduler_wake = Arc::new(Notify::new());
     let grpc_url = loopback_grpc_url(grpc_bound, loaded.gateway.tls.enabled);
-    let connectors_db_path = loaded
-        .storage
-        .journal_db_path
-        .parent()
-        .map(|path| path.join("connectors.sqlite3"))
-        .unwrap_or_else(|| PathBuf::from("data").join("connectors.sqlite3"));
+    let connectors_db_path =
+        connector_db_path_from_journal_path(loaded.storage.journal_db_path.as_path());
     let channels = Arc::new(
         channels::ChannelPlatform::initialize(grpc_url.clone(), auth.clone(), connectors_db_path)
             .context("failed to initialize channel connector platform")?,
@@ -4220,6 +4216,21 @@ fn parse_csv_values(raw: Option<&str>) -> Vec<String> {
     .unwrap_or_default()
 }
 
+fn connector_db_path_from_journal_path(journal_db_path: &FsPath) -> PathBuf {
+    let Some(parent) = journal_db_path.parent().filter(|path| !path.as_os_str().is_empty()) else {
+        return PathBuf::from("data").join("connectors.sqlite3");
+    };
+    let Some(stem) = journal_db_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return parent.join("connectors.sqlite3");
+    };
+    parent.join(format!("{stem}.connectors.sqlite3"))
+}
+
 #[allow(clippy::result_large_err)]
 fn parse_memory_sources_csv(raw: Option<&str>) -> Result<Vec<journal::MemorySource>, Response> {
     let mut parsed = Vec::new();
@@ -5917,6 +5928,7 @@ mod tests {
         collections::{HashMap, HashSet},
         fs,
         net::IpAddr,
+        path::PathBuf,
         str::FromStr,
         sync::Mutex,
         time::{Duration, Instant},
@@ -5931,7 +5943,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        build_memory_embedding_provider, clamp_console_relay_token_ttl_ms, constant_time_eq_bytes,
+        build_memory_embedding_provider, clamp_console_relay_token_ttl_ms,
+        connector_db_path_from_journal_path, constant_time_eq_bytes,
         consume_admin_rate_limit_with_now, consume_canvas_rate_limit_with_now,
         enforce_remote_bind_guard, find_hashed_secret_map_key, loopback_grpc_url,
         mint_console_relay_token, mint_console_secret_token, parse_offline_env_flag,
@@ -5994,6 +6007,22 @@ mod tests {
             error.to_string().contains("PALYRA_OFFLINE"),
             "error should mention PALYRA_OFFLINE"
         );
+    }
+
+    #[test]
+    fn connector_db_path_uses_journal_file_stem_for_uniqueness() {
+        let path =
+            connector_db_path_from_journal_path(std::path::Path::new("C:/tmp/journal-a.sqlite3"));
+        assert!(
+            path.ends_with("journal-a.connectors.sqlite3"),
+            "connector db path should derive from journal filename stem"
+        );
+    }
+
+    #[test]
+    fn connector_db_path_falls_back_to_data_default_when_parent_is_missing() {
+        let path = connector_db_path_from_journal_path(std::path::Path::new("journal.sqlite3"));
+        assert_eq!(path, PathBuf::from("data").join("connectors.sqlite3"));
     }
 
     #[test]
