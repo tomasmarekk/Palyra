@@ -89,6 +89,7 @@ pub(crate) fn select_backend(
     preference: BackendPreference,
 ) -> Result<Box<dyn BlobBackend>, VaultError> {
     ensure_owner_only_dir(root)?;
+    let root = canonicalize_existing_dir(root, "vault backend root directory")?;
     let marker_path = root.join(BACKEND_MARKER_FILE);
     if marker_path.exists() {
         let marker = fs::read_to_string(&marker_path).map_err(|error| {
@@ -98,13 +99,15 @@ pub(crate) fn select_backend(
             ))
         })?;
         let kind = BackendKind::parse(marker.trim())?;
-        let backend = backend_for_kind(kind, root)?;
+        let backend = backend_for_kind(kind, root.as_path())?;
         return Ok(backend);
     }
 
     let backend = match preference {
-        BackendPreference::EncryptedFile => backend_for_kind(BackendKind::EncryptedFile, root)?,
-        BackendPreference::Auto => choose_auto_backend(root)?,
+        BackendPreference::EncryptedFile => {
+            backend_for_kind(BackendKind::EncryptedFile, root.as_path())?
+        }
+        BackendPreference::Auto => choose_auto_backend(root.as_path())?,
     };
     let marker_tmp = marker_path.with_extension(format!("tmp.{}", Ulid::new()));
     fs::write(&marker_tmp, backend.kind().as_str().as_bytes()).map_err(|error| {
