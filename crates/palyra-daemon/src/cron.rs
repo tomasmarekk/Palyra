@@ -57,8 +57,9 @@ pub const MEMORY_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 pub const MEMORY_EMBEDDINGS_BACKFILL_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const MEMORY_EMBEDDINGS_BACKFILL_BATCH_SIZE: usize = 64;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CronTimezoneMode {
+    #[default]
     Utc,
     Local,
 }
@@ -78,12 +79,6 @@ impl CronTimezoneMode {
             "local" => Some(Self::Local),
             _ => None,
         }
-    }
-}
-
-impl Default for CronTimezoneMode {
-    fn default() -> Self {
-        Self::Utc
     }
 }
 
