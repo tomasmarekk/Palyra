@@ -2463,10 +2463,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "palyra-connectors"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "palyra-common",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "palyra-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "base64",
  "chrono",
@@ -2476,6 +2493,7 @@ dependencies = [
  "palyra-a2ui",
  "palyra-auth",
  "palyra-common",
+ "palyra-connectors",
  "palyra-identity",
  "palyra-plugins-runtime",
  "palyra-plugins-sdk",

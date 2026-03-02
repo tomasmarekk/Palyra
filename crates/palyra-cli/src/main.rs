@@ -3081,23 +3081,318 @@ fn agent_to_json(agent: &gateway_v1::Agent) -> serde_json::Value {
 
 fn run_channels(command: ChannelsCommand) -> Result<()> {
     match command {
-        ChannelsCommand::List => {
-            println!("channels.list status=stub message=\"channel plugins start in M31\"");
+        ChannelsCommand::List { url, token, principal, device_id, channel, json } => {
+            let base_url = resolve_channels_base_url(url);
+            let token = resolve_channels_token(token);
+            let endpoint = format!("{}/admin/v1/channels", base_url.trim_end_matches('/'));
+            let client = build_channels_client()?;
+            let response = send_channels_request(
+                client.get(endpoint),
+                token,
+                principal,
+                device_id,
+                channel,
+                "failed to call channels list endpoint",
+            )?;
+            emit_channels_list(response, json)?;
         }
-        ChannelsCommand::Connect { kind, name } => {
-            println!(
-                "channels.connect status=stub kind={} name={} message=\"channel plugins start in M31\"",
-                kind, name
-            );
+        ChannelsCommand::Status {
+            connector_id,
+            url,
+            token,
+            principal,
+            device_id,
+            channel,
+            json,
+        } => {
+            let base_url = resolve_channels_base_url(url);
+            let token = resolve_channels_token(token);
+            let endpoint =
+                format!("{}/admin/v1/channels/{}", base_url.trim_end_matches('/'), connector_id);
+            let client = build_channels_client()?;
+            let response = send_channels_request(
+                client.get(endpoint),
+                token,
+                principal,
+                device_id,
+                channel,
+                "failed to call channels status endpoint",
+            )?;
+            emit_channels_status(response, json)?;
         }
-        ChannelsCommand::Disconnect { name } => {
-            println!(
-                "channels.disconnect status=stub name={} message=\"channel plugins start in M31\"",
-                name
+        ChannelsCommand::Enable {
+            connector_id,
+            url,
+            token,
+            principal,
+            device_id,
+            channel,
+            json,
+        } => {
+            let base_url = resolve_channels_base_url(url);
+            let token = resolve_channels_token(token);
+            let endpoint = format!(
+                "{}/admin/v1/channels/{}/enabled",
+                base_url.trim_end_matches('/'),
+                connector_id
             );
+            let client = build_channels_client()?;
+            let response = send_channels_request(
+                client.post(endpoint).json(&json!({ "enabled": true })),
+                token,
+                principal,
+                device_id,
+                channel,
+                "failed to call channels enable endpoint",
+            )?;
+            emit_channels_status(response, json)?;
+        }
+        ChannelsCommand::Disable {
+            connector_id,
+            url,
+            token,
+            principal,
+            device_id,
+            channel,
+            json,
+        } => {
+            let base_url = resolve_channels_base_url(url);
+            let token = resolve_channels_token(token);
+            let endpoint = format!(
+                "{}/admin/v1/channels/{}/enabled",
+                base_url.trim_end_matches('/'),
+                connector_id
+            );
+            let client = build_channels_client()?;
+            let response = send_channels_request(
+                client.post(endpoint).json(&json!({ "enabled": false })),
+                token,
+                principal,
+                device_id,
+                channel,
+                "failed to call channels disable endpoint",
+            )?;
+            emit_channels_status(response, json)?;
+        }
+        ChannelsCommand::Logs {
+            connector_id,
+            url,
+            token,
+            principal,
+            device_id,
+            channel,
+            limit,
+            json,
+        } => {
+            let base_url = resolve_channels_base_url(url);
+            let token = resolve_channels_token(token);
+            let endpoint = format!(
+                "{}/admin/v1/channels/{}/logs",
+                base_url.trim_end_matches('/'),
+                connector_id
+            );
+            let client = build_channels_client()?;
+            let mut request = client.get(endpoint);
+            if let Some(limit) = limit {
+                request = request.query(&[("limit", limit)]);
+            }
+            let response = send_channels_request(
+                request,
+                token,
+                principal,
+                device_id,
+                channel,
+                "failed to call channels logs endpoint",
+            )?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&response)
+                        .context("failed to encode channels logs payload as JSON")?
+                );
+            } else {
+                let events = response
+                    .get("events")
+                    .and_then(Value::as_array)
+                    .map(|items| items.len())
+                    .unwrap_or(0);
+                let dead_letters = response
+                    .get("dead_letters")
+                    .and_then(Value::as_array)
+                    .map(|items| items.len())
+                    .unwrap_or(0);
+                println!(
+                    "channels.logs connector_id={} events={} dead_letters={}",
+                    connector_id, events, dead_letters
+                );
+            }
+        }
+        ChannelsCommand::Test {
+            connector_id,
+            text,
+            url,
+            token,
+            principal,
+            device_id,
+            channel,
+            conversation_id,
+            sender_id,
+            sender_display,
+            simulate_crash_once,
+            is_direct_message,
+            requested_broadcast,
+            json,
+        } => {
+            let base_url = resolve_channels_base_url(url);
+            let token = resolve_channels_token(token);
+            let endpoint = format!(
+                "{}/admin/v1/channels/{}/test",
+                base_url.trim_end_matches('/'),
+                connector_id
+            );
+            let client = build_channels_client()?;
+            let payload = json!({
+                "text": text,
+                "conversation_id": conversation_id,
+                "sender_id": sender_id,
+                "sender_display": sender_display,
+                "simulate_crash_once": simulate_crash_once,
+                "is_direct_message": is_direct_message,
+                "requested_broadcast": requested_broadcast,
+            });
+            let response = send_channels_request(
+                client.post(endpoint).json(&payload),
+                token,
+                principal,
+                device_id,
+                channel,
+                "failed to call channels test endpoint",
+            )?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&response)
+                        .context("failed to encode channels test payload as JSON")?
+                );
+            } else {
+                let accepted = response
+                    .get("ingest")
+                    .and_then(Value::as_object)
+                    .and_then(|ingest| ingest.get("accepted"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let immediate_delivery = response
+                    .get("ingest")
+                    .and_then(Value::as_object)
+                    .and_then(|ingest| ingest.get("immediate_delivery"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                println!(
+                    "channels.test connector_id={} accepted={} immediate_delivery={}",
+                    connector_id, accepted, immediate_delivery
+                );
+            }
         }
     }
     std::io::stdout().flush().context("stdout flush failed")
+}
+
+fn resolve_channels_base_url(url: Option<String>) -> String {
+    url.or_else(|| env::var("PALYRA_DAEMON_URL").ok())
+        .unwrap_or_else(|| DEFAULT_DAEMON_URL.to_owned())
+}
+
+fn resolve_channels_token(token: Option<String>) -> Option<String> {
+    token.or_else(|| env::var("PALYRA_ADMIN_TOKEN").ok())
+}
+
+fn build_channels_client() -> Result<Client> {
+    Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .context("failed to build channels HTTP client")
+}
+
+fn send_channels_request(
+    request: reqwest::blocking::RequestBuilder,
+    token: Option<String>,
+    principal: String,
+    device_id: String,
+    channel: Option<String>,
+    error_context: &'static str,
+) -> Result<Value> {
+    let mut request =
+        request.header("x-palyra-principal", principal).header("x-palyra-device-id", device_id);
+    if let Some(token) = token {
+        request = request.header("Authorization", format!("Bearer {token}"));
+    }
+    if let Some(channel) = channel {
+        request = request.header("x-palyra-channel", channel);
+    }
+    let response = request.send().context(error_context)?;
+    let response =
+        response.error_for_status().context("channels endpoint returned non-success status")?;
+    response.json().context("failed to parse channels endpoint JSON payload")
+}
+
+fn emit_channels_list(payload: Value, json_output: bool) -> Result<()> {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload)
+                .context("failed to encode channels list payload as JSON")?
+        );
+        return Ok(());
+    }
+    let connectors =
+        payload.get("connectors").and_then(Value::as_array).cloned().unwrap_or_default();
+    println!("channels.count={}", connectors.len());
+    for connector in connectors {
+        let connector_id =
+            connector.get("connector_id").and_then(Value::as_str).unwrap_or("unknown");
+        let kind = connector.get("kind").and_then(Value::as_str).unwrap_or("unknown");
+        let enabled = connector.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+        let readiness = connector.get("readiness").and_then(Value::as_str).unwrap_or("unknown");
+        let liveness = connector.get("liveness").and_then(Value::as_str).unwrap_or("unknown");
+        println!(
+            "channels.connector id={} kind={} enabled={} readiness={} liveness={}",
+            connector_id, kind, enabled, readiness, liveness
+        );
+    }
+    Ok(())
+}
+
+fn emit_channels_status(payload: Value, json_output: bool) -> Result<()> {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload)
+                .context("failed to encode channels status payload as JSON")?
+        );
+        return Ok(());
+    }
+    let connector = payload.get("connector").cloned().unwrap_or(payload);
+    let connector_id = connector.get("connector_id").and_then(Value::as_str).unwrap_or("unknown");
+    let enabled = connector.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+    let readiness = connector.get("readiness").and_then(Value::as_str).unwrap_or("unknown");
+    let liveness = connector.get("liveness").and_then(Value::as_str).unwrap_or("unknown");
+    let pending = connector
+        .get("queue_depth")
+        .and_then(Value::as_object)
+        .and_then(|queue| queue.get("pending_outbox"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let dead_letters = connector
+        .get("queue_depth")
+        .and_then(Value::as_object)
+        .and_then(|queue| queue.get("dead_letters"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    println!(
+        "channels.status id={} enabled={} readiness={} liveness={} pending_outbox={} dead_letters={}",
+        connector_id, enabled, readiness, liveness, pending, dead_letters
+    );
+    Ok(())
 }
 
 fn run_browser(command: BrowserCommand) -> Result<()> {

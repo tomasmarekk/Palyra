@@ -104,6 +104,119 @@ describe("M35 web console app", () => {
     expect(requestBody(toggleRequest?.body)).toContain("\"enabled\":false");
   });
 
+  it("manages channel connectors from channels section with CSRF-protected enable toggle", async () => {
+    const fetchMock = createQueuedFetch([
+      jsonResponse({
+        principal: "admin:web-console",
+        device_id: "device-1",
+        channel: "web",
+        csrf_token: "csrf-1",
+        issued_at_unix_ms: 100,
+        expires_at_unix_ms: 300
+      }),
+      jsonResponse({ approvals: [] }),
+      jsonResponse({
+        connectors: [
+          {
+            connector_id: "echo:default",
+            kind: "echo",
+            enabled: true,
+            readiness: "ready",
+            liveness: "running",
+            queue_depth: { pending_outbox: 0, dead_letters: 1 }
+          }
+        ]
+      }),
+      jsonResponse({
+        connector: {
+          connector_id: "echo:default",
+          kind: "echo",
+          enabled: true,
+          readiness: "ready",
+          liveness: "running",
+          queue_depth: { pending_outbox: 0, dead_letters: 1 }
+        }
+      }),
+      jsonResponse({
+        events: [
+          {
+            event_id: 1,
+            connector_id: "echo:default",
+            event_type: "outbox.retry",
+            level: "warn",
+            message: "retry scheduled",
+            created_at_unix_ms: 111
+          }
+        ],
+        dead_letters: [
+          {
+            dead_letter_id: 1,
+            connector_id: "echo:default",
+            envelope_id: "env-1:0",
+            reason: "permanent",
+            payload: { text: "failed" },
+            created_at_unix_ms: 112
+          }
+        ]
+      }),
+      jsonResponse({
+        connector: {
+          connector_id: "echo:default",
+          kind: "echo",
+          enabled: false,
+          readiness: "ready",
+          liveness: "stopped",
+          queue_depth: { pending_outbox: 0, dead_letters: 1 }
+        }
+      }),
+      jsonResponse({
+        connectors: [
+          {
+            connector_id: "echo:default",
+            kind: "echo",
+            enabled: false,
+            readiness: "ready",
+            liveness: "stopped",
+            queue_depth: { pending_outbox: 0, dead_letters: 1 }
+          }
+        ]
+      }),
+      jsonResponse({
+        connector: {
+          connector_id: "echo:default",
+          kind: "echo",
+          enabled: false,
+          readiness: "ready",
+          liveness: "stopped",
+          queue_depth: { pending_outbox: 0, dead_letters: 1 }
+        }
+      }),
+      jsonResponse({
+        events: [],
+        dead_letters: []
+      })
+    ]);
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Channels" }));
+    expect(await screen.findByRole("heading", { name: "Channel Connectors" })).toBeInTheDocument();
+    expect(await screen.findByText("echo:default")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Disable" }));
+
+    await waitFor(() => {
+      expect(screen.getByText("Connector disabled.")).toBeInTheDocument();
+    });
+
+    expect(requestUrl(fetchMock.mock.calls[5][0])).toBe("/console/v1/channels/echo%3Adefault/enabled");
+    const request = fetchMock.mock.calls[5][1];
+    const headers = new Headers(request?.headers);
+    expect(headers.get("x-palyra-csrf-token")).toBe("csrf-1");
+    expect(request?.method).toBe("POST");
+    expect(requestBody(request?.body)).toContain("\"enabled\":false");
+  });
+
   it("issues browser relay token from browser section with CSRF protection", async () => {
     const fetchMock = createQueuedFetch([
       jsonResponse({

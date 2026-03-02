@@ -350,6 +350,59 @@ export class ConsoleApiClient {
     return this.request(buildPathWithQuery(`/console/v1/cron/jobs/${encodeURIComponent(jobId)}/runs`, params));
   }
 
+  async listChannels(): Promise<{ connectors: JsonValue[] }> {
+    return this.request("/console/v1/channels");
+  }
+
+  async getChannelStatus(connectorId: string): Promise<{ connector: JsonValue }> {
+    return this.request(`/console/v1/channels/${encodeURIComponent(connectorId)}`);
+  }
+
+  async setChannelEnabled(
+    connectorId: string,
+    enabled: boolean
+  ): Promise<{ connector: JsonValue }> {
+    return this.request(
+      `/console/v1/channels/${encodeURIComponent(connectorId)}/enabled`,
+      {
+        method: "POST",
+        body: JSON.stringify({ enabled })
+      },
+      { csrf: true }
+    );
+  }
+
+  async listChannelLogs(
+    connectorId: string,
+    params?: URLSearchParams
+  ): Promise<{ events: JsonValue[]; dead_letters: JsonValue[] }> {
+    return this.request(
+      buildPathWithQuery(`/console/v1/channels/${encodeURIComponent(connectorId)}/logs`, params)
+    );
+  }
+
+  async sendChannelTestMessage(
+    connectorId: string,
+    payload: {
+      text: string;
+      conversation_id?: string;
+      sender_id?: string;
+      sender_display?: string;
+      simulate_crash_once?: boolean;
+      is_direct_message?: boolean;
+      requested_broadcast?: boolean;
+    }
+  ): Promise<{ ingest: JsonValue; status: JsonValue }> {
+    return this.request(
+      `/console/v1/channels/${encodeURIComponent(connectorId)}/test`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      },
+      { csrf: true }
+    );
+  }
+
   async searchMemory(params?: URLSearchParams): Promise<{ hits: JsonValue[] }> {
     return this.request(buildPathWithQuery("/console/v1/memory/search", params));
   }

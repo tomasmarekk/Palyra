@@ -67,6 +67,66 @@ describe("ConsoleApiClient", () => {
     ).rejects.toThrow("Missing CSRF token");
   });
 
+  it("uses GET without CSRF and POST with CSRF for channel operations", async () => {
+    const calls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
+    const responses = [
+      jsonResponse({
+        principal: "admin:web-console",
+        device_id: "device-1",
+        csrf_token: "csrf-1",
+        issued_at_unix_ms: 100,
+        expires_at_unix_ms: 200
+      }),
+      jsonResponse({
+        connectors: [
+          {
+            connector_id: "echo:default",
+            kind: "echo",
+            enabled: true,
+            readiness: "ready",
+            liveness: "running"
+          }
+        ]
+      }),
+      jsonResponse({
+        connector: {
+          connector_id: "echo:default",
+          kind: "echo",
+          enabled: false,
+          readiness: "ready",
+          liveness: "stopped"
+        }
+      })
+    ];
+    const fetcher: typeof fetch = (input, init) => {
+      calls.push({ input, init });
+      const response = responses.shift();
+      if (response === undefined) {
+        throw new Error("No response queued for fetch mock.");
+      }
+      return Promise.resolve(response);
+    };
+    const client = new ConsoleApiClient("", fetcher);
+
+    await client.login({
+      admin_token: "token",
+      principal: "admin:web-console",
+      device_id: "device-1",
+      channel: "web"
+    });
+    await client.listChannels();
+    await client.setChannelEnabled("echo:default", false);
+
+    expect(requestUrl(calls[1]?.input)).toBe("/console/v1/channels");
+    const listHeaders = new Headers(calls[1]?.init?.headers);
+    expect(listHeaders.get("x-palyra-csrf-token")).toBeNull();
+
+    expect(requestUrl(calls[2]?.input)).toBe("/console/v1/channels/echo%3Adefault/enabled");
+    const toggleHeaders = new Headers(calls[2]?.init?.headers);
+    expect(toggleHeaders.get("x-palyra-csrf-token")).toBe("csrf-1");
+    expect(calls[2]?.init?.method).toBe("POST");
+  });
+
   it("propagates structured backend errors", async () => {
     const fetcher: typeof fetch = () => {
       return Promise.resolve(jsonResponse({ error: "permission denied" }, 403));

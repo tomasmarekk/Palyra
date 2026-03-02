@@ -1,0 +1,28 @@
+{
+  "ingests": [
+    {
+      "accepted": true,
+      "enqueued_outbound": 1,
+      "envelope_id": "env-1"
+    },
+    {
+      "accepted": true,
+      "enqueued_outbound": 1,
+      "envelope_id": "env-2"
+    },
+    {
+      "accepted": true,
+      "enqueued_outbound": 1,
+      "envelope_id": "env-3"
+    }
+  ],
+  "attempts_per_envelope": {
+    "env-1:0": 1,
+    "env-2:0": 2,
+    "env-3:0": 2
+  },
+  "delivered_count": 3,
+  "queue_dead_letters": 0,
+  "queue_pending": 0,
+  "restart_count": 1
+}

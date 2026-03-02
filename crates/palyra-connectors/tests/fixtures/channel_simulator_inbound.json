@@ -1,0 +1,26 @@
+[
+  {
+    "envelope_id": "env-1",
+    "conversation_id": "conv-1",
+    "sender_id": "user-1",
+    "body": "hello from simulator",
+    "is_direct_message": true,
+    "requested_broadcast": false
+  },
+  {
+    "envelope_id": "env-2",
+    "conversation_id": "conv-1",
+    "sender_id": "user-1",
+    "body": "simulate backpressure [rate-limit-once]",
+    "is_direct_message": true,
+    "requested_broadcast": false
+  },
+  {
+    "envelope_id": "env-3",
+    "conversation_id": "conv-1",
+    "sender_id": "user-2",
+    "body": "simulate restart [connector-crash-once]",
+    "is_direct_message": false,
+    "requested_broadcast": true
+  }
+]

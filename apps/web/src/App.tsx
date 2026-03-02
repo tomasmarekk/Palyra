@@ -4,7 +4,16 @@ import { useEffect, useMemo, useState } from "react";
 import { ConsoleApiClient, type ConsoleSession, type JsonValue } from "./consoleApi";
 import { ChatConsolePanel } from "./chat/ChatConsolePanel";
 
-type Section = "chat" | "approvals" | "cron" | "memory" | "skills" | "browser" | "audit" | "diagnostics";
+type Section =
+  | "chat"
+  | "approvals"
+  | "cron"
+  | "channels"
+  | "memory"
+  | "skills"
+  | "browser"
+  | "audit"
+  | "diagnostics";
 type ThemeMode = "light" | "dark";
 type JsonObject = { [key: string]: JsonValue };
 type CronScheduleType = "cron" | "every" | "at";
@@ -88,6 +97,21 @@ export function App() {
   const [cronRuns, setCronRuns] = useState<JsonObject[]>([]);
   const [cronJobId, setCronJobId] = useState("");
   const [cronForm, setCronForm] = useState<CronForm>(DEFAULT_CRON_FORM);
+
+  const [channelsBusy, setChannelsBusy] = useState(false);
+  const [channelsConnectors, setChannelsConnectors] = useState<JsonObject[]>([]);
+  const [channelsSelectedConnectorId, setChannelsSelectedConnectorId] = useState("");
+  const [channelsSelectedStatus, setChannelsSelectedStatus] = useState<JsonObject | null>(null);
+  const [channelsEvents, setChannelsEvents] = useState<JsonObject[]>([]);
+  const [channelsDeadLetters, setChannelsDeadLetters] = useState<JsonObject[]>([]);
+  const [channelsLogsLimit, setChannelsLogsLimit] = useState("25");
+  const [channelsTestText, setChannelsTestText] = useState("hello from web console");
+  const [channelsTestConversationId, setChannelsTestConversationId] = useState("test:conversation");
+  const [channelsTestSenderId, setChannelsTestSenderId] = useState("test-user");
+  const [channelsTestSenderDisplay, setChannelsTestSenderDisplay] = useState("");
+  const [channelsTestCrashOnce, setChannelsTestCrashOnce] = useState(false);
+  const [channelsTestDirectMessage, setChannelsTestDirectMessage] = useState(true);
+  const [channelsTestBroadcast, setChannelsTestBroadcast] = useState(false);
 
   const [memoryBusy, setMemoryBusy] = useState(false);
   const [memoryQuery, setMemoryQuery] = useState("");
@@ -185,6 +209,9 @@ export function App() {
     }
     if (section === "cron") {
       void refreshCron();
+    }
+    if (section === "channels") {
+      void refreshChannels();
     }
     if (section === "memory") {
       void refreshMemoryStatus();
@@ -348,6 +375,157 @@ export function App() {
       setError(toErrorMessage(failure));
     } finally {
       setCronBusy(false);
+    }
+  }
+
+  async function refreshChannelLogs(connectorId: string): Promise<void> {
+    const params = new URLSearchParams();
+    const parsedLimit = parseInteger(channelsLogsLimit);
+    if (parsedLimit !== null && parsedLimit > 0) {
+      params.set("limit", String(parsedLimit));
+    }
+    const response = await api.listChannelLogs(connectorId, params.size > 0 ? params : undefined);
+    setChannelsEvents(toJsonObjectArray(response.events));
+    setChannelsDeadLetters(toJsonObjectArray(response.dead_letters));
+  }
+
+  async function refreshChannels(preferredConnectorId?: string): Promise<void> {
+    setChannelsBusy(true);
+    setError(null);
+    try {
+      const response = await api.listChannels();
+      const connectors = toJsonObjectArray(response.connectors);
+      setChannelsConnectors(connectors);
+
+      const requested = preferredConnectorId ?? channelsSelectedConnectorId;
+      const requestedTrimmed = requested.trim();
+      const connectorIds = connectors
+        .map((entry) => readString(entry, "connector_id"))
+        .filter((value): value is string => value !== null);
+      const nextConnectorId = requestedTrimmed.length > 0 && connectorIds.includes(requestedTrimmed)
+        ? requestedTrimmed
+        : (connectorIds[0] ?? "");
+
+      setChannelsSelectedConnectorId(nextConnectorId);
+      if (nextConnectorId.length === 0) {
+        setChannelsSelectedStatus(null);
+        setChannelsEvents([]);
+        setChannelsDeadLetters([]);
+        return;
+      }
+
+      const statusResponse = await api.getChannelStatus(nextConnectorId);
+      setChannelsSelectedStatus(isJsonObject(statusResponse.connector) ? statusResponse.connector : null);
+      await refreshChannelLogs(nextConnectorId);
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setChannelsBusy(false);
+    }
+  }
+
+  async function loadChannel(connectorId: string): Promise<void> {
+    if (connectorId.trim().length === 0) {
+      setError("Select a connector first.");
+      return;
+    }
+    setChannelsBusy(true);
+    setError(null);
+    try {
+      setChannelsSelectedConnectorId(connectorId);
+      const statusResponse = await api.getChannelStatus(connectorId);
+      setChannelsSelectedStatus(isJsonObject(statusResponse.connector) ? statusResponse.connector : null);
+      await refreshChannelLogs(connectorId);
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setChannelsBusy(false);
+    }
+  }
+
+  async function refreshSelectedChannelLogs(): Promise<void> {
+    if (channelsSelectedConnectorId.trim().length === 0) {
+      setError("Select a connector before loading logs.");
+      return;
+    }
+    setChannelsBusy(true);
+    setError(null);
+    try {
+      await refreshChannelLogs(channelsSelectedConnectorId.trim());
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setChannelsBusy(false);
+    }
+  }
+
+  async function setChannelEnabled(entry: JsonObject, enabled: boolean): Promise<void> {
+    const connectorId = readString(entry, "connector_id");
+    if (connectorId === null) {
+      setError("Connector payload missing connector_id.");
+      return;
+    }
+    setChannelsBusy(true);
+    setError(null);
+    try {
+      const response = await api.setChannelEnabled(connectorId, enabled);
+      if (isJsonObject(response.connector)) {
+        setChannelsSelectedStatus(response.connector);
+      }
+      setNotice(`Connector ${enabled ? "enabled" : "disabled"}.`);
+      await refreshChannels(connectorId);
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setChannelsBusy(false);
+    }
+  }
+
+  async function submitChannelTestMessage(event: React.FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+    if (channelsSelectedConnectorId.trim().length === 0) {
+      setError("Select a connector before sending a test message.");
+      return;
+    }
+    if (channelsTestText.trim().length === 0) {
+      setError("Test message text cannot be empty.");
+      return;
+    }
+    setChannelsBusy(true);
+    setError(null);
+    try {
+      const response = await api.sendChannelTestMessage(channelsSelectedConnectorId.trim(), {
+        text: channelsTestText.trim(),
+        conversation_id: emptyToUndefined(channelsTestConversationId),
+        sender_id: emptyToUndefined(channelsTestSenderId),
+        sender_display: emptyToUndefined(channelsTestSenderDisplay),
+        simulate_crash_once: channelsTestCrashOnce,
+        is_direct_message: channelsTestDirectMessage,
+        requested_broadcast: channelsTestBroadcast
+      });
+      if (isJsonObject(response.status)) {
+        setChannelsSelectedStatus(response.status);
+      }
+      if (isJsonObject(response.ingest)) {
+        const accepted = response.ingest.accepted === true ? "true" : "false";
+        const immediateDeliveryValue = response.ingest.immediate_delivery;
+        const immediateDelivery =
+          typeof immediateDeliveryValue === "number" || typeof immediateDeliveryValue === "string"
+            ? String(immediateDeliveryValue)
+            : "0";
+        setNotice(
+          `Channel test dispatched (accepted=${accepted}, immediate_delivery=${immediateDelivery}).`
+        );
+      } else {
+        setNotice("Channel test dispatched.");
+      }
+      setChannelsTestCrashOnce(false);
+      await refreshChannelLogs(channelsSelectedConnectorId.trim());
+      await refreshChannels(channelsSelectedConnectorId.trim());
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setChannelsBusy(false);
     }
   }
 
@@ -855,7 +1033,7 @@ export function App() {
           <p className="console-label">Palyra / M39</p>
           <h1>Web Console v1</h1>
           <p className="console-copy">
-            Chat streaming, approvals, cron, memory, skills, browser relay controls, and audit workflows without using CLI.
+            Chat streaming, approvals, cron, channel connectors, memory, skills, browser relay controls, and audit workflows without using CLI.
           </p>
         </div>
         <div className="console-session-box">
@@ -879,6 +1057,7 @@ export function App() {
         <button type="button" className={section === "chat" ? "is-active" : ""} onClick={() => setSection("chat")}>Chat</button>
         <button type="button" className={section === "approvals" ? "is-active" : ""} onClick={() => setSection("approvals")}>Approvals</button>
         <button type="button" className={section === "cron" ? "is-active" : ""} onClick={() => setSection("cron")}>Cron</button>
+        <button type="button" className={section === "channels" ? "is-active" : ""} onClick={() => setSection("channels")}>Channels</button>
         <button type="button" className={section === "memory" ? "is-active" : ""} onClick={() => setSection("memory")}>Memory</button>
         <button type="button" className={section === "skills" ? "is-active" : ""} onClick={() => setSection("skills")}>Skills</button>
         <button type="button" className={section === "browser" ? "is-active" : ""} onClick={() => setSection("browser")}>Browser</button>
@@ -1066,6 +1245,199 @@ export function App() {
           </section>
         </main>
       )}
+
+      {section === "channels" && (
+        <main className="console-card">
+          <header className="console-card__header">
+            <h2>Channel Connectors</h2>
+            <button
+              type="button"
+              onClick={() => void refreshChannels()}
+              disabled={channelsBusy}
+            >
+              {channelsBusy ? "Refreshing..." : "Refresh"}
+            </button>
+          </header>
+          <div className="console-table-wrap">
+            <table className="console-table">
+              <thead>
+                <tr>
+                  <th>Connector ID</th>
+                  <th>Kind</th>
+                  <th>Enabled</th>
+                  <th>Readiness</th>
+                  <th>Liveness</th>
+                  <th>Queue</th>
+                  <th>Last error</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {channelsConnectors.length === 0 && (
+                  <tr><td colSpan={8}>No channel connectors configured.</td></tr>
+                )}
+                {channelsConnectors.map((connector) => {
+                  const connectorId = readString(connector, "connector_id") ?? "(missing)";
+                  const enabled = readBool(connector, "enabled");
+                  const queueDepth = connector["queue_depth"];
+                  const pendingOutbox = isJsonObject(queueDepth)
+                    ? (readString(queueDepth, "pending_outbox") ?? "0")
+                    : "0";
+                  const deadLetters = isJsonObject(queueDepth)
+                    ? (readString(queueDepth, "dead_letters") ?? "0")
+                    : "0";
+                  const isSelected = connectorId === channelsSelectedConnectorId;
+                  return (
+                    <tr key={connectorId}>
+                      <td>{connectorId}</td>
+                      <td>{readString(connector, "kind") ?? "-"}</td>
+                      <td>{enabled ? "yes" : "no"}</td>
+                      <td>{readString(connector, "readiness") ?? "-"}</td>
+                      <td>{readString(connector, "liveness") ?? "-"}</td>
+                      <td>{pendingOutbox} / {deadLetters}</td>
+                      <td>{readString(connector, "last_error") ?? "-"}</td>
+                      <td className="console-action-cell">
+                        <button
+                          type="button"
+                          onClick={() => void loadChannel(connectorId)}
+                          disabled={channelsBusy}
+                        >
+                          {isSelected ? "Selected" : "Select"}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void setChannelEnabled(connector, !enabled)}
+                          disabled={channelsBusy}
+                        >
+                          {enabled ? "Disable" : "Enable"}
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+
+          <section className="console-subpanel">
+            <h3>Selected connector status</h3>
+            {channelsSelectedStatus === null ? (
+              <p>Select a connector to inspect status, events, and dead letters.</p>
+            ) : (
+              <pre>{toPrettyJson(channelsSelectedStatus, revealSensitiveValues)}</pre>
+            )}
+          </section>
+
+          <section className="console-subpanel">
+            <h3>Test message</h3>
+            <form
+              className="console-form"
+              onSubmit={(event) => {
+                void submitChannelTestMessage(event);
+              }}
+            >
+              <div className="console-grid-3">
+                <label>
+                  Connector ID
+                  <input value={channelsSelectedConnectorId} readOnly />
+                </label>
+                <label>
+                  Conversation ID
+                  <input
+                    value={channelsTestConversationId}
+                    onChange={(event) => setChannelsTestConversationId(event.target.value)}
+                  />
+                </label>
+                <label>
+                  Sender ID
+                  <input
+                    value={channelsTestSenderId}
+                    onChange={(event) => setChannelsTestSenderId(event.target.value)}
+                  />
+                </label>
+              </div>
+              <div className="console-grid-3">
+                <label>
+                  Sender display
+                  <input
+                    value={channelsTestSenderDisplay}
+                    onChange={(event) => setChannelsTestSenderDisplay(event.target.value)}
+                  />
+                </label>
+                <label>
+                  Logs limit
+                  <input
+                    value={channelsLogsLimit}
+                    onChange={(event) => setChannelsLogsLimit(event.target.value)}
+                  />
+                </label>
+                <div className="console-inline-actions">
+                  <button
+                    type="button"
+                    onClick={() => void refreshSelectedChannelLogs()}
+                    disabled={channelsBusy}
+                  >
+                    {channelsBusy ? "Loading..." : "Reload logs"}
+                  </button>
+                </div>
+              </div>
+              <label>
+                Text
+                <textarea
+                  rows={3}
+                  value={channelsTestText}
+                  onChange={(event) => setChannelsTestText(event.target.value)}
+                  required
+                />
+              </label>
+              <div className="console-grid-3">
+                <label className="console-checkbox-inline">
+                  <input
+                    type="checkbox"
+                    checked={channelsTestCrashOnce}
+                    onChange={(event) => setChannelsTestCrashOnce(event.target.checked)}
+                  />
+                  Simulate crash once
+                </label>
+                <label className="console-checkbox-inline">
+                  <input
+                    type="checkbox"
+                    checked={channelsTestDirectMessage}
+                    onChange={(event) => setChannelsTestDirectMessage(event.target.checked)}
+                  />
+                  Treat as direct message
+                </label>
+                <label className="console-checkbox-inline">
+                  <input
+                    type="checkbox"
+                    checked={channelsTestBroadcast}
+                    onChange={(event) => setChannelsTestBroadcast(event.target.checked)}
+                  />
+                  Request broadcast
+                </label>
+              </div>
+              <button type="submit" disabled={channelsBusy}>
+                {channelsBusy ? "Sending..." : "Send test message"}
+              </button>
+            </form>
+          </section>
+
+          <section className="console-subpanel">
+            <h3>Connector events</h3>
+            {channelsEvents.length === 0
+              ? <p>No connector events loaded.</p>
+              : <pre>{toPrettyJson(channelsEvents, revealSensitiveValues)}</pre>}
+          </section>
+
+          <section className="console-subpanel">
+            <h3>Dead letters</h3>
+            {channelsDeadLetters.length === 0
+              ? <p>No dead letters loaded.</p>
+              : <pre>{toPrettyJson(channelsDeadLetters, revealSensitiveValues)}</pre>}
+          </section>
+        </main>
+      )}
+
       {section === "memory" && (
         <main className="console-card">
           <header className="console-card__header">

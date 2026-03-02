@@ -1,5 +1,6 @@
 mod agents;
 mod channel_router;
+mod channels;
 mod config;
 mod cron;
 mod gateway;
@@ -147,6 +148,7 @@ struct Args {
 struct AppState {
     started_at: Instant,
     runtime: Arc<GatewayRuntimeState>,
+    channels: Arc<channels::ChannelPlatform>,
     browser_service_config: gateway::BrowserServiceRuntimeConfig,
     auth_runtime: Arc<gateway::AuthRuntimeState>,
     auth: GatewayAuthConfig,
@@ -332,6 +334,33 @@ struct ConsoleMemoryPurgeRequest {
     session_id: Option<String>,
     #[serde(default)]
     purge_all_principal: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChannelLogsQuery {
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChannelEnabledRequest {
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChannelTestRequest {
+    text: String,
+    #[serde(default)]
+    conversation_id: Option<String>,
+    #[serde(default)]
+    sender_id: Option<String>,
+    #[serde(default)]
+    sender_display: Option<String>,
+    #[serde(default)]
+    simulate_crash_once: Option<bool>,
+    #[serde(default)]
+    is_direct_message: Option<bool>,
+    #[serde(default)]
+    requested_broadcast: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1152,6 +1181,16 @@ async fn main() -> Result<()> {
 
     let scheduler_wake = Arc::new(Notify::new());
     let grpc_url = loopback_grpc_url(grpc_bound, loaded.gateway.tls.enabled);
+    let connectors_db_path = loaded
+        .storage
+        .journal_db_path
+        .parent()
+        .map(|path| path.join("connectors.sqlite3"))
+        .unwrap_or_else(|| PathBuf::from("data").join("connectors.sqlite3"));
+    let channels = Arc::new(
+        channels::ChannelPlatform::initialize(grpc_url.clone(), auth.clone(), connectors_db_path)
+            .context("failed to initialize channel connector platform")?,
+    );
     let _cron_scheduler_task = spawn_scheduler_loop(
         runtime.clone(),
         auth.clone(),
@@ -1164,6 +1203,7 @@ async fn main() -> Result<()> {
     let state = AppState {
         started_at,
         runtime: runtime.clone(),
+        channels: Arc::clone(&channels),
         browser_service_config: gateway::BrowserServiceRuntimeConfig {
             enabled: loaded.tool_call.browser_service.enabled,
             endpoint: loaded.tool_call.browser_service.endpoint.clone(),
@@ -1195,6 +1235,11 @@ async fn main() -> Result<()> {
         .route("/admin/v1/runs/{run_id}", get(admin_run_status_handler))
         .route("/admin/v1/runs/{run_id}/tape", get(admin_run_tape_handler))
         .route("/admin/v1/runs/{run_id}/cancel", post(admin_run_cancel_handler))
+        .route("/admin/v1/channels", get(admin_channels_list_handler))
+        .route("/admin/v1/channels/{connector_id}", get(admin_channel_status_handler))
+        .route("/admin/v1/channels/{connector_id}/enabled", post(admin_channel_set_enabled_handler))
+        .route("/admin/v1/channels/{connector_id}/logs", get(admin_channel_logs_handler))
+        .route("/admin/v1/channels/{connector_id}/test", post(admin_channel_test_handler))
         .route("/admin/v1/skills/{skill_id}/quarantine", post(admin_skill_quarantine_handler))
         .route("/admin/v1/skills/{skill_id}/enable", post(admin_skill_enable_handler))
         .layer(DefaultBodyLimit::max(HTTP_MAX_REQUEST_BODY_BYTES))
@@ -1235,6 +1280,14 @@ async fn main() -> Result<()> {
         .route("/console/v1/memory/status", get(console_memory_status_handler))
         .route("/console/v1/memory/search", get(console_memory_search_handler))
         .route("/console/v1/memory/purge", post(console_memory_purge_handler))
+        .route("/console/v1/channels", get(console_channels_list_handler))
+        .route("/console/v1/channels/{connector_id}", get(console_channel_status_handler))
+        .route(
+            "/console/v1/channels/{connector_id}/enabled",
+            post(console_channel_set_enabled_handler),
+        )
+        .route("/console/v1/channels/{connector_id}/logs", get(console_channel_logs_handler))
+        .route("/console/v1/channels/{connector_id}/test", post(console_channel_test_handler))
         .route("/console/v1/skills", get(console_skills_list_handler))
         .route("/console/v1/skills/install", post(console_skills_install_handler))
         .route("/console/v1/skills/{skill_id}/verify", post(console_skills_verify_handler))
@@ -1276,6 +1329,7 @@ async fn main() -> Result<()> {
         .merge(admin_routes)
         .merge(console_routes)
         .with_state(state);
+    let _channel_worker_task = Arc::clone(&channels).spawn_worker();
 
     let gateway_service = gateway::GatewayServiceImpl::new(runtime.clone(), auth.clone());
     let grpc_gateway_server =
@@ -1925,6 +1979,138 @@ async fn admin_run_cancel_handler(
         .await
         .map_err(runtime_status_response)?;
     Ok(Json(response))
+}
+
+async fn admin_channels_list_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, Response> {
+    authorize_headers(&headers, &state.auth).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    let _context = request_context_from_headers(&headers).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    state.runtime.record_admin_status_request();
+    let connectors = state.channels.list().map_err(channel_platform_error_response)?;
+    Ok(Json(json!({ "connectors": connectors })))
+}
+
+async fn admin_channel_status_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(connector_id): Path<String>,
+) -> Result<Json<Value>, Response> {
+    authorize_headers(&headers, &state.auth).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    let _context = request_context_from_headers(&headers).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    state.runtime.record_admin_status_request();
+    let connector_id = normalize_non_empty_field(connector_id, "connector_id")?;
+    let connector =
+        state.channels.status(connector_id.as_str()).map_err(channel_platform_error_response)?;
+    Ok(Json(json!({ "connector": connector })))
+}
+
+async fn admin_channel_set_enabled_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(connector_id): Path<String>,
+    Json(payload): Json<ChannelEnabledRequest>,
+) -> Result<Json<Value>, Response> {
+    authorize_headers(&headers, &state.auth).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    let _context = request_context_from_headers(&headers).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    state.runtime.record_admin_status_request();
+    let connector_id = normalize_non_empty_field(connector_id, "connector_id")?;
+    let connector = state
+        .channels
+        .set_enabled(connector_id.as_str(), payload.enabled)
+        .map_err(channel_platform_error_response)?;
+    Ok(Json(json!({ "connector": connector })))
+}
+
+async fn admin_channel_logs_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(connector_id): Path<String>,
+    Query(query): Query<ChannelLogsQuery>,
+) -> Result<Json<Value>, Response> {
+    authorize_headers(&headers, &state.auth).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    let _context = request_context_from_headers(&headers).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    state.runtime.record_admin_status_request();
+    let connector_id = normalize_non_empty_field(connector_id, "connector_id")?;
+    let events = state
+        .channels
+        .logs(connector_id.as_str(), query.limit)
+        .map_err(channel_platform_error_response)?;
+    let dead_letters = state
+        .channels
+        .dead_letters(connector_id.as_str(), query.limit)
+        .map_err(channel_platform_error_response)?;
+    Ok(Json(json!({
+        "events": events,
+        "dead_letters": dead_letters,
+    })))
+}
+
+async fn admin_channel_test_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(connector_id): Path<String>,
+    Json(payload): Json<ChannelTestRequest>,
+) -> Result<Json<Value>, Response> {
+    authorize_headers(&headers, &state.auth).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    let _context = request_context_from_headers(&headers).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    state.runtime.record_admin_status_request();
+    let connector_id = normalize_non_empty_field(connector_id, "connector_id")?;
+    let ingest = state
+        .channels
+        .submit_test_message(
+            connector_id.as_str(),
+            channels::ChannelTestMessageRequest {
+                text: payload.text,
+                conversation_id: payload
+                    .conversation_id
+                    .unwrap_or_else(|| "test:conversation".to_owned()),
+                sender_id: payload.sender_id.unwrap_or_else(|| "test-user".to_owned()),
+                sender_display: payload.sender_display,
+                simulate_crash_once: payload.simulate_crash_once.unwrap_or(false),
+                is_direct_message: payload.is_direct_message.unwrap_or(true),
+                requested_broadcast: payload.requested_broadcast.unwrap_or(false),
+            },
+        )
+        .await
+        .map_err(channel_platform_error_response)?;
+    let status =
+        state.channels.status(connector_id.as_str()).map_err(channel_platform_error_response)?;
+    Ok(Json(json!({
+        "ingest": ingest,
+        "status": status,
+    })))
 }
 
 async fn admin_skill_quarantine_handler(
@@ -3930,6 +4116,98 @@ async fn console_memory_purge_handler(
     Ok(Json(json!({ "deleted_count": deleted_count })))
 }
 
+async fn console_channels_list_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, Response> {
+    let _session = authorize_console_session(&state, &headers, false)?;
+    let connectors = state.channels.list().map_err(channel_platform_error_response)?;
+    Ok(Json(json!({ "connectors": connectors })))
+}
+
+async fn console_channel_status_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(connector_id): Path<String>,
+) -> Result<Json<Value>, Response> {
+    let _session = authorize_console_session(&state, &headers, false)?;
+    let connector_id = normalize_non_empty_field(connector_id, "connector_id")?;
+    let connector =
+        state.channels.status(connector_id.as_str()).map_err(channel_platform_error_response)?;
+    Ok(Json(json!({ "connector": connector })))
+}
+
+async fn console_channel_set_enabled_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(connector_id): Path<String>,
+    Json(payload): Json<ChannelEnabledRequest>,
+) -> Result<Json<Value>, Response> {
+    let _session = authorize_console_session(&state, &headers, true)?;
+    let connector_id = normalize_non_empty_field(connector_id, "connector_id")?;
+    let connector = state
+        .channels
+        .set_enabled(connector_id.as_str(), payload.enabled)
+        .map_err(channel_platform_error_response)?;
+    Ok(Json(json!({ "connector": connector })))
+}
+
+async fn console_channel_logs_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(connector_id): Path<String>,
+    Query(query): Query<ChannelLogsQuery>,
+) -> Result<Json<Value>, Response> {
+    let _session = authorize_console_session(&state, &headers, false)?;
+    let connector_id = normalize_non_empty_field(connector_id, "connector_id")?;
+    let events = state
+        .channels
+        .logs(connector_id.as_str(), query.limit)
+        .map_err(channel_platform_error_response)?;
+    let dead_letters = state
+        .channels
+        .dead_letters(connector_id.as_str(), query.limit)
+        .map_err(channel_platform_error_response)?;
+    Ok(Json(json!({
+        "events": events,
+        "dead_letters": dead_letters,
+    })))
+}
+
+async fn console_channel_test_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(connector_id): Path<String>,
+    Json(payload): Json<ChannelTestRequest>,
+) -> Result<Json<Value>, Response> {
+    let _session = authorize_console_session(&state, &headers, true)?;
+    let connector_id = normalize_non_empty_field(connector_id, "connector_id")?;
+    let ingest = state
+        .channels
+        .submit_test_message(
+            connector_id.as_str(),
+            channels::ChannelTestMessageRequest {
+                text: payload.text,
+                conversation_id: payload
+                    .conversation_id
+                    .unwrap_or_else(|| "test:conversation".to_owned()),
+                sender_id: payload.sender_id.unwrap_or_else(|| "test-user".to_owned()),
+                sender_display: payload.sender_display,
+                simulate_crash_once: payload.simulate_crash_once.unwrap_or(false),
+                is_direct_message: payload.is_direct_message.unwrap_or(true),
+                requested_broadcast: payload.requested_broadcast.unwrap_or(false),
+            },
+        )
+        .await
+        .map_err(channel_platform_error_response)?;
+    let status =
+        state.channels.status(connector_id.as_str()).map_err(channel_platform_error_response)?;
+    Ok(Json(json!({
+        "ingest": ingest,
+        "status": status,
+    })))
+}
+
 fn parse_csv_values(raw: Option<&str>) -> Vec<String> {
     raw.map(|value| {
         value
@@ -5276,6 +5554,28 @@ fn sanitize_http_error_message(raw: &str) -> String {
         Some(value) => value,
         None => crate::model_provider::sanitize_remote_error(raw),
     }
+}
+
+fn channel_platform_error_response(error: channels::ChannelPlatformError) -> Response {
+    let status = match &error {
+        channels::ChannelPlatformError::InvalidInput(message) => {
+            tonic::Status::invalid_argument(message.clone())
+        }
+        channels::ChannelPlatformError::Supervisor(
+            palyra_connectors::ConnectorSupervisorError::NotFound(message),
+        ) => tonic::Status::not_found(message.clone()),
+        channels::ChannelPlatformError::Supervisor(
+            palyra_connectors::ConnectorSupervisorError::Validation(message),
+        ) => tonic::Status::invalid_argument(message.clone()),
+        channels::ChannelPlatformError::Supervisor(
+            palyra_connectors::ConnectorSupervisorError::Router(message),
+        ) => tonic::Status::unavailable(message.clone()),
+        channels::ChannelPlatformError::Supervisor(
+            palyra_connectors::ConnectorSupervisorError::Adapter(message),
+        ) => tonic::Status::unavailable(message.clone()),
+        _ => tonic::Status::internal(error.to_string()),
+    };
+    runtime_status_response(status)
 }
 
 fn runtime_status_response(status: tonic::Status) -> Response {

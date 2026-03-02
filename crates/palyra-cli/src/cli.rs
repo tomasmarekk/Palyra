@@ -574,16 +574,110 @@ pub enum AuthCredentialArg {
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum ChannelsCommand {
-    List,
-    Connect {
+    List {
         #[arg(long)]
-        kind: String,
+        url: Option<String>,
         #[arg(long)]
-        name: String,
+        token: Option<String>,
+        #[arg(long, default_value = "user:local")]
+        principal: String,
+        #[arg(long, default_value = "01ARZ3NDEKTSV4RRFFQ69G5FAV")]
+        device_id: String,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
-    Disconnect {
+    Status {
+        connector_id: String,
         #[arg(long)]
-        name: String,
+        url: Option<String>,
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long, default_value = "user:local")]
+        principal: String,
+        #[arg(long, default_value = "01ARZ3NDEKTSV4RRFFQ69G5FAV")]
+        device_id: String,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Enable {
+        connector_id: String,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long, default_value = "user:local")]
+        principal: String,
+        #[arg(long, default_value = "01ARZ3NDEKTSV4RRFFQ69G5FAV")]
+        device_id: String,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Disable {
+        connector_id: String,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long, default_value = "user:local")]
+        principal: String,
+        #[arg(long, default_value = "01ARZ3NDEKTSV4RRFFQ69G5FAV")]
+        device_id: String,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Logs {
+        connector_id: String,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long, default_value = "user:local")]
+        principal: String,
+        #[arg(long, default_value = "01ARZ3NDEKTSV4RRFFQ69G5FAV")]
+        device_id: String,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Test {
+        connector_id: String,
+        #[arg(long)]
+        text: String,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long, default_value = "user:local")]
+        principal: String,
+        #[arg(long, default_value = "01ARZ3NDEKTSV4RRFFQ69G5FAV")]
+        device_id: String,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long)]
+        conversation_id: Option<String>,
+        #[arg(long)]
+        sender_id: Option<String>,
+        #[arg(long)]
+        sender_display: Option<String>,
+        #[arg(long, default_value_t = false)]
+        simulate_crash_once: bool,
+        #[arg(long, default_value_t = true)]
+        is_direct_message: bool,
+        #[arg(long, default_value_t = false)]
+        requested_broadcast: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 }
 
@@ -1901,15 +1995,35 @@ mod tests {
     }
 
     #[test]
-    fn parse_channels_connect() {
-        let parsed =
-            Cli::parse_from(["palyra", "channels", "connect", "--kind", "slack", "--name", "ops"]);
+    fn parse_channels_enable() {
+        let parsed = Cli::parse_from([
+            "palyra",
+            "channels",
+            "enable",
+            "echo:default",
+            "--url",
+            "http://127.0.0.1:7142",
+            "--token",
+            "admin-token",
+            "--principal",
+            "admin:ops",
+            "--device-id",
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "--channel",
+            "cli",
+            "--json",
+        ]);
         assert_eq!(
             parsed.command,
             Command::Channels {
-                command: ChannelsCommand::Connect {
-                    kind: "slack".to_owned(),
-                    name: "ops".to_owned(),
+                command: ChannelsCommand::Enable {
+                    connector_id: "echo:default".to_owned(),
+                    url: Some("http://127.0.0.1:7142".to_owned()),
+                    token: Some("admin-token".to_owned()),
+                    principal: "admin:ops".to_owned(),
+                    device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                    channel: Some("cli".to_owned()),
+                    json: true,
                 }
             }
         );

@@ -683,6 +683,139 @@ fn console_cron_workflow_create_disable_and_list_runs() -> Result<()> {
 }
 
 #[test]
+fn console_channels_endpoints_require_session_and_csrf() -> Result<()> {
+    let (child, admin_port) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("failed to build HTTP client")?;
+    let connector_id = "echo:default";
+
+    let no_session = client
+        .get(format!("http://127.0.0.1:{admin_port}/console/v1/channels"))
+        .send()
+        .context("failed to call channels list endpoint without session")?;
+    assert_eq!(no_session.status().as_u16(), 403, "channels list must require session");
+
+    let (cookie, csrf_token) = login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
+
+    let list_response = client
+        .get(format!("http://127.0.0.1:{admin_port}/console/v1/channels"))
+        .header("Cookie", cookie.clone())
+        .send()
+        .context("failed to call channels list endpoint")?
+        .error_for_status()
+        .context("channels list endpoint returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse channels list response json")?;
+    let connectors = list_response
+        .get("connectors")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("channels list response missing connectors array"))?;
+    assert!(
+        connectors.iter().any(|entry| {
+            entry.get("connector_id").and_then(Value::as_str) == Some(connector_id)
+        }),
+        "channels list response should include {connector_id}"
+    );
+
+    let missing_csrf = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/channels/{connector_id}/enabled"))
+        .header("Cookie", cookie.clone())
+        .json(&serde_json::json!({ "enabled": true }))
+        .send()
+        .context("failed to call channels enable endpoint without csrf token")?;
+    assert_eq!(
+        missing_csrf.status().as_u16(),
+        403,
+        "channels enable endpoint must enforce csrf token"
+    );
+
+    let enabled_response = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/channels/{connector_id}/enabled"))
+        .header("Cookie", cookie.clone())
+        .header("x-palyra-csrf-token", csrf_token.clone())
+        .json(&serde_json::json!({ "enabled": true }))
+        .send()
+        .context("failed to call channels enable endpoint with csrf token")?
+        .error_for_status()
+        .context("channels enable endpoint returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse channels enable response json")?;
+    assert_eq!(
+        enabled_response
+            .get("connector")
+            .and_then(|connector| connector.get("connector_id"))
+            .and_then(Value::as_str),
+        Some(connector_id),
+        "channels enable response should include connector payload"
+    );
+
+    let logs_response = client
+        .get(format!(
+            "http://127.0.0.1:{admin_port}/console/v1/channels/{connector_id}/logs?limit=5"
+        ))
+        .header("Cookie", cookie.clone())
+        .send()
+        .context("failed to call channels logs endpoint")?
+        .error_for_status()
+        .context("channels logs endpoint returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse channels logs response json")?;
+    assert!(
+        logs_response.get("events").and_then(Value::as_array).is_some(),
+        "channels logs response should include events array"
+    );
+    assert!(
+        logs_response.get("dead_letters").and_then(Value::as_array).is_some(),
+        "channels logs response should include dead_letters array"
+    );
+
+    let test_without_csrf = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/channels/{connector_id}/test"))
+        .header("Cookie", cookie.clone())
+        .json(&serde_json::json!({ "text": "hello from console test" }))
+        .send()
+        .context("failed to call channels test endpoint without csrf token")?;
+    assert_eq!(
+        test_without_csrf.status().as_u16(),
+        403,
+        "channels test endpoint must enforce csrf token"
+    );
+
+    let test_response = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/channels/{connector_id}/test"))
+        .header("Cookie", cookie)
+        .header("x-palyra-csrf-token", csrf_token)
+        .json(&serde_json::json!({
+            "text": "hello from console test",
+            "conversation_id": "test:conversation",
+            "sender_id": "test-user",
+            "is_direct_message": true,
+            "requested_broadcast": false,
+        }))
+        .send()
+        .context("failed to call channels test endpoint with csrf token")?
+        .error_for_status()
+        .context("channels test endpoint returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse channels test response json")?;
+    assert!(
+        test_response.get("ingest").is_some(),
+        "channels test response should include ingest payload"
+    );
+    assert!(
+        test_response.get("status").is_some(),
+        "channels test response should include status payload"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn console_memory_purge_requires_session_and_csrf() -> Result<()> {
     let (child, admin_port) = spawn_palyrad_with_dynamic_ports()?;
     let mut daemon = ChildGuard::new(child);

@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "crates/palyra-common",
+  "crates/palyra-connectors",
   "crates/palyra-auth",
   "crates/palyra-daemon",
   "crates/palyra-transport-quic",
