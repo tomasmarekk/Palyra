@@ -744,7 +744,7 @@ fn unix_ms_now() -> Result<i64, ConnectorSupervisorError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Mutex};
+    use std::{collections::HashMap, sync::Mutex, time::Duration};
 
     use tempfile::TempDir;
 
@@ -902,10 +902,20 @@ mod tests {
             .await
             .expect("ingest should succeed");
         assert!(ingest.accepted);
-        let drained =
-            supervisor.drain_due_outbox(16).await.expect("drain should succeed after retry delay");
+        let mut delivered = 0_usize;
+        for _ in 0..20 {
+            let drained = supervisor
+                .drain_due_outbox(16)
+                .await
+                .expect("drain should succeed while waiting for retry");
+            delivered = delivered.saturating_add(drained.delivered);
+            if delivered >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
         let status = supervisor.status("echo:default").expect("status should resolve");
-        assert!(drained.delivered >= 1, "retry drain should eventually deliver");
+        assert!(delivered >= 1, "retry drain should eventually deliver");
         assert!(status.restart_count >= 1, "restart counter should increment on restart retry");
     }
 }
