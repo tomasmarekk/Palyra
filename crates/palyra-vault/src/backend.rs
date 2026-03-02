@@ -185,7 +185,6 @@ fn backend_for_kind(kind: BackendKind, root: &Path) -> Result<Box<dyn BlobBacken
 #[derive(Debug, Clone)]
 struct EncryptedFileBackend {
     objects_root: PathBuf,
-    store_path: PathBuf,
 }
 
 impl EncryptedFileBackend {
@@ -209,17 +208,27 @@ impl EncryptedFileBackend {
             })?;
             ensure_owner_only_file(&store_path)?;
         }
-        Ok(Self { objects_root, store_path })
+        Ok(Self { objects_root })
     }
 
     fn read_store(&self) -> Result<BTreeMap<String, Vec<u8>>, VaultError> {
-        let bytes = fs::read(&self.store_path).map_err(|error| {
+        let store_root = canonicalize_existing_dir(
+            self.objects_root.as_path(),
+            "encrypted-file objects directory",
+        )?;
+        let store_path = store_root.join(OBJECTS_STORE_FILE);
+        ensure_path_within_root(
+            store_root.as_path(),
+            store_path.as_path(),
+            "encrypted-file objects store path",
+        )?;
+        let bytes = fs::read(&store_path).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 VaultError::NotFound
             } else {
                 VaultError::Io(format!(
                     "failed to read encrypted-file objects store {}: {error}",
-                    self.store_path.display()
+                    store_path.display()
                 ))
             }
         })?;
@@ -227,22 +236,32 @@ impl EncryptedFileBackend {
             .map_err(|error| {
                 VaultError::Io(format!(
                     "failed to parse encrypted-file objects store {}: {error}",
-                    self.store_path.display()
+                    store_path.display()
                 ))
             })?;
         Ok(parsed)
     }
 
     fn write_store(&self, store: &BTreeMap<String, Vec<u8>>) -> Result<(), VaultError> {
+        let store_root = canonicalize_existing_dir(
+            self.objects_root.as_path(),
+            "encrypted-file objects directory",
+        )?;
+        let store_path = store_root.join(OBJECTS_STORE_FILE);
+        ensure_path_within_root(
+            store_root.as_path(),
+            store_path.as_path(),
+            "encrypted-file objects store path",
+        )?;
         let payload = serde_json::to_vec(store).map_err(|error| {
             VaultError::Io(format!(
                 "failed to serialize encrypted-file objects store {}: {error}",
-                self.store_path.display()
+                store_path.display()
             ))
         })?;
-        let tmp_path = self.store_path.with_extension(format!("tmp.{}", Ulid::new()));
+        let tmp_path = store_root.join(format!("{}.tmp.{}", OBJECTS_STORE_FILE, Ulid::new()));
         ensure_path_within_root(
-            self.objects_root.as_path(),
+            store_root.as_path(),
             tmp_path.as_path(),
             "encrypted-file temporary objects store path",
         )?;
@@ -253,13 +272,13 @@ impl EncryptedFileBackend {
             ))
         })?;
         ensure_owner_only_file(&tmp_path)?;
-        fs::rename(&tmp_path, &self.store_path).map_err(|error| {
+        fs::rename(&tmp_path, &store_path).map_err(|error| {
             VaultError::Io(format!(
                 "failed to finalize encrypted-file objects store {}: {error}",
-                self.store_path.display()
+                store_path.display()
             ))
         })?;
-        ensure_owner_only_file(&self.store_path)?;
+        ensure_owner_only_file(&store_path)?;
         Ok(())
     }
 }
