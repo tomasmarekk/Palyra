@@ -89,7 +89,14 @@ impl FakeChannelAdapter {
         text: &str,
         is_direct_message: bool,
     ) -> Result<gateway_v1::RouteMessageResponse> {
-        self.inject_message_with_flags(client, text, is_direct_message, false).await
+        self.inject_message_with_flags_and_attachments(
+            client,
+            text,
+            is_direct_message,
+            false,
+            Vec::new(),
+        )
+        .await
     }
 
     async fn inject_message_with_flags(
@@ -101,12 +108,32 @@ impl FakeChannelAdapter {
         is_direct_message: bool,
         request_broadcast: bool,
     ) -> Result<gateway_v1::RouteMessageResponse> {
-        self.inject_message_with_envelope_id(
+        self.inject_message_with_flags_and_attachments(
             client,
             text,
             is_direct_message,
             request_broadcast,
-            ENVELOPE_ID,
+            Vec::new(),
+        )
+        .await
+    }
+
+    async fn inject_message_with_attachments(
+        &self,
+        client: &mut gateway_v1::gateway_service_client::GatewayServiceClient<
+            tonic::transport::Channel,
+        >,
+        text: &str,
+        is_direct_message: bool,
+        request_broadcast: bool,
+        attachments: Vec<common_v1::MessageAttachment>,
+    ) -> Result<gateway_v1::RouteMessageResponse> {
+        self.inject_message_with_flags_and_attachments(
+            client,
+            text,
+            is_direct_message,
+            request_broadcast,
+            attachments,
         )
         .await
     }
@@ -121,6 +148,49 @@ impl FakeChannelAdapter {
         request_broadcast: bool,
         envelope_id: &str,
     ) -> Result<gateway_v1::RouteMessageResponse> {
+        self.inject_message_with_envelope_id_and_attachments(
+            client,
+            text,
+            is_direct_message,
+            request_broadcast,
+            envelope_id,
+            Vec::new(),
+        )
+        .await
+    }
+
+    async fn inject_message_with_flags_and_attachments(
+        &self,
+        client: &mut gateway_v1::gateway_service_client::GatewayServiceClient<
+            tonic::transport::Channel,
+        >,
+        text: &str,
+        is_direct_message: bool,
+        request_broadcast: bool,
+        attachments: Vec<common_v1::MessageAttachment>,
+    ) -> Result<gateway_v1::RouteMessageResponse> {
+        self.inject_message_with_envelope_id_and_attachments(
+            client,
+            text,
+            is_direct_message,
+            request_broadcast,
+            ENVELOPE_ID,
+            attachments,
+        )
+        .await
+    }
+
+    async fn inject_message_with_envelope_id_and_attachments(
+        &self,
+        client: &mut gateway_v1::gateway_service_client::GatewayServiceClient<
+            tonic::transport::Channel,
+        >,
+        text: &str,
+        is_direct_message: bool,
+        request_broadcast: bool,
+        envelope_id: &str,
+        attachments: Vec<common_v1::MessageAttachment>,
+    ) -> Result<gateway_v1::RouteMessageResponse> {
         let mut request = tonic::Request::new(gateway_v1::RouteMessageRequest {
             v: 1,
             envelope: Some(common_v1::MessageEnvelope {
@@ -134,10 +204,7 @@ impl FakeChannelAdapter {
                     sender_handle: "user:ops".to_owned(),
                     sender_verified: true,
                 }),
-                content: Some(common_v1::MessageContent {
-                    text: text.to_owned(),
-                    attachments: Vec::new(),
-                }),
+                content: Some(common_v1::MessageContent { text: text.to_owned(), attachments }),
                 max_payload_bytes: 4096,
                 ..Default::default()
             }),
@@ -286,6 +353,104 @@ async fn grpc_route_message_with_fake_adapter_emits_reply_and_journal_events() -
             .iter()
             .any(|payload| payload.get("event").and_then(Value::as_str) == Some("message.replied")),
         "router flow should persist message.replied journal event"
+    );
+
+    server_handle.join().expect("scripted openai server thread should exit");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_route_message_preserves_attachment_metadata_in_outbound_and_journal() -> Result<()> {
+    let (openai_base_url, _request_count, server_handle) =
+        spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::immediate(
+            200,
+            r#"{"choices":[{"message":{"content":"attachment-aware reply"}}]}"#.to_owned(),
+        )])?;
+    let (child, admin_port, grpc_port, journal_db_path, config_path) =
+        spawn_palyrad_with_openai_provider_and_channel_router(
+            openai_base_url.as_str(),
+            OPENAI_API_KEY,
+        )?;
+    let _config_guard = TempFileGuard::new(config_path);
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+    let mut create_route_agent = tonic::Request::new(gateway_v1::CreateAgentRequest {
+        v: 1,
+        agent_id: "route".to_owned(),
+        display_name: "Route".to_owned(),
+        agent_dir: String::new(),
+        workspace_roots: vec!["workspace".to_owned()],
+        default_model_profile: "gpt-4o-mini".to_owned(),
+        default_tool_allowlist: vec!["palyra.echo".to_owned()],
+        default_skill_allowlist: vec!["acme.route".to_owned()],
+        set_default: true,
+        allow_absolute_paths: false,
+    });
+    authorize_metadata_with_principal(create_route_agent.metadata_mut(), "admin:ops")?;
+    client
+        .create_agent(create_route_agent)
+        .await
+        .context("failed to create route agent before RouteMessage attachment test")?;
+    let adapter = FakeChannelAdapter::default();
+    let request_attachments = vec![common_v1::MessageAttachment {
+        kind: common_v1::message_attachment::AttachmentKind::File as i32,
+        artifact_id: Some(common_v1::CanonicalId { ulid: "01ARZ3NDEKTSV4RRFFQ69G5FB2".to_owned() }),
+        size_bytes: 4096,
+    }];
+    let response = adapter
+        .inject_message_with_attachments(
+            &mut client,
+            "hey @palyra include attachment metadata",
+            false,
+            false,
+            request_attachments.clone(),
+        )
+        .await?;
+    assert!(
+        response.accepted,
+        "mention-matched message should be routed (reason={})",
+        response.decision_reason
+    );
+
+    let outbound = response
+        .outputs
+        .first()
+        .cloned()
+        .context("route message should include outbound payload")?;
+    assert_eq!(
+        outbound.attachments, request_attachments,
+        "route response should preserve inbound attachment metadata in outbound payload"
+    );
+
+    let message_events = load_message_router_journal_events(&journal_db_path)?;
+    let replied_payload = message_events
+        .iter()
+        .find(|payload| payload.get("event").and_then(Value::as_str) == Some("message.replied"))
+        .context("message.replied journal event should be present")?;
+    let replied_attachments = replied_payload
+        .get("attachments")
+        .and_then(Value::as_array)
+        .context("message.replied event should include attachments metadata array")?;
+    assert_eq!(replied_attachments.len(), 1);
+    assert_eq!(
+        replied_attachments[0].get("kind").and_then(Value::as_str),
+        Some("file"),
+        "journal payload should keep attachment kind"
+    );
+    assert_eq!(
+        replied_attachments[0].get("artifact_id").and_then(Value::as_str),
+        Some("01ARZ3NDEKTSV4RRFFQ69G5FB2"),
+        "journal payload should keep artifact id"
+    );
+    assert_eq!(
+        replied_attachments[0].get("size_bytes").and_then(Value::as_u64),
+        Some(4096),
+        "journal payload should keep attachment size"
     );
 
     server_handle.join().expect("scripted openai server thread should exit");

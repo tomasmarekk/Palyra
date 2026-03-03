@@ -77,8 +77,10 @@ impl ConnectorAdapter for DiscordConnectorAdapter {
         _instance: &ConnectorInstanceRecord,
         request: &OutboundMessageRequest,
     ) -> Result<Vec<OutboundMessageRequest>, ConnectorAdapterError> {
+        let rendered_text =
+            with_attachment_context(request.text.as_str(), request.attachments.as_slice());
         let chunks = chunk_discord_text(
-            request.text.as_str(),
+            rendered_text.as_str(),
             self.config.max_chunk_chars,
             self.config.max_chunk_lines,
         );
@@ -88,7 +90,9 @@ impl ConnectorAdapter for DiscordConnectorAdapter {
             ));
         }
         if chunks.len() == 1 {
-            return Ok(vec![request.clone()]);
+            let mut single = request.clone();
+            single.text = rendered_text;
+            return Ok(vec![single]);
         }
 
         let mut split = Vec::with_capacity(chunks.len());
@@ -864,7 +868,10 @@ mod tests {
         DiscordCredentialResolver, DiscordTransport, DiscordTransportResponse, OpenFence,
     };
     use crate::{
-        protocol::{ConnectorKind, DeliveryOutcome, OutboundMessageRequest, RetryClass},
+        protocol::{
+            AttachmentKind, AttachmentRef, ConnectorKind, DeliveryOutcome, OutboundMessageRequest,
+            RetryClass,
+        },
         storage::ConnectorInstanceRecord,
         supervisor::ConnectorAdapter,
     };
@@ -1225,6 +1232,35 @@ mod tests {
                 "chunk text should respect max char configuration"
             );
         }
+    }
+
+    #[test]
+    fn split_outbound_embeds_attachment_metadata_context() {
+        let transport = Arc::new(FakeTransport::default());
+        let adapter = adapter_with_fake_transport(transport);
+        let mut request = sample_request("reply with attachment context");
+        request.attachments = vec![AttachmentRef {
+            kind: AttachmentKind::Image,
+            url: Some("u".to_owned()),
+            artifact_ref: None,
+            filename: Some("a".to_owned()),
+            content_type: Some("i".to_owned()),
+            size_bytes: Some(1),
+        }];
+
+        let chunks = adapter
+            .split_outbound(&sample_instance(), &request)
+            .expect("split should succeed with attachment metadata");
+        assert_eq!(chunks.len(), 1, "short payload should stay in one chunk");
+        let rendered = &chunks[0].text;
+        assert!(
+            rendered.contains("[attachment-metadata]"),
+            "attachment metadata marker should be appended to outbound text"
+        );
+        assert!(
+            rendered.contains("kind=image, filename=a, content_type=i, size_bytes=1, source=u"),
+            "attachment metadata should preserve key fields for operator visibility"
+        );
     }
 
     #[test]
@@ -2338,6 +2374,63 @@ where
     sink.send(Message::Text(payload.to_string().into())).await.map_err(|error| {
         ConnectorAdapterError::Backend(format!("discord gateway write failed: {error}"))
     })
+}
+
+fn with_attachment_context(text: &str, attachments: &[AttachmentRef]) -> String {
+    let Some(summary) = render_attachment_context(attachments) else {
+        return text.to_owned();
+    };
+    let trimmed = text.trim_end();
+    if trimmed.is_empty() {
+        summary
+    } else {
+        format!("{trimmed}\n\n{summary}")
+    }
+}
+
+fn render_attachment_context(attachments: &[AttachmentRef]) -> Option<String> {
+    if attachments.is_empty() {
+        return None;
+    }
+    let mut lines = Vec::with_capacity(attachments.len().saturating_add(1));
+    lines.push("[attachment-metadata]".to_owned());
+    for (index, attachment) in attachments.iter().enumerate() {
+        lines.push(format!("- {}: {}", index.saturating_add(1), summarize_attachment(attachment)));
+    }
+    Some(lines.join("\n"))
+}
+
+fn summarize_attachment(attachment: &AttachmentRef) -> String {
+    let kind = match attachment.kind {
+        AttachmentKind::Image => "image",
+        AttachmentKind::File => "file",
+    };
+    let source = attachment
+        .url
+        .as_deref()
+        .or(attachment.artifact_ref.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown");
+    let filename = attachment
+        .filename
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown");
+    let content_type = attachment
+        .content_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown");
+    let size = attachment
+        .size_bytes
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_owned());
+    format!(
+        "kind={kind}, filename={filename}, content_type={content_type}, size_bytes={size}, source={source}"
+    )
 }
 
 #[derive(Debug, Clone)]

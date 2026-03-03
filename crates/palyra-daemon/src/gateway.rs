@@ -6699,6 +6699,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                         })
                     })
                     .collect::<Vec<_>>();
+                let route_output_attachments = content.attachments.clone();
                 self.state
                     .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
                         run_id: run_id.clone(),
@@ -6956,6 +6957,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                         payload_json: json!({
                             "reply_text": reply_text.clone(),
                             "route_key": plan.route_key.clone(),
+                            "attachments": route_attachment_metadata.clone(),
                             "agent_id": route_agent_id.clone(),
                             "agent_resolution_source": route_agent_resolution_source.clone(),
                         })
@@ -7006,6 +7008,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                         "envelope_id": envelope_id,
                         "channel": plan.channel.clone(),
                         "reply_preview": truncate_with_ellipsis(reply_text.clone(), 256),
+                        "attachments": route_attachment_metadata.clone(),
                         "agent_id": route_agent_id,
                         "agent_resolution_source": route_agent_resolution_source,
                         "config_hash": route_config_hash.clone(),
@@ -7032,7 +7035,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     run_id: Some(common_v1::CanonicalId { ulid: run_id }),
                     outputs: vec![gateway_v1::OutboundMessage {
                         text: reply_text,
-                        attachments: Vec::new(),
+                        attachments: route_output_attachments,
                         thread_id: plan.reply_thread_id.unwrap_or_default(),
                         in_reply_to_message_id: plan.in_reply_to_message_id.unwrap_or_default(),
                         broadcast: plan.is_broadcast,
