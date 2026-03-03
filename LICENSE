@@ -1,131 +1,69 @@
-Palyra Community Source License (PCSL) v1.0
-===========================================
+# Functional Source License, Version 1.1, ALv2 Future License
 
-SPDX-License-Identifier: LicenseRef-Palyra-Community-Source-1.0
+## Abbreviation
 
-Copyright (c) 2026 marektomas-cz
+FSL-1.1-ALv2
 
-NOTICE
-------
-This is a source-available license. It is NOT an OSI-approved “Open Source” license.
-It is intended to allow free use, modification, and free redistribution (including for
-internal commercial use), while prohibiting (a) selling the software itself and (b) offering
-the software as a paid hosted/managed service.
+## Notice
 
-1. Definitions
---------------
-1.1 “Licensor” means the copyright holder(s) offering the Software under this License.
+Copyright 2026 marektomas-cz
 
-1.2 “Software” means the source code, binaries (if any), build scripts, configuration, and
-documentation made available in this repository, including any portion of it.
+## Terms and Conditions
 
-1.3 “You” (or “Your”) means the individual or legal entity exercising permissions granted
-by this License.
+### Licensor ("We")
 
-1.4 “Distribute” means to provide, publish, share, transmit, or otherwise make available
-a copy of the Software or a Derivative Work to any third party by any means, including by
-download, source control hosting, package registries, container registries, app stores, or
-physical media.
+The party offering the Software under these Terms and Conditions.
 
-1.5 “Derivative Work” means any work based on the Software for which Your modifications
-(as a whole) would be considered an original work of authorship under applicable copyright law.
-For clarity: modifications, forks, patches, refactors, ports, and additions that incorporate
-any portion of the Software are Derivative Works.
+### The Software
 
-1.6 “Fee” means any monetary or non-monetary consideration (including subscription payments,
-license fees, access fees, usage fees, seat fees, revenue share, or any other thing of value)
-that a recipient must provide as a condition to (a) obtain a copy of the Software/Derivative Work,
-or (b) access or use the Software’s functionality.
+The "Software" is each version of the software that we make available under these Terms and Conditions, as indicated by our inclusion of these Terms and Conditions with the Software.
 
-1.7 “Hosted Service” means providing third parties access (directly or indirectly) to any
-substantial set of the features or functionality of the Software or a Derivative Work over a network,
-including SaaS, PaaS, hosted, managed service, or “X-as-a-service” offerings, regardless of whether
-access is provided via a web UI, API, CLI gateway, embedded console, or similar interface.
+### License Grant
 
-1.8 “Customer Environment” means infrastructure and accounts that are owned or controlled by the
-customer receiving Professional Services, where the customer has administrative control and can run
-the Software independently.
+Subject to your compliance with this License Grant and the Patents, Redistribution and Trademark clauses below, we hereby grant you the right to use, copy, modify, create derivative works, publicly perform, publicly display and redistribute the Software for any Permitted Purpose identified below.
 
-1.9 “Professional Services” means human-delivered services such as consulting, installation,
-configuration, integration, customization, training, security review, operations support, and
-troubleshooting performed for a specific customer.
+### Permitted Purpose
 
-2. License Grant
-----------------
-Subject to the terms and conditions of this License, the Licensor grants You a non-exclusive,
-worldwide, royalty-free license to:
+A Permitted Purpose is any purpose other than a Competing Use. A Competing Use means making the Software available to others in a commercial product or service that:
 
-(a) use and run the Software for any purpose, including internal commercial purposes;
+1. substitutes for the Software;
+2. substitutes for any other product or service we offer using the Software that exists as of the date we make the Software available; or
+3. offers the same or substantially similar functionality as the Software.
 
-(b) copy and modify the Software to create Derivative Works;
+Permitted Purposes specifically include using the Software:
 
-(c) Distribute the Software and Derivative Works, provided that such Distribution complies with
-Sections 3 and 4 below.
+1. for your internal use and access;
+2. for non-commercial education;
+3. for non-commercial research; and
+4. in connection with professional services that you provide to a licensee using the Software in accordance with these Terms and Conditions.
 
-3. Conditions
--------------
-3.1 License & Copyright Notice.
-You must include this License text and all copyright notices of the Licensor in all copies of the
-Software and Derivative Works that You Distribute.
+### Patents
 
-3.2 Same License for Redistribution.
-Any Distribution of the Software or Derivative Works must be under this License. You may not
-Distribute the Software or Derivative Works under different terms, and You may not impose additional
-restrictions on recipients regarding the Software or Derivative Works.
+To the extent your use for a Permitted Purpose would necessarily infringe our patents, the license grant above includes a license under our patents. If you make a claim against any party that the Software infringes or contributes to the infringement of any patent, then your patent license to the Software ends immediately.
 
-3.3 Mark Your Changes.
-If You Distribute a Derivative Work, You must include prominent notices stating that You have
-modified the Software.
+### Redistribution
 
-4. Restrictions (What You May NOT Do)
--------------------------------------
-4.1 No Paid Distribution (No Paywall / No Selling the Software).
-You may not Distribute the Software or any Derivative Work for a Fee.
-This includes, without limitation, selling licenses, selling copies, charging for downloads,
-or placing the Software or Derivative Works behind a paywall or subscription that is required to
-obtain a copy.
+The Terms and Conditions apply to all copies, modifications and derivatives of the Software.
 
-4.2 No Paid Hosted / Managed Service.
-You may not offer or provide the Software or any Derivative Work as part of a Hosted Service for a Fee.
+If you redistribute any copies, modifications or derivatives of the Software, you must include a copy of or a link to these Terms and Conditions and not remove any copyright notices provided in or with the Software.
 
-5. Explicit Permission: Paid Implementation / Consulting
---------------------------------------------------------
-Notwithstanding Sections 4.1 and 4.2, You MAY charge for Professional Services related to the Software,
-provided that ALL of the following are true:
+### Disclaimer
 
-(a) any copy of the Software or Derivative Works You provide to the customer is provided at no charge
-under this License;
+THE SOFTWARE IS PROVIDED "AS IS" AND WITHOUT WARRANTIES OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION WARRANTIES OF FITNESS FOR A PARTICULAR PURPOSE, MERCHANTABILITY, TITLE OR NON-INFRINGEMENT.
 
-(b) the customer is not charged a license fee, subscription fee, access fee, or usage fee for the
-Software itself;
+IN NO EVENT WILL WE HAVE ANY LIABILITY TO YOU ARISING OUT OF OR RELATED TO THE SOFTWARE, INCLUDING INDIRECT, SPECIAL, INCIDENTAL OR CONSEQUENTIAL DAMAGES, EVEN IF WE HAVE BEEN INFORMED OF THEIR POSSIBILITY IN ADVANCE.
 
-(c) the Software is deployed and operated in the Customer Environment (i.e., the customer controls
-the environment and can run the Software without You).
+### Trademarks
 
-For clarity: charging for “setup”, “migration”, “integration”, “training”, “support”, or similar
-Professional Services is allowed if the Software itself remains free of charge and is not provided
-as a paid Hosted Service.
+Except for displaying the License Details and identifying us as the origin of the Software, you have no right under these Terms and Conditions to use our trademarks, trade names, service marks or product names.
 
-6. Trademarks
--------------
-This License does not grant any rights in the Licensor’s trademarks, service marks, or logos.
+## Grant of Future License
 
-7. Termination
---------------
-If You violate any term of this License, Your rights under this License terminate automatically.
-If the Licensor notifies You of the violation and You cure it within 30 days of receiving notice,
-Your rights will be reinstated retroactively. Repeated violations after reinstatement may result in
-permanent termination.
+We hereby irrevocably grant you an additional license to use the Software under the Apache License, Version 2.0 that is effective on the second anniversary of the date we make the Software available. On or after that date, you may use the Software under the Apache License, Version 2.0, in which case the following will apply:
 
-8. Disclaimer of Warranty
--------------------------
-THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
-LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
-WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
 
-9. Contact for Commercial Exception
------------------------------------
-If You want to sell the Software, place it behind a paywall, or offer it as a hosted/managed service,
-you must obtain a separate commercial license from the Licensor.
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
