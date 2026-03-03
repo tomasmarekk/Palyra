@@ -5236,6 +5236,14 @@ fn agent_resolution_source_to_proto(source: AgentResolutionSource) -> i32 {
     }
 }
 
+fn agent_resolution_source_label(source: AgentResolutionSource) -> &'static str {
+    match source {
+        AgentResolutionSource::SessionBinding => "session_binding",
+        AgentResolutionSource::Default => "default",
+        AgentResolutionSource::Fallback => "fallback",
+    }
+}
+
 fn approval_option_messages(options: &[ApprovalPromptOption]) -> Vec<common_v1::ApprovalOption> {
     options
         .iter()
@@ -6605,6 +6613,37 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     .await?;
                 self.state.counters.channel_messages_routed.fetch_add(1, Ordering::Relaxed);
 
+                let route_agent = match self
+                    .state
+                    .resolve_agent_for_context(AgentResolveRequest {
+                        principal: context.principal.clone(),
+                        channel: Some(plan.channel.clone()),
+                        session_id: Some(session_id.clone()),
+                        preferred_agent_id: None,
+                        persist_session_binding: true,
+                    })
+                    .await
+                {
+                    Ok(outcome) => Some(outcome),
+                    Err(error) => {
+                        warn!(
+                            session_id = %session_id,
+                            run_id = %run_id,
+                            principal = %context.principal,
+                            channel = %plan.channel,
+                            status_code = ?error.code(),
+                            status_message = %error.message(),
+                            "route message agent resolution failed; continuing without agent binding metadata"
+                        );
+                        None
+                    }
+                };
+                let route_agent_id =
+                    route_agent.as_ref().map(|outcome| outcome.agent.agent_id.clone());
+                let route_agent_resolution_source = route_agent
+                    .as_ref()
+                    .map(|outcome| agent_resolution_source_label(outcome.source).to_owned());
+
                 let _ = record_message_router_journal_event(
                     &self.state,
                     &context,
@@ -6618,6 +6657,8 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                         "channel": input.channel.clone(),
                         "session_key": plan.session_key.clone(),
                         "route_key": plan.route_key.clone(),
+                        "agent_id": route_agent_id.clone(),
+                        "agent_resolution_source": route_agent_resolution_source.clone(),
                         "config_hash": route_config_hash.clone(),
                         "actor": {
                             "connector_channel": actor_connector.clone(),
@@ -6628,10 +6669,96 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                 )
                 .await;
 
+                let mut tape_seq = 1_i64;
+                let route_attachment_metadata = content
+                    .attachments
+                    .iter()
+                    .map(|attachment| {
+                        let kind = match common_v1::message_attachment::AttachmentKind::try_from(
+                            attachment.kind,
+                        )
+                        .ok()
+                        {
+                            Some(common_v1::message_attachment::AttachmentKind::Image) => "image",
+                            Some(common_v1::message_attachment::AttachmentKind::File) => "file",
+                            Some(common_v1::message_attachment::AttachmentKind::Audio) => "audio",
+                            Some(common_v1::message_attachment::AttachmentKind::Video) => "video",
+                            _ => "unspecified",
+                        };
+                        json!({
+                            "kind": kind,
+                            "artifact_id": attachment
+                                .artifact_id
+                                .as_ref()
+                                .map(|value| value.ulid.clone()),
+                            "size_bytes": if attachment.size_bytes > 0 {
+                                Some(attachment.size_bytes)
+                            } else {
+                                None
+                            },
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                self.state
+                    .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+                        run_id: run_id.clone(),
+                        seq: tape_seq,
+                        event_type: "message.received".to_owned(),
+                        payload_json: json!({
+                            "envelope_id": input.envelope_id.clone(),
+                            "text": input.text.clone(),
+                            "channel": input.channel.clone(),
+                            "route_key": plan.route_key.clone(),
+                            "attachments": route_attachment_metadata,
+                            "agent_id": route_agent_id.clone(),
+                            "agent_resolution_source": route_agent_resolution_source.clone(),
+                        })
+                        .to_string(),
+                    })
+                    .await?;
+                tape_seq = tape_seq.saturating_add(1);
+
+                ingest_memory_best_effort(
+                    &self.state,
+                    context.principal.as_str(),
+                    context.channel.as_deref(),
+                    Some(session_id.as_str()),
+                    MemorySource::TapeUserMessage,
+                    input.text.as_str(),
+                    Vec::new(),
+                    Some(0.9),
+                    "route_message_user_input",
+                )
+                .await;
+                let provider_input_text = match build_memory_augmented_prompt(
+                    &self.state,
+                    &context,
+                    run_id.as_str(),
+                    &mut tape_seq,
+                    session_id.as_str(),
+                    input.text.as_str(),
+                )
+                .await
+                {
+                    Ok(value) => value,
+                    Err(error) => {
+                        warn!(
+                            session_id = %session_id,
+                            run_id = %run_id,
+                            principal = %context.principal,
+                            channel = %plan.channel,
+                            status_code = ?error.code(),
+                            status_message = %error.message(),
+                            "route message memory auto-inject failed; falling back to raw input"
+                        );
+                        input.text.clone()
+                    }
+                };
+
                 let provider_response = self
                     .state
                     .execute_model_provider(ProviderRequest {
-                        input_text: input.text.clone(),
+                        input_text: provider_input_text,
                         json_mode: false,
                         vision_requested: content.attachments.iter().any(|attachment| {
                             attachment.kind
@@ -6808,27 +6935,29 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                         completion_tokens_delta: provider_response.completion_tokens,
                     })
                     .await?;
+
+                ingest_memory_best_effort(
+                    &self.state,
+                    context.principal.as_str(),
+                    context.channel.as_deref(),
+                    Some(session_id.as_str()),
+                    MemorySource::Summary,
+                    reply_text.as_str(),
+                    vec!["summary:route_message".to_owned()],
+                    Some(0.75),
+                    "route_message_model_summary",
+                )
+                .await;
                 self.state
                     .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
                         run_id: run_id.clone(),
-                        seq: 1,
-                        event_type: "message.received".to_owned(),
-                        payload_json: json!({
-                            "envelope_id": input.envelope_id.clone(),
-                            "text": input.text.clone(),
-                            "channel": input.channel.clone(),
-                        })
-                        .to_string(),
-                    })
-                    .await?;
-                self.state
-                    .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
-                        run_id: run_id.clone(),
-                        seq: 2,
+                        seq: tape_seq,
                         event_type: "message.replied".to_owned(),
                         payload_json: json!({
-                            "reply_text": reply_text,
+                            "reply_text": reply_text.clone(),
                             "route_key": plan.route_key.clone(),
+                            "agent_id": route_agent_id.clone(),
+                            "agent_resolution_source": route_agent_resolution_source.clone(),
                         })
                         .to_string(),
                     })
@@ -6851,6 +6980,8 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                         "route_key": plan.route_key.clone(),
                         "session_id": session_id,
                         "run_id": run_id,
+                        "agent_id": route_agent_id.clone(),
+                        "agent_resolution_source": route_agent_resolution_source.clone(),
                         "broadcast": plan.is_broadcast,
                         "queued_for_retry": false,
                         "quarantined": false,
@@ -6875,6 +7006,8 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                         "envelope_id": envelope_id,
                         "channel": plan.channel.clone(),
                         "reply_preview": truncate_with_ellipsis(reply_text.clone(), 256),
+                        "agent_id": route_agent_id,
+                        "agent_resolution_source": route_agent_resolution_source,
                         "config_hash": route_config_hash.clone(),
                         "actor": {
                             "connector_channel": actor_connector.clone(),

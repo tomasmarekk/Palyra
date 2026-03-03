@@ -29,6 +29,7 @@ const RUN_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAX";
 const RUN_ID_ALT: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAZ";
 const RUN_ID_THIRD: &str = "01ARZ3NDEKTSV4RRFFQ69G5FB0";
 const ENVELOPE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAY";
+const ENVELOPE_ID_ALT: &str = "01ARZ3NDEKTSV4RRFFQ69G5FB1";
 const OPENAI_API_KEY: &str = "sk-openai-integration-test";
 const VAULT_READ_APPROVAL_HEADER: &str = "x-palyra-vault-read-approval";
 const VAULT_READ_APPROVAL_ALLOW_VALUE: &str = "allow";
@@ -100,11 +101,31 @@ impl FakeChannelAdapter {
         is_direct_message: bool,
         request_broadcast: bool,
     ) -> Result<gateway_v1::RouteMessageResponse> {
+        self.inject_message_with_envelope_id(
+            client,
+            text,
+            is_direct_message,
+            request_broadcast,
+            ENVELOPE_ID,
+        )
+        .await
+    }
+
+    async fn inject_message_with_envelope_id(
+        &self,
+        client: &mut gateway_v1::gateway_service_client::GatewayServiceClient<
+            tonic::transport::Channel,
+        >,
+        text: &str,
+        is_direct_message: bool,
+        request_broadcast: bool,
+        envelope_id: &str,
+    ) -> Result<gateway_v1::RouteMessageResponse> {
         let mut request = tonic::Request::new(gateway_v1::RouteMessageRequest {
             v: 1,
             envelope: Some(common_v1::MessageEnvelope {
                 v: 1,
-                envelope_id: Some(common_v1::CanonicalId { ulid: ENVELOPE_ID.to_owned() }),
+                envelope_id: Some(common_v1::CanonicalId { ulid: envelope_id.to_owned() }),
                 origin: Some(common_v1::EnvelopeOrigin {
                     r#type: common_v1::envelope_origin::OriginType::Channel as i32,
                     channel: "cli".to_owned(),
@@ -171,6 +192,23 @@ async fn grpc_route_message_with_fake_adapter_emits_reply_and_journal_events() -
     let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
         .await
         .context("failed to connect gRPC client")?;
+    let mut create_route_agent = tonic::Request::new(gateway_v1::CreateAgentRequest {
+        v: 1,
+        agent_id: "route".to_owned(),
+        display_name: "Route".to_owned(),
+        agent_dir: String::new(),
+        workspace_roots: vec!["workspace".to_owned()],
+        default_model_profile: "gpt-4o-mini".to_owned(),
+        default_tool_allowlist: vec!["palyra.echo".to_owned()],
+        default_skill_allowlist: vec!["acme.route".to_owned()],
+        set_default: true,
+        allow_absolute_paths: false,
+    });
+    authorize_metadata_with_principal(create_route_agent.metadata_mut(), "admin:ops")?;
+    client
+        .create_agent(create_route_agent)
+        .await
+        .context("failed to create route agent before RouteMessage follow-up test")?;
     let adapter = FakeChannelAdapter::default();
     let response =
         adapter.inject_message(&mut client, "hey @palyra summarize daemon status", false).await?;
@@ -430,6 +468,128 @@ async fn grpc_route_message_rejects_broadcast_without_mention_even_for_dm() -> R
                     == Some("broadcast_requires_mention_match")
         }),
         "router flow should persist rejection reason for denied broadcast requests"
+    );
+
+    server_handle.join().expect("scripted openai server thread should exit");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_route_message_followup_reuses_session_memory_and_agent_binding() -> Result<()> {
+    let (openai_base_url, request_count, server_handle) = spawn_scripted_openai_server(vec![
+        ScriptedOpenAiResponse::immediate(
+            200,
+            r#"{"choices":[{"message":{"content":"first route reply"}}]}"#.to_owned(),
+        ),
+        ScriptedOpenAiResponse::immediate(
+            200,
+            r#"{"choices":[{"message":{"content":"second route reply"}}]}"#.to_owned(),
+        ),
+    ])?;
+    let (child, admin_port, grpc_port, _journal_db_path, config_path) =
+        spawn_palyrad_with_openai_provider_and_channel_router_with_memory_auto_inject(
+            openai_base_url.as_str(),
+            OPENAI_API_KEY,
+            3,
+        )?;
+    let _config_guard = TempFileGuard::new(config_path);
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+    let adapter = FakeChannelAdapter::default();
+    let first_response = adapter
+        .inject_message_with_envelope_id(
+            &mut client,
+            "hey @palyra release rollback checklist",
+            false,
+            false,
+            ENVELOPE_ID,
+        )
+        .await?;
+    assert!(first_response.accepted, "first route should be accepted");
+
+    let second_response = adapter
+        .inject_message_with_envelope_id(
+            &mut client,
+            "hey @palyra please recall the release rollback checklist",
+            false,
+            false,
+            ENVELOPE_ID_ALT,
+        )
+        .await?;
+    assert!(second_response.accepted, "follow-up route should be accepted");
+    let second_run_id = second_response
+        .run_id
+        .as_ref()
+        .map(|value| value.ulid.clone())
+        .context("follow-up route response must include run_id")?;
+
+    let tape_snapshot =
+        admin_get_json_async(admin_port, format!("/admin/v1/runs/{second_run_id}/tape")).await?;
+    let events = tape_snapshot
+        .get("events")
+        .and_then(Value::as_array)
+        .context("route run tape snapshot missing events")?;
+    let memory_auto_inject_event = events
+        .iter()
+        .find(|event| event.get("event_type").and_then(Value::as_str) == Some("memory_auto_inject"))
+        .context("follow-up route should append memory_auto_inject tape event")?;
+    let memory_payload_json = memory_auto_inject_event
+        .get("payload_json")
+        .and_then(Value::as_str)
+        .context("memory_auto_inject tape event missing payload_json")?;
+    let memory_payload: Value = serde_json::from_str(memory_payload_json)
+        .context("memory_auto_inject payload_json must be valid JSON")?;
+    assert_eq!(
+        memory_payload.get("query").and_then(Value::as_str),
+        Some("hey @palyra please recall the release rollback checklist"),
+        "auto-inject payload should retain follow-up query text"
+    );
+    let hits = memory_payload
+        .get("hits")
+        .and_then(Value::as_array)
+        .context("memory_auto_inject payload must include hits array")?;
+    assert!(
+        hits.iter()
+            .any(|hit| hit.get("source").and_then(Value::as_str) == Some("tape:user_message")),
+        "follow-up route should see scoped tape:user_message memories"
+    );
+
+    let route_received_event = events
+        .iter()
+        .find(|event| event.get("event_type").and_then(Value::as_str) == Some("message.received"))
+        .context("route run tape should include message.received event")?;
+    let route_received_payload_json = route_received_event
+        .get("payload_json")
+        .and_then(Value::as_str)
+        .context("message.received tape event missing payload_json")?;
+    let route_received_payload: Value = serde_json::from_str(route_received_payload_json)
+        .context("message.received payload_json must be valid JSON")?;
+    assert!(
+        route_received_payload.get("agent_id").is_some(),
+        "route message tape should include agent_id key even when resolution is unavailable"
+    );
+    assert!(
+        route_received_payload.get("agent_resolution_source").is_some(),
+        "route message tape should include agent_resolution_source key for auditing"
+    );
+    if let Some(source) =
+        route_received_payload.get("agent_resolution_source").and_then(Value::as_str)
+    {
+        assert!(
+            matches!(source, "session_binding" | "default" | "fallback"),
+            "agent_resolution_source should use canonical source labels"
+        );
+    }
+
+    assert_eq!(
+        request_count.load(Ordering::Relaxed),
+        2,
+        "two accepted route messages should perform two provider calls"
     );
 
     server_handle.join().expect("scripted openai server thread should exit");
@@ -5945,6 +6105,55 @@ fn spawn_palyrad_with_openai_provider_and_channel_router(
         .stderr(Stdio::null())
         .spawn()
         .context("failed to start palyrad with channel-router config")?;
+    let stdout = child.stdout.take().context("failed to capture palyrad stdout")?;
+    let (admin_port, grpc_port) = wait_for_listen_ports(stdout, &mut child)?;
+    Ok((child, admin_port, grpc_port, journal_db_path, config_path))
+}
+
+fn spawn_palyrad_with_openai_provider_and_channel_router_with_memory_auto_inject(
+    openai_base_url: &str,
+    openai_api_key: &str,
+    auto_inject_max_items: u32,
+) -> Result<(Child, u16, u16, PathBuf, PathBuf)> {
+    let config_path = write_channel_router_config()?;
+    let journal_db_path = unique_temp_journal_db_path();
+    let identity_store_dir = unique_temp_identity_store_dir();
+    let vault_dir = unique_temp_vault_dir();
+    prepare_test_vault_dir(&vault_dir)?;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_palyrad"))
+        .args([
+            "--bind",
+            "127.0.0.1",
+            "--port",
+            "0",
+            "--grpc-bind",
+            "127.0.0.1",
+            "--grpc-port",
+            "0",
+        ])
+        .env("PALYRA_CONFIG", config_path.to_string_lossy().to_string())
+        .env("PALYRA_ADMIN_TOKEN", ADMIN_TOKEN)
+        .env("PALYRA_GATEWAY_QUIC_BIND_ADDR", "127.0.0.1")
+        .env("PALYRA_GATEWAY_QUIC_PORT", "0")
+        .env("PALYRA_JOURNAL_DB_PATH", journal_db_path.to_string_lossy().to_string())
+        .env("PALYRA_GATEWAY_IDENTITY_STORE_DIR", identity_store_dir.to_string_lossy().to_string())
+        .env("PALYRA_VAULT_DIR", vault_dir.to_string_lossy().to_string())
+        .env("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED", "true")
+        .env("PALYRA_MODEL_PROVIDER_KIND", "openai_compatible")
+        .env("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", openai_base_url)
+        .env("PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL", "true")
+        .env("PALYRA_MODEL_PROVIDER_OPENAI_API_KEY", openai_api_key)
+        .env("PALYRA_MODEL_PROVIDER_MAX_RETRIES", "0")
+        .env("PALYRA_MODEL_PROVIDER_RETRY_BACKOFF_MS", "1")
+        .env("PALYRA_MODEL_PROVIDER_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "1")
+        .env("PALYRA_MODEL_PROVIDER_CIRCUIT_BREAKER_COOLDOWN_MS", "30000")
+        .env("PALYRA_MEMORY_AUTO_INJECT_ENABLED", "true")
+        .env("PALYRA_MEMORY_AUTO_INJECT_MAX_ITEMS", auto_inject_max_items.to_string())
+        .env("RUST_LOG", "info")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to start palyrad with channel-router + memory auto-inject config")?;
     let stdout = child.stdout.take().context("failed to capture palyrad stdout")?;
     let (admin_port, grpc_port) = wait_for_listen_ports(stdout, &mut child)?;
     Ok((child, admin_port, grpc_port, journal_db_path, config_path))
