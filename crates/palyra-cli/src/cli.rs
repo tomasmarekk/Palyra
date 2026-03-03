@@ -115,6 +115,18 @@ pub enum Command {
         #[command(subcommand)]
         command: SecretsCommand,
     },
+    Tunnel {
+        #[arg(long)]
+        ssh: String,
+        #[arg(long, default_value_t = 7142)]
+        remote_port: u16,
+        #[arg(long, default_value_t = 7142)]
+        local_port: u16,
+        #[arg(long, default_value_t = false)]
+        open: bool,
+        #[arg(long)]
+        identity_file: Option<String>,
+    },
     #[cfg(not(windows))]
     Pairing {
         #[command(subcommand)]
@@ -1066,6 +1078,18 @@ pub enum DaemonCommand {
         run_id: String,
         #[arg(long)]
         reason: Option<String>,
+    },
+    DashboardUrl {
+        #[arg(long)]
+        path: Option<String>,
+        #[arg(long, default_value_t = false)]
+        verify_remote: bool,
+        #[arg(long)]
+        identity_store_dir: Option<String>,
+        #[arg(long, default_value_t = false)]
+        open: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 }
 
@@ -2507,6 +2531,48 @@ mod tests {
     }
 
     #[test]
+    fn parse_tunnel_command_with_overrides() {
+        let parsed = Cli::parse_from([
+            "palyra",
+            "tunnel",
+            "--ssh",
+            "ops@example.com",
+            "--remote-port",
+            "7442",
+            "--local-port",
+            "17442",
+            "--open",
+            "--identity-file",
+            "C:/Users/test/.ssh/id_ed25519",
+        ]);
+        assert_eq!(
+            parsed.command,
+            Command::Tunnel {
+                ssh: "ops@example.com".to_owned(),
+                remote_port: 7442,
+                local_port: 17442,
+                open: true,
+                identity_file: Some("C:/Users/test/.ssh/id_ed25519".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_tunnel_command_defaults_ports_to_gateway_admin() {
+        let parsed = Cli::parse_from(["palyra", "tunnel", "--ssh", "ops@example.com"]);
+        assert_eq!(
+            parsed.command,
+            Command::Tunnel {
+                ssh: "ops@example.com".to_owned(),
+                remote_port: 7142,
+                local_port: 7142,
+                open: false,
+                identity_file: None,
+            }
+        );
+    }
+
+    #[test]
     fn parse_completion_powershell() {
         let parsed = Cli::parse_from(["palyra", "completion", "--shell", "powershell"]);
         assert_eq!(parsed.command, Command::Completion { shell: CompletionShell::Powershell });
@@ -2785,6 +2851,34 @@ mod tests {
                     channel: None,
                     run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),
                     reason: Some("operator requested".to_owned()),
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn parse_daemon_dashboard_url_with_verification_options() {
+        let parsed = Cli::parse_from([
+            "palyra",
+            "daemon",
+            "dashboard-url",
+            "--path",
+            "config/palyra.toml",
+            "--verify-remote",
+            "--identity-store-dir",
+            "state/identity",
+            "--open",
+            "--json",
+        ]);
+        assert_eq!(
+            parsed.command,
+            Command::Daemon {
+                command: DaemonCommand::DashboardUrl {
+                    path: Some("config/palyra.toml".to_owned()),
+                    verify_remote: true,
+                    identity_store_dir: Some("state/identity".to_owned()),
+                    open: true,
+                    json: true,
                 }
             }
         );

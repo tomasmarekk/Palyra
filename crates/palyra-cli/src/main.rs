@@ -82,12 +82,9 @@ use palyra_common::{
     HealthResponse, CANONICAL_JSON_ENVELOPE_VERSION, CANONICAL_PROTOCOL_MAJOR,
 };
 use palyra_common::{default_identity_store_root, default_state_root};
-use palyra_identity::DeviceIdentity;
-use palyra_identity::FilesystemSecretStore;
+use palyra_identity::{DeviceIdentity, FilesystemSecretStore, SecretStore};
 #[cfg(not(windows))]
-use palyra_identity::{
-    IdentityManager, PairingClientKind, PairingMethod, SecretStore, DEFAULT_CERT_VALIDITY,
-};
+use palyra_identity::{IdentityManager, PairingClientKind, PairingMethod, DEFAULT_CERT_VALIDITY};
 use palyra_policy::{evaluate_with_config, PolicyDecision, PolicyEvaluationConfig, PolicyRequest};
 use palyra_skills::{
     audit_skill_artifact_security, build_signed_skill_artifact, inspect_skill_artifact,
@@ -99,6 +96,8 @@ use palyra_vault::{
     VaultError, VaultRef, VaultScope,
 };
 use reqwest::blocking::Client;
+use reqwest::redirect::Policy as RedirectPolicy;
+use reqwest::tls::TlsInfo;
 use reqwest::Url;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -135,6 +134,7 @@ const DEFAULT_BROWSER_URL: &str = "http://127.0.0.1:7143";
 const DEFAULT_CHANNEL: &str = "cli";
 const DEFAULT_DEVICE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const REDACTED_CONFIG_VALUE: &str = "<redacted>";
+const GATEWAY_CA_STATE_KEY: &str = "identity/ca/state.json";
 const SKILLS_LAYOUT_VERSION: u32 = 1;
 const SKILLS_INDEX_FILE_NAME: &str = "installed-index.json";
 const SKILLS_AUDIT_FILE_NAME: &str = "audit.ndjson";
@@ -183,6 +183,9 @@ fn main() -> Result<()> {
         CliCommand::Patch { command } => run_patch(command),
         CliCommand::Skills { command } => run_skills(command),
         CliCommand::Secrets { command } => run_secrets(command),
+        CliCommand::Tunnel { ssh, remote_port, local_port, open, identity_file } => {
+            run_tunnel(ssh, remote_port, local_port, open, identity_file)
+        }
         #[cfg(not(windows))]
         CliCommand::Pairing { command } => run_pairing(command),
     }
@@ -4543,6 +4546,76 @@ fn run_onboarding(command: OnboardingCommand) -> Result<()> {
     }
 }
 
+fn run_tunnel(
+    ssh: String,
+    remote_port: u16,
+    local_port: u16,
+    open: bool,
+    identity_file: Option<String>,
+) -> Result<()> {
+    let ssh = normalize_required_text_arg(ssh, "--ssh")?;
+    let identity_file = identity_file.and_then(normalize_optional_text_arg);
+    let local_dashboard_url = format!("http://127.0.0.1:{local_port}/");
+    println!(
+        "tunnel.status=starting ssh_target={} local_dashboard_url={} forward={}=>127.0.0.1:{}",
+        ssh, local_dashboard_url, local_port, remote_port
+    );
+    std::io::stdout().flush().context("stdout flush failed")?;
+
+    if open {
+        open_url_in_default_browser(local_dashboard_url.as_str()).with_context(|| {
+            format!("failed to open local dashboard URL {}", local_dashboard_url)
+        })?;
+    }
+
+    let mut command = Command::new("ssh");
+    command.arg("-N");
+    command.arg("-L");
+    command.arg(format!("{local_port}:127.0.0.1:{remote_port}"));
+    if let Some(identity_file) = identity_file {
+        command.arg("-i");
+        command.arg(identity_file);
+    }
+    command.arg(ssh);
+
+    let status = command.status().context(
+        "failed to launch ssh for tunnel helper; ensure `ssh` is installed and available on PATH",
+    )?;
+    if !status.success() {
+        anyhow::bail!(
+            "ssh tunnel exited with status {}",
+            status.code().map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_owned())
+        );
+    }
+    Ok(())
+}
+
+fn open_url_in_default_browser(url: &str) -> Result<()> {
+    #[cfg(target_os = "windows")]
+    let status = Command::new("cmd")
+        .arg("/C")
+        .arg("start")
+        .arg("")
+        .arg(url)
+        .status()
+        .context("failed to invoke `cmd /C start`")?;
+
+    #[cfg(target_os = "macos")]
+    let status = Command::new("open").arg(url).status().context("failed to invoke `open`")?;
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let status =
+        Command::new("xdg-open").arg(url).status().context("failed to invoke `xdg-open`")?;
+
+    if !status.success() {
+        anyhow::bail!(
+            "browser open command exited with status {}",
+            status.code().map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_owned())
+        );
+    }
+    Ok(())
+}
+
 fn execute_agent_stream(
     connection: AgentConnection,
     request: AgentRunInput,
@@ -5266,6 +5339,418 @@ struct AcpShimInput {
     allow_sensitive_tools: Option<bool>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DashboardAccessMode {
+    Local,
+    Remote,
+}
+
+impl DashboardAccessMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Remote => "remote",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DashboardAccessSource {
+    ConfigRemoteUrl,
+    ConfigDaemonBind,
+    DefaultLoopback,
+}
+
+impl DashboardAccessSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ConfigRemoteUrl => "config_remote_url",
+            Self::ConfigDaemonBind => "config_daemon_bind",
+            Self::DefaultLoopback => "default_loopback",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DashboardRemoteVerificationMethod {
+    PinnedServerCertSha256,
+    PinnedGatewayCaSha256,
+}
+
+impl DashboardRemoteVerificationMethod {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::PinnedServerCertSha256 => "pinned_server_cert_sha256",
+            Self::PinnedGatewayCaSha256 => "pinned_gateway_ca_sha256",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DashboardRemoteVerification {
+    method: DashboardRemoteVerificationMethod,
+    expected_fingerprint_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DashboardAccessTarget {
+    url: String,
+    mode: DashboardAccessMode,
+    source: DashboardAccessSource,
+    config_path: Option<String>,
+    verification: Option<DashboardRemoteVerification>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct DashboardVerificationReport {
+    method: DashboardRemoteVerificationMethod,
+    expected_fingerprint_sha256: String,
+    observed_server_cert_fingerprint_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gateway_ca_fingerprint_sha256: Option<String>,
+    verified: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct StoredGatewayCaState {
+    certificate_pem: String,
+}
+
+fn resolve_dashboard_access_target(path_override: Option<String>) -> Result<DashboardAccessTarget> {
+    let config_path = resolve_dashboard_config_path(path_override)?;
+    let config_path_display = config_path.as_ref().map(|path| path.to_string_lossy().into_owned());
+
+    if let Some(config_path) = config_path {
+        let parsed = load_root_file_config(config_path.as_path())?;
+        let gateway_access = parsed.gateway_access.as_ref();
+        let remote_base_url = gateway_access
+            .and_then(|access| access.remote_base_url.as_deref())
+            .and_then(normalize_optional_text);
+        if let Some(remote_base_url) = remote_base_url {
+            let normalized_remote_url =
+                parse_remote_dashboard_base_url(remote_base_url, "gateway_access.remote_base_url")?;
+            let verification = resolve_dashboard_remote_verification(gateway_access)?;
+            return Ok(DashboardAccessTarget {
+                url: normalized_remote_url,
+                mode: DashboardAccessMode::Remote,
+                source: DashboardAccessSource::ConfigRemoteUrl,
+                config_path: config_path_display,
+                verification,
+            });
+        }
+
+        let local_url = resolve_local_dashboard_url_from_root_config(&parsed)?;
+        return Ok(DashboardAccessTarget {
+            url: local_url,
+            mode: DashboardAccessMode::Local,
+            source: DashboardAccessSource::ConfigDaemonBind,
+            config_path: config_path_display,
+            verification: None,
+        });
+    }
+
+    Ok(DashboardAccessTarget {
+        url: format!("http://127.0.0.1:{DEFAULT_DAEMON_PORT}/"),
+        mode: DashboardAccessMode::Local,
+        source: DashboardAccessSource::DefaultLoopback,
+        config_path: None,
+        verification: None,
+    })
+}
+
+fn resolve_dashboard_config_path(path_override: Option<String>) -> Result<Option<PathBuf>> {
+    if let Some(path_override) = path_override {
+        let parsed = parse_config_path(path_override.as_str())
+            .with_context(|| format!("dashboard config path is invalid: {}", path_override))?;
+        if !parsed.exists() {
+            anyhow::bail!("dashboard config file does not exist: {}", parsed.display());
+        }
+        return Ok(Some(parsed));
+    }
+
+    if let Ok(explicit) = env::var("PALYRA_CONFIG") {
+        let trimmed = explicit.trim();
+        if !trimmed.is_empty() {
+            let parsed = parse_config_path(trimmed)
+                .with_context(|| "PALYRA_CONFIG contains an invalid path")?;
+            if parsed.exists() {
+                return Ok(Some(parsed));
+            }
+        }
+    }
+
+    for candidate in default_config_search_paths() {
+        if candidate.exists() {
+            return Ok(Some(candidate));
+        }
+    }
+
+    Ok(None)
+}
+
+fn load_root_file_config(path: &Path) -> Result<RootFileConfig> {
+    let content =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let (document, _) = parse_document_with_migration(content.as_str())
+        .with_context(|| format!("failed to migrate {}", path.display()))?;
+    let migrated =
+        toml::to_string(&document).context("failed to serialize migrated config document")?;
+    toml::from_str(migrated.as_str()).context("invalid daemon config schema")
+}
+
+fn resolve_local_dashboard_url_from_root_config(parsed: &RootFileConfig) -> Result<String> {
+    let bind_addr = parsed
+        .daemon
+        .as_ref()
+        .and_then(|daemon| daemon.bind_addr.as_deref())
+        .unwrap_or(DEFAULT_DAEMON_BIND_ADDR);
+    let port = parsed.daemon.as_ref().and_then(|daemon| daemon.port).unwrap_or(DEFAULT_DAEMON_PORT);
+    let socket = parse_daemon_bind_socket(bind_addr, port)
+        .with_context(|| format!("invalid daemon bind config ({bind_addr}:{port})"))?;
+    Ok(format!("http://{}/", normalize_client_socket(socket)))
+}
+
+fn parse_remote_dashboard_base_url(raw: &str, source_name: &str) -> Result<String> {
+    let parsed =
+        Url::parse(raw).with_context(|| format!("{source_name} must be a valid absolute URL"))?;
+    if parsed.scheme() != "https" {
+        anyhow::bail!("{source_name} must use https://");
+    }
+    if parsed.host_str().is_none() {
+        anyhow::bail!("{source_name} must include a host");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        anyhow::bail!("{source_name} must not include embedded credentials");
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        anyhow::bail!("{source_name} must not include query or fragment");
+    }
+    Ok(parsed.to_string())
+}
+
+fn resolve_dashboard_remote_verification(
+    gateway_access: Option<&palyra_common::daemon_config_schema::FileGatewayAccessConfig>,
+) -> Result<Option<DashboardRemoteVerification>> {
+    let Some(gateway_access) = gateway_access else {
+        return Ok(None);
+    };
+    let pinned_server = gateway_access
+        .pinned_server_cert_fingerprint_sha256
+        .as_deref()
+        .and_then(normalize_optional_text);
+    let pinned_gateway_ca = gateway_access
+        .pinned_gateway_ca_fingerprint_sha256
+        .as_deref()
+        .and_then(normalize_optional_text);
+
+    if pinned_server.is_some() && pinned_gateway_ca.is_some() {
+        anyhow::bail!(
+            "gateway_access pins are ambiguous: configure only one of \
+             pinned_server_cert_fingerprint_sha256 or pinned_gateway_ca_fingerprint_sha256"
+        );
+    }
+
+    if let Some(pinned_server) = pinned_server {
+        let expected = normalize_sha256_fingerprint(
+            pinned_server,
+            "gateway_access.pinned_server_cert_fingerprint_sha256",
+        )?;
+        return Ok(Some(DashboardRemoteVerification {
+            method: DashboardRemoteVerificationMethod::PinnedServerCertSha256,
+            expected_fingerprint_sha256: expected,
+        }));
+    }
+
+    if let Some(pinned_gateway_ca) = pinned_gateway_ca {
+        let expected = normalize_sha256_fingerprint(
+            pinned_gateway_ca,
+            "gateway_access.pinned_gateway_ca_fingerprint_sha256",
+        )?;
+        return Ok(Some(DashboardRemoteVerification {
+            method: DashboardRemoteVerificationMethod::PinnedGatewayCaSha256,
+            expected_fingerprint_sha256: expected,
+        }));
+    }
+
+    Ok(None)
+}
+
+fn normalize_sha256_fingerprint(raw: &str, source_name: &str) -> Result<String> {
+    let normalized = raw
+        .chars()
+        .filter(|value| !value.is_ascii_whitespace() && *value != ':')
+        .map(|value| value.to_ascii_lowercase())
+        .collect::<String>();
+    if normalized.len() != 64 || !normalized.chars().all(|value| value.is_ascii_hexdigit()) {
+        anyhow::bail!("{source_name} must contain exactly 64 hexadecimal characters");
+    }
+    Ok(normalized)
+}
+
+fn verify_dashboard_remote_target(
+    target: &DashboardAccessTarget,
+    identity_store_dir: Option<String>,
+) -> Result<DashboardVerificationReport> {
+    if target.mode != DashboardAccessMode::Remote {
+        anyhow::bail!("remote dashboard verification requires a remote dashboard URL target");
+    }
+    let verification =
+        target.verification.as_ref().context("remote verification pin is not configured")?;
+    match verification.method {
+        DashboardRemoteVerificationMethod::PinnedServerCertSha256 => {
+            verify_remote_with_server_certificate_pin(
+                target.url.as_str(),
+                verification.expected_fingerprint_sha256.as_str(),
+            )
+        }
+        DashboardRemoteVerificationMethod::PinnedGatewayCaSha256 => {
+            verify_remote_with_gateway_ca_pin(
+                target.url.as_str(),
+                verification.expected_fingerprint_sha256.as_str(),
+                identity_store_dir,
+            )
+        }
+    }
+}
+
+fn verify_remote_with_server_certificate_pin(
+    url: &str,
+    expected_fingerprint_sha256: &str,
+) -> Result<DashboardVerificationReport> {
+    let parsed = Url::parse(url).with_context(|| format!("invalid remote dashboard URL: {url}"))?;
+    if parsed.scheme() != "https" {
+        anyhow::bail!("server certificate pin verification requires https:// URL");
+    }
+    let client = Client::builder()
+        .timeout(Duration::from_secs(8))
+        .redirect(RedirectPolicy::none())
+        .tls_info(true)
+        .tls_danger_accept_invalid_certs(true)
+        .build()
+        .context("failed to build verification HTTP client")?;
+    let response = client
+        .get(parsed.clone())
+        .send()
+        .with_context(|| format!("failed to connect remote dashboard URL {parsed}"))?;
+    let observed_server_cert_fingerprint_sha256 =
+        extract_peer_certificate_fingerprint_sha256(&response)?;
+    if observed_server_cert_fingerprint_sha256 != expected_fingerprint_sha256 {
+        anyhow::bail!(
+            "server certificate fingerprint mismatch: expected={} observed={}",
+            expected_fingerprint_sha256,
+            observed_server_cert_fingerprint_sha256
+        );
+    }
+    Ok(DashboardVerificationReport {
+        method: DashboardRemoteVerificationMethod::PinnedServerCertSha256,
+        expected_fingerprint_sha256: expected_fingerprint_sha256.to_owned(),
+        observed_server_cert_fingerprint_sha256,
+        gateway_ca_fingerprint_sha256: None,
+        verified: true,
+    })
+}
+
+fn verify_remote_with_gateway_ca_pin(
+    url: &str,
+    expected_ca_fingerprint_sha256: &str,
+    identity_store_dir: Option<String>,
+) -> Result<DashboardVerificationReport> {
+    let parsed = Url::parse(url).with_context(|| format!("invalid remote dashboard URL: {url}"))?;
+    if parsed.scheme() != "https" {
+        anyhow::bail!("gateway CA pin verification requires https:// URL");
+    }
+
+    let gateway_ca_pem = load_gateway_ca_certificate_pem(identity_store_dir)?;
+    let gateway_ca_der = decode_first_pem_certificate_der(gateway_ca_pem.as_str())?;
+    let gateway_ca_fingerprint_sha256 = sha256_hex(gateway_ca_der.as_slice());
+    if gateway_ca_fingerprint_sha256 != expected_ca_fingerprint_sha256 {
+        anyhow::bail!(
+            "gateway CA fingerprint mismatch: expected={} local={}",
+            expected_ca_fingerprint_sha256,
+            gateway_ca_fingerprint_sha256
+        );
+    }
+
+    let ca_certificate = reqwest::Certificate::from_pem(gateway_ca_pem.as_bytes())
+        .context("failed to parse gateway CA certificate PEM")?;
+    let client = Client::builder()
+        .timeout(Duration::from_secs(8))
+        .redirect(RedirectPolicy::none())
+        .tls_info(true)
+        .tls_certs_only([ca_certificate])
+        .build()
+        .context("failed to build gateway-CA verification HTTP client")?;
+    let response = client
+        .get(parsed.clone())
+        .send()
+        .with_context(|| format!("failed to connect remote dashboard URL {parsed}"))?;
+    let observed_server_cert_fingerprint_sha256 =
+        extract_peer_certificate_fingerprint_sha256(&response)?;
+    Ok(DashboardVerificationReport {
+        method: DashboardRemoteVerificationMethod::PinnedGatewayCaSha256,
+        expected_fingerprint_sha256: expected_ca_fingerprint_sha256.to_owned(),
+        observed_server_cert_fingerprint_sha256,
+        gateway_ca_fingerprint_sha256: Some(gateway_ca_fingerprint_sha256),
+        verified: true,
+    })
+}
+
+fn extract_peer_certificate_fingerprint_sha256(
+    response: &reqwest::blocking::Response,
+) -> Result<String> {
+    let tls_info = response.extensions().get::<TlsInfo>().ok_or_else(|| {
+        anyhow!("TLS peer certificate metadata is unavailable; enable HTTPS and TLS info capture")
+    })?;
+    let peer_certificate_der = tls_info.peer_certificate().ok_or_else(|| {
+        anyhow!("TLS handshake did not expose a peer certificate for fingerprint verification")
+    })?;
+    Ok(sha256_hex(peer_certificate_der))
+}
+
+fn load_gateway_ca_certificate_pem(identity_store_dir: Option<String>) -> Result<String> {
+    let identity_store_root = resolve_identity_store_root(identity_store_dir)?;
+    let store = FilesystemSecretStore::new(identity_store_root.as_path()).with_context(|| {
+        format!("failed to initialize identity store at {}", identity_store_root.display())
+    })?;
+    let raw = store.read_secret(GATEWAY_CA_STATE_KEY).map_err(anyhow::Error::from).with_context(
+        || {
+            format!(
+                "failed to read gateway CA state from {} key {}",
+                identity_store_root.display(),
+                GATEWAY_CA_STATE_KEY
+            )
+        },
+    )?;
+    let parsed: StoredGatewayCaState = serde_json::from_slice(raw.as_slice())
+        .context("failed to parse stored gateway CA state payload")?;
+    let certificate_pem = normalize_required_text_arg(parsed.certificate_pem, "gateway CA cert")?;
+    Ok(certificate_pem)
+}
+
+fn decode_first_pem_certificate_der(pem: &str) -> Result<Vec<u8>> {
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+    let begin = pem.find(BEGIN).context("certificate PEM BEGIN marker is missing")?;
+    let after_begin = &pem[(begin + BEGIN.len())..];
+    let end_offset = after_begin.find(END).context("certificate PEM END marker is missing")?;
+    let body = &after_begin[..end_offset];
+    let encoded = body.lines().map(str::trim).filter(|line| !line.is_empty()).collect::<String>();
+    if encoded.is_empty() {
+        anyhow::bail!("certificate PEM body is empty");
+    }
+    BASE64_STANDARD.decode(encoded.as_bytes()).context("certificate PEM body is not valid base64")
+}
+
+fn normalize_optional_text(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
 fn run_daemon(command: DaemonCommand) -> Result<()> {
     match command {
         DaemonCommand::Status { url } => {
@@ -5287,6 +5772,60 @@ fn run_daemon(command: DaemonCommand) -> Result<()> {
                 response.git_hash,
                 response.uptime_seconds
             );
+            std::io::stdout().flush().context("stdout flush failed")
+        }
+        DaemonCommand::DashboardUrl { path, verify_remote, identity_store_dir, open, json } => {
+            let target = resolve_dashboard_access_target(path)?;
+            let verification_report = if verify_remote {
+                Some(verify_dashboard_remote_target(
+                    &target,
+                    identity_store_dir.and_then(normalize_optional_text_arg),
+                )?)
+            } else {
+                None
+            };
+
+            if open {
+                open_url_in_default_browser(target.url.as_str())
+                    .with_context(|| format!("failed to open dashboard URL {}", target.url))?;
+            }
+
+            if json {
+                let output = serde_json::json!({
+                    "url": target.url,
+                    "mode": target.mode.as_str(),
+                    "source": target.source.as_str(),
+                    "config_path": target.config_path,
+                    "verification": verification_report,
+                    "opened": open,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&output)
+                        .context("failed to encode dashboard URL output as JSON")?
+                );
+            } else {
+                println!(
+                    "daemon.dashboard_url mode={} source={} url={} config_path={}",
+                    target.mode.as_str(),
+                    target.source.as_str(),
+                    target.url,
+                    target.config_path.as_deref().unwrap_or("none")
+                );
+                if let Some(verification_report) = verification_report {
+                    println!(
+                        "daemon.dashboard_url.verification method={} verified={} expected_sha256={} observed_server_sha256={} gateway_ca_sha256={}",
+                        verification_report.method.as_str(),
+                        verification_report.verified,
+                        verification_report.expected_fingerprint_sha256,
+                        verification_report.observed_server_cert_fingerprint_sha256,
+                        verification_report.gateway_ca_fingerprint_sha256.as_deref().unwrap_or("none")
+                    );
+                }
+                if open {
+                    println!("daemon.dashboard_url.opened=true");
+                }
+            }
             std::io::stdout().flush().context("stdout flush failed")
         }
         DaemonCommand::AdminStatus { url, token, principal, device_id, channel } => {
@@ -9747,17 +10286,18 @@ mod cli_v1_tests {
         fetch_remote_registry_entries_with_fetcher, is_retryable_grpc_error,
         memory_embeddings_model_configured, normalize_client_socket,
         normalize_installed_skills_index, normalize_prompt_secret_value,
-        normalize_relative_registry_path, parse_acp_shim_input_line,
-        parse_and_verify_signed_remote_registry_index,
+        normalize_relative_registry_path, normalize_sha256_fingerprint, parse_acp_shim_input_line,
+        parse_and_verify_signed_remote_registry_index, parse_remote_dashboard_base_url,
         process_runner_tier_b_allowlist_preflight_only,
         process_runner_tier_c_strict_offline_allowlists_empty,
-        process_runner_tier_c_windows_backend_supported, registry_key_id_for, sha256_hex,
-        trust_store_integrity_vault_key, validate_registry_index,
-        verify_or_initialize_trust_store_integrity, write_file_atomically, InstalledSkillRecord,
-        InstalledSkillSource, InstalledSkillsIndex, JournalCheckpointAttestationRequest,
-        JournalCheckpointModeArg, RegistrySignature, RootFileConfig, SignedSkillRegistryIndex,
-        SkillRegistryEntry, SkillRegistryIndex, REGISTRY_INDEX_SCHEMA_VERSION,
-        REGISTRY_SIGNATURE_ALGORITHM, REGISTRY_SIGNED_INDEX_SCHEMA_VERSION,
+        process_runner_tier_c_windows_backend_supported, registry_key_id_for,
+        resolve_dashboard_access_target, sha256_hex, trust_store_integrity_vault_key,
+        validate_registry_index, verify_or_initialize_trust_store_integrity, write_file_atomically,
+        DashboardAccessMode, DashboardAccessSource, InstalledSkillRecord, InstalledSkillSource,
+        InstalledSkillsIndex, JournalCheckpointAttestationRequest, JournalCheckpointModeArg,
+        RegistrySignature, RootFileConfig, SignedSkillRegistryIndex, SkillRegistryEntry,
+        SkillRegistryIndex, REGISTRY_INDEX_SCHEMA_VERSION, REGISTRY_SIGNATURE_ALGORITHM,
+        REGISTRY_SIGNED_INDEX_SCHEMA_VERSION,
     };
     use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
     use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -9917,6 +10457,111 @@ mod cli_v1_tests {
         assert_eq!(normalize_client_socket(ipv4_unspecified).to_string(), "127.0.0.1:7443");
         assert_eq!(normalize_client_socket(ipv6_unspecified).to_string(), "[::1]:7443");
         assert_eq!(normalize_client_socket(named).to_string(), "127.0.0.1:7443");
+    }
+
+    #[test]
+    fn normalize_sha256_fingerprint_accepts_colons_and_uppercase() {
+        let normalized = normalize_sha256_fingerprint(
+            "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99",
+            "gateway_access.pinned_server_cert_fingerprint_sha256",
+        )
+        .expect("fingerprint with separators should normalize");
+        assert_eq!(normalized, "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899");
+    }
+
+    #[test]
+    fn normalize_sha256_fingerprint_rejects_invalid_length() {
+        let error = normalize_sha256_fingerprint("abc123", "gateway_access.pinned_gateway_ca")
+            .expect_err("short fingerprint should fail");
+        assert!(error.to_string().contains("64 hexadecimal characters"));
+    }
+
+    #[test]
+    fn parse_remote_dashboard_base_url_rejects_query_and_fragment() {
+        let query_error = parse_remote_dashboard_base_url(
+            "https://dashboard.example.com/?token=abc",
+            "gateway_access.remote_base_url",
+        )
+        .expect_err("query parameters must be rejected");
+        assert!(query_error.to_string().contains("must not include query or fragment"));
+
+        let fragment_error = parse_remote_dashboard_base_url(
+            "https://dashboard.example.com/#frag",
+            "gateway_access.remote_base_url",
+        )
+        .expect_err("fragments must be rejected");
+        assert!(fragment_error.to_string().contains("must not include query or fragment"));
+    }
+
+    #[test]
+    fn resolve_dashboard_access_target_prefers_remote_url_from_config() {
+        let _lock = env_lock().lock().expect("env lock should be available");
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let config_path = tempdir.path().join("palyra.toml");
+        std::fs::write(
+            config_path.as_path(),
+            r#"
+version = 1
+[gateway_access]
+remote_base_url = "https://dashboard.example.com/"
+"#,
+        )
+        .expect("fixture config should be written");
+        let _config = ScopedEnvVar::set("PALYRA_CONFIG", config_path.to_string_lossy().as_ref());
+
+        let target =
+            resolve_dashboard_access_target(None).expect("dashboard access target should resolve");
+        assert_eq!(target.url, "https://dashboard.example.com/");
+        assert_eq!(target.mode, DashboardAccessMode::Remote);
+        assert_eq!(target.source, DashboardAccessSource::ConfigRemoteUrl);
+        assert!(target.verification.is_none());
+    }
+
+    #[test]
+    fn resolve_dashboard_access_target_uses_daemon_bind_when_remote_url_missing() {
+        let _lock = env_lock().lock().expect("env lock should be available");
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let config_path = tempdir.path().join("palyra.toml");
+        std::fs::write(
+            config_path.as_path(),
+            r#"
+version = 1
+[daemon]
+bind_addr = "0.0.0.0"
+port = 9191
+"#,
+        )
+        .expect("fixture config should be written");
+        let _config = ScopedEnvVar::set("PALYRA_CONFIG", config_path.to_string_lossy().as_ref());
+
+        let target =
+            resolve_dashboard_access_target(None).expect("dashboard access target should resolve");
+        assert_eq!(target.url, "http://127.0.0.1:9191/");
+        assert_eq!(target.mode, DashboardAccessMode::Local);
+        assert_eq!(target.source, DashboardAccessSource::ConfigDaemonBind);
+    }
+
+    #[test]
+    fn resolve_dashboard_access_target_rejects_ambiguous_remote_pin_config() {
+        let _lock = env_lock().lock().expect("env lock should be available");
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let config_path = tempdir.path().join("palyra.toml");
+        std::fs::write(
+            config_path.as_path(),
+            r#"
+version = 1
+[gateway_access]
+remote_base_url = "https://dashboard.example.com/"
+pinned_server_cert_fingerprint_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+pinned_gateway_ca_fingerprint_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+"#,
+        )
+        .expect("fixture config should be written");
+        let _config = ScopedEnvVar::set("PALYRA_CONFIG", config_path.to_string_lossy().as_ref());
+
+        let error = resolve_dashboard_access_target(None)
+            .expect_err("ambiguous pin configuration must be rejected");
+        assert!(error.to_string().contains("pins are ambiguous"));
     }
 
     #[test]

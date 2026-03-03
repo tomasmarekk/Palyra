@@ -22,6 +22,7 @@ const ui = {
   factGatewayHash: document.getElementById("factGatewayHash"),
   factGatewayUptime: document.getElementById("factGatewayUptime"),
   factDashboardUrl: document.getElementById("factDashboardUrl"),
+  factDashboardAccessMode: document.getElementById("factDashboardAccessMode"),
   discordConnectorId: document.getElementById("discordConnectorId"),
   discordEnabled: document.getElementById("discordEnabled"),
   discordAuthenticated: document.getElementById("discordAuthenticated"),
@@ -136,6 +137,7 @@ function renderSnapshot(snapshot) {
   ui.factGatewayHash.textContent = facts.gateway_git_hash ?? "-";
   ui.factGatewayUptime.textContent = formatDurationSeconds(facts.gateway_uptime_seconds);
   ui.factDashboardUrl.textContent = facts.dashboard_url ?? "-";
+  ui.factDashboardAccessMode.textContent = facts.dashboard_access_mode ?? "-";
 
   const discord = facts.discord ?? {};
   ui.discordConnectorId.textContent = discord.connector_id ?? "-";

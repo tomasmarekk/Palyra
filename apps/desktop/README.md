@@ -17,13 +17,13 @@
 - Shows health and quick facts:
   - gateway version + git hash,
   - uptime,
-  - dashboard URL,
+  - dashboard URL + access mode (`local`/`remote`),
   - Discord connector status (`discord:default`),
   - browser service status.
 - Shows last redacted diagnostics errors from `/console/v1/diagnostics`.
 - Shows redacted sidecar logs.
 - Exports support bundles via `palyra support-bundle export --output ...`.
-- Opens the web dashboard in the default browser.
+- Opens the discovered web dashboard target in the default browser (local or configured remote URL).
 
 ## Security behavior
 

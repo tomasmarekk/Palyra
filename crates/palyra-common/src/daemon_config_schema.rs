@@ -65,6 +65,7 @@ pub struct RootFileConfig {
     pub deployment: Option<FileDeploymentConfig>,
     pub daemon: Option<FileDaemonConfig>,
     pub gateway: Option<FileGatewayConfig>,
+    pub gateway_access: Option<FileGatewayAccessConfig>,
     pub cron: Option<FileCronConfig>,
     pub orchestrator: Option<FileOrchestratorConfig>,
     pub memory: Option<FileMemoryConfig>,
@@ -115,6 +116,14 @@ pub struct FileGatewayTlsConfig {
     pub cert_path: Option<String>,
     pub key_path: Option<String>,
     pub client_ca_path: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileGatewayAccessConfig {
+    pub remote_base_url: Option<String>,
+    pub pinned_server_cert_fingerprint_sha256: Option<String>,
+    pub pinned_gateway_ca_fingerprint_sha256: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -329,7 +338,7 @@ pub struct FileStorageConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_secret_config_path, redact_secret_config_values};
+    use super::{is_secret_config_path, redact_secret_config_values, RootFileConfig};
 
     #[test]
     fn secret_config_path_matching_is_case_insensitive() {
@@ -408,5 +417,26 @@ mod tests {
                 .and_then(toml::Value::as_str),
             Some("<redacted>")
         );
+    }
+
+    #[test]
+    fn gateway_access_section_parses_expected_fields() {
+        let parsed: RootFileConfig = toml::from_str(
+            r#"
+            [gateway_access]
+            remote_base_url = "https://console.example.com/palyra"
+            pinned_server_cert_fingerprint_sha256 = "01ab"
+            "#,
+        )
+        .expect("gateway access config should parse");
+
+        let gateway_access =
+            parsed.gateway_access.as_ref().expect("gateway_access section should be available");
+        assert_eq!(
+            gateway_access.remote_base_url.as_deref(),
+            Some("https://console.example.com/palyra")
+        );
+        assert_eq!(gateway_access.pinned_server_cert_fingerprint_sha256.as_deref(), Some("01ab"));
+        assert!(gateway_access.pinned_gateway_ca_fingerprint_sha256.is_none());
     }
 }

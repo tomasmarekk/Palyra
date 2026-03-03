@@ -1,6 +1,7 @@
 use std::{
     collections::VecDeque,
     env, fs,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -8,7 +9,12 @@ use std::{
 };
 
 use anyhow::{anyhow, bail, Context, Result};
-use palyra_common::redaction::{redact_auth_error, redact_url};
+use palyra_common::{
+    config_system::parse_document_with_migration,
+    daemon_config_schema::RootFileConfig,
+    default_config_search_paths, parse_config_path, parse_daemon_bind_socket,
+    redaction::{redact_auth_error, redact_url},
+};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -217,9 +223,32 @@ struct BrowserStatusSnapshot {
     last_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DashboardAccessMode {
+    Local,
+    Remote,
+}
+
+impl DashboardAccessMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Remote => "remote",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DashboardAccessTarget {
+    url: String,
+    mode: DashboardAccessMode,
+}
+
 #[derive(Debug, Serialize)]
 struct QuickFactsSnapshot {
     dashboard_url: String,
+    dashboard_access_mode: String,
     gateway_version: Option<String>,
     gateway_git_hash: Option<String>,
     gateway_uptime_seconds: Option<u64>,
@@ -343,8 +372,12 @@ impl ControlCenter {
         DesktopSettingsSnapshot { browser_service_enabled: self.persisted.browser_service_enabled }
     }
 
-    fn dashboard_url(&self) -> String {
-        format!("{DASHBOARD_SCHEME}://{LOOPBACK_HOST}:{}/", self.runtime.gateway_admin_port)
+    fn dashboard_access_target(&self) -> Result<DashboardAccessTarget> {
+        resolve_dashboard_access_target(self.runtime.gateway_admin_port)
+    }
+
+    fn default_dashboard_access_target(&self) -> DashboardAccessTarget {
+        default_dashboard_access_target(self.runtime.gateway_admin_port)
     }
 
     fn save_state_file(&self) -> Result<()> {
@@ -770,8 +803,20 @@ impl ControlCenter {
             self.browserd.last_exit.clone(),
         );
 
+        let dashboard_access = match self.dashboard_access_target() {
+            Ok(target) => target,
+            Err(error) => {
+                warnings.push(format!(
+                    "dashboard URL discovery failed: {}",
+                    sanitize_log_line(error.to_string().as_str())
+                ));
+                self.default_dashboard_access_target()
+            }
+        };
+
         let quick_facts = QuickFactsSnapshot {
-            dashboard_url: self.dashboard_url(),
+            dashboard_url: dashboard_access.url,
+            dashboard_access_mode: dashboard_access.mode.as_str().to_owned(),
             gateway_version: gateway_health.as_ref().map(|value| value.version.clone()),
             gateway_git_hash: gateway_health.as_ref().map(|value| value.git_hash.clone()),
             gateway_uptime_seconds: gateway_health.as_ref().map(|value| value.uptime_seconds),
@@ -953,7 +998,7 @@ impl ControlCenter {
     }
 
     fn open_dashboard(&self) -> Result<String> {
-        let url = self.dashboard_url();
+        let url = self.dashboard_access_target()?.url;
         webbrowser::open(url.as_str())
             .context("failed to open dashboard URL in default browser")?;
         Ok(url)
@@ -1162,6 +1207,111 @@ fn loopback_url(port: u16, path: &str) -> Result<Url> {
     }
     Url::parse(format!("{DASHBOARD_SCHEME}://{LOOPBACK_HOST}:{port}{path}").as_str())
         .with_context(|| format!("failed to construct loopback URL for path '{path}'"))
+}
+
+fn resolve_dashboard_access_target(default_port: u16) -> Result<DashboardAccessTarget> {
+    let Some(config_path) = resolve_dashboard_config_path()? else {
+        return Ok(default_dashboard_access_target(default_port));
+    };
+    let parsed = load_dashboard_root_file_config(config_path.as_path())?;
+
+    if let Some(remote_base_url) = parsed
+        .gateway_access
+        .as_ref()
+        .and_then(|access| access.remote_base_url.as_deref())
+        .and_then(normalize_optional_text)
+    {
+        return Ok(DashboardAccessTarget {
+            url: parse_remote_dashboard_base_url(
+                remote_base_url,
+                "gateway_access.remote_base_url",
+            )?,
+            mode: DashboardAccessMode::Remote,
+        });
+    }
+
+    let bind_addr = parsed
+        .daemon
+        .as_ref()
+        .and_then(|daemon| daemon.bind_addr.as_deref())
+        .unwrap_or(LOOPBACK_HOST);
+    let port = parsed.daemon.as_ref().and_then(|daemon| daemon.port).unwrap_or(default_port);
+    let socket = parse_daemon_bind_socket(bind_addr, port)
+        .with_context(|| format!("invalid daemon bind config ({bind_addr}:{port})"))?;
+    Ok(DashboardAccessTarget { url: format_dashboard_url(normalize_dashboard_socket(socket)), mode: DashboardAccessMode::Local })
+}
+
+fn resolve_dashboard_config_path() -> Result<Option<PathBuf>> {
+    if let Ok(explicit) = env::var("PALYRA_CONFIG") {
+        let trimmed = explicit.trim();
+        if !trimmed.is_empty() {
+            let parsed = parse_config_path(trimmed)
+                .with_context(|| "PALYRA_CONFIG contains an invalid path")?;
+            if parsed.exists() {
+                return Ok(Some(parsed));
+            }
+        }
+    }
+
+    for candidate in default_config_search_paths() {
+        if candidate.exists() {
+            return Ok(Some(candidate));
+        }
+    }
+
+    Ok(None)
+}
+
+fn load_dashboard_root_file_config(path: &Path) -> Result<RootFileConfig> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("failed to read desktop dashboard config {}", path.display()))?;
+    let (document, _) = parse_document_with_migration(content.as_str())
+        .with_context(|| format!("failed to migrate desktop dashboard config {}", path.display()))?;
+    let migrated = toml::to_string(&document)
+        .context("failed to serialize migrated desktop dashboard config document")?;
+    toml::from_str(migrated.as_str()).context("desktop dashboard config does not match schema")
+}
+
+fn parse_remote_dashboard_base_url(raw: &str, source_name: &str) -> Result<String> {
+    let parsed = Url::parse(raw)
+        .with_context(|| format!("{source_name} must be a valid absolute URL"))?;
+    if parsed.scheme() != "https" {
+        bail!("{source_name} must use https://");
+    }
+    if parsed.host_str().is_none() {
+        bail!("{source_name} must include a host");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        bail!("{source_name} must not include embedded credentials");
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        bail!("{source_name} must not include query or fragment");
+    }
+    Ok(parsed.to_string())
+}
+
+fn normalize_dashboard_socket(socket: SocketAddr) -> SocketAddr {
+    if socket.ip().is_unspecified() {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), socket.port())
+    } else {
+        socket
+    }
+}
+
+fn format_dashboard_url(socket: SocketAddr) -> String {
+    format!("{DASHBOARD_SCHEME}://{socket}/")
+}
+
+fn default_dashboard_access_target(default_port: u16) -> DashboardAccessTarget {
+    DashboardAccessTarget {
+        url: format!("{DASHBOARD_SCHEME}://{LOOPBACK_HOST}:{default_port}/"),
+        mode: DashboardAccessMode::Local,
+    }
+}
+
+fn normalize_optional_text(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() { None } else { Some(trimmed) }
 }
 
 fn compute_backoff_ms(attempt: u32) -> u64 {
@@ -1410,12 +1560,82 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+
     use serde_json::json;
 
     use super::{
         collect_redacted_errors, compute_backoff_ms, parse_discord_status, sanitize_log_line,
-        BrowserStatusSnapshot,
+        parse_remote_dashboard_base_url, resolve_dashboard_access_target, BrowserStatusSnapshot,
+        DashboardAccessMode, Ulid,
     };
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct ScopedEnvVar {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl ScopedEnvVar {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: tests serialize environment mutations with env_lock().
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                // SAFETY: tests serialize environment mutations with env_lock().
+                unsafe {
+                    std::env::set_var(self.key, previous);
+                }
+            } else {
+                // SAFETY: tests serialize environment mutations with env_lock().
+                unsafe {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    struct TempFixtureDir {
+        root: PathBuf,
+    }
+
+    impl TempFixtureDir {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("palyra-desktop-fixture-{}", Ulid::new()));
+            std::fs::create_dir_all(root.as_path()).expect("fixture directory should be created");
+            Self { root }
+        }
+
+        fn path(&self) -> &Path {
+            self.root.as_path()
+        }
+    }
+
+    impl Drop for TempFixtureDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(self.root.as_path());
+        }
+    }
+
+    fn write_config_file(root: &Path, content: &str) -> PathBuf {
+        let path = root.join("palyra.toml");
+        std::fs::write(path.as_path(), content).expect("fixture config should be written");
+        path
+    }
 
     #[test]
     fn backoff_uses_exponential_growth_with_cap() {
@@ -1483,5 +1703,73 @@ mod tests {
         };
         assert!(!snapshot.enabled);
         assert!(snapshot.healthy);
+    }
+
+    #[test]
+    fn remote_dashboard_url_parser_accepts_https_without_sensitive_parts() {
+        let parsed = parse_remote_dashboard_base_url(
+            "https://dashboard.example.com/path",
+            "gateway_access.remote_base_url",
+        )
+        .expect("https remote URL should be accepted");
+        assert_eq!(parsed, "https://dashboard.example.com/path");
+    }
+
+    #[test]
+    fn remote_dashboard_url_parser_rejects_non_https_and_credentials() {
+        let non_https = parse_remote_dashboard_base_url(
+            "http://dashboard.example.com",
+            "gateway_access.remote_base_url",
+        )
+        .expect_err("non-https URL must be rejected");
+        assert!(non_https.to_string().contains("must use https://"));
+
+        let credentials = parse_remote_dashboard_base_url(
+            "https://user:pass@dashboard.example.com",
+            "gateway_access.remote_base_url",
+        )
+        .expect_err("URL with embedded credentials must be rejected");
+        assert!(credentials.to_string().contains("must not include embedded credentials"));
+    }
+
+    #[test]
+    fn dashboard_access_target_prefers_remote_url_when_configured() {
+        let _env_guard = env_lock().lock().expect("env lock should be available");
+        let fixture = TempFixtureDir::new();
+        let config_path = write_config_file(
+            fixture.path(),
+            r#"
+version = 1
+[gateway_access]
+remote_base_url = "https://dashboard.example.com/"
+"#,
+        );
+        let _config_var =
+            ScopedEnvVar::set("PALYRA_CONFIG", config_path.to_string_lossy().as_ref());
+        let target = resolve_dashboard_access_target(7142)
+            .expect("dashboard access target should resolve from configured remote URL");
+        assert_eq!(target.url, "https://dashboard.example.com/");
+        assert_eq!(target.mode, DashboardAccessMode::Remote);
+    }
+
+    #[test]
+    fn dashboard_access_target_uses_local_daemon_bind_when_remote_url_is_missing() {
+        let _env_guard = env_lock().lock().expect("env lock should be available");
+        let fixture = TempFixtureDir::new();
+        let config_path = write_config_file(
+            fixture.path(),
+            r#"
+version = 1
+[daemon]
+bind_addr = "0.0.0.0"
+port = 9911
+"#,
+        );
+        let _config_var =
+            ScopedEnvVar::set("PALYRA_CONFIG", config_path.to_string_lossy().as_ref());
+        let target = resolve_dashboard_access_target(7142)
+            .expect("dashboard access target should resolve from daemon bind");
+        assert_eq!(target.url, "http://127.0.0.1:9911/");
+        assert_eq!(target.mode, DashboardAccessMode::Local);
     }
 }
