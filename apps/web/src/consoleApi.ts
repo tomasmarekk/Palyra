@@ -488,6 +488,7 @@ export class ConsoleApiClient {
       concurrency_limit?: number;
       broadcast_strategy?: "deny" | "mention_only" | "allow";
       confirm_open_guild_channels?: boolean;
+      verify_channel_id?: string;
     }
   ): Promise<{ [key: string]: JsonValue }> {
     return this.request(
@@ -513,6 +514,7 @@ export class ConsoleApiClient {
       concurrency_limit?: number;
       broadcast_strategy?: "deny" | "mention_only" | "allow";
       confirm_open_guild_channels?: boolean;
+      verify_channel_id?: string;
     }
   ): Promise<{ [key: string]: JsonValue }> {
     return this.request(

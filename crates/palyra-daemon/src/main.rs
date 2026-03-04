@@ -500,6 +500,8 @@ struct DiscordOnboardingRequest {
     broadcast_strategy: Option<String>,
     #[serde(default)]
     confirm_open_guild_channels: Option<bool>,
+    #[serde(default)]
+    verify_channel_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -603,6 +605,28 @@ struct DiscordInboundMonitorSummary {
     last_event_type: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DiscordChannelPermissionCheckStatus {
+    Ok,
+    Forbidden,
+    NotFound,
+    Unavailable,
+    ParseError,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DiscordChannelPermissionCheck {
+    channel_id: String,
+    status: DiscordChannelPermissionCheckStatus,
+    can_view_channel: bool,
+    can_send_messages: bool,
+    can_read_message_history: bool,
+    can_embed_links: bool,
+    can_attach_files: bool,
+    can_send_messages_in_threads: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct DiscordOnboardingPreflightResponse {
     connector_id: String,
@@ -617,6 +641,8 @@ struct DiscordOnboardingPreflightResponse {
     egress_allowlist: Vec<String>,
     security_defaults: Vec<String>,
     routing_preview: DiscordRoutingPreview,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    channel_permission_check: Option<DiscordChannelPermissionCheck>,
     inbound_monitor: DiscordInboundMonitorSummary,
     inbound_alive: bool,
     warnings: Vec<String>,
@@ -5185,7 +5211,10 @@ async fn evaluate_discord_onboarding_request(
         )));
     }
 
-    let (bot, application) = probe_discord_bot_identity(token.as_str()).await?;
+    let verify_channel_id =
+        normalize_optional_discord_channel_id(payload.verify_channel_id.as_deref())?;
+    let (bot, application, channel_permission_check) =
+        probe_discord_bot_identity(token.as_str(), verify_channel_id.as_deref()).await?;
     plan = finalize_discord_onboarding_plan(plan, &bot);
     let inbound_monitor = load_discord_inbound_monitor_summary(state, plan.connector_id.as_str());
     let mut warnings = build_discord_onboarding_warnings(
@@ -5193,6 +5222,7 @@ async fn evaluate_discord_onboarding_request(
         application.as_ref(),
         require_open_scope_confirmation,
     );
+    warnings.extend(build_discord_channel_permission_warnings(channel_permission_check.as_ref()));
     warnings.extend(build_discord_inbound_monitor_warnings(&inbound_monitor));
     let policy_warnings = evaluate_discord_policy_warnings(state, &plan);
     let invite_client_id = application
@@ -5215,6 +5245,7 @@ async fn evaluate_discord_onboarding_request(
         egress_allowlist: channels::discord_default_egress_allowlist(),
         security_defaults: build_discord_onboarding_security_defaults(&plan),
         routing_preview: build_discord_routing_preview(&plan),
+        channel_permission_check,
         inbound_alive: discord_inbound_monitor_is_alive(&inbound_monitor),
         inbound_monitor,
         warnings,
@@ -5286,6 +5317,28 @@ fn build_discord_onboarding_plan(
         concurrency_limit,
         confirm_open_guild_channels: payload.confirm_open_guild_channels.unwrap_or(false),
     })
+}
+
+#[allow(clippy::result_large_err)]
+fn normalize_optional_discord_channel_id(raw: Option<&str>) -> Result<Option<String>, Response> {
+    let Some(value) = raw else {
+        return Ok(None);
+    };
+    let normalized = value.trim();
+    if normalized.is_empty() {
+        return Ok(None);
+    }
+    if !normalized.chars().all(|character| character.is_ascii_digit()) {
+        return Err(runtime_status_response(tonic::Status::invalid_argument(
+            "verify_channel_id must contain only decimal digits",
+        )));
+    }
+    if !(16..=24).contains(&normalized.len()) {
+        return Err(runtime_status_response(tonic::Status::invalid_argument(
+            "verify_channel_id must be a canonical Discord snowflake id",
+        )));
+    }
+    Ok(Some(normalized.to_owned()))
 }
 
 fn finalize_discord_onboarding_plan(
@@ -5392,6 +5445,71 @@ fn build_discord_onboarding_warnings(
             "Unable to read Discord application flags; intents checks are best-effort and were not confirmed."
                 .to_owned(),
         );
+    }
+    warnings
+}
+
+fn build_discord_channel_permission_warnings(
+    check: Option<&DiscordChannelPermissionCheck>,
+) -> Vec<String> {
+    let Some(check) = check else {
+        return Vec::new();
+    };
+    let mut warnings = Vec::new();
+    match check.status {
+        DiscordChannelPermissionCheckStatus::Ok => {}
+        DiscordChannelPermissionCheckStatus::Forbidden => warnings.push(format!(
+            "Discord verify_channel_id preflight failed: bot cannot access channel '{}'. Verify channel visibility and permission overrides.",
+            check.channel_id
+        )),
+        DiscordChannelPermissionCheckStatus::NotFound => warnings.push(format!(
+            "Discord verify_channel_id preflight failed: channel '{}' was not found for this bot token.",
+            check.channel_id
+        )),
+        DiscordChannelPermissionCheckStatus::Unavailable => warnings.push(format!(
+            "Discord verify_channel_id preflight check for '{}' is unavailable right now. Retry probe/apply after Discord API connectivity stabilizes.",
+            check.channel_id
+        )),
+        DiscordChannelPermissionCheckStatus::ParseError => warnings.push(format!(
+            "Discord verify_channel_id preflight returned channel '{}', but permission bitset could not be parsed.",
+            check.channel_id
+        )),
+    }
+    if !check.can_view_channel {
+        warnings.push(format!(
+            "Discord verify_channel_id '{}' is missing 'View Channels' permission.",
+            check.channel_id
+        ));
+    }
+    if !check.can_send_messages {
+        warnings.push(format!(
+            "Discord verify_channel_id '{}' is missing 'Send Messages' permission.",
+            check.channel_id
+        ));
+    }
+    if !check.can_read_message_history {
+        warnings.push(format!(
+            "Discord verify_channel_id '{}' is missing 'Read Message History' permission.",
+            check.channel_id
+        ));
+    }
+    if !check.can_embed_links {
+        warnings.push(format!(
+            "Discord verify_channel_id '{}' is missing 'Embed Links' permission.",
+            check.channel_id
+        ));
+    }
+    if !check.can_attach_files {
+        warnings.push(format!(
+            "Discord verify_channel_id '{}' is missing 'Attach Files' permission.",
+            check.channel_id
+        ));
+    }
+    if !check.can_send_messages_in_threads {
+        warnings.push(format!(
+            "Discord verify_channel_id '{}' is missing 'Send Messages in Threads' permission.",
+            check.channel_id
+        ));
     }
     warnings
 }
@@ -5587,7 +5705,15 @@ fn evaluate_discord_policy_warnings(state: &AppState, plan: &DiscordOnboardingPl
 
 async fn probe_discord_bot_identity(
     token: &str,
-) -> Result<(DiscordBotIdentitySummary, Option<DiscordApplicationSummary>), Response> {
+    verify_channel_id: Option<&str>,
+) -> Result<
+    (
+        DiscordBotIdentitySummary,
+        Option<DiscordApplicationSummary>,
+        Option<DiscordChannelPermissionCheck>,
+    ),
+    Response,
+> {
     let client = ReqwestClient::builder()
         .timeout(Duration::from_millis(DISCORD_ONBOARDING_HTTP_TIMEOUT_MS))
         .build()
@@ -5653,7 +5779,140 @@ async fn probe_discord_bot_identity(
         .to_owned();
     let bot = DiscordBotIdentitySummary { id: bot_id, username: bot_username };
     let application = fetch_discord_application_summary(&client, token).await;
-    Ok((bot, application))
+    let channel_permission_check =
+        probe_discord_channel_permission_check(&client, token, verify_channel_id).await;
+    Ok((bot, application, channel_permission_check))
+}
+
+async fn probe_discord_channel_permission_check(
+    client: &ReqwestClient,
+    token: &str,
+    verify_channel_id: Option<&str>,
+) -> Option<DiscordChannelPermissionCheck> {
+    let channel_id = verify_channel_id?.trim();
+    if channel_id.is_empty() {
+        return None;
+    }
+    let channel_url = build_discord_api_url(format!("/channels/{channel_id}").as_str()).ok()?;
+    let response = match client
+        .get(channel_url)
+        .header("Authorization", format!("Bot {token}"))
+        .header("User-Agent", "palyra-discord-onboarding/1.0")
+        .send()
+        .await
+    {
+        Ok(value) => value,
+        Err(_) => {
+            return Some(DiscordChannelPermissionCheck {
+                channel_id: channel_id.to_owned(),
+                status: DiscordChannelPermissionCheckStatus::Unavailable,
+                can_view_channel: false,
+                can_send_messages: false,
+                can_read_message_history: false,
+                can_embed_links: false,
+                can_attach_files: false,
+                can_send_messages_in_threads: false,
+            });
+        }
+    };
+    let status_code = response.status().as_u16();
+    let status_success = response.status().is_success();
+    let body = response.text().await.unwrap_or_default();
+    if status_code == 403 {
+        return Some(DiscordChannelPermissionCheck {
+            channel_id: channel_id.to_owned(),
+            status: DiscordChannelPermissionCheckStatus::Forbidden,
+            can_view_channel: false,
+            can_send_messages: false,
+            can_read_message_history: false,
+            can_embed_links: false,
+            can_attach_files: false,
+            can_send_messages_in_threads: false,
+        });
+    }
+    if status_code == 404 {
+        return Some(DiscordChannelPermissionCheck {
+            channel_id: channel_id.to_owned(),
+            status: DiscordChannelPermissionCheckStatus::NotFound,
+            can_view_channel: false,
+            can_send_messages: false,
+            can_read_message_history: false,
+            can_embed_links: false,
+            can_attach_files: false,
+            can_send_messages_in_threads: false,
+        });
+    }
+    if !status_success {
+        return Some(DiscordChannelPermissionCheck {
+            channel_id: channel_id.to_owned(),
+            status: DiscordChannelPermissionCheckStatus::Unavailable,
+            can_view_channel: false,
+            can_send_messages: false,
+            can_read_message_history: false,
+            can_embed_links: false,
+            can_attach_files: false,
+            can_send_messages_in_threads: false,
+        });
+    }
+    let payload = match serde_json::from_str::<Value>(body.as_str()) {
+        Ok(value) => value,
+        Err(_) => {
+            return Some(DiscordChannelPermissionCheck {
+                channel_id: channel_id.to_owned(),
+                status: DiscordChannelPermissionCheckStatus::ParseError,
+                can_view_channel: true,
+                can_send_messages: false,
+                can_read_message_history: false,
+                can_embed_links: false,
+                can_attach_files: false,
+                can_send_messages_in_threads: false,
+            });
+        }
+    };
+    let Some(raw_permissions) = payload
+        .get("permissions")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Some(DiscordChannelPermissionCheck {
+            channel_id: channel_id.to_owned(),
+            status: DiscordChannelPermissionCheckStatus::ParseError,
+            can_view_channel: true,
+            can_send_messages: false,
+            can_read_message_history: false,
+            can_embed_links: false,
+            can_attach_files: false,
+            can_send_messages_in_threads: false,
+        });
+    };
+    let permissions_mask = match raw_permissions.parse::<u64>() {
+        Ok(value) => value,
+        Err(_) => {
+            return Some(DiscordChannelPermissionCheck {
+                channel_id: channel_id.to_owned(),
+                status: DiscordChannelPermissionCheckStatus::ParseError,
+                can_view_channel: true,
+                can_send_messages: false,
+                can_read_message_history: false,
+                can_embed_links: false,
+                can_attach_files: false,
+                can_send_messages_in_threads: false,
+            });
+        }
+    };
+    Some(DiscordChannelPermissionCheck {
+        channel_id: channel_id.to_owned(),
+        status: DiscordChannelPermissionCheckStatus::Ok,
+        can_view_channel: (permissions_mask & DISCORD_PERMISSION_VIEW_CHANNEL) != 0,
+        can_send_messages: (permissions_mask & DISCORD_PERMISSION_SEND_MESSAGES) != 0,
+        can_read_message_history: (permissions_mask & DISCORD_PERMISSION_READ_MESSAGE_HISTORY) != 0,
+        can_embed_links: (permissions_mask & DISCORD_PERMISSION_EMBED_LINKS) != 0,
+        can_attach_files: (permissions_mask & DISCORD_PERMISSION_ATTACH_FILES) != 0,
+        can_send_messages_in_threads: (permissions_mask
+            & DISCORD_PERMISSION_SEND_MESSAGES_IN_THREADS)
+            != 0,
+    })
 }
 
 async fn fetch_discord_application_summary(
@@ -7912,6 +8171,66 @@ mod tests {
     }
 
     #[test]
+    fn normalize_optional_discord_channel_id_accepts_valid_values() {
+        assert_eq!(
+            super::normalize_optional_discord_channel_id(None).expect("none should be accepted"),
+            None
+        );
+        assert_eq!(
+            super::normalize_optional_discord_channel_id(Some("   "))
+                .expect("blank should normalize to none"),
+            None
+        );
+        assert_eq!(
+            super::normalize_optional_discord_channel_id(Some("123456789012345678"))
+                .expect("valid snowflake should normalize"),
+            Some("123456789012345678".to_owned())
+        );
+    }
+
+    #[test]
+    fn normalize_optional_discord_channel_id_rejects_invalid_shapes() {
+        let invalid_non_digit = super::normalize_optional_discord_channel_id(Some("abc123"))
+            .expect_err("non-digit channel id should be rejected");
+        assert_eq!(
+            invalid_non_digit.status(),
+            StatusCode::BAD_REQUEST,
+            "non-digit verify_channel_id should map to 400"
+        );
+        let invalid_short = super::normalize_optional_discord_channel_id(Some("12345"))
+            .expect_err("short channel id should be rejected");
+        assert_eq!(
+            invalid_short.status(),
+            StatusCode::BAD_REQUEST,
+            "short verify_channel_id should map to 400"
+        );
+    }
+
+    #[test]
+    fn discord_channel_permission_warnings_include_missing_permission_details() {
+        let warnings = super::build_discord_channel_permission_warnings(Some(
+            &super::DiscordChannelPermissionCheck {
+                channel_id: "123456789012345678".to_owned(),
+                status: super::DiscordChannelPermissionCheckStatus::Ok,
+                can_view_channel: true,
+                can_send_messages: false,
+                can_read_message_history: false,
+                can_embed_links: false,
+                can_attach_files: false,
+                can_send_messages_in_threads: false,
+            },
+        ));
+        assert!(
+            warnings.iter().any(|entry| entry.contains("Send Messages")),
+            "warnings should include missing send messages permission"
+        );
+        assert!(
+            warnings.iter().any(|entry| entry.contains("Send Messages in Threads")),
+            "warnings should include missing thread send permission"
+        );
+    }
+
+    #[test]
     fn discord_onboarding_plan_defaults_to_dm_only_safe_baseline() {
         let payload = DiscordOnboardingRequest {
             account_id: None,
@@ -7926,6 +8245,7 @@ mod tests {
             direct_message_policy: None,
             broadcast_strategy: None,
             confirm_open_guild_channels: None,
+            verify_channel_id: None,
         };
         let plan = build_discord_onboarding_plan(&payload)
             .expect("default onboarding payload should parse");
@@ -7959,6 +8279,7 @@ mod tests {
             direct_message_policy: None,
             broadcast_strategy: None,
             confirm_open_guild_channels: None,
+            verify_channel_id: None,
         };
         let plan = build_discord_onboarding_plan(&payload).expect("plan should parse");
         let defaults = build_discord_onboarding_security_defaults(&plan);
@@ -7987,6 +8308,7 @@ mod tests {
             direct_message_policy: None,
             broadcast_strategy: None,
             confirm_open_guild_channels: None,
+            verify_channel_id: None,
         };
         let plan = build_discord_onboarding_plan(&payload).expect("plan should parse");
         let finalized = finalize_discord_onboarding_plan(

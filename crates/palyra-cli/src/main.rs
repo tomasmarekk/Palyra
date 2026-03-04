@@ -3580,6 +3580,7 @@ fn run_channels(command: ChannelsCommand) -> Result<()> {
                 principal,
                 device_id,
                 channel,
+                verify_channel_id,
                 json,
             } => {
                 if !std::io::stdin().is_terminal()
@@ -3610,6 +3611,7 @@ fn run_channels(command: ChannelsCommand) -> Result<()> {
                     "account_id": account_id,
                     "token": setup_token,
                     "mode": setup_mode,
+                    "verify_channel_id": verify_channel_id,
                 });
                 let probe_response = send_channels_request(
                     client.post(probe_endpoint).json(&probe_payload),
@@ -3622,6 +3624,7 @@ fn run_channels(command: ChannelsCommand) -> Result<()> {
                 eprintln!("discord setup preflight: token validation succeeded");
                 emit_discord_onboarding_warnings(&probe_response);
                 emit_discord_inbound_monitor_summary(&probe_response);
+                emit_discord_channel_permission_check(&probe_response);
                 emit_discord_onboarding_defaults(&probe_response);
 
                 let inbound_scope = prompt_discord_setup_scope()?;
@@ -3663,6 +3666,7 @@ fn run_channels(command: ChannelsCommand) -> Result<()> {
                     "concurrency_limit": concurrency_limit,
                     "broadcast_strategy": broadcast_strategy,
                     "confirm_open_guild_channels": confirm_open,
+                    "verify_channel_id": verify_channel_id,
                 });
                 let response = send_channels_request(
                     client.post(apply_endpoint).json(&apply_payload),
@@ -3699,6 +3703,7 @@ fn run_channels(command: ChannelsCommand) -> Result<()> {
                     );
                     emit_discord_onboarding_warnings(&response);
                     emit_discord_inbound_monitor_summary(&response);
+                    emit_discord_channel_permission_check(&response);
                     emit_discord_onboarding_defaults(&response);
                 }
             }
@@ -9406,6 +9411,37 @@ fn emit_discord_inbound_monitor_summary(payload: &Value) {
         recent_inbound,
         last_inbound_unix_ms,
         last_event_type
+    );
+}
+
+fn emit_discord_channel_permission_check(payload: &Value) {
+    let permission_check = payload.get("channel_permission_check").or_else(|| {
+        payload.get("preflight").and_then(|preflight| preflight.get("channel_permission_check"))
+    });
+    let Some(check) = permission_check.and_then(Value::as_object) else {
+        return;
+    };
+    let channel_id = check.get("channel_id").and_then(Value::as_str).unwrap_or("unknown");
+    let status = check.get("status").and_then(Value::as_str).unwrap_or("unknown");
+    let can_view_channel = check.get("can_view_channel").and_then(Value::as_bool).unwrap_or(false);
+    let can_send_messages =
+        check.get("can_send_messages").and_then(Value::as_bool).unwrap_or(false);
+    let can_read_history =
+        check.get("can_read_message_history").and_then(Value::as_bool).unwrap_or(false);
+    let can_embed_links = check.get("can_embed_links").and_then(Value::as_bool).unwrap_or(false);
+    let can_attach_files = check.get("can_attach_files").and_then(Value::as_bool).unwrap_or(false);
+    let can_send_threads =
+        check.get("can_send_messages_in_threads").and_then(Value::as_bool).unwrap_or(false);
+    eprintln!(
+        "discord.channel_permission_check channel_id={} status={} can_view_channel={} can_send_messages={} can_read_message_history={} can_embed_links={} can_attach_files={} can_send_messages_in_threads={}",
+        channel_id,
+        status,
+        can_view_channel,
+        can_send_messages,
+        can_read_history,
+        can_embed_links,
+        can_attach_files,
+        can_send_threads
     );
 }
 

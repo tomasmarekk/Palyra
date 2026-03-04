@@ -622,6 +622,8 @@ pub enum ChannelsDiscordCommand {
         device_id: String,
         #[arg(long)]
         channel: Option<String>,
+        #[arg(long)]
+        verify_channel_id: Option<String>,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -2295,6 +2297,8 @@ mod tests {
             "01ARZ3NDEKTSV4RRFFQ69G5FAV",
             "--channel",
             "cli",
+            "--verify-channel-id",
+            "123456789012345678",
             "--json",
         ]);
         assert_eq!(
@@ -2308,6 +2312,7 @@ mod tests {
                         principal: "admin:ops".to_owned(),
                         device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
                         channel: Some("cli".to_owned()),
+                        verify_channel_id: Some("123456789012345678".to_owned()),
                         json: true,
                     },
                 }
