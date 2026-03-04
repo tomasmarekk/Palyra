@@ -1124,6 +1124,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_outbound_preflight_respects_route_budget_without_explicit_retry_headers() {
+        let transport = Arc::new(FakeTransport::default());
+        transport.push_get_response(Ok(ok_identity_response()));
+        transport.push_post_response(Ok(DiscordTransportResponse {
+            status: 429,
+            headers: [("x-ratelimit-remaining".to_owned(), "0".to_owned())].into_iter().collect(),
+            body: "{\"message\":\"slow down\"}".to_owned(),
+        }));
+        transport.push_post_response(Ok(DiscordTransportResponse {
+            status: 200,
+            headers: Default::default(),
+            body: "{\"id\":\"unexpected-second-send\"}".to_owned(),
+        }));
+        let adapter = adapter_with_fake_transport(Arc::clone(&transport));
+        let request = sample_request("hello");
+
+        let first = adapter
+            .send_outbound(&sample_instance(), &request)
+            .await
+            .expect("first send should return rate-limit outcome");
+        let second = adapter
+            .send_outbound(&sample_instance(), &request)
+            .await
+            .expect("second send should be deferred by local preflight budget");
+
+        let DeliveryOutcome::Retry {
+            class: first_class, retry_after_ms: first_retry_after_ms, ..
+        } = first
+        else {
+            panic!("first outcome should be retry");
+        };
+        assert_eq!(first_class, RetryClass::RateLimit);
+        assert_eq!(
+            first_retry_after_ms,
+            Some(1_000),
+            "missing retry headers should still produce bounded retry_after fallback"
+        );
+
+        let DeliveryOutcome::Retry {
+            class: second_class,
+            reason: second_reason,
+            retry_after_ms: second_retry_after_ms,
+        } = second
+        else {
+            panic!("second outcome should be retry");
+        };
+        assert_eq!(second_class, RetryClass::RateLimit);
+        assert!(
+            second_reason.contains("local route/global rate-limit budget"),
+            "second retry should come from local preflight budget"
+        );
+        assert!(
+            second_retry_after_ms.unwrap_or(0) > 0,
+            "preflight fallback budget should report a positive wait"
+        );
+
+        let posts = transport
+            .captured()
+            .into_iter()
+            .filter(|entry| entry.method == "POST")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            posts.len(),
+            1,
+            "second send should be blocked locally instead of issuing another POST"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_outbound_preflight_respects_global_budget_without_retry_headers() {
+        let transport = Arc::new(FakeTransport::default());
+        transport.push_get_response(Ok(ok_identity_response()));
+        transport.push_post_response(Ok(DiscordTransportResponse {
+            status: 429,
+            headers: Default::default(),
+            body: "{\"message\":\"global limited\",\"global\":true}".to_owned(),
+        }));
+        transport.push_post_response(Ok(DiscordTransportResponse {
+            status: 200,
+            headers: Default::default(),
+            body: "{\"id\":\"unexpected-second-send\"}".to_owned(),
+        }));
+        let adapter = adapter_with_fake_transport(Arc::clone(&transport));
+        let request = sample_request("hello");
+
+        let first = adapter
+            .send_outbound(&sample_instance(), &request)
+            .await
+            .expect("first send should return rate-limit outcome");
+        let second = adapter
+            .send_outbound(&sample_instance(), &request)
+            .await
+            .expect("second send should be deferred by global preflight budget");
+
+        assert!(
+            matches!(first, DeliveryOutcome::Retry { class: RetryClass::RateLimit, .. }),
+            "first outcome should be rate-limit retry"
+        );
+
+        let DeliveryOutcome::Retry {
+            class: second_class,
+            reason: second_reason,
+            retry_after_ms: second_retry_after_ms,
+        } = second
+        else {
+            panic!("second outcome should be retry");
+        };
+        assert_eq!(second_class, RetryClass::RateLimit);
+        assert!(
+            second_reason.contains("local route/global rate-limit budget"),
+            "second retry should come from local preflight budget"
+        );
+        assert!(
+            second_retry_after_ms.unwrap_or(0) > 0,
+            "global fallback budget should report a positive wait"
+        );
+
+        let posts = transport
+            .captured()
+            .into_iter()
+            .filter(|entry| entry.method == "POST")
+            .collect::<Vec<_>>();
+        assert_eq!(posts.len(), 1, "global budget fallback should prevent immediate second POST");
+    }
+
+    #[tokio::test]
     async fn send_outbound_is_idempotent_for_same_envelope() {
         let transport = Arc::new(FakeTransport::default());
         transport.push_get_response(Ok(ok_identity_response()));
@@ -1970,6 +2096,13 @@ impl DiscordConnectorAdapter {
         let delay_ms = snapshot
             .retry_after_ms
             .or(snapshot.reset_after_ms)
+            .or_else(|| {
+                if snapshot.remaining == Some(0) || snapshot.global {
+                    Some(DEFAULT_MIN_RATE_LIMIT_RETRY_MS)
+                } else {
+                    None
+                }
+            })
             .map(|value| value.max(DEFAULT_MIN_RATE_LIMIT_RETRY_MS));
         if snapshot.global {
             if let Some(delay_ms) = delay_ms {
