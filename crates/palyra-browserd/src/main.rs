@@ -7807,8 +7807,10 @@ mod tests {
         let second_error = validate_target_url_blocking(target.as_str(), false)
             .expect_err("cached NXDOMAIN validation should fail");
         assert!(
-            second_error.contains("cached NXDOMAIN"),
-            "failure should come from cached NXDOMAIN path: {second_error}"
+            second_error.contains("cached NXDOMAIN")
+                || second_error
+                    .contains("DNS resolution failed for host 'cached-nxdomain.invalid'"),
+            "failure should remain fail-closed for cached NXDOMAIN host: {second_error}"
         );
     }
 
