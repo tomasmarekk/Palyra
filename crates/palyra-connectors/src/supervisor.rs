@@ -570,6 +570,8 @@ impl ConnectorSupervisor {
                 auto_ack_text: output.auto_ack_text.clone(),
                 auto_reaction: output.auto_reaction.clone(),
                 attachments: output.attachments.clone(),
+                structured_json: output.structured_json.clone(),
+                a2ui_update: output.a2ui_update.clone(),
                 timeout_ms: 30_000,
                 max_payload_bytes: self.config.max_outbound_body_bytes,
             };
@@ -971,6 +973,8 @@ mod tests {
                     auto_ack_text: None,
                     auto_reaction: None,
                     attachments: Vec::new(),
+                    structured_json: None,
+                    a2ui_update: None,
                 }],
                 route_key: Some("channel:echo:conversation:c1".to_owned()),
                 retry_attempt: 0,

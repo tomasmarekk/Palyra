@@ -1,6 +1,7 @@
 use std::fmt::{Display, Formatter};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 
 const MAX_CONNECTOR_ID_BYTES: usize = 128;
@@ -13,6 +14,9 @@ const MAX_ATTACHMENTS_PER_MESSAGE: usize = 32;
 const MAX_ATTACHMENT_REF_BYTES: usize = 1_024;
 const MAX_ATTACHMENT_FILENAME_BYTES: usize = 512;
 const MAX_ATTACHMENT_CONTENT_TYPE_BYTES: usize = 256;
+const MAX_STRUCTURED_OUTPUT_BYTES: usize = 128 * 1024;
+const MAX_A2UI_SURFACE_BYTES: usize = 128;
+const MAX_A2UI_PATCH_BYTES: usize = 128 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -195,6 +199,28 @@ impl AttachmentRef {
 pub type OutboundAttachment = AttachmentRef;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutboundA2uiUpdate {
+    pub surface: String,
+    #[serde(default)]
+    pub patch_json: Vec<u8>,
+}
+
+impl OutboundA2uiUpdate {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        validate_non_empty_identifier(
+            self.surface.as_str(),
+            "a2ui_update.surface",
+            MAX_A2UI_SURFACE_BYTES,
+        )?;
+        validate_json_bytes(
+            self.patch_json.as_slice(),
+            "a2ui_update.patch_json",
+            MAX_A2UI_PATCH_BYTES,
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InboundMessageEvent {
     pub envelope_id: String,
     pub connector_id: String,
@@ -246,6 +272,10 @@ pub struct RoutedOutboundMessage {
     pub auto_reaction: Option<String>,
     #[serde(default)]
     pub attachments: Vec<OutboundAttachment>,
+    #[serde(default)]
+    pub structured_json: Option<Vec<u8>>,
+    #[serde(default)]
+    pub a2ui_update: Option<OutboundA2uiUpdate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -273,6 +303,10 @@ pub struct OutboundMessageRequest {
     pub auto_reaction: Option<String>,
     #[serde(default)]
     pub attachments: Vec<OutboundAttachment>,
+    #[serde(default)]
+    pub structured_json: Option<Vec<u8>>,
+    #[serde(default)]
+    pub a2ui_update: Option<OutboundA2uiUpdate>,
     pub timeout_ms: u64,
     pub max_payload_bytes: usize,
 }
@@ -296,6 +330,12 @@ impl OutboundMessageRequest {
         )?;
         validate_message_body(self.text.as_str(), max_text_bytes, "text")?;
         validate_attachments(self.attachments.as_slice())?;
+        if let Some(structured_json) = self.structured_json.as_deref() {
+            validate_json_bytes(structured_json, "structured_json", MAX_STRUCTURED_OUTPUT_BYTES)?;
+        }
+        if let Some(update) = self.a2ui_update.as_ref() {
+            update.validate()?;
+        }
         if self.timeout_ms == 0 {
             return Err(ProtocolError::InvalidField {
                 field: "timeout_ms",
@@ -442,11 +482,27 @@ fn validate_attachments(attachments: &[AttachmentRef]) -> Result<(), ProtocolErr
     Ok(())
 }
 
+fn validate_json_bytes(
+    raw: &[u8],
+    field: &'static str,
+    max_bytes: usize,
+) -> Result<(), ProtocolError> {
+    if raw.is_empty() {
+        return Err(ProtocolError::InvalidField { field, reason: "cannot be empty" });
+    }
+    if raw.len() > max_bytes {
+        return Err(ProtocolError::InvalidField { field, reason: "value exceeds size limit" });
+    }
+    serde_json::from_slice::<Value>(raw)
+        .map_err(|_| ProtocolError::InvalidField { field, reason: "value is not valid JSON" })?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         AttachmentKind, AttachmentRef, ConnectorInstanceSpec, ConnectorKind, InboundMessageEvent,
-        OutboundMessageRequest, ProtocolError,
+        OutboundA2uiUpdate, OutboundMessageRequest, ProtocolError,
     };
 
     #[test]
@@ -505,6 +561,8 @@ mod tests {
             auto_ack_text: None,
             auto_reaction: None,
             attachments: Vec::new(),
+            structured_json: None,
+            a2ui_update: None,
             timeout_ms: 0,
             max_payload_bytes: 0,
         };
@@ -549,6 +607,63 @@ mod tests {
             Err(ProtocolError::InvalidField {
                 field: "attachments",
                 reason: "message exceeds attachment count limit",
+            })
+        );
+    }
+
+    #[test]
+    fn outbound_validation_rejects_invalid_structured_json() {
+        let request = OutboundMessageRequest {
+            envelope_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV:0".to_owned(),
+            connector_id: "echo:default".to_owned(),
+            conversation_id: "c1".to_owned(),
+            reply_thread_id: None,
+            in_reply_to_message_id: None,
+            text: "ok".to_owned(),
+            broadcast: false,
+            auto_ack_text: None,
+            auto_reaction: None,
+            attachments: Vec::new(),
+            structured_json: Some(br#"{"missing":"brace""#.to_vec()),
+            a2ui_update: None,
+            timeout_ms: 1_000,
+            max_payload_bytes: 8_192,
+        };
+        assert_eq!(
+            request.validate(1024),
+            Err(ProtocolError::InvalidField {
+                field: "structured_json",
+                reason: "value is not valid JSON",
+            })
+        );
+    }
+
+    #[test]
+    fn outbound_validation_rejects_invalid_a2ui_patch_json() {
+        let request = OutboundMessageRequest {
+            envelope_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV:0".to_owned(),
+            connector_id: "echo:default".to_owned(),
+            conversation_id: "c1".to_owned(),
+            reply_thread_id: None,
+            in_reply_to_message_id: None,
+            text: "ok".to_owned(),
+            broadcast: false,
+            auto_ack_text: None,
+            auto_reaction: None,
+            attachments: Vec::new(),
+            structured_json: None,
+            a2ui_update: Some(OutboundA2uiUpdate {
+                surface: "chat".to_owned(),
+                patch_json: br#"{"oops":"invalid""#.to_vec(),
+            }),
+            timeout_ms: 1_000,
+            max_payload_bytes: 8_192,
+        };
+        assert_eq!(
+            request.validate(1024),
+            Err(ProtocolError::InvalidField {
+                field: "a2ui_update.patch_json",
+                reason: "value is not valid JSON",
             })
         );
     }

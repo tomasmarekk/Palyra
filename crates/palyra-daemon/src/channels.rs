@@ -9,8 +9,8 @@ use palyra_connectors::{
     connectors::default_adapters, AttachmentKind, AttachmentRef, ConnectorInstanceSpec,
     ConnectorKind, ConnectorRouter, ConnectorRouterError, ConnectorStatusSnapshot,
     ConnectorSupervisor, ConnectorSupervisorConfig, ConnectorSupervisorError, InboundIngestOutcome,
-    InboundMessageEvent, OutboundAttachment, OutboundMessageRequest, RouteInboundResult,
-    RoutedOutboundMessage,
+    InboundMessageEvent, OutboundA2uiUpdate as ConnectorA2uiUpdate, OutboundAttachment,
+    OutboundMessageRequest, RouteInboundResult, RoutedOutboundMessage,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -264,6 +264,8 @@ impl ChannelPlatform {
             auto_ack_text: None,
             auto_reaction,
             attachments: Vec::new(),
+            structured_json: None,
+            a2ui_update: None,
             timeout_ms: 30_000,
             max_payload_bytes: self.supervisor_config().max_outbound_body_bytes,
         };
@@ -479,6 +481,8 @@ impl ConnectorRouter for GrpcChannelRouter {
                 auto_ack_text: non_empty(output.auto_ack_text),
                 auto_reaction: non_empty(output.auto_reaction),
                 attachments: from_proto_message_attachments(output.attachments.as_slice()),
+                structured_json: non_empty_bytes(output.structured_json),
+                a2ui_update: from_proto_a2ui_update(output.a2ui_update),
             })
             .collect();
         Ok(RouteInboundResult {
@@ -520,6 +524,14 @@ fn non_empty(raw: String) -> Option<String> {
         None
     } else {
         Some(trimmed.to_owned())
+    }
+}
+
+fn non_empty_bytes(raw: Vec<u8>) -> Option<Vec<u8>> {
+    if raw.is_empty() {
+        None
+    } else {
+        Some(raw)
     }
 }
 
@@ -617,6 +629,15 @@ fn from_proto_message_attachments(
         .collect()
 }
 
+fn from_proto_a2ui_update(update: Option<common_v1::A2uiUpdate>) -> Option<ConnectorA2uiUpdate> {
+    let update = update?;
+    let surface = update.surface.trim();
+    if surface.is_empty() || update.patch_json.is_empty() {
+        return None;
+    }
+    Some(ConnectorA2uiUpdate { surface: surface.to_owned(), patch_json: update.patch_json })
+}
+
 fn attachment_kind_to_proto(kind: AttachmentKind) -> i32 {
     match kind {
         AttachmentKind::Image => common_v1::message_attachment::AttachmentKind::Image as i32,
@@ -643,9 +664,9 @@ mod tests {
     use palyra_connectors::{AttachmentKind, AttachmentRef, ConnectorSupervisorError};
 
     use super::{
-        discord, discord_connector_id, discord_token_vault_ref, normalize_discord_account_id,
-        render_attachment_context, resolve_connector_gateway_auth, to_proto_message_attachments,
-        with_attachment_context, ChannelPlatformError,
+        discord, discord_connector_id, discord_token_vault_ref, from_proto_a2ui_update,
+        normalize_discord_account_id, render_attachment_context, resolve_connector_gateway_auth,
+        to_proto_message_attachments, with_attachment_context, ChannelPlatformError,
     };
     use crate::gateway::GatewayAuthConfig;
 
@@ -779,6 +800,41 @@ mod tests {
         assert_eq!(
             attachments[0].artifact_id.as_ref().map(|value| value.ulid.as_str()),
             Some("01ARZ3NDEKTSV4RRFFQ69G5FAV")
+        );
+    }
+
+    #[test]
+    fn proto_a2ui_update_mapping_requires_surface_and_patch_payload() {
+        let mapped =
+            from_proto_a2ui_update(Some(crate::gateway::proto::palyra::common::v1::A2uiUpdate {
+                v: 1,
+                surface: "chat".to_owned(),
+                patch_json: br#"[{"op":"replace","path":"/title","value":"ok"}]"#.to_vec(),
+            }))
+            .expect("valid proto A2UI update should map to connector update");
+        assert_eq!(mapped.surface, "chat");
+        assert_eq!(
+            mapped.patch_json,
+            br#"[{"op":"replace","path":"/title","value":"ok"}]"#.to_vec()
+        );
+
+        assert!(
+            from_proto_a2ui_update(Some(crate::gateway::proto::palyra::common::v1::A2uiUpdate {
+                v: 1,
+                surface: "  ".to_owned(),
+                patch_json: br#"{}"#.to_vec(),
+            }))
+            .is_none(),
+            "blank A2UI surface should be rejected"
+        );
+        assert!(
+            from_proto_a2ui_update(Some(crate::gateway::proto::palyra::common::v1::A2uiUpdate {
+                v: 1,
+                surface: "chat".to_owned(),
+                patch_json: Vec::new(),
+            }))
+            .is_none(),
+            "empty A2UI patch_json should be rejected"
         );
     }
 

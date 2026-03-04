@@ -508,6 +508,19 @@ async fn grpc_route_message_honors_json_mode_security_label_for_provider_request
     let plain_response =
         adapter.inject_message(&mut client, "hey @palyra return plain text", false).await?;
     assert!(plain_response.accepted, "baseline route message should be accepted");
+    let plain_outbound = plain_response
+        .outputs
+        .first()
+        .cloned()
+        .context("baseline route output should be present")?;
+    assert!(
+        plain_outbound.structured_json.is_empty(),
+        "non-json-mode route output should not include structured_json payload"
+    );
+    assert!(
+        plain_outbound.a2ui_update.is_none(),
+        "non-json-mode route output should not include a2ui_update payload"
+    );
 
     let json_mode_response = adapter
         .inject_message_with_security_labels(
@@ -527,6 +540,22 @@ async fn grpc_route_message_honors_json_mode_security_label_for_provider_request
     assert!(
         json_mode_outbound.text.contains("{\"ack\":\"json\"}"),
         "json-mode reply should include structured JSON payload"
+    );
+    assert!(
+        !json_mode_outbound.structured_json.is_empty(),
+        "json-mode route output should include structured_json payload"
+    );
+    assert!(
+        json_mode_outbound.a2ui_update.is_none(),
+        "json-mode route output without a2ui data should not include a2ui_update payload"
+    );
+    let json_mode_structured: Value =
+        serde_json::from_slice(json_mode_outbound.structured_json.as_slice())
+            .context("structured_json should decode as valid JSON")?;
+    assert_eq!(
+        json_mode_structured,
+        serde_json::json!({ "ack": "json" }),
+        "json-mode route output should preserve canonical structured JSON payload"
     );
 
     let captured_request_bodies =
@@ -554,6 +583,114 @@ async fn grpc_route_message_honors_json_mode_security_label_for_provider_request
         request_count.load(Ordering::Relaxed),
         2,
         "route json-mode test should perform two provider requests"
+    );
+
+    server_handle.join().expect("scripted openai server thread should exit");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_route_message_emits_a2ui_update_from_structured_json_mode_output() -> Result<()> {
+    let structured_payload = serde_json::json!({
+        "ack": "json",
+        "a2ui_update": {
+            "surface": "chat",
+            "patch_json": [
+                {
+                    "op": "replace",
+                    "path": "/title",
+                    "value": "Connector digest"
+                }
+            ]
+        }
+    })
+    .to_string();
+    let scripted_reply = serde_json::json!({
+        "choices": [
+            {
+                "message": {
+                    "content": structured_payload
+                }
+            }
+        ]
+    })
+    .to_string();
+    let (openai_base_url, request_count, server_handle) =
+        spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::immediate(200, scripted_reply)])?;
+    let (child, admin_port, grpc_port, _journal_db_path, config_path) =
+        spawn_palyrad_with_openai_provider_and_channel_router(
+            openai_base_url.as_str(),
+            OPENAI_API_KEY,
+        )?;
+    let _config_guard = TempFileGuard::new(config_path);
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+    let mut create_route_agent = tonic::Request::new(gateway_v1::CreateAgentRequest {
+        v: 1,
+        agent_id: "route".to_owned(),
+        display_name: "Route".to_owned(),
+        agent_dir: String::new(),
+        workspace_roots: vec!["workspace".to_owned()],
+        default_model_profile: "gpt-4o-mini".to_owned(),
+        default_tool_allowlist: vec!["palyra.echo".to_owned()],
+        default_skill_allowlist: vec!["acme.route".to_owned()],
+        set_default: true,
+        allow_absolute_paths: false,
+    });
+    authorize_metadata_with_principal(create_route_agent.metadata_mut(), "admin:ops")?;
+    client
+        .create_agent(create_route_agent)
+        .await
+        .context("failed to create route agent before RouteMessage a2ui output test")?;
+
+    let adapter = FakeChannelAdapter::default();
+    let response = adapter
+        .inject_message_with_security_labels(
+            &mut client,
+            "hey @palyra return json with a2ui",
+            false,
+            false,
+            vec!["json_mode".to_owned()],
+        )
+        .await?;
+    assert!(response.accepted, "json-mode route message should be accepted");
+    let outbound = response.outputs.first().cloned().context("route output should be present")?;
+    assert!(
+        !outbound.structured_json.is_empty(),
+        "json-mode route output should include structured_json"
+    );
+    let structured_json: Value = serde_json::from_slice(outbound.structured_json.as_slice())
+        .context("structured_json should decode as valid JSON")?;
+    assert_eq!(
+        structured_json.pointer("/a2ui_update/surface").and_then(Value::as_str),
+        Some("chat"),
+        "structured_json should preserve a2ui_update surface"
+    );
+    let a2ui_update =
+        outbound.a2ui_update.context("route output should include explicit a2ui_update payload")?;
+    assert_eq!(a2ui_update.surface, "chat");
+    let patch_json: Value = serde_json::from_slice(a2ui_update.patch_json.as_slice())
+        .context("a2ui_update.patch_json should decode as valid JSON")?;
+    assert_eq!(
+        patch_json,
+        serde_json::json!([
+            {
+                "op": "replace",
+                "path": "/title",
+                "value": "Connector digest"
+            }
+        ]),
+        "a2ui_update patch payload should remain intact"
+    );
+    assert_eq!(
+        request_count.load(Ordering::Relaxed),
+        1,
+        "route a2ui-output test should perform one provider request"
     );
 
     server_handle.join().expect("scripted openai server thread should exit");

@@ -465,6 +465,8 @@ message OutboundMessage {
   bool broadcast = 5;
   string auto_ack_text = 6;
   string auto_reaction = 7;
+  bytes structured_json = 17;
+  palyra.common.v1.A2uiUpdate a2ui_update = 18;
 
   reserved 8 to 16;
 }

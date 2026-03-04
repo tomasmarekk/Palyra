@@ -5206,6 +5206,59 @@ fn security_requests_json_mode(security: Option<&common_v1::SecurityContext>) ->
         .unwrap_or(false)
 }
 
+#[derive(Debug, Clone, Default)]
+struct RouteMessageStructuredOutput {
+    structured_json: Vec<u8>,
+    a2ui_update: Option<common_v1::A2uiUpdate>,
+}
+
+fn parse_route_message_structured_output(
+    reply_text: &str,
+    json_mode_requested: bool,
+) -> RouteMessageStructuredOutput {
+    if !json_mode_requested {
+        return RouteMessageStructuredOutput::default();
+    }
+    let trimmed = reply_text.trim();
+    if trimmed.is_empty() {
+        return RouteMessageStructuredOutput::default();
+    }
+    let parsed = match serde_json::from_str::<Value>(trimmed) {
+        Ok(value) => value,
+        Err(_) => return RouteMessageStructuredOutput::default(),
+    };
+    let structured_json = match serde_json::to_vec(&parsed) {
+        Ok(value) => value,
+        Err(_) => return RouteMessageStructuredOutput::default(),
+    };
+    let a2ui_update = parse_route_message_a2ui_update(&parsed);
+    RouteMessageStructuredOutput { structured_json, a2ui_update }
+}
+
+fn parse_route_message_a2ui_update(value: &Value) -> Option<common_v1::A2uiUpdate> {
+    let update = value.get("a2ui_update").or_else(|| value.get("a2ui"))?;
+    let update_object = update.as_object()?;
+    let surface = update_object
+        .get("surface")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?
+        .to_owned();
+    let patch_source = update_object.get("patch_json").or_else(|| update_object.get("patch"))?;
+    let patch_json = if let Some(raw_patch) = patch_source.as_str() {
+        match serde_json::from_str::<Value>(raw_patch) {
+            Ok(parsed_patch) => serde_json::to_vec(&parsed_patch).ok()?,
+            Err(_) => serde_json::to_vec(patch_source).ok()?,
+        }
+    } else {
+        serde_json::to_vec(patch_source).ok()?
+    };
+    if patch_json.is_empty() {
+        return None;
+    }
+    Some(common_v1::A2uiUpdate { v: CANONICAL_PROTOCOL_MAJOR, surface, patch_json })
+}
+
 fn split_route_message_reply_text(reply_text: &str, max_chars: usize) -> Vec<String> {
     let normalized = reply_text.trim();
     if normalized.is_empty() {
@@ -5233,6 +5286,8 @@ struct RouteMessageOutputTemplate<'a> {
     auto_ack_text: &'a str,
     auto_reaction: &'a str,
     attachments: &'a [common_v1::MessageAttachment],
+    structured_json: &'a [u8],
+    a2ui_update: Option<&'a common_v1::A2uiUpdate>,
 }
 
 fn build_route_message_outputs(
@@ -5264,6 +5319,12 @@ fn build_route_message_outputs(
             } else {
                 String::new()
             },
+            structured_json: if index == 0 {
+                template.structured_json.to_vec()
+            } else {
+                Vec::new()
+            },
+            a2ui_update: if index == 0 { template.a2ui_update.cloned() } else { None },
         });
     }
     outputs
@@ -7090,6 +7151,8 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                 if reply_text.trim().is_empty() {
                     reply_text = "ack".to_owned();
                 }
+                let route_structured_output =
+                    parse_route_message_structured_output(reply_text.as_str(), json_mode_requested);
                 if let Some(prefix) = plan.response_prefix.as_deref() {
                     reply_text = format!("{prefix}{reply_text}");
                 }
@@ -7178,6 +7241,11 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                             "reply_text": reply_text.clone(),
                             "route_key": plan.route_key.clone(),
                             "json_mode_requested": json_mode_requested,
+                            "structured_output_present": !route_structured_output.structured_json.is_empty(),
+                            "a2ui_surface": route_structured_output
+                                .a2ui_update
+                                .as_ref()
+                                .map(|value| value.surface.clone()),
                             "attachments": route_attachment_metadata.clone(),
                             "agent_id": route_agent_id.clone(),
                             "agent_resolution_source": route_agent_resolution_source.clone(),
@@ -7230,6 +7298,11 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                         "channel": plan.channel.clone(),
                         "reply_preview": truncate_with_ellipsis(reply_text.clone(), 256),
                         "json_mode_requested": json_mode_requested,
+                        "structured_output_present": !route_structured_output.structured_json.is_empty(),
+                        "a2ui_surface": route_structured_output
+                            .a2ui_update
+                            .as_ref()
+                            .map(|value| value.surface.clone()),
                         "attachments": route_attachment_metadata.clone(),
                         "agent_id": route_agent_id,
                         "agent_resolution_source": route_agent_resolution_source,
@@ -7258,6 +7331,8 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     auto_ack_text: plan.auto_ack_text.as_deref().unwrap_or_default(),
                     auto_reaction: plan.auto_reaction.as_deref().unwrap_or_default(),
                     attachments: route_output_attachments.as_slice(),
+                    structured_json: route_structured_output.structured_json.as_slice(),
+                    a2ui_update: route_structured_output.a2ui_update.as_ref(),
                 };
                 let route_outputs = build_route_message_outputs(
                     reply_text.as_str(),
@@ -16333,6 +16408,54 @@ summarize incident";
         assert_eq!(
             prompt, expected,
             "memory-augmented prompt rendering should stay deterministic for ordered hits"
+        );
+    }
+
+    #[test]
+    fn parse_route_message_structured_output_extracts_canonical_json_and_a2ui_update() {
+        let result = super::parse_route_message_structured_output(
+            r#"{
+                "ack":"json",
+                "a2ui_update":{
+                    "surface":"chat",
+                    "patch_json":[{"op":"replace","path":"/title","value":"Hello"}]
+                }
+            }"#,
+            true,
+        );
+        assert!(
+            !result.structured_json.is_empty(),
+            "json-mode parser should emit structured_json payload"
+        );
+        let structured: Value = serde_json::from_slice(result.structured_json.as_slice())
+            .expect("structured_json should decode as valid JSON");
+        assert_eq!(
+            structured.pointer("/ack").and_then(Value::as_str),
+            Some("json"),
+            "structured_json should preserve response payload"
+        );
+        let a2ui_update =
+            result.a2ui_update.expect("json-mode parser should extract explicit a2ui_update");
+        assert_eq!(a2ui_update.surface, "chat");
+        let patch_json: Value = serde_json::from_slice(a2ui_update.patch_json.as_slice())
+            .expect("a2ui_update.patch_json should decode as valid JSON");
+        assert_eq!(
+            patch_json,
+            json!([{ "op": "replace", "path": "/title", "value": "Hello" }]),
+            "a2ui patch payload should remain unchanged"
+        );
+    }
+
+    #[test]
+    fn parse_route_message_structured_output_is_fail_closed_for_invalid_json() {
+        let result = super::parse_route_message_structured_output(r#"{"ack":"json""#, true);
+        assert!(
+            result.structured_json.is_empty(),
+            "invalid json-mode payload must not populate structured_json"
+        );
+        assert!(
+            result.a2ui_update.is_none(),
+            "invalid json-mode payload must not populate a2ui_update"
         );
     }
 

@@ -44,6 +44,8 @@ impl ConnectorRouter for SimulatorRouter {
                 auto_ack_text: None,
                 auto_reaction: None,
                 attachments: Vec::new(),
+                structured_json: None,
+                a2ui_update: None,
             }],
             route_key: Some(format!(
                 "channel:{}:conversation:{}",

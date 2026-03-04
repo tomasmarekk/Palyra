@@ -127,6 +127,8 @@ mod tests {
             auto_ack_text: None,
             auto_reaction: None,
             attachments: Vec::new(),
+            structured_json: None,
+            a2ui_update: None,
             timeout_ms: 30_000,
             max_payload_bytes: 16_384,
         }
