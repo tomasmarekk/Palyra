@@ -226,6 +226,7 @@ impl FakeChannelAdapter {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn inject_message_with_envelope_id_attachments_and_payload_limit(
         &self,
         client: &mut gateway_v1::gateway_service_client::GatewayServiceClient<
