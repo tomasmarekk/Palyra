@@ -880,10 +880,11 @@ mod tests {
     use super::{
         chunk_discord_text, decode_gateway_binary_payload, deterministic_inbound_envelope_id,
         handle_gateway_envelope, normalize_discord_message_create, normalize_gateway_ws_url,
-        parse_fence_line, DiscordAdapterConfig, DiscordConnectorAdapter, DiscordCredential,
-        DiscordCredentialResolver, DiscordGatewayEnvelope, DiscordGatewayInflater,
-        DiscordGatewayMonitorContext, DiscordGatewayResumeState, DiscordRuntimeState,
-        DiscordTransport, DiscordTransportResponse, OpenFence,
+        parse_fence_line, run_discord_gateway_transport_loop, DiscordAdapterConfig,
+        DiscordConnectorAdapter, DiscordCredential, DiscordCredentialResolver,
+        DiscordGatewayEnvelope, DiscordGatewayInflater, DiscordGatewayMonitorContext,
+        DiscordGatewayResumeState, DiscordRuntimeState, DiscordTransport, DiscordTransportResponse,
+        OpenFence,
     };
     use crate::{
         protocol::{
@@ -894,11 +895,12 @@ mod tests {
         supervisor::ConnectorAdapter,
     };
     use async_trait::async_trait;
+    use futures::stream;
     use reqwest::Url;
     use serde_json::{json, Value};
     use tokio::sync::mpsc;
     use tokio::time::{interval, MissedTickBehavior};
-    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
     #[derive(Debug, Default)]
     struct StaticCredentialResolver {
@@ -980,6 +982,10 @@ mod tests {
     }
 
     impl RecordingMessageSink {
+        fn sent_messages(&self) -> Vec<Message> {
+            self.sent.lock().expect("recording sink lock should not be poisoned").clone()
+        }
+
         fn sent_payloads(&self) -> Vec<Value> {
             self.sent
                 .lock()
@@ -1384,6 +1390,145 @@ mod tests {
             "non-resumable invalid session should clear resume cursor"
         );
         assert_eq!(resume_state.bot_user_id.as_deref(), Some("bot-1"));
+    }
+
+    #[tokio::test]
+    async fn gateway_transport_loop_simulator_handles_reconnect_then_resume() {
+        let transport = Arc::new(FakeTransport::default());
+        let (sender, mut receiver) = mpsc::channel(4);
+        let (context, runtime_state) = sample_monitor_context(transport, sender);
+        let mut resume_state = DiscordGatewayResumeState::default();
+        let mut sink = RecordingMessageSink::default();
+
+        let mut scripted_stream = stream::iter(vec![
+            Ok::<Message, WsError>(Message::Binary(sample_gateway_zlib_frame().into())),
+            Ok(Message::Text(
+                json!({ "op": 10, "d": { "heartbeat_interval": 5_000 } }).to_string().into(),
+            )),
+            Ok(Message::Ping(vec![0xCA, 0xFE].into())),
+            Ok(Message::Text(
+                json!({
+                    "op": 0,
+                    "s": 41,
+                    "t": "READY",
+                    "d": {
+                        "session_id": "session-1",
+                        "user": { "id": "bot-1" }
+                    }
+                })
+                .to_string()
+                .into(),
+            )),
+            Ok(Message::Text(
+                json!({
+                    "op": 0,
+                    "s": 42,
+                    "t": "MESSAGE_CREATE",
+                    "d": {
+                        "id": "175928847299117063",
+                        "channel_id": "thread-123",
+                        "guild_id": "guild-1",
+                        "content": "deploy status?",
+                        "author": {
+                            "id": "user-7",
+                            "username": "operator"
+                        },
+                        "member": {
+                            "nick": "Ops"
+                        },
+                        "message_reference": {
+                            "channel_id": "parent-1"
+                        }
+                    }
+                })
+                .to_string()
+                .into(),
+            )),
+            Ok(Message::Text(json!({ "op": 7, "d": null }).to_string().into())),
+        ]);
+
+        let reconnect_error = run_discord_gateway_transport_loop(
+            &mut sink,
+            &mut scripted_stream,
+            &context,
+            "super-secret-token",
+            &mut resume_state,
+        )
+        .await
+        .expect_err("scripted reconnect opcode should end the current gateway stream loop");
+        assert!(
+            reconnect_error.to_string().contains("requested reconnect"),
+            "reconnect opcode should bubble stable reconnect error from transport loop"
+        );
+
+        let sent_payloads = sink.sent_payloads();
+        assert!(
+            sent_payloads
+                .iter()
+                .any(|payload| payload.get("op").and_then(Value::as_i64) == Some(2)),
+            "HELLO from scripted stream should trigger IDENTIFY write"
+        );
+        assert!(
+            sink.sent_messages().iter().any(|message| {
+                matches!(
+                    message,
+                    Message::Pong(payload) if payload.as_ref() == [0xCA, 0xFE].as_slice()
+                )
+            }),
+            "gateway loop should emit PONG for incoming PING frames"
+        );
+
+        let inbound = receiver
+            .try_recv()
+            .expect("scripted MESSAGE_CREATE should emit a normalized inbound event");
+        assert_eq!(inbound.connector_id, "discord:default");
+        assert_eq!(inbound.conversation_id, "thread-123");
+        assert_eq!(inbound.adapter_message_id.as_deref(), Some("175928847299117063"));
+        assert_eq!(inbound.adapter_thread_id.as_deref(), Some("thread-123"));
+        assert_eq!(
+            inbound.envelope_id,
+            deterministic_inbound_envelope_id("discord:default", "175928847299117063"),
+            "scripted reconnect scenario must preserve deterministic dedupe envelope IDs"
+        );
+        assert_eq!(resume_state.session_id.as_deref(), Some("session-1"));
+        assert_eq!(resume_state.bot_user_id.as_deref(), Some("bot-1"));
+        assert_eq!(resume_state.seq, Some(42));
+        assert_eq!(
+            runtime_state
+                .lock()
+                .expect("runtime state lock should not be poisoned")
+                .gateway_last_event_type
+                .as_deref(),
+            Some("MESSAGE_CREATE"),
+            "transport loop should update runtime last event marker"
+        );
+
+        let mut resume_stream = stream::iter(vec![Ok::<Message, WsError>(Message::Text(
+            json!({ "op": 10, "d": { "heartbeat_interval": 6_000 } }).to_string().into(),
+        ))]);
+        let second_error = run_discord_gateway_transport_loop(
+            &mut sink,
+            &mut resume_stream,
+            &context,
+            "super-secret-token",
+            &mut resume_state,
+        )
+        .await
+        .expect_err("single HELLO frame should terminate with stream-closed error");
+        assert!(
+            second_error.to_string().contains("closed the websocket stream"),
+            "second scripted stream should end with deterministic close reason"
+        );
+
+        let sent_payloads = sink.sent_payloads();
+        let resume_payload = sent_payloads
+            .iter()
+            .find(|payload| payload.get("op").and_then(Value::as_i64) == Some(6))
+            .and_then(|payload| payload.get("d"))
+            .cloned()
+            .expect("second scripted HELLO should emit RESUME payload");
+        assert_eq!(resume_payload.get("session_id").and_then(Value::as_str), Some("session-1"));
+        assert_eq!(resume_payload.get("seq").and_then(Value::as_i64), Some(42));
     }
 
     #[tokio::test]
@@ -2781,6 +2926,28 @@ async fn run_discord_gateway_session(
         state.last_error = None;
     }
 
+    run_discord_gateway_transport_loop(
+        &mut sink,
+        &mut stream,
+        context,
+        credential.token.as_str(),
+        resume_state,
+    )
+    .await
+}
+
+async fn run_discord_gateway_transport_loop<S, St>(
+    sink: &mut S,
+    stream: &mut St,
+    context: &DiscordGatewayMonitorContext,
+    bot_token: &str,
+    resume_state: &mut DiscordGatewayResumeState,
+) -> Result<(), ConnectorAdapterError>
+where
+    S: futures::Sink<Message> + Unpin,
+    S::Error: std::fmt::Display,
+    St: futures::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
     let mut heartbeat = interval(Duration::from_millis(DISCORD_GATEWAY_HEARTBEAT_FALLBACK_MS));
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut hello_received = false;
@@ -2790,7 +2957,7 @@ async fn run_discord_gateway_session(
         tokio::select! {
             _ = heartbeat.tick(), if hello_received => {
                 let heartbeat_payload = resume_state.seq.map(Value::from).unwrap_or(Value::Null);
-                send_gateway_op(&mut sink, 1, heartbeat_payload).await?;
+                send_gateway_op(sink, 1, heartbeat_payload).await?;
             }
             maybe_message = stream.next() => {
                 let Some(message) = maybe_message else {
@@ -2829,10 +2996,10 @@ async fn run_discord_gateway_session(
 
                 let envelope = parse_gateway_envelope(raw_text.as_str())?;
                 handle_gateway_envelope(
-                    &mut sink,
+                    sink,
                     envelope,
                     context,
-                    credential.token.as_str(),
+                    bot_token,
                     resume_state,
                     &mut heartbeat,
                     &mut hello_received,
