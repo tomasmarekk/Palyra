@@ -1092,16 +1092,17 @@ async fn grpc_route_message_rejects_broadcast_without_mention_even_for_dm() -> R
 
 #[tokio::test(flavor = "multi_thread")]
 async fn grpc_route_message_followup_reuses_session_memory_and_agent_binding() -> Result<()> {
-    let (openai_base_url, request_count, server_handle) = spawn_scripted_openai_server(vec![
-        ScriptedOpenAiResponse::immediate(
-            200,
-            r#"{"choices":[{"message":{"content":"first route reply"}}]}"#.to_owned(),
-        ),
-        ScriptedOpenAiResponse::immediate(
-            200,
-            r#"{"choices":[{"message":{"content":"second route reply"}}]}"#.to_owned(),
-        ),
-    ])?;
+    let (openai_base_url, request_bodies, request_count, server_handle) =
+        spawn_scripted_openai_server_with_request_capture(vec![
+            ScriptedOpenAiResponse::immediate(
+                200,
+                r#"{"choices":[{"message":{"content":"first route reply"}}]}"#.to_owned(),
+            ),
+            ScriptedOpenAiResponse::immediate(
+                200,
+                r#"{"choices":[{"message":{"content":"second route reply"}}]}"#.to_owned(),
+            ),
+        ])?;
     let (child, admin_port, grpc_port, _journal_db_path, config_path) =
         spawn_palyrad_with_openai_provider_and_channel_router_with_memory_auto_inject(
             openai_base_url.as_str(),
@@ -1201,6 +1202,43 @@ async fn grpc_route_message_followup_reuses_session_memory_and_agent_binding() -
             "agent_resolution_source should use canonical source labels"
         );
     }
+
+    let captured_request_bodies =
+        request_bodies.lock().expect("captured request bodies lock should not poison").clone();
+    assert_eq!(
+        captured_request_bodies.len(),
+        2,
+        "follow-up route test should capture two provider requests"
+    );
+    let first_request_payload: Value = serde_json::from_str(captured_request_bodies[0].as_str())
+        .context("first route provider payload should decode as valid JSON")?;
+    let second_request_payload: Value =
+        serde_json::from_str(captured_request_bodies[1].as_str())
+            .context("second route provider payload should decode as valid JSON")?;
+    let first_prompt = first_request_payload
+        .pointer("/messages/0/content")
+        .and_then(Value::as_str)
+        .context("first route provider request should include a user prompt")?;
+    let second_prompt = second_request_payload
+        .pointer("/messages/0/content")
+        .and_then(Value::as_str)
+        .context("second route provider request should include a user prompt")?;
+    assert!(
+        !first_prompt.contains("<recent_conversation>"),
+        "first route request should not include previous-run context when no prior run exists"
+    );
+    assert!(
+        second_prompt.contains("<recent_conversation>"),
+        "follow-up route request should include bounded recent conversation context"
+    );
+    assert!(
+        second_prompt.contains("assistant:") && second_prompt.contains("first route reply"),
+        "follow-up route prompt should include prior assistant reply context"
+    );
+    assert!(
+        second_prompt.contains("hey @palyra please recall the release rollback checklist"),
+        "follow-up route prompt should keep the current user input"
+    );
 
     assert_eq!(
         request_count.load(Ordering::Relaxed),

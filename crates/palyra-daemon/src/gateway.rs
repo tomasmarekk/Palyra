@@ -177,6 +177,9 @@ const MAX_MEMORY_ITEM_BYTES: usize = 16 * 1024;
 const MAX_MEMORY_ITEM_TOKENS: usize = 2_048;
 const MAX_MEMORY_TOOL_QUERY_BYTES: usize = 4 * 1024;
 const MAX_MEMORY_TOOL_TAGS: usize = 32;
+const MAX_PREVIOUS_RUN_CONTEXT_TAPE_EVENTS: usize = 128;
+const MAX_PREVIOUS_RUN_CONTEXT_TURNS: usize = 6;
+const MAX_PREVIOUS_RUN_CONTEXT_ENTRY_CHARS: usize = 512;
 const MAX_WORKSPACE_PATCH_TOOL_INPUT_BYTES: usize = 256 * 1024;
 const MAX_HTTP_FETCH_TOOL_INPUT_BYTES: usize = 64 * 1024;
 const MAX_HTTP_FETCH_BODY_BYTES: usize = 512 * 1024;
@@ -5306,6 +5309,7 @@ struct PrepareModelProviderInputRequest<'a> {
     run_id: &'a str,
     tape_seq: &'a mut i64,
     session_id: &'a str,
+    previous_run_id: Option<&'a str>,
     input_text: &'a str,
     attachments: &'a [common_v1::MessageAttachment],
     memory_ingest_reason: &'a str,
@@ -6758,6 +6762,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                         reset_session: false,
                     })
                     .await?;
+                let previous_run_id_for_context = resolved_session.session.last_run_id.clone();
                 let session_id = resolved_session.session.session_id;
                 let run_id = Ulid::new().to_string();
                 self.state
@@ -6890,6 +6895,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                         run_id: run_id.as_str(),
                         tape_seq: &mut tape_seq,
                         session_id: session_id.as_str(),
+                        previous_run_id: previous_run_id_for_context.as_deref(),
                         input_text: input.text.as_str(),
                         attachments: content.attachments.as_slice(),
                         memory_ingest_reason: "route_message_user_input",
@@ -7602,6 +7608,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
             let mut model_token_compaction_emitted = false;
             let mut in_progress_emitted = false;
             let mut remaining_tool_budget = state_for_stream.config.tool_call.max_calls_per_run;
+            let mut previous_session_run_id = None::<String>;
 
             while let Some(item) = stream.next().await {
                 let message = match item {
@@ -7772,6 +7779,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                             session_id.as_str(),
                         );
                     }
+                    previous_session_run_id = resolved_session.session.last_run_id.clone();
                     if resolved_session.session.session_id != session_id {
                         let status = Status::failed_precondition(
                             "resolved session_id does not match RunStream session_id",
@@ -7864,6 +7872,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     return;
                 };
 
+                let previous_run_id_for_context = previous_session_run_id.take();
                 let prepared_provider_input = match prepare_model_provider_input(
                     &state_for_stream,
                     &context_for_stream,
@@ -7871,6 +7880,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                         run_id: run_id.as_str(),
                         tape_seq: &mut tape_seq,
                         session_id: session_id_for_message.as_str(),
+                        previous_run_id: previous_run_id_for_context.as_deref(),
                         input_text: input_text.as_str(),
                         attachments: input_content.attachments.as_slice(),
                         memory_ingest_reason: "run_stream_user_input",
@@ -10408,15 +10418,16 @@ async fn build_memory_augmented_prompt(
     run_id: &str,
     tape_seq: &mut i64,
     session_id: &str,
-    input_text: &str,
+    memory_query_text: &str,
+    prompt_input_text: &str,
 ) -> Result<String, Status> {
-    let trimmed_input = input_text.trim();
+    let trimmed_input = memory_query_text.trim();
     if trimmed_input.is_empty() {
-        return Ok(input_text.to_owned());
+        return Ok(prompt_input_text.to_owned());
     }
     let memory_config = runtime_state.memory_config_snapshot();
     if !memory_config.auto_inject_enabled || memory_config.auto_inject_max_items == 0 {
-        return Ok(input_text.to_owned());
+        return Ok(prompt_input_text.to_owned());
     }
     let resource = format!("memory:session:{session_id}");
     if let Err(error) =
@@ -10429,7 +10440,7 @@ async fn build_memory_augmented_prompt(
             status_message = %error.message(),
             "memory auto-inject skipped because policy denied access"
         );
-        return Ok(input_text.to_owned());
+        return Ok(prompt_input_text.to_owned());
     }
 
     let search_hits = match runtime_state
@@ -10437,7 +10448,7 @@ async fn build_memory_augmented_prompt(
             principal: context.principal.clone(),
             channel: context.channel.clone(),
             session_id: Some(session_id.to_owned()),
-            query: input_text.to_owned(),
+            query: memory_query_text.to_owned(),
             top_k: memory_config.auto_inject_max_items,
             min_score: MEMORY_AUTO_INJECT_MIN_SCORE,
             tags: Vec::new(),
@@ -10455,11 +10466,11 @@ async fn build_memory_augmented_prompt(
                 status_message = %error.message(),
                 "memory auto-inject search failed"
             );
-            return Ok(input_text.to_owned());
+            return Ok(prompt_input_text.to_owned());
         }
     };
     if search_hits.is_empty() {
-        return Ok(input_text.to_owned());
+        return Ok(prompt_input_text.to_owned());
     }
 
     let selected_hits =
@@ -10470,13 +10481,79 @@ async fn build_memory_augmented_prompt(
             run_id: run_id.to_owned(),
             seq: *tape_seq,
             event_type: "memory_auto_inject".to_owned(),
-            payload_json: memory_auto_inject_tape_payload(input_text, selected_hits.as_slice()),
+            payload_json: memory_auto_inject_tape_payload(
+                memory_query_text,
+                selected_hits.as_slice(),
+            ),
         })
         .await?;
     *tape_seq = tape_seq.saturating_add(1);
     runtime_state.counters.memory_auto_inject_events.fetch_add(1, Ordering::Relaxed);
 
-    Ok(render_memory_augmented_prompt(selected_hits.as_slice(), input_text))
+    Ok(render_memory_augmented_prompt(selected_hits.as_slice(), prompt_input_text))
+}
+
+fn extract_previous_run_turn_from_tape_event(
+    event: &OrchestratorTapeRecord,
+) -> Option<(&'static str, String)> {
+    let payload = serde_json::from_str::<Value>(event.payload_json.as_str()).ok()?;
+    let (speaker, raw_text) = match event.event_type.as_str() {
+        "message.received" => ("user", payload.get("text").and_then(Value::as_str)?),
+        "message.replied" => ("assistant", payload.get("reply_text").and_then(Value::as_str)?),
+        _ => return None,
+    };
+    let normalized = raw_text.replace(['\r', '\n'], " ");
+    let trimmed = normalized.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some((
+        speaker,
+        truncate_with_ellipsis(trimmed.to_owned(), MAX_PREVIOUS_RUN_CONTEXT_ENTRY_CHARS),
+    ))
+}
+
+#[allow(clippy::result_large_err)]
+async fn build_previous_run_context_prompt(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    previous_run_id: Option<&str>,
+    input_text: &str,
+) -> Result<String, Status> {
+    let Some(previous_run_id) = previous_run_id else {
+        return Ok(input_text.to_owned());
+    };
+    let tape_snapshot = match runtime_state
+        .orchestrator_tape_snapshot(
+            previous_run_id.to_owned(),
+            None,
+            Some(MAX_PREVIOUS_RUN_CONTEXT_TAPE_EVENTS),
+        )
+        .await
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) if error.code() == tonic::Code::NotFound => return Ok(input_text.to_owned()),
+        Err(error) => return Err(error),
+    };
+
+    let mut turns = tape_snapshot
+        .events
+        .iter()
+        .filter_map(extract_previous_run_turn_from_tape_event)
+        .collect::<Vec<_>>();
+    if turns.is_empty() {
+        return Ok(input_text.to_owned());
+    }
+    if turns.len() > MAX_PREVIOUS_RUN_CONTEXT_TURNS {
+        let keep_from = turns.len() - MAX_PREVIOUS_RUN_CONTEXT_TURNS;
+        turns.drain(0..keep_from);
+    }
+
+    let mut block = String::from("<recent_conversation>\n");
+    for (index, (speaker, text)) in turns.iter().enumerate() {
+        block.push_str(format!("{}. {}: {text}\n", index + 1, speaker).as_str());
+    }
+    block.push_str("</recent_conversation>");
+    Ok(format!("{block}\n\n{input_text}"))
 }
 
 #[allow(clippy::result_large_err)]
@@ -10489,6 +10566,7 @@ async fn prepare_model_provider_input(
         run_id,
         tape_seq,
         session_id,
+        previous_run_id,
         input_text,
         attachments,
         memory_ingest_reason,
@@ -10507,6 +10585,23 @@ async fn prepare_model_provider_input(
         memory_ingest_reason,
     )
     .await;
+    let input_with_recent_context =
+        match build_previous_run_context_prompt(runtime_state, previous_run_id, input_text).await {
+            Ok(value) => value,
+            Err(error) => {
+                warn!(
+                    run_id,
+                    principal = %context.principal,
+                    session_id,
+                    previous_run_id = %previous_run_id.unwrap_or("n/a"),
+                    channel = channel_for_log,
+                    status_code = ?error.code(),
+                    status_message = %error.message(),
+                    "failed to enrich prompt with previous-run context; continuing with raw input"
+                );
+                input_text.to_owned()
+            }
+        };
     let provider_input_text = match build_memory_augmented_prompt(
         runtime_state,
         context,
@@ -10514,6 +10609,7 @@ async fn prepare_model_provider_input(
         tape_seq,
         session_id,
         input_text,
+        input_with_recent_context.as_str(),
     )
     .await
     {
@@ -16472,6 +16568,71 @@ summarize incident";
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn build_previous_run_context_prompt_includes_recent_turns_when_available() {
+        let state = build_test_runtime_state(false);
+        state
+            .journal_store
+            .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
+                session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned(),
+                session_key: "session:context".to_owned(),
+                session_label: Some("Context".to_owned()),
+                principal: "user:ops".to_owned(),
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                channel: Some("cli".to_owned()),
+            })
+            .expect("orchestrator session should be upserted");
+        state
+            .journal_store
+            .start_orchestrator_run(&OrchestratorRunStartRequest {
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),
+                session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned(),
+            })
+            .expect("previous run should start");
+        state
+            .journal_store
+            .append_orchestrator_tape_event(&OrchestratorTapeAppendRequest {
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),
+                seq: 0,
+                event_type: "message.received".to_owned(),
+                payload_json: r#"{"text":"first user question"}"#.to_owned(),
+            })
+            .expect("message.received tape event should persist");
+        state
+            .journal_store
+            .append_orchestrator_tape_event(&OrchestratorTapeAppendRequest {
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),
+                seq: 1,
+                event_type: "message.replied".to_owned(),
+                payload_json: r#"{"reply_text":"first assistant reply"}"#.to_owned(),
+            })
+            .expect("message.replied tape event should persist");
+
+        let prompt = super::build_previous_run_context_prompt(
+            &state,
+            Some("01ARZ3NDEKTSV4RRFFQ69G5FAX"),
+            "second user question",
+        )
+        .await
+        .expect("previous-run prompt enrichment should succeed");
+        assert!(
+            prompt.contains("<recent_conversation>"),
+            "prompt should include recent conversation context block"
+        );
+        assert!(
+            prompt.contains("1. user: first user question"),
+            "prompt should include the previous user turn"
+        );
+        assert!(
+            prompt.contains("2. assistant: first assistant reply"),
+            "prompt should include the previous assistant turn"
+        );
+        assert!(
+            prompt.ends_with("second user question"),
+            "prompt should keep the current input after context prelude"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn prepare_model_provider_input_marks_vision_requested_for_image_attachments() {
         let state = build_test_runtime_state(false);
         let mut memory_config = state.memory_config_snapshot();
@@ -16496,6 +16657,7 @@ summarize incident";
                 run_id: "01ARZ3NDEKTSV4RRFFQ69G5FB0",
                 tape_seq: &mut tape_seq,
                 session_id: "01ARZ3NDEKTSV4RRFFQ69G5FB1",
+                previous_run_id: None,
                 input_text: "summarize screenshot",
                 attachments: attachments.as_slice(),
                 memory_ingest_reason: "prepare_model_provider_input_test",
@@ -16566,6 +16728,7 @@ summarize incident";
                 run_id: "01ARZ3NDEKTSV4RRFFQ69G5FB4",
                 tape_seq: &mut tape_seq,
                 session_id: session_id.as_str(),
+                previous_run_id: None,
                 input_text: "rollback checklist",
                 attachments: &[],
                 memory_ingest_reason: "prepare_model_provider_input_fallback_test",
@@ -16619,6 +16782,7 @@ summarize incident";
                 run_id: "01ARZ3NDEKTSV4RRFFQ69G5FB7",
                 tape_seq: &mut tape_seq,
                 session_id: session_id.as_str(),
+                previous_run_id: None,
                 input_text: "rollback checklist",
                 attachments: &[],
                 memory_ingest_reason: "prepare_model_provider_input_fail_test",
