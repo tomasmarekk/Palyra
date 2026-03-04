@@ -3884,6 +3884,7 @@ fn chromium_new_tab_error_is_retryable(message: &str) -> bool {
     normalized.contains("event waited for never came")
         || (normalized.contains("websocket protocol error")
             && normalized.contains("sending after closing is not allowed"))
+        || normalized.contains("underlying connection is closed")
 }
 
 fn create_configured_chromium_tab_with_retry(
@@ -7846,6 +7847,12 @@ mod tests {
                 "WebSocket protocol error: Sending after closing is not allowed"
             ),
             "transient websocket close race should be retryable"
+        );
+        assert!(
+            chromium_new_tab_error_is_retryable(
+                "Unable to make method calls because underlying connection is closed"
+            ),
+            "transient connection-close race should be retryable"
         );
         assert!(
             !chromium_new_tab_error_is_retryable(
