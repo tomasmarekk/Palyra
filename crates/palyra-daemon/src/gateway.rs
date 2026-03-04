@@ -7056,28 +7056,17 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                                     "reusing cached tool approval decision for route message"
                                 );
                             }
-                            let policy_request_context = ToolRequestContext {
-                                principal: context.principal.clone(),
-                                device_id: Some(context.device_id.clone()),
-                                channel: route_tool_request_context.channel.clone(),
-                                session_id: Some(session_id.clone()),
-                                run_id: Some(run_id.clone()),
-                                skill_id: skill_context
-                                    .as_ref()
-                                    .map(|context| context.skill_id.clone()),
-                            };
-                            let decision = resolve_tool_proposal_decision(
-                                &self.state.config.tool_call,
-                                &mut remaining_tool_budget,
-                                &policy_request_context,
+                            let decision = resolve_tool_proposal_decision_for_context(
+                                &self.state,
+                                &context,
+                                route_tool_request_context.channel.as_deref(),
+                                session_id.as_str(),
+                                run_id.as_str(),
                                 tool_name.as_str(),
+                                skill_context.as_ref(),
+                                &mut remaining_tool_budget,
                                 skill_gate_decision,
                                 cached_approval_outcome.as_ref(),
-                            );
-                            record_tool_decision_metrics(
-                                &self.state,
-                                tool_name.as_str(),
-                                decision.allowed,
                             );
                             append_tool_decision_tape_event(
                                 &self.state,
@@ -7092,20 +7081,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                                 decision.policy_enforced,
                             )
                             .await?;
-                            record_policy_decision_journal_event(
-                                &self.state,
-                                &context,
-                                session_id.as_str(),
-                                run_id.as_str(),
-                                proposal_id.as_str(),
-                                tool_name.as_str(),
-                                decision.allowed,
-                                decision.reason.as_str(),
-                                decision.approval_required,
-                                decision.policy_enforced,
-                            )
-                            .await?;
-                            record_skill_gate_denial_if_needed(
+                            record_tool_proposal_decision_audit_trail(
                                 &self.state,
                                 &context,
                                 session_id.as_str(),
@@ -8653,28 +8629,17 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                                 None
                             };
 
-                            let policy_request_context = ToolRequestContext {
-                                principal: context_for_stream.principal.clone(),
-                                device_id: Some(context_for_stream.device_id.clone()),
-                                channel: context_for_stream.channel.clone(),
-                                session_id: active_session_id.clone(),
-                                run_id: Some(run_id.clone()),
-                                skill_id: skill_context
-                                    .as_ref()
-                                    .map(|context| context.skill_id.clone()),
-                            };
-                            let decision = resolve_tool_proposal_decision(
-                                &state_for_stream.config.tool_call,
-                                &mut remaining_tool_budget,
-                                &policy_request_context,
+                            let decision = resolve_tool_proposal_decision_for_context(
+                                &state_for_stream,
+                                &context_for_stream,
+                                context_for_stream.channel.as_deref(),
+                                session_id.as_str(),
+                                run_id.as_str(),
                                 tool_name.as_str(),
+                                skill_context.as_ref(),
+                                &mut remaining_tool_budget,
                                 skill_gate_decision,
                                 approval_outcome.as_ref(),
-                            );
-                            record_tool_decision_metrics(
-                                &state_for_stream,
-                                tool_name.as_str(),
-                                decision.allowed,
                             );
 
                             if let Err(error) = send_tool_decision_with_tape(
@@ -8722,33 +8687,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                                 let _ = sender.send(Err(status)).await;
                                 return;
                             };
-                            if let Err(error) = record_policy_decision_journal_event(
-                                &state_for_stream,
-                                &context_for_stream,
-                                session_id,
-                                run_id.as_str(),
-                                proposal_id.as_str(),
-                                tool_name.as_str(),
-                                decision.allowed,
-                                decision.reason.as_str(),
-                                decision.approval_required,
-                                decision.policy_enforced,
-                            )
-                            .await
-                            {
-                                finalize_run_failure(
-                                    &sender,
-                                    &state_for_stream,
-                                    &mut run_state,
-                                    active_run_id.as_deref(),
-                                    &mut tape_seq,
-                                    error.message(),
-                                )
-                                .await;
-                                let _ = sender.send(Err(error)).await;
-                                return;
-                            }
-                            if let Err(error) = record_skill_gate_denial_if_needed(
+                            if let Err(error) = record_tool_proposal_decision_audit_trail(
                                 &state_for_stream,
                                 &context_for_stream,
                                 session_id,
@@ -14670,6 +14609,92 @@ fn resolve_tool_proposal_decision(
         approval_outcome.map(|response| response.approved).unwrap_or(false),
     );
     apply_tool_approval_outcome(decision, tool_name, approval_outcome)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_tool_proposal_decision_for_context(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    request_context: &RequestContext,
+    channel: Option<&str>,
+    session_id: &str,
+    run_id: &str,
+    tool_name: &str,
+    skill_context: Option<&ToolSkillContext>,
+    remaining_tool_budget: &mut u32,
+    skill_gate_decision: Option<ToolDecision>,
+    approval_outcome: Option<&ToolApprovalOutcome>,
+) -> ToolDecision {
+    let policy_request_context = build_tool_policy_request_context(
+        request_context,
+        channel,
+        session_id,
+        run_id,
+        skill_context,
+    );
+    let decision = resolve_tool_proposal_decision(
+        &runtime_state.config.tool_call,
+        remaining_tool_budget,
+        &policy_request_context,
+        tool_name,
+        skill_gate_decision,
+        approval_outcome,
+    );
+    record_tool_decision_metrics(runtime_state, tool_name, decision.allowed);
+    decision
+}
+
+fn build_tool_policy_request_context(
+    request_context: &RequestContext,
+    channel: Option<&str>,
+    session_id: &str,
+    run_id: &str,
+    skill_context: Option<&ToolSkillContext>,
+) -> ToolRequestContext {
+    ToolRequestContext {
+        principal: request_context.principal.clone(),
+        device_id: Some(request_context.device_id.clone()),
+        channel: channel.map(ToOwned::to_owned),
+        session_id: Some(session_id.to_owned()),
+        run_id: Some(run_id.to_owned()),
+        skill_id: skill_context.map(|context| context.skill_id.clone()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_tool_proposal_decision_audit_trail(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: &RequestContext,
+    session_id: &str,
+    run_id: &str,
+    proposal_id: &str,
+    tool_name: &str,
+    skill_context: Option<&ToolSkillContext>,
+    decision: &ToolDecision,
+) -> Result<(), Status> {
+    record_policy_decision_journal_event(
+        runtime_state,
+        context,
+        session_id,
+        run_id,
+        proposal_id,
+        tool_name,
+        decision.allowed,
+        decision.reason.as_str(),
+        decision.approval_required,
+        decision.policy_enforced,
+    )
+    .await?;
+    record_skill_gate_denial_if_needed(
+        runtime_state,
+        context,
+        session_id,
+        run_id,
+        proposal_id,
+        tool_name,
+        skill_context,
+        decision,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
