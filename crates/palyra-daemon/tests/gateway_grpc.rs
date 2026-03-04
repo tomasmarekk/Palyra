@@ -138,6 +138,29 @@ impl FakeChannelAdapter {
         .await
     }
 
+    async fn inject_message_with_payload_limit_and_attachments(
+        &self,
+        client: &mut gateway_v1::gateway_service_client::GatewayServiceClient<
+            tonic::transport::Channel,
+        >,
+        text: &str,
+        is_direct_message: bool,
+        request_broadcast: bool,
+        max_payload_bytes: u64,
+        attachments: Vec<common_v1::MessageAttachment>,
+    ) -> Result<gateway_v1::RouteMessageResponse> {
+        self.inject_message_with_envelope_id_attachments_and_payload_limit(
+            client,
+            text,
+            is_direct_message,
+            request_broadcast,
+            ENVELOPE_ID,
+            attachments,
+            max_payload_bytes,
+        )
+        .await
+    }
+
     async fn inject_message_with_envelope_id(
         &self,
         client: &mut gateway_v1::gateway_service_client::GatewayServiceClient<
@@ -191,6 +214,30 @@ impl FakeChannelAdapter {
         envelope_id: &str,
         attachments: Vec<common_v1::MessageAttachment>,
     ) -> Result<gateway_v1::RouteMessageResponse> {
+        self.inject_message_with_envelope_id_attachments_and_payload_limit(
+            client,
+            text,
+            is_direct_message,
+            request_broadcast,
+            envelope_id,
+            attachments,
+            4096,
+        )
+        .await
+    }
+
+    async fn inject_message_with_envelope_id_attachments_and_payload_limit(
+        &self,
+        client: &mut gateway_v1::gateway_service_client::GatewayServiceClient<
+            tonic::transport::Channel,
+        >,
+        text: &str,
+        is_direct_message: bool,
+        request_broadcast: bool,
+        envelope_id: &str,
+        attachments: Vec<common_v1::MessageAttachment>,
+        max_payload_bytes: u64,
+    ) -> Result<gateway_v1::RouteMessageResponse> {
         let mut request = tonic::Request::new(gateway_v1::RouteMessageRequest {
             v: 1,
             envelope: Some(common_v1::MessageEnvelope {
@@ -205,7 +252,7 @@ impl FakeChannelAdapter {
                     sender_verified: true,
                 }),
                 content: Some(common_v1::MessageContent { text: text.to_owned(), attachments }),
-                max_payload_bytes: 4096,
+                max_payload_bytes,
                 ..Default::default()
             }),
             is_direct_message,
@@ -353,6 +400,119 @@ async fn grpc_route_message_with_fake_adapter_emits_reply_and_journal_events() -
             .iter()
             .any(|payload| payload.get("event").and_then(Value::as_str) == Some("message.replied")),
         "router flow should persist message.replied journal event"
+    );
+
+    server_handle.join().expect("scripted openai server thread should exit");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_route_message_splits_reply_into_multiple_outputs_when_payload_limit_is_small(
+) -> Result<()> {
+    let long_reply = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau";
+    let scripted_reply = format!(r#"{{"choices":[{{"message":{{"content":"{long_reply}"}}}}]}}"#);
+    let (openai_base_url, request_count, server_handle) =
+        spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::immediate(200, scripted_reply)])?;
+    let (child, admin_port, grpc_port, _journal_db_path, config_path) =
+        spawn_palyrad_with_openai_provider_and_channel_router(
+            openai_base_url.as_str(),
+            OPENAI_API_KEY,
+        )?;
+    let _config_guard = TempFileGuard::new(config_path);
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+    let mut create_route_agent = tonic::Request::new(gateway_v1::CreateAgentRequest {
+        v: 1,
+        agent_id: "route".to_owned(),
+        display_name: "Route".to_owned(),
+        agent_dir: String::new(),
+        workspace_roots: vec!["workspace".to_owned()],
+        default_model_profile: "gpt-4o-mini".to_owned(),
+        default_tool_allowlist: vec!["palyra.echo".to_owned()],
+        default_skill_allowlist: vec!["acme.route".to_owned()],
+        set_default: true,
+        allow_absolute_paths: false,
+    });
+    authorize_metadata_with_principal(create_route_agent.metadata_mut(), "admin:ops")?;
+    client
+        .create_agent(create_route_agent)
+        .await
+        .context("failed to create route agent before RouteMessage split-output test")?;
+
+    let adapter = FakeChannelAdapter::default();
+    let request_attachments = vec![common_v1::MessageAttachment {
+        kind: common_v1::message_attachment::AttachmentKind::File as i32,
+        artifact_id: Some(common_v1::CanonicalId { ulid: "01ARZ3NDEKTSV4RRFFQ69G5FB3".to_owned() }),
+        size_bytes: 2048,
+    }];
+    let response = adapter
+        .inject_message_with_payload_limit_and_attachments(
+            &mut client,
+            "hey @palyra generate a long response",
+            false,
+            false,
+            32,
+            request_attachments.clone(),
+        )
+        .await?;
+
+    assert!(
+        response.accepted,
+        "mention-matched message should be routed (reason={})",
+        response.decision_reason
+    );
+    assert!(
+        response.outputs.len() > 1,
+        "small payload limits should split long route replies into multiple outputs"
+    );
+    for output in &response.outputs {
+        assert!(
+            output.text.chars().count() <= 32,
+            "each route output chunk should respect the configured payload limit"
+        );
+        assert_eq!(output.thread_id, "thread-1");
+        assert_eq!(output.in_reply_to_message_id, "msg-1");
+        assert!(!output.broadcast);
+    }
+    assert_eq!(
+        response.outputs[0].attachments, request_attachments,
+        "attachments metadata should remain on the first route output chunk"
+    );
+    assert_eq!(response.outputs[0].auto_ack_text, "processing");
+    assert_eq!(response.outputs[0].auto_reaction, "eyes");
+    for output in response.outputs.iter().skip(1) {
+        assert!(
+            output.attachments.is_empty(),
+            "follow-up route output chunks should not duplicate attachment metadata"
+        );
+        assert!(
+            output.auto_ack_text.is_empty(),
+            "follow-up route output chunks should not repeat auto ack text"
+        );
+        assert!(
+            output.auto_reaction.is_empty(),
+            "follow-up route output chunks should not repeat auto reaction hints"
+        );
+    }
+    let merged = response.outputs.iter().map(|output| output.text.as_str()).collect::<String>();
+    assert!(
+        merged.starts_with("[cli]"),
+        "merged output chunks should preserve the route response prefix"
+    );
+    assert!(
+        merged.contains("alpha beta gamma delta"),
+        "merged output chunks should preserve the provider reply body"
+    );
+    assert_eq!(adapter.sent_messages(), response.outputs);
+    assert_eq!(
+        request_count.load(Ordering::Relaxed),
+        1,
+        "split route replies should still perform exactly one provider call"
     );
 
     server_handle.join().expect("scripted openai server thread should exit");

@@ -158,6 +158,7 @@ const APPROVAL_CHANNEL_UNAVAILABLE_REASON: &str =
 const APPROVAL_DENIED_REASON: &str = "tool execution denied by explicit client approval response";
 const APPROVAL_DECISION_CACHE_CAPACITY: usize = 1_024;
 const MAX_MODEL_TOKEN_TAPE_EVENTS_PER_RUN: usize = 1_024;
+const DEFAULT_ROUTE_MESSAGE_OUTPUT_MAX_CHARS: usize = 2_000;
 const MAX_CRON_JOB_NAME_BYTES: usize = 128;
 const MAX_CRON_PROMPT_BYTES: usize = 16 * 1024;
 const MAX_CRON_JITTER_MS: u64 = 60_000;
@@ -5198,6 +5199,65 @@ fn map_provider_error(error: ProviderError) -> Status {
     }
 }
 
+fn split_route_message_reply_text(reply_text: &str, max_chars: usize) -> Vec<String> {
+    let normalized = reply_text.trim();
+    if normalized.is_empty() {
+        return vec!["ack".to_owned()];
+    }
+    let limit = max_chars.max(1);
+    let chars = normalized.chars().collect::<Vec<_>>();
+    if chars.len() <= limit {
+        return vec![normalized.to_owned()];
+    }
+    let mut chunks = Vec::new();
+    let mut start = 0_usize;
+    while start < chars.len() {
+        let end = start.saturating_add(limit).min(chars.len());
+        chunks.push(chars[start..end].iter().collect::<String>());
+        start = end;
+    }
+    chunks
+}
+
+fn build_route_message_outputs(
+    reply_text: &str,
+    max_payload_bytes: u64,
+    thread_id: Option<&str>,
+    in_reply_to_message_id: Option<&str>,
+    broadcast: bool,
+    auto_ack_text: Option<&str>,
+    auto_reaction: Option<&str>,
+    attachments: &[common_v1::MessageAttachment],
+) -> Vec<gateway_v1::OutboundMessage> {
+    let max_chars = usize::try_from(max_payload_bytes)
+        .ok()
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_ROUTE_MESSAGE_OUTPUT_MAX_CHARS)
+        .min(DEFAULT_ROUTE_MESSAGE_OUTPUT_MAX_CHARS);
+    let chunks = split_route_message_reply_text(reply_text, max_chars);
+    let mut outputs = Vec::with_capacity(chunks.len());
+    for (index, chunk) in chunks.into_iter().enumerate() {
+        outputs.push(gateway_v1::OutboundMessage {
+            text: chunk,
+            attachments: if index == 0 { attachments.to_vec() } else { Vec::new() },
+            thread_id: thread_id.unwrap_or_default().to_owned(),
+            in_reply_to_message_id: in_reply_to_message_id.unwrap_or_default().to_owned(),
+            broadcast,
+            auto_ack_text: if index == 0 {
+                auto_ack_text.unwrap_or_default().to_owned()
+            } else {
+                String::new()
+            },
+            auto_reaction: if index == 0 {
+                auto_reaction.unwrap_or_default().to_owned()
+            } else {
+                String::new()
+            },
+        });
+    }
+    outputs
+}
+
 fn session_summary_message(session: &OrchestratorSessionRecord) -> gateway_v1::SessionSummary {
     gateway_v1::SessionSummary {
         session_id: Some(common_v1::CanonicalId { ulid: session.session_id.clone() }),
@@ -7026,6 +7086,16 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     .counters
                     .channel_router_queue_depth
                     .store(self.state.channel_router.queue_depth() as u64, Ordering::Relaxed);
+                let route_outputs = build_route_message_outputs(
+                    reply_text.as_str(),
+                    input.max_payload_bytes,
+                    plan.reply_thread_id.as_deref(),
+                    plan.in_reply_to_message_id.as_deref(),
+                    plan.is_broadcast,
+                    plan.auto_ack_text.as_deref(),
+                    plan.auto_reaction.as_deref(),
+                    route_output_attachments.as_slice(),
+                );
                 return Ok(Response::new(gateway_v1::RouteMessageResponse {
                     v: CANONICAL_PROTOCOL_MAJOR,
                     accepted: true,
@@ -7033,15 +7103,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     decision_reason: "routed".to_owned(),
                     session_id: Some(common_v1::CanonicalId { ulid: session_id }),
                     run_id: Some(common_v1::CanonicalId { ulid: run_id }),
-                    outputs: vec![gateway_v1::OutboundMessage {
-                        text: reply_text,
-                        attachments: route_output_attachments,
-                        thread_id: plan.reply_thread_id.unwrap_or_default(),
-                        in_reply_to_message_id: plan.in_reply_to_message_id.unwrap_or_default(),
-                        broadcast: plan.is_broadcast,
-                        auto_ack_text: plan.auto_ack_text.unwrap_or_default(),
-                        auto_reaction: plan.auto_reaction.unwrap_or_default(),
-                    }],
+                    outputs: route_outputs,
                     route_key: plan.route_key,
                     retry_attempt,
                     queue_depth: self.state.channel_router.queue_depth() as u32,
