@@ -7042,145 +7042,18 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                             reply_text.push_str(token.as_str());
                         }
                         ProviderEvent::ToolProposal { proposal_id, tool_name, input_json } => {
-                            self.state.counters.tool_proposals.fetch_add(1, Ordering::Relaxed);
-                            let route_tool_request_context = route_request_context.clone();
-                            let ToolProposalSecurityEvaluation {
-                                skill_context,
-                                skill_gate_decision,
-                                approval_subject_id,
-                                proposal_approval_required,
-                            } = evaluate_tool_proposal_security(
+                            let tool_summary = process_route_tool_proposal_event(
                                 &self.state,
-                                &route_tool_request_context,
+                                &route_request_context,
+                                session_id.as_str(),
                                 run_id.as_str(),
                                 proposal_id.as_str(),
                                 tool_name.as_str(),
                                 input_json.as_slice(),
-                            )
-                            .await;
-                            let cached_approval_outcome = resolve_cached_tool_approval_for_proposal(
-                                &self.state,
-                                &route_tool_request_context,
-                                session_id.as_str(),
-                                approval_subject_id.as_str(),
-                                proposal_approval_required,
-                                run_id.as_str(),
-                                proposal_id.as_str(),
-                                "route message",
-                            );
-                            let decision = resolve_tool_proposal_decision_for_context(
-                                &self.state,
-                                &route_tool_request_context,
-                                route_tool_request_context.channel.as_deref(),
-                                session_id.as_str(),
-                                run_id.as_str(),
-                                tool_name.as_str(),
-                                skill_context.as_ref(),
                                 &mut remaining_tool_budget,
-                                skill_gate_decision,
-                                cached_approval_outcome.as_ref(),
-                            );
-                            append_tool_decision_tape_event(
-                                &self.state,
-                                run_id.as_str(),
                                 &mut tape_seq,
-                                "tool.decision",
-                                proposal_id.as_str(),
-                                tool_name.as_str(),
-                                decision.allowed,
-                                decision.reason.as_str(),
-                                decision.approval_required,
-                                decision.policy_enforced,
                             )
                             .await?;
-                            record_tool_proposal_decision_audit_trail(
-                                &self.state,
-                                &route_tool_request_context,
-                                session_id.as_str(),
-                                run_id.as_str(),
-                                proposal_id.as_str(),
-                                tool_name.as_str(),
-                                skill_context.as_ref(),
-                                &decision,
-                            )
-                            .await?;
-
-                            let execution_outcome = if decision.allowed {
-                                self.state
-                                    .counters
-                                    .tool_execution_attempts
-                                    .fetch_add(1, Ordering::Relaxed);
-                                let started_at = Instant::now();
-                                let outcome = execute_tool_with_runtime_dispatch(
-                                    &self.state,
-                                    ToolRuntimeExecutionContext {
-                                        principal: route_tool_request_context.principal.as_str(),
-                                        channel: route_tool_request_context.channel.as_deref(),
-                                        session_id: session_id.as_str(),
-                                    },
-                                    proposal_id.as_str(),
-                                    tool_name.as_str(),
-                                    input_json.as_slice(),
-                                )
-                                .await;
-                                record_tool_execution_outcome_metrics(
-                                    &self.state,
-                                    ToolExecutionTraceContext {
-                                        run_id: run_id.as_str(),
-                                        proposal_id: proposal_id.as_str(),
-                                        tool_name: tool_name.as_str(),
-                                        execution_surface: "route_message",
-                                    },
-                                    decision.allowed,
-                                    started_at,
-                                    &outcome,
-                                );
-                                outcome
-                            } else {
-                                denied_execution_outcome(
-                                    proposal_id.as_str(),
-                                    tool_name.as_str(),
-                                    input_json.as_slice(),
-                                    decision.reason.as_str(),
-                                )
-                            };
-                            self.state
-                                .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
-                                    run_id: run_id.clone(),
-                                    seq: tape_seq,
-                                    event_type: "tool.executed".to_owned(),
-                                    payload_json: json!({
-                                        "proposal_id": proposal_id.clone(),
-                                        "tool_name": tool_name.clone(),
-                                        "success": execution_outcome.success,
-                                        "error": execution_outcome.error.clone(),
-                                        "attestation": {
-                                            "attestation_id": execution_outcome.attestation.attestation_id.clone(),
-                                            "execution_sha256": execution_outcome.attestation.execution_sha256.clone(),
-                                            "executed_at_unix_ms": execution_outcome.attestation.executed_at_unix_ms,
-                                            "timed_out": execution_outcome.attestation.timed_out,
-                                            "executor": execution_outcome.attestation.executor.clone(),
-                                            "sandbox_enforcement": execution_outcome.attestation.sandbox_enforcement.clone(),
-                                        }
-                                    })
-                                    .to_string(),
-                                })
-                                .await?;
-                            tape_seq = tape_seq.saturating_add(1);
-
-                            let tool_summary = build_and_ingest_tool_result_memory_summary(
-                                &self.state,
-                                ToolRuntimeExecutionContext {
-                                    principal: route_tool_request_context.principal.as_str(),
-                                    channel: route_tool_request_context.channel.as_deref(),
-                                    session_id: session_id.as_str(),
-                                },
-                                tool_name.as_str(),
-                                decision.allowed,
-                                &execution_outcome,
-                                "route_message_tool_result",
-                            )
-                            .await;
                             if !reply_text.is_empty() {
                                 reply_text.push('\n');
                             }
@@ -14776,6 +14649,151 @@ async fn record_skill_gate_denial_if_needed(
         decision.reason.as_str(),
     )
     .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_route_tool_proposal_event(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    route_request_context: &RequestContext,
+    session_id: &str,
+    run_id: &str,
+    proposal_id: &str,
+    tool_name: &str,
+    input_json: &[u8],
+    remaining_tool_budget: &mut u32,
+    tape_seq: &mut i64,
+) -> Result<String, Status> {
+    runtime_state.counters.tool_proposals.fetch_add(1, Ordering::Relaxed);
+    let ToolProposalSecurityEvaluation {
+        skill_context,
+        skill_gate_decision,
+        approval_subject_id,
+        proposal_approval_required,
+    } = evaluate_tool_proposal_security(
+        runtime_state,
+        route_request_context,
+        run_id,
+        proposal_id,
+        tool_name,
+        input_json,
+    )
+    .await;
+    let cached_approval_outcome = resolve_cached_tool_approval_for_proposal(
+        runtime_state,
+        route_request_context,
+        session_id,
+        approval_subject_id.as_str(),
+        proposal_approval_required,
+        run_id,
+        proposal_id,
+        "route message",
+    );
+    let decision = resolve_tool_proposal_decision_for_context(
+        runtime_state,
+        route_request_context,
+        route_request_context.channel.as_deref(),
+        session_id,
+        run_id,
+        tool_name,
+        skill_context.as_ref(),
+        remaining_tool_budget,
+        skill_gate_decision,
+        cached_approval_outcome.as_ref(),
+    );
+    append_tool_decision_tape_event(
+        runtime_state,
+        run_id,
+        tape_seq,
+        "tool.decision",
+        proposal_id,
+        tool_name,
+        decision.allowed,
+        decision.reason.as_str(),
+        decision.approval_required,
+        decision.policy_enforced,
+    )
+    .await?;
+    record_tool_proposal_decision_audit_trail(
+        runtime_state,
+        route_request_context,
+        session_id,
+        run_id,
+        proposal_id,
+        tool_name,
+        skill_context.as_ref(),
+        &decision,
+    )
+    .await?;
+
+    let execution_outcome = if decision.allowed {
+        runtime_state.counters.tool_execution_attempts.fetch_add(1, Ordering::Relaxed);
+        let started_at = Instant::now();
+        let outcome = execute_tool_with_runtime_dispatch(
+            runtime_state,
+            ToolRuntimeExecutionContext {
+                principal: route_request_context.principal.as_str(),
+                channel: route_request_context.channel.as_deref(),
+                session_id,
+            },
+            proposal_id,
+            tool_name,
+            input_json,
+        )
+        .await;
+        record_tool_execution_outcome_metrics(
+            runtime_state,
+            ToolExecutionTraceContext {
+                run_id,
+                proposal_id,
+                tool_name,
+                execution_surface: "route_message",
+            },
+            decision.allowed,
+            started_at,
+            &outcome,
+        );
+        outcome
+    } else {
+        denied_execution_outcome(proposal_id, tool_name, input_json, decision.reason.as_str())
+    };
+
+    runtime_state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: *tape_seq,
+            event_type: "tool.executed".to_owned(),
+            payload_json: json!({
+                "proposal_id": proposal_id,
+                "tool_name": tool_name,
+                "success": execution_outcome.success,
+                "error": execution_outcome.error.clone(),
+                "attestation": {
+                    "attestation_id": execution_outcome.attestation.attestation_id.clone(),
+                    "execution_sha256": execution_outcome.attestation.execution_sha256.clone(),
+                    "executed_at_unix_ms": execution_outcome.attestation.executed_at_unix_ms,
+                    "timed_out": execution_outcome.attestation.timed_out,
+                    "executor": execution_outcome.attestation.executor.clone(),
+                    "sandbox_enforcement": execution_outcome.attestation.sandbox_enforcement.clone(),
+                }
+            })
+            .to_string(),
+        })
+        .await?;
+    *tape_seq = (*tape_seq).saturating_add(1);
+
+    Ok(build_and_ingest_tool_result_memory_summary(
+        runtime_state,
+        ToolRuntimeExecutionContext {
+            principal: route_request_context.principal.as_str(),
+            channel: route_request_context.channel.as_deref(),
+            session_id,
+        },
+        tool_name,
+        decision.allowed,
+        &execution_outcome,
+        "route_message_tool_result",
+    )
+    .await)
 }
 
 fn build_pending_tool_approval(
