@@ -6910,6 +6910,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                 };
 
                 let mut reply_text = String::new();
+                let mut remaining_tool_budget = self.state.config.tool_call.max_calls_per_run;
                 for event in provider_response.events {
                     match event {
                         ProviderEvent::ModelToken { token, .. } => {
@@ -6918,16 +6919,229 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                             }
                             reply_text.push_str(token.as_str());
                         }
-                        ProviderEvent::ToolProposal { tool_name, .. } => {
+                        ProviderEvent::ToolProposal { proposal_id, tool_name, input_json } => {
+                            self.state.counters.tool_proposals.fetch_add(1, Ordering::Relaxed);
+                            let policy_request_context = ToolRequestContext {
+                                principal: context.principal.clone(),
+                                device_id: Some(context.device_id.clone()),
+                                channel: context.channel.clone(),
+                                session_id: Some(session_id.clone()),
+                                run_id: Some(run_id.clone()),
+                                skill_id: None,
+                            };
+                            let decision = decide_tool_call(
+                                &self.state.config.tool_call,
+                                &mut remaining_tool_budget,
+                                &policy_request_context,
+                                tool_name.as_str(),
+                                false,
+                            );
+                            if decision.allowed {
+                                self.state
+                                    .counters
+                                    .tool_decisions_allowed
+                                    .fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                self.state
+                                    .counters
+                                    .tool_decisions_denied
+                                    .fetch_add(1, Ordering::Relaxed);
+                                self.state.record_denied();
+                                if tool_name == PROCESS_RUNNER_TOOL_NAME {
+                                    self.state
+                                        .counters
+                                        .sandbox_policy_denies
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                            self.state
+                                .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+                                    run_id: run_id.clone(),
+                                    seq: tape_seq,
+                                    event_type: "tool.decision".to_owned(),
+                                    payload_json: json!({
+                                        "proposal_id": proposal_id.clone(),
+                                        "tool_name": tool_name.clone(),
+                                        "allowed": decision.allowed,
+                                        "reason": decision.reason.clone(),
+                                        "approval_required": decision.approval_required,
+                                        "policy_enforced": decision.policy_enforced,
+                                    })
+                                    .to_string(),
+                                })
+                                .await?;
+                            tape_seq = tape_seq.saturating_add(1);
+
+                            let execution_outcome = if decision.allowed {
+                                self.state
+                                    .counters
+                                    .tool_execution_attempts
+                                    .fetch_add(1, Ordering::Relaxed);
+                                let started_at = Instant::now();
+                                let outcome = if tool_name == "palyra.memory.search" {
+                                    execute_memory_search_tool(
+                                        &self.state,
+                                        context.principal.as_str(),
+                                        context.channel.as_deref(),
+                                        session_id.as_str(),
+                                        proposal_id.as_str(),
+                                        input_json.as_slice(),
+                                    )
+                                    .await
+                                } else if tool_name == HTTP_FETCH_TOOL_NAME {
+                                    execute_http_fetch_tool(
+                                        &self.state,
+                                        proposal_id.as_str(),
+                                        input_json.as_slice(),
+                                    )
+                                    .await
+                                } else if tool_name.starts_with("palyra.browser.") {
+                                    execute_browser_tool(
+                                        &self.state,
+                                        context.principal.as_str(),
+                                        context.channel.as_deref(),
+                                        tool_name.as_str(),
+                                        proposal_id.as_str(),
+                                        input_json.as_slice(),
+                                    )
+                                    .await
+                                } else if tool_name == WORKSPACE_PATCH_TOOL_NAME {
+                                    execute_workspace_patch_tool(
+                                        &self.state,
+                                        context.principal.as_str(),
+                                        context.channel.as_deref(),
+                                        session_id.as_str(),
+                                        proposal_id.as_str(),
+                                        input_json.as_slice(),
+                                    )
+                                    .await
+                                } else {
+                                    execute_tool_call(
+                                        &self.state.config.tool_call,
+                                        proposal_id.as_str(),
+                                        tool_name.as_str(),
+                                        input_json.as_slice(),
+                                    )
+                                    .await
+                                };
+                                if started_at.elapsed().as_millis()
+                                    > TOOL_EXECUTION_LATENCY_BUDGET_MS
+                                {
+                                    warn!(
+                                        run_id = %run_id,
+                                        proposal_id = %proposal_id,
+                                        tool_name = %tool_name,
+                                        execution_duration_ms = started_at.elapsed().as_millis(),
+                                        budget_ms = TOOL_EXECUTION_LATENCY_BUDGET_MS,
+                                        "route message tool execution exceeded latency budget"
+                                    );
+                                }
+                                if !outcome.success {
+                                    self.state
+                                        .counters
+                                        .tool_execution_failures
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                                if outcome.attestation.timed_out {
+                                    self.state
+                                        .counters
+                                        .tool_execution_timeouts
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                                if tool_name == PROCESS_RUNNER_TOOL_NAME {
+                                    record_process_runner_execution_metrics(
+                                        &self.state.counters,
+                                        decision.allowed,
+                                        &outcome,
+                                    );
+                                }
+                                outcome
+                            } else {
+                                denied_execution_outcome(
+                                    proposal_id.as_str(),
+                                    tool_name.as_str(),
+                                    input_json.as_slice(),
+                                    decision.reason.as_str(),
+                                )
+                            };
+
+                            if tool_name == WORKSPACE_PATCH_TOOL_NAME {
+                                if execution_outcome.success {
+                                    self.state
+                                        .counters
+                                        .patches_applied
+                                        .fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    self.state
+                                        .counters
+                                        .patches_rejected
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                                let (files_touched, rollback_performed) =
+                                    workspace_patch_metrics_from_output(
+                                        execution_outcome.output_json.as_slice(),
+                                    );
+                                if files_touched > 0 {
+                                    self.state
+                                        .counters
+                                        .patch_files_touched
+                                        .fetch_add(files_touched as u64, Ordering::Relaxed);
+                                }
+                                if rollback_performed {
+                                    self.state
+                                        .counters
+                                        .patch_rollbacks
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                            self.state
+                                .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+                                    run_id: run_id.clone(),
+                                    seq: tape_seq,
+                                    event_type: "tool.executed".to_owned(),
+                                    payload_json: json!({
+                                        "proposal_id": proposal_id.clone(),
+                                        "tool_name": tool_name.clone(),
+                                        "success": execution_outcome.success,
+                                        "error": execution_outcome.error.clone(),
+                                        "attestation": {
+                                            "attestation_id": execution_outcome.attestation.attestation_id.clone(),
+                                            "execution_sha256": execution_outcome.attestation.execution_sha256.clone(),
+                                            "executed_at_unix_ms": execution_outcome.attestation.executed_at_unix_ms,
+                                            "timed_out": execution_outcome.attestation.timed_out,
+                                            "executor": execution_outcome.attestation.executor.clone(),
+                                            "sandbox_enforcement": execution_outcome.attestation.sandbox_enforcement.clone(),
+                                        }
+                                    })
+                                    .to_string(),
+                                })
+                                .await?;
+                            tape_seq = tape_seq.saturating_add(1);
+
+                            let tool_summary = build_tool_result_memory_text(
+                                tool_name.as_str(),
+                                execution_outcome.success,
+                                execution_outcome.output_json.as_slice(),
+                                execution_outcome.error.as_str(),
+                            );
+                            if decision.allowed || execution_outcome.success {
+                                ingest_memory_best_effort(
+                                    &self.state,
+                                    context.principal.as_str(),
+                                    context.channel.as_deref(),
+                                    Some(session_id.as_str()),
+                                    MemorySource::TapeToolResult,
+                                    tool_summary.as_str(),
+                                    vec![format!("tool:{tool_name}")],
+                                    Some(if execution_outcome.success { 0.85 } else { 0.55 }),
+                                    "route_message_tool_result",
+                                )
+                                .await;
+                            }
                             if !reply_text.is_empty() {
                                 reply_text.push('\n');
                             }
-                            reply_text.push_str(
-                                format!(
-                                    "[tool proposal blocked by channel router v1: {tool_name}]"
-                                )
-                                .as_str(),
-                            );
+                            reply_text.push_str(tool_summary.as_str());
                         }
                     }
                 }

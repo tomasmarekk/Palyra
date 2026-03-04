@@ -923,6 +923,110 @@ async fn grpc_route_message_followup_reuses_session_memory_and_agent_binding() -
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn grpc_route_message_executes_allowlisted_memory_search_tool() -> Result<()> {
+    let response_body = openai_tool_call_response(
+        "palyra.memory.search",
+        &serde_json::json!({
+            "query": "rollback checklist",
+            "scope": "principal",
+            "top_k": 5,
+            "min_score": 0.0
+        }),
+    )?;
+    let (openai_base_url, request_count, server_handle) =
+        spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::immediate(200, response_body)])?;
+    let (child, admin_port, grpc_port, _journal_db_path, config_path) =
+        spawn_palyrad_with_openai_provider_and_channel_router_with_tool_policy(
+            openai_base_url.as_str(),
+            OPENAI_API_KEY,
+            "palyra.memory.search",
+            2,
+            750,
+        )?;
+    let _config_guard = TempFileGuard::new(config_path);
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut memory_client =
+        memory_v1::memory_service_client::MemoryServiceClient::connect(endpoint.clone())
+            .await
+            .context("failed to connect memory gRPC client")?;
+    let mut ingest_request = tonic::Request::new(memory_v1::IngestMemoryRequest {
+        v: 1,
+        source: memory_v1::MemorySource::Manual as i32,
+        content_text: "rollback checklist for route tool call".to_owned(),
+        channel: "cli".to_owned(),
+        session_id: Some(common_v1::CanonicalId { ulid: SESSION_ID.to_owned() }),
+        tags: vec!["route-tool".to_owned()],
+        confidence: 0.9,
+        ttl_unix_ms: 0,
+    });
+    authorize_metadata(ingest_request.metadata_mut())?;
+    let ingested_memory_id = memory_client
+        .ingest_memory(ingest_request)
+        .await
+        .context("failed to ingest memory for route message tool test")?
+        .into_inner()
+        .item
+        .and_then(|item| item.memory_id)
+        .map(|id| id.ulid)
+        .context("memory ingest should return canonical memory id")?;
+
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+    let mut create_route_agent = tonic::Request::new(gateway_v1::CreateAgentRequest {
+        v: 1,
+        agent_id: "route".to_owned(),
+        display_name: "Route".to_owned(),
+        agent_dir: String::new(),
+        workspace_roots: vec!["workspace".to_owned()],
+        default_model_profile: "gpt-4o-mini".to_owned(),
+        default_tool_allowlist: vec!["palyra.memory.search".to_owned()],
+        default_skill_allowlist: vec!["acme.route".to_owned()],
+        set_default: true,
+        allow_absolute_paths: false,
+    });
+    authorize_metadata_with_principal(create_route_agent.metadata_mut(), "admin:ops")?;
+    client
+        .create_agent(create_route_agent)
+        .await
+        .context("failed to create route agent before RouteMessage tool test")?;
+
+    let adapter = FakeChannelAdapter::default();
+    let response = adapter
+        .inject_message(&mut client, "hey @palyra run memory search for rollback checklist", false)
+        .await?;
+    assert!(
+        response.accepted,
+        "mention-matched message should be routed (reason={})",
+        response.decision_reason
+    );
+    let outbound = response
+        .outputs
+        .first()
+        .cloned()
+        .context("route message should include outbound payload")?;
+    assert!(
+        outbound.text.contains("tool=palyra.memory.search success=true"),
+        "route reply should include executed memory-search tool summary"
+    );
+    assert!(
+        outbound.text.contains(ingested_memory_id.as_str()),
+        "tool output preview should include ingested memory id to prove runtime execution"
+    );
+    assert_eq!(
+        request_count.load(Ordering::Relaxed),
+        1,
+        "route message tool execution should use exactly one model-provider call"
+    );
+
+    server_handle.join().expect("scripted openai server thread should exit");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn grpc_gateway_enforces_auth_and_streams_status() -> Result<()> {
     let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
     let mut daemon = ChildGuard::new(child);
@@ -6431,6 +6535,58 @@ fn spawn_palyrad_with_openai_provider_and_channel_router(
         .stderr(Stdio::null())
         .spawn()
         .context("failed to start palyrad with channel-router config")?;
+    let stdout = child.stdout.take().context("failed to capture palyrad stdout")?;
+    let (admin_port, grpc_port) = wait_for_listen_ports(stdout, &mut child)?;
+    Ok((child, admin_port, grpc_port, journal_db_path, config_path))
+}
+
+fn spawn_palyrad_with_openai_provider_and_channel_router_with_tool_policy(
+    openai_base_url: &str,
+    openai_api_key: &str,
+    allowed_tools: &str,
+    max_calls_per_run: u32,
+    execution_timeout_ms: u64,
+) -> Result<(Child, u16, u16, PathBuf, PathBuf)> {
+    let config_path = write_channel_router_config()?;
+    let journal_db_path = unique_temp_journal_db_path();
+    let identity_store_dir = unique_temp_identity_store_dir();
+    let vault_dir = unique_temp_vault_dir();
+    prepare_test_vault_dir(&vault_dir)?;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_palyrad"))
+        .args([
+            "--bind",
+            "127.0.0.1",
+            "--port",
+            "0",
+            "--grpc-bind",
+            "127.0.0.1",
+            "--grpc-port",
+            "0",
+        ])
+        .env("PALYRA_CONFIG", config_path.to_string_lossy().to_string())
+        .env("PALYRA_ADMIN_TOKEN", ADMIN_TOKEN)
+        .env("PALYRA_GATEWAY_QUIC_BIND_ADDR", "127.0.0.1")
+        .env("PALYRA_GATEWAY_QUIC_PORT", "0")
+        .env("PALYRA_JOURNAL_DB_PATH", journal_db_path.to_string_lossy().to_string())
+        .env("PALYRA_GATEWAY_IDENTITY_STORE_DIR", identity_store_dir.to_string_lossy().to_string())
+        .env("PALYRA_VAULT_DIR", vault_dir.to_string_lossy().to_string())
+        .env("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED", "true")
+        .env("PALYRA_MODEL_PROVIDER_KIND", "openai_compatible")
+        .env("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", openai_base_url)
+        .env("PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL", "true")
+        .env("PALYRA_MODEL_PROVIDER_OPENAI_API_KEY", openai_api_key)
+        .env("PALYRA_MODEL_PROVIDER_MAX_RETRIES", "0")
+        .env("PALYRA_MODEL_PROVIDER_RETRY_BACKOFF_MS", "1")
+        .env("PALYRA_MODEL_PROVIDER_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "1")
+        .env("PALYRA_MODEL_PROVIDER_CIRCUIT_BREAKER_COOLDOWN_MS", "30000")
+        .env("PALYRA_TOOL_CALL_ALLOWED_TOOLS", allowed_tools)
+        .env("PALYRA_TOOL_CALL_MAX_CALLS_PER_RUN", max_calls_per_run.to_string())
+        .env("PALYRA_TOOL_CALL_TIMEOUT_MS", execution_timeout_ms.to_string())
+        .env("RUST_LOG", "info")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to start palyrad with channel-router + tool policy config")?;
     let stdout = child.stdout.take().context("failed to capture palyrad stdout")?;
     let (admin_port, grpc_port) = wait_for_listen_ports(stdout, &mut child)?;
     Ok((child, admin_port, grpc_port, journal_db_path, config_path))
