@@ -5290,6 +5290,18 @@ struct RouteMessageOutputTemplate<'a> {
     a2ui_update: Option<&'a common_v1::A2uiUpdate>,
 }
 
+#[derive(Debug, Clone)]
+struct PreparedModelProviderInput {
+    provider_input_text: String,
+    vision_requested: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemoryPromptFailureMode {
+    Fail,
+    FallbackToRawInput { warn_message: &'static str },
+}
+
 fn build_route_message_outputs(
     reply_text: &str,
     max_payload_bytes: u64,
@@ -5328,6 +5340,12 @@ fn build_route_message_outputs(
         });
     }
     outputs
+}
+
+fn message_attachments_request_vision(attachments: &[common_v1::MessageAttachment]) -> bool {
+    attachments.iter().any(|attachment| {
+        attachment.kind == common_v1::message_attachment::AttachmentKind::Image as i32
+    })
 }
 
 fn session_summary_message(session: &OrchestratorSessionRecord) -> gateway_v1::SessionSummary {
@@ -6854,52 +6872,29 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     .await?;
                 tape_seq = tape_seq.saturating_add(1);
 
-                ingest_memory_best_effort(
-                    &self.state,
-                    context.principal.as_str(),
-                    context.channel.as_deref(),
-                    Some(session_id.as_str()),
-                    MemorySource::TapeUserMessage,
-                    input.text.as_str(),
-                    Vec::new(),
-                    Some(0.9),
-                    "route_message_user_input",
-                )
-                .await;
-                let provider_input_text = match build_memory_augmented_prompt(
+                let prepared_provider_input = prepare_model_provider_input(
                     &self.state,
                     &context,
                     run_id.as_str(),
                     &mut tape_seq,
                     session_id.as_str(),
                     input.text.as_str(),
+                    content.attachments.as_slice(),
+                    "route_message_user_input",
+                    MemoryPromptFailureMode::FallbackToRawInput {
+                        warn_message:
+                            "route message memory auto-inject failed; falling back to raw input",
+                    },
+                    plan.channel.as_str(),
                 )
-                .await
-                {
-                    Ok(value) => value,
-                    Err(error) => {
-                        warn!(
-                            session_id = %session_id,
-                            run_id = %run_id,
-                            principal = %context.principal,
-                            channel = %plan.channel,
-                            status_code = ?error.code(),
-                            status_message = %error.message(),
-                            "route message memory auto-inject failed; falling back to raw input"
-                        );
-                        input.text.clone()
-                    }
-                };
+                .await?;
 
                 let provider_response = self
                     .state
                     .execute_model_provider(ProviderRequest {
-                        input_text: provider_input_text,
+                        input_text: prepared_provider_input.provider_input_text,
                         json_mode: json_mode_requested,
-                        vision_requested: content.attachments.iter().any(|attachment| {
-                            attachment.kind
-                                == common_v1::message_attachment::AttachmentKind::Image as i32
-                        }),
+                        vision_requested: prepared_provider_input.vision_requested,
                     })
                     .await;
 
@@ -7834,9 +7829,6 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                 let input_envelope = message.input.unwrap_or_default();
                 let input_content = input_envelope.content.unwrap_or_default();
                 let input_text = input_content.text;
-                let vision_requested = input_content.attachments.iter().any(|attachment| {
-                    attachment.kind == common_v1::message_attachment::AttachmentKind::Image as i32
-                });
                 let json_mode_requested =
                     security_requests_json_mode(input_envelope.security.as_ref());
                 let session_id_for_message = if let Some(session_id) = active_session_id.as_deref()
@@ -7859,26 +7851,17 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     return;
                 };
 
-                ingest_memory_best_effort(
-                    &state_for_stream,
-                    context_for_stream.principal.as_str(),
-                    context_for_stream.channel.as_deref(),
-                    Some(session_id_for_message.as_str()),
-                    MemorySource::TapeUserMessage,
-                    input_text.as_str(),
-                    Vec::new(),
-                    Some(0.9),
-                    "run_stream_user_input",
-                )
-                .await;
-
-                let provider_input_text = match build_memory_augmented_prompt(
+                let prepared_provider_input = match prepare_model_provider_input(
                     &state_for_stream,
                     &context_for_stream,
                     run_id.as_str(),
                     &mut tape_seq,
                     session_id_for_message.as_str(),
                     input_text.as_str(),
+                    input_content.attachments.as_slice(),
+                    "run_stream_user_input",
+                    MemoryPromptFailureMode::Fail,
+                    context_for_stream.channel.as_deref().unwrap_or("n/a"),
                 )
                 .await
                 {
@@ -8048,9 +8031,9 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
 
                 let mut provider_future =
                     Box::pin(state_for_stream.execute_model_provider(ProviderRequest {
-                        input_text: provider_input_text,
+                        input_text: prepared_provider_input.provider_input_text,
                         json_mode: json_mode_requested,
-                        vision_requested,
+                        vision_requested: prepared_provider_input.vision_requested,
                     }));
                 let mut cancel_poll = interval(Duration::from_millis(100));
                 cancel_poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -10479,6 +10462,64 @@ async fn build_memory_augmented_prompt(
     runtime_state.counters.memory_auto_inject_events.fetch_add(1, Ordering::Relaxed);
 
     Ok(render_memory_augmented_prompt(selected_hits.as_slice(), input_text))
+}
+
+#[allow(clippy::result_large_err)]
+async fn prepare_model_provider_input(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: &RequestContext,
+    run_id: &str,
+    tape_seq: &mut i64,
+    session_id: &str,
+    input_text: &str,
+    attachments: &[common_v1::MessageAttachment],
+    memory_ingest_reason: &str,
+    memory_prompt_failure_mode: MemoryPromptFailureMode,
+    channel_for_log: &str,
+) -> Result<PreparedModelProviderInput, Status> {
+    ingest_memory_best_effort(
+        runtime_state,
+        context.principal.as_str(),
+        context.channel.as_deref(),
+        Some(session_id),
+        MemorySource::TapeUserMessage,
+        input_text,
+        Vec::new(),
+        Some(0.9),
+        memory_ingest_reason,
+    )
+    .await;
+    let provider_input_text = match build_memory_augmented_prompt(
+        runtime_state,
+        context,
+        run_id,
+        tape_seq,
+        session_id,
+        input_text,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => match memory_prompt_failure_mode {
+            MemoryPromptFailureMode::Fail => return Err(error),
+            MemoryPromptFailureMode::FallbackToRawInput { warn_message } => {
+                warn!(
+                    run_id,
+                    principal = %context.principal,
+                    session_id,
+                    channel = channel_for_log,
+                    status_code = ?error.code(),
+                    status_message = %error.message(),
+                    "{warn_message}"
+                );
+                input_text.to_owned()
+            }
+        },
+    };
+    Ok(PreparedModelProviderInput {
+        provider_input_text,
+        vision_requested: message_attachments_request_vision(attachments),
+    })
 }
 
 fn render_memory_augmented_prompt(hits: &[MemorySearchHit], input_text: &str) -> String {
@@ -15702,16 +15743,17 @@ mod tests {
     use crate::journal::{
         ApprovalCreateRequest, ApprovalDecision, ApprovalDecisionScope, ApprovalPolicySnapshot,
         ApprovalPromptOption, ApprovalPromptRecord, ApprovalRiskLevel, ApprovalSubjectType,
-        JournalAppendRequest, JournalConfig, JournalStore, MemoryItemRecord, MemoryScoreBreakdown,
-        MemorySearchHit, MemorySource, OrchestratorRunStartRequest,
-        OrchestratorSessionUpsertRequest, OrchestratorTapeAppendRequest,
+        JournalAppendRequest, JournalConfig, JournalStore, MemoryItemCreateRequest,
+        MemoryItemRecord, MemoryScoreBreakdown, MemorySearchHit, MemorySearchRequest, MemorySource,
+        OrchestratorRunStartRequest, OrchestratorSessionUpsertRequest,
+        OrchestratorTapeAppendRequest,
     };
     use tonic::Code;
     use ulid::Ulid;
 
     use super::{
         apply_tool_approval_outcome, authorize_approvals_action, authorize_headers,
-        authorize_metadata, best_effort_mark_approval_error, constant_time_eq,
+        authorize_metadata, best_effort_mark_approval_error, common_v1, constant_time_eq,
         enforce_memory_item_scope, enforce_vault_get_approval_policy, enforce_vault_scope_access,
         execute_http_fetch_tool, execute_memory_search_tool, execute_workspace_patch_tool,
         extend_patch_string_defaults, parse_patch_string_array_field,
@@ -16408,6 +16450,160 @@ summarize incident";
         assert_eq!(
             prompt, expected,
             "memory-augmented prompt rendering should stay deterministic for ordered hits"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prepare_model_provider_input_marks_vision_requested_for_image_attachments() {
+        let state = build_test_runtime_state(false);
+        let mut memory_config = state.memory_config_snapshot();
+        memory_config.auto_inject_enabled = false;
+        memory_config.auto_inject_max_items = 0;
+        state.configure_memory(memory_config);
+
+        let context = RequestContext {
+            principal: "user:ops".to_owned(),
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            channel: Some("cli".to_owned()),
+        };
+        let attachments = vec![common_v1::MessageAttachment {
+            kind: common_v1::message_attachment::AttachmentKind::Image as i32,
+            ..Default::default()
+        }];
+        let mut tape_seq = 1_i64;
+        let prepared = super::prepare_model_provider_input(
+            &state,
+            &context,
+            "01ARZ3NDEKTSV4RRFFQ69G5FB0",
+            &mut tape_seq,
+            "01ARZ3NDEKTSV4RRFFQ69G5FB1",
+            "summarize screenshot",
+            attachments.as_slice(),
+            "prepare_model_provider_input_test",
+            super::MemoryPromptFailureMode::Fail,
+            "cli",
+        )
+        .await
+        .expect("provider input preparation should succeed");
+        assert!(prepared.vision_requested, "image attachment should request vision mode");
+        assert_eq!(
+            prepared.provider_input_text, "summarize screenshot",
+            "without memory auto-inject helper should preserve raw input text"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prepare_model_provider_input_fallback_mode_returns_raw_input_when_tape_append_fails() {
+        let state = build_test_runtime_state(false);
+        let mut memory_config = state.memory_config_snapshot();
+        memory_config.auto_inject_enabled = true;
+        memory_config.auto_inject_max_items = 2;
+        state.configure_memory(memory_config);
+
+        let context = RequestContext {
+            principal: "user:ops".to_owned(),
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            channel: Some("cli".to_owned()),
+        };
+        let session_id = "01ARZ3NDEKTSV4RRFFQ69G5FB2".to_owned();
+        state
+            .ingest_memory_item(MemoryItemCreateRequest {
+                memory_id: "01ARZ3NDEKTSV4RRFFQ69G5FB3".to_owned(),
+                principal: context.principal.clone(),
+                channel: context.channel.clone(),
+                session_id: Some(session_id.clone()),
+                source: MemorySource::Manual,
+                content_text: "rollback checklist for deploy".to_owned(),
+                tags: vec!["ops".to_owned()],
+                confidence: Some(0.9),
+                ttl_unix_ms: None,
+            })
+            .await
+            .expect("memory ingest should seed auto-inject search");
+        let hits = state
+            .search_memory(MemorySearchRequest {
+                principal: context.principal.clone(),
+                channel: context.channel.clone(),
+                session_id: Some(session_id.clone()),
+                query: "rollback checklist".to_owned(),
+                top_k: 2,
+                min_score: 0.0,
+                tags: Vec::new(),
+                sources: Vec::new(),
+            })
+            .await
+            .expect("memory search should succeed");
+        assert!(
+            !hits.is_empty(),
+            "seeded memory must produce at least one auto-inject candidate for fallback-path validation"
+        );
+
+        let mut tape_seq = 1_i64;
+        let prepared = super::prepare_model_provider_input(
+            &state,
+            &context,
+            "01ARZ3NDEKTSV4RRFFQ69G5FB4",
+            &mut tape_seq,
+            session_id.as_str(),
+            "rollback checklist",
+            &[],
+            "prepare_model_provider_input_fallback_test",
+            super::MemoryPromptFailureMode::FallbackToRawInput { warn_message: "test fallback" },
+            "cli",
+        )
+        .await
+        .expect("fallback mode should not fail when tape append cannot persist");
+        assert_eq!(
+            prepared.provider_input_text, "rollback checklist",
+            "fallback mode should preserve raw input after memory auto-inject failure"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prepare_model_provider_input_fail_mode_propagates_tape_append_error() {
+        let state = build_test_runtime_state(false);
+        let mut memory_config = state.memory_config_snapshot();
+        memory_config.auto_inject_enabled = true;
+        memory_config.auto_inject_max_items = 2;
+        state.configure_memory(memory_config);
+
+        let context = RequestContext {
+            principal: "user:ops".to_owned(),
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            channel: Some("cli".to_owned()),
+        };
+        let session_id = "01ARZ3NDEKTSV4RRFFQ69G5FB5".to_owned();
+        state
+            .ingest_memory_item(MemoryItemCreateRequest {
+                memory_id: "01ARZ3NDEKTSV4RRFFQ69G5FB6".to_owned(),
+                principal: context.principal.clone(),
+                channel: context.channel.clone(),
+                session_id: Some(session_id.clone()),
+                source: MemorySource::Manual,
+                content_text: "rollback checklist for deploy".to_owned(),
+                tags: vec!["ops".to_owned()],
+                confidence: Some(0.9),
+                ttl_unix_ms: None,
+            })
+            .await
+            .expect("memory ingest should seed auto-inject search");
+        let mut tape_seq = 1_i64;
+        let result = super::prepare_model_provider_input(
+            &state,
+            &context,
+            "01ARZ3NDEKTSV4RRFFQ69G5FB7",
+            &mut tape_seq,
+            session_id.as_str(),
+            "rollback checklist",
+            &[],
+            "prepare_model_provider_input_fail_test",
+            super::MemoryPromptFailureMode::Fail,
+            "cli",
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "fail mode must propagate memory auto-inject tape persistence errors"
         );
     }
 
