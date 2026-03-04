@@ -36,6 +36,7 @@ chrono = "0.4.44"
 criterion = "0.8.2"
 ed25519-dalek = { version = "2.1.1", features = ["rand_core"] }
 futures = "0.3.31"
+flate2 = "1.1.5"
 headless_chrome = "1.0.21"
 hex = "0.4.3"
 hkdf = "0.12.4"

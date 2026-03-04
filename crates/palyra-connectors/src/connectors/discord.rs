@@ -8,6 +8,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use flate2::{Decompress, FlushDecompress};
 use futures::{SinkExt, StreamExt};
 use palyra_common::redaction::redact_auth_error;
 use reqwest::{redirect::Policy, Client, Url};
@@ -34,11 +35,15 @@ const DISCORD_MAX_MESSAGE_CHARS: usize = 2_000;
 const DISCORD_MAX_MESSAGE_LINES: usize = 17;
 const DISCORD_GATEWAY_VERSION: &str = "10";
 const DISCORD_GATEWAY_ENCODING: &str = "json";
+const DISCORD_GATEWAY_COMPRESSION: &str = "zlib-stream";
 const DISCORD_GATEWAY_INTENTS: u64 = (1 << 0) | (1 << 9) | (1 << 12) | (1 << 15);
 const DISCORD_GATEWAY_HEARTBEAT_FALLBACK_MS: u64 = 45_000;
 const DISCORD_GATEWAY_MONITOR_MIN_BACKOFF_MS: u64 = 1_000;
 const DISCORD_GATEWAY_MONITOR_MAX_BACKOFF_MS: u64 = 60_000;
 const DISCORD_GATEWAY_MONITOR_JITTER_MAX_MS: u64 = 500;
+const DISCORD_GATEWAY_ZLIB_SYNC_FLUSH_SUFFIX: [u8; 4] = [0x00, 0x00, 0xFF, 0xFF];
+const DISCORD_GATEWAY_MAX_COMPRESSED_FRAME_BYTES: usize = 512 * 1024;
+const DISCORD_GATEWAY_MAX_DECOMPRESSED_FRAME_BYTES: usize = 2 * 1024 * 1024;
 const DISCORD_INBOUND_BUFFER_CAPACITY: usize = 512;
 const IDENTITY_CACHE_TTL_MS: i64 = 5 * 60 * 1_000;
 const MAX_DELIVERY_CACHE: usize = 4_096;
@@ -869,9 +874,11 @@ mod tests {
     };
 
     use super::{
-        chunk_discord_text, deterministic_inbound_envelope_id, normalize_discord_message_create,
-        parse_fence_line, DiscordAdapterConfig, DiscordConnectorAdapter, DiscordCredential,
-        DiscordCredentialResolver, DiscordTransport, DiscordTransportResponse, OpenFence,
+        chunk_discord_text, decode_gateway_binary_payload, deterministic_inbound_envelope_id,
+        normalize_discord_message_create, normalize_gateway_ws_url, parse_fence_line,
+        DiscordAdapterConfig, DiscordConnectorAdapter, DiscordCredential,
+        DiscordCredentialResolver, DiscordGatewayInflater, DiscordTransport,
+        DiscordTransportResponse, OpenFence,
     };
     use crate::{
         protocol::{
@@ -1601,6 +1608,74 @@ mod tests {
             });
         }
     }
+
+    #[test]
+    fn normalize_gateway_ws_url_enforces_zlib_stream_compression() {
+        let url = Url::parse("https://gateway.discord.gg/?foo=bar")
+            .expect("input gateway URL should parse");
+        let normalized =
+            normalize_gateway_ws_url(url).expect("gateway URL normalization should succeed");
+        assert_eq!(normalized.scheme(), "wss");
+        assert_eq!(
+            normalized
+                .query_pairs()
+                .find(|(key, _)| key == "v")
+                .map(|(_, value)| value.into_owned()),
+            Some("10".to_owned()),
+            "normalized URL must set Discord gateway version"
+        );
+        assert_eq!(
+            normalized
+                .query_pairs()
+                .find(|(key, _)| key == "encoding")
+                .map(|(_, value)| value.into_owned()),
+            Some("json".to_owned()),
+            "normalized URL must set JSON encoding"
+        );
+        assert_eq!(
+            normalized
+                .query_pairs()
+                .find(|(key, _)| key == "compress")
+                .map(|(_, value)| value.into_owned()),
+            Some("zlib-stream".to_owned()),
+            "normalized URL must request zlib-stream compression"
+        );
+    }
+
+    #[test]
+    fn decode_gateway_binary_payload_decodes_zlib_stream_frame() {
+        let raw = r#"{"op":11,"d":null}"#;
+        let compressed = sample_gateway_zlib_frame();
+        let mut inflater = DiscordGatewayInflater::default();
+        let decoded = decode_gateway_binary_payload(compressed.as_slice(), &mut inflater)
+            .expect("zlib payload decode should not fail")
+            .expect("complete zlib payload should decode immediately");
+        assert_eq!(decoded, raw);
+    }
+
+    #[test]
+    fn decode_gateway_binary_payload_buffers_until_sync_flush_suffix() {
+        let raw = r#"{"op":11,"d":null}"#;
+        let compressed = sample_gateway_zlib_frame();
+        let split_at = compressed.len().saturating_sub(2).max(1);
+        let mut inflater = DiscordGatewayInflater::default();
+        let first = decode_gateway_binary_payload(&compressed[..split_at], &mut inflater)
+            .expect("partial zlib payload should not error");
+        assert!(
+            first.is_none(),
+            "decoder should wait for complete sync-flush suffix before emitting payload"
+        );
+        let second = decode_gateway_binary_payload(&compressed[split_at..], &mut inflater)
+            .expect("remaining zlib payload should decode without error");
+        assert_eq!(second.as_deref(), Some(raw));
+    }
+
+    fn sample_gateway_zlib_frame() -> Vec<u8> {
+        vec![
+            0x78, 0x9C, 0xAA, 0x56, 0xCA, 0x2F, 0x50, 0xB2, 0x32, 0x34, 0xD4, 0x51, 0x4A, 0x51,
+            0xB2, 0xCA, 0x2B, 0xCD, 0xC9, 0xA9, 0x05, 0x00, 0x00, 0x00, 0xFF, 0xFF,
+        ]
+    }
 }
 
 impl Default for DiscordAdapterConfig {
@@ -1848,6 +1923,18 @@ struct DiscordGatewayResumeState {
     session_id: Option<String>,
     seq: Option<i64>,
     bot_user_id: Option<String>,
+}
+
+#[derive(Debug)]
+struct DiscordGatewayInflater {
+    compressed_buffer: Vec<u8>,
+    decompressor: Decompress,
+}
+
+impl Default for DiscordGatewayInflater {
+    fn default() -> Self {
+        Self { compressed_buffer: Vec::new(), decompressor: Decompress::new(true) }
+    }
 }
 
 struct DiscordInboundMonitorHandle {
@@ -2416,6 +2503,7 @@ async fn run_discord_gateway_session(
     let mut heartbeat = interval(Duration::from_millis(DISCORD_GATEWAY_HEARTBEAT_FALLBACK_MS));
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut hello_received = false;
+    let mut gateway_inflater = DiscordGatewayInflater::default();
 
     loop {
         tokio::select! {
@@ -2433,8 +2521,10 @@ async fn run_discord_gateway_session(
                     ConnectorAdapterError::Backend(format!("discord gateway read failed: {error}"))
                 })?;
                 let raw_text = match message {
-                    Message::Text(payload) => payload.to_string(),
-                    Message::Binary(payload) => String::from_utf8_lossy(payload.as_ref()).to_string(),
+                    Message::Text(payload) => Some(payload.to_string()),
+                    Message::Binary(payload) => {
+                        decode_gateway_binary_payload(payload.as_ref(), &mut gateway_inflater)?
+                    }
                     Message::Ping(payload) => {
                         sink.send(Message::Pong(payload)).await.map_err(|error| {
                             ConnectorAdapterError::Backend(format!("discord gateway pong failed: {error}"))
@@ -2451,6 +2541,9 @@ async fn run_discord_gateway_session(
                         )));
                     }
                     Message::Pong(_) | Message::Frame(_) => continue,
+                };
+                let Some(raw_text) = raw_text else {
+                    continue;
                 };
 
                 let envelope = parse_gateway_envelope(raw_text.as_str())?;
@@ -2588,6 +2681,65 @@ where
     });
     sink.send(Message::Text(payload.to_string().into())).await.map_err(|error| {
         ConnectorAdapterError::Backend(format!("discord gateway write failed: {error}"))
+    })
+}
+
+fn decode_gateway_binary_payload(
+    payload: &[u8],
+    inflater: &mut DiscordGatewayInflater,
+) -> Result<Option<String>, ConnectorAdapterError> {
+    if payload.is_empty() {
+        return Ok(None);
+    }
+    if let Ok(raw_text) = std::str::from_utf8(payload) {
+        return Ok(Some(raw_text.to_owned()));
+    }
+    let projected_size = inflater.compressed_buffer.len().saturating_add(payload.len());
+    if projected_size > DISCORD_GATEWAY_MAX_COMPRESSED_FRAME_BYTES {
+        inflater.compressed_buffer.clear();
+        inflater.decompressor = Decompress::new(true);
+        return Err(ConnectorAdapterError::Backend(format!(
+            "discord gateway compressed payload exceeded {} bytes",
+            DISCORD_GATEWAY_MAX_COMPRESSED_FRAME_BYTES
+        )));
+    }
+    inflater.compressed_buffer.extend_from_slice(payload);
+    if !inflater.compressed_buffer.ends_with(&DISCORD_GATEWAY_ZLIB_SYNC_FLUSH_SUFFIX) {
+        return Ok(None);
+    }
+
+    let mut decoded = Vec::with_capacity(
+        inflater
+            .compressed_buffer
+            .len()
+            .saturating_mul(2)
+            .min(DISCORD_GATEWAY_MAX_DECOMPRESSED_FRAME_BYTES)
+            .max(1024),
+    );
+    if let Err(error) = inflater.decompressor.decompress_vec(
+        inflater.compressed_buffer.as_slice(),
+        &mut decoded,
+        FlushDecompress::Sync,
+    ) {
+        inflater.compressed_buffer.clear();
+        inflater.decompressor = Decompress::new(true);
+        return Err(ConnectorAdapterError::Backend(format!(
+            "discord gateway zlib payload decompression failed: {error}"
+        )));
+    }
+    inflater.compressed_buffer.clear();
+    if decoded.len() > DISCORD_GATEWAY_MAX_DECOMPRESSED_FRAME_BYTES {
+        inflater.decompressor = Decompress::new(true);
+        return Err(ConnectorAdapterError::Backend(format!(
+            "discord gateway decompressed payload exceeded {} bytes",
+            DISCORD_GATEWAY_MAX_DECOMPRESSED_FRAME_BYTES
+        )));
+    }
+    String::from_utf8(decoded).map(Some).map_err(|error| {
+        inflater.decompressor = Decompress::new(true);
+        ConnectorAdapterError::Backend(format!(
+            "discord gateway payload is not valid UTF-8 after decompression: {error}"
+        ))
     })
 }
 
@@ -2770,6 +2922,7 @@ fn normalize_gateway_ws_url(mut url: Url) -> Result<Url, ConnectorAdapterError> 
         pairs.clear();
         pairs.append_pair("v", DISCORD_GATEWAY_VERSION);
         pairs.append_pair("encoding", DISCORD_GATEWAY_ENCODING);
+        pairs.append_pair("compress", DISCORD_GATEWAY_COMPRESSION);
     }
     Ok(url)
 }

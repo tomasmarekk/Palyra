@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+flate2.workspace = true
 futures.workspace = true
 palyra-common = { version = "0.1.0", path = "../palyra-common" }
 reqwest.workspace = true
