@@ -7063,26 +7063,16 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                                 input_json.as_slice(),
                             )
                             .await;
-                            let cached_approval_outcome = if proposal_approval_required {
-                                self.state.resolve_cached_tool_approval(
-                                    &context,
-                                    session_id.as_str(),
-                                    approval_subject_id.as_str(),
-                                )
-                            } else {
-                                None
-                            };
-                            if let Some(cached_outcome) = cached_approval_outcome.as_ref() {
-                                info!(
-                                    run_id = %run_id,
-                                    proposal_id = %proposal_id,
-                                    approval_id = %cached_outcome.approval_id,
-                                    subject_id = %approval_subject_id,
-                                    decision = %cached_outcome.decision.as_str(),
-                                    decision_scope = %cached_outcome.decision_scope.as_str(),
-                                    "reusing cached tool approval decision for route message"
-                                );
-                            }
+                            let cached_approval_outcome = resolve_cached_tool_approval_for_proposal(
+                                &self.state,
+                                &context,
+                                session_id.as_str(),
+                                approval_subject_id.as_str(),
+                                proposal_approval_required,
+                                run_id.as_str(),
+                                proposal_id.as_str(),
+                                "route message",
+                            );
                             let decision = resolve_tool_proposal_decision_for_context(
                                 &self.state,
                                 &context,
@@ -8356,27 +8346,20 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                                 let _ = sender.send(Err(error)).await;
                                 return;
                             }
-                            let mut cached_approval_outcome = if proposal_approval_required {
-                                state_for_stream.resolve_cached_tool_approval(
+                            let mut cached_approval_outcome =
+                                resolve_cached_tool_approval_for_proposal(
+                                    &state_for_stream,
                                     &context_for_stream,
                                     session_id.as_str(),
                                     approval_subject_id.as_str(),
-                                )
-                            } else {
-                                None
-                            };
+                                    proposal_approval_required,
+                                    run_id.as_str(),
+                                    proposal_id.as_str(),
+                                    "run stream",
+                                );
 
                             let approval_outcome = if proposal_approval_required {
                                 if let Some(cached_outcome) = cached_approval_outcome.take() {
-                                    info!(
-                                        run_id = %run_id,
-                                        proposal_id = %proposal_id,
-                                        approval_id = %cached_outcome.approval_id,
-                                        subject_id = %approval_subject_id,
-                                        decision = %cached_outcome.decision.as_str(),
-                                        decision_scope = %cached_outcome.decision_scope.as_str(),
-                                        "reusing cached tool approval decision"
-                                    );
                                     if let Err(error) = send_tool_approval_response_with_tape(
                                         &sender,
                                         &state_for_stream,
@@ -14615,6 +14598,40 @@ async fn evaluate_tool_proposal_security(
         approval_subject_id,
         proposal_approval_required,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_cached_tool_approval_for_proposal(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    request_context: &RequestContext,
+    session_id: &str,
+    approval_subject_id: &str,
+    proposal_approval_required: bool,
+    run_id: &str,
+    proposal_id: &str,
+    execution_surface: &str,
+) -> Option<ToolApprovalOutcome> {
+    if !proposal_approval_required {
+        return None;
+    }
+    let cached_outcome = runtime_state.resolve_cached_tool_approval(
+        request_context,
+        session_id,
+        approval_subject_id,
+    );
+    if let Some(cached_outcome) = cached_outcome.as_ref() {
+        info!(
+            run_id = %run_id,
+            proposal_id = %proposal_id,
+            approval_id = %cached_outcome.approval_id,
+            subject_id = %approval_subject_id,
+            decision = %cached_outcome.decision.as_str(),
+            decision_scope = %cached_outcome.decision_scope.as_str(),
+            execution_surface = execution_surface,
+            "reusing cached tool approval decision"
+        );
+    }
+    cached_outcome
 }
 
 fn resolve_tool_proposal_decision(
