@@ -5305,6 +5305,14 @@ struct RouteMessageStructuredOutput {
     a2ui_update: Option<common_v1::A2uiUpdate>,
 }
 
+#[derive(Debug, Clone)]
+struct RouteProviderResponseOutcome {
+    reply_text: String,
+    structured_output: RouteMessageStructuredOutput,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+}
+
 fn parse_route_message_structured_output(
     reply_text: &str,
     json_mode_requested: bool,
@@ -5445,6 +5453,65 @@ fn build_route_message_outputs(
         });
     }
     outputs
+}
+
+#[allow(clippy::result_large_err)]
+#[allow(clippy::too_many_arguments)]
+async fn process_route_provider_response(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    route_request_context: &RequestContext,
+    session_id: &str,
+    run_id: &str,
+    provider_response: ProviderResponse,
+    json_mode_requested: bool,
+    response_prefix: Option<&str>,
+    remaining_tool_budget: &mut u32,
+    tape_seq: &mut i64,
+) -> Result<RouteProviderResponseOutcome, Status> {
+    let mut reply_text = String::new();
+    for event in provider_response.events {
+        match event {
+            ProviderEvent::ModelToken { token, .. } => {
+                if !reply_text.is_empty() {
+                    reply_text.push(' ');
+                }
+                reply_text.push_str(token.as_str());
+            }
+            ProviderEvent::ToolProposal { proposal_id, tool_name, input_json } => {
+                let tool_summary = process_route_tool_proposal_event(
+                    runtime_state,
+                    route_request_context,
+                    session_id,
+                    run_id,
+                    proposal_id.as_str(),
+                    tool_name.as_str(),
+                    input_json.as_slice(),
+                    remaining_tool_budget,
+                    tape_seq,
+                )
+                .await?;
+                if !reply_text.is_empty() {
+                    reply_text.push('\n');
+                }
+                reply_text.push_str(tool_summary.as_str());
+            }
+        }
+    }
+    if reply_text.trim().is_empty() {
+        reply_text = "ack".to_owned();
+    }
+    let structured_output =
+        parse_route_message_structured_output(reply_text.as_str(), json_mode_requested);
+    if let Some(prefix) = response_prefix {
+        reply_text = format!("{prefix}{reply_text}");
+    }
+
+    Ok(RouteProviderResponseOutcome {
+        reply_text,
+        structured_output,
+        prompt_tokens: provider_response.prompt_tokens,
+        completion_tokens: provider_response.completion_tokens,
+    })
 }
 
 #[allow(clippy::result_large_err)]
@@ -5743,44 +5810,21 @@ async fn handle_routed_route_message(
         }
     };
 
-    let mut reply_text = String::new();
     let mut remaining_tool_budget = runtime_state.config.tool_call.max_calls_per_run;
-    for event in provider_response.events {
-        match event {
-            ProviderEvent::ModelToken { token, .. } => {
-                if !reply_text.is_empty() {
-                    reply_text.push(' ');
-                }
-                reply_text.push_str(token.as_str());
-            }
-            ProviderEvent::ToolProposal { proposal_id, tool_name, input_json } => {
-                let tool_summary = process_route_tool_proposal_event(
-                    runtime_state,
-                    &route_request_context,
-                    session_id.as_str(),
-                    run_id.as_str(),
-                    proposal_id.as_str(),
-                    tool_name.as_str(),
-                    input_json.as_slice(),
-                    &mut remaining_tool_budget,
-                    &mut tape_seq,
-                )
-                .await?;
-                if !reply_text.is_empty() {
-                    reply_text.push('\n');
-                }
-                reply_text.push_str(tool_summary.as_str());
-            }
-        }
-    }
-    if reply_text.trim().is_empty() {
-        reply_text = "ack".to_owned();
-    }
-    let route_structured_output =
-        parse_route_message_structured_output(reply_text.as_str(), json_mode_requested);
-    if let Some(prefix) = plan.response_prefix.as_deref() {
-        reply_text = format!("{prefix}{reply_text}");
-    }
+    let route_provider_response = process_route_provider_response(
+        runtime_state,
+        &route_request_context,
+        session_id.as_str(),
+        run_id.as_str(),
+        provider_response,
+        json_mode_requested,
+        plan.response_prefix.as_deref(),
+        &mut remaining_tool_budget,
+        &mut tape_seq,
+    )
+    .await?;
+    let reply_text = route_provider_response.reply_text;
+    let route_structured_output = route_provider_response.structured_output;
     if let Err(error) = authorize_message_action(
         route_request_context.principal.as_str(),
         "channel.send",
@@ -5840,8 +5884,8 @@ async fn handle_routed_route_message(
     runtime_state
         .add_orchestrator_usage(OrchestratorUsageDelta {
             run_id: run_id.clone(),
-            prompt_tokens_delta: provider_response.prompt_tokens,
-            completion_tokens_delta: provider_response.completion_tokens,
+            prompt_tokens_delta: route_provider_response.prompt_tokens,
+            completion_tokens_delta: route_provider_response.completion_tokens,
         })
         .await?;
 
