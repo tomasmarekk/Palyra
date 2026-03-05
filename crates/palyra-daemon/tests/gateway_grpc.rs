@@ -1367,6 +1367,8 @@ async fn grpc_route_message_executes_allowlisted_memory_search_tool() -> Result<
 
 #[tokio::test(flavor = "multi_thread")]
 async fn grpc_route_message_reuses_cached_tool_approval_from_run_stream() -> Result<()> {
+    const ROUTE_SESSION_KEY: &str = "channel:cli:conversation:adapter-conv-1";
+
     let response_body = openai_tool_call_response(
         "palyra.process.run",
         &serde_json::json!({
@@ -1396,6 +1398,27 @@ async fn grpc_route_message_reuses_cached_tool_approval_from_run_stream() -> Res
         .await
         .context("failed to connect gRPC client")?;
     let adapter = FakeChannelAdapter::default();
+    let mut resolve_session_request = tonic::Request::new(gateway_v1::ResolveSessionRequest {
+        v: 1,
+        session_id: Some(common_v1::CanonicalId { ulid: SESSION_ID.to_owned() }),
+        session_key: ROUTE_SESSION_KEY.to_owned(),
+        session_label: "Route approval cache".to_owned(),
+        require_existing: false,
+        reset_session: false,
+    });
+    authorize_metadata(resolve_session_request.metadata_mut())?;
+    let resolved_session = client
+        .resolve_session(resolve_session_request)
+        .await
+        .context("failed to resolve deterministic route session before approval cache seed")?
+        .into_inner();
+    let resolved_summary =
+        resolved_session.session.context("resolve session response missing session summary")?;
+    assert_eq!(
+        resolved_summary.session_id.map(|id| id.ulid),
+        Some(SESSION_ID.to_owned()),
+        "resolve session should preserve explicit deterministic route session id"
+    );
 
     let mut first_route = adapter
         .inject_message_with_envelope_id(
@@ -1416,11 +1439,6 @@ async fn grpc_route_message_reuses_cached_tool_approval_from_run_stream() -> Res
         .take()
         .map(|id| id.ulid)
         .context("first route response missing run_id")?;
-    let route_session_id = first_route
-        .session_id
-        .take()
-        .map(|id| id.ulid)
-        .context("first route response missing session_id")?;
     let first_outbound = first_route
         .outputs
         .first()
@@ -1434,7 +1452,7 @@ async fn grpc_route_message_reuses_cached_tool_approval_from_run_stream() -> Res
     let (request_sender, request_receiver) = tokio_mpsc::channel(4);
     request_sender
         .send(sample_run_stream_request_with_ids(
-            route_session_id.as_str(),
+            SESSION_ID,
             RUN_ID,
             "seed cached tool approval for route".to_owned(),
         ))
@@ -1468,7 +1486,7 @@ async fn grpc_route_message_reuses_cached_tool_approval_from_run_stream() -> Res
                         .context("approval cache seed request missing proposal_id")?;
                     request_sender
                         .send(sample_tool_approval_response_request_for_session_and_run_with_scope(
-                            route_session_id.as_str(),
+                            SESSION_ID,
                             RUN_ID,
                             proposal_id,
                             true,
