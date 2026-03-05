@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, VecDeque},
     env,
     hash::{Hash, Hasher},
-    net::ToSocketAddrs,
+    net::{IpAddr, ToSocketAddrs},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -882,7 +882,8 @@ mod tests {
     use super::{
         chunk_discord_text, decode_gateway_binary_payload, deterministic_inbound_envelope_id,
         handle_gateway_envelope, normalize_discord_message_create, normalize_gateway_ws_url,
-        parse_fence_line, run_discord_gateway_transport_loop, DiscordAdapterConfig,
+        parse_fence_line, run_discord_gateway_transport_loop,
+        validate_discord_url_target_with_resolver, ConnectorNetGuard, DiscordAdapterConfig,
         DiscordConnectorAdapter, DiscordCredential, DiscordCredentialResolver,
         DiscordGatewayEnvelope, DiscordGatewayInflater, DiscordGatewayMonitorContext,
         DiscordGatewayResumeState, DiscordRuntimeState, DiscordTransport, DiscordTransportResponse,
@@ -894,7 +895,7 @@ mod tests {
             OutboundMessageRequest, RetryClass,
         },
         storage::ConnectorInstanceRecord,
-        supervisor::ConnectorAdapter,
+        supervisor::{ConnectorAdapter, ConnectorAdapterError},
     };
     use async_trait::async_trait;
     use futures::stream;
@@ -2030,13 +2031,43 @@ mod tests {
         let guard = adapter
             .build_net_guard(&instance)
             .expect("fallback allowlist should build a valid net guard");
+        let public = [std::net::IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34))];
         for host in
             ["discord.com", "gateway.discord.gg", "cdn.discordapp.net", "media.discordapp.com"]
         {
-            guard.validate_target(host, &[]).unwrap_or_else(|error| {
+            guard.validate_target(host, &public).unwrap_or_else(|error| {
                 panic!("host '{host}' should pass fallback allowlist: {error}")
             });
         }
+    }
+
+    #[test]
+    fn validate_url_target_reports_dns_failure_as_egress_deny() {
+        let guard = ConnectorNetGuard::new(&["*.invalid".to_owned()]).expect("guard should build");
+        let url =
+            Url::parse("https://missing-host.invalid/path").expect("fixture URL should parse");
+        let error = super::validate_discord_url_target(&guard, &url)
+            .expect_err("DNS failure should deny discord egress target");
+        let ConnectorAdapterError::Backend(message) = error;
+        assert!(
+            message.contains("DNS resolution failed"),
+            "error should report DNS resolution failure: {message}"
+        );
+    }
+
+    #[test]
+    fn validate_url_target_reports_empty_dns_results_as_egress_deny() {
+        let guard =
+            ConnectorNetGuard::new(&["*.discord.com".to_owned()]).expect("guard should build");
+        let url = Url::parse("https://gateway.discord.gg/path").expect("fixture URL should parse");
+        let error =
+            validate_discord_url_target_with_resolver(&guard, &url, |_host, _port| Ok(Vec::new()))
+                .expect_err("empty DNS responses should deny discord egress target");
+        let ConnectorAdapterError::Backend(message) = error;
+        assert!(
+            message.contains("DNS resolution returned no addresses"),
+            "error should mention empty DNS response: {message}"
+        );
     }
 
     #[test]
@@ -3324,6 +3355,17 @@ fn validate_discord_url_target(
     guard: &ConnectorNetGuard,
     url: &Url,
 ) -> Result<(), ConnectorAdapterError> {
+    validate_discord_url_target_with_resolver(guard, url, resolve_discord_target_addresses)
+}
+
+fn validate_discord_url_target_with_resolver<F>(
+    guard: &ConnectorNetGuard,
+    url: &Url,
+    resolver: F,
+) -> Result<(), ConnectorAdapterError>
+where
+    F: Fn(&str, u16) -> Result<Vec<IpAddr>, ConnectorAdapterError>,
+{
     let Some(host) = url.host_str() else {
         return Err(ConnectorAdapterError::Backend(
             "discord request URL is missing host".to_owned(),
@@ -3336,15 +3378,29 @@ fn validate_discord_url_target(
             443_u16
         };
     let port = url.port().unwrap_or(default_port);
-    let mut resolved = Vec::new();
-    if let Ok(addrs) = (host, port).to_socket_addrs() {
-        resolved.extend(addrs.map(|entry| entry.ip()));
-        resolved.sort_unstable();
-        resolved.dedup();
+    let mut resolved = resolver(host, port)?;
+    resolved.sort_unstable();
+    resolved.dedup();
+    if resolved.is_empty() {
+        return Err(ConnectorAdapterError::Backend(format!(
+            "discord egress denied: DNS resolution returned no addresses for '{host}:{port}'"
+        )));
     }
     guard
         .validate_target(host, resolved.as_slice())
         .map_err(|error| ConnectorAdapterError::Backend(format!("discord egress denied: {error}")))
+}
+
+fn resolve_discord_target_addresses(
+    host: &str,
+    port: u16,
+) -> Result<Vec<IpAddr>, ConnectorAdapterError> {
+    let addrs = (host, port).to_socket_addrs().map_err(|error| {
+        ConnectorAdapterError::Backend(format!(
+            "discord egress denied: DNS resolution failed for '{host}:{port}': {error}"
+        ))
+    })?;
+    Ok(addrs.map(|entry| entry.ip()).collect())
 }
 
 fn build_gateway_bot_url(api_base: &Url) -> Result<Url, ConnectorAdapterError> {

@@ -63,9 +63,7 @@ impl ConnectorNetGuard {
             }
             return Ok(());
         }
-        if !resolved_addrs.is_empty()
-            && netguard::validate_resolved_ip_addrs(resolved_addrs, false).is_err()
-        {
+        if netguard::validate_resolved_ip_addrs(resolved_addrs, false).is_err() {
             return Err(ConnectorNetGuardError::PrivateAddressBlocked(normalized_host));
         }
         Ok(())
@@ -138,8 +136,9 @@ mod tests {
     fn accepts_allowlisted_discord_hosts() {
         let guard = ConnectorNetGuard::new(&["discord.com".to_owned(), "*.discord.com".to_owned()])
             .expect("guard should build");
-        assert!(guard.validate_target("discord.com", &[]).is_ok());
-        assert!(guard.validate_target("gateway.discord.com", &[]).is_ok());
+        let public = [IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))];
+        assert!(guard.validate_target("discord.com", &public).is_ok());
+        assert!(guard.validate_target("gateway.discord.com", &public).is_ok());
     }
 
     #[test]
@@ -148,6 +147,17 @@ mod tests {
             ConnectorNetGuard::new(&["*.discord.com".to_owned()]).expect("guard should build");
         let private = [IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))];
         let result = guard.validate_target("gateway.discord.com", &private);
+        assert_eq!(
+            result,
+            Err(ConnectorNetGuardError::PrivateAddressBlocked("gateway.discord.com".to_owned()))
+        );
+    }
+
+    #[test]
+    fn rejects_allowlisted_host_when_dns_resolution_is_empty() {
+        let guard =
+            ConnectorNetGuard::new(&["*.discord.com".to_owned()]).expect("guard should build");
+        let result = guard.validate_target("gateway.discord.com", &[]);
         assert_eq!(
             result,
             Err(ConnectorNetGuardError::PrivateAddressBlocked("gateway.discord.com".to_owned()))
