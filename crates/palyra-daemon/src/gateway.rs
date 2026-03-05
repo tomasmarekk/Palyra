@@ -9818,16 +9818,19 @@ async fn execute_http_fetch_tool(
             }
         };
 
+    let cache_policy = HttpFetchCachePolicy {
+        allow_private_targets,
+        allow_redirects,
+        max_redirects,
+        max_response_bytes,
+        allowed_content_types: allowed_content_types.as_slice(),
+    };
     let cache_key = http_fetch_cache_key(
         method.as_str(),
         url.as_str(),
         request_headers.as_slice(),
         body.as_str(),
-        allow_private_targets,
-        allow_redirects,
-        max_redirects,
-        max_response_bytes,
-        allowed_content_types.as_slice(),
+        &cache_policy,
     );
     if cache_enabled {
         let now = current_unix_ms();
@@ -10078,21 +10081,26 @@ async fn execute_http_fetch_tool(
     }
 }
 
+struct HttpFetchCachePolicy<'a> {
+    allow_private_targets: bool,
+    allow_redirects: bool,
+    max_redirects: usize,
+    max_response_bytes: usize,
+    allowed_content_types: &'a [String],
+}
+
 fn http_fetch_cache_key(
     method: &str,
     url: &str,
     headers: &[(String, String)],
     body: &str,
-    allow_private_targets: bool,
-    allow_redirects: bool,
-    max_redirects: usize,
-    max_response_bytes: usize,
-    allowed_content_types: &[String],
+    policy: &HttpFetchCachePolicy<'_>,
 ) -> String {
     let mut normalized_headers =
         headers.iter().map(|(name, value)| format!("{name}:{value}")).collect::<Vec<_>>();
     normalized_headers.sort();
-    let mut normalized_content_types = allowed_content_types
+    let mut normalized_content_types = policy
+        .allowed_content_types
         .iter()
         .map(|value| value.trim().to_ascii_lowercase())
         .filter(|value| !value.is_empty())
@@ -10100,7 +10108,11 @@ fn http_fetch_cache_key(
     normalized_content_types.sort();
     normalized_content_types.dedup();
     let policy_fingerprint = format!(
-        "allow_private_targets={allow_private_targets};allow_redirects={allow_redirects};max_redirects={max_redirects};max_response_bytes={max_response_bytes};allowed_content_types={}",
+        "allow_private_targets={};allow_redirects={};max_redirects={};max_response_bytes={};allowed_content_types={}",
+        policy.allow_private_targets,
+        policy.allow_redirects,
+        policy.max_redirects,
+        policy.max_response_bytes,
         normalized_content_types.join(",")
     );
     let mut key = format!(
@@ -16324,10 +16336,10 @@ mod tests {
         validate_resolved_fetch_addresses, vault_get_requires_approval,
         workspace_patch_metrics_from_output, AuthError, GatewayAuthConfig,
         GatewayJournalConfigSnapshot, GatewayRuntimeConfigSnapshot, GatewayRuntimeState,
-        MemoryRuntimeConfig, ProviderRequest, RequestContext, RouteToolApprovalResolution,
-        SensitiveServiceRole, ToolApprovalOutcome, HEADER_CHANNEL, HEADER_DEVICE_ID,
-        HEADER_PRINCIPAL, MAX_APPROVAL_PAGE_LIMIT, VAULT_RATE_LIMIT_MAX_PRINCIPAL_BUCKETS,
-        VAULT_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW,
+        HttpFetchCachePolicy, MemoryRuntimeConfig, ProviderRequest, RequestContext,
+        RouteToolApprovalResolution, SensitiveServiceRole, ToolApprovalOutcome, HEADER_CHANNEL,
+        HEADER_DEVICE_ID, HEADER_PRINCIPAL, MAX_APPROVAL_PAGE_LIMIT,
+        VAULT_RATE_LIMIT_MAX_PRINCIPAL_BUCKETS, VAULT_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW,
     };
 
     static TEMP_JOURNAL_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -16721,38 +16733,48 @@ mod tests {
     fn http_fetch_cache_key_includes_policy_dimensions() {
         let headers = vec![("accept".to_owned(), "text/plain".to_owned())];
         let allowed_content_types = vec!["text/plain".to_owned(), "application/json".to_owned()];
+        let base_policy = HttpFetchCachePolicy {
+            allow_private_targets: false,
+            allow_redirects: true,
+            max_redirects: 3,
+            max_response_bytes: 4096,
+            allowed_content_types: allowed_content_types.as_slice(),
+        };
         let base = http_fetch_cache_key(
             "GET",
             "https://example.com/data",
             headers.as_slice(),
             "",
-            false,
-            true,
-            3,
-            4096,
-            allowed_content_types.as_slice(),
+            &base_policy,
         );
+        let permissive_policy = HttpFetchCachePolicy {
+            allow_private_targets: true,
+            allow_redirects: true,
+            max_redirects: 3,
+            max_response_bytes: 4096,
+            allowed_content_types: allowed_content_types.as_slice(),
+        };
         let different_policy = http_fetch_cache_key(
             "GET",
             "https://example.com/data",
             headers.as_slice(),
             "",
-            true,
-            true,
-            3,
-            4096,
-            allowed_content_types.as_slice(),
+            &permissive_policy,
         );
+        let narrowed_content_types = vec!["text/plain".to_owned()];
+        let narrowed_policy = HttpFetchCachePolicy {
+            allow_private_targets: false,
+            allow_redirects: true,
+            max_redirects: 3,
+            max_response_bytes: 4096,
+            allowed_content_types: narrowed_content_types.as_slice(),
+        };
         let different_content_types = http_fetch_cache_key(
             "GET",
             "https://example.com/data",
             headers.as_slice(),
             "",
-            false,
-            true,
-            3,
-            4096,
-            &["text/plain".to_owned()],
+            &narrowed_policy,
         );
         assert_ne!(
             base, different_policy,
