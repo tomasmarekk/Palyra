@@ -422,6 +422,12 @@ enum RunStreamProviderResponseOutcome {
     Cancelled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunStreamMessageProcessingOutcome {
+    Continue,
+    Terminate,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CanvasAssetRecord {
     content_type: String,
@@ -7609,390 +7615,26 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     return;
                 }
 
-                let session_id = match canonical_id(message.session_id, "session_id") {
-                    Ok(value) => value,
-                    Err(error) => {
-                        finalize_run_failure(
-                            &sender,
-                            &state_for_stream,
-                            &mut run_state,
-                            active_run_id.as_deref(),
-                            &mut tape_seq,
-                            error.message(),
-                        )
-                        .await;
-                        let _ = sender.send(Err(error)).await;
-                        return;
-                    }
-                };
-                let run_id = match canonical_id(message.run_id, "run_id") {
-                    Ok(value) => value,
-                    Err(error) => {
-                        finalize_run_failure(
-                            &sender,
-                            &state_for_stream,
-                            &mut run_state,
-                            active_run_id.as_deref(),
-                            &mut tape_seq,
-                            error.message(),
-                        )
-                        .await;
-                        let _ = sender.send(Err(error)).await;
-                        return;
-                    }
-                };
-
-                if let Some(expected_session) = active_session_id.as_ref() {
-                    if expected_session != &session_id {
-                        let status = Status::invalid_argument(
-                            "run stream cannot switch session_id mid-stream",
-                        );
-                        finalize_run_failure(
-                            &sender,
-                            &state_for_stream,
-                            &mut run_state,
-                            active_run_id.as_deref(),
-                            &mut tape_seq,
-                            status.message(),
-                        )
-                        .await;
-                        let _ = sender.send(Err(status)).await;
-                        return;
-                    }
-                }
-                if let Some(expected_run) = active_run_id.as_ref() {
-                    if expected_run != &run_id {
-                        let status =
-                            Status::invalid_argument("run stream cannot switch run_id mid-stream");
-                        finalize_run_failure(
-                            &sender,
-                            &state_for_stream,
-                            &mut run_state,
-                            active_run_id.as_deref(),
-                            &mut tape_seq,
-                            status.message(),
-                        )
-                        .await;
-                        let _ = sender.send(Err(status)).await;
-                        return;
-                    }
-                }
-
-                if active_run_id.is_none() {
-                    if let Err(error) = run_state.transition(RunTransition::Accept) {
-                        let status = Status::internal(error.to_string());
-                        finalize_run_failure(
-                            &sender,
-                            &state_for_stream,
-                            &mut run_state,
-                            active_run_id.as_deref(),
-                            &mut tape_seq,
-                            status.message(),
-                        )
-                        .await;
-                        let _ = sender.send(Err(status)).await;
-                        return;
-                    }
-                    let resolved_session = state_for_stream
-                        .resolve_orchestrator_session(OrchestratorSessionResolveRequest {
-                            session_id: Some(session_id.clone()),
-                            session_key: non_empty(message.session_key.clone()),
-                            session_label: non_empty(message.session_label.clone()),
-                            principal: context_for_stream.principal.clone(),
-                            device_id: context_for_stream.device_id.clone(),
-                            channel: context_for_stream.channel.clone(),
-                            require_existing: message.require_existing,
-                            reset_session: message.reset_session,
-                        })
-                        .await;
-                    let resolved_session = match resolved_session {
-                        Ok(outcome) => outcome,
-                        Err(error) => {
-                            finalize_run_failure(
-                                &sender,
-                                &state_for_stream,
-                                &mut run_state,
-                                active_run_id.as_deref(),
-                                &mut tape_seq,
-                                error.message(),
-                            )
-                            .await;
-                            let _ = sender.send(Err(error)).await;
-                            return;
-                        }
-                    };
-                    if message.reset_session {
-                        state_for_stream.clear_tool_approval_cache_for_session(
-                            &context_for_stream,
-                            session_id.as_str(),
-                        );
-                    }
-                    previous_session_run_id = resolved_session.session.last_run_id.clone();
-                    if resolved_session.session.session_id != session_id {
-                        let status = Status::failed_precondition(
-                            "resolved session_id does not match RunStream session_id",
-                        );
-                        finalize_run_failure(
-                            &sender,
-                            &state_for_stream,
-                            &mut run_state,
-                            active_run_id.as_deref(),
-                            &mut tape_seq,
-                            status.message(),
-                        )
-                        .await;
-                        let _ = sender.send(Err(status)).await;
-                        return;
-                    }
-                    if let Err(error) = state_for_stream
-                        .start_orchestrator_run(OrchestratorRunStartRequest {
-                            run_id: run_id.clone(),
-                            session_id: session_id.clone(),
-                        })
-                        .await
-                    {
-                        finalize_run_failure(
-                            &sender,
-                            &state_for_stream,
-                            &mut run_state,
-                            active_run_id.as_deref(),
-                            &mut tape_seq,
-                            error.message(),
-                        )
-                        .await;
-                        let _ = sender.send(Err(error)).await;
-                        return;
-                    }
-
-                    active_session_id = Some(session_id.clone());
-                    active_run_id = Some(run_id.clone());
-
-                    let accepted_message = format!(
-                        "accepted session={session_id} principal={}",
-                        context_for_stream.principal
-                    );
-                    if let Err(error) = send_status_with_tape(
-                        &sender,
-                        &state_for_stream,
-                        run_id.as_str(),
-                        &mut tape_seq,
-                        common_v1::stream_status::StatusKind::Accepted,
-                        accepted_message.as_str(),
-                    )
-                    .await
-                    {
-                        finalize_run_failure(
-                            &sender,
-                            &state_for_stream,
-                            &mut run_state,
-                            active_run_id.as_deref(),
-                            &mut tape_seq,
-                            error.message(),
-                        )
-                        .await;
-                        let _ = sender.send(Err(error)).await;
-                        return;
-                    }
-                }
-
-                let input_envelope = message.input.unwrap_or_default();
-                let input_content = input_envelope.content.unwrap_or_default();
-                let input_text = input_content.text;
-                let json_mode_requested =
-                    security_requests_json_mode(input_envelope.security.as_ref());
-                let session_id_for_message = if let Some(session_id) = active_session_id.as_deref()
-                {
-                    session_id.to_owned()
-                } else {
-                    let status = Status::internal(
-                        "run stream internal invariant violated: missing session_id for message",
-                    );
-                    finalize_run_failure(
-                        &sender,
-                        &state_for_stream,
-                        &mut run_state,
-                        active_run_id.as_deref(),
-                        &mut tape_seq,
-                        status.message(),
-                    )
-                    .await;
-                    let _ = sender.send(Err(status)).await;
-                    return;
-                };
-
-                let previous_run_id_for_context = previous_session_run_id.take();
-                let prepared_provider_input = match prepare_model_provider_input(
-                    &state_for_stream,
-                    &context_for_stream,
-                    PrepareModelProviderInputRequest {
-                        run_id: run_id.as_str(),
-                        tape_seq: &mut tape_seq,
-                        session_id: session_id_for_message.as_str(),
-                        previous_run_id: previous_run_id_for_context.as_deref(),
-                        input_text: input_text.as_str(),
-                        attachments: input_content.attachments.as_slice(),
-                        memory_ingest_reason: "run_stream_user_input",
-                        memory_prompt_failure_mode: MemoryPromptFailureMode::Fail,
-                        channel_for_log: context_for_stream.channel.as_deref().unwrap_or("n/a"),
-                    },
-                )
-                .await
-                {
-                    Ok(value) => value,
-                    Err(error) => {
-                        finalize_run_failure(
-                            &sender,
-                            &state_for_stream,
-                            &mut run_state,
-                            active_run_id.as_deref(),
-                            &mut tape_seq,
-                            error.message(),
-                        )
-                        .await;
-                        let _ = sender.send(Err(error)).await;
-                        return;
-                    }
-                };
-
-                if is_cancel_command(input_text.as_str()) {
-                    if let Err(error) = state_for_stream
-                        .request_orchestrator_cancel(OrchestratorCancelRequest {
-                            run_id: run_id.clone(),
-                            reason: "stream_cancel_command".to_owned(),
-                        })
-                        .await
-                    {
-                        finalize_run_failure(
-                            &sender,
-                            &state_for_stream,
-                            &mut run_state,
-                            active_run_id.as_deref(),
-                            &mut tape_seq,
-                            error.message(),
-                        )
-                        .await;
-                        let _ = sender.send(Err(error)).await;
-                        return;
-                    }
-                }
-
-                match state_for_stream.is_orchestrator_cancel_requested(run_id.clone()).await {
-                    Ok(true) => {
-                        if let Err(error) = transition_run_stream_to_cancelled(
-                            &sender,
-                            &state_for_stream,
-                            &mut run_state,
-                            run_id.as_str(),
-                            &mut tape_seq,
-                        )
-                        .await
-                        {
-                            finalize_run_failure(
-                                &sender,
-                                &state_for_stream,
-                                &mut run_state,
-                                active_run_id.as_deref(),
-                                &mut tape_seq,
-                                error.message(),
-                            )
-                            .await;
-                            let _ = sender.send(Err(error)).await;
-                            return;
-                        }
-                        return;
-                    }
-                    Ok(false) => {}
-                    Err(error) => {
-                        finalize_run_failure(
-                            &sender,
-                            &state_for_stream,
-                            &mut run_state,
-                            active_run_id.as_deref(),
-                            &mut tape_seq,
-                            error.message(),
-                        )
-                        .await;
-                        let _ = sender.send(Err(error)).await;
-                        return;
-                    }
-                }
-
-                if let Err(error) = ensure_run_stream_in_progress(
-                    &sender,
-                    &state_for_stream,
-                    &mut run_state,
-                    run_id.as_str(),
-                    &mut in_progress_emitted,
-                    &mut tape_seq,
-                )
-                .await
-                {
-                    finalize_run_failure(
-                        &sender,
-                        &state_for_stream,
-                        &mut run_state,
-                        active_run_id.as_deref(),
-                        &mut tape_seq,
-                        error.message(),
-                    )
-                    .await;
-                    let _ = sender.send(Err(error)).await;
-                    return;
-                }
-
-                let provider_response = match execute_run_stream_provider_request(
-                    &sender,
-                    &state_for_stream,
-                    &mut run_state,
-                    run_id.as_str(),
-                    ProviderRequest {
-                        input_text: prepared_provider_input.provider_input_text,
-                        json_mode: json_mode_requested,
-                        vision_requested: prepared_provider_input.vision_requested,
-                    },
-                    &mut tape_seq,
-                )
-                .await
-                {
-                    Ok(RunStreamProviderRequestOutcome::Completed(response)) => response,
-                    Ok(RunStreamProviderRequestOutcome::Cancelled) => {
-                        return;
-                    }
-                    Err(error) => {
-                        finalize_run_failure(
-                            &sender,
-                            &state_for_stream,
-                            &mut run_state,
-                            active_run_id.as_deref(),
-                            &mut tape_seq,
-                            error.message(),
-                        )
-                        .await;
-                        let _ = sender.send(Err(error)).await;
-                        return;
-                    }
-                };
-
-                match process_run_stream_provider_response(
+                match process_run_stream_message(
                     &sender,
                     &mut stream,
                     &state_for_stream,
                     &context_for_stream,
-                    active_session_id.as_deref(),
+                    &mut active_session_id,
+                    &mut active_run_id,
                     &mut run_state,
-                    session_id.as_str(),
-                    run_id.as_str(),
-                    session_id_for_message.as_str(),
-                    provider_response,
-                    &mut remaining_tool_budget,
                     &mut tape_seq,
                     &mut model_token_tape_events,
                     &mut model_token_compaction_emitted,
+                    &mut in_progress_emitted,
+                    &mut remaining_tool_budget,
+                    &mut previous_session_run_id,
+                    message,
                 )
                 .await
                 {
-                    Ok(RunStreamProviderResponseOutcome::Completed) => {}
-                    Ok(RunStreamProviderResponseOutcome::Cancelled) => {
+                    Ok(RunStreamMessageProcessingOutcome::Continue) => {}
+                    Ok(RunStreamMessageProcessingOutcome::Terminate) => {
                         return;
                     }
                     Err(error) => {
@@ -13907,6 +13549,202 @@ async fn ensure_run_stream_in_progress(
     .await?;
     *in_progress_emitted = true;
     Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+#[allow(clippy::too_many_arguments)]
+async fn process_run_stream_message(
+    sender: &mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
+    stream: &mut Streaming<common_v1::RunStreamRequest>,
+    runtime_state: &Arc<GatewayRuntimeState>,
+    request_context: &RequestContext,
+    active_session_id: &mut Option<String>,
+    active_run_id: &mut Option<String>,
+    run_state: &mut RunStateMachine,
+    tape_seq: &mut i64,
+    model_token_tape_events: &mut usize,
+    model_token_compaction_emitted: &mut bool,
+    in_progress_emitted: &mut bool,
+    remaining_tool_budget: &mut u32,
+    previous_session_run_id: &mut Option<String>,
+    message: common_v1::RunStreamRequest,
+) -> Result<RunStreamMessageProcessingOutcome, Status> {
+    let session_id = canonical_id(message.session_id, "session_id")?;
+    let run_id = canonical_id(message.run_id, "run_id")?;
+
+    if let Some(expected_session) = active_session_id.as_ref() {
+        if expected_session != &session_id {
+            return Err(Status::invalid_argument("run stream cannot switch session_id mid-stream"));
+        }
+    }
+    if let Some(expected_run) = active_run_id.as_ref() {
+        if expected_run != &run_id {
+            return Err(Status::invalid_argument("run stream cannot switch run_id mid-stream"));
+        }
+    }
+
+    if active_run_id.is_none() {
+        run_state
+            .transition(RunTransition::Accept)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        let resolved_session = runtime_state
+            .resolve_orchestrator_session(OrchestratorSessionResolveRequest {
+                session_id: Some(session_id.clone()),
+                session_key: non_empty(message.session_key.clone()),
+                session_label: non_empty(message.session_label.clone()),
+                principal: request_context.principal.clone(),
+                device_id: request_context.device_id.clone(),
+                channel: request_context.channel.clone(),
+                require_existing: message.require_existing,
+                reset_session: message.reset_session,
+            })
+            .await?;
+        if message.reset_session {
+            runtime_state
+                .clear_tool_approval_cache_for_session(request_context, session_id.as_str());
+        }
+        *previous_session_run_id = resolved_session.session.last_run_id.clone();
+        if resolved_session.session.session_id != session_id {
+            return Err(Status::failed_precondition(
+                "resolved session_id does not match RunStream session_id",
+            ));
+        }
+        runtime_state
+            .start_orchestrator_run(OrchestratorRunStartRequest {
+                run_id: run_id.clone(),
+                session_id: session_id.clone(),
+            })
+            .await?;
+
+        *active_session_id = Some(session_id.clone());
+        *active_run_id = Some(run_id.clone());
+
+        let accepted_message =
+            format!("accepted session={session_id} principal={}", request_context.principal);
+        send_status_with_tape(
+            sender,
+            runtime_state,
+            run_id.as_str(),
+            tape_seq,
+            common_v1::stream_status::StatusKind::Accepted,
+            accepted_message.as_str(),
+        )
+        .await?;
+    }
+
+    let input_envelope = message.input.unwrap_or_default();
+    let input_content = input_envelope.content.unwrap_or_default();
+    let input_text = input_content.text;
+    let json_mode_requested = security_requests_json_mode(input_envelope.security.as_ref());
+    let session_id_for_message = active_session_id
+        .as_deref()
+        .ok_or_else(|| {
+            Status::internal(
+                "run stream internal invariant violated: missing session_id for message",
+            )
+        })?
+        .to_owned();
+
+    let previous_run_id_for_context = previous_session_run_id.take();
+    let prepared_provider_input = prepare_model_provider_input(
+        runtime_state,
+        request_context,
+        PrepareModelProviderInputRequest {
+            run_id: run_id.as_str(),
+            tape_seq,
+            session_id: session_id_for_message.as_str(),
+            previous_run_id: previous_run_id_for_context.as_deref(),
+            input_text: input_text.as_str(),
+            attachments: input_content.attachments.as_slice(),
+            memory_ingest_reason: "run_stream_user_input",
+            memory_prompt_failure_mode: MemoryPromptFailureMode::Fail,
+            channel_for_log: request_context.channel.as_deref().unwrap_or("n/a"),
+        },
+    )
+    .await?;
+
+    if is_cancel_command(input_text.as_str()) {
+        runtime_state
+            .request_orchestrator_cancel(OrchestratorCancelRequest {
+                run_id: run_id.clone(),
+                reason: "stream_cancel_command".to_owned(),
+            })
+            .await?;
+    }
+
+    match runtime_state.is_orchestrator_cancel_requested(run_id.clone()).await {
+        Ok(true) => {
+            transition_run_stream_to_cancelled(
+                sender,
+                runtime_state,
+                run_state,
+                run_id.as_str(),
+                tape_seq,
+            )
+            .await?;
+            return Ok(RunStreamMessageProcessingOutcome::Terminate);
+        }
+        Ok(false) => {}
+        Err(error) => {
+            return Err(error);
+        }
+    }
+
+    ensure_run_stream_in_progress(
+        sender,
+        runtime_state,
+        run_state,
+        run_id.as_str(),
+        in_progress_emitted,
+        tape_seq,
+    )
+    .await?;
+
+    let provider_response = match execute_run_stream_provider_request(
+        sender,
+        runtime_state,
+        run_state,
+        run_id.as_str(),
+        ProviderRequest {
+            input_text: prepared_provider_input.provider_input_text,
+            json_mode: json_mode_requested,
+            vision_requested: prepared_provider_input.vision_requested,
+        },
+        tape_seq,
+    )
+    .await?
+    {
+        RunStreamProviderRequestOutcome::Completed(response) => response,
+        RunStreamProviderRequestOutcome::Cancelled => {
+            return Ok(RunStreamMessageProcessingOutcome::Terminate);
+        }
+    };
+
+    match process_run_stream_provider_response(
+        sender,
+        stream,
+        runtime_state,
+        request_context,
+        active_session_id.as_deref(),
+        run_state,
+        session_id.as_str(),
+        run_id.as_str(),
+        session_id_for_message.as_str(),
+        provider_response,
+        remaining_tool_budget,
+        tape_seq,
+        model_token_tape_events,
+        model_token_compaction_emitted,
+    )
+    .await?
+    {
+        RunStreamProviderResponseOutcome::Completed => {
+            Ok(RunStreamMessageProcessingOutcome::Continue)
+        }
+        RunStreamProviderResponseOutcome::Cancelled => {
+            Ok(RunStreamMessageProcessingOutcome::Terminate)
+        }
+    }
 }
 
 #[allow(clippy::result_large_err)]
