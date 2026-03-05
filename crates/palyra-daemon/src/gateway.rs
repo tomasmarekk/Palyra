@@ -416,6 +416,12 @@ enum RunStreamProviderRequestOutcome {
     Cancelled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunStreamProviderResponseOutcome {
+    Completed,
+    Cancelled,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CanvasAssetRecord {
     content_type: String,
@@ -8004,28 +8010,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     }
                 };
 
-                if let Err(error) = state_for_stream
-                    .add_orchestrator_usage(OrchestratorUsageDelta {
-                        run_id: run_id.clone(),
-                        prompt_tokens_delta: provider_response.prompt_tokens,
-                        completion_tokens_delta: 0,
-                    })
-                    .await
-                {
-                    finalize_run_failure(
-                        &sender,
-                        &state_for_stream,
-                        &mut run_state,
-                        active_run_id.as_deref(),
-                        &mut tape_seq,
-                        error.message(),
-                    )
-                    .await;
-                    let _ = sender.send(Err(error)).await;
-                    return;
-                }
-
-                let summary_tokens = match process_run_stream_provider_events(
+                match process_run_stream_provider_response(
                     &sender,
                     &mut stream,
                     &state_for_stream,
@@ -8034,7 +8019,8 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     &mut run_state,
                     session_id.as_str(),
                     run_id.as_str(),
-                    provider_response.events,
+                    session_id_for_message.as_str(),
+                    provider_response,
                     &mut remaining_tool_budget,
                     &mut tape_seq,
                     &mut model_token_tape_events,
@@ -8042,10 +8028,8 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                 )
                 .await
                 {
-                    Ok(RunStreamProviderEventsOutcome::Completed { summary_tokens }) => {
-                        summary_tokens
-                    }
-                    Ok(RunStreamProviderEventsOutcome::Cancelled) => {
+                    Ok(RunStreamProviderResponseOutcome::Completed) => {}
+                    Ok(RunStreamProviderResponseOutcome::Cancelled) => {
                         return;
                     }
                     Err(error) => {
@@ -8061,45 +8045,6 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                         let _ = sender.send(Err(error)).await;
                         return;
                     }
-                };
-
-                if provider_response.completion_tokens > 0 {
-                    if let Err(error) = state_for_stream
-                        .add_orchestrator_usage(OrchestratorUsageDelta {
-                            run_id: run_id.clone(),
-                            prompt_tokens_delta: 0,
-                            completion_tokens_delta: provider_response.completion_tokens,
-                        })
-                        .await
-                    {
-                        finalize_run_failure(
-                            &sender,
-                            &state_for_stream,
-                            &mut run_state,
-                            active_run_id.as_deref(),
-                            &mut tape_seq,
-                            error.message(),
-                        )
-                        .await;
-                        let _ = sender.send(Err(error)).await;
-                        return;
-                    }
-                }
-
-                if !summary_tokens.is_empty() {
-                    let summary_text = summary_tokens.join(" ");
-                    ingest_memory_best_effort(
-                        &state_for_stream,
-                        context_for_stream.principal.as_str(),
-                        context_for_stream.channel.as_deref(),
-                        Some(session_id_for_message.as_str()),
-                        MemorySource::Summary,
-                        summary_text.as_str(),
-                        vec!["summary:model_output".to_owned()],
-                        Some(0.75),
-                        "run_stream_model_summary",
-                    )
-                    .await;
                 }
             }
 
@@ -13967,6 +13912,84 @@ async fn execute_run_stream_provider_request(
             }
         }
     }
+}
+
+#[allow(clippy::result_large_err)]
+#[allow(clippy::too_many_arguments)]
+async fn process_run_stream_provider_response(
+    sender: &mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
+    stream: &mut Streaming<common_v1::RunStreamRequest>,
+    runtime_state: &Arc<GatewayRuntimeState>,
+    request_context: &RequestContext,
+    active_session_id: Option<&str>,
+    run_state: &mut RunStateMachine,
+    session_id: &str,
+    run_id: &str,
+    session_id_for_message: &str,
+    provider_response: ProviderResponse,
+    remaining_tool_budget: &mut u32,
+    tape_seq: &mut i64,
+    model_token_tape_events: &mut usize,
+    model_token_compaction_emitted: &mut bool,
+) -> Result<RunStreamProviderResponseOutcome, Status> {
+    runtime_state
+        .add_orchestrator_usage(OrchestratorUsageDelta {
+            run_id: run_id.to_owned(),
+            prompt_tokens_delta: provider_response.prompt_tokens,
+            completion_tokens_delta: 0,
+        })
+        .await?;
+
+    let summary_tokens = match process_run_stream_provider_events(
+        sender,
+        stream,
+        runtime_state,
+        request_context,
+        active_session_id,
+        run_state,
+        session_id,
+        run_id,
+        provider_response.events,
+        remaining_tool_budget,
+        tape_seq,
+        model_token_tape_events,
+        model_token_compaction_emitted,
+    )
+    .await?
+    {
+        RunStreamProviderEventsOutcome::Completed { summary_tokens } => summary_tokens,
+        RunStreamProviderEventsOutcome::Cancelled => {
+            return Ok(RunStreamProviderResponseOutcome::Cancelled);
+        }
+    };
+
+    if provider_response.completion_tokens > 0 {
+        runtime_state
+            .add_orchestrator_usage(OrchestratorUsageDelta {
+                run_id: run_id.to_owned(),
+                prompt_tokens_delta: 0,
+                completion_tokens_delta: provider_response.completion_tokens,
+            })
+            .await?;
+    }
+
+    if !summary_tokens.is_empty() {
+        let summary_text = summary_tokens.join(" ");
+        ingest_memory_best_effort(
+            runtime_state,
+            request_context.principal.as_str(),
+            request_context.channel.as_deref(),
+            Some(session_id_for_message),
+            MemorySource::Summary,
+            summary_text.as_str(),
+            vec!["summary:model_output".to_owned()],
+            Some(0.75),
+            "run_stream_model_summary",
+        )
+        .await;
+    }
+
+    Ok(RunStreamProviderResponseOutcome::Completed)
 }
 
 #[allow(clippy::too_many_arguments)]
