@@ -936,18 +936,21 @@ fn console_channels_endpoints_require_session_and_csrf() -> Result<()> {
             "requested_broadcast": false,
         }))
         .send()
-        .context("failed to call channels test endpoint with csrf token")?
-        .error_for_status()
-        .context("channels test endpoint returned non-success status")?
-        .json::<Value>()
-        .context("failed to parse channels test response json")?;
-    assert!(
-        test_response.get("ingest").is_some(),
-        "channels test response should include ingest payload"
+        .context("failed to call channels test endpoint with csrf token")?;
+    assert_eq!(
+        test_response.status().as_u16(),
+        412,
+        "channels test endpoint should fail with failed-precondition when connector token is missing"
     );
+    let test_response = test_response
+        .json::<Value>()
+        .context("failed to parse channels test error response json")?;
     assert!(
-        test_response.get("status").is_some(),
-        "channels test response should include status payload"
+        test_response
+            .get("error")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.contains("connector_token is required")),
+        "channels test error response should explain missing connector token requirement"
     );
 
     let discord_connector_id = "discord:default";

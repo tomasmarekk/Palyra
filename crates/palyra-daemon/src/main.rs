@@ -7640,6 +7640,14 @@ fn channel_platform_error_response(error: channels::ChannelPlatformError) -> Res
         ) => tonic::Status::invalid_argument(message.clone()),
         channels::ChannelPlatformError::Supervisor(
             palyra_connectors::ConnectorSupervisorError::Router(message),
+        ) if message.contains(
+            "connector_token is required for RouteMessage when gateway auth is enabled",
+        ) =>
+        {
+            tonic::Status::failed_precondition(message.clone())
+        }
+        channels::ChannelPlatformError::Supervisor(
+            palyra_connectors::ConnectorSupervisorError::Router(message),
         ) => tonic::Status::unavailable(message.clone()),
         channels::ChannelPlatformError::Supervisor(
             palyra_connectors::ConnectorSupervisorError::Adapter(message),
