@@ -79,7 +79,8 @@ use crate::{
         SkillExecutionStatus, SkillStatusRecord, SkillStatusUpsertRequest,
     },
     model_provider::{
-        ModelProvider, ProviderError, ProviderEvent, ProviderRequest, ProviderStatusSnapshot,
+        ModelProvider, ProviderError, ProviderEvent, ProviderRequest, ProviderResponse,
+        ProviderStatusSnapshot,
     },
     orchestrator::{is_cancel_command, RunLifecycleState, RunStateMachine, RunTransition},
     tool_protocol::{
@@ -406,6 +407,12 @@ enum RunStreamProviderEventsOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunStreamPostProviderOutcome {
     Completed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone)]
+enum RunStreamProviderRequestOutcome {
+    Completed(ProviderResponse),
     Cancelled,
 }
 
@@ -7964,77 +7971,36 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     in_progress_emitted = true;
                 }
 
-                let mut provider_future =
-                    Box::pin(state_for_stream.execute_model_provider(ProviderRequest {
+                let provider_response = match execute_run_stream_provider_request(
+                    &sender,
+                    &state_for_stream,
+                    &mut run_state,
+                    run_id.as_str(),
+                    ProviderRequest {
                         input_text: prepared_provider_input.provider_input_text,
                         json_mode: json_mode_requested,
                         vision_requested: prepared_provider_input.vision_requested,
-                    }));
-                let mut cancel_poll = interval(Duration::from_millis(100));
-                cancel_poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
-
-                let provider_response = loop {
-                    tokio::select! {
-                        provider_result = &mut provider_future => {
-                            match provider_result {
-                                Ok(response) => break response,
-                                Err(error) => {
-                                    finalize_run_failure(
-                                        &sender,
-                                        &state_for_stream,
-                                        &mut run_state,
-                                        active_run_id.as_deref(),
-                                        &mut tape_seq,
-                                        error.message(),
-                                    )
-                                    .await;
-                                    let _ = sender.send(Err(error)).await;
-                                    return;
-                                }
-                            }
-                        }
-                        _ = cancel_poll.tick() => {
-                            match state_for_stream.is_orchestrator_cancel_requested(run_id.clone()).await {
-                                Ok(true) => {
-                                    if let Err(error) = transition_run_stream_to_cancelled(
-                                        &sender,
-                                        &state_for_stream,
-                                        &mut run_state,
-                                        run_id.as_str(),
-                                        &mut tape_seq,
-                                    )
-                                    .await
-                                    {
-                                        finalize_run_failure(
-                                            &sender,
-                                            &state_for_stream,
-                                            &mut run_state,
-                                            active_run_id.as_deref(),
-                                            &mut tape_seq,
-                                            error.message(),
-                                        )
-                                        .await;
-                                        let _ = sender.send(Err(error)).await;
-                                        return;
-                                    }
-                                    return;
-                                }
-                                Ok(false) => {}
-                                Err(error) => {
-                                    finalize_run_failure(
-                                        &sender,
-                                        &state_for_stream,
-                                        &mut run_state,
-                                        active_run_id.as_deref(),
-                                        &mut tape_seq,
-                                        error.message(),
-                                    )
-                                    .await;
-                                    let _ = sender.send(Err(error)).await;
-                                    return;
-                                }
-                            }
-                        }
+                    },
+                    &mut tape_seq,
+                )
+                .await
+                {
+                    Ok(RunStreamProviderRequestOutcome::Completed(response)) => response,
+                    Ok(RunStreamProviderRequestOutcome::Cancelled) => {
+                        return;
+                    }
+                    Err(error) => {
+                        finalize_run_failure(
+                            &sender,
+                            &state_for_stream,
+                            &mut run_state,
+                            active_run_id.as_deref(),
+                            &mut tape_seq,
+                            error.message(),
+                        )
+                        .await;
+                        let _ = sender.send(Err(error)).await;
+                        return;
                     }
                 };
 
@@ -13960,6 +13926,47 @@ async fn finalize_run_stream_after_provider_response(
     }
 
     Ok(RunStreamPostProviderOutcome::Completed)
+}
+
+#[allow(clippy::result_large_err)]
+async fn execute_run_stream_provider_request(
+    sender: &mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_state: &mut RunStateMachine,
+    run_id: &str,
+    provider_request: ProviderRequest,
+    tape_seq: &mut i64,
+) -> Result<RunStreamProviderRequestOutcome, Status> {
+    let mut provider_future = Box::pin(runtime_state.execute_model_provider(provider_request));
+    let mut cancel_poll = interval(Duration::from_millis(100));
+    cancel_poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            provider_result = &mut provider_future => {
+                return provider_result.map(RunStreamProviderRequestOutcome::Completed);
+            }
+            _ = cancel_poll.tick() => {
+                match runtime_state.is_orchestrator_cancel_requested(run_id.to_owned()).await {
+                    Ok(true) => {
+                        transition_run_stream_to_cancelled(
+                            sender,
+                            runtime_state,
+                            run_state,
+                            run_id,
+                            tape_seq,
+                        )
+                        .await?;
+                        return Ok(RunStreamProviderRequestOutcome::Cancelled);
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
