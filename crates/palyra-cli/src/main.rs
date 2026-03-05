@@ -5479,6 +5479,23 @@ struct DashboardVerificationReport {
     verified: bool,
 }
 
+fn redacted_dashboard_verification_report(
+    verification: &DashboardRemoteVerification,
+    verified: bool,
+) -> DashboardVerificationReport {
+    DashboardVerificationReport {
+        method: verification.method,
+        expected_fingerprint_sha256: REDACTED.to_owned(),
+        observed_server_cert_fingerprint_sha256: REDACTED.to_owned(),
+        gateway_ca_fingerprint_sha256: matches!(
+            verification.method,
+            DashboardRemoteVerificationMethod::PinnedGatewayCaSha256
+        )
+        .then(|| REDACTED.to_owned()),
+        verified,
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct StoredGatewayCaState {
     certificate_pem: String,
@@ -5844,10 +5861,14 @@ fn run_daemon(command: DaemonCommand) -> Result<()> {
         DaemonCommand::DashboardUrl { path, verify_remote, identity_store_dir, open, json } => {
             let target = resolve_dashboard_access_target(path)?;
             let verification_report = if verify_remote {
-                Some(verify_dashboard_remote_target(
+                let _ = verify_dashboard_remote_target(
                     &target,
                     identity_store_dir.and_then(normalize_optional_text_arg),
-                )?)
+                )?;
+                target
+                    .verification
+                    .as_ref()
+                    .map(|verification| redacted_dashboard_verification_report(verification, true))
             } else {
                 None
             };

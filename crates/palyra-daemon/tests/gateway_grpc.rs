@@ -1397,7 +1397,7 @@ async fn grpc_route_message_reuses_cached_tool_approval_from_run_stream() -> Res
         .context("failed to connect gRPC client")?;
     let adapter = FakeChannelAdapter::default();
 
-    let first_route = adapter
+    let mut first_route = adapter
         .inject_message_with_envelope_id(
             &mut client,
             "hey @palyra run process command now",
@@ -1413,13 +1413,13 @@ async fn grpc_route_message_reuses_cached_tool_approval_from_run_stream() -> Res
     );
     let first_route_run_id = first_route
         .run_id
-        .as_ref()
-        .map(|id| id.ulid.clone())
+        .take()
+        .map(|id| id.ulid)
         .context("first route response missing run_id")?;
     let route_session_id = first_route
         .session_id
-        .as_ref()
-        .map(|id| id.ulid.clone())
+        .take()
+        .map(|id| id.ulid)
         .context("first route response missing session_id")?;
     let first_outbound = first_route
         .outputs
@@ -1508,7 +1508,7 @@ async fn grpc_route_message_reuses_cached_tool_approval_from_run_stream() -> Res
         .and_then(Value::as_u64)
         .context("status snapshot missing tool_execution_attempts before second route")?;
 
-    let second_route = adapter
+    let mut second_route = adapter
         .inject_message_with_envelope_id(
             &mut client,
             "hey @palyra run process command again",
@@ -1524,8 +1524,8 @@ async fn grpc_route_message_reuses_cached_tool_approval_from_run_stream() -> Res
     );
     let second_route_run_id = second_route
         .run_id
-        .as_ref()
-        .map(|id| id.ulid.clone())
+        .take()
+        .map(|id| id.ulid)
         .context("second route response missing run_id")?;
     let second_outbound = second_route
         .outputs
