@@ -15,6 +15,7 @@ use palyra_common::{
     default_config_search_paths, parse_config_path, parse_daemon_bind_socket,
     redaction::{redact_auth_error, redact_url},
 };
+use palyra_vault::{BackendPreference, Vault, VaultConfig, VaultError, VaultScope};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -23,7 +24,6 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, Mutex};
 use ulid::Ulid;
-use which::which;
 
 const SUPERVISOR_TICK_MS: u64 = 500;
 const MAX_LOG_LINES_PER_SERVICE: usize = 400;
@@ -32,6 +32,10 @@ const DASHBOARD_SCHEME: &str = "http";
 const LOOPBACK_HOST: &str = "127.0.0.1";
 const CONSOLE_PRINCIPAL: &str = "admin:desktop-control-center";
 const CONSOLE_DEVICE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+const DESKTOP_STATE_SCHEMA_VERSION: u32 = 2;
+const DESKTOP_SECRET_MAX_BYTES: usize = 4_096;
+const DESKTOP_SECRET_KEY_ADMIN_TOKEN: &str = "desktop_admin_token";
+const DESKTOP_SECRET_KEY_BROWSER_AUTH_TOKEN: &str = "desktop_browser_auth_token";
 
 const GATEWAY_ADMIN_PORT: u16 = 7142;
 const GATEWAY_GRPC_PORT: u16 = 7443;
@@ -174,20 +178,106 @@ impl Default for RuntimeConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DesktopStateFile {
     schema_version: u32,
-    admin_token: String,
-    browser_auth_token: String,
     browser_service_enabled: bool,
 }
 
 impl DesktopStateFile {
     fn new_default() -> Self {
         Self {
-            schema_version: 1,
-            admin_token: generate_secret_token(),
-            browser_auth_token: generate_secret_token(),
+            schema_version: DESKTOP_STATE_SCHEMA_VERSION,
             browser_service_enabled: true,
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LegacyDesktopStateFile {
+    #[serde(default = "default_legacy_schema_version")]
+    schema_version: u32,
+    #[serde(default)]
+    admin_token: String,
+    #[serde(default)]
+    browser_auth_token: String,
+    #[serde(default = "default_browser_service_enabled")]
+    browser_service_enabled: bool,
+}
+
+impl LegacyDesktopStateFile {
+    fn into_state(self) -> DesktopStateFile {
+        let _ = self.schema_version;
+        DesktopStateFile {
+            schema_version: DESKTOP_STATE_SCHEMA_VERSION,
+            browser_service_enabled: self.browser_service_enabled,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LoadedDesktopState {
+    persisted: DesktopStateFile,
+    admin_token: String,
+    browser_auth_token: String,
+}
+
+struct DesktopSecretStore {
+    vault: Vault,
+}
+
+impl DesktopSecretStore {
+    fn open(state_dir: &Path) -> Result<Self> {
+        let backend_preference = if cfg!(test) {
+            BackendPreference::EncryptedFile
+        } else {
+            BackendPreference::Auto
+        };
+        let vault = Vault::open_with_config(VaultConfig {
+            root: Some(state_dir.join("vault")),
+            identity_store_root: Some(state_dir.join("identity")),
+            backend_preference,
+            max_secret_bytes: DESKTOP_SECRET_MAX_BYTES,
+        })
+        .map_err(|error| anyhow!("failed to initialize desktop secret store: {error}"))?;
+        Ok(Self { vault })
+    }
+
+    fn load_or_create_secret(&self, key: &str, legacy_value: Option<&str>) -> Result<String> {
+        let scope = VaultScope::Global;
+        if let Some(value) = self.read_secret_utf8(&scope, key)? {
+            return Ok(value);
+        }
+
+        let value = normalize_optional_text(legacy_value.unwrap_or_default())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(generate_secret_token);
+        self.vault
+            .put_secret(&scope, key, value.as_bytes())
+            .map_err(|error| anyhow!("failed to persist desktop secret '{key}': {error}"))?;
+        Ok(value)
+    }
+
+    fn read_secret_utf8(&self, scope: &VaultScope, key: &str) -> Result<Option<String>> {
+        match self.vault.get_secret(scope, key) {
+            Ok(raw) => {
+                let decoded = String::from_utf8(raw).with_context(|| {
+                    format!("desktop secret '{key}' contains non UTF-8 bytes")
+                })?;
+                if decoded.trim().is_empty() {
+                    return Ok(None);
+                }
+                Ok(Some(decoded))
+            }
+            Err(VaultError::NotFound) => Ok(None),
+            Err(error) => Err(anyhow!("failed to read desktop secret '{key}': {error}")),
+        }
+    }
+}
+
+const fn default_legacy_schema_version() -> u32 {
+    1
+}
+
+const fn default_browser_service_enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize)]
@@ -313,6 +403,8 @@ struct ControlCenter {
     support_bundle_dir: PathBuf,
     state_file_path: PathBuf,
     persisted: DesktopStateFile,
+    admin_token: String,
+    browser_auth_token: String,
     runtime: RuntimeConfig,
     gateway: ManagedService,
     browserd: ManagedService,
@@ -335,7 +427,8 @@ impl ControlCenter {
         })?;
 
         let state_file_path = state_dir.join("state.json");
-        let persisted = load_or_initialize_state_file(state_file_path.as_path())?;
+        let secret_store = DesktopSecretStore::open(state_dir.as_path())?;
+        let loaded = load_or_initialize_state_file(state_file_path.as_path(), &secret_store)?;
 
         let runtime = RuntimeConfig::default();
         let gateway = ManagedService::new(vec![
@@ -358,7 +451,9 @@ impl ControlCenter {
             runtime_root,
             support_bundle_dir,
             state_file_path,
-            persisted,
+            persisted: loaded.persisted,
+            admin_token: loaded.admin_token,
+            browser_auth_token: loaded.browser_auth_token,
             runtime,
             gateway,
             browserd,
@@ -598,7 +693,7 @@ impl ControlCenter {
                     .arg("--grpc-port")
                     .arg(self.runtime.browser_grpc_port.to_string())
                     .arg("--auth-token")
-                    .arg(self.persisted.browser_auth_token.as_str());
+                    .arg(self.browser_auth_token.as_str());
                 for (key, value) in self.browserd_env() {
                     command.env(key, value);
                 }
@@ -653,7 +748,7 @@ impl ControlCenter {
         vec![
             ("PALYRA_DEPLOYMENT_MODE".to_owned(), "local_desktop".to_owned()),
             ("PALYRA_ADMIN_REQUIRE_AUTH".to_owned(), "true".to_owned()),
-            ("PALYRA_ADMIN_TOKEN".to_owned(), self.persisted.admin_token.clone()),
+            ("PALYRA_ADMIN_TOKEN".to_owned(), self.admin_token.clone()),
             ("PALYRA_STATE_ROOT".to_owned(), self.runtime_root.to_string_lossy().into_owned()),
             ("PALYRA_DAEMON_BIND_ADDR".to_owned(), LOOPBACK_HOST.to_owned()),
             ("PALYRA_DAEMON_PORT".to_owned(), self.runtime.gateway_admin_port.to_string()),
@@ -668,7 +763,7 @@ impl ControlCenter {
             ),
             (
                 "PALYRA_BROWSER_SERVICE_AUTH_TOKEN".to_owned(),
-                self.persisted.browser_auth_token.clone(),
+                self.browser_auth_token.clone(),
             ),
         ]
     }
@@ -676,7 +771,7 @@ impl ControlCenter {
     fn browserd_env(&self) -> Vec<(String, String)> {
         vec![
             ("PALYRA_STATE_ROOT".to_owned(), self.runtime_root.to_string_lossy().into_owned()),
-            ("PALYRA_BROWSERD_AUTH_TOKEN".to_owned(), self.persisted.browser_auth_token.clone()),
+            ("PALYRA_BROWSERD_AUTH_TOKEN".to_owned(), self.browser_auth_token.clone()),
         ]
     }
 
@@ -914,7 +1009,7 @@ impl ControlCenter {
     async fn login_console_session(&self) -> Result<()> {
         let url = loopback_url(self.runtime.gateway_admin_port, "/console/v1/auth/login")?;
         let payload = json!({
-            "admin_token": self.persisted.admin_token,
+            "admin_token": self.admin_token.clone(),
             "principal": CONSOLE_PRINCIPAL,
             "device_id": CONSOLE_DEVICE_ID,
         });
@@ -973,7 +1068,7 @@ impl ControlCenter {
             .arg("--output")
             .arg(output_path.as_os_str())
             .env("PALYRA_STATE_ROOT", self.runtime_root.to_string_lossy().into_owned())
-            .env("PALYRA_ADMIN_TOKEN", self.persisted.admin_token.clone());
+            .env("PALYRA_ADMIN_TOKEN", self.admin_token.clone());
 
         let output = command.output().await.context("failed to run support-bundle export")?;
         let stdout = sanitize_log_line(String::from_utf8_lossy(output.stdout.as_slice()).as_ref());
@@ -1330,14 +1425,10 @@ fn resolve_binary_path(binary_name: &str, env_override: &str) -> Result<PathBuf>
         let trimmed = value.trim();
         if !trimmed.is_empty() {
             let candidate = PathBuf::from(trimmed);
-            if candidate.exists() {
-                return Ok(candidate);
+            if !candidate.is_absolute() {
+                bail!("{env_override} must be an absolute path");
             }
-            bail!(
-                "{} points to '{}', but that file does not exist",
-                env_override,
-                candidate.display()
-            );
+            return canonicalize_explicit_binary_path(candidate.as_path(), env_override);
         }
     }
 
@@ -1354,22 +1445,42 @@ fn resolve_binary_path(binary_name: &str, env_override: &str) -> Result<PathBuf>
         }
     }
 
-    if let Ok(current_dir) = env::current_dir() {
-        candidates.push(current_dir.join("target").join("debug").join(executable_name.as_str()));
-        candidates.push(current_dir.join("target").join("release").join(executable_name.as_str()));
-    }
-
     for candidate in candidates {
-        if candidate.exists() {
-            return Ok(candidate);
+        if let Some(canonical) = canonicalize_binary_candidate(candidate.as_path()) {
+            return Ok(canonical);
         }
     }
 
-    if let Ok(path) = which(binary_name) {
-        return Ok(path);
-    }
+    bail!(
+        "unable to locate '{}'; set {} to an absolute path or place the binary next to the desktop executable",
+        binary_name,
+        env_override
+    )
+}
 
-    bail!("unable to locate '{}'; build/install it or set {}", binary_name, env_override)
+fn canonicalize_explicit_binary_path(candidate: &Path, env_override: &str) -> Result<PathBuf> {
+    let canonical = fs::canonicalize(candidate).with_context(|| {
+        format!("{env_override} points to '{}', but that file does not exist", candidate.display())
+    })?;
+    let metadata = fs::metadata(canonical.as_path()).with_context(|| {
+        format!(
+            "{env_override} points to '{}', but file metadata could not be read",
+            canonical.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        bail!(
+            "{env_override} points to '{}', but that path is not a file",
+            canonical.display()
+        );
+    }
+    Ok(canonical)
+}
+
+fn canonicalize_binary_candidate(candidate: &Path) -> Option<PathBuf> {
+    let canonical = fs::canonicalize(candidate).ok()?;
+    let metadata = fs::metadata(canonical.as_path()).ok()?;
+    if metadata.is_file() { Some(canonical) } else { None }
 }
 
 fn executable_file_name(base: &str) -> String {
@@ -1386,7 +1497,10 @@ fn resolve_desktop_state_root() -> Result<PathBuf> {
     })
 }
 
-fn load_or_initialize_state_file(path: &Path) -> Result<DesktopStateFile> {
+fn load_or_initialize_state_file(
+    path: &Path,
+    secret_store: &DesktopSecretStore,
+) -> Result<LoadedDesktopState> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| {
             format!("failed to create desktop state directory {}", parent.display())
@@ -1396,28 +1510,32 @@ fn load_or_initialize_state_file(path: &Path) -> Result<DesktopStateFile> {
     if path.exists() {
         let raw = fs::read_to_string(path)
             .with_context(|| format!("failed to read desktop state file {}", path.display()))?;
-        let mut state: DesktopStateFile = serde_json::from_str(raw.as_str())
+        let legacy_state: LegacyDesktopStateFile = serde_json::from_str(raw.as_str())
             .with_context(|| format!("failed to parse desktop state file {}", path.display()))?;
-        if state.admin_token.trim().is_empty() {
-            state.admin_token = generate_secret_token();
-        }
-        if state.browser_auth_token.trim().is_empty() {
-            state.browser_auth_token = generate_secret_token();
-        }
-        let encoded = serde_json::to_string_pretty(&state)
-            .context("failed to encode normalized desktop state file")?;
-        fs::write(path, encoded).with_context(|| {
-            format!("failed to persist normalized desktop state file {}", path.display())
-        })?;
-        return Ok(state);
+        let admin_token = secret_store
+            .load_or_create_secret(DESKTOP_SECRET_KEY_ADMIN_TOKEN, Some(legacy_state.admin_token.as_str()))?;
+        let browser_auth_token = secret_store.load_or_create_secret(
+            DESKTOP_SECRET_KEY_BROWSER_AUTH_TOKEN,
+            Some(legacy_state.browser_auth_token.as_str()),
+        )?;
+        let persisted = legacy_state.into_state();
+        persist_desktop_state_file(path, &persisted, "normalized")?;
+        return Ok(LoadedDesktopState { persisted, admin_token, browser_auth_token });
     }
 
-    let state = DesktopStateFile::new_default();
-    let encoded = serde_json::to_string_pretty(&state)
-        .context("failed to encode default desktop state file")?;
+    let persisted = DesktopStateFile::new_default();
+    let admin_token = secret_store.load_or_create_secret(DESKTOP_SECRET_KEY_ADMIN_TOKEN, None)?;
+    let browser_auth_token =
+        secret_store.load_or_create_secret(DESKTOP_SECRET_KEY_BROWSER_AUTH_TOKEN, None)?;
+    persist_desktop_state_file(path, &persisted, "default")?;
+    Ok(LoadedDesktopState { persisted, admin_token, browser_auth_token })
+}
+
+fn persist_desktop_state_file(path: &Path, state: &DesktopStateFile, label: &str) -> Result<()> {
+    let encoded = serde_json::to_string_pretty(state)
+        .with_context(|| format!("failed to encode {label} desktop state file"))?;
     fs::write(path, encoded)
-        .with_context(|| format!("failed to create desktop state file {}", path.display()))?;
-    Ok(state)
+        .with_context(|| format!("failed to persist {label} desktop state file {}", path.display()))
 }
 
 fn generate_secret_token() -> String {
@@ -1573,8 +1691,9 @@ mod tests {
 
     use super::{
         collect_redacted_errors, compute_backoff_ms, parse_discord_status, sanitize_log_line,
-        parse_remote_dashboard_base_url, resolve_dashboard_access_target, BrowserStatusSnapshot,
-        DashboardAccessMode, Ulid,
+        executable_file_name, load_or_initialize_state_file, parse_remote_dashboard_base_url,
+        resolve_binary_path, resolve_dashboard_access_target, BrowserStatusSnapshot,
+        DashboardAccessMode, DesktopSecretStore, Ulid,
     };
 
     fn env_lock() -> &'static Mutex<()> {
@@ -1614,6 +1733,24 @@ mod tests {
         }
     }
 
+    struct ScopedCurrentDir {
+        previous: PathBuf,
+    }
+
+    impl ScopedCurrentDir {
+        fn set(path: &Path) -> Self {
+            let previous = std::env::current_dir().expect("current directory should resolve");
+            std::env::set_current_dir(path).expect("current directory should be set");
+            Self { previous }
+        }
+    }
+
+    impl Drop for ScopedCurrentDir {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(self.previous.as_path());
+        }
+    }
+
     struct TempFixtureDir {
         root: PathBuf,
     }
@@ -1640,6 +1777,13 @@ mod tests {
         let path = root.join("palyra.toml");
         std::fs::write(path.as_path(), content).expect("fixture config should be written");
         path
+    }
+
+    fn write_file(path: &Path, content: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("fixture parent directory should be created");
+        }
+        std::fs::write(path, content).expect("fixture file should be written");
     }
 
     #[test]
@@ -1776,5 +1920,136 @@ port = 9911
             .expect("dashboard access target should resolve from daemon bind");
         assert_eq!(target.url, "http://127.0.0.1:9911/");
         assert_eq!(target.mode, DashboardAccessMode::Local);
+    }
+
+    #[test]
+    fn state_file_migration_moves_plaintext_tokens_to_secret_store() {
+        let fixture = TempFixtureDir::new();
+        let state_path = fixture.path().join("state.json");
+        let legacy_admin_token = format!("legacy-admin-{}", Ulid::new());
+        let legacy_browser_token = format!("legacy-browser-{}", Ulid::new());
+        let legacy = json!({
+            "schema_version": 1_u32,
+            "admin_token": legacy_admin_token,
+            "browser_auth_token": legacy_browser_token,
+            "browser_service_enabled": false,
+        });
+        write_file(
+            state_path.as_path(),
+            serde_json::to_string_pretty(&legacy)
+                .expect("legacy desktop state fixture should serialize")
+                .as_str(),
+        );
+
+        let secret_store =
+            DesktopSecretStore::open(fixture.path()).expect("secret store should initialize");
+        let loaded = load_or_initialize_state_file(state_path.as_path(), &secret_store)
+            .expect("legacy desktop state should migrate");
+        assert_eq!(
+            loaded.admin_token,
+            legacy["admin_token"]
+                .as_str()
+                .expect("legacy admin token fixture should be string")
+        );
+        assert_eq!(
+            loaded.browser_auth_token,
+            legacy["browser_auth_token"]
+                .as_str()
+                .expect("legacy browser token fixture should be string")
+        );
+        assert!(!loaded.persisted.browser_service_enabled);
+
+        let rewritten = std::fs::read_to_string(state_path.as_path())
+            .expect("rewritten desktop state should be readable");
+        assert!(!rewritten.contains(legacy["admin_token"].as_str().unwrap_or_default()));
+        assert!(!rewritten.contains(legacy["browser_auth_token"].as_str().unwrap_or_default()));
+
+        let persisted_json: serde_json::Value =
+            serde_json::from_str(rewritten.as_str()).expect("rewritten state should parse");
+        assert!(persisted_json.get("admin_token").is_none());
+        assert!(persisted_json.get("browser_auth_token").is_none());
+        assert_eq!(persisted_json["browser_service_enabled"], json!(false));
+
+        let loaded_again = load_or_initialize_state_file(state_path.as_path(), &secret_store)
+            .expect("migrated desktop state should load from secret store");
+        assert_eq!(loaded_again.admin_token, loaded.admin_token);
+        assert_eq!(loaded_again.browser_auth_token, loaded.browser_auth_token);
+    }
+
+    #[test]
+    fn state_file_initialization_never_writes_plaintext_tokens() {
+        let fixture = TempFixtureDir::new();
+        let state_path = fixture.path().join("state.json");
+        let secret_store =
+            DesktopSecretStore::open(fixture.path()).expect("secret store should initialize");
+        let loaded = load_or_initialize_state_file(state_path.as_path(), &secret_store)
+            .expect("desktop state should initialize");
+        let persisted_raw =
+            std::fs::read_to_string(state_path.as_path()).expect("desktop state should be readable");
+        assert!(!persisted_raw.contains(loaded.admin_token.as_str()));
+        assert!(!persisted_raw.contains(loaded.browser_auth_token.as_str()));
+        assert!(!persisted_raw.contains("admin_token"));
+        assert!(!persisted_raw.contains("browser_auth_token"));
+    }
+
+    #[test]
+    fn resolve_binary_path_accepts_absolute_env_override_file() {
+        let _env_guard = env_lock().lock().expect("env lock should be available");
+        let fixture = TempFixtureDir::new();
+        let binary_name = "palyra-resolver-override";
+        let binary_path = fixture.path().join(executable_file_name(binary_name));
+        write_file(binary_path.as_path(), "binary");
+
+        let override_path = binary_path.to_string_lossy().into_owned();
+        let _override = ScopedEnvVar::set("PALYRA_TEST_RESOLVE_BIN", override_path.as_str());
+        let resolved = resolve_binary_path(binary_name, "PALYRA_TEST_RESOLVE_BIN")
+            .expect("absolute env override should be accepted");
+        let expected = std::fs::canonicalize(binary_path.as_path())
+            .expect("canonicalized override path should resolve");
+        assert_eq!(resolved, expected);
+    }
+
+    #[test]
+    fn resolve_binary_path_rejects_relative_env_override() {
+        let _env_guard = env_lock().lock().expect("env lock should be available");
+        let _override = ScopedEnvVar::set("PALYRA_TEST_RESOLVE_BIN", "relative/path/to/palyrad");
+        let error = resolve_binary_path("palyrad", "PALYRA_TEST_RESOLVE_BIN")
+            .expect_err("relative env override must be rejected");
+        assert!(error.to_string().contains("must be an absolute path"));
+    }
+
+    #[test]
+    fn resolve_binary_path_rejects_cwd_target_fallback() {
+        let _env_guard = env_lock().lock().expect("env lock should be available");
+        let fixture = TempFixtureDir::new();
+        let binary_name = format!("palyra-cwd-{}", Ulid::new());
+        let binary_path = fixture
+            .path()
+            .join("target")
+            .join("debug")
+            .join(executable_file_name(binary_name.as_str()));
+        write_file(binary_path.as_path(), "binary");
+        let _cwd = ScopedCurrentDir::set(fixture.path());
+        let _override = ScopedEnvVar::set("PALYRA_TEST_RESOLVE_BIN", "");
+
+        let error = resolve_binary_path(binary_name.as_str(), "PALYRA_TEST_RESOLVE_BIN")
+            .expect_err("cwd fallback should be rejected");
+        assert!(error.to_string().contains("unable to locate"));
+    }
+
+    #[test]
+    fn resolve_binary_path_rejects_path_only_binary() {
+        let _env_guard = env_lock().lock().expect("env lock should be available");
+        let fixture = TempFixtureDir::new();
+        let binary_name = format!("palyra-path-{}", Ulid::new());
+        let binary_path = fixture.path().join(executable_file_name(binary_name.as_str()));
+        write_file(binary_path.as_path(), "binary");
+        let path_value = fixture.path().to_string_lossy().into_owned();
+        let _path = ScopedEnvVar::set("PATH", path_value.as_str());
+        let _override = ScopedEnvVar::set("PALYRA_TEST_RESOLVE_BIN", "");
+
+        let error = resolve_binary_path(binary_name.as_str(), "PALYRA_TEST_RESOLVE_BIN")
+            .expect_err("PATH fallback should be rejected");
+        assert!(error.to_string().contains("unable to locate"));
     }
 }
