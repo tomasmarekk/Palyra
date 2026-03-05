@@ -384,6 +384,27 @@ struct SupportBundleExportResult {
     command_output: String,
 }
 
+#[derive(Debug)]
+struct SnapshotBuildInputs {
+    runtime: RuntimeConfig,
+    browser_service_enabled: bool,
+    admin_token: String,
+    browser_last_exit: Option<String>,
+    gateway_running: bool,
+    browser_running: bool,
+    gateway_process: ServiceProcessSnapshot,
+    browserd_process: ServiceProcessSnapshot,
+    logs: Vec<LogLine>,
+    http_client: Client,
+}
+
+#[derive(Debug, Clone)]
+struct SupportBundleExportPlan {
+    runtime_root: PathBuf,
+    support_bundle_dir: PathBuf,
+    admin_token: String,
+}
+
 #[derive(Debug, Serialize)]
 struct DesktopSettingsSnapshot {
     browser_service_enabled: bool,
@@ -469,10 +490,6 @@ impl ControlCenter {
 
     fn dashboard_access_target(&self) -> Result<DashboardAccessTarget> {
         resolve_dashboard_access_target(self.runtime.gateway_admin_port)
-    }
-
-    fn default_dashboard_access_target(&self) -> DashboardAccessTarget {
-        default_dashboard_access_target(self.runtime.gateway_admin_port)
     }
 
     fn save_state_file(&self) -> Result<()> {
@@ -841,260 +858,28 @@ impl ControlCenter {
         combined
     }
 
-    async fn build_snapshot(&mut self) -> Result<ControlCenterSnapshot> {
+    fn capture_snapshot_inputs(&mut self) -> SnapshotBuildInputs {
         self.refresh_runtime_state();
-        let mut warnings = Vec::new();
-
-        let gateway_health = match self.fetch_health(self.runtime.gateway_admin_port).await {
-            Ok(payload) => payload,
-            Err(error) => {
-                warnings.push(format!(
-                    "gateway health check failed: {}",
-                    sanitize_log_line(error.to_string().as_str())
-                ));
-                None
-            }
-        };
-
-        let browser_health = if self.persisted.browser_service_enabled {
-            match self.fetch_health(self.runtime.browser_health_port).await {
-                Ok(payload) => payload,
-                Err(error) => {
-                    warnings.push(format!(
-                        "browser health check failed: {}",
-                        sanitize_log_line(error.to_string().as_str())
-                    ));
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        let (diagnostics_payload, discord_payload, console_warnings) =
-            self.fetch_console_payloads(gateway_health.is_some()).await;
-        warnings.extend(console_warnings);
-
-        let diagnostics_errors = diagnostics_payload
-            .as_ref()
-            .map(|value| collect_redacted_errors(value, MAX_DIAGNOSTIC_ERRORS))
-            .unwrap_or_default();
-
-        let diagnostics = DiagnosticsSnapshot {
-            generated_at_unix_ms: diagnostics_payload
-                .as_ref()
-                .and_then(|value| value.get("generated_at_unix_ms"))
-                .and_then(Value::as_i64),
-            errors: diagnostics_errors,
-        };
-
-        let discord = parse_discord_status(discord_payload.as_ref());
-
-        let browser_running = self.browserd.running();
-        let browser_status = build_browser_status(
-            self.persisted.browser_service_enabled,
-            browser_running,
-            browser_health.as_ref(),
-            self.browserd.last_exit.clone(),
-        );
-
-        let dashboard_access = match self.dashboard_access_target() {
-            Ok(target) => target,
-            Err(error) => {
-                warnings.push(format!(
-                    "dashboard URL discovery failed: {}",
-                    sanitize_log_line(error.to_string().as_str())
-                ));
-                self.default_dashboard_access_target()
-            }
-        };
-
-        let quick_facts = QuickFactsSnapshot {
-            dashboard_url: dashboard_access.url,
-            dashboard_access_mode: dashboard_access.mode.as_str().to_owned(),
-            gateway_version: gateway_health.as_ref().map(|value| value.version.clone()),
-            gateway_git_hash: gateway_health.as_ref().map(|value| value.git_hash.clone()),
-            gateway_uptime_seconds: gateway_health.as_ref().map(|value| value.uptime_seconds),
-            discord,
-            browser_service: browser_status,
-        };
-
-        let gateway_running = self.gateway.running();
-        let browser_enabled = self.persisted.browser_service_enabled;
-        let browser_healthy = quick_facts.browser_service.healthy;
-        let discord_degraded = quick_facts.discord.enabled && !quick_facts.discord.authenticated;
-        let diagnostics_degraded = !diagnostics.errors.is_empty();
-
-        let overall_status = if !gateway_running || gateway_health.is_none() {
-            OverallStatus::Down
-        } else if (browser_enabled && !browser_healthy) || discord_degraded || diagnostics_degraded
-        {
-            OverallStatus::Degraded
-        } else {
-            OverallStatus::Healthy
-        };
-
-        Ok(ControlCenterSnapshot {
-            generated_at_unix_ms: unix_ms_now(),
-            overall_status,
-            quick_facts,
-            diagnostics,
+        SnapshotBuildInputs {
+            runtime: self.runtime.clone(),
+            browser_service_enabled: self.persisted.browser_service_enabled,
+            admin_token: self.admin_token.clone(),
+            browser_last_exit: self.browserd.last_exit.clone(),
+            gateway_running: self.gateway.running(),
+            browser_running: self.browserd.running(),
             gateway_process: self.process_snapshot(ServiceKind::Gateway),
             browserd_process: self.process_snapshot(ServiceKind::Browserd),
             logs: self.collect_logs(),
-            warnings,
-        })
-    }
-    async fn fetch_health(&self, port: u16) -> Result<Option<HealthEndpointPayload>> {
-        let url = loopback_url(port, "/health")?;
-        let response = self.http_client.get(url).send().await.context("health request failed")?;
-        if !response.status().is_success() {
-            return Ok(None);
-        }
-        let payload = response
-            .json::<HealthEndpointPayload>()
-            .await
-            .context("failed to decode health payload")?;
-        if payload.status.trim().eq_ignore_ascii_case("ok") {
-            Ok(Some(payload))
-        } else {
-            Ok(None)
+            http_client: self.http_client.clone(),
         }
     }
 
-    async fn fetch_console_payloads(
-        &self,
-        gateway_health_available: bool,
-    ) -> (Option<Value>, Option<Value>, Vec<String>) {
-        let mut warnings = Vec::new();
-        if !gateway_health_available {
-            return (None, None, warnings);
+    fn prepare_support_bundle_export(&self) -> SupportBundleExportPlan {
+        SupportBundleExportPlan {
+            runtime_root: self.runtime_root.clone(),
+            support_bundle_dir: self.support_bundle_dir.clone(),
+            admin_token: self.admin_token.clone(),
         }
-
-        if let Err(error) = self.login_console_session().await {
-            warnings.push(format!(
-                "console login failed: {}",
-                sanitize_log_line(error.to_string().as_str())
-            ));
-            return (None, None, warnings);
-        }
-
-        let diagnostics = match self
-            .fetch_console_json("/console/v1/diagnostics")
-            .await
-            .with_context(|| "failed to fetch diagnostics payload".to_owned())
-        {
-            Ok(value) => Some(value),
-            Err(error) => {
-                warnings.push(sanitize_log_line(error.to_string().as_str()));
-                None
-            }
-        };
-
-        let discord = match self
-            .fetch_console_json("/console/v1/channels/discord%3Adefault")
-            .await
-            .with_context(|| "failed to fetch Discord connector status".to_owned())
-        {
-            Ok(value) => Some(value),
-            Err(error) => {
-                warnings.push(sanitize_log_line(error.to_string().as_str()));
-                None
-            }
-        };
-
-        (diagnostics, discord, warnings)
-    }
-
-    async fn login_console_session(&self) -> Result<()> {
-        let url = loopback_url(self.runtime.gateway_admin_port, "/console/v1/auth/login")?;
-        let payload = json!({
-            "admin_token": self.admin_token.clone(),
-            "principal": CONSOLE_PRINCIPAL,
-            "device_id": CONSOLE_DEVICE_ID,
-        });
-        let response = self
-            .http_client
-            .post(url)
-            .json(&payload)
-            .send()
-            .await
-            .context("console login request failed")?;
-        if response.status().is_success() {
-            return Ok(());
-        }
-
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        bail!("console login failed with HTTP {}: {}", status, sanitize_log_line(text.as_str()))
-    }
-
-    async fn fetch_console_json(&self, path: &str) -> Result<Value> {
-        let url = loopback_url(self.runtime.gateway_admin_port, path)?;
-        let response =
-            self.http_client.get(url).send().await.context("console GET request failed")?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            bail!(
-                "console request {} failed with HTTP {}: {}",
-                path,
-                status,
-                sanitize_log_line(text.as_str())
-            );
-        }
-
-        response.json::<Value>().await.context("failed to decode console JSON response")
-    }
-
-    async fn export_support_bundle(&self) -> Result<SupportBundleExportResult> {
-        let cli_path = resolve_binary_path("palyra", "PALYRA_DESKTOP_PALYRA_BIN")?;
-        let output_name = format!("support-bundle-{}.json", unix_ms_now());
-        let output_path = self.support_bundle_dir.join(output_name);
-
-        let mut command = Command::new(cli_path.as_path());
-        command.env_clear();
-        if let Ok(path) = env::var("PATH") {
-            command.env("PATH", path);
-        }
-        command.env("LANG", "C").env("LC_ALL", "C");
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .arg("support-bundle")
-            .arg("export")
-            .arg("--output")
-            .arg(output_path.as_os_str())
-            .env("PALYRA_STATE_ROOT", self.runtime_root.to_string_lossy().into_owned())
-            .env("PALYRA_ADMIN_TOKEN", self.admin_token.clone());
-
-        let output = command.output().await.context("failed to run support-bundle export")?;
-        let stdout = sanitize_log_line(String::from_utf8_lossy(output.stdout.as_slice()).as_ref());
-        let stderr = sanitize_log_line(String::from_utf8_lossy(output.stderr.as_slice()).as_ref());
-        let command_output = [stdout, stderr]
-            .into_iter()
-            .filter(|value| !value.trim().is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        if !output.status.success() {
-            bail!(
-                "support-bundle export failed (status={}): {}",
-                output
-                    .status
-                    .code()
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "unknown".to_owned()),
-                command_output
-            );
-        }
-
-        Ok(SupportBundleExportResult {
-            output_path: output_path.to_string_lossy().into_owned(),
-            command_output,
-        })
     }
 
     fn open_dashboard(&self) -> Result<String> {
@@ -1230,6 +1015,275 @@ fn collect_redacted_errors_inner(value: &Value, key_context: Option<&str>, out: 
         }
         _ => {}
     }
+}
+
+async fn build_snapshot_from_inputs(inputs: SnapshotBuildInputs) -> Result<ControlCenterSnapshot> {
+    let SnapshotBuildInputs {
+        runtime,
+        browser_service_enabled,
+        admin_token,
+        browser_last_exit,
+        gateway_running,
+        browser_running,
+        gateway_process,
+        browserd_process,
+        logs,
+        http_client,
+    } = inputs;
+    let mut warnings = Vec::new();
+
+    let gateway_health = match fetch_health(&http_client, runtime.gateway_admin_port).await {
+        Ok(payload) => payload,
+        Err(error) => {
+            warnings.push(format!(
+                "gateway health check failed: {}",
+                sanitize_log_line(error.to_string().as_str())
+            ));
+            None
+        }
+    };
+
+    let browser_health = if browser_service_enabled {
+        match fetch_health(&http_client, runtime.browser_health_port).await {
+            Ok(payload) => payload,
+            Err(error) => {
+                warnings.push(format!(
+                    "browser health check failed: {}",
+                    sanitize_log_line(error.to_string().as_str())
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let (diagnostics_payload, discord_payload, console_warnings) = fetch_console_payloads(
+        &http_client,
+        &runtime,
+        admin_token.as_str(),
+        gateway_health.is_some(),
+    )
+    .await;
+    warnings.extend(console_warnings);
+
+    let diagnostics_errors = diagnostics_payload
+        .as_ref()
+        .map(|value| collect_redacted_errors(value, MAX_DIAGNOSTIC_ERRORS))
+        .unwrap_or_default();
+    let diagnostics = DiagnosticsSnapshot {
+        generated_at_unix_ms: diagnostics_payload
+            .as_ref()
+            .and_then(|value| value.get("generated_at_unix_ms"))
+            .and_then(Value::as_i64),
+        errors: diagnostics_errors,
+    };
+
+    let discord = parse_discord_status(discord_payload.as_ref());
+    let browser_status = build_browser_status(
+        browser_service_enabled,
+        browser_running,
+        browser_health.as_ref(),
+        browser_last_exit,
+    );
+
+    let dashboard_access = match resolve_dashboard_access_target(runtime.gateway_admin_port) {
+        Ok(target) => target,
+        Err(error) => {
+            warnings.push(format!(
+                "dashboard URL discovery failed: {}",
+                sanitize_log_line(error.to_string().as_str())
+            ));
+            default_dashboard_access_target(runtime.gateway_admin_port)
+        }
+    };
+
+    let quick_facts = QuickFactsSnapshot {
+        dashboard_url: dashboard_access.url,
+        dashboard_access_mode: dashboard_access.mode.as_str().to_owned(),
+        gateway_version: gateway_health.as_ref().map(|value| value.version.clone()),
+        gateway_git_hash: gateway_health.as_ref().map(|value| value.git_hash.clone()),
+        gateway_uptime_seconds: gateway_health.as_ref().map(|value| value.uptime_seconds),
+        discord,
+        browser_service: browser_status,
+    };
+    let browser_healthy = quick_facts.browser_service.healthy;
+    let discord_degraded = quick_facts.discord.enabled && !quick_facts.discord.authenticated;
+    let diagnostics_degraded = !diagnostics.errors.is_empty();
+
+    let overall_status = if !gateway_running || gateway_health.is_none() {
+        OverallStatus::Down
+    } else if (browser_service_enabled && !browser_healthy) || discord_degraded || diagnostics_degraded
+    {
+        OverallStatus::Degraded
+    } else {
+        OverallStatus::Healthy
+    };
+
+    Ok(ControlCenterSnapshot {
+        generated_at_unix_ms: unix_ms_now(),
+        overall_status,
+        quick_facts,
+        diagnostics,
+        gateway_process,
+        browserd_process,
+        logs,
+        warnings,
+    })
+}
+
+async fn fetch_health(http_client: &Client, port: u16) -> Result<Option<HealthEndpointPayload>> {
+    let url = loopback_url(port, "/health")?;
+    let response = http_client.get(url).send().await.context("health request failed")?;
+    if !response.status().is_success() {
+        return Ok(None);
+    }
+    let payload =
+        response.json::<HealthEndpointPayload>().await.context("failed to decode health payload")?;
+    if payload.status.trim().eq_ignore_ascii_case("ok") {
+        Ok(Some(payload))
+    } else {
+        Ok(None)
+    }
+}
+
+async fn fetch_console_payloads(
+    http_client: &Client,
+    runtime: &RuntimeConfig,
+    admin_token: &str,
+    gateway_health_available: bool,
+) -> (Option<Value>, Option<Value>, Vec<String>) {
+    let mut warnings = Vec::new();
+    if !gateway_health_available {
+        return (None, None, warnings);
+    }
+
+    if let Err(error) = login_console_session(http_client, runtime, admin_token).await {
+        warnings.push(format!(
+            "console login failed: {}",
+            sanitize_log_line(error.to_string().as_str())
+        ));
+        return (None, None, warnings);
+    }
+
+    let diagnostics = match fetch_console_json(http_client, runtime, "/console/v1/diagnostics")
+        .await
+        .with_context(|| "failed to fetch diagnostics payload".to_owned())
+    {
+        Ok(value) => Some(value),
+        Err(error) => {
+            warnings.push(sanitize_log_line(error.to_string().as_str()));
+            None
+        }
+    };
+
+    let discord = match fetch_console_json(
+        http_client,
+        runtime,
+        "/console/v1/channels/discord%3Adefault",
+    )
+    .await
+    .with_context(|| "failed to fetch Discord connector status".to_owned())
+    {
+        Ok(value) => Some(value),
+        Err(error) => {
+            warnings.push(sanitize_log_line(error.to_string().as_str()));
+            None
+        }
+    };
+
+    (diagnostics, discord, warnings)
+}
+
+async fn login_console_session(
+    http_client: &Client,
+    runtime: &RuntimeConfig,
+    admin_token: &str,
+) -> Result<()> {
+    let url = loopback_url(runtime.gateway_admin_port, "/console/v1/auth/login")?;
+    let payload = json!({
+        "admin_token": admin_token,
+        "principal": CONSOLE_PRINCIPAL,
+        "device_id": CONSOLE_DEVICE_ID,
+    });
+    let response = http_client
+        .post(url)
+        .json(&payload)
+        .send()
+        .await
+        .context("console login request failed")?;
+    if response.status().is_success() {
+        return Ok(());
+    }
+
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    bail!("console login failed with HTTP {}: {}", status, sanitize_log_line(text.as_str()))
+}
+
+async fn fetch_console_json(http_client: &Client, runtime: &RuntimeConfig, path: &str) -> Result<Value> {
+    let url = loopback_url(runtime.gateway_admin_port, path)?;
+    let response = http_client.get(url).send().await.context("console GET request failed")?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        bail!(
+            "console request {} failed with HTTP {}: {}",
+            path,
+            status,
+            sanitize_log_line(text.as_str())
+        );
+    }
+
+    response.json::<Value>().await.context("failed to decode console JSON response")
+}
+
+async fn run_support_bundle_export(plan: SupportBundleExportPlan) -> Result<SupportBundleExportResult> {
+    let cli_path = resolve_binary_path("palyra", "PALYRA_DESKTOP_PALYRA_BIN")?;
+    let output_name = format!("support-bundle-{}.json", unix_ms_now());
+    let output_path = plan.support_bundle_dir.join(output_name);
+
+    let mut command = Command::new(cli_path.as_path());
+    command.env_clear();
+    if let Ok(path) = env::var("PATH") {
+        command.env("PATH", path);
+    }
+    command.env("LANG", "C").env("LC_ALL", "C");
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .arg("support-bundle")
+        .arg("export")
+        .arg("--output")
+        .arg(output_path.as_os_str())
+        .env("PALYRA_STATE_ROOT", plan.runtime_root.to_string_lossy().into_owned())
+        .env("PALYRA_ADMIN_TOKEN", plan.admin_token);
+
+    let output = command.output().await.context("failed to run support-bundle export")?;
+    let stdout = sanitize_log_line(String::from_utf8_lossy(output.stdout.as_slice()).as_ref());
+    let stderr = sanitize_log_line(String::from_utf8_lossy(output.stderr.as_slice()).as_ref());
+    let command_output = [stdout, stderr]
+        .into_iter()
+        .filter(|value| !value.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !output.status.success() {
+        bail!(
+            "support-bundle export failed (status={}): {}",
+            output
+                .status
+                .code()
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_owned()),
+            command_output
+        );
+    }
+
+    Ok(SupportBundleExportResult {
+        output_path: output_path.to_string_lossy().into_owned(),
+        command_output,
+    })
 }
 
 fn is_error_like_key(key: &str) -> bool {
@@ -1584,8 +1638,11 @@ struct DesktopAppState {
 
 #[tauri::command]
 async fn get_snapshot(state: State<'_, DesktopAppState>) -> Result<ControlCenterSnapshot, String> {
-    let mut supervisor = state.supervisor.lock().await;
-    supervisor.build_snapshot().await.map_err(|error| error.to_string())
+    let snapshot_inputs = {
+        let mut supervisor = state.supervisor.lock().await;
+        supervisor.capture_snapshot_inputs()
+    };
+    build_snapshot_from_inputs(snapshot_inputs).await.map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -1638,8 +1695,11 @@ async fn open_dashboard(state: State<'_, DesktopAppState>) -> Result<ActionResul
 async fn export_support_bundle(
     state: State<'_, DesktopAppState>,
 ) -> Result<SupportBundleExportResult, String> {
-    let supervisor = state.supervisor.lock().await;
-    supervisor.export_support_bundle().await.map_err(|error| error.to_string())
+    let export_plan = {
+        let supervisor = state.supervisor.lock().await;
+        supervisor.prepare_support_bundle_export()
+    };
+    run_support_bundle_export(export_plan).await.map_err(|error| error.to_string())
 }
 
 async fn supervisor_loop(supervisor: Arc<Mutex<ControlCenter>>) {
@@ -1683,17 +1743,23 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsString;
-    use std::path::{Path, PathBuf};
-    use std::sync::{Mutex, OnceLock};
+    use std::{
+        ffi::OsString,
+        io::{Read, Write},
+        net::TcpListener,
+        path::{Path, PathBuf},
+        sync::{Arc, Mutex, OnceLock},
+        time::Duration,
+    };
 
     use serde_json::json;
 
     use super::{
-        collect_redacted_errors, compute_backoff_ms, parse_discord_status, sanitize_log_line,
-        executable_file_name, load_or_initialize_state_file, parse_remote_dashboard_base_url,
-        resolve_binary_path, resolve_dashboard_access_target, BrowserStatusSnapshot,
-        DashboardAccessMode, DesktopSecretStore, Ulid,
+        build_snapshot_from_inputs, collect_redacted_errors, compute_backoff_ms,
+        executable_file_name, load_or_initialize_state_file, mpsc, parse_discord_status,
+        parse_remote_dashboard_base_url, resolve_binary_path, resolve_dashboard_access_target,
+        sanitize_log_line, BrowserStatusSnapshot, Client, ControlCenter, DashboardAccessMode,
+        DesktopSecretStore, DesktopStateFile, ManagedService, RuntimeConfig, Ulid,
     };
 
     fn env_lock() -> &'static Mutex<()> {
@@ -1784,6 +1850,42 @@ mod tests {
             std::fs::create_dir_all(parent).expect("fixture parent directory should be created");
         }
         std::fs::write(path, content).expect("fixture file should be written");
+    }
+
+    fn build_test_control_center(root: &Path) -> ControlCenter {
+        let runtime_root = root.join("runtime");
+        let support_bundle_dir = root.join("support-bundles");
+        std::fs::create_dir_all(runtime_root.as_path())
+            .expect("runtime root should be created for test control center");
+        std::fs::create_dir_all(support_bundle_dir.as_path())
+            .expect("support bundle directory should be created for test control center");
+        let runtime = RuntimeConfig::default();
+        let gateway = ManagedService::new(vec![
+            runtime.gateway_admin_port,
+            runtime.gateway_grpc_port,
+            runtime.gateway_quic_port,
+        ]);
+        let browserd = ManagedService::new(vec![runtime.browser_health_port, runtime.browser_grpc_port]);
+        let http_client = Client::builder()
+            .cookie_store(true)
+            .timeout(Duration::from_secs(4))
+            .build()
+            .expect("HTTP client should initialize for test control center");
+        let (log_tx, log_rx) = mpsc::unbounded_channel();
+        ControlCenter {
+            runtime_root,
+            support_bundle_dir,
+            state_file_path: root.join("state.json"),
+            persisted: DesktopStateFile::new_default(),
+            admin_token: format!("test-admin-{}", Ulid::new()),
+            browser_auth_token: format!("test-browser-{}", Ulid::new()),
+            runtime,
+            gateway,
+            browserd,
+            http_client,
+            log_tx,
+            log_rx,
+        }
     }
 
     #[test]
@@ -2051,5 +2153,80 @@ port = 9911
         let error = resolve_binary_path(binary_name.as_str(), "PALYRA_TEST_RESOLVE_BIN")
             .expect_err("PATH fallback should be rejected");
         assert!(error.to_string().contains("unable to locate"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn snapshot_build_releases_supervisor_lock_while_waiting_on_http() {
+        let fixture = TempFixtureDir::new();
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test listener should bind");
+        let port = listener.local_addr().expect("listener address should resolve").port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("listener should accept request");
+            let mut buffer = [0_u8; 1024];
+            let _ = stream.read(&mut buffer);
+            std::thread::sleep(Duration::from_millis(600));
+            let body = r#"{"status":"ok","version":"test","git_hash":"hash","uptime_seconds":1}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).expect("response should be written");
+            stream.flush().expect("response should be flushed");
+        });
+
+        let mut control_center = build_test_control_center(fixture.path());
+        control_center.runtime.gateway_admin_port = port;
+        control_center.persisted.browser_service_enabled = false;
+        control_center.gateway.desired_running = true;
+        let supervisor = Arc::new(tokio::sync::Mutex::new(control_center));
+
+        let snapshot_supervisor = supervisor.clone();
+        let snapshot_task = tokio::spawn(async move {
+            let inputs = {
+                let mut guard = snapshot_supervisor.lock().await;
+                guard.capture_snapshot_inputs()
+            };
+            build_snapshot_from_inputs(inputs).await
+        });
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let lock_attempt = tokio::time::timeout(Duration::from_millis(250), supervisor.lock()).await;
+        assert!(
+            lock_attempt.is_ok(),
+            "supervisor lock should remain available while snapshot is awaiting HTTP responses"
+        );
+        drop(lock_attempt);
+
+        let snapshot = snapshot_task
+            .await
+            .expect("snapshot task should join")
+            .expect("snapshot should build");
+        assert_eq!(snapshot.gateway_process.service, "gateway");
+        server.join().expect("test server thread should exit");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn support_bundle_export_plan_capture_does_not_hold_supervisor_lock() {
+        let fixture = TempFixtureDir::new();
+        let control_center = build_test_control_center(fixture.path());
+        let supervisor = Arc::new(tokio::sync::Mutex::new(control_center));
+        let export_plan = {
+            let guard = supervisor.lock().await;
+            guard.prepare_support_bundle_export()
+        };
+
+        let lock_attempt = tokio::time::timeout(Duration::from_millis(100), supervisor.lock()).await;
+        assert!(
+            lock_attempt.is_ok(),
+            "supervisor lock should remain available immediately after export plan capture"
+        );
+        assert!(
+            export_plan
+                .runtime_root
+                .ends_with(Path::new("runtime")),
+            "export plan should retain desktop runtime root from supervisor state"
+        );
     }
 }
