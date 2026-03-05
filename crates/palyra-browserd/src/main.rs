@@ -3069,6 +3069,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         request: Request<browser_v1::RelayActionRequest>,
     ) -> Result<Response<browser_v1::RelayActionResponse>, Status> {
         self.runtime.authorize(request.metadata()).await?;
+        let auth_header = request.metadata().get(AUTHORIZATION_HEADER).cloned();
         let mut payload = request.into_inner();
         let session_id = parse_session_id_from_proto(payload.session_id.take())
             .map_err(Status::invalid_argument)?;
@@ -3109,20 +3110,22 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                         result: None,
                     }));
                 };
-                let open_response = self
-                    .open_tab(Request::new(browser_v1::OpenTabRequest {
-                        v: CANONICAL_PROTOCOL_MAJOR,
-                        session_id: Some(proto::palyra::common::v1::CanonicalId {
-                            ulid: session_id.clone(),
-                        }),
-                        url: open_tab.url,
-                        activate: open_tab.activate,
-                        timeout_ms: open_tab.timeout_ms,
-                        allow_redirects: true,
-                        max_redirects: 3,
-                        allow_private_targets: false,
-                    }))
-                    .await?;
+                let mut open_request = Request::new(browser_v1::OpenTabRequest {
+                    v: CANONICAL_PROTOCOL_MAJOR,
+                    session_id: Some(proto::palyra::common::v1::CanonicalId {
+                        ulid: session_id.clone(),
+                    }),
+                    url: open_tab.url,
+                    activate: open_tab.activate,
+                    timeout_ms: open_tab.timeout_ms,
+                    allow_redirects: true,
+                    max_redirects: 3,
+                    allow_private_targets: false,
+                });
+                if let Some(value) = auth_header.clone() {
+                    open_request.metadata_mut().insert(AUTHORIZATION_HEADER, value);
+                }
+                let open_response = self.open_tab(open_request).await?;
                 let output = open_response.into_inner();
                 Ok(Response::new(browser_v1::RelayActionResponse {
                     v: CANONICAL_PROTOCOL_MAJOR,
@@ -3217,20 +3220,22 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                         result: None,
                     }));
                 };
-                let observe = self
-                    .observe(Request::new(browser_v1::ObserveRequest {
-                        v: CANONICAL_PROTOCOL_MAJOR,
-                        session_id: Some(proto::palyra::common::v1::CanonicalId {
-                            ulid: session_id.clone(),
-                        }),
-                        include_dom_snapshot: snapshot_payload.include_dom_snapshot,
-                        include_accessibility_tree: false,
-                        include_visible_text: snapshot_payload.include_visible_text,
-                        max_dom_snapshot_bytes: snapshot_payload.max_dom_snapshot_bytes,
-                        max_accessibility_tree_bytes: 0,
-                        max_visible_text_bytes: snapshot_payload.max_visible_text_bytes,
-                    }))
-                    .await?;
+                let mut observe_request = Request::new(browser_v1::ObserveRequest {
+                    v: CANONICAL_PROTOCOL_MAJOR,
+                    session_id: Some(proto::palyra::common::v1::CanonicalId {
+                        ulid: session_id.clone(),
+                    }),
+                    include_dom_snapshot: snapshot_payload.include_dom_snapshot,
+                    include_accessibility_tree: false,
+                    include_visible_text: snapshot_payload.include_visible_text,
+                    max_dom_snapshot_bytes: snapshot_payload.max_dom_snapshot_bytes,
+                    max_accessibility_tree_bytes: 0,
+                    max_visible_text_bytes: snapshot_payload.max_visible_text_bytes,
+                });
+                if let Some(value) = auth_header {
+                    observe_request.metadata_mut().insert(AUTHORIZATION_HEADER, value);
+                }
+                let observe = self.observe(observe_request).await?;
                 let observe = observe.into_inner();
                 Ok(Response::new(browser_v1::RelayActionResponse {
                     v: CANONICAL_PROTOCOL_MAJOR,
@@ -7495,9 +7500,9 @@ mod tests {
         BrowserEngineMode, BrowserProfileRecord, BrowserRuntimeState, BrowserServiceImpl,
         BrowserTabRecord, ChromiumSessionProxy, DnsCacheResolution, DnsValidationCache,
         PersistedSessionSnapshot, PersistedStateStore, ResolvedHostAddresses,
-        SessionPermissionsInternal, CANONICAL_PROTOCOL_MAJOR, CHROMIUM_PATH_ENV,
-        DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS, DEFAULT_GRPC_PORT, MAX_RELAY_PAYLOAD_BYTES,
-        ONE_BY_ONE_PNG, PROFILE_RECORD_SCHEMA_VERSION, STATE_KEY_LEN,
+        SessionPermissionsInternal, AUTHORIZATION_HEADER, CANONICAL_PROTOCOL_MAJOR,
+        CHROMIUM_PATH_ENV, DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS, DEFAULT_GRPC_PORT,
+        MAX_RELAY_PAYLOAD_BYTES, ONE_BY_ONE_PNG, PROFILE_RECORD_SCHEMA_VERSION, STATE_KEY_LEN,
     };
     use crate::proto;
     use crate::proto::palyra::browser::v1::browser_service_server::BrowserService;
@@ -7518,6 +7523,12 @@ mod tests {
     const PARITY_REDIRECT_TOKEN_URL: &str =
         include_str!("../../../fixtures/parity/redirect-token-url.txt");
     const PARITY_TRICKY_DOM_HTML: &str = include_str!("../../../fixtures/parity/tricky-dom.html");
+
+    fn insert_bearer_auth<T>(request: &mut Request<T>, token: &str) {
+        let value =
+            format!("Bearer {token}").parse().expect("authorization header value should be valid");
+        request.metadata_mut().insert(AUTHORIZATION_HEADER, value);
+    }
 
     fn resolve_chromium_path_for_tests() -> Option<PathBuf> {
         std::env::var(CHROMIUM_PATH_ENV)
@@ -9777,6 +9788,187 @@ mod tests {
             "error should explain relay payload bound: {}",
             status.message()
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn browser_service_relay_open_tab_succeeds_with_auth_token() {
+        const AUTH_TOKEN: &str = "test-token";
+        let (url, handle) = spawn_static_http_server(
+            200,
+            "<html><head><title>Relay Open Tab</title></head><body>relay open tab</body></html>",
+        );
+        let runtime = std::sync::Arc::new(
+            BrowserRuntimeState::new(&Args {
+                bind: "127.0.0.1".to_owned(),
+                port: 7143,
+                grpc_bind: "127.0.0.1".to_owned(),
+                grpc_port: 7543,
+                auth_token: Some(AUTH_TOKEN.to_owned()),
+                session_idle_ttl_ms: 60_000,
+                max_sessions: 16,
+                max_navigation_timeout_ms: 10_000,
+                max_session_lifetime_ms: 60_000,
+                max_screenshot_bytes: 128 * 1024,
+                max_response_bytes: 128 * 1024,
+                max_title_bytes: 4 * 1024,
+                engine_mode: BrowserEngineMode::Simulated,
+                chromium_path: None,
+                chromium_startup_timeout_ms: DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS,
+            })
+            .expect("runtime should initialize"),
+        );
+        let service = BrowserServiceImpl { runtime };
+        let mut create_request = Request::new(browser_v1::CreateSessionRequest {
+            v: 1,
+            principal: "user:ops".to_owned(),
+            idle_ttl_ms: 10_000,
+            budget: None,
+            allow_private_targets: true,
+            allow_downloads: false,
+            action_allowed_domains: Vec::new(),
+            persistence_enabled: false,
+            persistence_id: String::new(),
+            profile_id: None,
+            private_profile: false,
+            channel: String::new(),
+        });
+        insert_bearer_auth(&mut create_request, AUTH_TOKEN);
+        let created = service
+            .create_session(create_request)
+            .await
+            .expect("create_session should succeed")
+            .into_inner();
+        let session_id = created
+            .session_id
+            .as_ref()
+            .map(|value| value.ulid.clone())
+            .expect("session id should be present");
+
+        let mut relay_request = Request::new(browser_v1::RelayActionRequest {
+            v: 1,
+            session_id: Some(proto::palyra::common::v1::CanonicalId { ulid: session_id }),
+            extension_id: "com.palyra.extension".to_owned(),
+            action: browser_v1::RelayActionKind::OpenTab as i32,
+            payload: Some(browser_v1::relay_action_request::Payload::OpenTab(
+                browser_v1::RelayOpenTabPayload { url, activate: true, timeout_ms: 1_500 },
+            )),
+            max_payload_bytes: 4_096,
+        });
+        insert_bearer_auth(&mut relay_request, AUTH_TOKEN);
+        let relay = service
+            .relay_action(relay_request)
+            .await
+            .expect("relay open_tab should return response")
+            .into_inner();
+        assert!(relay.success, "relay open_tab should succeed with auth enabled");
+        assert!(
+            matches!(relay.result, Some(browser_v1::relay_action_response::Result::OpenedTab(_))),
+            "relay open_tab should return opened tab payload"
+        );
+
+        handle.join().expect("test server thread should exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn browser_service_relay_send_snapshot_succeeds_with_auth_token() {
+        const AUTH_TOKEN: &str = "test-token";
+        let (url, handle) = spawn_static_http_server(
+            200,
+            "<html><head><title>Relay Snapshot</title></head><body>relay snapshot text</body></html>",
+        );
+        let runtime = std::sync::Arc::new(
+            BrowserRuntimeState::new(&Args {
+                bind: "127.0.0.1".to_owned(),
+                port: 7143,
+                grpc_bind: "127.0.0.1".to_owned(),
+                grpc_port: 7543,
+                auth_token: Some(AUTH_TOKEN.to_owned()),
+                session_idle_ttl_ms: 60_000,
+                max_sessions: 16,
+                max_navigation_timeout_ms: 10_000,
+                max_session_lifetime_ms: 60_000,
+                max_screenshot_bytes: 128 * 1024,
+                max_response_bytes: 128 * 1024,
+                max_title_bytes: 4 * 1024,
+                engine_mode: BrowserEngineMode::Simulated,
+                chromium_path: None,
+                chromium_startup_timeout_ms: DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS,
+            })
+            .expect("runtime should initialize"),
+        );
+        let service = BrowserServiceImpl { runtime };
+        let mut create_request = Request::new(browser_v1::CreateSessionRequest {
+            v: 1,
+            principal: "user:ops".to_owned(),
+            idle_ttl_ms: 10_000,
+            budget: None,
+            allow_private_targets: true,
+            allow_downloads: false,
+            action_allowed_domains: Vec::new(),
+            persistence_enabled: false,
+            persistence_id: String::new(),
+            profile_id: None,
+            private_profile: false,
+            channel: String::new(),
+        });
+        insert_bearer_auth(&mut create_request, AUTH_TOKEN);
+        let created = service
+            .create_session(create_request)
+            .await
+            .expect("create_session should succeed")
+            .into_inner();
+        let session_id = created
+            .session_id
+            .as_ref()
+            .map(|value| value.ulid.clone())
+            .expect("session id should be present");
+
+        let mut navigate_request = Request::new(browser_v1::NavigateRequest {
+            v: 1,
+            session_id: Some(proto::palyra::common::v1::CanonicalId { ulid: session_id.clone() }),
+            url,
+            timeout_ms: 2_000,
+            allow_redirects: true,
+            max_redirects: 3,
+            allow_private_targets: true,
+        });
+        insert_bearer_auth(&mut navigate_request, AUTH_TOKEN);
+        let navigate =
+            service.navigate(navigate_request).await.expect("navigate should execute").into_inner();
+        assert!(navigate.success, "navigate should succeed before snapshot relay");
+
+        let mut relay_request = Request::new(browser_v1::RelayActionRequest {
+            v: 1,
+            session_id: Some(proto::palyra::common::v1::CanonicalId { ulid: session_id }),
+            extension_id: "com.palyra.extension".to_owned(),
+            action: browser_v1::RelayActionKind::SendPageSnapshot as i32,
+            payload: Some(browser_v1::relay_action_request::Payload::PageSnapshot(
+                browser_v1::RelayPageSnapshotPayload {
+                    include_dom_snapshot: true,
+                    include_visible_text: true,
+                    max_dom_snapshot_bytes: 16 * 1024,
+                    max_visible_text_bytes: 4 * 1024,
+                },
+            )),
+            max_payload_bytes: 4_096,
+        });
+        insert_bearer_auth(&mut relay_request, AUTH_TOKEN);
+        let relay = service
+            .relay_action(relay_request)
+            .await
+            .expect("relay send_page_snapshot should return response")
+            .into_inner();
+        assert!(relay.success, "relay send_page_snapshot should succeed with auth enabled");
+        let snapshot = match relay.result {
+            Some(browser_v1::relay_action_response::Result::Snapshot(snapshot)) => snapshot,
+            _ => panic!("relay snapshot action should return snapshot payload"),
+        };
+        assert!(
+            snapshot.visible_text.contains("relay snapshot text"),
+            "snapshot visible text should contain served page content"
+        );
+
+        handle.join().expect("test server thread should exit");
     }
 
     #[tokio::test(flavor = "multi_thread")]

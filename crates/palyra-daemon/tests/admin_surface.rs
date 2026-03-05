@@ -18,6 +18,7 @@ const ADMIN_TOKEN: &str = "test-admin-token";
 const DEVICE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const RUN_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAX";
 const CONSOLE_ADMIN_PRINCIPAL: &str = "admin:web-console";
+const CONSOLE_AUDITOR_PRINCIPAL: &str = "admin:web-auditor";
 const PALYRAD_STARTUP_ATTEMPTS: usize = 3;
 const PALYRAD_STARTUP_RETRY_DELAY: Duration = Duration::from_millis(150);
 static TEMP_IDENTITY_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -679,6 +680,104 @@ fn console_cron_workflow_create_disable_and_list_runs() -> Result<()> {
         runs_response.get("runs").and_then(Value::as_array).is_some(),
         "console cron runs response should include runs array"
     );
+    Ok(())
+}
+
+#[test]
+fn console_cron_endpoints_enforce_owner_principal_boundaries() -> Result<()> {
+    let (child, admin_port) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("failed to build HTTP client")?;
+    let (owner_cookie, owner_csrf_token) =
+        login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
+    let (auditor_cookie, auditor_csrf_token) =
+        login_console_session(&client, admin_port, CONSOLE_AUDITOR_PRINCIPAL)?;
+
+    let created_job = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/cron/jobs"))
+        .header("Cookie", owner_cookie.clone())
+        .header("x-palyra-csrf-token", owner_csrf_token.clone())
+        .json(&serde_json::json!({
+            "name": "owner-boundary-job",
+            "prompt": "owner boundary validation",
+            "schedule_type": "every",
+            "every_interval_ms": 60000,
+            "enabled": true,
+            "channel": "web",
+        }))
+        .send()
+        .context("failed to create owner-boundary cron job from console endpoint")?
+        .error_for_status()
+        .context("owner-boundary console cron create returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse owner-boundary console cron create response json")?;
+    let job_id = created_job
+        .get("job")
+        .and_then(|job| job.get("job_id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("owner-boundary create response missing job.job_id"))?
+        .to_owned();
+
+    let forbidden_disable = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/cron/jobs/{job_id}/enabled"))
+        .header("Cookie", auditor_cookie.clone())
+        .header("x-palyra-csrf-token", auditor_csrf_token)
+        .json(&serde_json::json!({ "enabled": false }))
+        .send()
+        .context("failed to disable owner-boundary cron job as non-owner principal")?;
+    assert_eq!(
+        forbidden_disable.status().as_u16(),
+        403,
+        "console cron enabled endpoint must reject non-owner principal"
+    );
+
+    let forbidden_runs = client
+        .get(format!("http://127.0.0.1:{admin_port}/console/v1/cron/jobs/{job_id}/runs"))
+        .header("Cookie", auditor_cookie)
+        .send()
+        .context("failed to list owner-boundary cron runs as non-owner principal")?;
+    assert_eq!(
+        forbidden_runs.status().as_u16(),
+        403,
+        "console cron runs endpoint must reject non-owner principal"
+    );
+
+    let owner_disable = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/cron/jobs/{job_id}/enabled"))
+        .header("Cookie", owner_cookie.clone())
+        .header("x-palyra-csrf-token", owner_csrf_token)
+        .json(&serde_json::json!({ "enabled": false }))
+        .send()
+        .context("failed to disable owner-boundary cron job as owner principal")?
+        .error_for_status()
+        .context("owner principal cron disable returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse owner-boundary cron disable response json")?;
+    assert_eq!(
+        owner_disable.get("job").and_then(|job| job.get("enabled")).and_then(Value::as_bool),
+        Some(false),
+        "owner principal should be able to disable owned cron job"
+    );
+
+    let owner_runs = client
+        .get(format!("http://127.0.0.1:{admin_port}/console/v1/cron/jobs/{job_id}/runs"))
+        .header("Cookie", owner_cookie)
+        .send()
+        .context("failed to list owner-boundary cron runs as owner principal")?
+        .error_for_status()
+        .context("owner principal cron runs returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse owner-boundary cron runs response json")?;
+    assert!(
+        owner_runs.get("runs").and_then(Value::as_array).is_some(),
+        "owner principal should retain access to cron runs endpoint"
+    );
+
     Ok(())
 }
 

@@ -4544,10 +4544,12 @@ async fn console_cron_set_enabled_handler(
     Path(job_id): Path<String>,
     Json(payload): Json<ConsoleCronEnabledRequest>,
 ) -> Result<Json<Value>, Response> {
-    let _session = authorize_console_session(&state, &headers, true)?;
+    let session = authorize_console_session(&state, &headers, true)?;
     validate_canonical_id(job_id.as_str()).map_err(|_| {
         runtime_status_response(tonic::Status::invalid_argument("job_id must be a canonical ULID"))
     })?;
+    ensure_console_cron_job_owner(&state, job_id.as_str(), session.context.principal.as_str())
+        .await?;
     let updated = state
         .runtime
         .update_cron_job(
@@ -4599,10 +4601,12 @@ async fn console_cron_runs_handler(
     Path(job_id): Path<String>,
     Query(query): Query<ConsoleCronRunsQuery>,
 ) -> Result<Json<Value>, Response> {
-    let _session = authorize_console_session(&state, &headers, false)?;
+    let session = authorize_console_session(&state, &headers, false)?;
     validate_canonical_id(job_id.as_str()).map_err(|_| {
         runtime_status_response(tonic::Status::invalid_argument("job_id must be a canonical ULID"))
     })?;
+    ensure_console_cron_job_owner(&state, job_id.as_str(), session.context.principal.as_str())
+        .await?;
     let (runs, next_after_run_id) = state
         .runtime
         .list_cron_runs(Some(job_id), query.after_run_id, query.limit)
@@ -4612,6 +4616,30 @@ async fn console_cron_runs_handler(
         "runs": runs,
         "next_after_run_id": next_after_run_id,
     })))
+}
+
+#[allow(clippy::result_large_err)]
+async fn ensure_console_cron_job_owner(
+    state: &AppState,
+    job_id: &str,
+    principal: &str,
+) -> Result<(), Response> {
+    let job = state
+        .runtime
+        .cron_job(job_id.to_owned())
+        .await
+        .map_err(runtime_status_response)?
+        .ok_or_else(|| {
+            runtime_status_response(tonic::Status::not_found(format!(
+                "cron job not found: {job_id}"
+            )))
+        })?;
+    if job.owner_principal != principal {
+        return Err(runtime_status_response(tonic::Status::permission_denied(
+            "cron job owner mismatch for authenticated principal",
+        )));
+    }
+    Ok(())
 }
 
 #[allow(clippy::result_large_err)]
