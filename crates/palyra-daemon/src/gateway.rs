@@ -57,8 +57,8 @@ use crate::{
     channel_router::{
         ChannelPairingSnapshot, ChannelRouter, ChannelRouterConfig,
         InboundMessage as ChannelInboundMessage, PairingApprovalOutcome, PairingCodeRecord,
-        PairingConsumeOutcome, RetryDisposition, RouteOutcome, RoutePreview as ChannelRoutePreview,
-        RoutedMessage as ChannelRoutedMessage,
+        PairingConsumeOutcome, RetryDisposition, RouteOutcome, RoutePlan as ChannelRoutePlan,
+        RoutePreview as ChannelRoutePreview, RoutedMessage as ChannelRoutedMessage,
     },
     cron::{normalize_schedule, schedule_to_proto, trigger_job_now, CronTimezoneMode},
     journal::{
@@ -5447,6 +5447,534 @@ fn build_route_message_outputs(
     outputs
 }
 
+#[allow(clippy::result_large_err)]
+#[allow(clippy::too_many_arguments)]
+async fn handle_routed_route_message(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    request_context: &RequestContext,
+    input: &ChannelInboundMessage,
+    content: &common_v1::MessageContent,
+    plan: &ChannelRoutePlan,
+    requested_session_label: Option<&str>,
+    json_mode_requested: bool,
+    envelope_id: &str,
+    route_config_hash: &str,
+    actor_connector: &str,
+    actor_gateway_principal: &str,
+    actor_gateway_device_id: &str,
+    retry_attempt: u32,
+) -> Result<gateway_v1::RouteMessageResponse, Status> {
+    let route_request_context =
+        request_context_with_resolved_route_channel(request_context, plan.channel.as_str());
+    let route_action = if plan.is_broadcast { "message.broadcast" } else { "message.reply" };
+    let policy_resource = format!("channel:{}", plan.channel);
+    if let Err(error) = authorize_message_action(
+        route_request_context.principal.as_str(),
+        route_action,
+        policy_resource.as_str(),
+        Some(plan.channel.as_str()),
+        None,
+        None,
+    ) {
+        runtime_state.record_denied();
+        runtime_state.counters.channel_messages_rejected.fetch_add(1, Ordering::Relaxed);
+        let journal_session_id = Ulid::new().to_string();
+        let journal_run_id = Ulid::new().to_string();
+        let _ = record_message_router_journal_event(
+            runtime_state,
+            &route_request_context,
+            journal_session_id.as_str(),
+            journal_run_id.as_str(),
+            "message.rejected",
+            common_v1::journal_event::EventActor::System as i32,
+            json!({
+                "event": "message.rejected",
+                "envelope_id": input.envelope_id.clone(),
+                "channel": input.channel.clone(),
+                "reason": error.message(),
+                "policy_action": route_action,
+                "queued_for_retry": false,
+                "quarantined": false,
+                "config_hash": route_config_hash,
+                "actor": {
+                    "connector_channel": actor_connector,
+                    "gateway_principal": actor_gateway_principal,
+                    "gateway_device_id": actor_gateway_device_id,
+                }
+            }),
+        )
+        .await;
+        return Ok(gateway_v1::RouteMessageResponse {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            accepted: false,
+            queued_for_retry: false,
+            decision_reason: error.message().to_owned(),
+            session_id: None,
+            run_id: None,
+            outputs: Vec::new(),
+            route_key: plan.route_key.clone(),
+            retry_attempt,
+            queue_depth: runtime_state.channel_router.queue_depth() as u32,
+        });
+    }
+
+    let resolved_session = runtime_state
+        .resolve_orchestrator_session(OrchestratorSessionResolveRequest {
+            session_id: None,
+            session_key: Some(plan.session_key.clone()),
+            session_label: requested_session_label
+                .map(ToOwned::to_owned)
+                .or(plan.session_label.clone()),
+            principal: route_request_context.principal.clone(),
+            device_id: route_request_context.device_id.clone(),
+            channel: Some(plan.channel.clone()),
+            require_existing: false,
+            reset_session: false,
+        })
+        .await?;
+    let previous_run_id_for_context = resolved_session.session.last_run_id.clone();
+    let session_id = resolved_session.session.session_id;
+    let run_id = Ulid::new().to_string();
+    runtime_state
+        .start_orchestrator_run(OrchestratorRunStartRequest {
+            run_id: run_id.clone(),
+            session_id: session_id.clone(),
+        })
+        .await?;
+    runtime_state
+        .update_orchestrator_run_state(run_id.clone(), RunLifecycleState::InProgress, None)
+        .await?;
+    runtime_state.counters.channel_messages_routed.fetch_add(1, Ordering::Relaxed);
+
+    let route_agent = match runtime_state
+        .resolve_agent_for_context(AgentResolveRequest {
+            principal: route_request_context.principal.clone(),
+            channel: Some(plan.channel.clone()),
+            session_id: Some(session_id.clone()),
+            preferred_agent_id: None,
+            persist_session_binding: true,
+        })
+        .await
+    {
+        Ok(outcome) => Some(outcome),
+        Err(error) => {
+            warn!(
+                session_id = %session_id,
+                run_id = %run_id,
+                principal = %route_request_context.principal,
+                channel = %plan.channel,
+                status_code = ?error.code(),
+                status_message = %error.message(),
+                "route message agent resolution failed; continuing without agent binding metadata"
+            );
+            None
+        }
+    };
+    let route_agent_id = route_agent.as_ref().map(|outcome| outcome.agent.agent_id.clone());
+    let route_agent_resolution_source = route_agent
+        .as_ref()
+        .map(|outcome| agent_resolution_source_label(outcome.source).to_owned());
+
+    let _ = record_message_router_journal_event(
+        runtime_state,
+        &route_request_context,
+        session_id.as_str(),
+        run_id.as_str(),
+        "message.received",
+        common_v1::journal_event::EventActor::User as i32,
+        json!({
+            "event": "message.received",
+            "envelope_id": input.envelope_id.clone(),
+            "channel": input.channel.clone(),
+            "session_key": plan.session_key.clone(),
+            "route_key": plan.route_key.clone(),
+            "json_mode_requested": json_mode_requested,
+            "agent_id": route_agent_id.clone(),
+            "agent_resolution_source": route_agent_resolution_source.clone(),
+            "config_hash": route_config_hash,
+            "actor": {
+                "connector_channel": actor_connector,
+                "gateway_principal": actor_gateway_principal,
+                "gateway_device_id": actor_gateway_device_id,
+            }
+        }),
+    )
+    .await;
+
+    let mut tape_seq = 1_i64;
+    let route_attachment_metadata = content
+        .attachments
+        .iter()
+        .map(|attachment| {
+            let kind =
+                match common_v1::message_attachment::AttachmentKind::try_from(attachment.kind).ok()
+                {
+                    Some(common_v1::message_attachment::AttachmentKind::Image) => "image",
+                    Some(common_v1::message_attachment::AttachmentKind::File) => "file",
+                    Some(common_v1::message_attachment::AttachmentKind::Audio) => "audio",
+                    Some(common_v1::message_attachment::AttachmentKind::Video) => "video",
+                    _ => "unspecified",
+                };
+            json!({
+                "kind": kind,
+                "artifact_id": attachment
+                    .artifact_id
+                    .as_ref()
+                    .map(|value| value.ulid.clone()),
+                "size_bytes": if attachment.size_bytes > 0 {
+                    Some(attachment.size_bytes)
+                } else {
+                    None
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    let route_output_attachments = content.attachments.clone();
+    runtime_state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.clone(),
+            seq: tape_seq,
+            event_type: "message.received".to_owned(),
+            payload_json: json!({
+                "envelope_id": input.envelope_id.clone(),
+                "text": input.text.clone(),
+                "channel": input.channel.clone(),
+                "route_key": plan.route_key.clone(),
+                "json_mode_requested": json_mode_requested,
+                "attachments": route_attachment_metadata.clone(),
+                "agent_id": route_agent_id.clone(),
+                "agent_resolution_source": route_agent_resolution_source.clone(),
+            })
+            .to_string(),
+        })
+        .await?;
+    tape_seq = tape_seq.saturating_add(1);
+
+    let prepared_provider_input = prepare_model_provider_input(
+        runtime_state,
+        &route_request_context,
+        PrepareModelProviderInputRequest {
+            run_id: run_id.as_str(),
+            tape_seq: &mut tape_seq,
+            session_id: session_id.as_str(),
+            previous_run_id: previous_run_id_for_context.as_deref(),
+            input_text: input.text.as_str(),
+            attachments: content.attachments.as_slice(),
+            memory_ingest_reason: "route_message_user_input",
+            memory_prompt_failure_mode: MemoryPromptFailureMode::FallbackToRawInput {
+                warn_message: "route message memory auto-inject failed; falling back to raw input",
+            },
+            channel_for_log: plan.channel.as_str(),
+        },
+    )
+    .await?;
+
+    let provider_response = runtime_state
+        .execute_model_provider(ProviderRequest {
+            input_text: prepared_provider_input.provider_input_text,
+            json_mode: json_mode_requested,
+            vision_requested: prepared_provider_input.vision_requested,
+        })
+        .await;
+
+    let provider_response = match provider_response {
+        Ok(response) => response,
+        Err(error) => {
+            let error_message = error.message().to_owned();
+            let retry_disposition =
+                runtime_state.channel_router.record_processing_failure(input, "provider_error");
+            if matches!(retry_disposition, RetryDisposition::Quarantined) {
+                runtime_state.counters.channel_messages_quarantined.fetch_add(1, Ordering::Relaxed);
+            } else {
+                runtime_state.counters.channel_messages_queued.fetch_add(1, Ordering::Relaxed);
+            }
+            runtime_state.counters.channel_messages_rejected.fetch_add(1, Ordering::Relaxed);
+            runtime_state.counters.channel_reply_failures.fetch_add(1, Ordering::Relaxed);
+            runtime_state
+                .update_orchestrator_run_state(
+                    run_id.clone(),
+                    RunLifecycleState::Failed,
+                    Some(error_message.clone()),
+                )
+                .await?;
+            let _ = record_message_router_journal_event(
+                runtime_state,
+                &route_request_context,
+                session_id.as_str(),
+                run_id.as_str(),
+                "message.rejected",
+                common_v1::journal_event::EventActor::System as i32,
+                json!({
+                    "event": "message.rejected",
+                    "envelope_id": input.envelope_id.clone(),
+                    "channel": input.channel.clone(),
+                    "reason": error_message,
+                    "retry_disposition": match retry_disposition {
+                        RetryDisposition::Queued => "queued",
+                        RetryDisposition::Quarantined => "quarantined",
+                    },
+                    "queued_for_retry": matches!(retry_disposition, RetryDisposition::Queued),
+                    "quarantined": matches!(retry_disposition, RetryDisposition::Quarantined),
+                    "config_hash": route_config_hash,
+                    "actor": {
+                        "connector_channel": actor_connector,
+                        "gateway_principal": actor_gateway_principal,
+                        "gateway_device_id": actor_gateway_device_id,
+                    }
+                }),
+            )
+            .await;
+            runtime_state
+                .counters
+                .channel_router_queue_depth
+                .store(runtime_state.channel_router.queue_depth() as u64, Ordering::Relaxed);
+            return Ok(gateway_v1::RouteMessageResponse {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                accepted: false,
+                queued_for_retry: matches!(retry_disposition, RetryDisposition::Queued),
+                decision_reason: "model_provider_failed".to_owned(),
+                session_id: Some(common_v1::CanonicalId { ulid: session_id }),
+                run_id: Some(common_v1::CanonicalId { ulid: run_id }),
+                outputs: Vec::new(),
+                route_key: plan.route_key.clone(),
+                retry_attempt: retry_attempt.saturating_add(1),
+                queue_depth: runtime_state.channel_router.queue_depth() as u32,
+            });
+        }
+    };
+
+    let mut reply_text = String::new();
+    let mut remaining_tool_budget = runtime_state.config.tool_call.max_calls_per_run;
+    for event in provider_response.events {
+        match event {
+            ProviderEvent::ModelToken { token, .. } => {
+                if !reply_text.is_empty() {
+                    reply_text.push(' ');
+                }
+                reply_text.push_str(token.as_str());
+            }
+            ProviderEvent::ToolProposal { proposal_id, tool_name, input_json } => {
+                let tool_summary = process_route_tool_proposal_event(
+                    runtime_state,
+                    &route_request_context,
+                    session_id.as_str(),
+                    run_id.as_str(),
+                    proposal_id.as_str(),
+                    tool_name.as_str(),
+                    input_json.as_slice(),
+                    &mut remaining_tool_budget,
+                    &mut tape_seq,
+                )
+                .await?;
+                if !reply_text.is_empty() {
+                    reply_text.push('\n');
+                }
+                reply_text.push_str(tool_summary.as_str());
+            }
+        }
+    }
+    if reply_text.trim().is_empty() {
+        reply_text = "ack".to_owned();
+    }
+    let route_structured_output =
+        parse_route_message_structured_output(reply_text.as_str(), json_mode_requested);
+    if let Some(prefix) = plan.response_prefix.as_deref() {
+        reply_text = format!("{prefix}{reply_text}");
+    }
+    if let Err(error) = authorize_message_action(
+        route_request_context.principal.as_str(),
+        "channel.send",
+        policy_resource.as_str(),
+        Some(plan.channel.as_str()),
+        Some(session_id.as_str()),
+        Some(run_id.as_str()),
+    ) {
+        runtime_state.record_denied();
+        runtime_state.counters.channel_messages_rejected.fetch_add(1, Ordering::Relaxed);
+        runtime_state.counters.channel_reply_failures.fetch_add(1, Ordering::Relaxed);
+        runtime_state
+            .update_orchestrator_run_state(
+                run_id.clone(),
+                RunLifecycleState::Failed,
+                Some(error.message().to_owned()),
+            )
+            .await?;
+        let _ = record_message_router_journal_event(
+            runtime_state,
+            &route_request_context,
+            session_id.as_str(),
+            run_id.as_str(),
+            "message.rejected",
+            common_v1::journal_event::EventActor::System as i32,
+            json!({
+                "event": "message.rejected",
+                "envelope_id": envelope_id,
+                "channel": plan.channel.clone(),
+                "reason": error.message(),
+                "policy_action": "channel.send",
+                "queued_for_retry": false,
+                "quarantined": false,
+                "config_hash": route_config_hash,
+                "actor": {
+                    "connector_channel": actor_connector,
+                    "gateway_principal": actor_gateway_principal,
+                    "gateway_device_id": actor_gateway_device_id,
+                }
+            }),
+        )
+        .await;
+        return Ok(gateway_v1::RouteMessageResponse {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            accepted: false,
+            queued_for_retry: false,
+            decision_reason: error.message().to_owned(),
+            session_id: Some(common_v1::CanonicalId { ulid: session_id }),
+            run_id: Some(common_v1::CanonicalId { ulid: run_id }),
+            outputs: Vec::new(),
+            route_key: plan.route_key.clone(),
+            retry_attempt,
+            queue_depth: runtime_state.channel_router.queue_depth() as u32,
+        });
+    }
+
+    runtime_state
+        .add_orchestrator_usage(OrchestratorUsageDelta {
+            run_id: run_id.clone(),
+            prompt_tokens_delta: provider_response.prompt_tokens,
+            completion_tokens_delta: provider_response.completion_tokens,
+        })
+        .await?;
+
+    ingest_memory_best_effort(
+        runtime_state,
+        route_request_context.principal.as_str(),
+        route_request_context.channel.as_deref(),
+        Some(session_id.as_str()),
+        MemorySource::Summary,
+        reply_text.as_str(),
+        vec!["summary:route_message".to_owned()],
+        Some(0.75),
+        "route_message_model_summary",
+    )
+    .await;
+    runtime_state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.clone(),
+            seq: tape_seq,
+            event_type: "message.replied".to_owned(),
+            payload_json: json!({
+                "reply_text": reply_text.clone(),
+                "route_key": plan.route_key.clone(),
+                "json_mode_requested": json_mode_requested,
+                "structured_output_present": !route_structured_output.structured_json.is_empty(),
+                "a2ui_surface": route_structured_output
+                    .a2ui_update
+                    .as_ref()
+                    .map(|value| value.surface.clone()),
+                "attachments": route_attachment_metadata.clone(),
+                "agent_id": route_agent_id.clone(),
+                "agent_resolution_source": route_agent_resolution_source.clone(),
+            })
+            .to_string(),
+        })
+        .await?;
+    runtime_state
+        .update_orchestrator_run_state(run_id.clone(), RunLifecycleState::Done, None)
+        .await?;
+
+    let _ = record_message_router_journal_event(
+        runtime_state,
+        &route_request_context,
+        session_id.as_str(),
+        run_id.as_str(),
+        "message.routed",
+        common_v1::journal_event::EventActor::System as i32,
+        json!({
+            "event": "message.routed",
+            "envelope_id": envelope_id,
+            "channel": plan.channel.clone(),
+            "route_key": plan.route_key.clone(),
+            "session_id": session_id.clone(),
+            "run_id": run_id.clone(),
+            "agent_id": route_agent_id.clone(),
+            "agent_resolution_source": route_agent_resolution_source.clone(),
+            "broadcast": plan.is_broadcast,
+            "queued_for_retry": false,
+            "quarantined": false,
+            "config_hash": route_config_hash,
+            "actor": {
+                "connector_channel": actor_connector,
+                "gateway_principal": actor_gateway_principal,
+                "gateway_device_id": actor_gateway_device_id,
+            }
+        }),
+    )
+    .await;
+    let _ = record_message_router_journal_event(
+        runtime_state,
+        &route_request_context,
+        session_id.as_str(),
+        run_id.as_str(),
+        "message.replied",
+        common_v1::journal_event::EventActor::System as i32,
+        json!({
+            "event": "message.replied",
+            "envelope_id": envelope_id,
+            "channel": plan.channel.clone(),
+            "reply_preview": truncate_with_ellipsis(reply_text.clone(), 256),
+            "json_mode_requested": json_mode_requested,
+            "structured_output_present": !route_structured_output.structured_json.is_empty(),
+            "a2ui_surface": route_structured_output
+                .a2ui_update
+                .as_ref()
+                .map(|value| value.surface.clone()),
+            "attachments": route_attachment_metadata,
+            "agent_id": route_agent_id,
+            "agent_resolution_source": route_agent_resolution_source,
+            "config_hash": route_config_hash,
+            "actor": {
+                "connector_channel": actor_connector,
+                "gateway_principal": actor_gateway_principal,
+                "gateway_device_id": actor_gateway_device_id,
+            }
+        }),
+    )
+    .await;
+
+    runtime_state.counters.channel_messages_replied.fetch_add(1, Ordering::Relaxed);
+    runtime_state
+        .counters
+        .channel_router_queue_depth
+        .store(runtime_state.channel_router.queue_depth() as u64, Ordering::Relaxed);
+    let route_output_template = RouteMessageOutputTemplate {
+        thread_id: plan.reply_thread_id.as_deref().unwrap_or_default(),
+        in_reply_to_message_id: plan.in_reply_to_message_id.as_deref().unwrap_or_default(),
+        broadcast: plan.is_broadcast,
+        auto_ack_text: plan.auto_ack_text.as_deref().unwrap_or_default(),
+        auto_reaction: plan.auto_reaction.as_deref().unwrap_or_default(),
+        attachments: route_output_attachments.as_slice(),
+        structured_json: route_structured_output.structured_json.as_slice(),
+        a2ui_update: route_structured_output.a2ui_update.as_ref(),
+    };
+    let route_outputs = build_route_message_outputs(
+        reply_text.as_str(),
+        input.max_payload_bytes,
+        &route_output_template,
+    );
+    Ok(gateway_v1::RouteMessageResponse {
+        v: CANONICAL_PROTOCOL_MAJOR,
+        accepted: true,
+        queued_for_retry: false,
+        decision_reason: "routed".to_owned(),
+        session_id: Some(common_v1::CanonicalId { ulid: session_id }),
+        run_id: Some(common_v1::CanonicalId { ulid: run_id }),
+        outputs: route_outputs,
+        route_key: plan.route_key.clone(),
+        retry_attempt,
+        queue_depth: runtime_state.channel_router.queue_depth() as u32,
+    })
+}
+
 fn message_attachments_request_vision(attachments: &[common_v1::MessageAttachment]) -> bool {
     attachments.iter().any(|attachment| {
         attachment.kind == common_v1::message_attachment::AttachmentKind::Image as i32
@@ -6784,541 +7312,23 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
             }
             RouteOutcome::Routed(routed) => {
                 let ChannelRoutedMessage { plan, lease: _route_lease } = *routed;
-                let route_request_context =
-                    request_context_with_resolved_route_channel(&context, plan.channel.as_str());
-                let route_action =
-                    if plan.is_broadcast { "message.broadcast" } else { "message.reply" };
-                let policy_resource = format!("channel:{}", plan.channel);
-                if let Err(error) = authorize_message_action(
-                    route_request_context.principal.as_str(),
-                    route_action,
-                    policy_resource.as_str(),
-                    Some(plan.channel.as_str()),
-                    None,
-                    None,
-                ) {
-                    self.state.record_denied();
-                    self.state.counters.channel_messages_rejected.fetch_add(1, Ordering::Relaxed);
-                    let journal_session_id = Ulid::new().to_string();
-                    let journal_run_id = Ulid::new().to_string();
-                    let _ = record_message_router_journal_event(
-                        &self.state,
-                        &route_request_context,
-                        journal_session_id.as_str(),
-                        journal_run_id.as_str(),
-                        "message.rejected",
-                        common_v1::journal_event::EventActor::System as i32,
-                        json!({
-                            "event": "message.rejected",
-                            "envelope_id": input.envelope_id.clone(),
-                            "channel": input.channel.clone(),
-                            "reason": error.message(),
-                            "policy_action": route_action,
-                            "queued_for_retry": false,
-                            "quarantined": false,
-                            "config_hash": route_config_hash.clone(),
-                            "actor": {
-                                "connector_channel": actor_connector.clone(),
-                                "gateway_principal": actor_gateway_principal.clone(),
-                                "gateway_device_id": actor_gateway_device_id.clone(),
-                            }
-                        }),
-                    )
-                    .await;
-                    return Ok(Response::new(gateway_v1::RouteMessageResponse {
-                        v: CANONICAL_PROTOCOL_MAJOR,
-                        accepted: false,
-                        queued_for_retry: false,
-                        decision_reason: error.message().to_owned(),
-                        session_id: None,
-                        run_id: None,
-                        outputs: Vec::new(),
-                        route_key: plan.route_key.clone(),
-                        retry_attempt,
-                        queue_depth: self.state.channel_router.queue_depth() as u32,
-                    }));
-                }
-
-                let resolved_session = self
-                    .state
-                    .resolve_orchestrator_session(OrchestratorSessionResolveRequest {
-                        session_id: None,
-                        session_key: Some(plan.session_key.clone()),
-                        session_label: requested_session_label
-                            .clone()
-                            .or(plan.session_label.clone()),
-                        principal: route_request_context.principal.clone(),
-                        device_id: route_request_context.device_id.clone(),
-                        channel: Some(plan.channel.clone()),
-                        require_existing: false,
-                        reset_session: false,
-                    })
-                    .await?;
-                let previous_run_id_for_context = resolved_session.session.last_run_id.clone();
-                let session_id = resolved_session.session.session_id;
-                let run_id = Ulid::new().to_string();
-                self.state
-                    .start_orchestrator_run(OrchestratorRunStartRequest {
-                        run_id: run_id.clone(),
-                        session_id: session_id.clone(),
-                    })
-                    .await?;
-                self.state
-                    .update_orchestrator_run_state(
-                        run_id.clone(),
-                        RunLifecycleState::InProgress,
-                        None,
-                    )
-                    .await?;
-                self.state.counters.channel_messages_routed.fetch_add(1, Ordering::Relaxed);
-
-                let route_agent = match self
-                    .state
-                    .resolve_agent_for_context(AgentResolveRequest {
-                        principal: route_request_context.principal.clone(),
-                        channel: Some(plan.channel.clone()),
-                        session_id: Some(session_id.clone()),
-                        preferred_agent_id: None,
-                        persist_session_binding: true,
-                    })
-                    .await
-                {
-                    Ok(outcome) => Some(outcome),
-                    Err(error) => {
-                        warn!(
-                            session_id = %session_id,
-                            run_id = %run_id,
-                            principal = %route_request_context.principal,
-                            channel = %plan.channel,
-                            status_code = ?error.code(),
-                            status_message = %error.message(),
-                            "route message agent resolution failed; continuing without agent binding metadata"
-                        );
-                        None
-                    }
-                };
-                let route_agent_id =
-                    route_agent.as_ref().map(|outcome| outcome.agent.agent_id.clone());
-                let route_agent_resolution_source = route_agent
-                    .as_ref()
-                    .map(|outcome| agent_resolution_source_label(outcome.source).to_owned());
-
-                let _ = record_message_router_journal_event(
+                let response = handle_routed_route_message(
                     &self.state,
-                    &route_request_context,
-                    session_id.as_str(),
-                    run_id.as_str(),
-                    "message.received",
-                    common_v1::journal_event::EventActor::User as i32,
-                    json!({
-                        "event": "message.received",
-                        "envelope_id": input.envelope_id.clone(),
-                        "channel": input.channel.clone(),
-                        "session_key": plan.session_key.clone(),
-                        "route_key": plan.route_key.clone(),
-                        "json_mode_requested": json_mode_requested,
-                        "agent_id": route_agent_id.clone(),
-                        "agent_resolution_source": route_agent_resolution_source.clone(),
-                        "config_hash": route_config_hash.clone(),
-                        "actor": {
-                            "connector_channel": actor_connector.clone(),
-                            "gateway_principal": actor_gateway_principal.clone(),
-                            "gateway_device_id": actor_gateway_device_id.clone(),
-                        }
-                    }),
-                )
-                .await;
-
-                let mut tape_seq = 1_i64;
-                let route_attachment_metadata = content
-                    .attachments
-                    .iter()
-                    .map(|attachment| {
-                        let kind = match common_v1::message_attachment::AttachmentKind::try_from(
-                            attachment.kind,
-                        )
-                        .ok()
-                        {
-                            Some(common_v1::message_attachment::AttachmentKind::Image) => "image",
-                            Some(common_v1::message_attachment::AttachmentKind::File) => "file",
-                            Some(common_v1::message_attachment::AttachmentKind::Audio) => "audio",
-                            Some(common_v1::message_attachment::AttachmentKind::Video) => "video",
-                            _ => "unspecified",
-                        };
-                        json!({
-                            "kind": kind,
-                            "artifact_id": attachment
-                                .artifact_id
-                                .as_ref()
-                                .map(|value| value.ulid.clone()),
-                            "size_bytes": if attachment.size_bytes > 0 {
-                                Some(attachment.size_bytes)
-                            } else {
-                                None
-                            },
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                let route_output_attachments = content.attachments.clone();
-                self.state
-                    .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
-                        run_id: run_id.clone(),
-                        seq: tape_seq,
-                        event_type: "message.received".to_owned(),
-                        payload_json: json!({
-                            "envelope_id": input.envelope_id.clone(),
-                            "text": input.text.clone(),
-                            "channel": input.channel.clone(),
-                            "route_key": plan.route_key.clone(),
-                            "json_mode_requested": json_mode_requested,
-                            "attachments": route_attachment_metadata,
-                            "agent_id": route_agent_id.clone(),
-                            "agent_resolution_source": route_agent_resolution_source.clone(),
-                        })
-                        .to_string(),
-                    })
-                    .await?;
-                tape_seq = tape_seq.saturating_add(1);
-
-                let prepared_provider_input = prepare_model_provider_input(
-                    &self.state,
-                    &route_request_context,
-                    PrepareModelProviderInputRequest {
-                        run_id: run_id.as_str(),
-                        tape_seq: &mut tape_seq,
-                        session_id: session_id.as_str(),
-                        previous_run_id: previous_run_id_for_context.as_deref(),
-                        input_text: input.text.as_str(),
-                        attachments: content.attachments.as_slice(),
-                        memory_ingest_reason: "route_message_user_input",
-                        memory_prompt_failure_mode: MemoryPromptFailureMode::FallbackToRawInput {
-                            warn_message:
-                                "route message memory auto-inject failed; falling back to raw input",
-                        },
-                        channel_for_log: plan.channel.as_str(),
-                    },
+                    &context,
+                    &input,
+                    &content,
+                    &plan,
+                    requested_session_label.as_deref(),
+                    json_mode_requested,
+                    envelope_id.as_str(),
+                    route_config_hash.as_str(),
+                    actor_connector.as_str(),
+                    actor_gateway_principal.as_str(),
+                    actor_gateway_device_id.as_str(),
+                    retry_attempt,
                 )
                 .await?;
-
-                let provider_response = self
-                    .state
-                    .execute_model_provider(ProviderRequest {
-                        input_text: prepared_provider_input.provider_input_text,
-                        json_mode: json_mode_requested,
-                        vision_requested: prepared_provider_input.vision_requested,
-                    })
-                    .await;
-
-                let provider_response = match provider_response {
-                    Ok(response) => response,
-                    Err(error) => {
-                        let error_message = error.message().to_owned();
-                        let retry_disposition = self
-                            .state
-                            .channel_router
-                            .record_processing_failure(&input, "provider_error");
-                        if matches!(retry_disposition, RetryDisposition::Quarantined) {
-                            self.state
-                                .counters
-                                .channel_messages_quarantined
-                                .fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            self.state
-                                .counters
-                                .channel_messages_queued
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                        self.state
-                            .counters
-                            .channel_messages_rejected
-                            .fetch_add(1, Ordering::Relaxed);
-                        self.state.counters.channel_reply_failures.fetch_add(1, Ordering::Relaxed);
-                        self.state
-                            .update_orchestrator_run_state(
-                                run_id.clone(),
-                                RunLifecycleState::Failed,
-                                Some(error_message.clone()),
-                            )
-                            .await?;
-                        let _ = record_message_router_journal_event(
-                            &self.state,
-                            &route_request_context,
-                            session_id.as_str(),
-                            run_id.as_str(),
-                            "message.rejected",
-                            common_v1::journal_event::EventActor::System as i32,
-                            json!({
-                                "event": "message.rejected",
-                                "envelope_id": input.envelope_id.clone(),
-                                "channel": input.channel.clone(),
-                                "reason": error_message,
-                                "retry_disposition": match retry_disposition {
-                                    RetryDisposition::Queued => "queued",
-                                    RetryDisposition::Quarantined => "quarantined",
-                                },
-                                "queued_for_retry": matches!(retry_disposition, RetryDisposition::Queued),
-                                "quarantined": matches!(retry_disposition, RetryDisposition::Quarantined),
-                                "config_hash": route_config_hash.clone(),
-                                "actor": {
-                                    "connector_channel": actor_connector.clone(),
-                                    "gateway_principal": actor_gateway_principal.clone(),
-                                    "gateway_device_id": actor_gateway_device_id.clone(),
-                                }
-                            }),
-                        )
-                        .await;
-                        self.state.counters.channel_router_queue_depth.store(
-                            self.state.channel_router.queue_depth() as u64,
-                            Ordering::Relaxed,
-                        );
-                        return Ok(Response::new(gateway_v1::RouteMessageResponse {
-                            v: CANONICAL_PROTOCOL_MAJOR,
-                            accepted: false,
-                            queued_for_retry: matches!(retry_disposition, RetryDisposition::Queued),
-                            decision_reason: "model_provider_failed".to_owned(),
-                            session_id: Some(common_v1::CanonicalId { ulid: session_id }),
-                            run_id: Some(common_v1::CanonicalId { ulid: run_id }),
-                            outputs: Vec::new(),
-                            route_key: plan.route_key.clone(),
-                            retry_attempt: retry_attempt.saturating_add(1),
-                            queue_depth: self.state.channel_router.queue_depth() as u32,
-                        }));
-                    }
-                };
-
-                let mut reply_text = String::new();
-                let mut remaining_tool_budget = self.state.config.tool_call.max_calls_per_run;
-                for event in provider_response.events {
-                    match event {
-                        ProviderEvent::ModelToken { token, .. } => {
-                            if !reply_text.is_empty() {
-                                reply_text.push(' ');
-                            }
-                            reply_text.push_str(token.as_str());
-                        }
-                        ProviderEvent::ToolProposal { proposal_id, tool_name, input_json } => {
-                            let tool_summary = process_route_tool_proposal_event(
-                                &self.state,
-                                &route_request_context,
-                                session_id.as_str(),
-                                run_id.as_str(),
-                                proposal_id.as_str(),
-                                tool_name.as_str(),
-                                input_json.as_slice(),
-                                &mut remaining_tool_budget,
-                                &mut tape_seq,
-                            )
-                            .await?;
-                            if !reply_text.is_empty() {
-                                reply_text.push('\n');
-                            }
-                            reply_text.push_str(tool_summary.as_str());
-                        }
-                    }
-                }
-                if reply_text.trim().is_empty() {
-                    reply_text = "ack".to_owned();
-                }
-                let route_structured_output =
-                    parse_route_message_structured_output(reply_text.as_str(), json_mode_requested);
-                if let Some(prefix) = plan.response_prefix.as_deref() {
-                    reply_text = format!("{prefix}{reply_text}");
-                }
-                if let Err(error) = authorize_message_action(
-                    route_request_context.principal.as_str(),
-                    "channel.send",
-                    policy_resource.as_str(),
-                    Some(plan.channel.as_str()),
-                    Some(session_id.as_str()),
-                    Some(run_id.as_str()),
-                ) {
-                    self.state.record_denied();
-                    self.state.counters.channel_messages_rejected.fetch_add(1, Ordering::Relaxed);
-                    self.state.counters.channel_reply_failures.fetch_add(1, Ordering::Relaxed);
-                    self.state
-                        .update_orchestrator_run_state(
-                            run_id.clone(),
-                            RunLifecycleState::Failed,
-                            Some(error.message().to_owned()),
-                        )
-                        .await?;
-                    let _ = record_message_router_journal_event(
-                        &self.state,
-                        &route_request_context,
-                        session_id.as_str(),
-                        run_id.as_str(),
-                        "message.rejected",
-                        common_v1::journal_event::EventActor::System as i32,
-                        json!({
-                            "event": "message.rejected",
-                            "envelope_id": envelope_id,
-                            "channel": plan.channel.clone(),
-                            "reason": error.message(),
-                            "policy_action": "channel.send",
-                            "queued_for_retry": false,
-                            "quarantined": false,
-                            "config_hash": route_config_hash.clone(),
-                            "actor": {
-                                "connector_channel": actor_connector.clone(),
-                                "gateway_principal": actor_gateway_principal.clone(),
-                                "gateway_device_id": actor_gateway_device_id.clone(),
-                            }
-                        }),
-                    )
-                    .await;
-                    return Ok(Response::new(gateway_v1::RouteMessageResponse {
-                        v: CANONICAL_PROTOCOL_MAJOR,
-                        accepted: false,
-                        queued_for_retry: false,
-                        decision_reason: error.message().to_owned(),
-                        session_id: Some(common_v1::CanonicalId { ulid: session_id }),
-                        run_id: Some(common_v1::CanonicalId { ulid: run_id }),
-                        outputs: Vec::new(),
-                        route_key: plan.route_key.clone(),
-                        retry_attempt,
-                        queue_depth: self.state.channel_router.queue_depth() as u32,
-                    }));
-                }
-
-                self.state
-                    .add_orchestrator_usage(OrchestratorUsageDelta {
-                        run_id: run_id.clone(),
-                        prompt_tokens_delta: provider_response.prompt_tokens,
-                        completion_tokens_delta: provider_response.completion_tokens,
-                    })
-                    .await?;
-
-                ingest_memory_best_effort(
-                    &self.state,
-                    route_request_context.principal.as_str(),
-                    route_request_context.channel.as_deref(),
-                    Some(session_id.as_str()),
-                    MemorySource::Summary,
-                    reply_text.as_str(),
-                    vec!["summary:route_message".to_owned()],
-                    Some(0.75),
-                    "route_message_model_summary",
-                )
-                .await;
-                self.state
-                    .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
-                        run_id: run_id.clone(),
-                        seq: tape_seq,
-                        event_type: "message.replied".to_owned(),
-                        payload_json: json!({
-                            "reply_text": reply_text.clone(),
-                            "route_key": plan.route_key.clone(),
-                            "json_mode_requested": json_mode_requested,
-                            "structured_output_present": !route_structured_output.structured_json.is_empty(),
-                            "a2ui_surface": route_structured_output
-                                .a2ui_update
-                                .as_ref()
-                                .map(|value| value.surface.clone()),
-                            "attachments": route_attachment_metadata.clone(),
-                            "agent_id": route_agent_id.clone(),
-                            "agent_resolution_source": route_agent_resolution_source.clone(),
-                        })
-                        .to_string(),
-                    })
-                    .await?;
-                self.state
-                    .update_orchestrator_run_state(run_id.clone(), RunLifecycleState::Done, None)
-                    .await?;
-
-                let _ = record_message_router_journal_event(
-                    &self.state,
-                    &route_request_context,
-                    session_id.as_str(),
-                    run_id.as_str(),
-                    "message.routed",
-                    common_v1::journal_event::EventActor::System as i32,
-                    json!({
-                        "event": "message.routed",
-                        "envelope_id": envelope_id,
-                        "channel": plan.channel.clone(),
-                        "route_key": plan.route_key.clone(),
-                        "session_id": session_id,
-                        "run_id": run_id,
-                        "agent_id": route_agent_id.clone(),
-                        "agent_resolution_source": route_agent_resolution_source.clone(),
-                        "broadcast": plan.is_broadcast,
-                        "queued_for_retry": false,
-                        "quarantined": false,
-                        "config_hash": route_config_hash.clone(),
-                        "actor": {
-                            "connector_channel": actor_connector.clone(),
-                            "gateway_principal": actor_gateway_principal.clone(),
-                            "gateway_device_id": actor_gateway_device_id.clone(),
-                        }
-                    }),
-                )
-                .await;
-                let _ = record_message_router_journal_event(
-                    &self.state,
-                    &route_request_context,
-                    session_id.as_str(),
-                    run_id.as_str(),
-                    "message.replied",
-                    common_v1::journal_event::EventActor::System as i32,
-                    json!({
-                        "event": "message.replied",
-                        "envelope_id": envelope_id,
-                        "channel": plan.channel.clone(),
-                        "reply_preview": truncate_with_ellipsis(reply_text.clone(), 256),
-                        "json_mode_requested": json_mode_requested,
-                        "structured_output_present": !route_structured_output.structured_json.is_empty(),
-                        "a2ui_surface": route_structured_output
-                            .a2ui_update
-                            .as_ref()
-                            .map(|value| value.surface.clone()),
-                        "attachments": route_attachment_metadata.clone(),
-                        "agent_id": route_agent_id,
-                        "agent_resolution_source": route_agent_resolution_source,
-                        "config_hash": route_config_hash.clone(),
-                        "actor": {
-                            "connector_channel": actor_connector.clone(),
-                            "gateway_principal": actor_gateway_principal.clone(),
-                            "gateway_device_id": actor_gateway_device_id.clone(),
-                        }
-                    }),
-                )
-                .await;
-
-                self.state.counters.channel_messages_replied.fetch_add(1, Ordering::Relaxed);
-                self.state
-                    .counters
-                    .channel_router_queue_depth
-                    .store(self.state.channel_router.queue_depth() as u64, Ordering::Relaxed);
-                let route_output_template = RouteMessageOutputTemplate {
-                    thread_id: plan.reply_thread_id.as_deref().unwrap_or_default(),
-                    in_reply_to_message_id: plan
-                        .in_reply_to_message_id
-                        .as_deref()
-                        .unwrap_or_default(),
-                    broadcast: plan.is_broadcast,
-                    auto_ack_text: plan.auto_ack_text.as_deref().unwrap_or_default(),
-                    auto_reaction: plan.auto_reaction.as_deref().unwrap_or_default(),
-                    attachments: route_output_attachments.as_slice(),
-                    structured_json: route_structured_output.structured_json.as_slice(),
-                    a2ui_update: route_structured_output.a2ui_update.as_ref(),
-                };
-                let route_outputs = build_route_message_outputs(
-                    reply_text.as_str(),
-                    input.max_payload_bytes,
-                    &route_output_template,
-                );
-                return Ok(Response::new(gateway_v1::RouteMessageResponse {
-                    v: CANONICAL_PROTOCOL_MAJOR,
-                    accepted: true,
-                    queued_for_retry: false,
-                    decision_reason: "routed".to_owned(),
-                    session_id: Some(common_v1::CanonicalId { ulid: session_id }),
-                    run_id: Some(common_v1::CanonicalId { ulid: run_id }),
-                    outputs: route_outputs,
-                    route_key: plan.route_key,
-                    retry_attempt,
-                    queue_depth: self.state.channel_router.queue_depth() as u32,
-                }));
+                return Ok(Response::new(response));
             }
         }
     }
