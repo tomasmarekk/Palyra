@@ -647,10 +647,23 @@ impl ConnectorSupervisor {
             let Some(adapter) = self.adapters.get(&instance.kind) else {
                 continue;
             };
-            let inbound = adapter
-                .poll_inbound(&instance, limit)
-                .await
-                .map_err(|error| ConnectorSupervisorError::Adapter(error.to_string()))?;
+            let inbound = match adapter.poll_inbound(&instance, limit).await {
+                Ok(inbound) => inbound,
+                Err(error) => {
+                    let now = unix_ms_now()?;
+                    self.store.record_event(
+                        instance.connector_id.as_str(),
+                        "inbound.poll_error",
+                        "warn",
+                        "adapter inbound poll failed; continuing with remaining connectors",
+                        Some(&json!({
+                            "error": error.to_string(),
+                        })),
+                        now,
+                    )?;
+                    continue;
+                }
+            };
             for event in inbound {
                 self.ingest_inbound(event).await?;
                 processed = processed.saturating_add(1);
@@ -1056,6 +1069,34 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct PollErrorAdapter;
+
+    #[async_trait]
+    impl ConnectorAdapter for PollErrorAdapter {
+        fn kind(&self) -> ConnectorKind {
+            ConnectorKind::Slack
+        }
+
+        async fn poll_inbound(
+            &self,
+            _instance: &crate::storage::ConnectorInstanceRecord,
+            _limit: usize,
+        ) -> Result<Vec<crate::protocol::InboundMessageEvent>, ConnectorAdapterError> {
+            Err(ConnectorAdapterError::Backend("simulated inbound poll failure".to_owned()))
+        }
+
+        async fn send_outbound(
+            &self,
+            _instance: &crate::storage::ConnectorInstanceRecord,
+            request: &crate::protocol::OutboundMessageRequest,
+        ) -> Result<DeliveryOutcome, ConnectorAdapterError> {
+            Ok(DeliveryOutcome::Delivered {
+                native_message_id: format!("native-{}", request.envelope_id),
+            })
+        }
+    }
+
+    #[derive(Default)]
     struct SlowCountingAdapter {
         sends: Mutex<HashMap<String, usize>>,
     }
@@ -1116,10 +1157,18 @@ mod tests {
     }
 
     fn sample_spec() -> ConnectorInstanceSpec {
+        sample_spec_with("echo:default", ConnectorKind::Echo, "channel:echo:default")
+    }
+
+    fn sample_spec_with(
+        connector_id: &str,
+        kind: ConnectorKind,
+        principal: &str,
+    ) -> ConnectorInstanceSpec {
         ConnectorInstanceSpec {
-            connector_id: "echo:default".to_owned(),
-            kind: ConnectorKind::Echo,
-            principal: "channel:echo:default".to_owned(),
+            connector_id: connector_id.to_owned(),
+            kind,
+            principal: principal.to_owned(),
             auth_profile_ref: None,
             token_vault_ref: None,
             egress_allowlist: Vec::new(),
@@ -1128,9 +1177,17 @@ mod tests {
     }
 
     fn sample_inbound(body: &str) -> crate::protocol::InboundMessageEvent {
+        sample_inbound_for("echo:default", "env-1", body)
+    }
+
+    fn sample_inbound_for(
+        connector_id: &str,
+        envelope_id: &str,
+        body: &str,
+    ) -> crate::protocol::InboundMessageEvent {
         crate::protocol::InboundMessageEvent {
-            envelope_id: "env-1".to_owned(),
-            connector_id: "echo:default".to_owned(),
+            envelope_id: envelope_id.to_owned(),
+            connector_id: connector_id.to_owned(),
             conversation_id: "c1".to_owned(),
             thread_id: None,
             sender_id: "u1".to_owned(),
@@ -1262,6 +1319,77 @@ mod tests {
         assert_eq!(processed, 1, "one inbound event should be processed");
         let status = supervisor.status("echo:default").expect("status should resolve");
         assert!(status.last_inbound_unix_ms.is_some(), "poll should update last inbound timestamp");
+    }
+
+    #[tokio::test]
+    async fn poll_inbound_continues_after_adapter_error_and_records_warning_event() {
+        let tempdir = TempDir::new().expect("tempdir should initialize");
+        let store = Arc::new(
+            ConnectorStore::open(tempdir.path().join("connectors.sqlite3"))
+                .expect("store should initialize"),
+        );
+        let healthy_adapter = Arc::new(FlakyAdapter::default());
+        let failing_adapter = Arc::new(PollErrorAdapter);
+        let supervisor = ConnectorSupervisor::new(
+            store,
+            Arc::new(RouterStub),
+            vec![healthy_adapter.clone(), failing_adapter],
+            ConnectorSupervisorConfig {
+                min_retry_delay_ms: 1,
+                base_retry_delay_ms: 1,
+                max_retry_delay_ms: 8,
+                ..ConnectorSupervisorConfig::default()
+            },
+        );
+        supervisor
+            .register_connector(&sample_spec_with(
+                "a-failing:default",
+                ConnectorKind::Slack,
+                "channel:slack:default",
+            ))
+            .expect("failing connector should register");
+        supervisor
+            .register_connector(&sample_spec_with(
+                "z-healthy:default",
+                ConnectorKind::Echo,
+                "channel:echo:default",
+            ))
+            .expect("healthy connector should register");
+        healthy_adapter.push_inbound(sample_inbound_for(
+            "z-healthy:default",
+            "env-healthy",
+            "hello from healthy poll",
+        ));
+
+        let processed =
+            supervisor.poll_inbound(8).await.expect("poll should continue after adapter failure");
+
+        assert_eq!(processed, 1, "healthy connector events should still be processed");
+        let status = supervisor
+            .status("z-healthy:default")
+            .expect("healthy connector status should resolve");
+        assert!(
+            status.last_inbound_unix_ms.is_some(),
+            "healthy connector should update last inbound timestamp"
+        );
+        let logs = supervisor
+            .list_logs("a-failing:default", 8)
+            .expect("failing connector logs should be readable");
+        let poll_error = logs
+            .iter()
+            .find(|entry| entry.event_type == "inbound.poll_error")
+            .expect("poll error warning should be recorded");
+        assert_eq!(poll_error.level, "warn");
+        assert_eq!(
+            poll_error.message,
+            "adapter inbound poll failed; continuing with remaining connectors"
+        );
+        let details =
+            poll_error.details.as_ref().expect("poll error should include diagnostic details");
+        assert_eq!(
+            details.get("error").and_then(Value::as_str),
+            Some("simulated inbound poll failure")
+        );
     }
 
     #[tokio::test]

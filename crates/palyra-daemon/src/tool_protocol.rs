@@ -1431,7 +1431,10 @@ mod tests {
 
         assert!(outcome.success, "sandbox process runner should execute allowlisted command");
         assert_eq!(outcome.attestation.executor, "sandbox_tier_b");
-        assert_eq!(outcome.attestation.sandbox_enforcement, "strict");
+        assert_eq!(
+            outcome.attestation.sandbox_enforcement,
+            config.process_runner.egress_enforcement_mode.as_str()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
