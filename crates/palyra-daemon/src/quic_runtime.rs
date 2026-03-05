@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::{anyhow, Context, Result};
 use palyra_transport_quic::{
@@ -6,11 +6,13 @@ use palyra_transport_quic::{
     DEFAULT_MAX_FRAME_BYTES, PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 
 const METHOD_HEALTH: &str = "node.health";
 const METHOD_STREAM_EVENTS: &str = "node.stream_events";
 const MAX_STREAM_SEQUENCE: u64 = 5;
+const MAX_CONCURRENT_CONNECTIONS: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct QuicRuntimeTlsMaterial {
@@ -62,8 +64,28 @@ pub fn bind_endpoint(
 }
 
 pub async fn serve(endpoint: quinn::Endpoint, node_rpc_mtls_required: bool) -> Result<()> {
+    serve_with_connection_limit(endpoint, node_rpc_mtls_required, MAX_CONCURRENT_CONNECTIONS).await
+}
+
+async fn serve_with_connection_limit(
+    endpoint: quinn::Endpoint,
+    node_rpc_mtls_required: bool,
+    max_concurrent_connections: usize,
+) -> Result<()> {
+    let connection_slots = Arc::new(Semaphore::new(max_concurrent_connections.max(1)));
     while let Some(connecting) = endpoint.accept().await {
+        let permit = match connection_slots.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                warn!(
+                    max_concurrent_connections = max_concurrent_connections.max(1),
+                    "QUIC connection dropped: global concurrency limit reached"
+                );
+                continue;
+            }
+        };
         tokio::spawn(async move {
+            let _permit = permit;
             let connection = match connecting.await {
                 Ok(connection) => connection,
                 Err(error) => {
@@ -202,8 +224,8 @@ mod tests {
     };
 
     use super::{
-        bind_endpoint, serve, QuicRuntimeRequest, QuicRuntimeResponse, QuicRuntimeTlsMaterial,
-        METHOD_HEALTH, METHOD_STREAM_EVENTS,
+        bind_endpoint, serve, serve_with_connection_limit, QuicRuntimeRequest, QuicRuntimeResponse,
+        QuicRuntimeTlsMaterial, METHOD_HEALTH, METHOD_STREAM_EVENTS,
     };
 
     struct TestPki {
@@ -301,6 +323,77 @@ mod tests {
         assert_eq!(sequences, vec![3, 4, 5]);
 
         connection.close(0_u32.into(), b"test complete");
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quic_runtime_rejects_connections_above_global_limit() {
+        let pki = build_test_pki();
+        let limits = QuicTransportLimits {
+            handshake_timeout: Duration::from_millis(750),
+            ..QuicTransportLimits::default()
+        };
+        let server_endpoint = bind_endpoint(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            &QuicRuntimeTlsMaterial {
+                ca_cert_pem: pki.ca_cert_pem.clone(),
+                cert_pem: pki.server_cert_pem.clone(),
+                key_pem: pki.server_key_pem.clone(),
+                require_client_auth: true,
+            },
+            &limits,
+        )
+        .expect("QUIC endpoint should bind");
+        let server_addr =
+            server_endpoint.local_addr().expect("bound QUIC endpoint should expose listen address");
+        let server_task = tokio::spawn(serve_with_connection_limit(server_endpoint, true, 1));
+
+        let client_tls = QuicClientTlsConfig {
+            ca_cert_pem: pki.ca_cert_pem.clone(),
+            client_cert_pem: Some(pki.client_cert_pem.clone()),
+            client_key_pem: Some(pki.client_key_pem.clone()),
+            server_name: "localhost".to_owned(),
+            pinned_server_fingerprint_sha256: None,
+        };
+        let client_endpoint = build_client_endpoint(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            &client_tls,
+            &limits,
+        )
+        .expect("client endpoint should bind");
+
+        let first_connection = connect_quic(&client_endpoint, server_addr, &client_tls, &limits)
+            .await
+            .expect("first client should connect within limit");
+
+        let second_connection =
+            connect_quic(&client_endpoint, server_addr, &client_tls, &limits).await;
+        assert!(
+            second_connection.is_err(),
+            "second client should be rejected once global connection limit is reached"
+        );
+
+        let (mut health_send, mut health_recv) =
+            first_connection.open_bi().await.expect("health stream should open");
+        send_request(
+            &mut health_send,
+            QuicRuntimeRequest {
+                protocol_version: PROTOCOL_VERSION,
+                method: METHOD_HEALTH.to_owned(),
+                resume_from: None,
+            },
+        )
+        .await;
+        health_send.finish().expect("health stream should finish");
+        let health_payload = read_frame(&mut health_recv, DEFAULT_MAX_FRAME_BYTES)
+            .await
+            .expect("health response should be readable");
+        let health: QuicRuntimeResponse =
+            serde_json::from_slice(health_payload.as_slice()).expect("health JSON should parse");
+        assert!(health.ok, "first connection should remain healthy within limit");
+
+        first_connection.close(0_u32.into(), b"test complete");
         server_task.abort();
         let _ = server_task.await;
     }
