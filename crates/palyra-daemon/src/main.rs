@@ -764,8 +764,6 @@ struct ConsoleBrowserRelayPageSnapshotPayload {
 
 #[derive(Debug, Deserialize)]
 struct ConsoleBrowserRelayActionRequest {
-    #[serde(default)]
-    relay_token: Option<String>,
     session_id: String,
     extension_id: String,
     action: String,
@@ -6995,16 +6993,6 @@ async fn console_browser_relay_action_handler(
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(extract_bearer_token)
-        .or_else(|| {
-            payload.relay_token.as_deref().and_then(|value| {
-                let trimmed = value.trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_owned())
-                }
-            })
-        })
         .ok_or_else(|| {
             runtime_status_response(tonic::Status::permission_denied(
                 "relay action requires bearer relay token",

@@ -191,6 +191,8 @@ describe("ConsoleApiClient", () => {
     const headers = new Headers(calls[0]?.init?.headers);
     expect(headers.get("authorization")).toBe("Bearer relay-token-1");
     expect(headers.get("x-palyra-csrf-token")).toBeNull();
+    const relayBodyText = (calls[0]?.init?.body as string | undefined) ?? "{}";
+    expect(relayBodyText).not.toContain("\"relay_token\"");
   });
 
   it("loads diagnostics snapshot without requiring CSRF header", async () => {

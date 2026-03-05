@@ -137,7 +137,54 @@ export function validateOpenTabUrl(urlRaw, allowlistPrefixes) {
   if (!["http:", "https:"].includes(parsed.protocol)) {
     throw new Error("Open-tab URL must use http or https.");
   }
-  const matched = allowlistPrefixes.some((prefix) => url.startsWith(prefix));
+  if (parsed.username.length > 0 || parsed.password.length > 0) {
+    throw new Error("Open-tab URL cannot include username or password.");
+  }
+  const normalizedHost = parsed.hostname.toLowerCase();
+  const normalizedPort = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
+  const normalizedPath = parsed.pathname.length > 0 ? parsed.pathname : "/";
+  const matched = allowlistPrefixes.some((rawPrefix) => {
+    const prefix = trimmed(rawPrefix);
+    if (!prefix) {
+      return false;
+    }
+    if (prefix === "http://" || prefix === "https://") {
+      return prefix === `${parsed.protocol}//`;
+    }
+    let parsedPrefix;
+    try {
+      parsedPrefix = new URL(prefix);
+    } catch (_error) {
+      return false;
+    }
+    if (!["http:", "https:"].includes(parsedPrefix.protocol)) {
+      return false;
+    }
+    if (
+      parsedPrefix.username.length > 0 ||
+      parsedPrefix.password.length > 0 ||
+      parsedPrefix.search.length > 0 ||
+      parsedPrefix.hash.length > 0
+    ) {
+      return false;
+    }
+    if (parsedPrefix.protocol !== parsed.protocol) {
+      return false;
+    }
+    if (parsedPrefix.hostname.toLowerCase() !== normalizedHost) {
+      return false;
+    }
+    const prefixPort = parsedPrefix.port || (parsedPrefix.protocol === "https:" ? "443" : "80");
+    if (prefixPort !== normalizedPort) {
+      return false;
+    }
+    const prefixPath = parsedPrefix.pathname.length > 0 ? parsedPrefix.pathname : "/";
+    if (prefixPath === "/") {
+      return true;
+    }
+    const normalizedPrefixPath = prefixPath.endsWith("/") ? prefixPath : `${prefixPath}/`;
+    return normalizedPath === prefixPath || normalizedPath.startsWith(normalizedPrefixPath);
+  });
   if (!matched) {
     throw new Error("Open-tab URL is not allowed by extension allowlist.");
   }

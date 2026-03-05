@@ -34,12 +34,43 @@ test("parseAllowlistPrefixes normalizes CSV and line input", () => {
 
 test("validateOpenTabUrl enforces prefix allowlist", () => {
   assert.equal(
-    validateOpenTabUrl("https://docs.palyra.dev", ["https://docs."]),
+    validateOpenTabUrl("https://docs.palyra.dev", ["https://docs.palyra.dev"]),
     "https://docs.palyra.dev/",
   );
   assert.throws(
-    () => validateOpenTabUrl("https://malicious.example", ["https://docs."]),
+    () => validateOpenTabUrl("https://malicious.example", ["https://docs.palyra.dev"]),
     /not allowed/,
+  );
+});
+
+test("validateOpenTabUrl rejects username/password confusion targets", () => {
+  assert.throws(
+    () => validateOpenTabUrl("https://example.com@evil.tld/path", ["https://example.com"]),
+    /username or password/,
+  );
+});
+
+test("validateOpenTabUrl rejects host-prefix confusion", () => {
+  assert.throws(
+    () => validateOpenTabUrl("https://example.com.evil.tld/path", ["https://example.com"]),
+    /not allowed/,
+  );
+});
+
+test("validateOpenTabUrl accepts same-origin path-prefix entries", () => {
+  assert.equal(
+    validateOpenTabUrl(
+      "https://docs.palyra.dev/security/guide",
+      ["https://docs.palyra.dev/security/"],
+    ),
+    "https://docs.palyra.dev/security/guide",
+  );
+});
+
+test("validateOpenTabUrl keeps scheme-only allowlist behavior", () => {
+  assert.equal(
+    validateOpenTabUrl("https://example.com/path", ["https://"]),
+    "https://example.com/path",
   );
 });
 

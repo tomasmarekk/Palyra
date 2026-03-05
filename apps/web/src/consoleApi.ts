@@ -742,7 +742,6 @@ export class ConsoleApiClient {
 
   async relayBrowserAction(
     payload: {
-      relay_token?: string;
       session_id: string;
       extension_id: string;
       action: "open_tab" | "capture_selection" | "send_page_snapshot";

@@ -505,17 +505,12 @@ fn resolve_connector_gateway_auth(
     if !auth.require_auth {
         return Ok((connector_principal.to_owned(), None));
     }
-    if let Some(connector_token) = auth.connector_token.as_deref() {
-        return Ok((connector_principal.to_owned(), Some(format!("Bearer {connector_token}"))));
-    }
-    let admin_token = auth.admin_token.as_deref().ok_or_else(|| {
+    let connector_token = auth.connector_token.as_deref().ok_or_else(|| {
         ConnectorSupervisorError::Router(
-            "admin auth is required but no admin token is configured".to_owned(),
+            "connector_token is required for RouteMessage when gateway auth is enabled".to_owned(),
         )
     })?;
-    let effective_principal =
-        auth.bound_principal.as_deref().unwrap_or(connector_principal).to_owned();
-    Ok((effective_principal, Some(format!("Bearer {admin_token}"))))
+    Ok((connector_principal.to_owned(), Some(format!("Bearer {connector_token}"))))
 }
 
 fn non_empty(raw: String) -> Option<String> {
@@ -869,24 +864,18 @@ mod tests {
     }
 
     #[test]
-    fn connector_gateway_auth_uses_admin_token_and_bound_principal_when_connector_token_missing() {
+    fn connector_gateway_auth_requires_connector_token_when_auth_is_enabled() {
         let auth = GatewayAuthConfig {
             require_auth: true,
             admin_token: Some("admin-secret".to_owned()),
             connector_token: None,
             bound_principal: Some("admin:ops".to_owned()),
         };
-        let (principal, authorization) =
-            resolve_connector_gateway_auth(&auth, "channel:discord:default")
-                .expect("admin auth fallback should succeed");
-        assert_eq!(
-            principal, "admin:ops",
-            "admin fallback should preserve configured principal binding behavior"
-        );
-        assert_eq!(
-            authorization.as_deref(),
-            Some("Bearer admin-secret"),
-            "admin token should be used when connector token is absent"
+        let error = resolve_connector_gateway_auth(&auth, "channel:discord:default")
+            .expect_err("auth-enabled path without connector token should fail");
+        assert!(
+            matches!(error, ConnectorSupervisorError::Router(message) if message.contains("connector_token is required")),
+            "missing connector token should be surfaced as deterministic router error"
         );
     }
 

@@ -782,6 +782,45 @@ fn console_cron_endpoints_enforce_owner_principal_boundaries() -> Result<()> {
 }
 
 #[test]
+fn console_browser_relay_action_rejects_body_token_without_authorization_header() -> Result<()> {
+    let (child, admin_port) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("failed to build HTTP client")?;
+
+    let response = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/browser/relay/actions"))
+        .json(&serde_json::json!({
+            "relay_token": "relay-token-from-body",
+            "session_id": DEVICE_ID,
+            "extension_id": "com.palyra.extension",
+            "action": "capture_selection",
+            "capture_selection": {
+                "selector": "body",
+                "max_selection_bytes": 128
+            }
+        }))
+        .send()
+        .context("failed to call relay action endpoint without authorization header")?;
+    assert_eq!(
+        response.status().as_u16(),
+        403,
+        "relay action endpoint must require authorization header token"
+    );
+    let body = response.text().context("failed to read relay action error response body")?;
+    assert!(
+        !body.contains("relay-token-from-body"),
+        "relay action denial must not echo relay token from request body"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn console_channels_endpoints_require_session_and_csrf() -> Result<()> {
     let (child, admin_port) = spawn_palyrad_with_dynamic_ports()?;
     let mut daemon = ChildGuard::new(child);
