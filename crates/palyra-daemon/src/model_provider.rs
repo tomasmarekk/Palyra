@@ -2,7 +2,7 @@ use std::{
     collections::hash_map::DefaultHasher,
     future::Future,
     hash::{Hash, Hasher},
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs},
+    net::{IpAddr, ToSocketAddrs},
     pin::Pin,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -370,7 +370,7 @@ where
         );
     }
     if let Ok(address) = host.parse::<IpAddr>() {
-        if is_private_or_local_ip(address) {
+        if palyra_common::netguard::is_private_or_local_ip(address) {
             anyhow::bail!(
                 "model_provider.openai_base_url host '{}' targets localhost/private network; set model_provider.allow_private_base_url=true or PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL=true to override for trusted local testing",
                 host
@@ -397,8 +397,9 @@ where
             host
         );
     }
-    if let Some(address) =
-        resolved_addresses.into_iter().find(|address| is_private_or_local_ip(*address))
+    if let Some(address) = resolved_addresses
+        .into_iter()
+        .find(|address| palyra_common::netguard::is_private_or_local_ip(*address))
     {
         anyhow::bail!(
             "model_provider.openai_base_url host '{}' resolves to private/local address '{}'; set model_provider.allow_private_base_url=true or PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL=true to override for trusted local testing",
@@ -418,30 +419,6 @@ fn resolve_hostname_ip_addrs(host: &str, port: u16) -> std::io::Result<Vec<IpAdd
 fn is_localhost_hostname(host: &str) -> bool {
     let normalized = host.trim_end_matches('.').to_ascii_lowercase();
     normalized == "localhost" || normalized.ends_with(".localhost")
-}
-
-fn is_private_or_local_ip(address: IpAddr) -> bool {
-    match address {
-        IpAddr::V4(ipv4) => is_private_or_local_ipv4(ipv4),
-        IpAddr::V6(ipv6) => is_private_or_local_ipv6(ipv6),
-    }
-}
-
-fn is_private_or_local_ipv4(address: Ipv4Addr) -> bool {
-    address.is_private()
-        || address.is_loopback()
-        || address.is_link_local()
-        || address.is_unspecified()
-}
-
-fn is_private_or_local_ipv6(address: Ipv6Addr) -> bool {
-    if let Some(mapped_ipv4) = address.to_ipv4_mapped() {
-        return is_private_or_local_ipv4(mapped_ipv4);
-    }
-    address.is_loopback()
-        || address.is_unicast_link_local()
-        || address.is_unique_local()
-        || address.is_unspecified()
 }
 
 #[derive(Debug)]
@@ -1492,7 +1469,7 @@ fn normalize_tool_arguments(raw: &str) -> Result<Vec<u8>, String> {
 mod tests {
     use std::{
         io::{BufRead, BufReader, Read, Write},
-        net::{IpAddr, Ipv4Addr, TcpListener, TcpStream},
+        net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, TcpStream},
         sync::{
             atomic::{AtomicUsize, Ordering},
             Arc, Mutex,
@@ -1845,9 +1822,50 @@ mod tests {
         validate_openai_base_url_network_policy_with_resolver(
             "https://api.example.invalid/v1",
             false,
-            |_host, _port| Ok(vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))]),
+            |_host, _port| Ok(vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]),
         )
         .expect("hostname resolving to public IP should pass private-network guard");
+    }
+
+    #[test]
+    fn openai_provider_rejects_special_use_ipv4_ranges_without_opt_in() {
+        for address in [
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(240, 0, 0, 1)),
+        ] {
+            let error = validate_openai_base_url_network_policy_with_resolver(
+                "https://api.example.invalid/v1",
+                false,
+                |_host, _port| Ok(vec![address]),
+            )
+            .expect_err("special-use IPv4 ranges must be rejected");
+            let rendered = format!("{error:#}");
+            assert!(
+                rendered.contains("resolves to private/local address"),
+                "error should describe private-network guard failure for {address}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn openai_provider_rejects_special_use_ipv6_ranges_without_opt_in() {
+        for address in [
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1)),
+            IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1)),
+        ] {
+            let error = validate_openai_base_url_network_policy_with_resolver(
+                "https://api.example.invalid/v1",
+                false,
+                |_host, _port| Ok(vec![address]),
+            )
+            .expect_err("special-use IPv6 ranges must be rejected");
+            let rendered = format!("{error:#}");
+            assert!(
+                rendered.contains("resolves to private/local address"),
+                "error should describe private-network guard failure for {address}: {rendered}"
+            );
+        }
     }
 
     #[test]

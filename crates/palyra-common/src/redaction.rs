@@ -62,35 +62,27 @@ pub fn redact_header(name: &str, value: &str) -> String {
 #[must_use]
 pub fn redact_url(raw: &str) -> String {
     let trimmed = raw.trim();
-    let Some(query_start) = trimmed.find('?') else {
-        return trimmed.to_owned();
-    };
-
-    let (prefix, rest) = trimmed.split_at(query_start + 1);
-    let (query, suffix) = split_query_suffix(rest);
-    if query.is_empty() {
-        return trimmed.to_owned();
+    if trimmed.is_empty() {
+        return String::new();
     }
 
-    let mut redacted_pairs = Vec::new();
-    for pair in query.split('&') {
-        if pair.is_empty() {
-            continue;
-        }
-        let (key, value) = split_query_pair(pair);
-        if is_sensitive_key(key) {
-            redacted_pairs.push(format!("{key}={REDACTED}"));
-        } else if value.is_empty() {
-            redacted_pairs.push(key.to_owned());
-        } else {
-            redacted_pairs.push(format!("{key}={value}"));
+    let (base_and_query, fragment) = split_once(trimmed, '#');
+    let (base, query) = split_once(base_and_query, '?');
+    let mut output = redact_url_userinfo(base);
+
+    if let Some(query) = query {
+        let redacted = redact_query_pairs(query);
+        if !redacted.is_empty() {
+            output.push('?');
+            output.push_str(redacted.as_str());
         }
     }
 
-    if redacted_pairs.is_empty() {
-        return trimmed.to_owned();
+    if let Some(fragment) = fragment {
+        output.push('#');
+        output.push_str(redact_query_pairs(fragment).as_str());
     }
-    format!("{prefix}{}{}", redacted_pairs.join("&"), suffix)
+    output
 }
 
 #[must_use]
@@ -183,11 +175,11 @@ fn split_trailing_punctuation(token: &str) -> (&str, &str) {
     token.split_at(index)
 }
 
-fn split_query_suffix(query_and_suffix: &str) -> (&str, &str) {
-    if let Some(fragment_index) = query_and_suffix.find('#') {
-        query_and_suffix.split_at(fragment_index)
+fn split_once(value: &str, delimiter: char) -> (&str, Option<&str>) {
+    if let Some((left, right)) = value.split_once(delimiter) {
+        (left, Some(right))
     } else {
-        (query_and_suffix, "")
+        (value, None)
     }
 }
 
@@ -197,6 +189,35 @@ fn split_query_pair(pair: &str) -> (&str, &str) {
     } else {
         (pair, "")
     }
+}
+
+fn redact_query_pairs(raw: &str) -> String {
+    let mut redacted_pairs = Vec::new();
+    for pair in raw.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (key, value) = split_query_pair(pair);
+        if is_sensitive_key(key) {
+            redacted_pairs.push(format!("{key}={REDACTED}"));
+        } else if value.is_empty() {
+            redacted_pairs.push(key.to_owned());
+        } else {
+            redacted_pairs.push(format!("{key}={value}"));
+        }
+    }
+    redacted_pairs.join("&")
+}
+
+fn redact_url_userinfo(base: &str) -> String {
+    let Some((scheme, rest)) = base.split_once("://") else {
+        return base.to_owned();
+    };
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let (authority, suffix) = rest.split_at(authority_end);
+    let redacted_authority =
+        authority.rsplit_once('@').map(|(_, host_and_port)| host_and_port).unwrap_or(authority);
+    format!("{scheme}://{redacted_authority}{suffix}")
 }
 
 fn normalize_key(key: &str) -> String {
@@ -246,6 +267,19 @@ mod tests {
             redacted,
             "https://example.test/path?token=<redacted>&mode=full&refresh_token=<redacted>"
         );
+    }
+
+    #[test]
+    fn url_redaction_removes_embedded_userinfo_credentials() {
+        let redacted = redact_url("https://user:pass@example.test/path");
+        assert_eq!(redacted, "https://example.test/path");
+        assert!(!redacted.contains("user:pass@"));
+    }
+
+    #[test]
+    fn url_redaction_masks_sensitive_fragment_values() {
+        let redacted = redact_url("https://example.test/callback#access_token=very-secret&mode=ok");
+        assert_eq!(redacted, "https://example.test/callback#access_token=<redacted>&mode=ok");
     }
 
     #[test]
