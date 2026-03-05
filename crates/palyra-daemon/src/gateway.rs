@@ -8184,52 +8184,19 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                             }
                         }
                         ProviderEvent::ToolProposal { proposal_id, tool_name, input_json } => {
-                            let run_stream_preparation =
-                                match prepare_run_stream_tool_proposal_execution(
-                                    &sender,
-                                    &mut stream,
-                                    &state_for_stream,
-                                    &context_for_stream,
-                                    active_session_id.as_deref(),
-                                    session_id.as_str(),
-                                    run_id.as_str(),
-                                    proposal_id.as_str(),
-                                    tool_name.as_str(),
-                                    input_json.as_slice(),
-                                    &mut remaining_tool_budget,
-                                    &mut tape_seq,
-                                )
-                                .await
-                                {
-                                    Ok(value) => value,
-                                    Err(error) => {
-                                        finalize_run_failure(
-                                            &sender,
-                                            &state_for_stream,
-                                            &mut run_state,
-                                            active_run_id.as_deref(),
-                                            &mut tape_seq,
-                                            error.message(),
-                                        )
-                                        .await;
-                                        let _ = sender.send(Err(error)).await;
-                                        return;
-                                    }
-                                };
-                            let RunStreamToolProposalPreparation { decision, resolved_session_id } =
-                                run_stream_preparation;
-
-                            match execute_run_stream_tool_proposal(
+                            match process_run_stream_tool_proposal_event(
                                 &sender,
+                                &mut stream,
                                 &state_for_stream,
                                 &context_for_stream,
+                                active_session_id.as_deref(),
                                 &mut run_state,
+                                session_id.as_str(),
                                 run_id.as_str(),
                                 proposal_id.as_str(),
                                 tool_name.as_str(),
                                 input_json.as_slice(),
-                                &decision,
-                                resolved_session_id.as_str(),
+                                &mut remaining_tool_budget,
                                 &mut tape_seq,
                             )
                             .await
@@ -14270,6 +14237,56 @@ async fn process_route_tool_proposal_event(
         "route_message_tool_result",
     )
     .await)
+}
+
+#[allow(clippy::result_large_err)]
+#[allow(clippy::too_many_arguments)]
+async fn process_run_stream_tool_proposal_event(
+    sender: &mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
+    stream: &mut Streaming<common_v1::RunStreamRequest>,
+    runtime_state: &Arc<GatewayRuntimeState>,
+    request_context: &RequestContext,
+    active_session_id: Option<&str>,
+    run_state: &mut RunStateMachine,
+    session_id: &str,
+    run_id: &str,
+    proposal_id: &str,
+    tool_name: &str,
+    input_json: &[u8],
+    remaining_tool_budget: &mut u32,
+    tape_seq: &mut i64,
+) -> Result<RunStreamToolExecutionOutcome, Status> {
+    let RunStreamToolProposalPreparation { decision, resolved_session_id } =
+        prepare_run_stream_tool_proposal_execution(
+            sender,
+            stream,
+            runtime_state,
+            request_context,
+            active_session_id,
+            session_id,
+            run_id,
+            proposal_id,
+            tool_name,
+            input_json,
+            remaining_tool_budget,
+            tape_seq,
+        )
+        .await?;
+
+    execute_run_stream_tool_proposal(
+        sender,
+        runtime_state,
+        request_context,
+        run_state,
+        run_id,
+        proposal_id,
+        tool_name,
+        input_json,
+        &decision,
+        resolved_session_id.as_str(),
+        tape_seq,
+    )
+    .await
 }
 
 #[allow(clippy::result_large_err)]
