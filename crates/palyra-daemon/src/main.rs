@@ -1677,6 +1677,10 @@ async fn main() -> Result<()> {
         .route("/console/v1/audit/events", get(console_audit_events_handler))
         .layer(DefaultBodyLimit::max(HTTP_MAX_REQUEST_BODY_BYTES))
         .route_layer(middleware::from_fn_with_state(state.clone(), admin_rate_limit_middleware))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            console_session_cookie_refresh_middleware,
+        ))
         .route_layer(middleware::from_fn(admin_console_security_headers_middleware));
     let canvas_routes = Router::new()
         .route("/canvas/v1/frame/{canvas_id}", get(canvas_frame_handler))
@@ -2018,6 +2022,28 @@ async fn admin_console_security_headers_middleware(request: Request, next: Next)
         HeaderValue::from_static("no-referrer"),
     );
     response
+}
+
+async fn console_session_cookie_refresh_middleware(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let request_headers = request.headers().clone();
+    let mut response = next.run(request).await;
+    if response.headers().contains_key(SET_COOKIE)
+        || matches!(response.status(), StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+    {
+        return response;
+    }
+    match refresh_console_session_cookie(&state, &request_headers) {
+        Ok(Some(cookie)) => {
+            response.headers_mut().append(SET_COOKIE, cookie);
+            response
+        }
+        Ok(None) => response,
+        Err(error_response) => error_response,
+    }
 }
 
 async fn canvas_security_headers_middleware(request: Request, next: Next) -> Response {
@@ -2875,11 +2901,16 @@ async fn console_login_handler(
     headers: HeaderMap,
     Json(payload): Json<ConsoleLoginRequest>,
 ) -> Result<(HeaderMap, Json<ConsoleSessionResponse>), Response> {
-    let principal = payload.principal.trim();
+    let requested_principal = payload.principal.trim();
     let device_id = payload.device_id.trim();
-    if principal.is_empty() {
+    if requested_principal.is_empty() {
         return Err(runtime_status_response(tonic::Status::invalid_argument(
             "principal cannot be empty",
+        )));
+    }
+    if !requested_principal.starts_with("admin:") {
+        return Err(runtime_status_response(tonic::Status::permission_denied(
+            "web console login requires an admin:* principal",
         )));
     }
     if device_id.is_empty() {
@@ -2887,6 +2918,12 @@ async fn console_login_handler(
             "device_id cannot be empty",
         )));
     }
+    if state.auth.require_auth && state.auth.bound_principal.is_none() {
+        return Err(runtime_status_response(tonic::Status::failed_precondition(
+            "console login requires configured admin.bound_principal when auth is enabled",
+        )));
+    }
+    let principal = state.auth.bound_principal.as_deref().unwrap_or(requested_principal);
 
     let mut auth_headers = HeaderMap::new();
     if let Some(token) = payload.admin_token.as_deref() {
@@ -2941,8 +2978,7 @@ async fn console_login_handler(
             "failed to read system clock: {error}"
         )))
     })?;
-    let expires_at_unix_ms =
-        now.saturating_add(i64::try_from(CONSOLE_SESSION_TTL_SECONDS).unwrap_or(i64::MAX) * 1_000);
+    let expires_at_unix_ms = next_console_session_expiry_unix_ms(now);
     let session_token = mint_console_secret_token();
     let csrf_token = mint_console_secret_token();
     let session = ConsoleSession {
@@ -3315,6 +3351,10 @@ fn build_console_session_response(
     }
 }
 
+fn next_console_session_expiry_unix_ms(now: i64) -> i64 {
+    now.saturating_add(i64::try_from(CONSOLE_SESSION_TTL_SECONDS).unwrap_or(i64::MAX) * 1_000)
+}
+
 #[allow(clippy::result_large_err)]
 fn authorize_console_session(
     state: &AppState,
@@ -3362,9 +3402,36 @@ fn authorize_console_session(
             )));
         }
     }
-    session.expires_at_unix_ms =
-        now.saturating_add(i64::try_from(CONSOLE_SESSION_TTL_SECONDS).unwrap_or(i64::MAX) * 1_000);
+    session.expires_at_unix_ms = next_console_session_expiry_unix_ms(now);
     Ok(session.clone())
+}
+
+#[allow(clippy::result_large_err)]
+fn refresh_console_session_cookie(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Option<HeaderValue>, Response> {
+    let Some(session_token) = cookie_value(headers, CONSOLE_SESSION_COOKIE_NAME) else {
+        return Ok(None);
+    };
+    let session_token_hash_sha256 = sha256_hex(session_token.as_bytes());
+    let now = unix_ms_now().map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "failed to read system clock: {error}"
+        )))
+    })?;
+    let mut sessions = lock_console_sessions(&state.console_sessions);
+    sessions.retain(|_, session| session.expires_at_unix_ms > now);
+    let Some(session_key) =
+        find_hashed_secret_map_key(&sessions, session_token_hash_sha256.as_str())
+    else {
+        return Ok(None);
+    };
+    let Some(session) = sessions.get_mut(session_key.as_str()) else {
+        return Ok(None);
+    };
+    session.expires_at_unix_ms = next_console_session_expiry_unix_ms(now);
+    build_console_session_cookie(session_token.as_str(), request_uses_tls(headers)).map(Some)
 }
 
 fn lock_console_sessions<'a>(

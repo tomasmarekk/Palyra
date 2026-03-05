@@ -777,6 +777,7 @@ impl ControlCenter {
             ("PALYRA_DEPLOYMENT_MODE".to_owned(), "local_desktop".to_owned()),
             ("PALYRA_ADMIN_REQUIRE_AUTH".to_owned(), "true".to_owned()),
             ("PALYRA_ADMIN_TOKEN".to_owned(), self.admin_token.clone()),
+            ("PALYRA_ADMIN_BOUND_PRINCIPAL".to_owned(), CONSOLE_PRINCIPAL.to_owned()),
             ("PALYRA_STATE_ROOT".to_owned(), self.runtime_root.to_string_lossy().into_owned()),
             ("PALYRA_DAEMON_BIND_ADDR".to_owned(), LOOPBACK_HOST.to_owned()),
             ("PALYRA_DAEMON_PORT".to_owned(), self.runtime.gateway_admin_port.to_string()),

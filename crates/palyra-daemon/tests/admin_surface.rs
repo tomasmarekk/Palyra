@@ -331,7 +331,7 @@ fn admin_skill_quarantine_and_enable_require_override_acknowledgement() -> Resul
 
 #[test]
 fn console_session_and_csrf_guards_are_enforced() -> Result<()> {
-    let (child, admin_port) = spawn_palyrad_with_dynamic_ports()?;
+    let (child, admin_port) = spawn_palyrad_with_bound_console_principal(CONSOLE_ADMIN_PRINCIPAL)?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
 
@@ -366,6 +366,11 @@ fn console_session_and_csrf_guards_are_enforced() -> Result<()> {
         .error_for_status()
         .context("console session endpoint returned non-success status")?;
     assert_admin_console_security_headers(session_response.headers())?;
+    let refreshed_cookie = header_value(session_response.headers(), "set-cookie")?;
+    assert!(
+        refreshed_cookie.starts_with(cookie.as_str()) && refreshed_cookie.contains("Max-Age=1800"),
+        "session endpoint should refresh the session cookie Max-Age"
+    );
     let session_response =
         session_response.text().context("failed to read console session response body")?;
     assert!(
@@ -400,8 +405,78 @@ fn console_session_and_csrf_guards_are_enforced() -> Result<()> {
 }
 
 #[test]
+fn console_login_requires_bound_principal_when_auth_is_enabled() -> Result<()> {
+    let (child, admin_port) =
+        spawn_palyrad_with_dynamic_ports_with_env(&[("PALYRA_ADMIN_BOUND_PRINCIPAL", "")])?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("failed to build HTTP client")?;
+
+    let response = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/auth/login"))
+        .json(&serde_json::json!({
+            "admin_token": ADMIN_TOKEN,
+            "principal": CONSOLE_ADMIN_PRINCIPAL,
+            "device_id": DEVICE_ID,
+            "channel": "web",
+        }))
+        .send()
+        .context("failed to call console login without bound principal")?;
+    assert_eq!(
+        response.status().as_u16(),
+        412,
+        "console login should fail closed when auth is enabled without bound principal"
+    );
+    let body = response.text().context("failed to read console login error response body")?;
+    assert!(
+        body.contains("admin.bound_principal"),
+        "console login error should explain missing bound principal requirement"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn console_login_uses_configured_bound_principal() -> Result<()> {
+    let (child, admin_port) = spawn_palyrad_with_bound_console_principal("admin:bound-console")?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("failed to build HTTP client")?;
+
+    let response = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/auth/login"))
+        .json(&serde_json::json!({
+            "admin_token": ADMIN_TOKEN,
+            "principal": CONSOLE_AUDITOR_PRINCIPAL,
+            "device_id": DEVICE_ID,
+            "channel": "web",
+        }))
+        .send()
+        .context("failed to call console login with bound principal")?
+        .error_for_status()
+        .context("console login with bound principal returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse console login response json")?;
+    assert_eq!(
+        response.get("principal").and_then(Value::as_str),
+        Some("admin:bound-console"),
+        "console login should ignore caller-selected principal when bound principal is configured"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn console_approvals_flow_requires_session_and_csrf() -> Result<()> {
-    let (child, admin_port) = spawn_palyrad_with_dynamic_ports()?;
+    let (child, admin_port) = spawn_palyrad_with_bound_console_principal(CONSOLE_ADMIN_PRINCIPAL)?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
 
@@ -469,7 +544,7 @@ fn console_approvals_flow_requires_session_and_csrf() -> Result<()> {
 
 #[test]
 fn console_chat_endpoints_require_session_and_csrf() -> Result<()> {
-    let (child, admin_port) = spawn_palyrad_with_dynamic_ports()?;
+    let (child, admin_port) = spawn_palyrad_with_bound_console_principal(CONSOLE_ADMIN_PRINCIPAL)?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
 
@@ -597,7 +672,7 @@ fn console_chat_endpoints_require_session_and_csrf() -> Result<()> {
 
 #[test]
 fn console_cron_workflow_create_disable_and_list_runs() -> Result<()> {
-    let (child, admin_port) = spawn_palyrad_with_dynamic_ports()?;
+    let (child, admin_port) = spawn_palyrad_with_bound_console_principal(CONSOLE_ADMIN_PRINCIPAL)?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
 
@@ -685,7 +760,8 @@ fn console_cron_workflow_create_disable_and_list_runs() -> Result<()> {
 
 #[test]
 fn console_cron_endpoints_enforce_owner_principal_boundaries() -> Result<()> {
-    let (child, admin_port) = spawn_palyrad_with_dynamic_ports()?;
+    let (child, admin_port) =
+        spawn_palyrad_with_dynamic_ports_with_env(&[("PALYRA_ADMIN_REQUIRE_AUTH", "false")])?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
 
@@ -783,7 +859,7 @@ fn console_cron_endpoints_enforce_owner_principal_boundaries() -> Result<()> {
 
 #[test]
 fn console_browser_relay_action_rejects_body_token_without_authorization_header() -> Result<()> {
-    let (child, admin_port) = spawn_palyrad_with_dynamic_ports()?;
+    let (child, admin_port) = spawn_palyrad_with_bound_console_principal(CONSOLE_ADMIN_PRINCIPAL)?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
 
@@ -822,7 +898,7 @@ fn console_browser_relay_action_rejects_body_token_without_authorization_header(
 
 #[test]
 fn console_channels_endpoints_require_session_and_csrf() -> Result<()> {
-    let (child, admin_port) = spawn_palyrad_with_dynamic_ports()?;
+    let (child, admin_port) = spawn_palyrad_with_bound_console_principal(CONSOLE_ADMIN_PRINCIPAL)?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
 
@@ -1002,7 +1078,7 @@ fn console_channels_endpoints_require_session_and_csrf() -> Result<()> {
 
 #[test]
 fn console_memory_purge_requires_session_and_csrf() -> Result<()> {
-    let (child, admin_port) = spawn_palyrad_with_dynamic_ports()?;
+    let (child, admin_port) = spawn_palyrad_with_bound_console_principal(CONSOLE_ADMIN_PRINCIPAL)?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
 
@@ -1053,7 +1129,7 @@ fn console_memory_purge_requires_session_and_csrf() -> Result<()> {
 
 #[test]
 fn console_login_rejects_oversized_request_body() -> Result<()> {
-    let (child, admin_port) = spawn_palyrad_with_dynamic_ports()?;
+    let (child, admin_port) = spawn_palyrad_with_bound_console_principal(CONSOLE_ADMIN_PRINCIPAL)?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
 
@@ -1113,9 +1189,17 @@ fn admin_run_cancel_rejects_oversized_request_body() -> Result<()> {
 }
 
 fn spawn_palyrad_with_dynamic_ports() -> Result<(Child, u16)> {
+    spawn_palyrad_with_dynamic_ports_with_env(&[])
+}
+
+fn spawn_palyrad_with_bound_console_principal(principal: &str) -> Result<(Child, u16)> {
+    spawn_palyrad_with_dynamic_ports_with_env(&[("PALYRA_ADMIN_BOUND_PRINCIPAL", principal)])
+}
+
+fn spawn_palyrad_with_dynamic_ports_with_env(extra_env: &[(&str, &str)]) -> Result<(Child, u16)> {
     let mut last_error: Option<anyhow::Error> = None;
     for attempt in 1..=PALYRAD_STARTUP_ATTEMPTS {
-        match spawn_palyrad_with_dynamic_ports_once() {
+        match spawn_palyrad_with_dynamic_ports_once(extra_env) {
             Ok(started) => return Ok(started),
             Err(error) => {
                 last_error = Some(error);
@@ -1203,12 +1287,13 @@ fn header_value(headers: &reqwest::header::HeaderMap, name: &str) -> Result<Stri
         .map(ToOwned::to_owned)
 }
 
-fn spawn_palyrad_with_dynamic_ports_once() -> Result<(Child, u16)> {
+fn spawn_palyrad_with_dynamic_ports_once(extra_env: &[(&str, &str)]) -> Result<(Child, u16)> {
     let journal_db_path = unique_temp_journal_db_path();
     let identity_store_dir = unique_temp_identity_store_dir();
     let vault_dir = unique_temp_vault_dir();
     prepare_test_vault_dir(&vault_dir)?;
-    let mut child = Command::new(env!("CARGO_BIN_EXE_palyrad"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_palyrad"));
+    command
         .args([
             "--bind",
             "127.0.0.1",
@@ -1227,9 +1312,11 @@ fn spawn_palyrad_with_dynamic_ports_once() -> Result<(Child, u16)> {
         .env("PALYRA_VAULT_DIR", vault_dir.to_string_lossy().to_string())
         .env("RUST_LOG", "info")
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("failed to start palyrad")?;
+        .stderr(Stdio::null());
+    for (name, value) in extra_env {
+        command.env(name, value);
+    }
+    let mut child = command.spawn().context("failed to start palyrad")?;
     let stdout = child.stdout.take().context("failed to capture palyrad stdout")?;
     let admin_port = match wait_for_admin_port(stdout, &mut child) {
         Ok(port) => port,
