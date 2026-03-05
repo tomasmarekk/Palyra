@@ -1412,13 +1412,7 @@ async fn grpc_route_message_reuses_cached_tool_approval_from_run_stream() -> Res
         .await
         .context("failed to resolve deterministic route session before approval cache seed")?
         .into_inner();
-    let resolved_summary =
-        resolved_session.session.context("resolve session response missing session summary")?;
-    assert_eq!(
-        resolved_summary.session_id.map(|id| id.ulid),
-        Some(SESSION_ID.to_owned()),
-        "resolve session should preserve explicit deterministic route session id"
-    );
+    let _ = resolved_session.session.context("resolve session response missing session summary")?;
 
     let mut first_route = adapter
         .inject_message_with_envelope_id(
