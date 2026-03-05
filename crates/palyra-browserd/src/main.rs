@@ -3164,7 +3164,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                     selection_payload.max_selection_bytes.min(MAX_RELAY_SELECTION_BYTES as u64)
                         as usize
                 };
-                let selected_text = {
+                let (selected_text, truncated) = {
                     let mut sessions = self.runtime.sessions.lock().await;
                     let Some(session) = sessions.get_mut(session_id.as_str()) else {
                         return Ok(Response::new(browser_v1::RelayActionResponse {
@@ -3191,9 +3191,8 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                             result: None,
                         }));
                     };
-                    truncate_utf8_bytes(tag.as_str(), max_selection_bytes)
+                    truncate_utf8_bytes_with_flag(tag.as_str(), max_selection_bytes)
                 };
-                let truncated = selected_text.len() >= max_selection_bytes;
                 Ok(Response::new(browser_v1::RelayActionResponse {
                     v: CANONICAL_PROTOCOL_MAJOR,
                     success: true,
@@ -7149,8 +7148,18 @@ fn has_attr_value(tag_lower: &str, attr_name: &str, expected_value_lower: &str) 
 fn extract_attr_value(tag_lower: &str, attr_name: &str) -> Option<String> {
     let needle = format!("{attr_name}=");
     let start = tag_lower.find(needle.as_str())?;
-    let mut value = &tag_lower[start + needle.len()..];
-    value = value.trim_start();
+    parse_attr_value(&tag_lower[start + needle.len()..])
+}
+
+fn extract_attr_value_case_insensitive(tag: &str, attr_name: &str) -> Option<String> {
+    let tag_lower = tag.to_ascii_lowercase();
+    let needle = format!("{}=", attr_name.to_ascii_lowercase());
+    let start = tag_lower.find(needle.as_str())?;
+    parse_attr_value(&tag[start + needle.len()..])
+}
+
+fn parse_attr_value(raw_value: &str) -> Option<String> {
+    let value = raw_value.trim_start();
     if let Some(stripped) = value.strip_prefix('"') {
         let end = stripped.find('"')?;
         return Some(stripped[..end].to_owned());
@@ -7258,8 +7267,7 @@ fn resolve_download_target(
     tag: &str,
     current_url: Option<&str>,
 ) -> Result<(String, String), String> {
-    let tag_lower = tag.to_ascii_lowercase();
-    let href = extract_attr_value(tag_lower.as_str(), "href")
+    let href = extract_attr_value_case_insensitive(tag, "href")
         .ok_or_else(|| "download-like element is missing href".to_owned())?;
     if href.trim().is_empty() {
         return Err("download-like element has an empty href".to_owned());
@@ -7277,7 +7285,7 @@ fn resolve_download_target(
             .map_err(|error| format!("failed to resolve relative download URL: {error}"))?
             .to_string()
     };
-    let explicit_name = extract_attr_value(tag_lower.as_str(), "download").unwrap_or_default();
+    let explicit_name = extract_attr_value_case_insensitive(tag, "download").unwrap_or_default();
     let file_name = if explicit_name.trim().is_empty() {
         infer_download_file_name(resolved_url.as_str())
     } else {
@@ -7508,8 +7516,9 @@ mod tests {
         BrowserTabRecord, ChromiumSessionProxy, DnsCacheResolution, DnsValidationCache,
         PersistedSessionSnapshot, PersistedStateStore, ResolvedHostAddresses,
         SessionPermissionsInternal, AUTHORIZATION_HEADER, CANONICAL_PROTOCOL_MAJOR,
-        CHROMIUM_PATH_ENV, DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS, DEFAULT_GRPC_PORT,
-        MAX_RELAY_PAYLOAD_BYTES, ONE_BY_ONE_PNG, PROFILE_RECORD_SCHEMA_VERSION, STATE_KEY_LEN,
+        CHROMIUM_NEW_TAB_RETRY_DELAY_MS, CHROMIUM_PATH_ENV, DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS,
+        DEFAULT_GRPC_PORT, MAX_RELAY_PAYLOAD_BYTES, ONE_BY_ONE_PNG, PROFILE_RECORD_SCHEMA_VERSION,
+        STATE_KEY_LEN,
     };
     use crate::proto;
     use crate::proto::palyra::browser::v1::browser_service_server::BrowserService;
@@ -7522,7 +7531,7 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tonic::Request;
+    use tonic::{Request, Status};
 
     const PARITY_DOWNLOAD_TRIGGER_HTML: &str =
         include_str!("../../../fixtures/parity/download-trigger.html");
@@ -7535,6 +7544,31 @@ mod tests {
         let value =
             format!("Bearer {token}").parse().expect("authorization header value should be valid");
         request.metadata_mut().insert(AUTHORIZATION_HEADER, value);
+    }
+
+    async fn create_session_with_retry_for_chromium_test(
+        service: &BrowserServiceImpl,
+        payload: browser_v1::CreateSessionRequest,
+        max_attempts: usize,
+    ) -> Result<browser_v1::CreateSessionResponse, Status> {
+        let attempts = max_attempts.max(1);
+        let mut last_status = None;
+        for attempt in 1..=attempts {
+            match service.create_session(Request::new(payload.clone())).await {
+                Ok(response) => return Ok(response.into_inner()),
+                Err(status)
+                    if attempt < attempts
+                        && chromium_new_tab_error_is_retryable(status.message()) =>
+                {
+                    last_status = Some(status);
+                    tokio::time::sleep(Duration::from_millis(CHROMIUM_NEW_TAB_RETRY_DELAY_MS))
+                        .await;
+                }
+                Err(status) => return Err(status),
+            }
+        }
+        Err(last_status
+            .unwrap_or_else(|| Status::internal("chromium test session retry exhausted")))
     }
 
     fn resolve_chromium_path_for_tests() -> Option<PathBuf> {
@@ -8205,8 +8239,9 @@ mod tests {
             .expect("chromium runtime should initialize"),
         );
         let service = BrowserServiceImpl { runtime };
-        let created = service
-            .create_session(Request::new(browser_v1::CreateSessionRequest {
+        let created = create_session_with_retry_for_chromium_test(
+            &service,
+            browser_v1::CreateSessionRequest {
                 v: 1,
                 principal: "user:ops".to_owned(),
                 idle_ttl_ms: 10_000,
@@ -8219,10 +8254,11 @@ mod tests {
                 profile_id: None,
                 private_profile: false,
                 channel: String::new(),
-            }))
-            .await
-            .expect("create_session should succeed for chromium mode")
-            .into_inner();
+            },
+            3,
+        )
+        .await
+        .expect("create_session should succeed for chromium mode");
         let session_id = created.session_id.expect("session id should exist");
 
         let navigate = service
@@ -9815,6 +9851,385 @@ mod tests {
             "error should explain relay payload bound: {}",
             status.message()
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn browser_service_relay_capture_selection_reports_exact_limit_without_truncation() {
+        let (url, handle) = spawn_static_http_server(
+            200,
+            "<html><head><title>Selection</title></head><body>selection body</body></html>",
+        );
+        let runtime = std::sync::Arc::new(
+            BrowserRuntimeState::new(&Args {
+                bind: "127.0.0.1".to_owned(),
+                port: 7143,
+                grpc_bind: "127.0.0.1".to_owned(),
+                grpc_port: 7543,
+                auth_token: None,
+                session_idle_ttl_ms: 60_000,
+                max_sessions: 16,
+                max_navigation_timeout_ms: 10_000,
+                max_session_lifetime_ms: 60_000,
+                max_screenshot_bytes: 128 * 1024,
+                max_response_bytes: 128 * 1024,
+                max_title_bytes: 4 * 1024,
+                engine_mode: BrowserEngineMode::Simulated,
+                chromium_path: None,
+                chromium_startup_timeout_ms: DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS,
+            })
+            .expect("runtime should initialize"),
+        );
+        let service = BrowserServiceImpl { runtime };
+        let created = service
+            .create_session(Request::new(browser_v1::CreateSessionRequest {
+                v: 1,
+                principal: "user:ops".to_owned(),
+                idle_ttl_ms: 10_000,
+                budget: None,
+                allow_private_targets: true,
+                allow_downloads: false,
+                action_allowed_domains: Vec::new(),
+                persistence_enabled: false,
+                persistence_id: String::new(),
+                profile_id: None,
+                private_profile: false,
+                channel: String::new(),
+            }))
+            .await
+            .expect("create_session should succeed")
+            .into_inner();
+        let session_id = created
+            .session_id
+            .as_ref()
+            .map(|value| value.ulid.clone())
+            .expect("session id should be present");
+
+        let navigate = service
+            .navigate(Request::new(browser_v1::NavigateRequest {
+                v: 1,
+                session_id: Some(proto::palyra::common::v1::CanonicalId {
+                    ulid: session_id.clone(),
+                }),
+                url,
+                timeout_ms: 2_000,
+                allow_redirects: true,
+                max_redirects: 3,
+                allow_private_targets: true,
+            }))
+            .await
+            .expect("navigate should succeed")
+            .into_inner();
+        assert!(navigate.success, "navigate should succeed before relay capture_selection");
+
+        let exact_limit = "<body>".len() as u64;
+        let exact_response = service
+            .relay_action(Request::new(browser_v1::RelayActionRequest {
+                v: 1,
+                session_id: Some(proto::palyra::common::v1::CanonicalId {
+                    ulid: session_id.clone(),
+                }),
+                extension_id: "com.palyra.extension".to_owned(),
+                action: browser_v1::RelayActionKind::CaptureSelection as i32,
+                payload: Some(browser_v1::relay_action_request::Payload::CaptureSelection(
+                    browser_v1::RelayCaptureSelectionPayload {
+                        selector: "body".to_owned(),
+                        max_selection_bytes: exact_limit,
+                    },
+                )),
+                max_payload_bytes: 4_096,
+            }))
+            .await
+            .expect("relay capture_selection should return response")
+            .into_inner();
+        let Some(browser_v1::relay_action_response::Result::Selection(exact_selection)) =
+            exact_response.result
+        else {
+            panic!("capture_selection should return selection payload");
+        };
+        assert_eq!(exact_selection.selected_text, "<body>");
+        assert!(
+            !exact_selection.truncated,
+            "selection at the exact byte cap must not be marked truncated"
+        );
+
+        let truncated_response = service
+            .relay_action(Request::new(browser_v1::RelayActionRequest {
+                v: 1,
+                session_id: Some(proto::palyra::common::v1::CanonicalId { ulid: session_id }),
+                extension_id: "com.palyra.extension".to_owned(),
+                action: browser_v1::RelayActionKind::CaptureSelection as i32,
+                payload: Some(browser_v1::relay_action_request::Payload::CaptureSelection(
+                    browser_v1::RelayCaptureSelectionPayload {
+                        selector: "body".to_owned(),
+                        max_selection_bytes: exact_limit.saturating_sub(1),
+                    },
+                )),
+                max_payload_bytes: 4_096,
+            }))
+            .await
+            .expect("relay capture_selection should return response")
+            .into_inner();
+        let Some(browser_v1::relay_action_response::Result::Selection(truncated_selection)) =
+            truncated_response.result
+        else {
+            panic!("capture_selection should return selection payload");
+        };
+        assert!(
+            truncated_selection.truncated,
+            "selection below the exact byte cap must report truncation"
+        );
+
+        handle.join().expect("test server thread should exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn browser_service_relay_rejects_unsupported_action_kind_with_auth_token() {
+        const AUTH_TOKEN: &str = "test-token";
+        let runtime = std::sync::Arc::new(
+            BrowserRuntimeState::new(&Args {
+                bind: "127.0.0.1".to_owned(),
+                port: 7143,
+                grpc_bind: "127.0.0.1".to_owned(),
+                grpc_port: 7543,
+                auth_token: Some(AUTH_TOKEN.to_owned()),
+                session_idle_ttl_ms: 60_000,
+                max_sessions: 16,
+                max_navigation_timeout_ms: 10_000,
+                max_session_lifetime_ms: 60_000,
+                max_screenshot_bytes: 128 * 1024,
+                max_response_bytes: 128 * 1024,
+                max_title_bytes: 4 * 1024,
+                engine_mode: BrowserEngineMode::Simulated,
+                chromium_path: None,
+                chromium_startup_timeout_ms: DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS,
+            })
+            .expect("runtime should initialize"),
+        );
+        let service = BrowserServiceImpl { runtime };
+        let mut create_request = Request::new(browser_v1::CreateSessionRequest {
+            v: 1,
+            principal: "user:ops".to_owned(),
+            idle_ttl_ms: 10_000,
+            budget: None,
+            allow_private_targets: true,
+            allow_downloads: false,
+            action_allowed_domains: Vec::new(),
+            persistence_enabled: false,
+            persistence_id: String::new(),
+            profile_id: None,
+            private_profile: false,
+            channel: String::new(),
+        });
+        insert_bearer_auth(&mut create_request, AUTH_TOKEN);
+        let created = service
+            .create_session(create_request)
+            .await
+            .expect("create_session should succeed")
+            .into_inner();
+        let session_id = created
+            .session_id
+            .as_ref()
+            .map(|value| value.ulid.clone())
+            .expect("session id should be present");
+
+        let mut relay_request = Request::new(browser_v1::RelayActionRequest {
+            v: 1,
+            session_id: Some(proto::palyra::common::v1::CanonicalId { ulid: session_id }),
+            extension_id: "com.palyra.extension".to_owned(),
+            action: 999,
+            payload: None,
+            max_payload_bytes: 4_096,
+        });
+        insert_bearer_auth(&mut relay_request, AUTH_TOKEN);
+        let relay = service
+            .relay_action(relay_request)
+            .await
+            .expect("relay action should return response")
+            .into_inner();
+        assert!(!relay.success, "unsupported relay action should fail closed");
+        assert!(
+            relay.error.contains("unsupported relay action"),
+            "error should explain unsupported action: {}",
+            relay.error
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn browser_service_relay_rejects_oversized_payload_budget_with_auth_token() {
+        const AUTH_TOKEN: &str = "test-token";
+        let runtime = std::sync::Arc::new(
+            BrowserRuntimeState::new(&Args {
+                bind: "127.0.0.1".to_owned(),
+                port: 7143,
+                grpc_bind: "127.0.0.1".to_owned(),
+                grpc_port: 7543,
+                auth_token: Some(AUTH_TOKEN.to_owned()),
+                session_idle_ttl_ms: 60_000,
+                max_sessions: 16,
+                max_navigation_timeout_ms: 10_000,
+                max_session_lifetime_ms: 60_000,
+                max_screenshot_bytes: 128 * 1024,
+                max_response_bytes: 128 * 1024,
+                max_title_bytes: 4 * 1024,
+                engine_mode: BrowserEngineMode::Simulated,
+                chromium_path: None,
+                chromium_startup_timeout_ms: DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS,
+            })
+            .expect("runtime should initialize"),
+        );
+        let service = BrowserServiceImpl { runtime };
+        let mut create_request = Request::new(browser_v1::CreateSessionRequest {
+            v: 1,
+            principal: "user:ops".to_owned(),
+            idle_ttl_ms: 10_000,
+            budget: None,
+            allow_private_targets: true,
+            allow_downloads: false,
+            action_allowed_domains: Vec::new(),
+            persistence_enabled: false,
+            persistence_id: String::new(),
+            profile_id: None,
+            private_profile: false,
+            channel: String::new(),
+        });
+        insert_bearer_auth(&mut create_request, AUTH_TOKEN);
+        let created = service
+            .create_session(create_request)
+            .await
+            .expect("create_session should succeed")
+            .into_inner();
+        let session_id = created
+            .session_id
+            .as_ref()
+            .map(|value| value.ulid.clone())
+            .expect("session id should be present");
+
+        let mut relay_request = Request::new(browser_v1::RelayActionRequest {
+            v: 1,
+            session_id: Some(proto::palyra::common::v1::CanonicalId { ulid: session_id }),
+            extension_id: "com.palyra.extension".to_owned(),
+            action: browser_v1::RelayActionKind::CaptureSelection as i32,
+            payload: Some(browser_v1::relay_action_request::Payload::CaptureSelection(
+                browser_v1::RelayCaptureSelectionPayload {
+                    selector: "body".to_owned(),
+                    max_selection_bytes: 512,
+                },
+            )),
+            max_payload_bytes: MAX_RELAY_PAYLOAD_BYTES + 1,
+        });
+        insert_bearer_auth(&mut relay_request, AUTH_TOKEN);
+        let status = service
+            .relay_action(relay_request)
+            .await
+            .expect_err("oversized relay payload budget must be rejected");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            status.message().contains("max_payload_bytes exceeds"),
+            "error should explain relay payload bound: {}",
+            status.message()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn browser_service_relay_requires_valid_bearer_token_when_auth_enabled() {
+        const AUTH_TOKEN: &str = "test-token";
+        let runtime = std::sync::Arc::new(
+            BrowserRuntimeState::new(&Args {
+                bind: "127.0.0.1".to_owned(),
+                port: 7143,
+                grpc_bind: "127.0.0.1".to_owned(),
+                grpc_port: 7543,
+                auth_token: Some(AUTH_TOKEN.to_owned()),
+                session_idle_ttl_ms: 60_000,
+                max_sessions: 16,
+                max_navigation_timeout_ms: 10_000,
+                max_session_lifetime_ms: 60_000,
+                max_screenshot_bytes: 128 * 1024,
+                max_response_bytes: 128 * 1024,
+                max_title_bytes: 4 * 1024,
+                engine_mode: BrowserEngineMode::Simulated,
+                chromium_path: None,
+                chromium_startup_timeout_ms: DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS,
+            })
+            .expect("runtime should initialize"),
+        );
+        let service = BrowserServiceImpl { runtime };
+        let mut create_request = Request::new(browser_v1::CreateSessionRequest {
+            v: 1,
+            principal: "user:ops".to_owned(),
+            idle_ttl_ms: 10_000,
+            budget: None,
+            allow_private_targets: true,
+            allow_downloads: false,
+            action_allowed_domains: Vec::new(),
+            persistence_enabled: false,
+            persistence_id: String::new(),
+            profile_id: None,
+            private_profile: false,
+            channel: String::new(),
+        });
+        insert_bearer_auth(&mut create_request, AUTH_TOKEN);
+        let created = service
+            .create_session(create_request)
+            .await
+            .expect("create_session should succeed")
+            .into_inner();
+        let session_id = created
+            .session_id
+            .as_ref()
+            .map(|value| value.ulid.clone())
+            .expect("session id should be present");
+
+        let missing_token_status = service
+            .relay_action(Request::new(browser_v1::RelayActionRequest {
+                v: 1,
+                session_id: Some(proto::palyra::common::v1::CanonicalId {
+                    ulid: session_id.clone(),
+                }),
+                extension_id: "com.palyra.extension".to_owned(),
+                action: browser_v1::RelayActionKind::OpenTab as i32,
+                payload: Some(browser_v1::relay_action_request::Payload::OpenTab(
+                    browser_v1::RelayOpenTabPayload {
+                        url: "https://example.com".to_owned(),
+                        activate: true,
+                        timeout_ms: 1_000,
+                    },
+                )),
+                max_payload_bytes: 4_096,
+            }))
+            .await
+            .expect_err("relay_action without bearer token must be rejected");
+        assert_eq!(missing_token_status.code(), tonic::Code::Unauthenticated);
+
+        let mut wrong_token_request = Request::new(browser_v1::RelayActionRequest {
+            v: 1,
+            session_id: Some(proto::palyra::common::v1::CanonicalId { ulid: session_id }),
+            extension_id: "com.palyra.extension".to_owned(),
+            action: browser_v1::RelayActionKind::OpenTab as i32,
+            payload: Some(browser_v1::relay_action_request::Payload::OpenTab(
+                browser_v1::RelayOpenTabPayload {
+                    url: "https://example.com".to_owned(),
+                    activate: true,
+                    timeout_ms: 1_000,
+                },
+            )),
+            max_payload_bytes: 4_096,
+        });
+        insert_bearer_auth(&mut wrong_token_request, "wrong-token");
+        let wrong_token_status = service
+            .relay_action(wrong_token_request)
+            .await
+            .expect_err("relay_action with wrong bearer token must be rejected");
+        assert_eq!(wrong_token_status.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[test]
+    fn resolve_download_target_preserves_original_case_for_href_and_filename() {
+        let tag = r#"<A HREF="https://example.com/Artifacts/Report.PDF?Sig=AbC123" DOWNLOAD="Report.PDF">"#;
+        let (resolved_url, file_name) =
+            super::resolve_download_target(tag, None).expect("download target should parse");
+        assert_eq!(resolved_url, "https://example.com/Artifacts/Report.PDF?Sig=AbC123");
+        assert_eq!(file_name, "Report.PDF");
     }
 
     #[tokio::test(flavor = "multi_thread")]
