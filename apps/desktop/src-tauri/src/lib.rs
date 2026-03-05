@@ -959,6 +959,11 @@ impl ControlCenter {
         let output_path = self.support_bundle_dir.join(output_name);
 
         let mut command = Command::new(cli_path.as_path());
+        command.env_clear();
+        if let Ok(path) = env::var("PATH") {
+            command.env("PATH", path);
+        }
+        command.env("LANG", "C").env("LC_ALL", "C");
         command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

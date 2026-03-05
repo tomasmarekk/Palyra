@@ -1277,11 +1277,15 @@ fn build_support_bundle_diagnostics_snapshot() -> SupportBundleDiagnosticsSnapsh
             };
         }
     };
-    let daemon_url = env::var("PALYRA_DAEMON_URL")
-        .ok()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| DEFAULT_DAEMON_URL.to_owned());
+    let daemon_url = match resolve_support_bundle_daemon_url() {
+        Ok(url) => url,
+        Err(error) => {
+            return SupportBundleDiagnosticsSnapshot {
+                admin_status: None,
+                admin_status_error: Some(sanitize_diagnostic_error(error.to_string().as_str())),
+            };
+        }
+    };
     let principal = resolve_doctor_admin_principal();
     match fetch_admin_status_payload(
         &client,
@@ -1303,6 +1307,37 @@ fn build_support_bundle_diagnostics_snapshot() -> SupportBundleDiagnosticsSnapsh
             admin_status_error: Some(sanitize_diagnostic_error(error.to_string().as_str())),
         },
     }
+}
+
+fn resolve_support_bundle_daemon_url() -> Result<String> {
+    let raw = env::var("PALYRA_DAEMON_URL")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_DAEMON_URL.to_owned());
+    parse_support_bundle_daemon_url(raw.as_str(), "PALYRA_DAEMON_URL")
+}
+
+fn parse_support_bundle_daemon_url(raw: &str, source_name: &str) -> Result<String> {
+    let parsed = Url::parse(raw.trim())
+        .with_context(|| format!("{source_name} must be a valid absolute URL"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        anyhow::bail!("{source_name} must use http:// or https://");
+    }
+    let host = parsed.host_str().ok_or_else(|| anyhow!("{source_name} must include a host"))?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        anyhow::bail!("{source_name} must not include embedded credentials");
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        anyhow::bail!("{source_name} must not include query or fragment");
+    }
+    let normalized_host = host.trim_start_matches('[').trim_end_matches(']');
+    let is_loopback = normalized_host.eq_ignore_ascii_case("localhost")
+        || normalized_host.parse::<IpAddr>().is_ok_and(|address| address.is_loopback());
+    if !is_loopback {
+        anyhow::bail!("{source_name} must target a loopback host for support-bundle diagnostics");
+    }
+    Ok(parsed.to_string())
 }
 
 fn build_support_bundle_journal_snapshot(
@@ -10444,14 +10479,14 @@ struct SkillStatusResponse {
 #[cfg(test)]
 mod cli_v1_tests {
     use super::{
-        build_journal_checkpoint_attestation, compare_semver_versions,
-        ensure_remote_registry_same_origin, fetch_limited_bytes,
+        build_journal_checkpoint_attestation, build_support_bundle_diagnostics_snapshot,
+        compare_semver_versions, ensure_remote_registry_same_origin, fetch_limited_bytes,
         fetch_remote_registry_entries_with_fetcher, is_retryable_grpc_error,
         memory_embeddings_model_configured, normalize_client_socket,
         normalize_installed_skills_index, normalize_prompt_secret_value,
         normalize_relative_registry_path, normalize_sha256_fingerprint, parse_acp_shim_input_line,
         parse_and_verify_signed_remote_registry_index, parse_remote_dashboard_base_url,
-        process_runner_tier_b_allowlist_preflight_only,
+        parse_support_bundle_daemon_url, process_runner_tier_b_allowlist_preflight_only,
         process_runner_tier_c_strict_offline_allowlists_empty,
         process_runner_tier_c_windows_backend_supported, registry_key_id_for,
         resolve_dashboard_access_target, sha256_hex, trust_store_integrity_vault_key,
@@ -10654,6 +10689,52 @@ mod cli_v1_tests {
         )
         .expect_err("fragments must be rejected");
         assert!(fragment_error.to_string().contains("must not include query or fragment"));
+    }
+
+    #[test]
+    fn parse_support_bundle_daemon_url_accepts_loopback_hosts() {
+        let localhost =
+            parse_support_bundle_daemon_url("http://localhost:7142", "PALYRA_DAEMON_URL")
+                .expect("localhost should be allowed for support-bundle diagnostics");
+        assert_eq!(localhost, "http://localhost:7142/");
+
+        let ipv4 = parse_support_bundle_daemon_url("http://127.0.0.1:7142", "PALYRA_DAEMON_URL")
+            .expect("loopback IPv4 should be allowed for support-bundle diagnostics");
+        assert_eq!(ipv4, "http://127.0.0.1:7142/");
+
+        let ipv6 = parse_support_bundle_daemon_url("http://[::1]:7142", "PALYRA_DAEMON_URL")
+            .expect("loopback IPv6 should be allowed for support-bundle diagnostics");
+        assert_eq!(ipv6, "http://[::1]:7142/");
+    }
+
+    #[test]
+    fn parse_support_bundle_daemon_url_rejects_non_loopback_hosts() {
+        let error =
+            parse_support_bundle_daemon_url("https://example.com:7142", "PALYRA_DAEMON_URL")
+                .expect_err("non-loopback host must be rejected for support-bundle diagnostics");
+        assert!(error
+            .to_string()
+            .contains("must target a loopback host for support-bundle diagnostics"));
+    }
+
+    #[test]
+    fn support_bundle_diagnostics_rejects_non_loopback_daemon_url_before_request() {
+        let _lock = env_lock().lock().expect("env lock should be available");
+        let _daemon_url = ScopedEnvVar::set("PALYRA_DAEMON_URL", "https://example.com:7142");
+        let _admin_token = ScopedEnvVar::set("PALYRA_ADMIN_TOKEN", "test-admin-token");
+
+        let snapshot = build_support_bundle_diagnostics_snapshot();
+        assert!(
+            snapshot.admin_status.is_none(),
+            "non-loopback daemon URL must skip admin status fetch"
+        );
+        let error = snapshot
+            .admin_status_error
+            .expect("non-loopback daemon URL should produce a diagnostic error");
+        assert!(
+            error.contains("must target a loopback host for support-bundle diagnostics"),
+            "diagnostic error should mention loopback requirement: {error}"
+        );
     }
 
     #[test]
