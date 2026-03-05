@@ -763,7 +763,7 @@ async fn grpc_route_message_splits_reply_into_multiple_outputs_when_payload_limi
     );
     for output in &response.outputs {
         assert!(
-            output.text.chars().count() <= 32,
+            output.text.len() <= 32,
             "each route output chunk should respect the configured payload limit"
         );
         assert_eq!(output.thread_id, "thread-1");
@@ -805,6 +805,98 @@ async fn grpc_route_message_splits_reply_into_multiple_outputs_when_payload_limi
         1,
         "split route replies should still perform exactly one provider call"
     );
+
+    server_handle.join().expect("scripted openai server thread should exit");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_route_message_splits_multibyte_reply_by_utf8_bytes() -> Result<()> {
+    let long_reply = "žluťoučký kůň 😀 こんにちは世界 přináší zprávu o stavu";
+    let scripted_reply = serde_json::json!({
+        "choices": [{
+            "message": {
+                "content": long_reply
+            }
+        }]
+    })
+    .to_string();
+    let (openai_base_url, request_count, server_handle) =
+        spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::immediate(200, scripted_reply)])?;
+    let (child, admin_port, grpc_port, _journal_db_path, config_path) =
+        spawn_palyrad_with_openai_provider_and_channel_router(
+            openai_base_url.as_str(),
+            OPENAI_API_KEY,
+        )?;
+    let _config_guard = TempFileGuard::new(config_path);
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+    let mut create_route_agent = tonic::Request::new(gateway_v1::CreateAgentRequest {
+        v: 1,
+        agent_id: "route".to_owned(),
+        display_name: "Route".to_owned(),
+        agent_dir: String::new(),
+        workspace_roots: vec!["workspace".to_owned()],
+        default_model_profile: "gpt-4o-mini".to_owned(),
+        default_tool_allowlist: vec!["palyra.echo".to_owned()],
+        default_skill_allowlist: vec!["acme.route".to_owned()],
+        set_default: true,
+        allow_absolute_paths: false,
+    });
+    authorize_metadata_with_principal(create_route_agent.metadata_mut(), "admin:ops")?;
+    client
+        .create_agent(create_route_agent)
+        .await
+        .context("failed to create route agent before RouteMessage multibyte split test")?;
+
+    const MAX_CHUNK_BYTES: u64 = 20;
+    let adapter = FakeChannelAdapter::default();
+    let response = adapter
+        .inject_message_with_payload_limit_and_attachments(
+            &mut client,
+            "hey @palyra generate a localized response",
+            false,
+            false,
+            MAX_CHUNK_BYTES,
+            Vec::new(),
+        )
+        .await?;
+
+    assert!(
+        response.accepted,
+        "mention-matched message should be routed (reason={})",
+        response.decision_reason
+    );
+    assert!(
+        response.outputs.len() > 1,
+        "multibyte reply should be split into multiple outputs under tight payload limits"
+    );
+    for output in &response.outputs {
+        assert!(
+            output.text.len() <= MAX_CHUNK_BYTES as usize,
+            "each route output chunk should respect UTF-8 byte payload limit"
+        );
+    }
+    let merged = response.outputs.iter().map(|output| output.text.as_str()).collect::<String>();
+    assert!(
+        merged.starts_with("[cli]"),
+        "merged multibyte output chunks should preserve route response prefix"
+    );
+    assert!(
+        merged.contains(long_reply),
+        "merged multibyte output chunks should preserve the provider reply body"
+    );
+    assert_eq!(
+        request_count.load(Ordering::Relaxed),
+        1,
+        "multibyte split route replies should perform exactly one provider call"
+    );
+    assert_eq!(adapter.sent_messages(), response.outputs);
 
     server_handle.join().expect("scripted openai server thread should exit");
     Ok(())

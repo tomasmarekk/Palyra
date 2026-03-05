@@ -1266,12 +1266,15 @@ fn mention_patterns_allow_mass_mentions(mention_patterns: &[String]) -> bool {
     })
 }
 
+fn is_identifier_continuation(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')
+}
+
 fn contains_boundary_delimited_pattern(text: &str, pattern: &str) -> bool {
     text.match_indices(pattern).any(|(start, _)| {
-        let left_boundary =
-            start == 0 || !text.as_bytes()[start.saturating_sub(1)].is_ascii_alphanumeric();
+        let left_boundary = start == 0 || !is_identifier_continuation(text.as_bytes()[start - 1]);
         let end = start.saturating_add(pattern.len());
-        let right_boundary = end >= text.len() || !text.as_bytes()[end].is_ascii_alphanumeric();
+        let right_boundary = end >= text.len() || !is_identifier_continuation(text.as_bytes()[end]);
         left_boundary && right_boundary
     })
 }
@@ -1423,6 +1426,38 @@ mod tests {
             RouteOutcome::Rejected(ref rejection)
                 if rejection.reason == "no_matching_mention_or_dm_policy"
         ));
+    }
+
+    #[test]
+    fn mention_substring_inside_handle_like_token_does_not_trigger_route() {
+        let router = ChannelRouter::new(baseline_config());
+        for text in [
+            "ping @palyra_admin for approvals",
+            "ping @palyra-prod for deploy status",
+            "ping @palyra.ops for routing status",
+        ] {
+            let outcome = router.begin_route(&inbound(text));
+            assert!(
+                matches!(
+                    outcome,
+                    RouteOutcome::Rejected(ref rejection)
+                        if rejection.reason == "no_matching_mention_or_dm_policy"
+                ),
+                "handle-like token should not trigger mention pattern: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn mention_pattern_still_matches_with_punctuation_boundaries() {
+        let router = ChannelRouter::new(baseline_config());
+        for text in ["hello @palyra, summarize status", "hello (@palyra) summarize status"] {
+            let outcome = router.begin_route(&inbound(text));
+            let RouteOutcome::Routed(routed) = outcome else {
+                panic!("punctuation-delimited mention should route: {text}");
+            };
+            routed.lease.release();
+        }
     }
 
     #[test]

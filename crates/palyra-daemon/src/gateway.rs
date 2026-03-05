@@ -159,7 +159,7 @@ const APPROVAL_CHANNEL_UNAVAILABLE_REASON: &str =
 const APPROVAL_DENIED_REASON: &str = "tool execution denied by explicit client approval response";
 const APPROVAL_DECISION_CACHE_CAPACITY: usize = 1_024;
 const MAX_MODEL_TOKEN_TAPE_EVENTS_PER_RUN: usize = 1_024;
-const DEFAULT_ROUTE_MESSAGE_OUTPUT_MAX_CHARS: usize = 2_000;
+const DEFAULT_ROUTE_MESSAGE_OUTPUT_MAX_BYTES: usize = 2_000;
 const MAX_CRON_JOB_NAME_BYTES: usize = 128;
 const MAX_CRON_PROMPT_BYTES: usize = 16 * 1024;
 const MAX_CRON_JITTER_MS: u64 = 60_000;
@@ -5386,22 +5386,29 @@ fn parse_route_message_a2ui_update(value: &Value) -> Option<common_v1::A2uiUpdat
     Some(common_v1::A2uiUpdate { v: CANONICAL_PROTOCOL_MAJOR, surface, patch_json })
 }
 
-fn split_route_message_reply_text(reply_text: &str, max_chars: usize) -> Vec<String> {
+fn split_route_message_reply_text(reply_text: &str, max_bytes: usize) -> Vec<String> {
     let normalized = reply_text.trim();
     if normalized.is_empty() {
         return vec!["ack".to_owned()];
     }
-    let limit = max_chars.max(1);
-    let chars = normalized.chars().collect::<Vec<_>>();
-    if chars.len() <= limit {
+    let limit = max_bytes.max(1);
+    if normalized.len() <= limit {
         return vec![normalized.to_owned()];
     }
     let mut chunks = Vec::new();
-    let mut start = 0_usize;
-    while start < chars.len() {
-        let end = start.saturating_add(limit).min(chars.len());
-        chunks.push(chars[start..end].iter().collect::<String>());
-        start = end;
+    let mut chunk_start = 0_usize;
+    let mut chunk_bytes = 0_usize;
+    for (index, character) in normalized.char_indices() {
+        let character_bytes = character.len_utf8();
+        if chunk_bytes + character_bytes > limit && chunk_bytes > 0 {
+            chunks.push(normalized[chunk_start..index].to_owned());
+            chunk_start = index;
+            chunk_bytes = 0;
+        }
+        chunk_bytes += character_bytes;
+    }
+    if chunk_start < normalized.len() {
+        chunks.push(normalized[chunk_start..].to_owned());
     }
     chunks
 }
@@ -5446,12 +5453,12 @@ fn build_route_message_outputs(
     max_payload_bytes: u64,
     template: &RouteMessageOutputTemplate<'_>,
 ) -> Vec<gateway_v1::OutboundMessage> {
-    let max_chars = usize::try_from(max_payload_bytes)
+    let max_bytes = usize::try_from(max_payload_bytes)
         .ok()
         .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_ROUTE_MESSAGE_OUTPUT_MAX_CHARS)
-        .min(DEFAULT_ROUTE_MESSAGE_OUTPUT_MAX_CHARS);
-    let chunks = split_route_message_reply_text(reply_text, max_chars);
+        .unwrap_or(DEFAULT_ROUTE_MESSAGE_OUTPUT_MAX_BYTES)
+        .min(DEFAULT_ROUTE_MESSAGE_OUTPUT_MAX_BYTES);
+    let chunks = split_route_message_reply_text(reply_text, max_bytes);
     let mut outputs = Vec::with_capacity(chunks.len());
     for (index, chunk) in chunks.into_iter().enumerate() {
         outputs.push(gateway_v1::OutboundMessage {
