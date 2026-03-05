@@ -7692,6 +7692,14 @@ fn validate_process_runner_backend_policy(
         );
     }
     if enabled
+        && matches!(tier, sandbox_runner::SandboxProcessRunnerTier::B)
+        && matches!(egress_enforcement_mode, sandbox_runner::EgressEnforcementMode::Strict)
+    {
+        anyhow::bail!(
+            "tool_call.process_runner.tier='b' does not support egress_enforcement_mode='strict'; use egress_enforcement_mode='preflight' or 'none', or opt into tier='c'"
+        );
+    }
+    if enabled
         && matches!(egress_enforcement_mode, sandbox_runner::EgressEnforcementMode::Strict)
         && has_host_allowlists
     {
@@ -9213,21 +9221,39 @@ mod tests {
     }
 
     #[test]
-    fn process_runner_backend_policy_allows_tier_b() {
+    fn process_runner_backend_policy_allows_tier_b_preflight_mode() {
         let result = validate_process_runner_backend_policy(
+            true,
+            SandboxProcessRunnerTier::B,
+            EgressEnforcementMode::Preflight,
+            false,
+        );
+        assert!(result.is_ok(), "tier-b should remain allowed in preflight mode");
+    }
+
+    #[test]
+    fn process_runner_backend_policy_rejects_tier_b_strict_mode() {
+        let error = validate_process_runner_backend_policy(
             true,
             SandboxProcessRunnerTier::B,
             EgressEnforcementMode::Strict,
             false,
+        )
+        .expect_err("tier-b strict mode should fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("tier='b' does not support egress_enforcement_mode='strict'"),
+            "error should explain strict-mode requirement to use preflight/none or tier-c"
         );
-        assert!(result.is_ok(), "tier-b should remain allowed");
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn process_runner_backend_policy_rejects_strict_mode_host_allowlists() {
         let error = validate_process_runner_backend_policy(
             true,
-            SandboxProcessRunnerTier::B,
+            SandboxProcessRunnerTier::C,
             EgressEnforcementMode::Strict,
             true,
         )

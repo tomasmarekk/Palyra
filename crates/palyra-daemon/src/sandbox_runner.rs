@@ -806,12 +806,9 @@ fn validate_runtime_egress_enforcement(
     policy: &SandboxProcessRunnerPolicy,
 ) -> Result<(), SandboxProcessRunError> {
     if matches!(policy.tier, SandboxProcessRunnerTier::B) {
-        if policy.allowed_egress_hosts.is_empty() && policy.allowed_dns_suffixes.is_empty() {
-            return Ok(());
-        }
         return Err(SandboxProcessRunError {
             kind: SandboxProcessRunErrorKind::EgressDenied,
-            message: "sandbox denied: runtime egress enforcement is unavailable in tier-b mode; remove egress allowlists, switch to preflight mode, or opt into tier-c backend".to_owned(),
+            message: "sandbox denied: runtime egress enforcement is unavailable in tier-b strict mode; use preflight/none or opt into tier-c backend".to_owned(),
         });
     }
 
@@ -1148,9 +1145,9 @@ mod tests {
 
     use super::{
         canonical_workspace_root, collect_requested_egress_hosts, is_host_allowlisted,
-        run_constrained_process, validate_argument_workspace_scope, EgressEnforcementMode,
-        ProcessRunnerInput, SandboxProcessRunErrorKind, SandboxProcessRunnerPolicy,
-        SandboxProcessRunnerTier,
+        run_constrained_process, validate_argument_workspace_scope,
+        validate_runtime_egress_enforcement, EgressEnforcementMode, ProcessRunnerInput,
+        SandboxProcessRunErrorKind, SandboxProcessRunnerPolicy, SandboxProcessRunnerTier,
     };
 
     fn sandbox_policy_with_allowed_executables(
@@ -1634,6 +1631,34 @@ mod tests {
                 .expect_err("argv count over limit must be denied deterministically");
         assert_eq!(error.kind, SandboxProcessRunErrorKind::InvalidInput);
         assert!(error.message.contains("supports at most"));
+    }
+
+    #[test]
+    fn validate_runtime_egress_enforcement_rejects_tier_b_strict_mode_without_allowlists() {
+        let workspace = std::env::current_dir().expect("workspace current_dir should resolve");
+        let policy = sandbox_policy(workspace);
+        let error = validate_runtime_egress_enforcement(&policy)
+            .expect_err("tier-b strict mode must fail closed even when allowlists are empty");
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::EgressDenied);
+        assert!(
+            error.message.contains("tier-b strict mode"),
+            "error should explain strict tier-b runtime egress enforcement requirement"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_constrained_process_fails_closed_for_tier_b_strict_mode_even_without_allowlists() {
+        let workspace = std::env::current_dir().expect("workspace current_dir should resolve");
+        let policy = sandbox_policy(workspace);
+        let input = br#"{"command":"uname","args":[]}"#;
+        let error = run_constrained_process(&policy, input, Duration::from_millis(1_000))
+            .expect_err("tier-b strict mode must fail closed even when allowlists are empty");
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::EgressDenied);
+        assert!(
+            error.message.contains("tier-b strict mode"),
+            "error should explain strict tier-b runtime egress enforcement requirement"
+        );
     }
 
     #[test]
