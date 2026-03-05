@@ -1178,9 +1178,9 @@ async fn fetch_console_payloads(
         return (None, None, warnings);
     }
 
-    if let Err(error) = login_console_session(http_client, runtime, admin_token).await {
+    if let Err(error) = ensure_console_session(http_client, runtime, admin_token).await {
         warnings.push(format!(
-            "console login failed: {}",
+            "console session bootstrap failed: {}",
             sanitize_log_line(error.to_string().as_str())
         ));
         return (None, None, warnings);
@@ -1213,6 +1213,40 @@ async fn fetch_console_payloads(
     };
 
     (diagnostics, discord, warnings)
+}
+
+async fn ensure_console_session(
+    http_client: &Client,
+    runtime: &RuntimeConfig,
+    admin_token: &str,
+) -> Result<()> {
+    if console_session_is_active(http_client, runtime).await? {
+        return Ok(());
+    }
+    login_console_session(http_client, runtime, admin_token).await
+}
+
+async fn console_session_is_active(http_client: &Client, runtime: &RuntimeConfig) -> Result<bool> {
+    let url = loopback_url(runtime.gateway_admin_port, "/console/v1/auth/session")?;
+    let response = http_client
+        .get(url)
+        .send()
+        .await
+        .context("console session request failed")?;
+    if response.status().is_success() {
+        response.bytes().await.context("failed to drain console session payload")?;
+        return Ok(true);
+    }
+    if matches!(response.status().as_u16(), 401 | 403) {
+        return Ok(false);
+    }
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    bail!(
+        "console session request failed with HTTP {}: {}",
+        status,
+        sanitize_log_line(text.as_str())
+    )
 }
 
 async fn login_console_session(
@@ -1752,11 +1786,25 @@ async fn supervisor_loop(supervisor: Arc<Mutex<ControlCenter>>) {
     }
 }
 
+fn format_control_center_init_error(error: &anyhow::Error) -> String {
+    format!(
+        "desktop initialization failed: {}",
+        sanitize_log_line(error.to_string().as_str())
+    )
+}
+
+fn initialize_control_center(
+    init: impl FnOnce() -> Result<ControlCenter>,
+) -> std::result::Result<ControlCenter, String> {
+    init().map_err(|error| format_control_center_init_error(&error))
+}
+
 pub fn run() {
-    let control_center = match ControlCenter::new() {
+    let control_center = match initialize_control_center(ControlCenter::new) {
         Ok(value) => value,
-        Err(error) => {
-            panic!("failed to initialize desktop control center: {error}");
+        Err(message) => {
+            eprintln!("{message}");
+            return;
         }
     };
 
@@ -1799,11 +1847,12 @@ mod tests {
 
     use super::{
         build_snapshot_from_inputs, collect_redacted_errors, compute_backoff_ms,
-        executable_file_name, load_or_initialize_state_file, mpsc, parse_discord_status,
-        parse_remote_dashboard_base_url, resolve_binary_path, resolve_dashboard_access_target,
-        sanitize_log_line, try_enqueue_log_event, BrowserStatusSnapshot, Client, ControlCenter,
-        DashboardAccessMode, DesktopSecretStore, DesktopStateFile, LogEvent, LogStream,
-        ManagedService, RuntimeConfig, ServiceKind, Ulid, LOG_EVENT_CHANNEL_CAPACITY,
+        executable_file_name, initialize_control_center, load_or_initialize_state_file, mpsc,
+        parse_discord_status, parse_remote_dashboard_base_url, resolve_binary_path,
+        resolve_dashboard_access_target, sanitize_log_line, try_enqueue_log_event,
+        BrowserStatusSnapshot, Client, ControlCenter, DashboardAccessMode, DesktopSecretStore,
+        DesktopStateFile, LogEvent, LogStream, ManagedService, RuntimeConfig, ServiceKind, Ulid,
+        LOG_EVENT_CHANNEL_CAPACITY,
     };
 
     fn env_lock() -> &'static Mutex<()> {
@@ -2250,6 +2299,135 @@ port = 9911
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_build_reuses_console_session_until_expiry() {
+        fn write_http_response(
+            stream: &mut std::net::TcpStream,
+            status_line: &str,
+            body: &str,
+            extra_headers: &[&str],
+        ) {
+            let mut response = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+                body.len()
+            );
+            for header in extra_headers {
+                response.push_str(header);
+                response.push_str("\r\n");
+            }
+            response.push_str("\r\n");
+            response.push_str(body);
+            stream.write_all(response.as_bytes()).expect("response should be written");
+            stream.flush().expect("response should be flushed");
+        }
+
+        let fixture = TempFixtureDir::new();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test listener should bind");
+        let port = listener.local_addr().expect("listener address should resolve").port();
+        let login_requests = Arc::new(AtomicU64::new(0));
+        let session_requests = Arc::new(AtomicU64::new(0));
+        let login_requests_server = Arc::clone(&login_requests);
+        let session_requests_server = Arc::clone(&session_requests);
+        let server = std::thread::spawn(move || {
+            for _ in 0..8 {
+                let (mut stream, _) = listener.accept().expect("listener should accept request");
+                let mut buffer = [0_u8; 4096];
+                let read = stream.read(&mut buffer).expect("request should be readable");
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                let request_line = request.lines().next().unwrap_or_default().to_owned();
+                let has_cookie = request.contains("palyra_console_session=session-1");
+
+                if request_line.starts_with("GET /health ") {
+                    write_http_response(
+                        &mut stream,
+                        "200 OK",
+                        r#"{"status":"ok","version":"test","git_hash":"hash","uptime_seconds":1}"#,
+                        &[],
+                    );
+                    continue;
+                }
+                if request_line.starts_with("GET /console/v1/auth/session ") {
+                    let prior_attempts = session_requests_server.fetch_add(1, Ordering::Relaxed);
+                    if prior_attempts == 0 {
+                        write_http_response(
+                            &mut stream,
+                            "403 Forbidden",
+                            r#"{"error":"console session cookie is missing"}"#,
+                            &[],
+                        );
+                    } else {
+                        assert!(
+                            has_cookie,
+                            "session reuse request should include cached console session cookie"
+                        );
+                        write_http_response(
+                            &mut stream,
+                            "200 OK",
+                            r#"{"principal":"admin:desktop-control-center","device_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","csrf_token":"csrf","issued_at_unix_ms":1,"expires_at_unix_ms":2}"#,
+                            &[],
+                        );
+                    }
+                    continue;
+                }
+                if request_line.starts_with("POST /console/v1/auth/login ") {
+                    login_requests_server.fetch_add(1, Ordering::Relaxed);
+                    write_http_response(
+                        &mut stream,
+                        "200 OK",
+                        r#"{"principal":"admin:desktop-control-center","device_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","csrf_token":"csrf","issued_at_unix_ms":1,"expires_at_unix_ms":2}"#,
+                        &["Set-Cookie: palyra_console_session=session-1; Path=/; HttpOnly; SameSite=Strict"],
+                    );
+                    continue;
+                }
+                if request_line.starts_with("GET /console/v1/diagnostics ") {
+                    write_http_response(
+                        &mut stream,
+                        "200 OK",
+                        r#"{"generated_at_unix_ms":123,"errors":[]}"#,
+                        &[],
+                    );
+                    continue;
+                }
+                if request_line.starts_with("GET /console/v1/channels/discord%3Adefault ") {
+                    write_http_response(
+                        &mut stream,
+                        "200 OK",
+                        r#"{"connector":{"connector_id":"discord:default","enabled":true,"readiness":"ready","liveness":"running"}}"#,
+                        &[],
+                    );
+                    continue;
+                }
+                panic!("unexpected desktop snapshot request: {request_line}");
+            }
+        });
+
+        let mut control_center = build_test_control_center(fixture.path());
+        control_center.runtime.gateway_admin_port = port;
+        control_center.persisted.browser_service_enabled = false;
+
+        let first_inputs = control_center.capture_snapshot_inputs();
+        build_snapshot_from_inputs(first_inputs)
+            .await
+            .expect("first snapshot should bootstrap console session");
+
+        let second_inputs = control_center.capture_snapshot_inputs();
+        build_snapshot_from_inputs(second_inputs)
+            .await
+            .expect("second snapshot should reuse cached console session");
+
+        assert_eq!(
+            login_requests.load(Ordering::Relaxed),
+            1,
+            "desktop snapshot polling should not re-login when the console session is still valid"
+        );
+        assert_eq!(
+            session_requests.load(Ordering::Relaxed),
+            2,
+            "desktop snapshot polling should probe existing console session before deciding to log in"
+        );
+        server.join().expect("test server thread should exit");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn snapshot_build_releases_supervisor_lock_while_waiting_on_http() {
         let fixture = TempFixtureDir::new();
@@ -2322,6 +2500,24 @@ port = 9911
                 .runtime_root
                 .ends_with(Path::new("runtime")),
             "export plan should retain desktop runtime root from supervisor state"
+        );
+    }
+
+    #[test]
+    fn initialize_control_center_returns_sanitized_error_without_panicking() {
+        let error = initialize_control_center(|| {
+            Err(anyhow::anyhow!(
+                "state initialization failed: admin_token=super-secret"
+            ))
+        })
+        .expect_err("initialization helper should surface errors without panicking");
+        assert!(
+            error.contains("desktop initialization failed"),
+            "initialization helper should prepend actionable startup context"
+        );
+        assert!(
+            !error.contains("super-secret"),
+            "initialization helper should sanitize sensitive values before reporting"
         );
     }
 }
