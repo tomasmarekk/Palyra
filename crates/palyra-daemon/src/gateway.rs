@@ -9804,11 +9804,30 @@ async fn execute_http_fetch_tool(
         );
     }
 
+    let initial_resolved_addrs =
+        match resolve_fetch_target_addresses(&url, allow_private_targets).await {
+            Ok(value) => value,
+            Err(error) => {
+                return http_fetch_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    format!("palyra.http.fetch target blocked: {error}"),
+                );
+            }
+        };
+
     let cache_key = http_fetch_cache_key(
         method.as_str(),
         url.as_str(),
         request_headers.as_slice(),
         body.as_str(),
+        allow_private_targets,
+        allow_redirects,
+        max_redirects,
+        max_response_bytes,
+        allowed_content_types.as_slice(),
     );
     if cache_enabled {
         let now = current_unix_ms();
@@ -9829,8 +9848,11 @@ async fn execute_http_fetch_tool(
     let started_at = Instant::now();
     let mut current_url = url;
     let mut redirects_followed = 0_usize;
+    let mut next_resolved_addrs = Some(initial_resolved_addrs);
     loop {
-        let resolved_addrs =
+        let resolved_addrs = if let Some(resolved) = next_resolved_addrs.take() {
+            resolved
+        } else {
             match resolve_fetch_target_addresses(&current_url, allow_private_targets).await {
                 Ok(value) => value,
                 Err(error) => {
@@ -9842,7 +9864,8 @@ async fn execute_http_fetch_tool(
                         format!("palyra.http.fetch target blocked: {error}"),
                     );
                 }
-            };
+            }
+        };
 
         let host = current_url.host_str().unwrap_or_default().to_owned();
         let mut client_builder = reqwest::Client::builder()
@@ -10060,12 +10083,32 @@ fn http_fetch_cache_key(
     url: &str,
     headers: &[(String, String)],
     body: &str,
+    allow_private_targets: bool,
+    allow_redirects: bool,
+    max_redirects: usize,
+    max_response_bytes: usize,
+    allowed_content_types: &[String],
 ) -> String {
     let mut normalized_headers =
         headers.iter().map(|(name, value)| format!("{name}:{value}")).collect::<Vec<_>>();
     normalized_headers.sort();
-    let mut key =
-        format!("{method}|{url}|{}|{}", normalized_headers.join("&"), sha256_hex(body.as_bytes()));
+    let mut normalized_content_types = allowed_content_types
+        .iter()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    normalized_content_types.sort();
+    normalized_content_types.dedup();
+    let policy_fingerprint = format!(
+        "allow_private_targets={allow_private_targets};allow_redirects={allow_redirects};max_redirects={max_redirects};max_response_bytes={max_response_bytes};allowed_content_types={}",
+        normalized_content_types.join(",")
+    );
+    let mut key = format!(
+        "{method}|{url}|{}|{}|{}",
+        normalized_headers.join("&"),
+        sha256_hex(body.as_bytes()),
+        sha256_hex(policy_fingerprint.as_bytes())
+    );
     if key.len() > MAX_HTTP_FETCH_CACHE_KEY_BYTES {
         key = format!("sha256:{}", sha256_hex(key.as_bytes()));
     }
@@ -16274,7 +16317,7 @@ mod tests {
         authorize_metadata, best_effort_mark_approval_error, common_v1, constant_time_eq,
         enforce_memory_item_scope, enforce_vault_get_approval_policy, enforce_vault_scope_access,
         execute_http_fetch_tool, execute_memory_search_tool, execute_workspace_patch_tool,
-        extend_patch_string_defaults, parse_patch_string_array_field,
+        extend_patch_string_defaults, http_fetch_cache_key, parse_patch_string_array_field,
         principal_has_sensitive_service_role, record_auth_refresh_journal_event,
         request_context_from_headers, resolve_cron_job_channel_for_create,
         resolve_fetch_target_addresses, resolve_route_tool_approval_outcome,
@@ -16672,6 +16715,94 @@ mod tests {
             outcome.error
         );
         handle.join().expect("static server should complete after single request");
+    }
+
+    #[test]
+    fn http_fetch_cache_key_includes_policy_dimensions() {
+        let headers = vec![("accept".to_owned(), "text/plain".to_owned())];
+        let allowed_content_types = vec!["text/plain".to_owned(), "application/json".to_owned()];
+        let base = http_fetch_cache_key(
+            "GET",
+            "https://example.com/data",
+            headers.as_slice(),
+            "",
+            false,
+            true,
+            3,
+            4096,
+            allowed_content_types.as_slice(),
+        );
+        let different_policy = http_fetch_cache_key(
+            "GET",
+            "https://example.com/data",
+            headers.as_slice(),
+            "",
+            true,
+            true,
+            3,
+            4096,
+            allowed_content_types.as_slice(),
+        );
+        let different_content_types = http_fetch_cache_key(
+            "GET",
+            "https://example.com/data",
+            headers.as_slice(),
+            "",
+            false,
+            true,
+            3,
+            4096,
+            &["text/plain".to_owned()],
+        );
+        assert_ne!(
+            base, different_policy,
+            "cache key must change when allow_private_targets policy changes"
+        );
+        assert_ne!(
+            base, different_content_types,
+            "cache key must change when allowed content type policy changes"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_fetch_strict_request_cannot_reuse_cache_warmed_under_permissive_policy() {
+        let state = build_test_runtime_state(false);
+        let (url, handle) = spawn_static_http_server("cached-response");
+
+        let permissive_input = serde_json::to_vec(&json!({
+            "url": url,
+            "allow_private_targets": true,
+            "cache": true
+        }))
+        .expect("permissive input should serialize");
+        let first = execute_http_fetch_tool(
+            &state,
+            "proposal-http-fetch-cache-permissive",
+            permissive_input.as_slice(),
+        )
+        .await;
+        assert!(first.success, "permissive request should populate cache");
+
+        let strict_input = serde_json::to_vec(&json!({
+            "url": url,
+            "allow_private_targets": false,
+            "cache": true
+        }))
+        .expect("strict input should serialize");
+        let second = execute_http_fetch_tool(
+            &state,
+            "proposal-http-fetch-cache-strict",
+            strict_input.as_slice(),
+        )
+        .await;
+        assert!(!second.success, "strict request must not replay permissive cached response");
+        assert!(
+            second.error.contains("target blocked") && second.error.contains("private/local"),
+            "strict request should fail with private-target policy error: {}",
+            second.error
+        );
+
+        handle.join().expect("static server should complete after initial permissive request");
     }
 
     #[test]
