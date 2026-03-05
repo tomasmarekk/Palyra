@@ -4949,7 +4949,7 @@ async fn navigate_with_guards(
         if let Some(value) = cookie_header.filter(|value| !value.trim().is_empty()) {
             request_builder = request_builder.header(COOKIE_HEADER, value);
         }
-        let response = match request_builder.send().await {
+        let mut response = match request_builder.send().await {
             Ok(value) => value,
             Err(error) => {
                 return NavigateOutcome {
@@ -5080,43 +5080,50 @@ async fn navigate_with_guards(
         }
 
         let status_code = response.status().as_u16();
-        let body = match response.bytes().await {
-            Ok(value) => value,
-            Err(error) => {
+        let mut body = Vec::new();
+        loop {
+            let next_chunk = match response.chunk().await {
+                Ok(value) => value,
+                Err(error) => {
+                    return NavigateOutcome {
+                        success: false,
+                        final_url: current_url.to_string(),
+                        status_code,
+                        title: String::new(),
+                        page_body: String::new(),
+                        body_bytes: body.len() as u64,
+                        latency_ms: started_at.elapsed().as_millis() as u64,
+                        error: format!("failed to read response body: {error}"),
+                        network_log,
+                        cookie_updates,
+                    }
+                }
+            };
+            let Some(chunk) = next_chunk else {
+                break;
+            };
+            let projected_len = (body.len() as u64).saturating_add(chunk.len() as u64);
+            if projected_len > max_response_bytes {
                 return NavigateOutcome {
                     success: false,
                     final_url: current_url.to_string(),
                     status_code,
                     title: String::new(),
                     page_body: String::new(),
-                    body_bytes: 0,
+                    body_bytes: projected_len,
                     latency_ms: started_at.elapsed().as_millis() as u64,
-                    error: format!("failed to read response body: {error}"),
+                    error: format!(
+                        "response exceeds max_response_bytes ({projected_len} > {max_response_bytes})"
+                    ),
                     network_log,
                     cookie_updates,
-                }
+                };
             }
-        };
-
-        if (body.len() as u64) > max_response_bytes {
-            return NavigateOutcome {
-                success: false,
-                final_url: current_url.to_string(),
-                status_code,
-                title: String::new(),
-                page_body: String::new(),
-                body_bytes: body.len() as u64,
-                latency_ms: started_at.elapsed().as_millis() as u64,
-                error: format!(
-                    "response exceeds max_response_bytes ({} > {max_response_bytes})",
-                    body.len()
-                ),
-                network_log,
-                cookie_updates,
-            };
+            body.extend_from_slice(chunk.as_ref());
         }
 
-        let page_body = String::from_utf8_lossy(body.as_ref()).to_string();
+        let body_len = body.len() as u64;
+        let page_body = String::from_utf8_lossy(body.as_slice()).to_string();
 
         return NavigateOutcome {
             success: (200..400).contains(&status_code),
@@ -5124,7 +5131,7 @@ async fn navigate_with_guards(
             status_code,
             title: extract_html_title(page_body.as_str()).unwrap_or_default().to_owned(),
             page_body,
-            body_bytes: body.len() as u64,
+            body_bytes: body_len,
             latency_ms: started_at.elapsed().as_millis() as u64,
             error: if status_code >= 400 {
                 format!("navigation returned HTTP {status_code}")
@@ -7708,9 +7715,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn navigate_with_guards_enforces_response_size_limit() {
-        let (url, handle) = spawn_static_http_server(
+        let (url, handle) = spawn_chunked_http_server(
             200,
-            "<html><head><title>Oversized</title></head><body>very large</body></html>",
+            &["<html><head><title>Oversized</title></head>", "<body>very ", "large</body></html>"],
         );
         let outcome = navigate_with_guards(url.as_str(), 2_000, true, 3, true, 16, None).await;
         assert!(!outcome.success, "oversized payload must fail");
@@ -7719,6 +7726,26 @@ mod tests {
             "size limit error should be explicit: {}",
             outcome.error
         );
+        assert!(
+            outcome.body_bytes > 16,
+            "reported body bytes should reflect the first oversized chunk boundary"
+        );
+        handle.join().expect("test server thread should exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn navigate_with_guards_allows_response_exactly_at_size_limit() {
+        let body = "<html><head><title>Exact</title></head><body>1234</body></html>";
+        let (url, handle) = spawn_chunked_http_server(
+            200,
+            &["<html><head><title>Exact</title></head>", "<body>1234</body></html>"],
+        );
+        let outcome =
+            navigate_with_guards(url.as_str(), 2_000, true, 3, true, body.len() as u64, None).await;
+        assert!(outcome.success, "payload at the cap must succeed");
+        assert_eq!(outcome.body_bytes, body.len() as u64);
+        assert_eq!(outcome.page_body, body);
+        assert_eq!(outcome.title, "Exact");
         handle.join().expect("test server thread should exit");
     }
 
@@ -10147,6 +10174,34 @@ mod tests {
             );
             stream.write_all(response.as_bytes()).expect("server should write response");
             stream.flush().expect("server should flush response");
+        });
+        (format!("http://{address}/"), handle)
+    }
+
+    fn spawn_chunked_http_server(
+        status_code: u16,
+        chunks: &[&str],
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let address = listener.local_addr().expect("listener local address should resolve");
+        let chunks = chunks.iter().map(|value| (*value).to_owned()).collect::<Vec<_>>();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("listener should accept request");
+            let _ = read_http_request(&mut stream);
+            let headers = format!(
+                "HTTP/1.1 {status_code} OK\r\nContent-Type: text/html\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(headers.as_bytes()).expect("server should write response headers");
+            stream.flush().expect("server should flush response headers");
+            for chunk in chunks {
+                let prefix = format!("{:X}\r\n", chunk.len());
+                stream.write_all(prefix.as_bytes()).expect("server should write chunk length");
+                stream.write_all(chunk.as_bytes()).expect("server should write chunk body");
+                stream.write_all(b"\r\n").expect("server should terminate chunk");
+                stream.flush().expect("server should flush chunk");
+            }
+            stream.write_all(b"0\r\n\r\n").expect("server should write chunked terminator");
+            stream.flush().expect("server should flush chunked terminator");
         });
         (format!("http://{address}/"), handle)
     }
