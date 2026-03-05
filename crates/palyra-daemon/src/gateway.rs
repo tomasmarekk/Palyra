@@ -391,6 +391,12 @@ enum RunStreamProviderEventGateOutcome {
     Cancelled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunStreamProviderEventOutcome {
+    Continue,
+    Cancelled,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CanvasAssetRecord {
     content_type: String,
@@ -8121,72 +8127,40 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                         }
                     }
 
-                    match provider_event {
-                        ProviderEvent::ModelToken { token, is_final } => {
-                            if !token.trim().is_empty() {
-                                summary_tokens.push(token.clone());
-                            }
-                            if let Err(error) = send_model_token_with_tape(
-                                &sender,
-                                &state_for_stream,
-                                run_id.as_str(),
-                                &mut tape_seq,
-                                &mut model_token_tape_events,
-                                &mut model_token_compaction_emitted,
-                                token.as_str(),
-                                is_final,
-                            )
-                            .await
-                            {
-                                finalize_run_failure(
-                                    &sender,
-                                    &state_for_stream,
-                                    &mut run_state,
-                                    active_run_id.as_deref(),
-                                    &mut tape_seq,
-                                    error.message(),
-                                )
-                                .await;
-                                let _ = sender.send(Err(error)).await;
-                                return;
-                            }
+                    match process_run_stream_provider_event(
+                        &sender,
+                        &mut stream,
+                        &state_for_stream,
+                        &context_for_stream,
+                        active_session_id.as_deref(),
+                        &mut run_state,
+                        session_id.as_str(),
+                        run_id.as_str(),
+                        provider_event,
+                        &mut summary_tokens,
+                        &mut remaining_tool_budget,
+                        &mut tape_seq,
+                        &mut model_token_tape_events,
+                        &mut model_token_compaction_emitted,
+                    )
+                    .await
+                    {
+                        Ok(RunStreamProviderEventOutcome::Continue) => {}
+                        Ok(RunStreamProviderEventOutcome::Cancelled) => {
+                            return;
                         }
-                        ProviderEvent::ToolProposal { proposal_id, tool_name, input_json } => {
-                            match process_run_stream_tool_proposal_event(
+                        Err(error) => {
+                            finalize_run_failure(
                                 &sender,
-                                &mut stream,
                                 &state_for_stream,
-                                &context_for_stream,
-                                active_session_id.as_deref(),
                                 &mut run_state,
-                                session_id.as_str(),
-                                run_id.as_str(),
-                                proposal_id.as_str(),
-                                tool_name.as_str(),
-                                input_json.as_slice(),
-                                &mut remaining_tool_budget,
+                                active_run_id.as_deref(),
                                 &mut tape_seq,
+                                error.message(),
                             )
-                            .await
-                            {
-                                Ok(RunStreamToolExecutionOutcome::Completed) => {}
-                                Ok(RunStreamToolExecutionOutcome::Cancelled) => {
-                                    return;
-                                }
-                                Err(error) => {
-                                    finalize_run_failure(
-                                        &sender,
-                                        &state_for_stream,
-                                        &mut run_state,
-                                        active_run_id.as_deref(),
-                                        &mut tape_seq,
-                                        error.message(),
-                                    )
-                                    .await;
-                                    let _ = sender.send(Err(error)).await;
-                                    return;
-                                }
-                            }
+                            .await;
+                            let _ = sender.send(Err(error)).await;
+                            return;
                         }
                     }
                 }
@@ -14294,6 +14268,71 @@ async fn process_run_stream_tool_proposal_event(
         tape_seq,
     )
     .await
+}
+
+#[allow(clippy::result_large_err)]
+#[allow(clippy::too_many_arguments)]
+async fn process_run_stream_provider_event(
+    sender: &mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
+    stream: &mut Streaming<common_v1::RunStreamRequest>,
+    runtime_state: &Arc<GatewayRuntimeState>,
+    request_context: &RequestContext,
+    active_session_id: Option<&str>,
+    run_state: &mut RunStateMachine,
+    session_id: &str,
+    run_id: &str,
+    provider_event: ProviderEvent,
+    summary_tokens: &mut Vec<String>,
+    remaining_tool_budget: &mut u32,
+    tape_seq: &mut i64,
+    model_token_tape_events: &mut usize,
+    model_token_compaction_emitted: &mut bool,
+) -> Result<RunStreamProviderEventOutcome, Status> {
+    match provider_event {
+        ProviderEvent::ModelToken { token, is_final } => {
+            if !token.trim().is_empty() {
+                summary_tokens.push(token.clone());
+            }
+            send_model_token_with_tape(
+                sender,
+                runtime_state,
+                run_id,
+                tape_seq,
+                model_token_tape_events,
+                model_token_compaction_emitted,
+                token.as_str(),
+                is_final,
+            )
+            .await?;
+            Ok(RunStreamProviderEventOutcome::Continue)
+        }
+        ProviderEvent::ToolProposal { proposal_id, tool_name, input_json } => {
+            match process_run_stream_tool_proposal_event(
+                sender,
+                stream,
+                runtime_state,
+                request_context,
+                active_session_id,
+                run_state,
+                session_id,
+                run_id,
+                proposal_id.as_str(),
+                tool_name.as_str(),
+                input_json.as_slice(),
+                remaining_tool_budget,
+                tape_seq,
+            )
+            .await?
+            {
+                RunStreamToolExecutionOutcome::Completed => {
+                    Ok(RunStreamProviderEventOutcome::Continue)
+                }
+                RunStreamToolExecutionOutcome::Cancelled => {
+                    Ok(RunStreamProviderEventOutcome::Cancelled)
+                }
+            }
+        }
+    }
 }
 
 #[allow(clippy::result_large_err)]
