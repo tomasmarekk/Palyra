@@ -1,4 +1,4 @@
-# Desktop Control Center (M50)
+# Desktop Control Center
 
 `apps/desktop` now hosts the **Palyra Desktop Control Center v1** implemented with Tauri.
 
@@ -76,8 +76,3 @@ $env:PALYRA_DESKTOP_PALYRA_BIN = "C:\path\to\palyra.exe"
 
 - `src-tauri/`: Rust backend + Tauri host.
 - `ui/`: lightweight web UI rendered by Tauri.
-
-## Architecture follow-up
-
-- The approved closure-debt plan for the desktop onboarding milestone lives in
-  `src-tauri/docs/architecture/desktop-onboarding-milestone-plan.md`.

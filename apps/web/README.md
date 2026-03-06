@@ -46,8 +46,3 @@ This package now hosts the Web Console runtime.
   `package-lock.json` via `npm --prefix apps/web run bootstrap`.
 - The clean-room guard verifies Node/npm ranges, launcher permissions, and the expected Rollup
   native optional package for the current OS/architecture.
-
-## Architecture follow-up
-
-- The approved closure-debt plan for the post-M39 UI architecture milestone lives in
-  `apps/web/docs/architecture/ui-architecture-milestone-plan.md`.
