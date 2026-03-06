@@ -72,14 +72,18 @@ osv:
 security:
     cargo audit
     cargo deny check
-    bash scripts/check-high-risk-patterns.sh
     bash scripts/check-runtime-artifacts.sh
+    bash scripts/check-desktop-glib-patch.sh
+    bash scripts/check-high-risk-patterns.sh
 
 artifact-hygiene:
     bash scripts/check-runtime-artifacts.sh
 
 artifact-clean:
     bash scripts/clean-runtime-artifacts.sh
+
+desktop-glib-patch-check:
+    bash scripts/check-desktop-glib-patch.sh
 
 sbom:
     cargo cyclonedx --format json --override-filename sbom

@@ -11831,6 +11831,64 @@ mod diagnostics_bundle_tests {
     }
 
     #[test]
+    fn support_bundle_redacts_browser_and_connector_diagnostics_payloads() {
+        let mut payload = serde_json::json!({
+            "browserd": {
+                "relay_token": "relay-secret",
+                "downloads_endpoint": "https://example.test/downloads?token=abc123&mode=ok",
+                "last_error": "Bearer browser-secret"
+            },
+            "channels": {
+                "discord:default": {
+                    "runtime": {
+                        "last_error": "authorization=discord-secret"
+                    },
+                    "webhook_url": "https://discord.test/api/webhooks/1?token=def456&mode=ok"
+                }
+            },
+            "auth_profiles": {
+                "profiles": [
+                    {
+                        "access_token": "oauth-secret",
+                        "refresh_failure_reason": "refresh_token=qwerty"
+                    }
+                ]
+            }
+        });
+        super::redact_json_value_tree(&mut payload, None);
+        assert_eq!(
+            payload.pointer("/browserd/relay_token").and_then(Value::as_str),
+            Some("<redacted>")
+        );
+        assert_eq!(
+            payload.pointer("/auth_profiles/profiles/0/access_token").and_then(Value::as_str),
+            Some("<redacted>")
+        );
+        assert_eq!(
+            payload.pointer("/browserd/downloads_endpoint").and_then(Value::as_str),
+            Some("https://example.test/downloads?token=<redacted>&mode=ok")
+        );
+        assert_eq!(
+            payload.pointer("/channels/discord:default/webhook_url").and_then(Value::as_str),
+            Some("https://discord.test/api/webhooks/1?token=<redacted>&mode=ok")
+        );
+        let browser_error =
+            payload.pointer("/browserd/last_error").and_then(Value::as_str).unwrap_or_default();
+        assert!(
+            browser_error.contains("<redacted>") && !browser_error.contains("browser-secret"),
+            "browser diagnostics error should stay redacted: {browser_error}"
+        );
+        let connector_error = payload
+            .pointer("/channels/discord:default/runtime/last_error")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            connector_error.contains("<redacted>") && !connector_error.contains("discord-secret"),
+            "connector diagnostics error should stay redacted: {connector_error}"
+        );
+    }
+
+    #[test]
     fn support_bundle_size_cap_trims_payload() {
         let mut bundle = oversized_bundle();
         let encoded = encode_support_bundle_with_cap(&mut bundle, 4096)

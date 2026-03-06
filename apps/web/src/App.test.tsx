@@ -658,6 +658,42 @@ describe("M35 web console app", () => {
     expect(requestUrl(fetchMock.mock.calls[2][0])).toBe("/console/v1/diagnostics");
   });
 
+  it("redacts sensitive diagnostics values in the web console by default", async () => {
+    const fetchMock = createQueuedFetch([
+      jsonResponse({
+        principal: "admin:web-console",
+        device_id: "device-1",
+        channel: "web",
+        csrf_token: "csrf-1",
+        issued_at_unix_ms: 100,
+        expires_at_unix_ms: 300
+      }),
+      jsonResponse({ approvals: [] }),
+      jsonResponse({
+        generated_at_unix_ms: 123,
+        model_provider: { openai_api_key: "sk-live-super-secret" },
+        rate_limits: { admin_api_max_requests_per_window: 30 },
+        auth_profiles: { profiles: [{ access_token: "oauth-secret" }] },
+        browserd: {
+          relay_token: "relay-secret",
+          last_error: "Bearer browser-secret"
+        }
+      })
+    ]);
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Diagnostics" }));
+    expect(await screen.findByRole("heading", { name: "Diagnostics" })).toBeInTheDocument();
+
+    const rendered = document.body.textContent ?? "";
+    expect(rendered).toContain("[redacted]");
+    expect(rendered).not.toContain("sk-live-super-secret");
+    expect(rendered).not.toContain("oauth-secret");
+    expect(rendered).not.toContain("relay-secret");
+    expect(rendered).not.toContain("browser-secret");
+  });
+
   it("streams chat transcript with inline approval controls and CSRF decision dispatch", async () => {
     const fetchMock = createQueuedFetch([
       jsonResponse({

@@ -2428,6 +2428,134 @@ port = 9911
         server.join().expect("test server thread should exit");
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_build_redacts_console_and_connector_diagnostics() {
+        fn write_http_response(
+            stream: &mut std::net::TcpStream,
+            status_line: &str,
+            body: &str,
+            extra_headers: &[&str],
+        ) {
+            let mut response = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+                body.len()
+            );
+            for header in extra_headers {
+                response.push_str(header);
+                response.push_str("\r\n");
+            }
+            response.push_str("\r\n");
+            response.push_str(body);
+            stream.write_all(response.as_bytes()).expect("response should be written");
+            stream.flush().expect("response should be flushed");
+        }
+
+        let fixture = TempFixtureDir::new();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test listener should bind");
+        let port = listener.local_addr().expect("listener address should resolve").port();
+        let server = std::thread::spawn(move || {
+            for _ in 0..5 {
+                let (mut stream, _) = listener.accept().expect("listener should accept request");
+                let mut buffer = [0_u8; 4096];
+                let read = stream.read(&mut buffer).expect("request should be readable");
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                let request_line = request.lines().next().unwrap_or_default().to_owned();
+                if request_line.starts_with("GET /health ") {
+                    write_http_response(
+                        &mut stream,
+                        "200 OK",
+                        r#"{"status":"ok","version":"test","git_hash":"hash","uptime_seconds":1}"#,
+                        &[],
+                    );
+                    continue;
+                }
+                if request_line.starts_with("GET /console/v1/auth/session ") {
+                    write_http_response(
+                        &mut stream,
+                        "403 Forbidden",
+                        r#"{"error":"console session cookie is missing"}"#,
+                        &[],
+                    );
+                    continue;
+                }
+                if request_line.starts_with("POST /console/v1/auth/login ") {
+                    write_http_response(
+                        &mut stream,
+                        "200 OK",
+                        r#"{"principal":"admin:desktop-control-center","device_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","csrf_token":"csrf","issued_at_unix_ms":1,"expires_at_unix_ms":2}"#,
+                        &["Set-Cookie: palyra_console_session=session-1; Path=/; HttpOnly; SameSite=Strict"],
+                    );
+                    continue;
+                }
+                if request_line.starts_with("GET /console/v1/diagnostics ") {
+                    write_http_response(
+                        &mut stream,
+                        "200 OK",
+                        r#"{
+                            "generated_at_unix_ms":123,
+                            "errors":["provider token=alpha"],
+                            "browserd":{"last_error":"Bearer browser-secret"},
+                            "auth_profiles":{"profiles":[{"refresh_failure_reason":"refresh_token=beta"}]}
+                        }"#,
+                        &[],
+                    );
+                    continue;
+                }
+                if request_line.starts_with("GET /console/v1/channels/discord%3Adefault ") {
+                    write_http_response(
+                        &mut stream,
+                        "200 OK",
+                        r#"{
+                            "connector":{"connector_id":"discord:default","enabled":true,"readiness":"degraded","liveness":"running"},
+                            "runtime":{"last_error":"discord send failed authorization=discord-secret url=https://discord.test/api/webhooks/1?token=hook-secret&mode=ok"}
+                        }"#,
+                        &[],
+                    );
+                    continue;
+                }
+                panic!("unexpected desktop snapshot request: {request_line}");
+            }
+        });
+
+        let mut control_center = build_test_control_center(fixture.path());
+        control_center.runtime.gateway_admin_port = port;
+        control_center.persisted.browser_service_enabled = false;
+
+        let snapshot = build_snapshot_from_inputs(control_center.capture_snapshot_inputs())
+            .await
+            .expect("snapshot should build");
+        assert!(
+            snapshot
+                .diagnostics
+                .errors
+                .iter()
+                .any(|entry| entry.contains("<redacted>")),
+            "desktop diagnostics should preserve redaction markers"
+        );
+        assert!(
+            snapshot
+                .diagnostics
+                .errors
+                .iter()
+                .all(|entry| {
+                    !entry.contains("alpha")
+                        && !entry.contains("browser-secret")
+                        && !entry.contains("beta")
+                }),
+            "desktop diagnostics must not leak raw secret values: {:?}",
+            snapshot.diagnostics.errors
+        );
+        let discord_error = snapshot.quick_facts.discord.last_error.unwrap_or_default();
+        assert!(
+            discord_error.contains("authorization=<redacted>")
+                && discord_error.contains("token=<redacted>")
+                && !discord_error.contains("discord-secret")
+                && !discord_error.contains("hook-secret"),
+            "desktop connector snapshot must sanitize connector diagnostics: {discord_error}"
+        );
+        server.join().expect("test server thread should exit");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn snapshot_build_releases_supervisor_lock_while_waiting_on_http() {
         let fixture = TempFixtureDir::new();

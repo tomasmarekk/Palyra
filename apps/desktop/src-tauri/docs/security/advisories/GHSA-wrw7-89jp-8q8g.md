@@ -44,9 +44,21 @@ Reference upstream fix:
 
 - `gtk-rs/gtk-rs-core#1343`
 
+Governance record:
+
+- Machine-readable contract: `third_party/glib-0.18.5-patched/PALYRA_PATCH_GOVERNANCE.env`
+- Owner: `@marektomas-cz`
+- Review cadence: every 30 days while the downstream patch remains active
+- Patched file checksum (`src/variant_iter.rs`, SHA-256): `821cbd7f2bdbf5407236cf15cc848e2d660581d97428924de77ca32899c31a95`
+- Verification command: `bash scripts/check-desktop-glib-patch.sh`
+
 ## Validation and regression coverage
 
 - Dependency resolution proof: `docs/security/dependency-graph/glib.md`
+- Governance verification:
+  - `bash scripts/check-desktop-glib-patch.sh`
+  - verifies the expected patched file checksum, the `Cargo.toml` patch override, and `cargo metadata`
+    resolution to the vendored path
 - Linux-only regression test:
   - `tests/glib_variantstriter_regression.rs`
   - exercises both forward collection and `DoubleEndedIterator` methods (`next_back`, `nth_back`)
@@ -60,7 +72,9 @@ GitHub Dependabot alert for this advisory is expected to stay non-upgradable unt
 Repository handling:
 
 - keep downstream backport active,
+- keep the governance record current (owner, cadence, checksum, upstream fix reference),
 - keep regression test and Linux release CI gate active,
+- keep the desktop glib patch governance check green in local pre-push and CI security gates,
 - keep advisory dismissal comment linked to this mitigation and to upstream fix reference.
 
 ## Exit plan (remove this patch)

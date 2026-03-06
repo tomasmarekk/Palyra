@@ -7,6 +7,9 @@ cargo fmt --all --check
 echo "Checking runtime artifact hygiene before local validation..."
 bash scripts/check-runtime-artifacts.sh
 
+echo "Checking desktop glib patch governance..."
+bash scripts/check-desktop-glib-patch.sh
+
 echo "Running clippy..."
 cargo clippy --workspace --all-targets -- -D warnings
 

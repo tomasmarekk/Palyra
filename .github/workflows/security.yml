@@ -74,6 +74,9 @@ jobs:
         with:
           toolchain: 1.91.0
 
+      - name: Desktop glib patch governance
+        run: bash scripts/check-desktop-glib-patch.sh
+
       - name: Install cargo-audit
         run: cargo install --locked cargo-audit --version 0.22.1
 

@@ -8937,6 +8937,19 @@ mod tests {
             "authorization": "Bearer topsecret",
             "endpoint": "https://example.test/callback?access_token=alpha&mode=ok",
             "error_message": "provider failure token=abc123",
+            "browserd": {
+                "relay_token": "relay-secret",
+                "downloads_endpoint": "https://example.test/downloads?token=browser-secret&mode=ok",
+                "last_error": "Bearer browser-secret"
+            },
+            "channels": {
+                "discord:default": {
+                    "runtime": {
+                        "last_error": "authorization=discord-secret"
+                    },
+                    "webhook_url": "https://discord.test/api/webhooks/1?token=hook-secret&mode=ok"
+                }
+            },
             "nested": {
                 "refresh_token": "beta"
             }
@@ -8954,6 +8967,20 @@ mod tests {
             payload.get("endpoint").and_then(serde_json::Value::as_str),
             Some("https://example.test/callback?access_token=<redacted>&mode=ok")
         );
+        assert_eq!(
+            payload.pointer("/browserd/relay_token").and_then(serde_json::Value::as_str),
+            Some("<redacted>")
+        );
+        assert_eq!(
+            payload.pointer("/browserd/downloads_endpoint").and_then(serde_json::Value::as_str),
+            Some("https://example.test/downloads?token=<redacted>&mode=ok")
+        );
+        assert_eq!(
+            payload
+                .pointer("/channels/discord:default/webhook_url")
+                .and_then(serde_json::Value::as_str),
+            Some("https://discord.test/api/webhooks/1?token=<redacted>&mode=ok")
+        );
         let redacted_error = payload
             .get("error_message")
             .and_then(serde_json::Value::as_str)
@@ -8962,6 +8989,22 @@ mod tests {
         assert!(
             !redacted_error.contains("abc123"),
             "error message should hide secret token values: {redacted_error}"
+        );
+        let browser_error = payload
+            .pointer("/browserd/last_error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            browser_error.contains("<redacted>") && !browser_error.contains("browser-secret"),
+            "browser diagnostics error should hide secret values: {browser_error}"
+        );
+        let connector_error = payload
+            .pointer("/channels/discord:default/runtime/last_error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            connector_error.contains("<redacted>") && !connector_error.contains("discord-secret"),
+            "connector diagnostics error should hide secret values: {connector_error}"
         );
     }
 
