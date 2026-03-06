@@ -21,6 +21,7 @@ use std::{
     fs,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path as FsPath, PathBuf},
+    process::Stdio,
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -40,7 +41,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use base64::Engine as _;
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use clap::Parser;
 use config::load_config;
 use cron::{spawn_scheduler_loop, MEMORY_MAINTENANCE_INTERVAL};
@@ -69,13 +70,16 @@ use palyra_common::default_identity_store_root;
 use palyra_common::{
     build_metadata,
     config_system::{
-        parse_document_with_migration, set_value_at_path, write_document_with_backups,
+        backup_path, get_value_at_path, parse_document_with_migration, parse_toml_value_literal,
+        recover_config_from_backup, serialize_document_pretty, set_value_at_path,
+        unset_value_at_path, write_document_with_backups, ConfigMigrationInfo,
     },
-    daemon_config_schema::RootFileConfig,
+    daemon_config_schema::{redact_secret_config_values, RootFileConfig},
     default_config_search_paths, health_response, parse_config_path, parse_daemon_bind_socket,
     redaction::{is_sensitive_key as redaction_key_is_sensitive, redact_auth_error, redact_url},
     validate_canonical_id, HealthResponse,
 };
+use palyra_control_plane as control_plane;
 use palyra_identity::IdentityManager;
 use palyra_identity::{FilesystemSecretStore, SecretStore};
 use palyra_policy::{
@@ -92,6 +96,7 @@ use reqwest::{Client as ReqwestClient, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use tokio::process::Command as TokioCommand;
 use tokio::sync::{mpsc, Notify};
 use tokio_stream::{
     wrappers::{ReceiverStream, TcpListenerStream},
@@ -191,6 +196,7 @@ struct AppState {
     console_sessions: Arc<Mutex<HashMap<String, ConsoleSession>>>,
     relay_tokens: Arc<Mutex<HashMap<String, ConsoleRelayToken>>>,
     console_chat_streams: Arc<Mutex<HashMap<String, ConsoleChatRunStream>>>,
+    support_bundle_jobs: Arc<Mutex<HashMap<String, control_plane::SupportBundleJob>>>,
     deployment: DeploymentRuntimeSnapshot,
     remote_admin_access: Arc<Mutex<Option<RemoteAdminAccessAttempt>>>,
 }
@@ -232,11 +238,6 @@ struct AdminRateLimitEntry {
 struct CanvasRateLimitEntry {
     window_started_at: Instant,
     requests_in_window: u32,
-}
-
-#[derive(Debug, Serialize)]
-struct ErrorBody {
-    error: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -319,6 +320,39 @@ struct ConsoleLoginRequest {
     principal: String,
     device_id: String,
     channel: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleAuthProfilesQuery {
+    after_profile_id: Option<String>,
+    limit: Option<u32>,
+    provider_kind: Option<String>,
+    provider_custom_name: Option<String>,
+    scope_kind: Option<String>,
+    scope_agent_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleAuthHealthQuery {
+    agent_id: Option<String>,
+    include_profiles: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleSecretsListQuery {
+    scope: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleSecretMetadataQuery {
+    scope: String,
+    key: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleSupportBundleJobsQuery {
+    after_job_id: Option<String>,
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1537,6 +1571,7 @@ async fn main() -> Result<()> {
         console_sessions: Arc::new(Mutex::new(HashMap::new())),
         relay_tokens: Arc::new(Mutex::new(HashMap::new())),
         console_chat_streams: Arc::new(Mutex::new(HashMap::new())),
+        support_bundle_jobs: Arc::new(Mutex::new(HashMap::new())),
         deployment: DeploymentRuntimeSnapshot {
             mode: loaded.deployment.mode.as_str().to_owned(),
             bind_profile: loaded.gateway.bind_profile.as_str().to_owned(),
@@ -1592,6 +1627,55 @@ async fn main() -> Result<()> {
         .route("/console/v1/auth/login", post(console_login_handler))
         .route("/console/v1/auth/logout", post(console_logout_handler))
         .route("/console/v1/auth/session", get(console_session_handler))
+        .route("/console/v1/control-plane/capabilities", get(console_capability_catalog_handler))
+        .route("/console/v1/deployment/posture", get(console_deployment_posture_handler))
+        .route("/console/v1/auth/profiles", get(console_auth_profiles_list_handler))
+        .route("/console/v1/auth/profiles", post(console_auth_profile_upsert_handler))
+        .route("/console/v1/auth/profiles/{profile_id}", get(console_auth_profile_get_handler))
+        .route(
+            "/console/v1/auth/profiles/{profile_id}/delete",
+            post(console_auth_profile_delete_handler),
+        )
+        .route("/console/v1/auth/health", get(console_auth_health_handler))
+        .route("/console/v1/auth/providers/openai", get(console_openai_provider_state_handler))
+        .route(
+            "/console/v1/auth/providers/openai/bootstrap",
+            post(console_openai_provider_bootstrap_handler),
+        )
+        .route(
+            "/console/v1/auth/providers/openai/callback-state",
+            get(console_openai_provider_callback_state_handler),
+        )
+        .route(
+            "/console/v1/auth/providers/openai/reconnect",
+            post(console_openai_provider_reconnect_handler),
+        )
+        .route(
+            "/console/v1/auth/providers/openai/revoke",
+            post(console_openai_provider_revoke_handler),
+        )
+        .route(
+            "/console/v1/auth/providers/openai/default-profile",
+            post(console_openai_provider_default_profile_handler),
+        )
+        .route("/console/v1/config/inspect", post(console_config_inspect_handler))
+        .route("/console/v1/config/validate", post(console_config_validate_handler))
+        .route("/console/v1/config/mutate", post(console_config_mutate_handler))
+        .route("/console/v1/config/migrate", post(console_config_migrate_handler))
+        .route("/console/v1/config/recover", post(console_config_recover_handler))
+        .route("/console/v1/secrets", get(console_secrets_list_handler))
+        .route("/console/v1/secrets", post(console_secret_set_handler))
+        .route("/console/v1/secrets/metadata", get(console_secret_metadata_handler))
+        .route("/console/v1/secrets/reveal", post(console_secret_reveal_handler))
+        .route("/console/v1/secrets/delete", post(console_secret_delete_handler))
+        .route("/console/v1/pairing", get(console_pairing_summary_handler))
+        .route("/console/v1/pairing/codes", post(console_pairing_code_mint_handler))
+        .route("/console/v1/support-bundle/jobs", get(console_support_bundle_jobs_list_handler))
+        .route("/console/v1/support-bundle/jobs", post(console_support_bundle_job_create_handler))
+        .route(
+            "/console/v1/support-bundle/jobs/{job_id}",
+            get(console_support_bundle_job_get_handler),
+        )
         .route("/console/v1/diagnostics", get(console_diagnostics_handler))
         .route("/console/v1/chat/sessions", get(console_chat_sessions_list_handler))
         .route("/console/v1/chat/sessions", post(console_chat_session_resolve_handler))
@@ -3038,6 +3122,790 @@ async fn console_session_handler(
     Ok(Json(build_console_session_response(&session, session.csrf_token.clone())))
 }
 
+async fn console_capability_catalog_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<control_plane::CapabilityCatalog>, Response> {
+    let _session = authorize_console_session(&state, &headers, false)?;
+    Ok(Json(build_capability_catalog()?))
+}
+
+async fn console_deployment_posture_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<control_plane::DeploymentPostureSummary>, Response> {
+    let _session = authorize_console_session(&state, &headers, false)?;
+    Ok(Json(build_deployment_posture_summary(&state)))
+}
+
+async fn console_auth_profiles_list_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ConsoleAuthProfilesQuery>,
+) -> Result<Json<control_plane::AuthProfileListEnvelope>, Response> {
+    let session = authorize_console_session(&state, &headers, false)?;
+    let limit = query.limit.unwrap_or(100).clamp(1, 500);
+    let mut request =
+        TonicRequest::new(gateway::proto::palyra::auth::v1::ListAuthProfilesRequest {
+            v: palyra_common::CANONICAL_PROTOCOL_MAJOR,
+            after_profile_id: query.after_profile_id.unwrap_or_default(),
+            limit,
+            provider_kind: parse_console_auth_provider_kind(query.provider_kind.as_deref()) as i32,
+            provider_custom_name: query.provider_custom_name.unwrap_or_default(),
+            scope_kind: parse_console_auth_scope_kind(query.scope_kind.as_deref()) as i32,
+            scope_agent_id: query.scope_agent_id.unwrap_or_default(),
+        });
+    apply_console_rpc_context(&state, &session, request.metadata_mut())?;
+    let service = build_console_auth_service(&state);
+    let response =
+        <gateway::AuthServiceImpl as gateway::proto::palyra::auth::v1::auth_service_server::AuthService>::list_profiles(
+            &service,
+            request,
+        )
+        .await
+        .map_err(runtime_status_response)?
+        .into_inner();
+    let profiles = response
+        .profiles
+        .iter()
+        .map(control_plane_auth_profile_from_proto)
+        .collect::<Result<Vec<_>, Response>>()?;
+    Ok(Json(control_plane::AuthProfileListEnvelope {
+        contract: contract_descriptor(),
+        page: build_page_info(
+            usize::try_from(limit).unwrap_or(usize::MAX),
+            profiles.len(),
+            trim_to_option(response.next_after_profile_id),
+        ),
+        profiles,
+    }))
+}
+
+async fn console_auth_profile_get_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(profile_id): Path<String>,
+) -> Result<Json<control_plane::AuthProfileEnvelope>, Response> {
+    let session = authorize_console_session(&state, &headers, false)?;
+    let profile_id = normalize_non_empty_field(profile_id, "profile_id")?;
+    let mut request = TonicRequest::new(gateway::proto::palyra::auth::v1::GetAuthProfileRequest {
+        v: palyra_common::CANONICAL_PROTOCOL_MAJOR,
+        profile_id,
+    });
+    apply_console_rpc_context(&state, &session, request.metadata_mut())?;
+    let service = build_console_auth_service(&state);
+    let response =
+        <gateway::AuthServiceImpl as gateway::proto::palyra::auth::v1::auth_service_server::AuthService>::get_profile(
+            &service,
+            request,
+        )
+        .await
+        .map_err(runtime_status_response)?
+        .into_inner();
+    let profile = response.profile.ok_or_else(|| {
+        runtime_status_response(tonic::Status::internal(
+            "auth get response did not include profile",
+        ))
+    })?;
+    Ok(Json(control_plane::AuthProfileEnvelope {
+        contract: contract_descriptor(),
+        profile: control_plane_auth_profile_from_proto(&profile)?,
+    }))
+}
+
+async fn console_auth_profile_upsert_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(profile): Json<control_plane::AuthProfileView>,
+) -> Result<Json<control_plane::AuthProfileEnvelope>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    let mut request = TonicRequest::new(gateway::proto::palyra::auth::v1::SetAuthProfileRequest {
+        v: palyra_common::CANONICAL_PROTOCOL_MAJOR,
+        profile: Some(control_plane_auth_profile_to_proto(&profile)?),
+    });
+    apply_console_rpc_context(&state, &session, request.metadata_mut())?;
+    let service = build_console_auth_service(&state);
+    let response =
+        <gateway::AuthServiceImpl as gateway::proto::palyra::auth::v1::auth_service_server::AuthService>::set_profile(
+            &service,
+            request,
+        )
+        .await
+        .map_err(runtime_status_response)?
+        .into_inner();
+    let profile = response.profile.ok_or_else(|| {
+        runtime_status_response(tonic::Status::internal(
+            "auth set response did not include profile",
+        ))
+    })?;
+    Ok(Json(control_plane::AuthProfileEnvelope {
+        contract: contract_descriptor(),
+        profile: control_plane_auth_profile_from_proto(&profile)?,
+    }))
+}
+
+async fn console_auth_profile_delete_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(profile_id): Path<String>,
+) -> Result<Json<control_plane::AuthProfileDeleteEnvelope>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    let profile_id = normalize_non_empty_field(profile_id, "profile_id")?;
+    let mut request =
+        TonicRequest::new(gateway::proto::palyra::auth::v1::DeleteAuthProfileRequest {
+            v: palyra_common::CANONICAL_PROTOCOL_MAJOR,
+            profile_id: profile_id.clone(),
+        });
+    apply_console_rpc_context(&state, &session, request.metadata_mut())?;
+    let service = build_console_auth_service(&state);
+    let response =
+        <gateway::AuthServiceImpl as gateway::proto::palyra::auth::v1::auth_service_server::AuthService>::delete_profile(
+            &service,
+            request,
+        )
+        .await
+        .map_err(runtime_status_response)?
+        .into_inner();
+    Ok(Json(control_plane::AuthProfileDeleteEnvelope {
+        contract: contract_descriptor(),
+        profile_id,
+        deleted: response.deleted,
+    }))
+}
+
+async fn console_auth_health_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ConsoleAuthHealthQuery>,
+) -> Result<Json<control_plane::AuthHealthEnvelope>, Response> {
+    let session = authorize_console_session(&state, &headers, false)?;
+    let mut request = TonicRequest::new(gateway::proto::palyra::auth::v1::GetAuthHealthRequest {
+        v: palyra_common::CANONICAL_PROTOCOL_MAJOR,
+        agent_id: query.agent_id.unwrap_or_default(),
+        include_profiles: query.include_profiles.unwrap_or(false),
+    });
+    apply_console_rpc_context(&state, &session, request.metadata_mut())?;
+    let service = build_console_auth_service(&state);
+    let response =
+        <gateway::AuthServiceImpl as gateway::proto::palyra::auth::v1::auth_service_server::AuthService>::get_health(
+            &service,
+            request,
+        )
+        .await
+        .map_err(runtime_status_response)?
+        .into_inner();
+    Ok(Json(control_plane::AuthHealthEnvelope {
+        contract: contract_descriptor(),
+        summary: auth_health_summary_json(response.summary.as_ref()),
+        expiry_distribution: auth_expiry_distribution_json(response.expiry_distribution.as_ref()),
+        profiles: response.profiles.iter().map(auth_profile_health_json).collect(),
+        refresh_metrics: auth_refresh_metrics_json(response.refresh_metrics.as_ref()),
+    }))
+}
+
+async fn console_openai_provider_state_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<control_plane::ProviderAuthStateEnvelope>, Response> {
+    let session = authorize_console_session(&state, &headers, false)?;
+    let profiles = list_console_auth_profiles(
+        &state,
+        &session,
+        gateway::proto::palyra::auth::v1::AuthProviderKind::Openai,
+    )
+    .await?;
+    let (document, _, _) = load_console_config_snapshot(None, false)?;
+    Ok(Json(build_openai_provider_state(&document, profiles)))
+}
+
+async fn console_openai_provider_bootstrap_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<control_plane::ProviderAuthActionRequest>,
+) -> Result<Json<control_plane::ProviderAuthActionEnvelope>, Response> {
+    let _session = authorize_console_session(&state, &headers, true)?;
+    let _ = payload;
+    Ok(Json(openai_provider_action_envelope(
+        "bootstrap",
+        "not_implemented",
+        "OpenAI OAuth bootstrap contract is published in M52; interactive bootstrap lands in M54.",
+        None,
+    )))
+}
+
+async fn console_openai_provider_callback_state_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<control_plane::ProviderAuthStateEnvelope>, Response> {
+    let session = authorize_console_session(&state, &headers, false)?;
+    let profiles = list_console_auth_profiles(
+        &state,
+        &session,
+        gateway::proto::palyra::auth::v1::AuthProviderKind::Openai,
+    )
+    .await?;
+    let (document, _, _) = load_console_config_snapshot(None, false)?;
+    let mut envelope = build_openai_provider_state(&document, profiles);
+    envelope.note = Some(
+        "Callback state is currently idle; interactive OAuth callback handling is introduced in M54."
+            .to_owned(),
+    );
+    Ok(Json(envelope))
+}
+
+async fn console_openai_provider_reconnect_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<control_plane::ProviderAuthActionRequest>,
+) -> Result<Json<control_plane::ProviderAuthActionEnvelope>, Response> {
+    let _session = authorize_console_session(&state, &headers, true)?;
+    Ok(Json(openai_provider_action_envelope(
+        "reconnect",
+        "not_implemented",
+        "Per-profile reconnect is not implemented yet; use auth health for refresh status and M54 for interactive reconnect.",
+        payload.profile_id,
+    )))
+}
+
+async fn console_openai_provider_revoke_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<control_plane::ProviderAuthActionRequest>,
+) -> Result<Json<control_plane::ProviderAuthActionEnvelope>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    let profile_id = payload.profile_id.ok_or_else(|| {
+        validation_error_response(
+            "profile_id",
+            "required",
+            "profile_id is required for provider revoke",
+        )
+    })?;
+    let mut request =
+        TonicRequest::new(gateway::proto::palyra::auth::v1::DeleteAuthProfileRequest {
+            v: palyra_common::CANONICAL_PROTOCOL_MAJOR,
+            profile_id: profile_id.clone(),
+        });
+    apply_console_rpc_context(&state, &session, request.metadata_mut())?;
+    let service = build_console_auth_service(&state);
+    let response =
+        <gateway::AuthServiceImpl as gateway::proto::palyra::auth::v1::auth_service_server::AuthService>::delete_profile(
+            &service,
+            request,
+        )
+        .await
+        .map_err(runtime_status_response)?
+        .into_inner();
+    if response.deleted {
+        let path = resolve_console_config_path(None, true)?;
+        if let Some(current_path) = path.as_deref() {
+            let current = read_console_config_profile_id(current_path)?;
+            if current.as_deref() == Some(profile_id.as_str()) {
+                let path_ref = FsPath::new(current_path);
+                let (mut document, _) = load_console_document_from_existing_path(path_ref)?;
+                let _ = unset_value_at_path(&mut document, "model_provider.auth_profile_id")
+                    .map_err(|error| {
+                        runtime_status_response(tonic::Status::invalid_argument(format!(
+                            "failed to unset model_provider.auth_profile_id: {error}"
+                        )))
+                    })?;
+                validate_daemon_compatible_document(&document)?;
+                write_document_with_backups(path_ref, &document, 5).map_err(|error| {
+                    runtime_status_response(tonic::Status::internal(format!(
+                        "failed to persist config {}: {error}",
+                        path_ref.display()
+                    )))
+                })?;
+            }
+        }
+    }
+    Ok(Json(openai_provider_action_envelope(
+        "revoke",
+        if response.deleted { "revoked" } else { "not_found" },
+        if response.deleted {
+            "OpenAI auth profile revoked."
+        } else {
+            "OpenAI auth profile did not exist."
+        },
+        Some(profile_id),
+    )))
+}
+
+async fn console_openai_provider_default_profile_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<control_plane::ProviderAuthActionRequest>,
+) -> Result<Json<control_plane::ProviderAuthActionEnvelope>, Response> {
+    let _session = authorize_console_session(&state, &headers, true)?;
+    let profile_id = payload.profile_id.ok_or_else(|| {
+        validation_error_response(
+            "profile_id",
+            "required",
+            "profile_id is required for default profile selection",
+        )
+    })?;
+    let path = resolve_console_config_path(None, false)?.ok_or_else(|| {
+        runtime_status_response(tonic::Status::failed_precondition(
+            "no daemon config file found; create one before selecting a default auth profile",
+        ))
+    })?;
+    let path_ref = FsPath::new(path.as_str());
+    let (mut document, _) = load_console_document_for_mutation(path_ref)?;
+    set_value_at_path(
+        &mut document,
+        "model_provider.auth_profile_id",
+        toml::Value::String(profile_id.clone()),
+    )
+    .map_err(|error| {
+        runtime_status_response(tonic::Status::invalid_argument(format!(
+            "failed to set model_provider.auth_profile_id: {error}"
+        )))
+    })?;
+    validate_daemon_compatible_document(&document)?;
+    write_document_with_backups(path_ref, &document, 5).map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "failed to persist config {}: {error}",
+            path_ref.display()
+        )))
+    })?;
+    Ok(Json(openai_provider_action_envelope(
+        "default_profile",
+        "selected",
+        "OpenAI default auth profile updated.",
+        Some(profile_id),
+    )))
+}
+
+async fn console_config_inspect_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<control_plane::ConfigInspectRequest>,
+) -> Result<Json<control_plane::ConfigDocumentSnapshot>, Response> {
+    let _session = authorize_console_session(&state, &headers, true)?;
+    let (mut document, migration, source_path) =
+        load_console_config_snapshot(payload.path.as_deref(), true)?;
+    if !payload.show_secrets {
+        redact_secret_config_values(&mut document);
+    }
+    let rendered = serialize_document_pretty(&document).map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "failed to serialize config document: {error}"
+        )))
+    })?;
+    Ok(Json(control_plane::ConfigDocumentSnapshot {
+        contract: contract_descriptor(),
+        source_path: source_path.clone(),
+        config_version: migration.target_version,
+        migrated_from_version: migration.migrated.then_some(migration.source_version),
+        redacted: !payload.show_secrets,
+        document_toml: rendered,
+        backups: config_backup_records(Some(source_path.as_str()), payload.backups.max(1), false)?,
+    }))
+}
+
+async fn console_config_validate_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<control_plane::ConfigValidateRequest>,
+) -> Result<Json<control_plane::ConfigValidationEnvelope>, Response> {
+    let _session = authorize_console_session(&state, &headers, true)?;
+    let (document, migration, source_path) =
+        load_console_config_snapshot(payload.path.as_deref(), false)?;
+    validate_daemon_compatible_document(&document)?;
+    Ok(Json(control_plane::ConfigValidationEnvelope {
+        contract: contract_descriptor(),
+        source_path,
+        valid: true,
+        config_version: migration.target_version,
+        migrated_from_version: migration.migrated.then_some(migration.source_version),
+    }))
+}
+
+async fn console_config_mutate_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<control_plane::ConfigMutationRequest>,
+) -> Result<Json<control_plane::ConfigMutationEnvelope>, Response> {
+    let _session = authorize_console_session(&state, &headers, true)?;
+    let path = resolve_console_config_path(payload.path.as_deref(), false)?.ok_or_else(|| {
+        runtime_status_response(tonic::Status::failed_precondition(
+            "config path could not be resolved",
+        ))
+    })?;
+    let path_ref = FsPath::new(path.as_str());
+    let (mut document, migration) = load_console_document_for_mutation(path_ref)?;
+    let operation = if let Some(value) = payload.value.as_deref() {
+        let literal = parse_toml_value_literal(value).map_err(|error| {
+            runtime_status_response(tonic::Status::invalid_argument(format!(
+                "config value must be a valid TOML literal: {error}"
+            )))
+        })?;
+        set_value_at_path(&mut document, payload.key.as_str(), literal).map_err(|error| {
+            runtime_status_response(tonic::Status::invalid_argument(format!(
+                "invalid config key path: {error}"
+            )))
+        })?;
+        "set"
+    } else {
+        let removed =
+            unset_value_at_path(&mut document, payload.key.as_str()).map_err(|error| {
+                runtime_status_response(tonic::Status::invalid_argument(format!(
+                    "invalid config key path: {error}"
+                )))
+            })?;
+        if !removed {
+            return Err(runtime_status_response(tonic::Status::not_found(format!(
+                "config key not found: {}",
+                payload.key
+            ))));
+        }
+        "unset"
+    };
+    validate_daemon_compatible_document(&document)?;
+    write_document_with_backups(path_ref, &document, payload.backups).map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "failed to persist config {}: {error}",
+            path_ref.display()
+        )))
+    })?;
+    Ok(Json(control_plane::ConfigMutationEnvelope {
+        contract: contract_descriptor(),
+        operation: operation.to_owned(),
+        source_path: path,
+        backups_retained: payload.backups,
+        config_version: migration.target_version,
+        migrated_from_version: migration.migrated.then_some(migration.source_version),
+        changed_key: Some(payload.key),
+    }))
+}
+
+async fn console_config_migrate_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<control_plane::ConfigInspectRequest>,
+) -> Result<Json<control_plane::ConfigMutationEnvelope>, Response> {
+    let _session = authorize_console_session(&state, &headers, true)?;
+    let path = resolve_console_config_path(payload.path.as_deref(), true)?.ok_or_else(|| {
+        runtime_status_response(tonic::Status::failed_precondition(
+            "no daemon config file found to migrate",
+        ))
+    })?;
+    let path_ref = FsPath::new(path.as_str());
+    let (document, migration) = load_console_document_from_existing_path(path_ref)?;
+    validate_daemon_compatible_document(&document)?;
+    if migration.migrated {
+        write_document_with_backups(path_ref, &document, payload.backups).map_err(|error| {
+            runtime_status_response(tonic::Status::internal(format!(
+                "failed to persist migrated config {}: {error}",
+                path_ref.display()
+            )))
+        })?;
+    }
+    Ok(Json(control_plane::ConfigMutationEnvelope {
+        contract: contract_descriptor(),
+        operation: "migrate".to_owned(),
+        source_path: path,
+        backups_retained: payload.backups,
+        config_version: migration.target_version,
+        migrated_from_version: migration.migrated.then_some(migration.source_version),
+        changed_key: None,
+    }))
+}
+
+async fn console_config_recover_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<control_plane::ConfigRecoverRequest>,
+) -> Result<Json<control_plane::ConfigMutationEnvelope>, Response> {
+    let _session = authorize_console_session(&state, &headers, true)?;
+    let path = resolve_console_config_path(payload.path.as_deref(), false)?.ok_or_else(|| {
+        runtime_status_response(tonic::Status::failed_precondition(
+            "config path could not be resolved",
+        ))
+    })?;
+    let path_ref = FsPath::new(path.as_str());
+    let candidate_backup = backup_path(path_ref, payload.backup);
+    let (backup_document, _) =
+        load_console_document_from_existing_path(candidate_backup.as_path())?;
+    validate_daemon_compatible_document(&backup_document)?;
+    recover_config_from_backup(path_ref, payload.backup, payload.backups).map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "failed to recover config {} from backup {}: {error}",
+            path_ref.display(),
+            payload.backup
+        )))
+    })?;
+    let (document, migration) = load_console_document_from_existing_path(path_ref)?;
+    validate_daemon_compatible_document(&document)?;
+    Ok(Json(control_plane::ConfigMutationEnvelope {
+        contract: contract_descriptor(),
+        operation: "recover".to_owned(),
+        source_path: path,
+        backups_retained: payload.backups,
+        config_version: migration.target_version,
+        migrated_from_version: migration.migrated.then_some(migration.source_version),
+        changed_key: None,
+    }))
+}
+
+async fn console_secrets_list_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ConsoleSecretsListQuery>,
+) -> Result<Json<control_plane::SecretMetadataList>, Response> {
+    let session = authorize_console_session(&state, &headers, false)?;
+    let scope = query.scope.trim().to_owned();
+    if scope.is_empty() {
+        return Err(validation_error_response("scope", "required", "scope is required"));
+    }
+    let mut request = TonicRequest::new(gateway::proto::palyra::gateway::v1::ListSecretsRequest {
+        v: palyra_common::CANONICAL_PROTOCOL_MAJOR,
+        scope: scope.clone(),
+    });
+    apply_console_rpc_context(&state, &session, request.metadata_mut())?;
+    let service = build_console_vault_service(&state);
+    let response =
+        <gateway::VaultServiceImpl as gateway::proto::palyra::gateway::v1::vault_service_server::VaultService>::list_secrets(
+            &service,
+            request,
+        )
+        .await
+        .map_err(runtime_status_response)?
+        .into_inner();
+    let secrets =
+        response.secrets.iter().map(control_plane_secret_metadata_from_proto).collect::<Vec<_>>();
+    Ok(Json(control_plane::SecretMetadataList {
+        contract: contract_descriptor(),
+        scope,
+        page: build_page_info(secrets.len().max(1), secrets.len(), None),
+        secrets,
+    }))
+}
+
+async fn console_secret_metadata_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ConsoleSecretMetadataQuery>,
+) -> Result<Json<control_plane::SecretMetadataEnvelope>, Response> {
+    let session = authorize_console_session(&state, &headers, false)?;
+    let metadata =
+        secret_metadata_from_runtime(&state, &session, query.scope.trim(), query.key.trim())
+            .await?;
+    Ok(Json(control_plane::SecretMetadataEnvelope {
+        contract: contract_descriptor(),
+        secret: metadata,
+    }))
+}
+
+async fn console_secret_set_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<control_plane::SecretSetRequest>,
+) -> Result<Json<control_plane::SecretMetadataEnvelope>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    let value = BASE64_STANDARD.decode(payload.value_base64.as_bytes()).map_err(|error| {
+        validation_error_response(
+            "value_base64",
+            "invalid_base64",
+            format!("value_base64 must decode from base64: {error}").as_str(),
+        )
+    })?;
+    let mut request = TonicRequest::new(gateway::proto::palyra::gateway::v1::PutSecretRequest {
+        v: palyra_common::CANONICAL_PROTOCOL_MAJOR,
+        scope: payload.scope,
+        key: payload.key,
+        value,
+    });
+    apply_console_rpc_context(&state, &session, request.metadata_mut())?;
+    let service = build_console_vault_service(&state);
+    let response =
+        <gateway::VaultServiceImpl as gateway::proto::palyra::gateway::v1::vault_service_server::VaultService>::put_secret(
+            &service,
+            request,
+        )
+        .await
+        .map_err(runtime_status_response)?
+        .into_inner();
+    let secret = response.secret.ok_or_else(|| {
+        runtime_status_response(tonic::Status::internal(
+            "vault put response did not include metadata",
+        ))
+    })?;
+    Ok(Json(control_plane::SecretMetadataEnvelope {
+        contract: contract_descriptor(),
+        secret: control_plane_secret_metadata_from_proto(&secret),
+    }))
+}
+
+async fn console_secret_reveal_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<control_plane::SecretRevealRequest>,
+) -> Result<Json<control_plane::SecretRevealEnvelope>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    if !payload.reveal {
+        return Err(validation_error_response(
+            "reveal",
+            "required_true",
+            "reveal must be true for secret reveal requests",
+        ));
+    }
+    let mut request = TonicRequest::new(gateway::proto::palyra::gateway::v1::GetSecretRequest {
+        v: palyra_common::CANONICAL_PROTOCOL_MAJOR,
+        scope: payload.scope.clone(),
+        key: payload.key.clone(),
+    });
+    apply_console_rpc_context(&state, &session, request.metadata_mut())?;
+    request.metadata_mut().insert(
+        gateway::HEADER_VAULT_READ_APPROVAL,
+        MetadataValue::try_from("allow").map_err(|_| {
+            runtime_status_response(tonic::Status::internal(
+                "failed to encode vault approval metadata",
+            ))
+        })?,
+    );
+    let service = build_console_vault_service(&state);
+    let response =
+        <gateway::VaultServiceImpl as gateway::proto::palyra::gateway::v1::vault_service_server::VaultService>::get_secret(
+            &service,
+            request,
+        )
+        .await
+        .map_err(runtime_status_response)?
+        .into_inner();
+    let value_utf8 =
+        String::from_utf8(response.value.clone()).ok().filter(|value| !value.trim().is_empty());
+    Ok(Json(control_plane::SecretRevealEnvelope {
+        contract: contract_descriptor(),
+        scope: payload.scope,
+        key: payload.key,
+        value_bytes: u32::try_from(response.value.len()).unwrap_or(u32::MAX),
+        value_base64: BASE64_STANDARD.encode(response.value),
+        value_utf8,
+    }))
+}
+
+async fn console_secret_delete_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<control_plane::SecretDeleteRequest>,
+) -> Result<Json<control_plane::SecretMetadataEnvelope>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    let metadata = secret_metadata_from_runtime(
+        &state,
+        &session,
+        payload.scope.as_str(),
+        payload.key.as_str(),
+    )
+    .await?;
+    let mut request = TonicRequest::new(gateway::proto::palyra::gateway::v1::DeleteSecretRequest {
+        v: palyra_common::CANONICAL_PROTOCOL_MAJOR,
+        scope: payload.scope,
+        key: payload.key,
+    });
+    apply_console_rpc_context(&state, &session, request.metadata_mut())?;
+    let service = build_console_vault_service(&state);
+    let response =
+        <gateway::VaultServiceImpl as gateway::proto::palyra::gateway::v1::vault_service_server::VaultService>::delete_secret(
+            &service,
+            request,
+        )
+        .await
+        .map_err(runtime_status_response)?
+        .into_inner();
+    if !response.deleted {
+        return Err(runtime_status_response(tonic::Status::not_found("secret did not exist")));
+    }
+    Ok(Json(control_plane::SecretMetadataEnvelope {
+        contract: contract_descriptor(),
+        secret: metadata,
+    }))
+}
+
+async fn console_pairing_summary_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<control_plane::PairingSummaryEnvelope>, Response> {
+    let _session = authorize_console_session(&state, &headers, false)?;
+    Ok(Json(control_plane::PairingSummaryEnvelope {
+        contract: contract_descriptor(),
+        channels: state
+            .runtime
+            .channel_router_pairing_snapshot(None)
+            .iter()
+            .map(control_plane_pairing_snapshot_from_runtime)
+            .collect(),
+    }))
+}
+
+async fn console_pairing_code_mint_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<control_plane::PairingCodeMintRequest>,
+) -> Result<Json<control_plane::PairingSummaryEnvelope>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    state
+        .runtime
+        .channel_router_mint_pairing_code(
+            payload.channel.as_str(),
+            payload.issued_by.as_deref().unwrap_or(session.context.principal.as_str()),
+            payload.ttl_ms,
+        )
+        .map_err(runtime_status_response)?;
+    Ok(Json(control_plane::PairingSummaryEnvelope {
+        contract: contract_descriptor(),
+        channels: state
+            .runtime
+            .channel_router_pairing_snapshot(Some(payload.channel.as_str()))
+            .iter()
+            .map(control_plane_pairing_snapshot_from_runtime)
+            .collect(),
+    }))
+}
+
+async fn console_support_bundle_jobs_list_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ConsoleSupportBundleJobsQuery>,
+) -> Result<Json<control_plane::SupportBundleJobListEnvelope>, Response> {
+    let _session = authorize_console_session(&state, &headers, false)?;
+    let limit = query.limit.unwrap_or(32).clamp(1, 256);
+    let jobs = list_support_bundle_jobs(&state, query.after_job_id.as_deref(), limit);
+    let next_cursor =
+        if jobs.len() == limit { jobs.last().map(|job| job.job_id.clone()) } else { None };
+    Ok(Json(control_plane::SupportBundleJobListEnvelope {
+        contract: contract_descriptor(),
+        page: build_page_info(limit, jobs.len(), next_cursor),
+        jobs,
+    }))
+}
+
+async fn console_support_bundle_job_create_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<control_plane::SupportBundleCreateRequest>,
+) -> Result<Json<control_plane::SupportBundleJobEnvelope>, Response> {
+    let _session = authorize_console_session(&state, &headers, true)?;
+    let job = create_support_bundle_job(&state, payload.retain_jobs)?;
+    Ok(Json(control_plane::SupportBundleJobEnvelope { contract: contract_descriptor(), job }))
+}
+
+async fn console_support_bundle_job_get_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+) -> Result<Json<control_plane::SupportBundleJobEnvelope>, Response> {
+    let _session = authorize_console_session(&state, &headers, false)?;
+    let job_id = normalize_non_empty_field(job_id, "job_id")?;
+    let job = {
+        let jobs = lock_support_bundle_jobs(&state.support_bundle_jobs);
+        jobs.get(job_id.as_str()).cloned()
+    }
+    .ok_or_else(|| {
+        runtime_status_response(tonic::Status::not_found("support bundle job not found"))
+    })?;
+    Ok(Json(control_plane::SupportBundleJobEnvelope { contract: contract_descriptor(), job }))
+}
+
 async fn console_diagnostics_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3081,6 +3949,7 @@ async fn console_diagnostics_handler(
     })?;
 
     Ok(Json(json!({
+        "contract": contract_descriptor(),
         "generated_at_unix_ms": generated_at_unix_ms,
         "model_provider": provider_payload,
         "rate_limits": {
@@ -3190,8 +4059,42 @@ async fn collect_console_browser_diagnostics(state: &AppState) -> Value {
 }
 
 fn collect_console_deployment_diagnostics(state: &AppState) -> Value {
-    let last_remote_admin_access =
-        lock_remote_admin_access(&state.remote_admin_access).as_ref().cloned();
+    serde_json::to_value(build_deployment_posture_summary(state)).unwrap_or_else(|_| {
+        json!({
+            "contract": { "contract_version": control_plane::CONTROL_PLANE_CONTRACT_VERSION },
+            "mode": state.deployment.mode,
+            "bind_profile": state.deployment.bind_profile,
+            "warnings": ["failed to encode typed deployment posture summary"],
+        })
+    })
+}
+
+fn contract_descriptor() -> control_plane::ContractDescriptor {
+    control_plane::ContractDescriptor {
+        contract_version: control_plane::CONTROL_PLANE_CONTRACT_VERSION.to_owned(),
+    }
+}
+
+fn build_page_info(
+    limit: usize,
+    returned: usize,
+    next_cursor: Option<String>,
+) -> control_plane::PageInfo {
+    control_plane::PageInfo { limit, returned, has_more: next_cursor.is_some(), next_cursor }
+}
+
+fn build_deployment_posture_summary(state: &AppState) -> control_plane::DeploymentPostureSummary {
+    let last_remote_admin_access = lock_remote_admin_access(&state.remote_admin_access)
+        .as_ref()
+        .cloned()
+        .map(|attempt| control_plane::RemoteAdminAccessAttempt {
+            observed_at_unix_ms: attempt.observed_at_unix_ms,
+            remote_ip_fingerprint: attempt.remote_ip_fingerprint,
+            method: attempt.method,
+            path: attempt.path,
+            status_code: attempt.status_code,
+            outcome: attempt.outcome,
+        });
     let admin_remote = !state
         .deployment
         .admin_bind_addr
@@ -3220,31 +4123,1018 @@ fn collect_console_deployment_diagnostics(state: &AppState) -> Value {
         warnings.push("Dashboard exposed publicly; ensure WAF/reverse proxy".to_owned());
     }
 
-    json!({
-        "mode": state.deployment.mode,
-        "bind_profile": state.deployment.bind_profile,
-        "bind_addresses": {
-            "admin": format!("{}:{}", state.deployment.admin_bind_addr, state.deployment.admin_port),
-            "grpc": format!("{}:{}", state.deployment.grpc_bind_addr, state.deployment.grpc_port),
-            "quic": if state.deployment.quic_enabled {
-                Value::String(format!("{}:{}", state.deployment.quic_bind_addr, state.deployment.quic_port))
+    control_plane::DeploymentPostureSummary {
+        contract: contract_descriptor(),
+        mode: state.deployment.mode.clone(),
+        bind_profile: state.deployment.bind_profile.clone(),
+        bind_addresses: control_plane::DeploymentBindAddresses {
+            admin: format!("{}:{}", state.deployment.admin_bind_addr, state.deployment.admin_port),
+            grpc: format!("{}:{}", state.deployment.grpc_bind_addr, state.deployment.grpc_port),
+            quic: if state.deployment.quic_enabled {
+                format!("{}:{}", state.deployment.quic_bind_addr, state.deployment.quic_port)
             } else {
-                Value::String("disabled".to_owned())
+                "disabled".to_owned()
             },
         },
-        "tls": {
-            "gateway_enabled": state.deployment.gateway_tls_enabled,
+        tls: control_plane::DeploymentTlsSummary {
+            gateway_enabled: state.deployment.gateway_tls_enabled,
         },
-        "admin_auth_required": state.deployment.admin_auth_required,
-        "dangerous_remote_bind_ack": {
-            "config": state.deployment.dangerous_remote_bind_ack_config,
-            "env": state.deployment.dangerous_remote_bind_ack_env,
-            "env_name": DANGEROUS_REMOTE_BIND_ACK_ENV,
+        admin_auth_required: state.deployment.admin_auth_required,
+        dangerous_remote_bind_ack: control_plane::DangerousRemoteBindAckSummary {
+            config: state.deployment.dangerous_remote_bind_ack_config,
+            env: state.deployment.dangerous_remote_bind_ack_env,
+            env_name: DANGEROUS_REMOTE_BIND_ACK_ENV.to_owned(),
         },
-        "remote_bind_detected": admin_remote || grpc_remote || quic_remote,
-        "last_remote_admin_access_attempt": last_remote_admin_access,
-        "warnings": warnings,
+        remote_bind_detected: admin_remote || grpc_remote || quic_remote,
+        last_remote_admin_access_attempt: last_remote_admin_access,
+        warnings,
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn parse_console_auth_provider_kind(
+    raw: Option<&str>,
+) -> gateway::proto::palyra::auth::v1::AuthProviderKind {
+    match raw.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => match value.to_ascii_lowercase().as_str() {
+            "openai" => gateway::proto::palyra::auth::v1::AuthProviderKind::Openai,
+            "anthropic" => gateway::proto::palyra::auth::v1::AuthProviderKind::Anthropic,
+            "telegram" => gateway::proto::palyra::auth::v1::AuthProviderKind::Telegram,
+            "slack" => gateway::proto::palyra::auth::v1::AuthProviderKind::Slack,
+            "discord" => gateway::proto::palyra::auth::v1::AuthProviderKind::Discord,
+            "webhook" => gateway::proto::palyra::auth::v1::AuthProviderKind::Webhook,
+            "custom" => gateway::proto::palyra::auth::v1::AuthProviderKind::Custom,
+            _ => gateway::proto::palyra::auth::v1::AuthProviderKind::Unspecified,
+        },
+        None => gateway::proto::palyra::auth::v1::AuthProviderKind::Unspecified,
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn parse_console_auth_scope_kind(
+    raw: Option<&str>,
+) -> gateway::proto::palyra::auth::v1::AuthScopeKind {
+    match raw.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => match value.to_ascii_lowercase().as_str() {
+            "global" => gateway::proto::palyra::auth::v1::AuthScopeKind::Global,
+            "agent" => gateway::proto::palyra::auth::v1::AuthScopeKind::Agent,
+            _ => gateway::proto::palyra::auth::v1::AuthScopeKind::Unspecified,
+        },
+        None => gateway::proto::palyra::auth::v1::AuthScopeKind::Unspecified,
+    }
+}
+
+fn build_console_auth_service(state: &AppState) -> gateway::AuthServiceImpl {
+    gateway::AuthServiceImpl::new(
+        Arc::clone(&state.runtime),
+        state.auth.clone(),
+        Arc::clone(&state.auth_runtime),
+    )
+}
+
+fn build_console_vault_service(state: &AppState) -> gateway::VaultServiceImpl {
+    gateway::VaultServiceImpl::new(Arc::clone(&state.runtime), state.auth.clone())
+}
+
+#[allow(clippy::result_large_err)]
+fn control_plane_auth_profile_from_proto(
+    profile: &gateway::proto::palyra::auth::v1::AuthProfile,
+) -> Result<control_plane::AuthProfileView, Response> {
+    let provider = profile.provider.as_ref().ok_or_else(|| {
+        runtime_status_response(tonic::Status::internal("auth profile missing provider"))
+    })?;
+    let scope = profile.scope.as_ref().ok_or_else(|| {
+        runtime_status_response(tonic::Status::internal("auth profile missing scope"))
+    })?;
+    let credential = profile.credential.as_ref().ok_or_else(|| {
+        runtime_status_response(tonic::Status::internal("auth profile missing credential"))
+    })?;
+    let credential = match credential.kind.as_ref() {
+        Some(gateway::proto::palyra::auth::v1::auth_credential::Kind::ApiKey(api_key)) => {
+            control_plane::AuthCredentialView::ApiKey {
+                api_key_vault_ref: api_key.api_key_vault_ref.clone(),
+            }
+        }
+        Some(gateway::proto::palyra::auth::v1::auth_credential::Kind::Oauth(oauth)) => {
+            control_plane::AuthCredentialView::Oauth {
+                access_token_vault_ref: oauth.access_token_vault_ref.clone(),
+                refresh_token_vault_ref: oauth.refresh_token_vault_ref.clone(),
+                token_endpoint: oauth.token_endpoint.clone(),
+                client_id: trim_to_option(oauth.client_id.clone()),
+                client_secret_vault_ref: trim_to_option(oauth.client_secret_vault_ref.clone()),
+                scopes: oauth.scopes.clone(),
+                expires_at_unix_ms: if oauth.expires_at_unix_ms > 0 {
+                    Some(oauth.expires_at_unix_ms)
+                } else {
+                    None
+                },
+                refresh_state: oauth
+                    .refresh_state
+                    .as_ref()
+                    .map(auth_oauth_refresh_state_json)
+                    .unwrap_or_else(|| json!({})),
+            }
+        }
+        None => {
+            return Err(runtime_status_response(tonic::Status::internal(
+                "auth profile credential kind is missing",
+            )))
+        }
+    };
+    Ok(control_plane::AuthProfileView {
+        profile_id: profile.profile_id.clone(),
+        provider: control_plane::AuthProfileProvider {
+            kind: auth_provider_kind_to_text(provider.kind).to_owned(),
+            custom_name: trim_to_option(provider.custom_name.clone()),
+        },
+        profile_name: profile.profile_name.clone(),
+        scope: control_plane::AuthProfileScope {
+            kind: auth_scope_kind_to_text(scope.kind).to_owned(),
+            agent_id: trim_to_option(scope.agent_id.clone()),
+        },
+        credential,
+        created_at_unix_ms: profile.created_at_unix_ms,
+        updated_at_unix_ms: profile.updated_at_unix_ms,
     })
+}
+
+#[allow(clippy::result_large_err)]
+fn control_plane_auth_profile_to_proto(
+    profile: &control_plane::AuthProfileView,
+) -> Result<gateway::proto::palyra::auth::v1::AuthProfile, Response> {
+    let provider_kind = auth_provider_kind_from_text(profile.provider.kind.as_str())?;
+    let scope_kind = auth_scope_kind_from_text(profile.scope.kind.as_str())?;
+    let credential = match &profile.credential {
+        control_plane::AuthCredentialView::ApiKey { api_key_vault_ref } => {
+            gateway::proto::palyra::auth::v1::AuthCredential {
+                kind: Some(gateway::proto::palyra::auth::v1::auth_credential::Kind::ApiKey(
+                    gateway::proto::palyra::auth::v1::ApiKeyCredential {
+                        api_key_vault_ref: api_key_vault_ref.clone(),
+                    },
+                )),
+            }
+        }
+        control_plane::AuthCredentialView::Oauth {
+            access_token_vault_ref,
+            refresh_token_vault_ref,
+            token_endpoint,
+            client_id,
+            client_secret_vault_ref,
+            scopes,
+            expires_at_unix_ms,
+            refresh_state,
+        } => gateway::proto::palyra::auth::v1::AuthCredential {
+            kind: Some(gateway::proto::palyra::auth::v1::auth_credential::Kind::Oauth(
+                gateway::proto::palyra::auth::v1::OAuthCredential {
+                    access_token_vault_ref: access_token_vault_ref.clone(),
+                    refresh_token_vault_ref: refresh_token_vault_ref.clone(),
+                    token_endpoint: token_endpoint.clone(),
+                    client_id: client_id.clone().unwrap_or_default(),
+                    client_secret_vault_ref: client_secret_vault_ref.clone().unwrap_or_default(),
+                    scopes: scopes.clone(),
+                    expires_at_unix_ms: expires_at_unix_ms.unwrap_or_default(),
+                    refresh_state: Some(auth_oauth_refresh_state_from_json(refresh_state)?),
+                },
+            )),
+        },
+    };
+    Ok(gateway::proto::palyra::auth::v1::AuthProfile {
+        profile_id: profile.profile_id.clone(),
+        provider: Some(gateway::proto::palyra::auth::v1::AuthProvider {
+            kind: provider_kind as i32,
+            custom_name: profile.provider.custom_name.clone().unwrap_or_default(),
+        }),
+        profile_name: profile.profile_name.clone(),
+        scope: Some(gateway::proto::palyra::auth::v1::AuthScope {
+            kind: scope_kind as i32,
+            agent_id: profile.scope.agent_id.clone().unwrap_or_default(),
+        }),
+        credential: Some(credential),
+        created_at_unix_ms: profile.created_at_unix_ms,
+        updated_at_unix_ms: profile.updated_at_unix_ms,
+    })
+}
+
+fn auth_provider_kind_to_text(value: i32) -> &'static str {
+    match gateway::proto::palyra::auth::v1::AuthProviderKind::try_from(value)
+        .unwrap_or(gateway::proto::palyra::auth::v1::AuthProviderKind::Unspecified)
+    {
+        gateway::proto::palyra::auth::v1::AuthProviderKind::Openai => "openai",
+        gateway::proto::palyra::auth::v1::AuthProviderKind::Anthropic => "anthropic",
+        gateway::proto::palyra::auth::v1::AuthProviderKind::Telegram => "telegram",
+        gateway::proto::palyra::auth::v1::AuthProviderKind::Slack => "slack",
+        gateway::proto::palyra::auth::v1::AuthProviderKind::Discord => "discord",
+        gateway::proto::palyra::auth::v1::AuthProviderKind::Webhook => "webhook",
+        gateway::proto::palyra::auth::v1::AuthProviderKind::Custom => "custom",
+        gateway::proto::palyra::auth::v1::AuthProviderKind::Unspecified => "unspecified",
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn auth_provider_kind_from_text(
+    raw: &str,
+) -> Result<gateway::proto::palyra::auth::v1::AuthProviderKind, Response> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "openai" => Ok(gateway::proto::palyra::auth::v1::AuthProviderKind::Openai),
+        "anthropic" => Ok(gateway::proto::palyra::auth::v1::AuthProviderKind::Anthropic),
+        "telegram" => Ok(gateway::proto::palyra::auth::v1::AuthProviderKind::Telegram),
+        "slack" => Ok(gateway::proto::palyra::auth::v1::AuthProviderKind::Slack),
+        "discord" => Ok(gateway::proto::palyra::auth::v1::AuthProviderKind::Discord),
+        "webhook" => Ok(gateway::proto::palyra::auth::v1::AuthProviderKind::Webhook),
+        "custom" => Ok(gateway::proto::palyra::auth::v1::AuthProviderKind::Custom),
+        _ => Err(validation_error_response(
+            "provider.kind",
+            "invalid_enum",
+            "provider.kind must be one of openai|anthropic|telegram|slack|discord|webhook|custom",
+        )),
+    }
+}
+
+fn auth_scope_kind_to_text(value: i32) -> &'static str {
+    match gateway::proto::palyra::auth::v1::AuthScopeKind::try_from(value)
+        .unwrap_or(gateway::proto::palyra::auth::v1::AuthScopeKind::Unspecified)
+    {
+        gateway::proto::palyra::auth::v1::AuthScopeKind::Global => "global",
+        gateway::proto::palyra::auth::v1::AuthScopeKind::Agent => "agent",
+        gateway::proto::palyra::auth::v1::AuthScopeKind::Unspecified => "unspecified",
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn auth_scope_kind_from_text(
+    raw: &str,
+) -> Result<gateway::proto::palyra::auth::v1::AuthScopeKind, Response> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "global" => Ok(gateway::proto::palyra::auth::v1::AuthScopeKind::Global),
+        "agent" => Ok(gateway::proto::palyra::auth::v1::AuthScopeKind::Agent),
+        _ => Err(validation_error_response(
+            "scope.kind",
+            "invalid_enum",
+            "scope.kind must be one of global|agent",
+        )),
+    }
+}
+
+fn auth_oauth_refresh_state_json(
+    refresh_state: &gateway::proto::palyra::auth::v1::OAuthRefreshState,
+) -> Value {
+    json!({
+        "failure_count": refresh_state.failure_count,
+        "last_error": refresh_state.last_error,
+        "last_attempt_unix_ms": refresh_state.last_attempt_unix_ms,
+        "last_success_unix_ms": refresh_state.last_success_unix_ms,
+        "next_allowed_refresh_unix_ms": refresh_state.next_allowed_refresh_unix_ms,
+    })
+}
+
+#[allow(clippy::result_large_err)]
+fn auth_oauth_refresh_state_from_json(
+    refresh_state: &Value,
+) -> Result<gateway::proto::palyra::auth::v1::OAuthRefreshState, Response> {
+    Ok(gateway::proto::palyra::auth::v1::OAuthRefreshState {
+        failure_count: refresh_state
+            .get("failure_count")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or_default(),
+        last_error: refresh_state
+            .get("last_error")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        last_attempt_unix_ms: refresh_state
+            .get("last_attempt_unix_ms")
+            .and_then(Value::as_i64)
+            .unwrap_or_default(),
+        last_success_unix_ms: refresh_state
+            .get("last_success_unix_ms")
+            .and_then(Value::as_i64)
+            .unwrap_or_default(),
+        next_allowed_refresh_unix_ms: refresh_state
+            .get("next_allowed_refresh_unix_ms")
+            .and_then(Value::as_i64)
+            .unwrap_or_default(),
+    })
+}
+
+fn auth_health_summary_json(
+    summary: Option<&gateway::proto::palyra::auth::v1::AuthHealthSummary>,
+) -> Value {
+    summary
+        .map(|summary| {
+            json!({
+                "total": summary.total,
+                "ok": summary.ok,
+                "expiring": summary.expiring,
+                "expired": summary.expired,
+                "missing": summary.missing,
+                "static_count": summary.static_count,
+            })
+        })
+        .unwrap_or_else(|| json!({}))
+}
+
+fn auth_expiry_distribution_json(
+    summary: Option<&gateway::proto::palyra::auth::v1::AuthExpiryDistribution>,
+) -> Value {
+    summary
+        .map(|summary| {
+            json!({
+                "expired": summary.expired,
+                "under_5m": summary.under_5m,
+                "between_5m_15m": summary.between_5m_15m,
+                "between_15m_60m": summary.between_15m_60m,
+                "between_1h_24h": summary.between_1h_24h,
+                "over_24h": summary.over_24h,
+                "unknown": summary.unknown,
+                "static_count": summary.static_count,
+                "missing": summary.missing,
+            })
+        })
+        .unwrap_or_else(|| json!({}))
+}
+
+fn auth_profile_health_json(
+    profile: &gateway::proto::palyra::auth::v1::AuthProfileHealth,
+) -> Value {
+    json!({
+        "profile_id": profile.profile_id,
+        "provider": profile.provider,
+        "profile_name": profile.profile_name,
+        "scope": profile.scope,
+        "credential_type": profile.credential_type,
+        "state": match gateway::proto::palyra::auth::v1::AuthHealthState::try_from(profile.state)
+            .unwrap_or(gateway::proto::palyra::auth::v1::AuthHealthState::Unspecified)
+        {
+            gateway::proto::palyra::auth::v1::AuthHealthState::Ok => "ok",
+            gateway::proto::palyra::auth::v1::AuthHealthState::Expiring => "expiring",
+            gateway::proto::palyra::auth::v1::AuthHealthState::Expired => "expired",
+            gateway::proto::palyra::auth::v1::AuthHealthState::Missing => "missing",
+            gateway::proto::palyra::auth::v1::AuthHealthState::Static => "static",
+            gateway::proto::palyra::auth::v1::AuthHealthState::Unspecified => "unspecified",
+        },
+        "reason": profile.reason,
+        "expires_at_unix_ms": if profile.expires_at_unix_ms > 0 {
+            Value::from(profile.expires_at_unix_ms)
+        } else {
+            Value::Null
+        },
+    })
+}
+
+fn auth_refresh_metrics_json(
+    metrics: Option<&gateway::proto::palyra::auth::v1::AuthRefreshMetrics>,
+) -> Value {
+    metrics
+        .map(|metrics| {
+            json!({
+                "attempts": metrics.attempts,
+                "successes": metrics.successes,
+                "failures": metrics.failures,
+                "by_provider": metrics.by_provider.iter().map(|entry| json!({
+                    "provider": entry.provider,
+                    "attempts": entry.attempts,
+                    "successes": entry.successes,
+                    "failures": entry.failures,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .unwrap_or_else(|| json!({}))
+}
+
+async fn list_console_auth_profiles(
+    state: &AppState,
+    session: &ConsoleSession,
+    provider_kind: gateway::proto::palyra::auth::v1::AuthProviderKind,
+) -> Result<Vec<control_plane::AuthProfileView>, Response> {
+    let mut request =
+        TonicRequest::new(gateway::proto::palyra::auth::v1::ListAuthProfilesRequest {
+            v: palyra_common::CANONICAL_PROTOCOL_MAJOR,
+            after_profile_id: String::new(),
+            limit: 256,
+            provider_kind: provider_kind as i32,
+            provider_custom_name: String::new(),
+            scope_kind: gateway::proto::palyra::auth::v1::AuthScopeKind::Unspecified as i32,
+            scope_agent_id: String::new(),
+        });
+    apply_console_rpc_context(state, session, request.metadata_mut())?;
+    let service = build_console_auth_service(state);
+    let response =
+        <gateway::AuthServiceImpl as gateway::proto::palyra::auth::v1::auth_service_server::AuthService>::list_profiles(
+            &service,
+            request,
+        )
+        .await
+        .map_err(runtime_status_response)?
+        .into_inner();
+    response.profiles.iter().map(control_plane_auth_profile_from_proto).collect()
+}
+
+fn openai_provider_action_envelope(
+    action: &str,
+    state: &str,
+    message: &str,
+    profile_id: Option<String>,
+) -> control_plane::ProviderAuthActionEnvelope {
+    control_plane::ProviderAuthActionEnvelope {
+        contract: contract_descriptor(),
+        provider: "openai".to_owned(),
+        action: action.to_owned(),
+        state: state.to_owned(),
+        message: message.to_owned(),
+        profile_id,
+    }
+}
+
+fn build_openai_provider_state(
+    document: &toml::Value,
+    profiles: Vec<control_plane::AuthProfileView>,
+) -> control_plane::ProviderAuthStateEnvelope {
+    let default_profile_id = get_value_at_path(document, "model_provider.auth_profile_id")
+        .ok()
+        .and_then(|value| value.and_then(toml::Value::as_str).map(str::to_owned));
+    let api_key_vault_ref = get_value_at_path(document, "model_provider.openai_api_key_vault_ref")
+        .ok()
+        .and_then(|value| value.and_then(toml::Value::as_str).map(str::to_owned))
+        .filter(|value| !value.trim().is_empty());
+    let api_key_inline = get_value_at_path(document, "model_provider.openai_api_key")
+        .ok()
+        .and_then(|value| value.and_then(toml::Value::as_str).map(str::to_owned))
+        .filter(|value| !value.trim().is_empty());
+    let state = if default_profile_id.is_some() {
+        "selected_profile"
+    } else if api_key_vault_ref.is_some() || api_key_inline.is_some() {
+        "api_key_configured"
+    } else {
+        "not_configured"
+    };
+    let note = if api_key_inline.is_some() {
+        Some("Inline API keys remain supported for backward compatibility, but operator auth flows should prefer auth profiles or vault refs.".to_owned())
+    } else if api_key_vault_ref.is_some() {
+        Some("Vault-backed API key is configured; selecting an auth profile will supersede direct API-key usage.".to_owned())
+    } else {
+        None
+    };
+    control_plane::ProviderAuthStateEnvelope {
+        contract: contract_descriptor(),
+        provider: "openai".to_owned(),
+        oauth_supported: true,
+        bootstrap_supported: true,
+        callback_supported: true,
+        reconnect_supported: true,
+        revoke_supported: true,
+        default_selection_supported: true,
+        default_profile_id,
+        available_profile_ids: profiles.into_iter().map(|profile| profile.profile_id).collect(),
+        state: state.to_owned(),
+        note,
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn load_console_document_from_existing_path(
+    path: &FsPath,
+) -> Result<(toml::Value, ConfigMigrationInfo), Response> {
+    let content = fs::read_to_string(path).map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "failed to read {}: {error}",
+            path.display()
+        )))
+    })?;
+    parse_document_with_migration(content.as_str()).map_err(|error| {
+        runtime_status_response(tonic::Status::invalid_argument(format!(
+            "failed to migrate config document {}: {error}",
+            path.display()
+        )))
+    })
+}
+
+#[allow(clippy::result_large_err)]
+fn load_console_document_for_mutation(
+    path: &FsPath,
+) -> Result<(toml::Value, ConfigMigrationInfo), Response> {
+    if path.exists() {
+        return load_console_document_from_existing_path(path);
+    }
+    parse_document_with_migration("").map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "failed to initialize empty config document: {error}"
+        )))
+    })
+}
+
+#[allow(clippy::result_large_err)]
+fn resolve_console_config_path(
+    path: Option<&str>,
+    require_existing: bool,
+) -> Result<Option<String>, Response> {
+    let resolved = match path.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(explicit) => {
+            let parsed = parse_config_path(explicit).map_err(|error| {
+                runtime_status_response(tonic::Status::invalid_argument(format!(
+                    "config path is invalid: {error}"
+                )))
+            })?;
+            Some(parsed.to_string_lossy().into_owned())
+        }
+        None => default_config_search_paths()
+            .into_iter()
+            .find(|candidate| candidate.exists())
+            .map(|candidate| candidate.to_string_lossy().into_owned()),
+    };
+
+    if require_existing {
+        if let Some(path) = resolved.as_deref() {
+            if !FsPath::new(path).exists() {
+                return Err(runtime_status_response(tonic::Status::not_found(format!(
+                    "config file does not exist: {path}"
+                ))));
+            }
+        }
+    }
+
+    Ok(resolved)
+}
+
+#[allow(clippy::result_large_err)]
+fn load_console_config_snapshot(
+    path: Option<&str>,
+    allow_defaults: bool,
+) -> Result<(toml::Value, ConfigMigrationInfo, String), Response> {
+    match resolve_console_config_path(path, false)? {
+        Some(path) => {
+            let path_ref = FsPath::new(path.as_str());
+            let (document, migration) = load_console_document_from_existing_path(path_ref)?;
+            Ok((document, migration, path))
+        }
+        None if allow_defaults => {
+            let (document, migration) = parse_document_with_migration("").map_err(|error| {
+                runtime_status_response(tonic::Status::internal(format!(
+                    "failed to load default config snapshot: {error}"
+                )))
+            })?;
+            Ok((document, migration, "defaults".to_owned()))
+        }
+        None => {
+            Err(runtime_status_response(tonic::Status::not_found("no daemon config file found")))
+        }
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn config_backup_records(
+    path: Option<&str>,
+    backups: usize,
+    require_existing: bool,
+) -> Result<Vec<control_plane::ConfigBackupRecord>, Response> {
+    let Some(path) = path.filter(|value| *value != "defaults") else {
+        return Ok(Vec::new());
+    };
+    if require_existing && !FsPath::new(path).exists() {
+        return Err(runtime_status_response(tonic::Status::not_found(format!(
+            "config file does not exist: {path}"
+        ))));
+    }
+    let path_ref = FsPath::new(path);
+    Ok((1..=backups)
+        .map(|index| {
+            let backup = backup_path(path_ref, index);
+            control_plane::ConfigBackupRecord {
+                index,
+                path: backup.to_string_lossy().into_owned(),
+                exists: backup.exists(),
+            }
+        })
+        .collect())
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_daemon_compatible_document(document: &toml::Value) -> Result<(), Response> {
+    let content = toml::to_string(document).map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "failed to serialize daemon config document: {error}"
+        )))
+    })?;
+    let parsed: RootFileConfig = toml::from_str(&content).map_err(|error| {
+        runtime_status_response(tonic::Status::invalid_argument(format!(
+            "invalid daemon config schema: {error}"
+        )))
+    })?;
+    let bind_addr = parsed
+        .daemon
+        .as_ref()
+        .and_then(|daemon| daemon.bind_addr.as_deref())
+        .unwrap_or("127.0.0.1");
+    let port = parsed.daemon.as_ref().and_then(|daemon| daemon.port).unwrap_or(7142);
+    let _ = parse_daemon_bind_socket(bind_addr, port).map_err(|error| {
+        runtime_status_response(tonic::Status::invalid_argument(format!(
+            "invalid daemon bind address or port: {error}"
+        )))
+    })?;
+
+    let grpc_bind_addr = parsed
+        .gateway
+        .as_ref()
+        .and_then(|gateway| gateway.grpc_bind_addr.as_deref())
+        .unwrap_or("127.0.0.1");
+    let grpc_port = parsed.gateway.as_ref().and_then(|gateway| gateway.grpc_port).unwrap_or(7443);
+    let _ = parse_daemon_bind_socket(grpc_bind_addr, grpc_port).map_err(|error| {
+        runtime_status_response(tonic::Status::invalid_argument(format!(
+            "invalid gateway gRPC bind address or port: {error}"
+        )))
+    })?;
+
+    let quic_enabled =
+        parsed.gateway.as_ref().and_then(|gateway| gateway.quic_enabled).unwrap_or(true);
+    if quic_enabled {
+        let quic_bind_addr = parsed
+            .gateway
+            .as_ref()
+            .and_then(|gateway| gateway.quic_bind_addr.as_deref())
+            .unwrap_or("127.0.0.1");
+        let quic_port =
+            parsed.gateway.as_ref().and_then(|gateway| gateway.quic_port).unwrap_or(7444);
+        let _ = parse_daemon_bind_socket(quic_bind_addr, quic_port).map_err(|error| {
+            runtime_status_response(tonic::Status::invalid_argument(format!(
+                "invalid gateway QUIC bind address or port: {error}"
+            )))
+        })?;
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn read_console_config_profile_id(path: &str) -> Result<Option<String>, Response> {
+    let (document, _) = load_console_document_from_existing_path(FsPath::new(path))?;
+    Ok(get_value_at_path(&document, "model_provider.auth_profile_id")
+        .map_err(|error| {
+            runtime_status_response(tonic::Status::invalid_argument(format!(
+                "invalid config key path for model_provider.auth_profile_id: {error}"
+            )))
+        })?
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned))
+}
+
+async fn secret_metadata_from_runtime(
+    state: &AppState,
+    session: &ConsoleSession,
+    scope: &str,
+    key: &str,
+) -> Result<control_plane::SecretMetadata, Response> {
+    if scope.trim().is_empty() {
+        return Err(validation_error_response("scope", "required", "scope is required"));
+    }
+    if key.trim().is_empty() {
+        return Err(validation_error_response("key", "required", "key is required"));
+    }
+    let mut request = TonicRequest::new(gateway::proto::palyra::gateway::v1::ListSecretsRequest {
+        v: palyra_common::CANONICAL_PROTOCOL_MAJOR,
+        scope: scope.to_owned(),
+    });
+    apply_console_rpc_context(state, session, request.metadata_mut())?;
+    let service = build_console_vault_service(state);
+    let response =
+        <gateway::VaultServiceImpl as gateway::proto::palyra::gateway::v1::vault_service_server::VaultService>::list_secrets(
+            &service,
+            request,
+        )
+        .await
+        .map_err(runtime_status_response)?
+        .into_inner();
+    response
+        .secrets
+        .iter()
+        .find(|secret| secret.key == key)
+        .map(control_plane_secret_metadata_from_proto)
+        .ok_or_else(|| {
+            runtime_status_response(tonic::Status::not_found("secret metadata not found"))
+        })
+}
+
+fn control_plane_secret_metadata_from_proto(
+    secret: &gateway::proto::palyra::gateway::v1::VaultSecretMetadata,
+) -> control_plane::SecretMetadata {
+    control_plane::SecretMetadata {
+        scope: secret.scope.clone(),
+        key: secret.key.clone(),
+        created_at_unix_ms: secret.created_at_unix_ms,
+        updated_at_unix_ms: secret.updated_at_unix_ms,
+        value_bytes: secret.value_bytes,
+    }
+}
+
+fn control_plane_pairing_snapshot_from_runtime(
+    snapshot: &channel_router::ChannelPairingSnapshot,
+) -> control_plane::PairingChannelSnapshot {
+    control_plane::PairingChannelSnapshot {
+        channel: snapshot.channel.clone(),
+        pending: snapshot
+            .pending
+            .iter()
+            .map(|pending| control_plane::PairingPendingRecord {
+                channel: pending.channel.clone(),
+                sender_identity: pending.sender_identity.clone(),
+                code: pending.code.clone(),
+                requested_at_unix_ms: pending.requested_at_unix_ms,
+                expires_at_unix_ms: pending.expires_at_unix_ms,
+                approval_id: pending.approval_id.clone(),
+            })
+            .collect(),
+        paired: snapshot
+            .paired
+            .iter()
+            .map(|paired| control_plane::PairingGrantRecord {
+                channel: paired.channel.clone(),
+                sender_identity: paired.sender_identity.clone(),
+                approved_at_unix_ms: paired.approved_at_unix_ms,
+                expires_at_unix_ms: paired.expires_at_unix_ms,
+                approval_id: paired.approval_id.clone(),
+            })
+            .collect(),
+        active_codes: snapshot
+            .active_codes
+            .iter()
+            .map(|code| control_plane::PairingCodeRecord {
+                code: code.code.clone(),
+                channel: code.channel.clone(),
+                issued_by: code.issued_by.clone(),
+                created_at_unix_ms: code.created_at_unix_ms,
+                expires_at_unix_ms: code.expires_at_unix_ms,
+            })
+            .collect(),
+    }
+}
+
+fn lock_support_bundle_jobs(
+    jobs: &Arc<Mutex<HashMap<String, control_plane::SupportBundleJob>>>,
+) -> std::sync::MutexGuard<'_, HashMap<String, control_plane::SupportBundleJob>> {
+    jobs.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn list_support_bundle_jobs(
+    state: &AppState,
+    after_job_id: Option<&str>,
+    limit: usize,
+) -> Vec<control_plane::SupportBundleJob> {
+    let jobs = lock_support_bundle_jobs(&state.support_bundle_jobs);
+    let mut entries = jobs.values().cloned().collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.job_id.cmp(&right.job_id));
+    entries
+        .into_iter()
+        .filter(|job| after_job_id.is_none_or(|after| job.job_id.as_str() > after))
+        .take(limit)
+        .collect()
+}
+
+#[allow(clippy::result_large_err)]
+fn create_support_bundle_job(
+    state: &AppState,
+    retain_jobs: usize,
+) -> Result<control_plane::SupportBundleJob, Response> {
+    let job_id = Ulid::new().to_string();
+    let requested_at_unix_ms = unix_ms_now().map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "failed to read system clock: {error}"
+        )))
+    })?;
+    let job = control_plane::SupportBundleJob {
+        job_id: job_id.clone(),
+        state: control_plane::SupportBundleJobState::Queued,
+        requested_at_unix_ms,
+        started_at_unix_ms: None,
+        completed_at_unix_ms: None,
+        output_path: None,
+        command_output: String::new(),
+        error: None,
+    };
+    {
+        let mut jobs = lock_support_bundle_jobs(&state.support_bundle_jobs);
+        jobs.insert(job_id.clone(), job.clone());
+    }
+
+    let jobs = Arc::clone(&state.support_bundle_jobs);
+    let admin_port = state.deployment.admin_port;
+    let admin_token = state.auth.admin_token.clone();
+    tokio::spawn(async move {
+        run_support_bundle_job(jobs, job_id, admin_port, admin_token, retain_jobs.max(1)).await;
+    });
+
+    Ok(job)
+}
+
+async fn run_support_bundle_job(
+    jobs: Arc<Mutex<HashMap<String, control_plane::SupportBundleJob>>>,
+    job_id: String,
+    admin_port: u16,
+    admin_token: Option<String>,
+    retain_jobs: usize,
+) {
+    let started_at = unix_ms_now().unwrap_or_default();
+    {
+        let mut guard = lock_support_bundle_jobs(&jobs);
+        if let Some(job) = guard.get_mut(job_id.as_str()) {
+            job.state = control_plane::SupportBundleJobState::Running;
+            job.started_at_unix_ms = Some(started_at);
+        }
+    }
+
+    let result = run_support_bundle_export_command(admin_port, admin_token).await;
+    let completed_at = unix_ms_now().unwrap_or_default();
+    let mut guard = lock_support_bundle_jobs(&jobs);
+    if let Some(job) = guard.get_mut(job_id.as_str()) {
+        job.completed_at_unix_ms = Some(completed_at);
+        match result {
+            Ok((output_path, command_output)) => {
+                job.state = control_plane::SupportBundleJobState::Succeeded;
+                job.output_path = Some(output_path);
+                job.command_output = command_output;
+                job.error = None;
+            }
+            Err(error) => {
+                job.state = control_plane::SupportBundleJobState::Failed;
+                job.error = Some(error);
+            }
+        }
+    }
+
+    let mut finished = guard.values().cloned().collect::<Vec<_>>();
+    finished.sort_by(|left, right| left.requested_at_unix_ms.cmp(&right.requested_at_unix_ms));
+    while finished.len() > retain_jobs {
+        if let Some(first) = finished.first() {
+            guard.remove(first.job_id.as_str());
+        }
+        finished.remove(0);
+    }
+}
+
+async fn run_support_bundle_export_command(
+    admin_port: u16,
+    admin_token: Option<String>,
+) -> Result<(String, String), String> {
+    let cli_path =
+        resolve_console_cli_binary_path().map_err(|error| sanitize_http_error_message(&error))?;
+    let support_bundle_root =
+        resolve_support_bundle_root().map_err(|error| sanitize_http_error_message(&error))?;
+    fs::create_dir_all(support_bundle_root.as_path()).map_err(|error| {
+        sanitize_http_error_message(
+            format!(
+                "failed to create support-bundle directory {}: {error}",
+                support_bundle_root.display()
+            )
+            .as_str(),
+        )
+    })?;
+    let output_path = support_bundle_root
+        .join(format!("support-bundle-{}.json", unix_ms_now().unwrap_or_default()));
+    let mut command = TokioCommand::new(cli_path.as_path());
+    command.env_clear();
+    if let Ok(path) = std::env::var("PATH") {
+        command.env("PATH", path);
+    }
+    command.env("LANG", "C").env("LC_ALL", "C");
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .arg("support-bundle")
+        .arg("export")
+        .arg("--output")
+        .arg(output_path.as_os_str())
+        .env("PALYRA_DAEMON_URL", format!("http://127.0.0.1:{admin_port}"));
+    if let Some(token) = admin_token.filter(|token| !token.trim().is_empty()) {
+        command.env("PALYRA_ADMIN_TOKEN", token);
+    }
+
+    let output = command.output().await.map_err(|error| {
+        sanitize_http_error_message(&format!("failed to run support-bundle export: {error}"))
+    })?;
+    let stdout =
+        sanitize_http_error_message(String::from_utf8_lossy(output.stdout.as_slice()).as_ref());
+    let stderr =
+        sanitize_http_error_message(String::from_utf8_lossy(output.stderr.as_slice()).as_ref());
+    let command_output = [stdout, stderr]
+        .into_iter()
+        .filter(|value| !value.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !output.status.success() {
+        return Err(sanitize_http_error_message(
+            format!(
+                "support-bundle export failed (status={}): {}",
+                output
+                    .status
+                    .code()
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_owned()),
+                command_output
+            )
+            .as_str(),
+        ));
+    }
+    Ok((output_path.to_string_lossy().into_owned(), command_output))
+}
+
+fn resolve_console_cli_binary_path() -> Result<PathBuf, String> {
+    if let Ok(current_exe) = std::env::current_exe() {
+        let executable_name = if cfg!(windows) { "palyra.exe" } else { "palyra" };
+        let mut candidates = Vec::<PathBuf>::new();
+        if let Some(parent) = current_exe.parent() {
+            candidates.push(parent.join(executable_name));
+        }
+        for ancestor in current_exe.ancestors().take(8) {
+            candidates.push(ancestor.join("target").join("debug").join(executable_name));
+            candidates.push(ancestor.join("target").join("release").join(executable_name));
+        }
+        for candidate in candidates {
+            if candidate.is_file() {
+                return fs::canonicalize(candidate).map_err(|error| error.to_string());
+            }
+        }
+    }
+    Err("unable to locate `palyra` CLI binary near daemon executable".to_owned())
+}
+
+fn resolve_support_bundle_root() -> Result<PathBuf, String> {
+    let identity_root = default_identity_store_root().map_err(|error| error.to_string())?;
+    let state_root =
+        identity_root.parent().map(FsPath::to_path_buf).unwrap_or_else(|| identity_root.clone());
+    Ok(state_root.join("support-bundles"))
+}
+
+#[allow(clippy::result_large_err)]
+fn build_capability_catalog() -> Result<control_plane::CapabilityCatalog, Response> {
+    let generated_at_unix_ms = unix_ms_now().map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "failed to read system clock: {error}"
+        )))
+    })?;
+    Ok(control_plane::CapabilityCatalog {
+        contract: contract_descriptor(),
+        version: "capability-catalog.v1".to_owned(),
+        generated_at_unix_ms,
+        capabilities: vec![
+            capability_entry("runtime.health", "runtime", "Daemon and runtime health", "palyrad", &["backend", "dashboard", "desktop"], "direct_ui", &["deployment"], &["/console/v1/diagnostics", "/console/v1/deployment/posture"], &["crates/palyra-daemon/tests/admin_surface.rs"]),
+            capability_entry("chat.sessions", "chat", "Chat sessions and run status", "palyrad", &["backend", "dashboard"], "direct_ui", &["none"], &["/console/v1/chat/sessions", "/console/v1/chat/runs/{run_id}/status"], &["crates/palyra-daemon/tests/admin_surface.rs", "apps/web/src/consoleApi.test.ts"]),
+            capability_entry("chat.stream", "chat", "Chat streaming execution", "palyrad", &["backend", "dashboard"], "direct_ui", &["tool_calls"], &["/console/v1/chat/sessions/{session_id}/messages/stream"], &["apps/web/src/consoleApi.test.ts"]),
+            capability_entry("approvals", "approvals", "Approval inbox and decisions", "palyrad", &["backend", "dashboard"], "direct_ui", &["policy"], &["/console/v1/approvals", "/console/v1/approvals/{approval_id}/decision"], &["crates/palyra-daemon/tests/admin_surface.rs"]),
+            capability_entry("cron", "cron", "Cron job create, update, run-now, and logs", "palyrad", &["backend", "dashboard"], "direct_ui", &["scheduler"], &["/console/v1/cron/jobs"], &["crates/palyra-daemon/tests/admin_surface.rs"]),
+            capability_entry("channels", "channels", "Channel connector status, test, and enablement", "palyrad", &["backend", "dashboard"], "direct_ui", &["deployment"], &["/console/v1/channels", "/console/v1/channels/{connector_id}/enabled"], &["crates/palyra-daemon/tests/admin_surface.rs"]),
+            capability_entry("channel.router", "channels", "Router previews, pairings, and warnings", "palyrad", &["backend", "dashboard"], "direct_ui", &["policy"], &["/console/v1/channels/router/rules", "/console/v1/pairing"], &["crates/palyra-daemon/tests/admin_surface.rs"]),
+            capability_entry("discord.onboarding", "channels", "Discord onboarding probe and apply", "palyrad", &["backend", "dashboard", "cli"], "direct_ui", &["secrets", "deployment"], &["/console/v1/channels/discord/onboarding/probe", "/console/v1/channels/discord/onboarding/apply"], &["crates/palyra-daemon/tests/admin_surface.rs"]),
+            capability_entry("browser.profiles", "browser", "Browser profile lifecycle", "palyrad", &["backend", "dashboard"], "direct_ui", &["browser"], &["/console/v1/browser/profiles"], &["apps/web/src/App.test.tsx"]),
+            capability_entry("browser.relay", "browser", "Browser relay tokens and actions", "palyrad", &["backend", "dashboard"], "direct_ui", &["browser"], &["/console/v1/browser/relay/tokens", "/console/v1/browser/relay/actions"], &["crates/palyra-daemon/tests/admin_surface.rs"]),
+            capability_entry("memory", "memory", "Memory status, search, and purge", "palyrad", &["backend", "dashboard"], "direct_ui", &["memory"], &["/console/v1/memory/status", "/console/v1/memory/purge"], &["crates/palyra-daemon/tests/admin_surface.rs"]),
+            capability_entry("skills", "skills", "Skill install, verify, audit, quarantine, and enable", "palyrad", &["backend", "dashboard", "cli"], "direct_ui", &["skills"], &["/console/v1/skills", "/console/v1/skills/{skill_id}/audit"], &["apps/web/src/App.test.tsx"]),
+            capability_entry("audit", "audit", "Audit event browsing", "palyrad", &["backend", "dashboard"], "direct_ui", &["audit"], &["/console/v1/audit/events"], &["apps/web/src/App.test.tsx"]),
+            capability_entry("auth.profiles", "auth", "Auth profile CRUD", "palyrad", &["backend", "dashboard", "cli"], "direct_ui", &["provider_auth", "secrets"], &["/console/v1/auth/profiles"], &["crates/palyra-daemon/tests/admin_surface.rs"]),
+            capability_entry("auth.health", "auth", "Auth profile health and refresh metrics", "palyrad", &["backend", "dashboard", "cli"], "direct_ui", &["provider_auth"], &["/console/v1/auth/health"], &["crates/palyra-daemon/tests/admin_surface.rs"]),
+            capability_entry("auth.openai", "auth", "OpenAI provider auth contract surface", "palyrad", &["backend", "dashboard"], "direct_ui", &["provider_auth", "deployment"], &["/console/v1/auth/providers/openai"], &["crates/palyra-daemon/tests/admin_surface.rs"]),
+            capability_entry("config.inspect", "config", "Config inspect and validate", "palyrad", &["backend", "dashboard", "cli"], "direct_ui", &["deployment", "secrets"], &["/console/v1/config/inspect", "/console/v1/config/validate"], &["crates/palyra-daemon/tests/admin_surface.rs", "crates/palyra-cli/tests/config_mutation.rs"]),
+            capability_entry("config.mutate", "config", "Config mutate, migrate, and recover", "palyrad", &["backend", "dashboard", "cli"], "direct_ui", &["deployment", "secrets"], &["/console/v1/config/mutate", "/console/v1/config/recover"], &["crates/palyra-daemon/tests/admin_surface.rs", "crates/palyra-cli/tests/config_mutation.rs"]),
+            capability_entry("secrets", "secrets", "Secret metadata, reveal, write, and delete", "palyrad", &["backend", "dashboard", "cli"], "direct_ui", &["secrets"], &["/console/v1/secrets", "/console/v1/secrets/reveal"], &["crates/palyra-daemon/tests/gateway_grpc.rs", "crates/palyra-daemon/tests/admin_surface.rs"]),
+            capability_entry("pairing", "pairing", "DM pairing codes and approval state", "palyrad", &["backend", "dashboard"], "direct_ui", &["channels", "approvals"], &["/console/v1/pairing", "/console/v1/pairing/codes"], &["crates/palyra-daemon/src/channel_router.rs"]),
+            capability_entry("gateway.access", "deployment", "Gateway access and deployment posture summary", "palyrad", &["backend", "dashboard", "desktop", "cli"], "direct_ui", &["deployment"], &["/console/v1/deployment/posture"], &["apps/desktop/src-tauri/src/lib.rs"]),
+            capability_entry("support.bundle", "support", "Support bundle export jobs", "palyrad", &["backend", "dashboard", "desktop", "cli"], "direct_ui", &["support"], &["/console/v1/support-bundle/jobs"], &["apps/desktop/src-tauri/src/lib.rs", "crates/palyra-cli/src/main.rs"]),
+        ],
+        migration_notes: vec![
+            control_plane::CapabilityMigrationNote {
+                id: "m52-page-meta".to_owned(),
+                message: "M52 adds typed contract/page/error metadata while preserving legacy response keys for existing dashboard consumers.".to_owned(),
+            },
+            control_plane::CapabilityMigrationNote {
+                id: "m52-openai-contract".to_owned(),
+                message: "OpenAI provider auth endpoints publish the control-plane contract in M52; interactive OAuth bootstrap/callback UX is completed in M54.".to_owned(),
+            },
+        ],
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn capability_entry(
+    id: &str,
+    domain: &str,
+    title: &str,
+    owner: &str,
+    surfaces: &[&str],
+    execution_mode: &str,
+    mutation_classes: &[&str],
+    contract_paths: &[&str],
+    test_refs: &[&str],
+) -> control_plane::CapabilityEntry {
+    control_plane::CapabilityEntry {
+        id: id.to_owned(),
+        domain: domain.to_owned(),
+        title: title.to_owned(),
+        owner: owner.to_owned(),
+        surfaces: surfaces.iter().map(|value| (*value).to_owned()).collect(),
+        execution_mode: execution_mode.to_owned(),
+        mutation_classes: mutation_classes.iter().map(|value| (*value).to_owned()).collect(),
+        test_refs: test_refs.iter().map(|value| (*value).to_owned()).collect(),
+        contract_paths: contract_paths.iter().map(|value| (*value).to_owned()).collect(),
+        notes: None,
+    }
 }
 
 async fn collect_console_browser_relay_failure_metrics(state: &AppState) -> (u64, Vec<String>) {
@@ -3519,6 +5409,7 @@ async fn console_chat_sessions_list_handler(
     Ok(Json(json!({
         "sessions": visible,
         "next_after_session_key": next_after_session_key,
+        "page": build_page_info(limit, visible.len(), next_after_session_key.clone()),
     })))
 }
 
@@ -4335,6 +6226,7 @@ async fn console_approvals_list_handler(
     Query(query): Query<ConsoleApprovalsQuery>,
 ) -> Result<Json<Value>, Response> {
     let _session = authorize_console_session(&state, &headers, false)?;
+    let limit = query.limit.unwrap_or(100).clamp(1, 500);
     let decision = parse_console_approval_decision(query.decision.as_deref())?;
     let subject_type = parse_console_approval_subject_type(query.subject_type.as_deref())?;
     let (approvals, next_after_approval_id) = state
@@ -4354,6 +6246,7 @@ async fn console_approvals_list_handler(
     Ok(Json(json!({
         "approvals": approvals,
         "next_after_approval_id": next_after_approval_id,
+        "page": build_page_info(limit, approvals.len(), next_after_approval_id.clone()),
     })))
 }
 
@@ -4504,6 +6397,7 @@ async fn console_cron_list_handler(
     Query(query): Query<ConsoleCronListQuery>,
 ) -> Result<Json<Value>, Response> {
     let session = authorize_console_session(&state, &headers, false)?;
+    let limit = query.limit.unwrap_or(100).clamp(1, 500);
     let (jobs, next_after_job_id) = state
         .runtime
         .list_cron_jobs(
@@ -4518,6 +6412,7 @@ async fn console_cron_list_handler(
     Ok(Json(json!({
         "jobs": jobs,
         "next_after_job_id": next_after_job_id,
+        "page": build_page_info(limit, jobs.len(), next_after_job_id.clone()),
     })))
 }
 
@@ -4667,6 +6562,7 @@ async fn console_cron_runs_handler(
     Query(query): Query<ConsoleCronRunsQuery>,
 ) -> Result<Json<Value>, Response> {
     let session = authorize_console_session(&state, &headers, false)?;
+    let limit = query.limit.unwrap_or(100).clamp(1, 500);
     validate_canonical_id(job_id.as_str()).map_err(|_| {
         runtime_status_response(tonic::Status::invalid_argument("job_id must be a canonical ULID"))
     })?;
@@ -4680,6 +6576,7 @@ async fn console_cron_runs_handler(
     Ok(Json(json!({
         "runs": runs,
         "next_after_run_id": next_after_run_id,
+        "page": build_page_info(limit, runs.len(), next_after_run_id.clone()),
     })))
 }
 
@@ -4929,7 +6826,10 @@ async fn console_channels_list_handler(
 ) -> Result<Json<Value>, Response> {
     let _session = authorize_console_session(&state, &headers, false)?;
     let connectors = state.channels.list().map_err(channel_platform_error_response)?;
-    Ok(Json(json!({ "connectors": connectors })))
+    Ok(Json(json!({
+        "connectors": connectors,
+        "page": build_page_info(connectors.len().max(1), connectors.len(), None),
+    })))
 }
 
 async fn console_channel_status_handler(
@@ -4973,6 +6873,7 @@ async fn console_channel_logs_handler(
     Query(query): Query<ChannelLogsQuery>,
 ) -> Result<Json<Value>, Response> {
     let _session = authorize_console_session(&state, &headers, false)?;
+    let limit = query.limit.unwrap_or(100);
     let connector_id = normalize_non_empty_field(connector_id, "connector_id")?;
     let events = state
         .channels
@@ -4985,6 +6886,11 @@ async fn console_channel_logs_handler(
     Ok(Json(json!({
         "events": events,
         "dead_letters": dead_letters,
+        "page": build_page_info(
+            limit.max(1),
+            events.len().max(dead_letters.len()),
+            None
+        ),
     })))
 }
 
@@ -6413,6 +8319,7 @@ async fn console_skills_list_handler(
         "skills_root": skills_root,
         "count": entries.len(),
         "entries": entries,
+        "page": build_page_info(entries.len().max(1), entries.len(), None),
     })))
 }
 
@@ -6760,6 +8667,7 @@ async fn console_audit_events_handler(
         "total_events": snapshot.total_events,
         "returned_events": events.len(),
         "events": events,
+        "page": build_page_info(limit, events.len(), None),
     })))
 }
 
@@ -6781,14 +8689,13 @@ async fn console_browser_profiles_list_handler(
     apply_browser_service_auth(&state, request.metadata_mut())?;
     let response =
         client.list_profiles(request).await.map_err(runtime_status_response)?.into_inner();
+    let profiles =
+        response.profiles.into_iter().map(console_browser_profile_to_json).collect::<Vec<_>>();
     Ok(Json(json!({
         "principal": principal,
         "active_profile_id": response.active_profile_id.map(|value| value.ulid),
-        "profiles": response
-            .profiles
-            .into_iter()
-            .map(console_browser_profile_to_json)
-            .collect::<Vec<_>>(),
+        "profiles": profiles,
+        "page": build_page_info(profiles.len().max(1), profiles.len(), None),
     })))
 }
 
@@ -6968,14 +8875,16 @@ async fn console_browser_downloads_list_handler(
         .await
         .map_err(runtime_status_response)?
         .into_inner();
+    let artifacts = response
+        .artifacts
+        .into_iter()
+        .map(console_browser_download_artifact_to_json)
+        .collect::<Vec<_>>();
     Ok(Json(json!({
-        "artifacts": response
-            .artifacts
-            .into_iter()
-            .map(console_browser_download_artifact_to_json)
-            .collect::<Vec<_>>(),
+        "artifacts": artifacts,
         "truncated": response.truncated,
         "error": response.error,
+        "page": build_page_info(query.limit.unwrap_or(50).clamp(1, 250) as usize, artifacts.len(), None),
     })))
 }
 
@@ -7675,8 +9584,21 @@ fn auth_error_response(error: AuthError) -> Response {
             StatusCode::BAD_REQUEST
         }
     };
-    let sanitized_error = sanitize_http_error_message(error.to_string().as_str());
-    (status, Json(ErrorBody { error: sanitized_error })).into_response()
+    let raw_error = error.to_string();
+    let sanitized_error = sanitize_http_error_message(raw_error.as_str());
+    let redacted = sanitized_error != raw_error;
+    let (code, category, retryable) = match error {
+        AuthError::MissingConfiguredToken => {
+            ("service_unavailable", control_plane::ErrorCategory::Dependency, true)
+        }
+        AuthError::InvalidAuthorizationHeader | AuthError::InvalidToken => {
+            ("unauthorized", control_plane::ErrorCategory::Auth, false)
+        }
+        AuthError::MissingContext(_) | AuthError::EmptyContext(_) | AuthError::InvalidDeviceId => {
+            ("validation_error", control_plane::ErrorCategory::Validation, false)
+        }
+    };
+    build_error_response(status, sanitized_error, code, category, retryable, Vec::new(), redacted)
 }
 
 fn sanitize_http_error_message(raw: &str) -> String {
@@ -7725,16 +9647,98 @@ fn channel_platform_error_response(error: channels::ChannelPlatformError) -> Res
 }
 
 fn runtime_status_response(status: tonic::Status) -> Response {
-    let http_status = match status.code() {
-        tonic::Code::PermissionDenied => StatusCode::FORBIDDEN,
-        tonic::Code::InvalidArgument => StatusCode::BAD_REQUEST,
-        tonic::Code::FailedPrecondition => StatusCode::PRECONDITION_FAILED,
-        tonic::Code::NotFound => StatusCode::NOT_FOUND,
-        tonic::Code::ResourceExhausted => StatusCode::TOO_MANY_REQUESTS,
-        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    let (http_status, code, category, retryable) = match status.code() {
+        tonic::Code::Unauthenticated => {
+            (StatusCode::UNAUTHORIZED, "unauthorized", control_plane::ErrorCategory::Auth, false)
+        }
+        tonic::Code::PermissionDenied => {
+            (StatusCode::FORBIDDEN, "forbidden", control_plane::ErrorCategory::Policy, false)
+        }
+        tonic::Code::InvalidArgument => (
+            StatusCode::BAD_REQUEST,
+            "validation_error",
+            control_plane::ErrorCategory::Validation,
+            false,
+        ),
+        tonic::Code::FailedPrecondition => (
+            StatusCode::PRECONDITION_FAILED,
+            "failed_precondition",
+            control_plane::ErrorCategory::Dependency,
+            false,
+        ),
+        tonic::Code::NotFound => {
+            (StatusCode::NOT_FOUND, "not_found", control_plane::ErrorCategory::NotFound, false)
+        }
+        tonic::Code::ResourceExhausted => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            control_plane::ErrorCategory::Availability,
+            true,
+        ),
+        tonic::Code::Unavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service_unavailable",
+            control_plane::ErrorCategory::Availability,
+            true,
+        ),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            control_plane::ErrorCategory::Internal,
+            false,
+        ),
     };
-    let sanitized_error = sanitize_http_error_message(status.message());
-    (http_status, Json(ErrorBody { error: sanitized_error })).into_response()
+    let raw_message = status.message().to_owned();
+    let sanitized_error = sanitize_http_error_message(raw_message.as_str());
+    let redacted = sanitized_error != raw_message;
+    build_error_response(
+        http_status,
+        sanitized_error,
+        code,
+        category,
+        retryable,
+        Vec::new(),
+        redacted,
+    )
+}
+
+fn validation_error_response(field: &str, code: &str, message: &str) -> Response {
+    build_error_response(
+        StatusCode::BAD_REQUEST,
+        sanitize_http_error_message(message),
+        "validation_error",
+        control_plane::ErrorCategory::Validation,
+        false,
+        vec![control_plane::ValidationIssue {
+            field: field.to_owned(),
+            code: code.to_owned(),
+            message: message.to_owned(),
+        }],
+        false,
+    )
+}
+
+fn build_error_response(
+    status: StatusCode,
+    message: String,
+    code: &str,
+    category: control_plane::ErrorCategory,
+    retryable: bool,
+    validation_errors: Vec<control_plane::ValidationIssue>,
+    redacted: bool,
+) -> Response {
+    (
+        status,
+        Json(control_plane::ErrorEnvelope {
+            error: message,
+            code: code.to_owned(),
+            category,
+            retryable,
+            redacted,
+            validation_errors,
+        }),
+    )
+        .into_response()
 }
 
 fn validate_admin_auth_config(auth: &GatewayAuthConfig) -> Result<()> {

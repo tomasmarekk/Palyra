@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { ConsoleApiClient, type ChatStreamLine, type JsonValue } from "./consoleApi";
+import {
+  ConsoleApiClient,
+  ControlPlaneApiError,
+  type ChatStreamLine,
+  type JsonValue
+} from "./consoleApi";
 
 describe("ConsoleApiClient", () => {
   it("uses CSRF token for mutating requests after login", async () => {
@@ -144,13 +149,30 @@ describe("ConsoleApiClient", () => {
     expect(calls[3]?.init?.method).toBe("POST");
   });
 
-  it("propagates structured backend errors", async () => {
+  it("propagates richer backend error envelopes", async () => {
     const fetcher: typeof fetch = () => {
-      return Promise.resolve(jsonResponse({ error: "permission denied" }, 403));
+      return Promise.resolve(
+        jsonResponse(
+          {
+            error: "permission denied",
+            code: "forbidden",
+            category: "policy",
+            retryable: false,
+            redacted: false,
+            validation_errors: []
+          },
+          403
+        )
+      );
     };
     const client = new ConsoleApiClient("", fetcher);
 
-    await expect(client.getSession()).rejects.toThrow("permission denied");
+    const result = await client.getSession().catch((error: unknown) => error);
+    expect(result).toBeInstanceOf(ControlPlaneApiError);
+    expect((result as ControlPlaneApiError).message).toBe("permission denied");
+    expect((result as ControlPlaneApiError).status).toBe(403);
+    expect((result as ControlPlaneApiError).code).toBe("forbidden");
+    expect((result as ControlPlaneApiError).category).toBe("policy");
   });
 
   it("fails requests that exceed timeout budget", async () => {
@@ -316,6 +338,114 @@ describe("ConsoleApiClient", () => {
     expect(requestUrl(calls[1]?.input)).toBe("/console/v1/diagnostics");
     const headers = new Headers(calls[1]?.init?.headers);
     expect(headers.get("x-palyra-csrf-token")).toBeNull();
+  });
+
+  it("retries safe-read GET requests once after a transport failure", async () => {
+    const calls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
+    const fetcher: typeof fetch = (input, init) => {
+      calls.push({ input, init });
+      if (calls.length === 1) {
+        return Promise.reject(new TypeError("network down"));
+      }
+      return Promise.resolve(
+        jsonResponse({
+          generated_at_unix_ms: 123,
+          model_provider: {},
+          rate_limits: {},
+          auth_profiles: {},
+          browserd: {}
+        })
+      );
+    };
+    const client = new ConsoleApiClient("", fetcher);
+
+    const diagnostics = await client.getDiagnostics();
+
+    expect(diagnostics.generated_at_unix_ms).toBe(123);
+    expect(calls).toHaveLength(2);
+    expect(requestUrl(calls[0]?.input)).toBe("/console/v1/diagnostics");
+    expect(requestUrl(calls[1]?.input)).toBe("/console/v1/diagnostics");
+  });
+
+  it("supports M52 control-plane domains with additive CSRF behavior", async () => {
+    const calls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
+    const responses = [
+      jsonResponse({
+        principal: "admin:web-console",
+        device_id: "device-1",
+        csrf_token: "csrf-1",
+        issued_at_unix_ms: 100,
+        expires_at_unix_ms: 200
+      }),
+      jsonResponse({
+        contract: { contract_version: "control-plane.v1" },
+        version: "capability-catalog.v1",
+        generated_at_unix_ms: 123,
+        capabilities: [],
+        migration_notes: []
+      }),
+      jsonResponse({
+        contract: { contract_version: "control-plane.v1" },
+        source_path: "defaults",
+        config_version: 1,
+        redacted: true,
+        document_toml: "version = 1\n",
+        backups: []
+      }),
+      jsonResponse({
+        contract: { contract_version: "control-plane.v1" },
+        operation: "set",
+        source_path: "palyra.toml",
+        backups_retained: 5,
+        config_version: 1,
+        changed_key: "model_provider.auth_profile_id"
+      }),
+      jsonResponse({
+        contract: { contract_version: "control-plane.v1" },
+        job: {
+          job_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+          state: "queued",
+          requested_at_unix_ms: 100,
+          command_output: ""
+        }
+      })
+    ];
+    const fetcher: typeof fetch = (input, init) => {
+      calls.push({ input, init });
+      const response = responses.shift();
+      if (response === undefined) {
+        throw new Error("No response queued for fetch mock.");
+      }
+      return Promise.resolve(response);
+    };
+    const client = new ConsoleApiClient("", fetcher);
+
+    await client.login({
+      admin_token: "token",
+      principal: "admin:web-console",
+      device_id: "device-1",
+      channel: "web"
+    });
+    await client.getCapabilityCatalog();
+    await client.inspectConfig({ path: "palyra.toml", show_secrets: false });
+    await client.mutateConfig({
+      key: "model_provider.auth_profile_id",
+      value: "\"openai-default\""
+    });
+    await client.createSupportBundleJob({ retain_jobs: 8 });
+
+    expect(requestUrl(calls[1]?.input)).toBe("/console/v1/control-plane/capabilities");
+    expect(new Headers(calls[1]?.init?.headers).get("x-palyra-csrf-token")).toBeNull();
+
+    expect(requestUrl(calls[2]?.input)).toBe("/console/v1/config/inspect");
+    expect(new Headers(calls[2]?.init?.headers).get("x-palyra-csrf-token")).toBeNull();
+    expect(calls[2]?.init?.method).toBe("POST");
+
+    expect(requestUrl(calls[3]?.input)).toBe("/console/v1/config/mutate");
+    expect(new Headers(calls[3]?.init?.headers).get("x-palyra-csrf-token")).toBe("csrf-1");
+
+    expect(requestUrl(calls[4]?.input)).toBe("/console/v1/support-bundle/jobs");
+    expect(new Headers(calls[4]?.init?.headers).get("x-palyra-csrf-token")).toBe("csrf-1");
   });
 
   it("lists chat sessions and streams NDJSON responses with CSRF", async () => {

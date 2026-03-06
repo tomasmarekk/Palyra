@@ -18,10 +18,11 @@ use palyra_common::{
     default_config_search_paths, parse_config_path, parse_daemon_bind_socket,
     redaction::{redact_auth_error, redact_url},
 };
+use palyra_control_plane::{self as control_plane, ControlPlaneClient, ControlPlaneClientConfig};
 use palyra_vault::{BackendPreference, Vault, VaultConfig, VaultError, VaultScope};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 use tauri::{Manager, State};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
@@ -1178,7 +1179,18 @@ async fn fetch_console_payloads(
         return (None, None, warnings);
     }
 
-    if let Err(error) = ensure_console_session(http_client, runtime, admin_token).await {
+    let mut control_plane = match build_control_plane_client(http_client.clone(), runtime) {
+        Ok(client) => client,
+        Err(error) => {
+            warnings.push(format!(
+                "control-plane client initialization failed: {}",
+                sanitize_log_line(error.to_string().as_str())
+            ));
+            return (None, None, warnings);
+        }
+    };
+
+    if let Err(error) = ensure_console_session(&mut control_plane, admin_token).await {
         warnings.push(format!(
             "console session bootstrap failed: {}",
             sanitize_log_line(error.to_string().as_str())
@@ -1186,13 +1198,13 @@ async fn fetch_console_payloads(
         return (None, None, warnings);
     }
 
-    let diagnostics = match fetch_console_json(http_client, runtime, "/console/v1/diagnostics")
-        .await
-        .with_context(|| "failed to fetch diagnostics payload".to_owned())
-    {
+    let diagnostics = match control_plane.get_diagnostics().await {
         Ok(value) => Some(value),
         Err(error) => {
-            warnings.push(sanitize_log_line(error.to_string().as_str()));
+            warnings.push(format!(
+                "failed to fetch diagnostics payload: {}",
+                sanitize_log_line(error.to_string().as_str())
+            ));
             None
         }
     };
@@ -1215,64 +1227,34 @@ async fn fetch_console_payloads(
     (diagnostics, discord, warnings)
 }
 
-async fn ensure_console_session(
-    http_client: &Client,
-    runtime: &RuntimeConfig,
-    admin_token: &str,
-) -> Result<()> {
-    if console_session_is_active(http_client, runtime).await? {
-        return Ok(());
-    }
-    login_console_session(http_client, runtime, admin_token).await
+fn build_control_plane_client(http_client: Client, runtime: &RuntimeConfig) -> Result<ControlPlaneClient> {
+    let config = ControlPlaneClientConfig::new(format!(
+        "{DASHBOARD_SCHEME}://{LOOPBACK_HOST}:{}/",
+        runtime.gateway_admin_port
+    ));
+    ControlPlaneClient::with_client(config, http_client)
+        .map_err(|error| anyhow!("failed to build control-plane client: {error}"))
 }
 
-async fn console_session_is_active(http_client: &Client, runtime: &RuntimeConfig) -> Result<bool> {
-    let url = loopback_url(runtime.gateway_admin_port, "/console/v1/auth/session")?;
-    let response = http_client
-        .get(url)
-        .send()
-        .await
-        .context("console session request failed")?;
-    if response.status().is_success() {
-        response.bytes().await.context("failed to drain console session payload")?;
-        return Ok(true);
+async fn ensure_console_session(control_plane: &mut ControlPlaneClient, admin_token: &str) -> Result<()> {
+    match control_plane.get_session().await {
+        Ok(_) => Ok(()),
+        Err(control_plane::ControlPlaneClientError::Http { status, .. })
+            if matches!(status, 401 | 403) =>
+        {
+            control_plane
+                .login(&control_plane::ConsoleLoginRequest {
+                    admin_token: admin_token.to_owned(),
+                    principal: CONSOLE_PRINCIPAL.to_owned(),
+                    device_id: CONSOLE_DEVICE_ID.to_owned(),
+                    channel: None,
+                })
+                .await
+                .map(|_| ())
+                .map_err(|error| anyhow!("console login failed: {error}"))
+        }
+        Err(error) => Err(anyhow!("console session request failed: {error}")),
     }
-    if matches!(response.status().as_u16(), 401 | 403) {
-        return Ok(false);
-    }
-    let status = response.status();
-    let text = response.text().await.unwrap_or_default();
-    bail!(
-        "console session request failed with HTTP {}: {}",
-        status,
-        sanitize_log_line(text.as_str())
-    )
-}
-
-async fn login_console_session(
-    http_client: &Client,
-    runtime: &RuntimeConfig,
-    admin_token: &str,
-) -> Result<()> {
-    let url = loopback_url(runtime.gateway_admin_port, "/console/v1/auth/login")?;
-    let payload = json!({
-        "admin_token": admin_token,
-        "principal": CONSOLE_PRINCIPAL,
-        "device_id": CONSOLE_DEVICE_ID,
-    });
-    let response = http_client
-        .post(url)
-        .json(&payload)
-        .send()
-        .await
-        .context("console login request failed")?;
-    if response.status().is_success() {
-        return Ok(());
-    }
-
-    let status = response.status();
-    let text = response.text().await.unwrap_or_default();
-    bail!("console login failed with HTTP {}: {}", status, sanitize_log_line(text.as_str()))
 }
 
 async fn fetch_console_json(http_client: &Client, runtime: &RuntimeConfig, path: &str) -> Result<Value> {
@@ -2581,6 +2563,7 @@ port = 9911
         control_center.runtime.gateway_admin_port = port;
         control_center.persisted.browser_service_enabled = false;
         control_center.gateway.desired_running = true;
+        control_center.gateway.next_restart_unix_ms = Some(i64::MAX);
         let supervisor = Arc::new(tokio::sync::Mutex::new(control_center));
 
         let snapshot_supervisor = supervisor.clone();

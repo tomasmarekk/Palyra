@@ -1149,6 +1149,215 @@ fn console_memory_purge_requires_session_and_csrf() -> Result<()> {
 }
 
 #[test]
+fn console_m52_control_plane_domains_publish_contract_metadata() -> Result<()> {
+    let (child, admin_port) = spawn_palyrad_with_bound_console_principal(CONSOLE_ADMIN_PRINCIPAL)?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(4))
+        .build()
+        .context("failed to build HTTP client")?;
+    let (cookie, csrf_token) = login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
+
+    let capability_catalog = client
+        .get(format!("http://127.0.0.1:{admin_port}/console/v1/control-plane/capabilities"))
+        .header("Cookie", cookie.clone())
+        .send()
+        .context("failed to fetch capability catalog")?
+        .error_for_status()
+        .context("capability catalog returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse capability catalog response json")?;
+    assert_eq!(
+        capability_catalog
+            .get("contract")
+            .and_then(|value| value.get("contract_version"))
+            .and_then(Value::as_str),
+        Some("control-plane.v1"),
+        "capability catalog should expose control-plane contract version"
+    );
+    assert!(
+        capability_catalog.get("capabilities").and_then(Value::as_array).is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|entry| entry.get("id").and_then(Value::as_str) == Some("auth.profiles"))
+        }),
+        "capability catalog should enumerate auth.profiles capability"
+    );
+
+    let deployment = client
+        .get(format!("http://127.0.0.1:{admin_port}/console/v1/deployment/posture"))
+        .header("Cookie", cookie.clone())
+        .send()
+        .context("failed to fetch deployment posture")?
+        .error_for_status()
+        .context("deployment posture returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse deployment posture response json")?;
+    assert_eq!(
+        deployment
+            .get("contract")
+            .and_then(|value| value.get("contract_version"))
+            .and_then(Value::as_str),
+        Some("control-plane.v1")
+    );
+    assert!(
+        deployment.get("bind_addresses").is_some(),
+        "deployment posture should expose bind addresses"
+    );
+
+    let auth_profiles = client
+        .get(format!("http://127.0.0.1:{admin_port}/console/v1/auth/profiles"))
+        .header("Cookie", cookie.clone())
+        .send()
+        .context("failed to fetch auth profiles")?
+        .error_for_status()
+        .context("auth profiles returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse auth profiles response json")?;
+    assert_eq!(
+        auth_profiles
+            .get("contract")
+            .and_then(|value| value.get("contract_version"))
+            .and_then(Value::as_str),
+        Some("control-plane.v1")
+    );
+    assert!(
+        auth_profiles
+            .get("page")
+            .and_then(|value| value.get("has_more"))
+            .and_then(Value::as_bool)
+            .is_some(),
+        "auth profile list should publish normalized page metadata"
+    );
+
+    let auth_health = client
+        .get(format!("http://127.0.0.1:{admin_port}/console/v1/auth/health?include_profiles=true"))
+        .header("Cookie", cookie.clone())
+        .send()
+        .context("failed to fetch auth health")?
+        .error_for_status()
+        .context("auth health returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse auth health response json")?;
+    assert!(
+        auth_health.get("summary").is_some() && auth_health.get("refresh_metrics").is_some(),
+        "auth health should expose summary and refresh metrics"
+    );
+
+    let secrets = client
+        .get(format!("http://127.0.0.1:{admin_port}/console/v1/secrets?scope=global"))
+        .header("Cookie", cookie.clone())
+        .send()
+        .context("failed to fetch secrets metadata")?
+        .error_for_status()
+        .context("secrets metadata returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse secrets metadata response json")?;
+    assert_eq!(
+        secrets
+            .get("contract")
+            .and_then(|value| value.get("contract_version"))
+            .and_then(Value::as_str),
+        Some("control-plane.v1")
+    );
+    assert!(secrets.get("page").is_some(), "secret metadata list should publish page metadata");
+
+    let inspect_without_csrf = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/config/inspect"))
+        .header("Cookie", cookie.clone())
+        .json(&serde_json::json!({}))
+        .send()
+        .context("failed to call config inspect without csrf")?;
+    assert_eq!(
+        inspect_without_csrf.status().as_u16(),
+        403,
+        "config inspect should enforce csrf even though it is read-oriented POST"
+    );
+
+    let config_inspect = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/config/inspect"))
+        .header("Cookie", cookie.clone())
+        .header("x-palyra-csrf-token", csrf_token.clone())
+        .json(&serde_json::json!({}))
+        .send()
+        .context("failed to call config inspect with csrf")?
+        .error_for_status()
+        .context("config inspect returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse config inspect response json")?;
+    assert!(
+        config_inspect.get("document_toml").is_some(),
+        "config inspect should expose serialized TOML snapshot"
+    );
+
+    let support_jobs = client
+        .get(format!("http://127.0.0.1:{admin_port}/console/v1/support-bundle/jobs"))
+        .header("Cookie", cookie.clone())
+        .send()
+        .context("failed to fetch support-bundle jobs")?
+        .error_for_status()
+        .context("support-bundle jobs returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse support-bundle jobs response json")?;
+    assert_eq!(
+        support_jobs
+            .get("contract")
+            .and_then(|value| value.get("contract_version"))
+            .and_then(Value::as_str),
+        Some("control-plane.v1")
+    );
+    assert!(
+        support_jobs.get("jobs").and_then(Value::as_array).is_some(),
+        "support-bundle job list should expose jobs array"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn console_m52_error_envelope_exposes_validation_metadata() -> Result<()> {
+    let (child, admin_port) = spawn_palyrad_with_bound_console_principal(CONSOLE_ADMIN_PRINCIPAL)?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(4))
+        .build()
+        .context("failed to build HTTP client")?;
+    let (cookie, csrf_token) = login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
+
+    let reveal_error = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/secrets/reveal"))
+        .header("Cookie", cookie)
+        .header("x-palyra-csrf-token", csrf_token)
+        .json(&serde_json::json!({
+            "scope": "global",
+            "key": "missing",
+            "reveal": false
+        }))
+        .send()
+        .context("failed to call secret reveal with invalid body")?;
+    assert_eq!(reveal_error.status().as_u16(), 400, "invalid reveal request should be rejected");
+    let body = reveal_error.json::<Value>().context("failed to parse reveal error json")?;
+    assert_eq!(body.get("code").and_then(Value::as_str), Some("validation_error"));
+    assert_eq!(body.get("category").and_then(Value::as_str), Some("validation"));
+    assert!(
+        body.get("validation_errors").and_then(Value::as_array).is_some_and(|issues| issues
+            .iter()
+            .any(|issue| { issue.get("field").and_then(Value::as_str) == Some("reveal") })),
+        "validation error should name the offending field"
+    );
+    assert!(
+        body.get("error").and_then(Value::as_str).is_some(),
+        "error envelope must preserve top-level error message for backward compatibility"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn console_login_rejects_oversized_request_body() -> Result<()> {
     let (child, admin_port) = spawn_palyrad_with_bound_console_principal(CONSOLE_ADMIN_PRINCIPAL)?;
     let mut daemon = ChildGuard::new(child);

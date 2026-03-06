@@ -107,8 +107,335 @@ export interface ConsoleDiagnosticsSnapshot {
   memory?: JsonValue;
 }
 
-interface ErrorEnvelope {
+export interface ContractDescriptor {
+  contract_version: string;
+}
+
+export interface PageInfo {
+  limit: number;
+  returned: number;
+  has_more: boolean;
+  next_cursor?: string;
+}
+
+export type ErrorCategory =
+  | "auth"
+  | "validation"
+  | "policy"
+  | "not_found"
+  | "conflict"
+  | "dependency"
+  | "availability"
+  | "internal";
+
+export interface ValidationIssue {
+  field: string;
+  code: string;
+  message: string;
+}
+
+export interface ErrorEnvelope {
   error?: string;
+  code?: string;
+  category?: ErrorCategory;
+  retryable?: boolean;
+  redacted?: boolean;
+  validation_errors?: ValidationIssue[];
+}
+
+export interface CapabilityEntry {
+  id: string;
+  domain: string;
+  title: string;
+  owner: string;
+  surfaces: string[];
+  execution_mode: string;
+  mutation_classes: string[];
+  test_refs: string[];
+  contract_paths: string[];
+  notes?: string;
+}
+
+export interface CapabilityMigrationNote {
+  id: string;
+  message: string;
+}
+
+export interface CapabilityCatalog {
+  contract: ContractDescriptor;
+  version: string;
+  generated_at_unix_ms: number;
+  capabilities: CapabilityEntry[];
+  migration_notes: CapabilityMigrationNote[];
+}
+
+export interface DeploymentPostureSummary {
+  contract: ContractDescriptor;
+  mode: string;
+  bind_profile: string;
+  bind_addresses: {
+    admin: string;
+    grpc: string;
+    quic: string;
+  };
+  tls: {
+    gateway_enabled: boolean;
+  };
+  admin_auth_required: boolean;
+  dangerous_remote_bind_ack: {
+    config: boolean;
+    env: boolean;
+    env_name: string;
+  };
+  remote_bind_detected: boolean;
+  last_remote_admin_access_attempt?: {
+    observed_at_unix_ms: number;
+    remote_ip_fingerprint: string;
+    method: string;
+    path: string;
+    status_code: number;
+    outcome: string;
+  };
+  warnings: string[];
+}
+
+export interface AuthProfileProvider {
+  kind: string;
+  custom_name?: string;
+}
+
+export interface AuthProfileScope {
+  kind: string;
+  agent_id?: string;
+}
+
+export type AuthCredentialView =
+  | {
+      type: "api_key";
+      api_key_vault_ref: string;
+    }
+  | {
+      type: "oauth";
+      access_token_vault_ref: string;
+      refresh_token_vault_ref: string;
+      token_endpoint: string;
+      client_id?: string;
+      client_secret_vault_ref?: string;
+      scopes: string[];
+      expires_at_unix_ms?: number;
+      refresh_state: JsonValue;
+    };
+
+export interface AuthProfileView {
+  profile_id: string;
+  provider: AuthProfileProvider;
+  profile_name: string;
+  scope: AuthProfileScope;
+  credential: AuthCredentialView;
+  created_at_unix_ms: number;
+  updated_at_unix_ms: number;
+}
+
+export interface AuthProfileListEnvelope {
+  contract: ContractDescriptor;
+  profiles: AuthProfileView[];
+  page: PageInfo;
+}
+
+export interface AuthProfileEnvelope {
+  contract: ContractDescriptor;
+  profile: AuthProfileView;
+}
+
+export interface AuthProfileDeleteEnvelope {
+  contract: ContractDescriptor;
+  profile_id: string;
+  deleted: boolean;
+}
+
+export interface AuthHealthEnvelope {
+  contract: ContractDescriptor;
+  summary: JsonValue;
+  expiry_distribution: JsonValue;
+  profiles: JsonValue[];
+  refresh_metrics: JsonValue;
+}
+
+export interface ProviderAuthStateEnvelope {
+  contract: ContractDescriptor;
+  provider: string;
+  oauth_supported: boolean;
+  bootstrap_supported: boolean;
+  callback_supported: boolean;
+  reconnect_supported: boolean;
+  revoke_supported: boolean;
+  default_selection_supported: boolean;
+  default_profile_id?: string;
+  available_profile_ids: string[];
+  state: string;
+  note?: string;
+}
+
+export interface ProviderAuthActionEnvelope {
+  contract: ContractDescriptor;
+  provider: string;
+  action: string;
+  state: string;
+  message: string;
+  profile_id?: string;
+}
+
+export interface ConfigBackupRecord {
+  index: number;
+  path: string;
+  exists: boolean;
+}
+
+export interface ConfigDocumentSnapshot {
+  contract: ContractDescriptor;
+  source_path: string;
+  config_version: number;
+  migrated_from_version?: number;
+  redacted: boolean;
+  document_toml: string;
+  backups: ConfigBackupRecord[];
+}
+
+export interface ConfigValidationEnvelope {
+  contract: ContractDescriptor;
+  source_path: string;
+  valid: boolean;
+  config_version: number;
+  migrated_from_version?: number;
+}
+
+export interface ConfigMutationEnvelope {
+  contract: ContractDescriptor;
+  operation: string;
+  source_path: string;
+  backups_retained: number;
+  config_version: number;
+  migrated_from_version?: number;
+  changed_key?: string;
+}
+
+export interface SecretMetadata {
+  scope: string;
+  key: string;
+  created_at_unix_ms: number;
+  updated_at_unix_ms: number;
+  value_bytes: number;
+}
+
+export interface SecretMetadataList {
+  contract: ContractDescriptor;
+  scope: string;
+  secrets: SecretMetadata[];
+  page: PageInfo;
+}
+
+export interface SecretMetadataEnvelope {
+  contract: ContractDescriptor;
+  secret: SecretMetadata;
+}
+
+export interface SecretRevealEnvelope {
+  contract: ContractDescriptor;
+  scope: string;
+  key: string;
+  value_bytes: number;
+  value_base64: string;
+  value_utf8?: string;
+}
+
+export interface PairingCodeRecord {
+  code: string;
+  channel: string;
+  issued_by: string;
+  created_at_unix_ms: number;
+  expires_at_unix_ms: number;
+}
+
+export interface PairingPendingRecord {
+  channel: string;
+  sender_identity: string;
+  code: string;
+  requested_at_unix_ms: number;
+  expires_at_unix_ms: number;
+  approval_id?: string;
+}
+
+export interface PairingGrantRecord {
+  channel: string;
+  sender_identity: string;
+  approved_at_unix_ms: number;
+  expires_at_unix_ms?: number;
+  approval_id?: string;
+}
+
+export interface PairingChannelSnapshot {
+  channel: string;
+  pending: PairingPendingRecord[];
+  paired: PairingGrantRecord[];
+  active_codes: PairingCodeRecord[];
+}
+
+export interface PairingSummaryEnvelope {
+  contract: ContractDescriptor;
+  channels: PairingChannelSnapshot[];
+}
+
+export interface SupportBundleJob {
+  job_id: string;
+  state: "queued" | "running" | "succeeded" | "failed";
+  requested_at_unix_ms: number;
+  started_at_unix_ms?: number;
+  completed_at_unix_ms?: number;
+  output_path?: string;
+  command_output: string;
+  error?: string;
+}
+
+export interface SupportBundleJobEnvelope {
+  contract: ContractDescriptor;
+  job: SupportBundleJob;
+}
+
+export interface SupportBundleJobListEnvelope {
+  contract: ContractDescriptor;
+  jobs: SupportBundleJob[];
+  page: PageInfo;
+}
+
+export class ControlPlaneApiError extends Error {
+  readonly status: number;
+  readonly code?: string;
+  readonly category?: ErrorCategory;
+  readonly retryable: boolean;
+  readonly redacted: boolean;
+  readonly validationErrors: ValidationIssue[];
+
+  constructor(
+    message: string,
+    options: {
+      status: number;
+      code?: string;
+      category?: ErrorCategory;
+      retryable?: boolean;
+      redacted?: boolean;
+      validationErrors?: ValidationIssue[];
+      cause?: unknown;
+    }
+  ) {
+    super(message, { cause: options.cause });
+    this.name = "ControlPlaneApiError";
+    this.status = options.status;
+    this.code = options.code;
+    this.category = options.category;
+    this.retryable = options.retryable ?? false;
+    this.redacted = options.redacted ?? false;
+    this.validationErrors = options.validationErrors ?? [];
+  }
 }
 
 interface RequestOptions {
@@ -117,6 +444,7 @@ interface RequestOptions {
 }
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
+const DEFAULT_SAFE_READ_RETRIES = 1;
 
 function buildPathWithQuery(path: string, params?: URLSearchParams): string {
   if (params === undefined || params.size === 0) {
@@ -168,6 +496,261 @@ export class ConsoleApiClient {
 
   async getDiagnostics(): Promise<ConsoleDiagnosticsSnapshot> {
     return this.request("/console/v1/diagnostics");
+  }
+
+  async getCapabilityCatalog(): Promise<CapabilityCatalog> {
+    return this.request("/console/v1/control-plane/capabilities");
+  }
+
+  async getDeploymentPosture(): Promise<DeploymentPostureSummary> {
+    return this.request("/console/v1/deployment/posture");
+  }
+
+  async listAuthProfiles(params?: URLSearchParams): Promise<AuthProfileListEnvelope> {
+    return this.request(buildPathWithQuery("/console/v1/auth/profiles", params));
+  }
+
+  async getAuthProfile(profileId: string): Promise<AuthProfileEnvelope> {
+    return this.request(`/console/v1/auth/profiles/${encodeURIComponent(profileId)}`);
+  }
+
+  async upsertAuthProfile(profile: AuthProfileView): Promise<AuthProfileEnvelope> {
+    return this.request(
+      "/console/v1/auth/profiles",
+      {
+        method: "POST",
+        body: JSON.stringify(profile)
+      },
+      { csrf: true }
+    );
+  }
+
+  async deleteAuthProfile(profileId: string): Promise<AuthProfileDeleteEnvelope> {
+    return this.request(
+      `/console/v1/auth/profiles/${encodeURIComponent(profileId)}/delete`,
+      {
+        method: "POST",
+        body: JSON.stringify({})
+      },
+      { csrf: true }
+    );
+  }
+
+  async getAuthHealth(params?: URLSearchParams): Promise<AuthHealthEnvelope> {
+    return this.request(buildPathWithQuery("/console/v1/auth/health", params));
+  }
+
+  async getOpenAiProviderState(): Promise<ProviderAuthStateEnvelope> {
+    return this.request("/console/v1/auth/providers/openai");
+  }
+
+  async startOpenAiProviderBootstrap(payload: { profile_id?: string } = {}): Promise<ProviderAuthActionEnvelope> {
+    return this.request(
+      "/console/v1/auth/providers/openai/bootstrap",
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      },
+      { csrf: true }
+    );
+  }
+
+  async getOpenAiProviderCallbackState(): Promise<ProviderAuthStateEnvelope> {
+    return this.request("/console/v1/auth/providers/openai/callback-state");
+  }
+
+  async reconnectOpenAiProvider(payload: { profile_id?: string } = {}): Promise<ProviderAuthActionEnvelope> {
+    return this.request(
+      "/console/v1/auth/providers/openai/reconnect",
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      },
+      { csrf: true }
+    );
+  }
+
+  async revokeOpenAiProvider(payload: { profile_id?: string } = {}): Promise<ProviderAuthActionEnvelope> {
+    return this.request(
+      "/console/v1/auth/providers/openai/revoke",
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      },
+      { csrf: true }
+    );
+  }
+
+  async setOpenAiDefaultProfile(payload: { profile_id?: string } = {}): Promise<ProviderAuthActionEnvelope> {
+    return this.request(
+      "/console/v1/auth/providers/openai/default-profile",
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      },
+      { csrf: true }
+    );
+  }
+
+  async inspectConfig(payload: {
+    path?: string;
+    show_secrets?: boolean;
+    backups?: number;
+  }): Promise<ConfigDocumentSnapshot> {
+    return this.request(
+      "/console/v1/config/inspect",
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      },
+      { csrf: false }
+    );
+  }
+
+  async validateConfig(payload: { path?: string }): Promise<ConfigValidationEnvelope> {
+    return this.request(
+      "/console/v1/config/validate",
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      },
+      { csrf: false }
+    );
+  }
+
+  async mutateConfig(payload: {
+    path?: string;
+    key: string;
+    value?: string;
+    backups?: number;
+  }): Promise<ConfigMutationEnvelope> {
+    return this.request(
+      "/console/v1/config/mutate",
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      },
+      { csrf: true }
+    );
+  }
+
+  async migrateConfig(payload: {
+    path?: string;
+    show_secrets?: boolean;
+    backups?: number;
+  }): Promise<ConfigMutationEnvelope> {
+    return this.request(
+      "/console/v1/config/migrate",
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      },
+      { csrf: true }
+    );
+  }
+
+  async recoverConfig(payload: {
+    path?: string;
+    backup?: number;
+    backups?: number;
+  }): Promise<ConfigMutationEnvelope> {
+    return this.request(
+      "/console/v1/config/recover",
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      },
+      { csrf: true }
+    );
+  }
+
+  async listSecrets(scope: string): Promise<SecretMetadataList> {
+    return this.request(`/console/v1/secrets?scope=${encodeURIComponent(scope)}`);
+  }
+
+  async getSecretMetadata(scope: string, key: string): Promise<SecretMetadataEnvelope> {
+    return this.request(
+      `/console/v1/secrets/metadata?scope=${encodeURIComponent(scope)}&key=${encodeURIComponent(key)}`
+    );
+  }
+
+  async setSecret(payload: {
+    scope: string;
+    key: string;
+    value_base64: string;
+  }): Promise<SecretMetadataEnvelope> {
+    return this.request(
+      "/console/v1/secrets",
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      },
+      { csrf: true }
+    );
+  }
+
+  async revealSecret(payload: {
+    scope: string;
+    key: string;
+    reveal: true;
+  }): Promise<SecretRevealEnvelope> {
+    return this.request(
+      "/console/v1/secrets/reveal",
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      },
+      { csrf: true }
+    );
+  }
+
+  async deleteSecret(payload: { scope: string; key: string }): Promise<SecretMetadataEnvelope> {
+    return this.request(
+      "/console/v1/secrets/delete",
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      },
+      { csrf: true }
+    );
+  }
+
+  async getPairingSummary(): Promise<PairingSummaryEnvelope> {
+    return this.request("/console/v1/pairing");
+  }
+
+  async mintPairingCode(payload: {
+    channel: string;
+    issued_by?: string;
+    ttl_ms?: number;
+  }): Promise<PairingSummaryEnvelope> {
+    return this.request(
+      "/console/v1/pairing/codes",
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      },
+      { csrf: true }
+    );
+  }
+
+  async listSupportBundleJobs(params?: URLSearchParams): Promise<SupportBundleJobListEnvelope> {
+    return this.request(buildPathWithQuery("/console/v1/support-bundle/jobs", params));
+  }
+
+  async createSupportBundleJob(payload: { retain_jobs?: number } = {}): Promise<SupportBundleJobEnvelope> {
+    return this.request(
+      "/console/v1/support-bundle/jobs",
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      },
+      { csrf: true }
+    );
+  }
+
+  async getSupportBundleJob(jobId: string): Promise<SupportBundleJobEnvelope> {
+    return this.request(`/console/v1/support-bundle/jobs/${encodeURIComponent(jobId)}`);
   }
 
   async listApprovals(params?: URLSearchParams): Promise<{ approvals: JsonValue[] }> {
@@ -799,47 +1382,44 @@ export class ConsoleApiClient {
     }
 
     const timeoutMs = normalizeRequestTimeoutMs(options.timeoutMs);
-    const requestController = new AbortController();
-    let timedOut = false;
-    const releaseCallerSignal = forwardAbortSignal(init.signal, requestController);
-    const timeoutHandle = setTimeout(() => {
-      timedOut = true;
-      requestController.abort();
-    }, timeoutMs);
+    const maxAttempts = method === "GET" ? DEFAULT_SAFE_READ_RETRIES + 1 : 1;
+    let attempt = 0;
 
-    let response: Response;
-    try {
-      response = await this.fetcher(`${this.basePath}${path}`, {
-        ...init,
-        headers,
-        credentials: "include",
-        signal: requestController.signal
-      });
-    } catch (error) {
-      if (isAbortError(error)) {
-        if (timedOut) {
-          throw new Error(`Request timed out after ${timeoutMs} ms.`, { cause: error });
+    while (true) {
+      attempt += 1;
+      const requestController = new AbortController();
+      let timedOut = false;
+      const releaseCallerSignal = forwardAbortSignal(init.signal, requestController);
+      const timeoutHandle = setTimeout(() => {
+        timedOut = true;
+        requestController.abort();
+      }, timeoutMs);
+
+      try {
+        const response = await this.fetcher(`${this.basePath}${path}`, {
+          ...init,
+          headers,
+          credentials: "include",
+          signal: requestController.signal
+        });
+        return (await parseJsonResponse<T>(response)) as T;
+      } catch (error) {
+        if (isAbortError(error)) {
+          if (timedOut) {
+            throw new Error(`Request timed out after ${timeoutMs} ms.`, { cause: error });
+          }
+          if (init.signal?.aborted === true) {
+            throw new Error("Request canceled.", { cause: error });
+          }
         }
-        if (init.signal?.aborted === true) {
-          throw new Error("Request canceled.", { cause: error });
+        if (!shouldRetrySafeRead(method, attempt, maxAttempts, error)) {
+          throw error;
         }
+      } finally {
+        clearTimeout(timeoutHandle);
+        releaseCallerSignal();
       }
-      throw error;
-    } finally {
-      clearTimeout(timeoutHandle);
-      releaseCallerSignal();
     }
-
-    const contentType = response.headers.get("content-type") ?? "";
-    const isJson = contentType.includes("application/json");
-    const payload = isJson
-      ? ((await response.json()) as JsonValue)
-      : ((await response.text()) as unknown as JsonValue);
-
-    if (!response.ok) {
-      throw new Error(extractErrorMessage(payload, response.status));
-    }
-    return payload as T;
   }
 }
 
@@ -877,22 +1457,65 @@ function isAbortError(error: unknown): boolean {
   return false;
 }
 
-function extractErrorMessage(payload: JsonValue, status: number): string {
+function shouldRetrySafeRead(
+  method: string,
+  attempt: number,
+  maxAttempts: number,
+  error: unknown
+): boolean {
+  if (method !== "GET" || attempt >= maxAttempts) {
+    return false;
+  }
+  if (error instanceof ControlPlaneApiError) {
+    return error.retryable;
+  }
+  return !isAbortError(error);
+}
+
+function parseErrorEnvelope(payload: JsonValue): ErrorEnvelope | null {
   if (payload !== null && typeof payload === "object" && !Array.isArray(payload)) {
     const envelope = payload as ErrorEnvelope;
     if (typeof envelope.error === "string" && envelope.error.trim().length > 0) {
-      return envelope.error;
+      return envelope;
     }
   }
-  return `Request failed with HTTP ${status}.`;
+  return null;
 }
 
-async function buildRequestError(response: Response): Promise<Error> {
+function buildControlPlaneApiError(payload: JsonValue, status: number): ControlPlaneApiError {
+  const envelope = parseErrorEnvelope(payload);
+  return new ControlPlaneApiError(
+    envelope?.error?.trim().length ? envelope.error : `Request failed with HTTP ${status}.`,
+    {
+      status,
+      code: envelope?.code,
+      category: envelope?.category,
+      retryable: envelope?.retryable,
+      redacted: envelope?.redacted,
+      validationErrors: envelope?.validation_errors
+    }
+  );
+}
+
+async function buildRequestError(response: Response): Promise<ControlPlaneApiError> {
   const contentType = response.headers.get("content-type") ?? "";
   const payload = contentType.includes("application/json")
     ? ((await response.json()) as JsonValue)
     : ((await response.text()) as unknown as JsonValue);
-  return new Error(extractErrorMessage(payload, response.status));
+  return buildControlPlaneApiError(payload, response.status);
+}
+
+async function parseJsonResponse<T>(response: Response): Promise<T> {
+  const contentType = response.headers.get("content-type") ?? "";
+  const isJson = contentType.includes("application/json");
+  const payload = isJson
+    ? ((await response.json()) as JsonValue)
+    : ((await response.text()) as unknown as JsonValue);
+
+  if (!response.ok) {
+    throw buildControlPlaneApiError(payload, response.status);
+  }
+  return payload as T;
 }
 
 function flushNdjsonBuffer(

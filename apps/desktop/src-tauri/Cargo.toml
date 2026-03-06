@@ -13,6 +13,7 @@ tauri-build = { version = "2.5.1", features = [] }
 [dependencies]
 anyhow = "1.0.102"
 palyra-common = { path = "../../../crates/palyra-common" }
+palyra-control-plane = { path = "../../../crates/palyra-control-plane" }
 palyra-vault = { path = "../../../crates/palyra-vault" }
 reqwest = { version = "0.13.2", default-features = false, features = ["json", "cookies", "native-tls"] }
 serde = { version = "1.0.218", features = ["derive"] }
