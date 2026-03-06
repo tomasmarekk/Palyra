@@ -27,9 +27,9 @@ jobs:
           cache: npm
           cache-dependency-path: apps/web/package-lock.json
 
-      - name: Install web dependencies
+      - name: Bootstrap web app
         if: ${{ hashFiles('apps/web/package-lock.json') != '' }}
-        run: npm --prefix apps/web ci
+        run: npm --prefix apps/web run bootstrap
 
       - name: npm audit (high)
         if: ${{ hashFiles('apps/web/package-lock.json') != '' }}

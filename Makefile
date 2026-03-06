@@ -14,7 +14,8 @@ validate-env:
 	$(MAKE) doctor
 
 dev: validate-env build
-	@echo "Bootstrap complete. Run 'make test' to verify workspace tests."
+	@echo "Bootstrap complete. Run 'make web-bootstrap' for the apps/web clean-room bootstrap."
+	@echo "Run 'make test' to verify workspace tests."
 
 lint:
 	cargo clippy --workspace --all-targets -- -D warnings
@@ -62,6 +63,18 @@ security-artifacts:
 	mkdir -p security-artifacts
 	$(MAKE) sbom
 	bash scripts/generate-attestation-placeholder.sh security-artifacts/attestation-placeholder.json
+
+web-bootstrap:
+	npm --prefix apps/web run bootstrap
+
+web-clean:
+	npm --prefix apps/web run clean
+
+web-check:
+	npm --prefix apps/web run ci:check
+
+web-cleanroom:
+	npm --prefix apps/web run cleanroom:check
 
 fuzz-build:
 	@if cargo fuzz --help >/dev/null 2>&1; then \

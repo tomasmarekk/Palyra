@@ -3,13 +3,22 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=20 <25",
+    "npm": ">=10 <12"
+  },
   "scripts": {
+    "bootstrap": "node ./scripts/devex.mjs bootstrap",
     "build": "vite build",
+    "ci:check": "node ./scripts/devex.mjs ci-check",
+    "clean": "node ./scripts/devex.mjs clean",
+    "cleanroom:check": "node ./scripts/devex.mjs cleanroom-check",
     "dev": "vite",
     "lint": "eslint \"**/*.{ts,tsx}\" --max-warnings=0 --no-error-on-unmatched-pattern",
     "test": "vitest",
     "test:run": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "verify-install": "node ./scripts/devex.mjs verify-install"
   },
   "dependencies": {
     "react": "^19.2.4",

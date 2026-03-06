@@ -16,7 +16,8 @@ validate-env:
 dev:
     just doctor
     cargo build --workspace --locked
-    @echo "Bootstrap complete. Run 'just test' to verify workspace tests."
+    @echo "Bootstrap complete. Run 'just web-bootstrap' for the apps/web clean-room bootstrap."
+    @echo "Run 'just test' to verify workspace tests."
 
 lint:
     cargo clippy --workspace --all-targets -- -D warnings
@@ -24,6 +25,18 @@ lint:
 lint-clients:
     bash apps/android/scripts/lint.sh
     bash apps/web/scripts/lint.sh
+
+web-bootstrap:
+    npm --prefix apps/web run bootstrap
+
+web-clean:
+    npm --prefix apps/web run clean
+
+web-check:
+    npm --prefix apps/web run ci:check
+
+web-cleanroom:
+    npm --prefix apps/web run cleanroom:check
 
 protocol-validate:
     bash scripts/protocol/validate-proto.sh
