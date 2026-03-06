@@ -1,0 +1,318 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`ConsoleShell snapshot coverage > renders deterministic shell navigation for the M53 baseline 1`] = `
+<div
+  class="console-shell"
+>
+  <header
+    class="console-topbar console-topbar--shell"
+  >
+    <div
+      class="console-topbar__title"
+    >
+      <p
+        class="console-label"
+      >
+        Palyra / M53
+      </p>
+      <h1>
+        Web Console v1
+      </h1>
+      <p
+        class="console-copy"
+      >
+        Dashboard owns the full operator surface. Desktop stays focused on onboarding, lifecycle, and support.
+      </p>
+    </div>
+    <div
+      class="console-session-box"
+    >
+      <p>
+        <strong>
+          Principal:
+        </strong>
+         
+        admin:web-console
+      </p>
+      <p>
+        <strong>
+          Device:
+        </strong>
+         
+        device-1
+      </p>
+      <p>
+        <strong>
+          Channel:
+        </strong>
+         
+        web
+      </p>
+      <p>
+        <strong>
+          Expires:
+        </strong>
+         
+        1. 1. 1970 1:00:00
+      </p>
+      <div
+        class="console-inline-actions"
+      >
+        <button
+          aria-label="Theme light"
+          type="button"
+        >
+          Theme: 
+          light
+        </button>
+        <label
+          class="console-checkbox-inline"
+        >
+          <input
+            type="checkbox"
+          />
+          Reveal sensitive values
+        </label>
+        <button
+          class="button--warn"
+          type="button"
+        >
+          Sign out
+        </button>
+      </div>
+    </div>
+  </header>
+  <div
+    class="console-shell__layout"
+  >
+    <aside
+      aria-label="Dashboard domains"
+      class="console-sidebar"
+    >
+      <div
+        class="console-sidebar__intro"
+      >
+        <p
+          class="console-label"
+        >
+          Information Architecture
+        </p>
+        <h2>
+          Operator domains
+        </h2>
+        <p
+          class="console-copy"
+        >
+          Unsupported or future capabilities are not hidden behind fake menus. Current surfaces map to live backend contracts.
+        </p>
+      </div>
+      <nav
+        class="console-domain-nav"
+      >
+        <button
+          aria-current="page"
+          aria-label="Overview"
+          class="is-active"
+          type="button"
+        >
+          <span
+            aria-hidden="true"
+          >
+            Overview
+          </span>
+          <small>
+            Product posture and current capability map
+          </small>
+        </button>
+        <button
+          aria-label="Chat"
+          class=""
+          type="button"
+        >
+          <span
+            aria-hidden="true"
+          >
+            Chat
+          </span>
+          <small>
+            Streaming operator workspace
+          </small>
+        </button>
+        <button
+          aria-label="Channels"
+          class=""
+          type="button"
+        >
+          <span
+            aria-hidden="true"
+          >
+            Channels
+          </span>
+          <small>
+            Discord and connector routing
+          </small>
+        </button>
+        <button
+          aria-label="OpenAI and Auth"
+          class=""
+          type="button"
+        >
+          <span
+            aria-hidden="true"
+          >
+            OpenAI and Auth
+          </span>
+          <small>
+            Provider state and auth profiles
+          </small>
+        </button>
+        <button
+          aria-label="Approvals"
+          class=""
+          type="button"
+        >
+          <span
+            aria-hidden="true"
+          >
+            Approvals
+          </span>
+          <small>
+            Sensitive action gate
+          </small>
+        </button>
+        <button
+          aria-label="Cron"
+          class=""
+          type="button"
+        >
+          <span
+            aria-hidden="true"
+          >
+            Cron
+          </span>
+          <small>
+            Scheduled prompts and runs
+          </small>
+        </button>
+        <button
+          aria-label="Browser"
+          class=""
+          type="button"
+        >
+          <span
+            aria-hidden="true"
+          >
+            Browser
+          </span>
+          <small>
+            Profiles, relay, downloads
+          </small>
+        </button>
+        <button
+          aria-label="Memory"
+          class=""
+          type="button"
+        >
+          <span
+            aria-hidden="true"
+          >
+            Memory
+          </span>
+          <small>
+            Retention, search, purge
+          </small>
+        </button>
+        <button
+          aria-label="Skills"
+          class=""
+          type="button"
+        >
+          <span
+            aria-hidden="true"
+          >
+            Skills
+          </span>
+          <small>
+            Install and runtime trust
+          </small>
+        </button>
+        <button
+          aria-label="Config and Secrets"
+          class=""
+          type="button"
+        >
+          <span
+            aria-hidden="true"
+          >
+            Config and Secrets
+          </span>
+          <small>
+            Config inspection and vault metadata
+          </small>
+        </button>
+        <button
+          aria-label="Diagnostics"
+          class=""
+          type="button"
+        >
+          <span
+            aria-hidden="true"
+          >
+            Diagnostics
+          </span>
+          <small>
+            Runtime health and redacted snapshots
+          </small>
+        </button>
+        <button
+          aria-label="Audit"
+          class=""
+          type="button"
+        >
+          <span
+            aria-hidden="true"
+          >
+            Audit
+          </span>
+          <small>
+            Journal events and operator filters
+          </small>
+        </button>
+        <button
+          aria-label="Support and Recovery"
+          class=""
+          type="button"
+        >
+          <span
+            aria-hidden="true"
+          >
+            Support and Recovery
+          </span>
+          <small>
+            Pairing and support bundles
+          </small>
+        </button>
+      </nav>
+    </aside>
+    <section
+      class="console-shell__content"
+    >
+      <p
+        class="console-notice"
+      >
+        Overview refreshed.
+      </p>
+      <section
+        class="console-card"
+      >
+        <h2>
+          Overview
+        </h2>
+        <p>
+          Baseline shell snapshot.
+        </p>
+      </section>
+    </section>
+  </div>
+</div>
+`;

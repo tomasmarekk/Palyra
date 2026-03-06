@@ -9,64 +9,169 @@
   <body>
     <div class="background-shape"></div>
     <main class="shell">
-      <header class="topbar">
-        <div>
+      <header class="topbar card">
+        <div class="hero-copy">
           <p class="eyebrow">Desktop Control Center</p>
           <h1>Palyra</h1>
+          <p class="lede">
+            Desktop owns local startup, onboarding, and recovery. Use the dashboard for the full
+            operator surface once runtime access is healthy.
+          </p>
         </div>
-        <div class="status-block">
+        <div class="hero-status">
           <span id="overallStatus" class="status-pill status-unknown">Unknown</span>
           <p id="statusTimestamp" class="hint">No snapshot loaded yet.</p>
         </div>
       </header>
 
-      <section class="controls card">
+      <section class="action-bar card" aria-label="Desktop lifecycle actions">
         <div class="button-row">
           <button id="startBtn" type="button">Start Palyra</button>
           <button id="stopBtn" type="button" class="secondary">Stop Palyra</button>
           <button id="restartBtn" type="button" class="secondary">Restart Palyra</button>
-          <button id="dashboardBtn" type="button" class="accent">Open Dashboard</button>
-          <button id="exportBundleBtn" type="button" class="secondary">Export Support Bundle</button>
+          <button id="dashboardBtn" type="button" class="accent" data-command="open_dashboard">
+            Open Dashboard
+          </button>
+          <button id="refreshBtn" type="button" class="secondary">Refresh Snapshot</button>
+          <button
+            id="exportBundleBtn"
+            type="button"
+            class="secondary"
+            data-command="export_support_bundle"
+          >
+            Export Support Bundle
+          </button>
         </div>
-        <div class="setting-row">
-          <label class="toggle">
-            <input id="browserEnabledToggle" type="checkbox" />
-            <span>Start browser sidecar (`palyra-browserd`) with gateway</span>
-          </label>
-          <button id="applySettingsBtn" type="button" class="secondary">Apply Setting</button>
-        </div>
-        <p id="actionMessage" class="hint"></p>
+        <p id="actionMessage" class="message-strip" role="status" aria-live="polite">
+          Waiting for desktop snapshot.
+        </p>
       </section>
 
-      <section class="facts-grid">
+      <section class="hero-grid">
         <article class="card">
-          <h2>Quick Facts</h2>
+          <div class="card-header">
+            <div>
+              <p class="eyebrow">Welcome and First Run</p>
+              <h2>Local onboarding checklist</h2>
+            </div>
+            <span id="onboardingState" class="status-pill status-unknown">Unknown</span>
+          </div>
+          <p class="hint">
+            This shell keeps local lifecycle tasks close at hand and hands off provider setup and
+            full operations to the dashboard.
+          </p>
+          <ol id="welcomeChecklist" class="checklist" aria-label="First-run checklist">
+            <li>Start the local runtime to collect a fresh status snapshot.</li>
+            <li>Open the dashboard and complete operator-facing setup.</li>
+            <li>Connect OpenAI in the dashboard and verify Discord readiness.</li>
+          </ol>
+        </article>
+
+        <article class="card">
+          <div class="card-header">
+            <div>
+              <p class="eyebrow">Runtime Status</p>
+              <h2>Sidecar lifecycle</h2>
+            </div>
+            <span id="runtimeSummaryBadge" class="status-pill status-unknown">Unknown</span>
+          </div>
+          <div class="status-card-grid">
+            <section class="status-card" aria-labelledby="gatewayRuntimeHeading">
+              <div class="status-card__header">
+                <h3 id="gatewayRuntimeHeading">Gateway</h3>
+                <span id="gatewayRuntimeBadge" class="mini-pill mini-pill--muted">Unknown</span>
+              </div>
+              <p id="gatewayProcessSummary">No process data yet.</p>
+              <p id="gatewayPorts" class="hint">Bound ports: -</p>
+            </section>
+            <section class="status-card" aria-labelledby="browserRuntimeHeading">
+              <div class="status-card__header">
+                <h3 id="browserRuntimeHeading">Browser sidecar</h3>
+                <span id="browserRuntimeBadge" class="mini-pill mini-pill--muted">Unknown</span>
+              </div>
+              <p id="browserProcessSummary">No process data yet.</p>
+              <p id="browserPorts" class="hint">Bound ports: -</p>
+            </section>
+          </div>
+          <div class="setting-panel">
+            <label class="toggle" for="browserEnabledToggle">
+              <input id="browserEnabledToggle" type="checkbox" />
+              <span>Start `palyra-browserd` automatically with the gateway</span>
+            </label>
+            <button id="applySettingsBtn" type="button" class="secondary">Apply Setting</button>
+          </div>
+        </article>
+      </section>
+
+      <section class="domain-grid">
+        <article class="card">
+          <div class="card-header">
+            <div>
+              <p class="eyebrow">Dashboard Access</p>
+              <h2>Operator handoff</h2>
+            </div>
+            <span id="dashboardModeBadge" class="mini-pill mini-pill--muted">Unknown</span>
+          </div>
           <dl class="facts-list">
-            <div>
-              <dt>Gateway Version</dt>
-              <dd id="factGatewayVersion">-</dd>
-            </div>
-            <div>
-              <dt>Gateway Git Hash</dt>
-              <dd id="factGatewayHash">-</dd>
-            </div>
-            <div>
-              <dt>Gateway Uptime</dt>
-              <dd id="factGatewayUptime">-</dd>
-            </div>
             <div>
               <dt>Dashboard URL</dt>
               <dd id="factDashboardUrl">-</dd>
             </div>
             <div>
-              <dt>Dashboard Access</dt>
+              <dt>Access mode</dt>
               <dd id="factDashboardAccessMode">-</dd>
             </div>
+            <div>
+              <dt>Gateway version</dt>
+              <dd id="factGatewayVersion">-</dd>
+            </div>
+            <div>
+              <dt>Gateway git hash</dt>
+              <dd id="factGatewayHash">-</dd>
+            </div>
+            <div>
+              <dt>Gateway uptime</dt>
+              <dd id="factGatewayUptime">-</dd>
+            </div>
           </dl>
+          <p id="dashboardAccessHint" class="hint">
+            The dashboard is the canonical operator surface once runtime access is available.
+          </p>
+          <div class="inline-actions">
+            <button type="button" class="accent" data-command="open_dashboard">Open Dashboard</button>
+          </div>
         </article>
 
         <article class="card">
-          <h2>Connector Health</h2>
+          <div class="card-header">
+            <div>
+              <p class="eyebrow">OpenAI Connect</p>
+              <h2>Provider setup handoff</h2>
+            </div>
+            <span id="openAiStatus" class="mini-pill mini-pill--muted">Dashboard</span>
+          </div>
+          <p id="openAiDetail">
+            OpenAI sign-in and credential management live in the dashboard. Desktop does not store
+            provider credentials in local state.
+          </p>
+          <ul class="checklist compact-list">
+            <li>Start the runtime if the gateway is not yet reachable.</li>
+            <li>Open the dashboard to connect OpenAI using the supported auth surface.</li>
+            <li>Return here only for local lifecycle and support actions.</li>
+          </ul>
+          <div class="inline-actions">
+            <button type="button" class="accent" data-command="open_dashboard">Open OpenAI Setup</button>
+          </div>
+        </article>
+
+        <article class="card">
+          <div class="card-header">
+            <div>
+              <p class="eyebrow">Discord Connect and Verify</p>
+              <h2>Connector health at a glance</h2>
+            </div>
+            <span id="discordStatusBadge" class="mini-pill mini-pill--muted">Unknown</span>
+          </div>
           <dl class="facts-list compact">
             <div>
               <dt>Connector</dt>
@@ -81,43 +186,76 @@
               <dd id="discordAuthenticated">-</dd>
             </div>
             <div>
-              <dt>Readiness / Liveness</dt>
+              <dt>Readiness / liveness</dt>
               <dd id="discordReadiness">-</dd>
             </div>
             <div>
-              <dt>Last Error</dt>
+              <dt>Last error</dt>
               <dd id="discordLastError">None</dd>
             </div>
           </dl>
+          <ul id="discordChecklist" class="checklist compact-list" aria-label="Discord verification checklist">
+            <li>Connector status will appear here after the first snapshot refresh.</li>
+          </ul>
+          <p class="hint">
+            Use the dashboard for onboarding, token entry, and verification workflows.
+          </p>
         </article>
 
         <article class="card">
-          <h2>Service Processes</h2>
-          <div class="process-section">
-            <h3>Gateway (`palyrad`)</h3>
-            <p id="gatewayProcessSummary">-</p>
-            <p id="gatewayPorts">-</p>
+          <div class="card-header">
+            <div>
+              <p class="eyebrow">Diagnostics and Support</p>
+              <h2>Redacted operational snapshot</h2>
+            </div>
+            <span id="supportStateBadge" class="mini-pill mini-pill--muted">Monitoring</span>
           </div>
-          <div class="process-section">
-            <h3>Browser (`palyra-browserd`)</h3>
-            <p id="browserProcessSummary">-</p>
-            <p id="browserPorts">-</p>
+          <p class="hint">
+            Diagnostics and logs are redacted. Export a support bundle when the local shell needs
+            deeper investigation.
+          </p>
+          <dl class="facts-list compact">
+            <div>
+              <dt>Diagnostics issues</dt>
+              <dd id="diagnosticErrorCount">-</dd>
+            </div>
+            <div>
+              <dt>Dropped log events</dt>
+              <dd id="droppedDiagnostics">-</dd>
+            </div>
+          </dl>
+          <div class="inline-actions">
+            <button type="button" class="secondary" data-command="export_support_bundle">
+              Export Support Bundle
+            </button>
           </div>
         </article>
       </section>
 
       <section class="bottom-grid">
         <article class="card">
-          <div class="card-title-row">
-            <h2>Diagnostics (Redacted)</h2>
-            <button id="refreshBtn" type="button" class="secondary">Refresh</button>
+          <div class="card-header">
+            <div>
+              <p class="eyebrow">Warnings and Diagnostics</p>
+              <h2>Current issues</h2>
+            </div>
           </div>
-          <ul id="diagnosticsList" class="diagnostics-list"></ul>
+          <ul id="warningList" class="warning-list" aria-label="Desktop warnings"></ul>
+          <div class="card-title-row">
+            <h3>Diagnostics errors</h3>
+            <button type="button" class="secondary" data-command="refresh_snapshot">Refresh</button>
+          </div>
+          <ul id="diagnosticsList" class="diagnostics-list" aria-label="Redacted diagnostics errors"></ul>
         </article>
 
         <article class="card">
-          <h2>Sidecar Logs (Redacted)</h2>
-          <pre id="logOutput" class="logs"></pre>
+          <div class="card-header">
+            <div>
+              <p class="eyebrow">Sidecar Logs</p>
+              <h2>Recent redacted output</h2>
+            </div>
+          </div>
+          <pre id="logOutput" class="logs" aria-live="polite">No sidecar logs captured yet.</pre>
         </article>
       </section>
     </main>

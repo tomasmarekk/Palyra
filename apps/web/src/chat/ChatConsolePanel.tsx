@@ -2,7 +2,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
-  A2uiRenderer,
   applyPatchDocument,
   documentToJsonValue,
   normalizeA2uiDocument,
@@ -18,56 +17,26 @@ import type {
   JsonValue,
   ConsoleApiClient
 } from "../consoleApi";
-
-const MAX_TRANSCRIPT_RETENTION = 800;
-const MAX_RENDERED_TRANSCRIPT = 120;
-const DEFAULT_APPROVAL_SCOPE = "once" as const;
-const DEFAULT_APPROVAL_TTL_MS = "300000";
-const SENSITIVE_KEY_PATTERN =
-  /(secret|token|password|cookie|authorization|credential|api[-_]?key|private[-_]?key|vault[-_]?ref)/i;
-const SENSITIVE_VALUE_PATTERN =
-  /^(Bearer\s+|sk-[a-z0-9]|ghp_[A-Za-z0-9]|xox[baprs]-|AIza[0-9A-Za-z\-_]{20,})/i;
-
-type ApprovalScope = "once" | "session" | "timeboxed";
-type TranscriptEntryKind =
-  | "meta"
-  | "user"
-  | "assistant"
-  | "status"
-  | "tool"
-  | "approval_request"
-  | "approval_response"
-  | "a2ui"
-  | "canvas"
-  | "journal"
-  | "error"
-  | "complete"
-  | "event";
-
-interface TranscriptEntry {
-  readonly id: string;
-  readonly kind: TranscriptEntryKind;
-  readonly created_at_unix_ms: number;
-  readonly run_id?: string;
-  readonly session_id?: string;
-  readonly title: string;
-  readonly text?: string;
-  readonly payload?: JsonValue;
-  readonly approval_id?: string;
-  readonly proposal_id?: string;
-  readonly tool_name?: string;
-  readonly surface?: string;
-  readonly canvas_url?: string;
-  readonly status?: string;
-  readonly is_final?: boolean;
-}
-
-interface ApprovalDraft {
-  readonly scope: ApprovalScope;
-  readonly reason: string;
-  readonly ttl_ms: string;
-  readonly busy: boolean;
-}
+import { ChatRunDrawer } from "./ChatRunDrawer";
+import { ChatTranscript } from "./ChatTranscript";
+import {
+  DEFAULT_APPROVAL_SCOPE,
+  DEFAULT_APPROVAL_TTL_MS,
+  MAX_RENDERED_TRANSCRIPT,
+  asBoolean,
+  asObject,
+  asString,
+  collectCanvasFrameUrls,
+  emptyToUndefined,
+  isAbortError,
+  normalizePatchValue,
+  parseInteger,
+  prettifyEventType,
+  retainTranscriptWindow,
+  shortId,
+  toErrorMessage
+} from "./chatShared";
+import type { ApprovalDraft, TranscriptEntry } from "./chatShared";
 
 interface ChatConsolePanelProps {
   readonly api: ConsoleApiClient;
@@ -839,75 +808,24 @@ export function ChatConsolePanel({
             </label>
           </header>
 
-          {hiddenTranscriptItems > 0 && (
-            <p className="chat-muted">
-              Showing latest {MAX_RENDERED_TRANSCRIPT} items. {hiddenTranscriptItems} older items are retained but not rendered.
-            </p>
-          )}
-
-          <div className="chat-transcript" ref={transcriptBoxRef} role="log" aria-live="polite">
-            {visibleTranscript.length === 0 ? (
-              <p className="chat-muted">Send a message to start streaming output.</p>
-            ) : (
-              visibleTranscript.map((entry) => (
-                <article key={entry.id} className={`chat-entry chat-entry--${entry.kind}`}>
-                  <header className="chat-entry-header">
-                    <strong>{entry.title}</strong>
-                    <span>{new Date(entry.created_at_unix_ms).toLocaleTimeString()}</span>
-                  </header>
-                  {entry.text !== undefined && <p className="chat-entry-text">{entry.text}</p>}
-
-                  {entry.kind === "approval_request" && entry.approval_id !== undefined && (
-                    <ApprovalRequestControls
-                      approvalId={entry.approval_id}
-                      draft={approvalDrafts[entry.approval_id]}
-                      onDraftChange={(next) => {
-                        updateApprovalDraft(entry.approval_id as string, () => next);
-                      }}
-                      onDecision={(approved) => {
-                        void decideInlineApproval(entry.approval_id as string, approved);
-                      }}
-                    />
-                  )}
-
-                  {entry.kind === "a2ui" && entry.surface !== undefined && a2uiDocuments[entry.surface] !== undefined && (
-                    <div className="chat-a2ui-shell">
-                      <A2uiRenderer document={a2uiDocuments[entry.surface]} />
-                    </div>
-                  )}
-
-                  {entry.kind === "canvas" && entry.canvas_url !== undefined && (
-                    <iframe
-                      className="chat-canvas-frame"
-                      title={`Canvas ${entry.run_id ?? ""}`}
-                      src={entry.canvas_url}
-                      sandbox="allow-scripts allow-same-origin"
-                      loading="lazy"
-                      referrerPolicy="no-referrer"
-                    />
-                  )}
-
-                  {entry.payload !== undefined && entry.kind !== "assistant" && entry.kind !== "user" && (
-                    <pre>{toPrettyJson(entry.payload, revealSensitiveValues)}</pre>
-                  )}
-
-                  {entry.run_id !== undefined && (
-                    <div className="chat-entry-actions">
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setRunDrawerId(entry.run_id as string);
-                          setRunDrawerOpen(true);
-                        }}
-                      >
-                        Open run details
-                      </button>
-                    </div>
-                  )}
-                </article>
-              ))
-            )}
-          </div>
+          <ChatTranscript
+            visibleTranscript={visibleTranscript}
+            hiddenTranscriptItems={hiddenTranscriptItems}
+            transcriptBoxRef={transcriptBoxRef}
+            approvalDrafts={approvalDrafts}
+            a2uiDocuments={a2uiDocuments}
+            revealSensitiveValues={revealSensitiveValues}
+            updateApprovalDraft={(approvalId, next) => {
+              updateApprovalDraft(approvalId, () => next);
+            }}
+            decideInlineApproval={(approvalId, approved) => {
+              void decideInlineApproval(approvalId, approved);
+            }}
+            openRunDetails={(runId) => {
+              setRunDrawerId(runId);
+              setRunDrawerOpen(true);
+            }}
+          />
 
           <form className="chat-composer" onSubmit={(event) => {
             void sendMessage(event);
@@ -942,364 +860,22 @@ export function ChatConsolePanel({
         </section>
       </div>
 
-      {runDrawerOpen && (
-        <aside className="chat-run-drawer" aria-label="Run details drawer">
-          <header className="chat-run-drawer__header">
-            <h3>Run details</h3>
-            <div className="console-inline-actions">
-              <select
-                value={runDrawerId}
-                onChange={(event) => setRunDrawerId(event.target.value)}
-              >
-                <option value="">Select run</option>
-                {runIds.map((runId) => (
-                  <option key={runId} value={runId}>{runId}</option>
-                ))}
-              </select>
-              <button
-                type="button"
-                onClick={() => {
-                  if (runDrawerId.trim().length > 0) {
-                    void loadRunDetails(runDrawerId.trim());
-                  }
-                }}
-                disabled={runDrawerId.trim().length === 0 || runDrawerBusy}
-              >
-                {runDrawerBusy ? "Loading..." : "Refresh run"}
-              </button>
-              <button type="button" onClick={() => setRunDrawerOpen(false)}>Close</button>
-            </div>
-          </header>
-
-          {runDrawerId.trim().length === 0 ? (
-            <p className="chat-muted">Select a run to inspect status and tape events.</p>
-          ) : (
-            <>
-              {runStatus === null ? (
-                <p className="chat-muted">No run status loaded yet.</p>
-              ) : (
-                <section className="console-subpanel">
-                  <h4>Status</h4>
-                  <div className="console-grid-3">
-                    <p><strong>State:</strong> {runStatus.state}</p>
-                    <p><strong>Prompt tokens:</strong> {runStatus.prompt_tokens}</p>
-                    <p><strong>Completion tokens:</strong> {runStatus.completion_tokens}</p>
-                    <p><strong>Total tokens:</strong> {runStatus.total_tokens}</p>
-                    <p><strong>Tape events:</strong> {runStatus.tape_events}</p>
-                    <p><strong>Updated:</strong> {new Date(runStatus.updated_at_unix_ms).toLocaleString()}</p>
-                  </div>
-                  {runStatus.last_error !== undefined && runStatus.last_error.length > 0 && (
-                    <p className="console-banner console-banner--error">{runStatus.last_error}</p>
-                  )}
-                </section>
-              )}
-
-              {runTape === null ? (
-                <p className="chat-muted">No tape snapshot loaded.</p>
-              ) : (
-                <section className="console-subpanel">
-                  <h4>Tape events ({runTape.events.length})</h4>
-                  <div className="chat-tape-list">
-                    {runTape.events.map((event) => (
-                      <article key={`${event.seq}-${event.event_type}`} className="chat-tape-item">
-                        <header>
-                          <strong>#{event.seq}</strong>
-                          <span>{event.event_type}</span>
-                        </header>
-                        <pre>{toPrettyJson(parseTapePayload(event.payload_json), revealSensitiveValues)}</pre>
-                      </article>
-                    ))}
-                  </div>
-                </section>
-              )}
-            </>
-          )}
-        </aside>
-      )}
+      <ChatRunDrawer
+        open={runDrawerOpen}
+        runIds={runIds}
+        runDrawerId={runDrawerId}
+        setRunDrawerId={setRunDrawerId}
+        runDrawerBusy={runDrawerBusy}
+        runStatus={runStatus}
+        runTape={runTape}
+        revealSensitiveValues={revealSensitiveValues}
+        refreshRun={() => {
+          if (runDrawerId.trim().length > 0) {
+            void loadRunDetails(runDrawerId.trim());
+          }
+        }}
+        close={() => setRunDrawerOpen(false)}
+      />
     </main>
   );
-}
-
-interface ApprovalRequestControlsProps {
-  readonly approvalId: string;
-  readonly draft: ApprovalDraft | undefined;
-  readonly onDraftChange: (next: ApprovalDraft) => void;
-  readonly onDecision: (approved: boolean) => void;
-}
-
-function ApprovalRequestControls({
-  approvalId,
-  draft,
-  onDraftChange,
-  onDecision
-}: ApprovalRequestControlsProps) {
-  const effectiveDraft =
-    draft ??
-    ({
-      scope: DEFAULT_APPROVAL_SCOPE,
-      reason: "",
-      ttl_ms: DEFAULT_APPROVAL_TTL_MS,
-      busy: false
-    } satisfies ApprovalDraft);
-
-  return (
-    <section className="chat-approval-controls" aria-label={`Approval controls ${approvalId}`}>
-      <div className="console-grid-4">
-        <label>
-          Scope
-          <select
-            value={effectiveDraft.scope}
-            onChange={(event) => {
-              const scope = normalizeScope(event.target.value);
-              onDraftChange({
-                ...effectiveDraft,
-                scope
-              });
-            }}
-            disabled={effectiveDraft.busy}
-          >
-            <option value="once">once</option>
-            <option value="session">session</option>
-            <option value="timeboxed">timeboxed</option>
-          </select>
-        </label>
-        <label>
-          TTL ms
-          <input
-            value={effectiveDraft.ttl_ms}
-            disabled={effectiveDraft.scope !== "timeboxed" || effectiveDraft.busy}
-            onChange={(event) => {
-              onDraftChange({
-                ...effectiveDraft,
-                ttl_ms: event.target.value
-              });
-            }}
-          />
-        </label>
-        <label>
-          Reason
-          <input
-            value={effectiveDraft.reason}
-            onChange={(event) => {
-              onDraftChange({
-                ...effectiveDraft,
-                reason: event.target.value
-              });
-            }}
-            disabled={effectiveDraft.busy}
-          />
-        </label>
-        <div className="console-inline-actions">
-          <button type="button" onClick={() => onDecision(true)} disabled={effectiveDraft.busy}>
-            Approve
-          </button>
-          <button type="button" className="button--warn" onClick={() => onDecision(false)} disabled={effectiveDraft.busy}>
-            Deny
-          </button>
-        </div>
-      </div>
-    </section>
-  );
-}
-
-function retainTranscriptWindow(values: TranscriptEntry[]): TranscriptEntry[] {
-  if (values.length <= MAX_TRANSCRIPT_RETENTION) {
-    return values;
-  }
-  return values.slice(values.length - MAX_TRANSCRIPT_RETENTION);
-}
-
-function collectCanvasFrameUrls(value: JsonValue): string[] {
-  const pending: JsonValue[] = [value];
-  const urls = new Set<string>();
-  let inspected = 0;
-  while (pending.length > 0 && inspected < 256) {
-    const current = pending.pop() as JsonValue;
-    inspected += 1;
-    if (typeof current === "string") {
-      const candidate = normalizeCanvasFrameUrl(current);
-      if (candidate !== null) {
-        urls.add(candidate);
-      }
-      continue;
-    }
-    if (Array.isArray(current)) {
-      for (const item of current) {
-        pending.push(item);
-      }
-      continue;
-    }
-    if (isJsonObject(current)) {
-      for (const valueItem of Object.values(current)) {
-        pending.push(valueItem);
-      }
-    }
-  }
-  return Array.from(urls);
-}
-
-function normalizeCanvasFrameUrl(raw: string): string | null {
-  if (!raw.includes("/canvas/v1/frame/")) {
-    return null;
-  }
-  let parsed: URL;
-  try {
-    parsed = new URL(raw, window.location.origin);
-  } catch {
-    return null;
-  }
-  if (parsed.origin !== window.location.origin) {
-    return null;
-  }
-  if (!parsed.pathname.startsWith("/canvas/v1/frame/")) {
-    return null;
-  }
-  if (!parsed.searchParams.has("token")) {
-    return null;
-  }
-  return parsed.toString();
-}
-
-function parseTapePayload(payload: string): JsonValue {
-  try {
-    return JSON.parse(payload) as JsonValue;
-  } catch {
-    return payload;
-  }
-}
-
-function normalizePatchValue(value: unknown): JsonValue | null {
-  if (isJsonValue(value)) {
-    return value;
-  }
-  if (typeof value === "string") {
-    try {
-      const parsed = JSON.parse(value) as unknown;
-      return isJsonValue(parsed) ? parsed : null;
-    } catch {
-      return null;
-    }
-  }
-  return null;
-}
-
-function shortId(value: string): string {
-  if (value.length <= 16) {
-    return value;
-  }
-  return `${value.slice(0, 8)}…${value.slice(-6)}`;
-}
-
-function prettifyEventType(value: string): string {
-  const normalized = value.replace(/_/g, " ").trim();
-  if (normalized.length === 0) {
-    return "Event";
-  }
-  return normalized.charAt(0).toUpperCase() + normalized.slice(1);
-}
-
-function normalizeScope(value: string): ApprovalScope {
-  if (value === "session") {
-    return "session";
-  }
-  if (value === "timeboxed") {
-    return "timeboxed";
-  }
-  return "once";
-}
-
-function parseInteger(raw: string): number | null {
-  const trimmed = raw.trim();
-  if (trimmed.length === 0) {
-    return null;
-  }
-  const parsed = Number.parseInt(trimmed, 10);
-  return Number.isFinite(parsed) ? parsed : null;
-}
-
-function emptyToUndefined(raw: string): string | undefined {
-  const trimmed = raw.trim();
-  return trimmed.length === 0 ? undefined : trimmed;
-}
-
-function isAbortError(error: unknown): boolean {
-  if (error instanceof DOMException) {
-    return error.name === "AbortError";
-  }
-  if (error instanceof Error) {
-    return error.name === "AbortError";
-  }
-  return false;
-}
-
-function toErrorMessage(error: unknown): string {
-  if (error instanceof Error) {
-    return error.message;
-  }
-  return "Unexpected failure.";
-}
-
-function asObject(value: unknown): Record<string, JsonValue> | null {
-  if (value !== null && typeof value === "object" && !Array.isArray(value)) {
-    return value as Record<string, JsonValue>;
-  }
-  return null;
-}
-
-function asString(value: unknown): string | null {
-  if (typeof value === "string") {
-    return value;
-  }
-  return null;
-}
-
-function asBoolean(value: unknown): boolean | null {
-  if (typeof value === "boolean") {
-    return value;
-  }
-  return null;
-}
-
-function isJsonObject(value: JsonValue): value is { [key: string]: JsonValue } {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function isJsonValue(value: unknown): value is JsonValue {
-  if (value === null) {
-    return true;
-  }
-  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
-    return true;
-  }
-  if (Array.isArray(value)) {
-    return value.every((entry) => isJsonValue(entry));
-  }
-  if (typeof value === "object") {
-    return Object.values(value as Record<string, unknown>).every((entry) => isJsonValue(entry));
-  }
-  return false;
-}
-
-function redactValue(value: JsonValue, revealSensitive: boolean): JsonValue {
-  if (revealSensitive) {
-    return value;
-  }
-  if (typeof value === "string") {
-    return SENSITIVE_VALUE_PATTERN.test(value) ? "[redacted]" : value;
-  }
-  if (Array.isArray(value)) {
-    return value.map((entry) => redactValue(entry, false));
-  }
-  if (isJsonObject(value)) {
-    const sanitized: { [key: string]: JsonValue } = {};
-    for (const [key, item] of Object.entries(value)) {
-      sanitized[key] = SENSITIVE_KEY_PATTERN.test(key) ? "[redacted]" : redactValue(item, false);
-    }
-    return sanitized;
-  }
-  return value;
-}
-
-function toPrettyJson(value: JsonValue, revealSensitive: boolean): string {
-  return JSON.stringify(redactValue(value, revealSensitive), null, 2);
 }
