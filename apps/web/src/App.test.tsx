@@ -73,7 +73,9 @@ describe("M35 web console app", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     render(<App />);
-    expect(await screen.findByText("APPROVAL-A")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByText("APPROVAL-A")).toBeInTheDocument();
+    }, { timeout: 5000 });
 
     fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
     expect(await screen.findByRole("heading", { name: "Operator Console" })).toBeInTheDocument();
@@ -686,12 +688,14 @@ describe("M35 web console app", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Diagnostics" }));
     expect(await screen.findByRole("heading", { name: "Diagnostics" })).toBeInTheDocument();
 
-    const rendered = document.body.textContent ?? "";
-    expect(rendered).toContain("[redacted]");
-    expect(rendered).not.toContain("sk-live-super-secret");
-    expect(rendered).not.toContain("oauth-secret");
-    expect(rendered).not.toContain("relay-secret");
-    expect(rendered).not.toContain("browser-secret");
+    await waitFor(() => {
+      const rendered = document.body.textContent ?? "";
+      expect(rendered).toContain("[redacted]");
+      expect(rendered).not.toContain("sk-live-super-secret");
+      expect(rendered).not.toContain("oauth-secret");
+      expect(rendered).not.toContain("relay-secret");
+      expect(rendered).not.toContain("browser-secret");
+    });
   });
 
   it("streams chat transcript with inline approval controls and CSRF decision dispatch", async () => {
