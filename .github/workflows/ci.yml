@@ -172,7 +172,7 @@ jobs:
           toolchain: 1.91.0
 
       - name: Install protobuf compiler
-        run: choco install protoc --yes --no-progress
+        run: ./scripts/protocol/install-protoc-windows.ps1
 
       - name: Validate protobuf schemas
         run: ./scripts/protocol/validate-proto.ps1
