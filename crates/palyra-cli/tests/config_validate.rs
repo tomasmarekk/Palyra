@@ -1,17 +1,29 @@
 use std::fs;
-use std::process::Command;
+use std::process::{Command, Output};
 
 use anyhow::{Context, Result};
 use tempfile::TempDir;
 
+fn configure_cli_env(command: &mut Command, workdir: &TempDir) {
+    command
+        .env("XDG_CONFIG_HOME", workdir.path().join("xdg-config"))
+        .env("HOME", workdir.path().join("home"))
+        .env("LOCALAPPDATA", workdir.path().join("localappdata"))
+        .env("APPDATA", workdir.path().join("appdata"))
+        .env("PROGRAMDATA", workdir.path().join("programdata"));
+}
+
+fn run_cli(workdir: &TempDir, args: &[&str]) -> Result<Output> {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_palyra"));
+    command.current_dir(workdir.path()).args(args);
+    configure_cli_env(&mut command, workdir);
+    command.output().with_context(|| format!("failed to execute palyra {}", args.join(" ")))
+}
+
 #[test]
 fn config_validate_without_path_uses_defaults_when_file_is_missing() -> Result<()> {
     let workdir = TempDir::new().context("failed to create temporary workdir")?;
-    let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
-        .current_dir(workdir.path())
-        .args(["config", "validate"])
-        .output()
-        .context("failed to execute palyra config validate")?;
+    let output = run_cli(&workdir, &["config", "validate"])?;
 
     assert!(
         output.status.success(),
@@ -26,11 +38,7 @@ fn config_validate_without_path_uses_defaults_when_file_is_missing() -> Result<(
 #[test]
 fn config_validate_with_explicit_missing_path_fails() -> Result<()> {
     let workdir = TempDir::new().context("failed to create temporary workdir")?;
-    let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
-        .current_dir(workdir.path())
-        .args(["config", "validate", "--path", "missing.toml"])
-        .output()
-        .context("failed to execute palyra config validate with explicit path")?;
+    let output = run_cli(&workdir, &["config", "validate", "--path", "missing.toml"])?;
 
     assert!(!output.status.success(), "explicit missing config path must fail");
     let stderr = String::from_utf8(output.stderr).context("stderr was not UTF-8")?;
@@ -45,11 +53,7 @@ fn config_validate_without_path_ignores_palyra_capitalized_path_in_cwd() -> Resu
     fs::write(&config_path, "[daemon]\nport=7142\n")
         .with_context(|| format!("failed to write {}", config_path.display()))?;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
-        .current_dir(workdir.path())
-        .args(["config", "validate"])
-        .output()
-        .context("failed to execute palyra config validate")?;
+    let output = run_cli(&workdir, &["config", "validate"])?;
 
     assert!(
         output.status.success(),
@@ -74,11 +78,7 @@ fn config_validate_without_path_ignores_config_directory_path_in_cwd() -> Result
     fs::write(&config_path, "[daemon]\nport=7142\n")
         .with_context(|| format!("failed to write {}", config_path.display()))?;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
-        .current_dir(workdir.path())
-        .args(["config", "validate"])
-        .output()
-        .context("failed to execute palyra config validate")?;
+    let output = run_cli(&workdir, &["config", "validate"])?;
 
     assert!(
         output.status.success(),
@@ -100,11 +100,7 @@ fn config_validate_with_explicit_path_rejects_non_numeric_daemon_port() -> Resul
     fs::write(&config_path, "[daemon]\nport='not-a-number'\n")
         .with_context(|| format!("failed to write {}", config_path.display()))?;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
-        .current_dir(workdir.path())
-        .args(["config", "validate", "--path", "invalid-port.toml"])
-        .output()
-        .context("failed to execute palyra config validate with invalid daemon port")?;
+    let output = run_cli(&workdir, &["config", "validate", "--path", "invalid-port.toml"])?;
 
     assert!(!output.status.success(), "config with string daemon port must fail validation");
     let stderr = String::from_utf8(output.stderr).context("stderr was not UTF-8")?;
@@ -119,11 +115,7 @@ fn config_validate_with_explicit_path_rejects_invalid_bind_address() -> Result<(
     fs::write(&config_path, "[daemon]\nbind_addr='bad host value'\nport=7142\n")
         .with_context(|| format!("failed to write {}", config_path.display()))?;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
-        .current_dir(workdir.path())
-        .args(["config", "validate", "--path", "invalid-bind.toml"])
-        .output()
-        .context("failed to execute palyra config validate with invalid bind address")?;
+    let output = run_cli(&workdir, &["config", "validate", "--path", "invalid-bind.toml"])?;
 
     assert!(!output.status.success(), "config with invalid bind address must fail");
     let stderr = String::from_utf8(output.stderr).context("stderr was not UTF-8")?;
@@ -141,11 +133,8 @@ fn config_validate_with_explicit_path_rejects_invalid_gateway_grpc_bind_address(
     fs::write(&config_path, "[gateway]\ngrpc_bind_addr='bad host value'\ngrpc_port=7443\n")
         .with_context(|| format!("failed to write {}", config_path.display()))?;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
-        .current_dir(workdir.path())
-        .args(["config", "validate", "--path", "invalid-gateway-grpc-bind.toml"])
-        .output()
-        .context("failed to execute palyra config validate with invalid gateway gRPC bind")?;
+    let output =
+        run_cli(&workdir, &["config", "validate", "--path", "invalid-gateway-grpc-bind.toml"])?;
 
     assert!(!output.status.success(), "config with invalid gateway gRPC bind must fail");
     let stderr = String::from_utf8(output.stderr).context("stderr was not UTF-8")?;
@@ -167,11 +156,8 @@ fn config_validate_with_explicit_path_rejects_invalid_gateway_quic_bind_when_ena
     )
     .with_context(|| format!("failed to write {}", config_path.display()))?;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
-        .current_dir(workdir.path())
-        .args(["config", "validate", "--path", "invalid-gateway-quic-bind.toml"])
-        .output()
-        .context("failed to execute palyra config validate with invalid gateway QUIC bind")?;
+    let output =
+        run_cli(&workdir, &["config", "validate", "--path", "invalid-gateway-quic-bind.toml"])?;
 
     assert!(!output.status.success(), "config with invalid gateway QUIC bind must fail");
     let stderr = String::from_utf8(output.stderr).context("stderr was not UTF-8")?;
@@ -193,11 +179,10 @@ fn config_validate_with_explicit_path_ignores_invalid_gateway_quic_bind_when_dis
     )
     .with_context(|| format!("failed to write {}", config_path.display()))?;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
-        .current_dir(workdir.path())
-        .args(["config", "validate", "--path", "disabled-gateway-quic-invalid-bind.toml"])
-        .output()
-        .context("failed to execute palyra config validate with disabled QUIC")?;
+    let output = run_cli(
+        &workdir,
+        &["config", "validate", "--path", "disabled-gateway-quic-invalid-bind.toml"],
+    )?;
 
     assert!(
         output.status.success(),
@@ -216,11 +201,7 @@ fn config_validate_with_explicit_path_accepts_valid_bind_address_and_port() -> R
     fs::write(&config_path, "[daemon]\nbind_addr='127.0.0.1'\nport=7142\n")
         .with_context(|| format!("failed to write {}", config_path.display()))?;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
-        .current_dir(workdir.path())
-        .args(["config", "validate", "--path", "valid-bind.toml"])
-        .output()
-        .context("failed to execute palyra config validate with valid bind address")?;
+    let output = run_cli(&workdir, &["config", "validate", "--path", "valid-bind.toml"])?;
 
     assert!(
         output.status.success(),
@@ -239,11 +220,7 @@ fn config_validate_with_explicit_path_accepts_ipv6_bind_address_without_brackets
     fs::write(&config_path, "[daemon]\nbind_addr='::1'\nport=7142\n")
         .with_context(|| format!("failed to write {}", config_path.display()))?;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
-        .current_dir(workdir.path())
-        .args(["config", "validate", "--path", "valid-ipv6-bind.toml"])
-        .output()
-        .context("failed to execute palyra config validate with ipv6 bind address")?;
+    let output = run_cli(&workdir, &["config", "validate", "--path", "valid-ipv6-bind.toml"])?;
 
     assert!(
         output.status.success(),
@@ -262,11 +239,7 @@ fn config_validate_with_explicit_path_rejects_non_boolean_identity_flag() -> Res
     fs::write(&config_path, "[identity]\nallow_insecure_node_rpc_without_mtls='definitely'\n")
         .with_context(|| format!("failed to write {}", config_path.display()))?;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
-        .current_dir(workdir.path())
-        .args(["config", "validate", "--path", "invalid-identity.toml"])
-        .output()
-        .context("failed to execute palyra config validate with invalid identity flag")?;
+    let output = run_cli(&workdir, &["config", "validate", "--path", "invalid-identity.toml"])?;
 
     assert!(!output.status.success(), "config with non-boolean identity flag must fail");
     let stderr = String::from_utf8(output.stderr).context("stderr was not UTF-8")?;
@@ -284,11 +257,7 @@ fn config_validate_with_explicit_path_rejects_unknown_identity_key() -> Result<(
     )
     .with_context(|| format!("failed to write {}", config_path.display()))?;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
-        .current_dir(workdir.path())
-        .args(["config", "validate", "--path", "unknown-identity-key.toml"])
-        .output()
-        .context("failed to execute palyra config validate with unknown identity key")?;
+    let output = run_cli(&workdir, &["config", "validate", "--path", "unknown-identity-key.toml"])?;
 
     assert!(!output.status.success(), "config with unknown identity key must fail");
     let stderr = String::from_utf8(output.stderr).context("stderr was not UTF-8")?;
@@ -303,11 +272,7 @@ fn config_validate_with_explicit_path_rejects_non_boolean_orchestrator_flag() ->
     fs::write(&config_path, "[orchestrator]\nrunloop_v1_enabled='sometimes'\n")
         .with_context(|| format!("failed to write {}", config_path.display()))?;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
-        .current_dir(workdir.path())
-        .args(["config", "validate", "--path", "invalid-orchestrator.toml"])
-        .output()
-        .context("failed to execute palyra config validate with invalid orchestrator flag")?;
+    let output = run_cli(&workdir, &["config", "validate", "--path", "invalid-orchestrator.toml"])?;
 
     assert!(!output.status.success(), "config with non-boolean orchestrator flag must fail");
     let stderr = String::from_utf8(output.stderr).context("stderr was not UTF-8")?;
