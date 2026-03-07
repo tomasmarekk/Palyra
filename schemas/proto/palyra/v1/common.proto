@@ -56,8 +56,19 @@ message MessageAttachment {
   CanonicalId artifact_id = 2;
   // Canonical contract limit is 104857600 bytes.
   uint64 size_bytes = 3;
+  string attachment_id = 4;
+  string filename = 5;
+  string declared_content_type = 6;
+  string source_url = 7;
+  string content_hash = 8;
+  string origin = 9;
+  string policy_context = 10;
+  bytes inline_bytes = 11;
+  bool upload_requested = 12;
+  uint32 width_px = 13;
+  uint32 height_px = 14;
 
-  reserved 4 to 8;
+  reserved 15 to 24;
 }
 
 message MessageContent {

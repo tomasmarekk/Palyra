@@ -740,6 +740,7 @@ async fn grpc_route_message_splits_reply_into_multiple_outputs_when_payload_limi
         kind: common_v1::message_attachment::AttachmentKind::File as i32,
         artifact_id: Some(common_v1::CanonicalId { ulid: "01ARZ3NDEKTSV4RRFFQ69G5FB3".to_owned() }),
         size_bytes: 2048,
+        ..Default::default()
     }];
     let response = adapter
         .inject_message_with_payload_limit_and_attachments(
@@ -944,6 +945,7 @@ async fn grpc_route_message_preserves_attachment_metadata_in_outbound_and_journa
         kind: common_v1::message_attachment::AttachmentKind::File as i32,
         artifact_id: Some(common_v1::CanonicalId { ulid: "01ARZ3NDEKTSV4RRFFQ69G5FB2".to_owned() }),
         size_bytes: 4096,
+        ..Default::default()
     }];
     let response = adapter
         .inject_message_with_attachments(

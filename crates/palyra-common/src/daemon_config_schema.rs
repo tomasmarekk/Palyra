@@ -70,6 +70,7 @@ pub struct RootFileConfig {
     pub cron: Option<FileCronConfig>,
     pub orchestrator: Option<FileOrchestratorConfig>,
     pub memory: Option<FileMemoryConfig>,
+    pub media: Option<FileMediaConfig>,
     pub model_provider: Option<FileModelProviderConfig>,
     pub tool_call: Option<FileToolCallConfig>,
     pub channel_router: Option<FileChannelRouterConfig>,
@@ -163,6 +164,30 @@ pub struct FileMemoryRetentionConfig {
     pub max_bytes: Option<u64>,
     pub ttl_days: Option<u32>,
     pub vacuum_schedule: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileMediaConfig {
+    pub download_enabled: Option<bool>,
+    pub outbound_upload_enabled: Option<bool>,
+    pub allow_http_fixture_urls: Option<bool>,
+    pub max_attachments_per_message: Option<u64>,
+    pub max_total_attachment_bytes_per_message: Option<u64>,
+    pub max_download_bytes: Option<u64>,
+    pub max_redirects: Option<u64>,
+    pub allowed_source_hosts: Option<Vec<String>>,
+    pub allowed_download_content_types: Option<Vec<String>>,
+    pub vision_allowed_content_types: Option<Vec<String>>,
+    pub vision_max_image_count: Option<u64>,
+    pub vision_max_image_bytes: Option<u64>,
+    pub vision_max_total_bytes: Option<u64>,
+    pub vision_max_dimension_px: Option<u32>,
+    pub outbound_allowed_content_types: Option<Vec<String>>,
+    pub outbound_max_upload_bytes: Option<u64>,
+    pub store_max_bytes: Option<u64>,
+    pub store_max_artifacts: Option<u64>,
+    pub retention_ttl_ms: Option<i64>,
 }
 
 #[derive(Debug, Default, Deserialize)]

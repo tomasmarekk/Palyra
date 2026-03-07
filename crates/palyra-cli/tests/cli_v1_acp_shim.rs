@@ -1,9 +1,9 @@
 use std::{
-    io::{Read, Write},
-    net::{SocketAddr, TcpListener, TcpStream},
+    io::{BufRead, BufReader, Read, Write},
+    net::{SocketAddr, TcpStream},
     path::PathBuf,
-    process::{Child, ChildStderr, Command, Stdio},
-    sync::atomic::{AtomicU32, Ordering},
+    process::{Child, ChildStderr, ChildStdout, Command, Stdio},
+    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
@@ -17,9 +17,7 @@ use ulid::Ulid;
 const ADMIN_TOKEN: &str = "test-admin-token";
 const DEVICE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
-const TEST_PORT_BASE: u16 = 40_000;
-const TEST_PORT_SLOT_COUNT: u32 = 6_000;
-static TEST_PORT_COUNTER: AtomicU32 = AtomicU32::new(0);
+const STARTUP_RETRY_ATTEMPTS: usize = 8;
 
 #[test]
 fn status_reports_http_grpc_and_admin_health() -> Result<()> {
@@ -284,52 +282,77 @@ fn onboarding_wizard_writes_config_file() -> Result<()> {
 }
 
 fn spawn_palyrad_with_dynamic_ports() -> Result<(Child, u16, u16)> {
-    let journal_db_path = unique_temp_journal_db_path();
-    let state_root_dir = unique_temp_state_root_dir();
-    let vault_dir = state_root_dir.join("vault");
-    let identity_store_dir = unique_temp_identity_store_dir();
-    std::fs::create_dir_all(&state_root_dir).with_context(|| {
-        format!("failed to create temporary state root directory {}", state_root_dir.display())
-    })?;
-    std::fs::create_dir_all(&vault_dir).with_context(|| {
-        format!("failed to create temporary vault directory {}", vault_dir.display())
-    })?;
-    std::fs::create_dir_all(&identity_store_dir).with_context(|| {
-        format!(
-            "failed to create temporary identity store directory {}",
-            identity_store_dir.display()
-        )
-    })?;
-    let (admin_port, grpc_port) = reserve_daemon_port_block()?;
-    let mut command = Command::new(resolve_palyrad_binary_path()?);
-    command
-        .args([
-            "--bind",
-            "127.0.0.1",
-            "--port",
-            &admin_port.to_string(),
-            "--grpc-bind",
-            "127.0.0.1",
-            "--grpc-port",
-            &grpc_port.to_string(),
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .env("PALYRA_ADMIN_TOKEN", ADMIN_TOKEN)
-        .env("PALYRA_GATEWAY_QUIC_BIND_ADDR", "127.0.0.1")
-        .env("PALYRA_GATEWAY_QUIC_PORT", "0")
-        .env("PALYRA_STATE_ROOT", state_root_dir.to_string_lossy().to_string())
-        .env("PALYRA_VAULT_BACKEND", "file")
-        .env("PALYRA_VAULT_DIR", vault_dir.to_string_lossy().to_string())
-        .env("PALYRA_JOURNAL_DB_PATH", journal_db_path.to_string_lossy().to_string())
-        .env("PALYRA_GATEWAY_IDENTITY_STORE_DIR", identity_store_dir.to_string_lossy().to_string())
-        .env("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED", "true")
-        .env("RUST_LOG", "info");
+    let mut last_error = None;
 
-    let mut child = command.spawn().context("failed to spawn palyrad process")?;
-    wait_for_health(admin_port, &mut child, STARTUP_TIMEOUT)?;
-    wait_for_tcp_listen(grpc_port, &mut child, STARTUP_TIMEOUT)?;
-    Ok((child, admin_port, grpc_port))
+    for attempt in 1..=STARTUP_RETRY_ATTEMPTS {
+        let journal_db_path = unique_temp_journal_db_path();
+        let state_root_dir = unique_temp_state_root_dir();
+        let vault_dir = state_root_dir.join("vault");
+        let identity_store_dir = unique_temp_identity_store_dir();
+        std::fs::create_dir_all(&state_root_dir).with_context(|| {
+            format!("failed to create temporary state root directory {}", state_root_dir.display())
+        })?;
+        std::fs::create_dir_all(&vault_dir).with_context(|| {
+            format!("failed to create temporary vault directory {}", vault_dir.display())
+        })?;
+        std::fs::create_dir_all(&identity_store_dir).with_context(|| {
+            format!(
+                "failed to create temporary identity store directory {}",
+                identity_store_dir.display()
+            )
+        })?;
+        let mut command = Command::new(resolve_palyrad_binary_path()?);
+        command
+            .args([
+                "--bind",
+                "127.0.0.1",
+                "--port",
+                "0",
+                "--grpc-bind",
+                "127.0.0.1",
+                "--grpc-port",
+                "0",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env("PALYRA_ADMIN_TOKEN", ADMIN_TOKEN)
+            .env("PALYRA_GATEWAY_QUIC_BIND_ADDR", "127.0.0.1")
+            .env("PALYRA_GATEWAY_QUIC_PORT", "0")
+            .env("PALYRA_STATE_ROOT", state_root_dir.to_string_lossy().to_string())
+            .env("PALYRA_VAULT_BACKEND", "file")
+            .env("PALYRA_VAULT_DIR", vault_dir.to_string_lossy().to_string())
+            .env("PALYRA_JOURNAL_DB_PATH", journal_db_path.to_string_lossy().to_string())
+            .env(
+                "PALYRA_GATEWAY_IDENTITY_STORE_DIR",
+                identity_store_dir.to_string_lossy().to_string(),
+            )
+            .env("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED", "true")
+            .env("RUST_LOG", "info");
+
+        let mut child = command.spawn().context("failed to spawn palyrad process")?;
+        let startup_result = child
+            .stdout
+            .take()
+            .context("failed to capture palyrad stdout")
+            .and_then(|stdout| wait_for_listen_ports(stdout, &mut child, STARTUP_TIMEOUT))
+            .and_then(|(admin_port, grpc_port)| {
+                wait_for_health(admin_port, &mut child, STARTUP_TIMEOUT)?;
+                wait_for_tcp_listen(grpc_port, &mut child, STARTUP_TIMEOUT)?;
+                Ok((admin_port, grpc_port))
+            });
+        match startup_result {
+            Ok((admin_port, grpc_port)) => return Ok((child, admin_port, grpc_port)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                last_error = Some(error.context(format!(
+                    "palyrad startup attempt {attempt}/{STARTUP_RETRY_ATTEMPTS} failed"
+                )));
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("failed to start palyrad for tests")))
 }
 
 fn unique_temp_journal_db_path() -> PathBuf {
@@ -354,39 +377,6 @@ fn unique_temp_state_root_dir() -> PathBuf {
         std::process::id(),
         generate_canonical_ulid()
     ))
-}
-
-fn reserve_daemon_port_block() -> Result<(u16, u16)> {
-    for _ in 0..TEST_PORT_SLOT_COUNT {
-        let slot = TEST_PORT_COUNTER.fetch_add(1, Ordering::Relaxed) % TEST_PORT_SLOT_COUNT;
-        let Some(base_port) =
-            TEST_PORT_BASE.checked_add((slot * 3).try_into().context("port slot overflow")?)
-        else {
-            continue;
-        };
-        let Some(grpc_port) = base_port.checked_add(1) else {
-            continue;
-        };
-        let Some(node_rpc_port) = grpc_port.checked_add(1) else {
-            continue;
-        };
-
-        let Ok(admin_listener) = TcpListener::bind(("127.0.0.1", base_port)) else {
-            continue;
-        };
-        let Ok(grpc_listener) = TcpListener::bind(("127.0.0.1", grpc_port)) else {
-            continue;
-        };
-        let Ok(node_listener) = TcpListener::bind(("127.0.0.1", node_rpc_port)) else {
-            continue;
-        };
-
-        drop(node_listener);
-        drop(grpc_listener);
-        drop(admin_listener);
-        return Ok((base_port, grpc_port));
-    }
-    anyhow::bail!("failed to reserve non-conflicting admin/grpc/node-rpc port block")
 }
 
 fn generate_canonical_ulid() -> String {
@@ -431,6 +421,82 @@ fn wait_for_tcp_listen(port: u16, daemon: &mut Child, timeout: Duration) -> Resu
         }
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn wait_for_listen_ports(
+    stdout: ChildStdout,
+    daemon: &mut Child,
+    timeout: Duration,
+) -> Result<(u16, u16)> {
+    let (sender, receiver) = mpsc::channel::<Result<(u16, u16), String>>();
+    thread::spawn(move || {
+        let mut sender = Some(sender);
+        let mut admin_port = None::<u16>;
+        let mut grpc_port = None::<u16>;
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else {
+                if let Some(sender) = sender.take() {
+                    let _ = sender.send(Err("failed to read palyrad stdout line".to_owned()));
+                }
+                return;
+            };
+
+            if admin_port.is_none() {
+                admin_port = parse_port_from_log(&line, "\"listen_addr\":\"");
+            }
+            if grpc_port.is_none() {
+                grpc_port = parse_port_from_log(&line, "\"grpc_listen_addr\":\"");
+            }
+
+            if let (Some(admin_port), Some(grpc_port)) = (admin_port, grpc_port) {
+                if let Some(sender) = sender.take() {
+                    let _ = sender.send(Ok((admin_port, grpc_port)));
+                }
+                return;
+            }
+        }
+
+        if let Some(sender) = sender.take() {
+            let _ = sender.send(Err(
+                "palyrad stdout closed before admin and gRPC listen addresses were published"
+                    .to_owned(),
+            ));
+        }
+    });
+
+    let timeout_at = Instant::now() + timeout;
+    loop {
+        match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(Ok(ports)) => return Ok(ports),
+            Ok(Err(message)) => anyhow::bail!("{message}"),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                anyhow::bail!("listen-address reader disconnected before publishing ports");
+            }
+        }
+
+        if Instant::now() > timeout_at {
+            anyhow::bail!("timed out waiting for palyrad listen address logs");
+        }
+        if let Some(status) = daemon.try_wait().context("failed to check palyrad status")? {
+            let stderr = read_child_stderr(daemon.stderr.take());
+            if stderr.is_empty() {
+                anyhow::bail!(
+                    "palyrad exited before publishing listen addresses with status: {status}"
+                );
+            }
+            anyhow::bail!(
+                "palyrad exited before publishing listen addresses with status: {status}; stderr: {stderr}"
+            );
+        }
+    }
+}
+
+fn parse_port_from_log(line: &str, prefix: &str) -> Option<u16> {
+    let start = line.find(prefix)? + prefix.len();
+    let rest = &line[start..];
+    let end = rest.find('"')?;
+    rest[..end].parse::<SocketAddr>().ok().map(|address| address.port())
 }
 
 fn wait_for_health(port: u16, daemon: &mut Child, timeout: Duration) -> Result<()> {

@@ -50,6 +50,32 @@ impl ModelProviderKind {
     }
 }
 
+fn provider_request_has_vision(request: &ProviderRequest) -> bool {
+    !request.vision_inputs.is_empty()
+}
+
+fn build_openai_chat_content(request: &ProviderRequest) -> Value {
+    if request.vision_inputs.is_empty() {
+        return Value::String(request.input_text.clone());
+    }
+
+    let mut parts = Vec::with_capacity(request.vision_inputs.len().saturating_add(1));
+    parts.push(json!({
+        "type": "text",
+        "text": request.input_text,
+    }));
+    for image in &request.vision_inputs {
+        parts.push(json!({
+            "type": "image_url",
+            "image_url": {
+                "url": format!("data:{};base64,{}", image.mime_type, image.bytes_base64),
+                "detail": "low",
+            }
+        }));
+    }
+    Value::Array(parts)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelProviderAuthProviderKind {
     Openai,
@@ -135,10 +161,20 @@ impl Default for ModelProviderConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderImageInput {
+    pub mime_type: String,
+    pub bytes_base64: String,
+    pub file_name: Option<String>,
+    pub width_px: Option<u32>,
+    pub height_px: Option<u32>,
+    pub artifact_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderRequest {
     pub input_text: String,
     pub json_mode: bool,
-    pub vision_requested: bool,
+    pub vision_inputs: Vec<ProviderImageInput>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -456,7 +492,7 @@ impl ModelProvider for DeterministicProvider {
     ) -> Pin<Box<dyn Future<Output = Result<ProviderResponse, ProviderError>> + Send + 'a>> {
         Box::pin(async move {
             let started_at = Instant::now();
-            if request.vision_requested {
+            if provider_request_has_vision(&request) {
                 self.record_runtime_metrics(true, 0, 0, 0, elapsed_millis_since(started_at));
                 return Err(ProviderError::VisionUnsupported {
                     provider: "deterministic".to_owned(),
@@ -939,7 +975,7 @@ impl OpenAiCompatibleProvider {
     ) -> Result<ProviderResponse, AttemptError> {
         let mut body = json!({
             "model": self.config.openai_model,
-            "messages": [{"role":"user","content": request.input_text}],
+            "messages": [{"role":"user","content": build_openai_chat_content(request)}],
             "stream": false,
         });
         if request.json_mode {
@@ -1037,12 +1073,6 @@ impl ModelProvider for OpenAiCompatibleProvider {
     ) -> Pin<Box<dyn Future<Output = Result<ProviderResponse, ProviderError>> + Send + 'a>> {
         Box::pin(async move {
             let started_at = Instant::now();
-            if request.vision_requested {
-                self.record_runtime_metrics(true, 0, 0, 0, elapsed_millis_since(started_at));
-                return Err(ProviderError::VisionUnsupported {
-                    provider: ModelProviderKind::OpenAiCompatible.as_str().to_owned(),
-                });
-            }
             let Some(api_key) = self.config.openai_api_key.as_ref() else {
                 self.record_runtime_metrics(true, 0, 0, 0, elapsed_millis_since(started_at));
                 return Err(ProviderError::MissingApiKey);
@@ -1135,7 +1165,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
                 streaming_tokens: true,
                 tool_calls: true,
                 json_mode: true,
-                vision: false,
+                vision: true,
             },
             openai_base_url: Some(self.config.openai_base_url.clone()),
             openai_model: Some(self.config.openai_model.clone()),
@@ -1482,7 +1512,8 @@ mod tests {
         build_embeddings_provider, build_model_provider, extract_completion_text,
         normalize_tool_arguments, sanitize_remote_error,
         validate_openai_base_url_network_policy_with_resolver, EmbeddingsRequest,
-        ModelProviderConfig, ModelProviderKind, ProviderError, ProviderEvent, ProviderRequest,
+        ModelProviderConfig, ModelProviderKind, ProviderError, ProviderEvent, ProviderImageInput,
+        ProviderRequest,
     };
 
     fn openai_test_config(base_url: String) -> ModelProviderConfig {
@@ -1513,7 +1544,7 @@ mod tests {
         let request = ProviderRequest {
             input_text: (0..64).map(|index| format!("token{index}")).collect::<Vec<_>>().join(" "),
             json_mode: false,
-            vision_requested: false,
+            vision_inputs: Vec::new(),
         };
         let response =
             provider.complete(request).await.expect("deterministic provider should succeed");
@@ -1536,7 +1567,7 @@ mod tests {
             .complete(ProviderRequest {
                 input_text: "measure deterministic metrics".to_owned(),
                 json_mode: false,
-                vision_requested: false,
+                vision_inputs: Vec::new(),
             })
             .await
             .expect("deterministic provider should succeed");
@@ -1544,7 +1575,14 @@ mod tests {
             .complete(ProviderRequest {
                 input_text: "vision request".to_owned(),
                 json_mode: false,
-                vision_requested: true,
+                vision_inputs: vec![ProviderImageInput {
+                    mime_type: "image/png".to_owned(),
+                    bytes_base64: "iVBORw0KGgo=".to_owned(),
+                    file_name: Some("vision.png".to_owned()),
+                    width_px: Some(1),
+                    height_px: Some(1),
+                    artifact_id: None,
+                }],
             })
             .await;
         assert!(matches!(failed, Err(ProviderError::VisionUnsupported { .. })));
@@ -1582,7 +1620,7 @@ mod tests {
             .complete(ProviderRequest {
                 input_text: "hello".to_owned(),
                 json_mode: false,
-                vision_requested: false,
+                vision_inputs: Vec::new(),
             })
             .await
             .expect("provider should succeed after retry");
@@ -1756,7 +1794,7 @@ mod tests {
             .complete(ProviderRequest {
                 input_text: "hello".to_owned(),
                 json_mode: false,
-                vision_requested: false,
+                vision_inputs: Vec::new(),
             })
             .await;
         assert!(matches!(first, Err(ProviderError::RequestFailed { .. })));
@@ -1764,7 +1802,7 @@ mod tests {
             .complete(ProviderRequest {
                 input_text: "hello again".to_owned(),
                 json_mode: false,
-                vision_requested: false,
+                vision_inputs: Vec::new(),
             })
             .await;
         assert!(
@@ -1991,7 +2029,7 @@ mod tests {
             .complete(ProviderRequest {
                 input_text: "hello".to_owned(),
                 json_mode: false,
-                vision_requested: false,
+                vision_inputs: Vec::new(),
             })
             .await;
 

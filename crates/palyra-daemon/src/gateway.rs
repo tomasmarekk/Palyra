@@ -78,9 +78,10 @@ use crate::{
         OrchestratorTapeAppendRequest, OrchestratorTapeRecord, OrchestratorUsageDelta,
         SkillExecutionStatus, SkillStatusRecord, SkillStatusUpsertRequest,
     },
+    media::MediaRuntimeConfig,
     model_provider::{
-        ModelProvider, ProviderError, ProviderEvent, ProviderRequest, ProviderResponse,
-        ProviderStatusSnapshot,
+        ModelProvider, ProviderError, ProviderEvent, ProviderImageInput, ProviderRequest,
+        ProviderResponse, ProviderStatusSnapshot,
     },
     orchestrator::{is_cancel_command, RunLifecycleState, RunStateMachine, RunTransition},
     tool_protocol::{
@@ -254,6 +255,7 @@ pub struct GatewayRuntimeConfigSnapshot {
     pub max_tape_entries_per_response: usize,
     pub max_tape_bytes_per_response: usize,
     pub channel_router: ChannelRouterConfig,
+    pub media: MediaRuntimeConfig,
     pub tool_call: ToolCallConfig,
     pub http_fetch: HttpFetchRuntimeConfig,
     pub browser_service: BrowserServiceRuntimeConfig,
@@ -5450,7 +5452,7 @@ struct RouteMessageOutputTemplate<'a> {
 #[derive(Debug, Clone)]
 struct PreparedModelProviderInput {
     provider_input_text: String,
-    vision_requested: bool,
+    vision_inputs: Vec<ProviderImageInput>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5796,7 +5798,7 @@ async fn handle_routed_route_message(
         .execute_model_provider(ProviderRequest {
             input_text: prepared_provider_input.provider_input_text,
             json_mode: json_mode_requested,
-            vision_requested: prepared_provider_input.vision_requested,
+            vision_inputs: prepared_provider_input.vision_inputs,
         })
         .await;
 
@@ -6089,10 +6091,54 @@ async fn handle_routed_route_message(
     })
 }
 
-fn message_attachments_request_vision(attachments: &[common_v1::MessageAttachment]) -> bool {
-    attachments.iter().any(|attachment| {
-        attachment.kind == common_v1::message_attachment::AttachmentKind::Image as i32
-    })
+fn build_provider_image_inputs(
+    attachments: &[common_v1::MessageAttachment],
+    media_config: &MediaRuntimeConfig,
+) -> Vec<ProviderImageInput> {
+    let mut inputs = Vec::new();
+    let mut total_bytes = 0usize;
+    for attachment in attachments {
+        if attachment.kind != common_v1::message_attachment::AttachmentKind::Image as i32 {
+            continue;
+        }
+        if inputs.len() >= media_config.vision_max_image_count {
+            break;
+        }
+        let Some(mime_type) = non_empty(attachment.declared_content_type.clone()) else {
+            continue;
+        };
+        if !media_config.vision_allowed_content_types.iter().any(|allowed| allowed == &mime_type) {
+            continue;
+        }
+        if attachment.inline_bytes.is_empty() {
+            continue;
+        }
+        let image_bytes = attachment.inline_bytes.len();
+        if image_bytes > media_config.vision_max_image_bytes {
+            continue;
+        }
+        if total_bytes.saturating_add(image_bytes) > media_config.vision_max_total_bytes {
+            break;
+        }
+        let width_px = (attachment.width_px > 0).then_some(attachment.width_px);
+        let height_px = (attachment.height_px > 0).then_some(attachment.height_px);
+        if width_px.is_some_and(|value| value > media_config.vision_max_dimension_px)
+            || height_px.is_some_and(|value| value > media_config.vision_max_dimension_px)
+        {
+            continue;
+        }
+        total_bytes = total_bytes.saturating_add(image_bytes);
+        inputs.push(ProviderImageInput {
+            mime_type,
+            bytes_base64: base64::engine::general_purpose::STANDARD
+                .encode(attachment.inline_bytes.as_slice()),
+            file_name: non_empty(attachment.filename.clone()),
+            width_px,
+            height_px,
+            artifact_id: attachment.artifact_id.as_ref().map(|value| value.ulid.clone()),
+        });
+    }
+    inputs
 }
 
 fn session_summary_message(session: &OrchestratorSessionRecord) -> gateway_v1::SessionSummary {
@@ -9294,7 +9340,7 @@ async fn prepare_model_provider_input(
     };
     Ok(PreparedModelProviderInput {
         provider_input_text,
-        vision_requested: message_attachments_request_vision(attachments),
+        vision_inputs: build_provider_image_inputs(attachments, &runtime_state.config.media),
     })
 }
 
@@ -13981,7 +14027,7 @@ async fn process_run_stream_message(
         ProviderRequest {
             input_text: prepared_provider_input.provider_input_text,
             json_mode: json_mode_requested,
-            vision_requested: prepared_provider_input.vision_requested,
+            vision_inputs: prepared_provider_input.vision_inputs,
         },
         tape_seq,
     )
@@ -16435,6 +16481,8 @@ mod tests {
         HEADER_DEVICE_ID, HEADER_PRINCIPAL, MAX_APPROVAL_PAGE_LIMIT,
         VAULT_RATE_LIMIT_MAX_PRINCIPAL_BUCKETS, VAULT_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW,
     };
+    use crate::media::MediaRuntimeConfig;
+    use crate::model_provider::ProviderImageInput;
 
     static TEMP_JOURNAL_COUNTER: AtomicU64 = AtomicU64::new(0);
     const PARITY_REDIRECT_CREDENTIALS_URL: &str =
@@ -16545,6 +16593,7 @@ mod tests {
                 max_tape_entries_per_response: 1_000,
                 max_tape_bytes_per_response: 2 * 1024 * 1024,
                 channel_router: crate::channel_router::ChannelRouterConfig::default(),
+                media: MediaRuntimeConfig::default(),
                 tool_call: crate::tool_protocol::ToolCallConfig {
                     allowed_tools: vec!["palyra.echo".to_owned()],
                     max_calls_per_run: 4,
@@ -17285,7 +17334,7 @@ summarize incident";
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn prepare_model_provider_input_marks_vision_requested_for_image_attachments() {
+    async fn prepare_model_provider_input_collects_vision_inputs_for_image_attachments() {
         let state = build_test_runtime_state(false);
         let mut memory_config = state.memory_config_snapshot();
         memory_config.auto_inject_enabled = false;
@@ -17299,6 +17348,10 @@ summarize incident";
         };
         let attachments = vec![common_v1::MessageAttachment {
             kind: common_v1::message_attachment::AttachmentKind::Image as i32,
+            declared_content_type: "image/png".to_owned(),
+            inline_bytes: vec![0x89, b'P', b'N', b'G'],
+            width_px: 128,
+            height_px: 64,
             ..Default::default()
         }];
         let mut tape_seq = 1_i64;
@@ -17319,7 +17372,12 @@ summarize incident";
         )
         .await
         .expect("provider input preparation should succeed");
-        assert!(prepared.vision_requested, "image attachment should request vision mode");
+        assert_eq!(
+            prepared.vision_inputs.len(),
+            1,
+            "image attachment should produce a vision input"
+        );
+        assert_eq!(prepared.vision_inputs[0].mime_type, "image/png");
         assert_eq!(
             prepared.provider_input_text, "summarize screenshot",
             "without memory auto-inject helper should preserve raw input text"
@@ -18046,7 +18104,7 @@ summarize incident";
             .execute_model_provider(ProviderRequest {
                 input_text: "status snapshot provider metrics".to_owned(),
                 json_mode: false,
-                vision_requested: false,
+                vision_inputs: Vec::new(),
             })
             .await
             .expect("deterministic provider request should succeed");
@@ -18054,7 +18112,14 @@ summarize incident";
             .execute_model_provider(ProviderRequest {
                 input_text: "vision unsupported path".to_owned(),
                 json_mode: false,
-                vision_requested: true,
+                vision_inputs: vec![ProviderImageInput {
+                    mime_type: "image/png".to_owned(),
+                    bytes_base64: "iVBORw0KGgo=".to_owned(),
+                    file_name: Some("status.png".to_owned()),
+                    width_px: Some(1),
+                    height_px: Some(1),
+                    artifact_id: None,
+                }],
             })
             .await;
         assert!(

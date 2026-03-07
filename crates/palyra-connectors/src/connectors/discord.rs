@@ -7,10 +7,11 @@ use std::{
 };
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use flate2::{Decompress, FlushDecompress};
 use futures::{SinkExt, StreamExt};
 use palyra_common::redaction::redact_auth_error;
-use reqwest::{redirect::Policy, Client, Url};
+use reqwest::{multipart, redirect::Policy, Client, Url};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
@@ -48,6 +49,9 @@ const IDENTITY_CACHE_TTL_MS: i64 = 5 * 60 * 1_000;
 const MAX_DELIVERY_CACHE: usize = 4_096;
 const MAX_ROUTE_LIMIT_CACHE: usize = 256;
 const DEFAULT_MIN_RATE_LIMIT_RETRY_MS: u64 = 250;
+const DISCORD_MAX_UPLOAD_BYTES: usize = 4 * 1024 * 1024;
+const DISCORD_UPLOAD_ALLOWED_CONTENT_TYPES: &[&str] =
+    &["image/png", "image/jpeg", "image/webp", "image/gif", "text/plain", "application/json"];
 const DISCORD_FALLBACK_ALLOWLIST: [&str; 8] = [
     "discord.com",
     "*.discord.com",
@@ -85,8 +89,16 @@ impl ConnectorAdapter for DiscordConnectorAdapter {
         _instance: &ConnectorInstanceRecord,
         request: &OutboundMessageRequest,
     ) -> Result<Vec<OutboundMessageRequest>, ConnectorAdapterError> {
-        let rendered_text =
-            with_attachment_context(request.text.as_str(), request.attachments.as_slice());
+        let rendered_text = with_attachment_context(
+            request.text.as_str(),
+            request
+                .attachments
+                .iter()
+                .filter(|attachment| !attachment.upload_requested)
+                .cloned()
+                .collect::<Vec<_>>()
+                .as_slice(),
+        );
         let chunks = chunk_discord_text(
             rendered_text.as_str(),
             self.config.max_chunk_chars,
@@ -109,6 +121,7 @@ impl ConnectorAdapter for DiscordConnectorAdapter {
             next.text = chunk;
             if index > 0 {
                 next.envelope_id = format!("{}:chunk{index}", request.envelope_id);
+                next.attachments.clear();
                 next.structured_json = None;
                 next.a2ui_update = None;
             }
@@ -266,17 +279,34 @@ impl ConnectorAdapter for DiscordConnectorAdapter {
             return Ok(DeliveryOutcome::PermanentFailure { reason: error.to_string() });
         }
 
-        let payload = build_discord_message_payload(request);
-        let response = match self
-            .transport
-            .post_json(
-                &message_url,
-                credential.token.as_str(),
-                &payload,
-                self.config.request_timeout_ms,
-            )
-            .await
-        {
+        let upload_files = match collect_discord_upload_files(request) {
+            Ok(files) => files,
+            Err(reason) => {
+                self.record_last_error(reason.as_str());
+                return Ok(DeliveryOutcome::PermanentFailure { reason });
+            }
+        };
+        let payload = build_discord_message_payload(request, upload_files.as_slice());
+        let response = match if upload_files.is_empty() {
+            self.transport
+                .post_json(
+                    &message_url,
+                    credential.token.as_str(),
+                    &payload,
+                    self.config.request_timeout_ms,
+                )
+                .await
+        } else {
+            self.transport
+                .post_multipart(
+                    &message_url,
+                    credential.token.as_str(),
+                    &payload,
+                    upload_files.as_slice(),
+                    self.config.request_timeout_ms,
+                )
+                .await
+        } {
             Ok(response) => response,
             Err(error) => {
                 let reason = redact_auth_error(error.to_string().as_str());
@@ -474,10 +504,80 @@ fn percent_encode_component(raw: &str) -> String {
     encoded
 }
 
-fn build_discord_message_payload(request: &OutboundMessageRequest) -> Value {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscordMultipartAttachment {
+    pub filename: String,
+    pub content_type: String,
+    pub bytes: Vec<u8>,
+}
+
+fn collect_discord_upload_files(
+    request: &OutboundMessageRequest,
+) -> Result<Vec<DiscordMultipartAttachment>, String> {
+    let mut files = Vec::new();
+    for attachment in &request.attachments {
+        if !attachment.upload_requested {
+            continue;
+        }
+        let Some(content_type) =
+            attachment.content_type.as_deref().map(str::trim).filter(|value| !value.is_empty())
+        else {
+            return Err("discord upload attachment requires content_type".to_owned());
+        };
+        if !DISCORD_UPLOAD_ALLOWED_CONTENT_TYPES.iter().any(|allowed| allowed == &content_type) {
+            return Err(format!(
+                "discord upload content type '{content_type}' is blocked by policy"
+            ));
+        }
+        let Some(inline_base64) =
+            attachment.inline_base64.as_deref().map(str::trim).filter(|value| !value.is_empty())
+        else {
+            return Err("discord upload attachment requires inline_base64".to_owned());
+        };
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(inline_base64)
+            .map_err(|_| "discord upload attachment inline_base64 is invalid".to_owned())?;
+        if bytes.len() > DISCORD_MAX_UPLOAD_BYTES {
+            return Err(format!(
+                "discord upload attachment exceeds max bytes ({}/{DISCORD_MAX_UPLOAD_BYTES})",
+                bytes.len()
+            ));
+        }
+        files.push(DiscordMultipartAttachment {
+            filename: sanitize_discord_upload_filename(
+                attachment.filename.as_deref(),
+                content_type,
+            ),
+            content_type: content_type.to_owned(),
+            bytes,
+        });
+    }
+    Ok(files)
+}
+
+fn build_discord_message_payload(
+    request: &OutboundMessageRequest,
+    upload_files: &[DiscordMultipartAttachment],
+) -> Value {
     let mut payload = json!({
         "content": request.text,
+        "nonce": discord_message_nonce(request),
+        "enforce_nonce": true,
     });
+    if !upload_files.is_empty() {
+        payload["attachments"] = Value::Array(
+            upload_files
+                .iter()
+                .enumerate()
+                .map(|(index, file)| {
+                    json!({
+                        "id": index.to_string(),
+                        "filename": file.filename,
+                    })
+                })
+                .collect(),
+        );
+    }
     if let Some(in_reply_to_message_id) =
         request.in_reply_to_message_id.as_deref().map(str::trim).filter(|value| !value.is_empty())
     {
@@ -487,6 +587,43 @@ fn build_discord_message_payload(request: &OutboundMessageRequest) -> Value {
         });
     }
     payload
+}
+
+fn discord_message_nonce(request: &OutboundMessageRequest) -> String {
+    stable_fingerprint_hex(
+        json!({
+            "envelope_id": request.envelope_id,
+            "connector_id": request.connector_id,
+            "conversation_id": request.conversation_id,
+            "thread_id": request.reply_thread_id,
+        })
+        .to_string()
+        .as_bytes(),
+    )
+}
+
+fn sanitize_discord_upload_filename(raw: Option<&str>, content_type: &str) -> String {
+    let mut sanitized = raw
+        .unwrap_or_default()
+        .chars()
+        .map(
+            |ch| if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') { ch } else { '_' },
+        )
+        .collect::<String>()
+        .trim_matches('.')
+        .to_owned();
+    if sanitized.is_empty() {
+        sanitized = match content_type {
+            "image/png" => "attachment.png".to_owned(),
+            "image/jpeg" => "attachment.jpg".to_owned(),
+            "image/webp" => "attachment.webp".to_owned(),
+            "image/gif" => "attachment.gif".to_owned(),
+            "application/json" => "attachment.json".to_owned(),
+            "text/plain" => "attachment.txt".to_owned(),
+            _ => "attachment.bin".to_owned(),
+        };
+    }
+    sanitized
 }
 
 fn parse_discord_message_id(raw_body: &str) -> Option<String> {
@@ -929,6 +1066,14 @@ mod tests {
         method: String,
         url: String,
         payload: Option<Value>,
+        multipart_files: Vec<CapturedMultipartFile>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct CapturedMultipartFile {
+        filename: String,
+        content_type: String,
+        bytes: Vec<u8>,
     }
 
     #[derive(Default)]
@@ -937,6 +1082,9 @@ mod tests {
             VecDeque<Result<DiscordTransportResponse, crate::supervisor::ConnectorAdapterError>>,
         >,
         post_responses: Mutex<
+            VecDeque<Result<DiscordTransportResponse, crate::supervisor::ConnectorAdapterError>>,
+        >,
+        post_multipart_responses: Mutex<
             VecDeque<Result<DiscordTransportResponse, crate::supervisor::ConnectorAdapterError>>,
         >,
         put_responses: Mutex<
@@ -963,6 +1111,16 @@ mod tests {
             self.post_responses
                 .lock()
                 .expect("post response lock should not be poisoned")
+                .push_back(response);
+        }
+
+        fn push_post_multipart_response(
+            &self,
+            response: Result<DiscordTransportResponse, crate::supervisor::ConnectorAdapterError>,
+        ) {
+            self.post_multipart_responses
+                .lock()
+                .expect("multipart response lock should not be poisoned")
                 .push_back(response);
         }
 
@@ -1050,7 +1208,12 @@ mod tests {
             _timeout_ms: u64,
         ) -> Result<DiscordTransportResponse, crate::supervisor::ConnectorAdapterError> {
             self.captured.lock().expect("captured lock should not be poisoned").push(
-                CapturedCall { method: "GET".to_owned(), url: url.to_string(), payload: None },
+                CapturedCall {
+                    method: "GET".to_owned(),
+                    url: url.to_string(),
+                    payload: None,
+                    multipart_files: Vec::new(),
+                },
             );
             self.get_responses
                 .lock()
@@ -1077,11 +1240,48 @@ mod tests {
                     method: "POST".to_owned(),
                     url: url.to_string(),
                     payload: Some(payload.clone()),
+                    multipart_files: Vec::new(),
                 },
             );
             self.post_responses
                 .lock()
                 .expect("post response lock should not be poisoned")
+                .pop_front()
+                .unwrap_or_else(|| {
+                    Ok(DiscordTransportResponse {
+                        status: 200,
+                        headers: Default::default(),
+                        body: "{\"id\":\"native-default\"}".to_owned(),
+                    })
+                })
+        }
+
+        async fn post_multipart(
+            &self,
+            url: &Url,
+            _token: &str,
+            payload: &Value,
+            files: &[super::DiscordMultipartAttachment],
+            _timeout_ms: u64,
+        ) -> Result<DiscordTransportResponse, crate::supervisor::ConnectorAdapterError> {
+            self.captured.lock().expect("captured lock should not be poisoned").push(
+                CapturedCall {
+                    method: "POST_MULTIPART".to_owned(),
+                    url: url.to_string(),
+                    payload: Some(payload.clone()),
+                    multipart_files: files
+                        .iter()
+                        .map(|file| CapturedMultipartFile {
+                            filename: file.filename.clone(),
+                            content_type: file.content_type.clone(),
+                            bytes: file.bytes.clone(),
+                        })
+                        .collect(),
+                },
+            );
+            self.post_multipart_responses
+                .lock()
+                .expect("multipart response lock should not be poisoned")
                 .pop_front()
                 .unwrap_or_else(|| {
                     Ok(DiscordTransportResponse {
@@ -1099,7 +1299,12 @@ mod tests {
             _timeout_ms: u64,
         ) -> Result<DiscordTransportResponse, crate::supervisor::ConnectorAdapterError> {
             self.captured.lock().expect("captured lock should not be poisoned").push(
-                CapturedCall { method: "PUT".to_owned(), url: url.to_string(), payload: None },
+                CapturedCall {
+                    method: "PUT".to_owned(),
+                    url: url.to_string(),
+                    payload: None,
+                    multipart_files: Vec::new(),
+                },
             );
             self.put_responses
                 .lock()
@@ -1112,6 +1317,24 @@ mod tests {
                         body: String::new(),
                     })
                 })
+        }
+    }
+
+    fn sample_inline_png_base64() -> String {
+        use base64::Engine as _;
+
+        base64::engine::general_purpose::STANDARD.encode([0_u8, 1_u8, 2_u8, 3_u8])
+    }
+
+    fn sample_upload_attachment() -> AttachmentRef {
+        AttachmentRef {
+            kind: AttachmentKind::Image,
+            filename: Some("sample image.png".to_owned()),
+            content_type: Some("image/png".to_owned()),
+            size_bytes: Some(4),
+            upload_requested: true,
+            inline_base64: Some(sample_inline_png_base64()),
+            ..AttachmentRef::default()
         }
     }
 
@@ -1860,6 +2083,103 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn send_outbound_uses_multipart_upload_for_requested_inline_attachments() {
+        let transport = Arc::new(FakeTransport::default());
+        transport.push_get_response(Ok(ok_identity_response()));
+        transport.push_post_multipart_response(Ok(DiscordTransportResponse {
+            status: 200,
+            headers: Default::default(),
+            body: "{\"id\":\"native-upload\"}".to_owned(),
+        }));
+        let adapter = adapter_with_fake_transport(Arc::clone(&transport));
+        let mut request = sample_request("upload");
+        request.attachments = vec![sample_upload_attachment()];
+
+        let outcome = adapter
+            .send_outbound(&sample_instance(), &request)
+            .await
+            .expect("multipart send should complete");
+        assert!(matches!(
+            outcome,
+            DeliveryOutcome::Delivered {
+                native_message_id
+            } if native_message_id == "native-upload"
+        ));
+
+        let captured = transport.captured();
+        assert_eq!(
+            captured.iter().filter(|entry| entry.method == "POST").count(),
+            0,
+            "upload requests should avoid JSON-only POST"
+        );
+        let multipart_call = captured
+            .iter()
+            .find(|entry| entry.method == "POST_MULTIPART")
+            .expect("expected multipart POST call");
+        let payload =
+            multipart_call.payload.as_ref().expect("multipart call should capture payload");
+        assert_eq!(
+            payload.get("attachments").and_then(Value::as_array).map(Vec::len),
+            Some(1),
+            "multipart payload should declare uploaded attachment metadata"
+        );
+        assert_eq!(
+            payload
+                .get("attachments")
+                .and_then(Value::as_array)
+                .and_then(|entries| entries.first())
+                .and_then(|entry| entry.get("filename"))
+                .and_then(Value::as_str),
+            Some("sample_image.png"),
+            "multipart payload should sanitize attachment filenames deterministically"
+        );
+        assert_eq!(multipart_call.multipart_files.len(), 1);
+        assert_eq!(multipart_call.multipart_files[0].content_type, "image/png");
+        assert_eq!(multipart_call.multipart_files[0].bytes, vec![0_u8, 1_u8, 2_u8, 3_u8]);
+    }
+
+    #[tokio::test]
+    async fn send_outbound_multipart_upload_is_idempotent_for_same_envelope() {
+        let transport = Arc::new(FakeTransport::default());
+        transport.push_get_response(Ok(ok_identity_response()));
+        transport.push_post_multipart_response(Ok(DiscordTransportResponse {
+            status: 200,
+            headers: Default::default(),
+            body: "{\"id\":\"native-upload-1\"}".to_owned(),
+        }));
+        let adapter = adapter_with_fake_transport(Arc::clone(&transport));
+        let mut request = sample_request("upload");
+        request.attachments = vec![sample_upload_attachment()];
+
+        let first = adapter
+            .send_outbound(&sample_instance(), &request)
+            .await
+            .expect("first multipart send should succeed");
+        let second = adapter
+            .send_outbound(&sample_instance(), &request)
+            .await
+            .expect("second multipart send should hit idempotency cache");
+
+        assert!(matches!(
+            first,
+            DeliveryOutcome::Delivered {
+                native_message_id
+            } if native_message_id == "native-upload-1"
+        ));
+        assert!(matches!(
+            second,
+            DeliveryOutcome::Delivered {
+                native_message_id
+            } if native_message_id == "native-upload-1"
+        ));
+        assert_eq!(
+            transport.captured().iter().filter(|entry| entry.method == "POST_MULTIPART").count(),
+            1,
+            "multipart upload path must not emit duplicate visible sends for the same envelope"
+        );
+    }
+
     #[test]
     fn split_outbound_chunks_large_payload_and_keeps_envelope_deterministic() {
         let transport = Arc::new(FakeTransport::default());
@@ -1890,10 +2210,10 @@ mod tests {
         request.attachments = vec![AttachmentRef {
             kind: AttachmentKind::Image,
             url: Some("u".to_owned()),
-            artifact_ref: None,
             filename: Some("a".to_owned()),
             content_type: Some("i".to_owned()),
             size_bytes: Some(1),
+            ..AttachmentRef::default()
         }];
 
         let chunks = adapter
@@ -1908,6 +2228,33 @@ mod tests {
         assert!(
             rendered.contains("kind=image, filename=a, content_type=i, size_bytes=1, source=u"),
             "attachment metadata should preserve key fields for operator visibility"
+        );
+    }
+
+    #[test]
+    fn split_outbound_keeps_upload_attachments_only_on_first_chunk() {
+        let transport = Arc::new(FakeTransport::default());
+        let adapter = adapter_with_fake_transport(transport);
+        let text = (0..100).map(|index| format!("line-{index}")).collect::<Vec<_>>().join("\n");
+        let mut request = sample_request(text.as_str());
+        request.attachments = vec![sample_upload_attachment()];
+
+        let chunks = adapter
+            .split_outbound(&sample_instance(), &request)
+            .expect("split should succeed with upload attachment");
+        assert!(chunks.len() > 1, "fixture should force multiple chunks");
+        assert_eq!(chunks[0].attachments.len(), 1, "first chunk should retain upload metadata");
+        assert!(
+            !chunks[0].text.contains("[attachment-metadata]"),
+            "upload attachments should not be rendered into textual metadata context"
+        );
+        assert!(
+            chunks[0].text.starts_with("line-0\nline-1"),
+            "first chunk should still preserve the leading body content"
+        );
+        assert!(
+            chunks.iter().skip(1).all(|chunk| chunk.attachments.is_empty()),
+            "secondary chunks must not re-upload the same attachment"
         );
     }
 
@@ -2152,6 +2499,23 @@ mod tests {
         assert_eq!(second.as_deref(), Some(raw));
     }
 
+    #[test]
+    fn parse_discord_attachments_treats_svg_as_file() {
+        let attachments = super::parse_discord_attachments(Some(&json!([{
+            "id": "att-1",
+            "url": "https://cdn.discordapp.com/attachments/1/2/diagram.svg",
+            "filename": "diagram.svg",
+            "content_type": "image/svg+xml",
+            "size": 128
+        }])));
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(
+            attachments[0].kind,
+            AttachmentKind::File,
+            "SVG attachments must not enter the image/vision pipeline"
+        );
+    }
+
     fn sample_gateway_zlib_frame() -> Vec<u8> {
         vec![
             0x78, 0x9C, 0xAA, 0x56, 0xCA, 0x2F, 0x50, 0xB2, 0x32, 0x34, 0xD4, 0x51, 0x4A, 0x51,
@@ -2266,6 +2630,15 @@ pub trait DiscordTransport: Send + Sync {
         timeout_ms: u64,
     ) -> Result<DiscordTransportResponse, ConnectorAdapterError>;
 
+    async fn post_multipart(
+        &self,
+        url: &Url,
+        token: &str,
+        payload: &Value,
+        files: &[DiscordMultipartAttachment],
+        timeout_ms: u64,
+    ) -> Result<DiscordTransportResponse, ConnectorAdapterError>;
+
     async fn put(
         &self,
         url: &Url,
@@ -2323,6 +2696,39 @@ impl DiscordTransport for ReqwestDiscordTransport {
             .header("User-Agent", "palyra-discord-connector/1.0")
             .timeout(Duration::from_millis(timeout_ms.max(1)))
             .json(payload)
+            .send()
+            .await
+            .map_err(map_reqwest_error)?;
+        response_to_transport(response).await
+    }
+
+    async fn post_multipart(
+        &self,
+        url: &Url,
+        token: &str,
+        payload: &Value,
+        files: &[DiscordMultipartAttachment],
+        timeout_ms: u64,
+    ) -> Result<DiscordTransportResponse, ConnectorAdapterError> {
+        let mut form = multipart::Form::new().text("payload_json", payload.to_string());
+        for (index, file) in files.iter().enumerate() {
+            let part = multipart::Part::bytes(file.bytes.clone())
+                .file_name(file.filename.clone())
+                .mime_str(file.content_type.as_str())
+                .map_err(|error| {
+                    ConnectorAdapterError::Backend(format!(
+                        "discord multipart content type is invalid: {error}"
+                    ))
+                })?;
+            form = form.part(format!("files[{index}]"), part);
+        }
+        let response = self
+            .client
+            .post(url.clone())
+            .header("Authorization", format!("Bot {token}"))
+            .header("User-Agent", "palyra-discord-connector/1.0")
+            .timeout(Duration::from_millis(timeout_ms.max(1)))
+            .multipart(form)
             .send()
             .await
             .map_err(map_reqwest_error)?;
@@ -3638,32 +4044,40 @@ fn parse_discord_attachments(raw: Option<&Value>) -> Vec<AttachmentRef> {
             {
                 return None;
             }
-            let kind = if content_type
+            let filename_lower = filename.as_deref().map(|value| value.to_ascii_lowercase());
+            let content_type_lower =
+                content_type.as_deref().map(|value| value.to_ascii_lowercase());
+            let is_svg = content_type_lower.as_deref() == Some("image/svg+xml")
+                || filename_lower.as_deref().is_some_and(|value| value.ends_with(".svg"));
+            let is_image_like = content_type_lower
                 .as_deref()
-                .map(|value| value.to_ascii_lowercase().starts_with("image/"))
+                .map(|value| value.starts_with("image/"))
                 .unwrap_or(false)
-                || filename.as_deref().map(|value| value.to_ascii_lowercase()).is_some_and(
-                    |value| {
-                        value.ends_with(".png")
-                            || value.ends_with(".jpg")
-                            || value.ends_with(".jpeg")
-                            || value.ends_with(".gif")
-                            || value.ends_with(".webp")
-                            || value.ends_with(".bmp")
-                            || value.ends_with(".svg")
-                    },
-                ) {
-                AttachmentKind::Image
-            } else {
-                AttachmentKind::File
-            };
+                || filename_lower.as_deref().is_some_and(|value| {
+                    value.ends_with(".png")
+                        || value.ends_with(".jpg")
+                        || value.ends_with(".jpeg")
+                        || value.ends_with(".gif")
+                        || value.ends_with(".webp")
+                        || value.ends_with(".bmp")
+                });
+            let kind =
+                if is_image_like && !is_svg { AttachmentKind::Image } else { AttachmentKind::File };
             Some(AttachmentRef {
                 kind,
+                attachment_id: entry
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned),
                 url,
                 artifact_ref: None,
                 filename,
                 content_type,
                 size_bytes,
+                origin: Some("discord_inbound".to_owned()),
+                ..AttachmentRef::default()
             })
         })
         .collect()

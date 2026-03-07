@@ -17,6 +17,7 @@ use crate::channel_router::{
     BroadcastStrategy, ChannelRouterConfig, ChannelRoutingRule, DirectMessagePolicy,
 };
 use crate::cron::CronTimezoneMode;
+use crate::media::MediaRuntimeConfig;
 use crate::model_provider::{
     validate_openai_base_url_network_policy, ModelProviderAuthProviderKind, ModelProviderConfig,
     ModelProviderKind,
@@ -107,6 +108,7 @@ pub struct LoadedConfig {
     pub cron: CronConfig,
     pub orchestrator: OrchestratorConfig,
     pub memory: MemoryConfig,
+    pub media: MediaRuntimeConfig,
     pub model_provider: ModelProviderConfig,
     pub tool_call: ToolCallConfig,
     pub channel_router: ChannelRouterConfig,
@@ -567,6 +569,7 @@ pub fn load_config() -> Result<LoadedConfig> {
     let mut cron = CronConfig::default();
     let mut orchestrator = OrchestratorConfig::default();
     let mut memory = MemoryConfig::default();
+    let mut media = MediaRuntimeConfig::default();
     let mut model_provider = ModelProviderConfig::default();
     let mut tool_call = ToolCallConfig::default();
     let mut channel_router = ChannelRouterConfig::default();
@@ -718,6 +721,98 @@ pub fn load_config() -> Result<LoadedConfig> {
                         "memory.retention.vacuum_schedule",
                     )?;
                 }
+            }
+        }
+        if let Some(file_media) = parsed.media {
+            if let Some(download_enabled) = file_media.download_enabled {
+                media.download_enabled = download_enabled;
+            }
+            if let Some(outbound_upload_enabled) = file_media.outbound_upload_enabled {
+                media.outbound_upload_enabled = outbound_upload_enabled;
+            }
+            if let Some(allow_http_fixture_urls) = file_media.allow_http_fixture_urls {
+                media.allow_http_fixture_urls = allow_http_fixture_urls;
+            }
+            if let Some(max_attachments_per_message) = file_media.max_attachments_per_message {
+                media.max_attachments_per_message = parse_positive_usize(
+                    max_attachments_per_message,
+                    "media.max_attachments_per_message",
+                )?;
+            }
+            if let Some(max_total_attachment_bytes_per_message) =
+                file_media.max_total_attachment_bytes_per_message
+            {
+                media.max_total_attachment_bytes_per_message = parse_positive_u64(
+                    max_total_attachment_bytes_per_message,
+                    "media.max_total_attachment_bytes_per_message",
+                )?;
+            }
+            if let Some(max_download_bytes) = file_media.max_download_bytes {
+                media.max_download_bytes =
+                    parse_positive_usize(max_download_bytes, "media.max_download_bytes")?;
+            }
+            if let Some(max_redirects) = file_media.max_redirects {
+                media.max_redirects = parse_positive_usize(max_redirects, "media.max_redirects")?;
+            }
+            if let Some(allowed_source_hosts) = file_media.allowed_source_hosts {
+                media.allowed_source_hosts = parse_host_allowlist(
+                    allowed_source_hosts.join(",").as_str(),
+                    "media.allowed_source_hosts",
+                )?;
+            }
+            if let Some(allowed_download_content_types) = file_media.allowed_download_content_types
+            {
+                media.allowed_download_content_types = parse_content_type_allowlist(
+                    allowed_download_content_types.join(",").as_str(),
+                    "media.allowed_download_content_types",
+                )?;
+            }
+            if let Some(vision_allowed_content_types) = file_media.vision_allowed_content_types {
+                media.vision_allowed_content_types = parse_content_type_allowlist(
+                    vision_allowed_content_types.join(",").as_str(),
+                    "media.vision_allowed_content_types",
+                )?;
+            }
+            if let Some(vision_max_image_count) = file_media.vision_max_image_count {
+                media.vision_max_image_count =
+                    parse_positive_usize(vision_max_image_count, "media.vision_max_image_count")?;
+            }
+            if let Some(vision_max_image_bytes) = file_media.vision_max_image_bytes {
+                media.vision_max_image_bytes =
+                    parse_positive_usize(vision_max_image_bytes, "media.vision_max_image_bytes")?;
+            }
+            if let Some(vision_max_total_bytes) = file_media.vision_max_total_bytes {
+                media.vision_max_total_bytes =
+                    parse_positive_usize(vision_max_total_bytes, "media.vision_max_total_bytes")?;
+            }
+            if let Some(vision_max_dimension_px) = file_media.vision_max_dimension_px {
+                media.vision_max_dimension_px =
+                    parse_positive_u32(vision_max_dimension_px, "media.vision_max_dimension_px")?;
+            }
+            if let Some(outbound_allowed_content_types) = file_media.outbound_allowed_content_types
+            {
+                media.outbound_allowed_content_types = parse_content_type_allowlist(
+                    outbound_allowed_content_types.join(",").as_str(),
+                    "media.outbound_allowed_content_types",
+                )?;
+            }
+            if let Some(outbound_max_upload_bytes) = file_media.outbound_max_upload_bytes {
+                media.outbound_max_upload_bytes = parse_positive_usize(
+                    outbound_max_upload_bytes,
+                    "media.outbound_max_upload_bytes",
+                )?;
+            }
+            if let Some(store_max_bytes) = file_media.store_max_bytes {
+                media.store_max_bytes =
+                    parse_positive_u64(store_max_bytes, "media.store_max_bytes")?;
+            }
+            if let Some(store_max_artifacts) = file_media.store_max_artifacts {
+                media.store_max_artifacts =
+                    parse_positive_usize(store_max_artifacts, "media.store_max_artifacts")?;
+            }
+            if let Some(retention_ttl_ms) = file_media.retention_ttl_ms {
+                media.retention_ttl_ms =
+                    parse_positive_i64(retention_ttl_ms, "media.retention_ttl_ms")?;
             }
         }
         if let Some(file_model_provider) = parsed.model_provider {
@@ -1926,6 +2021,7 @@ pub fn load_config() -> Result<LoadedConfig> {
         cron,
         orchestrator,
         memory,
+        media,
         model_provider,
         tool_call,
         channel_router,
@@ -2540,6 +2636,13 @@ fn parse_positive_u32(value: u32, name: &str) -> Result<u32> {
     Ok(value)
 }
 
+fn parse_positive_i64(value: i64, name: &str) -> Result<i64> {
+    if value <= 0 {
+        anyhow::bail!("{name} must be greater than 0");
+    }
+    Ok(value)
+}
+
 fn parse_positive_usize(value: u64, name: &str) -> Result<usize> {
     if value == 0 {
         anyhow::bail!("{name} must be greater than 0");
@@ -2832,6 +2935,47 @@ mod tests {
         assert_eq!(channels[0].channel.as_deref(), Some("slack"));
         assert_eq!(channels[0].direct_message_policy.as_deref(), Some("allow"));
         assert_eq!(channels[0].broadcast_strategy.as_deref(), Some("allow"));
+    }
+
+    #[test]
+    fn media_config_parses_attachment_pipeline_limits() {
+        let (parsed, _) = parse_root_file_config(
+            r#"
+            [media]
+            download_enabled = true
+            outbound_upload_enabled = true
+            max_attachments_per_message = 2
+            max_total_attachment_bytes_per_message = 8192
+            allowed_source_hosts = ["cdn.discordapp.com", "media.discordapp.net"]
+            allowed_download_content_types = ["image/png", "image/jpeg"]
+            vision_allowed_content_types = ["image/png"]
+            outbound_allowed_content_types = ["image/png", "text/plain"]
+            outbound_max_upload_bytes = 4096
+            retention_ttl_ms = 86400000
+            "#,
+        )
+        .expect("media attachment pipeline config should parse");
+
+        let media = parsed.media.expect("media section should exist");
+        assert_eq!(media.download_enabled, Some(true));
+        assert_eq!(media.outbound_upload_enabled, Some(true));
+        assert_eq!(media.max_attachments_per_message, Some(2));
+        assert_eq!(media.max_total_attachment_bytes_per_message, Some(8192));
+        assert_eq!(
+            media.allowed_source_hosts,
+            Some(vec!["cdn.discordapp.com".to_owned(), "media.discordapp.net".to_owned()])
+        );
+        assert_eq!(
+            media.allowed_download_content_types,
+            Some(vec!["image/png".to_owned(), "image/jpeg".to_owned()])
+        );
+        assert_eq!(media.vision_allowed_content_types, Some(vec!["image/png".to_owned()]));
+        assert_eq!(
+            media.outbound_allowed_content_types,
+            Some(vec!["image/png".to_owned(), "text/plain".to_owned()])
+        );
+        assert_eq!(media.outbound_max_upload_bytes, Some(4096));
+        assert_eq!(media.retention_ttl_ms, Some(86_400_000));
     }
 
     #[test]

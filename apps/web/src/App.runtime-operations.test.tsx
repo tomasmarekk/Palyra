@@ -111,6 +111,7 @@ describe("M56 runtime and operations surfaces", () => {
     expect(screen.getByText(/doctor --json/)).toBeInTheDocument();
     expect(screen.getByText(/Policy explain stays admin-only/)).toBeInTheDocument();
     expect(await screen.findByText(/message\.routed/)).toBeInTheDocument();
+    expect(await screen.findByText(/attachment\.download disabled by config/)).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Cron" }));
     expect(await screen.findByRole("heading", { name: "Cron" })).toBeInTheDocument();
@@ -125,6 +126,7 @@ describe("M56 runtime and operations surfaces", () => {
     expect(await screen.findByRole("heading", { name: "Channels and Router" })).toBeInTheDocument();
     expect(await screen.findByText("discord:default")).toBeInTheDocument();
     expect(screen.getByText("Broadcast messages remain denied by default.")).toBeInTheDocument();
+    expect(await screen.findByText(/attachment\.upload\.failed/)).toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText("Bot token"), { target: { value: "discord-bot-token" } });
     fireEvent.change(screen.getByLabelText("Verify channel ID"), {

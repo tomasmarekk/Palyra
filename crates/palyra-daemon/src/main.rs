@@ -7,6 +7,7 @@ mod config;
 mod cron;
 mod gateway;
 mod journal;
+mod media;
 mod model_provider;
 mod node_rpc;
 mod openai_auth;
@@ -1244,6 +1245,7 @@ async fn main() -> Result<()> {
             max_tape_entries_per_response: loaded.gateway.max_tape_entries_per_response,
             max_tape_bytes_per_response: loaded.gateway.max_tape_bytes_per_response,
             channel_router: loaded.channel_router.clone(),
+            media: loaded.media.clone(),
             tool_call: tool_protocol::ToolCallConfig {
                 allowed_tools: loaded.tool_call.allowed_tools.clone(),
                 max_calls_per_run: loaded.tool_call.max_calls_per_run,
@@ -1587,8 +1589,13 @@ async fn main() -> Result<()> {
     let connectors_db_path =
         connector_db_path_from_journal_path(loaded.storage.journal_db_path.as_path());
     let channels = Arc::new(
-        channels::ChannelPlatform::initialize(grpc_url.clone(), auth.clone(), connectors_db_path)
-            .context("failed to initialize channel connector platform")?,
+        channels::ChannelPlatform::initialize(
+            grpc_url.clone(),
+            auth.clone(),
+            connectors_db_path,
+            loaded.media.clone(),
+        )
+        .context("failed to initialize channel connector platform")?,
     );
     let _cron_scheduler_task = spawn_scheduler_loop(
         runtime.clone(),
@@ -3941,6 +3948,7 @@ async fn console_diagnostics_handler(
     redact_console_diagnostics_value(&mut auth_payload, None);
 
     let browser_payload = collect_console_browser_diagnostics(&state).await;
+    let media_payload = state.channels.media_snapshot().map_err(channel_platform_error_response)?;
     let memory_status =
         state.runtime.memory_maintenance_status().await.map_err(runtime_status_response)?;
     let memory_runtime_config = state.runtime.memory_config_snapshot();
@@ -3964,6 +3972,7 @@ async fn console_diagnostics_handler(
         },
         "auth_profiles": auth_payload,
         "browserd": browser_payload,
+        "media": media_payload,
         "deployment": deployment_payload,
         "memory": {
             "usage": memory_status.usage,
@@ -8081,7 +8090,15 @@ fn evaluate_discord_policy_warnings(state: &AppState, plan: &DiscordOnboardingPl
     let mut warnings = Vec::new();
     let principal = channels::discord_principal(plan.account_id.as_str());
     let resource = format!("channel:{}", plan.connector_id);
-    for action in ["message.reply", "channel.send", "message.broadcast"] {
+    for action in [
+        "message.reply",
+        "channel.send",
+        "message.broadcast",
+        "attachment.metadata.accept",
+        "attachment.download",
+        "attachment.vision",
+        "attachment.upload",
+    ] {
         match evaluate_with_config(
             &PolicyRequest {
                 principal: principal.clone(),

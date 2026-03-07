@@ -4,6 +4,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use palyra_common::{validate_canonical_id, CANONICAL_PROTOCOL_MAJOR};
 use palyra_connectors::{
     connectors::default_adapters, AttachmentKind, AttachmentRef, ConnectorAvailability,
@@ -13,7 +14,7 @@ use palyra_connectors::{
     OutboundA2uiUpdate as ConnectorA2uiUpdate, OutboundAttachment, OutboundMessageRequest,
     RouteInboundResult, RoutedOutboundMessage,
 };
-use serde_json::Value;
+use serde_json::{json, Value};
 use thiserror::Error;
 use tokio::time::{interval, MissedTickBehavior};
 use tonic::metadata::MetadataValue;
@@ -24,6 +25,7 @@ use crate::gateway::{
     proto::palyra::{common::v1 as common_v1, gateway::v1 as gateway_v1},
     GatewayAuthConfig, HEADER_CHANNEL, HEADER_DEVICE_ID, HEADER_PRINCIPAL,
 };
+use crate::media::{InboundAttachmentIngestRequest, MediaArtifactStore, MediaRuntimeConfig};
 
 mod discord;
 
@@ -42,6 +44,8 @@ pub enum ChannelPlatformError {
     Supervisor(#[from] ConnectorSupervisorError),
     #[error(transparent)]
     Store(#[from] palyra_connectors::ConnectorStoreError),
+    #[error(transparent)]
+    Media(#[from] crate::media::MediaStoreError),
     #[error("invalid test message input: {0}")]
     InvalidInput(String),
 }
@@ -79,6 +83,7 @@ pub struct ChannelDiscordTestSendOutcome {
 
 pub struct ChannelPlatform {
     supervisor: Arc<ConnectorSupervisor>,
+    media_store: Arc<MediaArtifactStore>,
     worker_interval: Duration,
 }
 
@@ -87,9 +92,16 @@ impl ChannelPlatform {
         grpc_url: String,
         auth: GatewayAuthConfig,
         db_path: PathBuf,
+        media_config: MediaRuntimeConfig,
     ) -> Result<Self, ChannelPlatformError> {
         let store = Arc::new(palyra_connectors::ConnectorStore::open(db_path)?);
-        let router = Arc::new(GrpcChannelRouter { grpc_url, auth });
+        let media_store = Arc::new(MediaArtifactStore::open(
+            media_db_path_from_connector_db_path(store.db_path()),
+            media_content_root_from_connector_db_path(store.db_path()),
+            media_config,
+        )?);
+        let router =
+            Arc::new(GrpcChannelRouter { grpc_url, auth, media_store: Arc::clone(&media_store) });
         let supervisor = Arc::new(ConnectorSupervisor::new(
             Arc::clone(&store),
             router,
@@ -98,6 +110,7 @@ impl ChannelPlatform {
         ));
         let platform = Self {
             supervisor,
+            media_store,
             worker_interval: Duration::from_millis(DEFAULT_CHANNEL_WORKER_INTERVAL_MS),
         };
         platform.ensure_default_connector_inventory()?;
@@ -148,7 +161,33 @@ impl ChannelPlatform {
         connector_id: &str,
     ) -> Result<Option<Value>, ChannelPlatformError> {
         self.ensure_operator_visible(connector_id)?;
-        self.supervisor.runtime_snapshot(connector_id).map_err(ChannelPlatformError::from)
+        let runtime =
+            self.supervisor.runtime_snapshot(connector_id).map_err(ChannelPlatformError::from)?;
+        let media = serde_json::to_value(self.media_store.build_connector_snapshot(connector_id)?)
+            .map_err(|error| {
+                ChannelPlatformError::InvalidInput(format!(
+                    "failed to serialize media runtime snapshot: {error}"
+                ))
+            })?;
+        Ok(Some(match runtime {
+            Some(Value::Object(mut payload)) => {
+                payload.insert("media".to_owned(), media);
+                Value::Object(payload)
+            }
+            Some(other) => json!({
+                "connector_runtime": other,
+                "media": media,
+            }),
+            None => json!({ "media": media }),
+        }))
+    }
+
+    pub fn media_snapshot(&self) -> Result<Value, ChannelPlatformError> {
+        serde_json::to_value(self.media_store.build_global_snapshot()?).map_err(|error| {
+            ChannelPlatformError::InvalidInput(format!(
+                "failed to serialize media diagnostics snapshot: {error}"
+            ))
+        })
     }
 
     pub fn set_enabled(
@@ -366,6 +405,177 @@ impl ChannelPlatform {
     }
 }
 
+async fn preprocess_discord_inbound_attachments(
+    media_store: &Arc<MediaArtifactStore>,
+    event: &InboundMessageEvent,
+) -> Result<Vec<AttachmentRef>, crate::media::MediaStoreError> {
+    let total_declared_bytes =
+        event.attachments.iter().filter_map(|attachment| attachment.size_bytes).sum::<u64>();
+    let mut prepared = Vec::with_capacity(event.attachments.len());
+    for (attachment_index, attachment) in event.attachments.iter().enumerate() {
+        prepared.push(
+            media_store
+                .ingest_inbound_attachment(InboundAttachmentIngestRequest {
+                    connector_id: event.connector_id.as_str(),
+                    envelope_id: event.envelope_id.as_str(),
+                    conversation_id: event.conversation_id.as_str(),
+                    adapter_message_id: event.adapter_message_id.as_deref(),
+                    attachment,
+                    attachment_index,
+                    attachment_count: event.attachments.len(),
+                    total_declared_bytes,
+                })
+                .await?,
+        );
+    }
+    Ok(prepared)
+}
+
+fn prepare_outbound_attachments(
+    media_store: &Arc<MediaArtifactStore>,
+    connector_id: &str,
+    attachments: Vec<OutboundAttachment>,
+) -> Result<Vec<OutboundAttachment>, crate::media::MediaStoreError> {
+    let config = media_store.config().clone();
+    let mut prepared = Vec::with_capacity(attachments.len());
+    for mut attachment in attachments {
+        if !attachment.upload_requested {
+            prepared.push(attachment);
+            continue;
+        }
+        if !config.outbound_upload_enabled {
+            block_outbound_upload_attachment(
+                media_store,
+                connector_id,
+                &mut attachment,
+                "attachment.upload disabled by config",
+            )?;
+            prepared.push(attachment);
+            continue;
+        }
+        if attachment.inline_base64.is_none() {
+            match attachment.artifact_ref.as_deref() {
+                Some(artifact_id) => match media_store.load_artifact_payload(artifact_id)? {
+                    Some(payload) => {
+                        attachment.inline_base64 =
+                            Some(BASE64_STANDARD.encode(payload.bytes.as_slice()));
+                        attachment.artifact_ref.get_or_insert_with(|| payload.artifact_id.clone());
+                        attachment.filename.get_or_insert_with(|| payload.filename.clone());
+                        attachment.content_type.get_or_insert_with(|| payload.content_type.clone());
+                        attachment.size_bytes.get_or_insert(payload.size_bytes);
+                        attachment.content_hash.get_or_insert(payload.sha256.clone());
+                        attachment.width_px = attachment.width_px.or(payload.width_px);
+                        attachment.height_px = attachment.height_px.or(payload.height_px);
+                    }
+                    None => {
+                        block_outbound_upload_attachment(
+                            media_store,
+                            connector_id,
+                            &mut attachment,
+                            "attachment.upload artifact_ref not found",
+                        )?;
+                        prepared.push(attachment);
+                        continue;
+                    }
+                },
+                None => {
+                    block_outbound_upload_attachment(
+                        media_store,
+                        connector_id,
+                        &mut attachment,
+                        "attachment.upload requires inline content or artifact_ref",
+                    )?;
+                    prepared.push(attachment);
+                    continue;
+                }
+            }
+        }
+        let Some(content_type) = attachment
+            .content_type
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+        else {
+            block_outbound_upload_attachment(
+                media_store,
+                connector_id,
+                &mut attachment,
+                "attachment.upload content_type is required",
+            )?;
+            prepared.push(attachment);
+            continue;
+        };
+        if !config.outbound_allowed_content_types.iter().any(|allowed| allowed == &content_type) {
+            block_outbound_upload_attachment(
+                media_store,
+                connector_id,
+                &mut attachment,
+                format!("attachment.upload content type '{content_type}' is blocked by policy")
+                    .as_str(),
+            )?;
+            prepared.push(attachment);
+            continue;
+        }
+        let decoded_size = attachment
+            .inline_base64
+            .as_deref()
+            .map(|value| {
+                BASE64_STANDARD.decode(value).map(|bytes| bytes.len()).unwrap_or(usize::MAX)
+            })
+            .unwrap_or_default();
+        if decoded_size > config.outbound_max_upload_bytes {
+            block_outbound_upload_attachment(
+                media_store,
+                connector_id,
+                &mut attachment,
+                format!(
+                    "attachment.upload exceeds max_upload_bytes ({decoded_size}/{})",
+                    config.outbound_max_upload_bytes
+                )
+                .as_str(),
+            )?;
+        }
+        prepared.push(attachment);
+    }
+    Ok(prepared)
+}
+
+fn block_outbound_upload_attachment(
+    media_store: &Arc<MediaArtifactStore>,
+    connector_id: &str,
+    attachment: &mut OutboundAttachment,
+    reason: &str,
+) -> Result<(), crate::media::MediaStoreError> {
+    attachment.policy_context = Some(reason.to_owned());
+    attachment.upload_requested = false;
+    attachment.inline_base64 = None;
+    media_store.record_upload_failure(
+        connector_id,
+        attachment.artifact_ref.as_deref(),
+        attachment.filename.as_deref(),
+        reason,
+    )
+}
+
+fn media_db_path_from_connector_db_path(connector_db_path: &std::path::Path) -> PathBuf {
+    let parent = connector_db_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    parent.join("media.sqlite3")
+}
+
+fn media_content_root_from_connector_db_path(connector_db_path: &std::path::Path) -> PathBuf {
+    let parent = connector_db_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    parent.join("media")
+}
+
 fn default_connector_specs() -> Vec<ConnectorInstanceSpec> {
     vec![
         ConnectorInstanceSpec {
@@ -384,6 +594,7 @@ fn default_connector_specs() -> Vec<ConnectorInstanceSpec> {
 struct GrpcChannelRouter {
     grpc_url: String,
     auth: GatewayAuthConfig,
+    media_store: Arc<MediaArtifactStore>,
 }
 
 #[async_trait::async_trait]
@@ -407,9 +618,15 @@ impl ConnectorRouter for GrpcChannelRouter {
         } else {
             event.sender_id.clone()
         };
-        let content_text =
-            with_attachment_context(event.body.as_str(), event.attachments.as_slice());
-        let message_attachments = to_proto_message_attachments(event.attachments.as_slice());
+        let attachments = if discord_connector {
+            preprocess_discord_inbound_attachments(&self.media_store, event)
+                .await
+                .map_err(|error| ConnectorRouterError::Message(error.to_string()))?
+        } else {
+            event.attachments.clone()
+        };
+        let content_text = with_attachment_context(event.body.as_str(), attachments.as_slice());
+        let message_attachments = to_proto_message_attachments(attachments.as_slice());
         let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(
             self.grpc_url.clone(),
         )
@@ -482,18 +699,25 @@ impl ConnectorRouter for GrpcChannelRouter {
         let outputs = response
             .outputs
             .into_iter()
-            .map(|output| RoutedOutboundMessage {
-                text: output.text,
-                thread_id: non_empty(output.thread_id),
-                in_reply_to_message_id: non_empty(output.in_reply_to_message_id),
-                broadcast: output.broadcast,
-                auto_ack_text: non_empty(output.auto_ack_text),
-                auto_reaction: non_empty(output.auto_reaction),
-                attachments: from_proto_message_attachments(output.attachments.as_slice()),
-                structured_json: non_empty_bytes(output.structured_json),
-                a2ui_update: from_proto_a2ui_update(output.a2ui_update),
+            .map(|output| {
+                Ok(RoutedOutboundMessage {
+                    text: output.text,
+                    thread_id: non_empty(output.thread_id),
+                    in_reply_to_message_id: non_empty(output.in_reply_to_message_id),
+                    broadcast: output.broadcast,
+                    auto_ack_text: non_empty(output.auto_ack_text),
+                    auto_reaction: non_empty(output.auto_reaction),
+                    attachments: prepare_outbound_attachments(
+                        &self.media_store,
+                        event.connector_id.as_str(),
+                        from_proto_message_attachments(output.attachments.as_slice()),
+                    )?,
+                    structured_json: non_empty_bytes(output.structured_json),
+                    a2ui_update: from_proto_a2ui_update(output.a2ui_update),
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, crate::media::MediaStoreError>>()
+            .map_err(|error| ConnectorRouterError::Message(error.to_string()))?;
         Ok(RouteInboundResult {
             accepted: response.accepted,
             queued_for_retry: response.queued_for_retry,
@@ -612,6 +836,21 @@ fn to_proto_message_attachments(
                 kind: attachment_kind_to_proto(attachment.kind),
                 artifact_id,
                 size_bytes: attachment.size_bytes.unwrap_or_default(),
+                attachment_id: attachment.attachment_id.clone().unwrap_or_default(),
+                filename: attachment.filename.clone().unwrap_or_default(),
+                declared_content_type: attachment.content_type.clone().unwrap_or_default(),
+                source_url: attachment.url.clone().unwrap_or_default(),
+                content_hash: attachment.content_hash.clone().unwrap_or_default(),
+                origin: attachment.origin.clone().unwrap_or_default(),
+                policy_context: attachment.policy_context.clone().unwrap_or_default(),
+                inline_bytes: attachment
+                    .inline_base64
+                    .as_deref()
+                    .and_then(|value| BASE64_STANDARD.decode(value).ok())
+                    .unwrap_or_default(),
+                upload_requested: attachment.upload_requested,
+                width_px: attachment.width_px.unwrap_or_default(),
+                height_px: attachment.height_px.unwrap_or_default(),
             }
         })
         .collect()
@@ -624,11 +863,23 @@ fn from_proto_message_attachments(
         .iter()
         .map(|attachment| OutboundAttachment {
             kind: attachment_kind_from_proto(attachment.kind),
-            url: None,
+            attachment_id: non_empty(attachment.attachment_id.clone()),
+            url: non_empty(attachment.source_url.clone()),
             artifact_ref: attachment.artifact_id.as_ref().map(|value| value.ulid.clone()),
-            filename: None,
-            content_type: None,
+            filename: non_empty(attachment.filename.clone()),
+            content_type: non_empty(attachment.declared_content_type.clone()),
             size_bytes: if attachment.size_bytes > 0 { Some(attachment.size_bytes) } else { None },
+            content_hash: non_empty(attachment.content_hash.clone()),
+            origin: non_empty(attachment.origin.clone()),
+            policy_context: non_empty(attachment.policy_context.clone()),
+            upload_requested: attachment.upload_requested,
+            inline_base64: if attachment.inline_bytes.is_empty() {
+                None
+            } else {
+                Some(BASE64_STANDARD.encode(attachment.inline_bytes.as_slice()))
+            },
+            width_px: if attachment.width_px > 0 { Some(attachment.width_px) } else { None },
+            height_px: if attachment.height_px > 0 { Some(attachment.height_px) } else { None },
         })
         .collect()
 }
@@ -678,6 +929,7 @@ mod tests {
         ChannelPlatform, ChannelPlatformError,
     };
     use crate::gateway::GatewayAuthConfig;
+    use crate::media::MediaRuntimeConfig;
 
     #[test]
     fn discord_account_id_normalization_enforces_supported_charset() {
@@ -773,6 +1025,7 @@ mod tests {
                 filename: Some("a.png".to_owned()),
                 content_type: Some("image/png".to_owned()),
                 size_bytes: Some(512),
+                ..AttachmentRef::default()
             }],
         );
         assert!(
@@ -793,11 +1046,9 @@ mod tests {
     fn proto_attachment_mapping_preserves_kind_and_size() {
         let attachments = to_proto_message_attachments(&[AttachmentRef {
             kind: AttachmentKind::Image,
-            url: None,
             artifact_ref: Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
-            filename: None,
-            content_type: None,
             size_bytes: Some(4_096),
+            ..AttachmentRef::default()
         }]);
         assert_eq!(attachments.len(), 1);
         assert_eq!(
@@ -946,6 +1197,7 @@ mod tests {
                 bound_principal: None,
             },
             tempdir.path().join("connectors.sqlite3"),
+            MediaRuntimeConfig::default(),
         )
         .expect("platform should initialize");
 

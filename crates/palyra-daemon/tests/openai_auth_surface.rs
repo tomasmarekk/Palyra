@@ -908,10 +908,16 @@ fn spawn_palyrad_with_dynamic_ports(extra_env: &[(String, String)]) -> Result<(C
 }
 
 fn spawn_palyrad_with_dynamic_ports_once(extra_env: &[(String, String)]) -> Result<(Child, u16)> {
+    let state_root_dir = unique_temp_dir("palyra-openai-auth-state-root");
     let journal_db_path = unique_temp_path("palyra-openai-auth-journal", "sqlite3");
-    let identity_store_dir = unique_temp_dir("palyra-openai-auth-identity");
-    let vault_dir = unique_temp_dir("palyra-openai-auth-vault");
+    let identity_store_dir = state_root_dir.join("identity");
+    let vault_dir = state_root_dir.join("vault");
+    let auth_profiles_path = state_root_dir.join("auth_profiles.toml");
+    let agents_registry_path = state_root_dir.join("agents.toml");
     let config_path = unique_temp_path("palyra-openai-auth-config", "toml");
+    fs::create_dir_all(&identity_store_dir).with_context(|| {
+        format!("failed to create test identity dir {}", identity_store_dir.display())
+    })?;
     prepare_test_vault_dir(&vault_dir)?;
     prepare_test_config(&config_path)?;
 
@@ -931,7 +937,10 @@ fn spawn_palyrad_with_dynamic_ports_once(extra_env: &[(String, String)]) -> Resu
         .env("PALYRA_CONFIG", config_path.to_string_lossy().to_string())
         .env("PALYRA_GATEWAY_QUIC_BIND_ADDR", "127.0.0.1")
         .env("PALYRA_GATEWAY_QUIC_PORT", "0")
+        .env("PALYRA_STATE_ROOT", state_root_dir.to_string_lossy().to_string())
         .env("PALYRA_JOURNAL_DB_PATH", journal_db_path.to_string_lossy().to_string())
+        .env("PALYRA_AUTH_PROFILES_PATH", auth_profiles_path.to_string_lossy().to_string())
+        .env("PALYRA_AGENTS_REGISTRY_PATH", agents_registry_path.to_string_lossy().to_string())
         .env("PALYRA_GATEWAY_IDENTITY_STORE_DIR", identity_store_dir.to_string_lossy().to_string())
         .env("PALYRA_VAULT_DIR", vault_dir.to_string_lossy().to_string())
         .env("RUST_LOG", "info")

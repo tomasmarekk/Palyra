@@ -197,6 +197,29 @@ export function diagnosticsFixture() {
       state: "ready",
       engine_mode: "chromium",
     },
+    media: {
+      policy: {
+        download_enabled: false,
+        outbound_upload_enabled: false,
+        allowed_source_hosts: ["cdn.discordapp.com"],
+      },
+      usage: {
+        artifact_count: 2,
+        stored_bytes: 16384,
+      },
+      retention: {
+        max_store_bytes: 67108864,
+        ttl_ms: 604800000,
+      },
+      recent_blocked_reasons: [
+        {
+          connector_id: "discord:default",
+          event_type: "attachment.download.blocked",
+          reason: "attachment.download disabled by config",
+        },
+      ],
+      recent_upload_failures: [],
+    },
   };
 }
 

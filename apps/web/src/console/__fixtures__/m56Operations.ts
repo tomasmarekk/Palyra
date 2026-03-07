@@ -122,6 +122,30 @@ export function channelStatusFixture() {
       enabled: true,
       readiness: "ready",
       liveness: "running",
+      runtime: {
+        media: {
+          policy: {
+            download_enabled: false,
+            outbound_upload_enabled: false,
+          },
+          usage: {
+            artifact_count: 1,
+            stored_bytes: 4096,
+          },
+          recent_blocked_reasons: [
+            {
+              event_type: "attachment.metadata.blocked",
+              reason: "attachment_metadata_type_blocked",
+            },
+          ],
+          recent_upload_failures: [
+            {
+              event_type: "attachment.upload.failed",
+              reason: "attachment.upload disabled by config",
+            },
+          ],
+        },
+      },
     },
   };
 }

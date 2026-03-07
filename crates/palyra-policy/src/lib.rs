@@ -152,6 +152,12 @@ when {
     context.action == "message.broadcast" ||
     context.action == "channel.send"
 };
+
+@id("allow_attachment_metadata_actions")
+permit(principal, action, resource)
+when {
+    context.action == "attachment.metadata.accept"
+};
 "#;
 
 const POLICY_DENY_REASON: &str = "tool execution denied by default: tool is not allowlisted";
@@ -413,6 +419,9 @@ fn decision_reason(
         }
         if normalized_action.starts_with("message.") || normalized_action == "channel.send" {
             return "message router action allowed by Cedar policy".to_owned();
+        }
+        if normalized_action == "attachment.metadata.accept" {
+            return "attachment metadata action allowed by Cedar policy".to_owned();
         }
         return "read-only action allowed by Cedar baseline policy".to_owned();
     }
@@ -854,6 +863,75 @@ mod tests {
             evaluate_with_config(&request, &PolicyEvaluationConfig::default()).expect("evaluation");
 
         assert_eq!(evaluation.decision, PolicyDecision::Allow);
+    }
+
+    #[test]
+    fn attachment_metadata_accept_is_explicitly_allowed() {
+        let request = PolicyRequest {
+            principal: "user:ops".to_owned(),
+            action: "attachment.metadata.accept".to_owned(),
+            resource: "channel:discord:default".to_owned(),
+        };
+
+        let evaluation =
+            evaluate_with_config(&request, &PolicyEvaluationConfig::default()).expect("evaluation");
+
+        assert_eq!(evaluation.decision, PolicyDecision::Allow);
+        assert!(
+            evaluation.explanation.reason.contains("attachment metadata action allowed"),
+            "attachment metadata accept should use the dedicated Cedar allow reason"
+        );
+    }
+
+    #[test]
+    fn attachment_download_is_denied_by_default() {
+        let request = PolicyRequest {
+            principal: "user:ops".to_owned(),
+            action: "attachment.download".to_owned(),
+            resource: "channel:discord:default".to_owned(),
+        };
+
+        let evaluation =
+            evaluate_with_config(&request, &PolicyEvaluationConfig::default()).expect("evaluation");
+
+        assert_eq!(
+            evaluation.decision,
+            PolicyDecision::DenyByDefault { reason: BASELINE_DENY_REASON.to_owned() }
+        );
+    }
+
+    #[test]
+    fn attachment_vision_is_denied_by_default() {
+        let request = PolicyRequest {
+            principal: "user:ops".to_owned(),
+            action: "attachment.vision".to_owned(),
+            resource: "channel:discord:default".to_owned(),
+        };
+
+        let evaluation =
+            evaluate_with_config(&request, &PolicyEvaluationConfig::default()).expect("evaluation");
+
+        assert_eq!(
+            evaluation.decision,
+            PolicyDecision::DenyByDefault { reason: BASELINE_DENY_REASON.to_owned() }
+        );
+    }
+
+    #[test]
+    fn attachment_upload_is_denied_by_default() {
+        let request = PolicyRequest {
+            principal: "user:ops".to_owned(),
+            action: "attachment.upload".to_owned(),
+            resource: "channel:discord:default".to_owned(),
+        };
+
+        let evaluation =
+            evaluate_with_config(&request, &PolicyEvaluationConfig::default()).expect("evaluation");
+
+        assert_eq!(
+            evaluation.decision,
+            PolicyDecision::DenyByDefault { reason: BASELINE_DENY_REASON.to_owned() }
+        );
     }
 
     #[test]

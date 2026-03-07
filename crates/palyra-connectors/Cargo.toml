@@ -8,10 +8,11 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+base64.workspace = true
 flate2.workspace = true
 futures.workspace = true
 palyra-common = { version = "0.1.0", path = "../palyra-common" }
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["multipart"] }
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -105,6 +105,7 @@ export interface ConsoleDiagnosticsSnapshot {
   auth_profiles: JsonValue;
   browserd: JsonValue;
   memory?: JsonValue;
+  media?: JsonValue;
 }
 
 export interface ContractDescriptor {

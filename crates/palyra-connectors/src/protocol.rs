@@ -14,6 +14,11 @@ const MAX_ATTACHMENTS_PER_MESSAGE: usize = 32;
 const MAX_ATTACHMENT_REF_BYTES: usize = 1_024;
 const MAX_ATTACHMENT_FILENAME_BYTES: usize = 512;
 const MAX_ATTACHMENT_CONTENT_TYPE_BYTES: usize = 256;
+const MAX_ATTACHMENT_ID_BYTES: usize = 128;
+const MAX_ATTACHMENT_HASH_BYTES: usize = 128;
+const MAX_ATTACHMENT_ORIGIN_BYTES: usize = 128;
+const MAX_ATTACHMENT_POLICY_CONTEXT_BYTES: usize = 512;
+const MAX_ATTACHMENT_INLINE_BASE64_BYTES: usize = 2 * 1024 * 1024;
 const MAX_STRUCTURED_OUTPUT_BYTES: usize = 128 * 1024;
 const MAX_A2UI_SURFACE_BYTES: usize = 128;
 const MAX_A2UI_PATCH_BYTES: usize = 128 * 1024;
@@ -207,6 +212,8 @@ pub struct AttachmentRef {
     #[serde(default)]
     pub kind: AttachmentKind,
     #[serde(default)]
+    pub attachment_id: Option<String>,
+    #[serde(default)]
     pub url: Option<String>,
     #[serde(default)]
     pub artifact_ref: Option<String>,
@@ -216,10 +223,29 @@ pub struct AttachmentRef {
     pub content_type: Option<String>,
     #[serde(default)]
     pub size_bytes: Option<u64>,
+    #[serde(default)]
+    pub content_hash: Option<String>,
+    #[serde(default)]
+    pub origin: Option<String>,
+    #[serde(default)]
+    pub policy_context: Option<String>,
+    #[serde(default)]
+    pub upload_requested: bool,
+    #[serde(default)]
+    pub inline_base64: Option<String>,
+    #[serde(default)]
+    pub width_px: Option<u32>,
+    #[serde(default)]
+    pub height_px: Option<u32>,
 }
 
 impl AttachmentRef {
     fn validate(&self) -> Result<(), ProtocolError> {
+        validate_optional_field(
+            self.attachment_id.as_deref(),
+            "attachments.attachment_id",
+            MAX_ATTACHMENT_ID_BYTES,
+        )?;
         validate_optional_field(self.url.as_deref(), "attachments.url", MAX_ATTACHMENT_REF_BYTES)?;
         validate_optional_field(
             self.artifact_ref.as_deref(),
@@ -236,6 +262,39 @@ impl AttachmentRef {
             "attachments.content_type",
             MAX_ATTACHMENT_CONTENT_TYPE_BYTES,
         )?;
+        validate_optional_field(
+            self.content_hash.as_deref(),
+            "attachments.content_hash",
+            MAX_ATTACHMENT_HASH_BYTES,
+        )?;
+        validate_optional_field(
+            self.origin.as_deref(),
+            "attachments.origin",
+            MAX_ATTACHMENT_ORIGIN_BYTES,
+        )?;
+        validate_optional_field(
+            self.policy_context.as_deref(),
+            "attachments.policy_context",
+            MAX_ATTACHMENT_POLICY_CONTEXT_BYTES,
+        )?;
+        validate_optional_field(
+            self.inline_base64.as_deref(),
+            "attachments.inline_base64",
+            MAX_ATTACHMENT_INLINE_BASE64_BYTES,
+        )?;
+        if self.upload_requested
+            && self
+                .inline_base64
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_none()
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "attachments.inline_base64",
+                reason: "upload_requested attachments must include inline_base64",
+            });
+        }
         Ok(())
     }
 }
@@ -652,10 +711,10 @@ mod tests {
             .map(|index| AttachmentRef {
                 kind: AttachmentKind::Image,
                 url: Some(format!("https://cdn.example.test/{index}.png")),
-                artifact_ref: None,
                 filename: Some(format!("{index}.png")),
                 content_type: Some("image/png".to_owned()),
                 size_bytes: Some(1_024),
+                ..AttachmentRef::default()
             })
             .collect();
         assert_eq!(

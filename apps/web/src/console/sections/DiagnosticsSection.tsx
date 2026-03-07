@@ -40,6 +40,10 @@ export function DiagnosticsSection({ app }: DiagnosticsSectionProps) {
             <h3>Browserd Status</h3>
             <pre>{toPrettyJson(app.diagnosticsSnapshot["browserd"] ?? null, app.revealSensitiveValues)}</pre>
           </section>
+          <section className="console-subpanel">
+            <h3>Media Pipeline</h3>
+            <pre>{toPrettyJson(app.diagnosticsSnapshot["media"] ?? null, app.revealSensitiveValues)}</pre>
+          </section>
         </>
       )}
     </main>
