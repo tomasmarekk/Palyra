@@ -104,6 +104,10 @@ const ui = {
   discordApplyBtn: byId("discordApplyBtn"),
   discordVerifyBtn: byId("discordVerifyBtn"),
   discordWizardWarnings: byId("discordWizardWarnings"),
+  discordPreflightBadge: byId("discordPreflightBadge"),
+  discordPreflightResults: byId("discordPreflightResults"),
+  discordApplyBadge: byId("discordApplyBadge"),
+  discordApplyResults: byId("discordApplyResults"),
   gatewayProcessSummary: byId("gatewayProcessSummary"),
   gatewayPorts: byId("gatewayPorts"),
   browserProcessSummary: byId("browserProcessSummary"),
@@ -135,6 +139,7 @@ const desktopState = {
 const discordWizardState = {
   preflight: null,
   apply: null,
+  verification: null,
   formDirty: false
 };
 
@@ -391,6 +396,12 @@ function renderOnboardingStatus(status) {
   ui.stateRootHint.textContent = status?.state_root_overridden
     ? `Desktop is using a custom runtime root. Default: ${asString(status?.default_state_root_path, "-")}`
     : `Default runtime root: ${asString(status?.default_state_root_path, "-")}`;
+  ui.startOnboardingBtn.textContent =
+    status?.phase === "home"
+      ? "Setup Complete"
+      : Number(status?.progress_completed ?? 0) > 0
+        ? "Resume Guided Setup"
+        : "Start Guided Setup";
   ui.startOnboardingBtn.disabled = status?.phase === "home";
   if (status?.phase !== "home" && !openAiState.targetProfileId && (openAiState.status?.summary?.total ?? 0) === 0) {
     ui.openAiSetDefaultToggle.checked = true;
@@ -402,6 +413,7 @@ function renderOnboardingStatus(status) {
   renderOnboardingHome(status);
   renderOnboardingEvents(status);
   applyDiscordDefaultsFromOnboarding(status);
+  renderDiscordResultCards(status);
 }
 
 function renderWelcomeChecklist() {
@@ -496,6 +508,109 @@ function renderDiscordWizardWarnings(warnings) {
   );
 }
 
+function appendLabeledResult(items, label, value) {
+  if (value === null || value === undefined) {
+    return;
+  }
+  if (Array.isArray(value)) {
+    if (value.length === 0) {
+      return;
+    }
+    items.push(`${label}: ${value.join(", ")}`);
+    return;
+  }
+  const text = String(value).trim();
+  if (text.length === 0) {
+    return;
+  }
+  items.push(`${label}: ${text}`);
+}
+
+function renderDiscordResultCards(status = desktopState.lastOnboarding) {
+  const preflight = discordWizardState.preflight;
+  const apply = discordWizardState.apply;
+  const verification = discordWizardState.verification;
+
+  const preflightItems = [];
+  if (preflight && typeof preflight === "object") {
+    appendLabeledResult(preflightItems, "Connector", preflight.connector_id);
+    appendLabeledResult(preflightItems, "Account", preflight.account_id);
+    appendLabeledResult(
+      preflightItems,
+      "Bot",
+      [preflight.bot_username, preflight.bot_id].filter(Boolean).join(" / ")
+    );
+    appendLabeledResult(preflightItems, "Inbound", preflight.inbound_alive === true ? "reachable" : "not yet reachable");
+    appendLabeledResult(preflightItems, "Invite", preflight.invite_url_template);
+    appendLabeledResult(preflightItems, "Required permissions", preflight.required_permissions);
+    appendLabeledResult(preflightItems, "Security defaults", preflight.security_defaults);
+  }
+
+  const preflightWarnings = [
+    ...(Array.isArray(preflight?.warnings) ? preflight.warnings : []),
+    ...(Array.isArray(preflight?.policy_warnings) ? preflight.policy_warnings : [])
+  ];
+  setLabeledStatus(
+    ui.discordPreflightBadge,
+    preflight ? (preflightWarnings.length > 0 ? "review" : "ready") : "waiting",
+    preflight ? (preflightWarnings.length > 0 ? "degraded" : "healthy") : "unknown"
+  );
+  renderList(
+    ui.discordPreflightResults,
+    preflightItems,
+    "Run Discord preflight to inspect bot identity, invite, and policy guidance."
+  );
+
+  const applyItems = [];
+  if (apply && typeof apply === "object") {
+    appendLabeledResult(applyItems, "Connector", apply.connector_id);
+    appendLabeledResult(applyItems, "Config path", apply.config_path);
+    appendLabeledResult(applyItems, "Config created", apply.config_created === true ? "yes" : "no");
+    appendLabeledResult(applyItems, "Connector enabled", apply.connector_enabled === true ? "yes" : "no");
+    appendLabeledResult(applyItems, "Inbound", apply.inbound_alive === true ? "alive" : "not yet alive");
+    appendLabeledResult(
+      applyItems,
+      "Readiness / liveness",
+      `${asString(apply.readiness, "unknown")} / ${asString(apply.liveness, "unknown")}`
+    );
+    appendLabeledResult(applyItems, "Token vault ref", apply.token_vault_ref);
+  }
+  if (status?.discord_verified) {
+    appendLabeledResult(applyItems, "Last verified target", status.discord_last_verified_target);
+    appendLabeledResult(applyItems, "Last verified at", formatUnixMs(status.discord_last_verified_at_unix_ms));
+  } else if (verification && typeof verification === "object") {
+    appendLabeledResult(applyItems, "Latest verify target", verification.target);
+    appendLabeledResult(applyItems, "Delivered", verification.delivered);
+    appendLabeledResult(applyItems, "Message", verification.message);
+  }
+
+  const applyWarnings = [
+    ...(Array.isArray(apply?.warnings) ? apply.warnings : []),
+    ...(Array.isArray(apply?.policy_warnings) ? apply.policy_warnings : []),
+    ...(Array.isArray(apply?.inbound_monitor_warnings) ? apply.inbound_monitor_warnings : [])
+  ];
+  const applyLabel = status?.discord_verified
+    ? "verified"
+    : apply
+      ? applyWarnings.length > 0
+        ? "applied"
+        : "ready"
+      : "waiting";
+  const applyStatus = status?.discord_verified
+    ? "healthy"
+    : apply
+      ? applyWarnings.length > 0
+        ? "degraded"
+        : "healthy"
+      : "unknown";
+  setLabeledStatus(ui.discordApplyBadge, applyLabel, applyStatus);
+  renderList(
+    ui.discordApplyResults,
+    applyItems,
+    "Apply the connector and run a test send to capture readiness details."
+  );
+}
+
 async function runDiscordPreflight() {
   const token = ui.discordTokenInput.value.trim();
   if (token.length === 0) {
@@ -522,6 +637,7 @@ async function runDiscordPreflight() {
       warnings.length > 0 ? "degraded" : "healthy",
       `Discord preflight OK for ${asString(response.bot_username, "bot")} (${asString(response.bot_id, "unknown id")}).`
     );
+    renderDiscordResultCards();
     await refreshOnboardingStatus();
   } catch (error) {
     setDiscordWizardState("preflight failed", "degraded", `Discord preflight failed: ${String(error)}`);
@@ -560,6 +676,7 @@ async function applyDiscordOnboardingFlow() {
       `Discord connector ${asString(response.connector_id, "discord:default")} applied.`
     );
     ui.discordTokenInput.value = "";
+    renderDiscordResultCards();
     await refreshAllData({ preserveMessage: true });
     setActionMessage(`Discord onboarding applied for ${asString(response.connector_id, "discord:default")}.`);
   } catch (error) {
@@ -590,12 +707,14 @@ async function runDiscordVerification() {
         text: normalizeEmptyToNull(ui.discordVerifyText.value)
       }
     });
+    discordWizardState.verification = response;
     renderDiscordWizardWarnings([]);
     setDiscordWizardState(
       "verified",
       "healthy",
       asString(response.message, "Discord verification dispatched.")
     );
+    renderDiscordResultCards();
     await refreshAllData({ preserveMessage: true });
     setActionMessage(asString(response.message, "Discord verification dispatched."));
   } catch (error) {
@@ -670,13 +789,35 @@ function renderSnapshot(snapshot, options = {}) {
   renderLogs(snapshot.logs);
 
   if (warnings.length > 0) {
-    setActionMessage(`Warnings: ${warnings.join(" | ")}`, true);
+    if (options.preserveMessage !== true) {
+      setActionMessage(`Warnings: ${warnings.join(" | ")}`, true);
+    }
     return;
   }
 
   if (options.preserveMessage !== true) {
     setActionMessage("Desktop snapshot refreshed.");
   }
+}
+
+function applyOpenAiCapabilities(status) {
+  const available = status?.available === true;
+  const bootstrapSupported = available && status?.bootstrap_supported === true;
+  const defaultSelectionSupported = available && status?.default_selection_supported === true;
+
+  ui.openAiApiKeySubmitBtn.disabled = !available;
+  ui.openAiOauthSubmitBtn.disabled = !bootstrapSupported;
+  ui.openAiSetDefaultToggle.disabled = !defaultSelectionSupported;
+
+  if (!available) {
+    ui.openAiOauthHint.textContent =
+      "Start the local runtime before using OAuth browser handoff from the desktop shell.";
+    return;
+  }
+
+  ui.openAiOauthHint.textContent = bootstrapSupported
+    ? "Desktop can bootstrap the OAuth attempt, open the browser and poll callback completion."
+    : "OAuth bootstrap is not exposed on this install. Use API key connect here or continue in the dashboard.";
 }
 
 function renderOpenAiStatus(status) {
@@ -691,6 +832,7 @@ function renderOpenAiStatus(status) {
     ui.openAiDetail.textContent =
       asString(status?.note, "Start the local runtime before opening the desktop OpenAI auth shell.");
     renderOpenAiProfilesList([]);
+    applyOpenAiCapabilities(status);
     return;
   }
 
@@ -708,6 +850,7 @@ function renderOpenAiStatus(status) {
   renderOpenAiProfilesList(profiles);
   reconcileOpenAiEditorSelection(profiles);
   refreshOpenAiEditorMode();
+  applyOpenAiCapabilities(status);
   if (desktopState.lastSnapshot) {
     renderWelcomeChecklist(desktopState.lastSnapshot);
   }
@@ -1035,6 +1178,10 @@ function applyOpenAiScopeVisibility() {
   ui.openAiAgentIdField.classList.toggle("field--hidden", !showAgentId);
 }
 
+function shouldRequestOpenAiDefaultSelection() {
+  return ui.openAiSetDefaultToggle.disabled !== true && ui.openAiSetDefaultToggle.checked === true;
+}
+
 async function submitOpenAiApiKey() {
   const apiKey = ui.openAiApiKeyInput.value;
   if (apiKey.trim().length === 0) {
@@ -1050,7 +1197,7 @@ async function submitOpenAiApiKey() {
       profileName: ui.openAiProfileNameInput.value.trim() || "OpenAI",
       scope: collectOpenAiScopePayload(),
       apiKey,
-      setDefault: ui.openAiSetDefaultToggle.checked
+      setDefault: shouldRequestOpenAiDefaultSelection()
     };
     const response = await invoke("connect_openai_api_key_command", { payload });
     ui.openAiApiKeyInput.value = "";
@@ -1073,7 +1220,7 @@ async function submitOpenAiOAuth() {
       clientId: normalizeEmptyToNull(ui.openAiOauthClientIdInput.value),
       clientSecret: normalizeEmptyToNull(ui.openAiOauthClientSecretInput.value),
       scopesText: ui.openAiOauthScopesInput.value.trim(),
-      setDefault: ui.openAiSetDefaultToggle.checked
+      setDefault: shouldRequestOpenAiDefaultSelection()
     };
     const response = await invoke("start_openai_oauth_bootstrap_command", { payload });
     ui.openAiOauthClientSecretInput.value = "";
@@ -1324,6 +1471,7 @@ async function bootstrap() {
   wireEvents();
   applyOpenAiScopeVisibility();
   refreshOpenAiEditorMode();
+  applyOpenAiCapabilities(null);
   ui.openAiOauthScopesInput.value = OPENAI_DEFAULT_SCOPES;
   ui.openAiSetDefaultToggle.checked = true;
   setDiscordWizardState(
@@ -1331,6 +1479,7 @@ async function bootstrap() {
     "unknown",
     "Run preflight, apply the connector, then send a verification message."
   );
+  renderDiscordResultCards();
   await loadSettings();
   await refreshAllData();
   pollHandle = window.setInterval(() => {

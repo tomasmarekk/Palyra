@@ -63,7 +63,7 @@ pub(crate) async fn get_settings(
 pub(crate) async fn get_onboarding_status(
     state: State<'_, DesktopAppState>,
 ) -> Result<OnboardingStatusSnapshot, String> {
-    let mut status = {
+    let status = {
         let mut supervisor = state.supervisor.lock().await;
         let inputs = supervisor.capture_onboarding_status_inputs();
         build_onboarding_status(inputs).await

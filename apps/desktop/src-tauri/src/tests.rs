@@ -39,6 +39,10 @@ fn env_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+    env_lock().lock().unwrap_or_else(|error| error.into_inner())
+}
+
 struct ScopedEnvVar {
     key: &'static str,
     previous: Option<OsString>,
@@ -175,26 +179,6 @@ fn build_test_discord_inputs(root: &Path, port: u16) -> DiscordControlPlaneInput
     DiscordControlPlaneInputs::capture(&control_center)
 }
 
-fn reserve_unused_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("ephemeral test port should bind");
-    listener.local_addr().expect("ephemeral port address should resolve").port()
-}
-
-fn assign_test_runtime_ports(control_center: &mut ControlCenter) {
-    let gateway_admin = reserve_unused_port();
-    let gateway_grpc = reserve_unused_port();
-    let gateway_quic = reserve_unused_port();
-    let browser_health = reserve_unused_port();
-    let browser_grpc = reserve_unused_port();
-    control_center.runtime.gateway_admin_port = gateway_admin;
-    control_center.runtime.gateway_grpc_port = gateway_grpc;
-    control_center.runtime.gateway_quic_port = gateway_quic;
-    control_center.runtime.browser_health_port = browser_health;
-    control_center.runtime.browser_grpc_port = browser_grpc;
-    control_center.gateway.bound_ports = vec![gateway_admin, gateway_grpc, gateway_quic];
-    control_center.browserd.bound_ports = vec![browser_health, browser_grpc];
-}
-
 fn write_json_response(
     stream: &mut std::net::TcpStream,
     status_line: &str,
@@ -312,7 +296,7 @@ fn remote_dashboard_url_parser_rejects_non_https_and_credentials() {
 
 #[test]
 fn dashboard_access_target_prefers_remote_url_when_configured() {
-    let _env_guard = env_lock().lock().expect("env lock should be available");
+    let _env_guard = lock_env();
     let fixture = TempFixtureDir::new();
     let config_path = write_config_file(
         fixture.path(),
@@ -331,7 +315,7 @@ remote_base_url = "https://dashboard.example.com/"
 
 #[test]
 fn dashboard_access_target_uses_local_daemon_bind_when_remote_url_is_missing() {
-    let _env_guard = env_lock().lock().expect("env lock should be available");
+    let _env_guard = lock_env();
     let fixture = TempFixtureDir::new();
     let config_path = write_config_file(
         fixture.path(),
@@ -434,14 +418,21 @@ fn state_file_initialization_seeds_onboarding_defaults() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn onboarding_status_advances_to_gateway_init_after_preflight_and_state_root_confirmation() {
-    let _env_guard = env_lock().lock().expect("env lock should be available");
+    let _env_guard = lock_env();
     let fixture = TempFixtureDir::new();
+    let config_path = write_config_file(
+        fixture.path(),
+        r#"
+version = 1
+"#,
+    );
     let gateway_binary = fixture.path().join(executable_file_name("palyrad"));
     let browser_binary = fixture.path().join(executable_file_name("palyra-browserd"));
     let cli_binary = fixture.path().join(executable_file_name("palyra"));
     write_file(gateway_binary.as_path(), "binary");
     write_file(browser_binary.as_path(), "binary");
     write_file(cli_binary.as_path(), "binary");
+    let _config_override = ScopedEnvVar::set("PALYRA_CONFIG", config_path.to_string_lossy().as_ref());
     let _gateway_override =
         ScopedEnvVar::set("PALYRA_DESKTOP_PALYRAD_BIN", gateway_binary.to_string_lossy().as_ref());
     let _browser_override = ScopedEnvVar::set(
@@ -452,7 +443,13 @@ async fn onboarding_status_advances_to_gateway_init_after_preflight_and_state_ro
         ScopedEnvVar::set("PALYRA_DESKTOP_PALYRA_BIN", cli_binary.to_string_lossy().as_ref());
 
     let mut control_center = build_test_control_center(fixture.path());
-    assign_test_runtime_ports(&mut control_center);
+    control_center.runtime.gateway_admin_port = 0;
+    control_center.runtime.gateway_grpc_port = 0;
+    control_center.runtime.gateway_quic_port = 0;
+    control_center.runtime.browser_health_port = 0;
+    control_center.runtime.browser_grpc_port = 0;
+    control_center.gateway.bound_ports = vec![0, 0, 0];
+    control_center.browserd.bound_ports = vec![0, 0];
     control_center
         .mark_onboarding_welcome_acknowledged()
         .expect("welcome acknowledgement should persist");
@@ -478,7 +475,7 @@ async fn onboarding_status_advances_to_gateway_init_after_preflight_and_state_ro
 
 #[test]
 fn resolve_binary_path_accepts_absolute_env_override_file() {
-    let _env_guard = env_lock().lock().expect("env lock should be available");
+    let _env_guard = lock_env();
     let fixture = TempFixtureDir::new();
     let binary_name = "palyra-resolver-override";
     let binary_path = fixture.path().join(executable_file_name(binary_name));
@@ -495,7 +492,7 @@ fn resolve_binary_path_accepts_absolute_env_override_file() {
 
 #[test]
 fn resolve_binary_path_rejects_relative_env_override() {
-    let _env_guard = env_lock().lock().expect("env lock should be available");
+    let _env_guard = lock_env();
     let _override = ScopedEnvVar::set("PALYRA_TEST_RESOLVE_BIN", "relative/path/to/palyrad");
     let error = resolve_binary_path("palyrad", "PALYRA_TEST_RESOLVE_BIN")
         .expect_err("relative env override must be rejected");
@@ -504,7 +501,7 @@ fn resolve_binary_path_rejects_relative_env_override() {
 
 #[test]
 fn resolve_binary_path_rejects_cwd_target_fallback() {
-    let _env_guard = env_lock().lock().expect("env lock should be available");
+    let _env_guard = lock_env();
     let fixture = TempFixtureDir::new();
     let binary_name = format!("palyra-cwd-{}", Ulid::new());
     let binary_path = fixture
@@ -523,7 +520,7 @@ fn resolve_binary_path_rejects_cwd_target_fallback() {
 
 #[test]
 fn resolve_binary_path_rejects_path_only_binary() {
-    let _env_guard = env_lock().lock().expect("env lock should be available");
+    let _env_guard = lock_env();
     let fixture = TempFixtureDir::new();
     let binary_name = format!("palyra-path-{}", Ulid::new());
     let binary_path = fixture.path().join(executable_file_name(binary_name.as_str()));
