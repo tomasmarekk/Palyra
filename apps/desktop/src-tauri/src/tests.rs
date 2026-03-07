@@ -13,6 +13,13 @@ use std::{
 use serde_json::json;
 
 use super::commands::initialize_control_center;
+use super::openai_auth::{
+    connect_openai_api_key, get_openai_oauth_callback_state, load_openai_auth_status,
+    open_external_browser, reconnect_openai_oauth, refresh_openai_profile, revoke_openai_profile,
+    set_openai_default_profile, start_openai_oauth_bootstrap, OpenAiApiKeyConnectRequest,
+    OpenAiControlPlaneInputs, OpenAiOAuthBootstrapRequest, OpenAiOAuthCallbackStateRequest,
+    OpenAiProfileActionRequest, OpenAiScopeInput,
+};
 use super::snapshot::resolve_dashboard_access_target;
 use super::{
     build_snapshot_from_inputs, collect_redacted_errors, compute_backoff_ms, executable_file_name,
@@ -148,6 +155,32 @@ fn build_test_control_center(root: &Path) -> ControlCenter {
         log_rx,
         dropped_log_events: Arc::new(AtomicU64::new(0)),
     }
+}
+
+fn build_test_openai_inputs(root: &Path, port: u16) -> OpenAiControlPlaneInputs {
+    let mut control_center = build_test_control_center(root);
+    control_center.runtime.gateway_admin_port = port;
+    OpenAiControlPlaneInputs::capture(&control_center)
+}
+
+fn write_json_response(
+    stream: &mut std::net::TcpStream,
+    status_line: &str,
+    body: &str,
+    extra_headers: &[&str],
+) {
+    let mut response = format!(
+        "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+        body.len()
+    );
+    for header in extra_headers {
+        response.push_str(header);
+        response.push_str("\r\n");
+    }
+    response.push_str("\r\n");
+    response.push_str(body);
+    stream.write_all(response.as_bytes()).expect("response should be written");
+    stream.flush().expect("response should be flushed");
 }
 
 #[test]
@@ -490,7 +523,7 @@ async fn snapshot_build_reuses_console_session_until_expiry() {
     let login_requests_server = Arc::clone(&login_requests);
     let session_requests_server = Arc::clone(&session_requests);
     let server = std::thread::spawn(move || {
-        for _ in 0..8 {
+        for _ in 0..9 {
             let (mut stream, _) = listener.accept().expect("listener should accept request");
             let mut buffer = [0_u8; 4096];
             let read = stream.read(&mut buffer).expect("request should be readable");
@@ -793,4 +826,413 @@ fn initialize_control_center_returns_sanitized_error_without_panicking() {
         !error.contains("super-secret"),
         "initialization helper should sanitize sensitive values before reporting"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn openai_auth_status_loads_profiles_and_redacts_refresh_state() {
+    let fixture = TempFixtureDir::new();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("test listener should bind");
+    let port = listener.local_addr().expect("listener address should resolve").port();
+    let server = std::thread::spawn(move || {
+        for _ in 0..5 {
+            let (mut stream, _) = listener.accept().expect("listener should accept request");
+            let mut buffer = [0_u8; 8192];
+            let read = stream.read(&mut buffer).expect("request should be readable");
+            let request = String::from_utf8_lossy(&buffer[..read]);
+            let request_line = request.lines().next().unwrap_or_default().to_owned();
+            if request_line.starts_with("GET /console/v1/auth/session ") {
+                write_json_response(
+                    &mut stream,
+                    "403 Forbidden",
+                    r#"{"error":"console session cookie is missing"}"#,
+                    &[],
+                );
+                continue;
+            }
+            if request_line.starts_with("POST /console/v1/auth/login ") {
+                write_json_response(
+                    &mut stream,
+                    "200 OK",
+                    r#"{"principal":"admin:desktop-control-center","device_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","csrf_token":"csrf-openai","issued_at_unix_ms":1,"expires_at_unix_ms":2}"#,
+                    &["Set-Cookie: palyra_console_session=session-openai; Path=/; HttpOnly; SameSite=Strict"],
+                );
+                continue;
+            }
+            if request_line.starts_with("GET /console/v1/auth/providers/openai ") {
+                write_json_response(
+                    &mut stream,
+                    "200 OK",
+                    r#"{"contract":{"contract_version":"control-plane.v1"},"provider":"openai","oauth_supported":true,"bootstrap_supported":true,"callback_supported":true,"reconnect_supported":true,"revoke_supported":true,"default_selection_supported":true,"default_profile_id":"openai-oauth","available_profile_ids":["openai-api","openai-oauth"],"state":"connected","note":"OpenAI auth is ready."}"#,
+                    &[],
+                );
+                continue;
+            }
+            if request_line.starts_with("GET /console/v1/auth/health?include_profiles=true ") {
+                write_json_response(
+                    &mut stream,
+                    "200 OK",
+                    r#"{"contract":{"contract_version":"control-plane.v1"},"summary":{"total":2,"ok":0,"expiring":1,"expired":0,"missing":0,"static_count":1},"expiry_distribution":{},"profiles":[{"profile_id":"openai-api","provider":"openai","profile_name":"OpenAI API","scope":"global","credential_type":"api_key","state":"static","reason":"API key stored in vault.","expires_at_unix_ms":null},{"profile_id":"openai-oauth","provider":"openai","profile_name":"OpenAI OAuth","scope":"agent:assistant","credential_type":"oauth","state":"expiring","reason":"Token expires soon.","expires_at_unix_ms":1700000000000}],"refresh_metrics":{"attempts":3,"successes":1,"failures":2,"by_provider":[{"provider":"openai","attempts":3,"successes":1,"failures":2}]}}"#,
+                    &[],
+                );
+                continue;
+            }
+            if request_line
+                .starts_with("GET /console/v1/auth/profiles?provider_kind=openai&limit=100 ")
+            {
+                write_json_response(
+                    &mut stream,
+                    "200 OK",
+                    r#"{"contract":{"contract_version":"control-plane.v1"},"profiles":[{"profile_id":"openai-api","provider":{"kind":"openai"},"profile_name":"OpenAI API","scope":{"kind":"global"},"credential":{"type":"api_key","api_key_vault_ref":"vault://openai/api"},"created_at_unix_ms":11,"updated_at_unix_ms":22},{"profile_id":"openai-oauth","provider":{"kind":"openai"},"profile_name":"OpenAI OAuth","scope":{"kind":"agent","agent_id":"assistant"},"credential":{"type":"oauth","access_token_vault_ref":"vault://openai/access","refresh_token_vault_ref":"vault://openai/refresh","token_endpoint":"https://auth.openai.com/oauth/token","client_id":"desktop-client","client_secret_vault_ref":"vault://openai/client-secret","scopes":["openid","profile","offline_access"],"expires_at_unix_ms":1700000000000,"refresh_state":{"failure_count":2,"last_error":"refresh_token=super-secret","last_attempt_unix_ms":1700000000100,"last_success_unix_ms":1700000000200,"next_allowed_refresh_unix_ms":1700000000300}},"created_at_unix_ms":33,"updated_at_unix_ms":44}],"page":{"limit":100,"returned":2,"next_cursor":null,"has_more":false}}"#,
+                    &[],
+                );
+                continue;
+            }
+            panic!("unexpected OpenAI auth status request: {request_line}");
+        }
+    });
+
+    let status = load_openai_auth_status(build_test_openai_inputs(fixture.path(), port))
+        .await
+        .expect("OpenAI auth status should load");
+    assert!(status.available);
+    assert_eq!(status.default_profile_id.as_deref(), Some("openai-oauth"));
+    assert_eq!(status.summary.total, 2);
+    assert_eq!(status.refresh_metrics.failures, 2);
+
+    let api_profile = status
+        .profiles
+        .iter()
+        .find(|profile| profile.profile_id == "openai-api")
+        .expect("API key profile should be present");
+    assert_eq!(api_profile.credential_type, "api_key");
+    assert!(api_profile.can_rotate_api_key);
+    assert_eq!(api_profile.health_state, "static");
+
+    let oauth_profile = status
+        .profiles
+        .iter()
+        .find(|profile| profile.profile_id == "openai-oauth")
+        .expect("OAuth profile should be present");
+    assert!(oauth_profile.is_default);
+    assert_eq!(oauth_profile.scope_label, "agent:assistant");
+    assert_eq!(oauth_profile.health_state, "expiring");
+    assert!(oauth_profile.can_reconnect);
+    assert_eq!(oauth_profile.refresh_state.as_ref().map(|value| value.failure_count), Some(2));
+    let refresh_error = oauth_profile
+        .refresh_state
+        .as_ref()
+        .and_then(|value| value.last_error.as_deref())
+        .unwrap_or_default();
+    assert!(
+        refresh_error.contains("<redacted>") && !refresh_error.contains("super-secret"),
+        "OAuth refresh error should stay redacted: {refresh_error}"
+    );
+
+    server.join().expect("test server thread should exit");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn openai_api_key_connect_bootstraps_console_session_and_posts_payload() {
+    let fixture = TempFixtureDir::new();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("test listener should bind");
+    let port = listener.local_addr().expect("listener address should resolve").port();
+    let server = std::thread::spawn(move || {
+        for _ in 0..3 {
+            let (mut stream, _) = listener.accept().expect("listener should accept request");
+            let mut buffer = [0_u8; 8192];
+            let read = stream.read(&mut buffer).expect("request should be readable");
+            let request = String::from_utf8_lossy(&buffer[..read]);
+            let request_line = request.lines().next().unwrap_or_default().to_owned();
+            if request_line.starts_with("GET /console/v1/auth/session ") {
+                write_json_response(
+                    &mut stream,
+                    "403 Forbidden",
+                    r#"{"error":"console session cookie is missing"}"#,
+                    &[],
+                );
+                continue;
+            }
+            if request_line.starts_with("POST /console/v1/auth/login ") {
+                write_json_response(
+                    &mut stream,
+                    "200 OK",
+                    r#"{"principal":"admin:desktop-control-center","device_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","csrf_token":"csrf-api","issued_at_unix_ms":1,"expires_at_unix_ms":2}"#,
+                    &["Set-Cookie: palyra_console_session=session-api; Path=/; HttpOnly; SameSite=Strict"],
+                );
+                continue;
+            }
+            if request_line.starts_with("POST /console/v1/auth/providers/openai/api-key ") {
+                assert!(
+                    request.contains("x-palyra-csrf-token: csrf-api"),
+                    "API key connect must include CSRF header"
+                );
+                assert!(request.contains("\"profile_name\":\"Rotated OpenAI\""));
+                assert!(request.contains("\"api_key\":\"sk-live-test\""));
+                assert!(request.contains("\"kind\":\"agent\""));
+                assert!(request.contains("\"agent_id\":\"assistant\""));
+                write_json_response(
+                    &mut stream,
+                    "200 OK",
+                    r#"{"contract":{"contract_version":"control-plane.v1"},"provider":"openai","action":"api_key","state":"connected","message":"OpenAI API key connected.","profile_id":"openai-api"}"#,
+                    &[],
+                );
+                continue;
+            }
+            panic!("unexpected OpenAI API key request: {request_line}");
+        }
+    });
+
+    let response = connect_openai_api_key(
+        build_test_openai_inputs(fixture.path(), port),
+        OpenAiApiKeyConnectRequest {
+            profile_id: Some("openai-api".to_owned()),
+            profile_name: "Rotated OpenAI".to_owned(),
+            scope: Some(OpenAiScopeInput {
+                kind: "agent".to_owned(),
+                agent_id: Some("assistant".to_owned()),
+            }),
+            api_key: "sk-live-test".to_owned(),
+            set_default: true,
+        },
+    )
+    .await
+    .expect("OpenAI API key connect should succeed");
+    assert_eq!(response.message, "OpenAI API key connected.");
+    server.join().expect("test server thread should exit");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn openai_oauth_bootstrap_and_callback_state_reuse_console_session() {
+    let fixture = TempFixtureDir::new();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("test listener should bind");
+    let port = listener.local_addr().expect("listener address should resolve").port();
+    let server = std::thread::spawn(move || {
+        for _ in 0..5 {
+            let (mut stream, _) = listener.accept().expect("listener should accept request");
+            let mut buffer = [0_u8; 8192];
+            let read = stream.read(&mut buffer).expect("request should be readable");
+            let request = String::from_utf8_lossy(&buffer[..read]);
+            let request_line = request.lines().next().unwrap_or_default().to_owned();
+            let has_cookie = request.contains("palyra_console_session=session-oauth");
+            if request_line.starts_with("GET /console/v1/auth/session ") {
+                if has_cookie {
+                    write_json_response(
+                        &mut stream,
+                        "200 OK",
+                        r#"{"principal":"admin:desktop-control-center","device_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","csrf_token":"csrf-oauth","issued_at_unix_ms":1,"expires_at_unix_ms":2}"#,
+                        &[],
+                    );
+                } else {
+                    write_json_response(
+                        &mut stream,
+                        "403 Forbidden",
+                        r#"{"error":"console session cookie is missing"}"#,
+                        &[],
+                    );
+                }
+                continue;
+            }
+            if request_line.starts_with("POST /console/v1/auth/login ") {
+                write_json_response(
+                    &mut stream,
+                    "200 OK",
+                    r#"{"principal":"admin:desktop-control-center","device_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","csrf_token":"csrf-oauth","issued_at_unix_ms":1,"expires_at_unix_ms":2}"#,
+                    &["Set-Cookie: palyra_console_session=session-oauth; Path=/; HttpOnly; SameSite=Strict"],
+                );
+                continue;
+            }
+            if request_line.starts_with("POST /console/v1/auth/providers/openai/bootstrap ") {
+                assert!(
+                    request.contains("x-palyra-csrf-token: csrf-oauth"),
+                    "OAuth bootstrap must include CSRF header"
+                );
+                assert!(request.contains("\"client_id\":\"desktop-client\""));
+                assert!(request.contains("\"client_secret\":\"desktop-secret\""));
+                write_json_response(
+                    &mut stream,
+                    "200 OK",
+                    r#"{"contract":{"contract_version":"control-plane.v1"},"provider":"openai","attempt_id":"attempt-1","authorization_url":"https://auth.openai.example/authorize?attempt=1","expires_at_unix_ms":1700000000000,"profile_id":"openai-oauth","message":"OpenAI OAuth authorization URL issued."}"#,
+                    &[],
+                );
+                continue;
+            }
+            if request_line.starts_with(
+                "GET /console/v1/auth/providers/openai/callback-state?attempt_id=attempt-1 ",
+            ) {
+                assert!(
+                    has_cookie,
+                    "callback-state polling should reuse the authenticated console session cookie"
+                );
+                write_json_response(
+                    &mut stream,
+                    "200 OK",
+                    r#"{"contract":{"contract_version":"control-plane.v1"},"provider":"openai","attempt_id":"attempt-1","state":"failed","message":"User denied the OpenAI authorization request.","profile_id":"openai-oauth","completed_at_unix_ms":1700000000200,"expires_at_unix_ms":1700000000000}"#,
+                    &[],
+                );
+                continue;
+            }
+            panic!("unexpected OpenAI OAuth request: {request_line}");
+        }
+    });
+
+    let inputs = build_test_openai_inputs(fixture.path(), port);
+    let bootstrap = start_openai_oauth_bootstrap(
+        inputs.clone(),
+        OpenAiOAuthBootstrapRequest {
+            profile_id: None,
+            profile_name: Some("OpenAI OAuth".to_owned()),
+            scope: Some(OpenAiScopeInput { kind: "global".to_owned(), agent_id: None }),
+            client_id: Some("desktop-client".to_owned()),
+            client_secret: Some("desktop-secret".to_owned()),
+            scopes_text: "openid, profile, offline_access".to_owned(),
+            set_default: true,
+        },
+    )
+    .await
+    .expect("OpenAI OAuth bootstrap should succeed");
+    assert_eq!(bootstrap.attempt_id, "attempt-1");
+    assert_eq!(bootstrap.profile_id.as_deref(), Some("openai-oauth"));
+
+    let callback_state = get_openai_oauth_callback_state(
+        inputs,
+        OpenAiOAuthCallbackStateRequest { attempt_id: "attempt-1".to_owned() },
+    )
+    .await
+    .expect("OpenAI OAuth callback state should load");
+    assert!(callback_state.is_terminal);
+    assert_eq!(callback_state.state, "failed");
+    assert_eq!(callback_state.profile_id.as_deref(), Some("openai-oauth"));
+
+    server.join().expect("test server thread should exit");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn openai_profile_actions_hit_expected_routes_including_reconnect() {
+    let fixture = TempFixtureDir::new();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("test listener should bind");
+    let port = listener.local_addr().expect("listener address should resolve").port();
+    let server = std::thread::spawn(move || {
+        for _ in 0..9 {
+            let (mut stream, _) = listener.accept().expect("listener should accept request");
+            let mut buffer = [0_u8; 8192];
+            let read = stream.read(&mut buffer).expect("request should be readable");
+            let request = String::from_utf8_lossy(&buffer[..read]);
+            let request_line = request.lines().next().unwrap_or_default().to_owned();
+            let has_cookie = request.contains("palyra_console_session=session-actions");
+            if request_line.starts_with("GET /console/v1/auth/session ") {
+                if has_cookie {
+                    write_json_response(
+                        &mut stream,
+                        "200 OK",
+                        r#"{"principal":"admin:desktop-control-center","device_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","csrf_token":"csrf-actions","issued_at_unix_ms":1,"expires_at_unix_ms":2}"#,
+                        &[],
+                    );
+                } else {
+                    write_json_response(
+                        &mut stream,
+                        "403 Forbidden",
+                        r#"{"error":"console session cookie is missing"}"#,
+                        &[],
+                    );
+                }
+                continue;
+            }
+            if request_line.starts_with("POST /console/v1/auth/login ") {
+                write_json_response(
+                    &mut stream,
+                    "200 OK",
+                    r#"{"principal":"admin:desktop-control-center","device_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","csrf_token":"csrf-actions","issued_at_unix_ms":1,"expires_at_unix_ms":2}"#,
+                    &["Set-Cookie: palyra_console_session=session-actions; Path=/; HttpOnly; SameSite=Strict"],
+                );
+                continue;
+            }
+            if request_line.starts_with("POST /console/v1/auth/providers/openai/refresh ") {
+                assert!(request.contains("x-palyra-csrf-token: csrf-actions"));
+                assert!(request.contains("\"profile_id\":\"openai-oauth\""));
+                write_json_response(
+                    &mut stream,
+                    "200 OK",
+                    r#"{"contract":{"contract_version":"control-plane.v1"},"provider":"openai","action":"refresh","state":"ok","message":"OpenAI profile refreshed.","profile_id":"openai-oauth"}"#,
+                    &[],
+                );
+                continue;
+            }
+            if request_line.starts_with("POST /console/v1/auth/providers/openai/default-profile ") {
+                assert!(request.contains("x-palyra-csrf-token: csrf-actions"));
+                assert!(request.contains("\"profile_id\":\"openai-oauth\""));
+                write_json_response(
+                    &mut stream,
+                    "200 OK",
+                    r#"{"contract":{"contract_version":"control-plane.v1"},"provider":"openai","action":"default_profile","state":"ok","message":"OpenAI default profile updated.","profile_id":"openai-oauth"}"#,
+                    &[],
+                );
+                continue;
+            }
+            if request_line.starts_with("POST /console/v1/auth/providers/openai/revoke ") {
+                assert!(request.contains("x-palyra-csrf-token: csrf-actions"));
+                assert!(request.contains("\"profile_id\":\"openai-oauth\""));
+                write_json_response(
+                    &mut stream,
+                    "200 OK",
+                    r#"{"contract":{"contract_version":"control-plane.v1"},"provider":"openai","action":"revoke","state":"revoked","message":"OpenAI profile revoked.","profile_id":"openai-oauth"}"#,
+                    &[],
+                );
+                continue;
+            }
+            if request_line.starts_with("POST /console/v1/auth/providers/openai/reconnect ") {
+                assert!(request.contains("x-palyra-csrf-token: csrf-actions"));
+                assert!(request.contains("\"profile_id\":\"openai-oauth\""));
+                write_json_response(
+                    &mut stream,
+                    "200 OK",
+                    r#"{"contract":{"contract_version":"control-plane.v1"},"provider":"openai","attempt_id":"attempt-reconnect","authorization_url":"https://auth.openai.example/authorize?attempt=reconnect","expires_at_unix_ms":1700000000500,"profile_id":"openai-oauth","message":"OpenAI OAuth authorization URL issued."}"#,
+                    &[],
+                );
+                continue;
+            }
+            panic!("unexpected OpenAI profile action request: {request_line}");
+        }
+    });
+
+    let inputs = build_test_openai_inputs(fixture.path(), port);
+    let request = OpenAiProfileActionRequest { profile_id: "openai-oauth".to_owned() };
+
+    let refresh = refresh_openai_profile(inputs.clone(), request.clone())
+        .await
+        .expect("refresh action should succeed");
+    assert_eq!(refresh.message, "OpenAI profile refreshed.");
+
+    let default_profile = set_openai_default_profile(inputs.clone(), request.clone())
+        .await
+        .expect("default selection should succeed");
+    assert_eq!(default_profile.message, "OpenAI default profile updated.");
+
+    let revoke = revoke_openai_profile(inputs.clone(), request.clone())
+        .await
+        .expect("revoke action should succeed");
+    assert_eq!(revoke.message, "OpenAI profile revoked.");
+
+    let reconnect =
+        reconnect_openai_oauth(inputs, request).await.expect("reconnect action should succeed");
+    assert_eq!(reconnect.attempt_id, "attempt-reconnect");
+    assert_eq!(reconnect.profile_id.as_deref(), Some("openai-oauth"));
+
+    server.join().expect("test server thread should exit");
+}
+
+#[test]
+fn openai_browser_handoff_requires_http_or_https() {
+    let invalid = open_external_browser("file:///tmp/openai", |_url| Ok::<(), std::io::Error>(()));
+    assert!(invalid
+        .expect_err("browser handoff should reject non-http URLs")
+        .to_string()
+        .contains("only supports http:// and https:// URLs"));
+
+    let mut opened_url = String::new();
+    open_external_browser("https://auth.openai.example/authorize", |url| {
+        opened_url = url.to_owned();
+        Ok::<(), std::io::Error>(())
+    })
+    .expect("https browser handoff should succeed");
+    assert_eq!(opened_url, "https://auth.openai.example/authorize");
 }

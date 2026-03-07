@@ -527,6 +527,62 @@ pub struct ProviderAuthActionRequest {
     pub profile_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenAiApiKeyUpsertRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    pub profile_name: String,
+    pub scope: AuthProfileScope,
+    pub api_key: String,
+    #[serde(default)]
+    pub set_default: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenAiOAuthBootstrapRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<AuthProfileScope>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<String>,
+    #[serde(default)]
+    pub set_default: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenAiOAuthBootstrapEnvelope {
+    pub contract: ContractDescriptor,
+    pub provider: String,
+    pub attempt_id: String,
+    pub authorization_url: String,
+    pub expires_at_unix_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenAiOAuthCallbackStateEnvelope {
+    pub contract: ContractDescriptor,
+    pub provider: String,
+    pub attempt_id: String,
+    pub state: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at_unix_ms: Option<i64>,
+}
+
 const fn default_config_backups() -> usize {
     5
 }
@@ -801,6 +857,48 @@ impl ControlPlaneClient {
     ) -> Result<ProviderAuthStateEnvelope, ControlPlaneClientError> {
         self.request_json(Method::GET, "console/v1/auth/providers/openai", None::<&Value>, false)
             .await
+    }
+
+    pub async fn connect_openai_api_key(
+        &self,
+        request: &OpenAiApiKeyUpsertRequest,
+    ) -> Result<ProviderAuthActionEnvelope, ControlPlaneClientError> {
+        self.request_json(
+            Method::POST,
+            "console/v1/auth/providers/openai/api-key",
+            Some(request),
+            true,
+        )
+        .await
+    }
+
+    pub async fn start_openai_oauth_bootstrap(
+        &self,
+        request: &OpenAiOAuthBootstrapRequest,
+    ) -> Result<OpenAiOAuthBootstrapEnvelope, ControlPlaneClientError> {
+        self.request_json(
+            Method::POST,
+            "console/v1/auth/providers/openai/bootstrap",
+            Some(request),
+            true,
+        )
+        .await
+    }
+
+    pub async fn get_openai_oauth_callback_state(
+        &self,
+        attempt_id: &str,
+    ) -> Result<OpenAiOAuthCallbackStateEnvelope, ControlPlaneClientError> {
+        self.request_json(
+            Method::GET,
+            format!(
+                "console/v1/auth/providers/openai/callback-state?attempt_id={}",
+                urlencoding(attempt_id)
+            ),
+            None::<&Value>,
+            false,
+        )
+        .await
     }
 
     pub async fn run_openai_provider_action(

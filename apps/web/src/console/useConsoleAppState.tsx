@@ -207,19 +207,6 @@ export function useConsoleAppState() {
     resetOverviewDomain
   } = overviewDomain;
   const {
-    authBusy,
-    authProfiles,
-    authHealth,
-    authProviderState,
-    authDefaultProfileId,
-    setAuthDefaultProfileId,
-    authBootstrapProfileId,
-    setAuthBootstrapProfileId,
-    refreshAuth,
-    executeOpenAiAction,
-    resetAuthDomain
-  } = authDomain;
-  const {
     configBusy,
     configInspectPath,
     setConfigInspectPath,
@@ -311,7 +298,7 @@ export function useConsoleAppState() {
       void refreshOverview();
     }
     if (section === "auth") {
-      void refreshAuth();
+      void authDomain.refreshAuth();
     }
     if (section === "approvals") {
       void refreshApprovals();
@@ -349,7 +336,7 @@ export function useConsoleAppState() {
     setSection("approvals");
     setRevealSensitiveValues(false);
     resetOverviewDomain();
-    resetAuthDomain();
+    authDomain.resetAuthDomain();
 
     setApprovalsBusy(false);
     setApprovals([]);
@@ -1837,16 +1824,7 @@ export function useConsoleAppState() {
     overviewDeployment,
     overviewSupportJobs,
     refreshOverview,
-    authBusy,
-    authProfiles,
-    authHealth,
-    authProviderState,
-    authDefaultProfileId,
-    setAuthDefaultProfileId,
-    authBootstrapProfileId,
-    setAuthBootstrapProfileId,
-    refreshAuth,
-    executeOpenAiAction,
+    ...authDomain,
     configBusy,
     configInspectPath,
     setConfigInspectPath,

@@ -536,6 +536,98 @@ textarea:focus {
   gap: 0.25rem;
 }
 
+.auth-summary-card {
+  align-content: start;
+}
+
+.auth-summary-value {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.auth-summary-grid,
+.auth-profile-card__grid {
+  display: grid;
+  gap: 0.45rem 0.8rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.auth-inline-note {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--surface-strong) 78%, transparent);
+  padding: 0.55rem 0.65rem;
+  display: grid;
+  gap: 0.35rem;
+}
+
+.auth-profile-select {
+  min-width: min(100%, 26rem);
+}
+
+.auth-profile-card {
+  gap: 0.75rem;
+}
+
+.auth-profile-card__header {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.7rem;
+  align-items: flex-start;
+}
+
+.auth-profile-card__title-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.auth-tag,
+.auth-status-pill {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 0.18rem 0.55rem;
+  font-size: 0.78rem;
+  line-height: 1.2;
+}
+
+.auth-tag {
+  border: 1px solid var(--border);
+  color: var(--accent-strong);
+  background: color-mix(in srgb, var(--surface-strong) 82%, transparent);
+}
+
+.auth-tag--default {
+  border-color: color-mix(in srgb, var(--accent) 38%, var(--border));
+  background: color-mix(in srgb, var(--accent) 12%, var(--surface-strong));
+}
+
+.auth-status-pill {
+  border: 1px solid transparent;
+  text-transform: capitalize;
+}
+
+.auth-status-pill--ok {
+  color: #0f6a48;
+  border-color: #69be9a;
+  background: #e8f8f2;
+}
+
+.auth-status-pill--warn {
+  color: #865312;
+  border-color: #dfb160;
+  background: #fff4db;
+}
+
+.auth-status-pill--danger {
+  color: #8f2f1f;
+  border-color: #d28a7d;
+  background: #fff0eb;
+}
+
 pre {
   margin: 0;
   white-space: pre-wrap;
@@ -938,6 +1030,11 @@ pre {
   .console-grid-3,
   .console-grid-4,
   .console-grid-5 {
+    grid-template-columns: 1fr;
+  }
+
+  .auth-summary-grid,
+  .auth-profile-card__grid {
     grid-template-columns: 1fr;
   }
 

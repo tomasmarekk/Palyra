@@ -146,21 +146,146 @@
           <div class="card-header">
             <div>
               <p class="eyebrow">OpenAI Connect</p>
-              <h2>Provider setup handoff</h2>
+              <h2>Desktop auth shell</h2>
             </div>
-            <span id="openAiStatus" class="mini-pill mini-pill--muted">Dashboard</span>
+            <span id="openAiStatus" class="mini-pill mini-pill--muted">Unknown</span>
           </div>
           <p id="openAiDetail">
-            OpenAI sign-in and credential management live in the dashboard. Desktop does not store
-            provider credentials in local state.
+            Desktop can start OpenAI auth directly while keeping provider secrets out of
+            desktop-local state. Use the dashboard for the full operator surface.
           </p>
-          <ul class="checklist compact-list">
-            <li>Start the runtime if the gateway is not yet reachable.</li>
-            <li>Open the dashboard to connect OpenAI using the supported auth surface.</li>
-            <li>Return here only for local lifecycle and support actions.</li>
-          </ul>
-          <div class="inline-actions">
-            <button type="button" class="accent" data-command="open_dashboard">Open OpenAI Setup</button>
+          <dl class="facts-list compact">
+            <div>
+              <dt>Provider state</dt>
+              <dd id="openAiProviderState">Unavailable</dd>
+            </div>
+            <div>
+              <dt>Default profile</dt>
+              <dd id="openAiDefaultProfile">None</dd>
+            </div>
+            <div>
+              <dt>Profiles</dt>
+              <dd id="openAiProfileCount">0</dd>
+            </div>
+            <div>
+              <dt>Refresh health</dt>
+              <dd id="openAiRefreshMetrics">-</dd>
+            </div>
+          </dl>
+          <div class="openai-shell-grid">
+            <section class="openai-section" aria-labelledby="openAiConnectHeading">
+              <div class="card-title-row">
+                <h3 id="openAiConnectHeading">Connect or rotate</h3>
+                <span id="openAiAttemptState" class="mini-pill mini-pill--muted">Idle</span>
+              </div>
+              <p id="openAiFormMode" class="hint">
+                Create a new OpenAI profile with API key or OAuth. Desktop sends credentials to
+                the local control plane and does not persist them in app-local state.
+              </p>
+              <p id="openAiAttemptDetail" class="hint">
+                Start the local runtime first if the OpenAI surface is unavailable.
+              </p>
+              <div class="form-grid">
+                <label class="field" for="openAiProfileNameInput">
+                  <span>Profile name</span>
+                  <input id="openAiProfileNameInput" type="text" placeholder="OpenAI" />
+                </label>
+                <label class="field" for="openAiScopeKindSelect">
+                  <span>Scope</span>
+                  <select id="openAiScopeKindSelect">
+                    <option value="global">Global</option>
+                    <option value="agent">Agent</option>
+                  </select>
+                </label>
+                <label id="openAiAgentIdField" class="field field--hidden" for="openAiAgentIdInput">
+                  <span>Agent ID</span>
+                  <input id="openAiAgentIdInput" type="text" placeholder="assistant" />
+                </label>
+                <label class="toggle compact-toggle" for="openAiSetDefaultToggle">
+                  <input id="openAiSetDefaultToggle" type="checkbox" />
+                  <span>Set as default profile after connect</span>
+                </label>
+              </div>
+              <div class="openai-method-grid">
+                <section class="subpanel" aria-labelledby="openAiApiKeyHeading">
+                  <div class="card-title-row">
+                    <h3 id="openAiApiKeyHeading">API key</h3>
+                  </div>
+                  <label class="field" for="openAiApiKeyInput">
+                    <span>API key</span>
+                    <input
+                      id="openAiApiKeyInput"
+                      type="password"
+                      placeholder="sk-..."
+                      autocomplete="off"
+                    />
+                  </label>
+                  <div class="inline-actions">
+                    <button id="openAiApiKeySubmitBtn" type="button" class="accent">
+                      Connect API Key
+                    </button>
+                    <button id="openAiEditorResetBtn" type="button" class="secondary">
+                      Clear Selection
+                    </button>
+                  </div>
+                  <p id="openAiApiKeyHint" class="hint">
+                    Use this flow for first connect or for rotating an existing API key profile.
+                  </p>
+                </section>
+
+                <section class="subpanel" aria-labelledby="openAiOauthHeading">
+                  <div class="card-title-row">
+                    <h3 id="openAiOauthHeading">OAuth browser handoff</h3>
+                  </div>
+                  <label class="field" for="openAiOauthClientIdInput">
+                    <span>Client ID</span>
+                    <input id="openAiOauthClientIdInput" type="text" placeholder="OpenAI OAuth client ID" />
+                  </label>
+                  <label class="field" for="openAiOauthClientSecretInput">
+                    <span>Client secret</span>
+                    <input
+                      id="openAiOauthClientSecretInput"
+                      type="password"
+                      placeholder="OpenAI OAuth client secret"
+                      autocomplete="off"
+                    />
+                  </label>
+                  <label class="field" for="openAiOauthScopesInput">
+                    <span>Scopes</span>
+                    <input
+                      id="openAiOauthScopesInput"
+                      type="text"
+                      value="openid, profile, email, offline_access"
+                    />
+                  </label>
+                  <div class="inline-actions">
+                    <button id="openAiOauthSubmitBtn" type="button" class="accent">
+                      Start OAuth
+                    </button>
+                    <button id="openAiOpenPendingBrowserBtn" type="button" class="secondary" disabled>
+                      Open Pending Browser Handoff
+                    </button>
+                  </div>
+                  <p id="openAiOauthHint" class="hint">
+                    Desktop can bootstrap the OAuth attempt, open the browser and poll callback completion.
+                  </p>
+                </section>
+              </div>
+            </section>
+
+            <section class="openai-section" aria-labelledby="openAiProfilesHeading">
+              <div class="card-title-row">
+                <h3 id="openAiProfilesHeading">Connected profiles</h3>
+                <button type="button" class="secondary" data-command="open_dashboard">
+                  Open Full Dashboard
+                </button>
+              </div>
+              <p class="hint">
+                Desktop covers connect, reconnect, refresh, revoke and default selection. Use the
+                dashboard for full operator detail and broader auth management.
+              </p>
+              <div id="openAiProfilesList" class="openai-profile-list" aria-live="polite"></div>
+            </section>
           </div>
         </article>
 

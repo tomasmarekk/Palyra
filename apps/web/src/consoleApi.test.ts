@@ -577,6 +577,111 @@ describe("ConsoleApiClient", () => {
       )
     ).rejects.toThrow("malformed JSON line");
   });
+
+  it("uses the OpenAI API key connect endpoint with CSRF", async () => {
+    const calls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
+    const responses = [
+      jsonResponse({
+        principal: "admin:web-console",
+        device_id: "device-1",
+        csrf_token: "csrf-1",
+        issued_at_unix_ms: 100,
+        expires_at_unix_ms: 200
+      }),
+      jsonResponse({
+        contract: { contract_version: "control-plane.v1" },
+        provider: "openai",
+        action: "api-key",
+        state: "connected",
+        message: "OpenAI API key stored.",
+        profile_id: "openai-default"
+      })
+    ];
+    const fetcher: typeof fetch = (input, init) => {
+      calls.push({ input, init });
+      const response = responses.shift();
+      if (response === undefined) {
+        throw new Error("No response queued for fetch mock.");
+      }
+      return Promise.resolve(response);
+    };
+    const client = new ConsoleApiClient("", fetcher);
+
+    await client.login({
+      admin_token: "token",
+      principal: "admin:web-console",
+      device_id: "device-1",
+      channel: "web"
+    });
+    await client.connectOpenAiApiKey({
+      profile_name: "default-openai",
+      scope: { kind: "global" },
+      api_key: "sk-test-key",
+      set_default: true
+    });
+
+    expect(requestUrl(calls[1]?.input)).toBe("/console/v1/auth/providers/openai/api-key");
+    expect(calls[1]?.init?.method).toBe("POST");
+    expect(new Headers(calls[1]?.init?.headers).get("x-palyra-csrf-token")).toBe("csrf-1");
+    const connectBody = typeof calls[1]?.init?.body === "string" ? calls[1]?.init?.body : "";
+    expect(connectBody).toContain("\"profile_name\":\"default-openai\"");
+    expect(connectBody).toContain("\"set_default\":true");
+  });
+
+  it("queries OpenAI callback state with attempt_id and keeps GET requests CSRF-free", async () => {
+    const calls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
+    const responses = [
+      jsonResponse({
+        principal: "admin:web-console",
+        device_id: "device-1",
+        csrf_token: "csrf-1",
+        issued_at_unix_ms: 100,
+        expires_at_unix_ms: 200
+      }),
+      jsonResponse({
+        contract: { contract_version: "control-plane.v1" },
+        provider: "openai",
+        attempt_id: "attempt-1",
+        state: "pending",
+        message: "Waiting for callback.",
+        profile_id: "openai-default",
+        expires_at_unix_ms: 10_000
+      }),
+      jsonResponse({
+        contract: { contract_version: "control-plane.v1" },
+        provider: "openai",
+        action: "refresh",
+        state: "refreshed",
+        message: "OpenAI token refreshed.",
+        profile_id: "openai-default"
+      })
+    ];
+    const fetcher: typeof fetch = (input, init) => {
+      calls.push({ input, init });
+      const response = responses.shift();
+      if (response === undefined) {
+        throw new Error("No response queued for fetch mock.");
+      }
+      return Promise.resolve(response);
+    };
+    const client = new ConsoleApiClient("", fetcher);
+
+    await client.login({
+      admin_token: "token",
+      principal: "admin:web-console",
+      device_id: "device-1",
+      channel: "web"
+    });
+    await client.getOpenAiProviderCallbackState("attempt-1");
+    await client.refreshOpenAiProvider({ profile_id: "openai-default" });
+
+    expect(requestUrl(calls[1]?.input)).toBe("/console/v1/auth/providers/openai/callback-state?attempt_id=attempt-1");
+    expect(new Headers(calls[1]?.init?.headers).get("x-palyra-csrf-token")).toBeNull();
+
+    expect(requestUrl(calls[2]?.input)).toBe("/console/v1/auth/providers/openai/refresh");
+    expect(calls[2]?.init?.method).toBe("POST");
+    expect(new Headers(calls[2]?.init?.headers).get("x-palyra-csrf-token")).toBe("csrf-1");
+  });
 });
 
 function jsonResponse(payload: unknown, status = 200): Response {

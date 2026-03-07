@@ -19,6 +19,7 @@ const BROWSER_GRPC_PORT: u16 = 7543;
 
 mod commands;
 mod desktop_state;
+mod openai_auth;
 mod snapshot;
 mod supervisor;
 

@@ -255,10 +255,30 @@ export interface AuthProfileDeleteEnvelope {
 
 export interface AuthHealthEnvelope {
   contract: ContractDescriptor;
-  summary: JsonValue;
+  summary: AuthHealthSummary;
   expiry_distribution: JsonValue;
-  profiles: JsonValue[];
+  profiles: AuthHealthProfile[];
   refresh_metrics: JsonValue;
+}
+
+export interface AuthHealthSummary {
+  total: number;
+  ok: number;
+  expiring: number;
+  expired: number;
+  missing: number;
+  static_count: number;
+}
+
+export interface AuthHealthProfile {
+  profile_id: string;
+  provider: string;
+  profile_name: string;
+  scope: string;
+  credential_type: string;
+  state: string;
+  reason: string;
+  expires_at_unix_ms?: number;
 }
 
 export interface ProviderAuthStateEnvelope {
@@ -283,6 +303,49 @@ export interface ProviderAuthActionEnvelope {
   state: string;
   message: string;
   profile_id?: string;
+}
+
+export interface ProviderAuthActionRequest {
+  profile_id?: string;
+}
+
+export interface OpenAiApiKeyUpsertRequest {
+  profile_id?: string;
+  profile_name: string;
+  scope: AuthProfileScope;
+  api_key: string;
+  set_default?: boolean;
+}
+
+export interface OpenAiOAuthBootstrapRequest {
+  profile_id?: string;
+  profile_name?: string;
+  scope?: AuthProfileScope;
+  client_id?: string;
+  client_secret?: string;
+  scopes?: string[];
+  set_default?: boolean;
+}
+
+export interface OpenAiOAuthBootstrapEnvelope {
+  contract: ContractDescriptor;
+  provider: string;
+  attempt_id: string;
+  authorization_url: string;
+  expires_at_unix_ms: number;
+  profile_id?: string;
+  message: string;
+}
+
+export interface OpenAiOAuthCallbackStateEnvelope {
+  contract: ContractDescriptor;
+  provider: string;
+  attempt_id: string;
+  state: string;
+  message: string;
+  profile_id?: string;
+  completed_at_unix_ms?: number;
+  expires_at_unix_ms?: number;
 }
 
 export interface ConfigBackupRecord {
@@ -540,11 +603,24 @@ export class ConsoleApiClient {
     return this.request(buildPathWithQuery("/console/v1/auth/health", params));
   }
 
+  async connectOpenAiApiKey(payload: OpenAiApiKeyUpsertRequest): Promise<ProviderAuthActionEnvelope> {
+    return this.request(
+      "/console/v1/auth/providers/openai/api-key",
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      },
+      { csrf: true }
+    );
+  }
+
   async getOpenAiProviderState(): Promise<ProviderAuthStateEnvelope> {
     return this.request("/console/v1/auth/providers/openai");
   }
 
-  async startOpenAiProviderBootstrap(payload: { profile_id?: string } = {}): Promise<ProviderAuthActionEnvelope> {
+  async startOpenAiProviderBootstrap(
+    payload: OpenAiOAuthBootstrapRequest = {}
+  ): Promise<OpenAiOAuthBootstrapEnvelope> {
     return this.request(
       "/console/v1/auth/providers/openai/bootstrap",
       {
@@ -555,11 +631,17 @@ export class ConsoleApiClient {
     );
   }
 
-  async getOpenAiProviderCallbackState(): Promise<ProviderAuthStateEnvelope> {
-    return this.request("/console/v1/auth/providers/openai/callback-state");
+  async getOpenAiProviderCallbackState(
+    attemptId: string
+  ): Promise<OpenAiOAuthCallbackStateEnvelope> {
+    const params = new URLSearchParams();
+    params.set("attempt_id", attemptId);
+    return this.request(buildPathWithQuery("/console/v1/auth/providers/openai/callback-state", params));
   }
 
-  async reconnectOpenAiProvider(payload: { profile_id?: string } = {}): Promise<ProviderAuthActionEnvelope> {
+  async reconnectOpenAiProvider(
+    payload: ProviderAuthActionRequest = {}
+  ): Promise<OpenAiOAuthBootstrapEnvelope> {
     return this.request(
       "/console/v1/auth/providers/openai/reconnect",
       {
@@ -570,7 +652,22 @@ export class ConsoleApiClient {
     );
   }
 
-  async revokeOpenAiProvider(payload: { profile_id?: string } = {}): Promise<ProviderAuthActionEnvelope> {
+  async refreshOpenAiProvider(
+    payload: ProviderAuthActionRequest = {}
+  ): Promise<ProviderAuthActionEnvelope> {
+    return this.request(
+      "/console/v1/auth/providers/openai/refresh",
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      },
+      { csrf: true }
+    );
+  }
+
+  async revokeOpenAiProvider(
+    payload: ProviderAuthActionRequest = {}
+  ): Promise<ProviderAuthActionEnvelope> {
     return this.request(
       "/console/v1/auth/providers/openai/revoke",
       {
@@ -581,7 +678,9 @@ export class ConsoleApiClient {
     );
   }
 
-  async setOpenAiDefaultProfile(payload: { profile_id?: string } = {}): Promise<ProviderAuthActionEnvelope> {
+  async setOpenAiDefaultProfile(
+    payload: ProviderAuthActionRequest = {}
+  ): Promise<ProviderAuthActionEnvelope> {
     return this.request(
       "/console/v1/auth/providers/openai/default-profile",
       {

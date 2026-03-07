@@ -974,6 +974,29 @@ impl AuthRuntimeState {
     }
 
     #[allow(clippy::result_large_err)]
+    pub async fn refresh_oauth_profile(
+        self: &Arc<Self>,
+        profile_id: String,
+        vault: Arc<Vault>,
+    ) -> Result<OAuthRefreshOutcome, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let outcome = state
+                .registry
+                .refresh_oauth_profile(
+                    profile_id.as_str(),
+                    vault.as_ref(),
+                    state.refresh_adapter.as_ref(),
+                )
+                .map_err(map_auth_profile_error)?;
+            state.record_refresh_outcome(&outcome);
+            Ok(outcome)
+        })
+        .await
+        .map_err(|_| Status::internal("auth refresh worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
     pub async fn admin_status_snapshot(
         self: &Arc<Self>,
         runtime_state: Arc<GatewayRuntimeState>,
@@ -2144,7 +2167,7 @@ impl GatewayRuntimeState {
     }
 
     #[allow(clippy::result_large_err)]
-    async fn record_journal_event(
+    pub(crate) async fn record_journal_event(
         self: &Arc<Self>,
         request: JournalAppendRequest,
     ) -> Result<crate::journal::JournalAppendOutcome, Status> {
@@ -8925,14 +8948,29 @@ impl auth_v1::auth_service_server::AuthService for AuthServiceImpl {
             format!("auth:profile:{profile_id}").as_str(),
         )?;
         let auth_runtime = Arc::clone(&self.auth_runtime);
-        let deleted = tokio::task::spawn_blocking(move || {
-            auth_runtime
+        let profile_id_for_delete = profile_id.clone();
+        let (deleted_profile, deleted) = tokio::task::spawn_blocking(move || {
+            let existing = auth_runtime
                 .registry()
-                .delete_profile(profile_id.as_str())
-                .map_err(map_auth_profile_error)
+                .get_profile(profile_id_for_delete.as_str())
+                .map_err(map_auth_profile_error)?;
+            let deleted = auth_runtime
+                .registry()
+                .delete_profile(profile_id_for_delete.as_str())
+                .map_err(map_auth_profile_error)?;
+            Ok::<_, Status>((existing, deleted))
         })
         .await
         .map_err(|_| Status::internal("auth delete worker panicked"))??;
+        if deleted {
+            record_auth_profile_deleted_journal_event(
+                &self.state,
+                &context,
+                profile_id.as_str(),
+                deleted_profile.as_ref(),
+            )
+            .await?;
+        }
 
         Ok(Response::new(auth_v1::DeleteAuthProfileResponse {
             v: CANONICAL_PROTOCOL_MAJOR,
@@ -15533,7 +15571,42 @@ async fn record_auth_profile_saved_journal_event(
 }
 
 #[allow(clippy::result_large_err)]
-async fn record_auth_refresh_journal_event(
+async fn record_auth_profile_deleted_journal_event(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: &RequestContext,
+    profile_id: &str,
+    profile: Option<&AuthProfileRecord>,
+) -> Result<(), Status> {
+    runtime_state
+        .record_journal_event(JournalAppendRequest {
+            event_id: Ulid::new().to_string(),
+            session_id: Ulid::new().to_string(),
+            run_id: Ulid::new().to_string(),
+            kind: common_v1::journal_event::EventKind::ToolExecuted as i32,
+            actor: common_v1::journal_event::EventActor::System as i32,
+            timestamp_unix_ms: current_unix_ms(),
+            payload_json: json!({
+                "event": "auth.profile.deleted",
+                "profile_id": profile_id,
+                "provider": profile.map(|value| value.provider.label()),
+                "scope": profile.map(|value| value.scope.scope_key()),
+                "credential_type": profile.map(|value| match value.credential.credential_type() {
+                    AuthCredentialType::ApiKey => "api_key",
+                    AuthCredentialType::Oauth => "oauth",
+                }),
+            })
+            .to_string()
+            .into_bytes(),
+            principal: context.principal.clone(),
+            device_id: context.device_id.clone(),
+            channel: context.channel.clone(),
+        })
+        .await
+        .map(|_| ())
+}
+
+#[allow(clippy::result_large_err)]
+pub(crate) async fn record_auth_refresh_journal_event(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: &RequestContext,
     outcome: &OAuthRefreshOutcome,

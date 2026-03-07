@@ -516,12 +516,19 @@ pub(crate) fn build_control_plane_client(
         .map_err(|error| anyhow!("failed to build control-plane client: {error}"))
 }
 
-async fn ensure_console_session(
+pub(crate) async fn ensure_console_session(
     control_plane: &mut ControlPlaneClient,
     admin_token: &str,
 ) -> Result<()> {
+    ensure_console_session_with_csrf(control_plane, admin_token).await.map(|_| ())
+}
+
+pub(crate) async fn ensure_console_session_with_csrf(
+    control_plane: &mut ControlPlaneClient,
+    admin_token: &str,
+) -> Result<String> {
     match control_plane.get_session().await {
-        Ok(_) => Ok(()),
+        Ok(session) => Ok(session.csrf_token),
         Err(control_plane::ControlPlaneClientError::Http { status: 401 | 403, .. }) => {
             control_plane
                 .login(&control_plane::ConsoleLoginRequest {
@@ -531,7 +538,7 @@ async fn ensure_console_session(
                     channel: None,
                 })
                 .await
-                .map(|_| ())
+                .map(|session| session.csrf_token)
                 .map_err(|error| anyhow!("console login failed: {error}"))
         }
         Err(error) => Err(anyhow!("console session request failed: {error}")),

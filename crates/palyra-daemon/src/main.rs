@@ -9,6 +9,8 @@ mod gateway;
 mod journal;
 mod model_provider;
 mod node_rpc;
+mod openai_auth;
+mod openai_surface;
 mod orchestrator;
 mod quic_runtime;
 mod sandbox_runner;
@@ -37,7 +39,7 @@ use axum::{
         HeaderMap, HeaderName, HeaderValue, StatusCode,
     },
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -46,9 +48,9 @@ use clap::Parser;
 use config::load_config;
 use cron::{spawn_scheduler_loop, MEMORY_MAINTENANCE_INTERVAL};
 use gateway::{
-    authorize_headers, request_context_from_headers, AuthError, CanvasAssetResponse,
-    GatewayAuthConfig, GatewayJournalConfigSnapshot, GatewayRuntimeConfigSnapshot,
-    GatewayRuntimeState, MemoryRuntimeConfig,
+    authorize_headers, record_auth_refresh_journal_event, request_context_from_headers, AuthError,
+    CanvasAssetResponse, GatewayAuthConfig, GatewayJournalConfigSnapshot,
+    GatewayRuntimeConfigSnapshot, GatewayRuntimeState, MemoryRuntimeConfig, RequestContext,
 };
 use journal::{
     ApprovalDecision, ApprovalDecisionScope, ApprovalSubjectType, CronJobUpdatePatch,
@@ -62,9 +64,22 @@ use model_provider::{
     ModelProviderAuthProviderKind, ModelProviderConfig, ModelProviderCredentialSource,
     ModelProviderKind,
 };
+use openai_auth::{
+    build_authorization_url, exchange_authorization_code, generate_pkce_verifier, normalize_scopes,
+    oauth_endpoint_config_from_env, pkce_challenge, render_callback_page, revoke_openai_token,
+    validate_openai_bearer_token, OpenAiCredentialValidationError, OpenAiOAuthAttemptStateRecord,
+    OPENAI_OAUTH_ATTEMPT_TTL_MS, OPENAI_OAUTH_CALLBACK_EVENT_TYPE,
+};
+use openai_surface::{
+    clear_model_provider_auth_profile_selection_if_matches, complete_openai_oauth_callback,
+    connect_openai_api_key, load_openai_oauth_callback_state, reconnect_openai_oauth_attempt,
+    refresh_openai_oauth_profile, revoke_openai_auth_profile, select_default_openai_auth_profile,
+    start_openai_oauth_attempt_from_request,
+};
 use palyra_auth::{
-    AuthCredential, AuthProfileRegistry, AuthProviderKind, HttpOAuthRefreshAdapter,
-    OAuthRefreshAdapter,
+    AuthCredential, AuthProfileError, AuthProfileRecord, AuthProfileRegistry, AuthProfileScope,
+    AuthProviderKind, HttpOAuthRefreshAdapter, OAuthRefreshAdapter, OAuthRefreshOutcomeKind,
+    OAuthRefreshState,
 };
 use palyra_common::default_identity_store_root;
 use palyra_common::{
@@ -91,7 +106,7 @@ use palyra_skills::{
     SkillSecurityAuditPolicy, SkillTrustStore,
 };
 use palyra_transport_quic::QuicTransportLimits;
-use palyra_vault::{Vault, VaultConfig as VaultConfigOptions, VaultRef};
+use palyra_vault::{Vault, VaultConfig as VaultConfigOptions, VaultRef, VaultScope};
 use reqwest::{Client as ReqwestClient, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -194,6 +209,7 @@ struct AppState {
     grpc_url: String,
     scheduler_wake: Arc<Notify>,
     console_sessions: Arc<Mutex<HashMap<String, ConsoleSession>>>,
+    openai_oauth_attempts: Arc<Mutex<HashMap<String, OpenAiOAuthAttempt>>>,
     relay_tokens: Arc<Mutex<HashMap<String, ConsoleRelayToken>>>,
     console_chat_streams: Arc<Mutex<HashMap<String, ConsoleChatRunStream>>>,
     support_bundle_jobs: Arc<Mutex<HashMap<String, control_plane::SupportBundleJob>>>,
@@ -216,6 +232,31 @@ struct DeploymentRuntimeSnapshot {
     admin_auth_required: bool,
     dangerous_remote_bind_ack_config: bool,
     dangerous_remote_bind_ack_env: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ConsoleActionContext {
+    principal: String,
+    device_id: String,
+    channel: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct OpenAiOAuthAttempt {
+    attempt_id: String,
+    expires_at_unix_ms: i64,
+    redirect_uri: String,
+    profile_id: String,
+    profile_name: String,
+    scope: control_plane::AuthProfileScope,
+    client_id: String,
+    client_secret: String,
+    scopes: Vec<String>,
+    token_endpoint: String,
+    code_verifier: String,
+    set_default: bool,
+    context: ConsoleActionContext,
+    state: OpenAiOAuthAttemptStateRecord,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -336,6 +377,22 @@ struct ConsoleAuthProfilesQuery {
 struct ConsoleAuthHealthQuery {
     agent_id: Option<String>,
     include_profiles: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleOpenAiCallbackStateQuery {
+    attempt_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleOpenAiCallbackQuery {
+    state: String,
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    error_description: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1569,6 +1626,7 @@ async fn main() -> Result<()> {
         grpc_url: grpc_url.clone(),
         scheduler_wake: Arc::clone(&scheduler_wake),
         console_sessions: Arc::new(Mutex::new(HashMap::new())),
+        openai_oauth_attempts: Arc::new(Mutex::new(HashMap::new())),
         relay_tokens: Arc::new(Mutex::new(HashMap::new())),
         console_chat_streams: Arc::new(Mutex::new(HashMap::new())),
         support_bundle_jobs: Arc::new(Mutex::new(HashMap::new())),
@@ -1639,6 +1697,10 @@ async fn main() -> Result<()> {
         .route("/console/v1/auth/health", get(console_auth_health_handler))
         .route("/console/v1/auth/providers/openai", get(console_openai_provider_state_handler))
         .route(
+            "/console/v1/auth/providers/openai/api-key",
+            post(console_openai_provider_api_key_handler),
+        )
+        .route(
             "/console/v1/auth/providers/openai/bootstrap",
             post(console_openai_provider_bootstrap_handler),
         )
@@ -1647,8 +1709,16 @@ async fn main() -> Result<()> {
             get(console_openai_provider_callback_state_handler),
         )
         .route(
+            "/console/v1/auth/providers/openai/callback",
+            get(console_openai_provider_callback_handler),
+        )
+        .route(
             "/console/v1/auth/providers/openai/reconnect",
             post(console_openai_provider_reconnect_handler),
+        )
+        .route(
+            "/console/v1/auth/providers/openai/refresh",
+            post(console_openai_provider_refresh_handler),
         )
         .route(
             "/console/v1/auth/providers/openai/revoke",
@@ -3251,6 +3321,12 @@ async fn console_auth_profile_delete_handler(
 ) -> Result<Json<control_plane::AuthProfileDeleteEnvelope>, Response> {
     let session = authorize_console_session(&state, &headers, true)?;
     let profile_id = normalize_non_empty_field(profile_id, "profile_id")?;
+    let existing_profile =
+        state.auth_runtime.registry().get_profile(profile_id.as_str()).map_err(|error| {
+            runtime_status_response(tonic::Status::internal(format!(
+                "failed to load auth profile before delete: {error}"
+            )))
+        })?;
     let mut request =
         TonicRequest::new(gateway::proto::palyra::auth::v1::DeleteAuthProfileRequest {
             v: palyra_common::CANONICAL_PROTOCOL_MAJOR,
@@ -3266,6 +3342,18 @@ async fn console_auth_profile_delete_handler(
         .await
         .map_err(runtime_status_response)?
         .into_inner();
+    if response.deleted
+        && existing_profile
+            .as_ref()
+            .is_some_and(|profile| profile.provider.kind == AuthProviderKind::Openai)
+    {
+        let _ = clear_model_provider_auth_profile_selection_if_matches(
+            &state,
+            &session.context,
+            profile_id.as_str(),
+        )
+        .await?;
+    }
     Ok(Json(control_plane::AuthProfileDeleteEnvelope {
         contract: contract_descriptor(),
         profile_id,
@@ -3314,57 +3402,62 @@ async fn console_openai_provider_state_handler(
         gateway::proto::palyra::auth::v1::AuthProviderKind::Openai,
     )
     .await?;
-    let (document, _, _) = load_console_config_snapshot(None, false)?;
+    let (document, _, _) = load_console_config_snapshot(None, true)?;
     Ok(Json(build_openai_provider_state(&document, profiles)))
+}
+
+async fn console_openai_provider_api_key_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<control_plane::OpenAiApiKeyUpsertRequest>,
+) -> Result<Json<control_plane::ProviderAuthActionEnvelope>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    connect_openai_api_key(&state, &session.context, payload).await.map(Json)
 }
 
 async fn console_openai_provider_bootstrap_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(payload): Json<control_plane::ProviderAuthActionRequest>,
-) -> Result<Json<control_plane::ProviderAuthActionEnvelope>, Response> {
-    let _session = authorize_console_session(&state, &headers, true)?;
-    let _ = payload;
-    Ok(Json(openai_provider_action_envelope(
-        "bootstrap",
-        "not_implemented",
-        "OpenAI OAuth bootstrap contract is published in M52; interactive bootstrap lands in M54.",
-        None,
-    )))
+    Json(payload): Json<control_plane::OpenAiOAuthBootstrapRequest>,
+) -> Result<Json<control_plane::OpenAiOAuthBootstrapEnvelope>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    start_openai_oauth_attempt_from_request(&state, &session.context, &headers, payload)
+        .await
+        .map(Json)
 }
 
 async fn console_openai_provider_callback_state_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Result<Json<control_plane::ProviderAuthStateEnvelope>, Response> {
-    let session = authorize_console_session(&state, &headers, false)?;
-    let profiles = list_console_auth_profiles(
-        &state,
-        &session,
-        gateway::proto::palyra::auth::v1::AuthProviderKind::Openai,
-    )
-    .await?;
-    let (document, _, _) = load_console_config_snapshot(None, false)?;
-    let mut envelope = build_openai_provider_state(&document, profiles);
-    envelope.note = Some(
-        "Callback state is currently idle; interactive OAuth callback handling is introduced in M54."
-            .to_owned(),
-    );
-    Ok(Json(envelope))
+    Query(query): Query<ConsoleOpenAiCallbackStateQuery>,
+) -> Result<Json<control_plane::OpenAiOAuthCallbackStateEnvelope>, Response> {
+    let _session = authorize_console_session(&state, &headers, false)?;
+    load_openai_oauth_callback_state(&state, query.attempt_id.as_str()).await.map(Json)
+}
+
+async fn console_openai_provider_callback_handler(
+    State(state): State<AppState>,
+    Query(query): Query<ConsoleOpenAiCallbackQuery>,
+) -> Result<Html<String>, Response> {
+    complete_openai_oauth_callback(&state, query).await.map(Html)
 }
 
 async fn console_openai_provider_reconnect_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(payload): Json<control_plane::ProviderAuthActionRequest>,
+) -> Result<Json<control_plane::OpenAiOAuthBootstrapEnvelope>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    reconnect_openai_oauth_attempt(&state, &session.context, &headers, payload).await.map(Json)
+}
+
+async fn console_openai_provider_refresh_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<control_plane::ProviderAuthActionRequest>,
 ) -> Result<Json<control_plane::ProviderAuthActionEnvelope>, Response> {
-    let _session = authorize_console_session(&state, &headers, true)?;
-    Ok(Json(openai_provider_action_envelope(
-        "reconnect",
-        "not_implemented",
-        "Per-profile reconnect is not implemented yet; use auth health for refresh status and M54 for interactive reconnect.",
-        payload.profile_id,
-    )))
+    let session = authorize_console_session(&state, &headers, true)?;
+    refresh_openai_oauth_profile(&state, &session.context, payload).await.map(Json)
 }
 
 async fn console_openai_provider_revoke_handler(
@@ -3373,61 +3466,7 @@ async fn console_openai_provider_revoke_handler(
     Json(payload): Json<control_plane::ProviderAuthActionRequest>,
 ) -> Result<Json<control_plane::ProviderAuthActionEnvelope>, Response> {
     let session = authorize_console_session(&state, &headers, true)?;
-    let profile_id = payload.profile_id.ok_or_else(|| {
-        validation_error_response(
-            "profile_id",
-            "required",
-            "profile_id is required for provider revoke",
-        )
-    })?;
-    let mut request =
-        TonicRequest::new(gateway::proto::palyra::auth::v1::DeleteAuthProfileRequest {
-            v: palyra_common::CANONICAL_PROTOCOL_MAJOR,
-            profile_id: profile_id.clone(),
-        });
-    apply_console_rpc_context(&state, &session, request.metadata_mut())?;
-    let service = build_console_auth_service(&state);
-    let response =
-        <gateway::AuthServiceImpl as gateway::proto::palyra::auth::v1::auth_service_server::AuthService>::delete_profile(
-            &service,
-            request,
-        )
-        .await
-        .map_err(runtime_status_response)?
-        .into_inner();
-    if response.deleted {
-        let path = resolve_console_config_path(None, true)?;
-        if let Some(current_path) = path.as_deref() {
-            let current = read_console_config_profile_id(current_path)?;
-            if current.as_deref() == Some(profile_id.as_str()) {
-                let path_ref = FsPath::new(current_path);
-                let (mut document, _) = load_console_document_from_existing_path(path_ref)?;
-                let _ = unset_value_at_path(&mut document, "model_provider.auth_profile_id")
-                    .map_err(|error| {
-                        runtime_status_response(tonic::Status::invalid_argument(format!(
-                            "failed to unset model_provider.auth_profile_id: {error}"
-                        )))
-                    })?;
-                validate_daemon_compatible_document(&document)?;
-                write_document_with_backups(path_ref, &document, 5).map_err(|error| {
-                    runtime_status_response(tonic::Status::internal(format!(
-                        "failed to persist config {}: {error}",
-                        path_ref.display()
-                    )))
-                })?;
-            }
-        }
-    }
-    Ok(Json(openai_provider_action_envelope(
-        "revoke",
-        if response.deleted { "revoked" } else { "not_found" },
-        if response.deleted {
-            "OpenAI auth profile revoked."
-        } else {
-            "OpenAI auth profile did not exist."
-        },
-        Some(profile_id),
-    )))
+    revoke_openai_auth_profile(&state, &session.context, payload).await.map(Json)
 }
 
 async fn console_openai_provider_default_profile_handler(
@@ -3435,44 +3474,8 @@ async fn console_openai_provider_default_profile_handler(
     headers: HeaderMap,
     Json(payload): Json<control_plane::ProviderAuthActionRequest>,
 ) -> Result<Json<control_plane::ProviderAuthActionEnvelope>, Response> {
-    let _session = authorize_console_session(&state, &headers, true)?;
-    let profile_id = payload.profile_id.ok_or_else(|| {
-        validation_error_response(
-            "profile_id",
-            "required",
-            "profile_id is required for default profile selection",
-        )
-    })?;
-    let path = resolve_console_config_path(None, false)?.ok_or_else(|| {
-        runtime_status_response(tonic::Status::failed_precondition(
-            "no daemon config file found; create one before selecting a default auth profile",
-        ))
-    })?;
-    let path_ref = FsPath::new(path.as_str());
-    let (mut document, _) = load_console_document_for_mutation(path_ref)?;
-    set_value_at_path(
-        &mut document,
-        "model_provider.auth_profile_id",
-        toml::Value::String(profile_id.clone()),
-    )
-    .map_err(|error| {
-        runtime_status_response(tonic::Status::invalid_argument(format!(
-            "failed to set model_provider.auth_profile_id: {error}"
-        )))
-    })?;
-    validate_daemon_compatible_document(&document)?;
-    write_document_with_backups(path_ref, &document, 5).map_err(|error| {
-        runtime_status_response(tonic::Status::internal(format!(
-            "failed to persist config {}: {error}",
-            path_ref.display()
-        )))
-    })?;
-    Ok(Json(openai_provider_action_envelope(
-        "default_profile",
-        "selected",
-        "OpenAI default auth profile updated.",
-        Some(profile_id),
-    )))
+    let session = authorize_console_session(&state, &headers, true)?;
+    select_default_openai_auth_profile(&state, &session.context, payload).await.map(Json)
 }
 
 async fn console_config_inspect_handler(
@@ -6680,6 +6683,23 @@ fn apply_console_rpc_context(
     session: &ConsoleSession,
     metadata: &mut tonic::metadata::MetadataMap,
 ) -> Result<(), Response> {
+    apply_console_request_context(
+        state,
+        session.context.principal.as_str(),
+        session.context.device_id.as_str(),
+        session.context.channel.as_deref(),
+        metadata,
+    )
+}
+
+#[allow(clippy::result_large_err)]
+fn apply_console_request_context(
+    state: &AppState,
+    principal: &str,
+    device_id: &str,
+    channel: Option<&str>,
+    metadata: &mut tonic::metadata::MetadataMap,
+) -> Result<(), Response> {
     if state.auth.require_auth {
         let token = state.auth.admin_token.as_deref().ok_or_else(|| {
             runtime_status_response(tonic::Status::failed_precondition(
@@ -6693,15 +6713,15 @@ fn apply_console_rpc_context(
         })?;
         metadata.insert("authorization", bearer);
     }
-    let principal = MetadataValue::try_from(session.context.principal.as_str()).map_err(|_| {
+    let principal = MetadataValue::try_from(principal).map_err(|_| {
         runtime_status_response(tonic::Status::internal("failed to encode principal metadata"))
     })?;
     metadata.insert(gateway::HEADER_PRINCIPAL, principal);
-    let device_id = MetadataValue::try_from(session.context.device_id.as_str()).map_err(|_| {
+    let device_id = MetadataValue::try_from(device_id).map_err(|_| {
         runtime_status_response(tonic::Status::internal("failed to encode device metadata"))
     })?;
     metadata.insert(gateway::HEADER_DEVICE_ID, device_id);
-    if let Some(channel) = session.context.channel.as_deref() {
+    if let Some(channel) = channel {
         let channel = MetadataValue::try_from(channel).map_err(|_| {
             runtime_status_response(tonic::Status::internal("failed to encode channel metadata"))
         })?;
