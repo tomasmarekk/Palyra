@@ -14,8 +14,8 @@ export function App() {
     return (
       <div className="console-root">
         <main className="console-card console-card--center">
-          <p className="console-label">Palyra / M53</p>
-          <h1>Web Console</h1>
+          <p className="console-label">Palyra / M56</p>
+          <h1>Web Dashboard</h1>
           <p>Checking existing session...</p>
         </main>
       </div>
@@ -26,8 +26,8 @@ export function App() {
     return (
       <div className="console-root">
         <main className="console-card console-card--auth">
-          <p className="console-label">Palyra / M53</p>
-          <h1>Operator Console</h1>
+          <p className="console-label">Palyra / M56</p>
+          <h1>Operator Dashboard</h1>
           <p className="console-copy">
             Sign in with an `admin:*` principal. Session cookie + CSRF are required for privileged actions.
           </p>

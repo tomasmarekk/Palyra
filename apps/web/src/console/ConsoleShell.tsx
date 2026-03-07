@@ -1,27 +1,12 @@
 import type { ReactNode } from "react";
 
-import type { ConsoleAppState, Section } from "./useConsoleAppState";
+import type { ConsoleAppState } from "./useConsoleAppState";
+import { CONSOLE_SECTIONS } from "./sectionMetadata";
 
 type ConsoleShellProps = {
   app: ConsoleAppState;
   children: ReactNode;
 };
-
-const SECTIONS: Array<{ id: Section; label: string; detail: string; ariaLabel?: string }> = [
-  { id: "overview", label: "Overview", detail: "Product posture and current capability map" },
-  { id: "chat", label: "Chat", detail: "Streaming operator workspace" },
-  { id: "channels", label: "Channels", detail: "Discord and connector routing" },
-  { id: "auth", label: "OpenAI and Auth", detail: "Provider state and auth profiles" },
-  { id: "approvals", label: "Approvals", detail: "Sensitive action gate" },
-  { id: "cron", label: "Cron", detail: "Scheduled prompts and runs" },
-  { id: "browser", label: "Browser", detail: "Profiles, relay, downloads" },
-  { id: "memory", label: "Memory", detail: "Retention, search, purge" },
-  { id: "skills", label: "Skills", detail: "Install and runtime trust" },
-  { id: "config", label: "Config and Secrets", detail: "Config inspection and vault metadata" },
-  { id: "diagnostics", label: "Diagnostics", detail: "Runtime health and redacted snapshots" },
-  { id: "audit", label: "Audit", detail: "Journal events and operator filters" },
-  { id: "support", label: "Support and Recovery", detail: "Pairing and support bundles" }
-];
 
 function formatSessionExpiry(unixMs: number): string {
   return new Intl.DateTimeFormat("sv-SE", {
@@ -41,10 +26,10 @@ export function ConsoleShell({ app, children }: ConsoleShellProps) {
     <div className="console-shell">
       <header className="console-topbar console-topbar--shell">
         <div className="console-topbar__title">
-          <p className="console-label">Palyra / M53</p>
-          <h1>Web Console v1</h1>
+          <p className="console-label">Palyra / M56</p>
+          <h1>Web Dashboard Operator Surface</h1>
           <p className="console-copy">
-            Dashboard owns the full operator surface. Desktop stays focused on onboarding, lifecycle, and support.
+            Dashboard reflects the implemented control-plane surface, including direct actions, explicit CLI handoffs, and internal-only capability notes.
           </p>
         </div>
         <div className="console-session-box">
@@ -86,18 +71,18 @@ export function ConsoleShell({ app, children }: ConsoleShellProps) {
             <p className="console-label">Information Architecture</p>
             <h2>Operator domains</h2>
             <p className="console-copy">
-              Unsupported or future capabilities are not hidden behind fake menus. Current surfaces map to live backend contracts.
+              Every menu maps to a live backend contract, a generated CLI handoff, or an explicit internal-only capability note.
             </p>
           </div>
           <nav className="console-domain-nav">
-            {SECTIONS.map((entry) => (
+            {CONSOLE_SECTIONS.map((entry) => (
               <button
                 key={entry.id}
                 type="button"
                 className={app.section === entry.id ? "is-active" : ""}
                 onClick={() => app.setSection(entry.id)}
                 aria-current={app.section === entry.id ? "page" : undefined}
-                aria-label={entry.ariaLabel ?? entry.label}
+                aria-label={entry.label}
               >
                 <span aria-hidden="true">{entry.label}</span>
                 <small>{entry.detail}</small>

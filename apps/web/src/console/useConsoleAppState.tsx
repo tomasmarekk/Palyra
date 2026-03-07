@@ -13,6 +13,7 @@ import { useAuthDomain } from "./hooks/useAuthDomain";
 import { useConfigDomain } from "./hooks/useConfigDomain";
 import { useOverviewDomain } from "./hooks/useOverviewDomain";
 import { useSupportDomain } from "./hooks/useSupportDomain";
+import type { Section } from "./sectionMetadata";
 import { DEFAULT_CRON_FORM, type CronForm, type LoginForm } from "./stateTypes";
 import {
   emptyToUndefined,
@@ -27,20 +28,7 @@ import {
   type JsonObject
 } from "./shared";
 
-export type Section =
-  | "overview"
-  | "chat"
-  | "auth"
-  | "approvals"
-  | "cron"
-  | "channels"
-  | "memory"
-  | "skills"
-  | "browser"
-  | "config"
-  | "audit"
-  | "diagnostics"
-  | "support";
+export type { Section } from "./sectionMetadata";
 export type ThemeMode = "light" | "dark";
 
 export function useConsoleAppState() {
@@ -48,7 +36,7 @@ export function useConsoleAppState() {
 
   const [booting, setBooting] = useState(true);
   const [session, setSession] = useState<ConsoleSession | null>(null);
-  const [section, setSection] = useState<Section>("approvals");
+  const [section, setSection] = useState<Section>("overview");
   const [theme, setTheme] = useState<ThemeMode>(() => {
     if (typeof window === "undefined") {
       return "light";
@@ -210,17 +198,27 @@ export function useConsoleAppState() {
     configBusy,
     configInspectPath,
     setConfigInspectPath,
+    configBackups,
+    setConfigBackups,
+    configMutationMode,
+    setConfigMutationMode,
     configInspectSnapshot,
     configMutationKey,
     setConfigMutationKey,
     configMutationValue,
     setConfigMutationValue,
     configValidation,
+    configLastMutation,
+    configDiffPreview,
+    configRecoverBackup,
+    setConfigRecoverBackup,
+    configDeploymentPosture,
     configSecretsScope,
     setConfigSecretsScope,
     configSecrets,
     configSecretKey,
     setConfigSecretKey,
+    configSecretMetadata,
     configSecretValue,
     setConfigSecretValue,
     configSecretReveal,
@@ -228,7 +226,10 @@ export function useConsoleAppState() {
     inspectConfigSurface,
     validateConfigSurface,
     mutateConfigSurface,
+    migrateConfigSurface,
+    recoverConfigSurface,
     refreshSecrets,
+    loadSecretMetadata,
     setSecretValue,
     revealSecretValue,
     deleteSecretValue,
@@ -237,16 +238,23 @@ export function useConsoleAppState() {
   const {
     supportBusy,
     supportPairingSummary,
+    supportDeployment,
     supportPairingChannel,
     setSupportPairingChannel,
     supportPairingIssuedBy,
     setSupportPairingIssuedBy,
     supportPairingTtlMs,
     setSupportPairingTtlMs,
+    supportBundleRetainJobs,
+    setSupportBundleRetainJobs,
     supportBundleJobs,
+    supportSelectedBundleJobId,
+    setSupportSelectedBundleJobId,
+    supportSelectedBundleJob,
     refreshSupport,
     mintSupportPairingCode,
     createSupportBundle,
+    loadSupportBundleJob,
     resetSupportDomain
   } = supportDomain;
 
@@ -289,6 +297,12 @@ export function useConsoleAppState() {
       window.localStorage.setItem("palyra.console.theme", theme);
     }
   }, [theme]);
+  useEffect(() => {
+    if (session === null) {
+      return;
+    }
+    void refreshOverview();
+  }, [session]);
 
   useEffect(() => {
     if (session === null) {
@@ -321,19 +335,16 @@ export function useConsoleAppState() {
     if (section === "config") {
       void refreshConfigSurface();
     }
-    if (section === "audit") {
+    if (section === "operations") {
       void refreshAudit();
-    }
-    if (section === "diagnostics") {
       void refreshDiagnostics();
     }
-    if (section === "support") {
+    if (section === "access" || section === "support") {
       void refreshSupport();
     }
   }, [section, session]);
-
   function resetOperatorScopedState(): void {
-    setSection("approvals");
+    setSection("overview");
     setRevealSensitiveValues(false);
     resetOverviewDomain();
     authDomain.resetAuthDomain();
@@ -1828,17 +1839,27 @@ export function useConsoleAppState() {
     configBusy,
     configInspectPath,
     setConfigInspectPath,
+    configBackups,
+    setConfigBackups,
+    configMutationMode,
+    setConfigMutationMode,
     configInspectSnapshot,
     configMutationKey,
     setConfigMutationKey,
     configMutationValue,
     setConfigMutationValue,
     configValidation,
+    configLastMutation,
+    configDiffPreview,
+    configRecoverBackup,
+    setConfigRecoverBackup,
+    configDeploymentPosture,
     configSecretsScope,
     setConfigSecretsScope,
     configSecrets,
     configSecretKey,
     setConfigSecretKey,
+    configSecretMetadata,
     configSecretValue,
     setConfigSecretValue,
     configSecretReveal,
@@ -1846,22 +1867,32 @@ export function useConsoleAppState() {
     inspectConfigSurface,
     validateConfigSurface,
     mutateConfigSurface,
+    migrateConfigSurface,
+    recoverConfigSurface,
     refreshSecrets,
+    loadSecretMetadata,
     setSecretValue,
     revealSecretValue,
     deleteSecretValue,
     supportBusy,
     supportPairingSummary,
+    supportDeployment,
     supportPairingChannel,
     setSupportPairingChannel,
     supportPairingIssuedBy,
     setSupportPairingIssuedBy,
     supportPairingTtlMs,
     setSupportPairingTtlMs,
+    supportBundleRetainJobs,
+    setSupportBundleRetainJobs,
     supportBundleJobs,
+    supportSelectedBundleJobId,
+    setSupportSelectedBundleJobId,
+    supportSelectedBundleJob,
     refreshSupport,
     mintSupportPairingCode,
-    createSupportBundle
+    createSupportBundle,
+    loadSupportBundleJob
   };
 }
 

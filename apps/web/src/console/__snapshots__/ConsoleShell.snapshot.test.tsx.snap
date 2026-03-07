@@ -1,6 +1,6 @@
 // Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
 
-exports[`ConsoleShell snapshot coverage > renders deterministic shell navigation for the M53 baseline 1`] = `
+exports[`ConsoleShell snapshot coverage > renders deterministic shell navigation for the M56 parity surface 1`] = `
 <div
   class="console-shell"
 >
@@ -13,15 +13,15 @@ exports[`ConsoleShell snapshot coverage > renders deterministic shell navigation
       <p
         class="console-label"
       >
-        Palyra / M53
+        Palyra / M56
       </p>
       <h1>
-        Web Console v1
+        Web Dashboard Operator Surface
       </h1>
       <p
         class="console-copy"
       >
-        Dashboard owns the full operator surface. Desktop stays focused on onboarding, lifecycle, and support.
+        Dashboard reflects the implemented control-plane surface, including direct actions, explicit CLI handoffs, and internal-only capability notes.
       </p>
     </div>
     <div
@@ -104,7 +104,7 @@ exports[`ConsoleShell snapshot coverage > renders deterministic shell navigation
         <p
           class="console-copy"
         >
-          Unsupported or future capabilities are not hidden behind fake menus. Current surfaces map to live backend contracts.
+          Every menu maps to a live backend contract, a generated CLI handoff, or an explicit internal-only capability note.
         </p>
       </div>
       <nav
@@ -122,49 +122,21 @@ exports[`ConsoleShell snapshot coverage > renders deterministic shell navigation
             Overview
           </span>
           <small>
-            Product posture and current capability map
+            Product posture and capability exposure map
           </small>
         </button>
         <button
-          aria-label="Chat"
+          aria-label="Chat and Sessions"
           class=""
           type="button"
         >
           <span
             aria-hidden="true"
           >
-            Chat
+            Chat and Sessions
           </span>
           <small>
             Streaming operator workspace
-          </small>
-        </button>
-        <button
-          aria-label="Channels"
-          class=""
-          type="button"
-        >
-          <span
-            aria-hidden="true"
-          >
-            Channels
-          </span>
-          <small>
-            Discord and connector routing
-          </small>
-        </button>
-        <button
-          aria-label="OpenAI and Auth"
-          class=""
-          type="button"
-        >
-          <span
-            aria-hidden="true"
-          >
-            OpenAI and Auth
-          </span>
-          <small>
-            Provider state and auth profiles
           </small>
         </button>
         <button
@@ -192,7 +164,21 @@ exports[`ConsoleShell snapshot coverage > renders deterministic shell navigation
             Cron
           </span>
           <small>
-            Scheduled prompts and runs
+            Scheduled prompts, runs, and logs
+          </small>
+        </button>
+        <button
+          aria-label="Channels and Router"
+          class=""
+          type="button"
+        >
+          <span
+            aria-hidden="true"
+          >
+            Channels and Router
+          </span>
+          <small>
+            Discord operations and routing policy
           </small>
         </button>
         <button
@@ -206,7 +192,7 @@ exports[`ConsoleShell snapshot coverage > renders deterministic shell navigation
             Browser
           </span>
           <small>
-            Profiles, relay, downloads
+            Profiles, relay, and downloads
           </small>
         </button>
         <button
@@ -220,7 +206,7 @@ exports[`ConsoleShell snapshot coverage > renders deterministic shell navigation
             Memory
           </span>
           <small>
-            Retention, search, purge
+            Retention, search, and purge
           </small>
         </button>
         <button
@@ -234,7 +220,21 @@ exports[`ConsoleShell snapshot coverage > renders deterministic shell navigation
             Skills
           </span>
           <small>
-            Install and runtime trust
+            Install and runtime trust posture
+          </small>
+        </button>
+        <button
+          aria-label="OpenAI and Auth Profiles"
+          class=""
+          type="button"
+        >
+          <span
+            aria-hidden="true"
+          >
+            OpenAI and Auth Profiles
+          </span>
+          <small>
+            Provider state and credential health
           </small>
         </button>
         <button
@@ -248,35 +248,35 @@ exports[`ConsoleShell snapshot coverage > renders deterministic shell navigation
             Config and Secrets
           </span>
           <small>
-            Config inspection and vault metadata
+            Config lifecycle and vault metadata
           </small>
         </button>
         <button
-          aria-label="Diagnostics"
+          aria-label="Pairing and Gateway Access"
           class=""
           type="button"
         >
           <span
             aria-hidden="true"
           >
-            Diagnostics
+            Pairing and Gateway Access
           </span>
           <small>
-            Runtime health and redacted snapshots
+            Pairing lifecycle and remote access posture
           </small>
         </button>
         <button
-          aria-label="Audit"
+          aria-label="Diagnostics and Audit"
           class=""
           type="button"
         >
           <span
             aria-hidden="true"
           >
-            Audit
+            Diagnostics and Audit
           </span>
           <small>
-            Journal events and operator filters
+            Runtime snapshots, audit, and CLI handoffs
           </small>
         </button>
         <button
@@ -290,7 +290,7 @@ exports[`ConsoleShell snapshot coverage > renders deterministic shell navigation
             Support and Recovery
           </span>
           <small>
-            Pairing and support bundles
+            Bundle export and recovery shortcuts
           </small>
         </button>
       </nav>

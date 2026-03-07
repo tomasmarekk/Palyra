@@ -448,6 +448,212 @@ describe("ConsoleApiClient", () => {
     expect(new Headers(calls[4]?.init?.headers).get("x-palyra-csrf-token")).toBe("csrf-1");
   });
 
+  it("supports M56 config, access, and support contract additions", async () => {
+    const calls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
+    const responses = [
+      jsonResponse({
+        principal: "admin:web-console",
+        device_id: "device-1",
+        csrf_token: "csrf-1",
+        issued_at_unix_ms: 100,
+        expires_at_unix_ms: 200
+      }),
+      jsonResponse({
+        contract: { contract_version: "control-plane.v1" },
+        operation: "migrate",
+        source_path: "palyra.toml",
+        backups_retained: 3,
+        config_version: 2
+      }),
+      jsonResponse({
+        contract: { contract_version: "control-plane.v1" },
+        operation: "recover",
+        source_path: "palyra.toml",
+        backups_retained: 3,
+        config_version: 1
+      }),
+      jsonResponse({
+        contract: { contract_version: "control-plane.v1" },
+        channels: []
+      }),
+      jsonResponse({
+        contract: { contract_version: "control-plane.v1" },
+        channels: []
+      }),
+      jsonResponse({
+        contract: { contract_version: "control-plane.v1" },
+        jobs: [],
+        page: { limit: 20, returned: 0, has_more: false }
+      }),
+      jsonResponse({
+        contract: { contract_version: "control-plane.v1" },
+        job: {
+          job_id: "support-job-1",
+          state: "queued",
+          requested_at_unix_ms: 100,
+          command_output: ""
+        }
+      }),
+      jsonResponse({
+        contract: { contract_version: "control-plane.v1" },
+        job: {
+          job_id: "support-job-1",
+          state: "queued",
+          requested_at_unix_ms: 100,
+          command_output: ""
+        }
+      }),
+      jsonResponse({
+        contract: { contract_version: "control-plane.v1" },
+        secret: {
+          scope: "global",
+          key: "openai_api_key",
+          created_at_unix_ms: 100,
+          updated_at_unix_ms: 120,
+          value_bytes: 32
+        }
+      })
+    ];
+    const fetcher: typeof fetch = (input, init) => {
+      calls.push({ input, init });
+      const response = responses.shift();
+      if (response === undefined) {
+        throw new Error("No response queued for fetch mock.");
+      }
+      return Promise.resolve(response);
+    };
+    const client = new ConsoleApiClient("", fetcher);
+
+    await client.login({
+      admin_token: "token",
+      principal: "admin:web-console",
+      device_id: "device-1",
+      channel: "web"
+    });
+    await client.migrateConfig({ path: "palyra.toml", backups: 3 });
+    await client.recoverConfig({ path: "palyra.toml", backup: 1, backups: 3 });
+    await client.getPairingSummary();
+    await client.mintPairingCode({ channel: "discord:default", ttl_ms: 600000 });
+    await client.listSupportBundleJobs();
+    await client.createSupportBundleJob({ retain_jobs: 8 });
+    await client.getSupportBundleJob("support-job-1");
+    await client.getSecretMetadata("global", "openai_api_key");
+
+    expect(requestUrl(calls[1]?.input)).toBe("/console/v1/config/migrate");
+    expect(new Headers(calls[1]?.init?.headers).get("x-palyra-csrf-token")).toBe("csrf-1");
+
+    expect(requestUrl(calls[2]?.input)).toBe("/console/v1/config/recover");
+    expect(new Headers(calls[2]?.init?.headers).get("x-palyra-csrf-token")).toBe("csrf-1");
+
+    expect(requestUrl(calls[3]?.input)).toBe("/console/v1/pairing");
+    expect(new Headers(calls[3]?.init?.headers).get("x-palyra-csrf-token")).toBeNull();
+
+    expect(requestUrl(calls[4]?.input)).toBe("/console/v1/pairing/codes");
+    expect(new Headers(calls[4]?.init?.headers).get("x-palyra-csrf-token")).toBe("csrf-1");
+
+    expect(requestUrl(calls[5]?.input)).toBe("/console/v1/support-bundle/jobs");
+    expect(new Headers(calls[5]?.init?.headers).get("x-palyra-csrf-token")).toBeNull();
+
+    expect(requestUrl(calls[6]?.input)).toBe("/console/v1/support-bundle/jobs");
+    expect(new Headers(calls[6]?.init?.headers).get("x-palyra-csrf-token")).toBe("csrf-1");
+
+    expect(requestUrl(calls[7]?.input)).toBe("/console/v1/support-bundle/jobs/support-job-1");
+    expect(new Headers(calls[7]?.init?.headers).get("x-palyra-csrf-token")).toBeNull();
+
+    expect(requestUrl(calls[8]?.input)).toBe(
+      "/console/v1/secrets/metadata?scope=global&key=openai_api_key"
+    );
+  });
+
+  it("supports M56 runtime operations contract additions", async () => {
+    const calls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
+    const responses = [
+      jsonResponse({
+        principal: "admin:web-console",
+        device_id: "device-1",
+        csrf_token: "csrf-1",
+        issued_at_unix_ms: 100,
+        expires_at_unix_ms: 200
+      }),
+      jsonResponse({ runs: [] }),
+      jsonResponse({ config: {}, config_hash: "router-hash-1" }),
+      jsonResponse({ warnings: [], config_hash: "router-hash-1" }),
+      jsonResponse({ preview: { accepted: true } }),
+      jsonResponse({ pairings: [], config_hash: "router-hash-1" }),
+      jsonResponse({ code: { code: "777888" }, config_hash: "router-hash-1" }),
+      jsonResponse({ report: { verified: true } }),
+      jsonResponse({ report: { audited: true }, quarantined: false }),
+      jsonResponse({ status: "quarantined" }),
+      jsonResponse({ status: "active" }),
+      jsonResponse({
+        principal: "admin:web-console",
+        active_profile_id: "profile-1",
+        profiles: []
+      }),
+      jsonResponse({ profile: { profile_id: "profile-1" } }),
+      jsonResponse({ profile: { profile_id: "profile-1" } }),
+      jsonResponse({ profile: { profile_id: "profile-1" } }),
+      jsonResponse({ deleted: true, active_profile_id: "profile-1" }),
+      jsonResponse({ artifacts: [], truncated: false, error: "" })
+    ];
+    const fetcher: typeof fetch = (input, init) => {
+      calls.push({ input, init });
+      const response = responses.shift();
+      if (response === undefined) {
+        throw new Error("No response queued for fetch mock.");
+      }
+      return Promise.resolve(response);
+    };
+    const client = new ConsoleApiClient("", fetcher);
+
+    await client.login({
+      admin_token: "token",
+      principal: "admin:web-console",
+      device_id: "device-1",
+      channel: "web"
+    });
+    await client.listCronRuns("cron-1");
+    await client.getChannelRouterRules();
+    await client.getChannelRouterWarnings();
+    await client.previewChannelRoute({ channel: "discord:default", text: "pair 123456" });
+    await client.listChannelRouterPairings();
+    await client.mintChannelRouterPairingCode({ channel: "discord:default" });
+    await client.verifySkill("acme.echo_http", { version: "1.2.3" });
+    await client.auditSkill("acme.echo_http", { version: "1.2.3", quarantine_on_fail: true });
+    await client.quarantineSkill({ skill_id: "acme.echo_http", version: "1.2.3" });
+    await client.enableSkill({ skill_id: "acme.echo_http", version: "1.2.3" });
+    await client.listBrowserProfiles();
+    await client.createBrowserProfile({ name: "Primary Browser" });
+    await client.renameBrowserProfile("profile-1", { name: "Renamed Browser" });
+    await client.activateBrowserProfile("profile-1");
+    await client.deleteBrowserProfile("profile-1");
+    await client.listBrowserDownloads();
+
+    expect(requestUrl(calls[1]?.input)).toBe("/console/v1/cron/jobs/cron-1/runs");
+    expect(new Headers(calls[1]?.init?.headers).get("x-palyra-csrf-token")).toBeNull();
+
+    expect(requestUrl(calls[2]?.input)).toBe("/console/v1/channels/router/rules");
+    expect(requestUrl(calls[3]?.input)).toBe("/console/v1/channels/router/warnings");
+
+    expect(requestUrl(calls[4]?.input)).toBe("/console/v1/channels/router/preview");
+    expect(new Headers(calls[4]?.init?.headers).get("x-palyra-csrf-token")).toBe("csrf-1");
+
+    expect(requestUrl(calls[5]?.input)).toBe("/console/v1/channels/router/pairings");
+    expect(requestUrl(calls[6]?.input)).toBe("/console/v1/channels/router/pairing-codes");
+
+    expect(requestUrl(calls[7]?.input)).toBe("/console/v1/skills/acme.echo_http/verify");
+    expect(requestUrl(calls[8]?.input)).toBe("/console/v1/skills/acme.echo_http/audit");
+    expect(requestUrl(calls[9]?.input)).toBe("/console/v1/skills/acme.echo_http/quarantine");
+    expect(requestUrl(calls[10]?.input)).toBe("/console/v1/skills/acme.echo_http/enable");
+
+    expect(requestUrl(calls[11]?.input)).toBe("/console/v1/browser/profiles");
+    expect(requestUrl(calls[12]?.input)).toBe("/console/v1/browser/profiles/create");
+    expect(requestUrl(calls[13]?.input)).toBe("/console/v1/browser/profiles/profile-1/rename");
+    expect(requestUrl(calls[14]?.input)).toBe("/console/v1/browser/profiles/profile-1/activate");
+    expect(requestUrl(calls[15]?.input)).toBe("/console/v1/browser/profiles/profile-1/delete");
+    expect(requestUrl(calls[16]?.input)).toBe("/console/v1/browser/downloads");
+  });
+
   it("lists chat sessions and streams NDJSON responses with CSRF", async () => {
     const calls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
     const responses = [

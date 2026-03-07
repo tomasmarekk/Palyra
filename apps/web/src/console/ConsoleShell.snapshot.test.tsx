@@ -9,7 +9,7 @@ afterEach(() => {
 });
 
 describe("ConsoleShell snapshot coverage", () => {
-  it("renders deterministic shell navigation for the M53 baseline", () => {
+  it("renders deterministic shell navigation for the M56 parity surface", () => {
     const app = {
       session: {
         principal: "admin:web-console",

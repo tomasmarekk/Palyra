@@ -2,7 +2,14 @@ import { useState } from "react";
 
 import type { ConsoleApiClient, JsonValue } from "../../consoleApi";
 import type { JsonObject } from "../shared";
-import { emptyToUndefined, isJsonObject, parseInteger, readString, toErrorMessage, toJsonObjectArray } from "../shared";
+import {
+  emptyToUndefined,
+  isJsonObject,
+  parseInteger,
+  readString,
+  toErrorMessage,
+  toJsonObjectArray
+} from "../shared";
 
 type UseSupportDomainArgs = {
   api: ConsoleApiClient;
@@ -13,23 +20,42 @@ type UseSupportDomainArgs = {
 export function useSupportDomain({ api, setError, setNotice }: UseSupportDomainArgs) {
   const [supportBusy, setSupportBusy] = useState(false);
   const [supportPairingSummary, setSupportPairingSummary] = useState<JsonObject | null>(null);
+  const [supportDeployment, setSupportDeployment] = useState<JsonObject | null>(null);
   const [supportPairingChannel, setSupportPairingChannel] = useState("discord:default");
   const [supportPairingIssuedBy, setSupportPairingIssuedBy] = useState("");
   const [supportPairingTtlMs, setSupportPairingTtlMs] = useState("600000");
+  const [supportBundleRetainJobs, setSupportBundleRetainJobs] = useState("16");
   const [supportBundleJobs, setSupportBundleJobs] = useState<JsonObject[]>([]);
+  const [supportSelectedBundleJobId, setSupportSelectedBundleJobId] = useState("");
+  const [supportSelectedBundleJob, setSupportSelectedBundleJob] = useState<JsonObject | null>(null);
 
   async function refreshSupport(): Promise<void> {
     setSupportBusy(true);
     setError(null);
     try {
-      const [pairingResponse, jobsResponse] = await Promise.all([
+      const [pairingResponse, jobsResponse, deploymentResponse] = await Promise.all([
         api.getPairingSummary(),
-        api.listSupportBundleJobs()
+        api.listSupportBundleJobs(),
+        api.getDeploymentPosture()
       ]);
       setSupportPairingSummary(
         isJsonObject(pairingResponse as unknown as JsonValue) ? (pairingResponse as unknown as JsonObject) : null
       );
       setSupportBundleJobs(toJsonObjectArray(jobsResponse.jobs as unknown as JsonValue[]));
+      setSupportDeployment(
+        isJsonObject(deploymentResponse as unknown as JsonValue)
+          ? (deploymentResponse as unknown as JsonObject)
+          : null
+      );
+      const nextSelectedJobId = supportSelectedBundleJobId.trim();
+      if (nextSelectedJobId.length > 0) {
+        const jobResponse = await api.getSupportBundleJob(nextSelectedJobId);
+        setSupportSelectedBundleJob(
+          isJsonObject(jobResponse.job as unknown as JsonValue)
+            ? (jobResponse.job as unknown as JsonObject)
+            : null
+        );
+      }
     } catch (failure) {
       setError(toErrorMessage(failure));
     } finally {
@@ -68,11 +94,20 @@ export function useSupportDomain({ api, setError, setNotice }: UseSupportDomainA
   }
 
   async function createSupportBundle(): Promise<void> {
+    const retainJobs = parseInteger(supportBundleRetainJobs);
+    if (retainJobs === null || retainJobs <= 0) {
+      setError("Retain jobs must be a positive integer.");
+      return;
+    }
     setSupportBusy(true);
     setError(null);
     setNotice(null);
     try {
-      const response = await api.createSupportBundleJob();
+      const response = await api.createSupportBundleJob({ retain_jobs: retainJobs });
+      const createdJob =
+        isJsonObject(response.job as unknown as JsonValue) ? (response.job as unknown as JsonObject) : null;
+      setSupportSelectedBundleJob(createdJob);
+      setSupportSelectedBundleJobId(readString(createdJob ?? {}, "job_id") ?? "");
       setNotice(
         `Support bundle job queued: ${readString(response.job as unknown as JsonObject, "job_id") ?? "unknown"}.`
       );
@@ -84,28 +119,60 @@ export function useSupportDomain({ api, setError, setNotice }: UseSupportDomainA
     }
   }
 
+  async function loadSupportBundleJob(): Promise<void> {
+    const jobId = supportSelectedBundleJobId.trim();
+    if (jobId.length === 0) {
+      setError("Support bundle job ID cannot be empty.");
+      return;
+    }
+    setSupportBusy(true);
+    setError(null);
+    try {
+      const response = await api.getSupportBundleJob(jobId);
+      setSupportSelectedBundleJob(
+        isJsonObject(response.job as unknown as JsonValue) ? (response.job as unknown as JsonObject) : null
+      );
+      setNotice("Support bundle job refreshed.");
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setSupportBusy(false);
+    }
+  }
+
   function resetSupportDomain(): void {
     setSupportBusy(false);
     setSupportPairingSummary(null);
+    setSupportDeployment(null);
     setSupportPairingChannel("discord:default");
     setSupportPairingIssuedBy("");
     setSupportPairingTtlMs("600000");
+    setSupportBundleRetainJobs("16");
     setSupportBundleJobs([]);
+    setSupportSelectedBundleJobId("");
+    setSupportSelectedBundleJob(null);
   }
 
   return {
     supportBusy,
     supportPairingSummary,
+    supportDeployment,
     supportPairingChannel,
     setSupportPairingChannel,
     supportPairingIssuedBy,
     setSupportPairingIssuedBy,
     supportPairingTtlMs,
     setSupportPairingTtlMs,
+    supportBundleRetainJobs,
+    setSupportBundleRetainJobs,
     supportBundleJobs,
+    supportSelectedBundleJobId,
+    setSupportSelectedBundleJobId,
+    supportSelectedBundleJob,
     refreshSupport,
     mintSupportPairingCode,
     createSupportBundle,
+    loadSupportBundleJob,
     resetSupportDomain
   };
 }

@@ -1185,6 +1185,59 @@ fn console_m52_control_plane_domains_publish_contract_metadata() -> Result<()> {
         }),
         "capability catalog should enumerate auth.profiles capability"
     );
+    let capability_entries = capability_catalog
+        .get("capabilities")
+        .and_then(Value::as_array)
+        .context("capability catalog should include capability entries array")?;
+    let gateway_verify = capability_entries
+        .iter()
+        .find(|entry| {
+            entry.get("id").and_then(Value::as_str) == Some("gateway.access.verify_remote")
+        })
+        .context("capability catalog should include gateway.access.verify_remote handoff entry")?;
+    assert_eq!(
+        gateway_verify.get("dashboard_section").and_then(Value::as_str),
+        Some("access"),
+        "gateway verify handoff should map to the access dashboard section"
+    );
+    assert_eq!(
+        gateway_verify.get("dashboard_exposure").and_then(Value::as_str),
+        Some("cli_handoff"),
+        "gateway verify handoff should be explicitly marked as a CLI handoff"
+    );
+    assert_eq!(
+        gateway_verify.get("execution_mode").and_then(Value::as_str),
+        Some("generated_cli"),
+        "gateway verify handoff should keep execution mode focused on CLI mechanics"
+    );
+    assert!(
+        gateway_verify.get("cli_handoff_commands").and_then(Value::as_array).is_some_and(
+            |commands| commands.iter().any(|command| {
+                command
+                    .as_str()
+                    .is_some_and(|value| value.contains("dashboard-url --verify-remote"))
+            })
+        ),
+        "gateway verify handoff should publish the generated CLI command"
+    );
+    let policy_explain = capability_entries
+        .iter()
+        .find(|entry| entry.get("id").and_then(Value::as_str) == Some("policy.explain"))
+        .context("capability catalog should include policy.explain internal-only entry")?;
+    assert_eq!(
+        policy_explain.get("dashboard_exposure").and_then(Value::as_str),
+        Some("internal_only"),
+        "policy explain should remain explicitly internal-only"
+    );
+    assert_eq!(
+        policy_explain.get("execution_mode").and_then(Value::as_str),
+        Some("internal"),
+        "policy explain should keep execution mode focused on internal mechanics"
+    );
+    assert!(
+        policy_explain.get("notes").and_then(Value::as_str).is_some(),
+        "internal-only catalog entries should publish a justification note"
+    );
 
     let deployment = client
         .get(format!("http://127.0.0.1:{admin_port}/console/v1/deployment/posture"))

@@ -146,10 +146,13 @@ export interface ErrorEnvelope {
 export interface CapabilityEntry {
   id: string;
   domain: string;
+  dashboard_section: string;
   title: string;
   owner: string;
   surfaces: string[];
   execution_mode: string;
+  dashboard_exposure?: "direct_action" | "cli_handoff" | "internal_only";
+  cli_handoff_commands: string[];
   mutation_classes: string[];
   test_refs: string[];
   contract_paths: string[];

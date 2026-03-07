@@ -2,6 +2,12 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "./App";
+import {
+  auditEventsFixture,
+  capabilityCatalogFixture,
+  deploymentPostureFixture,
+  supportBundleJobsFixture
+} from "./console/__fixtures__/m56ControlPlane";
 
 afterEach(() => {
   cleanup();
@@ -15,14 +21,14 @@ describe("M35 web console app", () => {
 
     render(<App />);
 
-    expect(await screen.findByRole("heading", { name: "Operator Console" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Operator Dashboard" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Approvals" })).not.toBeInTheDocument();
   });
 
   it("clears operator-scoped state on sign-out before next sign-in refresh completes", async () => {
     const delayedApprovals = createDeferredResponse();
     let activePrincipal = "admin:user-a";
-    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    const fetchMock = withM56Baseline((input: RequestInfo | URL, init?: RequestInit) => {
       const path = requestUrl(input);
       const method = (init?.method ?? "GET").toUpperCase();
 
@@ -73,19 +79,21 @@ describe("M35 web console app", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Approvals" }));
     await waitFor(() => {
       expect(screen.getByText("APPROVAL-A")).toBeInTheDocument();
     }, { timeout: 5000 });
 
     fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
-    expect(await screen.findByRole("heading", { name: "Operator Console" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Operator Dashboard" })).toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText("Admin token"), { target: { value: "token-b" } });
     fireEvent.change(screen.getByLabelText("Principal"), { target: { value: "admin:user-b" } });
     fireEvent.change(screen.getByLabelText("Device ID"), { target: { value: "device-b" } });
     fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
 
-    expect(await screen.findByRole("heading", { name: "Web Console v1" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Web Dashboard Operator Surface" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Approvals" }));
     expect(screen.queryByText("APPROVAL-A")).not.toBeInTheDocument();
     expect(screen.getByText("No approvals found.")).toBeInTheDocument();
 
@@ -100,7 +108,7 @@ describe("M35 web console app", () => {
 
   it("executes approval decision flow with CSRF-protected request", async () => {
     let approvalDecision: "pending" | "allow" = "pending";
-    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    const fetchMock = withM56Baseline((input: RequestInfo | URL, init?: RequestInit) => {
       const path = requestUrl(input);
       const method = (init?.method ?? "GET").toUpperCase();
 
@@ -135,6 +143,7 @@ describe("M35 web console app", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Approvals" }));
     expect(await screen.findByText("A1")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Select" }));
     fireEvent.click(screen.getByRole("button", { name: "Approve" }));
@@ -162,7 +171,6 @@ describe("M35 web console app", () => {
         issued_at_unix_ms: 100,
         expires_at_unix_ms: 300
       }),
-      jsonResponse({ approvals: [] }),
       jsonResponse({ jobs: [{ job_id: "J1", name: "job-one", enabled: true }] }),
       jsonResponse({ job: { job_id: "J2" } }),
       jsonResponse({
@@ -195,12 +203,10 @@ describe("M35 web console app", () => {
       expect(screen.getByText("Cron job disabled.")).toBeInTheDocument();
     });
 
-    expect(requestUrl(fetchMock.mock.calls[3][0])).toBe("/console/v1/cron/jobs");
-    const createRequest = fetchMock.mock.calls[3][1];
+    const [, createRequest] = findRequestCall(fetchMock, "/console/v1/cron/jobs", "POST");
     expect(createRequest?.method).toBe("POST");
 
-    expect(requestUrl(fetchMock.mock.calls[5][0])).toBe("/console/v1/cron/jobs/J1/enabled");
-    const toggleRequest = fetchMock.mock.calls[5][1];
+    const [, toggleRequest] = findRequestCall(fetchMock, "/console/v1/cron/jobs/J1/enabled", "POST");
     expect(toggleRequest?.method).toBe("POST");
     expect(requestBody(toggleRequest?.body)).toContain("\"enabled\":false");
   });
@@ -215,7 +221,6 @@ describe("M35 web console app", () => {
         issued_at_unix_ms: 100,
         expires_at_unix_ms: 300
       }),
-      jsonResponse({ approvals: [] }),
       jsonResponse({
         connectors: [
           {
@@ -337,8 +342,8 @@ describe("M35 web console app", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "Channels" }));
-    expect(await screen.findByRole("heading", { name: "Channel Connectors" })).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("button", { name: "Channels and Router" }));
+    expect(await screen.findByRole("heading", { name: "Channels and Router" })).toBeInTheDocument();
     expect(await screen.findByText("echo:default")).toBeInTheDocument();
     expect(await screen.findByText("internal_test_only")).toBeInTheDocument();
 
@@ -348,8 +353,7 @@ describe("M35 web console app", () => {
       expect(screen.getByText("Connector disabled.")).toBeInTheDocument();
     });
 
-    expect(requestUrl(fetchMock.mock.calls[8][0])).toBe("/console/v1/channels/echo%3Adefault/enabled");
-    const request = fetchMock.mock.calls[8][1];
+    const [, request] = findRequestCall(fetchMock, "/console/v1/channels/echo%3Adefault/enabled", "POST");
     const headers = new Headers(request?.headers);
     expect(headers.get("x-palyra-csrf-token")).toBe("csrf-1");
     expect(request?.method).toBe("POST");
@@ -366,7 +370,6 @@ describe("M35 web console app", () => {
         issued_at_unix_ms: 100,
         expires_at_unix_ms: 300
       }),
-      jsonResponse({ approvals: [] }),
       jsonResponse({
         connectors: [
           {
@@ -421,12 +424,12 @@ describe("M35 web console app", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "Channels" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Channels and Router" }));
 
     expect(await screen.findByText("echo:default")).toBeInTheDocument();
     expect(screen.queryByText("slack:default")).not.toBeInTheDocument();
     expect(await screen.findByText("internal_test_only")).toBeInTheDocument();
-    expect(requestUrl(fetchMock.mock.calls[3][0])).toBe("/console/v1/channels/echo%3Adefault");
+    expect(findRequestCall(fetchMock, "/console/v1/channels/echo%3Adefault", "GET")).toBeDefined();
   });
 
   it("runs discord onboarding preflight from channels wizard with CSRF-protected request", async () => {
@@ -439,7 +442,6 @@ describe("M35 web console app", () => {
         issued_at_unix_ms: 100,
         expires_at_unix_ms: 300
       }),
-      jsonResponse({ approvals: [] }),
       jsonResponse({
         connectors: [
           {
@@ -557,13 +559,13 @@ describe("M35 web console app", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "Channels" }));
-    expect(await screen.findByRole("heading", { name: "Discord Onboarding Wizard (M45)" })).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("button", { name: "Channels and Router" }));
+    expect(await screen.findByRole("heading", { name: "Discord onboarding wizard" })).toBeInTheDocument();
 
-    fireEvent.change(screen.getByLabelText("2) Discord bot token"), {
+    fireEvent.change(screen.getByLabelText("Bot token"), {
       target: { value: "test-token" }
     });
-    fireEvent.change(screen.getByLabelText("3) Optional verify channel ID"), {
+    fireEvent.change(screen.getByLabelText("Verify channel ID"), {
       target: { value: "123456789012345678" }
     });
     fireEvent.click(screen.getByRole("button", { name: "Run preflight" }));
@@ -575,8 +577,7 @@ describe("M35 web console app", () => {
     expect(screen.getByText("discord.com")).toBeInTheDocument();
     expect(screen.getByText("Attachments ingestion is metadata only by default.")).toBeInTheDocument();
 
-    expect(requestUrl(fetchMock.mock.calls[8][0])).toBe("/console/v1/channels/discord/onboarding/probe");
-    const request = fetchMock.mock.calls[8][1];
+    const [, request] = findRequestCall(fetchMock, "/console/v1/channels/discord/onboarding/probe", "POST");
     const headers = new Headers(request?.headers);
     expect(headers.get("x-palyra-csrf-token")).toBe("csrf-1");
     expect(request?.method).toBe("POST");
@@ -594,7 +595,6 @@ describe("M35 web console app", () => {
         issued_at_unix_ms: 100,
         expires_at_unix_ms: 300
       }),
-      jsonResponse({ approvals: [] }),
       jsonResponse({
         principal: "admin:web-console",
         active_profile_id: null,
@@ -614,9 +614,9 @@ describe("M35 web console app", () => {
 
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Browser" }));
-    expect(await screen.findByRole("heading", { name: "Browser Profiles + Relay" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Browser" })).toBeInTheDocument();
 
-    fireEvent.change(screen.getByPlaceholderText("01ARZ3NDEKTSV4RRFFQ69G5FAV"), {
+    fireEvent.change(screen.getAllByLabelText("Session ID")[0], {
       target: { value: "01ARZ3NDEKTSV4RRFFQ69G5FAV" }
     });
     fireEvent.click(screen.getByRole("button", { name: "Mint relay token" }));
@@ -625,8 +625,7 @@ describe("M35 web console app", () => {
       expect(screen.getByText("Browser relay token minted. Keep it private and short-lived.")).toBeInTheDocument();
     });
 
-    expect(requestUrl(fetchMock.mock.calls[3][0])).toBe("/console/v1/browser/relay/tokens");
-    const request = fetchMock.mock.calls[3][1];
+    const [, request] = findRequestCall(fetchMock, "/console/v1/browser/relay/tokens", "POST");
     const headers = new Headers(request?.headers);
     expect(headers.get("x-palyra-csrf-token")).toBe("csrf-1");
     expect(requestBody(request?.body)).toContain("\"extension_id\":\"com.palyra.extension\"");
@@ -642,7 +641,6 @@ describe("M35 web console app", () => {
         issued_at_unix_ms: 100,
         expires_at_unix_ms: 300
       }),
-      jsonResponse({ approvals: [] }),
       jsonResponse({
         generated_at_unix_ms: 123,
         model_provider: { kind: "openai-compatible" },
@@ -654,10 +652,10 @@ describe("M35 web console app", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "Diagnostics" }));
-    expect(await screen.findByRole("heading", { name: "Diagnostics" })).toBeInTheDocument();
-    expect(await screen.findByText("Model Provider + Rate Limits")).toBeInTheDocument();
-    expect(requestUrl(fetchMock.mock.calls[2][0])).toBe("/console/v1/diagnostics");
+    fireEvent.click(await screen.findByRole("button", { name: "Diagnostics and Audit" }));
+    expect(await screen.findByRole("heading", { name: "Diagnostics and Audit" })).toBeInTheDocument();
+    expect(await screen.findByText("Browser service")).toBeInTheDocument();
+    expect(findRequestCall(fetchMock, "/console/v1/diagnostics", "GET")).toBeDefined();
   });
 
   it("redacts sensitive diagnostics values in the web console by default", async () => {
@@ -670,7 +668,6 @@ describe("M35 web console app", () => {
         issued_at_unix_ms: 100,
         expires_at_unix_ms: 300
       }),
-      jsonResponse({ approvals: [] }),
       jsonResponse({
         generated_at_unix_ms: 123,
         model_provider: { openai_api_key: "sk-live-super-secret" },
@@ -685,8 +682,8 @@ describe("M35 web console app", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "Diagnostics" }));
-    expect(await screen.findByRole("heading", { name: "Diagnostics" })).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("button", { name: "Diagnostics and Audit" }));
+    expect(await screen.findByRole("heading", { name: "Diagnostics and Audit" })).toBeInTheDocument();
 
     await waitFor(() => {
       const rendered = document.body.textContent ?? "";
@@ -708,7 +705,6 @@ describe("M35 web console app", () => {
         issued_at_unix_ms: 100,
         expires_at_unix_ms: 300
       }),
-      jsonResponse({ approvals: [] }),
       jsonResponse({ sessions: [] }),
       jsonResponse({
         session: {
@@ -778,7 +774,7 @@ describe("M35 web console app", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "Chat" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Chat and Sessions" }));
     expect(await screen.findByRole("heading", { name: "Chat Workspace" })).toBeInTheDocument();
     await waitFor(() => {
       expect(screen.getByRole("button", { name: "Send" })).toBeEnabled();
@@ -797,11 +793,15 @@ describe("M35 web console app", () => {
       expect(screen.getByText("Approval A1 allowed.")).toBeInTheDocument();
     });
 
-    expect(requestUrl(fetchMock.mock.calls[4][0])).toBe(
-      "/console/v1/chat/sessions/01ARZ3NDEKTSV4RRFFQ69G5FAV/messages/stream"
+    const [, streamRequest] = findRequestCall(
+      fetchMock,
+      "/console/v1/chat/sessions/01ARZ3NDEKTSV4RRFFQ69G5FAV/messages/stream",
+      "POST"
     );
-    expect(requestUrl(fetchMock.mock.calls[6][0])).toBe("/console/v1/approvals/A1/decision");
-    const decisionHeaders = new Headers(fetchMock.mock.calls[6][1]?.headers);
+    expect(streamRequest?.method).toBe("POST");
+
+    const [, decisionRequest] = findRequestCall(fetchMock, "/console/v1/approvals/A1/decision", "POST");
+    const decisionHeaders = new Headers(decisionRequest?.headers);
     expect(decisionHeaders.get("x-palyra-csrf-token")).toBe("csrf-1");
   });
 
@@ -815,7 +815,6 @@ describe("M35 web console app", () => {
         issued_at_unix_ms: 100,
         expires_at_unix_ms: 300
       }),
-      jsonResponse({ approvals: [] }),
       jsonResponse({
         sessions: [
           {
@@ -885,7 +884,7 @@ describe("M35 web console app", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     const rendered = render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "Chat" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Chat and Sessions" }));
     await waitFor(() => {
       expect(screen.getByRole("button", { name: "Send" })).toBeEnabled();
     });
@@ -907,14 +906,14 @@ describe("M35 web console app", () => {
 });
 
 function createQueuedFetch(responses: Response[]) {
-  return vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+  return withM56Baseline((input: RequestInfo | URL, init?: RequestInit) => {
     void input;
     void init;
     const response = responses.shift();
     if (response === undefined) {
       throw new Error("No mocked response queued.");
     }
-    return Promise.resolve(response);
+    return response;
   });
 }
 
@@ -943,6 +942,70 @@ function requestBody(body: BodyInit | null | undefined): string {
     return body;
   }
   return "";
+}
+
+function withM56Baseline(handler: (input: RequestInfo | URL, init?: RequestInit) => Response | Promise<Response>) {
+  return vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const baseline = routeM56BaselineRequest(input, init);
+    if (baseline !== undefined) {
+      return baseline;
+    }
+    return await handler(input, init);
+  });
+}
+
+function routeM56BaselineRequest(input: RequestInfo | URL, init?: RequestInit): Response | undefined {
+  const path = requestUrl(input);
+  const method = (init?.method ?? "GET").toUpperCase();
+
+  if (method !== "GET") {
+    return undefined;
+  }
+  if (path === "/console/v1/control-plane/capabilities") {
+    return jsonResponse(capabilityCatalogFixture());
+  }
+  if (path === "/console/v1/deployment/posture") {
+    return jsonResponse(deploymentPostureFixture());
+  }
+  if (path === "/console/v1/support-bundle/jobs") {
+    return jsonResponse(supportBundleJobsFixture());
+  }
+  if (path === "/console/v1/audit/events") {
+    return jsonResponse(auditEventsFixture());
+  }
+  return undefined;
+}
+
+function findRequestCall(
+  fetchMock: { mock: { calls: unknown[] } },
+  path: string,
+  method: string
+): [RequestInfo | URL, RequestInit | undefined] {
+  const match = fetchMock.mock.calls.find((entry): entry is [RequestInfo | URL, RequestInit | undefined] => {
+    if (!Array.isArray(entry) || entry.length === 0) {
+      return false;
+    }
+
+    const [input, init] = entry as [unknown, unknown];
+    const validInput =
+      typeof input === "string" ||
+      input instanceof URL ||
+      (typeof Request !== "undefined" && input instanceof Request);
+    if (!validInput) {
+      return false;
+    }
+    if (init !== undefined && (typeof init !== "object" || init === null)) {
+      return false;
+    }
+
+    const typedInit = init as RequestInit | undefined;
+    return requestUrl(input as RequestInfo | URL) === path && (typedInit?.method ?? "GET").toUpperCase() === method;
+  });
+  expect(match).toBeDefined();
+  if (match === undefined) {
+    throw new Error(`Missing mocked request: ${method} ${path}`);
+  }
+  return match;
 }
 
 function ndjsonResponse(lines: unknown[]): Response {

@@ -94,6 +94,11 @@ export function isJsonObject(value: JsonValue): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+export function readObject(record: JsonObject, key: string): JsonObject | null {
+  const value = record[key];
+  return isJsonObject(value) ? value : null;
+}
+
 export function toJsonObjectArray(values: JsonValue[]): JsonObject[] {
   const rows: JsonObject[] = [];
   for (const value of values) {
@@ -143,6 +148,18 @@ export function readString(record: JsonObject, key: string): string | null {
 
 export function readBool(record: JsonObject, key: string): boolean {
   return record[key] === true;
+}
+
+export function readNumber(record: JsonObject, key: string): number | null {
+  const value = record[key];
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string") {
+    const parsed = Number.parseFloat(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
 }
 
 export function parseInteger(raw: string): number | null {
@@ -201,4 +218,11 @@ function redactValue(value: JsonValue, revealSensitive: boolean): JsonValue {
 
 export function toPrettyJson(value: JsonValue, revealSensitive: boolean): string {
   return JSON.stringify(redactValue(value, revealSensitive), null, 2);
+}
+
+export function formatUnixMs(value: number | null | undefined): string {
+  if (value === undefined || value === null || !Number.isFinite(value) || value <= 0) {
+    return "n/a";
+  }
+  return new Date(value).toLocaleString();
 }

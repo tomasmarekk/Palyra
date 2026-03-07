@@ -65,7 +65,7 @@ describe("M54 web auth surface", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "OpenAI and Auth" }));
+    fireEvent.click(await screen.findByRole("button", { name: "OpenAI and Auth Profiles" }));
     expect(await screen.findByRole("heading", { name: "Connect via API key" })).toBeInTheDocument();
 
     fireEvent.change(screen.getAllByLabelText("Profile name")[0], {
@@ -125,7 +125,7 @@ describe("M54 web auth surface", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "OpenAI and Auth" }));
+    fireEvent.click(await screen.findByRole("button", { name: "OpenAI and Auth Profiles" }));
 
     fireEvent.change(screen.getAllByLabelText("Profile name")[0], {
       target: { value: "default-openai" }
@@ -223,7 +223,7 @@ describe("M54 web auth surface", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "OpenAI and Auth" }));
+    fireEvent.click(await screen.findByRole("button", { name: "OpenAI and Auth Profiles" }));
     expect(await screen.findByRole("heading", { name: "Connect via OAuth" })).toBeInTheDocument();
 
     fireEvent.change(screen.getAllByLabelText("Profile name")[1], {
@@ -308,7 +308,7 @@ describe("M54 web auth surface", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "OpenAI and Auth" }));
+    fireEvent.click(await screen.findByRole("button", { name: "OpenAI and Auth Profiles" }));
 
     fireEvent.change(screen.getAllByLabelText("Profile name")[1], {
       target: { value: "oauth-primary" }

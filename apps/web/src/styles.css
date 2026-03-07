@@ -967,6 +967,85 @@ pre {
   fill: color-mix(in srgb, var(--accent) 78%, #ffffff);
 }
 
+.console-capability-grid,
+.console-capability-summary-grid {
+  display: grid;
+  gap: 0.85rem;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+}
+
+.console-capability-card,
+.console-capability-summary-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--surface) 92%, transparent);
+  padding: 0.85rem;
+  display: grid;
+  gap: 0.55rem;
+}
+
+.console-capability-card--cli_handoff {
+  border-color: color-mix(in srgb, var(--accent) 42%, var(--border));
+}
+
+.console-capability-card--internal_only {
+  border-color: color-mix(in srgb, #a5452c 45%, var(--border));
+}
+
+.console-capability-card__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 0.75rem;
+}
+
+.console-capability-card__header h4,
+.console-capability-summary-card h4 {
+  margin: 0;
+}
+
+.console-capability-badge {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--surface-strong) 84%, transparent);
+  padding: 0.18rem 0.55rem;
+  font-size: 0.78rem;
+  white-space: nowrap;
+}
+
+.console-capability-card__commands {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.console-code-block {
+  margin: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--surface-strong) 82%, transparent);
+  padding: 0.6rem;
+  overflow-x: auto;
+}
+
+.console-code-block code {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.console-compact-list {
+  margin: 0;
+  padding-left: 1.2rem;
+  display: grid;
+  gap: 0.3rem;
+}
+
+.console-secret-metadata {
+  display: grid;
+  gap: 0.25rem;
+}
+
 @keyframes card-in {
   from {
     opacity: 0;

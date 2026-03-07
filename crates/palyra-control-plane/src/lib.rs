@@ -414,15 +414,29 @@ pub struct CapabilityCatalog {
     pub migration_notes: Vec<CapabilityMigrationNote>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityDashboardExposure {
+    DirectAction,
+    CliHandoff,
+    InternalOnly,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilityEntry {
     pub id: String,
     pub domain: String,
+    #[serde(default)]
+    pub dashboard_section: String,
     pub title: String,
     pub owner: String,
     #[serde(default)]
     pub surfaces: Vec<String>,
     pub execution_mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dashboard_exposure: Option<CapabilityDashboardExposure>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cli_handoff_commands: Vec<String>,
     #[serde(default)]
     pub mutation_classes: Vec<String>,
     #[serde(default)]
@@ -1062,5 +1076,52 @@ mod tests {
     #[test]
     fn urlencoding_escapes_reserved_bytes() {
         assert_eq!(urlencoding("global/openai key"), "global%2Fopenai%20key");
+    }
+
+    #[test]
+    fn capability_entry_defaults_optional_dashboard_exposure_when_missing() {
+        let entry = serde_json::from_value::<CapabilityEntry>(serde_json::json!({
+            "id": "runtime.health",
+            "domain": "runtime",
+            "dashboard_section": "operations",
+            "title": "Runtime health",
+            "owner": "palyrad",
+            "surfaces": ["dashboard"],
+            "execution_mode": "direct_ui",
+            "cli_handoff_commands": [],
+            "mutation_classes": ["deployment"],
+            "test_refs": [],
+            "contract_paths": ["/console/v1/diagnostics"]
+        }))
+        .expect("capability entry should deserialize without dashboard_exposure");
+
+        assert_eq!(entry.dashboard_exposure, None);
+    }
+
+    #[test]
+    fn capability_entry_serializes_dashboard_exposure_when_present() {
+        let entry = CapabilityEntry {
+            id: "gateway.access.verify_remote".to_owned(),
+            domain: "deployment".to_owned(),
+            dashboard_section: "access".to_owned(),
+            title: "Remote dashboard URL verification".to_owned(),
+            owner: "palyra-cli".to_owned(),
+            surfaces: vec!["cli".to_owned(), "dashboard".to_owned()],
+            execution_mode: "generated_cli".to_owned(),
+            dashboard_exposure: Some(CapabilityDashboardExposure::CliHandoff),
+            cli_handoff_commands: vec![
+                "cargo run -p palyra-cli -- daemon dashboard-url --verify-remote --json".to_owned(),
+            ],
+            mutation_classes: vec!["deployment".to_owned()],
+            test_refs: Vec::new(),
+            contract_paths: Vec::new(),
+            notes: None,
+        };
+
+        let serialized = serde_json::to_value(entry).expect("capability entry should serialize");
+        assert_eq!(
+            serialized.get("dashboard_exposure").and_then(Value::as_str),
+            Some("cli_handoff")
+        );
     }
 }
