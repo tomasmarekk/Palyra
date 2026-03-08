@@ -4,7 +4,7 @@
 
 ## Platform support (v1)
 
-- Supported: **Windows**, **macOS**, and **Linux**.
+- Supported shipping bundles: **Windows**, **macOS**, and **Linux**.
 - Linux path currently uses a downstream backport patch for
   `GHSA-wrw7-89jp-8q8g` / `RUSTSEC-2024-0429` in `glib 0.18.5` because
   upstream Tauri Linux dependency constraints still pin the graph below `glib 0.20.0`.
@@ -32,6 +32,14 @@
 - Shows redacted sidecar logs.
 - Exports support bundles via `palyra support-bundle export --output ...`.
 - Opens the discovered web dashboard target in the default browser (local or configured remote URL).
+
+## Portable release layout
+
+- Release bundles keep `palyra-desktop-control-center`, `palyrad`, `palyra-browserd`, and `palyra`
+  in the same directory.
+- Sidecar resolution already prefers colocated binaries next to the desktop executable, so the
+  portable archive layout matches the runtime contract.
+- The canonical packaging smoke is `pwsh -NoLogo -File ../../scripts/test/run-release-smoke.ps1`.
 
 ## Security behavior
 

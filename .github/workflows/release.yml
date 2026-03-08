@@ -1,0 +1,301 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish a draft GitHub release and upload built assets
+        type: boolean
+        required: false
+        default: false
+      version:
+        description: Optional explicit version override; must match the repo release version
+        required: false
+        type: string
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+env:
+  CARGO_TERM_COLOR: always
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  prepare-release:
+    name: Prepare release metadata
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      publish: ${{ steps.meta.outputs.publish }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Derive release metadata
+        id: meta
+        shell: pwsh
+        run: |
+          $repoVersion = (./scripts/release/assert-version-coherence.ps1).Trim()
+          $requestedVersion = "${{ github.event.inputs.version }}"
+          if ($requestedVersion -and $requestedVersion -ne $repoVersion) {
+            throw "workflow_dispatch version '$requestedVersion' does not match repo version '$repoVersion'"
+          }
+
+          $tag =
+            if ("${{ github.event_name }}" -eq "push") {
+              $rawRef = "${{ github.ref }}"
+              if (-not $rawRef.StartsWith("refs/tags/v")) {
+                throw "Release workflow expects a refs/tags/v* ref, got $rawRef"
+              }
+              $rawRef.Substring("refs/tags/".Length)
+            } else {
+              "v$repoVersion"
+            }
+
+          if ($tag -ne "v$repoVersion") {
+            throw "Release tag '$tag' does not match repo version '$repoVersion'"
+          }
+
+          $publish =
+            if ("${{ github.event_name }}" -eq "push") {
+              "true"
+            } elseif ("${{ github.event.inputs.publish }}" -eq "true") {
+              "true"
+            } else {
+              "false"
+            }
+
+          $outputRoot = Join-Path $PWD "target/release-artifacts/release-metadata"
+          New-Item -ItemType Directory -Path $outputRoot -Force | Out-Null
+
+          $releaseNotesPath = Join-Path $outputRoot "release-notes-$repoVersion.md"
+          $migrationNotesPath = Join-Path $outputRoot "migration-notes-$repoVersion.md"
+
+          $releaseNotes = @"
+          # Palyra $repoVersion
+
+          - Portable desktop release bundles now ship the desktop control center, `palyrad`, `palyra-browserd`, and `palyra` as one colocated archive.
+          - Portable headless release packages now ship repeatable archive-based install/update flow with config initialization and migration validation.
+          - Release assets include SHA256 manifests, release manifests, provenance sidecars, and GitHub build attestations.
+          - Release packaging smoke now validates archive layout before release publication.
+          "@.Trim()
+
+          $migrationNotes = @"
+          # Migration notes for Palyra $repoVersion
+
+          - Desktop upgrades use archive replacement; stop the running app, replace the extracted install directory, and keep the existing state root.
+          - Headless upgrades require `palyra config migrate --path <config>` after unpacking the new archive and before restarting `palyrad`.
+          - No state-root relocation is required; runtime databases and support bundles stay outside the install directory.
+          "@.Trim()
+
+          Set-Content -LiteralPath $releaseNotesPath -Value $releaseNotes -NoNewline
+          Set-Content -LiteralPath $migrationNotesPath -Value $migrationNotes -NoNewline
+
+          if ($publish -eq "true") {
+            gh release view $tag | Out-Null 2>$null
+            if ($LASTEXITCODE -ne 0) {
+              gh release create $tag --draft --title "Palyra $repoVersion" --notes-file $releaseNotesPath
+            }
+            gh release upload $tag $releaseNotesPath $migrationNotesPath --clobber
+          }
+
+          "version=$repoVersion" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "publish=$publish" >> $env:GITHUB_OUTPUT
+
+  desktop-portable-bundles:
+    name: Desktop portable bundle (${{ matrix.os }})
+    needs: prepare-release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7
+        with:
+          toolchain: 1.91.0
+
+      - name: Install desktop Linux system dependencies
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev \
+            libxdo-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
+      - name: Build release binaries
+        shell: pwsh
+        run: |
+          cargo build -p palyra-daemon -p palyra-browserd -p palyra-cli --release --locked
+          cargo build --manifest-path apps/desktop/src-tauri/Cargo.toml --release --locked
+
+      - name: Package portable desktop bundle
+        id: package
+        shell: pwsh
+        run: |
+          . ./scripts/release/common.ps1
+          $version = "${{ needs.prepare-release.outputs.version }}"
+          $platform = Get-PlatformSlug
+          $outputRoot = Join-Path $PWD "target/release-artifacts/desktop"
+          ./scripts/release/package-portable.ps1 `
+            -ArtifactKind desktop `
+            -Version $version `
+            -Platform $platform `
+            -OutputRoot $outputRoot `
+            -DesktopBinaryPath (Join-Path $PWD ("apps/desktop/src-tauri/target/release/" + (Resolve-ExecutableName -BaseName "palyra-desktop-control-center"))) `
+            -DaemonBinaryPath (Join-Path $PWD ("target/release/" + (Resolve-ExecutableName -BaseName "palyrad"))) `
+            -BrowserBinaryPath (Join-Path $PWD ("target/release/" + (Resolve-ExecutableName -BaseName "palyra-browserd"))) `
+            -CliBinaryPath (Join-Path $PWD ("target/release/" + (Resolve-ExecutableName -BaseName "palyra"))) | Out-Null
+
+          $archivePath = Join-Path $outputRoot "palyra-desktop-$version-$platform.zip"
+          $manifestPath = Join-Path $outputRoot "palyra-desktop-$version-$platform.release-manifest.json"
+          $checksumsPath = Join-Path $outputRoot "palyra-desktop-$version-$platform.checksums.txt"
+          $archiveChecksumPath = Join-Path $outputRoot "palyra-desktop-$version-$platform.zip.sha256"
+          ./scripts/release/validate-portable-archive.ps1 -Path $archivePath -ExpectedArtifactKind desktop | Out-Null
+          $provenancePath = Join-Path $outputRoot "palyra-desktop-$version-$platform.provenance.json"
+          ./scripts/release/generate-release-provenance.ps1 `
+            -Version $version `
+            -ArtifactPaths @($archivePath, $manifestPath, $checksumsPath, $archiveChecksumPath) `
+            -OutputPath $provenancePath | Out-Null
+
+          "archive_path=$archivePath" >> $env:GITHUB_OUTPUT
+          "manifest_path=$manifestPath" >> $env:GITHUB_OUTPUT
+          "checksums_path=$checksumsPath" >> $env:GITHUB_OUTPUT
+          "archive_checksum_path=$archiveChecksumPath" >> $env:GITHUB_OUTPUT
+          "provenance_path=$provenancePath" >> $env:GITHUB_OUTPUT
+
+      - name: Upload desktop release assets
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: desktop-release-${{ matrix.os }}-${{ needs.prepare-release.outputs.version }}
+          path: |
+            ${{ steps.package.outputs.archive_path }}
+            ${{ steps.package.outputs.manifest_path }}
+            ${{ steps.package.outputs.checksums_path }}
+            ${{ steps.package.outputs.archive_checksum_path }}
+            ${{ steps.package.outputs.provenance_path }}
+          if-no-files-found: error
+
+      - name: Attest desktop bundle
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be
+        with:
+          subject-path: |
+            ${{ steps.package.outputs.archive_path }}
+            ${{ steps.package.outputs.manifest_path }}
+            ${{ steps.package.outputs.checksums_path }}
+            ${{ steps.package.outputs.archive_checksum_path }}
+            ${{ steps.package.outputs.provenance_path }}
+          show-summary: true
+
+      - name: Upload desktop bundle to release
+        if: needs.prepare-release.outputs.publish == 'true'
+        shell: pwsh
+        run: |
+          gh release upload "${{ needs.prepare-release.outputs.tag }}" `
+            "${{ steps.package.outputs.archive_path }}" `
+            "${{ steps.package.outputs.manifest_path }}" `
+            "${{ steps.package.outputs.checksums_path }}" `
+            "${{ steps.package.outputs.archive_checksum_path }}" `
+            "${{ steps.package.outputs.provenance_path }}" `
+            --clobber
+
+  headless-portable-package:
+    name: Headless portable package (ubuntu-latest)
+    needs: prepare-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7
+        with:
+          toolchain: 1.91.0
+
+      - name: Build release binaries
+        run: cargo build -p palyra-daemon -p palyra-browserd -p palyra-cli --release --locked
+
+      - name: Package portable headless bundle
+        id: package
+        shell: pwsh
+        run: |
+          . ./scripts/release/common.ps1
+          $version = "${{ needs.prepare-release.outputs.version }}"
+          $platform = Get-PlatformSlug
+          $outputRoot = Join-Path $PWD "target/release-artifacts/headless"
+          ./scripts/release/package-portable.ps1 `
+            -ArtifactKind headless `
+            -Version $version `
+            -Platform $platform `
+            -OutputRoot $outputRoot `
+            -DaemonBinaryPath (Join-Path $PWD ("target/release/" + (Resolve-ExecutableName -BaseName "palyrad"))) `
+            -BrowserBinaryPath (Join-Path $PWD ("target/release/" + (Resolve-ExecutableName -BaseName "palyra-browserd"))) `
+            -CliBinaryPath (Join-Path $PWD ("target/release/" + (Resolve-ExecutableName -BaseName "palyra"))) | Out-Null
+
+          $archivePath = Join-Path $outputRoot "palyra-headless-$version-$platform.zip"
+          $manifestPath = Join-Path $outputRoot "palyra-headless-$version-$platform.release-manifest.json"
+          $checksumsPath = Join-Path $outputRoot "palyra-headless-$version-$platform.checksums.txt"
+          $archiveChecksumPath = Join-Path $outputRoot "palyra-headless-$version-$platform.zip.sha256"
+          ./scripts/release/validate-portable-archive.ps1 -Path $archivePath -ExpectedArtifactKind headless | Out-Null
+          $provenancePath = Join-Path $outputRoot "palyra-headless-$version-$platform.provenance.json"
+          ./scripts/release/generate-release-provenance.ps1 `
+            -Version $version `
+            -ArtifactPaths @($archivePath, $manifestPath, $checksumsPath, $archiveChecksumPath) `
+            -OutputPath $provenancePath | Out-Null
+
+          "archive_path=$archivePath" >> $env:GITHUB_OUTPUT
+          "manifest_path=$manifestPath" >> $env:GITHUB_OUTPUT
+          "checksums_path=$checksumsPath" >> $env:GITHUB_OUTPUT
+          "archive_checksum_path=$archiveChecksumPath" >> $env:GITHUB_OUTPUT
+          "provenance_path=$provenancePath" >> $env:GITHUB_OUTPUT
+
+      - name: Upload headless release assets
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: headless-release-${{ needs.prepare-release.outputs.version }}
+          path: |
+            ${{ steps.package.outputs.archive_path }}
+            ${{ steps.package.outputs.manifest_path }}
+            ${{ steps.package.outputs.checksums_path }}
+            ${{ steps.package.outputs.archive_checksum_path }}
+            ${{ steps.package.outputs.provenance_path }}
+          if-no-files-found: error
+
+      - name: Attest headless bundle
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be
+        with:
+          subject-path: |
+            ${{ steps.package.outputs.archive_path }}
+            ${{ steps.package.outputs.manifest_path }}
+            ${{ steps.package.outputs.checksums_path }}
+            ${{ steps.package.outputs.archive_checksum_path }}
+            ${{ steps.package.outputs.provenance_path }}
+          show-summary: true
+
+      - name: Upload headless bundle to release
+        if: needs.prepare-release.outputs.publish == 'true'
+        shell: pwsh
+        run: |
+          gh release upload "${{ needs.prepare-release.outputs.tag }}" `
+            "${{ steps.package.outputs.archive_path }}" `
+            "${{ steps.package.outputs.manifest_path }}" `
+            "${{ steps.package.outputs.checksums_path }}" `
+            "${{ steps.package.outputs.archive_checksum_path }}" `
+            "${{ steps.package.outputs.provenance_path }}" `
+            --clobber

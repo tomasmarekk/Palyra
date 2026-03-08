@@ -41,6 +41,9 @@ web-cleanroom:
 deterministic-core:
     bash scripts/test/run-deterministic-core.sh
 
+release-smoke:
+    pwsh -NoLogo -File scripts/test/run-release-smoke.ps1
+
 push-gate-fast:
     bash scripts/run-pre-push-checks.sh
 

@@ -2,6 +2,7 @@
 param()
 
 $ErrorActionPreference = "Stop"
+$PSNativeCommandUseErrorActionPreference = $true
 $rootDir = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 Set-Location $rootDir
 
