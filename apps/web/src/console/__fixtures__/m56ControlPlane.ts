@@ -197,6 +197,82 @@ export function diagnosticsFixture() {
       state: "ready",
       engine_mode: "chromium",
     },
+    observability: {
+      failure_classes: {
+        config_failure: 1,
+        upstream_provider_failure: 2,
+        product_failure: 1,
+      },
+      provider_auth: {
+        attempts: 8,
+        failures: 2,
+        failure_rate_bps: 2500,
+        refresh_failures: 1,
+        state: "degraded",
+      },
+      dashboard: {
+        attempts: 12,
+        successes: 10,
+        failures: 2,
+        failure_rate_bps: 1666,
+      },
+      support_bundle: {
+        attempts: 4,
+        successes: 3,
+        failures: 1,
+        success_rate_bps: 7500,
+        last_job: {
+          job_id: "support-job-0",
+          state: "succeeded",
+          requested_at_unix_ms: 1699999999000,
+          completed_at_unix_ms: 1700000001000,
+          output_path: "state/support-bundles/support-job-0.zip",
+        },
+      },
+      connector: {
+        connectors: 1,
+        degraded_connectors: 1,
+        paused_connectors: 0,
+        queue_depth: 6,
+        dead_letters: 2,
+        upload_failures: 1,
+        upload_failure_rate_bps: 10000,
+        recent_errors: [
+          {
+            connector_id: "discord:default",
+            message: "attachment.upload.failed: remote upload rejected",
+          },
+        ],
+      },
+      browser: {
+        relay_actions: {
+          attempts: 5,
+          failures: 1,
+          failure_rate_bps: 2000,
+        },
+        recent_failure_samples: ["relay action timed out while switching tabs"],
+      },
+      recent_failures: [
+        {
+          operation: "provider_auth_refresh",
+          failure_class: "upstream_provider_failure",
+          message: "provider auth request failed with http 502",
+        },
+        {
+          operation: "discord_upload",
+          failure_class: "product_failure",
+          message: "attachment upload failed after retries",
+        },
+      ],
+      triage: {
+        failure_classes: ["config_failure", "upstream_provider_failure", "product_failure"],
+        common_order: [
+          "Check deployment posture and operator auth first.",
+          "Check OpenAI profile health and refresh metrics next.",
+          "Check Discord queue depth, dead letters, and upload failures next.",
+        ],
+      },
+    },
     media: {
       policy: {
         download_enabled: false,

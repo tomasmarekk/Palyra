@@ -194,7 +194,22 @@ pub(crate) async fn export_support_bundle(
         );
         supervisor.prepare_support_bundle_export()
     };
-    run_support_bundle_export(export_plan).await.map_err(command_error)
+    match run_support_bundle_export(export_plan).await {
+        Ok(result) => {
+            let mut supervisor = state.supervisor.lock().await;
+            let _ = supervisor.record_support_bundle_export_result(
+                true,
+                Some(result.output_path.clone()),
+            );
+            Ok(result)
+        }
+        Err(error) => {
+            let message = command_error(error);
+            let mut supervisor = state.supervisor.lock().await;
+            let _ = supervisor.record_support_bundle_export_result(false, Some(message.clone()));
+            Err(message)
+        }
+    }
 }
 
 #[tauri::command]

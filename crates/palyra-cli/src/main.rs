@@ -1184,6 +1184,7 @@ fn run_support_bundle_export(
     let output_path = resolve_support_bundle_output_path(output, generated_at_unix_ms);
 
     let build = build_metadata();
+    let diagnostics = build_support_bundle_diagnostics_snapshot();
     let mut bundle = SupportBundle {
         schema_version: 1,
         generated_at_unix_ms,
@@ -1199,7 +1200,9 @@ fn run_support_bundle_export(
         },
         doctor,
         config: build_support_bundle_config_snapshot(),
-        diagnostics: build_support_bundle_diagnostics_snapshot(),
+        observability: build_support_bundle_observability_snapshot(&diagnostics),
+        triage: build_support_bundle_triage_snapshot(),
+        diagnostics,
         journal: build_support_bundle_journal_snapshot(journal_hash_limit, error_limit),
         truncated: false,
         warnings: Vec::new(),
@@ -1328,6 +1331,35 @@ fn build_support_bundle_diagnostics_snapshot() -> SupportBundleDiagnosticsSnapsh
             admin_status: None,
             admin_status_error: Some(sanitize_diagnostic_error(error.to_string().as_str())),
         },
+    }
+}
+
+fn build_support_bundle_observability_snapshot(
+    diagnostics: &SupportBundleDiagnosticsSnapshot,
+) -> SupportBundleObservabilitySnapshot {
+    let summary =
+        diagnostics.admin_status.as_ref().and_then(|payload| payload.get("observability")).cloned();
+    let recent_failures =
+        summary.as_ref().and_then(|payload| payload.get("recent_failures")).cloned();
+    SupportBundleObservabilitySnapshot { summary, recent_failures }
+}
+
+fn build_support_bundle_triage_snapshot() -> SupportBundleTriageSnapshot {
+    SupportBundleTriageSnapshot {
+        playbook: "docs/operations/observability-supportability-v1.md".to_owned(),
+        failure_classes: vec![
+            "config_failure".to_owned(),
+            "upstream_provider_failure".to_owned(),
+            "product_failure".to_owned(),
+        ],
+        common_order: vec![
+            "Check deployment posture and operator auth first.".to_owned(),
+            "Check OpenAI profile health and refresh metrics next.".to_owned(),
+            "Check Discord queue depth, dead letters, and upload failures next.".to_owned(),
+            "Check browser relay failures and service health next.".to_owned(),
+            "If still unresolved, inspect observability.recent_failures and diagnostics.admin_status."
+                .to_owned(),
+        ],
     }
 }
 
@@ -10764,6 +10796,8 @@ struct SupportBundle {
     platform: SupportBundlePlatformSnapshot,
     doctor: DoctorReport,
     config: SupportBundleConfigSnapshot,
+    observability: SupportBundleObservabilitySnapshot,
+    triage: SupportBundleTriageSnapshot,
     diagnostics: SupportBundleDiagnosticsSnapshot,
     journal: SupportBundleJournalSnapshot,
     truncated: bool,
@@ -10800,6 +10834,21 @@ struct SupportBundleDiagnosticsSnapshot {
     admin_status: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     admin_status_error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SupportBundleObservabilitySnapshot {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recent_failures: Option<Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct SupportBundleTriageSnapshot {
+    playbook: String,
+    failure_classes: Vec<String>,
+    common_order: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -12040,6 +12089,7 @@ mod diagnostics_bundle_tests {
         DoctorSandboxSnapshot, DoctorSummary, SupportBundle, SupportBundleBuildSnapshot,
         SupportBundleConfigSnapshot, SupportBundleDiagnosticsSnapshot,
         SupportBundleJournalErrorRecord, SupportBundleJournalSnapshot,
+        SupportBundleObservabilitySnapshot, SupportBundleTriageSnapshot,
     };
     use serde_json::{json, Value};
 
@@ -12140,6 +12190,26 @@ mod diagnostics_bundle_tests {
                     }
                 })),
                 error: None,
+            },
+            observability: SupportBundleObservabilitySnapshot {
+                summary: Some(json!({
+                    "provider_auth": { "attempts": 4, "failures": 1, "failure_rate_bps": 2500 },
+                    "recent_failures": [
+                        { "operation": "provider_auth.oauth_refresh", "message": "http 503" }
+                    ]
+                })),
+                recent_failures: Some(json!([
+                    { "operation": "provider_auth.oauth_refresh", "message": "http 503" }
+                ])),
+            },
+            triage: SupportBundleTriageSnapshot {
+                playbook: "docs/operations/observability-supportability-v1.md".to_owned(),
+                failure_classes: vec![
+                    "config_failure".to_owned(),
+                    "upstream_provider_failure".to_owned(),
+                    "product_failure".to_owned(),
+                ],
+                common_order: vec!["Check deployment posture and operator auth first.".to_owned()],
             },
             diagnostics: SupportBundleDiagnosticsSnapshot {
                 admin_status: Some(json!({

@@ -11,6 +11,7 @@ const ui = {
   onboardingPhaseBadge: byId("onboardingPhaseBadge"),
   onboardingStepTitle: byId("onboardingStepTitle"),
   onboardingStepDetail: byId("onboardingStepDetail"),
+  onboardingFlowId: byId("onboardingFlowId"),
   onboardingBlockedCount: byId("onboardingBlockedCount"),
   onboardingWarningCount: byId("onboardingWarningCount"),
   onboardingPreflightList: byId("onboardingPreflightList"),
@@ -27,6 +28,8 @@ const ui = {
   onboardingRecoveryActions: byId("onboardingRecoveryActions"),
   recoveryRestartBtn: byId("recoveryRestartBtn"),
   onboardingEventList: byId("onboardingEventList"),
+  onboardingFailureSteps: byId("onboardingFailureSteps"),
+  onboardingSupportBundleStats: byId("onboardingSupportBundleStats"),
   runtimeSummaryBadge: byId("runtimeSummaryBadge"),
   gatewayRuntimeBadge: byId("gatewayRuntimeBadge"),
   browserRuntimeBadge: byId("browserRuntimeBadge"),
@@ -80,6 +83,13 @@ const ui = {
   openAiProfilesList: byId("openAiProfilesList"),
   diagnosticErrorCount: byId("diagnosticErrorCount"),
   droppedDiagnostics: byId("droppedDiagnostics"),
+  supportProviderAuthSummary: byId("supportProviderAuthSummary"),
+  supportConnectorSummary: byId("supportConnectorSummary"),
+  supportDashboardSummary: byId("supportDashboardSummary"),
+  supportBrowserSummary: byId("supportBrowserSummary"),
+  supportBundleSummary: byId("supportBundleSummary"),
+  supportRecentFailures: byId("supportRecentFailures"),
+  supportFailureClasses: byId("supportFailureClasses"),
   discordConnectorId: byId("discordConnectorId"),
   discordEnabled: byId("discordEnabled"),
   discordAuthenticated: byId("discordAuthenticated"),
@@ -180,6 +190,13 @@ function formatDurationSeconds(seconds) {
     return `${minutes}m ${secs}s`;
   }
   return `${secs}s`;
+}
+
+function formatBasisPointsPercent(value) {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return "-";
+  }
+  return `${(value / 100).toFixed(2)}%`;
 }
 
 function setStatusPill(node, status) {
@@ -322,6 +339,31 @@ function renderOnboardingEvents(status) {
   }
 }
 
+function renderOnboardingSupportability(status) {
+  const failureSteps = Array.isArray(status?.failure_step_counts) ? status.failure_step_counts : [];
+  if (failureSteps.length === 0) {
+    ui.onboardingFailureSteps.textContent = "No onboarding failure hotspots recorded.";
+  } else {
+    const summary = [...failureSteps]
+      .sort((left, right) => Number(right.failures ?? 0) - Number(left.failures ?? 0))
+      .slice(0, 3)
+      .map((entry) => `${asString(entry.step, "unknown")}=${Number(entry.failures ?? 0)}`)
+      .join(", ");
+    ui.onboardingFailureSteps.textContent = summary;
+  }
+
+  const bundleMetrics = status?.support_bundle_exports ?? {};
+  const attempts = Number(bundleMetrics.attempts ?? 0);
+  const successes = Number(bundleMetrics.successes ?? 0);
+  const failures = Number(bundleMetrics.failures ?? 0);
+  if (attempts <= 0) {
+    ui.onboardingSupportBundleStats.textContent = "No support bundle exports attempted yet.";
+    return;
+  }
+  ui.onboardingSupportBundleStats.textContent =
+    `${successes}/${attempts} succeeded (${formatBasisPointsPercent(Number(bundleMetrics.success_rate_bps ?? 0))}), failures=${failures}`;
+}
+
 function renderOnboardingRecovery(status) {
   const recovery = status?.recovery;
   if (!recovery || typeof recovery !== "object") {
@@ -386,6 +428,7 @@ function renderOnboardingStatus(status) {
     status?.current_step_detail,
     "Desktop will guide local runtime validation, OpenAI connect, Discord verification, and dashboard handoff."
   );
+  ui.onboardingFlowId.textContent = `Flow ID: ${asString(status?.flow_id, "unavailable")}`;
 
   primeStateRootInput(status);
   setLabeledStatus(
@@ -412,6 +455,7 @@ function renderOnboardingStatus(status) {
   renderOnboardingRecovery(status);
   renderOnboardingHome(status);
   renderOnboardingEvents(status);
+  renderOnboardingSupportability(status);
   applyDiscordDefaultsFromOnboarding(status);
   renderDiscordResultCards(status);
 }
@@ -834,6 +878,7 @@ function renderSnapshot(snapshot, options = {}) {
   const discord = facts.discord ?? {};
   const browserService = facts.browser_service ?? {};
   const diagnostics = snapshot.diagnostics ?? {};
+  const observability = diagnostics.observability ?? {};
   const warnings = Array.isArray(snapshot.warnings) ? snapshot.warnings : [];
 
   ui.factGatewayVersion.textContent = asString(facts.gateway_version, "Unavailable");
@@ -864,9 +909,21 @@ function renderSnapshot(snapshot, options = {}) {
     ui.discordStatusBadge,
     resolveDiscordBadgeStatus(discord)
   );
+  const connectorObservability = observability.connector ?? {};
+  const providerAuthObservability = observability.provider_auth ?? {};
+  const dashboardObservability = observability.dashboard ?? {};
+  const browserObservability = observability.browser ?? {};
+  const supportBundleObservability = observability.support_bundle ?? {};
+  const hasSupportDegradation =
+    (Array.isArray(diagnostics.errors) && diagnostics.errors.length > 0) ||
+    Number(observability.recent_failure_count ?? 0) > 0 ||
+    Number(connectorObservability.dead_letters ?? 0) > 0 ||
+    Number(providerAuthObservability.failures ?? 0) > 0 ||
+    Number(dashboardObservability.failures ?? 0) > 0 ||
+    Number(browserObservability.relay_failures ?? 0) > 0;
   setStatusPill(
     ui.supportStateBadge,
-    Array.isArray(diagnostics.errors) && diagnostics.errors.length > 0 ? "degraded" : "healthy"
+    hasSupportDegradation ? "degraded" : "healthy"
   );
 
   const browserSummary = Boolean(browserService.healthy)
@@ -880,6 +937,20 @@ function renderSnapshot(snapshot, options = {}) {
   ui.droppedDiagnostics.textContent = typeof diagnostics.dropped_log_events_total === "number"
     ? String(diagnostics.dropped_log_events_total)
     : "0";
+  ui.supportProviderAuthSummary.textContent =
+    `${asString(providerAuthObservability.state, "unknown")}; failures=${Number(providerAuthObservability.failures ?? 0)}/${Number(providerAuthObservability.attempts ?? 0)}, refresh=${Number(providerAuthObservability.refresh_failures ?? 0)}`;
+  ui.supportConnectorSummary.textContent =
+    `queue=${Number(connectorObservability.queue_depth ?? 0)}, dead=${Number(connectorObservability.dead_letters ?? 0)}, degraded=${Number(connectorObservability.degraded_connectors ?? 0)}, uploads=${Number(connectorObservability.upload_failures ?? 0)}`;
+  ui.supportDashboardSummary.textContent =
+    `failures=${Number(dashboardObservability.failures ?? 0)}/${Number(dashboardObservability.attempts ?? 0)} (${formatBasisPointsPercent(Number(dashboardObservability.failure_rate_bps ?? 0))})`;
+  ui.supportBrowserSummary.textContent =
+    `relay failures=${Number(browserObservability.relay_failures ?? 0)}/${Number(browserObservability.relay_attempts ?? 0)} (${formatBasisPointsPercent(Number(browserObservability.relay_failure_rate_bps ?? 0))})`;
+  ui.supportBundleSummary.textContent =
+    `${Number(supportBundleObservability.successes ?? 0)}/${Number(supportBundleObservability.attempts ?? 0)} succeeded (${formatBasisPointsPercent(Number(supportBundleObservability.success_rate_bps ?? 0))})`;
+  ui.supportRecentFailures.textContent = `${Number(observability.recent_failure_count ?? 0)} redacted failures in the current snapshot`;
+  const failureClasses = observability.failure_classes ?? {};
+  ui.supportFailureClasses.textContent =
+    `config=${Number(failureClasses.config_failure ?? 0)}, upstream=${Number(failureClasses.upstream_provider_failure ?? 0)}, product=${Number(failureClasses.product_failure ?? 0)}`;
 
   renderWelcomeChecklist();
   renderDiscordChecklist(discord);

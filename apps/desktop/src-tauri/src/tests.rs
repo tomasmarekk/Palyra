@@ -471,9 +471,12 @@ fn state_file_initialization_seeds_onboarding_defaults() {
         .expect("desktop state should initialize");
     assert!(loaded.persisted.runtime_state_root.is_none());
     assert!(loaded.persisted.onboarding.welcome_acknowledged_at_unix_ms.is_none());
+    assert!(!loaded.persisted.onboarding.flow_id.trim().is_empty());
     assert_eq!(loaded.persisted.onboarding.discord.account_id, "default");
     assert_eq!(loaded.persisted.onboarding.discord.broadcast_strategy, "deny");
     assert!(loaded.persisted.onboarding.recent_events.is_empty());
+    assert!(loaded.persisted.onboarding.failure_step_counts.is_empty());
+    assert_eq!(loaded.persisted.onboarding.support_bundle_export_attempts, 0);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -530,6 +533,82 @@ version = 1
             .any(|step| step.key == DesktopOnboardingStep::Environment && step.status == "complete"),
         "environment step should be marked complete once preflight passes"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn onboarding_status_surfaces_flow_id_failure_counts_and_bundle_metrics() {
+    let _env_guard = lock_env();
+    let fixture = TempFixtureDir::new();
+    let config_path = write_config_file(
+        fixture.path(),
+        r#"
+version = 1
+"#,
+    );
+    let gateway_binary = fixture.path().join(executable_file_name("palyrad"));
+    let browser_binary = fixture.path().join(executable_file_name("palyra-browserd"));
+    let cli_binary = fixture.path().join(executable_file_name("palyra"));
+    write_file(gateway_binary.as_path(), "binary");
+    write_file(browser_binary.as_path(), "binary");
+    write_file(cli_binary.as_path(), "binary");
+    let _config_override =
+        ScopedEnvVar::set("PALYRA_CONFIG", config_path.to_string_lossy().as_ref());
+    let _gateway_override =
+        ScopedEnvVar::set("PALYRA_DESKTOP_PALYRAD_BIN", gateway_binary.to_string_lossy().as_ref());
+    let _browser_override =
+        ScopedEnvVar::set("PALYRA_DESKTOP_BROWSERD_BIN", browser_binary.to_string_lossy().as_ref());
+    let _cli_override =
+        ScopedEnvVar::set("PALYRA_DESKTOP_PALYRA_BIN", cli_binary.to_string_lossy().as_ref());
+
+    let mut control_center = build_test_control_center(fixture.path());
+    control_center.runtime.gateway_admin_port = 0;
+    control_center.runtime.gateway_grpc_port = 0;
+    control_center.runtime.gateway_quic_port = 0;
+    control_center.runtime.browser_health_port = 0;
+    control_center.runtime.browser_grpc_port = 0;
+    control_center.gateway.bound_ports = vec![0, 0, 0];
+    control_center.browserd.bound_ports = vec![0, 0];
+    control_center
+        .mark_onboarding_welcome_acknowledged()
+        .expect("welcome acknowledgement should persist");
+    control_center
+        .set_runtime_state_root_override(None, true)
+        .expect("state root confirmation should persist");
+    control_center
+        .record_onboarding_failure(
+            DesktopOnboardingStep::Environment,
+            "Missing gateway binary".to_owned(),
+        )
+        .expect("first onboarding failure should persist");
+    control_center
+        .record_onboarding_failure(
+            DesktopOnboardingStep::Environment,
+            "Missing gateway binary".to_owned(),
+        )
+        .expect("second onboarding failure should persist");
+    control_center
+        .record_support_bundle_export_result(true, Some("bundle-one.json".to_owned()))
+        .expect("bundle success should persist");
+    control_center
+        .record_support_bundle_export_result(false, Some("bundle failed".to_owned()))
+        .expect("bundle failure should persist");
+
+    let status = build_onboarding_status(control_center.capture_onboarding_status_inputs())
+        .await
+        .expect("onboarding status should build");
+    assert!(!status.flow_id.trim().is_empty());
+    assert_eq!(
+        status
+            .failure_step_counts
+            .iter()
+            .find(|entry| entry.step == DesktopOnboardingStep::Environment.as_str())
+            .map(|entry| entry.failures),
+        Some(2)
+    );
+    assert_eq!(status.support_bundle_exports.attempts, 2);
+    assert_eq!(status.support_bundle_exports.successes, 1);
+    assert_eq!(status.support_bundle_exports.failures, 1);
+    assert_eq!(status.support_bundle_exports.success_rate_bps, 5_000);
 }
 
 #[test]
@@ -835,6 +914,52 @@ async fn snapshot_build_redacts_console_and_connector_diagnostics() {
                     r#"{
                             "generated_at_unix_ms":123,
                             "errors":["provider token=alpha"],
+                            "observability":{
+                                "provider_auth":{
+                                    "state":"degraded",
+                                    "attempts":8,
+                                    "failures":2,
+                                    "failure_rate_bps":2500,
+                                    "refresh_failures":1
+                                },
+                                "dashboard":{
+                                    "attempts":12,
+                                    "failures":2,
+                                    "failure_rate_bps":1666
+                                },
+                                "connector":{
+                                    "queue_depth":6,
+                                    "dead_letters":3,
+                                    "degraded_connectors":1,
+                                    "upload_failures":1,
+                                    "upload_failure_rate_bps":10000
+                                },
+                                "browser":{
+                                    "relay_actions":{
+                                        "attempts":5,
+                                        "failures":1,
+                                        "failure_rate_bps":2000
+                                    }
+                                },
+                                "support_bundle":{
+                                    "attempts":4,
+                                    "successes":3,
+                                    "failures":1,
+                                    "success_rate_bps":7500
+                                },
+                                "failure_classes":{
+                                    "config_failure":1,
+                                    "upstream_provider_failure":2,
+                                    "product_failure":1
+                                },
+                                "recent_failures":[
+                                    {
+                                        "operation":"provider_auth_refresh",
+                                        "failure_class":"upstream_provider_failure",
+                                        "message":"provider auth request failed with http 502"
+                                    }
+                                ]
+                            },
                             "browserd":{"last_error":"Bearer browser-secret"},
                             "auth_profiles":{"profiles":[{"refresh_failure_reason":"refresh_token=beta"}]}
                         }"#,
@@ -909,6 +1034,27 @@ async fn snapshot_build_redacts_console_and_connector_diagnostics() {
     assert!(snapshot.quick_facts.discord.queue_paused);
     assert_eq!(snapshot.quick_facts.discord.pending_outbox, 5);
     assert_eq!(snapshot.quick_facts.discord.dead_letters, 3);
+    assert_eq!(snapshot.diagnostics.observability.provider_auth.failures, 2);
+    assert_eq!(
+        snapshot.diagnostics.observability.provider_auth.failure_rate_bps,
+        2_500
+    );
+    assert_eq!(snapshot.diagnostics.observability.dashboard.failures, 2);
+    assert_eq!(snapshot.diagnostics.observability.connector.queue_depth, 6);
+    assert_eq!(snapshot.diagnostics.observability.browser.relay_failures, 1);
+    assert_eq!(
+        snapshot.diagnostics.observability.support_bundle.success_rate_bps,
+        7_500
+    );
+    assert_eq!(
+        snapshot
+            .diagnostics
+            .observability
+            .failure_classes
+            .upstream_provider_failure,
+        2
+    );
+    assert_eq!(snapshot.diagnostics.observability.recent_failure_count, 1);
     assert_eq!(snapshot.quick_facts.discord.saturation_state, "paused");
     assert_eq!(
         snapshot.quick_facts.discord.permission_gap_hint.as_deref(),

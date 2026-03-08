@@ -65,6 +65,9 @@
             Desktop will guide local runtime validation, OpenAI connect, Discord verification, and
             dashboard handoff.
           </p>
+          <p id="onboardingFlowId" class="hint">
+            Correlation flow ID will appear after the first onboarding refresh.
+          </p>
           <div id="onboardingRecoveryPanel" class="recovery-panel section-hidden">
             <div class="card-title-row">
               <h3>Recovery</h3>
@@ -137,6 +140,21 @@
             <ul id="onboardingEventList" class="warning-list compact-list" aria-label="Onboarding event history">
               <li>No onboarding events recorded yet.</li>
             </ul>
+          </section>
+          <section class="subpanel">
+            <div class="card-title-row">
+              <h3>Supportability signals</h3>
+            </div>
+            <dl class="facts-list compact">
+              <div>
+                <dt>Failure hotspots</dt>
+                <dd id="onboardingFailureSteps">No onboarding failure hotspots recorded.</dd>
+              </div>
+              <div>
+                <dt>Support bundle exports</dt>
+                <dd id="onboardingSupportBundleStats">No support bundle exports attempted yet.</dd>
+              </div>
+            </dl>
           </section>
         </article>
 
@@ -525,6 +543,34 @@
             <div>
               <dt>Dropped log events</dt>
               <dd id="droppedDiagnostics">-</dd>
+            </div>
+            <div>
+              <dt>Provider auth</dt>
+              <dd id="supportProviderAuthSummary">-</dd>
+            </div>
+            <div>
+              <dt>Connector operations</dt>
+              <dd id="supportConnectorSummary">-</dd>
+            </div>
+            <div>
+              <dt>Dashboard mutations</dt>
+              <dd id="supportDashboardSummary">-</dd>
+            </div>
+            <div>
+              <dt>Browser relay</dt>
+              <dd id="supportBrowserSummary">-</dd>
+            </div>
+            <div>
+              <dt>Bundle reliability</dt>
+              <dd id="supportBundleSummary">-</dd>
+            </div>
+            <div>
+              <dt>Recent failures</dt>
+              <dd id="supportRecentFailures">-</dd>
+            </div>
+            <div>
+              <dt>Failure classes</dt>
+              <dd id="supportFailureClasses">-</dd>
             </div>
           </dl>
           <div class="inline-actions">

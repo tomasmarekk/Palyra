@@ -1,6 +1,8 @@
 import { ConsoleSectionHeader } from "../components/ConsoleSectionHeader";
 import {
   formatUnixMs,
+  readNumber,
+  readObject,
   readString,
   toPrettyJson,
   toStringArray,
@@ -23,6 +25,7 @@ type SupportSectionProps = {
     | "createSupportBundle"
     | "loadSupportBundleJob"
     | "setSection"
+    | "diagnosticsSnapshot"
     | "revealSensitiveValues"
   >;
 };
@@ -31,6 +34,15 @@ export function SupportSection({ app }: SupportSectionProps) {
   const warnings = toStringArray(
     Array.isArray(app.supportDeployment?.warnings) ? app.supportDeployment.warnings : []
   );
+  const observability = readObject(app.diagnosticsSnapshot ?? {}, "observability");
+  const supportBundle = readObject(observability ?? {}, "support_bundle");
+  const triage = readObject(observability ?? {}, "triage");
+  const recentFailures = Array.isArray(observability?.recent_failures)
+    ? observability.recent_failures.filter((entry): entry is JsonObject => entry !== null && typeof entry === "object" && !Array.isArray(entry))
+    : [];
+  const latestFailure = recentFailures[0] ?? null;
+  const triageOrder = toStringArray(Array.isArray(triage?.common_order) ? triage.common_order : []);
+  const failedJobs = app.supportBundleJobs.filter((job) => readString(job, "state") === "failed").length;
 
   return (
     <main className="console-card">
@@ -54,7 +66,14 @@ export function SupportSection({ app }: SupportSectionProps) {
         <article className="console-subpanel">
           <h3>Support queue</h3>
           <p><strong>Jobs:</strong> {app.supportBundleJobs.length}</p>
+          <p><strong>Failed jobs:</strong> {failedJobs}</p>
           <p><strong>Selected job:</strong> {app.supportSelectedBundleJobId || "none"}</p>
+        </article>
+        <article className="console-subpanel">
+          <h3>Bundle reliability</h3>
+          <p><strong>Attempts:</strong> {readString(supportBundle ?? {}, "attempts") ?? "0"}</p>
+          <p><strong>Successes:</strong> {readString(supportBundle ?? {}, "successes") ?? "0"}</p>
+          <p><strong>Success rate:</strong> {formatRate(readNumber(supportBundle ?? {}, "success_rate_bps"))}</p>
         </article>
         <article className="console-subpanel">
           <h3>Recovery shortcuts</h3>
@@ -76,6 +95,12 @@ export function SupportSection({ app }: SupportSectionProps) {
           <p className="chat-muted">
             Detached operators can fall back to the CLI doctor and support-bundle commands published in the operations domain.
           </p>
+          {latestFailure !== null && (
+            <p className="chat-muted">
+              Latest redacted failure: {readString(latestFailure, "failure_class") ?? "unknown"} /{" "}
+              {readString(latestFailure, "operation") ?? "operation unavailable"}.
+            </p>
+          )}
         </article>
       </section>
 
@@ -190,6 +215,44 @@ export function SupportSection({ app }: SupportSectionProps) {
         )}
       </section>
 
+      <section className="console-grid-2">
+        <article className="console-subpanel">
+          <div className="console-subpanel__header">
+            <div>
+              <h3>Triage playbook</h3>
+              <p className="chat-muted">
+                Support workflows now publish the same starter order used in the support bundle so handoff between dashboard and offline troubleshooting stays consistent.
+              </p>
+            </div>
+          </div>
+          <p><strong>Playbook:</strong> {readString(triage ?? {}, "playbook") ?? "docs/operations/observability-supportability-v1.md"}</p>
+          {triageOrder.length === 0 ? (
+            <p>No triage order published.</p>
+          ) : (
+            <ol className="console-compact-list">
+              {triageOrder.map((step) => (
+                <li key={step}>{step}</li>
+              ))}
+            </ol>
+          )}
+        </article>
+        <article className="console-subpanel">
+          <div className="console-subpanel__header">
+            <div>
+              <h3>Latest redacted failure</h3>
+              <p className="chat-muted">
+                Operators can inspect the latest failure classification and message without exposing raw provider or connector secrets in the dashboard.
+              </p>
+            </div>
+          </div>
+          {latestFailure === null ? (
+            <p>No failures recorded.</p>
+          ) : (
+            <pre>{toPrettyJson(latestFailure, app.revealSensitiveValues)}</pre>
+          )}
+        </article>
+      </section>
+
       <section className="console-subpanel">
         <h3>Redacted health and posture snapshot</h3>
         {app.supportDeployment === null ? (
@@ -205,4 +268,11 @@ export function SupportSection({ app }: SupportSectionProps) {
 function readUnixMillis(record: JsonObject, key: string): number | null {
   const value = record[key];
   return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function formatRate(value: number | null): string {
+  if (value === null) {
+    return "n/a";
+  }
+  return `${(value / 100).toFixed(2)}%`;
 }

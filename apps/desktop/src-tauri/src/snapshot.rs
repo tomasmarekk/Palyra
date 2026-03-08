@@ -94,6 +94,65 @@ pub(crate) struct DiagnosticsSnapshot {
     pub(crate) generated_at_unix_ms: Option<i64>,
     pub(crate) errors: Vec<String>,
     pub(crate) dropped_log_events_total: u64,
+    pub(crate) observability: DesktopObservabilitySnapshot,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DesktopObservabilitySnapshot {
+    pub(crate) provider_auth: DesktopProviderAuthObservability,
+    pub(crate) dashboard: DesktopDashboardMutationObservability,
+    pub(crate) connector: DesktopConnectorObservability,
+    pub(crate) browser: DesktopBrowserObservability,
+    pub(crate) support_bundle: DesktopSupportBundleObservability,
+    pub(crate) failure_classes: DesktopFailureClassSummary,
+    pub(crate) recent_failure_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DesktopProviderAuthObservability {
+    pub(crate) state: String,
+    pub(crate) attempts: u64,
+    pub(crate) failures: u64,
+    pub(crate) failure_rate_bps: u32,
+    pub(crate) refresh_failures: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DesktopDashboardMutationObservability {
+    pub(crate) attempts: u64,
+    pub(crate) failures: u64,
+    pub(crate) failure_rate_bps: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DesktopConnectorObservability {
+    pub(crate) queue_depth: u64,
+    pub(crate) dead_letters: u64,
+    pub(crate) degraded_connectors: u64,
+    pub(crate) upload_failures: u64,
+    pub(crate) upload_failure_rate_bps: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DesktopBrowserObservability {
+    pub(crate) relay_attempts: u64,
+    pub(crate) relay_failures: u64,
+    pub(crate) relay_failure_rate_bps: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DesktopSupportBundleObservability {
+    pub(crate) attempts: u64,
+    pub(crate) successes: u64,
+    pub(crate) failures: u64,
+    pub(crate) success_rate_bps: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DesktopFailureClassSummary {
+    pub(crate) config_failure: u64,
+    pub(crate) upstream_provider_failure: u64,
+    pub(crate) product_failure: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -362,6 +421,100 @@ fn sanitize_json_string(value: Option<&Value>) -> Option<String> {
     }
 }
 
+fn build_desktop_observability_snapshot(
+    diagnostics_payload: Option<&Value>,
+) -> DesktopObservabilitySnapshot {
+    let observability = diagnostics_payload
+        .and_then(|payload| payload.get("observability"))
+        .and_then(Value::as_object);
+    let provider_auth = observability
+        .and_then(|root| root.get("provider_auth"))
+        .and_then(Value::as_object);
+    let dashboard = observability
+        .and_then(|root| root.get("dashboard"))
+        .and_then(Value::as_object);
+    let connector = observability
+        .and_then(|root| root.get("connector"))
+        .and_then(Value::as_object);
+    let browser_relay = observability
+        .and_then(|root| root.get("browser"))
+        .and_then(Value::as_object)
+        .and_then(|root| root.get("relay_actions"))
+        .and_then(Value::as_object);
+    let support_bundle = observability
+        .and_then(|root| root.get("support_bundle"))
+        .and_then(Value::as_object);
+    let failure_classes = observability
+        .and_then(|root| root.get("failure_classes"))
+        .and_then(Value::as_object);
+    let recent_failure_count = observability
+        .and_then(|root| root.get("recent_failures"))
+        .and_then(Value::as_array)
+        .map(|entries| entries.len())
+        .unwrap_or_default();
+
+    DesktopObservabilitySnapshot {
+        provider_auth: DesktopProviderAuthObservability {
+            state: provider_auth
+                .and_then(|entry| entry.get("state"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned(),
+            attempts: read_json_u64(provider_auth, "attempts"),
+            failures: read_json_u64(provider_auth, "failures"),
+            failure_rate_bps: read_json_u32(provider_auth, "failure_rate_bps"),
+            refresh_failures: read_json_u64(provider_auth, "refresh_failures"),
+        },
+        dashboard: DesktopDashboardMutationObservability {
+            attempts: read_json_u64(dashboard, "attempts"),
+            failures: read_json_u64(dashboard, "failures"),
+            failure_rate_bps: read_json_u32(dashboard, "failure_rate_bps"),
+        },
+        connector: DesktopConnectorObservability {
+            queue_depth: read_json_u64(connector, "queue_depth"),
+            dead_letters: read_json_u64(connector, "dead_letters"),
+            degraded_connectors: read_json_u64(connector, "degraded_connectors"),
+            upload_failures: read_json_u64(connector, "upload_failures"),
+            upload_failure_rate_bps: read_json_u32(connector, "upload_failure_rate_bps"),
+        },
+        browser: DesktopBrowserObservability {
+            relay_attempts: read_json_u64(browser_relay, "attempts"),
+            relay_failures: read_json_u64(browser_relay, "failures"),
+            relay_failure_rate_bps: read_json_u32(browser_relay, "failure_rate_bps"),
+        },
+        support_bundle: DesktopSupportBundleObservability {
+            attempts: read_json_u64(support_bundle, "attempts"),
+            successes: read_json_u64(support_bundle, "successes"),
+            failures: read_json_u64(support_bundle, "failures"),
+            success_rate_bps: read_json_u32(support_bundle, "success_rate_bps"),
+        },
+        failure_classes: DesktopFailureClassSummary {
+            config_failure: read_json_u64(failure_classes, "config_failure"),
+            upstream_provider_failure: read_json_u64(
+                failure_classes,
+                "upstream_provider_failure",
+            ),
+            product_failure: read_json_u64(failure_classes, "product_failure"),
+        },
+        recent_failure_count,
+    }
+}
+
+fn read_json_u64(record: Option<&serde_json::Map<String, Value>>, key: &str) -> u64 {
+    record
+        .and_then(|entry| entry.get(key))
+        .and_then(Value::as_u64)
+        .unwrap_or_default()
+}
+
+fn read_json_u32(record: Option<&serde_json::Map<String, Value>>, key: &str) -> u32 {
+    record
+        .and_then(|entry| entry.get(key))
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or_default()
+}
+
 pub(crate) fn collect_redacted_errors(value: &Value, limit: usize) -> Vec<String> {
     let mut collected = Vec::new();
     collect_redacted_errors_inner(value, None, &mut collected);
@@ -471,6 +624,7 @@ pub(crate) async fn build_snapshot_from_inputs(
             .and_then(Value::as_i64),
         errors: diagnostics_errors,
         dropped_log_events_total,
+        observability: build_desktop_observability_snapshot(diagnostics_payload.as_ref()),
     };
     if dropped_log_events_total > 0 {
         warnings.push(format!(

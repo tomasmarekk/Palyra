@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
 };
@@ -112,20 +113,31 @@ impl DesktopDiscordOnboardingState {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct DesktopOnboardingState {
+    pub(crate) flow_id: String,
     pub(crate) welcome_acknowledged_at_unix_ms: Option<i64>,
     pub(crate) state_root_confirmed_at_unix_ms: Option<i64>,
     pub(crate) dashboard_handoff_at_unix_ms: Option<i64>,
     pub(crate) completed_at_unix_ms: Option<i64>,
     pub(crate) last_failure: Option<DesktopOnboardingFailureState>,
     pub(crate) recent_events: Vec<DesktopOnboardingEvent>,
+    pub(crate) failure_step_counts: BTreeMap<String, u64>,
+    pub(crate) support_bundle_export_attempts: u64,
+    pub(crate) support_bundle_export_successes: u64,
+    pub(crate) support_bundle_export_failures: u64,
     pub(crate) openai: DesktopOpenAiOnboardingState,
     pub(crate) discord: DesktopDiscordOnboardingState,
 }
 
 impl DesktopOnboardingState {
+    pub(crate) fn ensure_flow_id(&mut self) {
+        if self.flow_id.trim().is_empty() {
+            self.flow_id = Ulid::new().to_string();
+        }
+    }
+
     pub(crate) fn push_event(
         &mut self,
         kind: impl Into<String>,
@@ -140,6 +152,43 @@ impl DesktopOnboardingState {
         if self.recent_events.len() > DESKTOP_ONBOARDING_EVENT_LIMIT {
             let overflow = self.recent_events.len().saturating_sub(DESKTOP_ONBOARDING_EVENT_LIMIT);
             self.recent_events.drain(0..overflow);
+        }
+    }
+
+    pub(crate) fn record_failure_step(&mut self, step: DesktopOnboardingStep) {
+        let key = step.as_str().to_owned();
+        let next = self.failure_step_counts.get(key.as_str()).copied().unwrap_or_default();
+        self.failure_step_counts.insert(key, next.saturating_add(1));
+    }
+
+    pub(crate) fn record_support_bundle_export_result(&mut self, success: bool) {
+        self.support_bundle_export_attempts = self.support_bundle_export_attempts.saturating_add(1);
+        if success {
+            self.support_bundle_export_successes =
+                self.support_bundle_export_successes.saturating_add(1);
+        } else {
+            self.support_bundle_export_failures =
+                self.support_bundle_export_failures.saturating_add(1);
+        }
+    }
+}
+
+impl Default for DesktopOnboardingState {
+    fn default() -> Self {
+        Self {
+            flow_id: Ulid::new().to_string(),
+            welcome_acknowledged_at_unix_ms: None,
+            state_root_confirmed_at_unix_ms: None,
+            dashboard_handoff_at_unix_ms: None,
+            completed_at_unix_ms: None,
+            last_failure: None,
+            recent_events: Vec::new(),
+            failure_step_counts: BTreeMap::new(),
+            support_bundle_export_attempts: 0,
+            support_bundle_export_successes: 0,
+            support_bundle_export_failures: 0,
+            openai: DesktopOpenAiOnboardingState::default(),
+            discord: DesktopDiscordOnboardingState::default(),
         }
     }
 }
@@ -330,7 +379,8 @@ pub(crate) fn load_or_initialize_state_file(
             DESKTOP_SECRET_KEY_BROWSER_AUTH_TOKEN,
             Some(persisted_envelope.browser_auth_token.as_str()),
         )?;
-        let persisted = persisted_envelope.into_state();
+        let mut persisted = persisted_envelope.into_state();
+        persisted.onboarding.ensure_flow_id();
         persist_desktop_state_file(path, &persisted, "normalized")?;
         return Ok(LoadedDesktopState { persisted, admin_token, browser_auth_token });
     }

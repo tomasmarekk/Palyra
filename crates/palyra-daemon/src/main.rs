@@ -10,6 +10,7 @@ mod journal;
 mod media;
 mod model_provider;
 mod node_rpc;
+mod observability;
 mod openai_auth;
 mod openai_surface;
 mod orchestrator;
@@ -37,7 +38,7 @@ use axum::{
         header::{
             AUTHORIZATION, CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, COOKIE, SET_COOKIE,
         },
-        HeaderMap, HeaderName, HeaderValue, StatusCode,
+        HeaderMap, HeaderName, HeaderValue, Method, StatusCode,
     },
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
@@ -64,6 +65,9 @@ use model_provider::{
     build_embeddings_provider, build_model_provider, EmbeddingsProvider, EmbeddingsRequest,
     ModelProviderAuthProviderKind, ModelProviderConfig, ModelProviderCredentialSource,
     ModelProviderKind,
+};
+use observability::{
+    CorrelationSnapshot as ObservabilityCorrelationSnapshot, FailureClass, ObservabilityState,
 };
 use openai_auth::{
     build_authorization_url, exchange_authorization_code, generate_pkce_verifier, normalize_scopes,
@@ -214,6 +218,7 @@ struct AppState {
     relay_tokens: Arc<Mutex<HashMap<String, ConsoleRelayToken>>>,
     console_chat_streams: Arc<Mutex<HashMap<String, ConsoleChatRunStream>>>,
     support_bundle_jobs: Arc<Mutex<HashMap<String, control_plane::SupportBundleJob>>>,
+    observability: Arc<ObservabilityState>,
     deployment: DeploymentRuntimeSnapshot,
     remote_admin_access: Arc<Mutex<Option<RemoteAdminAccessAttempt>>>,
 }
@@ -1649,6 +1654,7 @@ async fn main() -> Result<()> {
         relay_tokens: Arc::new(Mutex::new(HashMap::new())),
         console_chat_streams: Arc::new(Mutex::new(HashMap::new())),
         support_bundle_jobs: Arc::new(Mutex::new(HashMap::new())),
+        observability: Arc::new(ObservabilityState::default()),
         deployment: DeploymentRuntimeSnapshot {
             mode: loaded.deployment.mode.as_str().to_owned(),
             bind_profile: loaded.gateway.bind_profile.as_str().to_owned(),
@@ -1898,6 +1904,10 @@ async fn main() -> Result<()> {
         .route("/console/v1/audit/events", get(console_audit_events_handler))
         .layer(DefaultBodyLimit::max(HTTP_MAX_REQUEST_BODY_BYTES))
         .route_layer(middleware::from_fn_with_state(state.clone(), admin_rate_limit_middleware))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            console_observability_middleware,
+        ))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             console_session_cookie_refresh_middleware,
@@ -2245,6 +2255,39 @@ async fn admin_console_security_headers_middleware(request: Request, next: Next)
     response
 }
 
+async fn console_observability_middleware(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let response = next.run(request).await;
+    if !path.starts_with("/console/v1/")
+        || matches!(method, Method::GET | Method::HEAD | Method::OPTIONS)
+    {
+        return response;
+    }
+    let observed_at_unix_ms = unix_ms_now().unwrap_or_default();
+    let operation = format!("dashboard.mutation {} {}", method, path);
+    let success = response.status().is_success();
+    let failure_class = classify_console_mutation_failure(response.status());
+    let message = if success {
+        "ok".to_owned()
+    } else {
+        format!("request failed with http {}", response.status().as_u16())
+    };
+    state.observability.record_dashboard_mutation_result(
+        success,
+        operation,
+        failure_class,
+        message,
+        observed_at_unix_ms,
+        ObservabilityCorrelationSnapshot::default(),
+    );
+    response
+}
+
 async fn console_session_cookie_refresh_middleware(
     State(state): State<AppState>,
     request: Request,
@@ -2501,8 +2544,13 @@ async fn admin_status_handler(
             "failed to serialize auth status snapshot: {error}"
         )))
     })?;
+    let media_payload = state.channels.media_snapshot().map_err(channel_platform_error_response)?;
+    let observability_payload =
+        build_observability_payload(&state, &auth_payload, &media_payload).await?;
     if let Value::Object(ref mut map) = payload {
         map.insert("auth".to_owned(), auth_payload);
+        map.insert("media".to_owned(), media_payload);
+        map.insert("observability".to_owned(), observability_payload);
     }
     Ok(Json(payload))
 }
@@ -3931,7 +3979,27 @@ async fn console_openai_provider_api_key_handler(
     Json(payload): Json<control_plane::OpenAiApiKeyUpsertRequest>,
 ) -> Result<Json<control_plane::ProviderAuthActionEnvelope>, Response> {
     let session = authorize_console_session(&state, &headers, true)?;
-    connect_openai_api_key(&state, &session.context, payload).await.map(Json)
+    state.observability.record_provider_auth_attempt();
+    let profile_id = payload.profile_id.clone();
+    match connect_openai_api_key(&state, &session.context, payload).await {
+        Ok(envelope) => Ok(Json(envelope)),
+        Err(response) => {
+            record_provider_auth_failure(
+                &state,
+                "provider_auth.api_key_connect",
+                response.status(),
+                auth_correlation_from_context(
+                    &session.context,
+                    profile_id.as_deref(),
+                    None,
+                    None,
+                    None,
+                ),
+                false,
+            );
+            Err(response)
+        }
+    }
 }
 
 async fn console_openai_provider_bootstrap_handler(
@@ -3940,9 +4008,28 @@ async fn console_openai_provider_bootstrap_handler(
     Json(payload): Json<control_plane::OpenAiOAuthBootstrapRequest>,
 ) -> Result<Json<control_plane::OpenAiOAuthBootstrapEnvelope>, Response> {
     let session = authorize_console_session(&state, &headers, true)?;
-    start_openai_oauth_attempt_from_request(&state, &session.context, &headers, payload)
-        .await
-        .map(Json)
+    state.observability.record_provider_auth_attempt();
+    let profile_id = payload.profile_id.clone();
+    match start_openai_oauth_attempt_from_request(&state, &session.context, &headers, payload).await
+    {
+        Ok(envelope) => Ok(Json(envelope)),
+        Err(response) => {
+            record_provider_auth_failure(
+                &state,
+                "provider_auth.oauth_bootstrap",
+                response.status(),
+                auth_correlation_from_context(
+                    &session.context,
+                    profile_id.as_deref(),
+                    None,
+                    None,
+                    None,
+                ),
+                false,
+            );
+            Err(response)
+        }
+    }
 }
 
 async fn console_openai_provider_callback_state_handler(
@@ -3958,7 +4045,24 @@ async fn console_openai_provider_callback_handler(
     State(state): State<AppState>,
     Query(query): Query<ConsoleOpenAiCallbackQuery>,
 ) -> Result<Html<String>, Response> {
-    complete_openai_oauth_callback(&state, query).await.map(Html)
+    state.observability.record_provider_auth_attempt();
+    let attempt_id = query.state.clone();
+    match complete_openai_oauth_callback(&state, query).await {
+        Ok(page) => Ok(Html(page)),
+        Err(response) => {
+            record_provider_auth_failure(
+                &state,
+                "provider_auth.oauth_callback",
+                response.status(),
+                ObservabilityCorrelationSnapshot {
+                    auth_profile_id: Some(attempt_id),
+                    ..ObservabilityCorrelationSnapshot::default()
+                },
+                false,
+            );
+            Err(response)
+        }
+    }
 }
 
 async fn console_openai_provider_reconnect_handler(
@@ -3967,7 +4071,27 @@ async fn console_openai_provider_reconnect_handler(
     Json(payload): Json<control_plane::ProviderAuthActionRequest>,
 ) -> Result<Json<control_plane::OpenAiOAuthBootstrapEnvelope>, Response> {
     let session = authorize_console_session(&state, &headers, true)?;
-    reconnect_openai_oauth_attempt(&state, &session.context, &headers, payload).await.map(Json)
+    state.observability.record_provider_auth_attempt();
+    let profile_id = payload.profile_id.clone();
+    match reconnect_openai_oauth_attempt(&state, &session.context, &headers, payload).await {
+        Ok(envelope) => Ok(Json(envelope)),
+        Err(response) => {
+            record_provider_auth_failure(
+                &state,
+                "provider_auth.oauth_reconnect",
+                response.status(),
+                auth_correlation_from_context(
+                    &session.context,
+                    profile_id.as_deref(),
+                    None,
+                    None,
+                    None,
+                ),
+                false,
+            );
+            Err(response)
+        }
+    }
 }
 
 async fn console_openai_provider_refresh_handler(
@@ -3976,7 +4100,27 @@ async fn console_openai_provider_refresh_handler(
     Json(payload): Json<control_plane::ProviderAuthActionRequest>,
 ) -> Result<Json<control_plane::ProviderAuthActionEnvelope>, Response> {
     let session = authorize_console_session(&state, &headers, true)?;
-    refresh_openai_oauth_profile(&state, &session.context, payload).await.map(Json)
+    state.observability.record_provider_auth_attempt();
+    let profile_id = payload.profile_id.clone();
+    match refresh_openai_oauth_profile(&state, &session.context, payload).await {
+        Ok(envelope) => Ok(Json(envelope)),
+        Err(response) => {
+            record_provider_auth_failure(
+                &state,
+                "provider_auth.oauth_refresh",
+                response.status(),
+                auth_correlation_from_context(
+                    &session.context,
+                    profile_id.as_deref(),
+                    None,
+                    None,
+                    None,
+                ),
+                true,
+            );
+            Err(response)
+        }
+    }
 }
 
 async fn console_openai_provider_revoke_handler(
@@ -3985,7 +4129,27 @@ async fn console_openai_provider_revoke_handler(
     Json(payload): Json<control_plane::ProviderAuthActionRequest>,
 ) -> Result<Json<control_plane::ProviderAuthActionEnvelope>, Response> {
     let session = authorize_console_session(&state, &headers, true)?;
-    revoke_openai_auth_profile(&state, &session.context, payload).await.map(Json)
+    state.observability.record_provider_auth_attempt();
+    let profile_id = payload.profile_id.clone();
+    match revoke_openai_auth_profile(&state, &session.context, payload).await {
+        Ok(envelope) => Ok(Json(envelope)),
+        Err(response) => {
+            record_provider_auth_failure(
+                &state,
+                "provider_auth.oauth_revoke",
+                response.status(),
+                auth_correlation_from_context(
+                    &session.context,
+                    profile_id.as_deref(),
+                    None,
+                    None,
+                    None,
+                ),
+                false,
+            );
+            Err(response)
+        }
+    }
 }
 
 async fn console_openai_provider_default_profile_handler(
@@ -4465,6 +4629,8 @@ async fn console_diagnostics_handler(
         state.runtime.memory_maintenance_status().await.map_err(runtime_status_response)?;
     let memory_runtime_config = state.runtime.memory_config_snapshot();
     let deployment_payload = collect_console_deployment_diagnostics(&state);
+    let observability_payload =
+        build_observability_payload(&state, &auth_payload, &media_payload).await?;
     let generated_at_unix_ms = unix_ms_now().map_err(|error| {
         runtime_status_response(tonic::Status::internal(format!(
             "failed to read system clock: {error}"
@@ -4486,6 +4652,7 @@ async fn console_diagnostics_handler(
         "browserd": browser_payload,
         "media": media_payload,
         "deployment": deployment_payload,
+        "observability": observability_payload,
         "memory": {
             "usage": memory_status.usage,
             "retention": {
@@ -4591,6 +4758,297 @@ fn collect_console_deployment_diagnostics(state: &AppState) -> Value {
             "warnings": ["failed to encode typed deployment posture summary"],
         })
     })
+}
+
+async fn build_observability_payload(
+    state: &AppState,
+    auth_payload: &Value,
+    media_payload: &Value,
+) -> Result<Value, Response> {
+    let provider_auth =
+        build_provider_auth_observability(auth_payload, state.observability.as_ref());
+    let connector = build_connector_observability(state, media_payload).map_err(|error| *error)?;
+    let browser = collect_console_browser_action_diagnostics(state).await;
+    let support_bundle = build_support_bundle_observability(state);
+    let recent_failures = state.observability.recent_failures();
+    let failure_classes = build_failure_class_summary(recent_failures.as_slice());
+
+    Ok(json!({
+        "failure_classes": failure_classes,
+        "provider_auth": provider_auth,
+        "dashboard": serde_json::to_value(state.observability.dashboard_mutation_snapshot())
+            .unwrap_or_else(|_| json!({})),
+        "support_bundle": support_bundle,
+        "connector": connector,
+        "browser": browser,
+        "chat": {
+            "active_console_streams": lock_console_chat_streams(&state.console_chat_streams).len(),
+        },
+        "recent_failures": recent_failures,
+        "triage": {
+            "failure_classes": ["config_failure", "upstream_provider_failure", "product_failure"],
+            "common_order": [
+                "Check deployment posture and operator auth first.",
+                "Check OpenAI profile health and refresh metrics next.",
+                "Check Discord queue depth, dead letters, and upload failures next.",
+                "Check browser relay failures and service health next.",
+                "If still unresolved, export a support bundle and inspect recent failure correlations."
+            ]
+        }
+    }))
+}
+
+fn build_provider_auth_observability(
+    auth_payload: &Value,
+    observability: &ObservabilityState,
+) -> Value {
+    let auth_attempts = observability.provider_auth_snapshot();
+    let refresh_failures = auth_payload
+        .pointer("/refresh_metrics/failures")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| observability.provider_refresh_failures());
+    let total_profiles =
+        auth_payload.pointer("/summary/total").and_then(Value::as_u64).unwrap_or(0);
+    let expired = auth_payload.pointer("/summary/expired").and_then(Value::as_u64).unwrap_or(0);
+    let missing = auth_payload.pointer("/summary/missing").and_then(Value::as_u64).unwrap_or(0);
+    json!({
+        "attempts": auth_attempts.attempts,
+        "failures": auth_attempts.failures,
+        "failure_rate_bps": auth_attempts.failure_rate_bps,
+        "refresh_failures": refresh_failures,
+        "profiles": {
+            "total": total_profiles,
+            "expired": expired,
+            "missing": missing,
+        },
+        "state": if missing > 0 || expired > 0 || auth_attempts.failures > 0 {
+            "degraded"
+        } else {
+            "ok"
+        },
+    })
+}
+
+fn build_connector_observability(
+    state: &AppState,
+    media_payload: &Value,
+) -> Result<Value, Box<Response>> {
+    let connectors =
+        state.channels.list().map_err(|error| Box::new(channel_platform_error_response(error)))?;
+    let connector_count = connectors.len();
+    let mut queue_depth = 0_u64;
+    let mut dead_letters = 0_u64;
+    let mut paused = 0_u64;
+    let mut degraded = 0_u64;
+    let mut last_errors = Vec::<Value>::new();
+    for connector in connectors {
+        let queue = state
+            .channels
+            .queue_snapshot(connector.connector_id.as_str())
+            .map_err(|error| Box::new(channel_platform_error_response(error)))?;
+        queue_depth = queue_depth
+            .saturating_add(queue.pending_outbox)
+            .saturating_add(queue.due_outbox)
+            .saturating_add(queue.claimed_outbox);
+        dead_letters = dead_letters.saturating_add(queue.dead_letters);
+        if queue.paused {
+            paused = paused.saturating_add(1);
+        }
+        if connector.readiness.as_str() != "ready" || connector.liveness.as_str() != "running" {
+            degraded = degraded.saturating_add(1);
+        }
+        if let Some(runtime) = state
+            .channels
+            .runtime_snapshot(connector.connector_id.as_str())
+            .map_err(|error| Box::new(channel_platform_error_response(error)))?
+        {
+            if let Some(error) = runtime.get("last_error").and_then(Value::as_str) {
+                if !error.trim().is_empty() && last_errors.len() < 5 {
+                    last_errors.push(json!({
+                        "connector_id": connector.connector_id,
+                        "message": sanitize_http_error_message(error),
+                    }));
+                }
+            }
+        }
+    }
+    let upload_failures = media_payload
+        .get("recent_upload_failures")
+        .and_then(Value::as_array)
+        .map(|entries| entries.len() as u64)
+        .unwrap_or(0);
+    let upload_failure_rate_bps = if upload_failures > 0 { 10_000 } else { 0 };
+    Ok(json!({
+        "connectors": connector_count,
+        "degraded_connectors": degraded,
+        "paused_connectors": paused,
+        "queue_depth": queue_depth,
+        "dead_letters": dead_letters,
+        "upload_failures": upload_failures,
+        "upload_failure_rate_bps": upload_failure_rate_bps,
+        "upload_failure_rate_basis": "recent_upload_failures_only",
+        "recent_errors": last_errors,
+    }))
+}
+
+async fn collect_console_browser_action_diagnostics(state: &AppState) -> Value {
+    let snapshot = match state.runtime.recent_journal_snapshot(256).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return json!({
+                "relay_actions": {
+                    "attempts": 0,
+                    "failures": 0,
+                    "failure_rate_bps": 0,
+                },
+                "error": sanitize_http_error_message(
+                    format!("failed to query browser journal diagnostics: {error}").as_str()
+                ),
+            });
+        }
+    };
+
+    let mut attempts = 0_u64;
+    let mut failures = 0_u64;
+    let mut samples = Vec::<String>::new();
+    for event in snapshot.events {
+        let Ok(payload) = serde_json::from_str::<Value>(event.payload_json.as_str()) else {
+            continue;
+        };
+        if payload.get("event").and_then(Value::as_str) != Some("browser.relay.action") {
+            continue;
+        }
+        attempts = attempts.saturating_add(1);
+        let success = payload.get("success").and_then(Value::as_bool).unwrap_or(false);
+        if success {
+            continue;
+        }
+        failures = failures.saturating_add(1);
+        if let Some(message) = payload.get("error").and_then(Value::as_str) {
+            if !message.trim().is_empty() && samples.len() < 5 {
+                samples.push(sanitize_http_error_message(message));
+            }
+        }
+    }
+
+    json!({
+        "relay_actions": {
+            "attempts": attempts,
+            "failures": failures,
+            "failure_rate_bps": if attempts == 0 {
+                0
+            } else {
+                u32::try_from(failures.saturating_mul(10_000) / attempts).unwrap_or(u32::MAX)
+            },
+        },
+        "recent_failure_samples": samples,
+    })
+}
+
+fn build_support_bundle_observability(state: &AppState) -> Value {
+    let summary = state.observability.support_bundle_snapshot();
+    let latest_job = lock_support_bundle_jobs(&state.support_bundle_jobs)
+        .values()
+        .cloned()
+        .max_by(|left, right| left.requested_at_unix_ms.cmp(&right.requested_at_unix_ms));
+    json!({
+        "attempts": summary.attempts,
+        "successes": summary.successes,
+        "failures": summary.failures,
+        "success_rate_bps": if summary.attempts == 0 {
+            10_000
+        } else {
+            10_000_u32.saturating_sub(summary.failure_rate_bps)
+        },
+        "last_job": latest_job.map(|job| json!({
+            "job_id": job.job_id,
+            "state": match job.state {
+                control_plane::SupportBundleJobState::Queued => "queued",
+                control_plane::SupportBundleJobState::Running => "running",
+                control_plane::SupportBundleJobState::Succeeded => "succeeded",
+                control_plane::SupportBundleJobState::Failed => "failed",
+            },
+            "requested_at_unix_ms": job.requested_at_unix_ms,
+            "completed_at_unix_ms": job.completed_at_unix_ms,
+            "output_path": job.output_path,
+            "error": job.error,
+        })),
+    })
+}
+
+fn build_failure_class_summary(failures: &[observability::FailureSnapshot]) -> Value {
+    let mut config = 0_u64;
+    let mut upstream = 0_u64;
+    let mut product = 0_u64;
+    for failure in failures {
+        match failure.failure_class {
+            FailureClass::Config => config = config.saturating_add(1),
+            FailureClass::UpstreamProvider => upstream = upstream.saturating_add(1),
+            FailureClass::Product => product = product.saturating_add(1),
+        }
+    }
+    json!({
+        "config_failure": config,
+        "upstream_provider_failure": upstream,
+        "product_failure": product,
+    })
+}
+
+fn auth_correlation_from_context(
+    context: &RequestContext,
+    auth_profile_id: Option<&str>,
+    run_id: Option<&str>,
+    approval_id: Option<&str>,
+    envelope_id: Option<&str>,
+) -> ObservabilityCorrelationSnapshot {
+    let _ = context;
+    ObservabilityCorrelationSnapshot {
+        session_id: None,
+        run_id: run_id.map(ToOwned::to_owned),
+        approval_id: approval_id.map(ToOwned::to_owned),
+        envelope_id: envelope_id.map(ToOwned::to_owned),
+        auth_profile_id: auth_profile_id.map(ToOwned::to_owned),
+        onboarding_flow_id: None,
+        browser_session_id: None,
+    }
+}
+
+fn record_provider_auth_failure(
+    state: &AppState,
+    operation: &str,
+    status: StatusCode,
+    correlation: ObservabilityCorrelationSnapshot,
+    refresh_failure: bool,
+) {
+    let message = format!("provider auth request failed with http {}", status.as_u16());
+    let failure_class = classify_console_mutation_failure(status);
+    let observed_at_unix_ms = unix_ms_now().unwrap_or_default();
+    state.observability.record_provider_auth_failure(
+        operation,
+        failure_class,
+        message.clone(),
+        observed_at_unix_ms,
+        correlation.clone(),
+    );
+    if refresh_failure {
+        state.observability.record_provider_refresh_failure(
+            operation,
+            failure_class,
+            message,
+            observed_at_unix_ms,
+            correlation,
+        );
+    }
+}
+
+fn classify_console_mutation_failure(status: StatusCode) -> FailureClass {
+    match status {
+        StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT => {
+            FailureClass::UpstreamProvider
+        }
+        status if status.is_client_error() => FailureClass::Config,
+        _ => FailureClass::Product,
+    }
 }
 
 fn contract_descriptor() -> control_plane::ContractDescriptor {
@@ -5437,12 +5895,22 @@ fn create_support_bundle_job(
         let mut jobs = lock_support_bundle_jobs(&state.support_bundle_jobs);
         jobs.insert(job_id.clone(), job.clone());
     }
+    state.observability.record_support_bundle_export_started();
 
     let jobs = Arc::clone(&state.support_bundle_jobs);
     let admin_port = state.deployment.admin_port;
     let admin_token = state.auth.admin_token.clone();
+    let observability = Arc::clone(&state.observability);
     tokio::spawn(async move {
-        run_support_bundle_job(jobs, job_id, admin_port, admin_token, retain_jobs.max(1)).await;
+        run_support_bundle_job(
+            jobs,
+            observability,
+            job_id,
+            admin_port,
+            admin_token,
+            retain_jobs.max(1),
+        )
+        .await;
     });
 
     Ok(job)
@@ -5450,6 +5918,7 @@ fn create_support_bundle_job(
 
 async fn run_support_bundle_job(
     jobs: Arc<Mutex<HashMap<String, control_plane::SupportBundleJob>>>,
+    observability: Arc<ObservabilityState>,
     job_id: String,
     admin_port: u16,
     admin_token: Option<String>,
@@ -5475,9 +5944,23 @@ async fn run_support_bundle_job(
                 job.output_path = Some(output_path);
                 job.command_output = command_output;
                 job.error = None;
+                observability.record_support_bundle_export_result(
+                    true,
+                    "support_bundle.export",
+                    "ok",
+                    completed_at,
+                    ObservabilityCorrelationSnapshot::default(),
+                );
             }
             Err(error) => {
                 job.state = control_plane::SupportBundleJobState::Failed;
+                observability.record_support_bundle_export_result(
+                    false,
+                    "support_bundle.export",
+                    error.clone(),
+                    completed_at,
+                    ObservabilityCorrelationSnapshot::default(),
+                );
                 job.error = Some(error);
             }
         }

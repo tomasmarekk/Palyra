@@ -60,7 +60,22 @@ pub(crate) struct OnboardingRecoverySnapshot {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub(crate) struct OnboardingStepFailureMetric {
+    pub(crate) step: String,
+    pub(crate) failures: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct OnboardingSupportBundleMetrics {
+    pub(crate) attempts: u64,
+    pub(crate) successes: u64,
+    pub(crate) failures: u64,
+    pub(crate) success_rate_bps: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct OnboardingStatusSnapshot {
+    pub(crate) flow_id: String,
     pub(crate) phase: String,
     pub(crate) current_step: DesktopOnboardingStep,
     pub(crate) current_step_title: String,
@@ -87,6 +102,8 @@ pub(crate) struct OnboardingStatusSnapshot {
     pub(crate) discord_last_verified_at_unix_ms: Option<i64>,
     pub(crate) discord_defaults: DesktopDiscordOnboardingState,
     pub(crate) recovery: Option<OnboardingRecoverySnapshot>,
+    pub(crate) failure_step_counts: Vec<OnboardingStepFailureMetric>,
+    pub(crate) support_bundle_exports: OnboardingSupportBundleMetrics,
     pub(crate) recent_events: Vec<DesktopOnboardingEvent>,
     pub(crate) steps: Vec<OnboardingStepSnapshot>,
 }
@@ -226,6 +243,24 @@ pub(crate) async fn build_onboarding_status(
         .find(|step| step.key == current_step)
         .map(|step| step.detail.clone())
         .unwrap_or_else(|| "Desktop onboarding is waiting for the next step.".to_owned());
+    let failure_step_counts = persisted
+        .onboarding
+        .failure_step_counts
+        .iter()
+        .map(|(step, failures)| OnboardingStepFailureMetric {
+            step: step.clone(),
+            failures: *failures,
+        })
+        .collect::<Vec<_>>();
+    let support_bundle_exports = OnboardingSupportBundleMetrics {
+        attempts: persisted.onboarding.support_bundle_export_attempts,
+        successes: persisted.onboarding.support_bundle_export_successes,
+        failures: persisted.onboarding.support_bundle_export_failures,
+        success_rate_bps: success_rate_bps(
+            persisted.onboarding.support_bundle_export_successes,
+            persisted.onboarding.support_bundle_export_attempts,
+        ),
+    };
 
     let phase =
         if persisted.onboarding.completed_at_unix_ms.is_some()
@@ -238,6 +273,7 @@ pub(crate) async fn build_onboarding_status(
     .to_owned();
 
     Ok(OnboardingStatusSnapshot {
+        flow_id: persisted.onboarding.flow_id.clone(),
         phase,
         current_step,
         current_step_title,
@@ -264,9 +300,19 @@ pub(crate) async fn build_onboarding_status(
         discord_last_verified_at_unix_ms: persisted.onboarding.discord.last_verified_at_unix_ms,
         discord_defaults: persisted.onboarding.discord,
         recovery,
+        failure_step_counts,
+        support_bundle_exports,
         recent_events: persisted.onboarding.recent_events,
         steps,
     })
+}
+
+fn success_rate_bps(successes: u64, attempts: u64) -> u32 {
+    if attempts == 0 {
+        return 10_000;
+    }
+    let scaled = successes.saturating_mul(10_000) / attempts;
+    u32::try_from(scaled).unwrap_or(u32::MAX)
 }
 
 fn build_preflight_snapshot(

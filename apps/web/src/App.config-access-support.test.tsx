@@ -204,6 +204,9 @@ describe("M56 config, access, and support surfaces", () => {
     fireEvent.click(screen.getByRole("button", { name: "Support and Recovery" }));
     expect(await screen.findByRole("heading", { name: "Support and Recovery" })).toBeInTheDocument();
     expect(screen.getByText("Provider auth recovery")).toBeInTheDocument();
+    expect(screen.getByText("Bundle reliability")).toBeInTheDocument();
+    expect(screen.getByText("Triage playbook")).toBeInTheDocument();
+    expect(screen.getByText("docs/operations/observability-supportability-v1.md")).toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText("Retain jobs"), { target: { value: "8" } });
     fireEvent.click(screen.getByRole("button", { name: "Queue support bundle" }));

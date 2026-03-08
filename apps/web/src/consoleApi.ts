@@ -112,6 +112,7 @@ export interface ConsoleDiagnosticsSnapshot {
   rate_limits: JsonValue;
   auth_profiles: JsonValue;
   browserd: JsonValue;
+  observability?: JsonValue;
   memory?: JsonValue;
   media?: JsonValue;
 }

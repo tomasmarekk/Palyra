@@ -264,6 +264,7 @@ impl ControlCenter {
         kind: impl Into<String>,
         detail: Option<String>,
     ) -> Result<()> {
+        self.persisted.onboarding.ensure_flow_id();
         self.persisted
             .onboarding
             .push_event(kind, detail, unix_ms_now());
@@ -284,6 +285,8 @@ impl ControlCenter {
         message: String,
     ) -> Result<()> {
         let sanitized = sanitize_log_line(message.as_str());
+        self.persisted.onboarding.ensure_flow_id();
+        self.persisted.onboarding.record_failure_step(step);
         self.persisted.onboarding.last_failure = Some(super::desktop_state::DesktopOnboardingFailureState {
             step,
             message: sanitized.clone(),
@@ -292,6 +295,25 @@ impl ControlCenter {
         self.persisted.onboarding.push_event(
             "failure",
             Some(format!("{}: {}", step.as_str(), sanitized)),
+            unix_ms_now(),
+        );
+        self.save_state_file()
+    }
+
+    pub(crate) fn record_support_bundle_export_result(
+        &mut self,
+        success: bool,
+        detail: Option<String>,
+    ) -> Result<()> {
+        self.persisted.onboarding.ensure_flow_id();
+        self.persisted.onboarding.record_support_bundle_export_result(success);
+        self.persisted.onboarding.push_event(
+            if success {
+                "support_bundle_export_succeeded"
+            } else {
+                "support_bundle_export_failed"
+            },
+            detail,
             unix_ms_now(),
         );
         self.save_state_file()
