@@ -352,6 +352,20 @@ fn remote_dashboard_url_parser_rejects_non_https_and_credentials() {
     )
     .expect_err("URL with embedded credentials must be rejected");
     assert!(credentials.to_string().contains("must not include embedded credentials"));
+
+    let query = parse_remote_dashboard_base_url(
+        "https://dashboard.example.com/?token=secret",
+        "gateway_access.remote_base_url",
+    )
+    .expect_err("URL with a query string must be rejected");
+    assert!(query.to_string().contains("must not include query or fragment"));
+
+    let fragment = parse_remote_dashboard_base_url(
+        "https://dashboard.example.com/#state=secret",
+        "gateway_access.remote_base_url",
+    )
+    .expect_err("URL with a fragment must be rejected");
+    assert!(fragment.to_string().contains("must not include query or fragment"));
 }
 
 #[test]

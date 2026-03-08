@@ -12316,6 +12316,40 @@ mod diagnostics_bundle_tests {
     }
 
     #[test]
+    fn support_bundle_redacts_console_session_and_oauth_boundary_material() {
+        let mut payload = serde_json::json!({
+            "console": {
+                "csrf_token": "csrf-secret",
+                "session_cookie": "session=alpha",
+                "redirect_location": "https://dashboard.example.test/callback?access_token=oauth-secret&mode=ok",
+                "last_error": "Bearer browser-secret set-cookie=session=alpha refresh_token=qwerty"
+            }
+        });
+        super::redact_json_value_tree(&mut payload, None);
+        assert_eq!(
+            payload.pointer("/console/csrf_token").and_then(Value::as_str),
+            Some("<redacted>")
+        );
+        assert_eq!(
+            payload.pointer("/console/session_cookie").and_then(Value::as_str),
+            Some("<redacted>")
+        );
+        assert_eq!(
+            payload.pointer("/console/redirect_location").and_then(Value::as_str),
+            Some("https://dashboard.example.test/callback?access_token=<redacted>&mode=ok")
+        );
+        let error =
+            payload.pointer("/console/last_error").and_then(Value::as_str).unwrap_or_default();
+        assert!(
+            error.contains("<redacted>")
+                && !error.contains("browser-secret")
+                && !error.contains("session=alpha")
+                && !error.contains("qwerty"),
+            "console auth/session diagnostics must stay redacted: {error}"
+        );
+    }
+
+    #[test]
     fn support_bundle_size_cap_trims_payload() {
         let mut bundle = oversized_bundle();
         let encoded = encode_support_bundle_with_cap(&mut bundle, 4096)

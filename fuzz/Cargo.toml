@@ -10,7 +10,10 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 palyra-a2ui = { path = "../crates/palyra-a2ui" }
+palyra-auth = { path = "../crates/palyra-auth" }
 palyra-common = { path = "../crates/palyra-common" }
+palyra-connectors = { path = "../crates/palyra-connectors" }
+serde_json = "1"
 
 [[bin]]
 name = "config_path_parser"
@@ -43,6 +46,34 @@ bench = false
 [[bin]]
 name = "process_runner_input_parser"
 path = "fuzz_targets/process_runner_input_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "auth_profile_registry_parser"
+path = "fuzz_targets/auth_profile_registry_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "redaction_routines"
+path = "fuzz_targets/redaction_routines.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "channel_payload_validation"
+path = "fuzz_targets/channel_payload_validation.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "webhook_replay_verifier"
+path = "fuzz_targets/webhook_replay_verifier.rs"
 test = false
 doc = false
 bench = false

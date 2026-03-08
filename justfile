@@ -41,6 +41,12 @@ web-cleanroom:
 deterministic-core:
     bash scripts/test/run-deterministic-core.sh
 
+push-gate-fast:
+    bash scripts/run-pre-push-checks.sh
+
+push-gate-full:
+    PALYRA_PRE_PUSH_PROFILE=full bash scripts/run-pre-push-checks.sh
+
 deterministic-soak:
     bash scripts/test/run-deterministic-soak.sh
 
@@ -110,7 +116,11 @@ fuzz-build:
       cd fuzz && \
       cargo fuzz build config_path_parser && \
       cargo fuzz build a2ui_json_parser && \
-      cargo fuzz build webhook_payload_parser; \
+      cargo fuzz build webhook_payload_parser && \
+      cargo fuzz build auth_profile_registry_parser && \
+      cargo fuzz build redaction_routines && \
+      cargo fuzz build channel_payload_validation && \
+      cargo fuzz build webhook_replay_verifier; \
     else \
       echo "cargo-fuzz is not installed. Install it to compile fuzz targets."; \
       exit 1; \

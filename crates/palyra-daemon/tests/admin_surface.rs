@@ -1832,6 +1832,169 @@ fn console_m52_error_envelope_exposes_validation_metadata() -> Result<()> {
 }
 
 #[test]
+fn console_config_migrate_and_recover_require_session_csrf_and_keep_secrets_redacted() -> Result<()>
+{
+    let config_path = unique_temp_config_path();
+    write_test_config(
+        &config_path,
+        r#"
+version = 1
+[admin]
+auth_token = "config-admin-secret"
+
+[model_provider]
+openai_api_key = "sk-config-secret"
+"#,
+    )?;
+    let config_path_string = config_path.to_string_lossy().to_string();
+
+    let (child, admin_port) = spawn_palyrad_with_dynamic_ports_with_env(&[
+        ("PALYRA_ADMIN_BOUND_PRINCIPAL", CONSOLE_ADMIN_PRINCIPAL),
+        ("PALYRA_CONFIG", config_path_string.as_str()),
+    ])?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+        .context("failed to build HTTP client")?;
+    let migrate_payload = serde_json::json!({
+        "path": config_path_string,
+        "backups": 2
+    });
+
+    let migrate_without_session = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/config/migrate"))
+        .json(&migrate_payload)
+        .send()
+        .context("failed to call config migrate without session")?;
+    assert_eq!(
+        migrate_without_session.status().as_u16(),
+        403,
+        "config migrate must reject unauthenticated requests before any config mutation occurs"
+    );
+
+    let (cookie, csrf_token) = login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
+    let migrate_without_csrf = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/config/migrate"))
+        .header("Cookie", cookie.clone())
+        .json(&migrate_payload)
+        .send()
+        .context("failed to call config migrate without csrf")?;
+    assert_eq!(
+        migrate_without_csrf.status().as_u16(),
+        403,
+        "config migrate must enforce csrf on an authenticated console session"
+    );
+
+    let migrated = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/config/migrate"))
+        .header("Cookie", cookie.clone())
+        .header("x-palyra-csrf-token", csrf_token.clone())
+        .json(&migrate_payload)
+        .send()
+        .context("failed to call config migrate with csrf")?
+        .error_for_status()
+        .context("config migrate returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse config migrate response json")?;
+    assert_eq!(migrated.get("operation").and_then(Value::as_str), Some("migrate"));
+    assert_eq!(
+        migrated.get("source_path").and_then(Value::as_str),
+        Some(config_path.to_string_lossy().as_ref()),
+        "config migrate should report the migrated config path"
+    );
+
+    let mutated = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/config/mutate"))
+        .header("Cookie", cookie.clone())
+        .header("x-palyra-csrf-token", csrf_token.clone())
+        .json(&serde_json::json!({
+            "path": config_path.to_string_lossy(),
+            "key": "model_provider.auth_profile_id",
+            "value": "\"openai-default\"",
+            "backups": 2
+        }))
+        .send()
+        .context("failed to mutate config with csrf")?
+        .error_for_status()
+        .context("config mutate returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse config mutate response json")?;
+    assert_eq!(mutated.get("operation").and_then(Value::as_str), Some("set"));
+    assert_eq!(
+        mutated.get("changed_key").and_then(Value::as_str),
+        Some("model_provider.auth_profile_id")
+    );
+
+    let inspect = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/config/inspect"))
+        .header("Cookie", cookie.clone())
+        .header("x-palyra-csrf-token", csrf_token.clone())
+        .json(&serde_json::json!({
+            "path": config_path.to_string_lossy(),
+            "backups": 2
+        }))
+        .send()
+        .context("failed to inspect mutated config")?
+        .error_for_status()
+        .context("config inspect for mutated config returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse mutated config inspect response json")?;
+    let document_toml = inspect
+        .get("document_toml")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("config inspect did not include document_toml"))?;
+    assert!(
+        document_toml.contains("<redacted>"),
+        "config inspect should keep secret values redacted after migration"
+    );
+    assert!(
+        !document_toml.contains("config-admin-secret")
+            && !document_toml.contains("sk-config-secret"),
+        "config inspect must not leak raw config secrets after migration"
+    );
+
+    let recover_payload = serde_json::json!({
+        "path": config_path.to_string_lossy(),
+        "backup": 1,
+        "backups": 2
+    });
+    let recover_without_csrf = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/config/recover"))
+        .header("Cookie", cookie.clone())
+        .json(&recover_payload)
+        .send()
+        .context("failed to call config recover without csrf")?;
+    assert_eq!(
+        recover_without_csrf.status().as_u16(),
+        403,
+        "config recover must enforce csrf on an authenticated console session"
+    );
+
+    let recovered = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/config/recover"))
+        .header("Cookie", cookie)
+        .header("x-palyra-csrf-token", csrf_token)
+        .json(&recover_payload)
+        .send()
+        .context("failed to call config recover with csrf")?
+        .error_for_status()
+        .context("config recover returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse config recover response json")?;
+    assert_eq!(recovered.get("operation").and_then(Value::as_str), Some("recover"));
+    assert_eq!(
+        recovered.get("source_path").and_then(Value::as_str),
+        Some(config_path.to_string_lossy().as_ref()),
+        "config recover should report the recovered config path"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn console_login_rejects_oversized_request_body() -> Result<()> {
     let (child, admin_port) = spawn_palyrad_with_bound_console_principal(CONSOLE_ADMIN_PRINCIPAL)?;
     let mut daemon = ChildGuard::new(child);
@@ -2210,6 +2373,16 @@ fn unique_temp_vault_dir() -> PathBuf {
         .join(format!("palyra-admin-vault-{nonce}-{}-{counter}", std::process::id()))
 }
 
+fn unique_temp_config_path() -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_nanos();
+    let counter = TEMP_IDENTITY_COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir()
+        .join(format!("palyra-admin-config-{nonce}-{}-{counter}.toml", std::process::id()))
+}
+
 fn prepare_test_vault_dir(vault_dir: &PathBuf) -> Result<()> {
     fs::create_dir_all(vault_dir)
         .with_context(|| format!("failed to create test vault dir {}", vault_dir.display()))?;
@@ -2217,6 +2390,16 @@ fn prepare_test_vault_dir(vault_dir: &PathBuf) -> Result<()> {
     fs::write(&backend_marker, b"encrypted_file").with_context(|| {
         format!("failed to write vault backend marker {}", backend_marker.display())
     })?;
+    Ok(())
+}
+
+fn write_test_config(config_path: &PathBuf, contents: &str) -> Result<()> {
+    if let Some(parent) = config_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create test config dir {}", parent.display()))?;
+    }
+    fs::write(config_path, contents)
+        .with_context(|| format!("failed to write test config {}", config_path.display()))?;
     Ok(())
 }
 

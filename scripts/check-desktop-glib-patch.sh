@@ -4,6 +4,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 governance_file="$repo_root/apps/desktop/src-tauri/third_party/glib-0.18.5-patched/PALYRA_PATCH_GOVERNANCE.env"
 desktop_manifest="$repo_root/apps/desktop/src-tauri/Cargo.toml"
+desktop_lockfile="$repo_root/apps/desktop/src-tauri/Cargo.lock"
 desktop_regression_test="$repo_root/apps/desktop/src-tauri/tests/glib_variantstriter_regression.rs"
 
 if [[ ! -f "$governance_file" ]]; then
@@ -55,6 +56,11 @@ if [[ ! -f "$desktop_manifest" ]]; then
   exit 1
 fi
 
+if [[ ! -f "$desktop_lockfile" ]]; then
+  echo "Desktop Cargo.lock is missing: $desktop_lockfile" >&2
+  exit 1
+fi
+
 if [[ ! -f "$desktop_regression_test" ]]; then
   echo "Desktop glib regression test is missing: $desktop_regression_test" >&2
   exit 1
@@ -78,97 +84,22 @@ sha256_file() {
   exit 1
 }
 
-resolve_cargo() {
-  if command -v cargo >/dev/null 2>&1; then
-    command -v cargo
-    return 0
-  fi
-  if command -v cargo.exe >/dev/null 2>&1; then
-    command -v cargo.exe
-    return 0
-  fi
+extract_lock_package_block() {
+  local lockfile="$1"
+  local package_name="$2"
+  local package_version="$3"
 
-  local candidates=(
-    "${HOME:-}/.cargo/bin/cargo"
-    "${HOME:-}/.cargo/bin/cargo.exe"
-    "${USERPROFILE:-}/.cargo/bin/cargo.exe"
-  )
-  local candidate
-  for candidate in "${candidates[@]}"; do
-    if [[ -n "$candidate" && -x "$candidate" ]]; then
-      printf '%s\n' "$candidate"
-      return 0
-    fi
-  done
-
-  echo "cargo is required for desktop glib patch governance checks." >&2
-  exit 1
-}
-
-to_windows_path() {
-  local target="$1"
-  if command -v wslpath >/dev/null 2>&1; then
-    wslpath -w "$target"
-    return 0
-  fi
-  if command -v cygpath >/dev/null 2>&1; then
-    cygpath -w "$target"
-    return 0
-  fi
-  printf '%s\n' "$target"
-}
-
-run_cargo_metadata() {
-  local cargo_path="$1"
-  local manifest_path="$2"
-  if [[ "$cargo_path" == *.exe ]] && command -v powershell.exe >/dev/null 2>&1; then
-    local cargo_windows
-    cargo_windows="$(to_windows_path "$cargo_path")"
-    powershell.exe -NoLogo -NoProfile -Command \
-      "\$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(\$false); & '$cargo_windows' metadata --manifest-path '$manifest_path' --format-version 1 --locked"
-    return 0
-  fi
-
-  "$cargo_path" metadata --manifest-path "$manifest_path" --format-version 1 --locked
-}
-
-metadata_resolves_vendored_patch() {
-  local cargo_path="$1"
-  local manifest_path="$2"
-
-  if [[ "$cargo_path" == *.exe ]] && command -v python3 >/dev/null 2>&1; then
-    python3 - "$cargo_path" "$manifest_path" <<'PY'
-import subprocess
-import sys
-
-cargo_path, manifest_path = sys.argv[1:3]
-result = subprocess.run(
-    [cargo_path, "metadata", "--manifest-path", manifest_path, "--format-version", "1", "--locked"],
-    capture_output=True,
-    text=True,
-)
-if result.returncode != 0:
-    sys.stderr.write(result.stderr)
-    raise SystemExit(result.returncode)
-raise SystemExit(0 if "glib-0.18.5-patched#glib@0.18.5" in result.stdout else 1)
-PY
-    return $?
-  fi
-
-  if [[ "$cargo_path" == *.exe ]] && command -v powershell.exe >/dev/null 2>&1; then
-    local cargo_windows
-    cargo_windows="$(to_windows_path "$cargo_path")"
-    powershell.exe -NoLogo -NoProfile -Command \
-      "\$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(\$false); \$json = & '$cargo_windows' metadata --manifest-path '$manifest_path' --format-version 1 --locked | Out-String; if (\$json.Contains('glib-0.18.5-patched#glib@0.18.5')) { exit 0 } else { exit 1 }"
-    return $?
-  fi
-
-  local metadata_json
-  metadata_json="$(
-    run_cargo_metadata "$cargo_path" "$manifest_path"
-  )"
-  metadata_json="${metadata_json//\\//}"
-  printf '%s' "$metadata_json" | grep -F "glib-0.18.5-patched#glib@0.18.5" >/dev/null
+  awk -v target_name="$package_name" -v target_version="$package_version" '
+    BEGIN { RS="\\[\\[package\\]\\]\n"; ORS="" }
+    NR == 1 { next }
+    {
+      block = "[[package]]\n" $0
+      if (block ~ "name = \"" target_name "\"" && block ~ "version = \"" target_version "\"") {
+        print block
+        exit
+      }
+    }
+  ' "$lockfile"
 }
 
 patch_sha256="$(sha256_file "$patch_file")"
@@ -194,18 +125,17 @@ if ! grep -F '&mut p,' "$patch_file" >/dev/null; then
   exit 1
 fi
 
-cargo_bin="$(resolve_cargo)"
-desktop_manifest_for_cargo="$desktop_manifest"
-if [[ "$cargo_bin" == *.exe ]] && command -v wslpath >/dev/null 2>&1; then
-  desktop_manifest_for_cargo="$(to_windows_path "$desktop_manifest")"
-elif command -v cygpath >/dev/null 2>&1 && [[ "$(uname -s)" =~ ^(MINGW|MSYS|CYGWIN) ]]; then
-  desktop_manifest_for_cargo="$(to_windows_path "$desktop_manifest")"
+glib_lock_block="$(extract_lock_package_block "$desktop_lockfile" "$PALYRA_GLIB_PATCH_CRATE_NAME" "$PALYRA_GLIB_PATCH_CRATE_VERSION")"
+if [[ -z "$glib_lock_block" ]]; then
+  echo "Desktop Cargo.lock no longer contains the expected glib package entry." >&2
+  exit 1
 fi
-if ! metadata_resolves_vendored_patch "$cargo_bin" "$desktop_manifest_for_cargo"; then
-  echo "cargo metadata no longer resolves glib through the vendored patched path." >&2
+
+if printf '%s' "$glib_lock_block" | grep -F 'source = "registry+https://github.com/rust-lang/crates.io-index"' >/dev/null; then
+  echo "Desktop Cargo.lock resolves glib from crates.io instead of the vendored patched path." >&2
   exit 1
 fi
 
 echo "Desktop glib patch governance check passed."
 echo "crate=${PALYRA_GLIB_PATCH_CRATE_NAME}@${PALYRA_GLIB_PATCH_CRATE_VERSION} advisory=${PALYRA_GLIB_PATCH_ADVISORY}"
-echo "owner=${PALYRA_GLIB_PATCH_OWNER} review_cadence_days=${PALYRA_GLIB_PATCH_REVIEW_CADENCE_DAYS} checksum=${patch_sha256}"
+echo "owner=${PALYRA_GLIB_PATCH_OWNER} review_cadence_days=${PALYRA_GLIB_PATCH_REVIEW_CADENCE_DAYS} checksum=${patch_sha256} lockfile_resolution=vendored"

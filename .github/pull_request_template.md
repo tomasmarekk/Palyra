@@ -8,6 +8,7 @@
 - [ ] `cargo fmt --all --check`
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings`
 - [ ] `cargo test --workspace --locked`
+- [ ] no ignored (`.gitignore`) paths were force-added or pushed
 - [ ] relevant docs updated
 
 ## Security Threat Review (required)

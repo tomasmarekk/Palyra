@@ -215,6 +215,89 @@ fn console_openai_api_key_flow_surfaces_invalid_credentials() -> Result<()> {
 }
 
 #[test]
+fn console_openai_provider_mutations_require_console_session_and_csrf() -> Result<()> {
+    let _test_guard = lock_openai_auth_surface_test();
+    let mock = OpenAiMockServer::new(None, None)?;
+    wait_for_openai_mock_ready(&mock)?;
+
+    let (child, admin_port) = spawn_palyrad_with_dynamic_ports(&[
+        ("PALYRA_ADMIN_BOUND_PRINCIPAL".to_owned(), CONSOLE_ADMIN_PRINCIPAL.to_owned()),
+        ("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL".to_owned(), format!("{}/v1", mock.base_url())),
+        ("PALYRA_OPENAI_OAUTH_AUTHORIZATION_ENDPOINT".to_owned(), mock.authorization_endpoint()),
+        ("PALYRA_OPENAI_OAUTH_TOKEN_ENDPOINT".to_owned(), mock.token_endpoint()),
+        ("PALYRA_OPENAI_OAUTH_REVOCATION_ENDPOINT".to_owned(), mock.revocation_endpoint()),
+    ])?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = http_client()?;
+    let unauthorized_provider_state = client
+        .get(console_url(admin_port, "/console/v1/auth/providers/openai"))
+        .header("Authorization", "Bearer sk-live-openai")
+        .send()
+        .context("failed to call provider state without console session")?;
+    assert_eq!(
+        unauthorized_provider_state.status().as_u16(),
+        403,
+        "provider state must reject provider bearer tokens and still enforce the console session boundary"
+    );
+
+    let callback_state_without_session = client
+        .get(console_url(
+            admin_port,
+            "/console/v1/auth/providers/openai/callback-state?attempt_id=missing",
+        ))
+        .header("Authorization", "Bearer oauth-provider-token")
+        .send()
+        .context("failed to call callback-state without console session")?;
+    assert_eq!(
+        callback_state_without_session.status().as_u16(),
+        403,
+        "callback-state endpoint must reject provider tokens and keep the console session boundary intact"
+    );
+
+    let (cookie, _csrf_token) =
+        login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
+    let bootstrap_without_csrf = client
+        .post(console_url(admin_port, "/console/v1/auth/providers/openai/bootstrap"))
+        .header("Cookie", cookie.clone())
+        .json(&json!({
+            "profile_name": "OpenAI OAuth",
+            "scope": { "kind": "global" },
+            "client_id": "client-live-123",
+            "client_secret": "client-secret-live",
+            "scopes": ["openid", "offline_access"],
+            "set_default": false
+        }))
+        .send()
+        .context("failed to submit OpenAI OAuth bootstrap without CSRF")?;
+    assert_eq!(
+        bootstrap_without_csrf.status().as_u16(),
+        403,
+        "oauth bootstrap must enforce CSRF on an authenticated console session"
+    );
+
+    let api_key_without_csrf = client
+        .post(console_url(admin_port, "/console/v1/auth/providers/openai/api-key"))
+        .header("Cookie", cookie)
+        .json(&json!({
+            "profile_name": "OpenAI Production",
+            "scope": { "kind": "global" },
+            "api_key": "sk-live-openai",
+            "set_default": false
+        }))
+        .send()
+        .context("failed to submit OpenAI API key without CSRF")?;
+    assert_eq!(
+        api_key_without_csrf.status().as_u16(),
+        403,
+        "api-key connect must enforce CSRF on an authenticated console session"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn console_openai_oauth_flow_supports_happy_path_refresh_reconnect_and_revoke() -> Result<()> {
     let _test_guard = lock_openai_auth_surface_test();
     let mock = OpenAiMockServer::new(
@@ -485,6 +568,108 @@ fn console_openai_oauth_flow_supports_happy_path_refresh_reconnect_and_revoke() 
 }
 
 #[test]
+fn console_openai_oauth_callback_rejects_malformed_token_response_without_persisting_profile(
+) -> Result<()> {
+    let _test_guard = lock_openai_auth_surface_test();
+    let mock = OpenAiMockServer::new(None, None)?;
+    mock.set_authorization_code_raw_response(
+        "200 OK",
+        r#"{"access_token":"oauth-secret","refresh_token":"   ","expires_in":"oops"}"#,
+    );
+    wait_for_openai_mock_ready(&mock)?;
+
+    let (child, admin_port) = spawn_palyrad_with_dynamic_ports(&[
+        ("PALYRA_ADMIN_BOUND_PRINCIPAL".to_owned(), CONSOLE_ADMIN_PRINCIPAL.to_owned()),
+        ("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL".to_owned(), format!("{}/v1", mock.base_url())),
+        ("PALYRA_OPENAI_OAUTH_AUTHORIZATION_ENDPOINT".to_owned(), mock.authorization_endpoint()),
+        ("PALYRA_OPENAI_OAUTH_TOKEN_ENDPOINT".to_owned(), mock.token_endpoint()),
+        ("PALYRA_OPENAI_OAUTH_REVOCATION_ENDPOINT".to_owned(), mock.revocation_endpoint()),
+    ])?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = http_client()?;
+    let (cookie, csrf_token) = login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
+
+    let bootstrap = post_console_json(
+        &client,
+        admin_port,
+        "/console/v1/auth/providers/openai/bootstrap",
+        &cookie,
+        &csrf_token,
+        &json!({
+            "profile_name": "OpenAI OAuth Invalid",
+            "scope": { "kind": "global" },
+            "client_id": "client-live-123",
+            "client_secret": "client-secret-live",
+            "scopes": ["openid", "offline_access"],
+            "set_default": false
+        }),
+    )?;
+    let attempt_id = bootstrap
+        .get("attempt_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("oauth bootstrap response missing attempt_id"))?
+        .to_owned();
+
+    let callback_html = client
+        .get(console_url(
+            admin_port,
+            format!(
+                "/console/v1/auth/providers/openai/callback?state={attempt_id}&code=oauth-code-invalid"
+            )
+            .as_str(),
+        ))
+        .send()
+        .context("failed to submit OpenAI OAuth callback with malformed token reply")?
+        .error_for_status()
+        .context("malformed OpenAI OAuth callback returned non-success status")?
+        .text()
+        .context("failed to read malformed OAuth callback HTML body")?;
+    assert!(
+        callback_html.contains("OpenAI Connection Failed"),
+        "malformed token response should render a failure page"
+    );
+    assert!(
+        !callback_html.contains("oauth-secret"),
+        "failure page must not leak the raw token response: {callback_html}"
+    );
+
+    let callback_state = get_console_json(
+        &client,
+        admin_port,
+        format!("/console/v1/auth/providers/openai/callback-state?attempt_id={attempt_id}")
+            .as_str(),
+        &cookie,
+    )?;
+    assert_eq!(
+        callback_state.get("state").and_then(Value::as_str),
+        Some("failed"),
+        "callback state should converge to failed after malformed token parsing"
+    );
+    assert!(
+        callback_state
+            .get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| {
+                message.contains("OpenAI OAuth token response") && !message.contains("oauth-secret")
+            }),
+        "callback-state failure message should describe the parse failure without leaking secrets: {callback_state}"
+    );
+
+    let profiles = get_console_json(&client, admin_port, "/console/v1/auth/profiles", &cookie)?;
+    assert!(
+        profiles
+            .get("profiles")
+            .and_then(Value::as_array)
+            .is_some_and(|entries| entries.is_empty()),
+        "malformed OAuth token replies must not persist a partial auth profile"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn console_openai_oauth_callback_denial_persists_failed_attempt_state() -> Result<()> {
     let _test_guard = lock_openai_auth_surface_test();
     let mock = OpenAiMockServer::new(None, None)?;
@@ -589,6 +774,12 @@ struct TokenReply {
     expires_in_seconds: Option<u64>,
 }
 
+#[derive(Debug, Clone)]
+struct MockHttpResponse {
+    status: String,
+    body: String,
+}
+
 #[derive(Debug, Default, Clone)]
 struct OpenAiMockSnapshot {
     model_request_paths: Vec<String>,
@@ -604,6 +795,8 @@ struct OpenAiMockState {
     revoke_request_bodies: Vec<String>,
     authorization_code_reply: Option<TokenReply>,
     refresh_reply: Option<TokenReply>,
+    authorization_code_raw_response: Option<MockHttpResponse>,
+    refresh_raw_response: Option<MockHttpResponse>,
 }
 
 struct OpenAiMockServer {
@@ -664,6 +857,12 @@ impl OpenAiMockServer {
     fn allow_token(&self, token: &str) {
         let mut state = self.state.lock().expect("OpenAI mock state lock should be available");
         state.valid_tokens.insert(token.to_owned());
+    }
+
+    fn set_authorization_code_raw_response(&self, status: &str, body: &str) {
+        let mut state = self.state.lock().expect("OpenAI mock state lock should be available");
+        state.authorization_code_raw_response =
+            Some(MockHttpResponse { status: status.to_owned(), body: body.to_owned() });
     }
 
     fn base_url(&self) -> String {
@@ -735,6 +934,18 @@ fn handle_openai_mock_request(
     if request.request_line.starts_with("POST /oauth/token ") {
         let mut guard = state.lock().expect("OpenAI mock state lock should be available");
         guard.token_request_bodies.push(request.body.clone());
+        let raw_response = if request.body.contains("grant_type=authorization_code") {
+            guard.authorization_code_raw_response.clone()
+        } else if request.body.contains("grant_type=refresh_token") {
+            guard.refresh_raw_response.clone()
+        } else {
+            None
+        };
+        if let Some(response) = raw_response {
+            write_json_response(stream, response.status.as_str(), response.body.as_str())?;
+            return Ok(());
+        }
+
         let reply = if request.body.contains("grant_type=authorization_code") {
             guard.authorization_code_reply.clone()
         } else if request.body.contains("grant_type=refresh_token") {
