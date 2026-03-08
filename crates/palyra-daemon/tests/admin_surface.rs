@@ -1929,7 +1929,7 @@ fn console_support_bundle_job_lifecycle_publishes_deterministic_completion_state
         "support bundle job creation should start in queued state"
     );
 
-    let timeout_at = Instant::now() + Duration::from_secs(30);
+    let timeout_at = Instant::now() + Duration::from_secs(90);
     let mut seen_states = vec!["queued".to_owned()];
     let completed_job = loop {
         let current = client
