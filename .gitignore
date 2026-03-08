@@ -50,6 +50,7 @@ fuzz/coverage/
 security-artifacts/
 .palyra/
 data/
+apps/desktop/src-tauri/gen/
 /roadmap/
 /oc-docs/
 TechStack_Architecture.md
