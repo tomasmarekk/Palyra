@@ -53,8 +53,6 @@ struct WasmPluginRunInput {
     skill_id: Option<String>,
     #[serde(default)]
     skill_version: Option<String>,
-    #[serde(default)]
-    dev: bool,
     module_wat: Option<String>,
     module_base64: Option<String>,
     entrypoint: Option<String>,
@@ -234,10 +232,10 @@ fn decode_module_bytes(
     policy: &WasmPluginRunnerPolicy,
     input: &WasmPluginRunInput,
 ) -> Result<Vec<u8>, WasmPluginRunError> {
-    if inline_module_payload_present(input) && !policy.allow_inline_modules && !input.dev {
+    if inline_module_payload_present(input) && !policy.allow_inline_modules {
         return Err(WasmPluginRunError {
             kind: WasmPluginRunErrorKind::InvalidInput,
-            message: "palyra.plugin.run inline module payloads are disabled by runtime policy; set tool_call.wasm_runtime.allow_inline_modules=true or pass dev=true"
+            message: "palyra.plugin.run inline module payloads are disabled by runtime policy; set tool_call.wasm_runtime.allow_inline_modules=true"
                 .to_owned(),
         });
     }
@@ -506,10 +504,10 @@ mod tests {
     }
 
     #[test]
-    fn run_wasm_plugin_allows_inline_module_payload_with_dev_override() {
+    fn run_wasm_plugin_rejects_dev_override_flag_in_input() {
         let mut policy = test_policy();
         policy.allow_inline_modules = false;
-        let success = run_wasm_plugin(
+        let error = run_wasm_plugin(
             &policy,
             br#"{
                 "dev": true,
@@ -517,10 +515,9 @@ mod tests {
             }"#,
             Duration::from_secs(2),
         )
-        .expect("dev override should allow inline module payload");
-        let output: Value =
-            serde_json::from_slice(&success.output_json).expect("output_json should parse");
-        assert_eq!(output.get("exit_code").and_then(Value::as_i64), Some(1));
+        .expect_err("dev flag should be rejected from untrusted tool input");
+        assert_eq!(error.kind, WasmPluginRunErrorKind::InvalidInput);
+        assert!(error.message.contains("unknown field `dev`"));
     }
 
     #[test]
