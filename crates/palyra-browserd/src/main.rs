@@ -82,6 +82,7 @@ const DEFAULT_MAX_OBSERVE_SNAPSHOT_BYTES: u64 = 64 * 1024;
 const DEFAULT_MAX_VISIBLE_TEXT_BYTES: u64 = 16 * 1024;
 const DEFAULT_MAX_NETWORK_LOG_ENTRIES: usize = 256;
 const DEFAULT_MAX_NETWORK_LOG_BYTES: u64 = 64 * 1024;
+const DEFAULT_MAX_TABS_PER_SESSION: usize = 32;
 const MAX_NETWORK_LOG_HEADER_COUNT: usize = 24;
 const MAX_NETWORK_LOG_HEADER_VALUE_BYTES: usize = 256;
 const MAX_NETWORK_LOG_URL_BYTES: usize = 2 * 1024;
@@ -222,6 +223,7 @@ struct SessionBudget {
     max_visible_text_bytes: u64,
     max_network_log_entries: usize,
     max_network_log_bytes: u64,
+    max_tabs_per_session: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -465,6 +467,10 @@ impl BrowserSessionRecord {
         tab_id
     }
 
+    fn can_create_tab(&self) -> bool {
+        self.tabs.len() < self.budget.max_tabs_per_session
+    }
+
     fn tab_to_proto(&self, tab_id: &str) -> Option<browser_v1::BrowserTab> {
         self.tabs.get(tab_id).map(|tab| browser_v1::BrowserTab {
             v: CANONICAL_PROTOCOL_MAJOR,
@@ -506,7 +512,7 @@ impl BrowserSessionRecord {
 
     fn apply_snapshot(&mut self, snapshot: PersistedSessionSnapshot) {
         let mut tabs = HashMap::new();
-        for mut tab in snapshot.tabs {
+        for mut tab in snapshot.tabs.into_iter().take(self.budget.max_tabs_per_session) {
             if validate_canonical_id(tab.tab_id.as_str()).is_ok() {
                 tab.network_log = tab
                     .network_log
@@ -924,6 +930,7 @@ impl BrowserRuntimeState {
                 max_visible_text_bytes: DEFAULT_MAX_VISIBLE_TEXT_BYTES,
                 max_network_log_entries: DEFAULT_MAX_NETWORK_LOG_ENTRIES,
                 max_network_log_bytes: DEFAULT_MAX_NETWORK_LOG_BYTES,
+                max_tabs_per_session: DEFAULT_MAX_TABS_PER_SESSION,
             },
             max_sessions: args.max_sessions,
             state_store,
@@ -1134,6 +1141,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                 .map(|value| value.max_network_log_bytes)
                 .filter(|value| *value > 0)
                 .unwrap_or(self.runtime.default_budget.max_network_log_bytes),
+            max_tabs_per_session: self.runtime.default_budget.max_tabs_per_session,
             max_title_bytes: self.runtime.default_budget.max_title_bytes,
         };
         let action_allowed_domains =
@@ -2728,6 +2736,16 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                 }));
             };
             session.last_active = Instant::now();
+            if !session.can_create_tab() {
+                return Ok(Response::new(browser_v1::OpenTabResponse {
+                    v: CANONICAL_PROTOCOL_MAJOR,
+                    success: false,
+                    tab: None,
+                    navigated: false,
+                    status_code: 0,
+                    error: "tab_limit_reached".to_owned(),
+                }));
+            }
             let created_tab_id = session.create_tab();
             if payload.activate {
                 session.active_tab_id = created_tab_id.clone();
@@ -7560,8 +7578,8 @@ mod tests {
         BrowserTabRecord, ChromiumSessionProxy, DnsValidationCache, PersistedSessionSnapshot,
         PersistedStateStore, SessionPermissionsInternal, AUTHORIZATION_HEADER,
         CANONICAL_PROTOCOL_MAJOR, CHROMIUM_NEW_TAB_RETRY_DELAY_MS, CHROMIUM_PATH_ENV,
-        DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS, DEFAULT_GRPC_PORT, MAX_RELAY_PAYLOAD_BYTES,
-        ONE_BY_ONE_PNG, PROFILE_RECORD_SCHEMA_VERSION, STATE_KEY_LEN,
+        DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS, DEFAULT_GRPC_PORT, DEFAULT_MAX_TABS_PER_SESSION,
+        MAX_RELAY_PAYLOAD_BYTES, ONE_BY_ONE_PNG, PROFILE_RECORD_SCHEMA_VERSION, STATE_KEY_LEN,
     };
     use crate::proto;
     use crate::proto::palyra::browser::v1::browser_service_server::BrowserService;
@@ -9587,6 +9605,91 @@ mod tests {
         assert_eq!(second_tab_title.title, "Secondary Tab");
 
         handle.join().expect("test server thread should exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn browser_service_open_tab_enforces_session_tab_limit() {
+        let runtime = std::sync::Arc::new(
+            BrowserRuntimeState::new(&Args {
+                bind: "127.0.0.1".to_owned(),
+                port: 7143,
+                grpc_bind: "127.0.0.1".to_owned(),
+                grpc_port: 7543,
+                auth_token: None,
+                session_idle_ttl_ms: 60_000,
+                max_sessions: 16,
+                max_navigation_timeout_ms: 10_000,
+                max_session_lifetime_ms: 60_000,
+                max_screenshot_bytes: 128 * 1024,
+                max_response_bytes: 128 * 1024,
+                max_title_bytes: 4 * 1024,
+                engine_mode: BrowserEngineMode::Simulated,
+                chromium_path: None,
+                chromium_startup_timeout_ms: DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS,
+            })
+            .expect("runtime should initialize"),
+        );
+        let service = BrowserServiceImpl { runtime };
+        let created = service
+            .create_session(Request::new(browser_v1::CreateSessionRequest {
+                v: 1,
+                principal: "user:ops".to_owned(),
+                idle_ttl_ms: 10_000,
+                budget: None,
+                allow_private_targets: true,
+                allow_downloads: false,
+                action_allowed_domains: Vec::new(),
+                persistence_enabled: false,
+                persistence_id: String::new(),
+                profile_id: None,
+                private_profile: false,
+                channel: String::new(),
+            }))
+            .await
+            .expect("create_session should succeed")
+            .into_inner();
+        let session_id = created
+            .session_id
+            .as_ref()
+            .map(|value| value.ulid.clone())
+            .expect("session id should be present");
+
+        for _ in 0..(DEFAULT_MAX_TABS_PER_SESSION - 1) {
+            let opened = service
+                .open_tab(Request::new(browser_v1::OpenTabRequest {
+                    v: 1,
+                    session_id: Some(proto::palyra::common::v1::CanonicalId {
+                        ulid: session_id.clone(),
+                    }),
+                    url: String::new(),
+                    activate: false,
+                    timeout_ms: 2_000,
+                    allow_redirects: true,
+                    max_redirects: 3,
+                    allow_private_targets: true,
+                }))
+                .await
+                .expect("open_tab should execute")
+                .into_inner();
+            assert!(opened.success, "open_tab should succeed before tab limit");
+        }
+
+        let rejected = service
+            .open_tab(Request::new(browser_v1::OpenTabRequest {
+                v: 1,
+                session_id: Some(proto::palyra::common::v1::CanonicalId { ulid: session_id }),
+                url: String::new(),
+                activate: false,
+                timeout_ms: 2_000,
+                allow_redirects: true,
+                max_redirects: 3,
+                allow_private_targets: true,
+            }))
+            .await
+            .expect("open_tab should execute")
+            .into_inner();
+        assert!(!rejected.success, "open_tab should fail at tab limit");
+        assert_eq!(rejected.error, "tab_limit_reached");
     }
 
     #[tokio::test(flavor = "multi_thread")]
