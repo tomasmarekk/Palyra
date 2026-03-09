@@ -1938,11 +1938,7 @@ async fn grpc_route_message_denies_unknown_skill_before_approval_and_records_eve
     let skill_version = "9.9.9";
     let tool_arguments = serde_json::json!({
         "skill_id": skill_id,
-        "skill_version": skill_version,
-        "module_wat": "(module (func (export \"run\") (result i32) i32.const 1))",
-        "capabilities": {
-            "http_hosts": ["api.example.com"]
-        }
+        "skill_version": skill_version
     });
     let response_body = openai_tool_call_response("palyra.plugin.run", &tool_arguments)?;
     let (openai_base_url, _request_count, server_handle) =
@@ -5982,11 +5978,7 @@ async fn grpc_run_stream_blocks_sandbox_process_runner_non_allowlisted_egress_ho
 
 #[tokio::test(flavor = "multi_thread")]
 async fn grpc_run_stream_denies_wasm_plugin_runtime_without_approval_channel() -> Result<()> {
-    let skill_id = "acme.echo_http";
-    let skill_version = "1.2.3";
     let tool_arguments = serde_json::json!({
-        "skill_id": skill_id,
-        "skill_version": skill_version,
         "module_wat": r#"
             (module
                 (import "palyra:plugins/host-capabilities@0.1.0" "http-count" (func $http_count (result i32)))
@@ -6021,21 +6013,6 @@ async fn grpc_run_stream_denies_wasm_plugin_runtime_without_approval_channel() -
     let _config_guard = TempFileGuard::new(config_path);
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
-    let enable_response = admin_post_json_async(
-        admin_port,
-        format!("/admin/v1/skills/{skill_id}/enable"),
-        serde_json::json!({
-            "version": skill_version,
-            "reason": "integration-test activation for approval-gate path",
-            "override": true,
-        }),
-    )
-    .await?;
-    assert_eq!(
-        enable_response.get("status").and_then(Value::as_str),
-        Some("active"),
-        "admin enable endpoint should activate skill before approval-gate test"
-    );
 
     let endpoint = format!("http://127.0.0.1:{grpc_port}");
     let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
@@ -6108,16 +6085,13 @@ async fn grpc_run_stream_denies_wasm_plugin_runtime_without_approval_channel() -
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn grpc_run_stream_blocks_wasm_plugin_runtime_non_allowlisted_capability() -> Result<()> {
+async fn grpc_run_stream_denies_inline_wasm_with_skill_identity_before_approval() -> Result<()> {
     let skill_id = "acme.echo_http";
     let skill_version = "1.2.3";
     let tool_arguments = serde_json::json!({
         "skill_id": skill_id,
         "skill_version": skill_version,
-        "module_wat": "(module (func (export \"run\") (result i32) i32.const 1))",
-        "capabilities": {
-            "http_hosts": ["blocked.example"]
-        }
+        "module_wat": "(module (func (export \"run\") (result i32) i32.const 1))"
     });
     let response_body = openai_tool_call_response("palyra.plugin.run", &tool_arguments)?;
     let (openai_base_url, _request_count, server_handle) =
@@ -6146,7 +6120,7 @@ async fn grpc_run_stream_blocks_wasm_plugin_runtime_non_allowlisted_capability()
         format!("/admin/v1/skills/{skill_id}/enable"),
         serde_json::json!({
             "version": skill_version,
-            "reason": "integration-test activation for approval-gate path",
+            "reason": "integration-test activation for inline identity rejection",
             "override": true,
         }),
     )
@@ -6154,8 +6128,110 @@ async fn grpc_run_stream_blocks_wasm_plugin_runtime_non_allowlisted_capability()
     assert_eq!(
         enable_response.get("status").and_then(Value::as_str),
         Some("active"),
-        "admin enable endpoint should activate skill before approval-gate test"
+        "admin enable endpoint should activate skill before inline identity rejection test"
     );
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+
+    let mut stream_request =
+        tonic::Request::new(tokio_stream::iter(vec![sample_run_stream_request_with_text(
+            "inline wasm skill identity rejection path".to_owned(),
+        )]));
+    stream_request.metadata_mut().insert("authorization", format!("Bearer {ADMIN_TOKEN}").parse()?);
+    stream_request.metadata_mut().insert("x-palyra-principal", "user:ops".parse()?);
+    stream_request.metadata_mut().insert("x-palyra-device-id", DEVICE_ID.parse()?);
+    stream_request.metadata_mut().insert("x-palyra-channel", "cli".parse()?);
+
+    let mut response_stream =
+        client.run_stream(stream_request).await.context("failed to call RunStream")?.into_inner();
+
+    let mut saw_approval_request = false;
+    let mut saw_deny_decision = false;
+    let mut saw_failed_result = false;
+    while let Some(event) = response_stream.next().await {
+        let event = event.context("failed to read RunStream event")?;
+        if let Some(body) = event.body {
+            match body {
+                common_v1::run_stream_event::Body::ToolApprovalRequest(_) => {
+                    saw_approval_request = true;
+                }
+                common_v1::run_stream_event::Body::ToolDecision(decision) => {
+                    if decision.kind == common_v1::tool_decision::DecisionKind::Deny as i32 {
+                        assert!(
+                            decision.reason.contains("invalid skill context"),
+                            "deny reason should attribute rejection to invalid skill context"
+                        );
+                        assert!(
+                            decision.reason.contains(
+                                "skill_id cannot be combined with inline module payloads"
+                            ),
+                            "deny reason should explain why inline module identity is rejected"
+                        );
+                        assert!(
+                            !decision.approval_required,
+                            "invalid inline skill identity should short-circuit before approval"
+                        );
+                        saw_deny_decision = true;
+                    }
+                }
+                common_v1::run_stream_event::Body::ToolResult(result) => {
+                    if !result.success {
+                        assert!(
+                            result.error.contains("invalid skill context"),
+                            "failed result should include invalid skill context rejection"
+                        );
+                        saw_failed_result = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if saw_deny_decision && saw_failed_result {
+            break;
+        }
+    }
+
+    assert!(!saw_approval_request, "invalid inline skill identity must be denied before approval");
+    assert!(saw_deny_decision, "inline skill identity mix should emit deny decision");
+    assert!(saw_failed_result, "inline skill identity mix should emit failed tool result");
+
+    server_handle.join().expect("scripted openai server thread should exit");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_run_stream_blocks_wasm_plugin_runtime_non_allowlisted_capability() -> Result<()> {
+    let tool_arguments = serde_json::json!({
+        "module_wat": "(module (func (export \"run\") (result i32) i32.const 1))",
+        "capabilities": {
+            "http_hosts": ["blocked.example"]
+        }
+    });
+    let response_body = openai_tool_call_response("palyra.plugin.run", &tool_arguments)?;
+    let (openai_base_url, _request_count, server_handle) =
+        spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::immediate(200, response_body)])?;
+    let (child, admin_port, grpc_port, _journal_db_path, config_path) =
+        spawn_palyrad_with_openai_provider_tool_policy_and_wasm_runtime(WasmRuntimeSpawnConfig {
+            openai_base_url: openai_base_url.as_str(),
+            openai_api_key: OPENAI_API_KEY,
+            allowed_tools: "palyra.plugin.run",
+            max_calls_per_run: 2,
+            execution_timeout_ms: 2_000,
+            allowed_http_hosts: "api.example.com",
+            allowed_secrets: "",
+            allowed_storage_prefixes: "",
+            allowed_channels: "",
+            fuel_budget: 10_000_000,
+            max_memory_bytes: 64 * 1024 * 1024,
+            max_table_elements: 100_000,
+            max_instances: 256,
+        })?;
+    let _config_guard = TempFileGuard::new(config_path);
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
 
     let endpoint = format!("http://127.0.0.1:{grpc_port}");
     let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
@@ -6228,11 +6304,7 @@ async fn grpc_run_stream_denies_unknown_skill_before_approval() -> Result<()> {
     let skill_version = "9.9.9";
     let tool_arguments = serde_json::json!({
         "skill_id": skill_id,
-        "skill_version": skill_version,
-        "module_wat": "(module (func (export \"run\") (result i32) i32.const 1))",
-        "capabilities": {
-            "http_hosts": ["api.example.com"]
-        }
+        "skill_version": skill_version
     });
     let response_body = openai_tool_call_response("palyra.plugin.run", &tool_arguments)?;
     let (openai_base_url, _request_count, server_handle) =
@@ -6355,11 +6427,7 @@ async fn grpc_run_stream_denies_quarantined_skill_before_approval_and_records_ev
     let skill_version = "1.2.3";
     let tool_arguments = serde_json::json!({
         "skill_id": runtime_skill_id,
-        "skill_version": skill_version,
-        "module_wat": "(module (func (export \"run\") (result i32) i32.const 1))",
-        "capabilities": {
-            "http_hosts": ["api.example.com"]
-        }
+        "skill_version": skill_version
     });
     let response_body = openai_tool_call_response("palyra.plugin.run", &tool_arguments)?;
     let (openai_base_url, _request_count, server_handle) =

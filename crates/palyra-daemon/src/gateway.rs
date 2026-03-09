@@ -13379,24 +13379,43 @@ fn parse_tool_skill_context(
     let object = payload
         .as_object()
         .ok_or_else(|| Status::invalid_argument("tool input must be a JSON object"))?;
-    let skill_id_value = object.get("skill_id").ok_or_else(|| {
-        Status::invalid_argument("palyra.plugin.run requires non-empty skill_id for security gate")
-    })?;
-    let skill_id = skill_id_value
-        .as_str()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            Status::invalid_argument("palyra.plugin.run skill_id must be a non-empty string")
-        })?
-        .to_ascii_lowercase();
+    let has_inline_module_payload =
+        object.contains_key("module_wat") || object.contains_key("module_base64");
+    let skill_id = match object.get("skill_id") {
+        Some(skill_id_value) => Some(
+            skill_id_value
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    Status::invalid_argument(
+                        "palyra.plugin.run skill_id must be a non-empty string",
+                    )
+                })?
+                .to_ascii_lowercase(),
+        ),
+        None => None,
+    };
     let version = object
         .get("skill_version")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
-    Ok(Some(ToolSkillContext { skill_id, version }))
+    if skill_id.is_none() {
+        if version.is_some() {
+            return Err(Status::invalid_argument(
+                "palyra.plugin.run skill_version requires non-empty skill_id",
+            ));
+        }
+        return Ok(None);
+    }
+    if has_inline_module_payload {
+        return Err(Status::invalid_argument(
+            "palyra.plugin.run skill_id cannot be combined with inline module payloads",
+        ));
+    }
+    Ok(Some(ToolSkillContext { skill_id: skill_id.expect("checked"), version }))
 }
 
 #[allow(clippy::result_large_err)]
