@@ -309,7 +309,7 @@ pub struct OutboundA2uiUpdate {
 }
 
 impl OutboundA2uiUpdate {
-    fn validate(&self) -> Result<(), ProtocolError> {
+    fn validate(&self, max_patch_bytes: usize) -> Result<(), ProtocolError> {
         validate_non_empty_identifier(
             self.surface.as_str(),
             "a2ui_update.surface",
@@ -318,7 +318,7 @@ impl OutboundA2uiUpdate {
         validate_json_bytes(
             self.patch_json.as_slice(),
             "a2ui_update.patch_json",
-            MAX_A2UI_PATCH_BYTES,
+            max_patch_bytes.min(MAX_A2UI_PATCH_BYTES),
         )
     }
 }
@@ -433,12 +433,6 @@ impl OutboundMessageRequest {
         )?;
         validate_message_body(self.text.as_str(), max_text_bytes, "text")?;
         validate_attachments(self.attachments.as_slice())?;
-        if let Some(structured_json) = self.structured_json.as_deref() {
-            validate_json_bytes(structured_json, "structured_json", MAX_STRUCTURED_OUTPUT_BYTES)?;
-        }
-        if let Some(update) = self.a2ui_update.as_ref() {
-            update.validate()?;
-        }
         if self.timeout_ms == 0 {
             return Err(ProtocolError::InvalidField {
                 field: "timeout_ms",
@@ -450,6 +444,17 @@ impl OutboundMessageRequest {
                 field: "max_payload_bytes",
                 reason: "must be greater than zero",
             });
+        }
+        let max_payload_bytes = self.max_payload_bytes.min(max_text_bytes);
+        if let Some(structured_json) = self.structured_json.as_deref() {
+            validate_json_bytes(
+                structured_json,
+                "structured_json",
+                max_payload_bytes.min(MAX_STRUCTURED_OUTPUT_BYTES),
+            )?;
+        }
+        if let Some(update) = self.a2ui_update.as_ref() {
+            update.validate(max_payload_bytes)?;
         }
         Ok(())
     }
@@ -749,6 +754,63 @@ mod tests {
             Err(ProtocolError::InvalidField {
                 field: "structured_json",
                 reason: "value is not valid JSON",
+            })
+        );
+    }
+
+    #[test]
+    fn outbound_validation_rejects_structured_json_over_payload_limit() {
+        let request = OutboundMessageRequest {
+            envelope_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV:0".to_owned(),
+            connector_id: "echo:default".to_owned(),
+            conversation_id: "c1".to_owned(),
+            reply_thread_id: None,
+            in_reply_to_message_id: None,
+            text: "ok".to_owned(),
+            broadcast: false,
+            auto_ack_text: None,
+            auto_reaction: None,
+            attachments: Vec::new(),
+            structured_json: Some(br#"{"k":"0123456789"}"#.to_vec()),
+            a2ui_update: None,
+            timeout_ms: 1_000,
+            max_payload_bytes: 8,
+        };
+        assert_eq!(
+            request.validate(1024),
+            Err(ProtocolError::InvalidField {
+                field: "structured_json",
+                reason: "value exceeds size limit",
+            })
+        );
+    }
+
+    #[test]
+    fn outbound_validation_rejects_a2ui_patch_over_payload_limit() {
+        let request = OutboundMessageRequest {
+            envelope_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV:0".to_owned(),
+            connector_id: "echo:default".to_owned(),
+            conversation_id: "c1".to_owned(),
+            reply_thread_id: None,
+            in_reply_to_message_id: None,
+            text: "ok".to_owned(),
+            broadcast: false,
+            auto_ack_text: None,
+            auto_reaction: None,
+            attachments: Vec::new(),
+            structured_json: None,
+            a2ui_update: Some(OutboundA2uiUpdate {
+                surface: "chat".to_owned(),
+                patch_json: br#"{"op":"replace","path":"/title","value":"hello"}"#.to_vec(),
+            }),
+            timeout_ms: 1_000,
+            max_payload_bytes: 16,
+        };
+        assert_eq!(
+            request.validate(1024),
+            Err(ProtocolError::InvalidField {
+                field: "a2ui_update.patch_json",
+                reason: "value exceeds size limit",
             })
         );
     }
