@@ -17,6 +17,7 @@ use crate::{
 const BACKEND_MARKER_FILE: &str = "backend.kind";
 const OBJECTS_DIR: &str = "objects";
 const OBJECTS_STORE_FILE: &str = "objects.store.json";
+const MAX_OBJECTS_STORE_BYTES: u64 = 32 * 1024 * 1024;
 #[cfg(target_os = "macos")]
 const KEYCHAIN_SERVICE_NAME: &str = "palyra.vault.v1";
 #[cfg(target_os = "linux")]
@@ -222,6 +223,24 @@ impl EncryptedFileBackend {
             store_path.as_path(),
             "encrypted-file objects store path",
         )?;
+        let store_size = fs::metadata(&store_path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                VaultError::NotFound
+            } else {
+                VaultError::Io(format!(
+                    "failed to read encrypted-file objects store metadata {}: {error}",
+                    store_path.display()
+                ))
+            }
+        })?;
+        if store_size.len() > MAX_OBJECTS_STORE_BYTES {
+            return Err(VaultError::Io(format!(
+                "encrypted-file objects store {} exceeds max size ({} > {})",
+                store_path.display(),
+                store_size.len(),
+                MAX_OBJECTS_STORE_BYTES
+            )));
+        }
         let bytes = fs::read(&store_path).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 VaultError::NotFound
@@ -259,6 +278,14 @@ impl EncryptedFileBackend {
                 store_path.display()
             ))
         })?;
+        if payload.len() as u64 > MAX_OBJECTS_STORE_BYTES {
+            return Err(VaultError::Io(format!(
+                "encrypted-file objects store {} exceeds max size after update ({} > {})",
+                store_path.display(),
+                payload.len(),
+                MAX_OBJECTS_STORE_BYTES
+            )));
+        }
         let tmp_path = store_root.join(format!("{}.tmp.{}", OBJECTS_STORE_FILE, Ulid::new()));
         ensure_path_within_root(
             store_root.as_path(),
@@ -732,4 +759,49 @@ fn run_powershell_dpapi(script: &str, stdin_payload: &[u8]) -> Result<Vec<u8>, V
     STANDARD_NO_PAD.decode(encoded.as_bytes()).map_err(|error| {
         VaultError::Io(format!("failed to decode powershell DPAPI output: {error}"))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BlobBackend, EncryptedFileBackend, MAX_OBJECTS_STORE_BYTES, OBJECTS_STORE_FILE};
+    use crate::VaultError;
+    use std::{collections::BTreeMap, fs};
+    use tempfile::tempdir;
+
+    const TEST_OBJECT_ID: &str =
+        "obj_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn encrypted_file_backend_rejects_oversized_store_reads() {
+        let temp = tempdir().expect("tempdir should be created");
+        let backend =
+            EncryptedFileBackend::new(temp.path()).expect("backend should initialize cleanly");
+        let store_path = backend.objects_root.join(OBJECTS_STORE_FILE);
+        fs::write(&store_path, vec![b' '; MAX_OBJECTS_STORE_BYTES as usize + 1])
+            .expect("oversized store should be written");
+
+        let result = backend.get_blob(TEST_OBJECT_ID);
+        assert!(
+            matches!(result, Err(VaultError::Io(ref message)) if message.contains("exceeds max size")),
+            "unexpected result: {result:?}"
+        );
+    }
+
+    #[test]
+    fn encrypted_file_backend_rejects_oversized_store_writes() {
+        let temp = tempdir().expect("tempdir should be created");
+        let backend =
+            EncryptedFileBackend::new(temp.path()).expect("backend should initialize cleanly");
+        let mut store = BTreeMap::new();
+        store.insert(
+            TEST_OBJECT_ID.to_owned(),
+            vec![255_u8; (MAX_OBJECTS_STORE_BYTES / 4) as usize + 1024],
+        );
+
+        let result = backend.write_store(&store);
+        assert!(
+            matches!(result, Err(VaultError::Io(ref message)) if message.contains("exceeds max size after update")),
+            "unexpected result: {result:?}"
+        );
+    }
 }
