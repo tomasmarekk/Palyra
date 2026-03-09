@@ -7474,7 +7474,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                 }));
             }
             RouteOutcome::Routed(routed) => {
-                let ChannelRoutedMessage { plan, lease: _route_lease } = *routed;
+                let ChannelRoutedMessage { plan, lease: route_lease } = *routed;
                 let response = handle_routed_route_message(
                     &self.state,
                     &context,
@@ -7491,6 +7491,8 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     retry_attempt,
                 )
                 .await?;
+                // Keep the per-channel concurrency slot reserved across the routed async work.
+                drop(route_lease);
                 return Ok(Response::new(response));
             }
         }

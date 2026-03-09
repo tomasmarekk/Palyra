@@ -705,6 +705,135 @@ async fn grpc_route_message_emits_a2ui_update_from_structured_json_mode_output()
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn grpc_route_message_holds_channel_slot_until_routed_work_finishes() -> Result<()> {
+    let (openai_base_url, request_count, server_handle) = spawn_scripted_openai_server(vec![
+        ScriptedOpenAiResponse::delayed(
+            200,
+            r#"{"choices":[{"message":{"content":"slow provider reply"}}]}"#.to_owned(),
+            Duration::from_secs(2),
+        ),
+        ScriptedOpenAiResponse::immediate(
+            200,
+            r#"{"choices":[{"message":{"content":"cleanup provider reply"}}]}"#.to_owned(),
+        ),
+    ])?;
+    let (child, admin_port, grpc_port, _journal_db_path, config_path) =
+        spawn_palyrad_with_openai_provider_and_channel_router(
+            openai_base_url.as_str(),
+            OPENAI_API_KEY,
+        )?;
+    let _config_guard = TempFileGuard::new(config_path);
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut setup_client =
+        gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint.clone())
+            .await
+            .context("failed to connect setup gRPC client")?;
+    let mut create_route_agent = tonic::Request::new(gateway_v1::CreateAgentRequest {
+        v: 1,
+        agent_id: "route".to_owned(),
+        display_name: "Route".to_owned(),
+        agent_dir: String::new(),
+        workspace_roots: vec!["workspace".to_owned()],
+        default_model_profile: "gpt-4o-mini".to_owned(),
+        default_tool_allowlist: vec!["palyra.echo".to_owned()],
+        default_skill_allowlist: vec!["acme.route".to_owned()],
+        set_default: true,
+        allow_absolute_paths: false,
+    });
+    authorize_metadata_with_principal(create_route_agent.metadata_mut(), "admin:ops")?;
+    setup_client
+        .create_agent(create_route_agent)
+        .await
+        .context("failed to create route agent before RouteMessage concurrency test")?;
+
+    let mut first_client =
+        gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint.clone())
+            .await
+            .context("failed to connect first RouteMessage client")?;
+    let mut second_client =
+        gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint.clone())
+            .await
+            .context("failed to connect second RouteMessage client")?;
+    let first_adapter = FakeChannelAdapter::default();
+    let second_adapter = FakeChannelAdapter::default();
+    let first_route = tokio::spawn(async move {
+        first_adapter
+            .inject_message_with_envelope_id(
+                &mut first_client,
+                "hey @palyra keep the route in-flight",
+                false,
+                false,
+                ENVELOPE_ID,
+            )
+            .await
+    });
+
+    let wait_deadline = Instant::now() + Duration::from_secs(3);
+    while request_count.load(Ordering::Relaxed) == 0 {
+        if Instant::now() > wait_deadline {
+            anyhow::bail!("first RouteMessage request never reached the provider");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let queued = second_adapter
+        .inject_message_with_envelope_id(
+            &mut second_client,
+            "hey @palyra this should queue behind the first route",
+            false,
+            false,
+            ENVELOPE_ID_ALT,
+        )
+        .await?;
+    assert!(
+        !queued.accepted,
+        "second route should not be accepted while the first channel slot is still in-flight"
+    );
+    assert!(
+        queued.queued_for_retry,
+        "second route should be queued for retry when per-channel concurrency is exhausted"
+    );
+    assert_eq!(
+        queued.decision_reason, "backpressure_queue_full",
+        "queued route should expose the backpressure reason"
+    );
+    assert_eq!(queued.queue_depth, 1, "queued route should report retry queue depth");
+    assert_eq!(
+        request_count.load(Ordering::Relaxed),
+        1,
+        "queued RouteMessage must not trigger a second provider call"
+    );
+
+    let first_response = first_route.await.context("first RouteMessage task failed to join")??;
+    assert!(
+        first_response.accepted,
+        "first RouteMessage should still complete successfully once the provider responds"
+    );
+    assert!(
+        !first_response.queued_for_retry,
+        "first RouteMessage should remain the active in-flight request"
+    );
+
+    let openai_authority = openai_base_url
+        .strip_prefix("http://")
+        .and_then(|value| value.split('/').next())
+        .context("scripted OpenAI base URL should use http://")?;
+    let mut cleanup_stream = TcpStream::connect(openai_authority).with_context(|| {
+        format!("failed to connect cleanup request to scripted provider at {openai_authority}")
+    })?;
+    cleanup_stream.write_all(
+        b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
+    )?;
+    let _ = cleanup_stream.flush();
+
+    server_handle.join().expect("scripted openai server thread should exit");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn grpc_route_message_splits_reply_into_multiple_outputs_when_payload_limit_is_small(
 ) -> Result<()> {
     let long_reply = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau";
