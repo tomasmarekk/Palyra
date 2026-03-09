@@ -6797,6 +6797,9 @@ impl gateway_v1::canvas_service_server::CanvasService for CanvasServiceImpl {
 
         tokio::spawn(async move {
             loop {
+                if tx.is_closed() {
+                    return;
+                }
                 let patches = match state.list_canvas_state_patches(
                     &context_for_stream,
                     canvas_id_for_stream.as_str(),
