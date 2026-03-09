@@ -38,8 +38,6 @@ const SAMPLE_PNG_1X1: &[u8] = &[
     0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, b'I', b'E', b'N', b'D', 0xAE,
     0x42, 0x60, 0x82,
 ];
-const VAULT_READ_APPROVAL_HEADER: &str = "x-palyra-vault-read-approval";
-const VAULT_READ_APPROVAL_ALLOW_VALUE: &str = "allow";
 const MAX_TEST_CRON_JITTER_MS: u64 = 60_000;
 const GRPC_OVERSIZED_PAYLOAD_BYTES: usize = (4 * 1024 * 1024) + 8 * 1024;
 const TRANSPORT_LIMIT_TEST_JOURNAL_MAX_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
@@ -3987,7 +3985,7 @@ async fn grpc_memory_get_hides_ttl_expired_item() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn grpc_vault_get_requires_explicit_approval_for_selected_sensitive_ref() -> Result<()> {
+async fn grpc_vault_get_blocks_selected_sensitive_ref_even_with_approval_header() -> Result<()> {
     let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
@@ -4024,7 +4022,7 @@ async fn grpc_vault_get_requires_explicit_approval_for_selected_sensitive_ref() 
     let denied_error = vault_client
         .get_secret(denied_get_request)
         .await
-        .expect_err("selected sensitive vault ref must require explicit approval header");
+        .expect_err("selected sensitive vault ref must require server-side approval");
     assert_eq!(denied_error.code(), Code::PermissionDenied);
     assert!(
         denied_error.message().contains("requires explicit approval"),
@@ -4037,18 +4035,12 @@ async fn grpc_vault_get_requires_explicit_approval_for_selected_sensitive_ref() 
         key: secret_key.to_owned(),
     });
     authorize_metadata(approved_get_request.metadata_mut())?;
-    approved_get_request
-        .metadata_mut()
-        .insert(VAULT_READ_APPROVAL_HEADER, VAULT_READ_APPROVAL_ALLOW_VALUE.parse()?);
-    let approved_response = vault_client
+    approved_get_request.metadata_mut().insert("x-palyra-vault-read-approval", "allow".parse()?);
+    let approved_error = vault_client
         .get_secret(approved_get_request)
         .await
-        .context("approved sensitive vault read should succeed")?
-        .into_inner();
-    assert_eq!(
-        approved_response.value, secret_value,
-        "approved vault read should return stored secret bytes"
-    );
+        .expect_err("client-controlled approval header must not bypass sensitive vault guard");
+    assert_eq!(approved_error.code(), Code::PermissionDenied);
     Ok(())
 }
 

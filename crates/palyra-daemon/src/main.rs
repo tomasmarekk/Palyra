@@ -4459,37 +4459,21 @@ async fn console_secret_reveal_handler(
             "reveal must be true for secret reveal requests",
         ));
     }
-    let mut request = TonicRequest::new(gateway::proto::palyra::gateway::v1::GetSecretRequest {
-        v: palyra_common::CANONICAL_PROTOCOL_MAJOR,
-        scope: payload.scope.clone(),
-        key: payload.key.clone(),
-    });
-    apply_console_rpc_context(&state, &session, request.metadata_mut())?;
-    request.metadata_mut().insert(
-        gateway::HEADER_VAULT_READ_APPROVAL,
-        MetadataValue::try_from("allow").map_err(|_| {
-            runtime_status_response(tonic::Status::internal(
-                "failed to encode vault approval metadata",
-            ))
-        })?,
-    );
-    let service = build_console_vault_service(&state);
-    let response =
-        <gateway::VaultServiceImpl as gateway::proto::palyra::gateway::v1::vault_service_server::VaultService>::get_secret(
-            &service,
-            request,
-        )
-        .await
-        .map_err(runtime_status_response)?
-        .into_inner();
-    let value_utf8 =
-        String::from_utf8(response.value.clone()).ok().filter(|value| !value.trim().is_empty());
+    let value = gateway::reveal_vault_secret_for_console(
+        &state.runtime,
+        &session.context,
+        payload.scope.as_str(),
+        payload.key.as_str(),
+    )
+    .await
+    .map_err(runtime_status_response)?;
+    let value_utf8 = String::from_utf8(value.clone()).ok().filter(|value| !value.trim().is_empty());
     Ok(Json(control_plane::SecretRevealEnvelope {
         contract: contract_descriptor(),
         scope: payload.scope,
         key: payload.key,
-        value_bytes: u32::try_from(response.value.len()).unwrap_or(u32::MAX),
-        value_base64: BASE64_STANDARD.encode(response.value),
+        value_bytes: u32::try_from(value.len()).unwrap_or(u32::MAX),
+        value_base64: BASE64_STANDARD.encode(value),
         value_utf8,
     }))
 }

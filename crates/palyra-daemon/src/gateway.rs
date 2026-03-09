@@ -145,7 +145,6 @@ use proto::palyra::{
 pub const HEADER_PRINCIPAL: &str = "x-palyra-principal";
 pub const HEADER_DEVICE_ID: &str = "x-palyra-device-id";
 pub const HEADER_CHANNEL: &str = "x-palyra-channel";
-pub const HEADER_VAULT_READ_APPROVAL: &str = "x-palyra-vault-read-approval";
 const MAX_JOURNAL_RECENT_EVENTS: usize = 100;
 const MAX_SESSIONS_PAGE_LIMIT: usize = 500;
 const MAX_AGENTS_PAGE_LIMIT: usize = 500;
@@ -209,7 +208,6 @@ const MAX_VAULT_LIST_RESULTS: usize = 1_000;
 const VAULT_RATE_LIMIT_WINDOW_MS: u64 = 1_000;
 const VAULT_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW: u32 = 30;
 const VAULT_RATE_LIMIT_MAX_PRINCIPAL_BUCKETS: usize = 4_096;
-const VAULT_READ_APPROVAL_ALLOW_VALUE: &str = "allow";
 const MEMORY_SEARCH_LATENCY_BUDGET_MS: u128 = 75;
 const MEMORY_SEARCH_CACHE_CAPACITY: usize = 128;
 const MEMORY_AUTO_INJECT_MIN_SCORE: f64 = 0.2;
@@ -4765,21 +4763,11 @@ fn enforce_vault_get_approval_policy(
     scope: &VaultScope,
     key: &str,
     approval_required_refs: &[String],
-    approval_header: Option<&str>,
+    approval_granted: bool,
 ) -> Result<(), Status> {
     if !vault_get_requires_approval(scope, key, approval_required_refs) {
         return Ok(());
     }
-    let approved = match approval_header {
-        Some(value) if value.eq_ignore_ascii_case(VAULT_READ_APPROVAL_ALLOW_VALUE) => true,
-        Some(_) => {
-            return Err(Status::permission_denied(format!(
-                "vault read approval header must be '{}' when approval is required",
-                VAULT_READ_APPROVAL_ALLOW_VALUE
-            )));
-        }
-        None => false,
-    };
     let evaluation = evaluate_with_config(
         &PolicyRequest {
             principal: principal.to_owned(),
@@ -4787,7 +4775,7 @@ fn enforce_vault_get_approval_policy(
             resource: format!("secrets:{scope}:{key}"),
         },
         &PolicyEvaluationConfig {
-            allow_sensitive_tools: approved,
+            allow_sensitive_tools: approval_granted,
             sensitive_actions: vec!["vault.get".to_owned()],
             ..PolicyEvaluationConfig::default()
         },
@@ -4801,6 +4789,53 @@ fn enforce_vault_get_approval_policy(
             "vault read requires explicit approval for {scope}/{key}: {reason}"
         ))),
     }
+}
+
+#[allow(clippy::result_large_err)]
+async fn read_vault_secret_for_context(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: &RequestContext,
+    scope: VaultScope,
+    key: String,
+    approval_granted: bool,
+) -> Result<Vec<u8>, Status> {
+    enforce_vault_scope_access(&scope, context)?;
+    enforce_vault_get_approval_policy(
+        context.principal.as_str(),
+        &scope,
+        key.as_str(),
+        runtime_state.config.vault_get_approval_required_refs.as_slice(),
+        approval_granted,
+    )?;
+    authorize_vault_action(
+        context.principal.as_str(),
+        "vault.get",
+        format!("secrets:{scope}:{key}").as_str(),
+    )?;
+    let value = runtime_state.vault_get_secret(scope.clone(), key.clone()).await?;
+    record_vault_journal_event(
+        runtime_state,
+        context,
+        "secret.accessed",
+        "vault.get",
+        &scope,
+        Some(key.as_str()),
+        Some(value.len()),
+    )
+    .await?;
+    Ok(value)
+}
+
+#[allow(clippy::result_large_err)]
+pub(crate) async fn reveal_vault_secret_for_console(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: &RequestContext,
+    scope_literal: &str,
+    key_literal: &str,
+) -> Result<Vec<u8>, Status> {
+    let scope = parse_vault_scope(scope_literal)?;
+    let key = key_literal.trim().to_owned();
+    read_vault_secret_for_context(runtime_state, context, scope, key, true).await
 }
 
 #[allow(clippy::result_large_err)]
@@ -8775,43 +8810,11 @@ impl gateway_v1::vault_service_server::VaultService for VaultServiceImpl {
             return Err(Status::resource_exhausted("vault rate limit exceeded"));
         }
         self.state.counters.vault_get_requests.fetch_add(1, Ordering::Relaxed);
-
-        let approval_header = request
-            .metadata()
-            .get(HEADER_VAULT_READ_APPROVAL)
-            .and_then(|value| value.to_str().ok())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned);
-
         let payload = request.into_inner();
         require_supported_version(payload.v)?;
         let scope = parse_vault_scope(payload.scope.as_str())?;
-        enforce_vault_scope_access(&scope, &context)?;
         let key = payload.key.trim().to_owned();
-        enforce_vault_get_approval_policy(
-            context.principal.as_str(),
-            &scope,
-            key.as_str(),
-            self.state.config.vault_get_approval_required_refs.as_slice(),
-            approval_header.as_deref(),
-        )?;
-        authorize_vault_action(
-            context.principal.as_str(),
-            "vault.get",
-            format!("secrets:{scope}:{key}").as_str(),
-        )?;
-        let value = self.state.vault_get_secret(scope.clone(), key.clone()).await?;
-        record_vault_journal_event(
-            &self.state,
-            &context,
-            "secret.accessed",
-            "vault.get",
-            &scope,
-            Some(key.as_str()),
-            Some(value.len()),
-        )
-        .await?;
+        let value = read_vault_secret_for_context(&self.state, &context, scope, key, false).await?;
         Ok(Response::new(gateway_v1::GetSecretResponse { v: CANONICAL_PROTOCOL_MAJOR, value }))
     }
 
@@ -17798,7 +17801,7 @@ summarize incident";
             &super::VaultScope::Global,
             "openai_api_key",
             refs.as_slice(),
-            None,
+            false,
         )
         .expect_err("selected sensitive vault ref must be denied without explicit approval");
         assert_eq!(error.code(), tonic::Code::PermissionDenied);
@@ -17809,16 +17812,16 @@ summarize incident";
     }
 
     #[test]
-    fn vault_get_approval_policy_allows_with_explicit_approval_header() {
+    fn vault_get_approval_policy_allows_with_server_side_approval() {
         let refs = vec!["global/openai_api_key".to_owned()];
         let result = enforce_vault_get_approval_policy(
             "user:ops",
             &super::VaultScope::Global,
             "openai_api_key",
             refs.as_slice(),
-            Some("allow"),
+            true,
         );
-        assert!(result.is_ok(), "explicit approval header should allow configured sensitive ref");
+        assert!(result.is_ok(), "server-side approval should allow configured sensitive ref");
     }
 
     #[test]

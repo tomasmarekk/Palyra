@@ -11,6 +11,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use base64::prelude::{Engine as _, BASE64_STANDARD};
 use reqwest::blocking::Client;
 use serde_json::Value;
 
@@ -1826,6 +1827,70 @@ fn console_m52_error_envelope_exposes_validation_metadata() -> Result<()> {
     assert!(
         body.get("error").and_then(Value::as_str).is_some(),
         "error envelope must preserve top-level error message for backward compatibility"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn console_secret_reveal_allows_sensitive_ref_via_server_side_console_flow() -> Result<()> {
+    let (child, admin_port) = spawn_palyrad_with_bound_console_principal(CONSOLE_ADMIN_PRINCIPAL)?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(4))
+        .build()
+        .context("failed to build HTTP client")?;
+    let (cookie, csrf_token) = login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
+    let secret_value = b"sk-sensitive-vault-value";
+    let secret_value_base64 = BASE64_STANDARD.encode(secret_value);
+
+    let stored = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/secrets"))
+        .header("Cookie", cookie.clone())
+        .header("x-palyra-csrf-token", csrf_token.clone())
+        .json(&serde_json::json!({
+            "scope": "global",
+            "key": "openai_api_key",
+            "value_base64": secret_value_base64.clone()
+        }))
+        .send()
+        .context("failed to store sensitive secret through console")?
+        .error_for_status()
+        .context("console secret set returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse console secret set response json")?;
+    assert_eq!(
+        stored.pointer("/secret/key").and_then(Value::as_str),
+        Some("openai_api_key"),
+        "console secret set should persist the selected sensitive ref"
+    );
+
+    let revealed = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/secrets/reveal"))
+        .header("Cookie", cookie)
+        .header("x-palyra-csrf-token", csrf_token)
+        .json(&serde_json::json!({
+            "scope": "global",
+            "key": "openai_api_key",
+            "reveal": true
+        }))
+        .send()
+        .context("failed to reveal sensitive secret through console")?
+        .error_for_status()
+        .context("console secret reveal returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse console secret reveal response json")?;
+    assert_eq!(
+        revealed.get("value_base64").and_then(Value::as_str),
+        Some(secret_value_base64.as_str()),
+        "console reveal should return the stored sensitive bytes through the server-side path"
+    );
+    assert_eq!(
+        revealed.get("value_utf8").and_then(Value::as_str),
+        Some("sk-sensitive-vault-value"),
+        "console reveal should preserve UTF-8 content for operator display"
     );
 
     Ok(())
