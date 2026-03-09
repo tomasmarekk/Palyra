@@ -14222,41 +14222,50 @@ async fn resolve_route_tool_approval_outcome(
     {
         if let Some(decision) = record.decision {
             let resolved_outcome = tool_approval_outcome_from_record(&record, decision);
-            runtime_state.remember_tool_approval(
-                route_request_context,
-                session_id,
-                approval_subject_id,
-                &resolved_outcome,
-            );
-            append_tool_approval_response_tape_event(
+            if matches!(resolved_outcome.decision_scope, ApprovalDecisionScope::Once) {
+                info!(
+                    approval_id = %record.approval_id,
+                    approval_subject_id,
+                    "skipping replay of once-scoped route tool approval"
+                );
+            } else {
+                runtime_state.remember_tool_approval(
+                    route_request_context,
+                    session_id,
+                    approval_subject_id,
+                    &resolved_outcome,
+                );
+                append_tool_approval_response_tape_event(
+                    runtime_state,
+                    run_id,
+                    tape_seq,
+                    proposal_id,
+                    resolved_outcome.approval_id.as_str(),
+                    resolved_outcome.approved,
+                    resolved_outcome.reason.as_str(),
+                    resolved_outcome.decision_scope,
+                    resolved_outcome.decision_scope_ttl_ms,
+                )
+                .await?;
+                return Ok(RouteToolApprovalResolution::Resolved(Some(resolved_outcome)));
+            }
+        }
+        if record.decision.is_none() {
+            append_tool_approval_request_tape_event(
                 runtime_state,
                 run_id,
                 tape_seq,
                 proposal_id,
-                resolved_outcome.approval_id.as_str(),
-                resolved_outcome.approved,
-                resolved_outcome.reason.as_str(),
-                resolved_outcome.decision_scope,
-                resolved_outcome.decision_scope_ttl_ms,
+                record.approval_id.as_str(),
+                tool_name,
+                input_json,
+                true,
+                record.request_summary.as_str(),
+                &record.prompt,
             )
             .await?;
-            return Ok(RouteToolApprovalResolution::Resolved(Some(resolved_outcome)));
+            return Ok(RouteToolApprovalResolution::Pending { approval_id: record.approval_id });
         }
-
-        append_tool_approval_request_tape_event(
-            runtime_state,
-            run_id,
-            tape_seq,
-            proposal_id,
-            record.approval_id.as_str(),
-            tool_name,
-            input_json,
-            true,
-            record.request_summary.as_str(),
-            &record.prompt,
-        )
-        .await?;
-        return Ok(RouteToolApprovalResolution::Pending { approval_id: record.approval_id });
     }
 
     let pending_approval = build_pending_tool_approval(
@@ -18642,6 +18651,95 @@ summarize incident";
             "re-cached approval should match resolved approval record id"
         );
         assert!(cached.approved, "re-cached route approval should preserve allow verdict");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolve_route_tool_approval_outcome_does_not_reuse_once_scope_record() {
+        let state = build_test_runtime_state(false);
+        let context = RequestContext {
+            principal: "user:ops".to_owned(),
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            channel: Some("cli".to_owned()),
+        };
+        let session_id = Ulid::new().to_string();
+        let approval_subject_id = "tool:palyra.process.run".to_owned();
+
+        let mut approval_request = build_test_approval_request(902);
+        approval_request.session_id = session_id.clone();
+        approval_request.run_id = Ulid::new().to_string();
+        approval_request.principal = context.principal.clone();
+        approval_request.device_id = context.device_id.clone();
+        approval_request.channel = context.channel.clone();
+        approval_request.subject_id = approval_subject_id.clone();
+        approval_request.prompt.subject_id = approval_subject_id.clone();
+        approval_request.request_summary = "route approval once scope".to_owned();
+
+        let created = state
+            .create_approval_record(approval_request)
+            .await
+            .expect("approval create should succeed");
+        state
+            .resolve_approval_record(ApprovalResolveRequest {
+                approval_id: created.approval_id.clone(),
+                decision: ApprovalDecision::Allow,
+                decision_scope: ApprovalDecisionScope::Once,
+                decision_reason: "allow_once".to_owned(),
+                decision_scope_ttl_ms: None,
+            })
+            .await
+            .expect("approval resolve should succeed");
+
+        let run_id = Ulid::new().to_string();
+        let proposal_id = Ulid::new().to_string();
+        let input_json = serde_json::to_vec(&json!({
+            "command": "echo",
+            "args": ["route-approval-once"]
+        }))
+        .expect("route approval input json should encode");
+        state
+            .journal_store
+            .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
+                session_id: session_id.clone(),
+                session_key: format!("route:{session_id}"),
+                session_label: Some("Route approval once test".to_owned()),
+                principal: context.principal.clone(),
+                device_id: context.device_id.clone(),
+                channel: context.channel.clone(),
+            })
+            .expect("orchestrator session should be upserted for route approval once test");
+        state
+            .start_orchestrator_run(OrchestratorRunStartRequest {
+                run_id: run_id.clone(),
+                session_id: session_id.clone(),
+            })
+            .await
+            .expect("run should be started for route approval once test");
+
+        let mut tape_seq = 1_i64;
+        let resolution = resolve_route_tool_approval_outcome(
+            &state,
+            &context,
+            session_id.as_str(),
+            run_id.as_str(),
+            proposal_id.as_str(),
+            "palyra.process.run",
+            input_json.as_slice(),
+            None,
+            approval_subject_id.as_str(),
+            true,
+            &mut tape_seq,
+        )
+        .await
+        .expect("route approval resolution should succeed for once-scoped record");
+
+        let fresh_approval_id = match resolution {
+            RouteToolApprovalResolution::Pending { approval_id } => approval_id,
+            other => panic!("expected a fresh pending approval request, got {other:?}"),
+        };
+        assert_ne!(
+            fresh_approval_id, created.approval_id,
+            "once-scoped approval should not be reused for a subsequent route proposal"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
