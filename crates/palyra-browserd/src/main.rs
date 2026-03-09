@@ -1014,6 +1014,13 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         } else {
             Duration::from_millis(payload.idle_ttl_ms)
         };
+        let requested_budget = payload.budget.as_ref();
+        let clamp_u64_budget = |requested: Option<u64>, default: u64| {
+            requested.filter(|value| *value > 0).map(|value| value.min(default)).unwrap_or(default)
+        };
+        let clamp_usize_budget = |requested: Option<usize>, default: usize| {
+            requested.filter(|value| *value > 0).map(|value| value.min(default)).unwrap_or(default)
+        };
         let budget = SessionBudget {
             max_navigation_timeout_ms: payload
                 .budget
@@ -1033,30 +1040,24 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                 .map(|value| value.max_screenshot_bytes)
                 .filter(|value| *value > 0)
                 .unwrap_or(self.runtime.default_budget.max_screenshot_bytes),
-            max_response_bytes: payload
-                .budget
-                .as_ref()
-                .map(|value| value.max_response_bytes)
-                .filter(|value| *value > 0)
-                .unwrap_or(self.runtime.default_budget.max_response_bytes),
+            max_response_bytes: clamp_u64_budget(
+                requested_budget.map(|value| value.max_response_bytes),
+                self.runtime.default_budget.max_response_bytes,
+            ),
             max_action_timeout_ms: payload
                 .budget
                 .as_ref()
                 .map(|value| value.max_action_timeout_ms)
                 .filter(|value| *value > 0)
                 .unwrap_or(self.runtime.default_budget.max_action_timeout_ms),
-            max_type_input_bytes: payload
-                .budget
-                .as_ref()
-                .map(|value| value.max_type_input_bytes)
-                .filter(|value| *value > 0)
-                .unwrap_or(self.runtime.default_budget.max_type_input_bytes),
-            max_actions_per_session: payload
-                .budget
-                .as_ref()
-                .map(|value| value.max_actions_per_session)
-                .filter(|value| *value > 0)
-                .unwrap_or(self.runtime.default_budget.max_actions_per_session),
+            max_type_input_bytes: clamp_u64_budget(
+                requested_budget.map(|value| value.max_type_input_bytes),
+                self.runtime.default_budget.max_type_input_bytes,
+            ),
+            max_actions_per_session: clamp_u64_budget(
+                requested_budget.map(|value| value.max_actions_per_session),
+                self.runtime.default_budget.max_actions_per_session,
+            ),
             max_actions_per_window: payload
                 .budget
                 .as_ref()
@@ -1069,13 +1070,12 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                 .map(|value| value.action_rate_window_ms)
                 .filter(|value| *value > 0)
                 .unwrap_or(self.runtime.default_budget.action_rate_window_ms),
-            max_action_log_entries: payload
-                .budget
-                .as_ref()
-                .map(|value| value.max_action_log_entries)
-                .and_then(|value| usize::try_from(value).ok())
-                .filter(|value| *value > 0)
-                .unwrap_or(self.runtime.default_budget.max_action_log_entries),
+            max_action_log_entries: clamp_usize_budget(
+                requested_budget
+                    .map(|value| value.max_action_log_entries)
+                    .and_then(|value| usize::try_from(value).ok()),
+                self.runtime.default_budget.max_action_log_entries,
+            ),
             max_observe_snapshot_bytes: payload
                 .budget
                 .as_ref()
@@ -8535,6 +8535,83 @@ mod tests {
                 || click.error.contains("failed to resolve host"),
             "allowlist refresh should reject stale Chromium redirects: {}",
             click.error
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn browser_service_clamps_untrusted_session_budgets() {
+        let runtime = std::sync::Arc::new(
+            BrowserRuntimeState::new(&Args {
+                bind: "127.0.0.1".to_owned(),
+                port: 7143,
+                grpc_bind: "127.0.0.1".to_owned(),
+                grpc_port: 7543,
+                auth_token: None,
+                session_idle_ttl_ms: 60_000,
+                max_sessions: 16,
+                max_navigation_timeout_ms: 10_000,
+                max_session_lifetime_ms: 60_000,
+                max_screenshot_bytes: 128 * 1024,
+                max_response_bytes: 128 * 1024,
+                max_title_bytes: 4 * 1024,
+                engine_mode: BrowserEngineMode::Simulated,
+                chromium_path: None,
+                chromium_startup_timeout_ms: DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS,
+            })
+            .expect("runtime should initialize"),
+        );
+        let default_budget = runtime.default_budget.clone();
+        let service = BrowserServiceImpl { runtime };
+        let created = service
+            .create_session(Request::new(browser_v1::CreateSessionRequest {
+                v: 1,
+                principal: "user:ops".to_owned(),
+                idle_ttl_ms: 10_000,
+                budget: Some(browser_v1::SessionBudget {
+                    max_navigation_timeout_ms: 0,
+                    max_session_lifetime_ms: 0,
+                    max_screenshot_bytes: 0,
+                    max_response_bytes: u64::MAX,
+                    max_action_timeout_ms: 0,
+                    max_type_input_bytes: u64::MAX,
+                    max_actions_per_session: u64::MAX,
+                    max_actions_per_window: 0,
+                    action_rate_window_ms: 0,
+                    max_action_log_entries: u64::MAX,
+                    max_observe_snapshot_bytes: 0,
+                    max_visible_text_bytes: 0,
+                    max_network_log_entries: 0,
+                    max_network_log_bytes: 0,
+                }),
+                allow_private_targets: true,
+                allow_downloads: false,
+                action_allowed_domains: Vec::new(),
+                persistence_enabled: false,
+                persistence_id: String::new(),
+                profile_id: None,
+                private_profile: false,
+                channel: String::new(),
+            }))
+            .await
+            .expect("create_session should succeed")
+            .into_inner();
+        let effective_budget =
+            created.effective_budget.expect("effective budget should be returned");
+        assert_eq!(
+            effective_budget.max_response_bytes, default_budget.max_response_bytes,
+            "untrusted session budgets must not widen max_response_bytes"
+        );
+        assert_eq!(
+            effective_budget.max_type_input_bytes, default_budget.max_type_input_bytes,
+            "untrusted session budgets must not widen max_type_input_bytes"
+        );
+        assert_eq!(
+            effective_budget.max_actions_per_session, default_budget.max_actions_per_session,
+            "untrusted session budgets must not widen max_actions_per_session"
+        );
+        assert_eq!(
+            effective_budget.max_action_log_entries, default_budget.max_action_log_entries as u64,
+            "untrusted session budgets must not widen max_action_log_entries"
         );
     }
 
