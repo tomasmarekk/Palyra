@@ -96,7 +96,9 @@ use palyra_common::{
     },
     daemon_config_schema::{redact_secret_config_values, RootFileConfig},
     default_config_search_paths, health_response, parse_config_path, parse_daemon_bind_socket,
-    redaction::{is_sensitive_key as redaction_key_is_sensitive, redact_auth_error, redact_url},
+    redaction::{
+        is_sensitive_key as redaction_key_is_sensitive, redact_auth_error, redact_url, REDACTED,
+    },
     validate_canonical_id, HealthResponse,
 };
 use palyra_control_plane as control_plane;
@@ -247,7 +249,7 @@ struct ConsoleActionContext {
     channel: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct OpenAiOAuthAttempt {
     attempt_id: String,
     expires_at_unix_ms: i64,
@@ -258,11 +260,33 @@ struct OpenAiOAuthAttempt {
     client_id: String,
     client_secret: String,
     scopes: Vec<String>,
-    token_endpoint: String,
+    token_endpoint: Url,
     code_verifier: String,
     set_default: bool,
     context: ConsoleActionContext,
     state: OpenAiOAuthAttemptStateRecord,
+}
+
+impl std::fmt::Debug for OpenAiOAuthAttempt {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OpenAiOAuthAttempt")
+            .field("attempt_id", &self.attempt_id)
+            .field("expires_at_unix_ms", &self.expires_at_unix_ms)
+            .field("redirect_uri", &redact_url(self.redirect_uri.as_str()))
+            .field("profile_id", &self.profile_id)
+            .field("profile_name", &self.profile_name)
+            .field("scope", &self.scope)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &REDACTED)
+            .field("scopes", &self.scopes)
+            .field("token_endpoint", &redact_url(self.token_endpoint.as_str()))
+            .field("code_verifier", &REDACTED)
+            .field("set_default", &self.set_default)
+            .field("context", &self.context)
+            .field("state", &self.state)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

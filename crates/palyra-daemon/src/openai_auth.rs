@@ -26,9 +26,9 @@ const MODELS_PATH: &str = "models";
 
 #[derive(Debug, Clone)]
 pub(crate) struct OpenAiOAuthEndpointConfig {
-    pub(crate) authorization_endpoint: String,
-    pub(crate) token_endpoint: String,
-    pub(crate) revocation_endpoint: String,
+    pub(crate) authorization_endpoint: Url,
+    pub(crate) token_endpoint: Url,
+    pub(crate) revocation_endpoint: Url,
 }
 
 #[derive(Debug, Clone)]
@@ -62,21 +62,24 @@ struct OAuthTokenExchangePayload {
     expires_in: Option<u64>,
 }
 
-pub(crate) fn oauth_endpoint_config_from_env() -> OpenAiOAuthEndpointConfig {
-    OpenAiOAuthEndpointConfig {
-        authorization_endpoint: env::var(ENV_OPENAI_AUTHORIZATION_ENDPOINT)
-            .ok()
-            .and_then(|value| normalize_optional_text(value.as_str()).map(str::to_owned))
-            .unwrap_or_else(|| OPENAI_AUTHORIZATION_ENDPOINT.to_owned()),
-        token_endpoint: env::var(ENV_OPENAI_TOKEN_ENDPOINT)
-            .ok()
-            .and_then(|value| normalize_optional_text(value.as_str()).map(str::to_owned))
-            .unwrap_or_else(|| OPENAI_TOKEN_ENDPOINT.to_owned()),
-        revocation_endpoint: env::var(ENV_OPENAI_REVOCATION_ENDPOINT)
-            .ok()
-            .and_then(|value| normalize_optional_text(value.as_str()).map(str::to_owned))
-            .unwrap_or_else(|| OPENAI_REVOCATION_ENDPOINT.to_owned()),
-    }
+pub(crate) fn oauth_endpoint_config_from_env() -> Result<OpenAiOAuthEndpointConfig> {
+    Ok(OpenAiOAuthEndpointConfig {
+        authorization_endpoint: load_openai_oauth_endpoint_from_env(
+            ENV_OPENAI_AUTHORIZATION_ENDPOINT,
+            OPENAI_AUTHORIZATION_ENDPOINT,
+            "authorization endpoint",
+        )?,
+        token_endpoint: load_openai_oauth_endpoint_from_env(
+            ENV_OPENAI_TOKEN_ENDPOINT,
+            OPENAI_TOKEN_ENDPOINT,
+            "token endpoint",
+        )?,
+        revocation_endpoint: load_openai_oauth_endpoint_from_env(
+            ENV_OPENAI_REVOCATION_ENDPOINT,
+            OPENAI_REVOCATION_ENDPOINT,
+            "revocation endpoint",
+        )?,
+    })
 }
 
 pub(crate) fn normalize_scopes(scopes: &[String]) -> Vec<String> {
@@ -102,15 +105,14 @@ pub(crate) fn pkce_challenge(verifier: &str) -> String {
 }
 
 pub(crate) fn build_authorization_url(
-    endpoint: &str,
+    endpoint: &Url,
     client_id: &str,
     redirect_uri: &str,
     scopes: &[String],
     code_challenge: &str,
     state: &str,
 ) -> Result<String> {
-    let mut url = Url::parse(endpoint)
-        .with_context(|| format!("invalid OpenAI authorization endpoint: {endpoint}"))?;
+    let mut url = endpoint.clone();
     {
         let mut pairs = url.query_pairs_mut();
         pairs.append_pair("response_type", "code");
@@ -126,7 +128,7 @@ pub(crate) fn build_authorization_url(
 }
 
 pub(crate) async fn exchange_authorization_code(
-    token_endpoint: &str,
+    token_endpoint: &Url,
     redirect_uri: &str,
     client_id: &str,
     client_secret: &str,
@@ -150,8 +152,11 @@ pub(crate) async fn exchange_authorization_code(
         form_fields.push(("client_secret", client_secret.to_owned()));
     }
     let response =
-        client.post(token_endpoint).form(&form_fields).send().await.with_context(|| {
-            format!("OpenAI OAuth token exchange request failed for {token_endpoint}")
+        client.post(token_endpoint.clone()).form(&form_fields).send().await.with_context(|| {
+            format!(
+                "OpenAI OAuth token exchange request failed for host {}",
+                token_endpoint.host_str().unwrap_or("<unknown>")
+            )
         })?;
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
@@ -229,7 +234,7 @@ pub(crate) async fn validate_openai_bearer_token(
 }
 
 pub(crate) async fn revoke_openai_token(
-    revocation_endpoint: &str,
+    revocation_endpoint: &Url,
     client_id: &str,
     client_secret: &str,
     token: &str,
@@ -245,9 +250,14 @@ pub(crate) async fn revoke_openai_token(
         form_fields.push(("client_secret", client_secret.to_owned()));
     }
     let response =
-        client.post(revocation_endpoint).form(&form_fields).send().await.with_context(|| {
-            format!("OpenAI OAuth revocation request failed for {revocation_endpoint}")
-        })?;
+        client.post(revocation_endpoint.clone()).form(&form_fields).send().await.with_context(
+            || {
+                format!(
+                    "OpenAI OAuth revocation request failed for host {}",
+                    revocation_endpoint.host_str().unwrap_or("<unknown>")
+                )
+            },
+        )?;
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
     if !status.is_success() {
@@ -296,6 +306,44 @@ fn normalize_optional_text(raw: &str) -> Option<&str> {
     }
 }
 
+fn load_openai_oauth_endpoint_from_env(
+    env_name: &str,
+    default_value: &str,
+    label: &str,
+) -> Result<Url> {
+    let raw = env::var(env_name)
+        .ok()
+        .and_then(|value| normalize_optional_text(value.as_str()).map(str::to_owned))
+        .unwrap_or_else(|| default_value.to_owned());
+    parse_openai_oauth_endpoint(raw.as_str(), label)
+        .with_context(|| format!("invalid OpenAI OAuth {label} from {env_name}"))
+}
+
+fn parse_openai_oauth_endpoint(raw: &str, label: &str) -> Result<Url> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("OpenAI OAuth {label} cannot be empty");
+    }
+    let parsed = Url::parse(trimmed)
+        .with_context(|| format!("OpenAI OAuth {label} must be a valid absolute URL"))?;
+    let host =
+        parsed.host_str().ok_or_else(|| anyhow!("OpenAI OAuth {label} must include a host"))?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        anyhow::bail!("OpenAI OAuth {label} must not include embedded credentials");
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        anyhow::bail!("OpenAI OAuth {label} must not include query or fragment");
+    }
+    let loopback_http_allowed = host.eq_ignore_ascii_case("localhost")
+        || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
+    if parsed.scheme() != "https" && !(parsed.scheme() == "http" && loopback_http_allowed) {
+        anyhow::bail!(
+            "OpenAI OAuth {label} must use https (http is only allowed for loopback hosts)"
+        );
+    }
+    Ok(parsed)
+}
+
 fn openai_models_endpoint(base_url: &str) -> Result<Url> {
     let mut normalized = base_url.trim().to_owned();
     if !normalized.ends_with('/') {
@@ -323,5 +371,31 @@ mod tests {
         let endpoint = openai_models_endpoint("https://example.test/custom/")
             .expect("base URL with trailing slash should build a models endpoint");
         assert_eq!(endpoint.as_str(), "https://example.test/custom/models");
+    }
+
+    #[test]
+    fn parse_openai_oauth_endpoint_rejects_query_and_fragment() {
+        let query_error = parse_openai_oauth_endpoint(
+            "https://auth.openai.com/authorize?client_secret=secret",
+            "authorization endpoint",
+        )
+        .expect_err("query-bearing authorization endpoint must be rejected");
+        let fragment_error = parse_openai_oauth_endpoint(
+            "https://auth.openai.com/authorize#secret",
+            "authorization endpoint",
+        )
+        .expect_err("fragment-bearing authorization endpoint must be rejected");
+        assert!(query_error.to_string().contains("query or fragment"));
+        assert!(fragment_error.to_string().contains("query or fragment"));
+    }
+
+    #[test]
+    fn parse_openai_oauth_endpoint_rejects_embedded_credentials() {
+        let error = parse_openai_oauth_endpoint(
+            "https://user:secret@auth.openai.com/oauth/token",
+            "token endpoint",
+        )
+        .expect_err("credential-bearing token endpoint must be rejected");
+        assert!(error.to_string().contains("embedded credentials"));
     }
 }

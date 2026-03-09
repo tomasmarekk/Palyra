@@ -70,31 +70,32 @@ pub(crate) async fn start_openai_oauth_attempt_from_request(
     headers: &HeaderMap,
     payload: control_plane::OpenAiOAuthBootstrapRequest,
 ) -> Result<control_plane::OpenAiOAuthBootstrapEnvelope, Response> {
-    let profile_name = payload
-        .profile_name
+    let control_plane::OpenAiOAuthBootstrapRequest {
+        profile_id: payload_profile_id,
+        profile_name: payload_profile_name,
+        scope: payload_scope,
+        client_id: payload_client_id,
+        client_secret: payload_client_secret,
+        scopes: payload_scopes,
+        set_default,
+    } = payload;
+    let profile_name = payload_profile_name
         .as_deref()
         .map(normalize_openai_profile_name)
         .transpose()?
         .unwrap_or_else(|| "OpenAI".to_owned());
-    let profile_id = payload
-        .profile_id
+    let profile_id = payload_profile_id
         .as_deref()
         .map(|value| normalize_openai_identifier(value, "profile_id"))
         .transpose()?
         .unwrap_or_else(|| generate_openai_profile_id(profile_name.as_str()));
-    let scope = normalize_openai_profile_scope(payload.scope)?;
+    let scope = normalize_openai_profile_scope(payload_scope)?;
     let client_id = normalize_required_openai_text(
-        payload.client_id.as_deref().unwrap_or_default(),
+        payload_client_id.as_deref().unwrap_or_default(),
         "client_id",
     )?;
-    let client_secret = payload
-        .client_secret
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-        .unwrap_or_default();
-    let scopes = normalize_scopes(&payload.scopes);
+    let client_secret = normalize_optional_openai_secret(payload_client_secret);
+    let scopes = normalize_scopes(&payload_scopes);
     start_openai_oauth_attempt(
         state,
         context,
@@ -105,7 +106,7 @@ pub(crate) async fn start_openai_oauth_attempt_from_request(
         client_id,
         client_secret,
         scopes,
-        payload.set_default,
+        set_default,
     )
 }
 
@@ -194,7 +195,7 @@ pub(crate) async fn complete_openai_oauth_callback(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| validation_error_response("code", "required", "code is required"))?;
     let token_result = match exchange_authorization_code(
-        attempt.token_endpoint.as_str(),
+        &attempt.token_endpoint,
         attempt.redirect_uri.as_str(),
         attempt.client_id.as_str(),
         attempt.client_secret.as_str(),
@@ -276,7 +277,7 @@ pub(crate) async fn complete_openai_oauth_callback(
         credential: control_plane::AuthCredentialView::Oauth {
             access_token_vault_ref,
             refresh_token_vault_ref,
-            token_endpoint: attempt.token_endpoint.clone(),
+            token_endpoint: attempt.token_endpoint.to_string(),
             client_id: Some(attempt.client_id.clone()),
             client_secret_vault_ref,
             scopes: attempt.scopes.clone(),
@@ -458,9 +459,15 @@ pub(crate) async fn revoke_openai_auth_profile(
                 .map(|vault_ref| load_vault_secret_utf8(state.vault.as_ref(), vault_ref, "client_secret"))
                 .transpose()?
                 .unwrap_or_default();
-            let revocation_endpoint = oauth_endpoint_config_from_env().revocation_endpoint;
+            let revocation_endpoint = oauth_endpoint_config_from_env()
+                .map_err(|error| {
+                    runtime_status_response(tonic::Status::internal(format!(
+                        "failed to load OpenAI OAuth endpoint config: {error}"
+                    )))
+                })?
+                .revocation_endpoint;
             revoke_openai_token(
-                revocation_endpoint.as_str(),
+                &revocation_endpoint,
                 client_id,
                 client_secret.as_str(),
                 refresh_token.as_str(),
@@ -560,12 +567,16 @@ fn start_openai_oauth_attempt(
     })?;
     let expires_at_unix_ms = now.saturating_add(OPENAI_OAUTH_ATTEMPT_TTL_MS);
     let attempt_id = Ulid::new().to_string().to_ascii_lowercase();
-    let endpoint_config = oauth_endpoint_config_from_env();
+    let endpoint_config = oauth_endpoint_config_from_env().map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "failed to load OpenAI OAuth endpoint config: {error}"
+        )))
+    })?;
     let redirect_uri = build_openai_oauth_callback_url(headers)?;
     let code_verifier = generate_pkce_verifier();
     let code_challenge = pkce_challenge(code_verifier.as_str());
     let authorization_url = build_authorization_url(
-        endpoint_config.authorization_endpoint.as_str(),
+        &endpoint_config.authorization_endpoint,
         client_id.as_str(),
         redirect_uri.as_str(),
         &scopes,
@@ -678,6 +689,10 @@ fn normalize_required_openai_text(raw: &str, field: &'static str) -> Result<Stri
         return Err(validation_error_response(field, "required", &format!("{field} is required")));
     }
     Ok(trimmed.to_owned())
+}
+
+fn normalize_optional_openai_secret(raw: Option<String>) -> String {
+    raw.unwrap_or_default().trim().to_owned()
 }
 
 #[allow(clippy::result_large_err)]
@@ -1299,7 +1314,8 @@ mod tests {
             client_id: "client".to_owned(),
             client_secret: String::new(),
             scopes: vec!["openid".to_owned()],
-            token_endpoint: "https://auth0.openai.com/oauth/token".to_owned(),
+            token_endpoint: Url::parse("https://auth0.openai.com/oauth/token")
+                .expect("token endpoint URL should parse"),
             code_verifier: "verifier".to_owned(),
             set_default: false,
             context: ConsoleActionContext {
@@ -1332,7 +1348,8 @@ mod tests {
             client_id: "client".to_owned(),
             client_secret: String::new(),
             scopes: vec!["openid".to_owned()],
-            token_endpoint: "https://auth0.openai.com/oauth/token".to_owned(),
+            token_endpoint: Url::parse("https://auth0.openai.com/oauth/token")
+                .expect("token endpoint URL should parse"),
             code_verifier: "verifier".to_owned(),
             set_default: false,
             context: ConsoleActionContext {

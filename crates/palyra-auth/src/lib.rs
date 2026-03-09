@@ -340,6 +340,11 @@ impl OAuthRefreshAdapter for HttpOAuthRefreshAdapter {
         &self,
         request: &OAuthRefreshRequest,
     ) -> Result<OAuthRefreshResponse, OAuthRefreshError> {
+        let token_endpoint = parse_oauth_token_endpoint_url(
+            request.token_endpoint.as_str(),
+            "oauth refresh request token_endpoint",
+        )
+        .map_err(OAuthRefreshError::Transport)?;
         let client = Client::builder()
             .timeout(self.timeout)
             .redirect(reqwest::redirect::Policy::none())
@@ -360,7 +365,7 @@ impl OAuthRefreshAdapter for HttpOAuthRefreshAdapter {
         }
 
         let response = client
-            .post(request.token_endpoint.as_str())
+            .post(token_endpoint)
             .form(&form_fields)
             .send()
             .map_err(|error| OAuthRefreshError::Transport(error.to_string()))?;
@@ -1561,41 +1566,12 @@ fn normalize_vault_ref(raw: &str, field: &'static str) -> Result<String, AuthPro
 }
 
 fn normalize_token_endpoint(raw: &str) -> Result<String, AuthProfileError> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(AuthProfileError::InvalidField {
+    parse_oauth_token_endpoint_url(raw, "oauth.token_endpoint")
+        .map_err(|message| AuthProfileError::InvalidField {
             field: "oauth.token_endpoint",
-            message: "value cannot be empty".to_owned(),
-        });
-    }
-    let parsed = Url::parse(trimmed).map_err(|error| AuthProfileError::InvalidField {
-        field: "oauth.token_endpoint",
-        message: format!("invalid URL: {error}"),
-    })?;
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err(AuthProfileError::InvalidField {
-            field: "oauth.token_endpoint",
-            message: "URL must not include username/password components".to_owned(),
-        });
-    }
-    match parsed.scheme() {
-        "https" => {}
-        "http" => {
-            if !is_loopback_endpoint(&parsed) {
-                return Err(AuthProfileError::InvalidField {
-                    field: "oauth.token_endpoint",
-                    message: "http URL is allowed only for loopback hosts".to_owned(),
-                });
-            }
-        }
-        _ => {
-            return Err(AuthProfileError::InvalidField {
-                field: "oauth.token_endpoint",
-                message: "URL scheme must be https, or http for loopback hosts".to_owned(),
-            });
-        }
-    }
-    Ok(parsed.to_string())
+            message,
+        })
+        .map(|parsed| parsed.to_string())
 }
 
 fn is_loopback_endpoint(parsed: &Url) -> bool {
@@ -1607,6 +1583,35 @@ fn is_loopback_endpoint(parsed: &Url) -> bool {
         return true;
     }
     normalized_host.parse::<IpAddr>().is_ok_and(|address| address.is_loopback())
+}
+
+fn parse_oauth_token_endpoint_url(raw: &str, _field_name: &'static str) -> Result<Url, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("value cannot be empty".to_owned());
+    }
+    let parsed = Url::parse(trimmed).map_err(|error| format!("invalid URL: {error}"))?;
+    if parsed.host_str().is_none() {
+        return Err("URL must include a host".to_owned());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("URL must not include username/password components".to_owned());
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err("URL must not include query or fragment components".to_owned());
+    }
+    match parsed.scheme() {
+        "https" => {}
+        "http" => {
+            if !is_loopback_endpoint(&parsed) {
+                return Err("http URL is allowed only for loopback hosts".to_owned());
+            }
+        }
+        _ => {
+            return Err("URL scheme must be https, or http for loopback hosts".to_owned());
+        }
+    }
+    Ok(parsed)
 }
 
 fn next_profile_updated_at(previous_updated_at_unix_ms: i64, now_unix_ms: i64) -> i64 {
@@ -2108,6 +2113,26 @@ mod tests {
     }
 
     #[test]
+    fn normalize_token_endpoint_rejects_query_and_fragment_components() {
+        let query_error = normalize_token_endpoint("https://example.test/oauth/token?token=secret")
+            .expect_err("query-bearing token endpoint must be rejected");
+        let fragment_error = normalize_token_endpoint("https://example.test/oauth/token#secret")
+            .expect_err("fragment-bearing token endpoint must be rejected");
+        assert!(matches!(
+            query_error,
+            AuthProfileError::InvalidField { field, message }
+                if field == "oauth.token_endpoint"
+                    && message.contains("query or fragment")
+        ));
+        assert!(matches!(
+            fragment_error,
+            AuthProfileError::InvalidField { field, message }
+                if field == "oauth.token_endpoint"
+                    && message.contains("query or fragment")
+        ));
+    }
+
+    #[test]
     fn oauth_refresh_adapter_does_not_follow_redirects() {
         let (token_endpoint, redirect_thread) =
             spawn_redirect_server("http://127.0.0.1:0/oauth/token".to_owned());
@@ -2127,6 +2152,26 @@ mod tests {
             Err(OAuthRefreshError::HttpStatus { status }) if status == 307
         ));
         redirect_thread.join().expect("redirect test server thread should exit cleanly");
+    }
+
+    #[test]
+    fn oauth_refresh_adapter_rejects_query_bearing_endpoint() {
+        let adapter = HttpOAuthRefreshAdapter::with_timeout(Duration::from_secs(2))
+            .expect("HTTP adapter should initialize");
+        let request = OAuthRefreshRequest {
+            provider: AuthProvider::known(AuthProviderKind::Openai),
+            token_endpoint: "https://example.test/oauth/token?token=secret".to_owned(),
+            client_id: Some("test-client".to_owned()),
+            client_secret: Some("test-secret".to_owned()),
+            refresh_token: "refresh-token".to_owned(),
+            scopes: vec!["chat:read".to_owned()],
+        };
+        let result = adapter.refresh_access_token(&request);
+        assert!(matches!(
+            result,
+            Err(OAuthRefreshError::Transport(message))
+                if message.contains("query or fragment")
+        ));
     }
 
     #[test]
