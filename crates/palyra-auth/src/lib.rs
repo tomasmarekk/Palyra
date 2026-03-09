@@ -1,12 +1,13 @@
 use std::{
     collections::BTreeMap,
     env, fs,
-    net::IpAddr,
+    net::{IpAddr, ToSocketAddrs},
     path::{Component, Path, PathBuf},
     sync::Mutex,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use palyra_common::netguard;
 use palyra_vault::{Vault, VaultError, VaultRef};
 use reqwest::{blocking::Client, Url};
 use serde::{Deserialize, Serialize};
@@ -340,14 +341,11 @@ impl OAuthRefreshAdapter for HttpOAuthRefreshAdapter {
         &self,
         request: &OAuthRefreshRequest,
     ) -> Result<OAuthRefreshResponse, OAuthRefreshError> {
-        let token_endpoint = parse_oauth_token_endpoint_url(
-            request.token_endpoint.as_str(),
-            "oauth refresh request token_endpoint",
-        )
-        .map_err(OAuthRefreshError::Transport)?;
+        let token_endpoint = validate_runtime_token_endpoint(request.token_endpoint.as_str())?;
         let client = Client::builder()
             .timeout(self.timeout)
             .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
             .build()
             .map_err(|error| OAuthRefreshError::Transport(error.to_string()))?;
         let mut form_fields = vec![
@@ -1601,7 +1599,12 @@ fn parse_oauth_token_endpoint_url(raw: &str, _field_name: &'static str) -> Resul
         return Err("URL must not include query or fragment components".to_owned());
     }
     match parsed.scheme() {
-        "https" => {}
+        "https" => {
+            let host = parsed.host_str().ok_or_else(|| "URL must include a host".to_owned())?;
+            if token_endpoint_targets_private_host_literal(host)? {
+                return Err("https URL must not target localhost/private network hosts".to_owned());
+            }
+        }
         "http" => {
             if !is_loopback_endpoint(&parsed) {
                 return Err("http URL is allowed only for loopback hosts".to_owned());
@@ -1611,6 +1614,53 @@ fn parse_oauth_token_endpoint_url(raw: &str, _field_name: &'static str) -> Resul
             return Err("URL scheme must be https, or http for loopback hosts".to_owned());
         }
     }
+    Ok(parsed)
+}
+
+fn token_endpoint_targets_private_host_literal(host: &str) -> Result<bool, String> {
+    if netguard::is_localhost_hostname(host) {
+        return Ok(true);
+    }
+    Ok(netguard::parse_host_ip_literal(host)?.is_some_and(netguard::is_private_or_local_ip))
+}
+
+fn resolve_token_endpoint_addresses(host: &str, port: u16) -> std::io::Result<Vec<IpAddr>> {
+    (host, port).to_socket_addrs().map(|resolved| resolved.map(|address| address.ip()).collect())
+}
+
+fn validate_runtime_token_endpoint(url: &str) -> Result<Url, OAuthRefreshError> {
+    validate_runtime_token_endpoint_with_resolver(url, resolve_token_endpoint_addresses)
+}
+
+fn validate_runtime_token_endpoint_with_resolver<F>(
+    url: &str,
+    resolver: F,
+) -> Result<Url, OAuthRefreshError>
+where
+    F: Fn(&str, u16) -> std::io::Result<Vec<IpAddr>>,
+{
+    let parsed = parse_oauth_token_endpoint_url(url, "oauth refresh request token_endpoint")
+        .map_err(OAuthRefreshError::Transport)?;
+    if parsed.scheme() == "http" {
+        return Ok(parsed);
+    }
+
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| OAuthRefreshError::Transport("URL must include a host".to_owned()))?;
+    let port = parsed.port_or_known_default().ok_or_else(|| {
+        OAuthRefreshError::Transport("token endpoint URL must use a known default port".to_owned())
+    })?;
+    let resolved = resolver(host, port).map_err(|error| {
+        OAuthRefreshError::Transport(format!(
+            "oauth token endpoint host could not be resolved to enforce network policy: {error}"
+        ))
+    })?;
+    netguard::validate_resolved_ip_addrs(resolved.as_slice(), false).map_err(|error| {
+        OAuthRefreshError::Transport(format!(
+            "oauth token endpoint host violates network policy: {error}"
+        ))
+    })?;
     Ok(parsed)
 }
 
@@ -1761,10 +1811,11 @@ fn unix_ms_now() -> Result<i64, AuthProfileError> {
 mod tests {
     use super::{
         compute_backoff_ms, load_secret_utf8, normalize_optional_text, normalize_token_endpoint,
-        persist_secret_utf8, AuthCredential, AuthProfileError, AuthProfileListFilter,
-        AuthProfileRegistry, AuthProfileScope, AuthProfileSetRequest, AuthProvider,
-        AuthProviderKind, HttpOAuthRefreshAdapter, OAuthRefreshAdapter, OAuthRefreshError,
-        OAuthRefreshOutcomeKind, OAuthRefreshRequest, OAuthRefreshResponse, OAuthRefreshState,
+        persist_secret_utf8, validate_runtime_token_endpoint_with_resolver, AuthCredential,
+        AuthProfileError, AuthProfileListFilter, AuthProfileRegistry, AuthProfileScope,
+        AuthProfileSetRequest, AuthProvider, AuthProviderKind, HttpOAuthRefreshAdapter,
+        OAuthRefreshAdapter, OAuthRefreshError, OAuthRefreshOutcomeKind, OAuthRefreshRequest,
+        OAuthRefreshResponse, OAuthRefreshState,
     };
     use palyra_vault::Vault;
     use palyra_vault::{
@@ -1772,7 +1823,7 @@ mod tests {
     };
     use std::fs;
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{IpAddr, Ipv4Addr, TcpListener};
     use std::path::{Path, PathBuf};
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
@@ -2092,6 +2143,26 @@ mod tests {
     }
 
     #[test]
+    fn normalize_token_endpoint_rejects_https_private_targets() {
+        let localhost_error = normalize_token_endpoint("https://localhost/oauth/token")
+            .expect_err("https localhost token endpoint must be rejected");
+        let private_ip_error = normalize_token_endpoint("https://127.0.0.1/oauth/token")
+            .expect_err("https private ip token endpoint must be rejected");
+        assert!(matches!(
+            localhost_error,
+            AuthProfileError::InvalidField { field, message }
+                if field == "oauth.token_endpoint"
+                    && message.contains("localhost/private network")
+        ));
+        assert!(matches!(
+            private_ip_error,
+            AuthProfileError::InvalidField { field, message }
+                if field == "oauth.token_endpoint"
+                    && message.contains("localhost/private network")
+        ));
+    }
+
+    #[test]
     fn normalize_token_endpoint_rejects_userinfo_components() {
         let username_error = normalize_token_endpoint("https://user@example.test/oauth/token")
             .expect_err("username in URL should be rejected");
@@ -2171,6 +2242,20 @@ mod tests {
             result,
             Err(OAuthRefreshError::Transport(message))
                 if message.contains("query or fragment")
+        ));
+    }
+
+    #[test]
+    fn oauth_refresh_runtime_validation_rejects_https_hostnames_resolving_private_addresses() {
+        let result = validate_runtime_token_endpoint_with_resolver(
+            "https://auth.example.test/oauth/token",
+            |_host, _port| Ok(vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))]),
+        );
+        assert!(matches!(
+            result,
+            Err(OAuthRefreshError::Transport(message))
+                if message.contains("network policy")
+                    || message.contains("private/local")
         ));
     }
 
