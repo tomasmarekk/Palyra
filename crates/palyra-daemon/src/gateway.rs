@@ -14144,32 +14144,6 @@ async fn process_run_stream_provider_response(
 }
 
 #[allow(clippy::result_large_err)]
-async fn find_latest_route_tool_approval_record(
-    runtime_state: &Arc<GatewayRuntimeState>,
-    route_request_context: &RequestContext,
-    session_id: &str,
-    approval_subject_id: &str,
-) -> Result<Option<ApprovalRecord>, Status> {
-    let (records, _) = runtime_state
-        .list_approval_records(
-            None,
-            Some(MAX_APPROVAL_PAGE_LIMIT),
-            None,
-            None,
-            Some(approval_subject_id.to_owned()),
-            Some(route_request_context.principal.clone()),
-            None,
-            Some(ApprovalSubjectType::Tool),
-        )
-        .await?;
-    Ok(records.into_iter().rev().find(|record| {
-        record.session_id == session_id
-            && record.device_id == route_request_context.device_id
-            && record.channel == route_request_context.channel
-    }))
-}
-
-#[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 async fn resolve_route_tool_approval_outcome(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -14180,92 +14154,12 @@ async fn resolve_route_tool_approval_outcome(
     tool_name: &str,
     input_json: &[u8],
     skill_context: Option<&ToolSkillContext>,
-    approval_subject_id: &str,
+    _approval_subject_id: &str,
     proposal_approval_required: bool,
     tape_seq: &mut i64,
 ) -> Result<RouteToolApprovalResolution, Status> {
-    if let Some(cached_outcome) = resolve_cached_tool_approval_for_proposal(
-        runtime_state,
-        route_request_context,
-        session_id,
-        approval_subject_id,
-        proposal_approval_required,
-        run_id,
-        proposal_id,
-        "route message",
-    ) {
-        append_tool_approval_response_tape_event(
-            runtime_state,
-            run_id,
-            tape_seq,
-            proposal_id,
-            cached_outcome.approval_id.as_str(),
-            cached_outcome.approved,
-            cached_outcome.reason.as_str(),
-            cached_outcome.decision_scope,
-            cached_outcome.decision_scope_ttl_ms,
-        )
-        .await?;
-        return Ok(RouteToolApprovalResolution::Resolved(Some(cached_outcome)));
-    }
     if !proposal_approval_required {
         return Ok(RouteToolApprovalResolution::Resolved(None));
-    }
-
-    if let Some(record) = find_latest_route_tool_approval_record(
-        runtime_state,
-        route_request_context,
-        session_id,
-        approval_subject_id,
-    )
-    .await?
-    {
-        if let Some(decision) = record.decision {
-            let resolved_outcome = tool_approval_outcome_from_record(&record, decision);
-            if matches!(resolved_outcome.decision_scope, ApprovalDecisionScope::Once) {
-                info!(
-                    approval_id = %record.approval_id,
-                    approval_subject_id,
-                    "skipping replay of once-scoped route tool approval"
-                );
-            } else {
-                runtime_state.remember_tool_approval(
-                    route_request_context,
-                    session_id,
-                    approval_subject_id,
-                    &resolved_outcome,
-                );
-                append_tool_approval_response_tape_event(
-                    runtime_state,
-                    run_id,
-                    tape_seq,
-                    proposal_id,
-                    resolved_outcome.approval_id.as_str(),
-                    resolved_outcome.approved,
-                    resolved_outcome.reason.as_str(),
-                    resolved_outcome.decision_scope,
-                    resolved_outcome.decision_scope_ttl_ms,
-                )
-                .await?;
-                return Ok(RouteToolApprovalResolution::Resolved(Some(resolved_outcome)));
-            }
-        }
-        if record.decision.is_none() {
-            append_tool_approval_request_tape_event(
-                runtime_state,
-                run_id,
-                tape_seq,
-                proposal_id,
-                record.approval_id.as_str(),
-                tool_name,
-                input_json,
-                true,
-                record.request_summary.as_str(),
-                &record.prompt,
-            )
-            .await?;
-            return Ok(RouteToolApprovalResolution::Pending { approval_id: record.approval_id });
-        }
     }
 
     let pending_approval = build_pending_tool_approval(
@@ -18419,7 +18313,7 @@ summarize incident";
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn resolve_route_tool_approval_outcome_reuses_pending_record_across_retries() {
+    async fn resolve_route_tool_approval_outcome_does_not_reuse_pending_record_across_retries() {
         let state = build_test_runtime_state(false);
         let context = RequestContext {
             principal: "user:ops".to_owned(),
@@ -18502,11 +18396,11 @@ summarize incident";
         .expect("second route approval resolution should succeed");
         let second_approval_id = match second_resolution {
             RouteToolApprovalResolution::Pending { approval_id } => approval_id,
-            other => panic!("expected pending approval reuse, got {other:?}"),
+            other => panic!("expected a fresh pending approval, got {other:?}"),
         };
-        assert_eq!(
+        assert_ne!(
             second_approval_id, first_approval_id,
-            "route retries should deterministically reuse the same pending approval record"
+            "route retries should create a fresh approval record instead of reusing prior pending state"
         );
 
         let (records, _) = state
@@ -18532,17 +18426,17 @@ summarize incident";
             .collect::<Vec<_>>();
         assert_eq!(
             matching.len(),
-            1,
-            "route retries should not create duplicate pending approval records"
+            2,
+            "route retries should create distinct pending approval records for each proposal"
         );
         assert!(
-            matching[0].decision.is_none(),
-            "pending approval should remain unresolved until operator decision"
+            matching.iter().all(|record| record.decision.is_none()),
+            "route approval records should remain unresolved until an operator acts on each proposal"
         );
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn resolve_route_tool_approval_outcome_rehydrates_resolved_record_into_cache() {
+    async fn resolve_route_tool_approval_outcome_does_not_rehydrate_resolved_record_into_cache() {
         let state = build_test_runtime_state(false);
         let context = RequestContext {
             principal: "user:ops".to_owned(),
@@ -18629,28 +18523,25 @@ summarize incident";
         )
         .await
         .expect("route approval resolution should succeed for resolved record");
-        let outcome = match resolution {
-            RouteToolApprovalResolution::Resolved(Some(outcome)) => outcome,
-            other => panic!("expected resolved approval outcome, got {other:?}"),
+        let new_pending_approval_id = match resolution {
+            RouteToolApprovalResolution::Pending { approval_id } => approval_id,
+            other => panic!("expected pending approval outcome, got {other:?}"),
         };
-        assert!(outcome.approved, "resolved allow decision should remain approved");
-        assert_eq!(
-            outcome.approval_id, created.approval_id,
-            "route rehydration should use the existing resolved approval record"
+        assert_ne!(
+            new_pending_approval_id, created.approval_id,
+            "route flow must not reuse a previously resolved approval record"
         );
 
-        let cached = state
-            .resolve_cached_tool_approval(
-                &context,
-                session_id.as_str(),
-                approval_subject_id.as_str(),
-            )
-            .expect("resolved route approval should be re-cached for deterministic retries");
-        assert_eq!(
-            cached.approval_id, created.approval_id,
-            "re-cached approval should match resolved approval record id"
+        assert!(
+            state
+                .resolve_cached_tool_approval(
+                    &context,
+                    session_id.as_str(),
+                    approval_subject_id.as_str(),
+                )
+                .is_none(),
+            "route approval resolution should not populate cache from historical resolved records"
         );
-        assert!(cached.approved, "re-cached route approval should preserve allow verdict");
     }
 
     #[tokio::test(flavor = "multi_thread")]

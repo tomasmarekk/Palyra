@@ -1574,7 +1574,7 @@ async fn grpc_route_message_executes_allowlisted_memory_search_tool() -> Result<
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn grpc_route_message_reuses_cached_tool_approval_from_run_stream() -> Result<()> {
+async fn grpc_route_message_does_not_reuse_cached_tool_approval_from_run_stream() -> Result<()> {
     const ROUTE_SESSION_KEY: &str = "channel:cli:conversation:adapter-conv-1";
 
     let response_body = openai_tool_call_response(
@@ -1753,12 +1753,12 @@ async fn grpc_route_message_reuses_cached_tool_approval_from_run_stream() -> Res
         .cloned()
         .context("second route response should include outbound payload")?;
     assert!(
-        second_outbound.text.contains("tool=palyra.process.run"),
-        "second route should execute palyra.process.run after cached approval reuse"
+        second_outbound.text.to_ascii_lowercase().contains("approval required"),
+        "second route should still fail-closed even when a run-stream approval is cached"
     );
     assert!(
-        !second_outbound.text.to_ascii_lowercase().contains("approval required"),
-        "second route should not fail due missing approval when cache is available"
+        second_outbound.text.contains("tool=palyra.process.run success=false"),
+        "second route should report a denied tool proposal instead of successful execution"
     );
 
     let status_after_second_route =
@@ -1769,8 +1769,8 @@ async fn grpc_route_message_reuses_cached_tool_approval_from_run_stream() -> Res
         .context("status snapshot missing tool_execution_attempts after second route")?;
     assert_eq!(
         attempts_after,
-        attempts_before.saturating_add(1),
-        "second route should increase tool execution attempts when cached approval is reused"
+        attempts_before,
+        "second route should not increase tool execution attempts when cached approvals are ignored"
     );
 
     let policy_events = load_policy_decision_journal_events(&journal_db_path)?;
@@ -1791,9 +1791,14 @@ async fn grpc_route_message_reuses_cached_tool_approval_from_run_stream() -> Res
         policy_events.iter().any(|payload| {
             payload.get("_run_id").and_then(Value::as_str) == Some(second_route_run_id.as_str())
                 && payload.get("tool_name").and_then(Value::as_str) == Some("palyra.process.run")
-                && payload.get("kind").and_then(Value::as_str) == Some("allow")
+                && payload.get("kind").and_then(Value::as_str) == Some("deny")
+                && payload
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .map(|reason| reason.contains("approval required"))
+                    .unwrap_or(false)
         }),
-        "second route run should persist allow policy decision when cached approval is reused"
+        "second route run should persist a deny policy decision instead of reusing cached approval state"
     );
 
     server_handle.join().expect("scripted openai server thread should exit");
