@@ -24,7 +24,7 @@ if ((Test-Path -LiteralPath $InstallRoot) -and -not $Force) {
 }
 
 $installRoot = New-CleanDirectory -Path $InstallRoot
-Expand-Archive -LiteralPath $archivePath -DestinationPath $installRoot -Force
+Expand-ZipArchiveSafely -ArchivePath $archivePath -DestinationPath $installRoot
 
 $configParent = Split-Path -Parent $ConfigPath
 if ($configParent) {

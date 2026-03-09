@@ -19,7 +19,7 @@ if ((Test-Path -LiteralPath $InstallRoot) -and -not $Force) {
 }
 
 $installRoot = New-CleanDirectory -Path $InstallRoot
-Expand-Archive -LiteralPath $archivePath -DestinationPath $installRoot -Force
+Expand-ZipArchiveSafely -ArchivePath $archivePath -DestinationPath $installRoot
 
 $cliBinary = Join-Path $installRoot (Resolve-ExecutableName -BaseName "palyra")
 $daemonBinary = Join-Path $installRoot (Resolve-ExecutableName -BaseName "palyrad")

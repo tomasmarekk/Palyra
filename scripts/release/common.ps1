@@ -118,8 +118,53 @@ function Expand-ZipToTemporaryDirectory {
 
     $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ("palyra-release-" + [guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null
-    Expand-Archive -LiteralPath $ArchivePath -DestinationPath $tempRoot -Force
+    Expand-ZipArchiveSafely -ArchivePath $ArchivePath -DestinationPath $tempRoot
     return $tempRoot
+}
+
+function Expand-ZipArchiveSafely {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ArchivePath,
+        [Parameter(Mandatory = $true)]
+        [string]$DestinationPath
+    )
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+    $archivePath = Assert-FileExists -Path $ArchivePath -Label "Archive"
+    New-Item -ItemType Directory -Path $DestinationPath -Force | Out-Null
+
+    $destinationRoot = [IO.Path]::GetFullPath($DestinationPath)
+    if (-not $destinationRoot.EndsWith([IO.Path]::DirectorySeparatorChar)) {
+        $destinationRoot += [IO.Path]::DirectorySeparatorChar
+    }
+    $pathComparison =
+        if ($IsWindows) {
+            [StringComparison]::OrdinalIgnoreCase
+        } else {
+            [StringComparison]::Ordinal
+        }
+
+    $archive = [System.IO.Compression.ZipFile]::OpenRead($archivePath)
+    try {
+        foreach ($entry in $archive.Entries) {
+            $entryPath = $entry.FullName
+            if ([IO.Path]::IsPathRooted($entryPath)) {
+                throw "Archive contains an absolute path entry: '$entryPath'"
+            }
+
+            $expandedPath = [IO.Path]::GetFullPath((Join-Path $destinationRoot $entryPath))
+            if (-not $expandedPath.StartsWith($destinationRoot, $pathComparison)) {
+                throw "Archive contains a path traversal entry: '$entryPath'"
+            }
+        }
+    }
+    finally {
+        $archive.Dispose()
+    }
+
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($archivePath, $destinationRoot, $true)
 }
 
 function Get-WorkspaceVersion {
