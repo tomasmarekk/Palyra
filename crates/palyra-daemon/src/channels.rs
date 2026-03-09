@@ -724,7 +724,9 @@ impl ConnectorRouter for GrpcChannelRouter {
                     attachments: message_attachments,
                 }),
                 security: None,
-                max_payload_bytes: u64::try_from(content_text.len()).unwrap_or(u64::MAX),
+                max_payload_bytes: route_message_max_payload_bytes(
+                    &ConnectorSupervisorConfig::default(),
+                ),
             }),
             is_direct_message: event.is_direct_message,
             request_broadcast: event.requested_broadcast,
@@ -800,6 +802,10 @@ impl ConnectorRouter for GrpcChannelRouter {
             route_message_latency_ms: Some(route_message_latency_ms),
         })
     }
+}
+
+fn route_message_max_payload_bytes(config: &ConnectorSupervisorConfig) -> u64 {
+    u64::try_from(config.max_outbound_body_bytes).unwrap_or(u64::MAX)
 }
 
 #[allow(clippy::result_large_err)]
@@ -990,15 +996,16 @@ fn unix_ms_now() -> i64 {
 mod tests {
     use palyra_connectors::{
         AttachmentKind, AttachmentRef, ConnectorAvailability, ConnectorInstanceSpec, ConnectorKind,
-        ConnectorSupervisorError,
+        ConnectorSupervisorConfig, ConnectorSupervisorError,
     };
     use tempfile::TempDir;
 
     use super::{
         default_connector_specs, discord, discord_connector_id, discord_token_vault_ref,
         from_proto_a2ui_update, normalize_discord_account_id, render_attachment_context,
-        resolve_connector_gateway_auth, to_proto_message_attachments, with_attachment_context,
-        ChannelPlatform, ChannelPlatformError,
+        resolve_connector_gateway_auth, route_message_max_payload_bytes,
+        to_proto_message_attachments, with_attachment_context, ChannelPlatform,
+        ChannelPlatformError,
     };
     use crate::gateway::GatewayAuthConfig;
     use crate::media::MediaRuntimeConfig;
@@ -1229,6 +1236,23 @@ mod tests {
         assert!(
             matches!(error, ConnectorSupervisorError::Router(_)),
             "missing token should be surfaced as router error for deterministic channel logs"
+        );
+    }
+
+    #[test]
+    fn route_message_max_payload_bytes_uses_supervisor_outbound_limit() {
+        let config = ConnectorSupervisorConfig {
+            max_outbound_body_bytes: 4_096,
+            ..ConnectorSupervisorConfig::default()
+        };
+        let max_payload_bytes = route_message_max_payload_bytes(&config);
+        assert_eq!(
+            max_payload_bytes, 4_096,
+            "route requests should inherit the connector outbound payload budget"
+        );
+        assert_ne!(
+            max_payload_bytes, 5,
+            "route reply chunking must not collapse to the size of a short inbound prompt"
         );
     }
 
