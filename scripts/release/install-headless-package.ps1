@@ -39,11 +39,11 @@ $browserBinary = Join-Path $installRoot (Resolve-ExecutableName -BaseName "palyr
 $previousStateRoot = $env:PALYRA_STATE_ROOT
 try {
     $env:PALYRA_STATE_ROOT = $StateRoot
-    & $cliBinary version | Out-Null
-    & $daemonBinary --help | Out-Null
-    & $browserBinary --help | Out-Null
-    & $cliBinary init --mode remote --path $ConfigPath --force | Out-Null
-    & $cliBinary config validate --path $ConfigPath | Out-Null
+    Invoke-ExecutableQuiet -ExecutablePath $cliBinary -Arguments @("version")
+    Invoke-ExecutableQuiet -ExecutablePath $daemonBinary -Arguments @("--help")
+    Invoke-ExecutableQuiet -ExecutablePath $browserBinary -Arguments @("--help")
+    Invoke-ExecutableQuiet -ExecutablePath $cliBinary -Arguments @("init", "--mode", "remote", "--path", $ConfigPath, "--force")
+    Invoke-ExecutableQuiet -ExecutablePath $cliBinary -Arguments @("config", "validate", "--path", $ConfigPath)
 }
 finally {
     if ($null -eq $previousStateRoot) {

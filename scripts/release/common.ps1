@@ -135,3 +135,13 @@ function Get-WorkspaceVersion {
     }
     return $workspaceMatch.Groups["version"].Value
 }
+
+function Invoke-ExecutableQuiet {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ExecutablePath,
+        [string[]]$Arguments = @()
+    )
+
+    $null = & $ExecutablePath @Arguments
+}

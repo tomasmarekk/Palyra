@@ -25,9 +25,9 @@ $cliBinary = Join-Path $installRoot (Resolve-ExecutableName -BaseName "palyra")
 $daemonBinary = Join-Path $installRoot (Resolve-ExecutableName -BaseName "palyrad")
 $browserBinary = Join-Path $installRoot (Resolve-ExecutableName -BaseName "palyra-browserd")
 
-& $cliBinary version | Out-Null
-& $daemonBinary --help | Out-Null
-& $browserBinary --help | Out-Null
+Invoke-ExecutableQuiet -ExecutablePath $cliBinary -Arguments @("version")
+Invoke-ExecutableQuiet -ExecutablePath $daemonBinary -Arguments @("--help")
+Invoke-ExecutableQuiet -ExecutablePath $browserBinary -Arguments @("--help")
 
 $metadata = [ordered]@{
     installed_at_utc = (Get-Date).ToUniversalTime().ToString("o")
