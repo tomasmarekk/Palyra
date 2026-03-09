@@ -84,22 +84,78 @@ sha256_file() {
   exit 1
 }
 
-extract_lock_package_block() {
-  local lockfile="$1"
-  local package_name="$2"
-  local package_version="$3"
+select_python_interpreter() {
+  if command -v python3 >/dev/null 2>&1; then
+    printf '%s\n' python3
+    return 0
+  fi
+  if command -v python >/dev/null 2>&1; then
+    printf '%s\n' python
+    return 0
+  fi
+  echo "python3 or python is required for desktop glib metadata validation." >&2
+  exit 1
+}
 
-  awk -v target_name="$package_name" -v target_version="$package_version" '
-    BEGIN { RS="\\[\\[package\\]\\]\n"; ORS="" }
-    NR == 1 { next }
-    {
-      block = "[[package]]\n" $0
-      if (block ~ "name = \"" target_name "\"" && block ~ "version = \"" target_version "\"") {
-        print block
-        exit
-      }
-    }
-  ' "$lockfile"
+assert_resolved_vendored_glib() {
+  local manifest_path="$1"
+  local expected_crate_name="$2"
+  local expected_crate_version="$3"
+  local expected_patch_dir="$4"
+  local python_bin
+  python_bin="$(select_python_interpreter)"
+
+  local metadata_json
+  if ! metadata_json="$(cargo metadata --format-version 1 --locked --manifest-path "$manifest_path")"; then
+    echo "Failed to load Cargo metadata for desktop app." >&2
+    exit 1
+  fi
+
+  local metadata_validator
+  metadata_validator="$(cat <<'PY'
+import json
+import os
+import sys
+
+crate_name = sys.argv[1]
+crate_version = sys.argv[2]
+expected_patch_dir = os.path.realpath(sys.argv[3])
+expected_manifest = os.path.join(expected_patch_dir, "Cargo.toml")
+
+packages = json.load(sys.stdin).get("packages", [])
+matches = [
+    pkg for pkg in packages
+    if pkg.get("name") == crate_name and pkg.get("version") == crate_version
+]
+
+if not matches:
+    print("Desktop dependency graph no longer contains the expected glib package entry.", file=sys.stderr)
+    sys.exit(1)
+
+for pkg in matches:
+    pkg_source = pkg.get("source")
+    if pkg_source:
+        print(f"Desktop dependency graph resolves glib from unexpected source: {pkg_source}", file=sys.stderr)
+        sys.exit(1)
+
+    manifest_path = os.path.realpath(pkg.get("manifest_path", ""))
+    if manifest_path != expected_manifest:
+        print(
+            "Desktop dependency graph resolves glib from an unexpected path "
+            f"({manifest_path}) instead of {expected_manifest}.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+PY
+)"
+
+  if ! "$python_bin" -c "$metadata_validator" \
+      "$expected_crate_name" \
+      "$expected_crate_version" \
+      "$expected_patch_dir" \
+      <<<"$metadata_json"; then
+    exit 1
+  fi
 }
 
 patch_sha256="$(sha256_file "$patch_file")"
@@ -125,16 +181,11 @@ if ! grep -F '&mut p,' "$patch_file" >/dev/null; then
   exit 1
 fi
 
-glib_lock_block="$(extract_lock_package_block "$desktop_lockfile" "$PALYRA_GLIB_PATCH_CRATE_NAME" "$PALYRA_GLIB_PATCH_CRATE_VERSION")"
-if [[ -z "$glib_lock_block" ]]; then
-  echo "Desktop Cargo.lock no longer contains the expected glib package entry." >&2
-  exit 1
-fi
-
-if printf '%s' "$glib_lock_block" | grep -F 'source = "registry+https://github.com/rust-lang/crates.io-index"' >/dev/null; then
-  echo "Desktop Cargo.lock resolves glib from crates.io instead of the vendored patched path." >&2
-  exit 1
-fi
+assert_resolved_vendored_glib \
+  "$desktop_manifest" \
+  "$PALYRA_GLIB_PATCH_CRATE_NAME" \
+  "$PALYRA_GLIB_PATCH_CRATE_VERSION" \
+  "$patch_dir"
 
 echo "Desktop glib patch governance check passed."
 echo "crate=${PALYRA_GLIB_PATCH_CRATE_NAME}@${PALYRA_GLIB_PATCH_CRATE_VERSION} advisory=${PALYRA_GLIB_PATCH_ADVISORY}"
