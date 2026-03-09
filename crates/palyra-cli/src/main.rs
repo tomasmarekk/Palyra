@@ -5154,21 +5154,25 @@ fn run_tunnel(
 }
 
 fn open_url_in_default_browser(url: &str) -> Result<()> {
+    let normalized_url = normalize_browser_open_url(url)?;
+
     #[cfg(target_os = "windows")]
-    let status = Command::new("cmd")
-        .arg("/C")
-        .arg("start")
-        .arg("")
-        .arg(url)
+    let status = Command::new("explorer.exe")
+        .arg(normalized_url.as_str())
         .status()
-        .context("failed to invoke `cmd /C start`")?;
+        .context("failed to invoke `explorer.exe`")?;
 
     #[cfg(target_os = "macos")]
-    let status = Command::new("open").arg(url).status().context("failed to invoke `open`")?;
+    let status = Command::new("open")
+        .arg(normalized_url.as_str())
+        .status()
+        .context("failed to invoke `open`")?;
 
     #[cfg(all(unix, not(target_os = "macos")))]
-    let status =
-        Command::new("xdg-open").arg(url).status().context("failed to invoke `xdg-open`")?;
+    let status = Command::new("xdg-open")
+        .arg(normalized_url.as_str())
+        .status()
+        .context("failed to invoke `xdg-open`")?;
 
     if !status.success() {
         anyhow::bail!(
@@ -5177,6 +5181,17 @@ fn open_url_in_default_browser(url: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn normalize_browser_open_url(raw: &str) -> Result<String> {
+    let parsed = Url::parse(raw).with_context(|| "browser open requires a valid absolute URL")?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        anyhow::bail!("browser open only supports http:// and https:// URLs");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        anyhow::bail!("browser open URL must not include embedded credentials");
+    }
+    Ok(parsed.to_string())
 }
 
 fn execute_agent_stream(
@@ -10975,7 +10990,7 @@ mod cli_v1_tests {
         build_journal_checkpoint_attestation, build_support_bundle_diagnostics_snapshot,
         compare_semver_versions, ensure_remote_registry_same_origin, fetch_limited_bytes,
         fetch_remote_registry_entries_with_fetcher, is_retryable_grpc_error,
-        memory_embeddings_model_configured, normalize_client_socket,
+        memory_embeddings_model_configured, normalize_browser_open_url, normalize_client_socket,
         normalize_installed_skills_index, normalize_prompt_secret_value,
         normalize_relative_registry_path, normalize_sha256_fingerprint, parse_acp_shim_input_line,
         parse_and_verify_signed_remote_registry_index, parse_remote_dashboard_base_url,
@@ -11299,6 +11314,27 @@ pinned_gateway_ca_fingerprint_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
         let error = resolve_dashboard_access_target(None)
             .expect_err("ambiguous pin configuration must be rejected");
         assert!(error.to_string().contains("pins are ambiguous"));
+    }
+
+    #[test]
+    fn normalize_browser_open_url_requires_http_or_https() {
+        let error = normalize_browser_open_url("file:///tmp/palyra")
+            .expect_err("non-http browser handoff should be rejected");
+        assert!(error.to_string().contains("only supports http:// and https:// URLs"));
+    }
+
+    #[test]
+    fn normalize_browser_open_url_rejects_embedded_credentials() {
+        let error = normalize_browser_open_url("https://operator:secret@example.com/dashboard")
+            .expect_err("credential-bearing browser handoff should be rejected");
+        assert!(error.to_string().contains("embedded credentials"));
+    }
+
+    #[test]
+    fn normalize_browser_open_url_preserves_safe_dashboard_targets() {
+        let normalized = normalize_browser_open_url("https://dashboard.example.com/palyra/")
+            .expect("safe dashboard URL should normalize");
+        assert_eq!(normalized, "https://dashboard.example.com/palyra/");
     }
 
     #[test]
