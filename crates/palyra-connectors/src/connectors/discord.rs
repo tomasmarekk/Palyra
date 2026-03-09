@@ -8,7 +8,7 @@ use std::{
 
 use async_trait::async_trait;
 use base64::Engine as _;
-use flate2::{Decompress, FlushDecompress};
+use flate2::{Decompress, FlushDecompress, Status};
 use futures::{SinkExt, StreamExt};
 use palyra_common::redaction::redact_auth_error;
 use reqwest::{multipart, redirect::Policy, Client, Url};
@@ -44,6 +44,7 @@ const DISCORD_GATEWAY_MONITOR_JITTER_MAX_MS: u64 = 500;
 const DISCORD_GATEWAY_ZLIB_SYNC_FLUSH_SUFFIX: [u8; 4] = [0x00, 0x00, 0xFF, 0xFF];
 const DISCORD_GATEWAY_MAX_COMPRESSED_FRAME_BYTES: usize = 512 * 1024;
 const DISCORD_GATEWAY_MAX_DECOMPRESSED_FRAME_BYTES: usize = 2 * 1024 * 1024;
+const DISCORD_GATEWAY_DECOMPRESS_CHUNK_BYTES: usize = 8 * 1024;
 const DISCORD_INBOUND_BUFFER_CAPACITY: usize = 512;
 const IDENTITY_CACHE_TTL_MS: i64 = 5 * 60 * 1_000;
 const MAX_DELIVERY_CACHE: usize = 4_096;
@@ -1058,7 +1059,8 @@ mod tests {
         DiscordConnectorAdapter, DiscordCredential, DiscordCredentialResolver,
         DiscordGatewayEnvelope, DiscordGatewayInflater, DiscordGatewayMonitorContext,
         DiscordGatewayResumeState, DiscordRuntimeState, DiscordTransport, DiscordTransportResponse,
-        OpenFence,
+        OpenFence, DISCORD_GATEWAY_MAX_COMPRESSED_FRAME_BYTES,
+        DISCORD_GATEWAY_MAX_DECOMPRESSED_FRAME_BYTES, DISCORD_GATEWAY_ZLIB_SYNC_FLUSH_SUFFIX,
     };
     use crate::{
         protocol::{
@@ -1069,6 +1071,7 @@ mod tests {
         supervisor::{ConnectorAdapter, ConnectorAdapterError},
     };
     use async_trait::async_trait;
+    use flate2::{Compress, Compression, FlushCompress, Status};
     use futures::stream;
     use reqwest::Url;
     use serde_json::{json, Value};
@@ -2675,6 +2678,35 @@ mod tests {
     }
 
     #[test]
+    fn decode_gateway_binary_payload_rejects_frame_over_decompressed_limit() {
+        let oversized = vec![b'a'; DISCORD_GATEWAY_MAX_DECOMPRESSED_FRAME_BYTES.saturating_add(1)];
+        let compressed = compress_gateway_zlib_frame(oversized.as_slice());
+        assert!(
+            compressed.len() < DISCORD_GATEWAY_MAX_COMPRESSED_FRAME_BYTES,
+            "oversized decoded payload should stay below compressed frame budget in regression fixture"
+        );
+
+        let mut inflater = DiscordGatewayInflater::default();
+        let error = decode_gateway_binary_payload(compressed.as_slice(), &mut inflater)
+            .expect_err("oversized decoded payload must be rejected before unbounded growth");
+        let reason = error.to_string();
+        assert!(
+            reason.contains("decompressed payload exceeded"),
+            "oversized decoded payload should explain the decompressed frame limit"
+        );
+        assert!(
+            inflater.compressed_buffer.is_empty(),
+            "inflater should clear buffered compressed bytes after oversized frame rejection"
+        );
+
+        let recovered =
+            decode_gateway_binary_payload(sample_gateway_zlib_frame().as_slice(), &mut inflater)
+                .expect("inflater should remain usable after oversized frame reset")
+                .expect("complete zlib payload should decode after reset");
+        assert_eq!(recovered, r#"{"op":11,"d":null}"#);
+    }
+
+    #[test]
     fn parse_discord_attachments_treats_svg_as_file() {
         let attachments = super::parse_discord_attachments(Some(&json!([{
             "id": "att-1",
@@ -2696,6 +2728,46 @@ mod tests {
             0x78, 0x9C, 0xAA, 0x56, 0xCA, 0x2F, 0x50, 0xB2, 0x32, 0x34, 0xD4, 0x51, 0x4A, 0x51,
             0xB2, 0xCA, 0x2B, 0xCD, 0xC9, 0xA9, 0x05, 0x00, 0x00, 0x00, 0xFF, 0xFF,
         ]
+    }
+
+    fn compress_gateway_zlib_frame(raw: &[u8]) -> Vec<u8> {
+        let mut compressor = Compress::new(Compression::default(), true);
+        let mut compressed = Vec::new();
+        let mut output_chunk = [0_u8; 4 * 1024];
+        let mut input_offset = 0usize;
+
+        loop {
+            let total_in_before = compressor.total_in();
+            let total_out_before = compressor.total_out();
+            let flush_mode =
+                if input_offset < raw.len() { FlushCompress::None } else { FlushCompress::Sync };
+            let status = compressor
+                .compress(&raw[input_offset..], &mut output_chunk, flush_mode)
+                .expect("test zlib payload compression should succeed");
+            let consumed = usize::try_from(compressor.total_in().saturating_sub(total_in_before))
+                .unwrap_or(usize::MAX);
+            let produced = usize::try_from(compressor.total_out().saturating_sub(total_out_before))
+                .unwrap_or(usize::MAX);
+            input_offset = input_offset.saturating_add(consumed);
+            if produced > 0 {
+                compressed.extend_from_slice(&output_chunk[..produced]);
+            }
+
+            if input_offset >= raw.len()
+                && compressed.ends_with(&DISCORD_GATEWAY_ZLIB_SYNC_FLUSH_SUFFIX)
+            {
+                break;
+            }
+
+            if consumed == 0 && produced == 0 && matches!(status, Status::BufError) {
+                panic!("gateway compression fixture stalled before emitting sync-flush suffix");
+            }
+        }
+        assert!(
+            compressed.ends_with(&DISCORD_GATEWAY_ZLIB_SYNC_FLUSH_SUFFIX),
+            "gateway compression fixture must preserve the zlib sync-flush suffix"
+        );
+        compressed
     }
 }
 
@@ -3993,8 +4065,7 @@ fn decode_gateway_binary_payload(
     }
     let projected_size = inflater.compressed_buffer.len().saturating_add(payload.len());
     if projected_size > DISCORD_GATEWAY_MAX_COMPRESSED_FRAME_BYTES {
-        inflater.compressed_buffer.clear();
-        inflater.decompressor = Decompress::new(true);
+        reset_gateway_inflater(inflater);
         return Err(ConnectorAdapterError::Backend(format!(
             "discord gateway compressed payload exceeded {} bytes",
             DISCORD_GATEWAY_MAX_COMPRESSED_FRAME_BYTES
@@ -4011,31 +4082,68 @@ fn decode_gateway_binary_payload(
         .saturating_mul(2)
         .clamp(1024, DISCORD_GATEWAY_MAX_DECOMPRESSED_FRAME_BYTES);
     let mut decoded = Vec::with_capacity(estimated_capacity);
-    if let Err(error) = inflater.decompressor.decompress_vec(
-        inflater.compressed_buffer.as_slice(),
-        &mut decoded,
-        FlushDecompress::Sync,
-    ) {
-        inflater.compressed_buffer.clear();
-        inflater.decompressor = Decompress::new(true);
-        return Err(ConnectorAdapterError::Backend(format!(
-            "discord gateway zlib payload decompression failed: {error}"
-        )));
+    let mut output_chunk = [0_u8; DISCORD_GATEWAY_DECOMPRESS_CHUNK_BYTES];
+    let mut input_offset = 0usize;
+    while input_offset < inflater.compressed_buffer.len() {
+        let total_in_before = inflater.decompressor.total_in();
+        let total_out_before = inflater.decompressor.total_out();
+        let status = inflater
+            .decompressor
+            .decompress(
+                &inflater.compressed_buffer[input_offset..],
+                &mut output_chunk,
+                FlushDecompress::Sync,
+            )
+            .map_err(|error| {
+                reset_gateway_inflater(inflater);
+                ConnectorAdapterError::Backend(format!(
+                    "discord gateway zlib payload decompression failed: {error}"
+                ))
+            })?;
+
+        let consumed =
+            usize::try_from(inflater.decompressor.total_in().saturating_sub(total_in_before))
+                .unwrap_or(usize::MAX);
+        let produced =
+            usize::try_from(inflater.decompressor.total_out().saturating_sub(total_out_before))
+                .unwrap_or(usize::MAX);
+        input_offset = input_offset.saturating_add(consumed);
+
+        if produced > 0 {
+            if decoded.len().saturating_add(produced) > DISCORD_GATEWAY_MAX_DECOMPRESSED_FRAME_BYTES
+            {
+                reset_gateway_inflater(inflater);
+                return Err(ConnectorAdapterError::Backend(format!(
+                    "discord gateway decompressed payload exceeded {} bytes",
+                    DISCORD_GATEWAY_MAX_DECOMPRESSED_FRAME_BYTES
+                )));
+            }
+            decoded.extend_from_slice(&output_chunk[..produced]);
+        }
+
+        if consumed == 0 && produced == 0 {
+            reset_gateway_inflater(inflater);
+            return Err(ConnectorAdapterError::Backend(
+                "discord gateway zlib payload decompression stalled".to_owned(),
+            ));
+        }
+
+        if matches!(status, Status::StreamEnd) {
+            break;
+        }
     }
     inflater.compressed_buffer.clear();
-    if decoded.len() > DISCORD_GATEWAY_MAX_DECOMPRESSED_FRAME_BYTES {
-        inflater.decompressor = Decompress::new(true);
-        return Err(ConnectorAdapterError::Backend(format!(
-            "discord gateway decompressed payload exceeded {} bytes",
-            DISCORD_GATEWAY_MAX_DECOMPRESSED_FRAME_BYTES
-        )));
-    }
     String::from_utf8(decoded).map(Some).map_err(|error| {
-        inflater.decompressor = Decompress::new(true);
+        reset_gateway_inflater(inflater);
         ConnectorAdapterError::Backend(format!(
             "discord gateway payload is not valid UTF-8 after decompression: {error}"
         ))
     })
+}
+
+fn reset_gateway_inflater(inflater: &mut DiscordGatewayInflater) {
+    inflater.compressed_buffer.clear();
+    inflater.decompressor = Decompress::new(true);
 }
 
 fn with_attachment_context(text: &str, attachments: &[AttachmentRef]) -> String {
