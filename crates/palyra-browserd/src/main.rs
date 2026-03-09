@@ -1,7 +1,7 @@
 #[cfg(windows)]
 use std::process::Command;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     ffi::{OsStr, OsString},
     fs,
     io::Write,
@@ -617,6 +617,18 @@ struct PersistedSessionSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct BrowserTabRecordForHash {
+    tab_id: String,
+    last_title: String,
+    last_url: Option<String>,
+    last_page_body: String,
+    scroll_x: i64,
+    scroll_y: i64,
+    typed_inputs: BTreeMap<String, String>,
+    network_log: VecDeque<NetworkLogEntryInternal>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct PersistedSessionSnapshotLegacyForHash {
     v: u32,
     principal: String,
@@ -627,6 +639,27 @@ struct PersistedSessionSnapshotLegacyForHash {
     permissions: SessionPermissionsInternal,
     cookie_jar: HashMap<String, HashMap<String, String>>,
     storage_entries: HashMap<String, HashMap<String, String>>,
+    saved_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct LoadedPersistedSessionSnapshot {
+    snapshot: PersistedSessionSnapshot,
+    raw_hash_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PersistedSessionSnapshotForHash {
+    v: u32,
+    principal: String,
+    channel: Option<String>,
+    tabs: Vec<BrowserTabRecordForHash>,
+    tab_order: Vec<String>,
+    active_tab_id: String,
+    permissions: SessionPermissionsInternal,
+    cookie_jar: BTreeMap<String, BTreeMap<String, String>>,
+    storage_entries: BTreeMap<String, BTreeMap<String, String>>,
+    state_revision: u64,
     saved_at_unix_ms: u64,
 }
 
@@ -1122,16 +1155,20 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                 state_restored: false,
             },
         });
-        if let Some(snapshot) = restored_snapshot {
+        if let Some(restored_snapshot) = restored_snapshot {
             if let Some(profile_record) = profile.as_ref() {
-                validate_restored_snapshot_against_profile(&snapshot, profile_record).map_err(
-                    |error| {
-                        Status::failed_precondition(format!(
-                            "persisted state integrity validation failed: {error}"
-                        ))
-                    },
-                )?;
+                validate_restored_snapshot_against_profile(
+                    &restored_snapshot.snapshot,
+                    Some(restored_snapshot.raw_hash_sha256.as_str()),
+                    profile_record,
+                )
+                .map_err(|error| {
+                    Status::failed_precondition(format!(
+                        "persisted state integrity validation failed: {error}"
+                    ))
+                })?;
             }
+            let snapshot = restored_snapshot.snapshot;
             if snapshot.principal != principal {
                 return Err(Status::permission_denied(
                     "persisted state principal does not match session principal",
@@ -6039,7 +6076,7 @@ impl PersistedStateStore {
         &self,
         state_id: &str,
         profile_id: Option<&str>,
-    ) -> Result<Option<PersistedSessionSnapshot>> {
+    ) -> Result<Option<LoadedPersistedSessionSnapshot>> {
         let path = self.snapshot_path(state_id);
         if !path.exists() {
             return Ok(None);
@@ -6053,7 +6090,10 @@ impl PersistedStateStore {
             .with_context(|| {
                 format!("failed to deserialize persisted browser state '{}'", path.display())
             })?;
-        Ok(Some(snapshot))
+        Ok(Some(LoadedPersistedSessionSnapshot {
+            snapshot,
+            raw_hash_sha256: sha256_hex(decrypted.as_slice()),
+        }))
     }
 
     fn save_snapshot(
@@ -6642,8 +6682,44 @@ fn next_profile_state_revision(
     Ok(current.saturating_add(1).max(1))
 }
 
+fn map_to_sorted_map(map: &HashMap<String, String>) -> BTreeMap<String, String> {
+    map.iter().map(|(key, value)| (key.clone(), value.clone())).collect()
+}
+
+fn nested_map_to_sorted_map(
+    map: &HashMap<String, HashMap<String, String>>,
+) -> BTreeMap<String, BTreeMap<String, String>> {
+    map.iter().map(|(key, value)| (key.clone(), map_to_sorted_map(value))).collect()
+}
+
+fn tab_record_for_hash(tab: &BrowserTabRecord) -> BrowserTabRecordForHash {
+    BrowserTabRecordForHash {
+        tab_id: tab.tab_id.clone(),
+        last_title: tab.last_title.clone(),
+        last_url: tab.last_url.clone(),
+        last_page_body: tab.last_page_body.clone(),
+        scroll_x: tab.scroll_x,
+        scroll_y: tab.scroll_y,
+        typed_inputs: map_to_sorted_map(&tab.typed_inputs),
+        network_log: tab.network_log.clone(),
+    }
+}
+
 fn persisted_snapshot_hash(snapshot: &PersistedSessionSnapshot) -> Result<String> {
-    let bytes = serde_json::to_vec(snapshot)
+    let canonical = PersistedSessionSnapshotForHash {
+        v: snapshot.v,
+        principal: snapshot.principal.clone(),
+        channel: snapshot.channel.clone(),
+        tabs: snapshot.tabs.iter().map(tab_record_for_hash).collect(),
+        tab_order: snapshot.tab_order.clone(),
+        active_tab_id: snapshot.active_tab_id.clone(),
+        permissions: snapshot.permissions.clone(),
+        cookie_jar: nested_map_to_sorted_map(&snapshot.cookie_jar),
+        storage_entries: nested_map_to_sorted_map(&snapshot.storage_entries),
+        state_revision: snapshot.state_revision,
+        saved_at_unix_ms: snapshot.saved_at_unix_ms,
+    };
+    let bytes = serde_json::to_vec(&canonical)
         .context("failed to serialize persisted browser state snapshot hash payload")?;
     Ok(sha256_hex(bytes.as_slice()))
 }
@@ -6668,6 +6744,7 @@ fn persisted_snapshot_legacy_hash(snapshot: &PersistedSessionSnapshot) -> Result
 
 fn validate_restored_snapshot_against_profile(
     snapshot: &PersistedSessionSnapshot,
+    raw_hash_sha256: Option<&str>,
     profile: &BrowserProfileRecord,
 ) -> Result<()> {
     if snapshot.state_revision < profile.state_revision {
@@ -6680,6 +6757,9 @@ fn validate_restored_snapshot_against_profile(
     let Some(expected_hash) = profile.state_hash_sha256.as_deref() else {
         return Ok(());
     };
+    if raw_hash_sha256.is_some_and(|raw_hash| raw_hash == expected_hash) {
+        return Ok(());
+    }
     let current_hash = persisted_snapshot_hash(snapshot)?;
     if current_hash == expected_hash {
         return Ok(());
@@ -7470,11 +7550,11 @@ async fn fetch_download_artifact(
 mod tests {
     use super::{
         browser_v1, chromium_active_tab_for_session, chromium_new_tab_error_is_retryable,
-        constant_time_eq_bytes, default_browserd_state_dir_from_env,
-        enforce_non_loopback_bind_auth, navigate_with_guards, parse_daemon_bind_socket,
-        persisted_snapshot_hash, persisted_snapshot_legacy_hash,
+        constant_time_eq_bytes, default_browserd_state_dir_from_env, derive_state_encryption_key,
+        encrypt_state_blob, enforce_non_loopback_bind_auth, navigate_with_guards,
+        parse_daemon_bind_socket, persisted_snapshot_hash, persisted_snapshot_legacy_hash,
         record_chromium_remote_ip_incident, reset_dns_validation_tracking_for_tests,
-        run_chromium_blocking, store_dns_nxdomain_cache, update_profile_state_metadata,
+        run_chromium_blocking, sha256_hex, store_dns_nxdomain_cache, update_profile_state_metadata,
         validate_restored_snapshot_against_profile, validate_target_url_blocking, Args,
         BrowserEngineMode, BrowserProfileRecord, BrowserRuntimeState, BrowserServiceImpl,
         BrowserTabRecord, ChromiumSessionProxy, DnsValidationCache, PersistedSessionSnapshot,
@@ -9699,8 +9779,159 @@ mod tests {
             state_hash_sha256: Some(legacy_hash),
             record_hash_sha256: String::new(),
         };
-        validate_restored_snapshot_against_profile(&snapshot, &profile)
+        validate_restored_snapshot_against_profile(&snapshot, None, &profile)
             .expect("legacy hash path should stay backward compatible");
+    }
+
+    #[test]
+    fn persisted_snapshot_hash_is_stable_for_equivalent_hashmap_content() {
+        let mut first_tab = BrowserTabRecord::new("tab-1".to_owned());
+        first_tab.typed_inputs.insert("search".to_owned(), "palyra".to_owned());
+        first_tab.typed_inputs.insert("theme".to_owned(), "dark".to_owned());
+
+        let mut second_tab = BrowserTabRecord::new("tab-1".to_owned());
+        second_tab.typed_inputs.insert("theme".to_owned(), "dark".to_owned());
+        second_tab.typed_inputs.insert("search".to_owned(), "palyra".to_owned());
+
+        let mut first_cookie_inner = HashMap::new();
+        first_cookie_inner.insert("theme".to_owned(), "dark".to_owned());
+        first_cookie_inner.insert("session".to_owned(), "abc".to_owned());
+        let mut first_cookie_jar = HashMap::new();
+        first_cookie_jar.insert("https://example.com".to_owned(), first_cookie_inner);
+
+        let mut second_cookie_inner = HashMap::new();
+        second_cookie_inner.insert("session".to_owned(), "abc".to_owned());
+        second_cookie_inner.insert("theme".to_owned(), "dark".to_owned());
+        let mut second_cookie_jar = HashMap::new();
+        second_cookie_jar.insert("https://example.com".to_owned(), second_cookie_inner);
+
+        let mut first_storage_inner = HashMap::new();
+        first_storage_inner.insert("locale".to_owned(), "en".to_owned());
+        first_storage_inner.insert("layout".to_owned(), "compact".to_owned());
+        let mut first_storage_entries = HashMap::new();
+        first_storage_entries.insert("https://example.com".to_owned(), first_storage_inner);
+
+        let mut second_storage_inner = HashMap::new();
+        second_storage_inner.insert("layout".to_owned(), "compact".to_owned());
+        second_storage_inner.insert("locale".to_owned(), "en".to_owned());
+        let mut second_storage_entries = HashMap::new();
+        second_storage_entries.insert("https://example.com".to_owned(), second_storage_inner);
+
+        let snapshot_one = PersistedSessionSnapshot {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            principal: "user:ops".to_owned(),
+            channel: None,
+            tabs: vec![first_tab],
+            tab_order: vec!["tab-1".to_owned()],
+            active_tab_id: "tab-1".to_owned(),
+            permissions: SessionPermissionsInternal::default(),
+            cookie_jar: first_cookie_jar,
+            storage_entries: first_storage_entries,
+            state_revision: 5,
+            saved_at_unix_ms: 1_737_000_000_000,
+        };
+        let snapshot_two = PersistedSessionSnapshot {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            principal: "user:ops".to_owned(),
+            channel: None,
+            tabs: vec![second_tab],
+            tab_order: vec!["tab-1".to_owned()],
+            active_tab_id: "tab-1".to_owned(),
+            permissions: SessionPermissionsInternal::default(),
+            cookie_jar: second_cookie_jar,
+            storage_entries: second_storage_entries,
+            state_revision: 5,
+            saved_at_unix_ms: 1_737_000_000_000,
+        };
+
+        let hash_one =
+            persisted_snapshot_hash(&snapshot_one).expect("first hash generation should succeed");
+        let hash_two =
+            persisted_snapshot_hash(&snapshot_two).expect("second hash generation should succeed");
+
+        assert_eq!(
+            hash_one, hash_two,
+            "hash should remain stable when only HashMap insertion order changes"
+        );
+    }
+
+    #[test]
+    fn validate_restored_snapshot_against_profile_accepts_raw_persisted_hash() {
+        let state_dir = tempfile::tempdir().expect("state temp dir should be available");
+        let store = PersistedStateStore::new(state_dir.path().join("state"), [3_u8; STATE_KEY_LEN])
+            .expect("state store should initialize");
+        let profile_id = ulid::Ulid::new().to_string();
+        let raw_json = format!(
+            concat!(
+                "{{",
+                "\"v\":{},",
+                "\"principal\":\"user:ops\",",
+                "\"channel\":null,",
+                "\"tabs\":[{{",
+                "\"tab_id\":\"tab-1\",",
+                "\"last_title\":\"\",",
+                "\"last_url\":null,",
+                "\"last_page_body\":\"\",",
+                "\"scroll_x\":0,",
+                "\"scroll_y\":0,",
+                "\"typed_inputs\":{{\"theme\":\"dark\",\"search\":\"palyra\"}},",
+                "\"network_log\":[]",
+                "}}],",
+                "\"tab_order\":[\"tab-1\"],",
+                "\"active_tab_id\":\"tab-1\",",
+                "\"permissions\":{{\"camera\":\"Deny\",\"microphone\":\"Deny\",\"location\":\"Deny\"}},",
+                "\"cookie_jar\":{{\"https://example.com\":{{\"theme\":\"dark\",\"session\":\"abc\"}}}},",
+                "\"storage_entries\":{{\"https://example.com\":{{\"layout\":\"compact\",\"locale\":\"en\"}}}},",
+                "\"state_revision\":1,",
+                "\"saved_at_unix_ms\":1737000000000",
+                "}}"
+            ),
+            CANONICAL_PROTOCOL_MAJOR
+        );
+        let encrypted = encrypt_state_blob(
+            &derive_state_encryption_key(&store.key, Some(profile_id.as_str())),
+            raw_json.as_bytes(),
+        )
+        .expect("snapshot should encrypt");
+        std::fs::write(store.snapshot_path(profile_id.as_str()), encrypted)
+            .expect("snapshot should persist");
+
+        let loaded = store
+            .load_snapshot(profile_id.as_str(), Some(profile_id.as_str()))
+            .expect("snapshot load should succeed")
+            .expect("snapshot should be present");
+        let expected_raw_hash = sha256_hex(raw_json.as_bytes());
+        assert_eq!(
+            loaded.raw_hash_sha256, expected_raw_hash,
+            "load_snapshot should preserve the stored raw payload hash"
+        );
+        assert_ne!(
+            persisted_snapshot_hash(&loaded.snapshot).expect("canonical hash should compute"),
+            expected_raw_hash,
+            "test fixture should differ from canonical ordering so raw hash compatibility is exercised"
+        );
+        let profile = BrowserProfileRecord {
+            profile_id,
+            principal: "user:ops".to_owned(),
+            name: "Ops".to_owned(),
+            theme_color: None,
+            created_at_unix_ms: 1_737_000_000_000,
+            updated_at_unix_ms: 1_737_000_000_000,
+            last_used_unix_ms: 1_737_000_000_000,
+            persistence_enabled: true,
+            private_profile: false,
+            state_schema_version: PROFILE_RECORD_SCHEMA_VERSION,
+            state_revision: 1,
+            state_hash_sha256: Some(expected_raw_hash),
+            record_hash_sha256: String::new(),
+        };
+
+        validate_restored_snapshot_against_profile(
+            &loaded.snapshot,
+            Some(loaded.raw_hash_sha256.as_str()),
+            &profile,
+        )
+        .expect("raw persisted hash should keep older snapshots restorable");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -9781,10 +10012,11 @@ mod tests {
             .state_store
             .as_ref()
             .expect("state store should remain configured for rollback test");
-        let snapshot = store
+        let loaded_snapshot = store
             .load_snapshot(profile_id.as_str(), Some(profile_id.as_str()))
             .expect("snapshot load should succeed")
             .expect("snapshot should be present after persisted profile session");
+        let snapshot = loaded_snapshot.snapshot;
         assert!(
             snapshot.state_revision >= 1,
             "snapshot revision should advance after first persist"
