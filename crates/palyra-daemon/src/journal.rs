@@ -4698,7 +4698,8 @@ fn query_memory_usage_snapshot(
                         COALESCE(length(memory.content_text), 0) +
                         COALESCE(length(memory.content_hash), 0) +
                         COALESCE(length(memory.tags_json), 0) +
-                        COALESCE(length(vectors.embedding_vector), length(vectors.vector_blob), 0)
+                        COALESCE(length(vectors.embedding_vector), 0) +
+                        COALESCE(length(vectors.vector_blob), 0)
                     ),
                     0
                 )
@@ -4924,7 +4925,8 @@ fn evict_oldest_memory_items_by_byte_cap(
                     COALESCE(length(memory.content_text), 0) +
                     COALESCE(length(memory.content_hash), 0) +
                     COALESCE(length(memory.tags_json), 0) +
-                    COALESCE(length(vectors.embedding_vector), length(vectors.vector_blob), 0)
+                    COALESCE(length(vectors.embedding_vector), 0) +
+                    COALESCE(length(vectors.vector_blob), 0)
                 ) AS approx_bytes
             FROM memory_items AS memory
             LEFT JOIN memory_vectors AS vectors
@@ -7284,6 +7286,61 @@ mod tests {
     }
 
     #[test]
+    fn memory_usage_snapshot_counts_both_embedding_columns_when_present() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let memory_id = "01ARZ3NDEKTSV4RRFFQ69G5FD9";
+        store
+            .create_memory_item(&sample_memory_request(
+                memory_id,
+                "user:ops",
+                Some("cli"),
+                Some("01ARZ3NDEKTSV4RRFFQ69G5FA9"),
+                MemorySource::Manual,
+                "embedding accounting fixture",
+            ))
+            .expect("memory item should be created");
+
+        let usage = store.memory_maintenance_status().expect("status snapshot should load").usage;
+
+        let guard = store.connection.lock().expect("connection lock should not be poisoned");
+        let (expected_bytes, single_blob_bytes): (i64, i64) = guard
+            .query_row(
+                r#"
+                    SELECT
+                        COALESCE(length(memory.content_text), 0) +
+                        COALESCE(length(memory.content_hash), 0) +
+                        COALESCE(length(memory.tags_json), 0) +
+                        COALESCE(length(vectors.embedding_vector), 0) +
+                        COALESCE(length(vectors.vector_blob), 0),
+                        COALESCE(length(memory.content_text), 0) +
+                        COALESCE(length(memory.content_hash), 0) +
+                        COALESCE(length(memory.tags_json), 0) +
+                        COALESCE(length(vectors.embedding_vector), length(vectors.vector_blob), 0)
+                    FROM memory_items AS memory
+                    LEFT JOIN memory_vectors AS vectors
+                        ON vectors.memory_ulid = memory.memory_ulid
+                    WHERE memory.memory_ulid = ?1
+                    LIMIT 1
+                "#,
+                params![memory_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("byte accounting fixture should load");
+
+        assert_eq!(
+            usage.approx_bytes,
+            expected_bytes.max(0) as u64,
+            "usage snapshot should include both embedding columns"
+        );
+        assert!(
+            expected_bytes > single_blob_bytes,
+            "fixture should prove both embedding columns contribute bytes"
+        );
+    }
+
+    #[test]
     fn memory_maintenance_reduces_synthetic_store_size_deterministically() {
         let db_path = temp_db_path();
         let store = JournalStore::open(test_journal_config(db_path, false))
@@ -7329,6 +7386,83 @@ mod tests {
         assert_eq!(
             outcome.deleted_expired_count, 0,
             "ttl eviction should not run without ttl policy"
+        );
+    }
+
+    #[test]
+    fn memory_byte_cap_eviction_counts_both_embedding_columns() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let memory_id = "01ARZ3NDEKTSV4RRFFQ69G5FE0";
+        store
+            .create_memory_item(&sample_memory_request(
+                memory_id,
+                "user:ops",
+                Some("cli"),
+                Some("01ARZ3NDEKTSV4RRFFQ69G5FB0"),
+                MemorySource::Manual,
+                "byte-cap accounting fixture",
+            ))
+            .expect("memory item should be created");
+
+        let guard = store.connection.lock().expect("connection lock should not be poisoned");
+        let (expected_bytes, single_blob_bytes): (i64, i64) = guard
+            .query_row(
+                r#"
+                    SELECT
+                        COALESCE(length(memory.content_text), 0) +
+                        COALESCE(length(memory.content_hash), 0) +
+                        COALESCE(length(memory.tags_json), 0) +
+                        COALESCE(length(vectors.embedding_vector), 0) +
+                        COALESCE(length(vectors.vector_blob), 0),
+                        COALESCE(length(memory.content_text), 0) +
+                        COALESCE(length(memory.content_hash), 0) +
+                        COALESCE(length(memory.tags_json), 0) +
+                        COALESCE(length(vectors.embedding_vector), length(vectors.vector_blob), 0)
+                    FROM memory_items AS memory
+                    LEFT JOIN memory_vectors AS vectors
+                        ON vectors.memory_ulid = memory.memory_ulid
+                    WHERE memory.memory_ulid = ?1
+                    LIMIT 1
+                "#,
+                params![memory_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("byte accounting fixture should load");
+        drop(guard);
+
+        assert!(
+            expected_bytes > single_blob_bytes,
+            "fixture should prove both embedding columns contribute bytes"
+        );
+
+        let now = current_unix_ms().expect("system clock should be available");
+        let max_bytes =
+            u64::try_from(expected_bytes - 1).expect("expected bytes should be positive");
+        assert!(
+            max_bytes > single_blob_bytes.max(0) as u64,
+            "max_bytes should sit between the old single-copy count and the real double-copy count"
+        );
+
+        let outcome = store
+            .run_memory_maintenance(&MemoryMaintenanceRequest {
+                now_unix_ms: now,
+                retention: MemoryRetentionPolicy {
+                    max_entries: None,
+                    max_bytes: Some(max_bytes),
+                    ttl_days: None,
+                },
+                next_vacuum_due_at_unix_ms: None,
+                next_maintenance_run_at_unix_ms: Some(now.saturating_add(300_000)),
+            })
+            .expect("maintenance should succeed");
+
+        assert_eq!(outcome.entries_before, 1, "fixture should start with one memory row");
+        assert_eq!(outcome.entries_after, 0, "byte cap should evict the oversized row");
+        assert_eq!(
+            outcome.deleted_capacity_count, 1,
+            "capacity pass should remove the fixture row"
         );
     }
 
