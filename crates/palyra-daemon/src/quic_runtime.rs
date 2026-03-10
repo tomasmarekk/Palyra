@@ -548,16 +548,45 @@ mod tests {
                     );
                 }
                 Ok((mut send_stream, mut recv_stream)) => {
-                    send_request(
-                        &mut send_stream,
-                        QuicRuntimeRequest {
-                            protocol_version: PROTOCOL_VERSION,
-                            method: METHOD_HEALTH.to_owned(),
-                            resume_from: None,
-                        },
-                    )
-                    .await;
-                    send_stream.finish().expect("request stream should finish");
+                    let payload = serde_json::to_vec(&QuicRuntimeRequest {
+                        protocol_version: PROTOCOL_VERSION,
+                        method: METHOD_HEALTH.to_owned(),
+                        resume_from: None,
+                    })
+                    .expect("request should serialize");
+                    match write_frame(&mut send_stream, payload.as_slice(), DEFAULT_MAX_FRAME_BYTES)
+                        .await
+                    {
+                        Err(error) => {
+                            let message = error.to_string().to_ascii_lowercase();
+                            assert!(
+                                message.contains("connection lost")
+                                    || message.contains("closed")
+                                    || message.contains("revoked")
+                                    || message.contains("invalid peer certificate")
+                                    || message.contains("handshake failed"),
+                                "revoked client certificate must fail closed before request frame write completes: {error}"
+                            );
+                        }
+                        Ok(()) => {
+                            let finish_result = send_stream.finish();
+                            assert!(
+                                finish_result
+                                    .as_ref()
+                                    .err()
+                                    .map(|error| {
+                                        let message = error.to_string().to_ascii_lowercase();
+                                        message.contains("connection lost")
+                                            || message.contains("closed")
+                                            || message.contains("revoked")
+                                            || message.contains("invalid peer certificate")
+                                            || message.contains("handshake failed")
+                                    })
+                                    .unwrap_or(true),
+                                "revoked client certificate must not keep the request stream writable: {finish_result:?}"
+                            );
+                        }
+                    }
                     let response = read_frame(&mut recv_stream, DEFAULT_MAX_FRAME_BYTES).await;
                     assert!(
                         response
