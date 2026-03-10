@@ -1952,11 +1952,21 @@ impl JournalStore {
     pub fn list_orchestrator_sessions(
         &self,
         after_session_key: Option<&str>,
+        principal: &str,
+        device_id: &str,
+        channel: Option<&str>,
         limit: usize,
     ) -> Result<Vec<OrchestratorSessionRecord>, JournalError> {
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         let limit = limit.max(1);
-        load_orchestrator_sessions_page(&guard, after_session_key, limit)
+        load_orchestrator_sessions_page(
+            &guard,
+            after_session_key,
+            principal,
+            device_id,
+            channel,
+            limit,
+        )
     }
 
     pub fn start_orchestrator_run(
@@ -4113,6 +4123,9 @@ fn load_orchestrator_session_by_label(
 fn load_orchestrator_sessions_page(
     connection: &Connection,
     after_session_key: Option<&str>,
+    principal: &str,
+    device_id: &str,
+    channel: Option<&str>,
     limit: usize,
 ) -> Result<Vec<OrchestratorSessionRecord>, JournalError> {
     let mut statement = connection.prepare(
@@ -4129,11 +4142,15 @@ fn load_orchestrator_sessions_page(
                 last_run_ulid
             FROM orchestrator_sessions
             WHERE (?1 IS NULL OR session_key > ?1)
+              AND principal = ?2
+              AND device_id = ?3
+              AND ((channel = ?4) OR (channel IS NULL AND ?4 IS NULL))
             ORDER BY session_key ASC
-            LIMIT ?2
+            LIMIT ?5
         "#,
     )?;
-    let mut rows = statement.query(params![after_session_key, limit as i64])?;
+    let mut rows =
+        statement.query(params![after_session_key, principal, device_id, channel, limit as i64])?;
     let mut sessions = Vec::new();
     while let Some(row) = rows.next()? {
         sessions.push(map_orchestrator_session_row(row)?);
@@ -6125,6 +6142,88 @@ mod tests {
         assert_eq!(snapshot.principal, "user:ops");
         assert_eq!(snapshot.device_id, "01ARZ3NDEKTSV4RRFFQ69G5FAV");
         assert_eq!(snapshot.channel.as_deref(), Some("cli"));
+    }
+
+    #[test]
+    fn list_orchestrator_sessions_is_scoped_to_authenticated_identity() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+
+        for request in [
+            OrchestratorSessionUpsertRequest {
+                session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAA".to_owned(),
+                session_key: "session:alpha:visible".to_owned(),
+                session_label: Some("Visible alpha".to_owned()),
+                principal: "user:ops".to_owned(),
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                channel: Some("cli".to_owned()),
+            },
+            OrchestratorSessionUpsertRequest {
+                session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAB".to_owned(),
+                session_key: "session:beta:foreign-principal".to_owned(),
+                session_label: Some("Foreign principal".to_owned()),
+                principal: "user:other".to_owned(),
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                channel: Some("cli".to_owned()),
+            },
+            OrchestratorSessionUpsertRequest {
+                session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAC".to_owned(),
+                session_key: "session:delta:foreign-channel".to_owned(),
+                session_label: Some("Foreign channel".to_owned()),
+                principal: "user:ops".to_owned(),
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                channel: Some("web".to_owned()),
+            },
+            OrchestratorSessionUpsertRequest {
+                session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAD".to_owned(),
+                session_key: "session:gamma:foreign-device".to_owned(),
+                session_label: Some("Foreign device".to_owned()),
+                principal: "user:ops".to_owned(),
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAZ".to_owned(),
+                channel: Some("cli".to_owned()),
+            },
+            OrchestratorSessionUpsertRequest {
+                session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAE".to_owned(),
+                session_key: "session:omega:visible".to_owned(),
+                session_label: Some("Visible omega".to_owned()),
+                principal: "user:ops".to_owned(),
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                channel: Some("cli".to_owned()),
+            },
+        ] {
+            store.upsert_orchestrator_session(&request).expect("session upsert should succeed");
+        }
+
+        let first_page = store
+            .list_orchestrator_sessions(
+                None,
+                "user:ops",
+                "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                Some("cli"),
+                1,
+            )
+            .expect("scoped session listing should succeed");
+        assert_eq!(
+            first_page.iter().map(|session| session.session_key.as_str()).collect::<Vec<_>>(),
+            vec!["session:alpha:visible"],
+            "first page should include only the first visible session for the authenticated scope"
+        );
+
+        let second_page = store
+            .list_orchestrator_sessions(
+                Some("session:alpha:visible"),
+                "user:ops",
+                "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                Some("cli"),
+                2,
+            )
+            .expect("scoped session listing after cursor should succeed");
+        assert_eq!(
+            second_page.iter().map(|session| session.session_key.as_str()).collect::<Vec<_>>(),
+            vec!["session:omega:visible"],
+            "subsequent page should skip interleaved foreign sessions instead of leaking metadata"
+        );
     }
 
     #[test]

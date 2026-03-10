@@ -2186,6 +2186,84 @@ async fn grpc_resolve_session_and_list_sessions_roundtrip() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn grpc_list_sessions_is_scoped_to_authenticated_context() -> Result<()> {
+    let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+
+    for (session_key, principal, device_id, channel) in [
+        ("session:alpha:visible", "user:ops", DEVICE_ID, Some("cli")),
+        ("session:beta:foreign-principal", "user:other", DEVICE_ID, Some("cli")),
+        ("session:delta:foreign-channel", "user:ops", DEVICE_ID, Some("web")),
+        ("session:gamma:foreign-device", "user:ops", "01ARZ3NDEKTSV4RRFFQ69G5FAZ", Some("cli")),
+        ("session:omega:visible", "user:ops", DEVICE_ID, Some("cli")),
+    ] {
+        let mut request = tonic::Request::new(gateway_v1::ResolveSessionRequest {
+            v: 1,
+            session_id: None,
+            session_key: session_key.to_owned(),
+            session_label: String::new(),
+            require_existing: false,
+            reset_session: false,
+        });
+        authorize_metadata_with_context(request.metadata_mut(), principal, device_id, channel)?;
+        client
+            .resolve_session(request)
+            .await
+            .with_context(|| format!("failed to seed scoped test session {session_key}"))?;
+    }
+
+    let mut first_page_request = tonic::Request::new(gateway_v1::ListSessionsRequest {
+        v: 1,
+        after_session_key: String::new(),
+        limit: 1,
+    });
+    authorize_metadata(first_page_request.metadata_mut())?;
+    let first_page = client
+        .list_sessions(first_page_request)
+        .await
+        .context("failed to list first session page")?
+        .into_inner();
+    assert_eq!(
+        first_page.sessions.iter().map(|session| session.session_key.as_str()).collect::<Vec<_>>(),
+        vec!["session:alpha:visible"],
+        "first page should include only sessions visible to the authenticated context"
+    );
+    assert_eq!(
+        first_page.next_after_session_key, "session:alpha:visible",
+        "cursor should advance within the authenticated scope"
+    );
+
+    let mut second_page_request = tonic::Request::new(gateway_v1::ListSessionsRequest {
+        v: 1,
+        after_session_key: first_page.next_after_session_key.clone(),
+        limit: 2,
+    });
+    authorize_metadata(second_page_request.metadata_mut())?;
+    let second_page = client
+        .list_sessions(second_page_request)
+        .await
+        .context("failed to list second session page")?
+        .into_inner();
+    assert_eq!(
+        second_page.sessions.iter().map(|session| session.session_key.as_str()).collect::<Vec<_>>(),
+        vec!["session:omega:visible"],
+        "later pages must skip interleaved foreign sessions instead of leaking metadata"
+    );
+    assert!(
+        second_page.next_after_session_key.is_empty(),
+        "final scoped page should not advertise another cursor"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn grpc_agents_create_set_default_and_resolve_roundtrip() -> Result<()> {
     let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
     let mut daemon = ChildGuard::new(child);
@@ -8770,7 +8848,7 @@ fn authorize_metadata_with_principal(
     metadata: &mut tonic::metadata::MetadataMap,
     principal: &str,
 ) -> Result<()> {
-    authorize_metadata_with_principal_and_channel(metadata, principal, "cli")
+    authorize_metadata_with_context(metadata, principal, DEVICE_ID, Some("cli"))
 }
 
 fn authorize_metadata_with_principal_and_channel(
@@ -8778,10 +8856,21 @@ fn authorize_metadata_with_principal_and_channel(
     principal: &str,
     channel: &str,
 ) -> Result<()> {
+    authorize_metadata_with_context(metadata, principal, DEVICE_ID, Some(channel))
+}
+
+fn authorize_metadata_with_context(
+    metadata: &mut tonic::metadata::MetadataMap,
+    principal: &str,
+    device_id: &str,
+    channel: Option<&str>,
+) -> Result<()> {
     metadata.insert("authorization", format!("Bearer {ADMIN_TOKEN}").parse()?);
     metadata.insert("x-palyra-principal", principal.parse()?);
-    metadata.insert("x-palyra-device-id", DEVICE_ID.parse()?);
-    metadata.insert("x-palyra-channel", channel.parse()?);
+    metadata.insert("x-palyra-device-id", device_id.parse()?);
+    if let Some(channel) = channel {
+        metadata.insert("x-palyra-channel", channel.parse()?);
+    }
     Ok(())
 }
 

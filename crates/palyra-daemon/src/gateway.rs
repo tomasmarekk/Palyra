@@ -2446,12 +2446,21 @@ impl GatewayRuntimeState {
     fn list_orchestrator_sessions_blocking(
         &self,
         after_session_key: Option<String>,
+        principal: String,
+        device_id: String,
+        channel: Option<String>,
         requested_limit: Option<usize>,
     ) -> Result<(Vec<OrchestratorSessionRecord>, Option<String>), Status> {
         let limit = requested_limit.unwrap_or(100).clamp(1, MAX_SESSIONS_PAGE_LIMIT);
         let mut sessions = self
             .journal_store
-            .list_orchestrator_sessions(after_session_key.as_deref(), limit.saturating_add(1))
+            .list_orchestrator_sessions(
+                after_session_key.as_deref(),
+                principal.as_str(),
+                device_id.as_str(),
+                channel.as_deref(),
+                limit.saturating_add(1),
+            )
             .map_err(|error| map_orchestrator_store_error("list orchestrator sessions", error))?;
         let has_more = sessions.len() > limit;
         if has_more {
@@ -2469,11 +2478,20 @@ impl GatewayRuntimeState {
     pub async fn list_orchestrator_sessions(
         self: &Arc<Self>,
         after_session_key: Option<String>,
+        principal: String,
+        device_id: String,
+        channel: Option<String>,
         requested_limit: Option<usize>,
     ) -> Result<(Vec<OrchestratorSessionRecord>, Option<String>), Status> {
         let state = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
-            state.list_orchestrator_sessions_blocking(after_session_key, requested_limit)
+            state.list_orchestrator_sessions_blocking(
+                after_session_key,
+                principal,
+                device_id,
+                channel,
+                requested_limit,
+            )
         })
         .await
         .map_err(|_| Status::internal("orchestrator session list worker panicked"))?
@@ -7007,15 +7025,23 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
         &self,
         request: Request<gateway_v1::ListSessionsRequest>,
     ) -> Result<Response<gateway_v1::ListSessionsResponse>, Status> {
-        let _context = self.authorize_rpc(request.metadata(), "ListSessions")?;
+        let context = self.authorize_rpc(request.metadata(), "ListSessions")?;
         let payload = request.into_inner();
         if payload.v != CANONICAL_PROTOCOL_MAJOR {
             return Err(Status::failed_precondition("unsupported protocol major version"));
         }
         let after_session_key = non_empty(payload.after_session_key);
         let requested_limit = if payload.limit == 0 { None } else { Some(payload.limit as usize) };
-        let (sessions, next_after_session_key) =
-            self.state.list_orchestrator_sessions(after_session_key, requested_limit).await?;
+        let (sessions, next_after_session_key) = self
+            .state
+            .list_orchestrator_sessions(
+                after_session_key,
+                context.principal.clone(),
+                context.device_id.clone(),
+                context.channel.clone(),
+                requested_limit,
+            )
+            .await?;
         Ok(Response::new(gateway_v1::ListSessionsResponse {
             v: CANONICAL_PROTOCOL_MAJOR,
             sessions: sessions.iter().map(session_summary_message).collect(),

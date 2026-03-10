@@ -6864,21 +6864,21 @@ async fn console_chat_sessions_list_handler(
 ) -> Result<Json<Value>, Response> {
     let session = authorize_console_session(&state, &headers, false)?;
     let limit = query.limit.unwrap_or(32).clamp(1, 128);
-    let fetch_limit = limit.saturating_mul(5).clamp(limit, 512);
     let (sessions, next_after_session_key) = state
         .runtime
-        .list_orchestrator_sessions(query.after_session_key, Some(fetch_limit))
+        .list_orchestrator_sessions(
+            query.after_session_key,
+            session.context.principal.clone(),
+            session.context.device_id.clone(),
+            session.context.channel.clone(),
+            Some(limit),
+        )
         .await
         .map_err(runtime_status_response)?;
-    let visible: Vec<journal::OrchestratorSessionRecord> = sessions
-        .into_iter()
-        .filter(|entry| session_matches_console_context(entry, &session.context))
-        .take(limit)
-        .collect();
     Ok(Json(json!({
-        "sessions": visible,
+        "sessions": sessions,
         "next_after_session_key": next_after_session_key,
-        "page": build_page_info(limit, visible.len(), next_after_session_key.clone()),
+        "page": build_page_info(limit, sessions.len(), next_after_session_key.clone()),
     })))
 }
 
@@ -7263,20 +7263,6 @@ async fn console_chat_run_events_handler(
         "run": run,
         "tape": tape,
     })))
-}
-
-fn session_matches_console_context(
-    record: &journal::OrchestratorSessionRecord,
-    context: &gateway::RequestContext,
-) -> bool {
-    if record.principal != context.principal || record.device_id != context.device_id {
-        return false;
-    }
-    match (&record.channel, &context.channel) {
-        (Some(left), Some(right)) => left == right,
-        (None, None) => true,
-        _ => false,
-    }
 }
 
 fn run_matches_console_context(
