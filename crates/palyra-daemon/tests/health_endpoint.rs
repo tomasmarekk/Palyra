@@ -1,10 +1,9 @@
 use std::{
-    io::{BufRead, BufReader},
-    net::SocketAddr,
+    fs,
+    net::TcpListener,
     path::PathBuf,
-    process::{Child, ChildStdout, Command, Stdio},
+    process::{Child, Command, Stdio},
     sync::atomic::{AtomicU64, Ordering},
-    sync::mpsc,
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -38,32 +37,52 @@ fn palyrad_health_endpoint_returns_ok() -> Result<()> {
 }
 
 fn spawn_palyrad_with_dynamic_port() -> Result<(Child, u16)> {
+    let state_root_dir = unique_temp_state_root_dir();
     let journal_db_path = unique_temp_journal_db_path();
-    let identity_store_dir = unique_temp_identity_store_dir();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_palyrad"))
+    let identity_store_dir = state_root_dir.join("identity");
+    let vault_dir = state_root_dir.join("vault");
+    let config_path = unique_temp_config_path();
+    let port = reserve_loopback_port()?;
+    fs::create_dir_all(&identity_store_dir).with_context(|| {
+        format!("failed to create test identity dir {}", identity_store_dir.display())
+    })?;
+    prepare_test_vault_dir(&vault_dir)?;
+    write_test_config(&config_path, "version = 1\n")?;
+    let child = Command::new(env!("CARGO_BIN_EXE_palyrad"))
         .args([
             "--bind",
             "127.0.0.1",
             "--port",
-            "0",
+            port.to_string().as_str(),
             "--grpc-bind",
             "127.0.0.1",
             "--grpc-port",
             "0",
         ])
+        .env("PALYRA_CONFIG", config_path.to_string_lossy().to_string())
+        .env("PALYRA_STATE_ROOT", state_root_dir.to_string_lossy().to_string())
         .env("PALYRA_JOURNAL_DB_PATH", journal_db_path.to_string_lossy().to_string())
         .env("PALYRA_GATEWAY_IDENTITY_STORE_DIR", identity_store_dir.to_string_lossy().to_string())
+        .env("PALYRA_VAULT_DIR", vault_dir.to_string_lossy().to_string())
         .env("PALYRA_ADMIN_TOKEN", "test-admin-token")
         .env("PALYRA_GATEWAY_QUIC_BIND_ADDR", "127.0.0.1")
         .env("PALYRA_GATEWAY_QUIC_PORT", "0")
         .env("RUST_LOG", "info")
-        .stdout(Stdio::piped())
+        .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .context("failed to start palyrad")?;
-    let stdout = child.stdout.take().context("failed to capture palyrad stdout")?;
-    let port = wait_for_listen_port(stdout, &mut child)?;
     Ok((child, port))
+}
+
+fn unique_temp_state_root_dir() -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_nanos();
+    let counter = TEMP_IDENTITY_COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir()
+        .join(format!("palyra-health-state-root-{nonce}-{}-{counter}", std::process::id()))
 }
 
 fn unique_temp_journal_db_path() -> PathBuf {
@@ -75,67 +94,45 @@ fn unique_temp_journal_db_path() -> PathBuf {
         .join(format!("palyra-health-endpoint-{nonce}-{}.sqlite3", std::process::id()))
 }
 
-fn unique_temp_identity_store_dir() -> PathBuf {
+fn unique_temp_config_path() -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time should be after unix epoch")
         .as_nanos();
     let counter = TEMP_IDENTITY_COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir()
-        .join(format!("palyra-health-identity-{nonce}-{}-{counter}", std::process::id()))
+        .join(format!("palyra-health-config-{nonce}-{}-{counter}.toml", std::process::id()))
 }
 
-fn wait_for_listen_port(stdout: ChildStdout, daemon: &mut Child) -> Result<u16> {
-    let (sender, receiver) = mpsc::channel::<Result<u16, String>>();
-    thread::spawn(move || {
-        let mut sender = Some(sender);
-        for line in BufReader::new(stdout).lines() {
-            let Ok(line) = line else {
-                if let Some(sender) = sender.take() {
-                    let _ = sender.send(Err("failed to read palyrad stdout line".to_owned()));
-                }
-                return;
-            };
+fn reserve_loopback_port() -> Result<u16> {
+    let listener =
+        TcpListener::bind("127.0.0.1:0").context("failed to reserve loopback port for palyrad")?;
+    let port = listener
+        .local_addr()
+        .context("failed to inspect reserved loopback listener address")?
+        .port();
+    drop(listener);
+    Ok(port)
+}
 
-            if let Some(port) = parse_listen_port(&line) {
-                if let Some(sender) = sender.take() {
-                    let _ = sender.send(Ok(port));
-                }
-            }
-        }
+fn prepare_test_vault_dir(vault_dir: &PathBuf) -> Result<()> {
+    fs::create_dir_all(vault_dir)
+        .with_context(|| format!("failed to create test vault dir {}", vault_dir.display()))?;
+    let backend_marker = vault_dir.join("backend.kind");
+    fs::write(&backend_marker, b"encrypted_file").with_context(|| {
+        format!("failed to write vault backend marker {}", backend_marker.display())
+    })?;
+    Ok(())
+}
 
-        if let Some(sender) = sender.take() {
-            let _ = sender
-                .send(Err("palyrad stdout closed before listen address was published".to_owned()));
-        }
-    });
-
-    let timeout_at = Instant::now() + Duration::from_secs(10);
-    loop {
-        match receiver.recv_timeout(Duration::from_millis(100)) {
-            Ok(Ok(port)) => return Ok(port),
-            Ok(Err(message)) => anyhow::bail!("{message}"),
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                anyhow::bail!("listen-address reader disconnected before publishing a port");
-            }
-        }
-
-        if Instant::now() > timeout_at {
-            anyhow::bail!("timed out waiting for palyrad listen address log");
-        }
-        if let Some(status) = daemon.try_wait().context("failed to check palyrad status")? {
-            anyhow::bail!("palyrad exited before publishing listen address with status: {status}");
-        }
+fn write_test_config(config_path: &PathBuf, contents: &str) -> Result<()> {
+    if let Some(parent) = config_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create test config dir {}", parent.display()))?;
     }
-}
-
-fn parse_listen_port(line: &str) -> Option<u16> {
-    const LISTEN_ADDR_PREFIX: &str = "\"listen_addr\":\"";
-    let start = line.find(LISTEN_ADDR_PREFIX)? + LISTEN_ADDR_PREFIX.len();
-    let rest = &line[start..];
-    let end = rest.find('"')?;
-    rest[..end].parse::<SocketAddr>().ok().map(|address| address.port())
+    fs::write(config_path, contents)
+        .with_context(|| format!("failed to write test config {}", config_path.display()))?;
+    Ok(())
 }
 
 fn wait_for_health(port: u16, daemon: &mut Child) -> Result<()> {

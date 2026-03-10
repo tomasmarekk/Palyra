@@ -1,11 +1,10 @@
 use std::{
     fs,
-    io::{BufRead, BufReader},
-    net::SocketAddr,
+    io::Read,
+    net::TcpListener,
     path::PathBuf,
-    process::{Child, ChildStdout, Command, Stdio},
+    process::{Child, ChildStderr, Command, Stdio},
     sync::atomic::{AtomicU64, Ordering},
-    sync::mpsc,
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -22,6 +21,7 @@ const CONSOLE_ADMIN_PRINCIPAL: &str = "admin:web-console";
 const CONSOLE_AUDITOR_PRINCIPAL: &str = "admin:web-auditor";
 const PALYRAD_STARTUP_ATTEMPTS: usize = 3;
 const PALYRAD_STARTUP_RETRY_DELAY: Duration = Duration::from_millis(150);
+const PALYRAD_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 static TEMP_IDENTITY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[test]
@@ -2367,22 +2367,31 @@ fn header_value(headers: &reqwest::header::HeaderMap, name: &str) -> Result<Stri
 }
 
 fn spawn_palyrad_with_dynamic_ports_once(extra_env: &[(&str, &str)]) -> Result<(Child, u16)> {
+    let state_root_dir = unique_temp_state_root_dir();
     let journal_db_path = unique_temp_journal_db_path();
-    let identity_store_dir = unique_temp_identity_store_dir();
-    let vault_dir = unique_temp_vault_dir();
+    let identity_store_dir = state_root_dir.join("identity");
+    let vault_dir = state_root_dir.join("vault");
+    let default_config_path = unique_temp_config_path();
+    let admin_port = reserve_loopback_port()?;
+    fs::create_dir_all(&identity_store_dir).with_context(|| {
+        format!("failed to create test identity dir {}", identity_store_dir.display())
+    })?;
     prepare_test_vault_dir(&vault_dir)?;
+    write_test_config(&default_config_path, "version = 1\n")?;
     let mut command = Command::new(env!("CARGO_BIN_EXE_palyrad"));
     command
         .args([
             "--bind",
             "127.0.0.1",
             "--port",
-            "0",
+            admin_port.to_string().as_str(),
             "--grpc-bind",
             "127.0.0.1",
             "--grpc-port",
             "0",
         ])
+        .env("PALYRA_CONFIG", default_config_path.to_string_lossy().to_string())
+        .env("PALYRA_STATE_ROOT", state_root_dir.to_string_lossy().to_string())
         .env("PALYRA_ADMIN_TOKEN", ADMIN_TOKEN)
         .env("PALYRA_GATEWAY_QUIC_BIND_ADDR", "127.0.0.1")
         .env("PALYRA_GATEWAY_QUIC_PORT", "0")
@@ -2390,21 +2399,12 @@ fn spawn_palyrad_with_dynamic_ports_once(extra_env: &[(&str, &str)]) -> Result<(
         .env("PALYRA_GATEWAY_IDENTITY_STORE_DIR", identity_store_dir.to_string_lossy().to_string())
         .env("PALYRA_VAULT_DIR", vault_dir.to_string_lossy().to_string())
         .env("RUST_LOG", "info")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
     for (name, value) in extra_env {
         command.env(name, value);
     }
-    let mut child = command.spawn().context("failed to start palyrad")?;
-    let stdout = child.stdout.take().context("failed to capture palyrad stdout")?;
-    let admin_port = match wait_for_admin_port(stdout, &mut child) {
-        Ok(port) => port,
-        Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error).context("failed to capture palyrad admin listen port");
-        }
-    };
+    let child = command.spawn().context("failed to start palyrad")?;
     Ok((child, admin_port))
 }
 
@@ -2418,24 +2418,14 @@ fn unique_temp_journal_db_path() -> PathBuf {
         .join(format!("palyra-admin-surface-{nonce}-{}-{counter}.sqlite3", std::process::id()))
 }
 
-fn unique_temp_identity_store_dir() -> PathBuf {
+fn unique_temp_state_root_dir() -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time should be after unix epoch")
         .as_nanos();
     let counter = TEMP_IDENTITY_COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir()
-        .join(format!("palyra-admin-identity-{nonce}-{}-{counter}", std::process::id()))
-}
-
-fn unique_temp_vault_dir() -> PathBuf {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time should be after unix epoch")
-        .as_nanos();
-    let counter = TEMP_IDENTITY_COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir()
-        .join(format!("palyra-admin-vault-{nonce}-{}-{counter}", std::process::id()))
+        .join(format!("palyra-admin-state-root-{nonce}-{}-{counter}", std::process::id()))
 }
 
 fn unique_temp_config_path() -> PathBuf {
@@ -2446,6 +2436,17 @@ fn unique_temp_config_path() -> PathBuf {
     let counter = TEMP_IDENTITY_COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir()
         .join(format!("palyra-admin-config-{nonce}-{}-{counter}.toml", std::process::id()))
+}
+
+fn reserve_loopback_port() -> Result<u16> {
+    let listener =
+        TcpListener::bind("127.0.0.1:0").context("failed to reserve loopback port for palyrad")?;
+    let port = listener
+        .local_addr()
+        .context("failed to inspect reserved loopback listener address")?
+        .port();
+    drop(listener);
+    Ok(port)
 }
 
 fn prepare_test_vault_dir(vault_dir: &PathBuf) -> Result<()> {
@@ -2468,63 +2469,17 @@ fn write_test_config(config_path: &PathBuf, contents: &str) -> Result<()> {
     Ok(())
 }
 
-fn wait_for_admin_port(stdout: ChildStdout, daemon: &mut Child) -> Result<u16> {
-    let (sender, receiver) = mpsc::channel::<Result<u16, String>>();
-    thread::spawn(move || {
-        let mut sender = Some(sender);
-        for line in BufReader::new(stdout).lines() {
-            let Ok(line) = line else {
-                if let Some(sender) = sender.take() {
-                    let _ = sender.send(Err("failed to read palyrad stdout line".to_owned()));
-                }
-                return;
-            };
-            if let Some(port) = parse_port_from_log(&line, "\"listen_addr\":\"") {
-                if let Some(sender) = sender.take() {
-                    let _ = sender.send(Ok(port));
-                }
-                return;
-            }
-        }
-        if let Some(sender) = sender.take() {
-            let _ =
-                sender
-                    .send(Err("palyrad stdout closed before admin listen address was published"
-                        .to_owned()));
-        }
-    });
-
-    let timeout_at = Instant::now() + Duration::from_secs(10);
-    loop {
-        match receiver.recv_timeout(Duration::from_millis(100)) {
-            Ok(Ok(port)) => return Ok(port),
-            Ok(Err(message)) => anyhow::bail!("{message}"),
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                anyhow::bail!("admin listen-address reader disconnected before publishing a port");
-            }
-        }
-
-        if Instant::now() > timeout_at {
-            anyhow::bail!("timed out waiting for palyrad admin listen address log");
-        }
-        if let Some(status) = daemon.try_wait().context("failed to check palyrad status")? {
-            anyhow::bail!(
-                "palyrad exited before publishing admin listen address with status: {status}"
-            );
-        }
-    }
-}
-
-fn parse_port_from_log(line: &str, prefix: &str) -> Option<u16> {
-    let start = line.find(prefix)? + prefix.len();
-    let rest = &line[start..];
-    let end = rest.find('"')?;
-    rest[..end].parse::<SocketAddr>().ok().map(|address| address.port())
+fn read_child_stderr(stderr: Option<ChildStderr>) -> String {
+    let Some(mut stderr) = stderr else {
+        return String::new();
+    };
+    let mut buffer = String::new();
+    let _ = stderr.read_to_string(&mut buffer);
+    buffer.trim().to_owned()
 }
 
 fn wait_for_health(port: u16, daemon: &mut Child) -> Result<()> {
-    let timeout_at = Instant::now() + Duration::from_secs(10);
+    let timeout_at = Instant::now() + PALYRAD_STARTUP_TIMEOUT;
     let url = format!("http://127.0.0.1:{port}/healthz");
     let client = Client::builder()
         .timeout(Duration::from_millis(300))
@@ -2536,7 +2491,13 @@ fn wait_for_health(port: u16, daemon: &mut Child) -> Result<()> {
             anyhow::bail!("timed out waiting for palyrad health endpoint");
         }
         if let Some(status) = daemon.try_wait().context("failed to check palyrad status")? {
-            anyhow::bail!("palyrad exited before becoming healthy with status: {status}");
+            let stderr = read_child_stderr(daemon.stderr.take());
+            if stderr.is_empty() {
+                anyhow::bail!("palyrad exited before becoming healthy with status: {status}");
+            }
+            anyhow::bail!(
+                "palyrad exited before becoming healthy with status: {status}; stderr: {stderr}"
+            );
         }
         if client.get(&url).send().and_then(|response| response.error_for_status()).is_ok() {
             return Ok(());
