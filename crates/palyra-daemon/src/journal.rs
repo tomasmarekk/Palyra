@@ -32,7 +32,7 @@ const SENSITIVE_KEY_FRAGMENTS: &[&str] = &[
     "proof",
     "signature",
 ];
-const SENSITIVE_KEY_TOKENS: &[&str] = &["pin"];
+const SENSITIVE_KEY_TOKENS: &[&str] = &["pin", "pincode"];
 const MAX_CRON_JOBS_LIST_LIMIT: usize = 500;
 const MAX_CRON_RUNS_LIST_LIMIT: usize = 500;
 const MAX_APPROVALS_LIST_LIMIT: usize = 500;
@@ -5294,9 +5294,36 @@ fn is_sensitive_key(key: &str) -> bool {
     if SENSITIVE_KEY_FRAGMENTS.iter().any(|fragment| normalized.contains(fragment)) {
         return true;
     }
-    normalized
-        .split(|ch: char| !ch.is_ascii_alphanumeric())
-        .any(|token| SENSITIVE_KEY_TOKENS.contains(&token))
+    sensitive_key_tokens(key).any(|token| SENSITIVE_KEY_TOKENS.contains(&token.as_str()))
+}
+
+fn sensitive_key_tokens(key: &str) -> impl Iterator<Item = String> + '_ {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut previous_was_lowercase = false;
+
+    for ch in key.chars() {
+        if !ch.is_ascii_alphanumeric() {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+            previous_was_lowercase = false;
+            continue;
+        }
+
+        if ch.is_ascii_uppercase() && previous_was_lowercase && !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
+        }
+
+        current.push(ch.to_ascii_lowercase());
+        previous_was_lowercase = ch.is_ascii_lowercase();
+    }
+
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    tokens.into_iter()
 }
 
 fn looks_like_secret(value: &str) -> bool {
@@ -5721,7 +5748,7 @@ mod tests {
         store
             .append(&build_request(
                 "01ARZ3NDEKTSV4RRFFQ69G5FB9",
-                br#"{"pin":"1234","pinpoint_id":"region-1"}"#,
+                br#"{"pin":"1234","pinCode":"5678","pincode":"9012","pinpoint_id":"region-1","pinpointId":"region-2"}"#,
             ))
             .expect("append should succeed");
         let records = store.recent(1).expect("recent journal query should succeed");
@@ -5731,8 +5758,20 @@ mod tests {
             "explicit pin keys should remain redacted"
         );
         assert!(
+            records[0].payload_json.contains("\"pinCode\":\"<redacted>\""),
+            "camelCase pin code keys should be redacted"
+        );
+        assert!(
+            records[0].payload_json.contains("\"pincode\":\"<redacted>\""),
+            "concatenated pin code keys should be redacted"
+        );
+        assert!(
             records[0].payload_json.contains("\"pinpoint_id\":\"region-1\""),
             "pin substring in benign key names must not trigger over-redaction"
+        );
+        assert!(
+            records[0].payload_json.contains("\"pinpointId\":\"region-2\""),
+            "camelCase benign pinpoint keys must not trigger over-redaction"
         );
     }
 
