@@ -1,11 +1,12 @@
 use std::{
+    fs,
     io::{BufRead, BufReader},
     net::SocketAddr,
-    path::{Path, PathBuf},
+    path::Path,
     process::{Child, ChildStdout, Command, Stdio},
     sync::{mpsc, Arc},
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::{Context, Result};
@@ -43,7 +44,7 @@ use proto::palyra::{common::v1 as common_v1, node::v1 as node_v1};
 #[tokio::test(flavor = "multi_thread")]
 async fn node_rpc_mtls_rejects_clients_without_certificate() -> Result<()> {
     let identity = prepare_identity_store(false)?;
-    let (child, admin_port, node_rpc_port) =
+    let (child, admin_port, node_rpc_port, _runtime_root) =
         spawn_palyrad_with_dynamic_ports(identity.store_dir(), false)?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut()).await?;
@@ -70,7 +71,7 @@ async fn node_rpc_mtls_rejects_clients_without_certificate() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn node_rpc_mtls_accepts_valid_client_certificate() -> Result<()> {
     let identity = prepare_identity_store(false)?;
-    let (child, admin_port, node_rpc_port) =
+    let (child, admin_port, node_rpc_port, _runtime_root) =
         spawn_palyrad_with_dynamic_ports(identity.store_dir(), false)?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut()).await?;
@@ -92,7 +93,7 @@ async fn node_rpc_mtls_accepts_valid_client_certificate() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn node_rpc_mtls_rejects_revoked_client_certificate() -> Result<()> {
     let identity = prepare_identity_store(true)?;
-    let (child, admin_port, node_rpc_port) =
+    let (child, admin_port, node_rpc_port, _runtime_root) =
         spawn_palyrad_with_dynamic_ports(identity.store_dir(), false)?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut()).await?;
@@ -118,7 +119,7 @@ async fn node_rpc_mtls_rejects_revoked_client_certificate() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn node_rpc_insecure_opt_out_accepts_clients_without_certificate() -> Result<()> {
     let identity = prepare_identity_store(false)?;
-    let (child, admin_port, node_rpc_port) =
+    let (child, admin_port, node_rpc_port, _runtime_root) =
         spawn_palyrad_with_dynamic_ports(identity.store_dir(), true)?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut()).await?;
@@ -231,8 +232,18 @@ fn prepare_identity_store(revoke_after_pairing: bool) -> Result<PreparedIdentity
 fn spawn_palyrad_with_dynamic_ports(
     identity_store_dir: &Path,
     allow_insecure_node_rpc_without_mtls: bool,
-) -> Result<(Child, u16, u16)> {
-    let journal_db_path = unique_temp_journal_db_path();
+) -> Result<(Child, u16, u16, TempDir)> {
+    let runtime_root = TempDir::new().context("failed to create node RPC runtime root")?;
+    let state_root = runtime_root.path().join("state");
+    let vault_dir = runtime_root.path().join("vault");
+    let config_path = runtime_root.path().join("palyra.toml");
+    let journal_db_path = runtime_root.path().join("journal.sqlite3");
+    fs::create_dir_all(&state_root)
+        .with_context(|| format!("failed to create state root {}", state_root.display()))?;
+    fs::create_dir_all(&vault_dir)
+        .with_context(|| format!("failed to create vault dir {}", vault_dir.display()))?;
+    fs::write(&config_path, "version = 1\n")
+        .with_context(|| format!("failed to write config {}", config_path.display()))?;
     let mut command = Command::new(env!("CARGO_BIN_EXE_palyrad"));
     command
         .args([
@@ -245,11 +256,15 @@ fn spawn_palyrad_with_dynamic_ports(
             "--grpc-port",
             "0",
         ])
+        .env("PALYRA_CONFIG", config_path.to_string_lossy().to_string())
+        .env("PALYRA_STATE_ROOT", state_root.to_string_lossy().to_string())
         .env("PALYRA_ADMIN_TOKEN", ADMIN_TOKEN)
         .env("PALYRA_GATEWAY_QUIC_BIND_ADDR", "127.0.0.1")
         .env("PALYRA_GATEWAY_QUIC_PORT", "0")
         .env("PALYRA_JOURNAL_DB_PATH", journal_db_path.to_string_lossy().to_string())
         .env("PALYRA_GATEWAY_IDENTITY_STORE_DIR", identity_store_dir.to_string_lossy().to_string())
+        .env("PALYRA_VAULT_BACKEND", "encrypted-file")
+        .env("PALYRA_VAULT_DIR", vault_dir.to_string_lossy().to_string())
         .env("RUST_LOG", "info")
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -259,7 +274,7 @@ fn spawn_palyrad_with_dynamic_ports(
     let mut child = command.spawn().context("failed to start palyrad")?;
     let stdout = child.stdout.take().context("failed to capture palyrad stdout")?;
     let (admin_port, node_rpc_port) = wait_for_admin_and_node_rpc_ports(stdout, &mut child)?;
-    Ok((child, admin_port, node_rpc_port))
+    Ok((child, admin_port, node_rpc_port, runtime_root))
 }
 
 fn wait_for_admin_and_node_rpc_ports(
@@ -348,15 +363,6 @@ async fn wait_for_health(port: u16, daemon: &mut Child) -> Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-}
-
-fn unique_temp_journal_db_path() -> PathBuf {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time should be after unix epoch")
-        .as_nanos();
-    std::env::temp_dir()
-        .join(format!("palyra-node-rpc-mtls-{nonce}-{}.sqlite3", std::process::id()))
 }
 
 struct ChildGuard {
