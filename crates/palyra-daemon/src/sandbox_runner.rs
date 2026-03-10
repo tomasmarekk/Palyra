@@ -974,7 +974,8 @@ fn set_rlimit(resource: libc::c_int, limit: libc::rlim_t) -> std::io::Result<()>
 
 #[cfg(unix)]
 fn set_cpu_rlimit(cpu_time_limit_ms: u64) -> std::io::Result<()> {
-    set_rlimit(libc::RLIMIT_CPU as libc::c_int, cpu_ms_to_rlimit_seconds(cpu_time_limit_ms))
+    let cpu_limit_seconds = current_process_cpu_rlimit_seconds(cpu_time_limit_ms)?;
+    set_rlimit(libc::RLIMIT_CPU as libc::c_int, cpu_limit_seconds as libc::rlim_t)
 }
 
 #[cfg(unix)]
@@ -990,8 +991,37 @@ fn set_memory_rlimit(memory_limit_bytes: u64) -> std::io::Result<()> {
 }
 
 #[cfg(unix)]
-fn cpu_ms_to_rlimit_seconds(cpu_time_limit_ms: u64) -> libc::rlim_t {
-    cpu_time_limit_ms.max(1).div_ceil(1_000) as libc::rlim_t
+fn current_process_cpu_rlimit_seconds(cpu_time_limit_ms: u64) -> std::io::Result<u64> {
+    let used_micros = current_process_cpu_time_micros()?;
+    Ok(cpu_rlimit_seconds_from_usage_micros(cpu_time_limit_ms, used_micros))
+}
+
+#[cfg(unix)]
+fn current_process_cpu_time_micros() -> std::io::Result<u128> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let usage = unsafe { usage.assume_init() };
+    Ok(timeval_micros(usage.ru_utime).saturating_add(timeval_micros(usage.ru_stime)))
+}
+
+fn cpu_rlimit_seconds_from_usage_micros(cpu_time_limit_ms: u64, cpu_time_used_micros: u128) -> u64 {
+    let requested_seconds = cpu_ms_to_rlimit_seconds(cpu_time_limit_ms) as u128;
+    let used_seconds = cpu_time_used_micros.div_ceil(1_000_000);
+    requested_seconds.saturating_add(used_seconds).min(u64::MAX as u128) as u64
+}
+
+#[cfg(unix)]
+fn timeval_micros(value: libc::timeval) -> u128 {
+    let seconds = value.tv_sec.max(0) as u128;
+    let micros = value.tv_usec.max(0) as u128;
+    seconds.saturating_mul(1_000_000).saturating_add(micros)
+}
+
+fn cpu_ms_to_rlimit_seconds(cpu_time_limit_ms: u64) -> u64 {
+    cpu_time_limit_ms.max(1).div_ceil(1_000)
 }
 
 fn capture_child_output(
@@ -1127,10 +1157,11 @@ mod tests {
     };
 
     use super::{
-        canonical_workspace_root, collect_requested_egress_hosts, is_host_allowlisted,
-        run_constrained_process, validate_argument_workspace_scope,
-        validate_runtime_egress_enforcement, EgressEnforcementMode, ProcessRunnerInput,
-        SandboxProcessRunErrorKind, SandboxProcessRunnerPolicy, SandboxProcessRunnerTier,
+        canonical_workspace_root, collect_requested_egress_hosts,
+        cpu_rlimit_seconds_from_usage_micros, is_host_allowlisted, run_constrained_process,
+        validate_argument_workspace_scope, validate_runtime_egress_enforcement,
+        EgressEnforcementMode, ProcessRunnerInput, SandboxProcessRunErrorKind,
+        SandboxProcessRunnerPolicy, SandboxProcessRunnerTier,
     };
 
     fn portable_test_memory_limit_bytes() -> u64 {
@@ -1722,6 +1753,13 @@ mod tests {
             super::process_runner_executor_name(&policy).starts_with("sandbox_tier_c_"),
             "tier-c executions should expose backend-specific tier-c executor label"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cpu_rlimit_seconds_accounts_for_consumed_process_time() {
+        let limit = cpu_rlimit_seconds_from_usage_micros(2_000, 3_250_000);
+        assert_eq!(limit, 6);
     }
 
     #[test]
