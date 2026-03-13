@@ -1,5 +1,8 @@
 use crate::*;
 
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 pub(crate) async fn console_diagnostics_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1418,6 +1421,8 @@ pub(crate) async fn run_support_bundle_export_command(
     let output_path = support_bundle_root
         .join(format!("support-bundle-{}.json", unix_ms_now().unwrap_or_default()));
     let mut command = TokioCommand::new(cli_path.as_path());
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
     command.env_clear();
     if let Ok(path) = std::env::var("PATH") {
         command.env("PATH", path);

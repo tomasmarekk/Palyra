@@ -8,6 +8,7 @@ use std::{
 #[cfg(windows)]
 use std::{
     io::Read,
+    os::windows::process::CommandExt,
     process::{Command, Stdio},
 };
 
@@ -32,6 +33,8 @@ const METADATA_LOCK_STALE_AGE: Duration = Duration::from_secs(30);
 const WINDOWS_TASKLIST_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(windows)]
 const WINDOWS_TASKLIST_POLL_INTERVAL: Duration = Duration::from_millis(10);
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct MetadataFile {
@@ -300,7 +303,9 @@ fn metadata_lock_owner_is_alive(pid: u32) -> bool {
 
 #[cfg(windows)]
 fn run_tasklist_for_pid(pid: u32, timeout: Duration) -> std::io::Result<std::process::Output> {
-    let mut child = Command::new("tasklist")
+    let mut command = Command::new("tasklist");
+    command.creation_flags(CREATE_NO_WINDOW);
+    let mut child = command
         .arg("/FI")
         .arg(format!("PID eq {pid}"))
         .args(["/FO", "CSV", "/NH"])

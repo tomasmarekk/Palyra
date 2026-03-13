@@ -64,7 +64,6 @@ impl CertificateAuthority {
     pub fn issue_client_certificate(
         &mut self,
         device_id: &str,
-        identity_fingerprint: &str,
         validity: Duration,
     ) -> IdentityResult<IssuedCertificate> {
         let mut params = CertificateParams::new(Vec::<String>::new())
@@ -74,10 +73,6 @@ impl CertificateAuthority {
         distinguished_name.push(DnType::OrganizationName, "Palyra");
         params.distinguished_name = distinguished_name;
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
-        params.custom_extensions.push(rcgen::CustomExtension::from_oid_content(
-            &[1, 3, 6, 1, 4, 1, 53594, 5, 1],
-            identity_fingerprint.as_bytes().to_vec(),
-        ));
 
         self.issue_leaf_certificate(params, validity, format!("device:{device_id}"))
     }
@@ -209,11 +204,7 @@ mod tests {
         let validity = Duration::from_secs(3_600);
 
         let issued = ca
-            .issue_client_certificate(
-                "01ARZ3NDEKTSV4RRFFQ69G5FAV",
-                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-                validity,
-            )
+            .issue_client_certificate("01ARZ3NDEKTSV4RRFFQ69G5FAV", validity)
             .expect("certificate issuance should succeed");
 
         let (_, pem) = parse_x509_pem(issued.certificate_pem.as_bytes())

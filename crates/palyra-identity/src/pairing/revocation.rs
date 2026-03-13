@@ -33,11 +33,7 @@ impl IdentityManager {
         let previous_fingerprint =
             certificate_fingerprint_hex(&paired.current_certificate.certificate_pem)?;
 
-        let rotated = self.ca.issue_client_certificate(
-            device_id,
-            paired.identity_fingerprint.as_str(),
-            self.certificate_validity,
-        )?;
+        let rotated = self.ca.issue_client_certificate(device_id, self.certificate_validity)?;
         let rotated_fingerprint = certificate_fingerprint_hex(&rotated.certificate_pem)?;
         let previous_fingerprints = paired.certificate_fingerprints.clone();
         let mut updated = paired;

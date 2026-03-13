@@ -630,11 +630,7 @@ mod tests {
             .issue_server_certificate("localhost", Duration::from_secs(3_600))
             .expect("server certificate should issue");
         let client = certificate_authority
-            .issue_client_certificate(
-                "test-device",
-                "a".repeat(64).as_str(),
-                Duration::from_secs(3_600),
-            )
+            .issue_client_certificate("test-device", Duration::from_secs(3_600))
             .expect("client certificate should issue");
         TestPki {
             ca_cert_pem: certificate_authority.certificate_pem,

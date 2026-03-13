@@ -104,9 +104,6 @@ impl std::fmt::Debug for DevicePairingHello {
 pub struct PairedDevice {
     pub device_id: String,
     pub client_kind: PairingClientKind,
-    pub identity_fingerprint: String,
-    pub signing_public_key_hex: String,
-    pub transcript_hash_hex: String,
     pub current_certificate: IssuedCertificate,
     #[serde(default)]
     pub certificate_fingerprints: Vec<String>,
@@ -115,6 +112,9 @@ pub struct PairedDevice {
 #[derive(Debug, Clone)]
 pub struct PairingResult {
     pub device: PairedDevice,
+    pub identity_fingerprint: String,
+    pub signing_public_key_hex: String,
+    pub transcript_hash_hex: String,
     pub gateway_ca_certificate_pem: String,
 }
 

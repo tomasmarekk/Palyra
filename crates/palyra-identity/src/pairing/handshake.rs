@@ -267,19 +267,14 @@ impl IdentityManager {
         &mut self,
         verified: VerifiedPairingOutcome,
     ) -> IdentityResult<PairingResult> {
-        let certificate = self.ca.issue_client_certificate(
-            verified.device_id.as_str(),
-            verified.identity_fingerprint.as_str(),
-            self.certificate_validity,
-        )?;
+        let certificate = self
+            .ca
+            .issue_client_certificate(verified.device_id.as_str(), self.certificate_validity)?;
         let certificate_fingerprint = certificate_fingerprint_hex(&certificate.certificate_pem)?;
 
         let paired = PairedDevice {
             device_id: verified.device_id.clone(),
             client_kind: verified.client_kind,
-            identity_fingerprint: verified.identity_fingerprint,
-            signing_public_key_hex: verified.signing_public_key_hex,
-            transcript_hash_hex: verified.transcript_hash_hex,
             current_certificate: certificate.clone(),
             certificate_fingerprints: vec![certificate_fingerprint],
         };
@@ -290,6 +285,9 @@ impl IdentityManager {
 
         Ok(PairingResult {
             device: paired,
+            identity_fingerprint: verified.identity_fingerprint,
+            signing_public_key_hex: verified.signing_public_key_hex,
+            transcript_hash_hex: verified.transcript_hash_hex,
             gateway_ca_certificate_pem: self.ca.certificate_pem.clone(),
         })
     }

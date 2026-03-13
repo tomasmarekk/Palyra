@@ -61,9 +61,9 @@ pub(crate) fn run_pairing(command: PairingCommand) -> Result<()> {
                 result.device.device_id,
                 result.device.client_kind.as_str(),
                 method.as_str(),
-                result.device.identity_fingerprint,
-                result.device.signing_public_key_hex,
-                result.device.transcript_hash_hex,
+                result.identity_fingerprint,
+                result.signing_public_key_hex,
+                result.transcript_hash_hex,
                 store_root.display(),
             );
 
