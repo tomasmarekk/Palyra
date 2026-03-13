@@ -4,6 +4,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::{
+    io::Write,
+    process::{Command, Stdio},
+};
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
 #[cfg(windows)]
 use palyra_common::windows_security::{dpapi_protect_current_user, dpapi_unprotect_current_user};
 use ulid::Ulid;
