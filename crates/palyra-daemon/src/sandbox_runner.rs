@@ -982,7 +982,9 @@ fn set_cpu_rlimit(cpu_time_limit_ms: u64) -> std::io::Result<()> {
 fn set_memory_rlimit(memory_limit_bytes: u64) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
     {
-        return set_rlimit(libc::RLIMIT_DATA as libc::c_int, memory_limit_bytes as libc::rlim_t);
+        let current_virtual_size = current_process_virtual_size_bytes()?;
+        let memory_limit = relative_rlimit_bytes(current_virtual_size, memory_limit_bytes);
+        return set_rlimit(libc::RLIMIT_AS as libc::c_int, memory_limit as libc::rlim_t);
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -1007,10 +1009,35 @@ fn current_process_cpu_time_micros() -> std::io::Result<u128> {
     Ok(timeval_micros(usage.ru_utime).saturating_add(timeval_micros(usage.ru_stime)))
 }
 
+#[cfg(target_os = "macos")]
+fn current_process_virtual_size_bytes() -> std::io::Result<u64> {
+    let mut info = std::mem::MaybeUninit::<libc::mach_task_basic_info_data_t>::uninit();
+    let mut count = libc::MACH_TASK_BASIC_INFO_COUNT;
+    let result = unsafe {
+        libc::task_info(
+            libc::mach_task_self(),
+            libc::MACH_TASK_BASIC_INFO,
+            info.as_mut_ptr().cast::<libc::integer_t>(),
+            &mut count,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::other(format!(
+            "task_info(MACH_TASK_BASIC_INFO) failed with kern_return_t={result}"
+        )));
+    }
+    let info = unsafe { info.assume_init() };
+    Ok(info.virtual_size)
+}
+
 fn cpu_rlimit_seconds_from_usage_micros(cpu_time_limit_ms: u64, cpu_time_used_micros: u128) -> u64 {
     let requested_seconds = cpu_ms_to_rlimit_seconds(cpu_time_limit_ms) as u128;
     let used_seconds = cpu_time_used_micros.div_ceil(1_000_000);
     requested_seconds.saturating_add(used_seconds).min(u64::MAX as u128) as u64
+}
+
+fn relative_rlimit_bytes(current_bytes: u64, requested_budget_bytes: u64) -> u64 {
+    current_bytes.saturating_add(requested_budget_bytes)
 }
 
 #[cfg(unix)]
@@ -1158,10 +1185,10 @@ mod tests {
 
     use super::{
         canonical_workspace_root, collect_requested_egress_hosts,
-        cpu_rlimit_seconds_from_usage_micros, is_host_allowlisted, run_constrained_process,
-        validate_argument_workspace_scope, validate_runtime_egress_enforcement,
-        EgressEnforcementMode, ProcessRunnerInput, SandboxProcessRunErrorKind,
-        SandboxProcessRunnerPolicy, SandboxProcessRunnerTier,
+        cpu_rlimit_seconds_from_usage_micros, is_host_allowlisted, relative_rlimit_bytes,
+        run_constrained_process, validate_argument_workspace_scope,
+        validate_runtime_egress_enforcement, EgressEnforcementMode, ProcessRunnerInput,
+        SandboxProcessRunErrorKind, SandboxProcessRunnerPolicy, SandboxProcessRunnerTier,
     };
 
     fn portable_test_memory_limit_bytes() -> u64 {
@@ -1760,6 +1787,12 @@ mod tests {
     fn cpu_rlimit_seconds_accounts_for_consumed_process_time() {
         let limit = cpu_rlimit_seconds_from_usage_micros(2_000, 3_250_000);
         assert_eq!(limit, 6);
+    }
+
+    #[test]
+    fn relative_rlimit_bytes_adds_current_footprint_to_requested_budget() {
+        let limit = relative_rlimit_bytes(300 * 1024 * 1024, 128 * 1024 * 1024);
+        assert_eq!(limit, 428 * 1024 * 1024);
     }
 
     #[test]
