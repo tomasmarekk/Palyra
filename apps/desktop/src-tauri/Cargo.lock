@@ -2505,6 +2505,7 @@ dependencies = [
  "libc",
  "palyra-common",
  "rcgen",
+ "ring",
  "rustls",
  "serde",
  "serde_json",
