@@ -1036,6 +1036,7 @@ fn cpu_rlimit_seconds_from_usage_micros(cpu_time_limit_ms: u64, cpu_time_used_mi
     requested_seconds.saturating_add(used_seconds).min(u64::MAX as u128) as u64
 }
 
+#[cfg(any(test, target_os = "macos"))]
 fn relative_rlimit_bytes(current_bytes: u64, requested_budget_bytes: u64) -> u64 {
     current_bytes.saturating_add(requested_budget_bytes)
 }
