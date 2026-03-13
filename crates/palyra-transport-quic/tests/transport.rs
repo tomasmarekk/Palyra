@@ -462,11 +462,7 @@ fn build_test_pki() -> TestPki {
         .issue_server_certificate("localhost", Duration::from_secs(3_600))
         .expect("server cert should issue");
     let client = trusted_ca
-        .issue_client_certificate(
-            "test-device",
-            "a".repeat(64).as_str(),
-            Duration::from_secs(3_600),
-        )
+        .issue_client_certificate("test-device", Duration::from_secs(3_600))
         .expect("client cert should issue");
 
     let mut untrusted_ca =
