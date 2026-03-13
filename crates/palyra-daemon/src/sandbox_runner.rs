@@ -980,7 +980,14 @@ fn set_cpu_rlimit(cpu_time_limit_ms: u64) -> std::io::Result<()> {
 
 #[cfg(unix)]
 fn set_memory_rlimit(memory_limit_bytes: u64) -> std::io::Result<()> {
-    set_rlimit(libc::RLIMIT_AS as libc::c_int, memory_limit_bytes as libc::rlim_t)
+    #[cfg(target_os = "macos")]
+    {
+        return set_rlimit(libc::RLIMIT_DATA as libc::c_int, memory_limit_bytes as libc::rlim_t);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        set_rlimit(libc::RLIMIT_AS as libc::c_int, memory_limit_bytes as libc::rlim_t)
+    }
 }
 
 #[cfg(unix)]
