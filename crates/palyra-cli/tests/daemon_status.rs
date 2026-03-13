@@ -9,6 +9,7 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 use reqwest::blocking::Client;
+use tempfile::TempDir;
 
 const DEVICE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const STARTUP_RETRY_ATTEMPTS: usize = 8;
@@ -16,8 +17,8 @@ const STARTUP_HEALTH_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[test]
 fn palyra_daemon_status_reads_health_endpoint() -> Result<()> {
-    let (child, port) = spawn_palyrad_with_dynamic_port()?;
-    let _daemon = ChildGuard::new(child);
+    let (child, port, state_root) = spawn_palyrad_with_dynamic_port()?;
+    let _daemon = ChildGuard::new(child, state_root);
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_palyra"));
     let output = command
@@ -37,9 +38,9 @@ fn palyra_daemon_status_reads_health_endpoint() -> Result<()> {
 
 #[test]
 fn palyra_daemon_admin_status_without_token_succeeds_when_auth_is_disabled() -> Result<()> {
-    let (child, port) =
+    let (child, port, state_root) =
         spawn_palyrad_with_dynamic_port_and_env(&[("PALYRA_ADMIN_REQUIRE_AUTH", "false")])?;
-    let _daemon = ChildGuard::new(child);
+    let _daemon = ChildGuard::new(child, state_root);
 
     let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
         .args([
@@ -70,8 +71,8 @@ fn palyra_daemon_admin_status_without_token_succeeds_when_auth_is_disabled() -> 
 
 #[test]
 fn palyra_daemon_admin_status_without_token_fails_when_auth_is_required() -> Result<()> {
-    let (child, port) = spawn_palyrad_with_dynamic_port()?;
-    let _daemon = ChildGuard::new(child);
+    let (child, port, state_root) = spawn_palyrad_with_dynamic_port()?;
+    let _daemon = ChildGuard::new(child, state_root);
 
     let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
         .args([
@@ -129,15 +130,23 @@ fn palyra_daemon_run_cancel_rejects_non_canonical_run_id() -> Result<()> {
     Ok(())
 }
 
-fn spawn_palyrad_with_dynamic_port() -> Result<(Child, u16)> {
+fn spawn_palyrad_with_dynamic_port() -> Result<(Child, u16, TempDir)> {
     spawn_palyrad_with_dynamic_port_and_env(&[])
 }
 
-fn spawn_palyrad_with_dynamic_port_and_env(extra_env: &[(&str, &str)]) -> Result<(Child, u16)> {
+fn spawn_palyrad_with_dynamic_port_and_env(
+    extra_env: &[(&str, &str)],
+) -> Result<(Child, u16, TempDir)> {
     let mut last_error = None;
 
     for attempt in 1..=STARTUP_RETRY_ATTEMPTS {
         let port = reserve_loopback_port()?;
+        let state_root =
+            tempfile::tempdir().context("failed to create isolated palyrad state root")?;
+        let identity_store_dir = state_root.path().join("identity");
+        std::fs::create_dir_all(&identity_store_dir).with_context(|| {
+            format!("failed to create isolated test identity dir {}", identity_store_dir.display())
+        })?;
         let mut command = Command::new(resolve_palyrad_binary_path()?);
         command
             .args([
@@ -154,6 +163,11 @@ fn spawn_palyrad_with_dynamic_port_and_env(extra_env: &[(&str, &str)]) -> Result
             .stderr(Stdio::piped())
             .env("RUST_LOG", "info")
             .env("PALYRA_ADMIN_TOKEN", "test-admin-token")
+            .env("PALYRA_STATE_ROOT", state_root.path().to_string_lossy().to_string())
+            .env(
+                "PALYRA_GATEWAY_IDENTITY_STORE_DIR",
+                identity_store_dir.to_string_lossy().to_string(),
+            )
             .env("PALYRA_GATEWAY_QUIC_BIND_ADDR", "127.0.0.1")
             .env("PALYRA_GATEWAY_QUIC_PORT", "0");
         for (key, value) in extra_env {
@@ -162,7 +176,7 @@ fn spawn_palyrad_with_dynamic_port_and_env(extra_env: &[(&str, &str)]) -> Result
 
         let mut child = command.spawn().context("failed to spawn palyrad process")?;
         match wait_for_health(port, &mut child, STARTUP_HEALTH_TIMEOUT) {
-            Ok(()) => return Ok((child, port)),
+            Ok(()) => return Ok((child, port, state_root)),
             Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -243,11 +257,12 @@ fn read_child_stderr(stderr: Option<ChildStderr>) -> String {
 
 struct ChildGuard {
     child: Child,
+    _state_root: TempDir,
 }
 
 impl ChildGuard {
-    fn new(child: Child) -> Self {
-        Self { child }
+    fn new(child: Child, state_root: TempDir) -> Self {
+        Self { child, _state_root: state_root }
     }
 }
 

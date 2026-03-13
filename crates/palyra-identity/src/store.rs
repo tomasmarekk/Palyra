@@ -318,6 +318,12 @@ fn build_store_cipher(
     Ok(LessSafeKey::new(unbound))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoreEncryptionKeyWriteOutcome {
+    Created,
+    AlreadyExists,
+}
+
 fn load_or_create_store_encryption_key(
     root: &Path,
     #[cfg(windows)] owner_sid: Option<&str>,
@@ -334,13 +340,17 @@ fn load_or_create_store_encryption_key(
             "failed to generate identity store encryption key: {error}"
         ))
     })?;
-    write_store_encryption_key(
+    match write_store_encryption_key_if_absent(
         key_path.as_path(),
         &raw_key,
         #[cfg(windows)]
         owner_sid,
-    )?;
-    Ok(raw_key)
+    )? {
+        StoreEncryptionKeyWriteOutcome::Created => Ok(raw_key),
+        StoreEncryptionKeyWriteOutcome::AlreadyExists => {
+            read_store_encryption_key(key_path.as_path())
+        }
+    }
 }
 
 fn read_store_encryption_key(
@@ -366,11 +376,11 @@ fn read_store_encryption_key(
     Ok(key_bytes)
 }
 
-fn write_store_encryption_key(
+fn write_store_encryption_key_if_absent(
     path: &Path,
     raw_key: &[u8; SECRET_STORE_ENCRYPTION_KEY_BYTES],
     #[cfg(windows)] owner_sid: Option<&str>,
-) -> IdentityResult<()> {
+) -> IdentityResult<StoreEncryptionKeyWriteOutcome> {
     #[cfg(windows)]
     let encoded = windows_security::dpapi_protect_current_user(raw_key).map_err(|error| {
         IdentityError::Cryptographic(format!(
@@ -380,20 +390,22 @@ fn write_store_encryption_key(
     #[cfg(not(windows))]
     let encoded = raw_key.to_vec();
 
-    let tmp_path = path.with_extension(format!("tmp.{}", ulid::Ulid::new()));
-
-    let write_result: IdentityResult<()> = (|| {
+    let write_result: IdentityResult<StoreEncryptionKeyWriteOutcome> = (|| {
         #[cfg(windows)]
         {
             use std::io::Write;
 
-            let mut file = fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&tmp_path)
-                .map_err(|error| IdentityError::Internal(error.to_string()))?;
+            let mut file = fs::OpenOptions::new().create_new(true).write(true).open(path).map_err(
+                |error| {
+                    if error.kind() == std::io::ErrorKind::AlreadyExists {
+                        IdentityError::SecretNotFound
+                    } else {
+                        IdentityError::Internal(error.to_string())
+                    }
+                },
+            )?;
             harden_windows_path_permissions(
-                &tmp_path,
+                path,
                 owner_sid.ok_or_else(|| {
                     IdentityError::Internal(
                         "identity store encryption key owner SID is missing".to_owned(),
@@ -404,8 +416,6 @@ fn write_store_encryption_key(
             file.write_all(encoded.as_slice())
                 .map_err(|error| IdentityError::Internal(error.to_string()))?;
             file.sync_all().map_err(|error| IdentityError::Internal(error.to_string()))?;
-            fs::rename(&tmp_path, path)
-                .map_err(|error| IdentityError::Internal(error.to_string()))?;
             harden_windows_path_permissions(
                 path,
                 owner_sid.ok_or_else(|| {
@@ -415,6 +425,7 @@ fn write_store_encryption_key(
                 })?,
                 false,
             )?;
+            return Ok(StoreEncryptionKeyWriteOutcome::Created);
         }
         #[cfg(not(windows))]
         {
@@ -427,29 +438,41 @@ fn write_store_encryption_key(
                 .create_new(true)
                 .write(true)
                 .mode(0o600)
-                .open(&tmp_path)
-                .map_err(|error| IdentityError::Internal(error.to_string()))?;
+                .open(path)
+                .map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::AlreadyExists {
+                        IdentityError::SecretNotFound
+                    } else {
+                        IdentityError::Internal(error.to_string())
+                    }
+                })?;
             file.set_permissions(fs::Permissions::from_mode(0o600))
                 .map_err(|error| IdentityError::Internal(error.to_string()))?;
             file.write_all(encoded.as_slice())
                 .map_err(|error| IdentityError::Internal(error.to_string()))?;
             file.sync_all().map_err(|error| IdentityError::Internal(error.to_string()))?;
-            fs::rename(&tmp_path, path)
-                .map_err(|error| IdentityError::Internal(error.to_string()))?;
             if let Some(parent) = path.parent() {
                 fs::File::open(parent)
                     .map_err(|error| IdentityError::Internal(error.to_string()))?
                     .sync_all()
                     .map_err(|error| IdentityError::Internal(error.to_string()))?;
             }
+            return Ok(StoreEncryptionKeyWriteOutcome::Created);
         }
-        Ok(())
+        #[allow(unreachable_code)]
+        Ok(StoreEncryptionKeyWriteOutcome::Created)
     })();
 
-    if write_result.is_err() && tmp_path.exists() {
-        let _ = fs::remove_file(&tmp_path);
+    match write_result {
+        Ok(outcome) => Ok(outcome),
+        Err(IdentityError::SecretNotFound) => Ok(StoreEncryptionKeyWriteOutcome::AlreadyExists),
+        Err(error) => {
+            if path.exists() {
+                let _ = fs::remove_file(path);
+            }
+            Err(error)
+        }
     }
-    write_result
 }
 
 #[cfg(windows)]
@@ -683,6 +706,38 @@ mod tests {
 
         let loaded = store.read_secret(key).expect("legacy plaintext payload should still load");
         assert_eq!(loaded, payload);
+    }
+
+    #[test]
+    fn store_encryption_key_creation_is_first_writer_wins() {
+        let temp = tempdir().expect("temp dir should initialize");
+        let key_path = temp.path().join(super::SECRET_STORE_KEY_FILE);
+        let first_key = [0x11_u8; super::SECRET_STORE_ENCRYPTION_KEY_BYTES];
+        let second_key = [0x22_u8; super::SECRET_STORE_ENCRYPTION_KEY_BYTES];
+        #[cfg(windows)]
+        let owner_sid = super::current_user_sid().expect("current user SID should resolve");
+
+        let first_write = super::write_store_encryption_key_if_absent(
+            key_path.as_path(),
+            &first_key,
+            #[cfg(windows)]
+            Some(owner_sid.as_str()),
+        )
+        .expect("first key write should succeed");
+        assert_eq!(first_write, super::StoreEncryptionKeyWriteOutcome::Created);
+
+        let second_write = super::write_store_encryption_key_if_absent(
+            key_path.as_path(),
+            &second_key,
+            #[cfg(windows)]
+            Some(owner_sid.as_str()),
+        )
+        .expect("second key write should observe existing file");
+        assert_eq!(second_write, super::StoreEncryptionKeyWriteOutcome::AlreadyExists);
+
+        let persisted =
+            super::read_store_encryption_key(key_path.as_path()).expect("key should round-trip");
+        assert_eq!(persisted, first_key);
     }
 
     #[cfg(unix)]

@@ -143,7 +143,7 @@ impl IdentityManager {
             revoked_devices: self.revoked_devices.clone(),
             revoked_certificate_fingerprints: self.revoked_certificate_fingerprints.clone(),
         };
-        write_json(self.store.as_ref(), IDENTITY_STATE_BUNDLE_KEY, &state)?;
+        write_sealed_json(self.store.as_ref(), IDENTITY_STATE_BUNDLE_KEY, &state)?;
         self.state_generation = next_generation;
         Ok(())
     }
@@ -370,15 +370,6 @@ where
         Err(IdentityError::SecretNotFound) => Ok(T::default()),
         Err(error) => Err(error),
     }
-}
-
-fn write_json<T>(store: &dyn SecretStore, key: &str, value: &T) -> IdentityResult<()>
-where
-    T: serde::Serialize,
-{
-    let encoded =
-        serde_json::to_vec(value).map_err(|error| IdentityError::Internal(error.to_string()))?;
-    store.write_secret(key, &encoded)
 }
 
 fn write_sealed_json<T>(store: &dyn SecretStore, key: &str, value: &T) -> IdentityResult<()>
