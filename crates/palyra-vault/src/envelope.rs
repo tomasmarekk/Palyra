@@ -1,6 +1,6 @@
 use anyhow::Context;
 use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
-use rand::random;
+use getrandom::fill as fill_random_bytes;
 use ring::aead::{Aad, LessSafeKey, Nonce, Tag, UnboundKey, CHACHA20_POLY1305};
 
 use crate::{SensitiveBytes, VaultError};
@@ -28,7 +28,7 @@ pub fn seal(
     kek: &[u8; DEK_BYTES],
     aad: &[u8],
 ) -> Result<EnvelopePayload, VaultError> {
-    let mut dek = random::<[u8; DEK_BYTES]>();
+    let mut dek = secure_random_array("data encryption key")?;
     let (secret_nonce, secret_ciphertext, secret_mac) = seal_with_key(&dek, value, aad)?;
     let (dek_nonce, dek_ciphertext, dek_mac) = seal_with_key(kek, &dek, aad)?;
     dek.fill(0);
@@ -95,7 +95,7 @@ fn seal_with_key(
     let unbound_key = UnboundKey::new(&CHACHA20_POLY1305, key_bytes)
         .map_err(|_| VaultError::Crypto("failed to initialize AEAD key".to_owned()))?;
     let key = LessSafeKey::new(unbound_key);
-    let nonce = random::<[u8; NONCE_BYTES]>();
+    let nonce = secure_random_array("envelope nonce")?;
     let nonce_value = Nonce::assume_unique_for_key(nonce);
     let mut in_out = plaintext.to_vec();
     let tag = key
@@ -136,4 +136,12 @@ fn decode_fixed<const N: usize>(raw: &str, label: &str) -> Result<[u8; N], Vault
     let decoded = decode(raw, label)?;
     let slice = decoded.as_slice();
     slice.try_into().map_err(|_| VaultError::Crypto(format!("{label} length mismatch")))
+}
+
+fn secure_random_array<const N: usize>(label: &str) -> Result<[u8; N], VaultError> {
+    let mut bytes = [0_u8; N];
+    fill_random_bytes(&mut bytes).map_err(|error| {
+        VaultError::Crypto(format!("failed to read OS randomness for {label}: {error}"))
+    })?;
+    Ok(bytes)
 }

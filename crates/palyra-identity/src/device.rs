@@ -3,8 +3,8 @@ use std::fmt;
 use anyhow::Context;
 use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use getrandom::fill as fill_random_bytes;
 use palyra_common::validate_canonical_id;
-use rand::random;
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
@@ -32,8 +32,8 @@ impl DeviceIdentity {
         validate_canonical_id(device_id)
             .map_err(|error| IdentityError::InvalidCanonicalDeviceId(error.to_string()))?;
 
-        let signing_key = SigningKey::from_bytes(&random::<[u8; 32]>());
-        let x25519_bytes = random::<[u8; 32]>();
+        let signing_key = SigningKey::from_bytes(&secure_random_array()?);
+        let x25519_bytes = secure_random_array()?;
         let x25519_secret = StaticSecret::from(x25519_bytes);
 
         Ok(Self { device_id: device_id.to_owned(), signing_key, x25519_secret })
@@ -121,6 +121,16 @@ fn decode_fixed_32(value: &str) -> IdentityResult<[u8; 32]> {
     bytes
         .try_into()
         .map_err(|_| IdentityError::Internal("decoded secret length mismatch".to_owned()))
+}
+
+fn secure_random_array<const N: usize>() -> IdentityResult<[u8; N]> {
+    let mut bytes = [0_u8; N];
+    fill_random_bytes(&mut bytes).map_err(|error| {
+        IdentityError::Cryptographic(format!(
+            "failed to read OS randomness for device identity: {error}"
+        ))
+    })?;
+    Ok(bytes)
 }
 
 #[cfg(test)]

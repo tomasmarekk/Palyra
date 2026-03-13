@@ -1,8 +1,8 @@
 use std::time::SystemTime;
 
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
+use getrandom::fill as fill_random_bytes;
 use palyra_common::validate_canonical_id;
-use rand::random;
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
@@ -24,6 +24,15 @@ use super::{
     PairingResult, PairingSession,
 };
 
+#[derive(Debug, Clone)]
+struct VerifiedPairingOutcome {
+    device_id: String,
+    client_kind: PairingClientKind,
+    identity_fingerprint: String,
+    signing_public_key_hex: String,
+    transcript_hash_hex: String,
+}
+
 fn build_pending_pairing_session(
     client_kind: PairingClientKind,
     method: PairingMethod,
@@ -33,10 +42,10 @@ fn build_pending_pairing_session(
     validate_pairing_method(&method)?;
 
     let session_id = ulid::Ulid::new().to_string();
-    let gateway_secret_bytes = random::<[u8; 32]>();
+    let gateway_secret_bytes = secure_random_array()?;
     let gateway_ephemeral_secret = StaticSecret::from(gateway_secret_bytes);
     let gateway_ephemeral_public = X25519PublicKey::from(&gateway_ephemeral_secret).to_bytes();
-    let challenge = random::<[u8; 32]>();
+    let challenge = secure_random_array()?;
     let expires_at = started_at + pairing_window;
     let session = PairingSession {
         session_id: session_id.clone(),
@@ -160,14 +169,19 @@ impl IdentityManager {
         hello: DevicePairingHello,
         now: SystemTime,
     ) -> IdentityResult<PairingResult> {
-        self.mutate_persisted_state(|manager| manager.complete_pairing_inner(hello, now))
+        let _guard = self.acquire_state_mutation_guard()?;
+        self.reload_persisted_state()?;
+        let verified = self.complete_pairing_inner(hello, now)?;
+        let result = self.persist_verified_pairing(verified)?;
+        self.persist_identity_state_bundle()?;
+        Ok(result)
     }
 
     fn complete_pairing_inner(
         &mut self,
         hello: DevicePairingHello,
         now: SystemTime,
-    ) -> IdentityResult<PairingResult> {
+    ) -> IdentityResult<VerifiedPairingOutcome> {
         self.prune_expired_sessions(now, Some(hello.session_id.as_str()))?;
         validate_canonical_id(&hello.device_id)
             .map_err(|error| IdentityError::InvalidCanonicalDeviceId(error.to_string()))?;
@@ -239,30 +253,54 @@ impl IdentityManager {
         self.active_sessions.remove(&hello.session_id);
         let transcript_hash_hex = hex::encode(Sha256::digest(expected_mac));
         let identity_fingerprint = hex::encode(Sha256::digest(hello.device_signing_public));
+        let signing_public_key_hex = hex::encode(hello.device_signing_public);
+        Ok(VerifiedPairingOutcome {
+            device_id: hello.device_id,
+            client_kind: hello.client_kind,
+            identity_fingerprint,
+            signing_public_key_hex,
+            transcript_hash_hex,
+        })
+    }
+
+    fn persist_verified_pairing(
+        &mut self,
+        verified: VerifiedPairingOutcome,
+    ) -> IdentityResult<PairingResult> {
         let certificate = self.ca.issue_client_certificate(
-            hello.device_id.as_str(),
-            identity_fingerprint.as_str(),
+            verified.device_id.as_str(),
+            verified.identity_fingerprint.as_str(),
             self.certificate_validity,
         )?;
         let certificate_fingerprint = certificate_fingerprint_hex(&certificate.certificate_pem)?;
 
         let paired = PairedDevice {
-            device_id: hello.device_id.clone(),
-            client_kind: hello.client_kind,
-            identity_fingerprint,
-            signing_public_key_hex: hex::encode(hello.device_signing_public),
-            transcript_hash_hex,
+            device_id: verified.device_id.clone(),
+            client_kind: verified.client_kind,
+            identity_fingerprint: verified.identity_fingerprint,
+            signing_public_key_hex: verified.signing_public_key_hex,
+            transcript_hash_hex: verified.transcript_hash_hex,
             current_certificate: certificate.clone(),
             certificate_fingerprints: vec![certificate_fingerprint],
         };
-        if let Some(previous) = self.paired_devices.get(&hello.device_id).cloned() {
+        if let Some(previous) = self.paired_devices.get(&verified.device_id).cloned() {
             self.revoke_superseded_certificates(&previous)?;
         }
-        self.paired_devices.insert(hello.device_id.clone(), paired.clone());
+        self.paired_devices.insert(verified.device_id, paired.clone());
 
         Ok(PairingResult {
             device: paired,
             gateway_ca_certificate_pem: self.ca.certificate_pem.clone(),
         })
     }
+}
+
+fn secure_random_array<const N: usize>() -> IdentityResult<[u8; N]> {
+    let mut bytes = [0_u8; N];
+    fill_random_bytes(&mut bytes).map_err(|error| {
+        IdentityError::Cryptographic(format!(
+            "failed to read OS randomness for pairing session: {error}"
+        ))
+    })?;
+    Ok(bytes)
 }

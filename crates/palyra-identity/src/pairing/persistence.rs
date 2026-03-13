@@ -1,5 +1,7 @@
 #[cfg(windows)]
 use std::io::Read;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::{
     fs,
     io::Write,
@@ -32,6 +34,8 @@ pub(super) const IDENTITY_STATE_LOCK_FILENAME: &str = ".identity-state.lock";
 pub(super) const IDENTITY_STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(3);
 const IDENTITY_STATE_LOCK_RETRY: Duration = Duration::from_millis(20);
 const IDENTITY_STATE_STALE_LOCK_AGE: Duration = Duration::from_secs(30);
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 static IDENTITY_STATE_PROCESS_LOCK: Mutex<()> = Mutex::new(());
 
@@ -288,7 +292,7 @@ fn process_is_alive(pid: u32) -> bool {
 
 #[cfg(windows)]
 fn run_tasklist_for_pid(pid: u32, timeout: Duration) -> std::io::Result<std::process::Output> {
-    let mut child = std::process::Command::new("tasklist")
+    let mut child = windows_background_command("tasklist")
         .arg("/FI")
         .arg(format!("PID eq {pid}"))
         .args(["/FO", "CSV", "/NH"])
@@ -296,6 +300,13 @@ fn run_tasklist_for_pid(pid: u32, timeout: Duration) -> std::io::Result<std::pro
         .stderr(std::process::Stdio::piped())
         .spawn()?;
     wait_for_child_output_with_timeout(&mut child, timeout)
+}
+
+#[cfg(windows)]
+fn windows_background_command(program: &str) -> std::process::Command {
+    let mut command = std::process::Command::new(program);
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
 }
 
 #[cfg(windows)]

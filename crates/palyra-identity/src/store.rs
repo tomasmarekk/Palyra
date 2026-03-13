@@ -7,6 +7,9 @@ use std::{
 };
 
 #[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+#[cfg(windows)]
 use std::process::Command;
 
 use crate::error::{IdentityError, IdentityResult};
@@ -212,10 +215,12 @@ impl SecretStore for FilesystemSecretStore {
 
 #[cfg(windows)]
 const WINDOWS_SYSTEM_SID: &str = "S-1-5-18";
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[cfg(windows)]
 fn current_user_sid() -> IdentityResult<String> {
-    let output = Command::new("whoami")
+    let output = windows_background_command("whoami")
         .args(["/user", "/fo", "csv", "/nh"])
         .output()
         .map_err(|error| IdentityError::Internal(format!("failed to execute whoami: {error}")))?;
@@ -268,7 +273,7 @@ fn harden_windows_path_permissions(
     let grant_mask = if is_directory { "(OI)(CI)F" } else { "F" };
     let owner_grant = format!("*{owner_sid}:{grant_mask}");
     let system_grant = format!("*{WINDOWS_SYSTEM_SID}:{grant_mask}");
-    let output = Command::new("icacls")
+    let output = windows_background_command("icacls")
         .arg(path)
         .args(["/inheritance:r", "/grant:r"])
         .arg(owner_grant)
@@ -291,6 +296,13 @@ fn harden_windows_path_permissions(
         )));
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn windows_background_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
 }
 
 pub fn default_identity_storage_path(root: impl AsRef<Path>) -> PathBuf {

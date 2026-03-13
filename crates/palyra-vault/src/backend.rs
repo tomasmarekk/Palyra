@@ -6,6 +6,9 @@ use std::{
     process::{Command, Stdio},
 };
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
 use ulid::Ulid;
 
@@ -28,6 +31,8 @@ const SECRET_TOOL_SERVICE_NAME: &str = "palyra.vault.v1";
 const SECRET_TOOL_KEY_ATTR: &str = "key";
 #[cfg(windows)]
 const WINDOWS_DPAPI_OBJECTS_DIR: &str = "objects_dpapi";
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -645,7 +650,7 @@ impl WindowsDpapiBackend {
     }
 
     fn is_available() -> bool {
-        Command::new("powershell")
+        windows_background_command("powershell")
             .args(["-NoProfile", "-NonInteractive", "-Command", "$PSVersionTable.PSVersion.Major"])
             .output()
             .map(|output| output.status.success())
@@ -726,7 +731,7 @@ fn dpapi_unprotect(protected: &[u8]) -> Result<Vec<u8>, VaultError> {
 
 #[cfg(windows)]
 fn run_powershell_dpapi(script: &str, stdin_payload: &[u8]) -> Result<Vec<u8>, VaultError> {
-    let mut child = Command::new("powershell")
+    let mut child = windows_background_command("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -759,6 +764,13 @@ fn run_powershell_dpapi(script: &str, stdin_payload: &[u8]) -> Result<Vec<u8>, V
     STANDARD_NO_PAD.decode(encoded.as_bytes()).map_err(|error| {
         VaultError::Io(format!("failed to decode powershell DPAPI output: {error}"))
     })
+}
+
+#[cfg(windows)]
+fn windows_background_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
 }
 
 #[cfg(test)]

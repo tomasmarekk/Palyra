@@ -4,12 +4,17 @@ use std::{
 };
 
 #[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+#[cfg(windows)]
 use std::process::Command;
 
 use crate::VaultError;
 
 #[cfg(windows)]
 const WINDOWS_SYSTEM_SID: &str = "S-1-5-18";
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 pub(crate) fn default_vault_root(identity_store_root: &Path) -> PathBuf {
     if identity_store_root.file_name().is_some_and(|name| name == "identity") {
@@ -139,8 +144,10 @@ pub fn ensure_owner_only_file(path: &Path) -> Result<(), VaultError> {
 
 #[cfg(windows)]
 pub(crate) fn current_user_sid() -> Result<String, VaultError> {
-    let output =
-        Command::new("whoami").args(["/user", "/fo", "csv", "/nh"]).output().map_err(|error| {
+    let output = windows_background_command("whoami")
+        .args(["/user", "/fo", "csv", "/nh"])
+        .output()
+        .map_err(|error| {
             VaultError::Io(format!("failed to execute whoami for vault ACL: {error}"))
         })?;
     if !output.status.success() {
@@ -192,7 +199,7 @@ pub(crate) fn harden_windows_path_permissions(
     let grant_mask = if is_directory { "(OI)(CI)F" } else { "F" };
     let owner_grant = format!("*{owner_sid}:{grant_mask}");
     let system_grant = format!("*{WINDOWS_SYSTEM_SID}:{grant_mask}");
-    let output = Command::new("icacls")
+    let output = windows_background_command("icacls")
         .arg(path)
         .args(["/inheritance:r", "/grant:r"])
         .arg(owner_grant)
@@ -212,4 +219,11 @@ pub(crate) fn harden_windows_path_permissions(
         )));
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn windows_background_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
 }
