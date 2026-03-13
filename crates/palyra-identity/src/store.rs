@@ -2,12 +2,14 @@
 use palyra_common::windows_security;
 #[cfg(windows)]
 use std::collections::HashSet;
+#[cfg(windows)]
+use std::sync::OnceLock;
 use std::{
     any::Any,
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::Mutex,
 };
 
 use crate::error::{IdentityError, IdentityResult};
