@@ -8,6 +8,18 @@
   </head>
   <body>
     <div class="background-shape"></div>
+    <div id="bootOverlay" class="boot-overlay" role="status" aria-live="polite">
+      <section class="boot-card">
+        <p class="eyebrow">Launching Desktop Control Center</p>
+        <h2>Preparing local runtime surfaces</h2>
+        <p id="bootMessage" class="hint">
+          Loading desktop state, health signals, and recovery controls.
+        </p>
+        <div class="boot-progress" aria-hidden="true">
+          <span class="boot-progress__bar"></span>
+        </div>
+      </section>
+    </div>
     <main class="shell">
       <header class="topbar card">
         <div class="hero-copy">

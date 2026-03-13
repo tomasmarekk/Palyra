@@ -10,12 +10,15 @@
     "withGlobalTauri": true,
     "windows": [
       {
+        "label": "main",
         "title": "Palyra Control Center",
         "width": 1120,
         "height": 760,
         "minWidth": 900,
         "minHeight": 620,
-        "resizable": true
+        "resizable": true,
+        "center": true,
+        "visible": false
       }
     ],
     "security": {

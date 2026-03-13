@@ -1,10 +1,7 @@
 use crate::*;
 
 #[cfg(windows)]
-use std::os::windows::process::CommandExt;
-
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+use palyra_common::windows_security;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PersistedSessionSnapshot {
@@ -220,47 +217,7 @@ pub(crate) fn ensure_owner_only_file(path: &Path) -> Result<()> {
 
 #[cfg(windows)]
 pub(crate) fn current_user_sid() -> Result<String> {
-    let output = windows_background_command("whoami")
-        .args(["/user", "/fo", "csv", "/nh"])
-        .output()
-        .context("failed to execute whoami while resolving browserd state ACL SID")?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "whoami returned non-success status {} while resolving browserd state ACL SID: stdout={} stderr={}",
-            output.status.code().map_or_else(|| "unknown".to_owned(), |code| code.to_string()),
-            String::from_utf8_lossy(&output.stdout).trim(),
-            String::from_utf8_lossy(&output.stderr).trim(),
-        );
-    }
-    parse_whoami_sid_csv(String::from_utf8_lossy(&output.stdout).trim())
-        .ok_or_else(|| anyhow::anyhow!("failed to parse user SID from whoami output"))
-}
-
-#[cfg(windows)]
-pub(crate) fn parse_whoami_sid_csv(raw: &str) -> Option<String> {
-    let mut fields = Vec::new();
-    let mut current = String::new();
-    let mut in_quotes = false;
-    for ch in raw.chars() {
-        match ch {
-            '"' => in_quotes = !in_quotes,
-            ',' if !in_quotes => {
-                fields.push(current.trim().to_owned());
-                current.clear();
-            }
-            _ => current.push(ch),
-        }
-    }
-    fields.push(current.trim().to_owned());
-    if fields.len() < 2 {
-        return None;
-    }
-    let sid = fields[1].trim().trim_matches('"').to_owned();
-    if sid.starts_with("S-1-") {
-        Some(sid)
-    } else {
-        None
-    }
+    windows_security::current_user_sid().with_context(|| "failed to resolve browserd state ACL SID")
 }
 
 #[cfg(windows)]
@@ -269,36 +226,8 @@ pub(crate) fn harden_windows_path_permissions(
     owner_sid: &str,
     is_directory: bool,
 ) -> Result<()> {
-    let grant_mask = if is_directory { "(OI)(CI)F" } else { "F" };
-    let owner_grant = format!("*{owner_sid}:{grant_mask}");
-    let system_grant = format!("*{WINDOWS_SYSTEM_SID}:{grant_mask}");
-    let output = windows_background_command("icacls")
-        .arg(path)
-        .args(["/inheritance:r", "/grant:r"])
-        .arg(owner_grant)
-        .args(["/grant:r"])
-        .arg(system_grant)
-        .output()
-        .with_context(|| {
-            format!("failed to execute icacls for browserd state path '{}'", path.display())
-        })?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "icacls returned non-success status {} for '{}': stdout={} stderr={}",
-            output.status.code().map_or_else(|| "unknown".to_owned(), |code| code.to_string()),
-            path.display(),
-            String::from_utf8_lossy(&output.stdout).trim(),
-            String::from_utf8_lossy(&output.stderr).trim(),
-        );
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn windows_background_command(program: &str) -> Command {
-    let mut command = Command::new(program);
-    command.creation_flags(CREATE_NO_WINDOW);
-    command
+    windows_security::harden_windows_path_permissions(path, owner_sid, is_directory)
+        .with_context(|| format!("failed to harden browserd state path '{}'", path.display()))
 }
 
 pub(crate) fn decode_state_key(raw: &str) -> Result<[u8; STATE_KEY_LEN]> {

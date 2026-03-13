@@ -50,6 +50,66 @@ select {
     radial-gradient(circle at 82% 20%, rgba(10, 79, 134, 0.24), transparent 40%);
 }
 
+.boot-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: grid;
+  place-items: center;
+  padding: 1.25rem;
+  background:
+    linear-gradient(150deg, rgba(245, 240, 229, 0.84), rgba(220, 231, 241, 0.9)),
+    rgba(255, 255, 255, 0.55);
+  backdrop-filter: blur(18px);
+  transition:
+    opacity 220ms ease,
+    visibility 220ms ease;
+}
+
+.boot-overlay--hidden {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.boot-card {
+  width: min(34rem, 100%);
+  display: grid;
+  gap: 0.8rem;
+  padding: 1.35rem 1.4rem;
+  border-radius: var(--radius-lg);
+  border: 1px solid rgba(114, 123, 134, 0.22);
+  background: rgba(255, 253, 249, 0.94);
+  box-shadow: 0 24px 44px rgba(26, 41, 56, 0.12);
+}
+
+.boot-progress {
+  position: relative;
+  height: 0.7rem;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(13, 79, 128, 0.12);
+}
+
+.boot-progress__bar {
+  position: absolute;
+  inset: 0 auto 0 -35%;
+  width: 35%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--action), var(--action-strong));
+  animation: boot-progress-slide 1.15s ease-in-out infinite;
+}
+
+@keyframes boot-progress-slide {
+  0% {
+    transform: translateX(0);
+  }
+
+  100% {
+    transform: translateX(390%);
+  }
+}
+
 .shell {
   position: relative;
   width: min(1380px, calc(100% - 2rem));

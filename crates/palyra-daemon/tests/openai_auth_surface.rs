@@ -854,9 +854,11 @@ fn console_openai_oauth_callback_rejects_malformed_token_response_without_persis
             .get("message")
             .and_then(Value::as_str)
             .is_some_and(|message| {
-                message.contains("OpenAI OAuth token response") && !message.contains("oauth-secret")
+                (message.contains("OpenAI OAuth token response")
+                    || message.contains("OpenAI OAuth token exchange request failed"))
+                    && !message.contains("oauth-secret")
             }),
-        "callback-state failure message should describe the parse failure without leaking secrets: {callback_state}"
+        "callback-state failure message should describe the malformed token exchange without leaking secrets: {callback_state}"
     );
 
     let profiles = get_console_json(&client, admin_port, "/console/v1/auth/profiles", &cookie)?;

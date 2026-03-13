@@ -980,7 +980,7 @@ version = 1
     let listener = TcpListener::bind("127.0.0.1:0").expect("test listener should bind");
     let port = listener.local_addr().expect("listener address should resolve").port();
     let server = std::thread::spawn(move || {
-        for _ in 0..5 {
+        for _ in 0..6 {
             let (mut stream, _) = listener.accept().expect("listener should accept request");
             let mut buffer = [0_u8; 4096];
             let read = stream.read(&mut buffer).expect("request should be readable");
@@ -1018,6 +1018,15 @@ version = 1
                     &mut stream,
                     "200 OK",
                     r#"{"generated_at_unix_ms":123,"errors":[]}"#,
+                    &[],
+                );
+                continue;
+            }
+            if request_line.starts_with("GET /console/v1/auth/providers/openai ") {
+                write_http_response(
+                    &mut stream,
+                    "200 OK",
+                    r#"{"provider":"openai","summary":{"total":0,"ok":0,"static":0,"expiring":0,"expired":0},"profiles":[],"default_profile_id":null,"default_profile_name":null,"connect":{"mode":"idle"},"refresh":{"attempts":0,"success":0,"failed":0},"oauth":{"available":true},"status":"not_configured"}"#,
                     &[],
                 );
                 continue;

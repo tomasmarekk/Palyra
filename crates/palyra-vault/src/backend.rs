@@ -1,15 +1,11 @@
 use std::{
     collections::BTreeMap,
     fs,
-    io::Write,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
 };
 
 #[cfg(windows)]
-use std::os::windows::process::CommandExt;
-
-use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
+use palyra_common::windows_security::{dpapi_protect_current_user, dpapi_unprotect_current_user};
 use ulid::Ulid;
 
 use crate::{
@@ -31,8 +27,6 @@ const SECRET_TOOL_SERVICE_NAME: &str = "palyra.vault.v1";
 const SECRET_TOOL_KEY_ATTR: &str = "key";
 #[cfg(windows)]
 const WINDOWS_DPAPI_OBJECTS_DIR: &str = "objects_dpapi";
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -650,11 +644,7 @@ impl WindowsDpapiBackend {
     }
 
     fn is_available() -> bool {
-        windows_background_command("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", "$PSVersionTable.PSVersion.Major"])
-            .output()
-            .map(|output| output.status.success())
-            .unwrap_or(false)
+        true
     }
 
     fn object_path(&self, object_id: &str) -> Result<PathBuf, VaultError> {
@@ -717,60 +707,14 @@ impl BlobBackend for WindowsDpapiBackend {
 
 #[cfg(windows)]
 fn dpapi_protect(raw: &[u8]) -> Result<Vec<u8>, VaultError> {
-    let script = "$inputB64=[Console]::In.ReadToEnd();$bytes=[Convert]::FromBase64String($inputB64);$out=[System.Security.Cryptography.ProtectedData]::Protect($bytes,$null,[System.Security.Cryptography.DataProtectionScope]::CurrentUser);[Console]::Out.Write([Convert]::ToBase64String($out));";
-    let input = STANDARD_NO_PAD.encode(raw);
-    run_powershell_dpapi(script, input.as_bytes())
+    dpapi_protect_current_user(raw)
+        .map_err(|error| VaultError::Io(format!("failed to protect DPAPI payload: {error}")))
 }
 
 #[cfg(windows)]
 fn dpapi_unprotect(protected: &[u8]) -> Result<Vec<u8>, VaultError> {
-    let script = "$inputB64=[Console]::In.ReadToEnd();$bytes=[Convert]::FromBase64String($inputB64);$out=[System.Security.Cryptography.ProtectedData]::Unprotect($bytes,$null,[System.Security.Cryptography.DataProtectionScope]::CurrentUser);[Console]::Out.Write([Convert]::ToBase64String($out));";
-    let input = STANDARD_NO_PAD.encode(protected);
-    run_powershell_dpapi(script, input.as_bytes())
-}
-
-#[cfg(windows)]
-fn run_powershell_dpapi(script: &str, stdin_payload: &[u8]) -> Result<Vec<u8>, VaultError> {
-    let mut child = windows_background_command("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| {
-            VaultError::Io(format!("failed to execute powershell DPAPI command: {error}"))
-        })?;
-    let stdin = child.stdin.as_mut().ok_or_else(|| {
-        VaultError::Io("powershell DPAPI command did not expose stdin".to_owned())
-    })?;
-    stdin.write_all(stdin_payload).map_err(|error| {
-        VaultError::Io(format!("failed to write powershell DPAPI stdin: {error}"))
-    })?;
-    let output = child.wait_with_output().map_err(|error| {
-        VaultError::Io(format!("failed waiting for powershell DPAPI command: {error}"))
-    })?;
-    if !output.status.success() {
-        return Err(VaultError::Io(format!(
-            "powershell DPAPI command failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    let encoded = String::from_utf8(output.stdout)
-        .map_err(|error| {
-            VaultError::Io(format!("powershell DPAPI command output was non-UTF8: {error}"))
-        })?
-        .trim()
-        .to_owned();
-    STANDARD_NO_PAD.decode(encoded.as_bytes()).map_err(|error| {
-        VaultError::Io(format!("failed to decode powershell DPAPI output: {error}"))
-    })
-}
-
-#[cfg(windows)]
-fn windows_background_command(program: &str) -> Command {
-    let mut command = Command::new(program);
-    command.creation_flags(CREATE_NO_WINDOW);
-    command
+    dpapi_unprotect_current_user(protected)
+        .map_err(|error| VaultError::Io(format!("failed to unprotect DPAPI payload: {error}")))
 }
 
 #[cfg(test)]
@@ -815,5 +759,15 @@ mod tests {
             matches!(result, Err(VaultError::Io(ref message)) if message.contains("exceeds max size after update")),
             "unexpected result: {result:?}"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dpapi_roundtrip_preserves_payload_bytes() {
+        let payload = b"desktop-secret-token";
+        let sealed = super::dpapi_protect(payload).expect("DPAPI protect should succeed");
+        let opened =
+            super::dpapi_unprotect(sealed.as_slice()).expect("DPAPI unprotect should succeed");
+        assert_eq!(opened, payload);
     }
 }

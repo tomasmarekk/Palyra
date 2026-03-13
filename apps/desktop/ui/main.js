@@ -14,6 +14,8 @@ if (typeof invoke !== "function") {
 }
 
 const ui = {
+  bootOverlay: byId("bootOverlay"),
+  bootMessage: byId("bootMessage"),
   overallStatus: byId("overallStatus"),
   statusTimestamp: byId("statusTimestamp"),
   onboardingState: byId("onboardingState"),
@@ -160,6 +162,7 @@ const discordWizardState = createDiscordOnboardingState();
 let pollHandle = null;
 const ACTIVE_REFRESH_INTERVAL_MS = 4000;
 const IDLE_REFRESH_INTERVAL_MS = 12000;
+let mainWindowShown = false;
 
 function byId(id) {
   const element = document.getElementById(id);
@@ -172,6 +175,22 @@ function byId(id) {
 function setActionMessage(message, isError = false) {
   ui.actionMessage.textContent = message;
   ui.actionMessage.style.color = isError ? "#8f3024" : "var(--muted)";
+}
+
+function setBootMessage(message) {
+  ui.bootMessage.textContent = message;
+}
+
+function hideBootOverlay() {
+  ui.bootOverlay.classList.add("boot-overlay--hidden");
+}
+
+async function showMainWindow() {
+  if (mainWindowShown) {
+    return;
+  }
+  await invoke("show_main_window");
+  mainWindowShown = true;
 }
 
 function formatUnixMs(unixMs) {
@@ -1292,6 +1311,7 @@ function wireEvents() {
 }
 
 async function bootstrap() {
+  setBootMessage("Preparing the desktop shell.");
   wireEvents();
   applyOpenAiScopeVisibility();
   refreshOpenAiEditorMode();
@@ -1304,11 +1324,22 @@ async function bootstrap() {
     "Run preflight, apply the connector, then send a verification message."
   );
   renderDiscordResultCards();
+  await showMainWindow();
+  setBootMessage("Loading desktop settings.");
   await loadSettings();
+  setBootMessage("Refreshing local runtime status and recovery details.");
   await runRefreshLoopOnce();
+  hideBootOverlay();
 }
 
-bootstrap().catch((error) => {
+bootstrap().catch(async (error) => {
+  try {
+    await showMainWindow();
+  } catch (_showError) {
+    // Preserve the original bootstrap failure when the host window is already unavailable.
+  }
+  setBootMessage("Desktop initialization failed. Review the recovery details below.");
+  hideBootOverlay();
   setActionMessage(`Desktop control center failed to initialize: ${String(error)}`, true);
 });
 

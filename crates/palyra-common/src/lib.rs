@@ -9,6 +9,8 @@ pub mod netguard;
 pub mod process_runner_input;
 pub mod redaction;
 mod webhook;
+#[cfg(windows)]
+pub mod windows_security;
 pub mod workspace_patch;
 
 pub use build::{build_metadata, BuildMetadata};

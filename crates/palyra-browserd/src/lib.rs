@@ -1,5 +1,3 @@
-#[cfg(windows)]
-pub(crate) use std::process::Command;
 pub mod app;
 pub mod domain;
 pub mod engine;
@@ -154,8 +152,6 @@ const CHROMIUM_REMOTE_IP_GUARD_HANDLER_NAME: &str = "palyra.security.remote_ip_g
 const DNS_VALIDATION_CACHE_MAX_ENTRIES: usize = 512;
 const DNS_VALIDATION_NEGATIVE_TTL: Duration = Duration::from_secs(10);
 const DNS_VALIDATION_METRICS_LOG_INTERVAL: u64 = 256;
-#[cfg(windows)]
-const WINDOWS_SYSTEM_SID: &str = "S-1-5-18";
 const ONE_BY_ONE_PNG: &[u8] = &[
     137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0,
     0, 0, 31, 21, 196, 137, 0, 0, 0, 10, 73, 68, 65, 84, 120, 156, 99, 96, 0, 0, 0, 2, 0, 1, 229,

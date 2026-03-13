@@ -1,7 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use anyhow::Result;
-use tauri::{Manager, State};
+use tauri::{AppHandle, Manager, State};
 use tokio::sync::Mutex;
 
 use super::features::onboarding::connectors::discord::{
@@ -49,6 +49,16 @@ pub(crate) async fn get_snapshot(
         supervisor.capture_snapshot_inputs()
     };
     build_snapshot_from_inputs(snapshot_inputs).await.map_err(command_error)
+}
+
+#[tauri::command]
+pub(crate) fn show_main_window(app: AppHandle) -> Result<(), String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "desktop main window is unavailable".to_owned())?;
+    window.show().map_err(command_error)?;
+    window.set_focus().map_err(command_error)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -523,6 +533,7 @@ pub(crate) fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            show_main_window,
             get_snapshot,
             get_settings,
             get_onboarding_status,

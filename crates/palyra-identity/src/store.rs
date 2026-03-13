@@ -1,16 +1,14 @@
+#[cfg(windows)]
+use palyra_common::windows_security;
+#[cfg(windows)]
+use std::collections::HashSet;
 use std::{
     any::Any,
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Mutex, OnceLock},
 };
-
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
-
-#[cfg(windows)]
-use std::process::Command;
 
 use crate::error::{IdentityError, IdentityResult};
 
@@ -214,30 +212,38 @@ impl SecretStore for FilesystemSecretStore {
 }
 
 #[cfg(windows)]
-const WINDOWS_SYSTEM_SID: &str = "S-1-5-18";
+static WINDOWS_CURRENT_USER_SID: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 #[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+static HARDENED_WINDOWS_PATHS: OnceLock<Mutex<HashSet<(PathBuf, bool)>>> = OnceLock::new();
 
 #[cfg(windows)]
 fn current_user_sid() -> IdentityResult<String> {
-    let output = windows_background_command("whoami")
-        .args(["/user", "/fo", "csv", "/nh"])
-        .output()
-        .map_err(|error| IdentityError::Internal(format!("failed to execute whoami: {error}")))?;
-    if !output.status.success() {
-        return Err(IdentityError::Internal(format!(
-            "whoami returned non-success status {}: stdout={} stderr={}",
-            output.status.code().map_or_else(|| "unknown".to_owned(), |code| code.to_string()),
-            String::from_utf8_lossy(&output.stdout).trim(),
-            String::from_utf8_lossy(&output.stderr).trim(),
-        )));
+    let cache = WINDOWS_CURRENT_USER_SID.get_or_init(|| Mutex::new(None));
+    {
+        let cached = cache
+            .lock()
+            .map_err(|_| IdentityError::Internal("current user SID cache poisoned".to_owned()))?;
+        if let Some(sid) = cached.as_ref() {
+            return Ok(sid.clone());
+        }
     }
-    parse_whoami_sid_csv(String::from_utf8_lossy(&output.stdout).trim()).ok_or_else(|| {
-        IdentityError::Internal("failed to parse current user SID from whoami output".to_owned())
-    })
+    let sid = current_user_sid_uncached()?;
+    cache
+        .lock()
+        .map_err(|_| IdentityError::Internal("current user SID cache poisoned".to_owned()))?
+        .replace(sid.clone());
+    Ok(sid)
 }
 
 #[cfg(windows)]
+fn current_user_sid_uncached() -> IdentityResult<String> {
+    windows_security::current_user_sid().map_err(|error| {
+        IdentityError::Internal(format!("failed to resolve current user SID: {error}"))
+    })
+}
+
+#[cfg(all(test, windows))]
+#[allow(dead_code)]
 fn parse_whoami_sid_csv(raw: &str) -> Option<String> {
     let mut fields = Vec::new();
     let mut current = String::new();
@@ -270,49 +276,39 @@ fn harden_windows_path_permissions(
     owner_sid: &str,
     is_directory: bool,
 ) -> IdentityResult<()> {
-    let grant_mask = if is_directory { "(OI)(CI)F" } else { "F" };
-    let owner_grant = format!("*{owner_sid}:{grant_mask}");
-    let system_grant = format!("*{WINDOWS_SYSTEM_SID}:{grant_mask}");
-    let output = windows_background_command("icacls")
-        .arg(path)
-        .args(["/inheritance:r", "/grant:r"])
-        .arg(owner_grant)
-        .args(["/grant:r"])
-        .arg(system_grant)
-        .output()
-        .map_err(|error| {
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let cache = HARDENED_WINDOWS_PATHS.get_or_init(|| Mutex::new(HashSet::new()));
+    {
+        let cache = cache.lock().map_err(|_| {
+            IdentityError::Internal("identity path hardening cache poisoned".to_owned())
+        })?;
+        if cache.contains(&(canonical.clone(), is_directory)) {
+            return Ok(());
+        }
+    }
+    windows_security::harden_windows_path_permissions(path, owner_sid, is_directory).map_err(
+        |error| {
             IdentityError::Internal(format!(
-                "failed to execute icacls for {}: {error}",
+                "failed to harden Windows permissions for {}: {error}",
                 path.display()
             ))
-        })?;
-    if !output.status.success() {
-        return Err(IdentityError::Internal(format!(
-            "icacls returned non-success status {} for {}: stdout={} stderr={}",
-            output.status.code().map_or_else(|| "unknown".to_owned(), |code| code.to_string()),
-            path.display(),
-            String::from_utf8_lossy(&output.stdout).trim(),
-            String::from_utf8_lossy(&output.stderr).trim(),
-        )));
-    }
+        },
+    )?;
+    cache
+        .lock()
+        .map_err(|_| IdentityError::Internal("identity path hardening cache poisoned".to_owned()))?
+        .insert((canonical, is_directory));
     Ok(())
-}
-
-#[cfg(windows)]
-fn windows_background_command(program: &str) -> Command {
-    let mut command = Command::new(program);
-    command.creation_flags(CREATE_NO_WINDOW);
-    command
 }
 
 pub fn default_identity_storage_path(root: impl AsRef<Path>) -> PathBuf {
     root.as_ref().join(".palyra").join("identity")
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     #[cfg(windows)]
-    use super::{parse_whoami_sid_csv, FilesystemSecretStore, SecretStore};
+    use super::{FilesystemSecretStore, SecretStore};
     #[cfg(unix)]
     use super::{FilesystemSecretStore, SecretStore};
     #[cfg(unix)]
@@ -456,13 +452,6 @@ mod tests {
             stale_tmp_files.is_empty(),
             "temporary files should not remain after concurrent writes: {stale_tmp_files:?}"
         );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn parse_whoami_sid_csv_extracts_sid() {
-        let parsed = parse_whoami_sid_csv(r#""admin\palo","S-1-5-21-1-2-3-1001""#);
-        assert_eq!(parsed.as_deref(), Some("S-1-5-21-1-2-3-1001"));
     }
 
     #[cfg(windows)]

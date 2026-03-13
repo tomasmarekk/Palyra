@@ -5,13 +5,6 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-#[cfg(windows)]
-use std::{
-    io::Read,
-    os::windows::process::CommandExt,
-    process::{Command, Stdio},
-};
-
 use ulid::Ulid;
 
 use crate::{
@@ -29,12 +22,6 @@ pub(crate) const METADATA_VERSION: u32 = 1;
 const METADATA_LOCK_TIMEOUT: Duration = Duration::from_secs(3);
 const METADATA_LOCK_RETRY: Duration = Duration::from_millis(20);
 const METADATA_LOCK_STALE_AGE: Duration = Duration::from_secs(30);
-#[cfg(windows)]
-const WINDOWS_TASKLIST_TIMEOUT: Duration = Duration::from_secs(2);
-#[cfg(windows)]
-const WINDOWS_TASKLIST_POLL_INTERVAL: Duration = Duration::from_millis(10);
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct MetadataFile {
@@ -290,67 +277,7 @@ fn metadata_lock_owner_is_alive(pid: u32) -> bool {
 
 #[cfg(windows)]
 fn metadata_lock_owner_is_alive(pid: u32) -> bool {
-    let output = run_tasklist_for_pid(pid, WINDOWS_TASKLIST_TIMEOUT);
-    let Ok(output) = output else {
-        return false;
-    };
-    if !output.status.success() {
-        return false;
-    }
-    let pid_marker = format!(",\"{pid}\"");
-    String::from_utf8_lossy(&output.stdout).lines().any(|line| line.contains(&pid_marker))
-}
-
-#[cfg(windows)]
-fn run_tasklist_for_pid(pid: u32, timeout: Duration) -> std::io::Result<std::process::Output> {
-    let mut command = Command::new("tasklist");
-    command.creation_flags(CREATE_NO_WINDOW);
-    let mut child = command
-        .arg("/FI")
-        .arg(format!("PID eq {pid}"))
-        .args(["/FO", "CSV", "/NH"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    wait_for_child_output_with_timeout(&mut child, timeout)
-}
-
-#[cfg(windows)]
-fn wait_for_child_output_with_timeout(
-    child: &mut std::process::Child,
-    timeout: Duration,
-) -> std::io::Result<std::process::Output> {
-    let started_at = std::time::Instant::now();
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return collect_child_output(child, status);
-        }
-        if started_at.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("subprocess exceeded timeout of {}ms", timeout.as_millis()),
-            ));
-        }
-        thread::sleep(WINDOWS_TASKLIST_POLL_INTERVAL);
-    }
-}
-
-#[cfg(windows)]
-fn collect_child_output(
-    child: &mut std::process::Child,
-    status: std::process::ExitStatus,
-) -> std::io::Result<std::process::Output> {
-    let mut stdout = Vec::new();
-    if let Some(stdout_pipe) = child.stdout.as_mut() {
-        stdout_pipe.read_to_end(&mut stdout)?;
-    }
-    let mut stderr = Vec::new();
-    if let Some(stderr_pipe) = child.stderr.as_mut() {
-        stderr_pipe.read_to_end(&mut stderr)?;
-    }
-    Ok(std::process::Output { status, stdout, stderr })
+    palyra_common::windows_security::process_is_alive(pid).unwrap_or(false)
 }
 
 #[cfg(all(not(unix), not(windows)))]

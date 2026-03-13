@@ -1,20 +1,21 @@
+#[cfg(windows)]
+use palyra_common::windows_security;
+#[cfg(windows)]
+use std::{
+    collections::HashSet,
+    sync::{Mutex, OnceLock},
+};
 use std::{
     fs,
     path::{Component, Path, PathBuf},
 };
 
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
-
-#[cfg(windows)]
-use std::process::Command;
-
 use crate::VaultError;
 
 #[cfg(windows)]
-const WINDOWS_SYSTEM_SID: &str = "S-1-5-18";
+static WINDOWS_CURRENT_USER_SID: OnceLock<String> = OnceLock::new();
 #[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+static HARDENED_WINDOWS_PATHS: OnceLock<Mutex<HashSet<(PathBuf, bool)>>> = OnceLock::new();
 
 pub(crate) fn default_vault_root(identity_store_root: &Path) -> PathBuf {
     if identity_store_root.file_name().is_some_and(|name| name == "identity") {
@@ -144,26 +145,23 @@ pub fn ensure_owner_only_file(path: &Path) -> Result<(), VaultError> {
 
 #[cfg(windows)]
 pub(crate) fn current_user_sid() -> Result<String, VaultError> {
-    let output = windows_background_command("whoami")
-        .args(["/user", "/fo", "csv", "/nh"])
-        .output()
-        .map_err(|error| {
-            VaultError::Io(format!("failed to execute whoami for vault ACL: {error}"))
-        })?;
-    if !output.status.success() {
-        return Err(VaultError::Io(format!(
-            "whoami returned non-success status {} while resolving vault ACL user SID: stdout={} stderr={}",
-            output.status.code().map_or_else(|| "unknown".to_owned(), |code| code.to_string()),
-            String::from_utf8_lossy(&output.stdout).trim(),
-            String::from_utf8_lossy(&output.stderr).trim(),
-        )));
+    if let Some(value) = WINDOWS_CURRENT_USER_SID.get() {
+        return Ok(value.clone());
     }
-    parse_whoami_sid_csv(String::from_utf8_lossy(&output.stdout).trim()).ok_or_else(|| {
-        VaultError::Io("failed to parse current user SID from whoami output".to_owned())
+    let resolved = current_user_sid_uncached()?;
+    let _ = WINDOWS_CURRENT_USER_SID.set(resolved.clone());
+    Ok(resolved)
+}
+
+#[cfg(windows)]
+fn current_user_sid_uncached() -> Result<String, VaultError> {
+    windows_security::current_user_sid().map_err(|error| {
+        VaultError::Io(format!("failed to resolve current user SID for vault ACL: {error}"))
     })
 }
 
 #[cfg(windows)]
+#[allow(dead_code)]
 pub(crate) fn parse_whoami_sid_csv(raw: &str) -> Option<String> {
     let mut fields = Vec::new();
     let mut current = String::new();
@@ -196,34 +194,27 @@ pub(crate) fn harden_windows_path_permissions(
     owner_sid: &str,
     is_directory: bool,
 ) -> Result<(), VaultError> {
-    let grant_mask = if is_directory { "(OI)(CI)F" } else { "F" };
-    let owner_grant = format!("*{owner_sid}:{grant_mask}");
-    let system_grant = format!("*{WINDOWS_SYSTEM_SID}:{grant_mask}");
-    let output = windows_background_command("icacls")
-        .arg(path)
-        .args(["/inheritance:r", "/grant:r"])
-        .arg(owner_grant)
-        .args(["/grant:r"])
-        .arg(system_grant)
-        .output()
-        .map_err(|error| {
-            VaultError::Io(format!("failed to execute icacls for {}: {error}", path.display()))
-        })?;
-    if !output.status.success() {
-        return Err(VaultError::Io(format!(
-            "icacls returned non-success status {} for {}: stdout={} stderr={}",
-            output.status.code().map_or_else(|| "unknown".to_owned(), |code| code.to_string()),
-            path.display(),
-            String::from_utf8_lossy(&output.stdout).trim(),
-            String::from_utf8_lossy(&output.stderr).trim(),
-        )));
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let cache = HARDENED_WINDOWS_PATHS.get_or_init(|| Mutex::new(HashSet::new()));
+    {
+        let cache = cache
+            .lock()
+            .map_err(|_| VaultError::Io("vault path hardening cache poisoned".to_owned()))?;
+        if cache.contains(&(canonical.clone(), is_directory)) {
+            return Ok(());
+        }
     }
+    windows_security::harden_windows_path_permissions(path, owner_sid, is_directory).map_err(
+        |error| {
+            VaultError::Io(format!(
+                "failed to harden Windows permissions for {}: {error}",
+                path.display()
+            ))
+        },
+    )?;
+    cache
+        .lock()
+        .map_err(|_| VaultError::Io("vault path hardening cache poisoned".to_owned()))?
+        .insert((canonical, is_directory));
     Ok(())
-}
-
-#[cfg(windows)]
-fn windows_background_command(program: &str) -> Command {
-    let mut command = Command::new(program);
-    command.creation_flags(CREATE_NO_WINDOW);
-    command
 }
