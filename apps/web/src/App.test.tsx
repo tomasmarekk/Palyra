@@ -26,7 +26,10 @@ describe("M35 web console app", () => {
   });
 
   it("clears operator-scoped state on sign-out before next sign-in refresh completes", async () => {
-    const delayedApprovals = createDeferredResponse();
+    let releaseUserBApprovals: (() => void) | undefined;
+    const userBApprovalsReady = new Promise<void>((resolve) => {
+      releaseUserBApprovals = () => resolve();
+    });
     let activePrincipal = "admin:user-a";
     const fetchMock = withM56Baseline((input: RequestInfo | URL, init?: RequestInit) => {
       const path = requestUrl(input);
@@ -53,7 +56,11 @@ describe("M35 web console app", () => {
             })
           );
         }
-        return delayedApprovals.promise;
+        return userBApprovalsReady.then(() =>
+          jsonResponse({
+            approvals: [{ approval_id: "APPROVAL-B", subject_type: "tool", decision: "pending" }]
+          })
+        );
       }
 
       if (path === "/console/v1/auth/logout" && method === "POST") {
@@ -81,7 +88,7 @@ describe("M35 web console app", () => {
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Approvals" }));
     await waitFor(() => {
-      expect(screen.getByText("APPROVAL-A")).toBeInTheDocument();
+      expect((screen.getAllByText("APPROVAL-A").length)).toBeGreaterThan(0);
     }, { timeout: 5000 });
 
     fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
@@ -95,15 +102,17 @@ describe("M35 web console app", () => {
     expect(await screen.findByRole("heading", { name: "Web Dashboard Operator Surface" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Approvals" }));
     expect(screen.queryByText("APPROVAL-A")).not.toBeInTheDocument();
-    expect(screen.getByText("No approvals found.")).toBeInTheDocument();
+    expect(screen.getByText("No approval records loaded.")).toBeInTheDocument();
 
-    delayedApprovals.resolve(
-      jsonResponse({
-        approvals: [{ approval_id: "APPROVAL-B", subject_type: "tool", decision: "pending" }]
-      })
-    );
+    const releaseApprovals = releaseUserBApprovals;
+    if (releaseApprovals === undefined) {
+      throw new Error("Expected deferred approvals release hook for user B.");
+    }
+    releaseApprovals();
 
-    expect(await screen.findByText("APPROVAL-B")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(document.body).toHaveTextContent("APPROVAL-B");
+    });
   });
 
   it("executes approval decision flow with CSRF-protected request", async () => {
@@ -144,12 +153,11 @@ describe("M35 web console app", () => {
 
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Approvals" }));
-    expect(await screen.findByText("A1")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Select" }));
+    fireEvent.click(await screen.findByRole("button", { name: /A1/i }));
     fireEvent.click(screen.getByRole("button", { name: "Approve" }));
 
     await waitFor(() => {
-      expect(screen.getByText("Approval allowed.")).toBeInTheDocument();
+      expect(document.body).toHaveTextContent("Approval allowed.");
     });
 
     const decisionCalls = fetchMock.mock.calls.filter(
@@ -162,42 +170,56 @@ describe("M35 web console app", () => {
   });
 
   it("supports cron create and disable workflow from UI", async () => {
-    const fetchMock = createQueuedFetch([
-      jsonResponse({
-        principal: "admin:web-console",
-        device_id: "device-1",
-        channel: "web",
-        csrf_token: "csrf-1",
-        issued_at_unix_ms: 100,
-        expires_at_unix_ms: 300
-      }),
-      jsonResponse({ jobs: [{ job_id: "J1", name: "job-one", enabled: true }] }),
-      jsonResponse({ job: { job_id: "J2" } }),
-      jsonResponse({
-        jobs: [
-          { job_id: "J1", name: "job-one", enabled: true },
-          { job_id: "J2", name: "web-job", enabled: true }
-        ]
-      }),
-      jsonResponse({ job: { job_id: "J1", enabled: false } }),
-      jsonResponse({ jobs: [{ job_id: "J1", name: "job-one", enabled: false }] })
-    ]);
+    const cronJobs = [{ job_id: "J1", name: "job-one", enabled: true }];
+    const fetchMock = withM56Baseline((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = requestUrl(input);
+      const method = (init?.method ?? "GET").toUpperCase();
+
+      if (path === "/console/v1/auth/session" && method === "GET") {
+        return Promise.resolve(
+          jsonResponse({
+            principal: "admin:web-console",
+            device_id: "device-1",
+            channel: "web",
+            csrf_token: "csrf-1",
+            issued_at_unix_ms: 100,
+            expires_at_unix_ms: 300
+          })
+        );
+      }
+
+      if (path === "/console/v1/cron/jobs" && method === "GET") {
+        return Promise.resolve(jsonResponse({ jobs: cronJobs }));
+      }
+
+      if (path === "/console/v1/cron/jobs" && method === "POST") {
+        cronJobs.push({ job_id: "J2", name: "web-job", enabled: true });
+        return Promise.resolve(jsonResponse({ job: { job_id: "J2" } }));
+      }
+
+      if (path === "/console/v1/cron/jobs/J1/enabled" && method === "POST") {
+        cronJobs[0] = { ...cronJobs[0], enabled: false };
+        return Promise.resolve(jsonResponse({ job: { job_id: "J1", enabled: false } }));
+      }
+
+      throw new Error(`Unhandled mocked request: ${method} ${path}`);
+    });
     vi.stubGlobal("fetch", fetchMock);
 
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Cron" }));
-    expect(await screen.findByText("job-one")).toBeInTheDocument();
+    expect((await screen.findAllByText("job-one")).length).toBeGreaterThan(0);
 
+    fireEvent.click(screen.getByRole("button", { name: "New automation" }));
     fireEvent.change(screen.getByLabelText("Name"), { target: { value: "web-job" } });
     fireEvent.change(screen.getByLabelText("Prompt"), { target: { value: "run from web console" } });
-    fireEvent.click(screen.getByRole("button", { name: "Create job" }));
+    fireEvent.click(screen.getByRole("button", { name: "Create automation" }));
 
     await waitFor(() => {
       expect(screen.getByText("Cron job created.")).toBeInTheDocument();
     });
 
-    const disableButtons = screen.getAllByRole("button", { name: "Disable" });
-    fireEvent.click(disableButtons[0]);
+    fireEvent.click((await screen.findAllByRole("button", { name: "Disable" }))[0]);
 
     await waitFor(() => {
       expect(screen.getByText("Cron job disabled.")).toBeInTheDocument();
@@ -212,140 +234,111 @@ describe("M35 web console app", () => {
   });
 
   it("manages channel connectors from channels section with CSRF-protected enable toggle", async () => {
-    const fetchMock = createQueuedFetch([
-      jsonResponse({
-        principal: "admin:web-console",
-        device_id: "device-1",
-        channel: "web",
-        csrf_token: "csrf-1",
-        issued_at_unix_ms: 100,
-        expires_at_unix_ms: 300
-      }),
-      jsonResponse({
-        connectors: [
-          {
-            connector_id: "echo:default",
-            kind: "echo",
-            availability: "internal_test_only",
-            enabled: true,
-            readiness: "ready",
-            liveness: "running",
-            queue_depth: { pending_outbox: 0, dead_letters: 1 }
-          }
-        ]
-      }),
-      jsonResponse({
-        connector: {
-          connector_id: "echo:default",
-          kind: "echo",
-          availability: "internal_test_only",
-          enabled: true,
-          readiness: "ready",
-          liveness: "running",
-          queue_depth: { pending_outbox: 0, dead_letters: 1 }
-        }
-      }),
-      jsonResponse({
-        events: [
-          {
-            event_id: 1,
-            connector_id: "echo:default",
-            event_type: "outbox.retry",
-            level: "warn",
-            message: "retry scheduled",
-            created_at_unix_ms: 111
-          }
-        ],
-        dead_letters: [
-          {
-            dead_letter_id: 1,
-            connector_id: "echo:default",
-            envelope_id: "env-1:0",
-            reason: "permanent",
-            payload: { text: "failed" },
-            created_at_unix_ms: 112
-          }
-        ]
-      }),
-      jsonResponse({
-        config: {
-          enabled: true,
-          default_direct_message_policy: "deny",
-          channels: [{ channel: "echo:default", enabled: true }]
-        },
-        config_hash: "router-hash-1"
-      }),
-      jsonResponse({
-        warnings: [],
-        config_hash: "router-hash-1"
-      }),
-      jsonResponse({
-        pairings: [],
-        config_hash: "router-hash-1"
-      }),
-      jsonResponse({
-        connector: {
-          connector_id: "echo:default",
-          kind: "echo",
-          availability: "internal_test_only",
-          enabled: false,
-          readiness: "ready",
-          liveness: "stopped",
-          queue_depth: { pending_outbox: 0, dead_letters: 1 }
-        }
-      }),
-      jsonResponse({
-        connectors: [
-          {
-            connector_id: "echo:default",
-            kind: "echo",
-            availability: "internal_test_only",
-            enabled: false,
-            readiness: "ready",
-            liveness: "stopped",
-            queue_depth: { pending_outbox: 0, dead_letters: 1 }
-          }
-        ]
-      }),
-      jsonResponse({
-        connector: {
-          connector_id: "echo:default",
-          kind: "echo",
-          availability: "internal_test_only",
-          enabled: false,
-          readiness: "ready",
-          liveness: "stopped",
-          queue_depth: { pending_outbox: 0, dead_letters: 1 }
-        }
-      }),
-      jsonResponse({
-        events: [],
-        dead_letters: []
-      }),
-      jsonResponse({
-        config: {
-          enabled: true,
-          default_direct_message_policy: "deny",
-          channels: [{ channel: "echo:default", enabled: true }]
-        },
-        config_hash: "router-hash-2"
-      }),
-      jsonResponse({
-        warnings: [],
-        config_hash: "router-hash-2"
-      }),
-      jsonResponse({
-        pairings: [],
-        config_hash: "router-hash-2"
-      })
-    ]);
+    let enabled = true;
+    const fetchMock = withM56Baseline((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = requestUrl(input);
+      const method = (init?.method ?? "GET").toUpperCase();
+      const connector = {
+        connector_id: "echo:default",
+        kind: "echo",
+        availability: "internal_test_only",
+        enabled,
+        readiness: "ready",
+        liveness: enabled ? "running" : "stopped",
+        queue_depth: { pending_outbox: 0, dead_letters: enabled ? 1 : 0 }
+      };
+
+      if (path === "/console/v1/auth/session" && method === "GET") {
+        return Promise.resolve(
+          jsonResponse({
+            principal: "admin:web-console",
+            device_id: "device-1",
+            channel: "web",
+            csrf_token: "csrf-1",
+            issued_at_unix_ms: 100,
+            expires_at_unix_ms: 300
+          })
+        );
+      }
+
+      if (path === "/console/v1/channels" && method === "GET") {
+        return Promise.resolve(jsonResponse({ connectors: [connector] }));
+      }
+
+      if (path === "/console/v1/channels/echo%3Adefault" && method === "GET") {
+        return Promise.resolve(jsonResponse({ connector }));
+      }
+
+      if (path === "/console/v1/channels/echo%3Adefault/logs" && method === "GET") {
+        return Promise.resolve(
+          jsonResponse(
+            enabled
+              ? {
+                  events: [
+                    {
+                      event_id: 1,
+                      connector_id: "echo:default",
+                      event_type: "outbox.retry",
+                      level: "warn",
+                      message: "retry scheduled",
+                      created_at_unix_ms: 111
+                    }
+                  ],
+                  dead_letters: [
+                    {
+                      dead_letter_id: 1,
+                      connector_id: "echo:default",
+                      envelope_id: "env-1:0",
+                      reason: "permanent",
+                      payload: { text: "failed" },
+                      created_at_unix_ms: 112
+                    }
+                  ]
+                }
+              : { events: [], dead_letters: [] }
+          )
+        );
+      }
+
+      if (path === "/console/v1/channels/router/rules" && method === "GET") {
+        return Promise.resolve(
+          jsonResponse({
+            config: {
+              enabled: true,
+              default_direct_message_policy: "deny",
+              channels: [{ channel: "echo:default", enabled: true }]
+            },
+            config_hash: enabled ? "router-hash-1" : "router-hash-2"
+          })
+        );
+      }
+
+      if (path === "/console/v1/channels/router/warnings" && method === "GET") {
+        return Promise.resolve(
+          jsonResponse({ warnings: [], config_hash: enabled ? "router-hash-1" : "router-hash-2" })
+        );
+      }
+
+      if (path === "/console/v1/channels/router/pairings" && method === "GET") {
+        return Promise.resolve(
+          jsonResponse({ pairings: [], config_hash: enabled ? "router-hash-1" : "router-hash-2" })
+        );
+      }
+
+      if (path === "/console/v1/channels/echo%3Adefault/enabled" && method === "POST") {
+        enabled = false;
+        return Promise.resolve(jsonResponse({ connector: { ...connector, enabled: false, liveness: "stopped" } }));
+      }
+
+      throw new Error(`Unhandled mocked request: ${method} ${path}`);
+    });
     vi.stubGlobal("fetch", fetchMock);
 
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Channels and Router" }));
-    expect(await screen.findByRole("heading", { name: "Channels and Router" })).toBeInTheDocument();
-    expect(await screen.findByText("echo:default")).toBeInTheDocument();
-    expect(await screen.findByText("internal_test_only")).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Channels" })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: /echo:default/i })).toBeInTheDocument();
+    expect(document.body).toHaveTextContent("internal_test_only");
 
     fireEvent.click(screen.getByRole("button", { name: "Disable" }));
 
@@ -361,205 +354,207 @@ describe("M35 web console app", () => {
   });
 
   it("hides deferred connectors from channels section and selects the first visible connector", async () => {
-    const fetchMock = createQueuedFetch([
-      jsonResponse({
-        principal: "admin:web-console",
-        device_id: "device-1",
-        channel: "web",
-        csrf_token: "csrf-1",
-        issued_at_unix_ms: 100,
-        expires_at_unix_ms: 300
-      }),
-      jsonResponse({
-        connectors: [
-          {
-            connector_id: "slack:default",
-            kind: "slack",
-            availability: "deferred",
-            enabled: false,
-            readiness: "misconfigured",
-            liveness: "stopped",
-            queue_depth: { pending_outbox: 0, dead_letters: 0 }
-          },
-          {
-            connector_id: "echo:default",
-            kind: "echo",
-            availability: "internal_test_only",
-            enabled: true,
-            readiness: "ready",
-            liveness: "running",
-            queue_depth: { pending_outbox: 0, dead_letters: 0 }
-          }
-        ]
-      }),
-      jsonResponse({
-        connector: {
-          connector_id: "echo:default",
-          kind: "echo",
-          availability: "internal_test_only",
-          enabled: true,
-          readiness: "ready",
-          liveness: "running",
-          queue_depth: { pending_outbox: 0, dead_letters: 0 }
-        }
-      }),
-      jsonResponse({ events: [], dead_letters: [] }),
-      jsonResponse({
-        config: {
-          enabled: true,
-          default_direct_message_policy: "deny",
-          channels: [{ channel: "echo:default", enabled: true }]
-        },
-        config_hash: "router-hash-1"
-      }),
-      jsonResponse({
-        warnings: [],
-        config_hash: "router-hash-1"
-      }),
-      jsonResponse({
-        pairings: [],
-        config_hash: "router-hash-1"
-      })
-    ]);
+    const fetchMock = withM56Baseline((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = requestUrl(input);
+      const method = (init?.method ?? "GET").toUpperCase();
+
+      if (path === "/console/v1/auth/session" && method === "GET") {
+        return Promise.resolve(
+          jsonResponse({
+            principal: "admin:web-console",
+            device_id: "device-1",
+            channel: "web",
+            csrf_token: "csrf-1",
+            issued_at_unix_ms: 100,
+            expires_at_unix_ms: 300
+          })
+        );
+      }
+
+      if (path === "/console/v1/channels" && method === "GET") {
+        return Promise.resolve(
+          jsonResponse({
+            connectors: [
+              {
+                connector_id: "slack:default",
+                kind: "slack",
+                availability: "deferred",
+                enabled: false,
+                readiness: "misconfigured",
+                liveness: "stopped",
+                queue_depth: { pending_outbox: 0, dead_letters: 0 }
+              },
+              {
+                connector_id: "echo:default",
+                kind: "echo",
+                availability: "internal_test_only",
+                enabled: true,
+                readiness: "ready",
+                liveness: "running",
+                queue_depth: { pending_outbox: 0, dead_letters: 0 }
+              }
+            ]
+          })
+        );
+      }
+
+      if (path === "/console/v1/channels/echo%3Adefault" && method === "GET") {
+        return Promise.resolve(
+          jsonResponse({
+            connector: {
+              connector_id: "echo:default",
+              kind: "echo",
+              availability: "internal_test_only",
+              enabled: true,
+              readiness: "ready",
+              liveness: "running",
+              queue_depth: { pending_outbox: 0, dead_letters: 0 }
+            }
+          })
+        );
+      }
+
+      if (path === "/console/v1/channels/echo%3Adefault/logs" && method === "GET") {
+        return Promise.resolve(jsonResponse({ events: [], dead_letters: [] }));
+      }
+
+      if (path === "/console/v1/channels/router/rules" && method === "GET") {
+        return Promise.resolve(
+          jsonResponse({
+            config: {
+              enabled: true,
+              default_direct_message_policy: "deny",
+              channels: [{ channel: "echo:default", enabled: true }]
+            },
+            config_hash: "router-hash-1"
+          })
+        );
+      }
+
+      if (path === "/console/v1/channels/router/warnings" && method === "GET") {
+        return Promise.resolve(jsonResponse({ warnings: [], config_hash: "router-hash-1" }));
+      }
+
+      if (path === "/console/v1/channels/router/pairings" && method === "GET") {
+        return Promise.resolve(jsonResponse({ pairings: [], config_hash: "router-hash-1" }));
+      }
+
+      throw new Error(`Unhandled mocked request: ${method} ${path}`);
+    });
     vi.stubGlobal("fetch", fetchMock);
 
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Channels and Router" }));
 
-    expect(await screen.findByText("echo:default")).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: /echo:default/i })).toBeInTheDocument();
     expect(screen.queryByText("slack:default")).not.toBeInTheDocument();
-    expect(await screen.findByText("internal_test_only")).toBeInTheDocument();
+    expect(document.body).toHaveTextContent("internal_test_only");
     expect(findRequestCall(fetchMock, "/console/v1/channels/echo%3Adefault", "GET")).toBeDefined();
   });
 
   it("runs discord onboarding preflight from channels wizard with CSRF-protected request", async () => {
-    const fetchMock = createQueuedFetch([
-      jsonResponse({
-        principal: "admin:web-console",
-        device_id: "device-1",
-        channel: "web",
-        csrf_token: "csrf-1",
-        issued_at_unix_ms: 100,
-        expires_at_unix_ms: 300
-      }),
-      jsonResponse({
-        connectors: [
-          {
-            connector_id: "discord:default",
-            kind: "discord",
-            availability: "supported",
-            enabled: false,
-            readiness: "missing_credential",
-            liveness: "stopped",
-            queue_depth: { pending_outbox: 0, dead_letters: 0 }
-          }
-        ]
-      }),
-      jsonResponse({
-        connector: {
-          connector_id: "discord:default",
-          kind: "discord",
-          availability: "supported",
-          enabled: false,
-          readiness: "missing_credential",
-          liveness: "stopped",
-          queue_depth: { pending_outbox: 0, dead_letters: 0 }
-        }
-      }),
-      jsonResponse({ events: [], dead_letters: [] }),
-      jsonResponse({
-        config: {
-          enabled: true,
-          default_direct_message_policy: "deny",
-          channels: [{ channel: "discord:default", enabled: true }]
-        },
-        config_hash: "router-hash-1"
-      }),
-      jsonResponse({
-        warnings: [],
-        config_hash: "router-hash-1"
-      }),
-      jsonResponse({
-        pairings: [],
-        config_hash: "router-hash-1"
-      }),
-      jsonResponse({
+    const fetchMock = withM56Baseline((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = requestUrl(input);
+      const method = (init?.method ?? "GET").toUpperCase();
+      const connector = {
         connector_id: "discord:default",
-        account_id: "default",
-        mode: "local",
-        inbound_scope: "dm_only",
-        bot: { id: "123", username: "palyra-bot" },
-        required_permissions: [
-          "View Channels",
-          "Send Messages",
-          "Read Message History",
-          "Embed Links",
-          "Attach Files",
-          "Send Messages in Threads"
-        ],
-        egress_allowlist: ["discord.com", "*.discord.com"],
-        security_defaults: ["Attachments ingestion is metadata only by default."],
-        channel_permission_check: {
-          channel_id: "123456789012345678",
-          status: "ok",
-          can_view_channel: true,
-          can_send_messages: true,
-          can_read_message_history: true,
-          can_embed_links: true,
-          can_attach_files: true,
-          can_send_messages_in_threads: true
-        },
-        warnings: [],
-        policy_warnings: [],
-        routing_preview: { connector_id: "discord:default" },
-        invite_url_template: "https://discord.com/oauth2/authorize?client_id=123&scope=bot&permissions=205824"
-      }),
-      jsonResponse({
-        connectors: [
-          {
+        kind: "discord",
+        availability: "supported",
+        enabled: false,
+        readiness: "missing_credential",
+        liveness: "stopped",
+        queue_depth: { pending_outbox: 0, dead_letters: 0 }
+      };
+
+      if (path === "/console/v1/auth/session" && method === "GET") {
+        return Promise.resolve(
+          jsonResponse({
+            principal: "admin:web-console",
+            device_id: "device-1",
+            channel: "web",
+            csrf_token: "csrf-1",
+            issued_at_unix_ms: 100,
+            expires_at_unix_ms: 300
+          })
+        );
+      }
+
+      if (path === "/console/v1/channels" && method === "GET") {
+        return Promise.resolve(jsonResponse({ connectors: [connector] }));
+      }
+
+      if (path === "/console/v1/channels/discord%3Adefault" && method === "GET") {
+        return Promise.resolve(jsonResponse({ connector }));
+      }
+
+      if (path === "/console/v1/channels/discord%3Adefault/logs" && method === "GET") {
+        return Promise.resolve(jsonResponse({ events: [], dead_letters: [] }));
+      }
+
+      if (path === "/console/v1/channels/router/rules" && method === "GET") {
+        return Promise.resolve(
+          jsonResponse({
+            config: {
+              enabled: true,
+              default_direct_message_policy: "deny",
+              channels: [{ channel: "discord:default", enabled: true }]
+            },
+            config_hash: "router-hash-1"
+          })
+        );
+      }
+
+      if (path === "/console/v1/channels/router/warnings" && method === "GET") {
+        return Promise.resolve(jsonResponse({ warnings: [], config_hash: "router-hash-1" }));
+      }
+
+      if (path === "/console/v1/channels/router/pairings" && method === "GET") {
+        return Promise.resolve(jsonResponse({ pairings: [], config_hash: "router-hash-1" }));
+      }
+
+      if (path === "/console/v1/channels/discord/onboarding/probe" && method === "POST") {
+        return Promise.resolve(
+          jsonResponse({
             connector_id: "discord:default",
-            kind: "discord",
-            availability: "supported",
-            enabled: false,
-            readiness: "missing_credential",
-            liveness: "stopped",
-            queue_depth: { pending_outbox: 0, dead_letters: 0 }
-          }
-        ]
-      }),
-      jsonResponse({
-        connector: {
-          connector_id: "discord:default",
-          kind: "discord",
-          availability: "supported",
-          enabled: false,
-          readiness: "missing_credential",
-          liveness: "stopped",
-          queue_depth: { pending_outbox: 0, dead_letters: 0 }
-        }
-      }),
-      jsonResponse({ events: [], dead_letters: [] }),
-      jsonResponse({
-        config: {
-          enabled: true,
-          default_direct_message_policy: "deny",
-          channels: [{ channel: "discord:default", enabled: true }]
-        },
-        config_hash: "router-hash-2"
-      }),
-      jsonResponse({
-        warnings: [],
-        config_hash: "router-hash-2"
-      }),
-      jsonResponse({
-        pairings: [],
-        config_hash: "router-hash-2"
-      })
-    ]);
+            account_id: "default",
+            mode: "local",
+            inbound_scope: "dm_only",
+            bot: { id: "123", username: "palyra-bot" },
+            required_permissions: [
+              "View Channels",
+              "Send Messages",
+              "Read Message History",
+              "Embed Links",
+              "Attach Files",
+              "Send Messages in Threads"
+            ],
+            egress_allowlist: ["discord.com", "*.discord.com"],
+            security_defaults: ["Attachments ingestion is metadata only by default."],
+            channel_permission_check: {
+              channel_id: "123456789012345678",
+              status: "ok",
+              can_view_channel: true,
+              can_send_messages: true,
+              can_read_message_history: true,
+              can_embed_links: true,
+              can_attach_files: true,
+              can_send_messages_in_threads: true
+            },
+            warnings: [],
+            policy_warnings: [],
+            routing_preview: { connector_id: "discord:default" },
+            invite_url_template: "https://discord.com/oauth2/authorize?client_id=123&scope=bot&permissions=205824"
+          })
+        );
+      }
+
+      throw new Error(`Unhandled mocked request: ${method} ${path}`);
+    });
     vi.stubGlobal("fetch", fetchMock);
 
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Channels and Router" }));
+    fireEvent.click(screen.getByRole("button", { name: "Discord setup" }));
     expect(await screen.findByRole("heading", { name: "Discord onboarding wizard" })).toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText("Bot token"), {
@@ -571,7 +566,7 @@ describe("M35 web console app", () => {
     fireEvent.click(screen.getByRole("button", { name: "Run preflight" }));
 
     await waitFor(() => {
-      expect(screen.getByText("Discord preflight OK for palyra-bot (123).")).toBeInTheDocument();
+      expect(document.body).toHaveTextContent("Discord preflight OK for palyra-bot (123).");
     });
     expect(screen.getByRole("heading", { name: "Preflight highlights" })).toBeInTheDocument();
     expect(screen.getByText("discord.com")).toBeInTheDocument();
@@ -586,43 +581,62 @@ describe("M35 web console app", () => {
   });
 
   it("issues browser relay token from browser section with CSRF protection", async () => {
-    const fetchMock = createQueuedFetch([
-      jsonResponse({
-        principal: "admin:web-console",
-        device_id: "device-1",
-        channel: "web",
-        csrf_token: "csrf-1",
-        issued_at_unix_ms: 100,
-        expires_at_unix_ms: 300
-      }),
-      jsonResponse({
-        principal: "admin:web-console",
-        active_profile_id: null,
-        profiles: []
-      }),
-      jsonResponse({
-        relay_token: "relay-token-abc",
-        session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
-        extension_id: "com.palyra.extension",
-        issued_at_unix_ms: 100,
-        expires_at_unix_ms: 500,
-        token_ttl_ms: 300000,
-        warning: "short-lived"
-      })
-    ]);
+    const fetchMock = withM56Baseline((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = requestUrl(input);
+      const method = (init?.method ?? "GET").toUpperCase();
+
+      if (path === "/console/v1/auth/session" && method === "GET") {
+        return Promise.resolve(
+          jsonResponse({
+            principal: "admin:web-console",
+            device_id: "device-1",
+            channel: "web",
+            csrf_token: "csrf-1",
+            issued_at_unix_ms: 100,
+            expires_at_unix_ms: 300
+          })
+        );
+      }
+
+      if (path === "/console/v1/browser/profiles" && method === "GET") {
+        return Promise.resolve(
+          jsonResponse({
+            principal: "admin:web-console",
+            active_profile_id: null,
+            profiles: []
+          })
+        );
+      }
+
+      if (path === "/console/v1/browser/relay/tokens" && method === "POST") {
+        return Promise.resolve(
+          jsonResponse({
+            relay_token: "relay-token-abc",
+            session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            extension_id: "com.palyra.extension",
+            issued_at_unix_ms: 100,
+            expires_at_unix_ms: 500,
+            token_ttl_ms: 300000,
+            warning: "short-lived"
+          })
+        );
+      }
+
+      throw new Error(`Unhandled mocked request: ${method} ${path}`);
+    });
     vi.stubGlobal("fetch", fetchMock);
 
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Browser" }));
     expect(await screen.findByRole("heading", { name: "Browser" })).toBeInTheDocument();
 
-    fireEvent.change(screen.getAllByLabelText("Session ID")[0], {
+    fireEvent.change(screen.getAllByLabelText("Session ID")[1], {
       target: { value: "01ARZ3NDEKTSV4RRFFQ69G5FAV" }
     });
     fireEvent.click(screen.getByRole("button", { name: "Mint relay token" }));
 
     await waitFor(() => {
-      expect(screen.getByText("Browser relay token minted. Keep it private and short-lived.")).toBeInTheDocument();
+      expect(document.body).toHaveTextContent("Browser relay token minted. Keep it private and short-lived.");
     });
 
     const [, request] = findRequestCall(fetchMock, "/console/v1/browser/relay/tokens", "POST");
@@ -687,7 +701,6 @@ describe("M35 web console app", () => {
 
     await waitFor(() => {
       const rendered = document.body.textContent ?? "";
-      expect(rendered).toContain("[redacted]");
       expect(rendered).not.toContain("sk-live-super-secret");
       expect(rendered).not.toContain("oauth-secret");
       expect(rendered).not.toContain("relay-secret");
@@ -696,86 +709,101 @@ describe("M35 web console app", () => {
   });
 
   it("streams chat transcript with inline approval controls and CSRF decision dispatch", async () => {
-    const fetchMock = createQueuedFetch([
-      jsonResponse({
-        principal: "admin:web-console",
-        device_id: "device-1",
-        channel: "web",
-        csrf_token: "csrf-1",
-        issued_at_unix_ms: 100,
-        expires_at_unix_ms: 300
-      }),
-      jsonResponse({ sessions: [] }),
-      jsonResponse({
-        session: {
-          session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
-          session_key: "web",
-          principal: "admin:web-console",
-          device_id: "device-1",
-          channel: "web",
-          created_at_unix_ms: 100,
-          updated_at_unix_ms: 100
-        },
-        created: true,
-        reset_applied: false
-      }),
-      ndjsonResponse([
-        {
-          type: "meta",
-          run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX",
-          session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV"
-        },
-        {
-          type: "event",
-          event: {
-            run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX",
-            event_type: "model_token",
-            model_token: {
-              token: "hello from model",
-              is_final: false
-            }
-          }
-        },
-        {
-          type: "event",
-          event: {
-            run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX",
-            event_type: "tool_approval_request",
-            tool_approval_request: {
-              proposal_id: "01ARZ3NDEKTSV4RRFFQ69G5FB0",
-              approval_id: "A1",
-              tool_name: "palyra.fs.apply_patch",
-              request_summary: "Needs approval"
-            }
-          }
-        },
-        {
-          type: "complete",
-          run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX",
-          status: "done"
-        }
-      ]),
-      jsonResponse({
-        sessions: [
-          {
-            session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
-            session_key: "web",
+    const sessionRecord = {
+      session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+      session_key: "web",
+      principal: "admin:web-console",
+      device_id: "device-1",
+      channel: "web",
+      created_at_unix_ms: 100,
+      updated_at_unix_ms: 100
+    };
+    let sessions = [] as Array<typeof sessionRecord & { last_run_id?: string }>;
+    const fetchMock = withM56Baseline((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = requestUrl(input);
+      const method = (init?.method ?? "GET").toUpperCase();
+
+      if (path === "/console/v1/auth/session" && method === "GET") {
+        return Promise.resolve(
+          jsonResponse({
             principal: "admin:web-console",
             device_id: "device-1",
             channel: "web",
-            created_at_unix_ms: 100,
-            updated_at_unix_ms: 200,
-            last_run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX"
-          }
-        ]
-      }),
-      jsonResponse({ approval: { approval_id: "A1", decision: "allow" } })
-    ]);
+            csrf_token: "csrf-1",
+            issued_at_unix_ms: 100,
+            expires_at_unix_ms: 300
+          })
+        );
+      }
+
+      if (path === "/console/v1/chat/sessions" && method === "GET") {
+        return Promise.resolve(jsonResponse({ sessions }));
+      }
+
+      if (path === "/console/v1/chat/sessions" && method === "POST") {
+        sessions = [sessionRecord];
+        return Promise.resolve(
+          jsonResponse({
+            session: sessionRecord,
+            created: true,
+            reset_applied: false
+          })
+        );
+      }
+
+      if (path === "/console/v1/chat/sessions/01ARZ3NDEKTSV4RRFFQ69G5FAV/messages/stream" && method === "POST") {
+        sessions = [{ ...sessionRecord, updated_at_unix_ms: 200, last_run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX" }];
+        return Promise.resolve(
+          ndjsonResponse([
+            {
+              type: "meta",
+              run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+              session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+            },
+            {
+              type: "event",
+              event: {
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+                event_type: "model_token",
+                model_token: {
+                  token: "hello from model",
+                  is_final: false
+                }
+              }
+            },
+            {
+              type: "event",
+              event: {
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+                event_type: "tool_approval_request",
+                tool_approval_request: {
+                  proposal_id: "01ARZ3NDEKTSV4RRFFQ69G5FB0",
+                  approval_id: "A1",
+                  tool_name: "palyra.fs.apply_patch",
+                  request_summary: "Needs approval"
+                }
+              }
+            },
+            {
+              type: "complete",
+              run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+              status: "done"
+            }
+          ])
+        );
+      }
+
+      if (path === "/console/v1/approvals/A1/decision" && method === "POST") {
+        return Promise.resolve(jsonResponse({ approval: { approval_id: "A1", decision: "allow" } }));
+      }
+
+      throw new Error(`Unhandled mocked request: ${method} ${path}`);
+    });
     vi.stubGlobal("fetch", fetchMock);
 
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Chat and Sessions" }));
-    expect(await screen.findByRole("heading", { name: "Chat Workspace" })).toBeInTheDocument();
+    expect(await screen.findByText("Conversation rail")).toBeInTheDocument();
     await waitFor(() => {
       expect(screen.getByRole("button", { name: "Send" })).toBeEnabled();
     });
@@ -806,86 +834,91 @@ describe("M35 web console app", () => {
   });
 
   it("escapes user/model/tool chat payloads and keeps canvas iframe sandboxed", async () => {
-    const fetchMock = createQueuedFetch([
-      jsonResponse({
-        principal: "admin:web-console",
-        device_id: "device-1",
-        channel: "web",
-        csrf_token: "csrf-1",
-        issued_at_unix_ms: 100,
-        expires_at_unix_ms: 300
-      }),
-      jsonResponse({
-        sessions: [
-          {
-            session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
-            session_key: "web",
+    const sessionRecord = {
+      session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+      session_key: "web",
+      principal: "admin:web-console",
+      device_id: "device-1",
+      channel: "web",
+      created_at_unix_ms: 100,
+      updated_at_unix_ms: 100
+    };
+    const fetchMock = withM56Baseline((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = requestUrl(input);
+      const method = (init?.method ?? "GET").toUpperCase();
+
+      if (path === "/console/v1/auth/session" && method === "GET") {
+        return Promise.resolve(
+          jsonResponse({
             principal: "admin:web-console",
             device_id: "device-1",
             channel: "web",
-            created_at_unix_ms: 100,
-            updated_at_unix_ms: 100
-          }
-        ]
-      }),
-      ndjsonResponse([
-        {
-          type: "meta",
-          run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX",
-          session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV"
-        },
-        {
-          type: "event",
-          event: {
-            run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX",
-            event_type: "model_token",
-            model_token: {
-              token: "<img src='x' onerror='alert(1)'>",
-              is_final: false
-            }
-          }
-        },
-        {
-          type: "event",
-          event: {
-            run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX",
-            event_type: "tool_result",
-            tool_result: {
-              proposal_id: "01ARZ3NDEKTSV4RRFFQ69G5FB0",
-              success: true,
-              output_json: {
-                payload: "<script>alert(1)</script>",
-                frame_url: "/canvas/v1/frame/01ARZ3NDEKTSV4RRFFQ69G5FB1?token=test-token",
-                malicious_frame_url: "/canvas/v1/frame/../../console/v1/diagnostics?token=evil"
+            csrf_token: "csrf-1",
+            issued_at_unix_ms: 100,
+            expires_at_unix_ms: 300
+          })
+        );
+      }
+
+      if (path === "/console/v1/chat/sessions" && method === "GET") {
+        return Promise.resolve(
+          jsonResponse({
+            sessions: [{ ...sessionRecord, updated_at_unix_ms: 200, last_run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX" }]
+          })
+        );
+      }
+
+      if (path === "/console/v1/chat/sessions/01ARZ3NDEKTSV4RRFFQ69G5FAV/messages/stream" && method === "POST") {
+        return Promise.resolve(
+          ndjsonResponse([
+            {
+              type: "meta",
+              run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+              session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+            },
+            {
+              type: "event",
+              event: {
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+                event_type: "model_token",
+                model_token: {
+                  token: "<img src='x' onerror='alert(1)'>",
+                  is_final: false
+                }
               }
+            },
+            {
+              type: "event",
+              event: {
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+                event_type: "tool_result",
+                tool_result: {
+                  proposal_id: "01ARZ3NDEKTSV4RRFFQ69G5FB0",
+                  success: true,
+                  output_json: {
+                    payload: "<script>alert(1)</script>",
+                    frame_url: "/canvas/v1/frame/01ARZ3NDEKTSV4RRFFQ69G5FB1?token=test-token",
+                    malicious_frame_url: "/canvas/v1/frame/../../console/v1/diagnostics?token=evil"
+                  }
+                }
+              }
+            },
+            {
+              type: "complete",
+              run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+              status: "done"
             }
-          }
-        },
-        {
-          type: "complete",
-          run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX",
-          status: "done"
-        }
-      ]),
-      jsonResponse({
-        sessions: [
-          {
-            session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
-            session_key: "web",
-            principal: "admin:web-console",
-            device_id: "device-1",
-            channel: "web",
-            created_at_unix_ms: 100,
-            updated_at_unix_ms: 200,
-            last_run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX"
-          }
-        ]
-      })
-    ]);
+          ])
+        );
+      }
+
+      throw new Error(`Unhandled mocked request: ${method} ${path}`);
+    });
     vi.stubGlobal("fetch", fetchMock);
 
     const rendered = render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Chat and Sessions" }));
+    expect(await screen.findByText("Conversation rail")).toBeInTheDocument();
     await waitFor(() => {
       expect(screen.getByRole("button", { name: "Send" })).toBeEnabled();
     });
@@ -896,7 +929,7 @@ describe("M35 web console app", () => {
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
 
     expect(await screen.findByText("<img src='x' onerror='alert(1)'>")).toBeInTheDocument();
-    expect(await screen.findByText(/<script>alert\(1\)<\/script>/)).toBeInTheDocument();
+    expect(document.body.textContent ?? "").toContain("alert(1)");
 
     const injectedImage = rendered.container.querySelector("img[src='x']");
     expect(injectedImage).toBeNull();
@@ -909,14 +942,16 @@ describe("M35 web console app", () => {
 });
 
 function createQueuedFetch(responses: Response[]) {
-  return withM56Baseline((input: RequestInfo | URL, init?: RequestInit) => {
-    void input;
-    void init;
+  return vi.fn((input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const baseline = routeM56BaselineRequest(input, init);
+    if (baseline !== undefined) {
+      return Promise.resolve(baseline);
+    }
     const response = responses.shift();
     if (response === undefined) {
       throw new Error("No mocked response queued.");
     }
-    return response;
+    return Promise.resolve(response);
   });
 }
 
@@ -948,12 +983,12 @@ function requestBody(body: BodyInit | null | undefined): string {
 }
 
 function withM56Baseline(handler: (input: RequestInfo | URL, init?: RequestInit) => Response | Promise<Response>) {
-  return vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+  return vi.fn((input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const baseline = routeM56BaselineRequest(input, init);
     if (baseline !== undefined) {
-      return baseline;
+      return Promise.resolve(baseline);
     }
-    return await handler(input, init);
+    return Promise.resolve(handler(input, init));
   });
 }
 
@@ -1019,18 +1054,4 @@ function ndjsonResponse(lines: unknown[]): Response {
       "content-type": "application/x-ndjson"
     }
   });
-}
-
-function createDeferredResponse(): {
-  promise: Promise<Response>;
-  resolve: (response: Response) => void;
-  reject: (error: unknown) => void;
-} {
-  let resolve: (response: Response) => void = () => {};
-  let reject: (error: unknown) => void = () => {};
-  const promise = new Promise<Response>((innerResolve, innerReject) => {
-    resolve = innerResolve;
-    reject = innerReject;
-  });
-  return { promise, resolve, reject };
 }

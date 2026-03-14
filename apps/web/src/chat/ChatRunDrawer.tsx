@@ -32,40 +32,70 @@ export function ChatRunDrawer({
   }
 
   return (
-    <aside className="chat-run-drawer" aria-label="Run details drawer">
-      <header className="chat-run-drawer__header">
+    <aside className="chat-run-drawer" aria-label="Run details inspector">
+      <div className="workspace-panel__intro">
+        <p className="workspace-kicker">Inspector</p>
         <h3>Run details</h3>
-        <div className="console-inline-actions">
+        <p className="chat-muted">Inspect status, tape events, and token accounting only when you need to.</p>
+      </div>
+
+      <div className="workspace-field-grid workspace-field-grid--double">
+        <label>
+          Run
           <select value={runDrawerId} onChange={(event) => setRunDrawerId(event.target.value)}>
             <option value="">Select run</option>
             {runIds.map((runId) => (
-              <option key={runId} value={runId}>{runId}</option>
+              <option key={runId} value={runId}>
+                {runId}
+              </option>
             ))}
           </select>
+        </label>
+        <div className="workspace-inline-actions">
           <button type="button" onClick={refreshRun} disabled={runDrawerId.trim().length === 0 || runDrawerBusy}>
             {runDrawerBusy ? "Loading..." : "Refresh run"}
           </button>
-          <button type="button" onClick={close}>Close</button>
+          <button type="button" className="secondary" onClick={close}>
+            Hide inspector
+          </button>
         </div>
-      </header>
+      </div>
 
       {runDrawerId.trim().length === 0 ? (
-        <p className="chat-muted">Select a run to inspect status and tape events.</p>
+        <p className="workspace-empty">Select a run to inspect status and tape events.</p>
       ) : (
         <>
           {runStatus === null ? (
-            <p className="chat-muted">No run status loaded yet.</p>
+            <p className="workspace-empty">No run status loaded yet.</p>
           ) : (
-            <section className="console-subpanel">
+            <section className="chat-run-section">
               <h4>Status</h4>
-              <div className="console-grid-3">
-                <p><strong>State:</strong> {runStatus.state}</p>
-                <p><strong>Prompt tokens:</strong> {runStatus.prompt_tokens}</p>
-                <p><strong>Completion tokens:</strong> {runStatus.completion_tokens}</p>
-                <p><strong>Total tokens:</strong> {runStatus.total_tokens}</p>
-                <p><strong>Tape events:</strong> {runStatus.tape_events}</p>
-                <p><strong>Updated:</strong> {new Date(runStatus.updated_at_unix_ms).toLocaleString()}</p>
-              </div>
+              <dl className="workspace-detail-grid">
+                <div>
+                  <dt>State</dt>
+                  <dd>{runStatus.state}</dd>
+                </div>
+                <div>
+                  <dt>Prompt tokens</dt>
+                  <dd>{runStatus.prompt_tokens}</dd>
+                </div>
+                <div>
+                  <dt>Completion tokens</dt>
+                  <dd>{runStatus.completion_tokens}</dd>
+                </div>
+                <div>
+                  <dt>Total tokens</dt>
+                  <dd>{runStatus.total_tokens}</dd>
+                </div>
+                <div>
+                  <dt>Tape events</dt>
+                  <dd>{runStatus.tape_events}</dd>
+                </div>
+                <div>
+                  <dt>Updated</dt>
+                  <dd>{new Date(runStatus.updated_at_unix_ms).toLocaleString()}</dd>
+                </div>
+              </dl>
               {runStatus.last_error !== undefined && runStatus.last_error.length > 0 && (
                 <p className="console-banner console-banner--error">{runStatus.last_error}</p>
               )}
@@ -73,9 +103,9 @@ export function ChatRunDrawer({
           )}
 
           {runTape === null ? (
-            <p className="chat-muted">No tape snapshot loaded.</p>
+            <p className="workspace-empty">No tape snapshot loaded.</p>
           ) : (
-            <section className="console-subpanel">
+            <section className="chat-run-section">
               <h4>Tape events ({runTape.events.length})</h4>
               <div className="chat-tape-list">
                 {runTape.events.map((event) => (

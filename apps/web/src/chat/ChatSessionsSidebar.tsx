@@ -33,8 +33,14 @@ export function ChatSessionsSidebar({
 }: ChatSessionsSidebarProps) {
   return (
     <aside className="chat-sessions" aria-label="Chat sessions">
-      <h3>Sessions</h3>
-      <div className="chat-session-create">
+      <div className="workspace-panel__intro">
+        <p className="workspace-kicker">Sessions</p>
+        <h3>Conversation rail</h3>
+        <p className="chat-muted">Keep sessions secondary to the conversation, but always one click away.</p>
+      </div>
+
+      <section className="chat-session-editor">
+        <h4>New session</h4>
         <label>
           New label
           <input
@@ -44,11 +50,12 @@ export function ChatSessionsSidebar({
           />
         </label>
         <button type="button" onClick={createSession} disabled={sessionsBusy}>
-          Create
+          {sessionsBusy ? "Creating..." : "Create"}
         </button>
-      </div>
+      </section>
 
-      <div className="chat-session-edit">
+      <section className="chat-session-editor">
+        <h4>Selected session</h4>
         <label>
           Active label
           <input
@@ -57,7 +64,7 @@ export function ChatSessionsSidebar({
             disabled={selectedSession === null || sessionsBusy}
           />
         </label>
-        <div className="console-inline-actions">
+        <div className="workspace-inline-actions">
           <button type="button" onClick={renameSession} disabled={selectedSession === null || sessionsBusy}>
             Rename
           </button>
@@ -65,17 +72,15 @@ export function ChatSessionsSidebar({
             Reset
           </button>
         </div>
-      </div>
+      </section>
 
       <div className="chat-session-list" role="listbox" aria-label="Conversation sessions">
         {sortedSessions.length === 0 ? (
-          <p className="chat-muted">No sessions yet.</p>
+          <p className="workspace-empty">Create a session to start a conversation.</p>
         ) : (
           sortedSessions.map((session) => {
             const active = session.session_id === activeSessionId;
-            const label = session.session_label?.trim().length
-              ? session.session_label
-              : shortId(session.session_id);
+            const label = session.session_label?.trim().length ? session.session_label : shortId(session.session_id);
             return (
               <button
                 key={session.session_id}
@@ -84,7 +89,7 @@ export function ChatSessionsSidebar({
                 onClick={() => setActiveSessionId(session.session_id)}
                 aria-selected={active}
               >
-                <span>{label}</span>
+                <span className="chat-session-item__title">{label}</span>
                 <small>
                   Updated {new Date(session.updated_at_unix_ms).toLocaleTimeString()} · {shortId(session.session_id)}
                 </small>

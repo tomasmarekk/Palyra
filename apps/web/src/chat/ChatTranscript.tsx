@@ -40,7 +40,9 @@ export function ChatTranscript({
 
       <div className="chat-transcript" ref={transcriptBoxRef} role="log" aria-live="polite">
         {visibleTranscript.length === 0 ? (
-          <p className="chat-muted">Send a message to start streaming output.</p>
+          <div className="chat-transcript__empty">
+            <p>Create or select a session, then send the first operator message to begin streaming output.</p>
+          </div>
         ) : (
           visibleTranscript.map((entry) => (
             <article key={entry.id} className={`chat-entry chat-entry--${entry.kind}`}>
@@ -59,11 +61,13 @@ export function ChatTranscript({
                 />
               )}
 
-              {entry.kind === "a2ui" && entry.surface !== undefined && a2uiDocuments[entry.surface] !== undefined && (
-                <div className="chat-a2ui-shell">
-                  <A2uiRenderer document={a2uiDocuments[entry.surface]} />
-                </div>
-              )}
+              {entry.kind === "a2ui" &&
+                entry.surface !== undefined &&
+                a2uiDocuments[entry.surface] !== undefined && (
+                  <div className="chat-a2ui-shell">
+                    <A2uiRenderer document={a2uiDocuments[entry.surface]} />
+                  </div>
+                )}
 
               {entry.kind === "canvas" && entry.canvas_url !== undefined && (
                 <iframe
@@ -77,15 +81,12 @@ export function ChatTranscript({
               )}
 
               {entry.payload !== undefined && entry.kind !== "assistant" && entry.kind !== "user" && (
-                <PrettyJsonBlock
-                  value={entry.payload}
-                  revealSensitiveValues={revealSensitiveValues}
-                />
+                <PrettyJsonBlock value={entry.payload} revealSensitiveValues={revealSensitiveValues} />
               )}
 
               {entry.run_id !== undefined && (
                 <div className="chat-entry-actions">
-                  <button type="button" onClick={() => openRunDetails(entry.run_id as string)}>
+                  <button type="button" className="secondary" onClick={() => openRunDetails(entry.run_id as string)}>
                     Open run details
                   </button>
                 </div>

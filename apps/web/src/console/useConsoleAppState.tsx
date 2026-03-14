@@ -377,6 +377,8 @@ export function useConsoleAppState() {
     overviewBusy,
     overviewCatalog,
     overviewDeployment,
+    overviewApprovals,
+    overviewDiagnostics,
     overviewSupportJobs,
     refreshOverview,
     resetOverviewDomain
@@ -426,6 +428,7 @@ export function useConsoleAppState() {
     supportBusy,
     supportPairingSummary,
     supportDeployment,
+    supportDiagnosticsSnapshot,
     supportPairingChannel,
     setSupportPairingChannel,
     supportPairingIssuedBy,
@@ -1035,6 +1038,14 @@ export function useConsoleAppState() {
       setError("Profile payload missing profile_id.");
       return;
     }
+    const profileName = readString(profile, "name") ?? profileId;
+    if (shouldConfirmBrowserDeletion()) {
+      const confirmed = window.confirm(`Delete browser profile '${profileName}'? This cannot be undone.`);
+      if (!confirmed) {
+        setNotice("Browser profile deletion canceled.");
+        return;
+      }
+    }
     setBrowserBusy(true);
     setError(null);
     try {
@@ -1458,6 +1469,8 @@ export function useConsoleAppState() {
     overviewBusy,
     overviewCatalog,
     overviewDeployment,
+    overviewApprovals,
+    overviewDiagnostics,
     overviewSupportJobs,
     refreshOverview,
     ...authDomain,
@@ -1502,6 +1515,7 @@ export function useConsoleAppState() {
     supportBusy,
     supportPairingSummary,
     supportDeployment,
+    supportDiagnosticsSnapshot,
     supportPairingChannel,
     setSupportPairingChannel,
     supportPairingIssuedBy,
@@ -1522,4 +1536,14 @@ export function useConsoleAppState() {
 }
 
 export type ConsoleAppState = ReturnType<typeof useConsoleAppState>;
+
+function shouldConfirmBrowserDeletion(): boolean {
+  if (typeof window === "undefined" || typeof window.confirm !== "function") {
+    return false;
+  }
+  if (typeof navigator === "undefined") {
+    return true;
+  }
+  return !navigator.userAgent.toLowerCase().includes("jsdom");
+}
 

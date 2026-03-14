@@ -139,7 +139,7 @@ describe("M56 runtime and operations surfaces", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Cron" }));
     expect(await screen.findByRole("heading", { name: "Cron" })).toBeInTheDocument();
-    expect(await screen.findByText("nightly")).toBeInTheDocument();
+    expect((await screen.findAllByText("nightly")).length).toBeGreaterThan(0);
     fireEvent.click(screen.getByRole("button", { name: "Run now" }));
     await waitFor(() => {
       expect(screen.getByText("Run-now dispatched.")).toBeInTheDocument();
@@ -147,14 +147,13 @@ describe("M56 runtime and operations surfaces", () => {
     expect(await screen.findByText(/cron-run-1/)).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Channels and Router" }));
-    expect(await screen.findByRole("heading", { name: "Channels and Router" })).toBeInTheDocument();
-    expect(await screen.findByText("discord:default")).toBeInTheDocument();
-    expect(screen.getByText("Broadcast messages remain denied by default.")).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Channels" })).toBeInTheDocument();
+    expect((await screen.findAllByText("discord:default")).length).toBeGreaterThan(0);
     expect(await screen.findByText(/attachment\.upload\.failed/)).toBeInTheDocument();
-    expect(await screen.findByText("Queue paused: yes")).toBeInTheDocument();
-    expect(screen.getByText("Permission gap: missing permissions: send messages")).toBeInTheDocument();
+    expect(document.body).toHaveTextContent(/Queue paused\s*yes/);
+    expect(document.body).toHaveTextContent(/Discord permission gap\s*missing permissions: send messages/);
 
-    fireEvent.click(screen.getByRole("button", { name: "Run health refresh" }));
+    fireEvent.click(screen.getByRole("button", { name: "Refresh health" }));
     await waitFor(() => {
       expect(screen.getByText("Channel health refresh completed.")).toBeInTheDocument();
     });
@@ -174,17 +173,13 @@ describe("M56 runtime and operations surfaces", () => {
       expect(screen.getByText("Dead letter 1 discarded.")).toBeInTheDocument();
     });
 
-    fireEvent.change(screen.getByLabelText("Bot token"), { target: { value: "discord-bot-token" } });
-    fireEvent.change(screen.getByLabelText("Verify channel ID"), {
-      target: { value: "123456789012345678" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Run preflight" }));
+    fireEvent.click(screen.getByRole("button", { name: "Send connector test" }));
     await waitFor(() => {
-      expect(document.body.textContent ?? "").toContain("Invite URL template:");
+      expect(screen.getByText(/Channel test dispatched/)).toBeInTheDocument();
     });
-    expect(await screen.findByText("discord.com")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Apply onboarding" }));
-    expect(await screen.findByText(/"status": "applied"/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Router" }));
+    expect(await screen.findByText("Broadcast messages remain denied by default.")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Preview route" }));
     await waitFor(() => {
@@ -196,10 +191,18 @@ describe("M56 runtime and operations surfaces", () => {
       expect(screen.getByText("Pairing code minted: 777888.")).toBeInTheDocument();
     });
 
-    fireEvent.click(screen.getByRole("button", { name: "Send connector test" }));
-    await waitFor(() => {
-      expect(screen.getByText(/Channel test dispatched/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Discord setup" }));
+    fireEvent.change(screen.getByLabelText("Bot token"), { target: { value: "discord-bot-token" } });
+    fireEvent.change(screen.getByLabelText("Verify channel ID"), {
+      target: { value: "123456789012345678" },
     });
+    fireEvent.click(screen.getByRole("button", { name: "Run preflight" }));
+    await waitFor(() => {
+      expect(document.body.textContent ?? "").toContain("Invite URL template:");
+    });
+    expect(await screen.findByText("discord.com")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Apply onboarding" }));
+    expect(await screen.findByText(/"status": "applied"/)).toBeInTheDocument();
 
     fireEvent.click(screen.getByLabelText("Confirm Discord outbound test send"));
     fireEvent.click(screen.getByRole("button", { name: "Send Discord test" }));
@@ -333,22 +336,21 @@ describe("M56 runtime and operations surfaces", () => {
       expect(screen.getByText("Browser profile deleted.")).toBeInTheDocument();
     });
 
-    fireEvent.change(screen.getAllByLabelText("Session ID")[0], { target: { value: "browser-session-1" } });
+    fireEvent.change(screen.getAllByLabelText("Session ID")[1], { target: { value: "browser-session-1" } });
     fireEvent.click(screen.getByRole("button", { name: "Mint relay token" }));
     await waitFor(() => {
-      expect(
-        screen.getByText("Browser relay token minted. Keep it private and short-lived.")
-      ).toBeInTheDocument();
+      expect(document.body).toHaveTextContent("Browser relay token minted. Keep it private and short-lived.");
     });
     expect(document.body.textContent ?? "").toContain('"relay_token": "[redacted]"');
     fireEvent.click(screen.getByRole("button", { name: "Dispatch relay action" }));
     expect(await screen.findByText("Relay action 'capture_selection' completed.")).toBeInTheDocument();
     expect(screen.getByText(/selected_text/)).toBeInTheDocument();
 
-    fireEvent.change(screen.getAllByLabelText("Session ID")[1], { target: { value: "browser-session-1" } });
+    fireEvent.change(screen.getAllByLabelText("Session ID")[0], { target: { value: "browser-session-1" } });
     fireEvent.click(screen.getByRole("button", { name: "Load downloads" }));
-    expect(await screen.findByText(/report.csv/)).toBeInTheDocument();
+    expect((await screen.findAllByText(/report.csv/)).length).toBeGreaterThan(0);
   }, 15_000);
+
 });
 
 function routeBaseRequests(request: { path: string; method: string }) {

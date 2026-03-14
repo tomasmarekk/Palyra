@@ -21,6 +21,7 @@ export function useSupportDomain({ api, setError, setNotice }: UseSupportDomainA
   const [supportBusy, setSupportBusy] = useState(false);
   const [supportPairingSummary, setSupportPairingSummary] = useState<JsonObject | null>(null);
   const [supportDeployment, setSupportDeployment] = useState<JsonObject | null>(null);
+  const [supportDiagnosticsSnapshot, setSupportDiagnosticsSnapshot] = useState<JsonObject | null>(null);
   const [supportPairingChannel, setSupportPairingChannel] = useState("discord:default");
   const [supportPairingIssuedBy, setSupportPairingIssuedBy] = useState("");
   const [supportPairingTtlMs, setSupportPairingTtlMs] = useState("600000");
@@ -33,10 +34,11 @@ export function useSupportDomain({ api, setError, setNotice }: UseSupportDomainA
     setSupportBusy(true);
     setError(null);
     try {
-      const [pairingResponse, jobsResponse, deploymentResponse] = await Promise.all([
+      const [pairingResponse, jobsResponse, deploymentResponse, diagnosticsResponse] = await Promise.all([
         api.getPairingSummary(),
         api.listSupportBundleJobs(),
-        api.getDeploymentPosture()
+        api.getDeploymentPosture(),
+        api.getDiagnostics()
       ]);
       setSupportPairingSummary(
         isJsonObject(pairingResponse as unknown as JsonValue) ? (pairingResponse as unknown as JsonObject) : null
@@ -45,6 +47,11 @@ export function useSupportDomain({ api, setError, setNotice }: UseSupportDomainA
       setSupportDeployment(
         isJsonObject(deploymentResponse as unknown as JsonValue)
           ? (deploymentResponse as unknown as JsonObject)
+          : null
+      );
+      setSupportDiagnosticsSnapshot(
+        isJsonObject(diagnosticsResponse as unknown as JsonValue)
+          ? (diagnosticsResponse as unknown as JsonObject)
           : null
       );
       const nextSelectedJobId = supportSelectedBundleJobId.trim();
@@ -144,6 +151,7 @@ export function useSupportDomain({ api, setError, setNotice }: UseSupportDomainA
     setSupportBusy(false);
     setSupportPairingSummary(null);
     setSupportDeployment(null);
+    setSupportDiagnosticsSnapshot(null);
     setSupportPairingChannel("discord:default");
     setSupportPairingIssuedBy("");
     setSupportPairingTtlMs("600000");
@@ -157,6 +165,7 @@ export function useSupportDomain({ api, setError, setNotice }: UseSupportDomainA
     supportBusy,
     supportPairingSummary,
     supportDeployment,
+    supportDiagnosticsSnapshot,
     supportPairingChannel,
     setSupportPairingChannel,
     supportPairingIssuedBy,

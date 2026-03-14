@@ -1,12 +1,14 @@
-import { ConsoleSectionHeader } from "../components/ConsoleSectionHeader";
+import { Button } from "@heroui/react";
+
+import { WorkspaceMetricCard, WorkspacePageHeader, WorkspaceSectionCard, WorkspaceStatusChip } from "../components/workspace/WorkspaceChrome";
 import {
-  formatUnixMs,
   PrettyJsonBlock,
+  formatUnixMs,
   readNumber,
   readObject,
   readString,
   toStringArray,
-  type JsonObject,
+  type JsonObject
 } from "../shared";
 import type { ConsoleAppState } from "../useConsoleAppState";
 
@@ -15,6 +17,7 @@ type SupportSectionProps = {
     ConsoleAppState,
     | "supportBusy"
     | "supportDeployment"
+    | "supportDiagnosticsSnapshot"
     | "supportBundleRetainJobs"
     | "setSupportBundleRetainJobs"
     | "supportBundleJobs"
@@ -25,250 +28,271 @@ type SupportSectionProps = {
     | "createSupportBundle"
     | "loadSupportBundleJob"
     | "setSection"
-    | "diagnosticsSnapshot"
     | "revealSensitiveValues"
   >;
 };
 
 export function SupportSection({ app }: SupportSectionProps) {
-  const warnings = toStringArray(
-    Array.isArray(app.supportDeployment?.warnings) ? app.supportDeployment.warnings : []
-  );
-  const observability = readObject(app.diagnosticsSnapshot ?? {}, "observability");
+  const deployment = app.supportDeployment ?? {};
+  const warnings = toStringArray(Array.isArray(deployment.warnings) ? deployment.warnings : []);
+  const observability = readObject(app.supportDiagnosticsSnapshot ?? {}, "observability");
   const supportBundle = readObject(observability ?? {}, "support_bundle");
-  const triage = readObject(observability ?? {}, "triage");
-  const recentFailures = Array.isArray(observability?.recent_failures)
-    ? observability.recent_failures.filter((entry): entry is JsonObject => entry !== null && typeof entry === "object" && !Array.isArray(entry))
-    : [];
+  const providerAuth = readObject(observability ?? {}, "provider_auth");
+  const recentFailures = toJsonObjectArray(observability?.recent_failures);
   const latestFailure = recentFailures[0] ?? null;
-  const triageOrder = toStringArray(Array.isArray(triage?.common_order) ? triage.common_order : []);
-  const failedJobs = app.supportBundleJobs.filter((job) => readString(job, "state") === "failed").length;
+  const failedJobs = app.supportBundleJobs.filter((job) => readString(job, "state") === "failed");
+  const providerAuthState = readString(providerAuth ?? {}, "state") ?? "unknown";
+  const recoveryBacklog = readNumber(providerAuth ?? {}, "degraded_profiles") ?? 0;
 
   return (
-    <main className="console-card">
-      <ConsoleSectionHeader
-        title="Support and Recovery"
-        description="Support bundle export, last-known posture, and operator recovery shortcuts live here so incident response stays visible from the dashboard."
-        actions={(
-          <button type="button" onClick={() => void app.refreshSupport()} disabled={app.supportBusy}>
-            {app.supportBusy ? "Refreshing..." : "Refresh recovery"}
-          </button>
-        )}
+    <main className="workspace-page">
+      <WorkspacePageHeader
+        eyebrow="Control"
+        title="Support"
+        headingLabel="Support and Recovery"
+        description="Queue support bundles, inspect recent failures, and move into diagnostics or recovery flows without relying on the desktop surface."
+        status={
+          <>
+            <WorkspaceStatusChip tone={failedJobs.length > 0 ? "warning" : "success"}>
+              {failedJobs.length} failed jobs
+            </WorkspaceStatusChip>
+            <WorkspaceStatusChip tone={warnings.length > 0 ? "warning" : "default"}>
+              {warnings.length} deployment warnings
+            </WorkspaceStatusChip>
+            <WorkspaceStatusChip tone={latestFailure === null ? "default" : "warning"}>
+              {latestFailure === null ? "No recent failure" : "Recent failure published"}
+            </WorkspaceStatusChip>
+          </>
+        }
+        actions={
+          <Button
+            variant="secondary"
+            onPress={() => void app.refreshSupport()}
+            isDisabled={app.supportBusy}
+          >
+            {app.supportBusy ? "Refreshing..." : "Refresh support"}
+          </Button>
+        }
       />
 
-      <section className="console-grid-4 console-summary-grid">
-        <article className="console-subpanel">
-          <h3>Deployment snapshot</h3>
-          <p><strong>Mode:</strong> {readString(app.supportDeployment ?? {}, "mode") ?? "n/a"}</p>
-          <p><strong>Bind profile:</strong> {readString(app.supportDeployment ?? {}, "bind_profile") ?? "n/a"}</p>
-          <p><strong>Warnings:</strong> {warnings.length}</p>
-        </article>
-        <article className="console-subpanel">
-          <h3>Support queue</h3>
-          <p><strong>Jobs:</strong> {app.supportBundleJobs.length}</p>
-          <p><strong>Failed jobs:</strong> {failedJobs}</p>
-          <p><strong>Selected job:</strong> {app.supportSelectedBundleJobId || "none"}</p>
-        </article>
-        <article className="console-subpanel">
-          <h3>Bundle reliability</h3>
-          <p><strong>Attempts:</strong> {readString(supportBundle ?? {}, "attempts") ?? "0"}</p>
-          <p><strong>Successes:</strong> {readString(supportBundle ?? {}, "successes") ?? "0"}</p>
-          <p><strong>Success rate:</strong> {formatRate(readNumber(supportBundle ?? {}, "success_rate_bps"))}</p>
-        </article>
-        <article className="console-subpanel">
-          <h3>Recovery shortcuts</h3>
-          <div className="console-inline-actions">
-            <button type="button" className="secondary" onClick={() => app.setSection("auth")}>
-              Provider auth recovery
-            </button>
-            <button type="button" className="secondary" onClick={() => app.setSection("channels")}>
-              Connector recovery
-            </button>
-            <button type="button" className="secondary" onClick={() => app.setSection("config")}>
-              Config recovery
-            </button>
-          </div>
-        </article>
-        <article className="console-subpanel">
-          <h3>Restart guidance</h3>
-          <p>Use the desktop control center for local sidecar restarts, then re-check diagnostics and channel health from the dashboard.</p>
-          <p className="chat-muted">
-            Detached operators can fall back to the CLI doctor and support-bundle commands published in the operations domain.
-          </p>
-          {latestFailure !== null && (
-            <p className="chat-muted">
-              Latest redacted failure: {readString(latestFailure, "failure_class") ?? "unknown"} /{" "}
-              {readString(latestFailure, "operation") ?? "operation unavailable"}.
-            </p>
-          )}
-        </article>
+      <section className="workspace-metric-grid">
+        <WorkspaceMetricCard
+          label="Support queue"
+          value={app.supportBundleJobs.length}
+          detail={app.supportBundleJobs[0] === undefined ? "No queued jobs" : readString(app.supportBundleJobs[0], "state") ?? "unknown"}
+          tone={failedJobs.length > 0 ? "warning" : "default"}
+        />
+        <WorkspaceMetricCard
+          label="Bundle reliability"
+          value={formatRate(readNumber(supportBundle ?? {}, "success_rate_bps"))}
+          detail={`${readString(supportBundle ?? {}, "attempts") ?? "0"} attempts`}
+          tone={failedJobs.length > 0 ? "warning" : "success"}
+        />
+        <WorkspaceMetricCard
+          label="Deployment posture"
+          value={readString(deployment, "bind_profile") ?? "unknown"}
+          detail={readString(deployment, "mode") ?? "Mode unavailable"}
+        />
+        <WorkspaceMetricCard
+          label="Latest failure"
+          value={latestFailure === null ? "None" : readString(latestFailure, "failure_class") ?? "Unknown"}
+          detail={latestFailure === null ? "No recent failure signal." : readString(latestFailure, "operation") ?? "Operation unavailable"}
+          tone={latestFailure === null ? "default" : "warning"}
+        />
       </section>
 
-      <section className="console-grid-2">
-        <article className="console-subpanel">
-          <div className="console-subpanel__header">
-            <div>
-              <h3>Queue support bundle export</h3>
-              <p className="chat-muted">
-                Support bundles stay queue-backed so collection can continue even when a browser tab disconnects.
-              </p>
+      <section className="workspace-two-column">
+        <WorkspaceSectionCard
+          title="Queue support bundle"
+          description="Support bundle work now lives here, with queue-backed execution that survives browser disconnects."
+        >
+          <div className="workspace-stack">
+            <div className="workspace-form-grid">
+              <label>
+                Retain jobs
+                <input
+                  value={app.supportBundleRetainJobs}
+                  onChange={(event) => app.setSupportBundleRetainJobs(event.target.value)}
+                />
+              </label>
             </div>
-          </div>
-          <div className="console-grid-2">
-            <label>
-              Retain jobs
-              <input value={app.supportBundleRetainJobs} onChange={(event) => app.setSupportBundleRetainJobs(event.target.value)} />
-            </label>
             <div className="console-inline-actions">
-              <button type="button" onClick={() => void app.createSupportBundle()} disabled={app.supportBusy}>
+              <Button onPress={() => void app.createSupportBundle()} isDisabled={app.supportBusy}>
                 {app.supportBusy ? "Queueing..." : "Queue support bundle"}
-              </button>
+              </Button>
+              <Button variant="secondary" onPress={() => app.setSection("operations")}>
+                Open diagnostics
+              </Button>
+              <Button variant="secondary" onPress={() => app.setSection("config")}>
+                Open config
+              </Button>
             </div>
+            {warnings.length > 0 && (
+              <div className="workspace-callout workspace-callout--warning">
+                <p className="console-label">Current warnings</p>
+                <ul className="console-compact-list">
+                  {warnings.map((warning) => (
+                    <li key={warning}>{warning}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
           </div>
-          {warnings.length > 0 && (
-            <>
-              <p><strong>Last known warnings</strong></p>
-              <ul className="console-compact-list">
-                {warnings.map((warning) => (
-                  <li key={warning}>{warning}</li>
-                ))}
-              </ul>
-            </>
-          )}
-        </article>
+        </WorkspaceSectionCard>
 
-        <article className="console-subpanel">
-          <div className="console-subpanel__header">
-            <div>
-              <h3>Inspect queued job</h3>
-              <p className="chat-muted">
-                Load the latest export status, command output, and destination path without leaving the dashboard.
-              </p>
+        <WorkspaceSectionCard
+          title="Recent degraded signals"
+          description="Keep the latest failure classes and messages close to support actions."
+        >
+          {latestFailure === null ? (
+            <p className="chat-muted">No recent failures published by diagnostics.</p>
+          ) : (
+            <div className="workspace-stack">
+              <div className="workspace-callout workspace-callout--danger">
+                <strong>{readString(latestFailure, "failure_class") ?? "Unknown failure"}</strong>
+                <p className="chat-muted">
+                  {readString(latestFailure, "operation") ?? "Operation unavailable"} ·{" "}
+                  {readString(latestFailure, "message_redacted") ??
+                    readString(latestFailure, "message") ??
+                    "No redacted message published."}
+                </p>
+              </div>
+              <PrettyJsonBlock
+                value={latestFailure}
+                revealSensitiveValues={app.revealSensitiveValues}
+              />
+            </div>
+          )}
+        </WorkspaceSectionCard>
+      </section>
+
+      <section className="workspace-two-column">
+        <WorkspaceSectionCard
+          title="Provider auth recovery"
+          description="Keep provider-auth degradation and next recovery motion visible next to support workflows."
+        >
+          <div className="workspace-stack">
+            <div className="workspace-inline">
+              <WorkspaceStatusChip
+                tone={
+                  providerAuthState === "missing" || providerAuthState === "expired"
+                    ? "danger"
+                    : providerAuthState === "degraded"
+                      ? "warning"
+                      : "success"
+                }
+              >
+                {providerAuthState}
+              </WorkspaceStatusChip>
+              <WorkspaceStatusChip tone={recoveryBacklog > 0 ? "warning" : "default"}>
+                {recoveryBacklog} degraded profiles
+              </WorkspaceStatusChip>
+            </div>
+            <p className="chat-muted">
+              Recovery stays explicit: move into diagnostics for current failures or auth/config
+              settings when profile posture needs operator intervention.
+            </p>
+            <div className="console-inline-actions">
+              <Button variant="secondary" onPress={() => app.setSection("operations")}>
+                Open diagnostics
+              </Button>
+              <Button variant="secondary" onPress={() => app.setSection("auth")}>
+                Open auth profiles
+              </Button>
             </div>
           </div>
-          <div className="console-grid-2">
+        </WorkspaceSectionCard>
+
+        <WorkspaceSectionCard
+          title="Triage playbook"
+          description="Keep the support handoff order visible so the dashboard stays the primary recovery surface."
+        >
+          <div className="workspace-stack">
+            <ol className="workspace-bullet-list">
+              <li>Check deployment warnings and provider auth state.</li>
+              <li>Queue or load the latest support bundle job.</li>
+              <li>Inspect diagnostics before changing config or auth posture.</li>
+            </ol>
+            <div className="workspace-callout">
+              <p className="console-label">Reference</p>
+              <p className="chat-muted">docs/operations/observability-supportability-v1.md</p>
+            </div>
+          </div>
+        </WorkspaceSectionCard>
+      </section>
+
+      <section className="workspace-two-column">
+        <WorkspaceSectionCard
+          title="Queued jobs"
+          description="Support bundle jobs remain visible after completion so operators can verify output paths and failure reasons."
+        >
+          {app.supportBundleJobs.length === 0 ? (
+            <p className="chat-muted">No support bundle jobs queued.</p>
+          ) : (
+            <div className="workspace-list">
+              {app.supportBundleJobs.map((job) => {
+                const jobId = readString(job, "job_id") ?? "unknown";
+                const state = readString(job, "state") ?? "unknown";
+                return (
+                  <article key={jobId} className="workspace-list-item">
+                    <div>
+                      <strong>{jobId}</strong>
+                      <p className="chat-muted">
+                        {state} · requested {formatUnixMs(readUnixMillis(job, "requested_at_unix_ms"))}
+                      </p>
+                    </div>
+                    <div className="workspace-inline">
+                      <WorkspaceStatusChip tone={state === "failed" ? "danger" : "default"}>
+                        {state}
+                      </WorkspaceStatusChip>
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        onPress={() => app.setSupportSelectedBundleJobId(jobId)}
+                      >
+                        Select
+                      </Button>
+                    </div>
+                  </article>
+                );
+              })}
+            </div>
+          )}
+        </WorkspaceSectionCard>
+
+        <WorkspaceSectionCard
+          title="Selected job"
+          description="Load command output, output path, and failure detail for the chosen support bundle job."
+          actions={
+            <Button
+              variant="secondary"
+              size="sm"
+              onPress={() => void app.loadSupportBundleJob()}
+              isDisabled={app.supportBusy}
+            >
+              {app.supportBusy ? "Loading..." : "Load job"}
+            </Button>
+          }
+        >
+          <div className="workspace-form-grid">
             <label>
               Job ID
-              <input value={app.supportSelectedBundleJobId} onChange={(event) => app.setSupportSelectedBundleJobId(event.target.value)} />
+              <input
+                value={app.supportSelectedBundleJobId}
+                onChange={(event) => app.setSupportSelectedBundleJobId(event.target.value)}
+              />
             </label>
-            <div className="console-inline-actions">
-              <button type="button" onClick={() => void app.loadSupportBundleJob()} disabled={app.supportBusy}>
-                {app.supportBusy ? "Loading..." : "Load job"}
-              </button>
-            </div>
           </div>
+
           {app.supportSelectedBundleJob === null ? (
-            <p>No support bundle job selected.</p>
+            <p className="chat-muted">No support bundle job selected.</p>
           ) : (
             <PrettyJsonBlock
               value={app.supportSelectedBundleJob}
               revealSensitiveValues={app.revealSensitiveValues}
             />
           )}
-        </article>
-      </section>
-
-      <section className="console-subpanel">
-        <div className="console-subpanel__header">
-          <div>
-            <h3>Queued support bundle jobs</h3>
-            <p className="chat-muted">
-              Export jobs remain visible after completion so operators can confirm output paths and failure reasons.
-            </p>
-          </div>
-        </div>
-        {app.supportBundleJobs.length === 0 ? (
-          <p>No support bundle jobs queued.</p>
-        ) : (
-          <div className="console-table-wrap">
-            <table className="console-table">
-              <thead>
-                <tr>
-                  <th>Job ID</th>
-                  <th>State</th>
-                  <th>Requested</th>
-                  <th>Output</th>
-                  <th>Action</th>
-                </tr>
-              </thead>
-              <tbody>
-                {app.supportBundleJobs.map((job) => {
-                  const jobId = readString(job, "job_id") ?? "unknown";
-                  return (
-                    <tr key={jobId}>
-                      <td>{jobId}</td>
-                      <td>{readString(job, "state") ?? "unknown"}</td>
-                      <td>{formatUnixMs(readUnixMillis(job, "requested_at_unix_ms"))}</td>
-                      <td>{readString(job, "output_path") ?? "-"}</td>
-                      <td>
-                        <button
-                          type="button"
-                          className="secondary"
-                          onClick={() => app.setSupportSelectedBundleJobId(jobId)}
-                        >
-                          Select
-                        </button>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </section>
-
-      <section className="console-grid-2">
-        <article className="console-subpanel">
-          <div className="console-subpanel__header">
-            <div>
-              <h3>Triage playbook</h3>
-              <p className="chat-muted">
-                Support workflows now publish the same starter order used in the support bundle so handoff between dashboard and offline troubleshooting stays consistent.
-              </p>
-            </div>
-          </div>
-          <p><strong>Playbook:</strong> {readString(triage ?? {}, "playbook") ?? "docs/operations/observability-supportability-v1.md"}</p>
-          {triageOrder.length === 0 ? (
-            <p>No triage order published.</p>
-          ) : (
-            <ol className="console-compact-list">
-              {triageOrder.map((step) => (
-                <li key={step}>{step}</li>
-              ))}
-            </ol>
-          )}
-        </article>
-        <article className="console-subpanel">
-          <div className="console-subpanel__header">
-            <div>
-              <h3>Latest redacted failure</h3>
-              <p className="chat-muted">
-                Operators can inspect the latest failure classification and message without exposing raw provider or connector secrets in the dashboard.
-              </p>
-            </div>
-          </div>
-          {latestFailure === null ? (
-            <p>No failures recorded.</p>
-          ) : (
-            <PrettyJsonBlock
-              value={latestFailure}
-              revealSensitiveValues={app.revealSensitiveValues}
-            />
-          )}
-        </article>
-      </section>
-
-      <section className="console-subpanel">
-        <h3>Redacted health and posture snapshot</h3>
-        {app.supportDeployment === null ? (
-          <p>No deployment posture loaded.</p>
-        ) : (
-          <PrettyJsonBlock
-            value={app.supportDeployment}
-            revealSensitiveValues={app.revealSensitiveValues}
-          />
-        )}
+        </WorkspaceSectionCard>
       </section>
     </main>
   );
@@ -284,4 +308,13 @@ function formatRate(value: number | null): string {
     return "n/a";
   }
   return `${(value / 100).toFixed(2)}%`;
+}
+
+function toJsonObjectArray(value: unknown): JsonObject[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.filter((entry): entry is JsonObject => {
+    return entry !== null && typeof entry === "object" && !Array.isArray(entry);
+  });
 }

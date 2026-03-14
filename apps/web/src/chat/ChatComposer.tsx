@@ -25,6 +25,10 @@ export function ChatComposer({
         submitMessage();
       }}
     >
+      <div className="workspace-panel__intro">
+        <p className="workspace-kicker">Composer</p>
+        <h4>Next operator instruction</h4>
+      </div>
       <label>
         Message
         <textarea
@@ -34,14 +38,14 @@ export function ChatComposer({
           placeholder="Describe what you want the assistant to do"
         />
       </label>
-      <div className="console-inline-actions">
+      <div className="workspace-inline-actions">
         <button type="submit" disabled={streaming || activeSessionId.trim().length === 0}>
           {streaming ? "Streaming..." : "Send"}
         </button>
         <button type="button" className="button--warn" onClick={cancelStreaming} disabled={!streaming}>
           Cancel stream
         </button>
-        <button type="button" onClick={clearTranscript}>
+        <button type="button" className="secondary" onClick={clearTranscript}>
           Clear local transcript
         </button>
       </div>

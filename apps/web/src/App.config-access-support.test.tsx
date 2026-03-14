@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "./App";
@@ -206,7 +206,7 @@ describe("M56 config, access, and support surfaces", () => {
     fireEvent.click(screen.getByRole("button", { name: "Support and Recovery" }));
     expect(await screen.findByRole("heading", { name: "Support and Recovery" })).toBeInTheDocument();
     expect(screen.getByText("Provider auth recovery")).toBeInTheDocument();
-    expect(screen.getByText("Bundle reliability")).toBeInTheDocument();
+    expect(screen.getAllByText("Bundle reliability").length).toBeGreaterThan(0);
     expect(screen.getByText("Triage playbook")).toBeInTheDocument();
     expect(screen.getByText("docs/operations/observability-supportability-v1.md")).toBeInTheDocument();
 
@@ -232,23 +232,21 @@ describe("M56 config, access, and support surfaces", () => {
     render(<App />);
 
     expect(await screen.findByRole("heading", { name: "Web Dashboard Operator Surface" })).toBeInTheDocument();
-    const cliHandoffPanel = screen.getByRole("heading", { name: "CLI handoff surface" }).closest("article");
-    expect(cliHandoffPanel).not.toBeNull();
-    const cliHandoffScope = within(cliHandoffPanel as HTMLElement);
+    expect(screen.getByRole("heading", { name: "CLI handoff surface" })).toBeInTheDocument();
 
     const cliHandoffs = capabilityCatalogFixture().capabilities.filter(
       (entry) => entry.dashboard_exposure === "cli_handoff"
     );
     await waitFor(() => {
-      expect(cliHandoffScope.getByText(cliHandoffs[0].cli_handoff_commands[0])).toBeInTheDocument();
+      expect(screen.getByText(cliHandoffs[0].cli_handoff_commands[0])).toBeInTheDocument();
     });
     for (const capability of cliHandoffs) {
       for (const command of capability.cli_handoff_commands) {
-        expect(cliHandoffScope.getByText(command)).toBeInTheDocument();
+        expect(screen.getByText(command)).toBeInTheDocument();
       }
     }
 
-    expect(cliHandoffScope.queryByText("Chat sessions and run status")).not.toBeInTheDocument();
+    expect(screen.queryByText("Chat sessions and run status")).not.toBeInTheDocument();
   });
 });
 

@@ -216,12 +216,12 @@ exports[`ConsoleShell snapshot coverage > renders deterministic shell navigation
                     <span
                       class="text-sm font-semibold"
                     >
-                      Chat and Sessions
+                      Chat
                     </span>
                     <span
                       class="text-xs text-foreground-500"
                     >
-                      Streaming operator workspace
+                      Primary operator workspace
                     </span>
                   </span>
                 </button>
@@ -355,12 +355,12 @@ exports[`ConsoleShell snapshot coverage > renders deterministic shell navigation
                     <span
                       class="text-sm font-semibold"
                     >
-                      Cron
+                      Automation
                     </span>
                     <span
                       class="text-xs text-foreground-500"
                     >
-                      Scheduled prompts, runs, and logs
+                      Scheduled jobs, runs, and history
                     </span>
                   </span>
                 </button>
@@ -402,12 +402,12 @@ exports[`ConsoleShell snapshot coverage > renders deterministic shell navigation
                     <span
                       class="text-sm font-semibold"
                     >
-                      Channels and Router
+                      Channels
                     </span>
                     <span
                       class="text-xs text-foreground-500"
                     >
-                      Discord operations and routing policy
+                      Connectors, router, and Discord setup
                     </span>
                   </span>
                 </button>
@@ -499,12 +499,12 @@ exports[`ConsoleShell snapshot coverage > renders deterministic shell navigation
                     <span
                       class="text-sm font-semibold"
                     >
-                      Support and Recovery
+                      Support
                     </span>
                     <span
                       class="text-xs text-foreground-500"
                     >
-                      Support bundle and recovery shortcuts
+                      Bundles, recovery, and operator handoff
                     </span>
                   </span>
                 </button>

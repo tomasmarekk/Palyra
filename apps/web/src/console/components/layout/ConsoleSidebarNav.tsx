@@ -45,11 +45,12 @@ export function ConsoleSidebarNav({ currentSection, onSelect }: ConsoleSidebarNa
               <div className="space-y-2">
                 {group.items.map((entry) => {
                   const selected = currentSection === entry.id;
+                  const accessibleLabel = legacyNavigationLabel(entry.id) ?? entry.label;
                   return (
                     <button
                       key={entry.id}
                       type="button"
-                      aria-label={entry.label}
+                      aria-label={accessibleLabel}
                       className={`console-sidebar-button ${selected ? "console-sidebar-button--active" : ""}`}
                       onClick={() => {
                         onSelect(entry.id);
@@ -77,6 +78,21 @@ export function ConsoleSidebarNav({ currentSection, onSelect }: ConsoleSidebarNa
       </CardContent>
     </Card>
   );
+}
+
+function legacyNavigationLabel(section: Section): string | null {
+  switch (section) {
+    case "chat":
+      return "Chat and Sessions";
+    case "cron":
+      return "Cron";
+    case "channels":
+      return "Channels and Router";
+    case "support":
+      return "Support and Recovery";
+    default:
+      return null;
+  }
 }
 
 function NavigationGlyph({ section }: { section: Section }) {
