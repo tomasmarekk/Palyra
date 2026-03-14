@@ -86,6 +86,13 @@ impl ControlPlaneClient {
         self.request_json(Method::GET, "console/v1/diagnostics", None::<&Value>, false).await
     }
 
+    pub async fn get_json_value(
+        &self,
+        path: impl AsRef<str>,
+    ) -> Result<Value, ControlPlaneClientError> {
+        self.request_json(Method::GET, path, None::<&Value>, false).await
+    }
+
     pub async fn get_deployment_posture(
         &self,
     ) -> Result<DeploymentPostureSummary, ControlPlaneClientError> {

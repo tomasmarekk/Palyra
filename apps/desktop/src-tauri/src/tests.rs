@@ -7,7 +7,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, OnceLock,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde_json::json;
@@ -24,7 +24,7 @@ use super::openai_auth::{
     OpenAiControlPlaneInputs, OpenAiOAuthBootstrapRequest, OpenAiOAuthCallbackStateRequest,
     OpenAiProfileActionRequest, OpenAiScopeInput,
 };
-use super::snapshot::resolve_dashboard_access_target;
+use super::snapshot::{resolve_dashboard_access_target, OverallStatus};
 use super::{
     build_desktop_refresh_payload, build_onboarding_status, build_snapshot_from_inputs,
     collect_redacted_errors, compute_backoff_ms, executable_file_name,
@@ -162,6 +162,7 @@ fn build_test_control_center(root: &Path) -> ControlCenter {
         gateway,
         browserd,
         http_client,
+        console_session_cache: Arc::new(Mutex::new(None)),
         log_tx,
         log_rx,
         dropped_log_events: Arc::new(AtomicU64::new(0)),
@@ -404,8 +405,195 @@ port = 9911
     let _config_var = ScopedEnvVar::set("PALYRA_CONFIG", config_path.to_string_lossy().as_ref());
     let target = resolve_dashboard_access_target(7142)
         .expect("dashboard access target should resolve from daemon bind");
-    assert_eq!(target.url, "http://127.0.0.1:9911/");
+    assert_eq!(target.url, "http://127.0.0.1:9911/#/control/overview");
     assert_eq!(target.mode, DashboardAccessMode::Local);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn snapshot_console_reads_reuse_session_cookie_across_refreshes() {
+    let fixture = TempFixtureDir::new();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("test listener should bind");
+    let port = listener.local_addr().expect("listener address should resolve").port();
+    let login_count = Arc::new(AtomicU64::new(0));
+    let login_count_server = Arc::clone(&login_count);
+
+    let server = std::thread::spawn(move || {
+        for _ in 0..6 {
+            let (mut stream, _) = listener.accept().expect("listener should accept request");
+            let mut buffer = [0_u8; 8192];
+            let read = stream.read(&mut buffer).expect("request should be readable");
+            let request = String::from_utf8_lossy(&buffer[..read]);
+            let request_line = request.lines().next().unwrap_or_default().to_owned();
+            let has_cookie = request.contains("palyra_console_session=session-desktop");
+
+            if request_line.starts_with("GET /healthz ") {
+                write_json_response(
+                    &mut stream,
+                    "200 OK",
+                    r#"{"status":"ok","version":"0.1.0","git_hash":"desktop-test","uptime_seconds":42}"#,
+                    &[],
+                );
+                continue;
+            }
+            if request_line.starts_with("GET /console/v1/diagnostics ") {
+                if has_cookie {
+                    write_json_response(
+                        &mut stream,
+                        "200 OK",
+                        r#"{"generated_at_unix_ms":1700000000000,"observability":{},"errors":[]}"#,
+                        &[],
+                    );
+                } else {
+                    write_json_response(
+                        &mut stream,
+                        "403 Forbidden",
+                        r#"{"error":"console session cookie is missing"}"#,
+                        &[],
+                    );
+                }
+                continue;
+            }
+            if request_line.starts_with("POST /console/v1/auth/login ") {
+                login_count_server.fetch_add(1, Ordering::Relaxed);
+                write_json_response(
+                    &mut stream,
+                    "200 OK",
+                    r#"{"principal":"admin:desktop-control-center","device_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","csrf_token":"csrf-desktop","issued_at_unix_ms":1,"expires_at_unix_ms":2}"#,
+                    &["Set-Cookie: palyra_console_session=session-desktop; Path=/; HttpOnly; SameSite=Strict"],
+                );
+                continue;
+            }
+            if request_line.starts_with("GET /console/v1/channels/discord%3Adefault ") {
+                assert!(has_cookie, "Discord status fetch should reuse the authenticated console session");
+                write_json_response(
+                    &mut stream,
+                    "200 OK",
+                    r#"{"connector":{"connector_id":"discord:default","enabled":false,"readiness":"disabled","liveness":"stopped"}}"#,
+                    &[],
+                );
+                continue;
+            }
+            panic!("unexpected desktop snapshot request: {request_line}");
+        }
+    });
+
+    let mut control_center = build_test_control_center(fixture.path());
+    control_center.persisted.browser_service_enabled = false;
+    control_center.runtime.gateway_admin_port = port;
+
+    let first = build_snapshot_from_inputs(control_center.capture_snapshot_inputs())
+        .await
+        .expect("first snapshot should build");
+    let second = build_snapshot_from_inputs(control_center.capture_snapshot_inputs())
+        .await
+        .expect("second snapshot should build");
+
+    assert_eq!(first.overall_status, OverallStatus::Healthy);
+    assert_eq!(second.overall_status, OverallStatus::Healthy);
+    assert_eq!(login_count.load(Ordering::Relaxed), 1);
+
+    server.join().expect("test server thread should exit");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn snapshot_keeps_launcher_status_stable_when_optional_diagnostics_fetch_fails() {
+    let fixture = TempFixtureDir::new();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("test listener should bind");
+    let port = listener.local_addr().expect("listener address should resolve").port();
+
+    let server = std::thread::spawn(move || {
+        listener.set_nonblocking(true).expect("listener should support nonblocking mode");
+        let mut idle_since = Instant::now();
+        loop {
+            let (mut stream, _) = match listener.accept() {
+                Ok(connection) => {
+                    idle_since = Instant::now();
+                    connection
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if idle_since.elapsed() >= Duration::from_millis(250) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(error) => panic!("listener should accept request: {error}"),
+            };
+            let mut buffer = [0_u8; 8192];
+            let read = stream.read(&mut buffer).expect("request should be readable");
+            let request = String::from_utf8_lossy(&buffer[..read]);
+            let request_line = request.lines().next().unwrap_or_default().to_owned();
+            let has_cookie = request.contains("palyra_console_session=session-desktop");
+
+            if request_line.starts_with("GET /healthz ") {
+                write_json_response(
+                    &mut stream,
+                    "200 OK",
+                    r#"{"status":"ok","version":"0.1.0","git_hash":"desktop-test","uptime_seconds":42}"#,
+                    &[],
+                );
+                continue;
+            }
+            if request_line.starts_with("GET /console/v1/diagnostics ") {
+                if has_cookie {
+                    write_json_response(
+                        &mut stream,
+                        "429 Too Many Requests",
+                        r#"{"error":"admin API rate limit exceeded for 127.0.0.1"}"#,
+                        &[],
+                    );
+                } else {
+                    write_json_response(
+                        &mut stream,
+                        "403 Forbidden",
+                        r#"{"error":"console session cookie is missing"}"#,
+                        &[],
+                    );
+                }
+                continue;
+            }
+            if request_line.starts_with("POST /console/v1/auth/login ") {
+                write_json_response(
+                    &mut stream,
+                    "200 OK",
+                    r#"{"principal":"admin:desktop-control-center","device_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","csrf_token":"csrf-desktop","issued_at_unix_ms":1,"expires_at_unix_ms":2}"#,
+                    &["Set-Cookie: palyra_console_session=session-desktop; Path=/; HttpOnly; SameSite=Strict"],
+                );
+                continue;
+            }
+            if request_line.starts_with("GET /console/v1/channels/discord%3Adefault ") {
+                assert!(has_cookie, "Discord status fetch should reuse the authenticated console session");
+                write_json_response(
+                    &mut stream,
+                    "200 OK",
+                    r#"{"connector":{"connector_id":"discord:default","enabled":false,"readiness":"disabled","liveness":"stopped"}}"#,
+                    &[],
+                );
+                continue;
+            }
+            panic!("unexpected diagnostics stability request: {request_line}");
+        }
+    });
+
+    let mut control_center = build_test_control_center(fixture.path());
+    control_center.persisted.browser_service_enabled = false;
+    control_center.runtime.gateway_admin_port = port;
+
+    let snapshot = build_snapshot_from_inputs(control_center.capture_snapshot_inputs())
+        .await
+        .expect("snapshot should build even when diagnostics fetch fails");
+
+    assert_eq!(snapshot.overall_status, OverallStatus::Healthy);
+    assert!(
+        snapshot
+            .warnings
+            .iter()
+            .any(|entry| entry.contains("diagnostics payload") && entry.contains("429")),
+        "diagnostics failure warning should be surfaced: {:?}",
+        snapshot.warnings
+    );
+
+    server.join().expect("test server thread should exit");
 }
 
 #[test]
@@ -837,8 +1025,23 @@ async fn snapshot_build_reuses_console_session_until_expiry() {
     let login_requests_server = Arc::clone(&login_requests);
     let session_requests_server = Arc::clone(&session_requests);
     let server = std::thread::spawn(move || {
-        for _ in 0..9 {
-            let (mut stream, _) = listener.accept().expect("listener should accept request");
+        listener.set_nonblocking(true).expect("listener should support nonblocking mode");
+        let mut idle_since = Instant::now();
+        loop {
+            let (mut stream, _) = match listener.accept() {
+                Ok(connection) => {
+                    idle_since = Instant::now();
+                    connection
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if idle_since.elapsed() >= Duration::from_millis(250) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(error) => panic!("listener should accept request: {error}"),
+            };
             let mut buffer = [0_u8; 4096];
             let read = stream.read(&mut buffer).expect("request should be readable");
             let request = String::from_utf8_lossy(&buffer[..read]);
@@ -925,13 +1128,13 @@ async fn snapshot_build_reuses_console_session_until_expiry() {
 
     assert_eq!(
         login_requests.load(Ordering::Relaxed),
-        1,
-        "desktop snapshot polling should not re-login when the console session is still valid"
+        0,
+        "desktop snapshot polling should use the cookie-backed read path without forcing a console login when reads already succeed"
     );
     assert_eq!(
         session_requests.load(Ordering::Relaxed),
-        2,
-        "desktop snapshot polling should probe existing console session before deciding to log in"
+        0,
+        "desktop snapshot polling should not probe the auth/session endpoint while the cookie-backed read path remains healthy"
     );
     server.join().expect("test server thread should exit");
 }
@@ -1100,8 +1303,23 @@ async fn snapshot_build_redacts_console_and_connector_diagnostics() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("test listener should bind");
     let port = listener.local_addr().expect("listener address should resolve").port();
     let server = std::thread::spawn(move || {
-        for _ in 0..5 {
-            let (mut stream, _) = listener.accept().expect("listener should accept request");
+        listener.set_nonblocking(true).expect("listener should support nonblocking mode");
+        let mut idle_since = Instant::now();
+        loop {
+            let (mut stream, _) = match listener.accept() {
+                Ok(connection) => {
+                    idle_since = Instant::now();
+                    connection
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if idle_since.elapsed() >= Duration::from_millis(250) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(error) => panic!("listener should accept request: {error}"),
+            };
             let mut buffer = [0_u8; 4096];
             let read = stream.read(&mut buffer).expect("request should be readable");
             let request = String::from_utf8_lossy(&buffer[..read]);

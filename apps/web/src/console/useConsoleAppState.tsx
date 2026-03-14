@@ -68,7 +68,7 @@ export function useConsoleAppState() {
   const lastSectionAutoRefreshRef = useRef<Partial<Record<Section, number>>>({});
   const [theme, setTheme] = useState<ThemeMode>(() => {
     if (typeof window === "undefined") {
-      return "light";
+      return "dark";
     }
     const stored = window.localStorage.getItem("palyra.console.theme");
     if (stored === "light" || stored === "dark") {
@@ -77,7 +77,7 @@ export function useConsoleAppState() {
     if (window.matchMedia !== undefined && window.matchMedia("(prefers-color-scheme: dark)").matches) {
       return "dark";
     }
-    return "light";
+    return "dark";
   });
   const [revealSensitiveValues, setRevealSensitiveValues] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -483,7 +483,10 @@ export function useConsoleAppState() {
   }, [api]);
 
   useEffect(() => {
-    document.documentElement.setAttribute("data-theme", theme);
+    const root = document.documentElement;
+    root.setAttribute("data-theme", theme);
+    root.classList.toggle("dark", theme === "dark");
+    root.style.colorScheme = theme;
     if (typeof window !== "undefined") {
       window.localStorage.setItem("palyra.console.theme", theme);
     }

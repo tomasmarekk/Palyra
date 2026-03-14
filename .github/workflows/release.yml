@@ -80,8 +80,8 @@ jobs:
           $releaseNotes = @"
           # Palyra $repoVersion
 
-          - Portable desktop release bundles now ship the desktop control center, `palyrad`, `palyra-browserd`, and `palyra` as one colocated archive.
-          - Portable headless release packages now ship repeatable archive-based install/update flow with config initialization and migration validation.
+          - Portable desktop release bundles now ship the desktop control center, `palyrad`, `palyra-browserd`, `palyra`, and the colocated `web/` dashboard bundle.
+          - Portable headless release packages now ship repeatable archive-based install/update flow with config initialization and migration validation plus the colocated `web/` dashboard bundle.
           - Release assets include SHA256 manifests, release manifests, provenance sidecars, and GitHub build attestations.
           - Release packaging smoke now validates archive layout before release publication.
           "@.Trim()
@@ -131,7 +131,9 @@ jobs:
         with:
           node-version: 20
           cache: npm
-          cache-dependency-path: apps/desktop/ui/package-lock.json
+          cache-dependency-path: |
+            apps/desktop/ui/package-lock.json
+            apps/web/package-lock.json
 
       - name: Install desktop Linux system dependencies
         if: ${{ matrix.os == 'ubuntu-latest' }}
@@ -149,6 +151,10 @@ jobs:
       - name: Build desktop UI
         shell: pwsh
         run: ./scripts/test/ensure-desktop-ui.ps1
+
+      - name: Build web dashboard
+        shell: pwsh
+        run: ./scripts/test/ensure-web-ui.ps1
 
       - name: Build release binaries
         shell: pwsh
@@ -172,7 +178,8 @@ jobs:
             -DesktopBinaryPath (Join-Path $PWD ("apps/desktop/src-tauri/target/release/" + (Resolve-ExecutableName -BaseName "palyra-desktop-control-center"))) `
             -DaemonBinaryPath (Join-Path $PWD ("target/release/" + (Resolve-ExecutableName -BaseName "palyrad"))) `
             -BrowserBinaryPath (Join-Path $PWD ("target/release/" + (Resolve-ExecutableName -BaseName "palyra-browserd"))) `
-            -CliBinaryPath (Join-Path $PWD ("target/release/" + (Resolve-ExecutableName -BaseName "palyra"))) | Out-Null
+            -CliBinaryPath (Join-Path $PWD ("target/release/" + (Resolve-ExecutableName -BaseName "palyra"))) `
+            -WebDistPath (Join-Path $PWD "apps/web/dist") | Out-Null
 
           $archivePath = Join-Path $outputRoot "palyra-desktop-$version-$platform.zip"
           $manifestPath = Join-Path $outputRoot "palyra-desktop-$version-$platform.release-manifest.json"
@@ -239,6 +246,17 @@ jobs:
         with:
           toolchain: 1.91.0
 
+      - name: Setup Node.js
+        uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+
+      - name: Build web dashboard
+        shell: pwsh
+        run: ./scripts/test/ensure-web-ui.ps1
+
       - name: Build release binaries
         run: cargo build -p palyra-daemon -p palyra-browserd -p palyra-cli --release --locked
 
@@ -257,7 +275,8 @@ jobs:
             -OutputRoot $outputRoot `
             -DaemonBinaryPath (Join-Path $PWD ("target/release/" + (Resolve-ExecutableName -BaseName "palyrad"))) `
             -BrowserBinaryPath (Join-Path $PWD ("target/release/" + (Resolve-ExecutableName -BaseName "palyra-browserd"))) `
-            -CliBinaryPath (Join-Path $PWD ("target/release/" + (Resolve-ExecutableName -BaseName "palyra"))) | Out-Null
+            -CliBinaryPath (Join-Path $PWD ("target/release/" + (Resolve-ExecutableName -BaseName "palyra"))) `
+            -WebDistPath (Join-Path $PWD "apps/web/dist") | Out-Null
 
           $archivePath = Join-Path $outputRoot "palyra-headless-$version-$platform.zip"
           $manifestPath = Join-Path $outputRoot "palyra-headless-$version-$platform.release-manifest.json"

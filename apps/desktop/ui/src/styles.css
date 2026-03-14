@@ -4,17 +4,34 @@
 @layer theme, base, components, utilities;
 
 :root {
-  color-scheme: light;
-  --desktop-bg: #f6efe3;
-  --desktop-bg-deep: #f0e1c8;
-  --desktop-surface: rgba(255, 252, 247, 0.92);
-  --desktop-surface-strong: #fffdf9;
-  --desktop-border: rgba(31, 51, 55, 0.16);
-  --desktop-line: rgba(31, 51, 55, 0.09);
-  --desktop-text: #16262d;
-  --desktop-muted: #647278;
-  --desktop-accent: #0d7d74;
-  --desktop-shadow: 0 28px 60px rgba(22, 35, 40, 0.12);
+  color-scheme: dark;
+  --background: #0c1720;
+  --foreground: #edf5f8;
+  --default: #243742;
+  --default-foreground: #edf5f8;
+  --accent: #2aa39b;
+  --accent-foreground: #071516;
+  --success: #1f8f6f;
+  --success-foreground: #f3fdf8;
+  --warning: #b98934;
+  --warning-foreground: #0d1014;
+  --danger: #b75946;
+  --danger-foreground: #fff5f3;
+  --focus: #2aa39b;
+  --border-width: 1px;
+  --radius: 1rem;
+  --surface-shadow: 0 28px 60px rgba(0, 0, 0, 0.34);
+  --overlay-shadow: 0 28px 60px rgba(0, 0, 0, 0.42);
+  --desktop-bg: #08131b;
+  --desktop-bg-deep: #12212b;
+  --desktop-surface: rgba(13, 24, 33, 0.88);
+  --desktop-surface-strong: rgba(20, 34, 43, 0.96);
+  --desktop-border: rgba(138, 179, 193, 0.16);
+  --desktop-line: rgba(138, 179, 193, 0.12);
+  --desktop-text: #edf5f8;
+  --desktop-muted: #9bb2bc;
+  --desktop-accent: #2aa39b;
+  --desktop-shadow: 0 28px 60px rgba(0, 0, 0, 0.34);
   --desktop-radius-xl: 1.75rem;
   --desktop-radius-lg: 1.25rem;
 }
@@ -40,8 +57,8 @@ body {
     sans-serif;
   color: var(--desktop-text);
   background:
-    radial-gradient(circle at top left, rgba(242, 171, 73, 0.22), transparent 28%),
-    radial-gradient(circle at 88% 12%, rgba(44, 171, 152, 0.22), transparent 24%),
+    radial-gradient(circle at top left, rgba(242, 171, 73, 0.18), transparent 26%),
+    radial-gradient(circle at 88% 12%, rgba(44, 171, 152, 0.16), transparent 24%),
     linear-gradient(160deg, var(--desktop-bg), var(--desktop-bg-deep));
 }
 
@@ -96,8 +113,8 @@ body {
   display: grid;
   gap: 0.9rem;
   align-self: stretch;
-  background: rgba(22, 38, 45, 0.04);
-  border: 1px solid rgba(22, 38, 45, 0.08);
+  background: rgba(8, 21, 28, 0.78);
+  border: 1px solid rgba(138, 179, 193, 0.12);
   border-radius: calc(var(--desktop-radius-lg) + 0.1rem);
   padding: 1rem 1.05rem;
   position: relative;
@@ -251,8 +268,8 @@ body {
 .desktop-process-panel {
   border-radius: 1rem;
   padding: 1rem;
-  background: rgba(255, 255, 255, 0.58);
-  border: 1px solid rgba(22, 38, 45, 0.08);
+  background: rgba(8, 21, 28, 0.7);
+  border: 1px solid rgba(138, 179, 193, 0.12);
 }
 
 .desktop-issues,
@@ -275,7 +292,7 @@ body {
 }
 
 .desktop-error {
-  color: #9d3522;
+  color: #f38a74;
 }
 
 @media (max-width: 980px) {

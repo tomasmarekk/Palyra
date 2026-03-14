@@ -20,7 +20,7 @@ describe("ConsoleShell snapshot coverage", () => {
         issued_at_unix_ms: 100,
         expires_at_unix_ms: 200
       },
-      theme: "light",
+      theme: "dark",
       setTheme: vi.fn(),
       revealSensitiveValues: false,
       setRevealSensitiveValues: vi.fn(),

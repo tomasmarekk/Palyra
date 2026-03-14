@@ -5,7 +5,7 @@ use std::{
     process::Stdio,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -156,6 +156,12 @@ impl Default for RuntimeConfig {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ConsoleSessionCache {
+    pub(crate) csrf_token: String,
+    pub(crate) expires_at_unix_ms: i64,
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct ServiceProcessSnapshot {
     pub(crate) service: String,
@@ -191,6 +197,7 @@ pub(crate) struct ControlCenter {
     pub(crate) gateway: ManagedService,
     pub(crate) browserd: ManagedService,
     pub(crate) http_client: Client,
+    pub(crate) console_session_cache: Arc<Mutex<Option<ConsoleSessionCache>>>,
     pub(crate) log_tx: mpsc::Sender<LogEvent>,
     pub(crate) log_rx: mpsc::Receiver<LogEvent>,
     pub(crate) dropped_log_events: Arc<AtomicU64>,
@@ -244,6 +251,7 @@ impl ControlCenter {
             gateway,
             browserd,
             http_client,
+            console_session_cache: Arc::new(Mutex::new(None)),
             log_tx,
             log_rx,
             dropped_log_events,

@@ -91,7 +91,7 @@ exports[`ConsoleShell snapshot coverage > renders deterministic shell navigation
               type="button"
             >
               Theme: 
-              light
+              dark
             </button>
             <button
               class="button button--md button--danger-soft"

@@ -1,22 +1,40 @@
 @import "tailwindcss";
 @import "@heroui/styles";
 
+@custom-variant dark (&:where(.dark, .dark *));
+
 @layer theme, base, components, utilities;
 
 :root {
-  color-scheme: light;
-  --bg-base: #f5f3ec;
-  --bg-glow: #d9efe3;
-  --surface: #fffdf8;
-  --surface-strong: #ffffff;
-  --border: #1b3d4f33;
-  --text: #102c38;
-  --muted: #5d6d76;
-  --accent: #0d6f6a;
-  --accent-strong: #095f5a;
-  --warn: #a2351d;
-  --notice: #1d6a52;
-  --shadow: 0 18px 42px #15384b18;
+  color-scheme: dark;
+  --background: #0f1f28;
+  --foreground: #edf5f8;
+  --default: #20333d;
+  --default-foreground: #edf5f8;
+  --accent: #2aa39b;
+  --accent-foreground: #071516;
+  --success: #1f8f6f;
+  --success-foreground: #f3fdf8;
+  --warning: #b98934;
+  --warning-foreground: #0d1014;
+  --danger: #b75946;
+  --danger-foreground: #fff5f3;
+  --focus: #2aa39b;
+  --border-width: 1px;
+  --radius: 1rem;
+  --surface-shadow: 0 20px 44px rgba(0, 0, 0, 0.36);
+  --overlay-shadow: 0 20px 44px rgba(0, 0, 0, 0.46);
+  --bg-base: #0f1f28;
+  --bg-glow: #152f35;
+  --surface: #172b34;
+  --surface-strong: #1c333d;
+  --border: #8fb8c626;
+  --text: #edf5f8;
+  --muted: #9cb5bf;
+  --accent-strong: #16756f;
+  --warn: #c25c45;
+  --notice: #6acc9f;
+  --shadow: 0 20px 44px #00000052;
   --radius-lg: 1rem;
   --radius-md: 0.75rem;
   --radius-sm: 0.5rem;
@@ -31,20 +49,35 @@
   --palyra-runtime-down: var(--palyra-danger);
 }
 
-[data-theme="dark"] {
-  color-scheme: dark;
-  --bg-base: #0f1f28;
-  --bg-glow: #152f35;
-  --surface: #172b34;
-  --surface-strong: #1c333d;
-  --border: #8fb8c626;
-  --text: #edf5f8;
-  --muted: #9cb5bf;
-  --accent: #2aa39b;
-  --accent-strong: #16756f;
-  --warn: #c25c45;
-  --notice: #6acc9f;
-  --shadow: 0 20px 44px #00000052;
+[data-theme="light"] {
+  color-scheme: light;
+  --background: #f5f3ec;
+  --foreground: #102c38;
+  --default: #ffffff;
+  --default-foreground: #102c38;
+  --accent: #0d6f6a;
+  --accent-foreground: #f5fffc;
+  --success: #1d6a52;
+  --success-foreground: #f5fffc;
+  --warning: #a26f1c;
+  --warning-foreground: #fffdf8;
+  --danger: #a2351d;
+  --danger-foreground: #fff5f3;
+  --focus: #0d6f6a;
+  --surface-shadow: 0 18px 42px rgba(21, 56, 75, 0.09);
+  --overlay-shadow: 0 18px 42px rgba(21, 56, 75, 0.16);
+  --bg-base: #f5f3ec;
+  --bg-glow: #d9efe3;
+  --surface: #fffdf8;
+  --surface-strong: #ffffff;
+  --border: #1b3d4f33;
+  --text: #102c38;
+  --muted: #5d6d76;
+  --accent: #0d6f6a;
+  --accent-strong: #095f5a;
+  --warn: #a2351d;
+  --notice: #1d6a52;
+  --shadow: 0 18px 42px #15384b18;
 }
 
 *,
@@ -68,9 +101,9 @@ body {
     "Segoe UI",
     sans-serif;
   background:
-    radial-gradient(circle at 6% 2%, #f8c67569 0%, transparent 36%),
-    radial-gradient(circle at 92% 8%, #9edac98f 0%, transparent 38%),
-    linear-gradient(165deg, var(--bg-base), #ecf3f6);
+    radial-gradient(circle at 6% 2%, rgba(248, 198, 117, 0.16) 0%, transparent 30%),
+    radial-gradient(circle at 92% 8%, rgba(72, 168, 150, 0.16) 0%, transparent 34%),
+    linear-gradient(165deg, var(--bg-base), color-mix(in srgb, var(--bg-base) 72%, #041016));
   transition:
     background 220ms ease,
     color 220ms ease;
@@ -98,7 +131,11 @@ body {
   margin-inline: auto;
   border: 1px solid var(--border);
   background:
-    linear-gradient(180deg, color-mix(in srgb, var(--surface) 82%, white), var(--surface-strong)),
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--surface-strong) 88%, transparent),
+      var(--surface)
+    ),
     radial-gradient(circle at top right, rgba(56, 189, 248, 0.12), transparent 38%);
   box-shadow: var(--shadow);
 }
@@ -211,7 +248,11 @@ p {
   min-width: 0;
   border: 1px solid var(--border);
   background:
-    linear-gradient(180deg, color-mix(in srgb, var(--surface) 84%, white), var(--surface)),
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--surface-strong) 86%, transparent),
+      var(--surface)
+    ),
     radial-gradient(circle at top right, rgba(56, 189, 248, 0.14), transparent 32%);
   box-shadow: var(--shadow);
 }
@@ -293,7 +334,7 @@ p {
   min-height: 72px;
   padding: 0.85rem 0.95rem;
   border: 1px solid color-mix(in srgb, var(--border) 94%, transparent);
-  background: #ffffffd9;
+  background: color-mix(in srgb, var(--surface-strong) 88%, transparent);
   text-align: left;
 }
 
@@ -431,13 +472,13 @@ button.button--warn {
 
 button.secondary {
   color: var(--accent-strong);
-  background: #ffffffd6;
+  background: color-mix(in srgb, var(--surface-strong) 88%, transparent);
   border-color: #95adb659;
 }
 
 .console-nav button {
   color: var(--accent-strong);
-  background: #ffffffcc;
+  background: color-mix(in srgb, var(--surface-strong) 84%, transparent);
 }
 
 .console-nav button.is-active {
@@ -547,7 +588,7 @@ button.secondary {
   border-radius: var(--radius-md);
   padding: 0.78rem 0.85rem;
   color: var(--accent-strong);
-  background: #ffffffd4;
+  background: color-mix(in srgb, var(--surface-strong) 88%, transparent);
 }
 
 .console-domain-nav button small {
@@ -617,7 +658,7 @@ select,
 textarea {
   border: 1px solid #95adb638;
   border-radius: var(--radius-sm);
-  background: #fffefb;
+  background: color-mix(in srgb, var(--surface-strong) 88%, transparent);
   color: var(--text);
   padding: 0.48rem 0.6rem;
 }
@@ -797,7 +838,7 @@ pre {
   word-break: break-word;
   border: 1px solid #d4e2e6;
   border-radius: var(--radius-sm);
-  background: #fbfefd;
+  background: color-mix(in srgb, var(--surface-strong) 88%, transparent);
   padding: 0.6rem;
   font-family:
     "Cascadia Code",
@@ -1050,7 +1091,7 @@ pre {
 .workspace-tab {
   min-width: 132px;
   color: var(--accent-strong);
-  background: #ffffffd6;
+  background: color-mix(in srgb, var(--surface-strong) 88%, transparent);
 }
 
 .workspace-tab.is-active {
@@ -1267,7 +1308,7 @@ pre {
   min-height: 280px;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  background: #ffffff;
+  background: #0d1116;
 }
 
 [data-theme="dark"] .chat-canvas-frame {
@@ -1676,7 +1717,7 @@ pre {
 .workspace-tab-button {
   min-width: 132px;
   color: var(--accent-strong);
-  background: #ffffffd6;
+  background: color-mix(in srgb, var(--surface-strong) 88%, transparent);
 }
 
 .workspace-tab-button.is-active {

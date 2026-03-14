@@ -3,6 +3,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     process::Stdio,
+    sync::{Arc, Mutex},
     sync::atomic::Ordering,
 };
 
@@ -20,10 +21,14 @@ use serde_json::Value;
 use tokio::process::Command;
 
 use super::{
-    normalize_optional_text, resolve_binary_path, unix_ms_now, ControlCenter,
-    HealthEndpointPayload, LogLine, RuntimeConfig, ServiceKind, ServiceProcessSnapshot,
+    normalize_optional_text, resolve_binary_path, unix_ms_now, ControlCenter, HealthEndpointPayload,
+    LogLine, RuntimeConfig, ServiceKind, ServiceProcessSnapshot,
     CONSOLE_DEVICE_ID, CONSOLE_PRINCIPAL, DASHBOARD_SCHEME, LOOPBACK_HOST, MAX_DIAGNOSTIC_ERRORS,
 };
+use super::supervisor::ConsoleSessionCache;
+
+const DEFAULT_DASHBOARD_HASH_ROUTE: &str = "#/control/overview";
+const CONSOLE_SESSION_EXPIRY_SKEW_MS: i64 = 5_000;
 
 #[derive(Debug, Serialize)]
 pub(crate) struct DiscordStatusSnapshot {
@@ -199,6 +204,7 @@ pub(crate) struct SnapshotBuildInputs {
     pub(crate) browserd_process: ServiceProcessSnapshot,
     pub(crate) logs: Vec<LogLine>,
     pub(crate) http_client: Client,
+    pub(crate) console_session_cache: Arc<Mutex<Option<ConsoleSessionCache>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -231,6 +237,7 @@ impl ControlCenter {
             browserd_process: self.process_snapshot(ServiceKind::Browserd),
             logs: self.collect_logs(),
             http_client: self.http_client.clone(),
+            console_session_cache: Arc::clone(&self.console_session_cache),
         }
     }
 
@@ -559,6 +566,7 @@ pub(crate) async fn build_snapshot_from_inputs(
         browserd_process,
         logs,
         http_client,
+        console_session_cache,
     } = inputs;
     let mut warnings = Vec::new();
 
@@ -593,6 +601,7 @@ pub(crate) async fn build_snapshot_from_inputs(
         &runtime,
         admin_token.as_str(),
         gateway_health.is_some(),
+        console_session_cache.as_ref(),
     )
     .await;
     warnings.extend(console_warnings);
@@ -646,14 +655,10 @@ pub(crate) async fn build_snapshot_from_inputs(
     };
     let browser_healthy = quick_facts.browser_service.healthy;
     let discord_degraded = quick_facts.discord.enabled && !quick_facts.discord.authenticated;
-    let diagnostics_degraded = !diagnostics.errors.is_empty();
 
     let overall_status = if gateway_health.is_none() {
         OverallStatus::Down
-    } else if (browser_service_enabled && !browser_healthy)
-        || discord_degraded
-        || diagnostics_degraded
-    {
+    } else if (browser_service_enabled && !browser_healthy) || discord_degraded {
         OverallStatus::Degraded
     } else {
         OverallStatus::Healthy
@@ -693,6 +698,7 @@ async fn fetch_console_payloads(
     runtime: &RuntimeConfig,
     admin_token: &str,
     gateway_health_available: bool,
+    console_session_cache: &Mutex<Option<ConsoleSessionCache>>,
 ) -> (Option<Value>, Option<Value>, Vec<String>) {
     let mut warnings = Vec::new();
     if !gateway_health_available {
@@ -710,15 +716,14 @@ async fn fetch_console_payloads(
         }
     };
 
-    if let Err(error) = ensure_console_session(&mut control_plane, admin_token).await {
-        warnings.push(format!(
-            "console session bootstrap failed: {}",
-            sanitize_log_line(error.to_string().as_str())
-        ));
-        return (None, None, warnings);
-    }
-
-    let diagnostics = match control_plane.get_diagnostics().await {
+    let diagnostics = match get_console_json_with_login_retry(
+        &mut control_plane,
+        admin_token,
+        "console/v1/diagnostics",
+        console_session_cache,
+    )
+    .await
+    {
         Ok(value) => Some(value),
         Err(error) => {
             warnings.push(format!(
@@ -729,17 +734,21 @@ async fn fetch_console_payloads(
         }
     };
 
-    let discord =
-        match fetch_console_json(http_client, runtime, "/console/v1/channels/discord%3Adefault")
-            .await
-            .with_context(|| "failed to fetch Discord connector status".to_owned())
-        {
-            Ok(value) => Some(value),
-            Err(error) => {
-                warnings.push(sanitize_log_line(error.to_string().as_str()));
-                None
-            }
-        };
+    let discord = match get_console_json_with_login_retry(
+        &mut control_plane,
+        admin_token,
+        "console/v1/channels/discord%3Adefault",
+        console_session_cache,
+    )
+    .await
+    .with_context(|| "failed to fetch Discord connector status".to_owned())
+    {
+        Ok(value) => Some(value),
+        Err(error) => {
+            warnings.push(sanitize_log_line(error.to_string().as_str()));
+            None
+        }
+    };
 
     (diagnostics, discord, warnings)
 }
@@ -760,50 +769,138 @@ pub(crate) async fn ensure_console_session(
     control_plane: &mut ControlPlaneClient,
     admin_token: &str,
 ) -> Result<()> {
-    ensure_console_session_with_csrf(control_plane, admin_token).await.map(|_| ())
+    request_console_session(control_plane, admin_token).await.map(|_| ())
 }
 
 pub(crate) async fn ensure_console_session_with_csrf(
     control_plane: &mut ControlPlaneClient,
     admin_token: &str,
 ) -> Result<String> {
+    request_console_session(control_plane, admin_token)
+        .await
+        .map(|session| session.csrf_token)
+}
+
+async fn request_console_session(
+    control_plane: &mut ControlPlaneClient,
+    admin_token: &str,
+) -> Result<control_plane::ConsoleSession> {
     match control_plane.get_session().await {
-        Ok(session) => Ok(session.csrf_token),
-        Err(control_plane::ControlPlaneClientError::Http { status: 401 | 403, .. }) => {
-            control_plane
-                .login(&control_plane::ConsoleLoginRequest {
-                    admin_token: admin_token.to_owned(),
-                    principal: CONSOLE_PRINCIPAL.to_owned(),
-                    device_id: CONSOLE_DEVICE_ID.to_owned(),
-                    channel: None,
-                })
-                .await
-                .map(|session| session.csrf_token)
-                .map_err(|error| anyhow!("console login failed: {error}"))
-        }
+        Ok(session) => Ok(session),
+        Err(control_plane::ControlPlaneClientError::Http { status: 401 | 403, .. }) => control_plane
+            .login(&control_plane::ConsoleLoginRequest {
+                admin_token: admin_token.to_owned(),
+                principal: CONSOLE_PRINCIPAL.to_owned(),
+                device_id: CONSOLE_DEVICE_ID.to_owned(),
+                channel: None,
+            })
+            .await
+            .map_err(|error| anyhow!("console login failed: {error}")),
         Err(error) => Err(anyhow!("console session request failed: {error}")),
     }
 }
 
 async fn fetch_console_json(
-    http_client: &Client,
-    runtime: &RuntimeConfig,
+    control_plane: &ControlPlaneClient,
     path: &str,
 ) -> Result<Value> {
-    let url = loopback_url(runtime.gateway_admin_port, path)?;
-    let response = http_client.get(url).send().await.context("console GET request failed")?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        bail!(
-            "console request {} failed with HTTP {}: {}",
-            path,
-            status,
-            sanitize_log_line(text.as_str())
-        );
-    }
+    control_plane.get_json_value(path).await.map_err(anyhow::Error::new)
+}
 
-    response.json::<Value>().await.context("failed to decode console JSON response")
+async fn get_console_json_with_login_retry(
+    control_plane: &mut ControlPlaneClient,
+    admin_token: &str,
+    path: &str,
+    console_session_cache: &Mutex<Option<ConsoleSessionCache>>,
+) -> Result<Value> {
+    restore_console_session_state(control_plane, console_session_cache);
+
+    match fetch_console_json(control_plane, path).await {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            let should_retry = matches!(
+                error.downcast_ref::<control_plane::ControlPlaneClientError>(),
+                Some(control_plane::ControlPlaneClientError::Http { status: 401 | 403, .. })
+            );
+            if !should_retry {
+                return Err(error);
+            }
+
+            clear_console_session_cache(console_session_cache);
+            login_console_session(control_plane, admin_token, console_session_cache)
+                .await
+                .map_err(|login_error| anyhow!("console session bootstrap failed: {login_error}"))?;
+            fetch_console_json(control_plane, path).await.map_err(|retry_error| {
+                anyhow!(
+                    "console request {path} failed after login: {}",
+                    sanitize_log_line(retry_error.to_string().as_str())
+                )
+            })
+        }
+    }
+}
+
+fn restore_console_session_state(
+    control_plane: &mut ControlPlaneClient,
+    console_session_cache: &Mutex<Option<ConsoleSessionCache>>,
+) {
+    let Ok(cache) = console_session_cache.lock() else {
+        return;
+    };
+    let Some(session) = cache.as_ref() else {
+        return;
+    };
+    if session.expires_at_unix_ms <= unix_ms_now() {
+        return;
+    }
+    if session.csrf_token.trim().is_empty() {
+        return;
+    }
+    control_plane.set_csrf_token(Some(session.csrf_token.clone()));
+}
+
+fn cache_console_session(
+    console_session_cache: &Mutex<Option<ConsoleSessionCache>>,
+    session: &control_plane::ConsoleSession,
+) {
+    let now = unix_ms_now();
+    let expires_at_unix_ms = if session.expires_at_unix_ms > now {
+        session.expires_at_unix_ms
+    } else {
+        now.saturating_add(CONSOLE_SESSION_EXPIRY_SKEW_MS)
+    };
+    let Ok(mut cache) = console_session_cache.lock() else {
+        return;
+    };
+    *cache = Some(ConsoleSessionCache {
+        csrf_token: session.csrf_token.clone(),
+        expires_at_unix_ms,
+    });
+}
+
+fn clear_console_session_cache(console_session_cache: &Mutex<Option<ConsoleSessionCache>>) {
+    let Ok(mut cache) = console_session_cache.lock() else {
+        return;
+    };
+    *cache = None;
+}
+
+async fn login_console_session(
+    control_plane: &mut ControlPlaneClient,
+    admin_token: &str,
+    console_session_cache: &Mutex<Option<ConsoleSessionCache>>,
+) -> Result<()> {
+    let session = control_plane
+        .login(&control_plane::ConsoleLoginRequest {
+            admin_token: admin_token.to_owned(),
+            principal: CONSOLE_PRINCIPAL.to_owned(),
+            device_id: CONSOLE_DEVICE_ID.to_owned(),
+            channel: None,
+        })
+        .await
+        .map_err(|error| anyhow!("console login failed: {error}"))?;
+    cache_console_session(console_session_cache, &session);
+    Ok(())
 }
 
 pub(crate) async fn run_support_bundle_export(
@@ -1075,12 +1172,14 @@ pub(crate) fn normalize_dashboard_socket(socket: SocketAddr) -> SocketAddr {
 }
 
 pub(crate) fn format_dashboard_url(socket: SocketAddr) -> String {
-    format!("{DASHBOARD_SCHEME}://{socket}/")
+    format!("{DASHBOARD_SCHEME}://{socket}/{DEFAULT_DASHBOARD_HASH_ROUTE}")
 }
 
 pub(crate) fn default_dashboard_access_target(default_port: u16) -> DashboardAccessTarget {
     DashboardAccessTarget {
-        url: format!("{DASHBOARD_SCHEME}://{LOOPBACK_HOST}:{default_port}/"),
+        url: format!(
+            "{DASHBOARD_SCHEME}://{LOOPBACK_HOST}:{default_port}/{DEFAULT_DASHBOARD_HASH_ROUTE}"
+        ),
         mode: DashboardAccessMode::Local,
     }
 }

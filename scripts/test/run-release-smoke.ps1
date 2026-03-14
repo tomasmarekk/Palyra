@@ -15,6 +15,7 @@ New-Item -ItemType Directory -Path $outputRoot -Force | Out-Null
 Push-Location $repoRoot
 try {
     & (Join-Path $repoRoot "scripts/test/ensure-desktop-ui.ps1")
+    & (Join-Path $repoRoot "scripts/test/ensure-web-ui.ps1")
     cargo build -p palyra-daemon -p palyra-browserd -p palyra-cli --release --locked
     cargo build --manifest-path apps/desktop/src-tauri/Cargo.toml --release --locked
 }
@@ -26,6 +27,7 @@ $desktopBinary = Join-Path $repoRoot ("apps/desktop/src-tauri/target/release/" +
 $daemonBinary = Join-Path $repoRoot ("target/release/" + (Resolve-ExecutableName -BaseName "palyrad"))
 $browserBinary = Join-Path $repoRoot ("target/release/" + (Resolve-ExecutableName -BaseName "palyra-browserd"))
 $cliBinary = Join-Path $repoRoot ("target/release/" + (Resolve-ExecutableName -BaseName "palyra"))
+$webDist = Join-Path $repoRoot "apps/web/dist"
 
 $desktopPackageOutput = Join-Path $outputRoot "desktop"
 $headlessPackageOutput = Join-Path $outputRoot "headless"
@@ -37,7 +39,8 @@ $headlessPackageOutput = Join-Path $outputRoot "headless"
     -DesktopBinaryPath $desktopBinary `
     -DaemonBinaryPath $daemonBinary `
     -BrowserBinaryPath $browserBinary `
-    -CliBinaryPath $cliBinary | Out-Null
+    -CliBinaryPath $cliBinary `
+    -WebDistPath $webDist | Out-Null
 
 & (Join-Path $repoRoot "scripts/release/package-portable.ps1") `
     -ArtifactKind headless `
@@ -45,7 +48,8 @@ $headlessPackageOutput = Join-Path $outputRoot "headless"
     -OutputRoot $headlessPackageOutput `
     -DaemonBinaryPath $daemonBinary `
     -BrowserBinaryPath $browserBinary `
-    -CliBinaryPath $cliBinary | Out-Null
+    -CliBinaryPath $cliBinary `
+    -WebDistPath $webDist | Out-Null
 
 $platform = Get-PlatformSlug
 $desktopArchive = Join-Path $desktopPackageOutput "palyra-desktop-$version-$platform.zip"

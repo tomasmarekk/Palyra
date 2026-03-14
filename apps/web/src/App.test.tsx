@@ -16,6 +16,7 @@ afterEach(() => {
 
 describe("M35 web console app", () => {
   it("requires authentication before showing privileged pages", async () => {
+    window.localStorage.removeItem("palyra.console.theme");
     const fetchMock = createQueuedFetch([jsonResponse({ error: "missing session" }, 403)]);
     vi.stubGlobal("fetch", fetchMock);
 
@@ -23,6 +24,9 @@ describe("M35 web console app", () => {
 
     expect(await screen.findByRole("heading", { name: "Operator Dashboard" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Approvals" })).not.toBeInTheDocument();
+    expect(document.documentElement.dataset.theme).toBe("dark");
+    expect(document.documentElement.classList.contains("dark")).toBe(true);
+    expect(document.documentElement.style.colorScheme).toBe("dark");
   });
 
   it("clears operator-scoped state on sign-out before next sign-in refresh completes", async () => {

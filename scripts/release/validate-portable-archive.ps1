@@ -40,6 +40,7 @@ try {
     foreach ($requiredFile in $requiredCommonFiles) {
         Assert-FileExists -Path (Join-Path $payloadRoot $requiredFile) -Label $requiredFile | Out-Null
     }
+    Assert-FileExists -Path (Join-Path $payloadRoot "web/index.html") -Label "web/index.html" | Out-Null
 
     $requiredBinaries =
         if ($manifest.artifact_kind -eq "desktop") {

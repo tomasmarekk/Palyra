@@ -11,7 +11,8 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$BrowserBinaryPath,
     [Parameter(Mandatory = $true)]
-    [string]$CliBinaryPath
+    [string]$CliBinaryPath,
+    [string]$WebDistPath
 )
 
 Set-StrictMode -Version Latest
@@ -46,6 +47,14 @@ if ($ArtifactKind -eq "desktop") {
 $resolvedDaemonBinary = Assert-FileExists -Path $DaemonBinaryPath -Label "Daemon binary"
 $resolvedBrowserBinary = Assert-FileExists -Path $BrowserBinaryPath -Label "Browser service binary"
 $resolvedCliBinary = Assert-FileExists -Path $CliBinaryPath -Label "CLI binary"
+$resolvedWebDistPath =
+    if ([string]::IsNullOrWhiteSpace($WebDistPath)) {
+        $null = Assert-FileExists -Path (Join-Path $repoRoot "apps/web/dist/index.html") -Label "Web dashboard bundle"
+        Join-Path $repoRoot "apps/web/dist"
+    } else {
+        $null = Assert-FileExists -Path (Join-Path $WebDistPath "index.html") -Label "Web dashboard bundle"
+        $WebDistPath
+    }
 
 $binaryEntries = [System.Collections.Generic.List[object]]::new()
 
@@ -76,6 +85,7 @@ Copy-BinaryIntoPayload -SourcePath $resolvedBrowserBinary -LogicalName "palyra-b
 Copy-BinaryIntoPayload -SourcePath $resolvedCliBinary -LogicalName "palyra"
 
 Copy-Item -LiteralPath (Join-Path $repoRoot "LICENSE") -Destination (Join-Path $payloadRoot "LICENSE.txt") -Force
+Copy-Item -LiteralPath $resolvedWebDistPath -Destination (Join-Path $payloadRoot "web") -Recurse -Force
 
 $installBody =
     if ($ArtifactKind -eq "desktop") {
@@ -86,7 +96,7 @@ Platform: $Platform
 
 Install
 1. Extract this archive into a dedicated directory.
-2. Keep `palyra-desktop-control-center`, `palyrad`, `palyra-browserd`, and `palyra` in the same directory.
+2. Keep `palyra-desktop-control-center`, `palyrad`, `palyra-browserd`, `palyra`, and the `web/` directory in the same directory.
 3. Launch the desktop control center binary from that directory.
 
 Update
@@ -138,8 +148,8 @@ $releaseNotesBody =
 @"
 Release notes for Palyra $Version
 
-- Portable desktop bundles now ship the desktop control center, `palyrad`, `palyra-browserd`, and `palyra` as one colocated archive.
-- Portable headless packages now ship repeatable archive-based install/update flow with config initialization and migration validation.
+- Portable desktop bundles now ship the desktop control center, `palyrad`, `palyra-browserd`, `palyra`, and the colocated `web/` dashboard bundle.
+- Portable headless packages now ship repeatable archive-based install/update flow with config initialization and migration validation plus the colocated `web/` dashboard bundle.
 - Release artifacts now include SHA256 manifests, release manifests, provenance sidecars, and package-boundary validation.
 - Release packaging smoke validates archive layout before publication.
 "@

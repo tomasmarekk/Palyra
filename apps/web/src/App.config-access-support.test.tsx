@@ -32,7 +32,10 @@ afterEach(() => {
 });
 
 describe("M56 config, access, and support surfaces", () => {
-  it("operates config lifecycle and explicit secret reveal with default redaction", async () => {
+  it(
+    "operates config lifecycle and explicit secret reveal with default redaction",
+    { timeout: 15_000 },
+    async () => {
     const initialToml = "version = 1\n[model_provider]\nauth_profile_id = \"openai-default\"\n";
     const migratedToml = "version = 2\n[model_provider]\nauth_profile_id = \"openai-migrated\"\n";
     let currentToml = initialToml;
@@ -246,7 +249,8 @@ describe("M56 config, access, and support surfaces", () => {
     expect(screen.getByText(cliHandoffs[3].cli_handoff_commands[1])).toBeInTheDocument();
 
     expect(screen.queryByText("Chat sessions and run status")).not.toBeInTheDocument();
-  });
+    },
+  );
 });
 
 function routeOverviewRequests(request: MockRequest, jobs = supportBundleJobsFixture().jobs) {

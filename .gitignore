@@ -43,6 +43,7 @@ lcov.info
 !crates/palyra-skills/examples/echo-http/sbom.cdx.json
 apps/web/node_modules/
 apps/web/dist/
+apps/desktop/ui/dist/
 .palyra-doctor-write-check.tmp
 fuzz/artifacts/
 fuzz/corpus/

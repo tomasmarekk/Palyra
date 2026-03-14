@@ -8,7 +8,7 @@ use axum::{
 use crate::{
     app::state::AppState,
     transport::http::{
-        handlers::{admin, canvas, console, health},
+        handlers::{admin, canvas, console, health, web_ui},
         middleware as http_middleware,
     },
     HTTP_MAX_REQUEST_BODY_BYTES,
@@ -417,10 +417,11 @@ pub(crate) fn build_router(state: AppState) -> Router {
         ))
         .route_layer(middleware::from_fn(http_middleware::canvas_security_headers_middleware));
     Router::new()
-        .route("/", get(health::dashboard_handoff_handler))
+        .route("/runtime", get(health::dashboard_handoff_handler))
         .route("/healthz", get(health::health_handler))
         .merge(canvas_routes)
         .merge(admin_routes)
         .merge(console_routes)
+        .fallback(get(web_ui::web_ui_entry_handler))
         .with_state(state)
 }

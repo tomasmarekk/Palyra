@@ -61,6 +61,7 @@ if (-not $SkipBuild) {
     Push-Location $repoRoot
     try {
         & (Join-Path $repoRoot "scripts/test/ensure-desktop-ui.ps1")
+        & (Join-Path $repoRoot "scripts/test/ensure-web-ui.ps1")
         cargo build -p palyra-daemon -p palyra-browserd -p palyra-cli --release --locked
         cargo build --manifest-path apps/desktop/src-tauri/Cargo.toml --release --locked
     }
@@ -80,6 +81,7 @@ $daemonBinary = Join-Path $repoRoot ("target/release/" + (Resolve-ExecutableName
 $browserBinary =
     Join-Path $repoRoot ("target/release/" + (Resolve-ExecutableName -BaseName "palyra-browserd"))
 $cliBinary = Join-Path $repoRoot ("target/release/" + (Resolve-ExecutableName -BaseName "palyra"))
+$webDist = Join-Path $repoRoot "apps/web/dist"
 
 $packageOutput = & (Join-Path $repoRoot "scripts/release/package-portable.ps1") `
     -ArtifactKind desktop `
@@ -88,7 +90,8 @@ $packageOutput = & (Join-Path $repoRoot "scripts/release/package-portable.ps1") 
     -DesktopBinaryPath $desktopBinary `
     -DaemonBinaryPath $daemonBinary `
     -BrowserBinaryPath $browserBinary `
-    -CliBinaryPath $cliBinary
+    -CliBinaryPath $cliBinary `
+    -WebDistPath $webDist
 $packageMetadata = Convert-KeyValueOutputToHashtable -Lines $packageOutput
 $archivePath = $packageMetadata["archive_path"]
 if ([string]::IsNullOrWhiteSpace($archivePath)) {

@@ -19,20 +19,20 @@ pub(crate) async fn dashboard_handoff_handler(State(state): State<AppState>) -> 
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Palyra Dashboard Handoff</title>
+    <title>Palyra Runtime Status</title>
     <style>
       :root {{
-        color-scheme: light;
+        color-scheme: dark;
         font-family: "Segoe UI", "Helvetica Neue", sans-serif;
-        background: #f4efe4;
-        color: #1b1d20;
+        background: #09131b;
+        color: #eff7fa;
       }}
       body {{
         margin: 0;
         min-height: 100vh;
         background:
-          radial-gradient(circle at top right, rgba(205, 122, 41, 0.18), transparent 32rem),
-          linear-gradient(180deg, #f8f2e7 0%, #efe4d3 100%);
+          radial-gradient(circle at top right, rgba(42, 163, 155, 0.18), transparent 32rem),
+          linear-gradient(180deg, #0c1821 0%, #142530 100%);
       }}
       main {{
         max-width: 48rem;
@@ -40,10 +40,10 @@ pub(crate) async fn dashboard_handoff_handler(State(state): State<AppState>) -> 
         padding: 3rem 1.5rem 4rem;
       }}
       .panel {{
-        background: rgba(255, 251, 245, 0.92);
-        border: 1px solid rgba(27, 29, 32, 0.08);
+        background: rgba(13, 24, 33, 0.9);
+        border: 1px solid rgba(155, 190, 204, 0.16);
         border-radius: 1.25rem;
-        box-shadow: 0 1.25rem 3rem rgba(49, 41, 25, 0.12);
+        box-shadow: 0 1.25rem 3rem rgba(0, 0, 0, 0.32);
         padding: 1.5rem;
       }}
       h1 {{
@@ -68,13 +68,13 @@ pub(crate) async fn dashboard_handoff_handler(State(state): State<AppState>) -> 
         gap: 0.45rem;
         border-radius: 999px;
         padding: 0.35rem 0.75rem;
-        background: rgba(23, 124, 73, 0.12);
-        color: #16553a;
+        background: rgba(83, 212, 198, 0.14);
+        color: #8be8da;
         font-size: 0.92rem;
         font-weight: 600;
       }}
       a {{
-        color: #0f4f8a;
+        color: #63d4c6;
       }}
       code {{
         font-family: "Cascadia Code", "Fira Code", monospace;
@@ -88,14 +88,16 @@ pub(crate) async fn dashboard_handoff_handler(State(state): State<AppState>) -> 
         <div class="badge">Runtime {status}</div>
         <h1>Palyra Local Runtime</h1>
         <p>
-          The local control plane is responding. Desktop Control Center owns startup, onboarding,
-          recovery, and auth bootstrap on this machine.
+          The local control plane is responding. The full operator dashboard now lives at the root
+          URL, while this page remains a narrow runtime and diagnostics surface.
         </p>
         <p>
-          Use the desktop app for first-run workflows. The authenticated operator APIs remain
-          available under <code>/console/v1/*</code> once a console session is established.
+          Use <a href="/">the dashboard</a> for the operator workspace. The authenticated operator
+          APIs remain available under <code>/console/v1/*</code> once a console session is
+          established.
         </p>
         <ul>
+          <li><a href="/">Open dashboard</a></li>
           <li><a href="/healthz">Health endpoint</a></li>
           <li><a href="/console/v1/control-plane/capabilities">Capability catalog</a></li>
           <li><a href="/console/v1/diagnostics">Diagnostics snapshot</a></li>
