@@ -124,18 +124,12 @@ describe("M56 runtime and operations surfaces", () => {
 
     render(<App />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Diagnostics and Audit" }));
-    expect(await screen.findByRole("heading", { name: "Diagnostics and Audit" })).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("button", { name: "Diagnostics" }));
+    expect(await screen.findByRole("heading", { name: "Diagnostics" })).toBeInTheDocument();
     expect(screen.getByText(/doctor --json/)).toBeInTheDocument();
     expect(screen.getByText(/Policy explain stays admin-only/)).toBeInTheDocument();
     expect(await screen.findByText(/message\.routed/)).toBeInTheDocument();
-    expect(await screen.findByText(/attachment\.download disabled by config/)).toBeInTheDocument();
-    expect(await screen.findByText("Failure classification summary")).toBeInTheDocument();
-    expect(screen.getByText("Starter triage order")).toBeInTheDocument();
-    expect((await screen.findAllByText(/provider_auth_refresh/)).length).toBeGreaterThan(0);
-    expect(
-      (await screen.findAllByText(/discord:default: attachment\.upload\.failed: remote upload rejected/)).length
-    ).toBeGreaterThan(0);
+    expect(await screen.findByText("Diagnostics snapshot")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Cron" }));
     expect(await screen.findByRole("heading", { name: "Cron" })).toBeInTheDocument();
@@ -284,9 +278,10 @@ describe("M56 runtime and operations surfaces", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Memory" }));
     expect(await screen.findByRole("heading", { name: "Memory" })).toBeInTheDocument();
     fireEvent.change(screen.getByLabelText("Query"), { target: { value: "paired sender" } });
-    fireEvent.click(screen.getByRole("button", { name: "Search memory" }));
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
     expect(await screen.findByText(/paired sender prefers concise replies/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Purge memory" }));
+    fireEvent.click((await screen.findAllByRole("button", { name: "Purge memory" }))[1]);
     await waitFor(() => {
       expect(screen.getByText("Purged 1 memory item(s).")).toBeInTheDocument();
     });
@@ -303,10 +298,12 @@ describe("M56 runtime and operations surfaces", () => {
       expect(screen.getByText("Skill action 'audit' completed.")).toBeInTheDocument();
     });
     fireEvent.click(screen.getByRole("button", { name: "Quarantine" }));
+    fireEvent.click((await screen.findAllByRole("button", { name: "Quarantine skill" }))[0]);
     await waitFor(() => {
       expect(screen.getByText("Skill action 'quarantine' completed.")).toBeInTheDocument();
     });
     fireEvent.click(screen.getByRole("button", { name: "Enable" }));
+    fireEvent.click((await screen.findAllByRole("button", { name: "Enable skill" }))[0]);
     await waitFor(() => {
       expect(screen.getByText("Skill action 'enable' completed.")).toBeInTheDocument();
     });

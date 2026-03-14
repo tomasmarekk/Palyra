@@ -1,15 +1,9 @@
 import type { CapabilityCatalog } from "../../consoleApi";
 import { capabilitiesByMode, capabilitiesForSection } from "../capabilityCatalog";
 import { CapabilityCardList } from "../components/CapabilityCards";
-import { ConsoleSectionHeader } from "../components/ConsoleSectionHeader";
-import {
-  PrettyJsonBlock,
-  readNumber,
-  readObject,
-  readString,
-  toStringArray,
-  type JsonObject,
-} from "../shared";
+import { WorkspaceMetricCard, WorkspacePageHeader, WorkspaceSectionCard, WorkspaceStatusChip } from "../components/workspace/WorkspaceChrome";
+import { WorkspaceEmptyState, WorkspaceInlineNotice, WorkspaceTable, workspaceToneForState } from "../components/workspace/WorkspacePatterns";
+import { PrettyJsonBlock, formatUnixMs, readNumber, readObject, readString, toStringArray, type JsonObject } from "../shared";
 import type { ConsoleAppState } from "../useConsoleAppState";
 
 type OperationsSectionProps = {
@@ -34,282 +28,175 @@ export function OperationsSection({ app }: OperationsSectionProps) {
   const catalog = readCapabilityCatalog(app.overviewCatalog);
   const groupedCapabilities = capabilitiesByMode(capabilitiesForSection(catalog, "operations"));
   const diagnostics = app.diagnosticsSnapshot;
+  const observability = readObject(diagnostics ?? {}, "observability");
   const modelProvider = readObject(diagnostics ?? {}, "model_provider");
-  const rateLimits = readObject(diagnostics ?? {}, "rate_limits");
   const authProfiles = readObject(diagnostics ?? {}, "auth_profiles");
   const browserd = readObject(diagnostics ?? {}, "browserd");
-  const observability = readObject(diagnostics ?? {}, "observability");
-  const providerAuth = readObject(observability ?? {}, "provider_auth");
-  const dashboard = readObject(observability ?? {}, "dashboard");
+  const recentFailures = readJsonObjectArray(observability?.recent_failures);
   const connector = readObject(observability ?? {}, "connector");
   const browser = readObject(observability ?? {}, "browser");
-  const browserRelay = readObject(browser ?? {}, "relay_actions");
-  const failureClasses = readObject(observability ?? {}, "failure_classes");
-  const recentFailures = Array.isArray(observability?.recent_failures)
-    ? observability.recent_failures.filter((entry): entry is JsonObject => entry !== null && typeof entry === "object" && !Array.isArray(entry))
-    : [];
-  const connectorErrors = Array.isArray(connector?.recent_errors)
-    ? connector.recent_errors.filter((entry): entry is JsonObject => entry !== null && typeof entry === "object" && !Array.isArray(entry))
-    : [];
-  const browserFailureSamples = toStringArray(
-    Array.isArray(browser?.recent_failure_samples) ? browser.recent_failure_samples : []
-  );
-  const triage = readObject(observability ?? {}, "triage");
-  const triageOrder = toStringArray(Array.isArray(triage?.common_order) ? triage.common_order : []);
+  const browserFailureSamples = toStringArray(Array.isArray(browser?.recent_failure_samples) ? browser.recent_failure_samples : []);
 
   return (
-    <main className="console-card">
-      <ConsoleSectionHeader
-        title="Diagnostics and Audit"
-        description="Runtime status, audit browsing, developer diagnostics handoffs, and internal-only capability justifications live together in the operations domain."
+    <main className="workspace-page">
+      <WorkspacePageHeader
+        eyebrow="Settings"
+        title="Diagnostics"
+        description="Technical detail now lives here instead of dominating Overview: runtime status, audit events, CLI handoffs, and bounded troubleshooting context."
+        status={
+          <>
+            <WorkspaceStatusChip tone={workspaceToneForState(readString(modelProvider ?? {}, "state") ?? "unknown")}>
+              Provider: {readString(modelProvider ?? {}, "state") ?? "unknown"}
+            </WorkspaceStatusChip>
+            <WorkspaceStatusChip tone={recentFailures.length > 0 ? "warning" : "default"}>
+              {recentFailures.length} recent failures
+            </WorkspaceStatusChip>
+          </>
+        }
         actions={(
-          <div className="console-inline-actions">
-            <button type="button" onClick={() => void app.refreshDiagnostics()} disabled={app.diagnosticsBusy}>
-              {app.diagnosticsBusy ? "Refreshing diagnostics..." : "Refresh diagnostics"}
-            </button>
-            <button type="button" onClick={() => void app.refreshAudit()} disabled={app.auditBusy}>
-              {app.auditBusy ? "Refreshing audit..." : "Refresh audit"}
-            </button>
+          <div className="workspace-inline">
+            <button type="button" onClick={() => void app.refreshDiagnostics()} disabled={app.diagnosticsBusy}>{app.diagnosticsBusy ? "Refreshing..." : "Refresh diagnostics"}</button>
+            <button type="button" className="secondary" onClick={() => void app.refreshAudit()} disabled={app.auditBusy}>{app.auditBusy ? "Refreshing..." : "Refresh audit"}</button>
           </div>
         )}
       />
 
-      <section className="console-grid-4 console-summary-grid">
-        <article className="console-subpanel">
-          <h3>Model provider</h3>
-          <p><strong>State:</strong> {readString(modelProvider ?? {}, "state") ?? "n/a"}</p>
-          <p><strong>Provider:</strong> {readString(modelProvider ?? {}, "provider") ?? "n/a"}</p>
-        </article>
-        <article className="console-subpanel">
-          <h3>Rate limits</h3>
-          <p><strong>Request budget:</strong> {readString(rateLimits ?? {}, "request_budget") ?? "n/a"}</p>
-          <p><strong>Reset:</strong> {readString(rateLimits ?? {}, "reset_at_unix_ms") ?? "n/a"}</p>
-        </article>
-        <article className="console-subpanel">
-          <h3>Auth health</h3>
-          <p><strong>Summary state:</strong> {readString(authProfiles ?? {}, "state") ?? "n/a"}</p>
-          <p><strong>Profiles:</strong> {Array.isArray(authProfiles?.profiles) ? authProfiles.profiles.length : 0}</p>
-        </article>
-        <article className="console-subpanel">
-          <h3>Browser service</h3>
-          <p><strong>State:</strong> {readString(browserd ?? {}, "state") ?? "n/a"}</p>
-          <p><strong>Mode:</strong> {readString(browserd ?? {}, "engine_mode") ?? "n/a"}</p>
-        </article>
+      <section className="workspace-metric-grid">
+        <WorkspaceMetricCard label="Model provider" value={readString(modelProvider ?? {}, "provider") ?? "n/a"} detail={readString(modelProvider ?? {}, "state") ?? "No provider state loaded."} tone={workspaceToneForState(readString(modelProvider ?? {}, "state") ?? "unknown")} />
+        <WorkspaceMetricCard label="Auth state" value={readString(authProfiles ?? {}, "state") ?? "n/a"} detail={`${Array.isArray(authProfiles?.profiles) ? authProfiles.profiles.length : 0} profiles published`} tone={workspaceToneForState(readString(authProfiles ?? {}, "state") ?? "unknown")} />
+        <WorkspaceMetricCard label="Browser service" value={readString(browserd ?? {}, "state") ?? "n/a"} detail={readString(browserd ?? {}, "engine_mode") ?? "No engine mode published."} tone={workspaceToneForState(readString(browserd ?? {}, "state") ?? "unknown")} />
+        <WorkspaceMetricCard label="Connector dead letters" value={readString(connector ?? {}, "dead_letters") ?? "0"} detail={`${browserFailureSamples.length} browser relay failure samples published.`} tone={recentFailures.length > 0 ? "warning" : "default"} />
       </section>
 
-      <section className="console-grid-4 console-summary-grid">
-        <article className="console-subpanel">
-          <h3>Provider auth failures</h3>
-          <p><strong>State:</strong> {readString(providerAuth ?? {}, "state") ?? "n/a"}</p>
-          <p><strong>Failure rate:</strong> {formatRate(readNumber(providerAuth ?? {}, "failure_rate_bps"))}</p>
-          <p><strong>Refresh failures:</strong> {readString(providerAuth ?? {}, "refresh_failures") ?? "0"}</p>
-        </article>
-        <article className="console-subpanel">
-          <h3>Connector operations</h3>
-          <p><strong>Queue depth:</strong> {readString(connector ?? {}, "queue_depth") ?? "0"}</p>
-          <p><strong>Dead letters:</strong> {readString(connector ?? {}, "dead_letters") ?? "0"}</p>
-          <p><strong>Upload failure rate:</strong> {formatRate(readNumber(connector ?? {}, "upload_failure_rate_bps"))}</p>
-        </article>
-        <article className="console-subpanel">
-          <h3>Dashboard mutations</h3>
-          <p><strong>Attempts:</strong> {readString(dashboard ?? {}, "attempts") ?? "0"}</p>
-          <p><strong>Failures:</strong> {readString(dashboard ?? {}, "failures") ?? "0"}</p>
-          <p><strong>Error rate:</strong> {formatRate(readNumber(dashboard ?? {}, "failure_rate_bps"))}</p>
-        </article>
-        <article className="console-subpanel">
-          <h3>Browser relay</h3>
-          <p><strong>Attempts:</strong> {readString(browserRelay ?? {}, "attempts") ?? "0"}</p>
-          <p><strong>Failures:</strong> {readString(browserRelay ?? {}, "failures") ?? "0"}</p>
-          <p><strong>Error rate:</strong> {formatRate(readNumber(browserRelay ?? {}, "failure_rate_bps"))}</p>
-        </article>
-      </section>
+      {recentFailures.length > 0 ? (
+        <WorkspaceInlineNotice title="Recent failures" tone="warning">
+          <ul className="console-compact-list">
+            {recentFailures.slice(0, 4).map((failure, index) => (
+              <li key={`${readString(failure, "operation") ?? "failure"}-${index}`}>
+                <strong>{readString(failure, "failure_class") ?? "unknown"}</strong>: {readString(failure, "message") ?? readString(failure, "operation") ?? "No detail"}
+              </li>
+            ))}
+          </ul>
+        </WorkspaceInlineNotice>
+      ) : null}
 
-      <section className="console-grid-2">
-        <article className="console-subpanel">
-          <div className="console-subpanel__header">
-            <div>
-              <h3>Published CLI handoffs</h3>
-              <p className="chat-muted">
-                Low-level diagnostics and protocol utilities stay discoverable here even when execution remains outside the browser session.
-              </p>
+      <section className="workspace-aside-grid">
+        <div className="workspace-stack">
+          <WorkspaceSectionCard title="Audit events" description="Use quick filters near the table header and keep the actions column-free so the event stream stays readable.">
+            <div className="workspace-form-grid">
+              <label>Principal filter<input value={app.auditFilterPrincipal} onChange={(event) => app.setAuditFilterPrincipal(event.target.value)} /></label>
+              <label>Payload contains<input value={app.auditFilterContains} onChange={(event) => app.setAuditFilterContains(event.target.value)} /></label>
             </div>
-          </div>
-          <CapabilityCardList
-            entries={groupedCapabilities.cli_handoff}
-            emptyMessage="No CLI handoffs are currently published for operations."
-          />
-        </article>
-        <article className="console-subpanel">
-          <div className="console-subpanel__header">
-            <div>
-              <h3>Internal-only capability notes</h3>
-              <p className="chat-muted">
-                Internal-only capabilities remain visible so hidden operational power does not become accidental product surface.
-              </p>
-            </div>
-          </div>
-          <CapabilityCardList
-            entries={groupedCapabilities.internal_only}
-            emptyMessage="No internal-only capability notes are currently published for operations."
-          />
-        </article>
-      </section>
-
-      <section className="console-grid-2">
-        <article className="console-subpanel">
-          <div className="console-subpanel__header">
-            <div>
-              <h3>Failure classification summary</h3>
-              <p className="chat-muted">
-                The backend keeps a redacted distinction between config issues, upstream provider failures, and product failures so operators can start triage in the right layer.
-              </p>
-            </div>
-          </div>
-          <p><strong>Config:</strong> {readString(failureClasses ?? {}, "config_failure") ?? "0"}</p>
-          <p><strong>Upstream provider:</strong> {readString(failureClasses ?? {}, "upstream_provider_failure") ?? "0"}</p>
-          <p><strong>Product:</strong> {readString(failureClasses ?? {}, "product_failure") ?? "0"}</p>
-          <p><strong>Recent failures:</strong> {recentFailures.length}</p>
-        </article>
-        <article className="console-subpanel">
-          <div className="console-subpanel__header">
-            <div>
-              <h3>Starter triage order</h3>
-              <p className="chat-muted">
-                Dashboard exposes the same redacted triage order used in support artifacts so incident response starts consistently.
-              </p>
-            </div>
-          </div>
-          {triageOrder.length === 0 ? (
-            <p>No triage order published.</p>
-          ) : (
-            <ol className="console-compact-list">
-              {triageOrder.map((step) => (
-                <li key={step}>{step}</li>
-              ))}
-            </ol>
-          )}
-        </article>
-      </section>
-
-      <section className="console-subpanel">
-        <div className="console-subpanel__header">
-          <div>
-            <h3>Audit event browser</h3>
-            <p className="chat-muted">
-              Filter the journal view by principal or free-text containment. Results stay redacted unless the operator explicitly opts into revealing sensitive values.
-            </p>
-          </div>
+            {app.auditEvents.length === 0 ? (
+              <WorkspaceEmptyState title="No audit events loaded" description="Refresh audit to load the current redacted event stream." compact />
+            ) : (
+              <WorkspaceTable ariaLabel="Audit events" columns={["When", "Event", "Principal", "Summary"]}>
+                {app.auditEvents.map((event, index) => (
+                  <tr key={`${readString(event, "event_type") ?? "event"}-${index}`}>
+                    <td>{formatAuditTime(event)}</td>
+                    <td>{formatAuditEventName(event)}</td>
+                    <td>{readString(event, "principal") ?? "n/a"}</td>
+                    <td>{formatAuditSummary(event)}</td>
+                  </tr>
+                ))}
+              </WorkspaceTable>
+            )}
+          </WorkspaceSectionCard>
         </div>
-        <div className="console-grid-2">
-          <label>
-            Principal filter
-            <input value={app.auditFilterPrincipal} onChange={(event) => app.setAuditFilterPrincipal(event.target.value)} />
-          </label>
-          <label>
-            Payload contains
-            <input value={app.auditFilterContains} onChange={(event) => app.setAuditFilterContains(event.target.value)} />
-          </label>
-        </div>
-        {app.auditEvents.length === 0 ? (
-          <p>No audit events loaded.</p>
-        ) : (
-          <PrettyJsonBlock
-            value={app.auditEvents}
-            revealSensitiveValues={app.revealSensitiveValues}
-          />
-        )}
-      </section>
 
-      <section className="console-grid-2">
-        <article className="console-subpanel">
-          <div className="console-subpanel__header">
-            <div>
-              <h3>Recent redacted failures</h3>
-              <p className="chat-muted">
-                Correlated failures stay redacted, but still expose enough operation and class detail to reduce guesswork during provider auth, dashboard, and connector incidents.
-              </p>
-            </div>
-          </div>
-          {recentFailures.length === 0 ? (
-            <p>No recent failures recorded.</p>
-          ) : (
-            <ul className="console-compact-list">
-              {recentFailures.map((entry, index) => (
-                <li key={`${readString(entry, "operation") ?? "failure"}-${index}`}>
-                  <strong>{readString(entry, "failure_class") ?? "unknown"}</strong>:{" "}
-                  {readString(entry, "operation") ?? "operation unavailable"}{" "}
-                  ({readString(entry, "message") ?? "no detail"})
-                </li>
-              ))}
-            </ul>
-          )}
-        </article>
-        <article className="console-subpanel">
-          <div className="console-subpanel__header">
-            <div>
-              <h3>Connector and browser samples</h3>
-              <p className="chat-muted">
-                Samples stay bounded and redacted so operators can spot recurring symptoms without pulling raw logs into the browser.
-              </p>
-            </div>
-          </div>
-          <p><strong>Connector samples:</strong></p>
-          {connectorErrors.length === 0 ? (
-            <p>No connector error samples.</p>
-          ) : (
-            <ul className="console-compact-list">
-              {connectorErrors.map((entry, index) => (
-                <li key={`${readString(entry, "connector_id") ?? "connector"}-${index}`}>
-                  {readString(entry, "connector_id") ?? "connector"}: {readString(entry, "message") ?? "no detail"}
-                </li>
-              ))}
-            </ul>
-          )}
-          <p><strong>Browser relay samples:</strong></p>
-          {browserFailureSamples.length === 0 ? (
-            <p>No browser relay samples.</p>
-          ) : (
-            <ul className="console-compact-list">
-              {browserFailureSamples.map((sample) => (
-                <li key={sample}>{sample}</li>
-              ))}
-            </ul>
-          )}
-        </article>
-      </section>
+        <div className="workspace-stack">
+          <WorkspaceSectionCard title="CLI handoffs" description="Deeper troubleshooting remains explicit instead of hiding behind undocumented operator steps.">
+            <CapabilityCardList entries={groupedCapabilities.cli_handoff} emptyMessage="No CLI handoffs are currently published for diagnostics." />
+          </WorkspaceSectionCard>
 
-      <section className="console-subpanel">
-        <div className="console-subpanel__header">
-          <div>
-            <h3>Redacted diagnostics snapshot</h3>
-            <p className="chat-muted">
-              Diagnostics stay redacted by default and mirror the backend troubleshooting snapshot rather than inventing parallel client-side heuristics.
-            </p>
-          </div>
+          <WorkspaceSectionCard title="Internal notes" description="Keep internal-only capabilities visible so hidden power does not become accidental product surface.">
+            <CapabilityCardList entries={groupedCapabilities.internal_only} emptyMessage="No internal-only capability notes are currently published for diagnostics." />
+          </WorkspaceSectionCard>
+
+          <WorkspaceSectionCard title="Diagnostics snapshot" description="Raw snapshot stays available as a secondary surface after the summary and tables.">
+            {diagnostics === null ? (
+              <WorkspaceEmptyState title="No diagnostics loaded" description="Refresh diagnostics to load the latest redacted snapshot." compact />
+            ) : (
+              <PrettyJsonBlock value={diagnostics} revealSensitiveValues={app.revealSensitiveValues} />
+            )}
+          </WorkspaceSectionCard>
         </div>
-        {diagnostics === null ? (
-          <p>No diagnostics loaded.</p>
-        ) : (
-          <PrettyJsonBlock
-            value={diagnostics}
-            revealSensitiveValues={app.revealSensitiveValues}
-          />
-        )}
       </section>
     </main>
   );
 }
 
-function formatRate(value: number | null): string {
-  if (value === null) {
-    return "n/a";
-  }
-  return `${(value / 100).toFixed(2)}%`;
+function readCapabilityCatalog(value: JsonObject | null): CapabilityCatalog | null {
+  return value !== null && Array.isArray(value.capabilities) ? value as unknown as CapabilityCatalog : null;
 }
 
-function readCapabilityCatalog(value: JsonObject | null): CapabilityCatalog | null {
-  if (value === null || !Array.isArray(value.capabilities)) {
-    return null;
+function readJsonObjectArray(value: unknown): JsonObject[] {
+  return Array.isArray(value) ? value.filter((entry): entry is JsonObject => entry !== null && typeof entry === "object" && !Array.isArray(entry)) : [];
+}
+
+function formatAuditTime(event: JsonObject): string {
+  return (
+    formatUnixMs(
+      readNumber(event, "timestamp_unix_ms") ??
+      readNumber(event, "observed_at_unix_ms") ??
+      readNumber(event, "created_at_unix_ms")
+    ) ??
+    readString(event, "occurred_at") ??
+    readString(event, "created_at") ??
+    "n/a"
+  );
+}
+
+function formatAuditEventName(event: JsonObject): string {
+  return (
+    readString(event, "event_type") ??
+    readString(event, "event") ??
+    mapAuditKind(readNumber(event, "kind")) ??
+    "unknown"
+  );
+}
+
+function formatAuditSummary(event: JsonObject): string {
+  const summary =
+    readString(event, "message") ??
+    readString(event, "summary") ??
+    readString(event, "reason");
+  if (summary !== null) {
+    return summary;
   }
-  return value as unknown as CapabilityCatalog;
+
+  if (event.payload !== undefined && event.payload !== null) {
+    if (typeof event.payload === "string" || typeof event.payload === "number" || typeof event.payload === "boolean") {
+      return String(event.payload);
+    }
+    if (typeof event.payload === "object" && !Array.isArray(event.payload)) {
+      const entries = Object.entries(event.payload as Record<string, unknown>);
+      if (entries.length > 0) {
+        return entries.map(([key, value]) => `${key}: ${String(value)}`).join(", ");
+      }
+    }
+  }
+
+  return readString(event, "payload_json") ?? "No summary";
+}
+
+function mapAuditKind(kind: number | null): string | null {
+  switch (kind) {
+    case 1:
+      return "message.received";
+    case 2:
+      return "model.token";
+    case 3:
+      return "tool.proposed";
+    case 4:
+      return "tool.executed";
+    case 5:
+      return "a2ui.updated";
+    case 6:
+      return "run.completed";
+    case 7:
+      return "run.failed";
+    default:
+      return null;
+  }
 }

@@ -1,21 +1,5 @@
-export const CONSOLE_SECTIONS = [
-  { id: "overview", label: "Overview", detail: "Product posture and capability exposure map" },
-  { id: "chat", label: "Chat", detail: "Primary operator workspace" },
-  { id: "approvals", label: "Approvals", detail: "Sensitive action gate" },
-  { id: "cron", label: "Automation", detail: "Scheduled jobs, runs, and history" },
-  { id: "channels", label: "Channels", detail: "Connectors, router, and Discord setup" },
-  { id: "browser", label: "Browser", detail: "Profiles, relay, and downloads" },
-  { id: "agents", label: "Agents", detail: "Registry, defaults, and workspace setup" },
-  { id: "memory", label: "Memory", detail: "Retention, search, and purge" },
-  { id: "skills", label: "Skills", detail: "Install and runtime trust posture" },
-  { id: "auth", label: "OpenAI and Auth Profiles", detail: "OpenAI and auth profile state" },
-  { id: "config", label: "Config and Secrets", detail: "Config lifecycle and secrets controls" },
-  { id: "access", label: "Pairing and Gateway Access", detail: "Pairing lifecycle and remote access posture" },
-  { id: "operations", label: "Diagnostics and Audit", detail: "Runtime snapshots, audit, and CLI handoffs" },
-  { id: "support", label: "Support", detail: "Bundles, recovery, and operator handoff" }
-] as const;
+import { CONSOLE_SECTIONS, type Section } from "./sectionMetadata";
 
-export type Section = (typeof CONSOLE_SECTIONS)[number]["id"];
 export type NavigationEntry = (typeof CONSOLE_SECTIONS)[number];
 
 export type NavigationGroup = {
@@ -57,7 +41,7 @@ export const CONSOLE_NAV_GROUPS: readonly NavigationGroup[] = [
   {
     id: "settings",
     label: "Settings",
-    items: resolveEntries(["auth", "config", "access", "operations"])
+    items: resolveEntries(["auth", "access", "config", "secrets", "operations"])
   }
 ] as const;
 
@@ -73,6 +57,7 @@ const SECTION_PATHS: Readonly<Record<Section, string>> = {
   skills: "/agent/skills",
   auth: "/settings/profiles",
   config: "/settings/config",
+  secrets: "/settings/secrets",
   access: "/settings/access",
   operations: "/settings/diagnostics",
   support: "/control/support"
@@ -92,6 +77,7 @@ const SECTION_GROUPS: Readonly<Record<Section, NavigationGroup["id"]>> = {
   skills: "agent",
   auth: "settings",
   config: "settings",
+  secrets: "settings",
   access: "settings",
   operations: "settings",
   support: "control"

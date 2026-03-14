@@ -8,10 +8,11 @@ export const CONSOLE_SECTIONS = [
   { id: "agents", label: "Agents", detail: "Registry, defaults, and workspace setup" },
   { id: "memory", label: "Memory", detail: "Retention, search, and purge" },
   { id: "skills", label: "Skills", detail: "Install and runtime trust posture" },
-  { id: "auth", label: "OpenAI and Auth Profiles", detail: "OpenAI and auth profile state" },
-  { id: "config", label: "Config and Secrets", detail: "Config lifecycle and secrets controls" },
-  { id: "access", label: "Pairing and Gateway Access", detail: "Pairing lifecycle and remote access posture" },
-  { id: "operations", label: "Diagnostics and Audit", detail: "Runtime snapshots, audit, and CLI handoffs" },
+  { id: "auth", label: "Profiles", detail: "Provider auth profiles and health posture" },
+  { id: "config", label: "Config", detail: "Inspect, validate, mutate, and recover config" },
+  { id: "secrets", label: "Secrets", detail: "Vault-backed secret metadata and reveal flows" },
+  { id: "access", label: "Access", detail: "Pairing lifecycle and remote access posture" },
+  { id: "operations", label: "Diagnostics", detail: "Runtime snapshots, audit, and CLI handoffs" },
   { id: "support", label: "Support", detail: "Bundles, recovery, and operator handoff" }
 ] as const;
 

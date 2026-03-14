@@ -1,13 +1,11 @@
-import { ConsoleSectionHeader } from "../components/ConsoleSectionHeader";
-import {
-  formatUnixMs,
-  PrettyJsonBlock,
-  readNumber,
-  readString,
-  toStringArray,
-  type JsonObject,
-} from "../shared";
+import { useState } from "react";
+
+import { WorkspaceMetricCard, WorkspacePageHeader, WorkspaceSectionCard, WorkspaceStatusChip } from "../components/workspace/WorkspaceChrome";
+import { WorkspaceEmptyState, WorkspaceInlineNotice, WorkspaceTable, workspaceToneForState } from "../components/workspace/WorkspacePatterns";
+import { formatUnixMs, PrettyJsonBlock, readNumber, readString, toStringArray, type JsonObject } from "../shared";
 import type { ConsoleAppState } from "../useConsoleAppState";
+
+type ConfigTab = "inspect" | "validate" | "mutate" | "recover";
 
 type ConfigSectionProps = {
   app: Pick<
@@ -30,15 +28,6 @@ type ConfigSectionProps = {
     | "configRecoverBackup"
     | "setConfigRecoverBackup"
     | "configDeploymentPosture"
-    | "configSecretsScope"
-    | "setConfigSecretsScope"
-    | "configSecrets"
-    | "configSecretKey"
-    | "setConfigSecretKey"
-    | "configSecretMetadata"
-    | "configSecretValue"
-    | "setConfigSecretValue"
-    | "configSecretReveal"
     | "revealSensitiveValues"
     | "refreshConfigSurface"
     | "inspectConfigSurface"
@@ -46,27 +35,32 @@ type ConfigSectionProps = {
     | "mutateConfigSurface"
     | "migrateConfigSurface"
     | "recoverConfigSurface"
-    | "refreshSecrets"
-    | "loadSecretMetadata"
-    | "setSecretValue"
-    | "revealSecretValue"
-    | "deleteSecretValue"
   >;
 };
 
 export function ConfigSection({ app }: ConfigSectionProps) {
-  const warnings = toStringArray(
-    Array.isArray(app.configDeploymentPosture?.warnings) ? app.configDeploymentPosture.warnings : []
-  );
+  const [activeTab, setActiveTab] = useState<ConfigTab>("inspect");
+  const warnings = toStringArray(Array.isArray(app.configDeploymentPosture?.warnings) ? app.configDeploymentPosture.warnings : []);
   const backups = Array.isArray(app.configInspectSnapshot?.backups)
     ? app.configInspectSnapshot.backups.filter((entry): entry is JsonObject => typeof entry === "object" && entry !== null && !Array.isArray(entry))
     : [];
 
   return (
-    <main className="console-card">
-      <ConsoleSectionHeader
-        title="Config and Secrets"
-        description="Operate config lifecycle and Vault-backed secrets directly from the dashboard with redacted snapshots, explicit reveal actions, and dangerous deployment warnings."
+    <main className="workspace-page">
+      <WorkspacePageHeader
+        eyebrow="Settings"
+        title="Config"
+        description="Inspect first, validate second, mutate deliberately, and keep recovery explicit. Secrets now live on their own page."
+        status={
+          <>
+            <WorkspaceStatusChip tone={workspaceToneForState(app.configValidation?.valid === true ? "valid" : warnings.length > 0 ? "warning" : "unknown")}>
+              {app.configValidation?.valid === true ? "Validation ready" : "Check config"}
+            </WorkspaceStatusChip>
+            <WorkspaceStatusChip tone={warnings.length > 0 ? "warning" : "default"}>
+              {warnings.length} warnings
+            </WorkspaceStatusChip>
+          </>
+        }
         actions={(
           <button type="button" onClick={() => void app.refreshConfigSurface()} disabled={app.configBusy}>
             {app.configBusy ? "Refreshing..." : "Refresh config"}
@@ -74,238 +68,136 @@ export function ConfigSection({ app }: ConfigSectionProps) {
         )}
       />
 
-      <section className="console-grid-4 console-summary-grid">
-        <article className="console-subpanel">
-          <h3>Config source</h3>
-          <p><strong>Path:</strong> {(readString(app.configInspectSnapshot ?? {}, "source_path") ?? app.configInspectPath) || "n/a"}</p>
-          <p><strong>Version:</strong> {readString(app.configInspectSnapshot ?? {}, "config_version") ?? "n/a"}</p>
-          <p><strong>Backups:</strong> {backups.length}</p>
-        </article>
-        <article className="console-subpanel">
-          <h3>Validation</h3>
-          <p><strong>Status:</strong> {app.configValidation?.valid === true ? "valid" : app.configValidation === null ? "not loaded" : "check output"}</p>
-          <p><strong>Migrated from:</strong> {readString(app.configValidation ?? {}, "migrated_from_version") ?? "n/a"}</p>
-        </article>
-        <article className="console-subpanel">
-          <h3>Last mutation</h3>
-          <p><strong>Operation:</strong> {readString(app.configLastMutation ?? {}, "operation") ?? "n/a"}</p>
-          <p><strong>Changed key:</strong> {readString(app.configLastMutation ?? {}, "changed_key") ?? "n/a"}</p>
-          <p><strong>Backups retained:</strong> {readString(app.configLastMutation ?? {}, "backups_retained") ?? "n/a"}</p>
-        </article>
-        <article className="console-subpanel">
-          <h3>Danger warnings</h3>
-          {warnings.length === 0 ? (
-            <p>No dangerous deployment posture warnings were published.</p>
-          ) : (
-            <ul className="console-compact-list">
-              {warnings.map((warning) => (
-                <li key={warning}>{warning}</li>
-              ))}
-            </ul>
-          )}
-        </article>
+      <section className="workspace-metric-grid workspace-metric-grid--compact">
+        <WorkspaceMetricCard label="Source path" value={(readString(app.configInspectSnapshot ?? {}, "source_path") ?? app.configInspectPath) || "n/a"} detail="Canonical config path currently being inspected." />
+        <WorkspaceMetricCard label="Backups" value={backups.length} detail="Retained backups visible for recovery flows." tone={backups.length > 0 ? "accent" : "default"} />
+        <WorkspaceMetricCard label="Last mutation" value={readString(app.configLastMutation ?? {}, "operation") ?? "none"} detail={readString(app.configLastMutation ?? {}, "changed_key") ?? "No recent mutation loaded."} tone={app.configLastMutation === null ? "default" : "warning"} />
       </section>
 
-      <section className="console-grid-2">
-        <article className="console-subpanel">
-          <div className="console-subpanel__header">
-            <div>
-              <h3>Inspect, validate, mutate, migrate</h3>
-              <p className="chat-muted">
-                All document views stay redacted by default. Mutations publish a diff preview instead of expecting operators to hand-edit TOML in another shell.
-              </p>
-            </div>
-          </div>
-          <div className="console-grid-4">
-            <label>
-              Path
-              <input value={app.configInspectPath} onChange={(event) => app.setConfigInspectPath(event.target.value)} />
-            </label>
-            <label>
-              Backups
-              <input value={app.configBackups} onChange={(event) => app.setConfigBackups(event.target.value)} />
-            </label>
-            <label>
-              Mutation mode
-              <select
-                value={app.configMutationMode}
-                onChange={(event) =>
-                  app.setConfigMutationMode(event.target.value === "unset" ? "unset" : "set")
-                }
-              >
-                <option value="set">set</option>
-                <option value="unset">unset</option>
-              </select>
-            </label>
-            <label>
-              Recover backup
-              <input value={app.configRecoverBackup} onChange={(event) => app.setConfigRecoverBackup(event.target.value)} />
-            </label>
-          </div>
-          <div className="console-grid-2">
-            <label>
-              Key
-              <input value={app.configMutationKey} onChange={(event) => app.setConfigMutationKey(event.target.value)} />
-            </label>
-            <label>
-              Value
-              <input
-                value={app.configMutationValue}
-                onChange={(event) => app.setConfigMutationValue(event.target.value)}
-                disabled={app.configMutationMode === "unset"}
-                placeholder={app.configMutationMode === "unset" ? "Value not used for unset" : "\"value\""}
-              />
-            </label>
-          </div>
-          <div className="console-inline-actions">
-            <button type="button" onClick={() => void app.inspectConfigSurface()} disabled={app.configBusy}>
-              Inspect
-            </button>
-            <button type="button" onClick={() => void app.validateConfigSurface()} disabled={app.configBusy}>
-              Validate
-            </button>
-            <button type="button" onClick={() => void app.mutateConfigSurface()} disabled={app.configBusy}>
-              {app.configMutationMode === "unset" ? "Unset key" : "Apply mutation"}
-            </button>
-            <button type="button" onClick={() => void app.migrateConfigSurface()} disabled={app.configBusy}>
-              Migrate
-            </button>
-            <button type="button" className="button--warn" onClick={() => void app.recoverConfigSurface()} disabled={app.configBusy}>
-              Recover backup
-            </button>
-          </div>
-          {app.configDiffPreview !== null && (
-            <>
-              <p><strong>Redacted diff preview</strong></p>
-              <pre className="console-code-block"><code>{app.configDiffPreview}</code></pre>
-            </>
-          )}
-        </article>
+      {warnings.length > 0 ? (
+        <WorkspaceInlineNotice title="Deployment warnings" tone="warning">
+          <ul className="console-compact-list">{warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul>
+        </WorkspaceInlineNotice>
+      ) : null}
 
-        <article className="console-subpanel">
-          <div className="console-subpanel__header">
-            <div>
-              <h3>Secret metadata and reveal path</h3>
-              <p className="chat-muted">
-                Secret reads require an explicit reveal action. Metadata can be inspected without exposing the raw secret body.
-              </p>
-            </div>
-          </div>
-          <div className="console-grid-3">
-            <label>
-              Scope
-              <input value={app.configSecretsScope} onChange={(event) => app.setConfigSecretsScope(event.target.value)} />
-            </label>
-            <label>
-              Key
-              <input value={app.configSecretKey} onChange={(event) => app.setConfigSecretKey(event.target.value)} />
-            </label>
-            <label>
-              Value
-              <input
-                type="password"
-                autoComplete="off"
-                value={app.configSecretValue}
-                onChange={(event) => app.setConfigSecretValue(event.target.value)}
-              />
-            </label>
-          </div>
-          <div className="console-inline-actions">
-            <button type="button" onClick={() => void app.refreshSecrets()} disabled={app.configBusy}>
-              Reload metadata
-            </button>
-            <button type="button" onClick={() => void app.loadSecretMetadata()} disabled={app.configBusy}>
-              Load selected metadata
-            </button>
-            <button type="button" onClick={() => void app.setSecretValue()} disabled={app.configBusy}>
-              Store or replace secret
-            </button>
-            <button type="button" onClick={() => void app.revealSecretValue()} disabled={app.configBusy}>
-              Explicit reveal
-            </button>
-            <button type="button" className="button--warn" onClick={() => void app.deleteSecretValue()} disabled={app.configBusy}>
-              Delete secret
-            </button>
-          </div>
-          {app.configSecretMetadata !== null && (
-            <div className="console-secret-metadata">
-              <p><strong>Created:</strong> {formatUnixMs(readNumber(app.configSecretMetadata, "created_at_unix_ms"))}</p>
-              <p><strong>Updated:</strong> {formatUnixMs(readNumber(app.configSecretMetadata, "updated_at_unix_ms"))}</p>
-              <p><strong>Value bytes:</strong> {readString(app.configSecretMetadata, "value_bytes") ?? "n/a"}</p>
-            </div>
-          )}
-          {app.configSecretReveal !== null && (
-            <>
-              <p><strong>Reveal result</strong></p>
-              <PrettyJsonBlock
-                value={app.configSecretReveal}
-                revealSensitiveValues={app.revealSensitiveValues}
-              />
-            </>
-          )}
-        </article>
-      </section>
+      <div className="workspace-inline">
+        {(["inspect", "validate", "mutate", "recover"] as const).map((tab) => (
+          <button key={tab} type="button" className={`workspace-tab-button${activeTab === tab ? " is-active" : ""}`} onClick={() => setActiveTab(tab)}>
+            {tab[0].toUpperCase() + tab.slice(1)}
+          </button>
+        ))}
+      </div>
 
-      <section className="console-grid-2">
-        <article className="console-subpanel">
-          <h3>Redacted config snapshot</h3>
-          {app.configInspectSnapshot === null ? (
-            <p>No config snapshot loaded.</p>
-          ) : (
-            <PrettyJsonBlock
-              value={app.configInspectSnapshot}
-              revealSensitiveValues={app.revealSensitiveValues}
-            />
-          )}
-        </article>
-        <article className="console-subpanel">
-          <h3>Secret metadata list</h3>
-          {app.configSecrets.length === 0 ? (
-            <p>No secret metadata loaded.</p>
-          ) : (
-            <div className="console-table-wrap">
-              <table className="console-table">
-                <thead>
-                  <tr>
-                    <th>Scope</th>
-                    <th>Key</th>
-                    <th>Updated</th>
-                    <th>Bytes</th>
-                    <th>Action</th>
+      {activeTab === "inspect" && (
+        <section className="workspace-two-column">
+          <WorkspaceSectionCard title="Inspect and migrate" description="Read the current document safely and keep migration as an explicit operator action.">
+            <div className="workspace-stack">
+              <div className="workspace-form-grid">
+                <label>Path<input value={app.configInspectPath} onChange={(event) => app.setConfigInspectPath(event.target.value)} /></label>
+                <label>Backups<input value={app.configBackups} onChange={(event) => app.setConfigBackups(event.target.value)} /></label>
+              </div>
+              <div className="workspace-inline">
+                <button type="button" onClick={() => void app.inspectConfigSurface()} disabled={app.configBusy}>Inspect</button>
+                <button type="button" className="secondary" onClick={() => void app.migrateConfigSurface()} disabled={app.configBusy}>Migrate</button>
+              </div>
+            </div>
+          </WorkspaceSectionCard>
+
+          <WorkspaceSectionCard title="Redacted snapshot" description="Document view stays redacted by default and no longer competes with secrets management on the same page.">
+            {app.configInspectSnapshot === null ? (
+              <WorkspaceEmptyState title="No snapshot loaded" description="Run inspect to load the current config document." compact />
+            ) : (
+              <PrettyJsonBlock value={app.configInspectSnapshot} revealSensitiveValues={app.revealSensitiveValues} />
+            )}
+          </WorkspaceSectionCard>
+        </section>
+      )}
+
+      {activeTab === "validate" && (
+        <section className="workspace-two-column">
+          <WorkspaceSectionCard title="Validation" description="Keep validation result obvious before any mutation or recovery step.">
+            <div className="workspace-inline">
+              <button type="button" onClick={() => void app.validateConfigSurface()} disabled={app.configBusy}>Validate</button>
+            </div>
+            <dl className="workspace-key-value-grid">
+              <div><dt>Status</dt><dd>{app.configValidation?.valid === true ? "valid" : app.configValidation === null ? "not loaded" : "needs review"}</dd></div>
+              <div><dt>Version</dt><dd>{readString(app.configValidation ?? {}, "config_version") ?? "n/a"}</dd></div>
+              <div><dt>Migrated from</dt><dd>{readString(app.configValidation ?? {}, "migrated_from_version") ?? "n/a"}</dd></div>
+              <div><dt>Path</dt><dd>{readString(app.configValidation ?? {}, "source_path") ?? app.configInspectPath}</dd></div>
+            </dl>
+          </WorkspaceSectionCard>
+
+          <WorkspaceSectionCard title="Validation payload" description="Raw payload stays secondary to the human-readable summary.">
+            {app.configValidation === null ? (
+              <WorkspaceEmptyState title="No validation payload" description="Run validate to load the backend validation result." compact />
+            ) : (
+              <PrettyJsonBlock value={app.configValidation} revealSensitiveValues={app.revealSensitiveValues} />
+            )}
+          </WorkspaceSectionCard>
+        </section>
+      )}
+
+      {activeTab === "mutate" && (
+        <section className="workspace-two-column">
+          <WorkspaceSectionCard title="Mutate config" description="Keep mutation small and explicit, with mode, key, and value separated from the rest of the page.">
+            <div className="workspace-stack">
+              <div className="workspace-form-grid">
+                <label>Mode<select value={app.configMutationMode} onChange={(event) => app.setConfigMutationMode(event.target.value === "unset" ? "unset" : "set")}><option value="set">set</option><option value="unset">unset</option></select></label>
+                <label>Key<input value={app.configMutationKey} onChange={(event) => app.setConfigMutationKey(event.target.value)} /></label>
+                <label>Value<input value={app.configMutationValue} onChange={(event) => app.setConfigMutationValue(event.target.value)} disabled={app.configMutationMode === "unset"} placeholder={app.configMutationMode === "unset" ? "Value unused for unset" : "\"value\""} /></label>
+              </div>
+              <div className="workspace-inline">
+                <button type="button" onClick={() => void app.mutateConfigSurface()} disabled={app.configBusy}>{app.configMutationMode === "unset" ? "Unset key" : "Apply mutation"}</button>
+              </div>
+            </div>
+          </WorkspaceSectionCard>
+
+          <WorkspaceSectionCard title="Mutation output" description="Review the last backend mutation and its redacted diff before moving on.">
+            <dl className="workspace-key-value-grid">
+              <div><dt>Operation</dt><dd>{readString(app.configLastMutation ?? {}, "operation") ?? "n/a"}</dd></div>
+              <div><dt>Changed key</dt><dd>{readString(app.configLastMutation ?? {}, "changed_key") ?? "n/a"}</dd></div>
+              <div><dt>Backups retained</dt><dd>{readString(app.configLastMutation ?? {}, "backups_retained") ?? "n/a"}</dd></div>
+              <div><dt>Updated</dt><dd>{readString(app.configLastMutation ?? {}, "source_path") ?? app.configInspectPath}</dd></div>
+            </dl>
+            {app.configDiffPreview !== null ? (
+              <pre className="workspace-code-panel"><code>{app.configDiffPreview}</code></pre>
+            ) : (
+              <WorkspaceEmptyState title="No diff preview" description="A redacted diff appears here after a mutation or migration." compact />
+            )}
+          </WorkspaceSectionCard>
+        </section>
+      )}
+
+      {activeTab === "recover" && (
+        <section className="workspace-two-column">
+          <WorkspaceSectionCard title="Recover from backup" description="Recovery stays visibly risky and grounded in the actual retained backup list.">
+            <div className="workspace-stack">
+              <div className="workspace-form-grid">
+                <label>Backup index<input value={app.configRecoverBackup} onChange={(event) => app.setConfigRecoverBackup(event.target.value)} /></label>
+                <label>Backups retained<input value={app.configBackups} onChange={(event) => app.setConfigBackups(event.target.value)} /></label>
+              </div>
+              <div className="workspace-inline">
+                <button type="button" className="button--warn" onClick={() => void app.recoverConfigSurface()} disabled={app.configBusy}>Recover backup</button>
+              </div>
+            </div>
+          </WorkspaceSectionCard>
+
+          <WorkspaceSectionCard title="Available backups" description="Use the published backup records instead of guessing restore targets.">
+            {backups.length === 0 ? (
+              <WorkspaceEmptyState title="No backups published" description="Inspect config with retained backups to populate recovery targets." compact />
+            ) : (
+              <WorkspaceTable ariaLabel="Config backups" columns={["Index", "Path", "Exists", "Updated"]}>
+                {backups.map((backup) => (
+                  <tr key={readString(backup, "path") ?? String(readNumber(backup, "index") ?? 0)}>
+                    <td>{readString(backup, "index") ?? "n/a"}</td>
+                    <td>{readString(backup, "path") ?? "n/a"}</td>
+                    <td>{readString(backup, "exists") ?? "n/a"}</td>
+                    <td>{formatUnixMs(readNumber(backup, "updated_at_unix_ms"))}</td>
                   </tr>
-                </thead>
-                <tbody>
-                  {app.configSecrets.map((entry) => {
-                    const scope = readString(entry, "scope") ?? "unknown";
-                    const key = readString(entry, "key") ?? "unknown";
-                    return (
-                      <tr key={`${scope}:${key}`}>
-                        <td>{scope}</td>
-                        <td>{key}</td>
-                        <td>{formatUnixMs(readNumber(entry, "updated_at_unix_ms"))}</td>
-                        <td>{readString(entry, "value_bytes") ?? "n/a"}</td>
-                        <td>
-                          <button type="button" className="secondary" onClick={() => app.setConfigSecretKey(key)}>
-                            Select
-                          </button>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </article>
-      </section>
-
-      {app.configValidation !== null && (
-        <section className="console-subpanel">
-          <h3>Validation payload</h3>
-          <PrettyJsonBlock
-            value={app.configValidation}
-            revealSensitiveValues={app.revealSensitiveValues}
-          />
+                ))}
+              </WorkspaceTable>
+            )}
+          </WorkspaceSectionCard>
         </section>
       )}
     </main>

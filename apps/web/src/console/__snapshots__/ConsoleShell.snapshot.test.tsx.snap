@@ -276,7 +276,7 @@ exports[`ConsoleShell snapshot coverage > renders deterministic shell navigation
                     <span
                       class="text-xs text-foreground-500"
                     >
-                      Product posture and capability exposure map
+                      Operational posture, risks, and next actions
                     </span>
                   </span>
                 </button>
@@ -641,7 +641,7 @@ exports[`ConsoleShell snapshot coverage > renders deterministic shell navigation
                 class="space-y-2"
               >
                 <button
-                  aria-label="OpenAI and Auth Profiles"
+                  aria-label="Profiles"
                   class="console-sidebar-button "
                   type="button"
                 >
@@ -676,17 +676,64 @@ exports[`ConsoleShell snapshot coverage > renders deterministic shell navigation
                     <span
                       class="text-sm font-semibold"
                     >
-                      OpenAI and Auth Profiles
+                      Profiles
                     </span>
                     <span
                       class="text-xs text-foreground-500"
                     >
-                      OpenAI and auth profile state
+                      Provider auth profiles and health posture
                     </span>
                   </span>
                 </button>
                 <button
-                  aria-label="Config and Secrets"
+                  aria-label="Access"
+                  class="console-sidebar-button "
+                  type="button"
+                >
+                  <span
+                    aria-hidden="true"
+                    class="flex h-10 w-10 items-center justify-center rounded-2xl border border-white/40 bg-white/60 text-slate-500 dark:border-white/10 dark:bg-slate-900/80 dark:text-slate-300"
+                  >
+                    <svg
+                      class="h-5 w-5"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      stroke-width="1.8"
+                      viewBox="0 0 24 24"
+                    >
+                      <path
+                        d="M8 12a4 4 0 0 1 8 0"
+                      />
+                      <path
+                        d="M8 12v4"
+                      />
+                      <path
+                        d="M16 12v4"
+                      />
+                      <path
+                        d="M6 19h12"
+                      />
+                    </svg>
+                  </span>
+                  <span
+                    class="flex flex-1 flex-col items-start text-left"
+                  >
+                    <span
+                      class="text-sm font-semibold"
+                    >
+                      Access
+                    </span>
+                    <span
+                      class="text-xs text-foreground-500"
+                    >
+                      Pairing lifecycle and remote access posture
+                    </span>
+                  </span>
+                </button>
+                <button
+                  aria-label="Config"
                   class="console-sidebar-button "
                   type="button"
                 >
@@ -728,64 +775,41 @@ exports[`ConsoleShell snapshot coverage > renders deterministic shell navigation
                     <span
                       class="text-sm font-semibold"
                     >
-                      Config and Secrets
+                      Config
                     </span>
                     <span
                       class="text-xs text-foreground-500"
                     >
-                      Config lifecycle and secrets controls
+                      Inspect, validate, mutate, and recover config
                     </span>
                   </span>
                 </button>
                 <button
-                  aria-label="Pairing and Gateway Access"
+                  aria-label="Secrets"
                   class="console-sidebar-button "
                   type="button"
                 >
                   <span
                     aria-hidden="true"
                     class="flex h-10 w-10 items-center justify-center rounded-2xl border border-white/40 bg-white/60 text-slate-500 dark:border-white/10 dark:bg-slate-900/80 dark:text-slate-300"
-                  >
-                    <svg
-                      class="h-5 w-5"
-                      fill="none"
-                      stroke="currentColor"
-                      stroke-linecap="round"
-                      stroke-linejoin="round"
-                      stroke-width="1.8"
-                      viewBox="0 0 24 24"
-                    >
-                      <path
-                        d="M8 12a4 4 0 0 1 8 0"
-                      />
-                      <path
-                        d="M8 12v4"
-                      />
-                      <path
-                        d="M16 12v4"
-                      />
-                      <path
-                        d="M6 19h12"
-                      />
-                    </svg>
-                  </span>
+                  />
                   <span
                     class="flex flex-1 flex-col items-start text-left"
                   >
                     <span
                       class="text-sm font-semibold"
                     >
-                      Pairing and Gateway Access
+                      Secrets
                     </span>
                     <span
                       class="text-xs text-foreground-500"
                     >
-                      Pairing lifecycle and remote access posture
+                      Vault-backed secret metadata and reveal flows
                     </span>
                   </span>
                 </button>
                 <button
-                  aria-label="Diagnostics and Audit"
+                  aria-label="Diagnostics"
                   class="console-sidebar-button "
                   type="button"
                 >
@@ -818,7 +842,7 @@ exports[`ConsoleShell snapshot coverage > renders deterministic shell navigation
                     <span
                       class="text-sm font-semibold"
                     >
-                      Diagnostics and Audit
+                      Diagnostics
                     </span>
                     <span
                       class="text-xs text-foreground-500"

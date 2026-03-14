@@ -65,19 +65,19 @@ describe("M54 web auth surface", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "OpenAI and Auth Profiles" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Profiles" }));
     expect(await screen.findByRole("heading", { name: "Connect via API key" })).toBeInTheDocument();
 
     fireEvent.change(screen.getAllByLabelText("Profile name")[0], {
       target: { value: "default-openai" }
     });
-    fireEvent.change(screen.getByLabelText("OpenAI API key"), {
+    fireEvent.change(screen.getByLabelText("API key"), {
       target: { value: "sk-test-key" }
     });
     await waitFor(() => {
-      expect(screen.getByRole("button", { name: "Connect API key" })).toBeEnabled();
+      expect(screen.getByRole("button", { name: "Create profile" })).toBeEnabled();
     });
-    fireEvent.click(screen.getByRole("button", { name: "Connect API key" }));
+    fireEvent.click(screen.getByRole("button", { name: "Create profile" }));
 
     await waitFor(() => {
       expect(screen.getByText("OpenAI API key stored.")).toBeInTheDocument();
@@ -125,18 +125,18 @@ describe("M54 web auth surface", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "OpenAI and Auth Profiles" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Profiles" }));
 
     fireEvent.change(screen.getAllByLabelText("Profile name")[0], {
       target: { value: "default-openai" }
     });
-    fireEvent.change(screen.getByLabelText("OpenAI API key"), {
+    fireEvent.change(screen.getByLabelText("API key"), {
       target: { value: "sk-invalid" }
     });
     await waitFor(() => {
-      expect(screen.getByRole("button", { name: "Connect API key" })).toBeEnabled();
+      expect(screen.getByRole("button", { name: "Create profile" })).toBeEnabled();
     });
-    fireEvent.click(screen.getByRole("button", { name: "Connect API key" }));
+    fireEvent.click(screen.getByRole("button", { name: "Create profile" }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "OpenAI API key rejected by provider validation."
@@ -223,16 +223,16 @@ describe("M54 web auth surface", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "OpenAI and Auth Profiles" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Profiles" }));
     expect(await screen.findByRole("heading", { name: "Connect via OAuth" })).toBeInTheDocument();
 
     fireEvent.change(screen.getAllByLabelText("Profile name")[1], {
       target: { value: "oauth-primary" }
     });
-    fireEvent.change(screen.getByLabelText("OAuth client_id"), {
+    fireEvent.change(screen.getByLabelText("Client id"), {
       target: { value: "client-id-1" }
     });
-    fireEvent.change(screen.getByLabelText("OAuth client_secret"), {
+    fireEvent.change(screen.getByLabelText("Client secret"), {
       target: { value: "client-secret-1" }
     });
     await waitFor(() => {
@@ -243,7 +243,7 @@ describe("M54 web auth surface", () => {
     await waitFor(() => {
       expect(window.open).toHaveBeenCalled();
     });
-    fireEvent.click(await screen.findByRole("button", { name: "Poll callback state" }));
+    fireEvent.click((await screen.findAllByRole("button", { name: "Poll callback" }))[0]);
 
     await waitFor(() => {
       expect(screen.getAllByText("OpenAI OAuth connected.").length).toBeGreaterThan(0);
@@ -308,22 +308,22 @@ describe("M54 web auth surface", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "OpenAI and Auth Profiles" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Profiles" }));
 
     fireEvent.change(screen.getAllByLabelText("Profile name")[1], {
       target: { value: "oauth-primary" }
     });
-    fireEvent.change(screen.getByLabelText("OAuth client_id"), {
+    fireEvent.change(screen.getByLabelText("Client id"), {
       target: { value: "client-id-1" }
     });
-    fireEvent.change(screen.getByLabelText("OAuth client_secret"), {
+    fireEvent.change(screen.getByLabelText("Client secret"), {
       target: { value: "client-secret-1" }
     });
     await waitFor(() => {
       expect(screen.getByRole("button", { name: "Start OpenAI OAuth" })).toBeEnabled();
     });
     fireEvent.click(screen.getByRole("button", { name: "Start OpenAI OAuth" }));
-    fireEvent.click(await screen.findByRole("button", { name: "Poll callback state" }));
+    fireEvent.click((await screen.findAllByRole("button", { name: "Poll callback" }))[0]);
 
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "OpenAI OAuth attempt expired before the callback completed."
@@ -480,10 +480,14 @@ describe("M54 web auth surface", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "OpenAI and Auth Profiles" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Profiles" }));
 
     expect((await screen.findAllByText("api-primary")).length).toBeGreaterThan(0);
     expect((await screen.findAllByText("oauth-primary")).length).toBeGreaterThan(0);
+
+    const oauthRow = screen.getByText("oauth-primary").closest("tr");
+    expect(oauthRow).not.toBeNull();
+    fireEvent.click(within(oauthRow!).getByRole("button", { name: "Inspect" }));
 
     fireEvent.click(screen.getByRole("button", { name: "Set as default" }));
     await waitFor(() => {
@@ -506,11 +510,8 @@ describe("M54 web auth surface", () => {
     expect(
       await screen.findByText("OpenAI OAuth window opened. Finish the authorization to complete the profile.")
     ).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Poll callback state" })).toBeInTheDocument();
-
-    const oauthCard = screen.getAllByText("oauth-primary")[0]?.closest("article");
-    expect(oauthCard).not.toBeNull();
-    fireEvent.click(within(oauthCard!).getByRole("button", { name: "Revoke" }));
+    expect(screen.getAllByRole("button", { name: "Poll callback" }).length).toBeGreaterThan(0);
+    fireEvent.click(screen.getByRole("button", { name: "Revoke" }));
     await waitFor(() => {
       expect(screen.getByText("OpenAI auth profile revoked.")).toBeInTheDocument();
     });

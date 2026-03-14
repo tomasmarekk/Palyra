@@ -41,6 +41,7 @@ export const AUTO_REFRESH_SECTION_TTL_MS: Partial<Record<Section, number>> = {
   memory: 10_000,
   skills: 10_000,
   config: 15_000,
+  secrets: 15_000,
   access: 10_000,
   operations: 10_000,
   support: 10_000
@@ -530,6 +531,9 @@ export function useConsoleAppState() {
     }
     if (section === "config") {
       void refreshConfigSurface();
+    }
+    if (section === "secrets") {
+      void refreshSecrets();
     }
     if (section === "operations") {
       void refreshAudit();

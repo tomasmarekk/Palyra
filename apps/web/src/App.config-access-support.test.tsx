@@ -88,18 +88,17 @@ describe("M56 config, access, and support surfaces", () => {
 
     render(<App />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Config and Secrets" }));
-    expect(await screen.findByRole("heading", { name: "Config and Secrets" })).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("button", { name: "Config" }));
+    expect(await screen.findByRole("heading", { name: "Config" })).toBeInTheDocument();
     await waitFor(() => {
       expect(document.body).toHaveTextContent(
         "Remote gateway exposure requires explicit verification and operator acknowledgement."
       );
     });
 
-    const keyInputs = screen.getAllByLabelText("Key");
-    const valueInputs = screen.getAllByLabelText("Value");
-    fireEvent.change(keyInputs[0], { target: { value: "model_provider.auth_profile_id" } });
-    fireEvent.change(valueInputs[0], { target: { value: "\"openai-rotated\"" } });
+    fireEvent.click(screen.getByRole("button", { name: "Mutate" }));
+    fireEvent.change(screen.getByLabelText("Key"), { target: { value: "model_provider.auth_profile_id" } });
+    fireEvent.change(screen.getByLabelText("Value"), { target: { value: "\"openai-rotated\"" } });
     fireEvent.click(screen.getByRole("button", { name: "Apply mutation" }));
 
     await waitFor(() => {
@@ -107,33 +106,36 @@ describe("M56 config, access, and support surfaces", () => {
     });
     expect(screen.getAllByText(/openai-rotated/).length).toBeGreaterThan(0);
 
+    fireEvent.click(screen.getByRole("button", { name: "Inspect" }));
     fireEvent.click(screen.getByRole("button", { name: "Migrate" }));
     await waitFor(() => {
       expect(screen.getByText("Config migration completed.")).toBeInTheDocument();
     });
 
+    fireEvent.click(screen.getByRole("button", { name: "Recover" }));
     fireEvent.click(screen.getByRole("button", { name: "Recover backup" }));
     await waitFor(() => {
       expect(screen.getByText("Recovered config from backup 1.")).toBeInTheDocument();
     });
 
-    fireEvent.change(keyInputs[1], { target: { value: "openai_api_key" } });
-    fireEvent.change(valueInputs[1], { target: { value: "sk-test-key" } });
-    fireEvent.click(screen.getByRole("button", { name: "Store or replace secret" }));
+    fireEvent.click(screen.getByRole("button", { name: "Secrets" }));
+    expect(await screen.findByRole("heading", { name: "Secrets" })).toBeInTheDocument();
+    fireEvent.change(screen.getAllByLabelText("Key")[0], { target: { value: "openai_api_key" } });
+    fireEvent.change(screen.getByLabelText("Value"), { target: { value: "sk-test-key" } });
+    fireEvent.click(screen.getByRole("button", { name: "Store secret" }));
     await waitFor(() => {
       expect(screen.getByText("Secret metadata refreshed.")).toBeInTheDocument();
     });
 
     fireEvent.click(screen.getByRole("button", { name: "Explicit reveal" }));
-    await waitFor(() => {
-      expect(document.body.textContent ?? "").toContain("[redacted]");
-    });
+    expect(screen.getByText("Sensitive / masked")).toBeInTheDocument();
     expect(screen.queryByText("sk-test-key")).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByLabelText("Reveal sensitive values"));
     expect(await screen.findByText(/sk-test-key/)).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "Delete secret" }));
+    fireEvent.click(screen.getAllByRole("button", { name: "Delete secret" })[0]);
+    fireEvent.click((await screen.findAllByRole("button", { name: "Delete secret" }))[1]);
     await waitFor(() => {
       expect(screen.getByText("Secret deleted.")).toBeInTheDocument();
     });
@@ -191,12 +193,10 @@ describe("M56 config, access, and support surfaces", () => {
 
     render(<App />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Pairing and Gateway Access" }));
-    expect(await screen.findByRole("heading", { name: "Pairing and Gateway Access" })).toBeInTheDocument();
-    const cliHandoffPanel = screen.getByRole("heading", { name: "Published CLI handoffs" }).closest("article");
-    expect(cliHandoffPanel).not.toBeNull();
-    expect(cliHandoffPanel).toHaveTextContent("dashboard-url --verify-remote");
-    expect(cliHandoffPanel).toHaveTextContent("tunnel --ssh");
+    fireEvent.click(await screen.findByRole("button", { name: "Access" }));
+    expect(await screen.findByRole("heading", { name: "Access" })).toBeInTheDocument();
+    expect(document.body).toHaveTextContent("dashboard-url --verify-remote");
+    expect(document.body).toHaveTextContent("tunnel --ssh");
 
     fireEvent.click(await screen.findByRole("button", { name: "Mint pairing code" }));
     await waitFor(() => {
@@ -231,20 +231,19 @@ describe("M56 config, access, and support surfaces", () => {
 
     render(<App />);
 
-    expect(await screen.findByRole("heading", { name: "Web Dashboard Operator Surface" })).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "CLI handoff surface" })).toBeInTheDocument();
-
     const cliHandoffs = capabilityCatalogFixture().capabilities.filter(
       (entry) => entry.dashboard_exposure === "cli_handoff"
     );
+    fireEvent.click(await screen.findByRole("button", { name: "Access" }));
     await waitFor(() => {
       expect(screen.getByText(cliHandoffs[0].cli_handoff_commands[0])).toBeInTheDocument();
     });
-    for (const capability of cliHandoffs) {
-      for (const command of capability.cli_handoff_commands) {
-        expect(screen.getByText(command)).toBeInTheDocument();
-      }
-    }
+    expect(screen.getByText(cliHandoffs[1].cli_handoff_commands[0])).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Diagnostics" }));
+    expect(await screen.findByText(cliHandoffs[2].cli_handoff_commands[0])).toBeInTheDocument();
+    expect(screen.getByText(cliHandoffs[3].cli_handoff_commands[0])).toBeInTheDocument();
+    expect(screen.getByText(cliHandoffs[3].cli_handoff_commands[1])).toBeInTheDocument();
 
     expect(screen.queryByText("Chat sessions and run status")).not.toBeInTheDocument();
   });

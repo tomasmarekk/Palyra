@@ -21,7 +21,7 @@ const SECTION_FALLBACK_BY_DOMAIN: Record<string, Section> = {
   pairing: "access",
   protocol: "operations",
   runtime: "operations",
-  secrets: "config",
+  secrets: "secrets",
   skills: "skills",
   support: "support"
 };

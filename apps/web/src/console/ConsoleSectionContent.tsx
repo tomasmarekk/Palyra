@@ -10,6 +10,7 @@ import { CronSection } from "./sections/CronSection";
 import { MemorySection } from "./sections/MemorySection";
 import { OperationsSection } from "./sections/OperationsSection";
 import { OverviewSection } from "./sections/OverviewSection";
+import { SecretsSection } from "./sections/SecretsSection";
 import { SkillsSection } from "./sections/SkillsSection";
 import { SupportSection } from "./sections/SupportSection";
 import type { ConsoleAppState } from "./useConsoleAppState";
@@ -49,6 +50,8 @@ export function ConsoleSectionContent({ app }: ConsoleSectionContentProps) {
       return <AuthSection app={app} />;
     case "config":
       return <ConfigSection app={app} />;
+    case "secrets":
+      return <SecretsSection app={app} />;
     case "access":
       return <AccessSection app={app} />;
     case "operations":

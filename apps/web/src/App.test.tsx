@@ -666,9 +666,9 @@ describe("M35 web console app", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "Diagnostics and Audit" }));
-    expect(await screen.findByRole("heading", { name: "Diagnostics and Audit" })).toBeInTheDocument();
-    expect(await screen.findByText("Browser service")).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("button", { name: "Diagnostics" }));
+    expect(await screen.findByRole("heading", { name: "Diagnostics" })).toBeInTheDocument();
+    expect((await screen.findAllByText("Browser service")).length).toBeGreaterThan(0);
     expect(findRequestCall(fetchMock, "/console/v1/diagnostics", "GET")).toBeDefined();
   });
 
@@ -696,8 +696,8 @@ describe("M35 web console app", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "Diagnostics and Audit" }));
-    expect(await screen.findByRole("heading", { name: "Diagnostics and Audit" })).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("button", { name: "Diagnostics" }));
+    expect(await screen.findByRole("heading", { name: "Diagnostics" })).toBeInTheDocument();
 
     await waitFor(() => {
       const rendered = document.body.textContent ?? "";
