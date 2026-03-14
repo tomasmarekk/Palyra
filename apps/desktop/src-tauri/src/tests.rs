@@ -25,6 +25,7 @@ use super::openai_auth::{
     OpenAiProfileActionRequest, OpenAiScopeInput,
 };
 use super::snapshot::{resolve_dashboard_access_target, OverallStatus};
+use super::supervisor::ConsolePayloadCache;
 use super::{
     build_desktop_refresh_payload, build_onboarding_status, build_snapshot_from_inputs,
     collect_redacted_errors, compute_backoff_ms, executable_file_name,
@@ -163,6 +164,7 @@ fn build_test_control_center(root: &Path) -> ControlCenter {
         browserd,
         http_client,
         console_session_cache: Arc::new(Mutex::new(None)),
+        console_payload_cache: Arc::new(Mutex::new(ConsolePayloadCache::default())),
         log_tx,
         log_rx,
         dropped_log_events: Arc::new(AtomicU64::new(0)),

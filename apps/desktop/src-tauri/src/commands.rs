@@ -19,8 +19,9 @@ use super::openai_auth::{
     OpenAiProfileActionRequest,
 };
 use super::snapshot::{
-    build_snapshot_from_inputs, run_support_bundle_export, sanitize_log_line, ActionResult,
-    ControlCenterSnapshot, DesktopSettingsSnapshot, SupportBundleExportResult,
+    build_dashboard_open_url, build_snapshot_from_inputs, run_support_bundle_export,
+    sanitize_log_line, ActionResult, ControlCenterSnapshot, DesktopSettingsSnapshot,
+    SupportBundleExportResult,
 };
 use super::{
     build_onboarding_status, ControlCenter, DesktopOnboardingStep, DiscordOnboardingRequest,
@@ -176,9 +177,12 @@ pub(crate) async fn restart_palyra(
 pub(crate) async fn open_dashboard(
     state: State<'_, DesktopAppState>,
 ) -> Result<ActionResult, String> {
-    let snapshot_inputs = {
+    let (snapshot_inputs, dashboard_open_inputs) = {
         let mut supervisor = state.supervisor.lock().await;
-        supervisor.capture_snapshot_inputs()
+        (
+            supervisor.capture_snapshot_inputs(),
+            supervisor.capture_dashboard_open_inputs(),
+        )
     };
     let snapshot = build_snapshot_from_inputs(snapshot_inputs).await.map_err(command_error)?;
     if snapshot.quick_facts.dashboard_access_mode == "local"
@@ -193,8 +197,16 @@ pub(crate) async fn open_dashboard(
         return Err(message);
     }
 
+    let dashboard_url = build_dashboard_open_url(
+        dashboard_open_inputs,
+        snapshot.quick_facts.dashboard_url.as_str(),
+        snapshot.quick_facts.dashboard_access_mode.as_str(),
+    )
+    .await
+    .map_err(command_error)?;
+
     let mut supervisor = state.supervisor.lock().await;
-    let url = supervisor.open_dashboard().map_err(|error| {
+    let url = supervisor.open_dashboard(dashboard_url.as_str()).map_err(|error| {
         let _ = supervisor
             .record_onboarding_failure(DesktopOnboardingStep::DashboardHandoff, error.to_string());
         command_error(error)

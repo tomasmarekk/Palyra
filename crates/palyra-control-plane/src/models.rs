@@ -474,6 +474,18 @@ pub struct ConsoleLoginRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsoleBrowserHandoffRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redirect_path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsoleBrowserHandoffEnvelope {
+    pub handoff_url: String,
+    pub expires_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigInspectRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,

@@ -37,6 +37,7 @@ pub(crate) struct AppState {
     pub(crate) grpc_url: String,
     pub(crate) scheduler_wake: Arc<Notify>,
     pub(crate) console_sessions: Arc<Mutex<HashMap<String, ConsoleSession>>>,
+    pub(crate) console_browser_handoffs: Arc<Mutex<HashMap<String, ConsoleBrowserHandoff>>>,
     pub(crate) openai_oauth_attempts: Arc<Mutex<HashMap<String, OpenAiOAuthAttempt>>>,
     pub(crate) relay_tokens: Arc<Mutex<HashMap<String, ConsoleRelayToken>>>,
     pub(crate) console_chat_streams: Arc<Mutex<HashMap<String, ConsoleChatRunStream>>>,
@@ -138,6 +139,14 @@ pub(crate) struct ConsoleSession {
     pub(crate) csrf_token: String,
     pub(crate) context: gateway::RequestContext,
     pub(crate) issued_at_unix_ms: i64,
+    pub(crate) expires_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ConsoleBrowserHandoff {
+    pub(crate) token_hash_sha256: String,
+    pub(crate) context: gateway::RequestContext,
+    pub(crate) redirect_path: String,
     pub(crate) expires_at_unix_ms: i64,
 }
 

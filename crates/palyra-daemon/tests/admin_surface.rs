@@ -32,6 +32,7 @@ fn admin_status_requires_token_and_context() -> Result<()> {
 
     let client = Client::builder()
         .timeout(Duration::from_secs(2))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("failed to build HTTP client")?;
     let url = format!("http://127.0.0.1:{admin_port}/admin/v1/status");
@@ -402,6 +403,76 @@ fn console_session_and_csrf_guards_are_enforced() -> Result<()> {
         200,
         "console logout should succeed with valid csrf token"
     );
+    Ok(())
+}
+
+#[test]
+fn console_browser_handoff_bootstraps_a_browser_session() -> Result<()> {
+    let (child, admin_port) = spawn_palyrad_with_bound_console_principal(CONSOLE_ADMIN_PRINCIPAL)?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("failed to build HTTP client")?;
+
+    let (cookie, csrf_token) = login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
+
+    let handoff_response = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/auth/browser-handoff"))
+        .header("Cookie", cookie.clone())
+        .header("x-palyra-csrf-token", csrf_token)
+        .json(&serde_json::json!({
+            "redirect_path": "/#/control/overview"
+        }))
+        .send()
+        .context("failed to create console browser handoff")?
+        .error_for_status()
+        .context("console browser handoff endpoint returned non-success status")?;
+    assert_admin_console_security_headers(handoff_response.headers())?;
+    let handoff = handoff_response
+        .json::<Value>()
+        .context("failed to parse console browser handoff response json")?;
+    let handoff_url = handoff
+        .get("handoff_url")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("browser handoff response missing handoff_url"))?;
+    let consume_client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("failed to build browser handoff consume client")?;
+    let bootstrap_response = consume_client
+        .get(handoff_url)
+        .send()
+        .context("failed to consume console browser handoff")?;
+    assert_eq!(
+        bootstrap_response.status().as_u16(),
+        303,
+        "console browser handoff should redirect into the dashboard"
+    );
+    assert_admin_console_security_headers(bootstrap_response.headers())?;
+    assert_eq!(
+        header_value(bootstrap_response.headers(), "location")?,
+        "/#/control/overview",
+        "browser handoff should keep the requested redirect path"
+    );
+    let handoff_cookie = header_value(bootstrap_response.headers(), "set-cookie")?
+        .split(';')
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("browser handoff set-cookie header missing cookie pair"))?
+        .to_owned();
+
+    let session_response = client
+        .get(format!("http://127.0.0.1:{admin_port}/console/v1/auth/session"))
+        .header("Cookie", handoff_cookie)
+        .send()
+        .context("failed to verify browser handoff session")?
+        .error_for_status()
+        .context("browser handoff session did not authorize console auth/session")?;
+    assert_admin_console_security_headers(session_response.headers())?;
+
     Ok(())
 }
 

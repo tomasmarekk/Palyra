@@ -1,4 +1,14 @@
+use crate::app::state::ConsoleBrowserHandoff;
 use crate::*;
+
+const CONSOLE_BROWSER_HANDOFF_TTL_MS: i64 = 60_000;
+const DEFAULT_CONSOLE_BROWSER_REDIRECT_PATH: &str = "/#/control/overview";
+const CONSOLE_BROWSER_HANDOFF_HOST: &str = "127.0.0.1";
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct ConsoleBrowserBootstrapQuery {
+    token: String,
+}
 
 pub(crate) async fn console_login_handler(
     State(state): State<AppState>,
@@ -82,42 +92,16 @@ pub(crate) async fn console_login_handler(
             "failed to read system clock: {error}"
         )))
     })?;
-    let expires_at_unix_ms = next_console_session_expiry_unix_ms(now);
-    let session_token = mint_console_secret_token();
-    let csrf_token = mint_console_secret_token();
-    let session = ConsoleSession {
-        session_token_hash_sha256: sha256_hex(session_token.as_bytes()),
-        csrf_token: csrf_token.clone(),
-        context,
-        issued_at_unix_ms: now,
-        expires_at_unix_ms,
-    };
-
-    {
-        let mut sessions = lock_console_sessions(&state.console_sessions);
-        sessions.retain(|_, existing| existing.expires_at_unix_ms > now);
-        if sessions.len() >= CONSOLE_MAX_ACTIVE_SESSIONS {
-            let mut oldest: Option<(String, i64)> = None;
-            for (session_hash, existing) in sessions.iter() {
-                if oldest
-                    .as_ref()
-                    .is_none_or(|(_, issued_at)| existing.issued_at_unix_ms < *issued_at)
-                {
-                    oldest = Some((session_hash.clone(), existing.issued_at_unix_ms));
-                }
-            }
-            if let Some((session_hash, _)) = oldest {
-                sessions.remove(session_hash.as_str());
-            }
-        }
-        sessions.insert(session.session_token_hash_sha256.clone(), session.clone());
-    }
+    let (session_token, session) = issue_console_session(&state, context, now);
 
     let secure_cookie = request_uses_tls(&headers);
     let mut response_headers = HeaderMap::new();
     response_headers
         .insert(SET_COOKIE, build_console_session_cookie(session_token.as_str(), secure_cookie)?);
-    Ok((response_headers, Json(build_console_session_response(&session, csrf_token))))
+    Ok((
+        response_headers,
+        Json(build_console_session_response(&session, session.csrf_token.clone())),
+    ))
 }
 
 pub(crate) async fn console_logout_handler(
@@ -132,6 +116,86 @@ pub(crate) async fn console_logout_handler(
     let mut response_headers = HeaderMap::new();
     response_headers.insert(SET_COOKIE, clear_console_session_cookie(request_uses_tls(&headers))?);
     Ok((response_headers, Json(json!({ "signed_out": true }))))
+}
+
+pub(crate) async fn console_browser_handoff_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<control_plane::ConsoleBrowserHandoffRequest>,
+) -> Result<Json<control_plane::ConsoleBrowserHandoffEnvelope>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    let redirect_path = normalize_console_browser_redirect_path(payload.redirect_path.as_deref())?;
+    let now = unix_ms_now().map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "failed to read system clock: {error}"
+        )))
+    })?;
+    let expires_at_unix_ms = now.saturating_add(CONSOLE_BROWSER_HANDOFF_TTL_MS);
+    let handoff_token = mint_console_secret_token();
+    let handoff = ConsoleBrowserHandoff {
+        token_hash_sha256: sha256_hex(handoff_token.as_bytes()),
+        context: session.context.clone(),
+        redirect_path,
+        expires_at_unix_ms,
+    };
+
+    {
+        let mut handoffs = lock_console_browser_handoffs(&state.console_browser_handoffs);
+        handoffs.retain(|_, existing| existing.expires_at_unix_ms > now);
+        handoffs.insert(handoff.token_hash_sha256.clone(), handoff);
+    }
+
+    let handoff_url = format!(
+        "http://{CONSOLE_BROWSER_HANDOFF_HOST}:{}/console/v1/auth/browser-handoff/consume?token={handoff_token}",
+        state.deployment.admin_port
+    );
+    Ok(Json(control_plane::ConsoleBrowserHandoffEnvelope { handoff_url, expires_at_unix_ms }))
+}
+
+pub(crate) async fn console_browser_bootstrap_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ConsoleBrowserBootstrapQuery>,
+) -> Result<Response, Response> {
+    let token = query.token.trim();
+    if token.is_empty() {
+        return Err(runtime_status_response(tonic::Status::invalid_argument(
+            "browser handoff token is required",
+        )));
+    }
+    let now = unix_ms_now().map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "failed to read system clock: {error}"
+        )))
+    })?;
+    let handoff = {
+        let mut handoffs = lock_console_browser_handoffs(&state.console_browser_handoffs);
+        handoffs.retain(|_, existing| existing.expires_at_unix_ms > now);
+        handoffs.remove(sha256_hex(token.as_bytes()).as_str()).ok_or_else(|| {
+            runtime_status_response(tonic::Status::permission_denied(
+                "browser handoff token is invalid or expired",
+            ))
+        })?
+    };
+    let (session_token, _session) = issue_console_session(&state, handoff.context, now);
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response_headers.insert(
+        SET_COOKIE,
+        build_console_session_cookie(session_token.as_str(), request_uses_tls(&headers))?,
+    );
+    response_headers.insert(
+        "location",
+        HeaderValue::from_str(handoff.redirect_path.as_str()).map_err(|_| {
+            runtime_status_response(tonic::Status::invalid_argument(
+                "browser handoff redirect path contains unsupported characters",
+            ))
+        })?,
+    );
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::SEE_OTHER;
+    *response.headers_mut() = response_headers;
+    Ok(response)
 }
 
 pub(crate) async fn console_session_handler(
@@ -543,4 +607,72 @@ pub(crate) async fn console_openai_provider_default_profile_handler(
 ) -> Result<Json<control_plane::ProviderAuthActionEnvelope>, Response> {
     let session = authorize_console_session(&state, &headers, true)?;
     select_default_openai_auth_profile(&state, &session.context, payload).await.map(Json)
+}
+
+fn issue_console_session(
+    state: &AppState,
+    context: gateway::RequestContext,
+    now: i64,
+) -> (String, ConsoleSession) {
+    let expires_at_unix_ms = next_console_session_expiry_unix_ms(now);
+    let session_token = mint_console_secret_token();
+    let csrf_token = mint_console_secret_token();
+    let session = ConsoleSession {
+        session_token_hash_sha256: sha256_hex(session_token.as_bytes()),
+        csrf_token,
+        context,
+        issued_at_unix_ms: now,
+        expires_at_unix_ms,
+    };
+
+    {
+        let mut sessions = lock_console_sessions(&state.console_sessions);
+        sessions.retain(|_, existing| existing.expires_at_unix_ms > now);
+        if sessions.len() >= CONSOLE_MAX_ACTIVE_SESSIONS {
+            let mut oldest: Option<(String, i64)> = None;
+            for (session_hash, existing) in sessions.iter() {
+                if oldest
+                    .as_ref()
+                    .is_none_or(|(_, issued_at)| existing.issued_at_unix_ms < *issued_at)
+                {
+                    oldest = Some((session_hash.clone(), existing.issued_at_unix_ms));
+                }
+            }
+            if let Some((session_hash, _)) = oldest {
+                sessions.remove(session_hash.as_str());
+            }
+        }
+        sessions.insert(session.session_token_hash_sha256.clone(), session.clone());
+    }
+
+    (session_token, session)
+}
+
+#[allow(clippy::result_large_err)]
+fn normalize_console_browser_redirect_path(candidate: Option<&str>) -> Result<String, Response> {
+    let redirect_path = candidate
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_CONSOLE_BROWSER_REDIRECT_PATH);
+    if !redirect_path.starts_with('/') || redirect_path.starts_with("//") {
+        return Err(runtime_status_response(tonic::Status::invalid_argument(
+            "browser handoff redirect path must stay same-origin",
+        )));
+    }
+    if redirect_path.contains('\\') || redirect_path.contains('\r') || redirect_path.contains('\n')
+    {
+        return Err(runtime_status_response(tonic::Status::invalid_argument(
+            "browser handoff redirect path contains unsupported characters",
+        )));
+    }
+    Ok(redirect_path.to_owned())
+}
+
+fn lock_console_browser_handoffs<'a>(
+    handoffs: &'a Arc<Mutex<HashMap<String, ConsoleBrowserHandoff>>>,
+) -> std::sync::MutexGuard<'a, HashMap<String, ConsoleBrowserHandoff>> {
+    match handoffs.lock() {
+        Ok(guard) => guard,
+        Err(error) => error.into_inner(),
+    }
 }

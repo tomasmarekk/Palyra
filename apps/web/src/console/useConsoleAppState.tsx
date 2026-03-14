@@ -19,7 +19,7 @@ import { useConfigDomain } from "./hooks/useConfigDomain";
 import { useOverviewDomain } from "./hooks/useOverviewDomain";
 import { useSupportDomain } from "./hooks/useSupportDomain";
 import type { Section } from "./sectionMetadata";
-import { DEFAULT_CRON_FORM, type CronForm, type LoginForm } from "./stateTypes";
+import { DEFAULT_CRON_FORM, DEFAULT_LOGIN_FORM, type CronForm, type LoginForm } from "./stateTypes";
 import {
   emptyToUndefined,
   parseInteger,
@@ -85,12 +85,7 @@ export function useConsoleAppState() {
 
   const [loginBusy, setLoginBusy] = useState(false);
   const [logoutBusy, setLogoutBusy] = useState(false);
-  const [loginFormState, setLoginFormState] = useState<LoginForm>({
-    adminToken: "",
-    principal: "admin:web-console",
-    deviceId: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
-    channel: "web"
-  });
+  const [loginFormState, setLoginFormState] = useState<LoginForm>(() => ({ ...DEFAULT_LOGIN_FORM }));
   const loginForm: LoginForm = loginFormState;
   const setLoginForm: Dispatch<SetStateAction<LoginForm>> = setLoginFormState;
 

@@ -87,6 +87,21 @@ function fallbackText(value: string | null): string {
   return value;
 }
 
+function collectAttentionItems(snapshot: ControlCenterSnapshot): string[] {
+  const unique = new Set<string>();
+  for (const item of [...snapshot.warnings, ...snapshot.diagnostics.errors]) {
+    const normalized = item.trim();
+    if (normalized.length === 0 || unique.has(normalized)) {
+      continue;
+    }
+    unique.add(normalized);
+    if (unique.size >= 5) {
+      break;
+    }
+  }
+  return [...unique];
+}
+
 function StatusCard({
   eyebrow,
   title,
@@ -118,10 +133,7 @@ export function App() {
   const [notice, setNotice] = useState<string | null>(null);
   const mainWindowShownRef = useRef(false);
 
-  const attentionItems = useMemo(() => {
-    const items = [...snapshot.warnings, ...snapshot.diagnostics.errors];
-    return items.slice(0, 5);
-  }, [snapshot]);
+  const attentionItems = useMemo(() => collectAttentionItems(snapshot), [snapshot]);
 
   const revealMainWindow = useEffectEvent(async () => {
     if (mainWindowShownRef.current || !isDesktopHostAvailable()) {

@@ -99,8 +99,8 @@ describe("M35 web console app", () => {
     expect(await screen.findByRole("heading", { name: "Operator Dashboard" })).toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText("Admin token"), { target: { value: "token-b" } });
-    fireEvent.change(screen.getByLabelText("Principal"), { target: { value: "admin:user-b" } });
-    fireEvent.change(screen.getByLabelText("Device ID"), { target: { value: "device-b" } });
+    fireEvent.change(screen.getByLabelText("Operator principal"), { target: { value: "admin:user-b" } });
+    fireEvent.change(screen.getByLabelText("Device label"), { target: { value: "device-b" } });
     fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
 
     expect(await screen.findByRole("heading", { name: "Web Dashboard Operator Surface" })).toBeInTheDocument();

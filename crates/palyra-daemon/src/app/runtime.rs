@@ -8,8 +8,9 @@ use std::{
 use tokio::sync::Notify;
 
 use super::state::{
-    AdminRateLimitEntry, AppState, CanvasRateLimitEntry, ConsoleChatRunStream, ConsoleRelayToken,
-    ConsoleSession, DeploymentRuntimeSnapshot, RemoteAdminAccessAttempt,
+    AdminRateLimitEntry, AppState, CanvasRateLimitEntry, ConsoleBrowserHandoff,
+    ConsoleChatRunStream, ConsoleRelayToken, ConsoleSession, DeploymentRuntimeSnapshot,
+    RemoteAdminAccessAttempt,
 };
 use crate::{
     channels,
@@ -51,6 +52,9 @@ pub(crate) fn build_app_state(
         grpc_url: context.grpc_url,
         scheduler_wake: context.scheduler_wake,
         console_sessions: Arc::new(Mutex::new(HashMap::<String, ConsoleSession>::new())),
+        console_browser_handoffs: Arc::new(Mutex::new(
+            HashMap::<String, ConsoleBrowserHandoff>::new(),
+        )),
         openai_oauth_attempts: Arc::new(Mutex::new(HashMap::new())),
         relay_tokens: Arc::new(Mutex::new(HashMap::<String, ConsoleRelayToken>::new())),
         console_chat_streams: Arc::new(Mutex::new(HashMap::<String, ConsoleChatRunStream>::new())),

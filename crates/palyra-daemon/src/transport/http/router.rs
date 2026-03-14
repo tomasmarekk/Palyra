@@ -116,6 +116,14 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/console/v1/auth/logout", post(console::auth::console_logout_handler))
         .route("/console/v1/auth/session", get(console::auth::console_session_handler))
         .route(
+            "/console/v1/auth/browser-handoff",
+            post(console::auth::console_browser_handoff_handler),
+        )
+        .route(
+            "/console/v1/auth/browser-handoff/consume",
+            get(console::auth::console_browser_bootstrap_handler),
+        )
+        .route(
             "/console/v1/control-plane/capabilities",
             get(console::auth::console_capability_catalog_handler),
         )

@@ -13,6 +13,7 @@ use std::{
 use anyhow::{bail, Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
@@ -162,6 +163,18 @@ pub(crate) struct ConsoleSessionCache {
     pub(crate) expires_at_unix_ms: i64,
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CachedConsolePayload {
+    pub(crate) payload: Option<Value>,
+    pub(crate) fetched_at_unix_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ConsolePayloadCache {
+    pub(crate) diagnostics: CachedConsolePayload,
+    pub(crate) discord: CachedConsolePayload,
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct ServiceProcessSnapshot {
     pub(crate) service: String,
@@ -198,6 +211,7 @@ pub(crate) struct ControlCenter {
     pub(crate) browserd: ManagedService,
     pub(crate) http_client: Client,
     pub(crate) console_session_cache: Arc<Mutex<Option<ConsoleSessionCache>>>,
+    pub(crate) console_payload_cache: Arc<Mutex<ConsolePayloadCache>>,
     pub(crate) log_tx: mpsc::Sender<LogEvent>,
     pub(crate) log_rx: mpsc::Receiver<LogEvent>,
     pub(crate) dropped_log_events: Arc<AtomicU64>,
@@ -252,6 +266,7 @@ impl ControlCenter {
             browserd,
             http_client,
             console_session_cache: Arc::new(Mutex::new(None)),
+            console_payload_cache: Arc::new(Mutex::new(ConsolePayloadCache::default())),
             log_tx,
             log_rx,
             dropped_log_events,
@@ -847,12 +862,10 @@ impl ControlCenter {
         combined
     }
 
-    pub(crate) fn open_dashboard(&self) -> Result<String> {
-        let url =
-            super::snapshot::resolve_dashboard_access_target(self.runtime.gateway_admin_port)?.url;
-        webbrowser::open(url.as_str())
+    pub(crate) fn open_dashboard(&self, url: &str) -> Result<String> {
+        webbrowser::open(url)
             .context("failed to open dashboard URL in default browser")?;
-        Ok(url)
+        Ok(url.to_owned())
     }
 }
 

@@ -30,13 +30,15 @@ export function ConsoleAuthScreen({
                 Operator Dashboard
               </h1>
               <p className="max-w-2xl text-sm leading-6 text-slate-600 dark:text-slate-300">
-                Sign in with an <code>admin:*</code> principal. Session cookie and CSRF remain
-                required for privileged actions.
+                Desktop Control Center can open this dashboard with an already bootstrapped local
+                session. If you landed here directly in a browser, you can still sign in manually
+                with your admin token. The advanced identity fields stay collapsed unless you are
+                troubleshooting a session mismatch.
               </p>
             </div>
           </div>
 
-          <form className="grid gap-4 md:grid-cols-2" onSubmit={(event) => void onSubmit(event)}>
+          <form className="space-y-5" onSubmit={(event) => void onSubmit(event)}>
             <label className="console-auth-field">
               <span>Admin token</span>
               <input
@@ -49,39 +51,61 @@ export function ConsoleAuthScreen({
                 }
               />
             </label>
-            <label className="console-auth-field">
-              <span>Principal</span>
-              <input
-                required
-                value={loginForm.principal}
-                onChange={(event) =>
-                  setLoginForm((previous) => ({ ...previous, principal: event.target.value }))
-                }
-              />
-            </label>
-            <label className="console-auth-field">
-              <span>Device ID</span>
-              <input
-                required
-                value={loginForm.deviceId}
-                onChange={(event) =>
-                  setLoginForm((previous) => ({ ...previous, deviceId: event.target.value }))
-                }
-              />
-            </label>
-            <label className="console-auth-field">
-              <span>Channel</span>
-              <input
-                value={loginForm.channel}
-                onChange={(event) =>
-                  setLoginForm((previous) => ({ ...previous, channel: event.target.value }))
-                }
-              />
-            </label>
-            <div className="col-span-full flex flex-wrap items-center justify-end gap-3 pt-2">
-              <Button type="button" variant="ghost" onPress={() => setLoginForm(DEFAULT_LOGIN_FORM)} isDisabled={loginBusy}>
-                Reset
+
+            <details className="rounded-2xl border border-white/15 bg-slate-950/30 px-4 py-3 text-sm text-slate-300">
+              <summary className="cursor-pointer list-none font-medium text-slate-100">
+                Advanced session identity
+              </summary>
+              <div className="mt-4 grid gap-4 md:grid-cols-2">
+                <label className="console-auth-field">
+                  <span>Operator principal</span>
+                  <input
+                    required
+                    value={loginForm.principal}
+                    onChange={(event) =>
+                      setLoginForm((previous) => ({ ...previous, principal: event.target.value }))
+                    }
+                  />
+                </label>
+                <label className="console-auth-field">
+                  <span>Device label</span>
+                  <input
+                    required
+                    value={loginForm.deviceId}
+                    onChange={(event) =>
+                      setLoginForm((previous) => ({ ...previous, deviceId: event.target.value }))
+                    }
+                  />
+                </label>
+                <label className="console-auth-field md:col-span-2">
+                  <span>Channel label</span>
+                  <input
+                    placeholder="Optional"
+                    value={loginForm.channel}
+                    onChange={(event) =>
+                      setLoginForm((previous) => ({ ...previous, channel: event.target.value }))
+                    }
+                  />
+                </label>
+              </div>
+            </details>
+
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-slate-300">
+              <p>
+                Manual browser sign-in still keeps the existing session cookie and CSRF guardrails
+                in place. Open from desktop for the shortest local path on a single machine.
+              </p>
+              <Button
+                type="button"
+                variant="ghost"
+                onPress={() => setLoginForm(DEFAULT_LOGIN_FORM)}
+                isDisabled={loginBusy}
+              >
+                Restore defaults
               </Button>
+            </div>
+
+            <div className="flex flex-wrap items-center justify-end gap-3 pt-1">
               <Button type="submit" variant="primary" isDisabled={loginBusy}>
                 {loginBusy ? "Signing in..." : "Sign in"}
               </Button>

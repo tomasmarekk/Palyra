@@ -25,10 +25,12 @@ use super::{
     LogLine, RuntimeConfig, ServiceKind, ServiceProcessSnapshot,
     CONSOLE_DEVICE_ID, CONSOLE_PRINCIPAL, DASHBOARD_SCHEME, LOOPBACK_HOST, MAX_DIAGNOSTIC_ERRORS,
 };
-use super::supervisor::ConsoleSessionCache;
+use super::supervisor::{CachedConsolePayload, ConsolePayloadCache, ConsoleSessionCache};
 
 const DEFAULT_DASHBOARD_HASH_ROUTE: &str = "#/control/overview";
 const CONSOLE_SESSION_EXPIRY_SKEW_MS: i64 = 5_000;
+const CONSOLE_PAYLOAD_CACHE_TTL_MS: i64 = 15_000;
+const CONSOLE_PAYLOAD_STALE_WARNING_MS: i64 = 60_000;
 
 #[derive(Debug, Serialize)]
 pub(crate) struct DiscordStatusSnapshot {
@@ -192,6 +194,13 @@ pub(crate) struct SupportBundleExportResult {
     pub(crate) command_output: String,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct DashboardOpenInputs {
+    pub(crate) runtime: RuntimeConfig,
+    pub(crate) admin_token: String,
+    pub(crate) http_client: Client,
+}
+
 #[derive(Debug)]
 pub(crate) struct SnapshotBuildInputs {
     pub(crate) runtime: RuntimeConfig,
@@ -205,6 +214,7 @@ pub(crate) struct SnapshotBuildInputs {
     pub(crate) logs: Vec<LogLine>,
     pub(crate) http_client: Client,
     pub(crate) console_session_cache: Arc<Mutex<Option<ConsoleSessionCache>>>,
+    pub(crate) console_payload_cache: Arc<Mutex<ConsolePayloadCache>>,
 }
 
 #[derive(Debug, Clone)]
@@ -238,6 +248,15 @@ impl ControlCenter {
             logs: self.collect_logs(),
             http_client: self.http_client.clone(),
             console_session_cache: Arc::clone(&self.console_session_cache),
+            console_payload_cache: Arc::clone(&self.console_payload_cache),
+        }
+    }
+
+    pub(crate) fn capture_dashboard_open_inputs(&self) -> DashboardOpenInputs {
+        DashboardOpenInputs {
+            runtime: self.runtime.clone(),
+            admin_token: self.admin_token.clone(),
+            http_client: self.http_client.clone(),
         }
     }
 
@@ -541,15 +560,44 @@ pub(crate) fn collect_redacted_errors_inner(
             }
         }
         Value::String(raw) => {
-            if key_context.is_some_and(is_error_like_key) {
+            if key_context.is_some_and(should_collect_operator_error_key) {
                 let sanitized = sanitize_log_line(raw.as_str());
-                if !sanitized.trim().is_empty() {
+                if !sanitized.trim().is_empty()
+                    && !is_internal_operator_diagnostic_label(
+                        key_context.unwrap_or_default(),
+                        sanitized.as_str(),
+                    )
+                {
                     out.push(sanitized);
                 }
             }
         }
         _ => {}
     }
+}
+
+fn should_collect_operator_error_key(key: &str) -> bool {
+    let lowered = key.to_ascii_lowercase();
+    if matches!(lowered.as_str(), "failure_class" | "failure_classes" | "recent_upload_failures_only")
+    {
+        return false;
+    }
+    is_error_like_key(key)
+}
+
+fn is_internal_operator_diagnostic_label(key: &str, value: &str) -> bool {
+    let lowered_key = key.trim().to_ascii_lowercase();
+    let lowered_value = value.trim().to_ascii_lowercase();
+    if lowered_key == "failure_class" {
+        return true;
+    }
+    matches!(
+        lowered_value.as_str(),
+        "config_failure"
+            | "product_failure"
+            | "upstream_provider_failure"
+            | "recent_upload_failures_only"
+    )
 }
 
 pub(crate) async fn build_snapshot_from_inputs(
@@ -567,6 +615,7 @@ pub(crate) async fn build_snapshot_from_inputs(
         logs,
         http_client,
         console_session_cache,
+        console_payload_cache,
     } = inputs;
     let mut warnings = Vec::new();
 
@@ -602,6 +651,7 @@ pub(crate) async fn build_snapshot_from_inputs(
         admin_token.as_str(),
         gateway_health.is_some(),
         console_session_cache.as_ref(),
+        console_payload_cache.as_ref(),
     )
     .await;
     warnings.extend(console_warnings);
@@ -699,6 +749,7 @@ async fn fetch_console_payloads(
     admin_token: &str,
     gateway_health_available: bool,
     console_session_cache: &Mutex<Option<ConsoleSessionCache>>,
+    console_payload_cache: &Mutex<ConsolePayloadCache>,
 ) -> (Option<Value>, Option<Value>, Vec<String>) {
     let mut warnings = Vec::new();
     if !gateway_health_available {
@@ -716,41 +767,150 @@ async fn fetch_console_payloads(
         }
     };
 
-    let diagnostics = match get_console_json_with_login_retry(
+    let diagnostics = match get_console_json_with_cache(
         &mut control_plane,
         admin_token,
-        "console/v1/diagnostics",
+        ConsolePayloadKind::Diagnostics,
         console_session_cache,
+        console_payload_cache,
     )
     .await
     {
-        Ok(value) => Some(value),
+        Ok(value) => value,
         Err(error) => {
-            warnings.push(format!(
-                "failed to fetch diagnostics payload: {}",
-                sanitize_log_line(error.to_string().as_str())
-            ));
+            warnings.push(error);
             None
         }
     };
 
-    let discord = match get_console_json_with_login_retry(
+    let discord = match get_console_json_with_cache(
         &mut control_plane,
         admin_token,
-        "console/v1/channels/discord%3Adefault",
+        ConsolePayloadKind::Discord,
         console_session_cache,
+        console_payload_cache,
     )
     .await
-    .with_context(|| "failed to fetch Discord connector status".to_owned())
     {
-        Ok(value) => Some(value),
+        Ok(value) => value,
         Err(error) => {
-            warnings.push(sanitize_log_line(error.to_string().as_str()));
+            warnings.push(error);
             None
         }
     };
 
     (diagnostics, discord, warnings)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ConsolePayloadKind {
+    Diagnostics,
+    Discord,
+}
+
+impl ConsolePayloadKind {
+    fn path(self) -> &'static str {
+        match self {
+            Self::Diagnostics => "console/v1/diagnostics",
+            Self::Discord => "console/v1/channels/discord%3Adefault",
+        }
+    }
+
+    fn failure_label(self) -> &'static str {
+        match self {
+            Self::Diagnostics => "failed to fetch diagnostics payload",
+            Self::Discord => "failed to fetch Discord connector status",
+        }
+    }
+}
+
+async fn get_console_json_with_cache(
+    control_plane: &mut ControlPlaneClient,
+    admin_token: &str,
+    kind: ConsolePayloadKind,
+    console_session_cache: &Mutex<Option<ConsoleSessionCache>>,
+    console_payload_cache: &Mutex<ConsolePayloadCache>,
+) -> Result<Option<Value>, String> {
+    if let Some(cached) = load_cached_console_payload(kind, console_payload_cache, CONSOLE_PAYLOAD_CACHE_TTL_MS)
+    {
+        return Ok(Some(cached));
+    }
+
+    match get_console_json_with_login_retry(
+        control_plane,
+        admin_token,
+        kind.path(),
+        console_session_cache,
+    )
+    .await
+    {
+        Ok(value) => {
+            store_cached_console_payload(kind, console_payload_cache, &value);
+            Ok(Some(value))
+        }
+        Err(error) => {
+            if let Some(cached) =
+                load_cached_console_payload(kind, console_payload_cache, CONSOLE_PAYLOAD_STALE_WARNING_MS)
+            {
+                return Ok(Some(cached));
+            }
+            Err(format!(
+                "{}: {}",
+                kind.failure_label(),
+                sanitize_log_line(error.to_string().as_str())
+            ))
+        }
+    }
+}
+
+fn load_cached_console_payload(
+    kind: ConsolePayloadKind,
+    console_payload_cache: &Mutex<ConsolePayloadCache>,
+    max_age_ms: i64,
+) -> Option<Value> {
+    let now = unix_ms_now();
+    let Ok(cache) = console_payload_cache.lock() else {
+        return None;
+    };
+    let cached = cached_console_payload_for_kind(&cache, kind)?;
+    let fetched_at_unix_ms = cached.fetched_at_unix_ms?;
+    if now.saturating_sub(fetched_at_unix_ms) > max_age_ms {
+        return None;
+    }
+    cached.payload.clone()
+}
+
+fn store_cached_console_payload(
+    kind: ConsolePayloadKind,
+    console_payload_cache: &Mutex<ConsolePayloadCache>,
+    value: &Value,
+) {
+    let Ok(mut cache) = console_payload_cache.lock() else {
+        return;
+    };
+    let cached = cached_console_payload_for_kind_mut(&mut cache, kind);
+    cached.payload = Some(value.clone());
+    cached.fetched_at_unix_ms = Some(unix_ms_now());
+}
+
+fn cached_console_payload_for_kind(
+    cache: &ConsolePayloadCache,
+    kind: ConsolePayloadKind,
+) -> Option<&CachedConsolePayload> {
+    match kind {
+        ConsolePayloadKind::Diagnostics => Some(&cache.diagnostics),
+        ConsolePayloadKind::Discord => Some(&cache.discord),
+    }
+}
+
+fn cached_console_payload_for_kind_mut(
+    cache: &mut ConsolePayloadCache,
+    kind: ConsolePayloadKind,
+) -> &mut CachedConsolePayload {
+    match kind {
+        ConsolePayloadKind::Diagnostics => &mut cache.diagnostics,
+        ConsolePayloadKind::Discord => &mut cache.discord,
+    }
 }
 
 pub(crate) fn build_control_plane_client(
@@ -781,6 +941,28 @@ pub(crate) async fn ensure_console_session_with_csrf(
         .map(|session| session.csrf_token)
 }
 
+pub(crate) async fn build_dashboard_open_url(
+    inputs: DashboardOpenInputs,
+    dashboard_url: &str,
+    dashboard_access_mode: &str,
+) -> Result<String> {
+    if !dashboard_access_mode.eq_ignore_ascii_case("local") {
+        return Ok(dashboard_url.to_owned());
+    }
+
+    let redirect_path = dashboard_redirect_path_from_url(dashboard_url)?;
+    let mut control_plane = build_control_plane_client(inputs.http_client.clone(), &inputs.runtime)?;
+    let _csrf_token =
+        ensure_console_session_with_csrf(&mut control_plane, inputs.admin_token.as_str()).await?;
+    let handoff = control_plane
+        .create_browser_handoff(&control_plane::ConsoleBrowserHandoffRequest {
+            redirect_path: Some(redirect_path),
+        })
+        .await
+        .map_err(|error| anyhow!("browser handoff bootstrap failed: {error}"))?;
+    Ok(handoff.handoff_url)
+}
+
 async fn request_console_session(
     control_plane: &mut ControlPlaneClient,
     admin_token: &str,
@@ -798,6 +980,33 @@ async fn request_console_session(
             .map_err(|error| anyhow!("console login failed: {error}")),
         Err(error) => Err(anyhow!("console session request failed: {error}")),
     }
+}
+
+fn dashboard_redirect_path_from_url(dashboard_url: &str) -> Result<String> {
+    let parsed = Url::parse(dashboard_url)
+        .with_context(|| format!("failed to parse dashboard URL {dashboard_url}"))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow!("dashboard URL is missing a host"))?;
+    if !host.eq_ignore_ascii_case(LOOPBACK_HOST) {
+        bail!("dashboard browser handoff only supports loopback dashboard URLs");
+    }
+    let mut redirect_path = parsed.path().to_owned();
+    if let Some(query) = parsed.query() {
+        redirect_path.push('?');
+        redirect_path.push_str(query);
+    }
+    if let Some(fragment) = parsed.fragment() {
+        redirect_path.push('#');
+        redirect_path.push_str(fragment);
+    }
+    if redirect_path.trim().is_empty() {
+        return Ok("/".to_owned());
+    }
+    if !redirect_path.starts_with('/') {
+        redirect_path.insert(0, '/');
+    }
+    Ok(redirect_path)
 }
 
 async fn fetch_console_json(
@@ -981,6 +1190,52 @@ fn support_bundle_inherited_env_keys() -> &'static [&'static str] {
 #[cfg(not(windows))]
 fn support_bundle_inherited_env_keys() -> &'static [&'static str] {
     &["PATH", "PALYRA_CONFIG", "HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "TMPDIR"]
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{collect_redacted_errors, dashboard_redirect_path_from_url};
+
+    #[test]
+    fn collect_redacted_errors_ignores_internal_failure_class_labels() {
+        let payload = json!({
+            "observability": {
+                "failure_classes": {
+                    "recent_upload_failures_only": "recent_upload_failures_only"
+                },
+                "recent_failures": [
+                    {
+                        "failure_class": "config_failure",
+                        "message": "console session bootstrap failed: request failed with HTTP 429"
+                    },
+                    {
+                        "failure_class": "product_failure",
+                        "message": "failed to fetch Discord connector status"
+                    }
+                ]
+            }
+        });
+
+        let errors = collect_redacted_errors(&payload, 10);
+
+        assert!(
+            errors.iter().all(|entry| !entry.ends_with("_failure")),
+            "failure class labels should stay out of operator-facing diagnostics: {errors:?}"
+        );
+        assert!(
+            errors.iter().any(|entry| entry.contains("HTTP 429")),
+            "operator-facing diagnostics should retain actionable messages: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn dashboard_redirect_path_from_url_preserves_hash_routes() {
+        let redirect_path = dashboard_redirect_path_from_url("http://127.0.0.1:7142/#/control/overview")
+            .expect("loopback dashboard URL should produce redirect path");
+        assert_eq!(redirect_path, "/#/control/overview");
+    }
 }
 
 pub(crate) fn is_error_like_key(key: &str) -> bool {

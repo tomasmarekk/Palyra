@@ -82,6 +82,14 @@ impl ControlPlaneClient {
         Ok(session)
     }
 
+    pub async fn create_browser_handoff(
+        &self,
+        request: &ConsoleBrowserHandoffRequest,
+    ) -> Result<ConsoleBrowserHandoffEnvelope, ControlPlaneClientError> {
+        self.request_json(Method::POST, "console/v1/auth/browser-handoff", Some(request), true)
+            .await
+    }
+
     pub async fn get_diagnostics(&self) -> Result<Value, ControlPlaneClientError> {
         self.request_json(Method::GET, "console/v1/diagnostics", None::<&Value>, false).await
     }

@@ -20,9 +20,9 @@ export type CronForm = {
 
 export const DEFAULT_LOGIN_FORM: LoginForm = {
   adminToken: "",
-  principal: "admin:web-console",
-  deviceId: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
-  channel: "web"
+  principal: "admin:local-browser",
+  deviceId: "local-browser",
+  channel: ""
 };
 
 export const DEFAULT_CRON_FORM: CronForm = {
