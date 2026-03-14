@@ -29,6 +29,39 @@ describe("M35 web console app", () => {
     expect(document.documentElement.style.colorScheme).toBe("dark");
   });
 
+  it("retries bootstrap session after a redirected desktop handoff", async () => {
+    window.localStorage.removeItem("palyra.console.theme");
+    const originalGetEntriesByType = window.performance.getEntriesByType.bind(window.performance);
+    vi.spyOn(window.performance, "getEntriesByType").mockImplementation((type: string) => {
+      if (type === "navigation") {
+        return [{ redirectCount: 1 } as unknown as PerformanceNavigationTiming];
+      }
+      return originalGetEntriesByType(type);
+    });
+
+    const fetchMock = createQueuedFetch([
+      jsonResponse({ error: "console session cookie is missing" }, 403),
+      jsonResponse({
+        principal: "admin:desktop-control-center",
+        device_id: "device-1",
+        csrf_token: "csrf-1",
+        issued_at_unix_ms: 100,
+        expires_at_unix_ms: 300
+      })
+    ]);
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", { name: "Web Dashboard Operator Surface" })
+    ).toBeInTheDocument();
+    const sessionCalls = fetchMock.mock.calls.filter(
+      (call) => requestUrl(call[0]) === "/console/v1/auth/session"
+    );
+    expect(sessionCalls).toHaveLength(2);
+  });
+
   it("clears operator-scoped state on sign-out before next sign-in refresh completes", async () => {
     let releaseUserBApprovals: (() => void) | undefined;
     const userBApprovalsReady = new Promise<void>((resolve) => {

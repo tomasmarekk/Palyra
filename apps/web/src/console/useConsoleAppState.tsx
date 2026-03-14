@@ -9,7 +9,7 @@ import {
   useState
 } from "react";
 
-import { ConsoleApiClient, type ConsoleSession, type JsonValue } from "../consoleApi";
+import { ConsoleApiClient, ControlPlaneApiError, type ConsoleSession, type JsonValue } from "../consoleApi";
 import { createChannelCoreDomain } from "../features/channels/core/domain";
 import { useChannelCoreState } from "../features/channels/core/useChannelCoreState";
 import { createDiscordChannelDomain } from "../features/channels/connectors/discord/domain";
@@ -47,6 +47,9 @@ export const AUTO_REFRESH_SECTION_TTL_MS: Partial<Record<Section, number>> = {
   support: 10_000
 };
 
+const BOOTSTRAP_SESSION_RETRY_DELAY_MS = 200;
+const BOOTSTRAP_SESSION_RETRY_ATTEMPTS = 4;
+
 export function shouldAutoRefreshSection(
   section: Section,
   lastRefreshedAt: number | null,
@@ -57,6 +60,53 @@ export function shouldAutoRefreshSection(
     return true;
   }
   return now - lastRefreshedAt >= ttlMs;
+}
+
+function navigationLikelyFollowedBrowserHandoff(): boolean {
+  if (typeof window === "undefined" || typeof performance === "undefined") {
+    return false;
+  }
+
+  const [entry] = performance.getEntriesByType("navigation") as PerformanceNavigationTiming[];
+  return (entry?.redirectCount ?? 0) > 0;
+}
+
+function shouldRetryBootstrapSession(
+  error: unknown,
+  attempt: number,
+  maxAttempts: number
+): boolean {
+  if (!(error instanceof ControlPlaneApiError)) {
+    return false;
+  }
+  if (attempt >= maxAttempts) {
+    return false;
+  }
+  return error.status === 401 || error.status === 403;
+}
+
+async function waitForBootstrapRetry(attempt: number): Promise<void> {
+  const delayMs = BOOTSTRAP_SESSION_RETRY_DELAY_MS * attempt;
+  await new Promise((resolve) => window.setTimeout(resolve, delayMs));
+}
+
+async function loadBootstrapSession(api: ConsoleApiClient): Promise<ConsoleSession> {
+  const maxAttempts = navigationLikelyFollowedBrowserHandoff()
+    ? BOOTSTRAP_SESSION_RETRY_ATTEMPTS
+    : 1;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await api.getSession();
+    } catch (error) {
+      if (!shouldRetryBootstrapSession(error, attempt, maxAttempts)) {
+        throw error;
+      }
+      await waitForBootstrapRetry(attempt);
+    }
+  }
+
+  throw new Error("Bootstrap session retry loop exhausted without returning a session.");
 }
 
 export function useConsoleAppState() {
@@ -449,7 +499,7 @@ export function useConsoleAppState() {
     const bootstrap = async () => {
       setBooting(true);
       try {
-        const current = await api.getSession();
+        const current = await loadBootstrapSession(api);
         if (cancelled) {
           return;
         }
