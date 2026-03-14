@@ -662,6 +662,7 @@ pub(crate) fn issue_console_session(
     (session_token, session)
 }
 
+#[allow(clippy::result_large_err)]
 pub(crate) fn consume_console_browser_handoff(
     state: &AppState,
     token: &str,
