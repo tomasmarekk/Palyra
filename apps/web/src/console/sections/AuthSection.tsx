@@ -1,6 +1,13 @@
 import { useState } from "react";
 
 import type { AuthHealthProfile, AuthProfileView } from "../../consoleApi";
+import {
+  ActionButton,
+  AppForm,
+  CheckboxField,
+  SelectField,
+  TextInputField
+} from "../components/ui";
 import { WorkspaceMetricCard, WorkspacePageHeader, WorkspaceSectionCard, WorkspaceStatusChip } from "../components/workspace/WorkspaceChrome";
 import { WorkspaceEmptyState, WorkspaceInlineNotice, WorkspaceRedactedValue, WorkspaceTable, workspaceToneForState } from "../components/workspace/WorkspacePatterns";
 import { formatUnixMs, readNumber, type JsonObject } from "../shared";
@@ -68,9 +75,9 @@ export function AuthSection({ app }: AuthSectionProps) {
           </>
         }
         actions={(
-          <button type="button" onClick={() => void app.refreshAuth()} disabled={app.authBusy}>
+          <ActionButton type="button" variant="primary" onPress={() => void app.refreshAuth()} isDisabled={app.authBusy}>
             {app.authBusy ? "Refreshing..." : "Refresh profiles"}
-          </button>
+          </ActionButton>
         )}
       />
 
@@ -97,7 +104,7 @@ export function AuthSection({ app }: AuthSectionProps) {
                       <td>{scopeLabel}</td>
                       <td>{profile.credential.type === "oauth" ? "OAuth" : "API key"}</td>
                       <td><div className="workspace-table__status"><WorkspaceStatusChip tone={workspaceToneForState(state)}>{state}</WorkspaceStatusChip></div></td>
-                      <td><div className="workspace-table__actions"><button type="button" className="secondary" onClick={() => setSelectedProfileId(profile.profile_id)}>Inspect</button></div></td>
+                      <td><div className="workspace-table__actions"><ActionButton aria-label={`Inspect ${profile.profile_name}`} type="button" variant="secondary" onPress={() => setSelectedProfileId(profile.profile_id)}>Inspect</ActionButton></div></td>
                     </tr>
                   );
                 })}
@@ -119,10 +126,10 @@ export function AuthSection({ app }: AuthSectionProps) {
             <WorkspaceInlineNotice title="OAuth callback" tone={workspaceToneForState(app.authOauthCallbackState?.state ?? "pending")}>
               <p>{app.authOauthCallbackState?.message ?? app.authActiveOauthAttempt.message}</p>
               <div className="workspace-inline">
-                <button type="button" className="secondary" onClick={() => app.openActiveOauthWindow()} disabled={app.authBusy}>Reopen authorization</button>
-                <button type="button" className="secondary" onClick={() => void app.checkOpenAiCallbackState(app.authActiveOauthAttempt?.attempt_id)} disabled={app.authPolling}>
+                <ActionButton type="button" variant="secondary" onPress={() => app.openActiveOauthWindow()} isDisabled={app.authBusy}>Reopen authorization</ActionButton>
+                <ActionButton type="button" variant="secondary" onPress={() => void app.checkOpenAiCallbackState(app.authActiveOauthAttempt?.attempt_id)} isDisabled={app.authPolling}>
                   {app.authPolling ? "Checking..." : "Poll callback"}
-                </button>
+                </ActionButton>
               </div>
             </WorkspaceInlineNotice>
           ) : null}
@@ -208,21 +215,17 @@ function SelectedProfileCard({ app, profile, health }: SelectedProfileCardProps)
 
       <div className="workspace-inline">
         {!isDefault && app.authProviderState?.default_selection_supported && (
-          <button type="button" className="secondary" onClick={() => void app.setOpenAiDefaultProfile(profile.profile_id)} disabled={app.authBusy}>
-            Set as default
-          </button>
+          <ActionButton type="button" variant="secondary" onPress={() => void app.setOpenAiDefaultProfile(profile.profile_id)} isDisabled={app.authBusy}>Set as default</ActionButton>
         )}
         {profile.credential.type === "oauth" ? (
           <>
-            <button type="button" className="secondary" onClick={() => void app.reconnectOpenAiProfile(profile.profile_id)} disabled={app.authBusy || !app.authProviderState?.reconnect_supported}>Reconnect</button>
-            <button type="button" className="secondary" onClick={() => void app.refreshOpenAiProfile(profile.profile_id)} disabled={app.authBusy}>Refresh token</button>
+            <ActionButton type="button" variant="secondary" onPress={() => void app.reconnectOpenAiProfile(profile.profile_id)} isDisabled={app.authBusy || !app.authProviderState?.reconnect_supported}>Reconnect</ActionButton>
+            <ActionButton type="button" variant="secondary" onPress={() => void app.refreshOpenAiProfile(profile.profile_id)} isDisabled={app.authBusy}>Refresh token</ActionButton>
           </>
         ) : (
-          <button type="button" className="secondary" onClick={() => app.prepareApiKeyRotation(profile)} disabled={app.authBusy}>Rotate API key</button>
+          <ActionButton type="button" variant="secondary" onPress={() => app.prepareApiKeyRotation(profile)} isDisabled={app.authBusy}>Rotate API key</ActionButton>
         )}
-        <button type="button" className="button--warn" onClick={() => void app.revokeOpenAiProfile(profile.profile_id)} disabled={app.authBusy || !app.authProviderState?.revoke_supported}>
-          Revoke
-        </button>
+        <ActionButton type="button" variant="danger" onPress={() => void app.revokeOpenAiProfile(profile.profile_id)} isDisabled={app.authBusy || !app.authProviderState?.revoke_supported}>Revoke</ActionButton>
       </div>
     </div>
   );
@@ -233,18 +236,18 @@ function ApiKeyForm({ app }: { app: AuthSectionProps["app"] }) {
     <WorkspaceSectionCard
       title={app.authApiKeyDraft.profileId.trim().length > 0 ? "Rotate API key" : "Connect via API key"}
       description={app.authApiKeyDraft.profileId.trim().length > 0 ? `Updating profile ${app.authApiKeyDraft.profileId}.` : "Create a new OpenAI auth profile backed by a Vault-stored API key."}
-      actions={app.authApiKeyDraft.profileId.trim().length > 0 ? <button type="button" className="secondary" onClick={() => app.cancelApiKeyRotation()} disabled={app.authBusy}>Cancel rotation</button> : undefined}
+      actions={app.authApiKeyDraft.profileId.trim().length > 0 ? <ActionButton type="button" variant="secondary" onPress={() => app.cancelApiKeyRotation()} isDisabled={app.authBusy}>Cancel rotation</ActionButton> : undefined}
     >
-      <form className="workspace-stack" onSubmit={(event) => { event.preventDefault(); void app.connectOpenAiApiKey(); }}>
+      <AppForm className="workspace-stack" onSubmit={(event) => { event.preventDefault(); void app.connectOpenAiApiKey(); }}>
         <div className="workspace-form-grid">
-          <label>Profile name<input value={app.authApiKeyDraft.profileName} onChange={(event) => app.setAuthApiKeyDraft((current) => ({ ...current, profileName: event.target.value }))} placeholder="default-openai" /></label>
-          <label>Scope<select value={app.authApiKeyDraft.scopeKind} onChange={(event) => app.setAuthApiKeyDraft((current) => ({ ...current, scopeKind: event.target.value === "agent" ? "agent" : "global" }))}><option value="global">global</option><option value="agent">agent</option></select></label>
-          <label className="console-checkbox-inline"><input type="checkbox" checked={app.authApiKeyDraft.setDefault} onChange={(event) => app.setAuthApiKeyDraft((current) => ({ ...current, setDefault: event.target.checked }))} />Set as default</label>
+          <TextInputField label="Profile name" value={app.authApiKeyDraft.profileName} onChange={(value) => app.setAuthApiKeyDraft((current) => ({ ...current, profileName: value }))} placeholder="default-openai" />
+          <SelectField label="Scope" value={app.authApiKeyDraft.scopeKind} onChange={(value) => app.setAuthApiKeyDraft((current) => ({ ...current, scopeKind: value === "agent" ? "agent" : "global" }))} options={[{ key: "global", label: "global" }, { key: "agent", label: "agent" }]} />
+          <CheckboxField checked={app.authApiKeyDraft.setDefault} label="Set as default" onChange={(checked) => app.setAuthApiKeyDraft((current) => ({ ...current, setDefault: checked }))} />
         </div>
-        {app.authApiKeyDraft.scopeKind === "agent" && <label>Agent id<input value={app.authApiKeyDraft.agentId} onChange={(event) => app.setAuthApiKeyDraft((current) => ({ ...current, agentId: event.target.value }))} /></label>}
-        <label>API key<input type="password" autoComplete="off" value={app.authApiKeyDraft.apiKey} onChange={(event) => app.setAuthApiKeyDraft((current) => ({ ...current, apiKey: event.target.value }))} /></label>
-        <div className="workspace-inline"><button type="submit" disabled={app.authBusy}>{app.authBusy ? "Submitting..." : app.authApiKeyDraft.profileId.trim().length > 0 ? "Rotate API key" : "Create profile"}</button></div>
-      </form>
+        {app.authApiKeyDraft.scopeKind === "agent" && <TextInputField label="Agent id" value={app.authApiKeyDraft.agentId} onChange={(value) => app.setAuthApiKeyDraft((current) => ({ ...current, agentId: value }))} />}
+        <TextInputField label="API key" type="password" autoComplete="off" value={app.authApiKeyDraft.apiKey} onChange={(value) => app.setAuthApiKeyDraft((current) => ({ ...current, apiKey: value }))} />
+        <div className="workspace-inline"><ActionButton type="submit" variant="primary" isDisabled={app.authBusy}>{app.authBusy ? "Submitting..." : app.authApiKeyDraft.profileId.trim().length > 0 ? "Rotate API key" : "Create profile"}</ActionButton></div>
+      </AppForm>
     </WorkspaceSectionCard>
   );
 }
@@ -252,24 +255,24 @@ function ApiKeyForm({ app }: { app: AuthSectionProps["app"] }) {
 function OAuthForm({ app }: { app: AuthSectionProps["app"] }) {
   return (
     <WorkspaceSectionCard title="Connect via OAuth" description="Bootstrap OAuth from the dashboard and keep callback state visible without exposing secrets.">
-      <form className="workspace-stack" onSubmit={(event) => { event.preventDefault(); void app.startOpenAiOAuth(); }}>
+      <AppForm className="workspace-stack" onSubmit={(event) => { event.preventDefault(); void app.startOpenAiOAuth(); }}>
         <div className="workspace-form-grid">
-          <label>Profile name<input value={app.authOAuthDraft.profileName} onChange={(event) => app.setAuthOAuthDraft((current) => ({ ...current, profileName: event.target.value }))} placeholder="default-openai-oauth" /></label>
-          <label>Scope<select value={app.authOAuthDraft.scopeKind} onChange={(event) => app.setAuthOAuthDraft((current) => ({ ...current, scopeKind: event.target.value === "agent" ? "agent" : "global" }))}><option value="global">global</option><option value="agent">agent</option></select></label>
-          <label className="console-checkbox-inline"><input type="checkbox" checked={app.authOAuthDraft.setDefault} onChange={(event) => app.setAuthOAuthDraft((current) => ({ ...current, setDefault: event.target.checked }))} />Set as default</label>
+          <TextInputField label="Profile name" value={app.authOAuthDraft.profileName} onChange={(value) => app.setAuthOAuthDraft((current) => ({ ...current, profileName: value }))} placeholder="default-openai-oauth" />
+          <SelectField label="Scope" value={app.authOAuthDraft.scopeKind} onChange={(value) => app.setAuthOAuthDraft((current) => ({ ...current, scopeKind: value === "agent" ? "agent" : "global" }))} options={[{ key: "global", label: "global" }, { key: "agent", label: "agent" }]} />
+          <CheckboxField checked={app.authOAuthDraft.setDefault} label="Set as default" onChange={(checked) => app.setAuthOAuthDraft((current) => ({ ...current, setDefault: checked }))} />
         </div>
-        {app.authOAuthDraft.scopeKind === "agent" && <label>Agent id<input value={app.authOAuthDraft.agentId} onChange={(event) => app.setAuthOAuthDraft((current) => ({ ...current, agentId: event.target.value }))} /></label>}
+        {app.authOAuthDraft.scopeKind === "agent" && <TextInputField label="Agent id" value={app.authOAuthDraft.agentId} onChange={(value) => app.setAuthOAuthDraft((current) => ({ ...current, agentId: value }))} />}
         <div className="workspace-form-grid">
-          <label>Client id<input value={app.authOAuthDraft.clientId} onChange={(event) => app.setAuthOAuthDraft((current) => ({ ...current, clientId: event.target.value }))} /></label>
-          <label>Client secret<input type="password" autoComplete="off" value={app.authOAuthDraft.clientSecret} onChange={(event) => app.setAuthOAuthDraft((current) => ({ ...current, clientSecret: event.target.value }))} /></label>
-          <label>Scopes<input value={app.authOAuthDraft.scopes} onChange={(event) => app.setAuthOAuthDraft((current) => ({ ...current, scopes: event.target.value }))} placeholder="openid profile email" /></label>
+          <TextInputField label="Client id" value={app.authOAuthDraft.clientId} onChange={(value) => app.setAuthOAuthDraft((current) => ({ ...current, clientId: value }))} />
+          <TextInputField label="Client secret" type="password" autoComplete="off" value={app.authOAuthDraft.clientSecret} onChange={(value) => app.setAuthOAuthDraft((current) => ({ ...current, clientSecret: value }))} />
+          <TextInputField label="Scopes" value={app.authOAuthDraft.scopes} onChange={(value) => app.setAuthOAuthDraft((current) => ({ ...current, scopes: value }))} placeholder="openid profile email" />
         </div>
         <div className="workspace-inline">
-          <button type="submit" disabled={app.authBusy}>{app.authBusy ? "Starting..." : "Start OpenAI OAuth"}</button>
-          {app.authActiveOauthAttempt !== null && <button type="button" className="secondary" onClick={() => app.openActiveOauthWindow()} disabled={app.authBusy}>Reopen authorization</button>}
-          {app.authActiveOauthAttempt !== null && <button type="button" className="secondary" onClick={() => void app.checkOpenAiCallbackState(app.authActiveOauthAttempt?.attempt_id)} disabled={app.authPolling}>{app.authPolling ? "Checking..." : "Poll callback"}</button>}
+          <ActionButton type="submit" variant="primary" isDisabled={app.authBusy}>{app.authBusy ? "Starting..." : "Start OpenAI OAuth"}</ActionButton>
+          {app.authActiveOauthAttempt !== null && <ActionButton type="button" variant="secondary" onPress={() => app.openActiveOauthWindow()} isDisabled={app.authBusy}>Reopen authorization</ActionButton>}
+          {app.authActiveOauthAttempt !== null && <ActionButton type="button" variant="secondary" onPress={() => void app.checkOpenAiCallbackState(app.authActiveOauthAttempt?.attempt_id)} isDisabled={app.authPolling}>{app.authPolling ? "Checking..." : "Poll callback"}</ActionButton>}
         </div>
-      </form>
+      </AppForm>
     </WorkspaceSectionCard>
   );
 }

@@ -1,5 +1,9 @@
 import { useState } from "react";
 
+import {
+  ActionButton,
+  TextInputField
+} from "../components/ui";
 import { WorkspaceMetricCard, WorkspacePageHeader, WorkspaceSectionCard, WorkspaceStatusChip } from "../components/workspace/WorkspaceChrome";
 import {
   WorkspaceConfirmDialog,
@@ -71,9 +75,9 @@ export function SecretsSection({ app }: SecretsSectionProps) {
           </>
         }
         actions={(
-          <button type="button" onClick={() => void app.refreshSecrets()} disabled={app.configBusy}>
+          <ActionButton type="button" variant="primary" onPress={() => void app.refreshSecrets()} isDisabled={app.configBusy}>
             {app.configBusy ? "Refreshing..." : "Refresh secrets"}
-          </button>
+          </ActionButton>
         )}
       />
 
@@ -103,13 +107,7 @@ export function SecretsSection({ app }: SecretsSectionProps) {
             title="Secret inventory"
             description="Pick a secret to inspect metadata or reveal it explicitly in the current session."
             actions={(
-              <label>
-                Scope
-                <input
-                  value={app.configSecretsScope}
-                  onChange={(event) => app.setConfigSecretsScope(event.target.value)}
-                />
-              </label>
+              <TextInputField label="Scope" value={app.configSecretsScope} onChange={app.setConfigSecretsScope} />
             )}
           >
             {app.configSecrets.length === 0 ? (
@@ -140,28 +138,18 @@ export function SecretsSection({ app }: SecretsSectionProps) {
                       <td>{readString(secret, "value_bytes") ?? "n/a"}</td>
                       <td>
                         <div className="workspace-table__actions">
-                          <button
-                            type="button"
-                            className="secondary"
-                            onClick={() => {
+                          <ActionButton type="button" variant="secondary" onPress={() => {
                               app.setConfigSecretKey(key);
                               void app.loadSecretMetadata();
-                            }}
-                            disabled={app.configBusy}
-                          >
+                            }} isDisabled={app.configBusy}>
                             Inspect
-                          </button>
-                          <button
-                            type="button"
-                            className="secondary"
-                            onClick={() => {
+                          </ActionButton>
+                          <ActionButton type="button" variant="secondary" onPress={() => {
                               app.setConfigSecretKey(key);
                               void app.revealSecretValue();
-                            }}
-                            disabled={app.configBusy}
-                          >
+                            }} isDisabled={app.configBusy}>
                             Reveal
-                          </button>
+                          </ActionButton>
                         </div>
                       </td>
                     </tr>
@@ -194,40 +182,13 @@ export function SecretsSection({ app }: SecretsSectionProps) {
             description="Metadata reads, writes, reveal, and delete all stay explicit on the selected key."
           >
             <div className="workspace-stack">
-              <label>
-                Key
-                <input
-                  value={app.configSecretKey}
-                  onChange={(event) => app.setConfigSecretKey(event.target.value)}
-                />
-              </label>
-              <label>
-                Value
-                <input
-                  type="password"
-                  autoComplete="off"
-                  value={app.configSecretValue}
-                  onChange={(event) => app.setConfigSecretValue(event.target.value)}
-                />
-              </label>
+              <TextInputField label="Key" value={app.configSecretKey} onChange={app.setConfigSecretKey} />
+              <TextInputField label="Value" type="password" autoComplete="off" value={app.configSecretValue} onChange={app.setConfigSecretValue} />
               <div className="workspace-inline">
-                <button type="button" onClick={() => void app.loadSecretMetadata()} disabled={app.configBusy}>
-                  Load metadata
-                </button>
-                <button type="button" onClick={() => void app.setSecretValue()} disabled={app.configBusy}>
-                  {app.configBusy ? "Working..." : "Store secret"}
-                </button>
-                <button type="button" className="secondary" onClick={() => void app.revealSecretValue()} disabled={app.configBusy}>
-                  Explicit reveal
-                </button>
-                <button
-                  type="button"
-                  className="button--warn"
-                  onClick={() => setConfirmingDelete(true)}
-                  disabled={app.configBusy || app.configSecretKey.trim().length === 0}
-                >
-                  Delete secret
-                </button>
+                <ActionButton type="button" variant="primary" onPress={() => void app.loadSecretMetadata()} isDisabled={app.configBusy}>Load metadata</ActionButton>
+                <ActionButton type="button" variant="primary" onPress={() => void app.setSecretValue()} isDisabled={app.configBusy}>{app.configBusy ? "Working..." : "Store secret"}</ActionButton>
+                <ActionButton type="button" variant="secondary" onPress={() => void app.revealSecretValue()} isDisabled={app.configBusy}>Explicit reveal</ActionButton>
+                <ActionButton type="button" variant="danger" onPress={() => setConfirmingDelete(true)} isDisabled={app.configBusy || app.configSecretKey.trim().length === 0}>Delete secret</ActionButton>
               </div>
             </div>
           </WorkspaceSectionCard>

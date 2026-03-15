@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "./App";
@@ -134,7 +134,7 @@ describe("M56 runtime and operations surfaces", () => {
     fireEvent.click(screen.getByRole("button", { name: "Cron" }));
     expect(await screen.findByRole("heading", { name: "Cron" })).toBeInTheDocument();
     expect((await screen.findAllByText("nightly")).length).toBeGreaterThan(0);
-    fireEvent.click(screen.getByRole("button", { name: "Run now" }));
+    fireEvent.click(screen.getByRole("button", { name: /Run .* now/ }));
     await waitFor(() => {
       expect(screen.getByText("Run-now dispatched.")).toBeInTheDocument();
     });
@@ -281,7 +281,8 @@ describe("M56 runtime and operations surfaces", () => {
     fireEvent.click(screen.getByRole("button", { name: "Search" }));
     expect(await screen.findByText(/paired sender prefers concise replies/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Purge memory" }));
-    fireEvent.click((await screen.findAllByRole("button", { name: "Purge memory" }))[1]);
+    const purgeDialog = await screen.findByRole("alertdialog", { name: "Purge memory" });
+    fireEvent.click(within(purgeDialog).getByRole("button", { name: "Purge memory" }));
     await waitFor(() => {
       expect(screen.getByText("Purged 1 memory item(s).")).toBeInTheDocument();
     });
@@ -298,12 +299,22 @@ describe("M56 runtime and operations surfaces", () => {
       expect(screen.getByText("Skill action 'audit' completed.")).toBeInTheDocument();
     });
     fireEvent.click(screen.getByRole("button", { name: "Quarantine" }));
-    fireEvent.click((await screen.findAllByRole("button", { name: "Quarantine skill" }))[0]);
+    fireEvent.click(
+      within(await screen.findByRole("alertdialog", { name: "Quarantine skill" })).getByRole(
+        "button",
+        { name: "Quarantine skill" }
+      )
+    );
     await waitFor(() => {
       expect(screen.getByText("Skill action 'quarantine' completed.")).toBeInTheDocument();
     });
     fireEvent.click(screen.getByRole("button", { name: "Enable" }));
-    fireEvent.click((await screen.findAllByRole("button", { name: "Enable skill" }))[0]);
+    fireEvent.click(
+      within(await screen.findByRole("alertdialog", { name: "Enable skill" })).getByRole(
+        "button",
+        { name: "Enable skill" }
+      )
+    );
     await waitFor(() => {
       expect(screen.getByText("Skill action 'enable' completed.")).toBeInTheDocument();
     });
@@ -317,18 +328,18 @@ describe("M56 runtime and operations surfaces", () => {
     });
 
     fireEvent.change(screen.getByLabelText("New name"), { target: { value: "Renamed Browser" } });
-    fireEvent.click(screen.getAllByRole("button", { name: "Select" })[0]);
+    fireEvent.click(screen.getAllByRole("button", { name: /^Select / })[0]);
     fireEvent.click(screen.getByRole("button", { name: "Rename profile" }));
     await waitFor(() => {
       expect(screen.getByText("Browser profile renamed.")).toBeInTheDocument();
     });
 
-    fireEvent.click(screen.getAllByRole("button", { name: "Activate" })[0]);
+    fireEvent.click(screen.getAllByRole("button", { name: /^Activate / })[0]);
     await waitFor(() => {
       expect(screen.getByText("Browser profile activated.")).toBeInTheDocument();
     });
 
-    fireEvent.click(screen.getAllByRole("button", { name: "Delete" })[1]);
+    fireEvent.click(screen.getAllByRole("button", { name: /^Delete / })[1]);
     await waitFor(() => {
       expect(screen.getByText("Browser profile deleted.")).toBeInTheDocument();
     });
@@ -453,10 +464,8 @@ describe("M56 runtime and operations surfaces", () => {
     expect((await screen.findAllByText("review-agent")).length).toBeGreaterThan(0);
     expect(await screen.findByText("state/agents/review-agent")).toBeInTheDocument();
 
-    const mainAgentButton = screen.getByText("Main Agent").closest("button");
-    expect(mainAgentButton).not.toBeNull();
-    fireEvent.click(mainAgentButton!);
-    fireEvent.click(await screen.findByRole("button", { name: "Set as default" }));
+    fireEvent.click((await screen.findAllByRole("button", { name: /^Inspect / }))[0]);
+    fireEvent.click(await screen.findByRole("button", { name: "Set Main Agent as default" }));
 
     await waitFor(() => {
       expect(screen.getByText("Default agent set to 'main'.")).toBeInTheDocument();

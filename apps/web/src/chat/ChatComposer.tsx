@@ -1,3 +1,10 @@
+import {
+  ActionButton,
+  ActionCluster,
+  AppForm,
+  TextAreaField
+} from "../console/components/ui";
+
 type ChatComposerProps = {
   composerText: string;
   setComposerText: (value: string) => void;
@@ -18,7 +25,7 @@ export function ChatComposer({
   clearTranscript
 }: ChatComposerProps) {
   return (
-    <form
+    <AppForm
       className="chat-composer"
       onSubmit={(event) => {
         event.preventDefault();
@@ -29,26 +36,33 @@ export function ChatComposer({
         <p className="workspace-kicker">Composer</p>
         <h4>Next operator instruction</h4>
       </div>
-      <label>
-        Message
-        <textarea
-          value={composerText}
-          onChange={(event) => setComposerText(event.target.value)}
-          rows={4}
-          placeholder="Describe what you want the assistant to do"
-        />
-      </label>
-      <div className="workspace-inline-actions">
-        <button type="submit" disabled={streaming || activeSessionId.trim().length === 0}>
+      <TextAreaField
+        label="Message"
+        placeholder="Describe what you want the assistant to do"
+        rows={4}
+        value={composerText}
+        onChange={setComposerText}
+      />
+      <ActionCluster>
+        <ActionButton
+          isDisabled={streaming || activeSessionId.trim().length === 0}
+          type="submit"
+          variant="primary"
+        >
           {streaming ? "Streaming..." : "Send"}
-        </button>
-        <button type="button" className="button--warn" onClick={cancelStreaming} disabled={!streaming}>
+        </ActionButton>
+        <ActionButton
+          isDisabled={!streaming}
+          type="button"
+          variant="danger"
+          onPress={cancelStreaming}
+        >
           Cancel stream
-        </button>
-        <button type="button" className="secondary" onClick={clearTranscript}>
+        </ActionButton>
+        <ActionButton type="button" variant="secondary" onPress={clearTranscript}>
           Clear local transcript
-        </button>
-      </div>
-    </form>
+        </ActionButton>
+      </ActionCluster>
+    </AppForm>
   );
 }

@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "./App";
@@ -138,7 +138,8 @@ describe("M56 config, access, and support surfaces", () => {
     expect(await screen.findByText(/sk-test-key/)).toBeInTheDocument();
 
     fireEvent.click(screen.getAllByRole("button", { name: "Delete secret" })[0]);
-    fireEvent.click((await screen.findAllByRole("button", { name: "Delete secret" }))[1]);
+    const deleteDialog = await screen.findByRole("alertdialog", { name: "Delete secret" });
+    fireEvent.click(within(deleteDialog).getByRole("button", { name: "Delete secret" }));
     await waitFor(() => {
       expect(screen.getByText("Secret deleted.")).toBeInTheDocument();
     });

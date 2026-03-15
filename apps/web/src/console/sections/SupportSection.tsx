@@ -1,6 +1,17 @@
-import { Button } from "@heroui/react";
-
-import { WorkspaceMetricCard, WorkspacePageHeader, WorkspaceSectionCard, WorkspaceStatusChip } from "../components/workspace/WorkspaceChrome";
+import {
+  ActionButton,
+  ActionCluster,
+  EmptyState,
+  EntityTable,
+  InlineNotice,
+  TextInputField
+} from "../components/ui";
+import {
+  WorkspaceMetricCard,
+  WorkspacePageHeader,
+  WorkspaceSectionCard,
+  WorkspaceStatusChip
+} from "../components/workspace/WorkspaceChrome";
 import {
   PrettyJsonBlock,
   formatUnixMs,
@@ -32,6 +43,12 @@ type SupportSectionProps = {
   >;
 };
 
+type SupportJobRow = {
+  jobId: string;
+  state: string;
+  requestedAt: string;
+};
+
 export function SupportSection({ app }: SupportSectionProps) {
   const deployment = app.supportDeployment ?? {};
   const warnings = toStringArray(Array.isArray(deployment.warnings) ? deployment.warnings : []);
@@ -43,6 +60,12 @@ export function SupportSection({ app }: SupportSectionProps) {
   const failedJobs = app.supportBundleJobs.filter((job) => readString(job, "state") === "failed");
   const providerAuthState = readString(providerAuth ?? {}, "state") ?? "unknown";
   const recoveryBacklog = readNumber(providerAuth ?? {}, "degraded_profiles") ?? 0;
+
+  const supportJobRows: SupportJobRow[] = app.supportBundleJobs.map((job) => ({
+    jobId: readString(job, "job_id") ?? "unknown",
+    state: readString(job, "state") ?? "unknown",
+    requestedAt: formatUnixMs(readUnixMillis(job, "requested_at_unix_ms"))
+  }));
 
   return (
     <main className="workspace-page">
@@ -65,13 +88,13 @@ export function SupportSection({ app }: SupportSectionProps) {
           </>
         }
         actions={
-          <Button
+          <ActionButton
             variant="secondary"
             onPress={() => void app.refreshSupport()}
             isDisabled={app.supportBusy}
           >
             {app.supportBusy ? "Refreshing..." : "Refresh support"}
-          </Button>
+          </ActionButton>
         }
       />
 
@@ -79,7 +102,11 @@ export function SupportSection({ app }: SupportSectionProps) {
         <WorkspaceMetricCard
           label="Support queue"
           value={app.supportBundleJobs.length}
-          detail={app.supportBundleJobs[0] === undefined ? "No queued jobs" : readString(app.supportBundleJobs[0], "state") ?? "unknown"}
+          detail={
+            app.supportBundleJobs[0] === undefined
+              ? "No queued jobs"
+              : readString(app.supportBundleJobs[0], "state") ?? "unknown"
+          }
           tone={failedJobs.length > 0 ? "warning" : "default"}
         />
         <WorkspaceMetricCard
@@ -95,8 +122,16 @@ export function SupportSection({ app }: SupportSectionProps) {
         />
         <WorkspaceMetricCard
           label="Latest failure"
-          value={latestFailure === null ? "None" : readString(latestFailure, "failure_class") ?? "Unknown"}
-          detail={latestFailure === null ? "No recent failure signal." : readString(latestFailure, "operation") ?? "Operation unavailable"}
+          value={
+            latestFailure === null
+              ? "None"
+              : readString(latestFailure, "failure_class") ?? "Unknown"
+          }
+          detail={
+            latestFailure === null
+              ? "No recent failure signal."
+              : readString(latestFailure, "operation") ?? "Operation unavailable"
+          }
           tone={latestFailure === null ? "default" : "warning"}
         />
       </section>
@@ -107,36 +142,34 @@ export function SupportSection({ app }: SupportSectionProps) {
           description="Support bundle work now lives here, with queue-backed execution that survives browser disconnects."
         >
           <div className="workspace-stack">
-            <div className="workspace-form-grid">
-              <label>
-                Retain jobs
-                <input
-                  value={app.supportBundleRetainJobs}
-                  onChange={(event) => app.setSupportBundleRetainJobs(event.target.value)}
-                />
-              </label>
-            </div>
-            <div className="console-inline-actions">
-              <Button onPress={() => void app.createSupportBundle()} isDisabled={app.supportBusy}>
+            <TextInputField
+              label="Retain jobs"
+              value={app.supportBundleRetainJobs}
+              onChange={app.setSupportBundleRetainJobs}
+            />
+            <ActionCluster>
+              <ActionButton
+                onPress={() => void app.createSupportBundle()}
+                isDisabled={app.supportBusy}
+              >
                 {app.supportBusy ? "Queueing..." : "Queue support bundle"}
-              </Button>
-              <Button variant="secondary" onPress={() => app.setSection("operations")}>
+              </ActionButton>
+              <ActionButton variant="secondary" onPress={() => app.setSection("operations")}>
                 Open diagnostics
-              </Button>
-              <Button variant="secondary" onPress={() => app.setSection("config")}>
+              </ActionButton>
+              <ActionButton variant="secondary" onPress={() => app.setSection("config")}>
                 Open config
-              </Button>
-            </div>
-            {warnings.length > 0 && (
-              <div className="workspace-callout workspace-callout--warning">
-                <p className="console-label">Current warnings</p>
+              </ActionButton>
+            </ActionCluster>
+            {warnings.length > 0 ? (
+              <InlineNotice title="Current warnings" tone="warning">
                 <ul className="console-compact-list">
                   {warnings.map((warning) => (
                     <li key={warning}>{warning}</li>
                   ))}
                 </ul>
-              </div>
-            )}
+              </InlineNotice>
+            ) : null}
           </div>
         </WorkspaceSectionCard>
 
@@ -145,18 +178,19 @@ export function SupportSection({ app }: SupportSectionProps) {
           description="Keep the latest failure classes and messages close to support actions."
         >
           {latestFailure === null ? (
-            <p className="chat-muted">No recent failures published by diagnostics.</p>
+            <EmptyState
+              compact
+              title="No recent failures"
+              description="No recent failures published by diagnostics."
+            />
           ) : (
             <div className="workspace-stack">
-              <div className="workspace-callout workspace-callout--danger">
-                <strong>{readString(latestFailure, "failure_class") ?? "Unknown failure"}</strong>
-                <p className="chat-muted">
-                  {readString(latestFailure, "operation") ?? "Operation unavailable"} ·{" "}
-                  {readString(latestFailure, "message_redacted") ??
-                    readString(latestFailure, "message") ??
-                    "No redacted message published."}
-                </p>
-              </div>
+              <InlineNotice title={readString(latestFailure, "failure_class") ?? "Unknown failure"} tone="danger">
+                {readString(latestFailure, "operation") ?? "Operation unavailable"} ·{" "}
+                {readString(latestFailure, "message_redacted") ??
+                  readString(latestFailure, "message") ??
+                  "No redacted message published."}
+              </InlineNotice>
               <PrettyJsonBlock
                 value={latestFailure}
                 revealSensitiveValues={app.revealSensitiveValues}
@@ -192,14 +226,14 @@ export function SupportSection({ app }: SupportSectionProps) {
               Recovery stays explicit: move into diagnostics for current failures or auth/config
               settings when profile posture needs operator intervention.
             </p>
-            <div className="console-inline-actions">
-              <Button variant="secondary" onPress={() => app.setSection("operations")}>
+            <ActionCluster>
+              <ActionButton variant="secondary" onPress={() => app.setSection("operations")}>
                 Open diagnostics
-              </Button>
-              <Button variant="secondary" onPress={() => app.setSection("auth")}>
+              </ActionButton>
+              <ActionButton variant="secondary" onPress={() => app.setSection("auth")}>
                 Open auth profiles
-              </Button>
-            </div>
+              </ActionButton>
+            </ActionCluster>
           </div>
         </WorkspaceSectionCard>
 
@@ -213,10 +247,9 @@ export function SupportSection({ app }: SupportSectionProps) {
               <li>Queue or load the latest support bundle job.</li>
               <li>Inspect diagnostics before changing config or auth posture.</li>
             </ol>
-            <div className="workspace-callout">
-              <p className="console-label">Reference</p>
-              <p className="chat-muted">docs/operations/observability-supportability-v1.md</p>
-            </div>
+            <InlineNotice title="Reference" tone="default">
+              docs/operations/observability-supportability-v1.md
+            </InlineNotice>
           </div>
         </WorkspaceSectionCard>
       </section>
@@ -226,72 +259,85 @@ export function SupportSection({ app }: SupportSectionProps) {
           title="Queued jobs"
           description="Support bundle jobs remain visible after completion so operators can verify output paths and failure reasons."
         >
-          {app.supportBundleJobs.length === 0 ? (
-            <p className="chat-muted">No support bundle jobs queued.</p>
-          ) : (
-            <div className="workspace-list">
-              {app.supportBundleJobs.map((job) => {
-                const jobId = readString(job, "job_id") ?? "unknown";
-                const state = readString(job, "state") ?? "unknown";
-                return (
-                  <article key={jobId} className="workspace-list-item">
-                    <div>
-                      <strong>{jobId}</strong>
-                      <p className="chat-muted">
-                        {state} · requested {formatUnixMs(readUnixMillis(job, "requested_at_unix_ms"))}
-                      </p>
-                    </div>
-                    <div className="workspace-inline">
-                      <WorkspaceStatusChip tone={state === "failed" ? "danger" : "default"}>
-                        {state}
-                      </WorkspaceStatusChip>
-                      <Button
-                        variant="secondary"
-                        size="sm"
-                        onPress={() => app.setSupportSelectedBundleJobId(jobId)}
-                      >
-                        Select
-                      </Button>
-                    </div>
-                  </article>
-                );
-              })}
-            </div>
-          )}
+          <EntityTable
+            ariaLabel="Support bundle jobs"
+            columns={[
+              {
+                key: "job",
+                label: "Job",
+                isRowHeader: true,
+                render: (row: SupportJobRow) => (
+                  <div className="workspace-stack">
+                    <strong>{row.jobId}</strong>
+                    <span className="chat-muted">requested {row.requestedAt}</span>
+                  </div>
+                )
+              },
+              {
+                key: "state",
+                label: "State",
+                render: (row: SupportJobRow) => (
+                  <WorkspaceStatusChip tone={row.state === "failed" ? "danger" : "default"}>
+                    {row.state}
+                  </WorkspaceStatusChip>
+                )
+              },
+              {
+                key: "actions",
+                label: "Actions",
+                align: "end",
+                render: (row: SupportJobRow) => (
+                  <ActionButton
+                    variant="secondary"
+                    size="sm"
+                    onPress={() => app.setSupportSelectedBundleJobId(row.jobId)}
+                  >
+                    Select
+                  </ActionButton>
+                )
+              }
+            ]}
+            rows={supportJobRows}
+            getRowId={(row) => row.jobId}
+            emptyTitle="No support bundle jobs queued"
+            emptyDescription="Queue a support bundle to inspect command output and artifact paths."
+          />
         </WorkspaceSectionCard>
 
         <WorkspaceSectionCard
           title="Selected job"
           description="Load command output, output path, and failure detail for the chosen support bundle job."
           actions={
-            <Button
+            <ActionButton
               variant="secondary"
               size="sm"
               onPress={() => void app.loadSupportBundleJob()}
               isDisabled={app.supportBusy}
             >
               {app.supportBusy ? "Loading..." : "Load job"}
-            </Button>
+            </ActionButton>
           }
         >
-          <div className="workspace-form-grid">
-            <label>
-              Job ID
-              <input
-                value={app.supportSelectedBundleJobId}
-                onChange={(event) => app.setSupportSelectedBundleJobId(event.target.value)}
-              />
-            </label>
-          </div>
-
-          {app.supportSelectedBundleJob === null ? (
-            <p className="chat-muted">No support bundle job selected.</p>
-          ) : (
-            <PrettyJsonBlock
-              value={app.supportSelectedBundleJob}
-              revealSensitiveValues={app.revealSensitiveValues}
+          <div className="workspace-stack">
+            <TextInputField
+              label="Job ID"
+              value={app.supportSelectedBundleJobId}
+              onChange={app.setSupportSelectedBundleJobId}
             />
-          )}
+
+            {app.supportSelectedBundleJob === null ? (
+              <EmptyState
+                compact
+                title="No support bundle job selected"
+                description="Select a job and load it to inspect details."
+              />
+            ) : (
+              <PrettyJsonBlock
+                value={app.supportSelectedBundleJob}
+                revealSensitiveValues={app.revealSensitiveValues}
+              />
+            )}
+          </div>
         </WorkspaceSectionCard>
       </section>
     </main>

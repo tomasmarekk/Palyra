@@ -1,8 +1,29 @@
 import { useState } from "react";
 
-import { WorkspaceMetricCard, WorkspacePageHeader, WorkspaceSectionCard, WorkspaceStatusChip } from "../components/workspace/WorkspaceChrome";
-import { WorkspaceConfirmDialog, WorkspaceEmptyState, WorkspaceInlineNotice, WorkspaceTable } from "../components/workspace/WorkspacePatterns";
-import { formatUnixMs, readNumber, readObject, readString, type JsonObject } from "../shared";
+import {
+  ActionButton,
+  CheckboxField,
+  TextInputField
+} from "../components/ui";
+import {
+  WorkspaceMetricCard,
+  WorkspacePageHeader,
+  WorkspaceSectionCard,
+  WorkspaceStatusChip
+} from "../components/workspace/WorkspaceChrome";
+import {
+  WorkspaceConfirmDialog,
+  WorkspaceEmptyState,
+  WorkspaceInlineNotice,
+  WorkspaceTable
+} from "../components/workspace/WorkspacePatterns";
+import {
+  formatUnixMs,
+  readNumber,
+  readObject,
+  readString,
+  type JsonObject
+} from "../shared";
 import type { ConsoleAppState } from "../useConsoleAppState";
 
 type MemorySectionProps = {
@@ -50,66 +71,71 @@ export function MemorySection({ app }: MemorySectionProps) {
             </WorkspaceStatusChip>
           </>
         }
-        actions={(
-          <button type="button" onClick={() => void app.refreshMemoryStatus()} disabled={app.memoryStatusBusy}>
+        actions={
+          <ActionButton
+            isDisabled={app.memoryStatusBusy}
+            type="button"
+            variant="primary"
+            onPress={() => void app.refreshMemoryStatus()}
+          >
             {app.memoryStatusBusy ? "Refreshing..." : "Refresh status"}
-          </button>
-        )}
+          </ActionButton>
+        }
       />
 
       <section className="workspace-metric-grid workspace-metric-grid--compact">
         <WorkspaceMetricCard
-          label="Stored items"
-          value={readNumber(usage ?? {}, "item_count") ?? readNumber(usage ?? {}, "entries") ?? 0}
           detail="Current retained memory entries visible to the maintenance surface."
-          tone={(readNumber(usage ?? {}, "item_count") ?? readNumber(usage ?? {}, "entries") ?? 0) > 0 ? "accent" : "default"}
+          label="Stored items"
+          tone={
+            (readNumber(usage ?? {}, "item_count") ?? readNumber(usage ?? {}, "entries") ?? 0) > 0
+              ? "accent"
+              : "default"
+          }
+          value={readNumber(usage ?? {}, "item_count") ?? readNumber(usage ?? {}, "entries") ?? 0}
         />
         <WorkspaceMetricCard
+          detail="Vector rows currently stored for hybrid retrieval."
           label="Vectors"
           value={readNumber(usage ?? {}, "vector_count") ?? 0}
-          detail="Vector rows currently stored for hybrid retrieval."
         />
         <WorkspaceMetricCard
+          detail="Retention policy remains visible so search and purge decisions stay grounded."
           label="Retention TTL"
           value={`${readNumber(retention ?? {}, "ttl_days") ?? 0} days`}
-          detail="Retention policy remains visible so search and purge decisions stay grounded."
         />
       </section>
 
       <section className="workspace-aside-grid">
         <div className="workspace-stack">
           <WorkspaceSectionCard
-            title="Search memory"
             description="Use a short query and optional channel scope to find relevant memory without needing internal retrieval jargon."
+            title="Search memory"
           >
             <form className="workspace-stack" onSubmit={(event) => void app.searchMemory(event)}>
               <div className="workspace-form-grid">
-                <label>
-                  Query
-                  <input
-                    value={app.memoryQuery}
-                    onChange={(event) => app.setMemoryQuery(event.target.value)}
-                  />
-                </label>
-                <label>
-                  Channel
-                  <input
-                    value={app.memoryChannel}
-                    onChange={(event) => app.setMemoryChannel(event.target.value)}
-                  />
-                </label>
+                <TextInputField
+                  label="Query"
+                  value={app.memoryQuery}
+                  onChange={app.setMemoryQuery}
+                />
+                <TextInputField
+                  label="Channel"
+                  value={app.memoryChannel}
+                  onChange={app.setMemoryChannel}
+                />
                 <div className="workspace-inline">
-                  <button type="submit" disabled={app.memoryBusy}>
+                  <ActionButton isDisabled={app.memoryBusy} type="submit" variant="primary">
                     {app.memoryBusy ? "Searching..." : "Search"}
-                  </button>
+                  </ActionButton>
                 </div>
               </div>
             </form>
 
             {app.memoryHits.length === 0 ? (
               <WorkspaceEmptyState
-                title="No memory hits loaded"
                 description="Search by query and optional channel to inspect what the current principal can retrieve."
+                title="No memory hits loaded"
               />
             ) : (
               <WorkspaceTable
@@ -122,12 +148,23 @@ export function MemorySection({ app }: MemorySectionProps) {
                       <div className="workspace-table__meta">
                         <strong>{readMemoryId(hit, index)}</strong>
                         <span className="chat-muted">
-                          {readString(hit, "session_id") ?? readString(readObject(hit, "item") ?? {}, "session_id") ?? "No session"}
+                          {readString(hit, "session_id") ??
+                            readString(readObject(hit, "item") ?? {}, "session_id") ??
+                            "No session"}
                         </span>
                       </div>
                     </td>
-                    <td>{readString(hit, "channel") ?? readString(readObject(hit, "item") ?? {}, "channel") ?? "n/a"}</td>
-                    <td>{readString(hit, "snippet") ?? readString(hit, "content") ?? readString(readObject(hit, "item") ?? {}, "content_text") ?? "No snippet"}</td>
+                    <td>
+                      {readString(hit, "channel") ??
+                        readString(readObject(hit, "item") ?? {}, "channel") ??
+                        "n/a"}
+                    </td>
+                    <td>
+                      {readString(hit, "snippet") ??
+                        readString(hit, "content") ??
+                        readString(readObject(hit, "item") ?? {}, "content_text") ??
+                        "No snippet"}
+                    </td>
                     <td>{formatScore(hit)}</td>
                   </tr>
                 ))}
@@ -138,14 +175,14 @@ export function MemorySection({ app }: MemorySectionProps) {
 
         <div className="workspace-stack">
           <WorkspaceSectionCard
-            title="Retention and maintenance"
             description="Keep maintenance timings and retention policy visible so purge stays a deliberate operational choice."
+            title="Retention and maintenance"
           >
             {app.memoryStatus === null ? (
               <WorkspaceEmptyState
-                title="No memory status loaded"
-                description="Refresh status to inspect current usage, TTL policy, and maintenance timing."
                 compact
+                description="Refresh status to inspect current usage, TTL policy, and maintenance timing."
+                title="No memory status loaded"
               />
             ) : (
               <dl className="workspace-key-value-grid">
@@ -170,7 +207,7 @@ export function MemorySection({ app }: MemorySectionProps) {
                   <dd>
                     {formatUnixMs(
                       readNumber(maintenance ?? {}, "last_vacuum_at_unix_ms") ??
-                      readNumber(app.memoryStatus, "last_vacuum_at_unix_ms")
+                        readNumber(app.memoryStatus, "last_vacuum_at_unix_ms")
                     )}
                   </dd>
                 </div>
@@ -183,43 +220,37 @@ export function MemorySection({ app }: MemorySectionProps) {
           </WorkspaceSectionCard>
 
           <WorkspaceSectionCard
-            title="Purge memory"
             description="Purge stays secondary and destructive. Narrow the scope when possible before choosing purge-all."
+            title="Purge memory"
           >
             <div className="workspace-stack">
               <div className="workspace-form-grid">
-                <label>
-                  Channel
-                  <input
-                    value={app.memoryPurgeChannel}
-                    onChange={(event) => app.setMemoryPurgeChannel(event.target.value)}
-                  />
-                </label>
-                <label>
-                  Session ID
-                  <input
-                    value={app.memoryPurgeSessionId}
-                    onChange={(event) => app.setMemoryPurgeSessionId(event.target.value)}
-                  />
-                </label>
-                <label className="console-checkbox-inline">
-                  <input
-                    type="checkbox"
-                    checked={app.memoryPurgeAll}
-                    onChange={(event) => app.setMemoryPurgeAll(event.target.checked)}
-                  />
-                  Purge all principal memory
-                </label>
+                <TextInputField
+                  label="Channel"
+                  value={app.memoryPurgeChannel}
+                  onChange={app.setMemoryPurgeChannel}
+                />
+                <TextInputField
+                  label="Session ID"
+                  value={app.memoryPurgeSessionId}
+                  onChange={app.setMemoryPurgeSessionId}
+                />
+                <CheckboxField
+                  checked={app.memoryPurgeAll}
+                  description="Delete all memory visible to the current principal."
+                  label="Purge all principal memory"
+                  onChange={app.setMemoryPurgeAll}
+                />
               </div>
               <div className="workspace-inline">
-                <button
+                <ActionButton
+                  isDisabled={app.memoryBusy}
                   type="button"
-                  className="button--warn"
-                  onClick={() => setConfirmingPurge(true)}
-                  disabled={app.memoryBusy}
+                  variant="danger"
+                  onPress={() => setConfirmingPurge(true)}
                 >
                   {app.memoryBusy ? "Purging..." : "Purge memory"}
-                </button>
+                </ActionButton>
               </div>
             </div>
           </WorkspaceSectionCard>
@@ -234,21 +265,21 @@ export function MemorySection({ app }: MemorySectionProps) {
       </section>
 
       <WorkspaceConfirmDialog
+        isBusy={app.memoryBusy}
         isOpen={confirmingPurge}
-        onOpenChange={setConfirmingPurge}
-        title="Purge memory"
+        confirmLabel="Purge memory"
+        confirmTone="danger"
         description={
           app.memoryPurgeAll
             ? "Delete all memory for the current principal? This is the broadest purge path."
             : `Delete memory for channel ${app.memoryPurgeChannel || "n/a"} and session ${app.memoryPurgeSessionId || "n/a"}?`
         }
-        confirmLabel="Purge memory"
-        confirmTone="danger"
-        isBusy={app.memoryBusy}
+        title="Purge memory"
         onConfirm={() => {
           setConfirmingPurge(false);
           void app.purgeMemory();
         }}
+        onOpenChange={setConfirmingPurge}
       />
     </main>
   );
@@ -263,6 +294,7 @@ function readMemoryId(hit: JsonObject, index: number): string {
 }
 
 function formatScore(hit: JsonObject): string {
-  const score = readNumber(hit, "score") ?? readNumber(readObject(hit, "breakdown") ?? {}, "final_score");
+  const score =
+    readNumber(hit, "score") ?? readNumber(readObject(hit, "breakdown") ?? {}, "final_score");
   return score === null ? "n/a" : score.toFixed(2);
 }

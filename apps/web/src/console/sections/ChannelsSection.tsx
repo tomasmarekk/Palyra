@@ -1,9 +1,24 @@
-import { Button } from "@heroui/react";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 
 import { DiscordOnboardingPanel } from "../../features/channels/connectors/discord/components/DiscordOnboardingPanel";
 import { DiscordConnectorActionsPanel } from "../../features/channels/connectors/discord/components/DiscordConnectorActionsPanel";
-import { WorkspaceMetricCard, WorkspacePageHeader, WorkspaceSectionCard, WorkspaceStatusChip } from "../components/workspace/WorkspaceChrome";
+import {
+  ActionButton,
+  ActionCluster,
+  AppForm,
+  CheckboxField,
+  EmptyState,
+  EntityTable,
+  InlineNotice,
+  KeyValueList,
+  TextInputField
+} from "../components/ui";
+import {
+  WorkspaceMetricCard,
+  WorkspacePageHeader,
+  WorkspaceSectionCard,
+  WorkspaceStatusChip
+} from "../components/workspace/WorkspaceChrome";
 import {
   PrettyJsonBlock,
   channelConnectorAvailability,
@@ -15,6 +30,27 @@ import {
 import type { ConsoleAppState } from "../useConsoleAppState";
 
 type ChannelsTab = "connectors" | "router" | "discord";
+
+type ConnectorRow = {
+  connector: JsonObject;
+  connectorId: string;
+  connectorKind: string;
+  enabled: boolean;
+  readiness: string;
+  availability: string;
+  isSelected: boolean;
+};
+
+type DeadLetterRow = {
+  deadLetterId: number;
+};
+
+type PairingRow = {
+  id: string;
+  channel: string;
+  principal: string;
+  status: string;
+};
 
 export function ChannelsSection({ app }: { app: ConsoleAppState }) {
   const [activeTab, setActiveTab] = useState<ChannelsTab>("connectors");
@@ -30,7 +66,55 @@ export function ChannelsSection({ app }: { app: ConsoleAppState }) {
     selectedOperations !== null ? readObject(selectedOperations, "discord") : null;
   const selectedHealthRefresh = readObject(selectedStatusPayload, "health_refresh");
   const selectedConnectorKind = readString(selectedConnector, "kind");
-  const enabledConnectors = app.channelsConnectors.filter((connector) => readBool(connector, "enabled"));
+  const enabledConnectors = app.channelsConnectors.filter((connector) =>
+    readBool(connector, "enabled")
+  );
+
+  const connectorRows = useMemo<ConnectorRow[]>(
+    () =>
+      app.channelsConnectors.map((connector) => {
+        const connectorId = readString(connector, "connector_id") ?? "unknown";
+        return {
+          connector,
+          connectorId,
+          connectorKind: readString(connector, "kind") ?? "unknown kind",
+          enabled: readBool(connector, "enabled"),
+          readiness: readString(connector, "readiness") ?? "readiness n/a",
+          availability: channelConnectorAvailability(connector),
+          isSelected: connectorId === app.channelsSelectedConnectorId
+        };
+      }),
+    [app.channelsConnectors, app.channelsSelectedConnectorId]
+  );
+
+  const deadLetterRows = useMemo<DeadLetterRow[]>(
+    () =>
+      app.channelsDeadLetters.flatMap((deadLetter) => {
+        const deadLetterId =
+          typeof deadLetter.dead_letter_id === "number"
+            ? deadLetter.dead_letter_id
+            : Number(deadLetter.dead_letter_id ?? Number.NaN);
+        return Number.isFinite(deadLetterId) ? [{ deadLetterId }] : [];
+      }),
+    [app.channelsDeadLetters]
+  );
+
+  const pairingRows = useMemo<PairingRow[]>(
+    () =>
+      app.channelRouterPairings.map((pairing, index) => {
+        const record = asJsonObject(pairing);
+        return {
+          id:
+            readString(record, "pairing_id") ??
+            readString(record, "principal") ??
+            `pairing-${index}`,
+          channel: readString(record, "channel") ?? readString(record, "channel_id") ?? "n/a",
+          principal: readString(record, "principal") ?? readString(record, "user_id") ?? "n/a",
+          status: readString(record, "status") ?? "unknown"
+        };
+      }),
+    [app.channelRouterPairings]
+  );
 
   return (
     <main className="workspace-page">
@@ -43,7 +127,9 @@ export function ChannelsSection({ app }: { app: ConsoleAppState }) {
             <WorkspaceStatusChip tone={enabledConnectors.length > 0 ? "success" : "default"}>
               {enabledConnectors.length} enabled
             </WorkspaceStatusChip>
-            <WorkspaceStatusChip tone={app.channelRouterWarnings.length > 0 ? "warning" : "success"}>
+            <WorkspaceStatusChip
+              tone={app.channelRouterWarnings.length > 0 ? "warning" : "success"}
+            >
               {app.channelRouterWarnings.length} router warnings
             </WorkspaceStatusChip>
             <WorkspaceStatusChip tone={app.discordWizardBusy ? "warning" : "default"}>
@@ -52,13 +138,13 @@ export function ChannelsSection({ app }: { app: ConsoleAppState }) {
           </>
         }
         actions={
-          <Button
+          <ActionButton
             variant="secondary"
             onPress={() => void app.refreshChannels()}
             isDisabled={app.channelsBusy}
           >
             {app.channelsBusy ? "Refreshing..." : "Refresh channels"}
-          </Button>
+          </ActionButton>
         }
       />
 
@@ -81,40 +167,49 @@ export function ChannelsSection({ app }: { app: ConsoleAppState }) {
         <WorkspaceMetricCard
           label="Router pairings"
           value={app.channelRouterPairings.length}
-          detail={app.channelRouterMintResult === null ? "No fresh pairing code minted." : "Latest mint result available."}
+          detail={
+            app.channelRouterMintResult === null
+              ? "No fresh pairing code minted."
+              : "Latest mint result available."
+          }
           tone={app.channelRouterWarnings.length > 0 ? "warning" : "default"}
         />
         <WorkspaceMetricCard
           label="Discord onboarding"
-          value={app.discordWizardApply === null ? "Awaiting action" : readString(app.discordWizardApply, "result") ?? "Result ready"}
-          detail={app.discordWizardPreflight === null ? "Run preflight to inspect requirements." : "Preflight results are available."}
+          value={
+            app.discordWizardApply === null
+              ? "Awaiting action"
+              : readString(app.discordWizardApply, "result") ?? "Result ready"
+          }
+          detail={
+            app.discordWizardPreflight === null
+              ? "Run preflight to inspect requirements."
+              : "Preflight results are available."
+          }
           tone={app.discordWizardApply === null ? "default" : "success"}
         />
       </section>
 
-      <section className="workspace-tab-row" aria-label="Channels workspace modes">
-        <button
-          type="button"
-          className={`workspace-tab${activeTab === "connectors" ? " is-active" : ""}`}
-          onClick={() => setActiveTab("connectors")}
+      <ActionCluster className="workspace-tab-row" aria-label="Channels workspace modes">
+        <ActionButton
+          variant={activeTab === "connectors" ? "primary" : "ghost"}
+          onPress={() => setActiveTab("connectors")}
         >
           Connectors
-        </button>
-        <button
-          type="button"
-          className={`workspace-tab${activeTab === "router" ? " is-active" : ""}`}
-          onClick={() => setActiveTab("router")}
+        </ActionButton>
+        <ActionButton
+          variant={activeTab === "router" ? "primary" : "ghost"}
+          onPress={() => setActiveTab("router")}
         >
           Router
-        </button>
-        <button
-          type="button"
-          className={`workspace-tab${activeTab === "discord" ? " is-active" : ""}`}
-          onClick={() => setActiveTab("discord")}
+        </ActionButton>
+        <ActionButton
+          variant={activeTab === "discord" ? "primary" : "ghost"}
+          onPress={() => setActiveTab("discord")}
         >
           Discord setup
-        </button>
-      </section>
+        </ActionButton>
+      </ActionCluster>
 
       {activeTab === "connectors" && (
         <section className="workspace-two-column">
@@ -122,57 +217,68 @@ export function ChannelsSection({ app }: { app: ConsoleAppState }) {
             title="Connector inventory"
             description="Enable, disable, and select the connector you want to inspect before using test or recovery actions."
           >
-            {app.channelsConnectors.length === 0 ? (
-              <p className="chat-muted">No channel connectors configured.</p>
-            ) : (
-              <div className="workspace-list">
-                {app.channelsConnectors.map((connector) => {
-                  const connectorId = readString(connector, "connector_id") ?? "unknown";
-                  const enabled = readBool(connector, "enabled");
-                  const isSelected = connectorId === app.channelsSelectedConnectorId;
-                  return (
-                    <article key={connectorId} className={`workspace-list-item workspace-list-item--job${isSelected ? " is-active" : ""}`}>
-                      <button
-                        type="button"
-                        className="workspace-list-button workspace-list-button--flat"
-                        onClick={() => void app.selectChannelConnector(connectorId)}
+            <EntityTable
+              ariaLabel="Connector inventory"
+              columns={[
+                {
+                  key: "connector",
+                  label: "Connector",
+                  isRowHeader: true,
+                  render: (row) => (
+                    <div className="workspace-stack">
+                      <strong>{row.connectorId}</strong>
+                      <span className="chat-muted">
+                        {row.connectorKind} · {row.availability}
+                      </span>
+                    </div>
+                  )
+                },
+                {
+                  key: "state",
+                  label: "State",
+                  render: (row) => (
+                    <div className="workspace-inline">
+                      <WorkspaceStatusChip tone={row.enabled ? "success" : "default"}>
+                        {row.enabled ? "enabled" : "disabled"}
+                      </WorkspaceStatusChip>
+                      <WorkspaceStatusChip tone="default">{row.readiness}</WorkspaceStatusChip>
+                      {row.isSelected ? (
+                        <WorkspaceStatusChip tone="accent">selected</WorkspaceStatusChip>
+                      ) : null}
+                    </div>
+                  )
+                },
+                {
+                  key: "actions",
+                  label: "Actions",
+                  align: "end",
+                  render: (row) => (
+                    <ActionCluster>
+                      <ActionButton
+                        aria-label={`Select ${row.connectorId}`}
+                        variant="secondary"
+                        size="sm"
+                        onPress={() => void app.selectChannelConnector(row.connectorId)}
                       >
-                        <div>
-                          <strong>{connectorId}</strong>
-                          <p className="chat-muted">
-                            {readString(connector, "kind") ?? "unknown kind"} · {channelConnectorAvailability(connector)}
-                          </p>
-                        </div>
-                        <div className="workspace-inline">
-                          <WorkspaceStatusChip tone={enabled ? "success" : "default"}>
-                            {enabled ? "enabled" : "disabled"}
-                          </WorkspaceStatusChip>
-                          <WorkspaceStatusChip tone="default">
-                            {readString(connector, "readiness") ?? "readiness n/a"}
-                          </WorkspaceStatusChip>
-                        </div>
-                      </button>
-                      <div className="console-inline-actions">
-                        <Button
-                          variant="secondary"
-                          size="sm"
-                          onPress={() => void app.selectChannelConnector(connectorId)}
-                        >
-                          Select
-                        </Button>
-                        <Button
-                          size="sm"
-                          onPress={() => void app.toggleConnector(connector, !enabled)}
-                          isDisabled={app.channelsBusy}
-                        >
-                          {enabled ? "Disable" : "Enable"}
-                        </Button>
-                      </div>
-                    </article>
-                  );
-                })}
-              </div>
-            )}
+                        Select
+                      </ActionButton>
+                      <ActionButton
+                        aria-label={`${row.enabled ? "Disable" : "Enable"} ${row.connectorId}`}
+                        size="sm"
+                        onPress={() => void app.toggleConnector(row.connector, !row.enabled)}
+                        isDisabled={app.channelsBusy}
+                      >
+                        {row.enabled ? "Disable" : "Enable"}
+                      </ActionButton>
+                    </ActionCluster>
+                  )
+                }
+              ]}
+              rows={connectorRows}
+              getRowId={(row) => row.connectorId}
+              emptyTitle="No connectors configured"
+              emptyDescription="Configure at least one connector to inspect status and recovery actions."
+            />
           </WorkspaceSectionCard>
 
           <WorkspaceSectionCard
@@ -181,7 +287,11 @@ export function ChannelsSection({ app }: { app: ConsoleAppState }) {
           >
             <div className="workspace-stack">
               {app.channelsSelectedStatus === null ? (
-                <p className="chat-muted">Select a connector to inspect its current runtime state.</p>
+                <EmptyState
+                  compact
+                  title="No connector selected"
+                  description="Select a connector from inventory to inspect runtime state."
+                />
               ) : (
                 <PrettyJsonBlock
                   value={app.channelsSelectedStatus}
@@ -190,139 +300,131 @@ export function ChannelsSection({ app }: { app: ConsoleAppState }) {
               )}
 
               <div className="workspace-form-grid">
-                <label>
-                  Selected connector
-                  <input value={app.channelsSelectedConnectorId} readOnly />
-                </label>
-                <label>
-                  Log limit
-                  <input
-                    value={app.channelsLogsLimit}
-                    onChange={(event) => app.setChannelsLogsLimit(event.target.value)}
-                  />
-                </label>
+                <TextInputField
+                  label="Selected connector"
+                  value={app.channelsSelectedConnectorId}
+                  onChange={() => undefined}
+                  readOnly
+                />
+                <TextInputField
+                  label="Log limit"
+                  value={app.channelsLogsLimit}
+                  onChange={app.setChannelsLogsLimit}
+                />
               </div>
 
-              <div className="console-inline-actions">
-                <Button
+              <ActionCluster>
+                <ActionButton
                   variant="secondary"
                   onPress={() => void app.pauseChannelQueue()}
                   isDisabled={app.channelsBusy}
                 >
                   Pause queue
-                </Button>
-                <Button
+                </ActionButton>
+                <ActionButton
                   variant="secondary"
                   onPress={() => void app.resumeChannelQueue()}
                   isDisabled={app.channelsBusy}
                 >
                   Resume queue
-                </Button>
-                <Button
+                </ActionButton>
+                <ActionButton
                   variant="secondary"
                   onPress={() => void app.drainChannelQueue()}
                   isDisabled={app.channelsBusy}
                 >
                   Drain queue
-                </Button>
-                <Button
+                </ActionButton>
+                <ActionButton
                   variant="secondary"
                   onPress={() => void app.refreshChannelHealth()}
                   isDisabled={app.channelsBusy}
                 >
                   Refresh health
-                </Button>
-              </div>
+                </ActionButton>
+              </ActionCluster>
 
               {(selectedQueue !== null || selectedHealthRefresh !== null) && (
-                <div className="workspace-callout">
-                  <p className="console-label">Recovery telemetry</p>
-                  <dl className="workspace-key-value-grid">
-                    <div>
-                      <dt>Queue paused</dt>
-                      <dd>{readBool(selectedQueue ?? {}, "paused") ? "yes" : "no"}</dd>
-                    </div>
-                    <div>
-                      <dt>Dead letters</dt>
-                      <dd>{displayScalar(selectedQueue?.dead_letters, "0")}</dd>
-                    </div>
-                    <div>
-                      <dt>Saturation</dt>
-                      <dd>{readString(selectedSaturation ?? {}, "state") ?? "n/a"}</dd>
-                    </div>
-                    <div>
-                      <dt>Last auth failure</dt>
-                      <dd>{readString(selectedOperations ?? {}, "last_auth_failure") ?? "none"}</dd>
-                    </div>
-                    <div>
-                      <dt>Discord permission gap</dt>
-                      <dd>{readString(selectedDiscordOps ?? {}, "last_permission_failure") ?? "none"}</dd>
-                    </div>
-                  </dl>
-                  {selectedHealthRefresh !== null && (
+                <InlineNotice title="Recovery telemetry" tone="default">
+                  <KeyValueList
+                    items={[
+                      {
+                        label: "Queue paused",
+                        value: readBool(selectedQueue ?? {}, "paused") ? "yes" : "no"
+                      },
+                      {
+                        label: "Dead letters",
+                        value: displayScalar(selectedQueue?.dead_letters, "0")
+                      },
+                      {
+                        label: "Saturation",
+                        value: readString(selectedSaturation ?? {}, "state") ?? "n/a"
+                      },
+                      {
+                        label: "Last auth failure",
+                        value: readString(selectedOperations ?? {}, "last_auth_failure") ?? "none"
+                      },
+                      {
+                        label: "Discord permission gap",
+                        value:
+                          readString(selectedDiscordOps ?? {}, "last_permission_failure") ??
+                          "none"
+                      }
+                    ]}
+                  />
+                  {selectedHealthRefresh !== null ? (
                     <PrettyJsonBlock
                       value={selectedHealthRefresh}
                       revealSensitiveValues={app.revealSensitiveValues}
                     />
-                  )}
-                </div>
+                  ) : null}
+                </InlineNotice>
               )}
 
-              <form className="workspace-form" onSubmit={(event) => void app.sendChannelTest(event)}>
+              <AppForm onSubmit={(event) => void app.sendChannelTest(event)}>
                 <div className="workspace-form-grid">
-                  <label>
-                    Text
-                    <input value={app.channelsTestText} onChange={(event) => app.setChannelsTestText(event.target.value)} />
-                  </label>
-                  <label>
-                    Conversation ID
-                    <input
-                      value={app.channelsTestConversationId}
-                      onChange={(event) => app.setChannelsTestConversationId(event.target.value)}
-                    />
-                  </label>
-                  <label>
-                    Sender ID
-                    <input value={app.channelsTestSenderId} onChange={(event) => app.setChannelsTestSenderId(event.target.value)} />
-                  </label>
-                  <label>
-                    Sender display
-                    <input
-                      value={app.channelsTestSenderDisplay}
-                      onChange={(event) => app.setChannelsTestSenderDisplay(event.target.value)}
-                    />
-                  </label>
+                  <TextInputField
+                    label="Text"
+                    value={app.channelsTestText}
+                    onChange={app.setChannelsTestText}
+                  />
+                  <TextInputField
+                    label="Conversation ID"
+                    value={app.channelsTestConversationId}
+                    onChange={app.setChannelsTestConversationId}
+                  />
+                  <TextInputField
+                    label="Sender ID"
+                    value={app.channelsTestSenderId}
+                    onChange={app.setChannelsTestSenderId}
+                  />
+                  <TextInputField
+                    label="Sender display"
+                    value={app.channelsTestSenderDisplay}
+                    onChange={app.setChannelsTestSenderDisplay}
+                  />
                 </div>
                 <div className="workspace-inline">
-                  <label className="console-checkbox-inline">
-                    <input
-                      type="checkbox"
-                      checked={app.channelsTestCrashOnce}
-                      onChange={(event) => app.setChannelsTestCrashOnce(event.target.checked)}
-                    />
-                    Simulate crash once
-                  </label>
-                  <label className="console-checkbox-inline">
-                    <input
-                      type="checkbox"
-                      checked={app.channelsTestDirectMessage}
-                      onChange={(event) => app.setChannelsTestDirectMessage(event.target.checked)}
-                    />
-                    Direct message
-                  </label>
-                  <label className="console-checkbox-inline">
-                    <input
-                      type="checkbox"
-                      checked={app.channelsTestBroadcast}
-                      onChange={(event) => app.setChannelsTestBroadcast(event.target.checked)}
-                    />
-                    Broadcast
-                  </label>
+                  <CheckboxField
+                    label="Simulate crash once"
+                    checked={app.channelsTestCrashOnce}
+                    onChange={app.setChannelsTestCrashOnce}
+                  />
+                  <CheckboxField
+                    label="Direct message"
+                    checked={app.channelsTestDirectMessage}
+                    onChange={app.setChannelsTestDirectMessage}
+                  />
+                  <CheckboxField
+                    label="Broadcast"
+                    checked={app.channelsTestBroadcast}
+                    onChange={app.setChannelsTestBroadcast}
+                  />
                 </div>
-                <Button type="submit" isDisabled={app.channelsBusy}>
+                <ActionButton type="submit" isDisabled={app.channelsBusy}>
                   {app.channelsBusy ? "Sending..." : "Send connector test"}
-                </Button>
-              </form>
+                </ActionButton>
+              </AppForm>
 
               {(app.channelsEvents.length > 0 || app.channelsDeadLetters.length > 0) && (
                 <WorkspaceSectionCard
@@ -330,46 +432,57 @@ export function ChannelsSection({ app }: { app: ConsoleAppState }) {
                   description="Recent events and replay controls remain visible without leaving the connector workspace."
                   className="workspace-section-card--nested"
                 >
-                  {app.channelsDeadLetters.length > 0 && (
-                    <div className="workspace-list">
-                      {app.channelsDeadLetters.map((deadLetter) => {
-                        const deadLetterId =
-                          typeof deadLetter.dead_letter_id === "number"
-                            ? deadLetter.dead_letter_id
-                            : Number(deadLetter.dead_letter_id ?? Number.NaN);
-                        if (!Number.isFinite(deadLetterId)) {
-                          return null;
-                        }
-                        return (
-                          <article key={deadLetterId} className="workspace-list-item">
-                            <strong>Dead letter {deadLetterId}</strong>
-                            <div className="console-inline-actions">
-                              <Button
-                                variant="secondary"
-                                size="sm"
-                                onPress={() => void app.replayChannelDeadLetter(deadLetterId)}
-                                isDisabled={app.channelsBusy}
-                              >
-                                Replay
-                              </Button>
-                              <Button
-                                variant="secondary"
-                                size="sm"
-                                onPress={() => void app.discardChannelDeadLetter(deadLetterId)}
-                                isDisabled={app.channelsBusy}
-                              >
-                                Discard
-                              </Button>
-                            </div>
-                          </article>
-                        );
-                      })}
-                    </div>
-                  )}
-                  <PrettyJsonBlock
-                    value={{ events: app.channelsEvents, dead_letters: app.channelsDeadLetters }}
-                    revealSensitiveValues={app.revealSensitiveValues}
-                  />
+                  <div className="workspace-stack">
+                    {deadLetterRows.length > 0 ? (
+                      <EntityTable
+                        ariaLabel="Connector dead letters"
+                        columns={[
+                          {
+                            key: "id",
+                            label: "Dead letter",
+                            isRowHeader: true,
+                            render: (row) => <strong>{row.deadLetterId}</strong>
+                          },
+                          {
+                            key: "actions",
+                            label: "Actions",
+                            align: "end",
+                            render: (row) => (
+                              <ActionCluster>
+                                <ActionButton
+                                  variant="secondary"
+                                  size="sm"
+                                  onPress={() => void app.replayChannelDeadLetter(row.deadLetterId)}
+                                  isDisabled={app.channelsBusy}
+                                >
+                                  Replay
+                                </ActionButton>
+                                <ActionButton
+                                  variant="secondary"
+                                  size="sm"
+                                  onPress={() => void app.discardChannelDeadLetter(row.deadLetterId)}
+                                  isDisabled={app.channelsBusy}
+                                >
+                                  Discard
+                                </ActionButton>
+                              </ActionCluster>
+                            )
+                          }
+                        ]}
+                        rows={deadLetterRows}
+                        getRowId={(row) => String(row.deadLetterId)}
+                        emptyTitle="No dead letters"
+                        emptyDescription="Dead-letter actions will appear here when retries fail."
+                      />
+                    ) : null}
+                    <PrettyJsonBlock
+                      value={{
+                        events: app.channelsEvents,
+                        dead_letters: app.channelsDeadLetters
+                      }}
+                      revealSensitiveValues={app.revealSensitiveValues}
+                    />
+                  </div>
                 </WorkspaceSectionCard>
               )}
             </div>
@@ -385,7 +498,9 @@ export function ChannelsSection({ app }: { app: ConsoleAppState }) {
           >
             <div className="workspace-stack">
               <div className="workspace-inline">
-                <WorkspaceStatusChip tone={app.channelRouterWarnings.length > 0 ? "warning" : "success"}>
+                <WorkspaceStatusChip
+                  tone={app.channelRouterWarnings.length > 0 ? "warning" : "success"}
+                >
                   {app.channelRouterWarnings.length} warnings
                 </WorkspaceStatusChip>
                 <WorkspaceStatusChip tone="default">
@@ -393,16 +508,26 @@ export function ChannelsSection({ app }: { app: ConsoleAppState }) {
                 </WorkspaceStatusChip>
               </div>
               {app.channelRouterWarnings.length === 0 ? (
-                <p className="chat-muted">No router warnings published.</p>
+                <EmptyState
+                  compact
+                  title="No router warnings"
+                  description="No router warnings published for the current configuration."
+                />
               ) : (
-                <ul className="console-compact-list">
-                  {app.channelRouterWarnings.map((warning) => (
-                    <li key={warning}>{warning}</li>
-                  ))}
-                </ul>
+                <InlineNotice title="Current warnings" tone="warning">
+                  <ul className="console-compact-list">
+                    {app.channelRouterWarnings.map((warning) => (
+                      <li key={warning}>{warning}</li>
+                    ))}
+                  </ul>
+                </InlineNotice>
               )}
               {app.channelRouterRules === null ? (
-                <p className="chat-muted">No router rules loaded.</p>
+                <EmptyState
+                  compact
+                  title="No router rules"
+                  description="Refresh router state to inspect the active routing rules."
+                />
               ) : (
                 <PrettyJsonBlock
                   value={app.channelRouterRules}
@@ -416,146 +541,148 @@ export function ChannelsSection({ app }: { app: ConsoleAppState }) {
             title="Route preview"
             description="Use a controlled preview form to verify allowlist, DM, and broadcast behavior before a live message arrives."
           >
-            <form className="workspace-form" onSubmit={(event) => void app.previewChannelRouter(event)}>
+            <AppForm onSubmit={(event) => void app.previewChannelRouter(event)}>
               <div className="workspace-form-grid">
-                <label>
-                  Channel
-                  <input value={app.channelRouterPreviewChannel} onChange={(event) => app.setChannelRouterPreviewChannel(event.target.value)} />
-                </label>
-                <label>
-                  Text
-                  <input value={app.channelRouterPreviewText} onChange={(event) => app.setChannelRouterPreviewText(event.target.value)} />
-                </label>
-                <label>
-                  Conversation ID
-                  <input
-                    value={app.channelRouterPreviewConversationId}
-                    onChange={(event) => app.setChannelRouterPreviewConversationId(event.target.value)}
-                  />
-                </label>
-                <label>
-                  Sender identity
-                  <input
-                    value={app.channelRouterPreviewSenderIdentity}
-                    onChange={(event) => app.setChannelRouterPreviewSenderIdentity(event.target.value)}
-                  />
-                </label>
-                <label>
-                  Sender display
-                  <input
-                    value={app.channelRouterPreviewSenderDisplay}
-                    onChange={(event) => app.setChannelRouterPreviewSenderDisplay(event.target.value)}
-                  />
-                </label>
-                <label>
-                  Max payload bytes
-                  <input
-                    value={app.channelRouterPreviewMaxPayloadBytes}
-                    onChange={(event) => app.setChannelRouterPreviewMaxPayloadBytes(event.target.value)}
-                  />
-                </label>
+                <TextInputField
+                  label="Channel"
+                  value={app.channelRouterPreviewChannel}
+                  onChange={app.setChannelRouterPreviewChannel}
+                />
+                <TextInputField
+                  label="Text"
+                  value={app.channelRouterPreviewText}
+                  onChange={app.setChannelRouterPreviewText}
+                />
+                <TextInputField
+                  label="Conversation ID"
+                  value={app.channelRouterPreviewConversationId}
+                  onChange={app.setChannelRouterPreviewConversationId}
+                />
+                <TextInputField
+                  label="Sender identity"
+                  value={app.channelRouterPreviewSenderIdentity}
+                  onChange={app.setChannelRouterPreviewSenderIdentity}
+                />
+                <TextInputField
+                  label="Sender display"
+                  value={app.channelRouterPreviewSenderDisplay}
+                  onChange={app.setChannelRouterPreviewSenderDisplay}
+                />
+                <TextInputField
+                  label="Max payload bytes"
+                  value={app.channelRouterPreviewMaxPayloadBytes}
+                  onChange={app.setChannelRouterPreviewMaxPayloadBytes}
+                />
               </div>
               <div className="workspace-inline">
-                <label className="console-checkbox-inline">
-                  <input
-                    type="checkbox"
-                    checked={app.channelRouterPreviewSenderVerified}
-                    onChange={(event) => app.setChannelRouterPreviewSenderVerified(event.target.checked)}
-                  />
-                  Sender verified
-                </label>
-                <label className="console-checkbox-inline">
-                  <input
-                    type="checkbox"
-                    checked={app.channelRouterPreviewIsDirectMessage}
-                    onChange={(event) => app.setChannelRouterPreviewIsDirectMessage(event.target.checked)}
-                  />
-                  Direct message
-                </label>
-                <label className="console-checkbox-inline">
-                  <input
-                    type="checkbox"
-                    checked={app.channelRouterPreviewRequestedBroadcast}
-                    onChange={(event) => app.setChannelRouterPreviewRequestedBroadcast(event.target.checked)}
-                  />
-                  Requested broadcast
-                </label>
+                <CheckboxField
+                  label="Sender verified"
+                  checked={app.channelRouterPreviewSenderVerified}
+                  onChange={app.setChannelRouterPreviewSenderVerified}
+                />
+                <CheckboxField
+                  label="Direct message"
+                  checked={app.channelRouterPreviewIsDirectMessage}
+                  onChange={app.setChannelRouterPreviewIsDirectMessage}
+                />
+                <CheckboxField
+                  label="Requested broadcast"
+                  checked={app.channelRouterPreviewRequestedBroadcast}
+                  onChange={app.setChannelRouterPreviewRequestedBroadcast}
+                />
               </div>
-              <Button type="submit" isDisabled={app.channelsBusy}>
+              <ActionButton type="submit" isDisabled={app.channelsBusy}>
                 {app.channelsBusy ? "Previewing..." : "Preview route"}
-              </Button>
-            </form>
-            {app.channelRouterPreviewResult !== null && (
+              </ActionButton>
+            </AppForm>
+            {app.channelRouterPreviewResult !== null ? (
               <PrettyJsonBlock
                 value={app.channelRouterPreviewResult}
                 revealSensitiveValues={app.revealSensitiveValues}
               />
-            )}
+            ) : null}
           </WorkspaceSectionCard>
 
           <WorkspaceSectionCard
             title="Pairings"
             description="Mint pairing codes and inspect current pairings without leaving the routing mode."
           >
-            <form className="workspace-form" onSubmit={(event) => void app.mintChannelRouterPairingCode(event)}>
-              <div className="workspace-form-grid">
-                <label>
-                  Filter channel
-                  <input
+            <div className="workspace-stack">
+              <AppForm onSubmit={(event) => void app.mintChannelRouterPairingCode(event)}>
+                <div className="workspace-form-grid">
+                  <TextInputField
+                    label="Filter channel"
                     value={app.channelRouterPairingsFilterChannel}
-                    onChange={(event) => app.setChannelRouterPairingsFilterChannel(event.target.value)}
+                    onChange={app.setChannelRouterPairingsFilterChannel}
                   />
-                </label>
-                <label>
-                  Mint channel
-                  <input
+                  <TextInputField
+                    label="Mint channel"
                     value={app.channelRouterMintChannel}
-                    onChange={(event) => app.setChannelRouterMintChannel(event.target.value)}
+                    onChange={app.setChannelRouterMintChannel}
                   />
-                </label>
-                <label>
-                  Issued by
-                  <input
+                  <TextInputField
+                    label="Issued by"
                     value={app.channelRouterMintIssuedBy}
-                    onChange={(event) => app.setChannelRouterMintIssuedBy(event.target.value)}
+                    onChange={app.setChannelRouterMintIssuedBy}
                   />
-                </label>
-                <label>
-                  TTL ms
-                  <input
+                  <TextInputField
+                    label="TTL ms"
                     value={app.channelRouterMintTtlMs}
-                    onChange={(event) => app.setChannelRouterMintTtlMs(event.target.value)}
+                    onChange={app.setChannelRouterMintTtlMs}
                   />
-                </label>
-              </div>
-              <div className="console-inline-actions">
-                <Button
-                  variant="secondary"
-                  onPress={() => void app.refreshChannelRouterPairings()}
-                  isDisabled={app.channelsBusy}
-                >
-                  Refresh pairings
-                </Button>
-                <Button type="submit" isDisabled={app.channelsBusy}>
-                  {app.channelsBusy ? "Minting..." : "Mint pairing code"}
-                </Button>
-              </div>
-            </form>
+                </div>
+                <ActionCluster>
+                  <ActionButton
+                    type="button"
+                    variant="secondary"
+                    onPress={() => void app.refreshChannelRouterPairings()}
+                    isDisabled={app.channelsBusy}
+                  >
+                    Refresh pairings
+                  </ActionButton>
+                  <ActionButton type="submit" isDisabled={app.channelsBusy}>
+                    {app.channelsBusy ? "Minting..." : "Mint pairing code"}
+                  </ActionButton>
+                </ActionCluster>
+              </AppForm>
 
-            {app.channelRouterMintResult !== null && (
-              <PrettyJsonBlock
-                value={app.channelRouterMintResult}
-                revealSensitiveValues={app.revealSensitiveValues}
+              {app.channelRouterMintResult !== null ? (
+                <PrettyJsonBlock
+                  value={app.channelRouterMintResult}
+                  revealSensitiveValues={app.revealSensitiveValues}
+                />
+              ) : null}
+
+              <EntityTable
+                ariaLabel="Channel router pairings"
+                columns={[
+                  {
+                    key: "channel",
+                    label: "Channel",
+                    isRowHeader: true,
+                    render: (row) => <strong>{row.channel}</strong>
+                  },
+                  {
+                    key: "principal",
+                    label: "Principal",
+                    render: (row) => row.principal
+                  },
+                  {
+                    key: "status",
+                    label: "Status",
+                    render: (row) => (
+                      <WorkspaceStatusChip tone={row.status === "active" ? "success" : "default"}>
+                        {row.status}
+                      </WorkspaceStatusChip>
+                    )
+                  }
+                ]}
+                rows={pairingRows}
+                getRowId={(row) => row.id}
+                emptyTitle="No pairings loaded"
+                emptyDescription="Mint a pairing code or refresh pairings to inspect current associations."
               />
-            )}
-            {app.channelRouterPairings.length === 0 ? (
-              <p className="chat-muted">No pairings loaded.</p>
-            ) : (
-              <PrettyJsonBlock
-                value={app.channelRouterPairings}
-                revealSensitiveValues={app.revealSensitiveValues}
-              />
-            )}
+            </div>
           </WorkspaceSectionCard>
         </section>
       )}
@@ -574,32 +701,31 @@ export function ChannelsSection({ app }: { app: ConsoleAppState }) {
             description="Verification send, targeted health checks, and connector-specific actions stay alongside the onboarding flow."
           >
             <div className="workspace-stack">
-              <div className="workspace-form-grid">
-                <label>
-                  Verify channel
-                  <input
-                    value={app.discordWizardVerifyChannelId}
-                    onChange={(event) => app.setDiscordWizardVerifyChannelId(event.target.value)}
-                  />
-                </label>
-              </div>
-              <div className="console-inline-actions">
-                <Button
+              <TextInputField
+                label="Verify channel"
+                value={app.discordWizardVerifyChannelId}
+                onChange={app.setDiscordWizardVerifyChannelId}
+              />
+              <ActionCluster>
+                <ActionButton
                   variant="secondary"
                   onPress={() => void app.refreshChannelHealth()}
                   isDisabled={app.channelsBusy}
                 >
                   Refresh health
-                </Button>
-                <Button
+                </ActionButton>
+                <ActionButton
                   variant="secondary"
                   onPress={() => void app.refreshChannels()}
                   isDisabled={app.channelsBusy}
                 >
                   Refresh connector state
-                </Button>
-              </div>
-              <DiscordConnectorActionsPanel app={app} selectedConnectorKind={selectedConnectorKind} />
+                </ActionButton>
+              </ActionCluster>
+              <DiscordConnectorActionsPanel
+                app={app}
+                selectedConnectorKind={selectedConnectorKind}
+              />
             </div>
           </WorkspaceSectionCard>
         </section>
@@ -616,4 +742,10 @@ function displayScalar(value: unknown, fallback = "n/a"): string {
     return String(value);
   }
   return fallback;
+}
+
+function asJsonObject(value: unknown): JsonObject {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as JsonObject)
+    : {};
 }

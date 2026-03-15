@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "./App";
@@ -82,7 +82,9 @@ describe("M54 web auth surface", () => {
     await waitFor(() => {
       expect(screen.getByText("OpenAI API key stored.")).toBeInTheDocument();
     });
-    expect(screen.getAllByText("default-openai").length).toBeGreaterThan(0);
+    await waitFor(() => {
+      expect(document.body).toHaveTextContent("default-openai");
+    }, { timeout: 5_000 });
     expect(apiKeyConnectBody).toContain("\"profile_name\":\"default-openai\"");
     expect(apiKeyConnectBody).toContain("\"api_key\":\"sk-test-key\"");
     expect(apiKeyConnectBody).toContain("\"set_default\":true");
@@ -248,7 +250,9 @@ describe("M54 web auth surface", () => {
     await waitFor(() => {
       expect(screen.getAllByText("OpenAI OAuth connected.").length).toBeGreaterThan(0);
     });
-    expect(screen.getAllByText("oauth-primary").length).toBeGreaterThan(0);
+    await waitFor(() => {
+      expect(document.body).toHaveTextContent("oauth-primary");
+    }, { timeout: 5_000 });
     expect(popupClose).toHaveBeenCalled();
   });
 
@@ -482,12 +486,12 @@ describe("M54 web auth surface", () => {
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Profiles" }));
 
-    expect((await screen.findAllByText("api-primary")).length).toBeGreaterThan(0);
-    expect((await screen.findAllByText("oauth-primary")).length).toBeGreaterThan(0);
+    await waitFor(() => {
+      expect(document.body).toHaveTextContent("api-primary");
+      expect(document.body).toHaveTextContent("oauth-primary");
+    }, { timeout: 5_000 });
 
-    const oauthRow = screen.getByText("oauth-primary").closest("tr");
-    expect(oauthRow).not.toBeNull();
-    fireEvent.click(within(oauthRow!).getByRole("button", { name: "Inspect" }));
+    fireEvent.click((await screen.findAllByRole("button", { name: /^Inspect / }))[1]);
 
     fireEvent.click(screen.getByRole("button", { name: "Set as default" }));
     await waitFor(() => {

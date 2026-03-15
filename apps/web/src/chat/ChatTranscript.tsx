@@ -1,3 +1,6 @@
+import { ScrollShadow } from "@heroui/react";
+
+import { ActionButton, EmptyState } from "../console/components/ui";
 import { A2uiRenderer, type A2uiDocument } from "../a2ui";
 
 import {
@@ -38,10 +41,14 @@ export function ChatTranscript({
         </p>
       )}
 
-      <div className="chat-transcript" ref={transcriptBoxRef} role="log" aria-live="polite">
+      <ScrollShadow className="chat-transcript" ref={transcriptBoxRef} role="log" aria-live="polite">
         {visibleTranscript.length === 0 ? (
           <div className="chat-transcript__empty">
-            <p>Create or select a session, then send the first operator message to begin streaming output.</p>
+            <EmptyState
+              compact
+              description="Create or select a session, then send the first operator message to begin streaming output."
+              title="No transcript yet"
+            />
           </div>
         ) : (
           visibleTranscript.map((entry) => (
@@ -86,15 +93,20 @@ export function ChatTranscript({
 
               {entry.run_id !== undefined && (
                 <div className="chat-entry-actions">
-                  <button type="button" className="secondary" onClick={() => openRunDetails(entry.run_id as string)}>
+                  <ActionButton
+                    size="sm"
+                    type="button"
+                    variant="secondary"
+                    onPress={() => openRunDetails(entry.run_id as string)}
+                  >
                     Open run details
-                  </button>
+                  </ActionButton>
                 </div>
               )}
             </article>
           ))
         )}
-      </div>
+      </ScrollShadow>
     </>
   );
 }

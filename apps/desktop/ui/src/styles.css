@@ -25,7 +25,6 @@
   --desktop-bg: #08131b;
   --desktop-bg-deep: #12212b;
   --desktop-surface: rgba(13, 24, 33, 0.88);
-  --desktop-surface-strong: rgba(20, 34, 43, 0.96);
   --desktop-border: rgba(138, 179, 193, 0.16);
   --desktop-line: rgba(138, 179, 193, 0.12);
   --desktop-text: #edf5f8;
@@ -70,27 +69,21 @@ body {
   gap: 1.1rem;
 }
 
-.desktop-hero,
-.desktop-card,
-.desktop-notice,
-.desktop-actions__group {
+.desktop-surface,
+.desktop-subcard {
   background: var(--desktop-surface);
   border: 1px solid var(--desktop-border);
   box-shadow: var(--desktop-shadow);
   backdrop-filter: blur(14px);
 }
 
-.desktop-hero {
+.desktop-page-header {
   border-radius: var(--desktop-radius-xl);
-  padding: 1.55rem;
-  display: grid;
-  grid-template-columns: minmax(0, 1.45fr) minmax(280px, 0.8fr);
-  gap: 1.25rem;
-  position: relative;
   overflow: hidden;
+  position: relative;
 }
 
-.desktop-hero::after {
+.desktop-page-header::after {
   content: "";
   position: absolute;
   right: -5rem;
@@ -102,14 +95,26 @@ body {
   pointer-events: none;
 }
 
-.desktop-hero__copy {
+.desktop-page-header__content {
   display: grid;
-  gap: 0.85rem;
+  grid-template-columns: minmax(0, 1.45fr) minmax(280px, 0.8fr);
+  gap: 1.25rem;
+  padding: 1.55rem;
   position: relative;
   z-index: 1;
 }
 
-.desktop-hero__summary {
+.desktop-page-header__copy {
+  display: grid;
+  gap: 0.85rem;
+}
+
+.desktop-page-header__actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.desktop-header-summary {
   display: grid;
   gap: 0.9rem;
   align-self: stretch;
@@ -117,69 +122,66 @@ body {
   border: 1px solid rgba(138, 179, 193, 0.12);
   border-radius: calc(var(--desktop-radius-lg) + 0.1rem);
   padding: 1rem 1.05rem;
-  position: relative;
-  z-index: 1;
+  min-width: min(100%, 20rem);
 }
 
-.desktop-hero__summary-row {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 1rem;
-  font-size: 0.96rem;
-}
-
-.desktop-actions {
+.desktop-page-header__title-block,
+.desktop-section-card__title-block {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 0.9rem;
-  align-items: center;
+  gap: 0.6rem;
 }
 
-.desktop-actions__group {
-  border-radius: var(--desktop-radius-lg);
-  padding: 0.9rem;
+.desktop-chip-row {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.75rem;
+  gap: 0.65rem;
 }
 
-.desktop-overview,
-.desktop-detail-grid {
+.desktop-action-bar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 1rem;
+  align-items: end;
+  padding: 1.05rem 1.15rem;
+}
+
+.desktop-action-bar__cluster {
+  display: grid;
+  gap: 0.55rem;
+}
+
+.desktop-action-bar__cluster--end {
+  justify-items: end;
+}
+
+.desktop-action-group {
+  flex-wrap: wrap;
+}
+
+.desktop-action-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  max-width: 28rem;
+  color: var(--desktop-muted);
+  font-size: 0.92rem;
+}
+
+.desktop-grid {
   display: grid;
   gap: 1.1rem;
 }
 
-.desktop-overview {
+.desktop-grid--metrics {
   grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
-.desktop-detail-grid {
-  grid-template-columns: minmax(0, 1.3fr) minmax(0, 0.9fr);
-}
-
-.desktop-card,
-.desktop-notice {
-  border-radius: var(--desktop-radius-lg);
-}
-
-.desktop-card h2,
-.desktop-hero h1 {
-  margin: 0;
-}
-
-.desktop-card h3 {
-  margin: 0 0 0.9rem;
-  font-size: 1rem;
-}
-
-.desktop-card p,
-.desktop-hero p {
-  margin: 0;
+.desktop-grid--details {
+  grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr);
 }
 
 .desktop-eyebrow {
-  margin-bottom: 0.35rem;
+  margin: 0 0 0.35rem;
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--desktop-muted);
@@ -196,14 +198,19 @@ body {
   font-weight: 700;
 }
 
-.desktop-hero h1 {
+.desktop-page-header h1,
+.desktop-section-card__title-block h2,
+.desktop-subcard h3 {
+  margin: 0;
+}
+
+.desktop-page-header h1 {
   max-width: 14ch;
   font-size: clamp(2.2rem, 3vw, 3.4rem);
   line-height: 0.98;
   letter-spacing: -0.04em;
 }
 
-.desktop-copy,
 .desktop-muted {
   color: var(--desktop-muted);
 }
@@ -215,32 +222,48 @@ body {
   text-transform: uppercase;
 }
 
-.desktop-card__header {
+.desktop-section-card__header,
+.desktop-subcard__header {
   display: flex;
   justify-content: space-between;
   align-items: flex-start;
   gap: 1rem;
 }
 
-.desktop-card__lede {
-  margin-bottom: 1rem;
-  line-height: 1.45;
+.desktop-section-card__copy {
+  display: grid;
+  gap: 0.2rem;
 }
 
-.desktop-mono {
-  font-family:
-    "IBM Plex Mono",
-    "Cascadia Code",
-    "Fira Code",
-    monospace;
+.desktop-section-card__body {
+  display: grid;
+  gap: 1rem;
 }
 
-.desktop-pairs {
+.desktop-section-card__footer {
+  padding-top: 0.35rem;
+}
+
+.desktop-metric-card__value {
+  font-size: clamp(1.35rem, 2vw, 1.95rem);
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: -0.03em;
+  text-transform: capitalize;
+}
+
+.desktop-metric-card__detail,
+.desktop-inline-detail {
+  display: grid;
+  gap: 0.7rem;
+}
+
+.desktop-key-value-list {
   display: grid;
   gap: 0.8rem;
 }
 
-.desktop-pairs div {
+.desktop-key-value-list div {
   display: flex;
   justify-content: space-between;
   gap: 1.2rem;
@@ -249,60 +272,112 @@ body {
   border-top: 1px solid var(--desktop-line);
 }
 
-.desktop-pairs dt {
+.desktop-key-value-list dt {
   color: var(--desktop-muted);
   font-size: 0.92rem;
 }
 
-.desktop-pairs dd {
+.desktop-key-value-list dd {
   margin: 0;
   text-align: right;
   font-weight: 600;
+  max-width: 30ch;
+  word-break: break-word;
 }
 
-.desktop-process-stack {
+.desktop-url-block {
+  padding: 0.95rem 1rem;
+  border-radius: 1rem;
+  background: rgba(8, 21, 28, 0.7);
+  border: 1px solid rgba(138, 179, 193, 0.12);
+  overflow-wrap: anywhere;
+}
+
+.desktop-panel-grid {
   display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 0.9rem;
 }
 
-.desktop-process-panel {
+.desktop-subcard {
   border-radius: 1rem;
-  padding: 1rem;
-  background: rgba(8, 21, 28, 0.7);
-  border: 1px solid rgba(138, 179, 193, 0.12);
 }
 
-.desktop-issues,
-.desktop-notice__content {
-  margin: 0;
+.desktop-subcard__body {
   display: grid;
-  gap: 0.6rem;
+  gap: 1rem;
 }
 
-.desktop-issues {
-  padding-left: 1rem;
+.desktop-notice-stack,
+.desktop-loading-stack {
+  display: grid;
+  gap: 0.75rem;
 }
 
-.desktop-notice__content {
-  padding: 0.1rem 0;
+.desktop-inline-notice {
+  border: 1px solid var(--desktop-border);
 }
 
-.desktop-notice__line {
-  color: var(--desktop-text);
+.desktop-scroll-list {
+  max-height: 17rem;
+  padding-right: 0.35rem;
 }
 
-.desktop-error {
-  color: #f38a74;
+.desktop-attention-list {
+  margin: 0;
+  padding-left: 1.1rem;
+  display: grid;
+  gap: 0.75rem;
+}
+
+.desktop-empty-state {
+  border-style: dashed;
+  box-shadow: none;
+}
+
+.desktop-empty-state--compact .desktop-section-card__body {
+  gap: 0.5rem;
+}
+
+.desktop-skeleton {
+  border-radius: 999px;
+}
+
+.desktop-skeleton--chip {
+  width: 7.5rem;
+  height: 2rem;
+}
+
+.desktop-skeleton--text {
+  width: 8rem;
+  height: 1.1rem;
+}
+
+.desktop-skeleton--metric {
+  width: 7rem;
+  height: 2rem;
+}
+
+.desktop-skeleton--detail {
+  width: min(100%, 18rem);
+  height: 1rem;
+}
+
+.desktop-skeleton--url {
+  width: 100%;
+  height: 2.75rem;
+  border-radius: 1rem;
 }
 
 @media (max-width: 980px) {
-  .desktop-hero,
-  .desktop-overview,
-  .desktop-detail-grid {
+  .desktop-page-header__content,
+  .desktop-grid--metrics,
+  .desktop-grid--details,
+  .desktop-panel-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .desktop-hero h1 {
+  .desktop-page-header h1 {
     max-width: 18ch;
   }
 }
@@ -313,10 +388,26 @@ body {
     padding-top: 1rem;
   }
 
-  .desktop-actions,
-  .desktop-hero,
-  .desktop-overview,
-  .desktop-detail-grid {
+  .desktop-page-header__content,
+  .desktop-action-bar,
+  .desktop-grid--metrics,
+  .desktop-grid--details,
+  .desktop-panel-grid {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .desktop-page-header__actions,
+  .desktop-action-bar__cluster--end {
+    justify-items: stretch;
+  }
+
+  .desktop-key-value-list div {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .desktop-key-value-list dd {
+    text-align: left;
+    max-width: 100%;
   }
 }

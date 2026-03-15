@@ -1,4 +1,4 @@
-import { Button, Modal } from "@heroui/react";
+import { Modal } from "@heroui/react";
 import { useEffect, useMemo, useState } from "react";
 
 import type {
@@ -7,6 +7,17 @@ import type {
   AgentListEnvelope,
   AgentRecord
 } from "../../consoleApi";
+import {
+  ActionButton,
+  ActionCluster,
+  CheckboxField,
+  EmptyState,
+  EntityTable,
+  InlineNotice,
+  KeyValueList,
+  TextAreaField,
+  TextInputField
+} from "../components/ui";
 import {
   WorkspaceMetricCard,
   WorkspacePageHeader,
@@ -31,6 +42,11 @@ type AgentDraft = {
   defaultSkillAllowlist: string;
   setDefault: boolean;
   allowAbsolutePaths: boolean;
+};
+
+type AgentRow = AgentRecord & {
+  isDefault: boolean;
+  isSelected: boolean;
 };
 
 const WIZARD_STEPS: ReadonlyArray<{
@@ -185,13 +201,18 @@ export function AgentsSection({ app }: AgentsSectionProps) {
 
   const filteredAgents = useMemo(() => {
     const query = filter.trim().toLowerCase();
+    const agentRows = agents.map((agent) => ({
+      ...agent,
+      isDefault: agent.agent_id === defaultAgentId,
+      isSelected: agent.agent_id === selectedAgentId
+    }));
     if (query.length === 0) {
-      return agents;
+      return agentRows;
     }
-    return agents.filter((agent) =>
+    return agentRows.filter((agent) =>
       `${agent.display_name} ${agent.agent_id} ${agent.default_model_profile}`.toLowerCase().includes(query)
     );
-  }, [agents, filter]);
+  }, [agents, defaultAgentId, filter, selectedAgentId]);
 
   const validationMessage = validationMessageForStep(wizardStep, draft);
   const detailRecord = selectedAgent?.agent ?? null;
@@ -251,12 +272,16 @@ export function AgentsSection({ app }: AgentsSectionProps) {
           </>
         }
         actions={
-          <div className="console-inline-actions">
-            <Button variant="secondary" onPress={() => void refreshAgents()} isDisabled={agentsBusy}>
+          <ActionCluster>
+            <ActionButton
+              variant="secondary"
+              onPress={() => void refreshAgents()}
+              isDisabled={agentsBusy}
+            >
               {agentsBusy ? "Refreshing..." : "Refresh agents"}
-            </Button>
-            <Button onPress={() => setWizardOpen(true)}>Create agent</Button>
-          </div>
+            </ActionButton>
+            <ActionButton onPress={() => setWizardOpen(true)}>Create agent</ActionButton>
+          </ActionCluster>
         }
       />
 
@@ -264,7 +289,11 @@ export function AgentsSection({ app }: AgentsSectionProps) {
         <WorkspaceMetricCard
           label="Registry size"
           value={agents.length}
-          detail={agents.length > 0 ? `${agents[0]?.display_name ?? "Agent"} is ready for review.` : "Create the first agent to establish a default registry."}
+          detail={
+            agents.length > 0
+              ? `${agents[0]?.display_name ?? "Agent"} is ready for review.`
+              : "Create the first agent to establish a default registry."
+          }
           tone={agents.length > 0 ? "success" : "warning"}
         />
         <WorkspaceMetricCard
@@ -286,47 +315,81 @@ export function AgentsSection({ app }: AgentsSectionProps) {
           description="Search the registry, scan default state quickly, and select an agent for detail review."
         >
           <div className="workspace-stack">
-            <label>
-              Search agents
-              <input
-                value={filter}
-                onChange={(event) => setFilter(event.target.value)}
-                placeholder="main, review, gpt-4o-mini"
-              />
-            </label>
+            <TextInputField
+              label="Search agents"
+              value={filter}
+              onChange={setFilter}
+              placeholder="main, review, gpt-4o-mini"
+            />
 
-            <div className="workspace-list">
-              {filteredAgents.length === 0 ? (
-                <div className="workspace-empty">
-                  {agents.length === 0 ? "No agents registered yet. Open the setup wizard to create the first one." : "No agents match the current filter."}
-                </div>
-              ) : (
-                filteredAgents.map((agent) => {
-                  const isActive = agent.agent_id === selectedAgentId;
-                  const isDefault = agent.agent_id === defaultAgentId;
-                  return (
-                    <article key={agent.agent_id} className={`workspace-list-item workspace-list-item--job${isActive ? " is-active" : ""}`}>
-                      <button
-                        type="button"
-                        className={`workspace-list-button workspace-list-button--flat${isActive ? " is-active" : ""}`}
-                        onClick={() => setSelectedAgentId(agent.agent_id)}
+            <EntityTable
+              ariaLabel="Agent registry"
+              columns={[
+                {
+                  key: "agent",
+                  label: "Agent",
+                  isRowHeader: true,
+                  render: (agent: AgentRow) => (
+                    <div className="workspace-stack">
+                      <strong>{agent.display_name}</strong>
+                      <span className="chat-muted">{agent.agent_id}</span>
+                    </div>
+                  )
+                },
+                {
+                  key: "state",
+                  label: "State",
+                  render: (agent: AgentRow) => (
+                    <div className="workspace-inline">
+                      <WorkspaceStatusChip tone={agent.isDefault ? "success" : "default"}>
+                        {agent.isDefault ? "default" : "registered"}
+                      </WorkspaceStatusChip>
+                      <WorkspaceStatusChip tone="accent">
+                        {agent.default_model_profile}
+                      </WorkspaceStatusChip>
+                      {agent.isSelected ? (
+                        <WorkspaceStatusChip tone="accent">selected</WorkspaceStatusChip>
+                      ) : null}
+                    </div>
+                  )
+                },
+                {
+                  key: "actions",
+                  label: "Actions",
+                  align: "end",
+                  render: (agent: AgentRow) => (
+                    <ActionCluster>
+                      <ActionButton
+                        aria-label={`Inspect ${agent.display_name}`}
+                        variant="secondary"
+                        size="sm"
+                        onPress={() => setSelectedAgentId(agent.agent_id)}
                       >
-                        <div className="workspace-list-button__meta">
-                          <strong className="workspace-list-button__title">{agent.display_name}</strong>
-                          <small>{agent.agent_id}</small>
-                        </div>
-                        <div className="workspace-tag-row">
-                          <WorkspaceStatusChip tone={isDefault ? "success" : "default"}>
-                            {isDefault ? "default" : "registered"}
-                          </WorkspaceStatusChip>
-                          <WorkspaceStatusChip tone="accent">{agent.default_model_profile}</WorkspaceStatusChip>
-                        </div>
-                      </button>
-                    </article>
-                  );
-                })
-              )}
-            </div>
+                        Inspect
+                      </ActionButton>
+                      {!agent.isDefault ? (
+                        <ActionButton
+                          aria-label={`Set ${agent.display_name} as default`}
+                          size="sm"
+                          onPress={() => void handleSetDefault(agent.agent_id)}
+                          isDisabled={agentsBusy}
+                        >
+                          Set default
+                        </ActionButton>
+                      ) : null}
+                    </ActionCluster>
+                  )
+                }
+              ]}
+              rows={filteredAgents}
+              getRowId={(agent: AgentRow) => agent.agent_id}
+              emptyTitle={agents.length === 0 ? "No agents registered" : "No matching agents"}
+              emptyDescription={
+                agents.length === 0
+                  ? "Open the setup wizard to create the first agent."
+                  : "Adjust the current filter to find a matching agent."
+              }
+            />
           </div>
         </WorkspaceSectionCard>
 
@@ -337,275 +400,269 @@ export function AgentsSection({ app }: AgentsSectionProps) {
           {detailBusy ? (
             <p className="chat-muted">Loading agent detail...</p>
           ) : detailRecord === null ? (
-            <div className="workspace-empty">Select an agent from the registry to inspect its detail.</div>
+            <EmptyState
+              compact
+              title="No agent selected"
+              description="Select an agent from the registry to inspect its detail."
+            />
           ) : (
             <div className="workspace-stack">
               <div className="workspace-inline">
                 <WorkspaceStatusChip tone={selectedAgent?.is_default ? "success" : "default"}>
                   {selectedAgent?.is_default ? "Default agent" : "Registered agent"}
                 </WorkspaceStatusChip>
-                <WorkspaceStatusChip tone="accent">{detailRecord.default_model_profile}</WorkspaceStatusChip>
+                <WorkspaceStatusChip tone="accent">
+                  {detailRecord.default_model_profile}
+                </WorkspaceStatusChip>
               </div>
 
-              <dl className="workspace-key-value-grid">
-                <div>
-                  <dt>Display name</dt>
-                  <dd>{detailRecord.display_name}</dd>
-                </div>
-                <div>
-                  <dt>Agent ID</dt>
-                  <dd>{detailRecord.agent_id}</dd>
-                </div>
-                <div>
-                  <dt>Agent dir</dt>
-                  <dd>{detailRecord.agent_dir}</dd>
-                </div>
-                <div>
-                  <dt>Created</dt>
-                  <dd>{formatUnixMs(detailRecord.created_at_unix_ms)}</dd>
-                </div>
-                <div>
-                  <dt>Updated</dt>
-                  <dd>{formatUnixMs(detailRecord.updated_at_unix_ms)}</dd>
-                </div>
-              </dl>
+              <KeyValueList
+                items={[
+                  { label: "Display name", value: detailRecord.display_name },
+                  { label: "Agent ID", value: detailRecord.agent_id },
+                  { label: "Agent dir", value: detailRecord.agent_dir },
+                  { label: "Created", value: formatUnixMs(detailRecord.created_at_unix_ms) },
+                  { label: "Updated", value: formatUnixMs(detailRecord.updated_at_unix_ms) }
+                ]}
+              />
 
               <div className="workspace-two-column">
-                <div className="workspace-panel workspace-panel--embedded">
-                  <div className="workspace-panel__intro">
-                    <h3>Workspace roots</h3>
-                    <p className="chat-muted">Keep the execution boundary visible and operator-reviewable.</p>
-                  </div>
+                <WorkspaceSectionCard
+                  title="Workspace roots"
+                  description="Keep the execution boundary visible and operator-reviewable."
+                  className="workspace-section-card--nested"
+                >
                   <ul className="workspace-bullet-list">
                     {detailRecord.workspace_roots.map((root) => (
                       <li key={root}>{root}</li>
                     ))}
                   </ul>
-                </div>
+                </WorkspaceSectionCard>
 
-                <div className="workspace-panel workspace-panel--embedded">
-                  <div className="workspace-panel__intro">
-                    <h3>Allowlists</h3>
-                    <p className="chat-muted">No speculative permissions are injected by the wizard.</p>
-                  </div>
-                  <p><strong>Tools:</strong> {detailRecord.default_tool_allowlist.join(", ") || "No explicit tool allowlist"}</p>
-                  <p><strong>Skills:</strong> {detailRecord.default_skill_allowlist.join(", ") || "No explicit skill allowlist"}</p>
-                </div>
+                <WorkspaceSectionCard
+                  title="Allowlists"
+                  description="No speculative permissions are injected by the wizard."
+                  className="workspace-section-card--nested"
+                >
+                  <KeyValueList
+                    items={[
+                      {
+                        label: "Tools",
+                        value:
+                          detailRecord.default_tool_allowlist.join(", ") ||
+                          "No explicit tool allowlist"
+                      },
+                      {
+                        label: "Skills",
+                        value:
+                          detailRecord.default_skill_allowlist.join(", ") ||
+                          "No explicit skill allowlist"
+                      }
+                    ]}
+                  />
+                </WorkspaceSectionCard>
               </div>
 
-              {!selectedAgent?.is_default && (
-                <div className="workspace-inline">
-                  <Button onPress={() => void handleSetDefault(detailRecord.agent_id)} isDisabled={agentsBusy}>
-                    {agentsBusy ? "Applying..." : "Set as default"}
-                  </Button>
-                </div>
-              )}
+              {!selectedAgent?.is_default ? (
+                <ActionButton
+                  onPress={() => void handleSetDefault(detailRecord.agent_id)}
+                  isDisabled={agentsBusy}
+                >
+                  {agentsBusy ? "Applying..." : "Set as default"}
+                </ActionButton>
+              ) : null}
             </div>
           )}
         </WorkspaceSectionCard>
       </section>
 
       <Modal isOpen={wizardOpen} onOpenChange={setWizardOpen}>
+        <Modal.Trigger aria-hidden="true" className="sr-only">
+          Open agent wizard
+        </Modal.Trigger>
         <Modal.Backdrop />
         <Modal.Container placement="center" size="lg">
           <Modal.Dialog>
             <Modal.Header>
               <div className="workspace-stack">
                 <h3>Create agent</h3>
-                <p className="chat-muted">Create a real registry entry backed by the daemon, not local mock state.</p>
+                <p className="chat-muted">
+                  Create a real registry entry backed by the daemon, not local mock state.
+                </p>
               </div>
             </Modal.Header>
             <Modal.Body>
-              <div className="workspace-tab-row" role="tablist" aria-label="Agent wizard steps">
+              <ActionCluster className="workspace-tab-row">
                 {WIZARD_STEPS.map((step) => (
-                  <button
+                  <ActionButton
                     key={step.id}
                     type="button"
-                    role="tab"
-                    aria-selected={wizardStep === step.id}
-                    className={`workspace-tab-button${wizardStep === step.id ? " is-active" : ""}`}
-                    onClick={() => setWizardStep(step.id)}
+                    variant={wizardStep === step.id ? "primary" : "ghost"}
+                    onPress={() => setWizardStep(step.id)}
                   >
                     {step.label}
-                  </button>
+                  </ActionButton>
                 ))}
-              </div>
+              </ActionCluster>
 
-              <div className="workspace-panel workspace-panel--embedded">
-                <div className="workspace-panel__intro">
-                  <h3>{WIZARD_STEPS[wizardStep].label}</h3>
-                  <p className="chat-muted">{WIZARD_STEPS[wizardStep].description}</p>
-                </div>
-
-                {wizardStep === 0 && (
+              <WorkspaceSectionCard
+                title={WIZARD_STEPS[wizardStep].label}
+                description={WIZARD_STEPS[wizardStep].description}
+                className="workspace-section-card--nested"
+              >
+                {wizardStep === 0 ? (
                   <div className="workspace-form-grid">
-                    <label>
-                      Agent ID
-                      <input
-                        value={draft.agentId}
-                        onChange={(event) => setDraft((current) => ({ ...current, agentId: event.target.value }))}
-                        placeholder="review-agent"
-                      />
-                    </label>
-                    <label>
-                      Display name
-                      <input
-                        value={draft.displayName}
-                        onChange={(event) => setDraft((current) => ({ ...current, displayName: event.target.value }))}
-                        placeholder="Review Agent"
-                      />
-                    </label>
+                    <TextInputField
+                      label="Agent ID"
+                      value={draft.agentId}
+                      onChange={(agentId) => setDraft((current) => ({ ...current, agentId }))}
+                      placeholder="review-agent"
+                    />
+                    <TextInputField
+                      label="Display name"
+                      value={draft.displayName}
+                      onChange={(displayName) =>
+                        setDraft((current) => ({ ...current, displayName }))
+                      }
+                      placeholder="Review Agent"
+                    />
                   </div>
-                )}
+                ) : null}
 
-                {wizardStep === 1 && (
+                {wizardStep === 1 ? (
                   <div className="workspace-stack">
-                    <label>
-                      Agent dir
-                      <input
-                        value={draft.agentDir}
-                        onChange={(event) => setDraft((current) => ({ ...current, agentDir: event.target.value }))}
-                        placeholder="Leave blank for safe state-root defaults"
-                      />
-                    </label>
-                    <label>
-                      Workspace roots
-                      <textarea
-                        rows={4}
-                        value={draft.workspaceRoots}
-                        onChange={(event) => setDraft((current) => ({ ...current, workspaceRoots: event.target.value }))}
-                        placeholder={"workspace\nworkspace-review"}
-                      />
-                    </label>
-                    <label className="console-checkbox-inline">
-                      <input
-                        type="checkbox"
-                        checked={draft.allowAbsolutePaths}
-                        onChange={(event) =>
-                          setDraft((current) => ({ ...current, allowAbsolutePaths: event.target.checked }))
-                        }
-                      />
-                      Allow absolute paths
-                    </label>
+                    <TextInputField
+                      label="Agent dir"
+                      value={draft.agentDir}
+                      onChange={(agentDir) => setDraft((current) => ({ ...current, agentDir }))}
+                      placeholder="Leave blank for safe state-root defaults"
+                    />
+                    <TextAreaField
+                      label="Workspace roots"
+                      rows={4}
+                      value={draft.workspaceRoots}
+                      onChange={(workspaceRoots) =>
+                        setDraft((current) => ({ ...current, workspaceRoots }))
+                      }
+                      placeholder={"workspace\nworkspace-review"}
+                    />
+                    <CheckboxField
+                      label="Allow absolute paths"
+                      checked={draft.allowAbsolutePaths}
+                      onChange={(allowAbsolutePaths) =>
+                        setDraft((current) => ({ ...current, allowAbsolutePaths }))
+                      }
+                    />
                   </div>
-                )}
+                ) : null}
 
-                {wizardStep === 2 && (
+                {wizardStep === 2 ? (
                   <div className="workspace-stack">
                     <div className="workspace-form-grid">
-                      <label>
-                        Default model profile
-                        <input
-                          value={draft.defaultModelProfile}
-                          onChange={(event) =>
-                            setDraft((current) => ({ ...current, defaultModelProfile: event.target.value }))
-                          }
-                          placeholder="gpt-4o-mini"
-                        />
-                      </label>
-                      <label className="console-checkbox-inline">
-                        <input
-                          type="checkbox"
-                          checked={draft.setDefault}
-                          onChange={(event) => setDraft((current) => ({ ...current, setDefault: event.target.checked }))}
-                        />
-                        Set as default agent
-                      </label>
+                      <TextInputField
+                        label="Default model profile"
+                        value={draft.defaultModelProfile}
+                        onChange={(defaultModelProfile) =>
+                          setDraft((current) => ({ ...current, defaultModelProfile }))
+                        }
+                        placeholder="gpt-4o-mini"
+                      />
+                      <CheckboxField
+                        label="Set as default agent"
+                        checked={draft.setDefault}
+                        onChange={(setDefault) =>
+                          setDraft((current) => ({ ...current, setDefault }))
+                        }
+                      />
                     </div>
-                    <label>
-                      Tool allowlist
-                      <textarea
-                        rows={3}
-                        value={draft.defaultToolAllowlist}
-                        onChange={(event) =>
-                          setDraft((current) => ({ ...current, defaultToolAllowlist: event.target.value }))
-                        }
-                        placeholder={"palyra.echo\npalyra.http.fetch"}
-                      />
-                    </label>
-                    <label>
-                      Skill allowlist
-                      <textarea
-                        rows={3}
-                        value={draft.defaultSkillAllowlist}
-                        onChange={(event) =>
-                          setDraft((current) => ({ ...current, defaultSkillAllowlist: event.target.value }))
-                        }
-                        placeholder={"acme.echo\nacme.review"}
-                      />
-                    </label>
+                    <TextAreaField
+                      label="Tool allowlist"
+                      rows={3}
+                      value={draft.defaultToolAllowlist}
+                      onChange={(defaultToolAllowlist) =>
+                        setDraft((current) => ({ ...current, defaultToolAllowlist }))
+                      }
+                      placeholder={"palyra.echo\npalyra.http.fetch"}
+                    />
+                    <TextAreaField
+                      label="Skill allowlist"
+                      rows={3}
+                      value={draft.defaultSkillAllowlist}
+                      onChange={(defaultSkillAllowlist) =>
+                        setDraft((current) => ({ ...current, defaultSkillAllowlist }))
+                      }
+                      placeholder={"acme.echo\nacme.review"}
+                    />
                   </div>
-                )}
+                ) : null}
 
-                {wizardStep === 3 && (
-                  <dl className="workspace-key-value-grid">
-                    <div>
-                      <dt>Agent ID</dt>
-                      <dd>{draft.agentId.trim() || "n/a"}</dd>
-                    </div>
-                    <div>
-                      <dt>Display name</dt>
-                      <dd>{draft.displayName.trim() || "n/a"}</dd>
-                    </div>
-                    <div>
-                      <dt>Agent dir</dt>
-                      <dd>{draft.agentDir.trim() || "Auto under state root"}</dd>
-                    </div>
-                    <div>
-                      <dt>Workspace roots</dt>
-                      <dd>{resolveWorkspaceRoots(draft).join(", ")}</dd>
-                    </div>
-                    <div>
-                      <dt>Model profile</dt>
-                      <dd>{draft.defaultModelProfile.trim() || "Backend default"}</dd>
-                    </div>
-                    <div>
-                      <dt>Tool allowlist</dt>
-                      <dd>{parseTextList(draft.defaultToolAllowlist).join(", ") || "none"}</dd>
-                    </div>
-                    <div>
-                      <dt>Skill allowlist</dt>
-                      <dd>{parseTextList(draft.defaultSkillAllowlist).join(", ") || "none"}</dd>
-                    </div>
-                    <div>
-                      <dt>Default selection</dt>
-                      <dd>{draft.setDefault ? "Set as default" : "Keep current default"}</dd>
-                    </div>
-                    <div>
-                      <dt>Absolute paths</dt>
-                      <dd>{draft.allowAbsolutePaths ? "Allowed" : "Disabled"}</dd>
-                    </div>
-                  </dl>
-                )}
+                {wizardStep === 3 ? (
+                  <KeyValueList
+                    items={[
+                      { label: "Agent ID", value: draft.agentId.trim() || "n/a" },
+                      { label: "Display name", value: draft.displayName.trim() || "n/a" },
+                      { label: "Agent dir", value: draft.agentDir.trim() || "Auto under state root" },
+                      { label: "Workspace roots", value: resolveWorkspaceRoots(draft).join(", ") },
+                      {
+                        label: "Model profile",
+                        value: draft.defaultModelProfile.trim() || "Backend default"
+                      },
+                      {
+                        label: "Tool allowlist",
+                        value: parseTextList(draft.defaultToolAllowlist).join(", ") || "none"
+                      },
+                      {
+                        label: "Skill allowlist",
+                        value: parseTextList(draft.defaultSkillAllowlist).join(", ") || "none"
+                      },
+                      {
+                        label: "Default selection",
+                        value: draft.setDefault ? "Set as default" : "Keep current default"
+                      },
+                      {
+                        label: "Absolute paths",
+                        value: draft.allowAbsolutePaths ? "Allowed" : "Disabled"
+                      }
+                    ]}
+                  />
+                ) : null}
 
-                {validationMessage !== null && (
-                  <div className="workspace-callout workspace-callout--warning">{validationMessage}</div>
-                )}
-              </div>
+                {validationMessage !== null ? (
+                  <InlineNotice title="Validation" tone="warning">
+                    {validationMessage}
+                  </InlineNotice>
+                ) : null}
+              </WorkspaceSectionCard>
             </Modal.Body>
             <Modal.Footer>
-              <div className="console-inline-actions">
-                <Button variant="secondary" onPress={closeWizard}>
+              <ActionCluster>
+                <ActionButton variant="secondary" onPress={closeWizard}>
                   Cancel
-                </Button>
-                {wizardStep > 0 && (
-                  <Button variant="secondary" onPress={() => setWizardStep((wizardStep - 1) as WizardStep)}>
+                </ActionButton>
+                {wizardStep > 0 ? (
+                  <ActionButton
+                    variant="secondary"
+                    onPress={() => setWizardStep((wizardStep - 1) as WizardStep)}
+                  >
                     Back
-                  </Button>
-                )}
+                  </ActionButton>
+                ) : null}
                 {wizardStep < 3 ? (
-                  <Button
+                  <ActionButton
                     onPress={() => setWizardStep((wizardStep + 1) as WizardStep)}
                     isDisabled={validationMessage !== null}
                   >
                     Next
-                  </Button>
+                  </ActionButton>
                 ) : (
-                  <Button onPress={() => void handleCreateAgent()} isDisabled={validationMessage !== null || agentsBusy}>
+                  <ActionButton
+                    onPress={() => void handleCreateAgent()}
+                    isDisabled={validationMessage !== null || agentsBusy}
+                  >
                     {agentsBusy ? "Creating..." : "Create agent"}
-                  </Button>
+                  </ActionButton>
                 )}
-              </div>
+              </ActionCluster>
             </Modal.Footer>
           </Modal.Dialog>
         </Modal.Container>

@@ -1,5 +1,14 @@
 import { useEffect, useMemo, useState, type FormEvent } from "react";
 
+import {
+  ActionButton,
+  AppForm,
+  CheckboxField,
+  EmptyState,
+  EntityTable,
+  SelectField,
+  TextInputField
+} from "../console/components/ui";
 import { SanitizedMarkdown } from "./markdown";
 import type {
   A2uiChartComponent,
@@ -16,6 +25,11 @@ interface A2uiRendererProps {
   readonly onFormSubmit?: (event: A2uiFormSubmitEvent) => void;
 }
 
+type A2uiTableRow = {
+  id: string;
+  cells: readonly string[];
+};
+
 export function A2uiRenderer({ document, onFormSubmit }: A2uiRendererProps) {
   return (
     <section className="a2ui-renderer" data-surface={document.surface} aria-label={document.surface}>
@@ -30,7 +44,11 @@ export function A2uiRenderer({ document, onFormSubmit }: A2uiRendererProps) {
         </article>
       ))}
       {document.components.length === 0 ? (
-        <article className="a2ui-component a2ui-component-empty">No renderable components.</article>
+        <EmptyState
+          compact
+          title="No renderable components"
+          description="This A2UI document does not contain any renderable components."
+        />
       ) : null}
     </section>
   );
@@ -62,28 +80,7 @@ function ComponentBody({ component, onFormSubmit }: ComponentBodyProps) {
         </ul>
       );
     case "table":
-      return (
-        <div className="a2ui-table-wrap">
-          <table className="a2ui-table">
-            <thead>
-              <tr>
-                {component.props.columns.map((column) => (
-                  <th key={`${component.id}-${column}`}>{column}</th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {component.props.rows.map((row, rowIndex) => (
-                <tr key={`${component.id}-row-${rowIndex}`}>
-                  {row.map((cell, cellIndex) => (
-                    <td key={`${component.id}-cell-${rowIndex}-${cellIndex}`}>{cell}</td>
-                  ))}
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      );
+      return <A2uiTable component={component} />;
     case "form":
       return <A2uiForm component={component} onSubmit={onFormSubmit} />;
     case "chart":
@@ -91,6 +88,32 @@ function ComponentBody({ component, onFormSubmit }: ComponentBodyProps) {
     default:
       return null;
   }
+}
+
+function A2uiTable({ component }: { component: Extract<A2uiComponent, { type: "table" }> }) {
+  const columns = component.props.columns.map((column, index) => ({
+    key: `column-${index}`,
+    label: column,
+    isRowHeader: index === 0,
+    render: (row: A2uiTableRow) => row.cells[index] ?? ""
+  }));
+
+  const rows: A2uiTableRow[] = component.props.rows.map((cells, rowIndex) => ({
+    id: `${component.id}-row-${rowIndex}`,
+    cells
+  }));
+
+  return (
+    <EntityTable
+      ariaLabel={component.id}
+      columns={columns}
+      rows={rows}
+      getRowId={(row) => row.id}
+      emptyTitle="No table rows"
+      emptyDescription="This table component does not currently contain any rows."
+      className="a2ui-table-wrap"
+    />
+  );
 }
 
 interface A2uiFormProps {
@@ -125,7 +148,7 @@ function A2uiForm({ component, onSubmit }: A2uiFormProps) {
   }
 
   return (
-    <form className="a2ui-form" onSubmit={handleSubmit}>
+    <AppForm className="a2ui-form" onSubmit={handleSubmit}>
       <header className="a2ui-form-header">
         <h3>{component.props.title}</h3>
       </header>
@@ -141,9 +164,9 @@ function A2uiForm({ component, onSubmit }: A2uiFormProps) {
         ))}
       </div>
       <footer className="a2ui-form-footer">
-        <button type="submit">{component.props.submitLabel}</button>
+        <ActionButton type="submit">{component.props.submitLabel}</ActionButton>
       </footer>
-    </form>
+    </AppForm>
   );
 }
 
@@ -160,95 +183,68 @@ function FormFieldRow({ componentId, field, value, onChange }: FormFieldRowProps
   if (field.type === "checkbox") {
     const checked = typeof value === "boolean" ? value : field.defaultValue;
     return (
-      <label htmlFor={inputId} className="a2ui-form-field a2ui-form-field-checkbox">
-        <input
-          id={inputId}
-          type="checkbox"
-          checked={checked}
-          onChange={(event) => onChange(field.id, event.currentTarget.checked)}
-        />
-        <span>{field.label}</span>
-      </label>
+      <CheckboxField
+        label={field.label}
+        description={field.hint.length > 0 ? field.hint : undefined}
+        checked={checked}
+        onChange={(nextValue) => onChange(field.id, nextValue)}
+      />
     );
   }
 
   if (field.type === "select") {
     const selectedValue = typeof value === "string" ? value : field.defaultValue;
     return (
-      <label htmlFor={inputId} className="a2ui-form-field">
-        <span>{field.label}</span>
-        <select
-          id={inputId}
-          value={selectedValue}
-          required={field.required}
-          onChange={(event) => onChange(field.id, event.currentTarget.value)}
-        >
-          {field.options.map((option) => (
-            <option key={`${field.id}-${option.value}`} value={option.value}>
-              {option.label}
-            </option>
-          ))}
-        </select>
-        {field.hint.length > 0 ? <small>{field.hint}</small> : null}
-      </label>
+      <SelectField
+        name={inputId}
+        label={field.label}
+        value={selectedValue}
+        description={field.hint.length > 0 ? field.hint : undefined}
+        onChange={(nextValue) => onChange(field.id, nextValue)}
+        options={field.options.map((option) => ({
+          key: option.value,
+          label: option.label
+        }))}
+      />
     );
   }
 
   if (field.type === "number") {
     const numberValue = typeof value === "number" ? value : field.defaultValue;
     return (
-      <label htmlFor={inputId} className="a2ui-form-field">
-        <span>{field.label}</span>
-        <input
-          id={inputId}
-          type="number"
-          min={field.min}
-          max={field.max}
-          step={field.step}
-          required={field.required}
-          value={numberValue}
-          onChange={(event) => {
-            const parsed = Number.parseFloat(event.currentTarget.value);
-            onChange(field.id, Number.isFinite(parsed) ? parsed : field.defaultValue);
-          }}
-        />
-        {field.hint.length > 0 ? <small>{field.hint}</small> : null}
-      </label>
+      <TextInputField
+        name={inputId}
+        label={field.label}
+        type="number"
+        value={String(numberValue)}
+        description={field.hint.length > 0 ? field.hint : undefined}
+        required={field.required}
+        onChange={(nextValue) => {
+          const parsed = Number.parseFloat(nextValue);
+          onChange(field.id, Number.isFinite(parsed) ? parsed : field.defaultValue);
+        }}
+      />
     );
   }
 
   const textValue = typeof value === "string" ? value : field.defaultValue;
   return (
-    <label htmlFor={inputId} className="a2ui-form-field">
-      <span>{field.label}</span>
-      <input
-        id={inputId}
-        type={field.type}
-        value={textValue}
-        placeholder={field.placeholder}
-        required={field.required}
-        onChange={(event) => onChange(field.id, event.currentTarget.value)}
-      />
-      {field.hint.length > 0 ? <small>{field.hint}</small> : null}
-    </label>
+    <TextInputField
+      name={inputId}
+      label={field.label}
+      type={field.type}
+      value={textValue}
+      placeholder={field.placeholder}
+      description={field.hint.length > 0 ? field.hint : undefined}
+      required={field.required}
+      onChange={(nextValue) => onChange(field.id, nextValue)}
+    />
   );
 }
 
 function buildInitialFormValues(fields: readonly A2uiFormField[]): Record<string, A2uiFormValue> {
   const values: Record<string, A2uiFormValue> = {};
   for (const field of fields) {
-    if (field.type === "checkbox") {
-      values[field.id] = field.defaultValue;
-      continue;
-    }
-    if (field.type === "number") {
-      values[field.id] = field.defaultValue;
-      continue;
-    }
-    if (field.type === "select") {
-      values[field.id] = field.defaultValue;
-      continue;
-    }
     values[field.id] = field.defaultValue;
   }
   return values;

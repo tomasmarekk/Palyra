@@ -1,5 +1,11 @@
 import { useState } from "react";
 
+import {
+  ActionButton,
+  AppForm,
+  CheckboxField,
+  TextInputField
+} from "../components/ui";
 import { WorkspaceMetricCard, WorkspacePageHeader, WorkspaceSectionCard, WorkspaceStatusChip } from "../components/workspace/WorkspaceChrome";
 import { WorkspaceConfirmDialog, WorkspaceEmptyState, WorkspaceInlineNotice, WorkspaceTable, workspaceToneForState } from "../components/workspace/WorkspacePatterns";
 import { readString, skillMetadata, toPrettyJson, type JsonObject } from "../shared";
@@ -52,9 +58,9 @@ export function SkillsSection({ app }: SkillsSectionProps) {
           </>
         }
         actions={(
-          <button type="button" onClick={() => void app.refreshSkills()} disabled={app.skillsBusy}>
+          <ActionButton type="button" variant="primary" onPress={() => void app.refreshSkills()} isDisabled={app.skillsBusy}>
             {app.skillsBusy ? "Refreshing..." : "Refresh skills"}
-          </button>
+          </ActionButton>
         )}
       />
 
@@ -125,28 +131,10 @@ export function SkillsSection({ app }: SkillsSectionProps) {
                       <td>{publisherState}</td>
                       <td>
                         <div className="workspace-table__actions">
-                          <button type="button" className="secondary" onClick={() => void app.executeSkillAction(entry, "verify")} disabled={app.skillsBusy}>
-                            Verify
-                          </button>
-                          <button type="button" className="secondary" onClick={() => void app.executeSkillAction(entry, "audit")} disabled={app.skillsBusy}>
-                            Audit
-                          </button>
-                          <button
-                            type="button"
-                            className="button--warn"
-                            onClick={() => setPendingAction({ entry, action: "quarantine", skillId })}
-                            disabled={app.skillsBusy}
-                          >
-                            Quarantine
-                          </button>
-                          <button
-                            type="button"
-                            className="secondary"
-                            onClick={() => setPendingAction({ entry, action: "enable", skillId })}
-                            disabled={app.skillsBusy}
-                          >
-                            Enable
-                          </button>
+                          <ActionButton type="button" variant="secondary" onPress={() => void app.executeSkillAction(entry, "verify")} isDisabled={app.skillsBusy}>Verify</ActionButton>
+                          <ActionButton type="button" variant="secondary" onPress={() => void app.executeSkillAction(entry, "audit")} isDisabled={app.skillsBusy}>Audit</ActionButton>
+                          <ActionButton type="button" variant="danger" onPress={() => setPendingAction({ entry, action: "quarantine", skillId })} isDisabled={app.skillsBusy}>Quarantine</ActionButton>
+                          <ActionButton type="button" variant="secondary" onPress={() => setPendingAction({ entry, action: "enable", skillId })} isDisabled={app.skillsBusy}>Enable</ActionButton>
                         </div>
                       </td>
                     </tr>
@@ -162,43 +150,15 @@ export function SkillsSection({ app }: SkillsSectionProps) {
             title="Install artifact"
             description="Install stays compact and operational. This page should not feel like an app store."
           >
-            <form className="workspace-stack" onSubmit={(event) => void app.installSkill(event)}>
-              <label>
-                Artifact path
-                <input
-                  value={app.skillArtifactPath}
-                  onChange={(event) => app.setSkillArtifactPath(event.target.value)}
-                />
-              </label>
-              <label>
-                Operator reason
-                <input
-                  value={app.skillReason}
-                  onChange={(event) => app.setSkillReason(event.target.value)}
-                />
-              </label>
+            <AppForm className="workspace-stack" onSubmit={(event) => void app.installSkill(event)}>
+              <TextInputField label="Artifact path" value={app.skillArtifactPath} onChange={app.setSkillArtifactPath} />
+              <TextInputField label="Operator reason" value={app.skillReason} onChange={app.setSkillReason} />
               <div className="workspace-inline">
-                <label className="console-checkbox-inline">
-                  <input
-                    type="checkbox"
-                    checked={app.skillAllowTofu}
-                    onChange={(event) => app.setSkillAllowTofu(event.target.checked)}
-                  />
-                  Allow TOFU
-                </label>
-                <label className="console-checkbox-inline">
-                  <input
-                    type="checkbox"
-                    checked={app.skillAllowUntrusted}
-                    onChange={(event) => app.setSkillAllowUntrusted(event.target.checked)}
-                  />
-                  Allow untrusted
-                </label>
-                <button type="submit" disabled={app.skillsBusy}>
-                  {app.skillsBusy ? "Installing..." : "Install skill"}
-                </button>
+                <CheckboxField checked={app.skillAllowTofu} label="Allow TOFU" onChange={app.setSkillAllowTofu} />
+                <CheckboxField checked={app.skillAllowUntrusted} label="Allow untrusted" onChange={app.setSkillAllowUntrusted} />
+                <ActionButton type="submit" variant="primary" isDisabled={app.skillsBusy}>{app.skillsBusy ? "Installing..." : "Install skill"}</ActionButton>
               </div>
-            </form>
+            </AppForm>
           </WorkspaceSectionCard>
 
           <WorkspaceSectionCard

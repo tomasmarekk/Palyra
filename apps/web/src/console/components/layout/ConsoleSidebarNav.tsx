@@ -1,4 +1,4 @@
-import { Card, CardContent, Chip } from "@heroui/react";
+import { Button, Card, CardContent, Chip, ScrollShadow } from "@heroui/react";
 import { useNavigate } from "react-router-dom";
 
 import { CONSOLE_NAV_GROUPS, getSectionPath } from "../../navigation";
@@ -36,45 +36,48 @@ export function ConsoleSidebarNav({ currentSection, onSelect }: ConsoleSidebarNa
           </div>
         </div>
 
-        <nav aria-label="Dashboard domains" className="space-y-5">
-          {CONSOLE_NAV_GROUPS.map((group) => (
-            <div key={group.id} className="space-y-2">
-              <p className="text-xs font-semibold uppercase tracking-[0.24em] text-slate-400 dark:text-slate-500">
-                {group.label}
-              </p>
-              <div className="space-y-2">
-                {group.items.map((entry) => {
-                  const selected = currentSection === entry.id;
-                  const accessibleLabel = legacyNavigationLabel(entry.id) ?? entry.label;
-                  return (
-                    <button
-                      key={entry.id}
-                      type="button"
-                      aria-label={accessibleLabel}
-                      className={`console-sidebar-button ${selected ? "console-sidebar-button--active" : ""}`}
-                      onClick={() => {
-                        onSelect(entry.id);
-                        void navigate(getSectionPath(entry.id));
-                      }}
-                      aria-current={selected ? "page" : undefined}
-                    >
-                      <span
-                        aria-hidden="true"
-                        className={`flex h-10 w-10 items-center justify-center rounded-2xl border ${selected ? "border-accent/35 bg-accent/10 text-accent-700 dark:text-accent-300" : "border-white/40 bg-white/60 text-slate-500 dark:border-white/10 dark:bg-slate-900/80 dark:text-slate-300"}`}
+        <ScrollShadow className="console-sidebar__scroll">
+          <nav aria-label="Dashboard domains" className="space-y-5 pr-2">
+            {CONSOLE_NAV_GROUPS.map((group) => (
+              <div key={group.id} className="space-y-2">
+                <p className="text-xs font-semibold uppercase tracking-[0.24em] text-slate-400 dark:text-slate-500">
+                  {group.label}
+                </p>
+                <div className="space-y-2">
+                  {group.items.map((entry) => {
+                    const selected = currentSection === entry.id;
+                    const accessibleLabel = legacyNavigationLabel(entry.id) ?? entry.label;
+                    return (
+                      <Button
+                        key={entry.id}
+                        aria-current={selected ? "page" : undefined}
+                        aria-label={accessibleLabel}
+                        className="justify-start px-4 py-3"
+                        fullWidth
+                        variant={selected ? "secondary" : "ghost"}
+                        onPress={() => {
+                          onSelect(entry.id);
+                          void navigate(getSectionPath(entry.id));
+                        }}
                       >
-                        <NavigationGlyph section={entry.id} />
-                      </span>
-                      <span className="flex flex-1 flex-col items-start text-left">
-                        <span className="text-sm font-semibold">{entry.label}</span>
-                        <span className="text-xs text-foreground-500">{entry.detail}</span>
-                      </span>
-                    </button>
-                  );
-                })}
+                        <span
+                          aria-hidden="true"
+                          className={`flex h-10 w-10 items-center justify-center rounded-2xl border ${selected ? "border-accent/35 bg-accent/10 text-accent-700 dark:text-accent-300" : "border-white/40 bg-white/60 text-slate-500 dark:border-white/10 dark:bg-slate-900/80 dark:text-slate-300"}`}
+                        >
+                          <NavigationGlyph section={entry.id} />
+                        </span>
+                        <span className="flex flex-1 flex-col items-start text-left">
+                          <span className="text-sm font-semibold">{entry.label}</span>
+                          <span className="text-xs text-foreground-500">{entry.detail}</span>
+                        </span>
+                      </Button>
+                    );
+                  })}
+                </div>
               </div>
-            </div>
-          ))}
-        </nav>
+            ))}
+          </nav>
+        </ScrollShadow>
       </CardContent>
     </Card>
   );

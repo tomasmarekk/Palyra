@@ -1,7 +1,16 @@
-import { Card, CardContent, Chip } from "@heroui/react";
+import { Chip } from "@heroui/react";
 import { useEffect, useMemo } from "react";
 
 import type { ConsoleApiClient } from "../consoleApi";
+import {
+  ActionButton,
+  EmptyState,
+  KeyValueList,
+  MetricCard,
+  SectionCard,
+  StatusChip,
+  SwitchField
+} from "../console/components/ui";
 
 import { ChatComposer } from "./ChatComposer";
 import { ChatRunDrawer } from "./ChatRunDrawer";
@@ -95,41 +104,86 @@ export function ChatConsolePanel({
   return (
     <main className="workspace-page chat-workspace">
       <section className="workspace-summary-grid">
-        <ChatMetric label="Session" value={sessions.selectedSession?.session_label?.trim() || (sessions.selectedSession ? shortId(sessions.selectedSession.session_id) : "none")} tone={sessions.selectedSession ? "success" : "warning"} />
-        <ChatMetric label="Active run" value={activeRunId ?? "none"} tone={activeRunId ? "default" : "warning"} />
-        <ChatMetric label="Pending approvals" value={String(pendingApprovalCount)} tone={pendingApprovalCount > 0 ? "warning" : "success"} />
-        <ChatMetric label="A2UI surfaces" value={String(a2uiSurfaces.length)} tone={a2uiSurfaces.length > 0 ? "default" : "success"} />
+        <MetricCard
+          detail="Current working conversation."
+          label="Session"
+          tone={sessions.selectedSession ? "success" : "warning"}
+          value={
+            sessions.selectedSession?.session_label?.trim() ||
+            (sessions.selectedSession ? shortId(sessions.selectedSession.session_id) : "none")
+          }
+        />
+        <MetricCard
+          detail="Most recent run in focus."
+          label="Active run"
+          tone={activeRunId ? "default" : "warning"}
+          value={activeRunId ?? "none"}
+        />
+        <MetricCard
+          detail="Inline approval requests awaiting a decision."
+          label="Pending approvals"
+          tone={pendingApprovalCount > 0 ? "warning" : "success"}
+          value={String(pendingApprovalCount)}
+        />
+        <MetricCard
+          detail="Published A2UI surfaces for the current session."
+          label="A2UI surfaces"
+          tone={a2uiSurfaces.length > 0 ? "default" : "success"}
+          value={String(a2uiSurfaces.length)}
+        />
       </section>
 
       <section className="chat-workspace__layout">
-        <Card className="chat-panel border border-white/40 bg-white/80 shadow-xl shadow-slate-900/5 dark:border-white/10 dark:bg-slate-950/70">
-          <CardContent className="px-4 py-4">
-            <ChatSessionsSidebar
-              sessionsBusy={sessions.sessionsBusy}
-              newSessionLabel={sessions.newSessionLabel}
-              setNewSessionLabel={sessions.setNewSessionLabel}
-              createSession={() => {
-                void sessions.createSession();
-              }}
-              sessionLabelDraft={sessions.sessionLabelDraft}
-              setSessionLabelDraft={sessions.setSessionLabelDraft}
-              selectedSession={sessions.selectedSession}
-              renameSession={() => {
-                void sessions.renameSession();
-              }}
-              resetSession={() => {
-                void resetSessionAndTranscript();
-              }}
-              sortedSessions={sessions.sortedSessions}
-              activeSessionId={sessions.activeSessionId}
-              setActiveSessionId={sessions.setActiveSessionId}
-            />
-          </CardContent>
-        </Card>
+        <SectionCard
+          className="chat-panel"
+          description="Create, rename, reset, and switch sessions."
+          title="Sessions"
+        >
+          <ChatSessionsSidebar
+            sessionsBusy={sessions.sessionsBusy}
+            newSessionLabel={sessions.newSessionLabel}
+            setNewSessionLabel={sessions.setNewSessionLabel}
+            createSession={() => {
+              void sessions.createSession();
+            }}
+            sessionLabelDraft={sessions.sessionLabelDraft}
+            setSessionLabelDraft={sessions.setSessionLabelDraft}
+            selectedSession={sessions.selectedSession}
+            renameSession={() => {
+              void sessions.renameSession();
+            }}
+            resetSession={() => {
+              void resetSessionAndTranscript();
+            }}
+            sortedSessions={sessions.sortedSessions}
+            activeSessionId={sessions.activeSessionId}
+            setActiveSessionId={sessions.setActiveSessionId}
+          />
+        </SectionCard>
 
-        <Card className="chat-panel chat-panel--conversation border border-white/40 bg-white/80 shadow-xl shadow-slate-900/5 dark:border-white/10 dark:bg-slate-950/70">
-          <CardContent className="chat-panel__body px-4 py-4">
-            <header className="chat-main-header">
+        <SectionCard
+          className="chat-panel chat-panel--conversation"
+          description="Conversation state, streaming output, and operator controls."
+          title={
+            sessions.selectedSession === null
+              ? "No active session"
+              : sessions.selectedSession.session_label?.trim().length
+                ? sessions.selectedSession.session_label
+                : shortId(sessions.selectedSession.session_id)
+          }
+          actions={
+            <div className="workspace-inline-actions">
+              <StatusChip tone={streaming ? "warning" : "success"}>
+                {streaming ? "Streaming" : "Idle"}
+              </StatusChip>
+              <Chip variant="secondary">
+                {activeRunId === null ? "No active run" : `Active run: ${activeRunId}`}
+              </Chip>
+            </div>
+          }
+        >
+          <div className="chat-panel__body">
+            <div className="chat-main-header">
               <div className="workspace-panel__intro">
                 <p className="workspace-kicker">Chat</p>
                 <h2>
@@ -144,28 +198,25 @@ export function ChatConsolePanel({
                 </p>
               </div>
               <div className="workspace-inline-actions">
-                <Chip color={streaming ? "warning" : "success"} variant="soft">
-                  {streaming ? "Streaming" : "Idle"}
-                </Chip>
-                <label className="console-checkbox-inline">
-                  <input
-                    type="checkbox"
-                    checked={allowSensitiveTools}
-                    onChange={(event) => setAllowSensitiveTools(event.target.checked)}
-                  />
-                  Allow sensitive tools for next run
-                </label>
-                <button
+                <SwitchField
+                  checked={allowSensitiveTools}
+                  description="Applies to the next run only."
+                  label="Allow sensitive tools"
+                  onChange={setAllowSensitiveTools}
+                />
+                <ActionButton
+                  isDisabled={sessions.sessionsBusy}
                   type="button"
-                  className="secondary"
-                  onClick={() => void sessions.refreshSessions(false)}
-                  disabled={sessions.sessionsBusy}
+                  variant="secondary"
+                  onPress={() => void sessions.refreshSessions(false)}
                 >
                   {sessions.sessionsBusy ? "Refreshing..." : "Refresh sessions"}
-                </button>
-                <button
+                </ActionButton>
+                <ActionButton
+                  isDisabled={(activeRunId ?? runIds[0] ?? null) === null}
                   type="button"
-                  onClick={() => {
+                  variant="primary"
+                  onPress={() => {
                     const targetRunId = activeRunId ?? runIds[0] ?? null;
                     if (targetRunId === null) {
                       setError("No run is available for inspection.");
@@ -173,12 +224,11 @@ export function ChatConsolePanel({
                     }
                     openRunDetails(targetRunId);
                   }}
-                  disabled={(activeRunId ?? runIds[0] ?? null) === null}
                 >
                   Run details
-                </button>
+                </ActionButton>
               </div>
-            </header>
+            </div>
 
             <ChatTranscript
               visibleTranscript={visibleTranscript}
@@ -208,126 +258,109 @@ export function ChatConsolePanel({
                 setNotice("Local transcript cleared.");
               }}
             />
-          </CardContent>
-        </Card>
+          </div>
+        </SectionCard>
 
         <div className="chat-inspector-column">
-          <Card className="chat-panel chat-panel--sticky border border-white/40 bg-white/80 shadow-xl shadow-slate-900/5 dark:border-white/10 dark:bg-slate-950/70">
-            <CardContent className="gap-4 px-4 py-4">
-              <div className="workspace-panel__intro">
-                <p className="workspace-kicker">Session Context</p>
-                <h3>{sessions.selectedSession?.session_label?.trim() || "Session summary"}</h3>
-              </div>
-              <dl className="workspace-detail-grid">
-                <div>
-                  <dt>Session ID</dt>
-                  <dd>{sessions.selectedSession ? shortId(sessions.selectedSession.session_id) : "none"}</dd>
-                </div>
-                <div>
-                  <dt>Updated</dt>
-                  <dd>
-                    {sessions.selectedSession
-                      ? new Date(sessions.selectedSession.updated_at_unix_ms).toLocaleString()
-                      : "n/a"}
-                  </dd>
-                </div>
-                <div>
-                  <dt>Visible transcript</dt>
-                  <dd>{visibleTranscript.length}</dd>
-                </div>
-                <div>
-                  <dt>Known runs</dt>
-                  <dd>{runIds.length}</dd>
-                </div>
-              </dl>
-              <div className="workspace-inline-actions">
-                <button type="button" className="button--warn" onClick={() => {
+          <SectionCard
+            className="chat-panel chat-panel--sticky"
+            description="Fast session context while you work."
+            title={sessions.selectedSession?.session_label?.trim() || "Session summary"}
+          >
+            <KeyValueList
+              items={[
+                {
+                  label: "Session ID",
+                  value: sessions.selectedSession
+                    ? shortId(sessions.selectedSession.session_id)
+                    : "none"
+                },
+                {
+                  label: "Updated",
+                  value: sessions.selectedSession
+                    ? new Date(sessions.selectedSession.updated_at_unix_ms).toLocaleString()
+                    : "n/a"
+                },
+                { label: "Visible transcript", value: visibleTranscript.length },
+                { label: "Known runs", value: runIds.length }
+              ]}
+            />
+            <div className="workspace-inline-actions">
+              <ActionButton
+                isDisabled={sessions.selectedSession === null || sessions.sessionsBusy}
+                type="button"
+                variant="danger"
+                onPress={() => {
                   void resetSessionAndTranscript();
-                }} disabled={sessions.selectedSession === null || sessions.sessionsBusy}>
-                  Reset session
-                </button>
-              </div>
-            </CardContent>
-          </Card>
+                }}
+              >
+                Reset session
+              </ActionButton>
+            </div>
+          </SectionCard>
 
-          <Card className="chat-panel border border-white/40 bg-white/80 shadow-xl shadow-slate-900/5 dark:border-white/10 dark:bg-slate-950/70">
-            <CardContent className="gap-4 px-4 py-4">
-              <div className="workspace-panel__intro">
-                <p className="workspace-kicker">Workspace Signals</p>
-                <h3>Approvals and A2UI</h3>
-              </div>
-              <div className="workspace-tag-row">
-                <Chip color={pendingApprovalCount > 0 ? "warning" : "success"} variant="soft">
-                  {pendingApprovalCount} approval{pendingApprovalCount === 1 ? "" : "s"}
-                </Chip>
-                <Chip variant="secondary">{a2uiSurfaces.length} A2UI surface{a2uiSurfaces.length === 1 ? "" : "s"}</Chip>
-              </div>
-              {a2uiSurfaces.length === 0 ? (
-                <p className="workspace-empty">No A2UI documents published for this session yet.</p>
-              ) : (
-                <ul className="workspace-bullet-list">
-                  {a2uiSurfaces.map((surface) => (
-                    <li key={surface}>{surface}</li>
-                  ))}
-                </ul>
-              )}
-            </CardContent>
-          </Card>
+          <SectionCard
+            className="chat-panel"
+            description="Approval and surface signals stay visible without taking over the main transcript."
+            title="Workspace signals"
+          >
+            <div className="workspace-tag-row">
+              <Chip color={pendingApprovalCount > 0 ? "warning" : "success"} variant="soft">
+                {pendingApprovalCount} approval{pendingApprovalCount === 1 ? "" : "s"}
+              </Chip>
+              <Chip variant="secondary">
+                {a2uiSurfaces.length} A2UI surface{a2uiSurfaces.length === 1 ? "" : "s"}
+              </Chip>
+            </div>
+            {a2uiSurfaces.length === 0 ? (
+              <EmptyState
+                compact
+                description="No A2UI documents published for this session yet."
+                title="No A2UI surfaces"
+              />
+            ) : (
+              <ul className="workspace-bullet-list">
+                {a2uiSurfaces.map((surface) => (
+                  <li key={surface}>{surface}</li>
+                ))}
+              </ul>
+            )}
+          </SectionCard>
 
           {inspectorVisible ? (
-            <Card className="chat-panel border border-white/40 bg-white/80 shadow-xl shadow-slate-900/5 dark:border-white/10 dark:bg-slate-950/70">
-              <CardContent className="px-4 py-4">
-                <ChatRunDrawer
-                  open
-                  runIds={runIds}
-                  runDrawerId={runDrawerId}
-                  setRunDrawerId={setRunDrawerId}
-                  runDrawerBusy={runDrawerBusy}
-                  runStatus={runStatus}
-                  runTape={runTape}
-                  revealSensitiveValues={revealSensitiveValues}
-                  refreshRun={refreshRunDetails}
-                  close={closeRunDrawer}
-                />
-              </CardContent>
-            </Card>
+            <SectionCard
+              className="chat-panel"
+              description="Status, tape, and token usage for the selected run."
+              title="Run inspector"
+            >
+              <ChatRunDrawer
+                open
+                runIds={runIds}
+                runDrawerId={runDrawerId}
+                setRunDrawerId={setRunDrawerId}
+                runDrawerBusy={runDrawerBusy}
+                runStatus={runStatus}
+                runTape={runTape}
+                revealSensitiveValues={revealSensitiveValues}
+                refreshRun={refreshRunDetails}
+                close={closeRunDrawer}
+              />
+            </SectionCard>
           ) : (
-            <Card className="chat-panel border border-white/40 bg-white/80 shadow-xl shadow-slate-900/5 dark:border-white/10 dark:bg-slate-950/70">
-              <CardContent className="gap-3 px-4 py-4">
-                <div className="workspace-panel__intro">
-                  <p className="workspace-kicker">Inspector</p>
-                  <h3>Run details will appear here</h3>
-                </div>
-                <p className="workspace-empty">Open a run after the first streamed response to inspect status, tape, and token usage.</p>
-              </CardContent>
-            </Card>
+            <SectionCard
+              className="chat-panel"
+              description="Run details become available after the first streamed response."
+              title="Inspector"
+            >
+              <EmptyState
+                compact
+                description="Open a run after the first streamed response to inspect status, tape, and token usage."
+                title="Run details will appear here"
+              />
+            </SectionCard>
           )}
         </div>
       </section>
     </main>
-  );
-}
-
-function ChatMetric({
-  label,
-  value,
-  tone
-}: {
-  label: string;
-  value: string;
-  tone: "default" | "success" | "warning" | "danger" | "accent";
-}) {
-  return (
-    <Card className="workspace-stat-card border border-white/40 bg-white/80 shadow-xl shadow-slate-900/5 dark:border-white/10 dark:bg-slate-950/70">
-      <CardContent className="gap-3 px-5 py-4">
-        <div className="workspace-stat-card__header">
-          <p className="workspace-kicker">{label}</p>
-          <Chip color={tone} variant="soft">
-            {value}
-          </Chip>
-        </div>
-        <p className="workspace-stat-card__value">{value}</p>
-      </CardContent>
-    </Card>
   );
 }

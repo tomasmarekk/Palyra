@@ -1,3 +1,12 @@
+import { Button, ScrollShadow } from "@heroui/react";
+
+import {
+  ActionButton,
+  ActionCluster,
+  EmptyState,
+  SectionCard,
+  TextInputField
+} from "../console/components/ui";
 import type { ChatSessionRecord } from "../consoleApi";
 
 import { shortId } from "./chatShared";
@@ -39,65 +48,88 @@ export function ChatSessionsSidebar({
         <p className="chat-muted">Keep sessions secondary to the conversation, but always one click away.</p>
       </div>
 
-      <section className="chat-session-editor">
-        <h4>New session</h4>
-        <label>
-          New label
-          <input
-            value={newSessionLabel}
-            onChange={(event) => setNewSessionLabel(event.target.value)}
-            placeholder="optional"
-          />
-        </label>
-        <button type="button" onClick={createSession} disabled={sessionsBusy}>
-          {sessionsBusy ? "Creating..." : "Create"}
-        </button>
-      </section>
+      <SectionCard title="New session">
+        <TextInputField
+          label="New label"
+          placeholder="optional"
+          value={newSessionLabel}
+          onChange={setNewSessionLabel}
+        />
+        <ActionCluster>
+          <ActionButton
+            isDisabled={sessionsBusy}
+            type="button"
+            variant="primary"
+            onPress={createSession}
+          >
+            {sessionsBusy ? "Creating..." : "Create"}
+          </ActionButton>
+        </ActionCluster>
+      </SectionCard>
 
-      <section className="chat-session-editor">
-        <h4>Selected session</h4>
-        <label>
-          Active label
-          <input
-            value={sessionLabelDraft}
-            onChange={(event) => setSessionLabelDraft(event.target.value)}
-            disabled={selectedSession === null || sessionsBusy}
-          />
-        </label>
-        <div className="workspace-inline-actions">
-          <button type="button" onClick={renameSession} disabled={selectedSession === null || sessionsBusy}>
+      <SectionCard title="Selected session">
+        <TextInputField
+          disabled={selectedSession === null || sessionsBusy}
+          label="Active label"
+          value={sessionLabelDraft}
+          onChange={setSessionLabelDraft}
+        />
+        <ActionCluster>
+          <ActionButton
+            isDisabled={selectedSession === null || sessionsBusy}
+            type="button"
+            variant="primary"
+            onPress={renameSession}
+          >
             Rename
-          </button>
-          <button type="button" className="button--warn" onClick={resetSession} disabled={selectedSession === null || sessionsBusy}>
+          </ActionButton>
+          <ActionButton
+            isDisabled={selectedSession === null || sessionsBusy}
+            type="button"
+            variant="danger"
+            onPress={resetSession}
+          >
             Reset
-          </button>
-        </div>
-      </section>
+          </ActionButton>
+        </ActionCluster>
+      </SectionCard>
 
-      <div className="chat-session-list" role="listbox" aria-label="Conversation sessions">
+      <ScrollShadow className="chat-session-list" role="listbox">
         {sortedSessions.length === 0 ? (
-          <p className="workspace-empty">Create a session to start a conversation.</p>
+          <EmptyState
+            compact
+            description="Create a session to start a conversation."
+            title="No sessions yet"
+          />
         ) : (
           sortedSessions.map((session) => {
             const active = session.session_id === activeSessionId;
-            const label = session.session_label?.trim().length ? session.session_label : shortId(session.session_id);
+            const label = session.session_label?.trim().length
+              ? session.session_label
+              : shortId(session.session_id);
+
             return (
-              <button
+              <Button
                 key={session.session_id}
-                type="button"
-                className={`chat-session-item${active ? " is-active" : ""}`}
-                onClick={() => setActiveSessionId(session.session_id)}
                 aria-selected={active}
+                className="chat-session-item"
+                fullWidth
+                type="button"
+                variant={active ? "secondary" : "tertiary"}
+                onPress={() => setActiveSessionId(session.session_id)}
               >
-                <span className="chat-session-item__title">{label}</span>
-                <small>
-                  Updated {new Date(session.updated_at_unix_ms).toLocaleTimeString()} · {shortId(session.session_id)}
-                </small>
-              </button>
+                <span className="flex w-full flex-col items-start gap-1 text-left">
+                  <span className="chat-session-item__title">{label}</span>
+                  <small>
+                    Updated {new Date(session.updated_at_unix_ms).toLocaleTimeString()} ·{" "}
+                    {shortId(session.session_id)}
+                  </small>
+                </span>
+              </Button>
             );
           })
         )}
-      </div>
+      </ScrollShadow>
     </aside>
   );
 }

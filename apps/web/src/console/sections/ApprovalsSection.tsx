@@ -1,5 +1,9 @@
 import { Button } from "@heroui/react";
 
+import {
+  SelectField,
+  TextInputField
+} from "../components/ui";
 import { WorkspaceMetricCard, WorkspacePageHeader, WorkspaceSectionCard, WorkspaceStatusChip } from "../components/workspace/WorkspaceChrome";
 import { PrettyJsonBlock, formatUnixMs, readObject, readString, type JsonObject } from "../shared";
 import type { ConsoleAppState } from "../useConsoleAppState";
@@ -91,11 +95,12 @@ export function ApprovalsSection({ app }: ApprovalsSectionProps) {
                 const decision = readString(approval, "decision");
                 const isActive = approvalId === selectedApprovalId;
                 return (
-                  <button
+                  <Button
                     key={approvalId}
                     type="button"
                     className={`workspace-list-button${isActive ? " is-active" : ""}`}
-                    onClick={() => app.setApprovalId(approvalId)}
+                    variant={isActive ? "secondary" : "ghost"}
+                    onPress={() => app.setApprovalId(approvalId)}
                   >
                     <div>
                       <strong>{readString(approval, "request_summary") ?? approvalId}</strong>
@@ -107,7 +112,7 @@ export function ApprovalsSection({ app }: ApprovalsSectionProps) {
                     <WorkspaceStatusChip tone={decision === null ? "warning" : "default"}>
                       {decision ?? "pending"}
                     </WorkspaceStatusChip>
-                  </button>
+                  </Button>
                 );
               })
             )}
@@ -185,29 +190,9 @@ export function ApprovalsSection({ app }: ApprovalsSectionProps) {
               )}
 
               <div className="workspace-form-grid">
-                <label>
-                  Approval ID
-                  <input value={selectedApprovalId} readOnly />
-                </label>
-                <label>
-                  Reason
-                  <input
-                    value={app.approvalReason}
-                    onChange={(event) => app.setApprovalReason(event.target.value)}
-                    placeholder="Optional operator note"
-                  />
-                </label>
-                <label>
-                  Decision scope
-                  <select
-                    value={app.approvalScope}
-                    onChange={(event) => app.setApprovalScope(event.target.value)}
-                  >
-                    <option value="once">once</option>
-                    <option value="session">session</option>
-                    <option value="timeboxed">timeboxed</option>
-                  </select>
-                </label>
+                <TextInputField label="Approval ID" value={selectedApprovalId} readOnly onChange={() => {}} />
+                <TextInputField label="Reason" value={app.approvalReason} onChange={app.setApprovalReason} placeholder="Optional operator note" />
+                <SelectField label="Decision scope" value={app.approvalScope} onChange={app.setApprovalScope} options={[{ key: "once", label: "once" }, { key: "session", label: "session" }, { key: "timeboxed", label: "timeboxed" }]} />
               </div>
 
               <div className="console-inline-actions">

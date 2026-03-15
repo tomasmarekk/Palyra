@@ -1,4 +1,4 @@
-import { cleanup, render } from "@testing-library/react";
+import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 
@@ -9,7 +9,7 @@ afterEach(() => {
   cleanup();
 });
 
-describe("ConsoleShell snapshot coverage", () => {
+describe("ConsoleShell layout coverage", () => {
   it("renders deterministic shell navigation for the M56 parity surface", () => {
     const app = {
       session: {
@@ -32,7 +32,7 @@ describe("ConsoleShell snapshot coverage", () => {
       error: null
     } as unknown as ConsoleAppState;
 
-    const rendered = render(
+    render(
       <MemoryRouter>
         <ConsoleShell app={app}>
           <section className="console-card">
@@ -43,6 +43,14 @@ describe("ConsoleShell snapshot coverage", () => {
       </MemoryRouter>
     );
 
-    expect(rendered.container.firstChild).toMatchSnapshot();
+    expect(
+      screen.getByRole("heading", { name: "Web Dashboard Operator Surface" })
+    ).toBeInTheDocument();
+    expect(screen.getByText("Overview refreshed.")).toBeInTheDocument();
+    expect(screen.getByText("admin:web-console")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Reveal sensitive values" })
+    ).toBeInTheDocument();
+    expect(screen.getByText("Cookie session + CSRF")).toBeInTheDocument();
   });
 });

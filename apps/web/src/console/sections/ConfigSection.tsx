@@ -1,8 +1,31 @@
+import { Button, ButtonGroup } from "@heroui/react";
 import { useState } from "react";
 
-import { WorkspaceMetricCard, WorkspacePageHeader, WorkspaceSectionCard, WorkspaceStatusChip } from "../components/workspace/WorkspaceChrome";
-import { WorkspaceEmptyState, WorkspaceInlineNotice, WorkspaceTable, workspaceToneForState } from "../components/workspace/WorkspacePatterns";
-import { formatUnixMs, PrettyJsonBlock, readNumber, readString, toStringArray, type JsonObject } from "../shared";
+import {
+  ActionButton,
+  SelectField,
+  TextInputField
+} from "../components/ui";
+import {
+  WorkspaceMetricCard,
+  WorkspacePageHeader,
+  WorkspaceSectionCard,
+  WorkspaceStatusChip
+} from "../components/workspace/WorkspaceChrome";
+import {
+  WorkspaceEmptyState,
+  WorkspaceInlineNotice,
+  WorkspaceTable,
+  workspaceToneForState
+} from "../components/workspace/WorkspacePatterns";
+import {
+  formatUnixMs,
+  PrettyJsonBlock,
+  readNumber,
+  readString,
+  toStringArray,
+  type JsonObject
+} from "../shared";
 import type { ConsoleAppState } from "../useConsoleAppState";
 
 type ConfigTab = "inspect" | "validate" | "mutate" | "recover";
@@ -40,9 +63,16 @@ type ConfigSectionProps = {
 
 export function ConfigSection({ app }: ConfigSectionProps) {
   const [activeTab, setActiveTab] = useState<ConfigTab>("inspect");
-  const warnings = toStringArray(Array.isArray(app.configDeploymentPosture?.warnings) ? app.configDeploymentPosture.warnings : []);
+  const warnings = toStringArray(
+    Array.isArray(app.configDeploymentPosture?.warnings)
+      ? app.configDeploymentPosture.warnings
+      : []
+  );
   const backups = Array.isArray(app.configInspectSnapshot?.backups)
-    ? app.configInspectSnapshot.backups.filter((entry): entry is JsonObject => typeof entry === "object" && entry !== null && !Array.isArray(entry))
+    ? app.configInspectSnapshot.backups.filter(
+        (entry): entry is JsonObject =>
+          typeof entry === "object" && entry !== null && !Array.isArray(entry)
+      )
     : [];
 
   return (
@@ -53,7 +83,15 @@ export function ConfigSection({ app }: ConfigSectionProps) {
         description="Inspect first, validate second, mutate deliberately, and keep recovery explicit. Secrets now live on their own page."
         status={
           <>
-            <WorkspaceStatusChip tone={workspaceToneForState(app.configValidation?.valid === true ? "valid" : warnings.length > 0 ? "warning" : "unknown")}>
+            <WorkspaceStatusChip
+              tone={workspaceToneForState(
+                app.configValidation?.valid === true
+                  ? "valid"
+                  : warnings.length > 0
+                    ? "warning"
+                    : "unknown"
+              )}
+            >
               {app.configValidation?.valid === true ? "Validation ready" : "Check config"}
             </WorkspaceStatusChip>
             <WorkspaceStatusChip tone={warnings.length > 0 ? "warning" : "default"}>
@@ -61,53 +99,116 @@ export function ConfigSection({ app }: ConfigSectionProps) {
             </WorkspaceStatusChip>
           </>
         }
-        actions={(
-          <button type="button" onClick={() => void app.refreshConfigSurface()} disabled={app.configBusy}>
+        actions={
+          <ActionButton
+            isDisabled={app.configBusy}
+            type="button"
+            variant="primary"
+            onPress={() => void app.refreshConfigSurface()}
+          >
             {app.configBusy ? "Refreshing..." : "Refresh config"}
-          </button>
-        )}
+          </ActionButton>
+        }
       />
 
       <section className="workspace-metric-grid workspace-metric-grid--compact">
-        <WorkspaceMetricCard label="Source path" value={(readString(app.configInspectSnapshot ?? {}, "source_path") ?? app.configInspectPath) || "n/a"} detail="Canonical config path currently being inspected." />
-        <WorkspaceMetricCard label="Backups" value={backups.length} detail="Retained backups visible for recovery flows." tone={backups.length > 0 ? "accent" : "default"} />
-        <WorkspaceMetricCard label="Last mutation" value={readString(app.configLastMutation ?? {}, "operation") ?? "none"} detail={readString(app.configLastMutation ?? {}, "changed_key") ?? "No recent mutation loaded."} tone={app.configLastMutation === null ? "default" : "warning"} />
+        <WorkspaceMetricCard
+          detail="Canonical config path currently being inspected."
+          label="Source path"
+          value={(readString(app.configInspectSnapshot ?? {}, "source_path") ?? app.configInspectPath) || "n/a"}
+        />
+        <WorkspaceMetricCard
+          detail="Retained backups visible for recovery flows."
+          label="Backups"
+          tone={backups.length > 0 ? "accent" : "default"}
+          value={backups.length}
+        />
+        <WorkspaceMetricCard
+          detail={readString(app.configLastMutation ?? {}, "changed_key") ?? "No recent mutation loaded."}
+          label="Last mutation"
+          tone={app.configLastMutation === null ? "default" : "warning"}
+          value={readString(app.configLastMutation ?? {}, "operation") ?? "none"}
+        />
       </section>
 
       {warnings.length > 0 ? (
         <WorkspaceInlineNotice title="Deployment warnings" tone="warning">
-          <ul className="console-compact-list">{warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul>
+          <ul className="console-compact-list">
+            {warnings.map((warning) => (
+              <li key={warning}>{warning}</li>
+            ))}
+          </ul>
         </WorkspaceInlineNotice>
       ) : null}
 
-      <div className="workspace-inline">
+      <ButtonGroup className="workspace-inline">
         {(["inspect", "validate", "mutate", "recover"] as const).map((tab) => (
-          <button key={tab} type="button" className={`workspace-tab-button${activeTab === tab ? " is-active" : ""}`} onClick={() => setActiveTab(tab)}>
+          <Button
+            key={tab}
+            type="button"
+            variant={activeTab === tab ? "secondary" : "ghost"}
+            onPress={() => setActiveTab(tab)}
+          >
             {tab[0].toUpperCase() + tab.slice(1)}
-          </button>
+          </Button>
         ))}
-      </div>
+      </ButtonGroup>
 
       {activeTab === "inspect" && (
         <section className="workspace-two-column">
-          <WorkspaceSectionCard title="Inspect and migrate" description="Read the current document safely and keep migration as an explicit operator action.">
+          <WorkspaceSectionCard
+            description="Read the current document safely and keep migration as an explicit operator action."
+            title="Inspect and migrate"
+          >
             <div className="workspace-stack">
               <div className="workspace-form-grid">
-                <label>Path<input value={app.configInspectPath} onChange={(event) => app.setConfigInspectPath(event.target.value)} /></label>
-                <label>Backups<input value={app.configBackups} onChange={(event) => app.setConfigBackups(event.target.value)} /></label>
+                <TextInputField
+                  label="Path"
+                  value={app.configInspectPath}
+                  onChange={app.setConfigInspectPath}
+                />
+                <TextInputField
+                  label="Backups"
+                  value={app.configBackups}
+                  onChange={app.setConfigBackups}
+                />
               </div>
               <div className="workspace-inline">
-                <button type="button" onClick={() => void app.inspectConfigSurface()} disabled={app.configBusy}>Inspect</button>
-                <button type="button" className="secondary" onClick={() => void app.migrateConfigSurface()} disabled={app.configBusy}>Migrate</button>
+                <ActionButton
+                  isDisabled={app.configBusy}
+                  type="button"
+                  variant="primary"
+                  onPress={() => void app.inspectConfigSurface()}
+                >
+                  Inspect
+                </ActionButton>
+                <ActionButton
+                  isDisabled={app.configBusy}
+                  type="button"
+                  variant="secondary"
+                  onPress={() => void app.migrateConfigSurface()}
+                >
+                  Migrate
+                </ActionButton>
               </div>
             </div>
           </WorkspaceSectionCard>
 
-          <WorkspaceSectionCard title="Redacted snapshot" description="Document view stays redacted by default and no longer competes with secrets management on the same page.">
+          <WorkspaceSectionCard
+            description="Document view stays redacted by default and no longer competes with secrets management on the same page."
+            title="Redacted snapshot"
+          >
             {app.configInspectSnapshot === null ? (
-              <WorkspaceEmptyState title="No snapshot loaded" description="Run inspect to load the current config document." compact />
+              <WorkspaceEmptyState
+                compact
+                description="Run inspect to load the current config document."
+                title="No snapshot loaded"
+              />
             ) : (
-              <PrettyJsonBlock value={app.configInspectSnapshot} revealSensitiveValues={app.revealSensitiveValues} />
+              <PrettyJsonBlock
+                revealSensitiveValues={app.revealSensitiveValues}
+                value={app.configInspectSnapshot}
+              />
             )}
           </WorkspaceSectionCard>
         </section>
@@ -115,23 +216,61 @@ export function ConfigSection({ app }: ConfigSectionProps) {
 
       {activeTab === "validate" && (
         <section className="workspace-two-column">
-          <WorkspaceSectionCard title="Validation" description="Keep validation result obvious before any mutation or recovery step.">
+          <WorkspaceSectionCard
+            description="Keep validation result obvious before any mutation or recovery step."
+            title="Validation"
+          >
             <div className="workspace-inline">
-              <button type="button" onClick={() => void app.validateConfigSurface()} disabled={app.configBusy}>Validate</button>
+              <ActionButton
+                isDisabled={app.configBusy}
+                type="button"
+                variant="primary"
+                onPress={() => void app.validateConfigSurface()}
+              >
+                Validate
+              </ActionButton>
             </div>
             <dl className="workspace-key-value-grid">
-              <div><dt>Status</dt><dd>{app.configValidation?.valid === true ? "valid" : app.configValidation === null ? "not loaded" : "needs review"}</dd></div>
-              <div><dt>Version</dt><dd>{readString(app.configValidation ?? {}, "config_version") ?? "n/a"}</dd></div>
-              <div><dt>Migrated from</dt><dd>{readString(app.configValidation ?? {}, "migrated_from_version") ?? "n/a"}</dd></div>
-              <div><dt>Path</dt><dd>{readString(app.configValidation ?? {}, "source_path") ?? app.configInspectPath}</dd></div>
+              <div>
+                <dt>Status</dt>
+                <dd>
+                  {app.configValidation?.valid === true
+                    ? "valid"
+                    : app.configValidation === null
+                      ? "not loaded"
+                      : "needs review"}
+                </dd>
+              </div>
+              <div>
+                <dt>Version</dt>
+                <dd>{readString(app.configValidation ?? {}, "config_version") ?? "n/a"}</dd>
+              </div>
+              <div>
+                <dt>Migrated from</dt>
+                <dd>{readString(app.configValidation ?? {}, "migrated_from_version") ?? "n/a"}</dd>
+              </div>
+              <div>
+                <dt>Path</dt>
+                <dd>{readString(app.configValidation ?? {}, "source_path") ?? app.configInspectPath}</dd>
+              </div>
             </dl>
           </WorkspaceSectionCard>
 
-          <WorkspaceSectionCard title="Validation payload" description="Raw payload stays secondary to the human-readable summary.">
+          <WorkspaceSectionCard
+            description="Raw payload stays secondary to the human-readable summary."
+            title="Validation payload"
+          >
             {app.configValidation === null ? (
-              <WorkspaceEmptyState title="No validation payload" description="Run validate to load the backend validation result." compact />
+              <WorkspaceEmptyState
+                compact
+                description="Run validate to load the backend validation result."
+                title="No validation payload"
+              />
             ) : (
-              <PrettyJsonBlock value={app.configValidation} revealSensitiveValues={app.revealSensitiveValues} />
+              <PrettyJsonBlock
+                revealSensitiveValues={app.revealSensitiveValues}
+                value={app.configValidation}
+              />
             )}
           </WorkspaceSectionCard>
         </section>
@@ -139,30 +278,85 @@ export function ConfigSection({ app }: ConfigSectionProps) {
 
       {activeTab === "mutate" && (
         <section className="workspace-two-column">
-          <WorkspaceSectionCard title="Mutate config" description="Keep mutation small and explicit, with mode, key, and value separated from the rest of the page.">
+          <WorkspaceSectionCard
+            description="Keep mutation small and explicit, with mode, key, and value separated from the rest of the page."
+            title="Mutate config"
+          >
             <div className="workspace-stack">
               <div className="workspace-form-grid">
-                <label>Mode<select value={app.configMutationMode} onChange={(event) => app.setConfigMutationMode(event.target.value === "unset" ? "unset" : "set")}><option value="set">set</option><option value="unset">unset</option></select></label>
-                <label>Key<input value={app.configMutationKey} onChange={(event) => app.setConfigMutationKey(event.target.value)} /></label>
-                <label>Value<input value={app.configMutationValue} onChange={(event) => app.setConfigMutationValue(event.target.value)} disabled={app.configMutationMode === "unset"} placeholder={app.configMutationMode === "unset" ? "Value unused for unset" : "\"value\""} /></label>
+                <SelectField
+                  label="Mode"
+                  options={[
+                    { key: "set", label: "set" },
+                    { key: "unset", label: "unset" }
+                  ]}
+                  value={app.configMutationMode}
+                  onChange={(value) =>
+                    app.setConfigMutationMode(value === "unset" ? "unset" : "set")
+                  }
+                />
+                <TextInputField
+                  label="Key"
+                  value={app.configMutationKey}
+                  onChange={app.setConfigMutationKey}
+                />
+                <TextInputField
+                  disabled={app.configMutationMode === "unset"}
+                  label="Value"
+                  placeholder={
+                    app.configMutationMode === "unset"
+                      ? "Value unused for unset"
+                      : "\"value\""
+                  }
+                  value={app.configMutationValue}
+                  onChange={app.setConfigMutationValue}
+                />
               </div>
               <div className="workspace-inline">
-                <button type="button" onClick={() => void app.mutateConfigSurface()} disabled={app.configBusy}>{app.configMutationMode === "unset" ? "Unset key" : "Apply mutation"}</button>
+                <ActionButton
+                  isDisabled={app.configBusy}
+                  type="button"
+                  variant="primary"
+                  onPress={() => void app.mutateConfigSurface()}
+                >
+                  {app.configMutationMode === "unset" ? "Unset key" : "Apply mutation"}
+                </ActionButton>
               </div>
             </div>
           </WorkspaceSectionCard>
 
-          <WorkspaceSectionCard title="Mutation output" description="Review the last backend mutation and its redacted diff before moving on.">
+          <WorkspaceSectionCard
+            description="Review the last backend mutation and its redacted diff before moving on."
+            title="Mutation output"
+          >
             <dl className="workspace-key-value-grid">
-              <div><dt>Operation</dt><dd>{readString(app.configLastMutation ?? {}, "operation") ?? "n/a"}</dd></div>
-              <div><dt>Changed key</dt><dd>{readString(app.configLastMutation ?? {}, "changed_key") ?? "n/a"}</dd></div>
-              <div><dt>Backups retained</dt><dd>{readString(app.configLastMutation ?? {}, "backups_retained") ?? "n/a"}</dd></div>
-              <div><dt>Updated</dt><dd>{readString(app.configLastMutation ?? {}, "source_path") ?? app.configInspectPath}</dd></div>
+              <div>
+                <dt>Operation</dt>
+                <dd>{readString(app.configLastMutation ?? {}, "operation") ?? "n/a"}</dd>
+              </div>
+              <div>
+                <dt>Changed key</dt>
+                <dd>{readString(app.configLastMutation ?? {}, "changed_key") ?? "n/a"}</dd>
+              </div>
+              <div>
+                <dt>Backups retained</dt>
+                <dd>{readString(app.configLastMutation ?? {}, "backups_retained") ?? "n/a"}</dd>
+              </div>
+              <div>
+                <dt>Updated</dt>
+                <dd>{readString(app.configLastMutation ?? {}, "source_path") ?? app.configInspectPath}</dd>
+              </div>
             </dl>
             {app.configDiffPreview !== null ? (
-              <pre className="workspace-code-panel"><code>{app.configDiffPreview}</code></pre>
+              <pre className="workspace-code-panel">
+                <code>{app.configDiffPreview}</code>
+              </pre>
             ) : (
-              <WorkspaceEmptyState title="No diff preview" description="A redacted diff appears here after a mutation or migration." compact />
+              <WorkspaceEmptyState
+                compact
+                description="A redacted diff appears here after a mutation or migration."
+                title="No diff preview"
+              />
             )}
           </WorkspaceSectionCard>
         </section>
@@ -170,25 +364,52 @@ export function ConfigSection({ app }: ConfigSectionProps) {
 
       {activeTab === "recover" && (
         <section className="workspace-two-column">
-          <WorkspaceSectionCard title="Recover from backup" description="Recovery stays visibly risky and grounded in the actual retained backup list.">
+          <WorkspaceSectionCard
+            description="Recovery stays visibly risky and grounded in the actual retained backup list."
+            title="Recover from backup"
+          >
             <div className="workspace-stack">
               <div className="workspace-form-grid">
-                <label>Backup index<input value={app.configRecoverBackup} onChange={(event) => app.setConfigRecoverBackup(event.target.value)} /></label>
-                <label>Backups retained<input value={app.configBackups} onChange={(event) => app.setConfigBackups(event.target.value)} /></label>
+                <TextInputField
+                  label="Backup index"
+                  value={app.configRecoverBackup}
+                  onChange={app.setConfigRecoverBackup}
+                />
+                <TextInputField
+                  label="Backups retained"
+                  value={app.configBackups}
+                  onChange={app.setConfigBackups}
+                />
               </div>
               <div className="workspace-inline">
-                <button type="button" className="button--warn" onClick={() => void app.recoverConfigSurface()} disabled={app.configBusy}>Recover backup</button>
+                <ActionButton
+                  isDisabled={app.configBusy}
+                  type="button"
+                  variant="danger"
+                  onPress={() => void app.recoverConfigSurface()}
+                >
+                  Recover backup
+                </ActionButton>
               </div>
             </div>
           </WorkspaceSectionCard>
 
-          <WorkspaceSectionCard title="Available backups" description="Use the published backup records instead of guessing restore targets.">
+          <WorkspaceSectionCard
+            description="Use the published backup records instead of guessing restore targets."
+            title="Available backups"
+          >
             {backups.length === 0 ? (
-              <WorkspaceEmptyState title="No backups published" description="Inspect config with retained backups to populate recovery targets." compact />
+              <WorkspaceEmptyState
+                compact
+                description="Inspect config with retained backups to populate recovery targets."
+                title="No backups published"
+              />
             ) : (
               <WorkspaceTable ariaLabel="Config backups" columns={["Index", "Path", "Exists", "Updated"]}>
                 {backups.map((backup) => (
-                  <tr key={readString(backup, "path") ?? String(readNumber(backup, "index") ?? 0)}>
+                  <tr
+                    key={readString(backup, "path") ?? String(readNumber(backup, "index") ?? 0)}
+                  >
                     <td>{readString(backup, "index") ?? "n/a"}</td>
                     <td>{readString(backup, "path") ?? "n/a"}</td>
                     <td>{readString(backup, "exists") ?? "n/a"}</td>

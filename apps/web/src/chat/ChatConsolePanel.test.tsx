@@ -106,9 +106,10 @@ describe("ChatConsolePanel", () => {
     expect(await screen.findByText("initial-two")).toBeInTheDocument();
     expect(await screen.findByText(/run-two-initial/)).toBeInTheDocument();
 
-    const runSelect = screen.getByRole("combobox");
-    fireEvent.change(runSelect, { target: { value: runOneId } });
-    fireEvent.change(runSelect, { target: { value: runTwoId } });
+    fireEvent.click(screen.getByRole("button", { name: / Run$/ }));
+    fireEvent.click(await screen.findByRole("option", { name: runOneId }));
+    fireEvent.click(screen.getByRole("button", { name: / Run$/ }));
+    fireEvent.click(await screen.findByRole("option", { name: runTwoId }));
 
     await waitFor(() => {
       expect(chatRunStatus).toHaveBeenCalledTimes(3);

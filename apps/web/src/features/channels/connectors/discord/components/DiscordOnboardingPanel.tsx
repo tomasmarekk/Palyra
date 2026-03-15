@@ -1,3 +1,10 @@
+import {
+  ActionButton,
+  ActionCluster,
+  CheckboxField,
+  SelectField,
+  TextInputField
+} from "../../../../../console/components/ui";
 import { DiscordOnboardingHighlights, toPrettyJson } from "../../../../../console/shared";
 import type { ConsoleAppState } from "../../../../../console/useConsoleAppState";
 
@@ -8,6 +15,23 @@ type DiscordOnboardingPanelProps = {
 export function DiscordOnboardingPanel({
   app,
 }: DiscordOnboardingPanelProps) {
+  const modeOptions = [
+    { key: "local", label: "local" },
+    { key: "remote_vps", label: "remote_vps" }
+  ] as const;
+
+  const scopeOptions = [
+    { key: "dm_only", label: "dm_only" },
+    { key: "allowlisted_guild_channels", label: "allowlisted_guild_channels" },
+    { key: "open_guild_channels", label: "open_guild_channels" }
+  ] as const;
+
+  const broadcastOptions = [
+    { key: "deny", label: "deny" },
+    { key: "mention_only", label: "mention_only" },
+    { key: "allow", label: "allow" }
+  ] as const;
+
   return (
     <section className="console-subpanel">
       <div className="console-subpanel__header">
@@ -20,132 +44,93 @@ export function DiscordOnboardingPanel({
         </div>
       </div>
       <div className="console-grid-4">
-        <label>
-          Account ID
-          <input
-            value={app.discordWizardAccountId}
-            onChange={(event) =>
-              app.setDiscordWizardAccountId(event.target.value)
-            }
-          />
-        </label>
-        <label>
-          Mode
-          <select
-            value={app.discordWizardMode}
-            onChange={(event) =>
-              app.setDiscordWizardMode(
-                event.target.value === "remote_vps" ? "remote_vps" : "local"
-              )
-            }
-          >
-            <option value="local">local</option>
-            <option value="remote_vps">remote_vps</option>
-          </select>
-        </label>
-        <label>
-          Bot token
-          <input
-            value={app.discordWizardToken}
-            onChange={(event) => app.setDiscordWizardToken(event.target.value)}
-            placeholder="Never persisted in config plaintext"
-          />
-        </label>
-        <label>
-          Verify channel ID
-          <input
-            value={app.discordWizardVerifyChannelId}
-            onChange={(event) =>
-              app.setDiscordWizardVerifyChannelId(event.target.value)
-            }
-          />
-        </label>
+        <TextInputField
+          label="Account ID"
+          value={app.discordWizardAccountId}
+          onChange={app.setDiscordWizardAccountId}
+        />
+        <SelectField
+          label="Mode"
+          value={app.discordWizardMode}
+          onChange={(value) =>
+            app.setDiscordWizardMode(value === "remote_vps" ? "remote_vps" : "local")
+          }
+          options={modeOptions}
+        />
+        <TextInputField
+          label="Bot token"
+          value={app.discordWizardToken}
+          onChange={app.setDiscordWizardToken}
+          placeholder="Never persisted in config plaintext"
+        />
+        <TextInputField
+          label="Verify channel ID"
+          value={app.discordWizardVerifyChannelId}
+          onChange={app.setDiscordWizardVerifyChannelId}
+        />
       </div>
       <div className="console-grid-4">
-        <label>
-          Inbound scope
-          <select
-            value={app.discordWizardScope}
-            onChange={(event) =>
-              app.setDiscordWizardScope(
-                event.target.value as
-                  | "dm_only"
-                  | "allowlisted_guild_channels"
-                  | "open_guild_channels"
-              )
-            }
-          >
-            <option value="dm_only">dm_only</option>
-            <option value="allowlisted_guild_channels">
-              allowlisted_guild_channels
-            </option>
-            <option value="open_guild_channels">open_guild_channels</option>
-          </select>
-        </label>
-        <label>
-          Allow from
-          <input
-            value={app.discordWizardAllowFrom}
-            onChange={(event) => app.setDiscordWizardAllowFrom(event.target.value)}
-          />
-        </label>
-        <label>
-          Deny from
-          <input
-            value={app.discordWizardDenyFrom}
-            onChange={(event) => app.setDiscordWizardDenyFrom(event.target.value)}
-          />
-        </label>
-        <label>
-          Concurrency
-          <input
-            value={app.discordWizardConcurrency}
-            onChange={(event) =>
-              app.setDiscordWizardConcurrency(event.target.value)
-            }
-          />
-        </label>
+        <SelectField
+          label="Inbound scope"
+          value={app.discordWizardScope}
+          onChange={(value) =>
+            app.setDiscordWizardScope(
+              value as "dm_only" | "allowlisted_guild_channels" | "open_guild_channels"
+            )
+          }
+          options={scopeOptions}
+        />
+        <TextInputField
+          label="Allow from"
+          value={app.discordWizardAllowFrom}
+          onChange={app.setDiscordWizardAllowFrom}
+        />
+        <TextInputField
+          label="Deny from"
+          value={app.discordWizardDenyFrom}
+          onChange={app.setDiscordWizardDenyFrom}
+        />
+        <TextInputField
+          label="Concurrency"
+          value={app.discordWizardConcurrency}
+          onChange={app.setDiscordWizardConcurrency}
+        />
       </div>
-      <div className="console-inline-actions">
-        <label className="console-checkbox-inline">
-          <input
-            type="checkbox"
+      <div className="workspace-stack">
+        <div className="console-grid-4">
+          <CheckboxField
+            label="Require mention"
             checked={app.discordWizardRequireMention}
-            onChange={(event) =>
-              app.setDiscordWizardRequireMention(event.target.checked)
-            }
+            onChange={app.setDiscordWizardRequireMention}
+            disabled={app.discordWizardBusy}
           />
-          Require mention
-        </label>
-        <label>
-          Broadcast strategy
-          <select
+          <SelectField
+            label="Broadcast strategy"
             value={app.discordWizardBroadcast}
-            onChange={(event) =>
-              app.setDiscordWizardBroadcast(
-                event.target.value as "deny" | "mention_only" | "allow"
-              )
+            onChange={(value) =>
+              app.setDiscordWizardBroadcast(value as "deny" | "mention_only" | "allow")
             }
+            options={broadcastOptions}
+            disabled={app.discordWizardBusy}
+          />
+        </div>
+        <ActionCluster>
+          <ActionButton
+            type="button"
+            variant="secondary"
+            onPress={() => void app.runDiscordPreflight()}
+            isDisabled={app.discordWizardBusy}
           >
-            <option value="deny">deny</option>
-            <option value="mention_only">mention_only</option>
-            <option value="allow">allow</option>
-          </select>
-        </label>
-        <button
-          type="button"
-          onClick={() => void app.runDiscordPreflight()}
-          disabled={app.discordWizardBusy}
-        >
-          {app.discordWizardBusy ? "Running..." : "Run preflight"}
-        </button>
-        <button
-          type="button"
-          onClick={() => void app.applyDiscordOnboarding()}
-          disabled={app.discordWizardBusy}
-        >
-          {app.discordWizardBusy ? "Applying..." : "Apply onboarding"}
-        </button>
+            {app.discordWizardBusy ? "Running..." : "Run preflight"}
+          </ActionButton>
+          <ActionButton
+            type="button"
+            onPress={() => void app.applyDiscordOnboarding()}
+            isDisabled={app.discordWizardBusy}
+          >
+            {app.discordWizardBusy ? "Applying..." : "Apply onboarding"}
+          </ActionButton>
+        </ActionCluster>
       </div>
       {app.discordWizardPreflight !== null && (
         <DiscordOnboardingHighlights

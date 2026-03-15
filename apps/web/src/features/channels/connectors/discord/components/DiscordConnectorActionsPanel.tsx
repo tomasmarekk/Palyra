@@ -1,3 +1,9 @@
+import {
+  ActionButton,
+  AppForm,
+  CheckboxField,
+  TextInputField
+} from "../../../../../console/components/ui";
 import type { ConsoleAppState } from "../../../../../console/useConsoleAppState";
 
 type DiscordConnectorActionsPanelProps = {
@@ -14,99 +20,71 @@ export function DiscordConnectorActionsPanel({
       {selectedConnectorKind === "discord" && (
         <>
           <h4>Discord direct verification</h4>
-          <form
+          <AppForm
             className="console-form"
             onSubmit={(event) => void app.sendDiscordTest(event)}
           >
             <div className="console-grid-4">
-              <label>
-                Target
-                <input
-                  value={app.channelsDiscordTarget}
-                  onChange={(event) =>
-                    app.setChannelsDiscordTarget(event.target.value)
-                  }
-                />
-              </label>
-              <label>
-                Text
-                <input
-                  value={app.channelsDiscordText}
-                  onChange={(event) => app.setChannelsDiscordText(event.target.value)}
-                />
-              </label>
-              <label>
-                Auto reaction
-                <input
-                  value={app.channelsDiscordAutoReaction}
-                  onChange={(event) =>
-                    app.setChannelsDiscordAutoReaction(event.target.value)
-                  }
-                />
-              </label>
-              <label>
-                Thread ID
-                <input
-                  value={app.channelsDiscordThreadId}
-                  onChange={(event) =>
-                    app.setChannelsDiscordThreadId(event.target.value)
-                  }
-                />
-              </label>
-            </div>
-            <label className="console-checkbox-inline">
-              <input
-                type="checkbox"
-                checked={app.channelsDiscordConfirm}
-                onChange={(event) =>
-                  app.setChannelsDiscordConfirm(event.target.checked)
-                }
+              <TextInputField
+                label="Target"
+                value={app.channelsDiscordTarget}
+                onChange={app.setChannelsDiscordTarget}
               />
-              Confirm Discord outbound test send
-            </label>
-            <button type="submit" disabled={app.channelsBusy}>
+              <TextInputField
+                label="Text"
+                value={app.channelsDiscordText}
+                onChange={app.setChannelsDiscordText}
+              />
+              <TextInputField
+                label="Auto reaction"
+                value={app.channelsDiscordAutoReaction}
+                onChange={app.setChannelsDiscordAutoReaction}
+              />
+              <TextInputField
+                label="Thread ID"
+                value={app.channelsDiscordThreadId}
+                onChange={app.setChannelsDiscordThreadId}
+              />
+            </div>
+            <CheckboxField
+              label="Confirm Discord outbound test send"
+              checked={app.channelsDiscordConfirm}
+              onChange={app.setChannelsDiscordConfirm}
+              disabled={app.channelsBusy}
+            />
+            <ActionButton type="submit" isDisabled={app.channelsBusy}>
               {app.channelsBusy ? "Sending..." : "Send Discord test"}
-            </button>
-          </form>
+            </ActionButton>
+          </AppForm>
         </>
       )}
 
       <h4>Discord verify target</h4>
       <div className="console-grid-3">
-        <label>
-          Target
-          <input
-            value={app.discordWizardVerifyTarget}
-            onChange={(event) =>
-              app.setDiscordWizardVerifyTarget(event.target.value)
-            }
-          />
-        </label>
-        <label>
-          Text
-          <input
-            value={app.discordWizardVerifyText}
-            onChange={(event) => app.setDiscordWizardVerifyText(event.target.value)}
-          />
-        </label>
-        <label className="console-checkbox-inline">
-          <input
-            type="checkbox"
-            checked={app.discordWizardVerifyConfirm}
-            onChange={(event) =>
-              app.setDiscordWizardVerifyConfirm(event.target.checked)
-            }
-          />
-          Confirm verification send
-        </label>
+        <TextInputField
+          label="Target"
+          value={app.discordWizardVerifyTarget}
+          onChange={app.setDiscordWizardVerifyTarget}
+        />
+        <TextInputField
+          label="Text"
+          value={app.discordWizardVerifyText}
+          onChange={app.setDiscordWizardVerifyText}
+        />
+        <CheckboxField
+          label="Confirm verification send"
+          checked={app.discordWizardVerifyConfirm}
+          onChange={app.setDiscordWizardVerifyConfirm}
+          disabled={app.channelsBusy}
+        />
       </div>
-      <button
+      <ActionButton
         type="button"
-        onClick={() => void app.runDiscordVerification()}
-        disabled={app.channelsBusy}
+        onPress={() => void app.runDiscordVerification()}
+        isDisabled={app.channelsBusy}
       >
         {app.channelsBusy ? "Verifying..." : "Verify Discord target"}
-      </button>
+      </ActionButton>
     </>
   );
 }

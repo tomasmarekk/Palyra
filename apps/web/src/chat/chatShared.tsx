@@ -1,5 +1,13 @@
 import { memo, useMemo } from "react";
 
+import {
+  ActionButton,
+  ActionCluster,
+  AppForm,
+  SectionCard,
+  SelectField,
+  TextInputField
+} from "../console/components/ui";
 import type { JsonValue } from "../consoleApi";
 
 const SENSITIVE_KEY_PATTERN =
@@ -83,63 +91,71 @@ export function ApprovalRequestControls({
   };
 
   return (
-    <section className="console-subpanel chat-approval-box">
-      <h4>Approval required</h4>
-      <p className="chat-muted">Approval ID: {approvalId}</p>
-      <div className="console-grid-3">
-        <label>
-          Scope
-          <select
-            value={effectiveDraft.scope}
-            onChange={(event) => {
-              onDraftChange({
-                ...effectiveDraft,
-                scope: normalizeScope(event.target.value)
-              });
-            }}
-            disabled={effectiveDraft.busy}
+    <SectionCard
+      className="chat-approval-box"
+      description={`Approval ID: ${approvalId}`}
+      title="Approval required"
+    >
+      <AppForm className="console-grid-3">
+        <SelectField
+          disabled={effectiveDraft.busy}
+          label="Scope"
+          options={[
+            { key: "once", label: "once" },
+            { key: "session", label: "session" },
+            { key: "timeboxed", label: "timeboxed" }
+          ]}
+          value={effectiveDraft.scope}
+          onChange={(value) =>
+            onDraftChange({
+              ...effectiveDraft,
+              scope: normalizeScope(value)
+            })
+          }
+        />
+        <TextInputField
+          description="Used only when scope is timeboxed."
+          disabled={effectiveDraft.busy || effectiveDraft.scope !== "timeboxed"}
+          label="TTL (ms)"
+          value={effectiveDraft.ttl_ms}
+          onChange={(value) =>
+            onDraftChange({
+              ...effectiveDraft,
+              ttl_ms: value
+            })
+          }
+        />
+        <TextInputField
+          disabled={effectiveDraft.busy}
+          label="Reason"
+          value={effectiveDraft.reason}
+          onChange={(value) =>
+            onDraftChange({
+              ...effectiveDraft,
+              reason: value
+            })
+          }
+        />
+        <ActionCluster>
+          <ActionButton
+            isDisabled={effectiveDraft.busy}
+            type="button"
+            variant="primary"
+            onPress={() => onDecision(true)}
           >
-            <option value="once">once</option>
-            <option value="session">session</option>
-            <option value="timeboxed">timeboxed</option>
-          </select>
-        </label>
-        <label>
-          TTL (ms)
-          <input
-            value={effectiveDraft.ttl_ms}
-            onChange={(event) => {
-              onDraftChange({
-                ...effectiveDraft,
-                ttl_ms: event.target.value
-              });
-            }}
-            disabled={effectiveDraft.busy || effectiveDraft.scope !== "timeboxed"}
-          />
-        </label>
-        <label>
-          Reason
-          <input
-            value={effectiveDraft.reason}
-            onChange={(event) => {
-              onDraftChange({
-                ...effectiveDraft,
-                reason: event.target.value
-              });
-            }}
-            disabled={effectiveDraft.busy}
-          />
-        </label>
-        <div className="console-inline-actions">
-          <button type="button" onClick={() => onDecision(true)} disabled={effectiveDraft.busy}>
             Approve
-          </button>
-          <button type="button" className="button--warn" onClick={() => onDecision(false)} disabled={effectiveDraft.busy}>
+          </ActionButton>
+          <ActionButton
+            isDisabled={effectiveDraft.busy}
+            type="button"
+            variant="danger"
+            onPress={() => onDecision(false)}
+          >
             Deny
-          </button>
-        </div>
-      </div>
-    </section>
+          </ActionButton>
+        </ActionCluster>
+      </AppForm>
+    </SectionCard>
   );
 }
 

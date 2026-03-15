@@ -1,5 +1,10 @@
 import { Button } from "@heroui/react";
 
+import {
+  CheckboxField,
+  SelectField,
+  TextInputField
+} from "../components/ui";
 import { WorkspaceMetricCard, WorkspacePageHeader, WorkspaceSectionCard, WorkspaceStatusChip } from "../components/workspace/WorkspaceChrome";
 import { PrettyJsonBlock, formatUnixMs, readBool, readNumber, readString, type JsonObject } from "../shared";
 import type { ConsoleAppState } from "../useConsoleAppState";
@@ -148,25 +153,28 @@ export function BrowserSection({ app }: BrowserSectionProps) {
                       </WorkspaceStatusChip>
                     </div>
                     <div className="console-inline-actions">
-                      <Button
-                        variant="secondary"
-                        size="sm"
-                        onPress={() => app.setBrowserRenameProfileId(profileId)}
-                      >
-                        Select
-                      </Button>
-                      <Button
-                        size="sm"
-                        onPress={() => void app.activateBrowserProfile(profile)}
-                        isDisabled={app.browserBusy}
-                      >
-                        Activate
-                      </Button>
-                      <Button
-                        variant="danger-soft"
-                        size="sm"
-                        onPress={() => void app.deleteBrowserProfile(profile)}
-                        isDisabled={app.browserBusy}
+                       <Button
+                         aria-label={`Select ${readString(profile, "name") ?? profileId}`}
+                         variant="secondary"
+                         size="sm"
+                         onPress={() => app.setBrowserRenameProfileId(profileId)}
+                       >
+                         Select
+                       </Button>
+                       <Button
+                         aria-label={`Activate ${readString(profile, "name") ?? profileId}`}
+                         size="sm"
+                         onPress={() => void app.activateBrowserProfile(profile)}
+                         isDisabled={app.browserBusy}
+                       >
+                         Activate
+                       </Button>
+                       <Button
+                         aria-label={`Delete ${readString(profile, "name") ?? profileId}`}
+                         variant="danger-soft"
+                         size="sm"
+                         onPress={() => void app.deleteBrowserProfile(profile)}
+                         isDisabled={app.browserBusy}
                       >
                         Delete
                       </Button>
@@ -185,36 +193,13 @@ export function BrowserSection({ app }: BrowserSectionProps) {
           <div className="workspace-stack">
             <form className="workspace-form" onSubmit={(event) => void app.createBrowserProfile(event)}>
               <div className="workspace-form-grid">
-                <label>
-                  Principal
-                  <input value={app.browserPrincipal} onChange={(event) => app.setBrowserPrincipal(event.target.value)} />
-                </label>
-                <label>
-                  Profile name
-                  <input value={app.browserProfileName} onChange={(event) => app.setBrowserProfileName(event.target.value)} />
-                </label>
-                <label>
-                  Theme color
-                  <input value={app.browserProfileTheme} onChange={(event) => app.setBrowserProfileTheme(event.target.value)} />
-                </label>
+                <TextInputField label="Principal" value={app.browserPrincipal} onChange={app.setBrowserPrincipal} />
+                <TextInputField label="Profile name" value={app.browserProfileName} onChange={app.setBrowserProfileName} />
+                <TextInputField label="Theme color" value={app.browserProfileTheme} onChange={app.setBrowserProfileTheme} />
               </div>
               <div className="workspace-inline">
-                <label className="console-checkbox-inline">
-                  <input
-                    type="checkbox"
-                    checked={app.browserProfilePersistence}
-                    onChange={(event) => app.setBrowserProfilePersistence(event.target.checked)}
-                  />
-                  Persistence enabled
-                </label>
-                <label className="console-checkbox-inline">
-                  <input
-                    type="checkbox"
-                    checked={app.browserProfilePrivate}
-                    onChange={(event) => app.setBrowserProfilePrivate(event.target.checked)}
-                  />
-                  Private profile
-                </label>
+                <CheckboxField checked={app.browserProfilePersistence} label="Persistence enabled" onChange={app.setBrowserProfilePersistence} />
+                <CheckboxField checked={app.browserProfilePrivate} label="Private profile" onChange={app.setBrowserProfilePrivate} />
               </div>
               <Button type="submit" isDisabled={app.browserBusy}>
                 {app.browserBusy ? "Creating..." : "Create profile"}
@@ -226,14 +211,8 @@ export function BrowserSection({ app }: BrowserSectionProps) {
               void app.renameBrowserProfile();
             }}>
               <div className="workspace-form-grid">
-                <label>
-                  Profile ID
-                  <input value={app.browserRenameProfileId} onChange={(event) => app.setBrowserRenameProfileId(event.target.value)} />
-                </label>
-                <label>
-                  New name
-                  <input value={app.browserRenameName} onChange={(event) => app.setBrowserRenameName(event.target.value)} />
-                </label>
+                <TextInputField label="Profile ID" value={app.browserRenameProfileId} onChange={app.setBrowserRenameProfileId} />
+                <TextInputField label="New name" value={app.browserRenameName} onChange={app.setBrowserRenameName} />
               </div>
               <Button variant="secondary" type="submit" isDisabled={app.browserBusy}>
                 {app.browserBusy ? "Renaming..." : "Rename profile"}
@@ -259,21 +238,8 @@ export function BrowserSection({ app }: BrowserSectionProps) {
           }
         >
           <div className="workspace-form-grid">
-            <label>
-              Session ID
-              <input
-                value={app.browserDownloadsSessionId}
-                onChange={(event) => app.setBrowserDownloadsSessionId(event.target.value)}
-              />
-            </label>
-            <label className="console-checkbox-inline">
-              <input
-                type="checkbox"
-                checked={app.browserDownloadsQuarantinedOnly}
-                onChange={(event) => app.setBrowserDownloadsQuarantinedOnly(event.target.checked)}
-              />
-              Quarantined only
-            </label>
+            <TextInputField label="Session ID" value={app.browserDownloadsSessionId} onChange={app.setBrowserDownloadsSessionId} />
+            <CheckboxField checked={app.browserDownloadsQuarantinedOnly} label="Quarantined only" onChange={app.setBrowserDownloadsQuarantinedOnly} />
           </div>
 
           {downloads.length === 0 ? (
@@ -314,18 +280,9 @@ export function BrowserSection({ app }: BrowserSectionProps) {
         >
           <div className="workspace-stack">
             <div className="workspace-form-grid">
-              <label>
-                Session ID
-                <input value={app.browserRelaySessionId} onChange={(event) => app.setBrowserRelaySessionId(event.target.value)} />
-              </label>
-              <label>
-                Extension ID
-                <input value={app.browserRelayExtensionId} onChange={(event) => app.setBrowserRelayExtensionId(event.target.value)} />
-              </label>
-              <label>
-                TTL ms
-                <input value={app.browserRelayTtlMs} onChange={(event) => app.setBrowserRelayTtlMs(event.target.value)} />
-              </label>
+              <TextInputField label="Session ID" value={app.browserRelaySessionId} onChange={app.setBrowserRelaySessionId} />
+              <TextInputField label="Extension ID" value={app.browserRelayExtensionId} onChange={app.setBrowserRelayExtensionId} />
+              <TextInputField label="TTL ms" value={app.browserRelayTtlMs} onChange={app.setBrowserRelayTtlMs} />
             </div>
             <div className="console-inline-actions">
               <Button onPress={() => void app.mintBrowserRelayToken()} isDisabled={app.browserBusy}>
@@ -346,29 +303,22 @@ export function BrowserSection({ app }: BrowserSectionProps) {
             )}
 
             <div className="workspace-form-grid">
-              <label>
-                Action
-                <select
-                  value={app.browserRelayAction}
-                  onChange={(event) =>
-                    app.setBrowserRelayAction(
-                      event.target.value as "open_tab" | "capture_selection" | "send_page_snapshot"
-                    )
-                  }
-                >
-                  <option value="capture_selection">capture_selection</option>
-                  <option value="open_tab">open_tab</option>
-                  <option value="send_page_snapshot">send_page_snapshot</option>
-                </select>
-              </label>
-              <label>
-                Open-tab URL
-                <input value={app.browserRelayOpenTabUrl} onChange={(event) => app.setBrowserRelayOpenTabUrl(event.target.value)} />
-              </label>
-              <label>
-                Capture selector
-                <input value={app.browserRelaySelector} onChange={(event) => app.setBrowserRelaySelector(event.target.value)} />
-              </label>
+              <SelectField
+                label="Action"
+                options={[
+                  { key: "capture_selection", label: "capture_selection" },
+                  { key: "open_tab", label: "open_tab" },
+                  { key: "send_page_snapshot", label: "send_page_snapshot" }
+                ]}
+                value={app.browserRelayAction}
+                onChange={(value) =>
+                  app.setBrowserRelayAction(
+                    value as "open_tab" | "capture_selection" | "send_page_snapshot"
+                  )
+                }
+              />
+              <TextInputField label="Open-tab URL" value={app.browserRelayOpenTabUrl} onChange={app.setBrowserRelayOpenTabUrl} />
+              <TextInputField label="Capture selector" value={app.browserRelaySelector} onChange={app.setBrowserRelaySelector} />
             </div>
 
             <Button

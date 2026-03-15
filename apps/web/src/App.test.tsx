@@ -344,7 +344,7 @@ describe("M35 web console app", () => {
       expect(screen.getByText("Cron job created.")).toBeInTheDocument();
     });
 
-    fireEvent.click((await screen.findAllByRole("button", { name: "Disable" }))[0]);
+    fireEvent.click((await screen.findAllByRole("button", { name: /^Disable / }))[0]);
 
     await waitFor(() => {
       expect(screen.getByText("Cron job disabled.")).toBeInTheDocument();
@@ -462,10 +462,12 @@ describe("M35 web console app", () => {
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Channels and Router" }));
     expect(await screen.findByRole("heading", { name: "Channels" })).toBeInTheDocument();
-    expect(await screen.findByRole("button", { name: /echo:default/i })).toBeInTheDocument();
-    expect(document.body).toHaveTextContent("internal_test_only");
+    await waitFor(() => {
+      expect(document.body).toHaveTextContent("echo:default");
+      expect(document.body).toHaveTextContent("internal_test_only");
+    }, { timeout: 5_000 });
 
-    fireEvent.click(screen.getByRole("button", { name: "Disable" }));
+    fireEvent.click(screen.getByRole("button", { name: "Disable echo:default" }));
 
     await waitFor(() => {
       expect(screen.getByText("Connector disabled.")).toBeInTheDocument();
@@ -571,9 +573,11 @@ describe("M35 web console app", () => {
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Channels and Router" }));
 
-    expect(await screen.findByRole("button", { name: /echo:default/i })).toBeInTheDocument();
+    await waitFor(() => {
+      expect(document.body).toHaveTextContent("echo:default");
+      expect(document.body).toHaveTextContent("internal_test_only");
+    }, { timeout: 5_000 });
     expect(screen.queryByText("slack:default")).not.toBeInTheDocument();
-    expect(document.body).toHaveTextContent("internal_test_only");
     expect(findRequestCall(fetchMock, "/console/v1/channels/echo%3Adefault", "GET")).toBeDefined();
   });
 

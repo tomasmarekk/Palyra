@@ -1,3 +1,12 @@
+import {
+  ActionButton,
+  ActionCluster,
+  EmptyState,
+  InlineNotice,
+  KeyValueList,
+  SelectField,
+  SectionCard
+} from "../console/components/ui";
 import type { ChatRunStatusRecord, ChatRunTapeSnapshot } from "../consoleApi";
 
 import { parseTapePayload, toPrettyJson } from "./chatShared";
@@ -40,73 +49,73 @@ export function ChatRunDrawer({
       </div>
 
       <div className="workspace-field-grid workspace-field-grid--double">
-        <label>
-          Run
-          <select value={runDrawerId} onChange={(event) => setRunDrawerId(event.target.value)}>
-            <option value="">Select run</option>
-            {runIds.map((runId) => (
-              <option key={runId} value={runId}>
-                {runId}
-              </option>
-            ))}
-          </select>
-        </label>
-        <div className="workspace-inline-actions">
-          <button type="button" onClick={refreshRun} disabled={runDrawerId.trim().length === 0 || runDrawerBusy}>
+        <SelectField
+          label="Run"
+          options={runIds.map((runId) => ({ key: runId, label: runId }))}
+          placeholder="Select run"
+          value={runDrawerId}
+          onChange={setRunDrawerId}
+        />
+        <ActionCluster className="items-end">
+          <ActionButton
+            isDisabled={runDrawerId.trim().length === 0 || runDrawerBusy}
+            type="button"
+            variant="primary"
+            onPress={refreshRun}
+          >
             {runDrawerBusy ? "Loading..." : "Refresh run"}
-          </button>
-          <button type="button" className="secondary" onClick={close}>
+          </ActionButton>
+          <ActionButton type="button" variant="secondary" onPress={close}>
             Hide inspector
-          </button>
-        </div>
+          </ActionButton>
+        </ActionCluster>
       </div>
 
       {runDrawerId.trim().length === 0 ? (
-        <p className="workspace-empty">Select a run to inspect status and tape events.</p>
+        <EmptyState
+          compact
+          description="Select a run to inspect status and tape events."
+          title="No run selected"
+        />
       ) : (
         <>
           {runStatus === null ? (
-            <p className="workspace-empty">No run status loaded yet.</p>
+            <EmptyState
+              compact
+              description="Refresh a run to inspect its current status."
+              title="No run status loaded yet"
+            />
           ) : (
-            <section className="chat-run-section">
-              <h4>Status</h4>
-              <dl className="workspace-detail-grid">
-                <div>
-                  <dt>State</dt>
-                  <dd>{runStatus.state}</dd>
-                </div>
-                <div>
-                  <dt>Prompt tokens</dt>
-                  <dd>{runStatus.prompt_tokens}</dd>
-                </div>
-                <div>
-                  <dt>Completion tokens</dt>
-                  <dd>{runStatus.completion_tokens}</dd>
-                </div>
-                <div>
-                  <dt>Total tokens</dt>
-                  <dd>{runStatus.total_tokens}</dd>
-                </div>
-                <div>
-                  <dt>Tape events</dt>
-                  <dd>{runStatus.tape_events}</dd>
-                </div>
-                <div>
-                  <dt>Updated</dt>
-                  <dd>{new Date(runStatus.updated_at_unix_ms).toLocaleString()}</dd>
-                </div>
-              </dl>
-              {runStatus.last_error !== undefined && runStatus.last_error.length > 0 && (
-                <p className="console-banner console-banner--error">{runStatus.last_error}</p>
-              )}
-            </section>
+            <SectionCard title="Status">
+              <KeyValueList
+                items={[
+                  { label: "State", value: runStatus.state },
+                  { label: "Prompt tokens", value: runStatus.prompt_tokens },
+                  { label: "Completion tokens", value: runStatus.completion_tokens },
+                  { label: "Total tokens", value: runStatus.total_tokens },
+                  { label: "Tape events", value: runStatus.tape_events },
+                  {
+                    label: "Updated",
+                    value: new Date(runStatus.updated_at_unix_ms).toLocaleString()
+                  }
+                ]}
+              />
+              {runStatus.last_error !== undefined && runStatus.last_error.length > 0 ? (
+                <InlineNotice title="Run error" tone="danger">
+                  {runStatus.last_error}
+                </InlineNotice>
+              ) : null}
+            </SectionCard>
           )}
 
           {runTape === null ? (
-            <p className="workspace-empty">No tape snapshot loaded.</p>
+            <EmptyState
+              compact
+              description="Refresh a run to load its tape snapshot."
+              title="No tape snapshot loaded"
+            />
           ) : (
-            <section className="chat-run-section">
-              <h4>Tape events ({runTape.events.length})</h4>
+            <SectionCard title={`Tape events (${runTape.events.length})`}>
               <div className="chat-tape-list">
                 {runTape.events.map((event) => (
                   <article key={`${event.seq}-${event.event_type}`} className="chat-tape-item">
@@ -118,7 +127,7 @@ export function ChatRunDrawer({
                   </article>
                 ))}
               </div>
-            </section>
+            </SectionCard>
           )}
         </>
       )}

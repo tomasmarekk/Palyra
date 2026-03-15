@@ -1,6 +1,10 @@
 import type { CapabilityCatalog } from "../../consoleApi";
 import { capabilitiesByMode, capabilitiesForSection } from "../capabilityCatalog";
 import { CapabilityCardList } from "../components/CapabilityCards";
+import {
+  ActionButton,
+  TextInputField
+} from "../components/ui";
 import { WorkspaceMetricCard, WorkspacePageHeader, WorkspaceSectionCard, WorkspaceStatusChip } from "../components/workspace/WorkspaceChrome";
 import { WorkspaceEmptyState, WorkspaceInlineNotice, WorkspaceTable, workspaceToneForState } from "../components/workspace/WorkspacePatterns";
 import { PrettyJsonBlock, formatUnixMs, readNumber, readObject, readString, toStringArray, type JsonObject } from "../shared";
@@ -55,8 +59,8 @@ export function OperationsSection({ app }: OperationsSectionProps) {
         }
         actions={(
           <div className="workspace-inline">
-            <button type="button" onClick={() => void app.refreshDiagnostics()} disabled={app.diagnosticsBusy}>{app.diagnosticsBusy ? "Refreshing..." : "Refresh diagnostics"}</button>
-            <button type="button" className="secondary" onClick={() => void app.refreshAudit()} disabled={app.auditBusy}>{app.auditBusy ? "Refreshing..." : "Refresh audit"}</button>
+            <ActionButton type="button" variant="primary" onPress={() => void app.refreshDiagnostics()} isDisabled={app.diagnosticsBusy}>{app.diagnosticsBusy ? "Refreshing..." : "Refresh diagnostics"}</ActionButton>
+            <ActionButton type="button" variant="secondary" onPress={() => void app.refreshAudit()} isDisabled={app.auditBusy}>{app.auditBusy ? "Refreshing..." : "Refresh audit"}</ActionButton>
           </div>
         )}
       />
@@ -84,8 +88,8 @@ export function OperationsSection({ app }: OperationsSectionProps) {
         <div className="workspace-stack">
           <WorkspaceSectionCard title="Audit events" description="Use quick filters near the table header and keep the actions column-free so the event stream stays readable.">
             <div className="workspace-form-grid">
-              <label>Principal filter<input value={app.auditFilterPrincipal} onChange={(event) => app.setAuditFilterPrincipal(event.target.value)} /></label>
-              <label>Payload contains<input value={app.auditFilterContains} onChange={(event) => app.setAuditFilterContains(event.target.value)} /></label>
+              <TextInputField label="Principal filter" value={app.auditFilterPrincipal} onChange={app.setAuditFilterPrincipal} />
+              <TextInputField label="Payload contains" value={app.auditFilterContains} onChange={app.setAuditFilterContains} />
             </div>
             {app.auditEvents.length === 0 ? (
               <WorkspaceEmptyState title="No audit events loaded" description="Refresh audit to load the current redacted event stream." compact />
