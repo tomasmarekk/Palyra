@@ -35,28 +35,25 @@ impl<'de> Deserialize<'de> for BoundedConsoleAgentIdentifier {
     }
 }
 
-#[derive(Debug, Deserialize)]
-pub(crate) struct ConsoleAgentsQuery {
-    pub(crate) after_agent_id: Option<BoundedConsoleAgentIdentifier>,
-    pub(crate) limit: Option<usize>,
+#[derive(Debug, Default)]
+struct ConsoleAgentsListQuery {
+    after_agent_id: Option<String>,
+    limit: Option<usize>,
 }
 
 pub(crate) async fn console_agents_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<ConsoleAgentsQuery>,
+    uri: axum::http::Uri,
 ) -> Result<Json<control_plane::AgentListEnvelope>, Response> {
     let session = authorize_console_session(&state, &headers, false)?;
     authorize_console_agent_action(&state, session.context.principal.as_str(), "agent.list")?;
 
+    let query = parse_console_agents_list_query(&state, &uri)?;
     let limit = query.limit.unwrap_or(100).clamp(1, 500);
-    let after_agent_id = query
-        .after_agent_id
-        .map(|value| normalize_console_agent_id(&state, value.as_str(), "after_agent_id"))
-        .transpose()?;
     let page = state
         .runtime
-        .list_agents(after_agent_id, Some(limit))
+        .list_agents(query.after_agent_id, Some(limit))
         .await
         .map_err(runtime_status_response)?;
 
@@ -223,4 +220,44 @@ fn normalize_console_agent_id(
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         runtime_status_response(error)
     })
+}
+
+#[allow(clippy::result_large_err)]
+fn parse_console_agents_list_query(
+    state: &AppState,
+    uri: &axum::http::Uri,
+) -> Result<ConsoleAgentsListQuery, Response> {
+    let mut parsed = ConsoleAgentsListQuery::default();
+    let Some(query) = uri.query() else {
+        return Ok(parsed);
+    };
+
+    for segment in query.split('&') {
+        if segment.is_empty() {
+            continue;
+        }
+        let (key, raw_value) = segment.split_once('=').unwrap_or((segment, ""));
+        match key {
+            "after_agent_id" => {
+                if raw_value.len() > CONSOLE_MAX_AGENT_ID_QUERY_BYTES {
+                    return Err(runtime_status_response(tonic::Status::invalid_argument(format!(
+                        "after_agent_id cannot exceed {CONSOLE_MAX_AGENT_ID_QUERY_BYTES} bytes"
+                    ))));
+                }
+                parsed.after_agent_id =
+                    Some(normalize_console_agent_id(state, raw_value, "after_agent_id")?);
+            }
+            "limit" => {
+                let limit = raw_value.parse::<usize>().map_err(|_| {
+                    runtime_status_response(tonic::Status::invalid_argument(
+                        "limit must be an unsigned integer",
+                    ))
+                })?;
+                parsed.limit = Some(limit);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(parsed)
 }
