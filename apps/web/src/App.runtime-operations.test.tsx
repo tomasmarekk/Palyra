@@ -473,7 +473,7 @@ describe("M56 runtime and operations surfaces", () => {
       expect(screen.getByText("Default agent set to 'main'.")).toBeInTheDocument();
     });
     expect(await screen.findByText("Default main")).toBeInTheDocument();
-  }, 15_000);
+  }, runtimeWorkflowTimeoutMs);
 
 });
 
