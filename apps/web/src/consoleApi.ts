@@ -579,6 +579,18 @@ function buildPathWithQuery(path: string, params?: URLSearchParams): string {
   return `${path}?${params.toString()}`;
 }
 
+function invokeFetch(
+  fetcher: typeof fetch,
+  input: RequestInfo | URL,
+  init: RequestInit
+): Promise<Response> {
+  return Reflect.apply(
+    fetcher as unknown as (input: RequestInfo | URL, init: RequestInit) => Promise<Response>,
+    globalThis,
+    [input, init]
+  );
+}
+
 export class ConsoleApiClient {
   private csrfToken: string | null = null;
 
@@ -1663,7 +1675,7 @@ export class ConsoleApiClient {
       }, timeoutMs);
 
       try {
-        const response = await this.fetcher(`${this.basePath}${path}`, {
+        const response = await invokeFetch(this.fetcher, `${this.basePath}${path}`, {
           ...init,
           headers,
           credentials: "include",

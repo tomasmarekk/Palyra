@@ -1,5 +1,6 @@
 use crate::app::state::ConsoleBrowserHandoff;
 use crate::*;
+use reqwest::Url;
 
 const CONSOLE_BROWSER_HANDOFF_TTL_MS: i64 = 60_000;
 const DEFAULT_CONSOLE_BROWSER_REDIRECT_PATH: &str = "/#/control/overview";
@@ -159,7 +160,6 @@ pub(crate) async fn console_browser_handoff_handler(
 
 pub(crate) async fn console_browser_bootstrap_handler(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Query(query): Query<ConsoleBrowserBootstrapQuery>,
 ) -> Result<Response, Response> {
     let now = unix_ms_now().map_err(|error| {
@@ -167,17 +167,19 @@ pub(crate) async fn console_browser_bootstrap_handler(
             "failed to read system clock: {error}"
         )))
     })?;
-    let handoff = consume_console_browser_handoff(&state, query.token.trim(), now)?;
-    let (session_token, _session) = issue_console_session(&state, handoff.context, now);
+    let handoff = load_console_browser_handoff(&state, query.token.trim(), now)?;
     let mut response_headers = HeaderMap::new();
     response_headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response_headers.insert(
-        SET_COOKIE,
-        build_console_session_cookie(session_token.as_str(), request_uses_tls(&headers))?,
-    );
-    response_headers.insert(
         "location",
-        HeaderValue::from_str(handoff.redirect_path.as_str()).map_err(|_| {
+        HeaderValue::from_str(
+            build_console_browser_bootstrap_redirect(
+                handoff.redirect_path.as_str(),
+                query.token.trim(),
+            )?
+            .as_str(),
+        )
+        .map_err(|_| {
             runtime_status_response(tonic::Status::invalid_argument(
                 "browser handoff redirect path contains unsupported characters",
             ))
@@ -668,18 +670,64 @@ pub(crate) fn consume_console_browser_handoff(
     token: &str,
     now: i64,
 ) -> Result<ConsoleBrowserHandoff, Response> {
+    let token_hash_sha256 = validate_console_browser_handoff_token(token)?;
+    let mut handoffs = lock_console_browser_handoffs(&state.console_browser_handoffs);
+    handoffs.retain(|_, existing| existing.expires_at_unix_ms > now);
+    handoffs.remove(token_hash_sha256.as_str()).ok_or_else(|| {
+        runtime_status_response(tonic::Status::permission_denied(
+            "browser handoff token is invalid or expired",
+        ))
+    })
+}
+
+#[allow(clippy::result_large_err)]
+fn load_console_browser_handoff(
+    state: &AppState,
+    token: &str,
+    now: i64,
+) -> Result<ConsoleBrowserHandoff, Response> {
+    let token_hash_sha256 = validate_console_browser_handoff_token(token)?;
+    let mut handoffs = lock_console_browser_handoffs(&state.console_browser_handoffs);
+    handoffs.retain(|_, existing| existing.expires_at_unix_ms > now);
+    handoffs.get(token_hash_sha256.as_str()).cloned().ok_or_else(|| {
+        runtime_status_response(tonic::Status::permission_denied(
+            "browser handoff token is invalid or expired",
+        ))
+    })
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_console_browser_handoff_token(token: &str) -> Result<String, Response> {
     if token.is_empty() {
         return Err(runtime_status_response(tonic::Status::invalid_argument(
             "browser handoff token is required",
         )));
     }
-    let mut handoffs = lock_console_browser_handoffs(&state.console_browser_handoffs);
-    handoffs.retain(|_, existing| existing.expires_at_unix_ms > now);
-    handoffs.remove(sha256_hex(token.as_bytes()).as_str()).ok_or_else(|| {
-        runtime_status_response(tonic::Status::permission_denied(
-            "browser handoff token is invalid or expired",
+    Ok(sha256_hex(token.as_bytes()))
+}
+
+#[allow(clippy::result_large_err)]
+fn build_console_browser_bootstrap_redirect(
+    redirect_path: &str,
+    token: &str,
+) -> Result<String, Response> {
+    let redirect_target = format!("http://{CONSOLE_BROWSER_HANDOFF_HOST}{redirect_path}");
+    let mut redirect = Url::parse(redirect_target.as_str()).map_err(|_| {
+        runtime_status_response(tonic::Status::invalid_argument(
+            "browser handoff redirect path contains unsupported characters",
         ))
-    })
+    })?;
+    redirect.query_pairs_mut().append_pair("desktop_handoff_token", token);
+    let mut location = redirect.path().to_owned();
+    if let Some(query) = redirect.query() {
+        location.push('?');
+        location.push_str(query);
+    }
+    if let Some(fragment) = redirect.fragment() {
+        location.push('#');
+        location.push_str(fragment);
+    }
+    Ok(location)
 }
 
 #[allow(clippy::result_large_err)]

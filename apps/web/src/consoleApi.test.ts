@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   ConsoleApiClient,
@@ -7,7 +7,40 @@ import {
   type JsonValue
 } from "./consoleApi";
 
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
 describe("ConsoleApiClient", () => {
+  it("invokes the default global fetch with the browser global as its receiver", async () => {
+    const calls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
+    const fetcher = vi.fn(function (
+      this: unknown,
+      input: RequestInfo | URL,
+      init?: RequestInit
+    ): Promise<Response> {
+      expect(this).toBe(globalThis);
+      calls.push({ input, init });
+      return Promise.resolve(
+        jsonResponse({
+          principal: "admin:web-console",
+          device_id: "device-1",
+          csrf_token: "csrf-1",
+          issued_at_unix_ms: 100,
+          expires_at_unix_ms: 200
+        })
+      );
+    }) as typeof fetch;
+    vi.stubGlobal("fetch", fetcher);
+
+    const client = new ConsoleApiClient("");
+    const session = await client.getSession();
+
+    expect(session.principal).toBe("admin:web-console");
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(requestUrl(calls[0]?.input)).toBe("/console/v1/auth/session");
+  });
+
   it("uses CSRF token for mutating requests after login", async () => {
     const calls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
     const responses = [

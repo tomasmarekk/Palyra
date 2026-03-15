@@ -11,7 +11,7 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use reqwest::Client;
+use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -863,8 +863,7 @@ impl ControlCenter {
     }
 
     pub(crate) fn open_dashboard(&self, url: &str) -> Result<String> {
-        webbrowser::open(url)
-            .context("failed to open dashboard URL in default browser")?;
+        open_url_in_default_browser(url)?;
         Ok(url.to_owned())
     }
 }
@@ -884,10 +883,58 @@ pub(crate) fn normalize_optional_text(raw: &str) -> Option<&str> {
     }
 }
 
+fn open_url_in_default_browser(url: &str) -> Result<()> {
+    let normalized_url = normalize_browser_open_url(url)?;
+    webbrowser::open(normalized_url.as_str())
+        .context("failed to open dashboard URL in default browser")?;
+    Ok(())
+}
+
+fn normalize_browser_open_url(raw: &str) -> Result<String> {
+    let parsed =
+        Url::parse(raw).with_context(|| "dashboard browser open requires a valid absolute URL")?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        bail!("dashboard browser open only supports http:// and https:// URLs");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        bail!("dashboard browser open URL must not include embedded credentials");
+    }
+    Ok(parsed.to_string())
+}
+
 pub(crate) fn compute_backoff_ms(attempt: u32) -> u64 {
     let exponent = attempt.min(5);
     let scaled = 1_000_u64.saturating_mul(1_u64 << exponent);
     scaled.min(30_000)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_browser_open_url;
+
+    #[test]
+    fn normalize_browser_open_url_accepts_http_and_https_urls() {
+        let http = normalize_browser_open_url("http://127.0.0.1:7142/console")
+            .expect("http dashboard URL should be accepted");
+        let https = normalize_browser_open_url("https://example.test/console")
+            .expect("https dashboard URL should be accepted");
+
+        assert_eq!(http, "http://127.0.0.1:7142/console");
+        assert_eq!(https, "https://example.test/console");
+    }
+
+    #[test]
+    fn normalize_browser_open_url_rejects_embedded_credentials() {
+        let error = normalize_browser_open_url("https://operator:secret@example.test/console")
+            .expect_err("embedded credentials should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("must not include embedded credentials"),
+            "unexpected error: {error}"
+        );
+    }
 }
 
 pub(crate) fn validate_runtime_state_root_override(

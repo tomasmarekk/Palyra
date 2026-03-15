@@ -371,7 +371,9 @@ fn console_session_and_csrf_guards_are_enforced() -> Result<()> {
     assert_admin_console_security_headers(session_response.headers())?;
     let refreshed_cookie = header_value(session_response.headers(), "set-cookie")?;
     assert!(
-        refreshed_cookie.starts_with(cookie.as_str()) && refreshed_cookie.contains("Max-Age=1800"),
+        refreshed_cookie.starts_with(cookie.as_str())
+            && refreshed_cookie.contains("Max-Age=1800")
+            && refreshed_cookie.contains("SameSite=Lax"),
         "session endpoint should refresh the session cookie Max-Age"
     );
     let session_response =
@@ -454,16 +456,39 @@ fn console_browser_handoff_bootstraps_a_browser_session() -> Result<()> {
         "console browser handoff should redirect into the dashboard"
     );
     assert_admin_console_security_headers(bootstrap_response.headers())?;
+    let handoff_token = Url::parse(handoff_url)
+        .context("failed to parse handoff_url")?
+        .query_pairs()
+        .find_map(|(key, value)| (key == "token").then(|| value.into_owned()))
+        .ok_or_else(|| anyhow::anyhow!("browser handoff_url missing token query parameter"))?;
     assert_eq!(
         header_value(bootstrap_response.headers(), "location")?,
-        "/#/control/overview",
-        "browser handoff should keep the requested redirect path"
+        format!("/?desktop_handoff_token={handoff_token}#/control/overview"),
+        "browser handoff should redirect into the web bootstrap route"
     );
-    let handoff_cookie = header_value(bootstrap_response.headers(), "set-cookie")?
+    assert!(
+        bootstrap_response.headers().get("set-cookie").is_none(),
+        "browser handoff redirect should not try to set the session cookie directly"
+    );
+
+    let session_bootstrap_response = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/auth/browser-handoff/session"))
+        .json(&serde_json::json!({ "token": handoff_token }))
+        .send()
+        .context("failed to consume console browser handoff through session endpoint")?
+        .error_for_status()
+        .context("console browser handoff session endpoint returned non-success status")?;
+    assert_admin_console_security_headers(session_bootstrap_response.headers())?;
+    let handoff_cookie = header_value(session_bootstrap_response.headers(), "set-cookie")?
         .split(';')
         .next()
         .ok_or_else(|| anyhow::anyhow!("browser handoff set-cookie header missing cookie pair"))?
         .to_owned();
+    let handoff_set_cookie = header_value(session_bootstrap_response.headers(), "set-cookie")?;
+    assert!(
+        handoff_set_cookie.contains("SameSite=Lax"),
+        "browser handoff session bootstrap should issue a top-level navigation compatible session cookie"
+    );
 
     let session_response = client
         .get(format!("http://127.0.0.1:{admin_port}/console/v1/auth/session"))
@@ -527,6 +552,11 @@ fn console_browser_handoff_session_endpoint_bootstraps_a_browser_session() -> Re
         .next()
         .ok_or_else(|| anyhow::anyhow!("browser handoff set-cookie header missing cookie pair"))?
         .to_owned();
+    let handoff_set_cookie = header_value(bootstrap_response.headers(), "set-cookie")?;
+    assert!(
+        handoff_set_cookie.contains("SameSite=Lax"),
+        "browser handoff session bootstrap should issue a top-level navigation compatible session cookie"
+    );
     let session = bootstrap_response
         .json::<Value>()
         .context("failed to parse handoff session response json")?;
