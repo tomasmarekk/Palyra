@@ -1119,6 +1119,18 @@ fn console_agent_endpoints_require_session_and_csrf_and_bridge_runtime() -> Resu
     );
     assert_admin_console_security_headers(oversized_after_agent_id_response.headers())?;
 
+    let oversized_agent_path_response = client
+        .get(format!("http://127.0.0.1:{admin_port}/console/v1/agents/{}", "a".repeat(512)))
+        .header("Cookie", cookie.clone())
+        .send()
+        .context("failed to call agent get endpoint with oversized agent_id path")?;
+    assert_eq!(
+        oversized_agent_path_response.status().as_u16(),
+        400,
+        "agent get endpoint should reject oversized agent_id path values"
+    );
+    assert_admin_console_security_headers(oversized_agent_path_response.headers())?;
+
     let create_main_payload = serde_json::json!({
         "agent_id": "main",
         "display_name": "Main",

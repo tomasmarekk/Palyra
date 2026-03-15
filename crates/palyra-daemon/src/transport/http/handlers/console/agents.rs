@@ -12,15 +12,15 @@ use crate::{
 const CONSOLE_MAX_AGENT_ID_QUERY_BYTES: usize = 64;
 
 #[derive(Debug)]
-pub(crate) struct BoundedConsoleAgentQueryId(String);
+pub(crate) struct BoundedConsoleAgentIdentifier(String);
 
-impl BoundedConsoleAgentQueryId {
+impl BoundedConsoleAgentIdentifier {
     fn as_str(&self) -> &str {
         self.0.as_str()
     }
 }
 
-impl<'de> Deserialize<'de> for BoundedConsoleAgentQueryId {
+impl<'de> Deserialize<'de> for BoundedConsoleAgentIdentifier {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -28,7 +28,7 @@ impl<'de> Deserialize<'de> for BoundedConsoleAgentQueryId {
         let value = Cow::<'de, str>::deserialize(deserializer)?;
         if value.len() > CONSOLE_MAX_AGENT_ID_QUERY_BYTES {
             return Err(de::Error::custom(format!(
-                "after_agent_id cannot exceed {CONSOLE_MAX_AGENT_ID_QUERY_BYTES} bytes"
+                "agent identifier cannot exceed {CONSOLE_MAX_AGENT_ID_QUERY_BYTES} bytes"
             )));
         }
         Ok(Self(value.into_owned()))
@@ -37,7 +37,7 @@ impl<'de> Deserialize<'de> for BoundedConsoleAgentQueryId {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ConsoleAgentsQuery {
-    pub(crate) after_agent_id: Option<BoundedConsoleAgentQueryId>,
+    pub(crate) after_agent_id: Option<BoundedConsoleAgentIdentifier>,
     pub(crate) limit: Option<usize>,
 }
 
@@ -71,7 +71,7 @@ pub(crate) async fn console_agents_list_handler(
 pub(crate) async fn console_agent_get_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(agent_id): Path<String>,
+    Path(agent_id): Path<BoundedConsoleAgentIdentifier>,
 ) -> Result<Json<control_plane::AgentEnvelope>, Response> {
     let session = authorize_console_session(&state, &headers, false)?;
     authorize_console_agent_action(&state, session.context.principal.as_str(), "agent.get")?;
@@ -152,7 +152,7 @@ pub(crate) async fn console_agent_create_handler(
 pub(crate) async fn console_agent_set_default_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(agent_id): Path<String>,
+    Path(agent_id): Path<BoundedConsoleAgentIdentifier>,
 ) -> Result<Json<control_plane::AgentSetDefaultEnvelope>, Response> {
     let session = authorize_console_session(&state, &headers, true)?;
     authorize_console_agent_action(
