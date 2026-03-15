@@ -1,4 +1,6 @@
-use serde::Deserialize;
+use std::borrow::Cow;
+
+use serde::{de, Deserialize, Deserializer};
 
 use crate::{
     agents::{AgentCreateRequest, AgentRecord},
@@ -7,9 +9,35 @@ use crate::{
     *,
 };
 
+const CONSOLE_MAX_AGENT_ID_QUERY_BYTES: usize = 64;
+
+#[derive(Debug)]
+pub(crate) struct BoundedConsoleAgentQueryId(String);
+
+impl BoundedConsoleAgentQueryId {
+    fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl<'de> Deserialize<'de> for BoundedConsoleAgentQueryId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Cow::<'de, str>::deserialize(deserializer)?;
+        if value.len() > CONSOLE_MAX_AGENT_ID_QUERY_BYTES {
+            return Err(de::Error::custom(format!(
+                "after_agent_id cannot exceed {CONSOLE_MAX_AGENT_ID_QUERY_BYTES} bytes"
+            )));
+        }
+        Ok(Self(value.into_owned()))
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct ConsoleAgentsQuery {
-    pub(crate) after_agent_id: Option<String>,
+    pub(crate) after_agent_id: Option<BoundedConsoleAgentQueryId>,
     pub(crate) limit: Option<usize>,
 }
 
@@ -24,7 +52,7 @@ pub(crate) async fn console_agents_list_handler(
     let limit = query.limit.unwrap_or(100).clamp(1, 500);
     let after_agent_id = query
         .after_agent_id
-        .map(|value| normalize_console_agent_id(&state, value, "after_agent_id"))
+        .map(|value| normalize_console_agent_id(&state, value.as_str(), "after_agent_id"))
         .transpose()?;
     let page = state
         .runtime
@@ -48,7 +76,7 @@ pub(crate) async fn console_agent_get_handler(
     let session = authorize_console_session(&state, &headers, false)?;
     authorize_console_agent_action(&state, session.context.principal.as_str(), "agent.get")?;
 
-    let agent_id = normalize_console_agent_id(&state, agent_id, "agent_id")?;
+    let agent_id = normalize_console_agent_id(&state, agent_id.as_str(), "agent_id")?;
     let (agent, is_default) =
         state.runtime.get_agent(agent_id).await.map_err(runtime_status_response)?;
 
@@ -133,7 +161,7 @@ pub(crate) async fn console_agent_set_default_handler(
         "agent.set_default",
     )?;
 
-    let agent_id = normalize_console_agent_id(&state, agent_id, "agent_id")?;
+    let agent_id = normalize_console_agent_id(&state, agent_id.as_str(), "agent_id")?;
     let outcome =
         state.runtime.set_default_agent(agent_id).await.map_err(runtime_status_response)?;
 
@@ -184,10 +212,10 @@ fn authorize_console_agent_action(
 #[allow(clippy::result_large_err)]
 fn normalize_console_agent_id(
     state: &AppState,
-    raw: String,
+    raw: &str,
     field_name: &'static str,
 ) -> Result<String, Response> {
-    normalize_agent_identifier(raw.as_str(), field_name).map_err(|error| {
+    normalize_agent_identifier(raw, field_name).map_err(|error| {
         state
             .runtime
             .counters

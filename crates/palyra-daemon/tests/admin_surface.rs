@@ -1104,6 +1104,21 @@ fn console_agent_endpoints_require_session_and_csrf_and_bridge_runtime() -> Resu
         "fresh daemon should not publish a default agent id"
     );
 
+    let oversized_after_agent_id_response = client
+        .get(format!(
+            "http://127.0.0.1:{admin_port}/console/v1/agents?after_agent_id={}",
+            "a".repeat(512)
+        ))
+        .header("Cookie", cookie.clone())
+        .send()
+        .context("failed to call agents list endpoint with oversized after_agent_id")?;
+    assert_eq!(
+        oversized_after_agent_id_response.status().as_u16(),
+        400,
+        "agents list endpoint should reject oversized after_agent_id query values"
+    );
+    assert_admin_console_security_headers(oversized_after_agent_id_response.headers())?;
+
     let create_main_payload = serde_json::json!({
         "agent_id": "main",
         "display_name": "Main",
