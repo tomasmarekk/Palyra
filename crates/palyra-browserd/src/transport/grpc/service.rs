@@ -1010,13 +1010,13 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                     origin = tab.last_url.as_deref().and_then(url_origin_key);
                 }
                 if let Some(origin_key) = origin {
-                    let storage = session.storage_entries.entry(origin_key).or_default();
-                    if payload.clear_existing {
-                        storage.insert(selector.to_owned(), text.clone());
-                    } else {
-                        let entry = storage.entry(selector.to_owned()).or_default();
-                        entry.push_str(text.as_str());
-                    }
+                    apply_storage_entry_update(
+                        session,
+                        origin_key.as_str(),
+                        selector,
+                        text.as_str(),
+                        payload.clear_existing,
+                    );
                 }
             }
         }

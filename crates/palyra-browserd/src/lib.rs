@@ -148,6 +148,11 @@ const DOWNLOAD_ALLOWED_MIME_TYPES: &[&str] = &[
 const MAX_RELAY_EXTENSION_ID_BYTES: usize = 96;
 const MAX_RELAY_SELECTION_BYTES: usize = 8 * 1024;
 const MAX_RELAY_PAYLOAD_BYTES: u64 = 32 * 1024;
+const MAX_COOKIE_DOMAINS_PER_SESSION: usize = 32;
+const MAX_COOKIES_PER_DOMAIN: usize = 32;
+const MAX_STORAGE_ORIGINS_PER_SESSION: usize = 16;
+const MAX_STORAGE_ENTRIES_PER_ORIGIN: usize = 32;
+const MAX_STORAGE_ENTRY_VALUE_BYTES: usize = 4 * 1024;
 const CHROMIUM_REMOTE_IP_GUARD_HANDLER_NAME: &str = "palyra.security.remote_ip_guard";
 const DNS_VALIDATION_CACHE_MAX_ENTRIES: usize = 512;
 const DNS_VALIDATION_NEGATIVE_TTL: Duration = Duration::from_secs(10);
@@ -536,8 +541,8 @@ impl BrowserSessionRecord {
         }
         self.tabs = tabs;
         self.permissions = snapshot.permissions;
-        self.cookie_jar = snapshot.cookie_jar;
-        self.storage_entries = snapshot.storage_entries;
+        self.cookie_jar = clamp_cookie_jar(snapshot.cookie_jar);
+        self.storage_entries = clamp_storage_entries(snapshot.storage_entries);
     }
 }
 
@@ -1487,9 +1492,108 @@ fn apply_cookie_updates(session: &mut BrowserSessionRecord, updates: &[CookieUpd
             }
             continue;
         }
+        if !session.cookie_jar.contains_key(update.domain.as_str())
+            && session.cookie_jar.len() >= MAX_COOKIE_DOMAINS_PER_SESSION
+        {
+            continue;
+        }
         let domain_cookies = session.cookie_jar.entry(update.domain.clone()).or_default();
+        if !domain_cookies.contains_key(update.name.as_str())
+            && domain_cookies.len() >= MAX_COOKIES_PER_DOMAIN
+        {
+            continue;
+        }
         domain_cookies.insert(update.name.clone(), update.value.clone());
     }
+}
+
+fn apply_storage_entry_update(
+    session: &mut BrowserSessionRecord,
+    origin: &str,
+    key: &str,
+    value: &str,
+    clear_existing: bool,
+) {
+    let origin = origin.trim();
+    let key = key.trim();
+    if origin.is_empty() || key.is_empty() {
+        return;
+    }
+    if !session.storage_entries.contains_key(origin)
+        && session.storage_entries.len() >= MAX_STORAGE_ORIGINS_PER_SESSION
+    {
+        return;
+    }
+    let storage = session.storage_entries.entry(origin.to_owned()).or_default();
+    if !storage.contains_key(key) && storage.len() >= MAX_STORAGE_ENTRIES_PER_ORIGIN {
+        return;
+    }
+    if clear_existing {
+        storage.insert(key.to_owned(), truncate_utf8_bytes(value, MAX_STORAGE_ENTRY_VALUE_BYTES));
+        return;
+    }
+    let existing = storage.entry(key.to_owned()).or_default();
+    let mut combined = String::with_capacity(existing.len() + value.len());
+    combined.push_str(existing.as_str());
+    combined.push_str(value);
+    *existing = truncate_utf8_bytes(combined.as_str(), MAX_STORAGE_ENTRY_VALUE_BYTES);
+}
+
+fn clamp_cookie_jar(
+    cookie_jar: HashMap<String, HashMap<String, String>>,
+) -> HashMap<String, HashMap<String, String>> {
+    let mut clamped = HashMap::new();
+    for (domain, cookies) in cookie_jar {
+        if domain.trim().is_empty() {
+            continue;
+        }
+        if clamped.len() >= MAX_COOKIE_DOMAINS_PER_SESSION {
+            break;
+        }
+        let mut clamped_cookies = HashMap::new();
+        for (name, value) in cookies {
+            if name.trim().is_empty() {
+                continue;
+            }
+            if clamped_cookies.len() >= MAX_COOKIES_PER_DOMAIN {
+                break;
+            }
+            clamped_cookies.insert(name, truncate_utf8_bytes(value.as_str(), 1024));
+        }
+        if !clamped_cookies.is_empty() {
+            clamped.insert(domain, clamped_cookies);
+        }
+    }
+    clamped
+}
+
+fn clamp_storage_entries(
+    storage_entries: HashMap<String, HashMap<String, String>>,
+) -> HashMap<String, HashMap<String, String>> {
+    let mut clamped = HashMap::new();
+    for (origin, entries) in storage_entries {
+        if origin.trim().is_empty() {
+            continue;
+        }
+        if clamped.len() >= MAX_STORAGE_ORIGINS_PER_SESSION {
+            break;
+        }
+        let mut clamped_entries = HashMap::new();
+        for (key, value) in entries {
+            if key.trim().is_empty() {
+                continue;
+            }
+            if clamped_entries.len() >= MAX_STORAGE_ENTRIES_PER_ORIGIN {
+                break;
+            }
+            clamped_entries
+                .insert(key, truncate_utf8_bytes(value.as_str(), MAX_STORAGE_ENTRY_VALUE_BYTES));
+        }
+        if !clamped_entries.is_empty() {
+            clamped.insert(origin, clamped_entries);
+        }
+    }
+    clamped
 }
 
 fn url_origin_key(raw_url: &str) -> Option<String> {

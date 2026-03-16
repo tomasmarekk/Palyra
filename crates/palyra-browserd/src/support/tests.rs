@@ -2254,6 +2254,253 @@ fn validate_restored_snapshot_against_profile_accepts_legacy_hash_for_revision_z
         .expect("legacy hash path should stay backward compatible");
 }
 
+fn test_session_record() -> super::BrowserSessionRecord {
+    super::BrowserSessionRecord::with_defaults(super::BrowserSessionInit {
+        principal: "user:ops".to_owned(),
+        channel: None,
+        now: Instant::now(),
+        idle_ttl: Duration::from_secs(60),
+        budget: super::SessionBudget {
+            max_navigation_timeout_ms: 5_000,
+            max_session_lifetime_ms: 60_000,
+            max_screenshot_bytes: 128 * 1024,
+            max_response_bytes: 128 * 1024,
+            max_title_bytes: 4 * 1024,
+            max_action_timeout_ms: 5_000,
+            max_type_input_bytes: 4 * 1024,
+            max_actions_per_session: 256,
+            max_actions_per_window: 20,
+            action_rate_window_ms: 1_000,
+            max_action_log_entries: 64,
+            max_observe_snapshot_bytes: 64 * 1024,
+            max_visible_text_bytes: 16 * 1024,
+            max_network_log_entries: 64,
+            max_network_log_bytes: 64 * 1024,
+            max_tabs_per_session: 8,
+        },
+        allow_private_targets: false,
+        allow_downloads: false,
+        action_allowed_domains: Vec::new(),
+        profile_id: None,
+        private_profile: false,
+        persistence: super::SessionPersistenceState::default(),
+    })
+}
+
+#[test]
+fn apply_cookie_updates_enforces_domain_and_cookie_quotas() {
+    let mut session = test_session_record();
+    for idx in 0..(super::MAX_COOKIE_DOMAINS_PER_SESSION + 8) {
+        super::apply_cookie_updates(
+            &mut session,
+            &[super::CookieUpdate {
+                domain: format!("d{idx}.example.com"),
+                name: "sid".to_owned(),
+                value: format!("v{idx}"),
+            }],
+        );
+    }
+    assert_eq!(
+        session.cookie_jar.len(),
+        super::MAX_COOKIE_DOMAINS_PER_SESSION,
+        "domain quota should cap growth"
+    );
+
+    let mut capped_domain_session = test_session_record();
+    let capped_domain = "quota.example.com".to_owned();
+    for idx in 0..(super::MAX_COOKIES_PER_DOMAIN + 8) {
+        super::apply_cookie_updates(
+            &mut capped_domain_session,
+            &[super::CookieUpdate {
+                domain: capped_domain.clone(),
+                name: format!("c{idx}"),
+                value: format!("v{idx}"),
+            }],
+        );
+    }
+    let cookies = capped_domain_session
+        .cookie_jar
+        .get(capped_domain.as_str())
+        .expect("quota test domain should exist");
+    assert_eq!(
+        cookies.len(),
+        super::MAX_COOKIES_PER_DOMAIN,
+        "per-domain cookie quota should cap growth"
+    );
+
+    super::apply_cookie_updates(
+        &mut capped_domain_session,
+        &[super::CookieUpdate {
+            domain: capped_domain.clone(),
+            name: "c0".to_owned(),
+            value: "updated".to_owned(),
+        }],
+    );
+    assert_eq!(
+        capped_domain_session
+            .cookie_jar
+            .get(capped_domain.as_str())
+            .and_then(|domain| domain.get("c0"))
+            .map(String::as_str),
+        Some("updated"),
+        "existing cookies should remain mutable at quota"
+    );
+
+    super::apply_cookie_updates(
+        &mut capped_domain_session,
+        &[super::CookieUpdate {
+            domain: capped_domain.clone(),
+            name: "c0".to_owned(),
+            value: String::new(),
+        }],
+    );
+    assert!(
+        capped_domain_session
+            .cookie_jar
+            .get(capped_domain.as_str())
+            .is_some_and(|domain| !domain.contains_key("c0")),
+        "delete updates should still remove existing cookies"
+    );
+}
+
+#[test]
+fn apply_storage_entry_update_enforces_origin_key_and_value_quotas() {
+    let mut session = test_session_record();
+    for idx in 0..(super::MAX_STORAGE_ORIGINS_PER_SESSION + 8) {
+        super::apply_storage_entry_update(
+            &mut session,
+            format!("https://o{idx}.example.com").as_str(),
+            "field",
+            "value",
+            true,
+        );
+    }
+    assert_eq!(
+        session.storage_entries.len(),
+        super::MAX_STORAGE_ORIGINS_PER_SESSION,
+        "origin quota should cap growth"
+    );
+
+    let mut capped_origin_session = test_session_record();
+    let origin = "https://quota.example.com";
+    for idx in 0..(super::MAX_STORAGE_ENTRIES_PER_ORIGIN + 8) {
+        super::apply_storage_entry_update(
+            &mut capped_origin_session,
+            origin,
+            format!("f{idx}").as_str(),
+            "v",
+            true,
+        );
+    }
+    let storage =
+        capped_origin_session.storage_entries.get(origin).expect("quota test origin should exist");
+    assert_eq!(
+        storage.len(),
+        super::MAX_STORAGE_ENTRIES_PER_ORIGIN,
+        "per-origin storage quota should cap growth"
+    );
+
+    super::apply_storage_entry_update(&mut capped_origin_session, origin, "f0", "updated", true);
+    assert_eq!(
+        capped_origin_session
+            .storage_entries
+            .get(origin)
+            .and_then(|entries| entries.get("f0"))
+            .map(String::as_str),
+        Some("updated"),
+        "existing storage keys should remain mutable at quota"
+    );
+
+    let mut append_session = test_session_record();
+    let append_origin = "https://append.example.com";
+    super::apply_storage_entry_update(&mut append_session, append_origin, "appended", "a", true);
+    for _ in 0..(super::MAX_STORAGE_ENTRY_VALUE_BYTES + 64) {
+        super::apply_storage_entry_update(
+            &mut append_session,
+            append_origin,
+            "appended",
+            "a",
+            false,
+        );
+    }
+    assert_eq!(
+        append_session
+            .storage_entries
+            .get(append_origin)
+            .and_then(|entries| entries.get("appended"))
+            .map(String::len),
+        Some(super::MAX_STORAGE_ENTRY_VALUE_BYTES),
+        "storage entry values should be truncated across repeated appends"
+    );
+}
+
+#[test]
+fn apply_snapshot_clamps_cookie_and_storage_state() {
+    let mut session = test_session_record();
+    let mut cookie_jar = HashMap::new();
+    for domain_idx in 0..(super::MAX_COOKIE_DOMAINS_PER_SESSION + 4) {
+        let mut cookies = HashMap::new();
+        for cookie_idx in 0..(super::MAX_COOKIES_PER_DOMAIN + 4) {
+            cookies.insert(format!("c{cookie_idx}"), "v".repeat(16));
+        }
+        cookie_jar.insert(format!("d{domain_idx}.example.com"), cookies);
+    }
+    let mut storage_entries = HashMap::new();
+    for origin_idx in 0..(super::MAX_STORAGE_ORIGINS_PER_SESSION + 4) {
+        let mut entries = HashMap::new();
+        for entry_idx in 0..(super::MAX_STORAGE_ENTRIES_PER_ORIGIN + 4) {
+            entries.insert(
+                format!("k{entry_idx}"),
+                "x".repeat(super::MAX_STORAGE_ENTRY_VALUE_BYTES + 32),
+            );
+        }
+        storage_entries.insert(format!("https://o{origin_idx}.example.com"), entries);
+    }
+    let snapshot = PersistedSessionSnapshot {
+        v: CANONICAL_PROTOCOL_MAJOR,
+        principal: "user:ops".to_owned(),
+        channel: None,
+        tabs: vec![BrowserTabRecord::new(ulid::Ulid::new().to_string())],
+        tab_order: Vec::new(),
+        active_tab_id: String::new(),
+        permissions: SessionPermissionsInternal::default(),
+        cookie_jar,
+        storage_entries,
+        state_revision: 1,
+        saved_at_unix_ms: 1_737_000_000_000,
+    };
+
+    session.apply_snapshot(snapshot);
+
+    assert_eq!(
+        session.cookie_jar.len(),
+        super::MAX_COOKIE_DOMAINS_PER_SESSION,
+        "restored cookie domains should be clamped"
+    );
+    assert!(
+        session.cookie_jar.values().all(|cookies| cookies.len() <= super::MAX_COOKIES_PER_DOMAIN),
+        "restored cookies per domain should be clamped"
+    );
+    assert_eq!(
+        session.storage_entries.len(),
+        super::MAX_STORAGE_ORIGINS_PER_SESSION,
+        "restored storage origins should be clamped"
+    );
+    assert!(
+        session
+            .storage_entries
+            .values()
+            .all(|entries| entries.len() <= super::MAX_STORAGE_ENTRIES_PER_ORIGIN),
+        "restored storage keys per origin should be clamped"
+    );
+    assert!(
+        session.storage_entries.values().all(|entries| {
+            entries.values().all(|value| value.len() <= super::MAX_STORAGE_ENTRY_VALUE_BYTES)
+        }),
+        "restored storage values should be truncated"
+    );
+}
+
 #[test]
 fn persisted_snapshot_hash_is_stable_for_equivalent_hashmap_content() {
     let mut first_tab = BrowserTabRecord::new("tab-1".to_owned());
