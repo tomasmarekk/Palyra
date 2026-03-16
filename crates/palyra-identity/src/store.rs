@@ -390,42 +390,44 @@ fn write_store_encryption_key_if_absent(
     #[cfg(not(windows))]
     let encoded = raw_key.to_vec();
 
+    let tmp_path = loop {
+        let candidate = path.with_extension(format!("tmp.{}", ulid::Ulid::new()));
+        if !candidate.exists() {
+            break candidate;
+        }
+    };
+
     let write_result: IdentityResult<StoreEncryptionKeyWriteOutcome> = (|| {
         #[cfg(windows)]
         {
             use std::io::Write;
 
-            let mut file = fs::OpenOptions::new().create_new(true).write(true).open(path).map_err(
-                |error| {
-                    if error.kind() == std::io::ErrorKind::AlreadyExists {
-                        IdentityError::SecretNotFound
-                    } else {
-                        IdentityError::Internal(error.to_string())
-                    }
-                },
-            )?;
-            harden_windows_path_permissions(
-                path,
-                owner_sid.ok_or_else(|| {
-                    IdentityError::Internal(
-                        "identity store encryption key owner SID is missing".to_owned(),
-                    )
-                })?,
-                false,
-            )?;
+            let owner_sid = owner_sid.ok_or_else(|| {
+                IdentityError::Internal(
+                    "identity store encryption key owner SID is missing".to_owned(),
+                )
+            })?;
+            let mut file = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&tmp_path)
+                .map_err(|error| IdentityError::Internal(error.to_string()))?;
+            harden_windows_path_permissions(&tmp_path, owner_sid, false)?;
             file.write_all(encoded.as_slice())
                 .map_err(|error| IdentityError::Internal(error.to_string()))?;
             file.sync_all().map_err(|error| IdentityError::Internal(error.to_string()))?;
-            harden_windows_path_permissions(
-                path,
-                owner_sid.ok_or_else(|| {
-                    IdentityError::Internal(
-                        "identity store encryption key owner SID is missing".to_owned(),
-                    )
-                })?,
-                false,
-            )?;
-            return Ok(StoreEncryptionKeyWriteOutcome::Created);
+            return match fs::hard_link(&tmp_path, path) {
+                Ok(()) => {
+                    fs::remove_file(&tmp_path)
+                        .map_err(|error| IdentityError::Internal(error.to_string()))?;
+                    harden_windows_path_permissions(path, owner_sid, false)?;
+                    Ok(StoreEncryptionKeyWriteOutcome::Created)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    Ok(StoreEncryptionKeyWriteOutcome::AlreadyExists)
+                }
+                Err(error) => Err(IdentityError::Internal(error.to_string())),
+            };
         }
         #[cfg(not(windows))]
         {
@@ -438,41 +440,39 @@ fn write_store_encryption_key_if_absent(
                 .create_new(true)
                 .write(true)
                 .mode(0o600)
-                .open(path)
-                .map_err(|error| {
-                    if error.kind() == std::io::ErrorKind::AlreadyExists {
-                        IdentityError::SecretNotFound
-                    } else {
-                        IdentityError::Internal(error.to_string())
-                    }
-                })?;
+                .open(&tmp_path)
+                .map_err(|error| IdentityError::Internal(error.to_string()))?;
             file.set_permissions(fs::Permissions::from_mode(0o600))
                 .map_err(|error| IdentityError::Internal(error.to_string()))?;
             file.write_all(encoded.as_slice())
                 .map_err(|error| IdentityError::Internal(error.to_string()))?;
             file.sync_all().map_err(|error| IdentityError::Internal(error.to_string()))?;
-            if let Some(parent) = path.parent() {
-                fs::File::open(parent)
-                    .map_err(|error| IdentityError::Internal(error.to_string()))?
-                    .sync_all()
-                    .map_err(|error| IdentityError::Internal(error.to_string()))?;
-            }
-            return Ok(StoreEncryptionKeyWriteOutcome::Created);
+            return match fs::hard_link(&tmp_path, path) {
+                Ok(()) => {
+                    fs::remove_file(&tmp_path)
+                        .map_err(|error| IdentityError::Internal(error.to_string()))?;
+                    if let Some(parent) = path.parent() {
+                        fs::File::open(parent)
+                            .map_err(|error| IdentityError::Internal(error.to_string()))?
+                            .sync_all()
+                            .map_err(|error| IdentityError::Internal(error.to_string()))?;
+                    }
+                    Ok(StoreEncryptionKeyWriteOutcome::Created)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    Ok(StoreEncryptionKeyWriteOutcome::AlreadyExists)
+                }
+                Err(error) => Err(IdentityError::Internal(error.to_string())),
+            };
         }
         #[allow(unreachable_code)]
         Ok(StoreEncryptionKeyWriteOutcome::Created)
     })();
 
-    match write_result {
-        Ok(outcome) => Ok(outcome),
-        Err(IdentityError::SecretNotFound) => Ok(StoreEncryptionKeyWriteOutcome::AlreadyExists),
-        Err(error) => {
-            if path.exists() {
-                let _ = fs::remove_file(path);
-            }
-            Err(error)
-        }
+    if tmp_path.exists() {
+        let _ = fs::remove_file(&tmp_path);
     }
+    write_result
 }
 
 #[cfg(windows)]
@@ -738,6 +738,75 @@ mod tests {
         let persisted =
             super::read_store_encryption_key(key_path.as_path()).expect("key should round-trip");
         assert_eq!(persisted, first_key);
+        let stale_tmp_files: Vec<String> = std::fs::read_dir(temp.path())
+            .expect("temporary directory should be readable")
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|file_name| {
+                file_name.starts_with(format!("{}.tmp.", super::SECRET_STORE_KEY_FILE).as_str())
+            })
+            .collect();
+        assert!(
+            stale_tmp_files.is_empty(),
+            "temporary key files should not remain after create-if-absent: {stale_tmp_files:?}"
+        );
+    }
+
+    #[test]
+    fn load_or_create_store_encryption_key_is_atomic_under_concurrency() {
+        let temp = tempdir().expect("temp dir should initialize");
+        let root = temp.path().to_path_buf();
+        let key_path = root.join(super::SECRET_STORE_KEY_FILE);
+        let start = std::sync::Arc::new(std::sync::Barrier::new(8));
+        #[cfg(windows)]
+        let owner_sid = super::current_user_sid().expect("current user SID should resolve");
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let root = root.clone();
+            let start = std::sync::Arc::clone(&start);
+            #[cfg(windows)]
+            let owner_sid = owner_sid.clone();
+            handles.push(std::thread::spawn(move || {
+                start.wait();
+                super::load_or_create_store_encryption_key(
+                    root.as_path(),
+                    #[cfg(windows)]
+                    Some(owner_sid.as_str()),
+                    #[cfg(not(windows))]
+                    None,
+                )
+            }));
+        }
+
+        let mut loaded_keys = Vec::new();
+        for handle in handles {
+            loaded_keys.push(
+                handle
+                    .join()
+                    .expect("worker should join successfully")
+                    .expect("concurrent store initialization should succeed"),
+            );
+        }
+
+        let persisted =
+            super::read_store_encryption_key(key_path.as_path()).expect("key should round-trip");
+        assert!(
+            loaded_keys.iter().all(|key| *key == persisted),
+            "every concurrent initializer should observe the published key"
+        );
+        let stale_tmp_files: Vec<String> = std::fs::read_dir(temp.path())
+            .expect("temporary directory should be readable")
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|file_name| {
+                file_name.starts_with(format!("{}.tmp.", super::SECRET_STORE_KEY_FILE).as_str())
+            })
+            .collect();
+        assert!(
+            stale_tmp_files.is_empty(),
+            "temporary key files should not remain after concurrent initialization: {stale_tmp_files:?}"
+        );
     }
 
     #[cfg(unix)]
