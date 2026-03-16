@@ -200,11 +200,31 @@ where
             return None;
         }
         if needles.iter().any(|needle| normalized.contains(needle)) {
-            Some(message.trim().to_owned())
+            Some(sanitize_http_error_message(message.trim()))
         } else {
             None
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_matching_message;
+
+    #[test]
+    fn find_matching_message_redacts_secret_like_values() {
+        let message = find_matching_message(
+            [Some("unauthorized: bearer topsecret token=abc123")],
+            &["unauthorized", "token"],
+        )
+        .expect("matching auth failure should be returned");
+
+        assert!(message.contains("<redacted>"), "matching message should be sanitized: {message}");
+        assert!(
+            !message.contains("topsecret") && !message.contains("token=abc123"),
+            "matching message should not leak sensitive values: {message}"
+        );
+    }
 }
 
 fn discord_account_id_from_connector_id(connector_id: &str) -> Option<&str> {
