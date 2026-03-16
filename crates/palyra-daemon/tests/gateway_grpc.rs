@@ -5739,7 +5739,7 @@ async fn grpc_approvals_service_persists_and_exports_denied_tool_approval() -> R
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 async fn grpc_run_stream_executes_sandbox_process_runner_within_workspace_scope() -> Result<()> {
     let (openai_base_url, _request_count, server_handle) =
         spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::immediate(
@@ -5862,6 +5862,118 @@ async fn grpc_run_stream_executes_sandbox_process_runner_within_workspace_scope(
     assert!(saw_allow_decision, "sandbox process tool call should be allowed by policy");
     assert!(saw_success_result, "sandbox process tool call should execute successfully");
     assert!(saw_sandbox_attestation, "sandbox process tool call should emit sandbox attestation");
+
+    server_handle.join().expect("scripted openai server thread should exit");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(target_os = "macos")]
+async fn grpc_run_stream_denies_sandbox_process_runner_on_macos() -> Result<()> {
+    let (openai_base_url, _request_count, server_handle) =
+        spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::immediate(
+            200,
+            r#"{"choices":[{"message":{"tool_calls":[{"function":{"name":"palyra.process.run","arguments":"{\"command\":\"uname\",\"args\":[]}"}}]}}]}"#
+                .to_owned(),
+        )])?;
+    let workspace_root =
+        std::env::current_dir().context("failed to resolve workspace root for process runner")?;
+    let (child, admin_port, grpc_port, _journal_db_path, config_path) =
+        spawn_palyrad_with_openai_provider_tool_policy_and_process_runner(
+            ProcessRunnerSpawnConfig {
+                openai_base_url: openai_base_url.as_str(),
+                openai_api_key: OPENAI_API_KEY,
+                allowed_tools: "palyra.process.run",
+                max_calls_per_run: 2,
+                execution_timeout_ms: 2_000,
+                workspace_root: workspace_root.as_path(),
+                allowed_executables: "uname",
+                allowed_egress_hosts: "",
+                allowed_dns_suffixes: "",
+            },
+        )?;
+    let _config_guard = TempFileGuard::new(config_path);
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+
+    let (request_sender, request_receiver) = tokio_mpsc::channel(4);
+    request_sender
+        .send(sample_run_stream_request_with_text(
+            "sandbox process runner macos deny path".to_owned(),
+        ))
+        .await
+        .context("failed to send initial sandbox process runner request")?;
+    let mut stream_request = tonic::Request::new(ReceiverStream::new(request_receiver));
+    stream_request.metadata_mut().insert("authorization", format!("Bearer {ADMIN_TOKEN}").parse()?);
+    stream_request.metadata_mut().insert("x-palyra-principal", "user:ops".parse()?);
+    stream_request.metadata_mut().insert("x-palyra-device-id", DEVICE_ID.parse()?);
+    stream_request.metadata_mut().insert("x-palyra-channel", "cli".parse()?);
+
+    let mut response_stream =
+        client.run_stream(stream_request).await.context("failed to call RunStream")?.into_inner();
+
+    let mut saw_approval_request = false;
+    let mut saw_allow_decision = false;
+    let mut saw_failed_result = false;
+    loop {
+        let next_event = tokio::time::timeout(Duration::from_secs(5), response_stream.next())
+            .await
+            .context("sandbox process runner macos deny stream stalled before expected events")?;
+        let Some(event) = next_event else {
+            break;
+        };
+        let event = event.context("failed to read RunStream event")?;
+        if let Some(body) = event.body {
+            match body {
+                common_v1::run_stream_event::Body::ToolApprovalRequest(approval_request) => {
+                    let proposal_id = approval_request
+                        .proposal_id
+                        .as_ref()
+                        .map(|proposal_id| proposal_id.ulid.as_str())
+                        .context("tool approval request missing proposal_id")?;
+                    request_sender
+                        .send(sample_tool_approval_response_request(
+                            proposal_id,
+                            true,
+                            "allow_once",
+                        ))
+                        .await
+                        .context("failed to send tool approval response")?;
+                    saw_approval_request = true;
+                }
+                common_v1::run_stream_event::Body::ToolDecision(decision) => {
+                    if decision.kind == common_v1::tool_decision::DecisionKind::Allow as i32 {
+                        saw_allow_decision = true;
+                    }
+                }
+                common_v1::run_stream_event::Body::ToolResult(result) => {
+                    if !result.success {
+                        assert!(
+                            result.error.contains("unavailable on macOS"),
+                            "macOS process runner denial should explain fail-closed platform block"
+                        );
+                        saw_failed_result = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if saw_approval_request && saw_allow_decision && saw_failed_result {
+            break;
+        }
+    }
+
+    assert!(
+        saw_approval_request,
+        "sensitive process runner tool call should request explicit approval"
+    );
+    assert!(saw_allow_decision, "sandbox process tool call should be allowed by policy");
+    assert!(saw_failed_result, "macOS process runner denial must produce failed tool result");
 
     server_handle.join().expect("scripted openai server thread should exit");
     Ok(())
@@ -6974,7 +7086,7 @@ async fn grpc_run_stream_admin_cancel_preempts_inflight_tool_execution() -> Resu
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 async fn grpc_run_stream_admin_cancel_waits_for_inflight_process_runner_completion() -> Result<()> {
     let response_body = openai_tool_call_response(
         "palyra.process.run",
