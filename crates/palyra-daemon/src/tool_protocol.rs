@@ -1409,7 +1409,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     async fn execute_tool_call_runs_sandbox_process_runner() {
         if std::process::Command::new("uname").output().is_err() {
             return;
@@ -1443,6 +1443,56 @@ mod tests {
         .await;
 
         assert!(outcome.success, "sandbox process runner should execute allowlisted command");
+        assert_eq!(outcome.attestation.executor, "sandbox_tier_b");
+        assert_eq!(
+            outcome.attestation.sandbox_enforcement,
+            config.process_runner.egress_enforcement_mode.as_str()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg(target_os = "macos")]
+    async fn execute_tool_call_fails_closed_for_macos_process_runner() {
+        if std::process::Command::new("uname").output().is_err() {
+            return;
+        }
+        let config = ToolCallConfig {
+            allowed_tools: vec!["palyra.process.run".to_owned()],
+            max_calls_per_run: 1,
+            execution_timeout_ms: 2_000,
+            process_runner: SandboxProcessRunnerPolicy {
+                enabled: true,
+                tier: SandboxProcessRunnerTier::B,
+                workspace_root: std::env::current_dir().expect("current_dir should resolve"),
+                allowed_executables: vec!["uname".to_owned()],
+                allow_interpreters: false,
+                egress_enforcement_mode: EgressEnforcementMode::Preflight,
+                allowed_egress_hosts: Vec::new(),
+                allowed_dns_suffixes: Vec::new(),
+                cpu_time_limit_ms: 2_000,
+                memory_limit_bytes: portable_test_process_runner_memory_limit_bytes(),
+                max_output_bytes: 64 * 1024,
+            },
+            wasm_runtime: default_wasm_runtime_policy(),
+        };
+
+        let outcome = execute_tool_call(
+            &config,
+            "01ARZ3NDEKTSV4RRFFQ69G5FA2",
+            "palyra.process.run",
+            br#"{"command":"uname","args":[]}"#,
+        )
+        .await;
+
+        assert!(
+            !outcome.success,
+            "macOS process runner must fail closed without reliable resource quotas"
+        );
+        assert!(
+            outcome.error.contains("unavailable on macOS"),
+            "macOS failure should explain missing quota enforcement: {}",
+            outcome.error
+        );
         assert_eq!(outcome.attestation.executor, "sandbox_tier_b");
         assert_eq!(
             outcome.attestation.sandbox_enforcement,

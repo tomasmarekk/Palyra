@@ -192,6 +192,7 @@ pub fn run_constrained_process(
     if matches!(policy.egress_enforcement_mode, EgressEnforcementMode::Strict) {
         validate_runtime_egress_enforcement(policy)?;
     }
+    validate_platform_resource_quota_support(policy)?;
 
     let per_call_timeout = input
         .timeout_ms
@@ -903,6 +904,23 @@ fn execute_process(
     capture_child_output(&mut child, timeout, policy.max_output_bytes as usize)
 }
 
+fn validate_platform_resource_quota_support(
+    _policy: &SandboxProcessRunnerPolicy,
+) -> Result<(), SandboxProcessRunError> {
+    #[cfg(target_os = "macos")]
+    {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::UnsupportedPlatform,
+            message: "sandbox process runner is unavailable on macOS until reliable fail-closed CPU/memory quota enforcement is implemented"
+                .to_owned(),
+        });
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(())
+    }
+}
+
 fn build_process_command(
     policy: &SandboxProcessRunnerPolicy,
     input: &ProcessRunnerInput,
@@ -1015,7 +1033,11 @@ fn set_cpu_rlimit(cpu_time_limit_ms: u64) -> std::io::Result<()> {
 fn set_memory_rlimit(memory_limit_bytes: u64) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
     {
-        return set_rlimit(libc::RLIMIT_AS as libc::c_int, memory_limit_bytes as libc::rlim_t);
+        let _ = memory_limit_bytes;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "macOS does not expose a reliable total-memory rlimit for fail-closed sandbox execution",
+        ));
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -1304,7 +1326,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     fn run_constrained_process_executes_allowlisted_command() {
         if Command::new("uname").output().is_err() {
             return;
@@ -1324,6 +1346,27 @@ mod tests {
             .and_then(serde_json::Value::as_str)
             .expect("stdout should be present in process output");
         assert!(!stdout.trim().is_empty(), "stdout should include uname output");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn run_constrained_process_fails_closed_on_macos_without_reliable_resource_quotas() {
+        if Command::new("uname").output().is_err() {
+            return;
+        }
+        let workspace = std::env::current_dir().expect("workspace current_dir should resolve");
+        let mut policy = sandbox_policy(workspace);
+        policy.egress_enforcement_mode = EgressEnforcementMode::Preflight;
+        let input = br#"{"command":"uname","args":[]}"#;
+
+        let error = run_constrained_process(&policy, input, Duration::from_millis(3_000))
+            .expect_err("macOS process runner must fail closed without reliable resource quotas");
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::UnsupportedPlatform);
+        assert!(
+            error.message.contains("unavailable on macOS"),
+            "macOS denial should explain missing fail-closed quota support: {}",
+            error.message
+        );
     }
 
     #[test]
@@ -1570,7 +1613,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     fn run_constrained_process_sanitizes_child_environment() {
         if Command::new("env").output().is_err() {
             return;
@@ -1603,7 +1646,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     fn run_constrained_process_enforces_combined_output_quota() {
         if Command::new("cat").arg("--version").output().is_err() {
             return;
@@ -1621,7 +1664,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     fn run_constrained_process_runtime_failure_redacts_child_stderr_payload() {
         if Command::new("cat").arg("--version").output().is_err() {
             return;
@@ -1702,7 +1745,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     fn run_constrained_process_skips_egress_validation_in_none_mode() {
         if Command::new("echo").arg("ok").output().is_err() {
             return;
@@ -1723,7 +1766,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     fn run_constrained_process_allows_preflight_mode_without_runtime_network_backend() {
         if Command::new("echo").arg("ok").output().is_err() {
             return;
@@ -1857,7 +1900,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(all(unix, not(target_os = "macos")))]
     fn run_constrained_process_tier_c_executes_when_backend_binary_is_available() {
         if Command::new("uname").output().is_err() {
             return;
