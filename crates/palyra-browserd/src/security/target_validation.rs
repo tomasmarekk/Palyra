@@ -175,6 +175,12 @@ static DNS_VALIDATION_CACHE: LazyLock<std::sync::Mutex<DnsValidationCache>> = La
 static DNS_VALIDATION_METRICS: LazyLock<DnsValidationMetrics> =
     LazyLock::new(DnsValidationMetrics::default);
 
+#[derive(Debug, Clone)]
+pub(crate) struct ValidatedTargetUrl {
+    pub(crate) host: Option<String>,
+    pub(crate) resolved_socket_addrs: Vec<SocketAddr>,
+}
+
 pub(crate) fn validate_target_url_blocking(
     raw_url: &str,
     allow_private_targets: bool,
@@ -426,45 +432,44 @@ pub(crate) async fn navigate_with_guards(
             }
         }
     };
-    let client = match reqwest::Client::builder()
-        .redirect(Policy::none())
-        .timeout(Duration::from_millis(timeout_ms.max(1)))
-        .build()
-    {
-        Ok(value) => value,
-        Err(error) => {
-            return NavigateOutcome {
-                success: false,
-                final_url: current_url.to_string(),
-                status_code: 0,
-                title: String::new(),
-                page_body: String::new(),
-                body_bytes: 0,
-                latency_ms: started_at.elapsed().as_millis() as u64,
-                error: format!("failed to build HTTP client: {error}"),
-                network_log,
-                cookie_updates,
-            }
-        }
-    };
-
     let redirect_limit = max_redirects.clamp(1, 10);
     let mut redirects = 0_u32;
     loop {
-        if let Err(error) = validate_target_url(&current_url, allow_private_targets).await {
-            return NavigateOutcome {
-                success: false,
-                final_url: current_url.to_string(),
-                status_code: 0,
-                title: String::new(),
-                page_body: String::new(),
-                body_bytes: 0,
-                latency_ms: started_at.elapsed().as_millis() as u64,
-                error,
-                network_log,
-                cookie_updates,
-            };
-        }
+        let validated_target = match validate_target_url(&current_url, allow_private_targets).await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                return NavigateOutcome {
+                    success: false,
+                    final_url: current_url.to_string(),
+                    status_code: 0,
+                    title: String::new(),
+                    page_body: String::new(),
+                    body_bytes: 0,
+                    latency_ms: started_at.elapsed().as_millis() as u64,
+                    error,
+                    network_log,
+                    cookie_updates,
+                };
+            }
+        };
+        let client = match build_pinned_http_client(timeout_ms, &validated_target) {
+            Ok(value) => value,
+            Err(error) => {
+                return NavigateOutcome {
+                    success: false,
+                    final_url: current_url.to_string(),
+                    status_code: 0,
+                    title: String::new(),
+                    page_body: String::new(),
+                    body_bytes: 0,
+                    latency_ms: started_at.elapsed().as_millis() as u64,
+                    error: format!("failed to build HTTP client: {error}"),
+                    network_log,
+                    cookie_updates,
+                };
+            }
+        };
 
         let request_started = Instant::now();
         let mut request_builder = client.get(current_url.clone());
@@ -690,13 +695,34 @@ pub(crate) fn enforce_remote_response_ip_policy(
 pub(crate) async fn validate_target_url(
     url: &Url,
     allow_private_targets: bool,
-) -> Result<(), String> {
+) -> Result<ValidatedTargetUrl, String> {
     let result = async {
         let (host, port) = extract_target_host_port(url)?;
         let resolved = resolve_host_addresses_async(host, port).await?;
-        enforce_resolved_host_policy(host, resolved, allow_private_targets)
+        let resolved_addresses = resolved.addresses.clone();
+        enforce_resolved_host_policy(host, resolved, allow_private_targets)?;
+        let resolved_socket_addrs = resolved_addresses
+            .into_iter()
+            .map(|address| SocketAddr::new(address, port))
+            .collect::<Vec<_>>();
+        let host = if host.parse::<IpAddr>().is_ok() { None } else { Some(host.to_owned()) };
+        Ok(ValidatedTargetUrl { host, resolved_socket_addrs })
     }
     .await;
     maybe_log_dns_validation_metrics();
     result
+}
+
+pub(crate) fn build_pinned_http_client(
+    timeout_ms: u64,
+    validated_target: &ValidatedTargetUrl,
+) -> Result<reqwest::Client, reqwest::Error> {
+    let mut client_builder = reqwest::Client::builder()
+        .redirect(Policy::none())
+        .timeout(Duration::from_millis(timeout_ms.max(1)));
+    if let Some(host) = validated_target.host.as_ref() {
+        client_builder = client_builder
+            .resolve_to_addrs(host.as_str(), validated_target.resolved_socket_addrs.as_slice());
+    }
+    client_builder.build()
 }

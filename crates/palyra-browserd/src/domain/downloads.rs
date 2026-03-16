@@ -217,14 +217,11 @@ pub(crate) async fn fetch_download_artifact(
 ) -> Result<DownloadArtifactRecord, String> {
     let mut current_url =
         Url::parse(source_url).map_err(|error| format!("invalid download URL: {error}"))?;
-    let client = reqwest::Client::builder()
-        .redirect(Policy::none())
-        .timeout(Duration::from_millis(timeout_ms.max(1)))
-        .build()
-        .map_err(|error| format!("failed to build download HTTP client: {error}"))?;
     let mut redirects = 0_u32;
     let response = loop {
-        validate_target_url(&current_url, allow_private_targets).await?;
+        let validated_target = validate_target_url(&current_url, allow_private_targets).await?;
+        let client = build_pinned_http_client(timeout_ms, &validated_target)
+            .map_err(|error| format!("failed to build download HTTP client: {error}"))?;
         let response = client
             .get(current_url.clone())
             .send()

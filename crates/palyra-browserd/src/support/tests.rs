@@ -5,8 +5,8 @@ use super::{
     persisted_snapshot_hash, persisted_snapshot_legacy_hash, record_chromium_remote_ip_incident,
     reset_dns_validation_tracking_for_tests, run_chromium_blocking, sha256_hex,
     store_dns_nxdomain_cache, update_profile_state_metadata,
-    validate_restored_snapshot_against_profile, validate_target_url_blocking, Args,
-    BrowserEngineMode, BrowserProfileRecord, BrowserRuntimeState, BrowserServiceImpl,
+    validate_restored_snapshot_against_profile, validate_target_url, validate_target_url_blocking,
+    Args, BrowserEngineMode, BrowserProfileRecord, BrowserRuntimeState, BrowserServiceImpl,
     BrowserTabRecord, ChromiumSessionProxy, DnsValidationCache, PersistedSessionSnapshot,
     PersistedStateStore, SessionPermissionsInternal, AUTHORIZATION_HEADER,
     CANONICAL_PROTOCOL_MAJOR, CHROMIUM_NEW_TAB_RETRY_DELAY_MS, CHROMIUM_PATH_ENV,
@@ -16,6 +16,7 @@ use super::{
 use crate::proto;
 use crate::proto::palyra::browser::v1::browser_service_server::BrowserService;
 use crate::security::auth::constant_time_eq_bytes;
+use reqwest::Url;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::{Read, Write};
@@ -309,6 +310,22 @@ async fn navigate_with_guards_blocks_remote_private_ip_after_cached_dns_mismatch
     );
 
     reset_dns_validation_tracking_for_tests();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn validate_target_url_pins_dns_resolution_for_hostnames() {
+    let target = Url::parse("http://localhost:8080/").expect("URL should parse");
+    let validated =
+        validate_target_url(&target, true).await.expect("localhost should validate with opt-in");
+    assert_eq!(validated.host.as_deref(), Some("localhost"));
+    assert!(
+        !validated.resolved_socket_addrs.is_empty(),
+        "validated hostnames should return at least one pinned socket address"
+    );
+    assert!(
+        validated.resolved_socket_addrs.iter().all(|addr| addr.port() == 8080),
+        "pinned socket addresses should preserve the URL port"
+    );
 }
 
 #[test]
