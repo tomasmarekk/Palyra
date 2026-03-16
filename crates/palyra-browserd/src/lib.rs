@@ -905,6 +905,8 @@ fn is_sensitive_query_key(raw_key: &str) -> bool {
             | "access_token"
             | "id_token"
             | "refresh_token"
+            | "code"
+            | "state"
             | "auth"
             | "authorization"
             | "api_key"

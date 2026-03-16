@@ -70,6 +70,21 @@ fn resolve_chromium_path_for_tests() -> Option<PathBuf> {
 }
 
 #[test]
+fn query_redaction_treats_oauth_code_and_state_as_sensitive() {
+    let redacted = super::redact_query_pairs("code=oauth123&state=abc123&safe=1");
+    assert!(redacted.contains("code=<redacted>"), "oauth code must be redacted: {redacted}");
+    assert!(redacted.contains("state=<redacted>"), "oauth state must be redacted: {redacted}");
+    assert!(
+        redacted.contains("safe=1"),
+        "non-sensitive parameters should be preserved: {redacted}"
+    );
+    assert!(
+        !redacted.contains("oauth123") && !redacted.contains("abc123"),
+        "sensitive values must not leak: {redacted}"
+    );
+}
+
+#[test]
 fn default_browserd_state_dir_prefers_state_root_override() {
     let resolved = default_browserd_state_dir_from_env(
         Some(OsString::from("state-root")),
