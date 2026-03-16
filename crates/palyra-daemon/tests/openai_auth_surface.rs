@@ -917,7 +917,7 @@ fn console_openai_oauth_callback_denial_persists_failed_attempt_state() -> Resul
         .get(console_url(
             admin_port,
             format!(
-                "/console/v1/auth/providers/openai/callback?state={attempt_id}&error=access_denied&error_description=User%20denied"
+                "/console/v1/auth/providers/openai/callback?state={attempt_id}&error=access_denied&error_description=bad%20%3C%2Fscript%3E%3Cscript%3Ealert(1)%3C%2Fscript%3E"
             )
             .as_str(),
         ))
@@ -930,6 +930,14 @@ fn console_openai_oauth_callback_denial_persists_failed_attempt_state() -> Resul
     assert!(
         denied_html.contains("OpenAI Connection Failed"),
         "denied callback should render a failure page for the operator"
+    );
+    assert!(
+        !denied_html.contains("</script><script>alert(1)</script>"),
+        "denied callback page must not contain raw script breakout content: {denied_html}"
+    );
+    assert!(
+        denied_html.contains("\\u003c/script\\u003e\\u003cscript\\u003ealert(1)\\u003c/script\\u003e"),
+        "denied callback page should escape the callback payload before embedding it in a script tag: {denied_html}"
     );
 
     let callback_state = get_console_json(

@@ -275,13 +275,28 @@ pub(crate) fn render_callback_page(title: &str, body: &str, payload_json: Option
     let escaped_title = html_escape(title);
     let escaped_body = html_escape(body);
     let post_message_script = payload_json.map_or_else(String::new, |payload| {
+        let safe_payload = escape_json_for_script_tag(payload);
         format!(
-            "if (window.opener && !window.opener.closed) {{ try {{ window.opener.postMessage({payload}, window.location.origin); window.close(); }} catch (_error) {{ }} }}"
+            "if (window.opener && !window.opener.closed) {{ try {{ window.opener.postMessage({safe_payload}, window.location.origin); window.close(); }} catch (_error) {{ }} }}"
         )
     });
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>{escaped_title}</title><style>body{{font-family:ui-sans-serif,system-ui,sans-serif;background:#f7f4ec;color:#1f2933;margin:0;padding:32px}}main{{max-width:560px;margin:0 auto;background:#fff;border:1px solid #d8d1c2;border-radius:16px;padding:24px;box-shadow:0 20px 60px rgba(31,41,51,.08)}}h1{{margin-top:0;font-size:1.4rem}}p{{line-height:1.5}}code{{background:#f2ede2;padding:2px 6px;border-radius:6px}}</style></head><body><main><h1>{escaped_title}</h1><p>{escaped_body}</p><p>You can return to Palyra now.</p></main><script>{post_message_script}</script></body></html>"
     )
+}
+
+fn escape_json_for_script_tag(raw_json: &str) -> String {
+    raw_json
+        .chars()
+        .map(|ch| match ch {
+            '&' => "\\u0026".to_owned(),
+            '<' => "\\u003c".to_owned(),
+            '>' => "\\u003e".to_owned(),
+            '\u{2028}' => "\\u2028".to_owned(),
+            '\u{2029}' => "\\u2029".to_owned(),
+            _ => ch.to_string(),
+        })
+        .collect()
 }
 
 fn html_escape(raw: &str) -> String {
@@ -397,5 +412,20 @@ mod tests {
         )
         .expect_err("credential-bearing token endpoint must be rejected");
         assert!(error.to_string().contains("embedded credentials"));
+    }
+
+    #[test]
+    fn render_callback_page_escapes_script_breakout_sequences_in_payload_json() {
+        let html = render_callback_page(
+            "OpenAI OAuth callback",
+            "You can return to Palyra now.",
+            Some(r#"{"message":"bad </script><script>alert(1)</script>"}"#),
+        );
+
+        assert!(!html.contains("</script><script>alert(1)</script>"));
+        assert!(
+            html.contains(r#"\u003c/script\u003e\u003cscript\u003ealert(1)\u003c/script\u003e"#),
+            "callback payload should remain script-safe: {html}"
+        );
     }
 }
