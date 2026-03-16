@@ -494,6 +494,17 @@ fn validate_argument_workspace_scope(
             let _ = resolve_scoped_path(workspace_root, cwd, value, false)?;
             continue;
         }
+        if let Some(value) = option_compact_value(arg.as_str()) {
+            if let Some(file_url_path) = parse_file_url_path(value)? {
+                let _ = resolve_scoped_path(workspace_root, cwd, file_url_path.as_str(), false)?;
+                continue;
+            }
+            if !argument_requires_path_validation(value) {
+                continue;
+            }
+            let _ = resolve_scoped_path(workspace_root, cwd, value, false)?;
+            continue;
+        }
         if !argument_requires_path_validation(arg.as_str()) {
             continue;
         }
@@ -509,6 +520,28 @@ fn option_assignment_value(arg: &str) -> Option<&str> {
     }
     let (_, value) = trimmed.split_once('=')?;
     Some(value)
+}
+
+fn option_compact_value(arg: &str) -> Option<&str> {
+    let trimmed = arg.trim();
+    if !trimmed.starts_with('-') || trimmed.starts_with("--") {
+        return None;
+    }
+
+    let mut char_indices = trimmed.char_indices();
+    let (_, first) = char_indices.next()?;
+    debug_assert_eq!(first, '-');
+    let (_, second) = char_indices.next()?;
+    if !second.is_ascii_alphabetic() {
+        return None;
+    }
+
+    let (value_index, value_char) = char_indices.next()?;
+    if value_char == '=' || value_char.is_whitespace() {
+        return None;
+    }
+
+    Some(&trimmed[value_index..])
 }
 
 fn argument_requires_path_validation(arg: &str) -> bool {
@@ -1434,6 +1467,67 @@ mod tests {
             &args,
         )
         .expect("workspace-relative path in flag assignment should be allowed");
+
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn validate_argument_workspace_scope_rejects_compact_short_option_absolute_path() {
+        let workspace = unique_temp_dir("workspace-compact-short-option-absolute");
+        fs::create_dir_all(&workspace).expect("workspace directory should be created");
+        let canonical_workspace = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+        let args = vec!["-C/etc".to_owned()];
+
+        let error = validate_argument_workspace_scope(
+            canonical_workspace.as_path(),
+            canonical_workspace.as_path(),
+            "tar",
+            &args,
+        )
+        .expect_err("compact short option with absolute path must be denied");
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
+
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn validate_argument_workspace_scope_rejects_compact_short_option_path_traversal() {
+        let workspace = unique_temp_dir("workspace-compact-short-option-traversal");
+        fs::create_dir_all(&workspace).expect("workspace directory should be created");
+        let canonical_workspace = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+        let args = vec!["-C../..".to_owned()];
+
+        let error = validate_argument_workspace_scope(
+            canonical_workspace.as_path(),
+            canonical_workspace.as_path(),
+            "tar",
+            &args,
+        )
+        .expect_err("compact short option with path traversal must be denied");
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
+
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn validate_argument_workspace_scope_allows_compact_short_option_workspace_relative_path() {
+        let workspace = unique_temp_dir("workspace-compact-short-option-relative");
+        let inside_dir = workspace.join("inside");
+        fs::create_dir_all(&inside_dir).expect("workspace subdirectory should be created");
+        let canonical_workspace = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+        let args = vec!["-Cinside".to_owned()];
+
+        validate_argument_workspace_scope(
+            canonical_workspace.as_path(),
+            canonical_workspace.as_path(),
+            "tar",
+            &args,
+        )
+        .expect("compact short option with workspace-relative path should be allowed");
 
         let _ = fs::remove_dir_all(&workspace);
     }
