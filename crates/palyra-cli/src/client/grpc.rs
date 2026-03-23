@@ -127,6 +127,13 @@ pub(crate) fn inject_run_stream_metadata(
         "x-palyra-channel",
         connection.channel.parse().context("invalid channel metadata value")?,
     );
+    metadata.insert(
+        "x-palyra-trace-id",
+        connection
+            .trace_id
+            .parse()
+            .context("invalid trace_id metadata value")?,
+    );
     Ok(())
 }
 

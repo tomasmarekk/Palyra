@@ -3,42 +3,36 @@ use serde_json::json;
 
 use crate::{
     args::ChannelsRouterCommand, client::channels as channels_client, normalize_optional_text_arg,
-    normalize_required_text_arg, output::channels as channels_output,
+    normalize_required_text_arg, output, output::channels as channels_output,
 };
 
 pub(crate) fn run(command: ChannelsRouterCommand) -> Result<()> {
     match command {
         ChannelsRouterCommand::Rules { url, token, principal, device_id, channel, json } => {
-            let base_url = channels_client::resolve_base_url(url);
-            let token = channels_client::resolve_token(token);
+            let request_context =
+                channels_client::resolve_request_context(url, token, principal, device_id, channel)?;
             let endpoint =
-                format!("{}/admin/v1/channels/router/rules", base_url.trim_end_matches('/'));
+                format!("{}/admin/v1/channels/router/rules", request_context.base_url.trim_end_matches('/'));
             let client = channels_client::build_client()?;
             let response = channels_client::send_request(
                 client.get(endpoint),
-                token,
-                principal,
-                device_id,
-                channel,
+                request_context,
                 "failed to call channel router rules endpoint",
             )?;
-            channels_output::emit_router_rules(response, json)?;
+            channels_output::emit_router_rules(response, output::preferred_json(json))?;
         }
         ChannelsRouterCommand::Warnings { url, token, principal, device_id, channel, json } => {
-            let base_url = channels_client::resolve_base_url(url);
-            let token = channels_client::resolve_token(token);
+            let request_context =
+                channels_client::resolve_request_context(url, token, principal, device_id, channel)?;
             let endpoint =
-                format!("{}/admin/v1/channels/router/warnings", base_url.trim_end_matches('/'));
+                format!("{}/admin/v1/channels/router/warnings", request_context.base_url.trim_end_matches('/'));
             let client = channels_client::build_client()?;
             let response = channels_client::send_request(
                 client.get(endpoint),
-                token,
-                principal,
-                device_id,
-                channel,
+                request_context,
                 "failed to call channel router warnings endpoint",
             )?;
-            channels_output::emit_router_warnings(response, json)?;
+            channels_output::emit_router_warnings(response, output::preferred_json(json))?;
         }
         ChannelsRouterCommand::Preview {
             route_channel,
@@ -61,10 +55,10 @@ pub(crate) fn run(command: ChannelsRouterCommand) -> Result<()> {
         } => {
             let route_channel = normalize_route_channel_arg(route_channel)?;
             let text = normalize_required_text_arg(text, "text")?;
-            let base_url = channels_client::resolve_base_url(url);
-            let token = channels_client::resolve_token(token);
+            let request_context =
+                channels_client::resolve_request_context(url, token, principal, device_id, channel)?;
             let endpoint =
-                format!("{}/admin/v1/channels/router/preview", base_url.trim_end_matches('/'));
+                format!("{}/admin/v1/channels/router/preview", request_context.base_url.trim_end_matches('/'));
             let client = channels_client::build_client()?;
             let payload = json!({
                 "channel": route_channel,
@@ -81,13 +75,10 @@ pub(crate) fn run(command: ChannelsRouterCommand) -> Result<()> {
             });
             let response = channels_client::send_request(
                 client.post(endpoint).json(&payload),
-                token,
-                principal,
-                device_id,
-                channel,
+                request_context,
                 "failed to call channel router preview endpoint",
             )?;
-            channels_output::emit_router_preview(response, json)?;
+            channels_output::emit_router_preview(response, output::preferred_json(json))?;
         }
         ChannelsRouterCommand::Pairings {
             route_channel,
@@ -98,10 +89,10 @@ pub(crate) fn run(command: ChannelsRouterCommand) -> Result<()> {
             channel,
             json,
         } => {
-            let base_url = channels_client::resolve_base_url(url);
-            let token = channels_client::resolve_token(token);
+            let request_context =
+                channels_client::resolve_request_context(url, token, principal, device_id, channel)?;
             let endpoint =
-                format!("{}/admin/v1/channels/router/pairings", base_url.trim_end_matches('/'));
+                format!("{}/admin/v1/channels/router/pairings", request_context.base_url.trim_end_matches('/'));
             let client = channels_client::build_client()?;
             let mut request = client.get(endpoint);
             if let Some(route_channel) = route_channel {
@@ -110,13 +101,10 @@ pub(crate) fn run(command: ChannelsRouterCommand) -> Result<()> {
             }
             let response = channels_client::send_request(
                 request,
-                token,
-                principal,
-                device_id,
-                channel,
+                request_context,
                 "failed to call channel router pairings endpoint",
             )?;
-            channels_output::emit_router_pairings(response, json)?;
+            channels_output::emit_router_pairings(response, output::preferred_json(json))?;
         }
         ChannelsRouterCommand::MintPairingCode {
             route_channel,
@@ -130,11 +118,11 @@ pub(crate) fn run(command: ChannelsRouterCommand) -> Result<()> {
             json,
         } => {
             let route_channel = normalize_route_channel_arg(route_channel)?;
-            let base_url = channels_client::resolve_base_url(url);
-            let token = channels_client::resolve_token(token);
+            let request_context =
+                channels_client::resolve_request_context(url, token, principal, device_id, channel)?;
             let endpoint = format!(
                 "{}/admin/v1/channels/router/pairing-codes",
-                base_url.trim_end_matches('/')
+                request_context.base_url.trim_end_matches('/')
             );
             let client = channels_client::build_client()?;
             let payload = json!({
@@ -144,13 +132,10 @@ pub(crate) fn run(command: ChannelsRouterCommand) -> Result<()> {
             });
             let response = channels_client::send_request(
                 client.post(endpoint).json(&payload),
-                token,
-                principal,
-                device_id,
-                channel,
+                request_context,
                 "failed to call channel router pairing-code mint endpoint",
             )?;
-            channels_output::emit_router_pairing_code(response, json)?;
+            channels_output::emit_router_pairing_code(response, output::preferred_json(json))?;
         }
     }
     Ok(())

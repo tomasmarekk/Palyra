@@ -1,12 +1,36 @@
 use crate::*;
 
+fn root_context() -> Result<app::RootCommandContext> {
+    app::current_root_context()
+        .ok_or_else(|| anyhow!("CLI root context is unavailable for gateway command"))
+}
+
+fn apply_http_connection_headers(
+    request: reqwest::blocking::RequestBuilder,
+    connection: &app::HttpConnection,
+) -> reqwest::blocking::RequestBuilder {
+    let mut request = request
+        .header("x-palyra-principal", connection.principal.clone())
+        .header("x-palyra-device-id", connection.device_id.clone())
+        .header("x-palyra-channel", connection.channel.clone())
+        .header("x-palyra-trace-id", connection.trace_id.clone());
+    if let Some(token) = connection.token.as_ref() {
+        request = request.header("Authorization", format!("Bearer {token}"));
+    }
+    request
+}
+
 pub(crate) fn run_daemon(command: DaemonCommand) -> Result<()> {
     match command {
         DaemonCommand::Status { url } => {
-            let base_url = url
-                .or_else(|| env::var("PALYRA_DAEMON_URL").ok())
-                .unwrap_or_else(|| DEFAULT_DAEMON_URL.to_owned());
-            let status_url = format!("{}/healthz", base_url.trim_end_matches('/'));
+            let connection = root_context()?.resolve_http_connection(
+                app::ConnectionOverrides {
+                    daemon_url: url,
+                    ..app::ConnectionOverrides::default()
+                },
+                app::ConnectionDefaults::USER,
+            )?;
+            let status_url = format!("{}/healthz", connection.base_url.trim_end_matches('/'));
             let client = Client::builder()
                 .timeout(std::time::Duration::from_secs(2))
                 .build()
@@ -82,21 +106,29 @@ pub(crate) fn run_daemon(command: DaemonCommand) -> Result<()> {
             std::io::stdout().flush().context("stdout flush failed")
         }
         DaemonCommand::AdminStatus { url, token, principal, device_id, channel } => {
-            let base_url = url
-                .or_else(|| env::var("PALYRA_DAEMON_URL").ok())
-                .unwrap_or_else(|| DEFAULT_DAEMON_URL.to_owned());
-            let token = token.or_else(|| env::var("PALYRA_ADMIN_TOKEN").ok());
+            let connection = root_context()?.resolve_http_connection(
+                app::ConnectionOverrides {
+                    daemon_url: url,
+                    token,
+                    principal,
+                    device_id,
+                    channel,
+                    grpc_url: None,
+                },
+                app::ConnectionDefaults::USER,
+            )?;
             let client = Client::builder()
                 .timeout(std::time::Duration::from_secs(2))
                 .build()
                 .context("failed to build HTTP client")?;
             let response = fetch_admin_status(
                 &client,
-                base_url.as_str(),
-                token,
-                principal,
-                device_id,
-                channel,
+                connection.base_url.as_str(),
+                connection.token,
+                connection.principal,
+                connection.device_id,
+                Some(connection.channel),
+                Some(connection.trace_id),
             )?;
 
             println!(
@@ -112,25 +144,24 @@ pub(crate) fn run_daemon(command: DaemonCommand) -> Result<()> {
             std::io::stdout().flush().context("stdout flush failed")
         }
         DaemonCommand::JournalRecent { url, token, principal, device_id, channel, limit } => {
-            let base_url = url
-                .or_else(|| env::var("PALYRA_DAEMON_URL").ok())
-                .unwrap_or_else(|| "http://127.0.0.1:7142".to_owned());
-            let endpoint = format!("{}/admin/v1/journal/recent", base_url.trim_end_matches('/'));
-            let token = token.or_else(|| env::var("PALYRA_ADMIN_TOKEN").ok());
+            let connection = root_context()?.resolve_http_connection(
+                app::ConnectionOverrides {
+                    daemon_url: url,
+                    token,
+                    principal,
+                    device_id,
+                    channel,
+                    grpc_url: None,
+                },
+                app::ConnectionDefaults::USER,
+            )?;
+            let endpoint =
+                format!("{}/admin/v1/journal/recent", connection.base_url.trim_end_matches('/'));
             let client = Client::builder()
                 .timeout(std::time::Duration::from_secs(2))
                 .build()
                 .context("failed to build HTTP client")?;
-            let mut request = client
-                .get(endpoint)
-                .header("x-palyra-principal", principal)
-                .header("x-palyra-device-id", device_id);
-            if let Some(token) = token {
-                request = request.header("Authorization", format!("Bearer {token}"));
-            }
-            if let Some(channel) = channel {
-                request = request.header("x-palyra-channel", channel);
-            }
+            let mut request = apply_http_connection_headers(client.get(endpoint), &connection);
             if let Some(limit) = limit {
                 request = request.query(&[("limit", limit)]);
             }
@@ -311,25 +342,24 @@ pub(crate) fn run_daemon(command: DaemonCommand) -> Result<()> {
         DaemonCommand::RunStatus { url, token, principal, device_id, channel, run_id } => {
             validate_canonical_id(run_id.as_str())
                 .context("run_id must be a canonical ULID for daemon run-status")?;
-            let base_url = url
-                .or_else(|| env::var("PALYRA_DAEMON_URL").ok())
-                .unwrap_or_else(|| "http://127.0.0.1:7142".to_owned());
-            let endpoint = format!("{}/admin/v1/runs/{run_id}", base_url.trim_end_matches('/'));
-            let token = token.or_else(|| env::var("PALYRA_ADMIN_TOKEN").ok());
+            let connection = root_context()?.resolve_http_connection(
+                app::ConnectionOverrides {
+                    daemon_url: url,
+                    token,
+                    principal,
+                    device_id,
+                    channel,
+                    grpc_url: None,
+                },
+                app::ConnectionDefaults::USER,
+            )?;
+            let endpoint =
+                format!("{}/admin/v1/runs/{run_id}", connection.base_url.trim_end_matches('/'));
             let client = Client::builder()
                 .timeout(std::time::Duration::from_secs(2))
                 .build()
                 .context("failed to build HTTP client")?;
-            let mut request = client
-                .get(endpoint)
-                .header("x-palyra-principal", principal)
-                .header("x-palyra-device-id", device_id);
-            if let Some(token) = token {
-                request = request.header("Authorization", format!("Bearer {token}"));
-            }
-            if let Some(channel) = channel {
-                request = request.header("x-palyra-channel", channel);
-            }
+            let request = apply_http_connection_headers(client.get(endpoint), &connection);
             let response: RunStatusResponse = request
                 .send()
                 .context("failed to call daemon run status endpoint")?
@@ -361,26 +391,24 @@ pub(crate) fn run_daemon(command: DaemonCommand) -> Result<()> {
         } => {
             validate_canonical_id(run_id.as_str())
                 .context("run_id must be a canonical ULID for daemon run-tape")?;
-            let base_url = url
-                .or_else(|| env::var("PALYRA_DAEMON_URL").ok())
-                .unwrap_or_else(|| "http://127.0.0.1:7142".to_owned());
+            let connection = root_context()?.resolve_http_connection(
+                app::ConnectionOverrides {
+                    daemon_url: url,
+                    token,
+                    principal,
+                    device_id,
+                    channel,
+                    grpc_url: None,
+                },
+                app::ConnectionDefaults::USER,
+            )?;
             let endpoint =
-                format!("{}/admin/v1/runs/{run_id}/tape", base_url.trim_end_matches('/'));
-            let token = token.or_else(|| env::var("PALYRA_ADMIN_TOKEN").ok());
+                format!("{}/admin/v1/runs/{run_id}/tape", connection.base_url.trim_end_matches('/'));
             let client = Client::builder()
                 .timeout(std::time::Duration::from_secs(2))
                 .build()
                 .context("failed to build HTTP client")?;
-            let mut request = client
-                .get(endpoint)
-                .header("x-palyra-principal", principal)
-                .header("x-palyra-device-id", device_id);
-            if let Some(token) = token {
-                request = request.header("Authorization", format!("Bearer {token}"));
-            }
-            if let Some(channel) = channel {
-                request = request.header("x-palyra-channel", channel);
-            }
+            let mut request = apply_http_connection_headers(client.get(endpoint), &connection);
             if let Some(after_seq) = after_seq {
                 request = request.query(&[("after_seq", after_seq)]);
             }
@@ -415,26 +443,24 @@ pub(crate) fn run_daemon(command: DaemonCommand) -> Result<()> {
         DaemonCommand::RunCancel { url, token, principal, device_id, channel, run_id, reason } => {
             validate_canonical_id(run_id.as_str())
                 .context("run_id must be a canonical ULID for daemon run-cancel")?;
-            let base_url = url
-                .or_else(|| env::var("PALYRA_DAEMON_URL").ok())
-                .unwrap_or_else(|| "http://127.0.0.1:7142".to_owned());
+            let connection = root_context()?.resolve_http_connection(
+                app::ConnectionOverrides {
+                    daemon_url: url,
+                    token,
+                    principal,
+                    device_id,
+                    channel,
+                    grpc_url: None,
+                },
+                app::ConnectionDefaults::USER,
+            )?;
             let endpoint =
-                format!("{}/admin/v1/runs/{run_id}/cancel", base_url.trim_end_matches('/'));
-            let token = token.or_else(|| env::var("PALYRA_ADMIN_TOKEN").ok());
+                format!("{}/admin/v1/runs/{run_id}/cancel", connection.base_url.trim_end_matches('/'));
             let client = Client::builder()
                 .timeout(std::time::Duration::from_secs(2))
                 .build()
                 .context("failed to build HTTP client")?;
-            let mut request = client
-                .post(endpoint)
-                .header("x-palyra-principal", principal)
-                .header("x-palyra-device-id", device_id);
-            if let Some(token) = token {
-                request = request.header("Authorization", format!("Bearer {token}"));
-            }
-            if let Some(channel) = channel {
-                request = request.header("x-palyra-channel", channel);
-            }
+            let mut request = apply_http_connection_headers(client.post(endpoint), &connection);
             if let Some(reason) = reason {
                 request = request.json(&RunCancelRequestBody { reason });
             }

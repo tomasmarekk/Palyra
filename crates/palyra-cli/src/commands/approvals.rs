@@ -1,13 +1,10 @@
 use crate::{output::approvals as approvals_output, *};
 
 pub(crate) fn run_approvals(command: ApprovalsCommand) -> Result<()> {
-    let connection = AgentConnection {
-        grpc_url: resolve_grpc_url(None)?,
-        token: env::var("PALYRA_ADMIN_TOKEN").ok(),
-        principal: "user:local".to_owned(),
-        device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
-        channel: DEFAULT_CHANNEL.to_owned(),
-    };
+    let root_context = app::current_root_context()
+        .ok_or_else(|| anyhow!("CLI root context is unavailable for approvals command"))?;
+    let connection = root_context
+        .resolve_grpc_connection(app::ConnectionOverrides::default(), app::ConnectionDefaults::USER)?;
     let runtime = build_runtime()?;
     runtime.block_on(run_approvals_async(command, connection))
 }
@@ -33,6 +30,7 @@ pub(crate) async fn run_approvals_async(
             decision,
             json,
         } => {
+            let json = output::preferred_json(json);
             if let (Some(since_ms), Some(until_ms)) = (since, until) {
                 if since_ms > until_ms {
                     return Err(anyhow!(
@@ -64,6 +62,7 @@ pub(crate) async fn run_approvals_async(
             approvals_output::emit_list(&response, json)?;
         }
         ApprovalsCommand::Show { approval_id, json } => {
+            let json = output::preferred_json(json);
             validate_canonical_id(approval_id.as_str())
                 .context("approval id must be a canonical ULID")?;
             let mut request = Request::new(gateway_v1::GetApprovalRequest {

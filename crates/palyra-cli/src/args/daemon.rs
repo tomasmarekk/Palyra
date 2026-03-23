@@ -19,10 +19,10 @@ pub enum DaemonCommand {
         url: Option<String>,
         #[arg(long)]
         token: Option<String>,
-        #[arg(long, default_value = "user:local")]
-        principal: String,
-        #[arg(long, default_value = "01ARZ3NDEKTSV4RRFFQ69G5FAV")]
-        device_id: String,
+        #[arg(long)]
+        principal: Option<String>,
+        #[arg(long)]
+        device_id: Option<String>,
         #[arg(long)]
         channel: Option<String>,
     },
@@ -31,10 +31,10 @@ pub enum DaemonCommand {
         url: Option<String>,
         #[arg(long)]
         token: Option<String>,
-        #[arg(long, default_value = "user:local")]
-        principal: String,
-        #[arg(long, default_value = "01ARZ3NDEKTSV4RRFFQ69G5FAV")]
-        device_id: String,
+        #[arg(long)]
+        principal: Option<String>,
+        #[arg(long)]
+        device_id: Option<String>,
         #[arg(long)]
         channel: Option<String>,
         #[arg(long)]
@@ -65,10 +65,10 @@ pub enum DaemonCommand {
         url: Option<String>,
         #[arg(long)]
         token: Option<String>,
-        #[arg(long, default_value = "user:local")]
-        principal: String,
-        #[arg(long, default_value = "01ARZ3NDEKTSV4RRFFQ69G5FAV")]
-        device_id: String,
+        #[arg(long)]
+        principal: Option<String>,
+        #[arg(long)]
+        device_id: Option<String>,
         #[arg(long)]
         channel: Option<String>,
         #[arg(long)]
@@ -79,10 +79,10 @@ pub enum DaemonCommand {
         url: Option<String>,
         #[arg(long)]
         token: Option<String>,
-        #[arg(long, default_value = "user:local")]
-        principal: String,
-        #[arg(long, default_value = "01ARZ3NDEKTSV4RRFFQ69G5FAV")]
-        device_id: String,
+        #[arg(long)]
+        principal: Option<String>,
+        #[arg(long)]
+        device_id: Option<String>,
         #[arg(long)]
         channel: Option<String>,
         #[arg(long)]
@@ -97,10 +97,10 @@ pub enum DaemonCommand {
         url: Option<String>,
         #[arg(long)]
         token: Option<String>,
-        #[arg(long, default_value = "user:local")]
-        principal: String,
-        #[arg(long, default_value = "01ARZ3NDEKTSV4RRFFQ69G5FAV")]
-        device_id: String,
+        #[arg(long)]
+        principal: Option<String>,
+        #[arg(long)]
+        device_id: Option<String>,
         #[arg(long)]
         channel: Option<String>,
         #[arg(long)]

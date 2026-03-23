@@ -33,7 +33,7 @@ fn parse_init_remote_with_overrides() {
     ]);
     assert_eq!(
         parsed.command,
-        Command::Init {
+        Command::Setup {
             mode: InitModeArg::Remote,
             path: Some("config/palyra.toml".to_owned()),
             force: true,
@@ -80,8 +80,8 @@ fn parse_status_with_admin_context() {
             grpc_url: Some("http://127.0.0.1:7443".to_owned()),
             admin: true,
             token: Some("test-token".to_owned()),
-            principal: "user:ops".to_owned(),
-            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            principal: Some("user:ops".to_owned()),
+            device_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
             channel: Some("cli".to_owned()),
         }
     );
@@ -112,9 +112,9 @@ fn parse_agent_run_with_prompt() {
             command: AgentCommand::Run {
                 grpc_url: Some("http://127.0.0.1:7443".to_owned()),
                 token: Some("test-token".to_owned()),
-                principal: "user:local".to_owned(),
-                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
-                channel: "cli".to_owned(),
+                principal: None,
+                device_id: None,
+                channel: None,
                 session_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned()),
                 run_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned()),
                 prompt: Some("hello".to_owned()),
@@ -135,9 +135,9 @@ fn parse_agent_interactive_with_defaults() {
             command: AgentCommand::Interactive {
                 grpc_url: None,
                 token: None,
-                principal: "user:local".to_owned(),
-                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
-                channel: "cli".to_owned(),
+                principal: None,
+                device_id: None,
+                channel: None,
                 session_id: None,
                 allow_sensitive_tools: false,
                 ndjson: false,
@@ -162,9 +162,9 @@ fn parse_agent_acp_shim_from_ndjson_stdin() {
             command: AgentCommand::AcpShim {
                 grpc_url: Some("http://127.0.0.1:7443".to_owned()),
                 token: None,
-                principal: "user:local".to_owned(),
-                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
-                channel: "cli".to_owned(),
+                principal: None,
+                device_id: None,
+                channel: None,
                 session_id: None,
                 run_id: None,
                 prompt: None,
@@ -185,9 +185,9 @@ fn parse_agent_acp_with_defaults() {
             command: AgentCommand::Acp {
                 grpc_url: None,
                 token: None,
-                principal: "user:local".to_owned(),
-                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
-                channel: "cli".to_owned(),
+                principal: None,
+                device_id: None,
+                channel: None,
                 allow_sensitive_tools: false,
             }
         }
@@ -1228,7 +1228,7 @@ fn parse_daemon_status_with_url() {
     let parsed = Cli::parse_from(["palyra", "daemon", "status", "--url", "http://127.0.0.1:7142"]);
     assert_eq!(
         parsed.command,
-        Command::Daemon {
+        Command::Gateway {
             command: DaemonCommand::Status { url: Some("http://127.0.0.1:7142".to_owned()) }
         }
     );
@@ -1281,12 +1281,12 @@ fn parse_daemon_admin_status_with_explicit_context() {
     ]);
     assert_eq!(
         parsed.command,
-        Command::Daemon {
+        Command::Gateway {
             command: DaemonCommand::AdminStatus {
                 url: Some("http://127.0.0.1:7142".to_owned()),
                 token: Some("test-token".to_owned()),
-                principal: "user:ops".to_owned(),
-                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                principal: Some("user:ops".to_owned()),
+                device_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
                 channel: Some("cli".to_owned()),
             }
         }
@@ -1314,12 +1314,12 @@ fn parse_daemon_journal_recent_with_limit() {
     ]);
     assert_eq!(
         parsed.command,
-        Command::Daemon {
+        Command::Gateway {
             command: DaemonCommand::JournalRecent {
                 url: Some("http://127.0.0.1:7142".to_owned()),
                 token: Some("test-token".to_owned()),
-                principal: "user:ops".to_owned(),
-                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                principal: Some("user:ops".to_owned()),
+                device_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
                 channel: Some("cli".to_owned()),
                 limit: Some(25),
             }
@@ -1338,7 +1338,7 @@ fn parse_daemon_journal_vacuum_with_db_path() {
     ]);
     assert_eq!(
         parsed.command,
-        Command::Daemon {
+        Command::Gateway {
             command: DaemonCommand::JournalVacuum {
                 db_path: Some("data/journal.sqlite3".to_owned())
             }
@@ -1359,7 +1359,7 @@ fn parse_daemon_journal_checkpoint_with_mode() {
     ]);
     assert_eq!(
         parsed.command,
-        Command::Daemon {
+        Command::Gateway {
             command: DaemonCommand::JournalCheckpoint {
                 db_path: Some("data/journal.sqlite3".to_owned()),
                 mode: JournalCheckpointModeArg::Restart,
@@ -1394,7 +1394,7 @@ fn parse_daemon_journal_checkpoint_with_signature_options() {
     ]);
     assert_eq!(
         parsed.command,
-        Command::Daemon {
+        Command::Gateway {
             command: DaemonCommand::JournalCheckpoint {
                 db_path: Some("data/journal.sqlite3".to_owned()),
                 mode: JournalCheckpointModeArg::Truncate,
@@ -1429,12 +1429,12 @@ fn parse_daemon_run_status_with_run_id() {
     ]);
     assert_eq!(
         parsed.command,
-        Command::Daemon {
+        Command::Gateway {
             command: DaemonCommand::RunStatus {
                 url: Some("http://127.0.0.1:7142".to_owned()),
                 token: Some("test-token".to_owned()),
-                principal: "user:ops".to_owned(),
-                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                principal: Some("user:ops".to_owned()),
+                device_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
                 channel: Some("cli".to_owned()),
                 run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),
             }
@@ -1459,12 +1459,12 @@ fn parse_daemon_run_cancel_with_reason() {
     ]);
     assert_eq!(
         parsed.command,
-        Command::Daemon {
+        Command::Gateway {
             command: DaemonCommand::RunCancel {
                 url: Some("http://127.0.0.1:7142".to_owned()),
                 token: Some("test-token".to_owned()),
-                principal: "user:local".to_owned(),
-                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                principal: None,
+                device_id: None,
                 channel: None,
                 run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),
                 reason: Some("operator requested".to_owned()),
@@ -1489,7 +1489,7 @@ fn parse_daemon_dashboard_url_with_verification_options() {
     ]);
     assert_eq!(
         parsed.command,
-        Command::Daemon {
+        Command::Gateway {
             command: DaemonCommand::DashboardUrl {
                 path: Some("config/palyra.toml".to_owned()),
                 verify_remote: true,

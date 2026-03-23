@@ -5,6 +5,8 @@ fn interactive_session_started_message() -> &'static str {
 }
 
 pub(crate) fn run_agent(command: AgentCommand) -> Result<()> {
+    let root_context = app::current_root_context()
+        .ok_or_else(|| anyhow!("CLI root context is unavailable for agent command"))?;
     match command {
         AgentCommand::Run {
             grpc_url,
@@ -20,16 +22,20 @@ pub(crate) fn run_agent(command: AgentCommand) -> Result<()> {
             ndjson,
         } => {
             let input_prompt = resolve_prompt_input(prompt, prompt_stdin)?;
-            let connection = AgentConnection {
-                grpc_url: resolve_grpc_url(grpc_url)?,
-                token: token.or_else(|| env::var("PALYRA_ADMIN_TOKEN").ok()),
-                principal,
-                device_id,
-                channel,
-            };
+            let connection = root_context.resolve_grpc_connection(
+                app::ConnectionOverrides {
+                    grpc_url,
+                    token,
+                    principal,
+                    device_id,
+                    channel,
+                    daemon_url: None,
+                },
+                app::ConnectionDefaults::USER,
+            )?;
             let request =
                 build_agent_run_input(session_id, run_id, input_prompt, allow_sensitive_tools)?;
-            execute_agent_stream(connection, request, ndjson)
+            execute_agent_stream(connection, request, output::preferred_ndjson(false, ndjson))
         }
         AgentCommand::Interactive {
             grpc_url,
@@ -41,16 +47,20 @@ pub(crate) fn run_agent(command: AgentCommand) -> Result<()> {
             allow_sensitive_tools,
             ndjson,
         } => {
-            let connection = AgentConnection {
-                grpc_url: resolve_grpc_url(grpc_url)?,
-                token: token.or_else(|| env::var("PALYRA_ADMIN_TOKEN").ok()),
-                principal,
-                device_id,
-                channel,
-            };
+            let connection = root_context.resolve_grpc_connection(
+                app::ConnectionOverrides {
+                    grpc_url,
+                    token,
+                    principal,
+                    device_id,
+                    channel,
+                    daemon_url: None,
+                },
+                app::ConnectionDefaults::USER,
+            )?;
             let session_id = resolve_or_generate_canonical_id(session_id)?;
             let started_message = interactive_session_started_message();
-            if ndjson {
+            if output::preferred_ndjson(false, ndjson) {
                 eprintln!("{started_message}");
                 std::io::stderr().flush().context("stderr flush failed")?;
             } else {
@@ -91,13 +101,17 @@ pub(crate) fn run_agent(command: AgentCommand) -> Result<()> {
             allow_sensitive_tools,
             ndjson_stdin,
         } => {
-            let connection = AgentConnection {
-                grpc_url: resolve_grpc_url(grpc_url)?,
-                token: token.or_else(|| env::var("PALYRA_ADMIN_TOKEN").ok()),
-                principal,
-                device_id,
-                channel,
-            };
+            let connection = root_context.resolve_grpc_connection(
+                app::ConnectionOverrides {
+                    grpc_url,
+                    token,
+                    principal,
+                    device_id,
+                    channel,
+                    daemon_url: None,
+                },
+                app::ConnectionDefaults::USER,
+            )?;
             if ndjson_stdin {
                 return run_acp_shim_from_stdin(connection, allow_sensitive_tools);
             }
@@ -115,13 +129,17 @@ pub(crate) fn run_agent(command: AgentCommand) -> Result<()> {
             channel,
             allow_sensitive_tools,
         } => {
-            let connection = AgentConnection {
-                grpc_url: resolve_grpc_url(grpc_url)?,
-                token: token.or_else(|| env::var("PALYRA_ADMIN_TOKEN").ok()),
-                principal,
-                device_id,
-                channel,
-            };
+            let connection = root_context.resolve_grpc_connection(
+                app::ConnectionOverrides {
+                    grpc_url,
+                    token,
+                    principal,
+                    device_id,
+                    channel,
+                    daemon_url: None,
+                },
+                app::ConnectionDefaults::USER,
+            )?;
             acp_bridge::run_agent_acp_bridge(connection, allow_sensitive_tools)
         }
     }

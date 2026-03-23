@@ -1,0 +1,68 @@
+Palyra operator CLI for secure local and remote runtime management.
+
+Usage: palyra.exe [OPTIONS] <COMMAND>
+
+Commands:
+  version         Show CLI build metadata
+  setup           Bootstrap a Palyra installation [aliases: init]
+  doctor
+  status          Show transport and admin status across HTTP/gRPC surfaces
+  agent
+  agents
+  cron
+  memory
+  approvals
+  auth
+  channels
+  browser
+  completion      Generate shell completion scripts
+  onboarding      [aliases: onboard]
+  gateway         Gateway and runtime diagnostics surface [aliases: daemon]
+  dashboard       Resolve or open the operator dashboard URL
+  support-bundle
+  policy
+  protocol
+  config
+  patch
+  skills          [aliases: skill]
+  secrets
+  tunnel
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global Options:
+      --profile <PROFILE>
+
+      --config <CONFIG_PATH>
+
+      --state-root <STATE_ROOT>
+
+  -v, --verbose...
+          Increase logging verbosity (-v => debug, -vv => trace)
+
+      --log-level <LOG_LEVEL>
+          [default: info]
+          [possible values: error, warn, info, debug, trace]
+
+      --output-format <OUTPUT_FORMAT>
+          [default: text]
+          [possible values: text, json, ndjson]
+
+      --plain
+
+      --no-color
+
+Examples:
+  palyra setup --mode local
+  palyra gateway status
+  palyra dashboard --open
+  palyra --profile staging agents list --json
+  palyra --config ./palyra.toml --output-format json status --admin
+
+Canonical command map:
+  setup      Preferred bootstrap/init workflow (`init` remains as a compatibility alias)
+  gateway    Preferred runtime/admin family (`daemon` remains as a compatibility alias)
+  dashboard  Thin operator shortcut for dashboard URL discovery/open workflows
+  onboarding Operator onboarding workflows (`onboard` remains as a compatibility alias)

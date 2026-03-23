@@ -1,0 +1,48 @@
+Bootstrap a Palyra installation
+
+Usage: palyra.exe setup [OPTIONS]
+
+Options:
+      --mode <MODE>
+          [default: local]
+          [possible values: local, remote]
+
+      --path <PATH>
+
+      --force
+
+      --tls-scaffold <TLS_SCAFFOLD>
+          [default: bring-your-own]
+          [possible values: none, bring-your-own, self-signed]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global Options:
+      --profile <PROFILE>
+
+      --config <CONFIG_PATH>
+
+      --state-root <STATE_ROOT>
+
+  -v, --verbose...
+          Increase logging verbosity (-v => debug, -vv => trace)
+
+      --log-level <LOG_LEVEL>
+          [default: info]
+          [possible values: error, warn, info, debug, trace]
+
+      --output-format <OUTPUT_FORMAT>
+          [default: text]
+          [possible values: text, json, ndjson]
+
+      --plain
+
+      --no-color
+
+Examples:
+  palyra setup --mode local
+  palyra setup --mode remote --path ./config/palyra.toml --force
+
+Discoverability:
+  Use `palyra gateway status` after setup to verify runtime health.

@@ -912,6 +912,7 @@ mod tests {
                 principal: "user:test".to_owned(),
                 device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
                 channel: "cli".to_owned(),
+                trace_id: "cli:test".to_owned(),
             },
             false,
             Arc::new(Mutex::new(BridgeState::default())),

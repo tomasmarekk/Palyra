@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use std::io::Write;
 
 use crate::{
-    args::ChannelsCommand, client::channels as channels_client, output::channels as channels_output,
+    args::ChannelsCommand, client::channels as channels_client, output, output::channels as channels_output,
 };
 
 pub(crate) fn run(command: ChannelsCommand) -> Result<()> {
@@ -17,19 +17,17 @@ pub(crate) fn run(command: ChannelsCommand) -> Result<()> {
         ChannelsCommand::Discord { command } => connectors::discord::run(command)?,
         ChannelsCommand::Router { command } => router::run(command)?,
         ChannelsCommand::List { url, token, principal, device_id, channel, json } => {
-            let base_url = channels_client::resolve_base_url(url);
-            let token = channels_client::resolve_token(token);
-            let endpoint = format!("{}/admin/v1/channels", base_url.trim_end_matches('/'));
+            let request_context =
+                channels_client::resolve_request_context(url, token, principal, device_id, channel)?;
+            let endpoint =
+                format!("{}/admin/v1/channels", request_context.base_url.trim_end_matches('/'));
             let client = channels_client::build_client()?;
             let response = channels_client::send_request(
                 client.get(endpoint),
-                token,
-                principal,
-                device_id,
-                channel,
+                request_context,
                 "failed to call channels list endpoint",
             )?;
-            channels_output::emit_list(response, json)?;
+            channels_output::emit_list(response, output::preferred_json(json))?;
         }
         ChannelsCommand::Status {
             connector_id,
@@ -49,7 +47,7 @@ pub(crate) fn run(command: ChannelsCommand) -> Result<()> {
                 channel,
                 "failed to call channels status endpoint",
             )?;
-            channels_output::emit_status(response, json)?;
+            channels_output::emit_status(response, output::preferred_json(json))?;
         }
         ChannelsCommand::HealthRefresh {
             connector_id,
@@ -72,7 +70,7 @@ pub(crate) fn run(command: ChannelsCommand) -> Result<()> {
                 channel,
                 "failed to call channels health-refresh endpoint",
             )?;
-            channels_output::emit_status(response, json)?;
+            channels_output::emit_status(response, output::preferred_json(json))?;
         }
         ChannelsCommand::Enable {
             connector_id,
@@ -94,7 +92,7 @@ pub(crate) fn run(command: ChannelsCommand) -> Result<()> {
                 channel,
                 "failed to call channels enable endpoint",
             )?;
-            channels_output::emit_status(response, json)?;
+            channels_output::emit_status(response, output::preferred_json(json))?;
         }
         ChannelsCommand::QueuePause {
             connector_id,
@@ -116,7 +114,7 @@ pub(crate) fn run(command: ChannelsCommand) -> Result<()> {
                 channel,
                 "failed to call channels queue pause endpoint",
             )?;
-            channels_output::emit_status(response, json)?;
+            channels_output::emit_status(response, output::preferred_json(json))?;
         }
         ChannelsCommand::QueueResume {
             connector_id,
@@ -138,7 +136,7 @@ pub(crate) fn run(command: ChannelsCommand) -> Result<()> {
                 channel,
                 "failed to call channels queue resume endpoint",
             )?;
-            channels_output::emit_status(response, json)?;
+            channels_output::emit_status(response, output::preferred_json(json))?;
         }
         ChannelsCommand::QueueDrain {
             connector_id,
@@ -160,7 +158,7 @@ pub(crate) fn run(command: ChannelsCommand) -> Result<()> {
                 channel,
                 "failed to call channels queue drain endpoint",
             )?;
-            channels_output::emit_status(response, json)?;
+            channels_output::emit_status(response, output::preferred_json(json))?;
         }
         ChannelsCommand::DeadLetterReplay {
             connector_id,
@@ -184,7 +182,7 @@ pub(crate) fn run(command: ChannelsCommand) -> Result<()> {
                 channel,
                 "failed to call channels dead-letter replay endpoint",
             )?;
-            channels_output::emit_status(response, json)?;
+            channels_output::emit_status(response, output::preferred_json(json))?;
         }
         ChannelsCommand::DeadLetterDiscard {
             connector_id,
@@ -208,7 +206,7 @@ pub(crate) fn run(command: ChannelsCommand) -> Result<()> {
                 channel,
                 "failed to call channels dead-letter discard endpoint",
             )?;
-            channels_output::emit_status(response, json)?;
+            channels_output::emit_status(response, output::preferred_json(json))?;
         }
         ChannelsCommand::Disable {
             connector_id,
@@ -230,7 +228,7 @@ pub(crate) fn run(command: ChannelsCommand) -> Result<()> {
                 channel,
                 "failed to call channels disable endpoint",
             )?;
-            channels_output::emit_status(response, json)?;
+            channels_output::emit_status(response, output::preferred_json(json))?;
         }
         ChannelsCommand::Logs {
             connector_id,
@@ -242,11 +240,11 @@ pub(crate) fn run(command: ChannelsCommand) -> Result<()> {
             limit,
             json,
         } => {
-            let base_url = channels_client::resolve_base_url(url);
-            let token = channels_client::resolve_token(token);
+            let request_context =
+                channels_client::resolve_request_context(url, token, principal, device_id, channel)?;
             let endpoint = format!(
                 "{}/admin/v1/channels/{}/logs",
-                base_url.trim_end_matches('/'),
+                request_context.base_url.trim_end_matches('/'),
                 connector_id
             );
             let client = channels_client::build_client()?;
@@ -256,13 +254,10 @@ pub(crate) fn run(command: ChannelsCommand) -> Result<()> {
             }
             let response = channels_client::send_request(
                 request,
-                token,
-                principal,
-                device_id,
-                channel,
+                request_context,
                 "failed to call channels logs endpoint",
             )?;
-            emit_logs(connector_id.as_str(), response, json)?;
+            emit_logs(connector_id.as_str(), response, output::preferred_json(json))?;
         }
         ChannelsCommand::Test {
             connector_id,
@@ -299,7 +294,7 @@ pub(crate) fn run(command: ChannelsCommand) -> Result<()> {
                 channel,
                 "failed to call channels test endpoint",
             )?;
-            emit_test(connector_id.as_str(), response, json)?;
+            emit_test(connector_id.as_str(), response, output::preferred_json(json))?;
         }
     }
     std::io::stdout().flush().context("stdout flush failed")
@@ -314,18 +309,15 @@ pub(super) fn get_connector_status(
     channel: Option<String>,
     error_context: &'static str,
 ) -> Result<Value> {
-    let base_url = channels_client::resolve_base_url(url);
-    let token = channels_client::resolve_token(token);
-    let endpoint = format!("{}/admin/v1/channels/{}", base_url.trim_end_matches('/'), connector_id);
+    let request_context =
+        channels_client::resolve_request_context(url, token, principal, device_id, channel)?;
+    let endpoint = format!(
+        "{}/admin/v1/channels/{}",
+        request_context.base_url.trim_end_matches('/'),
+        connector_id
+    );
     let client = channels_client::build_client()?;
-    channels_client::send_request(
-        client.get(endpoint),
-        token,
-        principal,
-        device_id,
-        channel,
-        error_context,
-    )
+    channels_client::send_request(client.get(endpoint), request_context, error_context)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -340,11 +332,11 @@ pub(super) fn post_connector_action(
     channel: Option<String>,
     error_context: &'static str,
 ) -> Result<Value> {
-    let base_url = channels_client::resolve_base_url(url);
-    let token = channels_client::resolve_token(token);
+    let request_context =
+        channels_client::resolve_request_context(url, token, principal, device_id, channel)?;
     let endpoint = format!(
         "{}/admin/v1/channels/{}{}",
-        base_url.trim_end_matches('/'),
+        request_context.base_url.trim_end_matches('/'),
         connector_id,
         action_suffix
     );
@@ -354,7 +346,7 @@ pub(super) fn post_connector_action(
     } else {
         client.post(endpoint)
     };
-    channels_client::send_request(request, token, principal, device_id, channel, error_context)
+    channels_client::send_request(request, request_context, error_context)
 }
 
 fn emit_logs(connector_id: &str, response: Value, json_output: bool) -> Result<()> {

@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::io::IsTerminal;
 
-use crate::{client::channels as channels_client, prompt_yes_no, prompt_yes_no_default};
+use crate::{client::channels as channels_client, output, prompt_yes_no, prompt_yes_no_default};
 
 use super::{emit, prompt, request};
 
@@ -24,14 +24,17 @@ pub(crate) fn run(
         bail!("discord setup requires an interactive terminal (stdin/stdout/stderr TTY)");
     }
 
-    let base_url = channels_client::resolve_base_url(url);
-    let admin_token = channels_client::resolve_token(token);
+    let request_context =
+        channels_client::resolve_request_context(url, token, principal, device_id, channel)?;
     let setup_mode = prompt::setup_mode()?;
     let setup_token = prompt::setup_token()?;
     let connector_id = request::connector_id(account_id.as_str())?;
     let client = channels_client::build_client()?;
     let probe_endpoint =
-        format!("{}/admin/v1/channels/discord/onboarding/probe", base_url.trim_end_matches('/'),);
+        format!(
+            "{}/admin/v1/channels/discord/onboarding/probe",
+            request_context.base_url.trim_end_matches('/'),
+        );
     let probe_response = channels_client::send_request(
         client.post(probe_endpoint).json(&request::probe_payload(
             account_id.as_str(),
@@ -39,10 +42,7 @@ pub(crate) fn run(
             setup_mode.as_str(),
             verify_channel_id.as_deref(),
         )),
-        admin_token.clone(),
-        principal.clone(),
-        device_id.clone(),
-        channel.clone(),
+        request_context.clone(),
         "failed to call discord onboarding probe endpoint",
     )?;
     eprintln!("discord setup preflight: token validation succeeded");
@@ -72,7 +72,10 @@ pub(crate) fn run(
     };
 
     let apply_endpoint =
-        format!("{}/admin/v1/channels/discord/onboarding/apply", base_url.trim_end_matches('/'),);
+        format!(
+            "{}/admin/v1/channels/discord/onboarding/apply",
+            request_context.base_url.trim_end_matches('/'),
+        );
     let response = channels_client::send_request(
         client.post(apply_endpoint).json(&request::apply_payload(
             account_id.as_str(),
@@ -87,13 +90,10 @@ pub(crate) fn run(
             confirm_open,
             verify_channel_id.as_deref(),
         )),
-        admin_token,
-        principal,
-        device_id,
-        channel,
+        request_context,
         "failed to call discord onboarding apply endpoint",
     )?;
-    emit_apply_response(connector_id.as_str(), response, json_output)
+    emit_apply_response(connector_id.as_str(), response, output::preferred_json(json_output))
 }
 
 fn emit_apply_response(connector_id: &str, response: Value, json_output: bool) -> Result<()> {

@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 
-use crate::client::channels as channels_client;
+use crate::{client::channels as channels_client, output};
 
 use super::{emit, request};
 
@@ -23,10 +23,14 @@ pub(crate) fn run(
         bail!("discord verify requires explicit confirmation (--confirm)");
     }
     let connector_id = request::connector_id(account_id.as_str())?;
-    let base_url = channels_client::resolve_base_url(url);
-    let token = channels_client::resolve_token(token);
+    let request_context =
+        channels_client::resolve_request_context(url, token, principal, device_id, channel)?;
     let endpoint =
-        format!("{}/admin/v1/channels/{}/test-send", base_url.trim_end_matches('/'), connector_id);
+        format!(
+            "{}/admin/v1/channels/{}/test-send",
+            request_context.base_url.trim_end_matches('/'),
+            connector_id
+        );
     let client = channels_client::build_client()?;
     let response = channels_client::send_request(
         client.post(endpoint).json(&request::verify_payload(
@@ -35,13 +39,10 @@ pub(crate) fn run(
             auto_reaction.as_deref(),
             thread_id.as_deref(),
         )),
-        token,
-        principal,
-        device_id,
-        channel,
+        request_context,
         "failed to call discord channels test-send endpoint",
     )?;
-    if json_output {
+    if output::preferred_json(json_output) {
         println!(
             "{}",
             serde_json::to_string_pretty(&response)

@@ -1,13 +1,10 @@
 use crate::*;
 
 pub(crate) fn run_agents(command: AgentsCommand) -> Result<()> {
-    let connection = AgentConnection {
-        grpc_url: resolve_grpc_url(None)?,
-        token: env::var("PALYRA_ADMIN_TOKEN").ok(),
-        principal: "admin:local".to_owned(),
-        device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
-        channel: DEFAULT_CHANNEL.to_owned(),
-    };
+    let root_context = app::current_root_context()
+        .ok_or_else(|| anyhow!("CLI root context is unavailable for agents command"))?;
+    let connection = root_context
+        .resolve_grpc_connection(app::ConnectionOverrides::default(), app::ConnectionDefaults::ADMIN)?;
     let runtime = build_runtime()?;
     runtime.block_on(run_agents_async(command, connection))
 }
@@ -24,6 +21,8 @@ pub(crate) async fn run_agents_async(
 
     match command {
         AgentsCommand::List { after, limit, json, ndjson } => {
+            let json = output::preferred_json(json);
+            let ndjson = output::preferred_ndjson(json, ndjson);
             let mut request = Request::new(gateway_v1::ListAgentsRequest {
                 v: CANONICAL_PROTOCOL_MAJOR,
                 limit: limit.unwrap_or(100),
@@ -81,6 +80,7 @@ pub(crate) async fn run_agents_async(
             }
         }
         AgentsCommand::Show { agent_id, json } => {
+            let json = output::preferred_json(json);
             let mut request = Request::new(gateway_v1::GetAgentRequest {
                 v: CANONICAL_PROTOCOL_MAJOR,
                 agent_id: normalize_agent_id_cli(agent_id.as_str())?,
@@ -109,6 +109,7 @@ pub(crate) async fn run_agents_async(
             }
         }
         AgentsCommand::SetDefault { agent_id, json } => {
+            let json = output::preferred_json(json);
             let mut request = Request::new(gateway_v1::SetDefaultAgentRequest {
                 v: CANONICAL_PROTOCOL_MAJOR,
                 agent_id: normalize_agent_id_cli(agent_id.as_str())?,
@@ -151,6 +152,7 @@ pub(crate) async fn run_agents_async(
             allow_absolute_paths,
             json,
         } => {
+            let json = output::preferred_json(json);
             let mut request = Request::new(gateway_v1::CreateAgentRequest {
                 v: CANONICAL_PROTOCOL_MAJOR,
                 agent_id: normalize_agent_id_cli(agent_id.as_str())?,

@@ -53,6 +53,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Component, Path, PathBuf},
     process::Command,
+    process::ExitCode,
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -164,8 +165,17 @@ const DANGEROUS_REMOTE_BIND_ACK_ENV: &str = "PALYRA_GATEWAY_DANGEROUS_REMOTE_BIN
 const TRUST_STORE_INTEGRITY_VAULT_SCOPE: VaultScope = VaultScope::Global;
 const TRUST_STORE_INTEGRITY_VAULT_KEY_PREFIX: &str = "skills.trust_store.integrity.";
 
-pub fn run() -> Result<()> {
-    run_cli_entrypoint()
+pub fn run() -> ExitCode {
+    match run_cli_entrypoint() {
+        Ok(()) => output::CliExitCode::Success.as_exit_code(),
+        Err(error) => match output::emit_error(&error) {
+            Ok(exit_code) => exit_code.as_exit_code(),
+            Err(emit_error) => {
+                eprintln!("error[internal_error] failed to render CLI error: {emit_error}");
+                output::CliExitCode::Internal.as_exit_code()
+            }
+        },
+    }
 }
 
 #[cfg(windows)]
@@ -187,10 +197,23 @@ fn run_cli_entrypoint() -> Result<()> {
 }
 
 fn run_cli() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error)
+            if matches!(
+                error.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            ) =>
+        {
+            error.print().context("failed to print clap display output")?;
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let _root_context = app::install_root_context(cli.root.clone())?;
     match cli.command {
         CliCommand::Version => print_version(),
-        CliCommand::Init { mode, path, force, tls_scaffold } => {
+        CliCommand::Setup { mode, path, force, tls_scaffold } => {
             commands::init::run_init(mode, path, force, tls_scaffold)
         }
         CliCommand::Doctor { strict, json } => commands::doctor::run_doctor(strict, json),
@@ -207,7 +230,16 @@ fn run_cli() -> Result<()> {
         CliCommand::Browser { command } => commands::browser::run_browser(command),
         CliCommand::Completion { shell } => commands::completion::run_completion(shell),
         CliCommand::Onboarding { command } => commands::onboarding::run_onboarding(command),
-        CliCommand::Daemon { command } => commands::daemon::run_daemon(command),
+        CliCommand::Gateway { command } => commands::daemon::run_daemon(command),
+        CliCommand::Dashboard { path, verify_remote, identity_store_dir, open, json } => {
+            commands::daemon::run_daemon(DaemonCommand::DashboardUrl {
+                path,
+                verify_remote,
+                identity_store_dir,
+                open,
+                json,
+            })
+        }
         CliCommand::SupportBundle { command } => {
             commands::support_bundle::run_support_bundle(command)
         }
@@ -227,6 +259,40 @@ fn run_cli() -> Result<()> {
 
 fn print_version() -> Result<()> {
     let build = build_metadata();
+    if let Some(context) = app::current_root_context() {
+        if context.prefers_json() {
+            return output::print_json_pretty(
+                &json!({
+                    "name": "palyra",
+                    "version": build.version,
+                    "git_hash": build.git_hash,
+                    "build_profile": build.build_profile,
+                    "trace_id": context.trace_id(),
+                    "profile": context.profile_name(),
+                    "state_root": context.state_root().display().to_string(),
+                    "log_level": format!("{:?}", context.log_level()).to_ascii_lowercase(),
+                    "no_color": context.no_color(),
+                }),
+                "failed to encode version output as JSON",
+            );
+        }
+        if context.prefers_ndjson() {
+            return output::print_json_line(
+                &json!({
+                    "name": "palyra",
+                    "version": build.version,
+                    "git_hash": build.git_hash,
+                    "build_profile": build.build_profile,
+                    "trace_id": context.trace_id(),
+                    "profile": context.profile_name(),
+                    "state_root": context.state_root().display().to_string(),
+                    "log_level": format!("{:?}", context.log_level()).to_ascii_lowercase(),
+                    "no_color": context.no_color(),
+                }),
+                "failed to encode version output as NDJSON",
+            );
+        }
+    }
     println!(
         "name=palyra version={} git_hash={} build_profile={}",
         build.version, build.git_hash, build.build_profile
@@ -675,6 +741,7 @@ fn collect_doctor_connectivity_snapshot(
             principal,
             DEFAULT_DEVICE_ID.to_owned(),
             None,
+            None,
         ) {
             Ok(mut payload) => {
                 redact_json_value_tree(&mut payload, None);
@@ -1098,6 +1165,7 @@ fn build_support_bundle_diagnostics_snapshot() -> SupportBundleDiagnosticsSnapsh
         Some(token),
         principal,
         DEFAULT_DEVICE_ID.to_owned(),
+        None,
         None,
     ) {
         Ok(mut payload) => {
@@ -2679,6 +2747,7 @@ fn fetch_admin_status_payload(
     principal: String,
     device_id: String,
     channel: Option<String>,
+    trace_id: Option<String>,
 ) -> Result<Value> {
     let status_url = format!("{}/admin/v1/status", base_url.trim_end_matches('/'));
     let mut request = client
@@ -2690,6 +2759,9 @@ fn fetch_admin_status_payload(
     }
     if let Some(channel) = channel {
         request = request.header("x-palyra-channel", channel);
+    }
+    if let Some(trace_id) = trace_id {
+        request = request.header("x-palyra-trace-id", trace_id);
     }
 
     let mut payload: Value = request
@@ -2710,9 +2782,11 @@ fn fetch_admin_status(
     principal: String,
     device_id: String,
     channel: Option<String>,
+    trace_id: Option<String>,
 ) -> Result<AdminStatusResponse> {
-    let payload =
-        fetch_admin_status_payload(client, base_url, token, principal, device_id, channel)?;
+    let payload = fetch_admin_status_payload(
+        client, base_url, token, principal, device_id, channel, trace_id,
+    )?;
     serde_json::from_value(payload).context("failed to decode daemon admin status summary payload")
 }
 
@@ -2723,6 +2797,7 @@ struct AgentConnection {
     principal: String,
     device_id: String,
     channel: String,
+    trace_id: String,
 }
 
 #[derive(Debug, Clone)]
