@@ -97,7 +97,8 @@ Platform: $Platform
 Install
 1. Extract this archive into a dedicated directory.
 2. Keep `palyra-desktop-control-center`, `palyrad`, `palyra-browserd`, `palyra`, and the `web/` directory in the same directory.
-3. Launch the desktop control center binary from that directory.
+3. Treat `palyra` as a first-class entry point: either run it directly from this directory or expose it on your shell `PATH` with a shim or symlink.
+4. Launch the desktop control center binary from that directory.
 
 Update
 1. Close the running desktop control center and sidecars.
@@ -117,9 +118,10 @@ Platform: $Platform
 
 Install
 1. Extract this archive into a dedicated directory.
-2. Run `palyra init --mode remote --path <install-root>/config/palyra.toml --force`.
-3. Validate the generated config with `palyra config validate --path <install-root>/config/palyra.toml`.
-4. Start `palyrad` with `PALYRA_CONFIG=<install-root>/config/palyra.toml`.
+2. Treat `palyra` as a first-class entry point: either run it directly from this directory or expose it on your shell `PATH` with a shim or symlink.
+3. Run `palyra setup --mode remote --path <install-root>/config/palyra.toml --force`.
+4. Validate the generated config with `palyra config validate --path <install-root>/config/palyra.toml`.
+5. Start `palyrad` with `PALYRA_CONFIG=<install-root>/config/palyra.toml`.
 
 Update
 1. Stop `palyrad`.
@@ -148,10 +150,10 @@ $releaseNotesBody =
 @"
 Release notes for Palyra $Version
 
-- Portable desktop bundles now ship the desktop control center, `palyrad`, `palyra-browserd`, `palyra`, and the colocated `web/` dashboard bundle.
-- Portable headless packages now ship repeatable archive-based install/update flow with config initialization and migration validation plus the colocated `web/` dashboard bundle.
+- Portable desktop bundles now ship the desktop control center, `palyrad`, `palyra-browserd`, `palyra`, and the colocated `web/` dashboard bundle, with installer support for exposing `palyra` as a user-scoped command.
+- Portable headless packages now ship repeatable archive-based install/update flow with `palyra setup`, config initialization/migration validation, and installer support for exposing `palyra` as a user-scoped command.
 - Release artifacts now include SHA256 manifests, release manifests, provenance sidecars, and package-boundary validation.
-- Release packaging smoke validates archive layout before publication.
+- Release packaging smoke validates archive layout plus post-install `palyra version`, `palyra --help`, and `palyra doctor --json`.
 "@
 
 $migrationNotesBody =
@@ -160,6 +162,7 @@ Migration notes for Palyra $Version
 
 - Desktop updates use archive replacement; keep the existing state root and replace only the install directory contents.
 - Headless updates require `palyra config migrate --path <config>` after unpacking new binaries and before restarting `palyrad`.
+- Installer-driven CLI shims are user-scoped and reversible; uninstall cleanup should remove the shim only when it still points at the install being removed.
 - No state-root relocation is required for this release; support bundles and runtime databases stay outside the install directory.
 "@
 

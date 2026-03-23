@@ -49,6 +49,7 @@ $workspaceRoot =
 $artifactsRoot = Join-Path $workspaceRoot "artifacts"
 $installRoot = Join-Path $workspaceRoot "install"
 $stateRoot = Join-Path $workspaceRoot "state"
+$cliCommandRoot = Join-Path $workspaceRoot "cli-bin"
 
 $desktopBinary =
     Join-Path $installRoot (Resolve-ExecutableName -BaseName "palyra-desktop-control-center")
@@ -60,11 +61,9 @@ foreach ($binaryPath in @($desktopBinary, $daemonBinary, $browserBinary)) {
 }
 
 if (Test-Path -LiteralPath $installRoot) {
-    Remove-Item -LiteralPath $installRoot -Recurse -Force
-}
-
-if (Test-Path -LiteralPath $stateRoot) {
-    Remove-Item -LiteralPath $stateRoot -Recurse -Force
+    & (Join-Path $PSScriptRoot "../release/uninstall-package.ps1") `
+        -InstallRoot $installRoot `
+        -RemoveStateRoot | Out-Null
 }
 
 if ((Test-Path -LiteralPath $artifactsRoot) -and -not $KeepArtifacts) {
@@ -83,4 +82,5 @@ if ((Test-Path -LiteralPath $workspaceRoot) -and -not (Get-ChildItem -LiteralPat
 Write-Output "workspace_root=$workspaceRoot"
 Write-Output "install_root=$installRoot"
 Write-Output "state_root=$stateRoot"
+Write-Output "cli_command_root=$cliCommandRoot"
 Write-Output "artifacts_removed=$($KeepArtifacts -eq $false)"

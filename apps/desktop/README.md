@@ -30,6 +30,9 @@
 
 - Release bundles keep `palyra-desktop-control-center`, `palyrad`, `palyra-browserd`, and `palyra`
   in the same directory.
+- `scripts/release/install-desktop-package.ps1` exposes `palyra` as a first-class user command by
+  default. The managed CLI root is `%LOCALAPPDATA%\Palyra\bin` on Windows and `~/.local/bin` on
+  macOS/Linux, or an explicit test root when `-CliCommandRoot` is provided.
 - Sidecar resolution already prefers colocated binaries next to the desktop executable, so the
   portable archive layout matches the runtime contract.
 - The canonical packaging smoke is `pwsh -NoLogo -File ../../scripts/test/run-release-smoke.ps1`.
@@ -37,6 +40,8 @@
   - `pwsh -NoLogo -File ../../scripts/test/install-clean-desktop.ps1 -Launch`
   - `pwsh -NoLogo -File ../../scripts/test/uninstall-clean-desktop.ps1`
   - default harness root: `%LOCALAPPDATA%\Palyra-TestHarness`
+- Installer metadata is written to `install-metadata.json` inside the install root and is consumed
+  by `scripts/release/uninstall-package.ps1` for reversible CLI shim cleanup.
 
 ## Security behavior
 

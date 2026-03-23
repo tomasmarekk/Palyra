@@ -19,29 +19,6 @@ function Get-DefaultHarnessRoot {
     return Join-Path $localAppData "Palyra-TestHarness"
 }
 
-function Convert-KeyValueOutputToHashtable {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string[]]$Lines
-    )
-
-    $result = @{}
-    foreach ($line in $Lines) {
-        if ([string]::IsNullOrWhiteSpace($line)) {
-            continue
-        }
-
-        $parts = $line -split "=", 2
-        if ($parts.Count -ne 2) {
-            throw "Unexpected script output line: $line"
-        }
-
-        $result[$parts[0].Trim()] = $parts[1].Trim()
-    }
-
-    return $result
-}
-
 $repoRoot = Get-RepoRoot
 $workspaceRoot =
     if ([string]::IsNullOrWhiteSpace($WorkspaceRoot)) {
@@ -54,6 +31,7 @@ $artifactsRoot = Join-Path $workspaceRoot "artifacts"
 $desktopPackageOutput = Join-Path $artifactsRoot "desktop"
 $installRoot = Join-Path $workspaceRoot "install"
 $stateRoot = Join-Path $workspaceRoot "state"
+$cliCommandRoot = Join-Path $workspaceRoot "cli-bin"
 
 New-Item -ItemType Directory -Path $workspaceRoot -Force | Out-Null
 
@@ -110,11 +88,18 @@ New-Item -ItemType Directory -Path $stateRoot -Force | Out-Null
 $installOutput = & (Join-Path $repoRoot "scripts/release/install-desktop-package.ps1") `
     -ArchivePath $archivePath `
     -InstallRoot $installRoot `
+    -StateRoot $stateRoot `
+    -CliCommandRoot $cliCommandRoot `
+    -NoPersistCliPath `
     -Force
 $installMetadata = Convert-KeyValueOutputToHashtable -Lines $installOutput
 $resolvedInstallRoot = $installMetadata["install_root"]
 if ([string]::IsNullOrWhiteSpace($resolvedInstallRoot)) {
     $resolvedInstallRoot = $installRoot
+}
+$resolvedCliCommandRoot = $installMetadata["cli_command_root"]
+if ([string]::IsNullOrWhiteSpace($resolvedCliCommandRoot)) {
+    $resolvedCliCommandRoot = $cliCommandRoot
 }
 
 $launcherPath = Join-Path $resolvedInstallRoot "Launch-Palyra-Test.ps1"
@@ -159,6 +144,7 @@ $installSummary = [ordered]@{
     archive_path = $archivePath
     install_root = $resolvedInstallRoot
     state_root = $stateRoot
+    cli_command_root = $resolvedCliCommandRoot
     launcher_path = $launcherPath
 }
 $installSummary |
@@ -173,4 +159,5 @@ Write-Output "workspace_root=$workspaceRoot"
 Write-Output "archive_path=$archivePath"
 Write-Output "install_root=$resolvedInstallRoot"
 Write-Output "state_root=$stateRoot"
+Write-Output "cli_command_root=$resolvedCliCommandRoot"
 Write-Output "launcher_path=$launcherPath"
