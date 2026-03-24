@@ -28,6 +28,7 @@ const CLI_PROFILE_SCHEMA_VERSION: u32 = 1;
 #[derive(Debug, Clone)]
 pub(crate) struct RootCommandContext {
     state_root: PathBuf,
+    config_path: Option<PathBuf>,
     profile_name: Option<String>,
     output_format: OutputFormatArg,
     log_level: LogLevelArg,
@@ -144,6 +145,10 @@ impl RootCommandContext {
 
     pub(crate) fn state_root(&self) -> &Path {
         self.state_root.as_path()
+    }
+
+    pub(crate) fn config_path(&self) -> Option<&Path> {
+        self.config_path.as_deref()
     }
 
     pub(crate) fn prefers_json(&self) -> bool {
@@ -324,6 +329,7 @@ fn build_root_context(root: RootOptions) -> Result<RootCommandContext> {
         no_color: root.no_color,
         trace_id: format!("cli:{}", Ulid::new()),
         state_root,
+        config_path,
         profile_name,
         profile,
         config_defaults,

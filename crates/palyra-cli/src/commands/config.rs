@@ -32,7 +32,7 @@ pub(crate) fn run_config(command: Option<ConfigCommand>) -> Result<()> {
         ConfigCommand::Path { path, json } => {
             let resolved = match path {
                 Some(explicit) => resolve_config_path(Some(explicit), false)?,
-                None => find_default_config_path()
+                None => effective_config_path()
                     .context("no default config file found; pass --path to select a config file")?,
             };
             if output::preferred_json(json) {
@@ -49,7 +49,7 @@ pub(crate) fn run_config(command: Option<ConfigCommand>) -> Result<()> {
             let path = match path {
                 Some(explicit) => resolve_config_path(Some(explicit), true)?,
                 None => {
-                    if let Some(found) = find_default_config_path() {
+                    if let Some(found) = effective_config_path() {
                         found
                     } else {
                         println!("config=valid source=defaults");
@@ -211,7 +211,7 @@ struct ConfigStatusPayload {
 fn build_config_status_payload(path: Option<String>) -> Result<ConfigStatusPayload> {
     let path = match path {
         Some(explicit) => Some(resolve_config_path(Some(explicit), false)?),
-        None => find_default_config_path(),
+        None => effective_config_path(),
     };
     let Some(path_value) = path else {
         return Ok(ConfigStatusPayload {

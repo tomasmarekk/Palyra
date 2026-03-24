@@ -5154,7 +5154,7 @@ fn resolve_config_path(path: Option<String>, require_existing: bool) -> Result<S
                 .with_context(|| format!("config path is invalid: {}", explicit))?;
             parsed.to_string_lossy().into_owned()
         }
-        None => find_default_config_path()
+        None => effective_config_path()
             .context("no default config file found; pass --path to select a config file")?,
     };
 
@@ -5173,6 +5173,15 @@ fn find_default_config_path() -> Option<String> {
     }
 
     None
+}
+
+fn effective_config_path() -> Option<String> {
+    if let Some(path) = app::current_root_context()
+        .and_then(|context| context.config_path().map(|path| path.to_string_lossy().into_owned()))
+    {
+        return Some(path);
+    }
+    find_default_config_path()
 }
 
 fn resolve_identity_store_root(store_dir: Option<String>) -> Result<PathBuf> {
