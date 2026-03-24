@@ -1,7 +1,8 @@
 use clap::Parser;
 
 use super::{
-    AgentCommand, AgentsCommand, ApprovalDecisionArg, ApprovalExportFormatArg, ApprovalsCommand,
+    AgentCommand, AgentsCommand, ApprovalDecisionArg, ApprovalDecisionScopeArg,
+    ApprovalExportFormatArg, ApprovalResolveDecisionArg, ApprovalSubjectTypeArg, ApprovalsCommand,
     AuthCommand, AuthCredentialArg, AuthOpenAiCommand, AuthProfilesCommand, AuthProviderArg,
     AuthScopeArg, BrowserCommand, ChannelsCommand, ChannelsDiscordCommand, ChannelsRouterCommand,
     Cli, Command, CompletionShell, ConfigCommand, CronCommand, CronConcurrencyPolicyArg,
@@ -590,6 +591,7 @@ fn parse_approvals_list() {
                 subject: Some("tool:palyra.process.run".to_owned()),
                 principal: Some("user:ops".to_owned()),
                 decision: Some(ApprovalDecisionArg::Deny),
+                subject_type: None,
                 json: true,
             }
         }
@@ -635,6 +637,107 @@ fn parse_approvals_export() {
                 subject: None,
                 principal: None,
                 decision: Some(ApprovalDecisionArg::Allow),
+                subject_type: None,
+            }
+        }
+    );
+}
+
+#[test]
+fn parse_approvals_list_with_subject_type() {
+    let parsed =
+        Cli::parse_from(["palyra", "approvals", "list", "--subject-type", "browser-action"]);
+    assert_eq!(
+        parsed.command,
+        Command::Approvals {
+            command: ApprovalsCommand::List {
+                after: None,
+                limit: None,
+                since: None,
+                until: None,
+                subject: None,
+                principal: None,
+                decision: None,
+                subject_type: Some(ApprovalSubjectTypeArg::BrowserAction),
+                json: false,
+            }
+        }
+    );
+}
+
+#[test]
+fn parse_approvals_export_with_subject_type() {
+    let parsed =
+        Cli::parse_from(["palyra", "approvals", "export", "--subject-type", "node-capability"]);
+    assert_eq!(
+        parsed.command,
+        Command::Approvals {
+            command: ApprovalsCommand::Export {
+                format: ApprovalExportFormatArg::Ndjson,
+                limit: None,
+                since: None,
+                until: None,
+                subject: None,
+                principal: None,
+                decision: None,
+                subject_type: Some(ApprovalSubjectTypeArg::NodeCapability),
+            }
+        }
+    );
+}
+
+#[test]
+fn parse_approvals_decide_allow_timeboxed() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "approvals",
+        "decide",
+        "01ARZ3NDEKTSV4RRFFQ69G5FB3",
+        "--decision",
+        "allow",
+        "--scope",
+        "timeboxed",
+        "--ttl-ms",
+        "600000",
+        "--reason",
+        "operator-approved",
+        "--json",
+    ]);
+    assert_eq!(
+        parsed.command,
+        Command::Approvals {
+            command: ApprovalsCommand::Decide {
+                approval_id: "01ARZ3NDEKTSV4RRFFQ69G5FB3".to_owned(),
+                decision: ApprovalResolveDecisionArg::Allow,
+                scope: ApprovalDecisionScopeArg::Timeboxed,
+                ttl_ms: Some(600_000),
+                reason: Some("operator-approved".to_owned()),
+                json: true,
+            }
+        }
+    );
+}
+
+#[test]
+fn parse_approvals_decide_deny_defaults_to_once() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "approvals",
+        "decide",
+        "01ARZ3NDEKTSV4RRFFQ69G5FB4",
+        "--decision",
+        "deny",
+    ]);
+    assert_eq!(
+        parsed.command,
+        Command::Approvals {
+            command: ApprovalsCommand::Decide {
+                approval_id: "01ARZ3NDEKTSV4RRFFQ69G5FB4".to_owned(),
+                decision: ApprovalResolveDecisionArg::Deny,
+                scope: ApprovalDecisionScopeArg::Once,
+                ttl_ms: None,
+                reason: None,
+                json: false,
             }
         }
     );

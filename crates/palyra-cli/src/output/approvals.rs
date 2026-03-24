@@ -30,14 +30,15 @@ pub(crate) fn emit_list(
     );
     for approval in &response.approvals {
         println!(
-            "approval id={} subject={} decision={} principal={} requested_at_ms={} resolved_at_ms={}",
+            "approval id={} subject_type={} subject={} decision={} principal={} requested_at_ms={} resolved_at_ms={}",
             approval
                 .approval_id
                 .as_ref()
                 .map(|value| value.ulid.as_str())
                 .unwrap_or("unknown"),
+            approval_subject_type_to_text(approval.subject_type),
             approval.subject_id,
-            approval_decision_to_text(approval.decision),
+            approval_status_text(approval),
             approval.principal,
             approval.requested_at_unix_ms,
             approval.resolved_at_unix_ms
@@ -55,12 +56,23 @@ pub(crate) fn emit_show(approval: &gateway_v1::ApprovalRecord, json_output: bool
     }
 
     println!(
-        "approvals.show id={} subject={} decision={} scope={} reason={}",
+        "approvals.show id={} subject_type={} subject={} decision={} scope={} reason={}",
         approval.approval_id.as_ref().map(|value| value.ulid.as_str()).unwrap_or("unknown"),
+        approval_subject_type_to_text(approval.subject_type),
         approval.subject_id,
-        approval_decision_to_text(approval.decision),
+        approval_status_text(approval),
         approval_scope_to_text(approval.decision_scope),
         approval.decision_reason
     );
     Ok(())
+}
+
+fn approval_status_text(approval: &gateway_v1::ApprovalRecord) -> &'static str {
+    if approval.resolved_at_unix_ms == 0
+        && approval.decision == gateway_v1::ApprovalDecision::Unspecified as i32
+    {
+        "pending"
+    } else {
+        approval_decision_to_text(approval.decision)
+    }
 }

@@ -17,11 +17,26 @@ pub enum ApprovalsCommand {
         principal: Option<String>,
         #[arg(long, value_enum)]
         decision: Option<ApprovalDecisionArg>,
+        #[arg(long, value_enum)]
+        subject_type: Option<ApprovalSubjectTypeArg>,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
     Show {
         approval_id: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Decide {
+        approval_id: String,
+        #[arg(long, value_enum)]
+        decision: ApprovalResolveDecisionArg,
+        #[arg(long, value_enum, default_value_t = ApprovalDecisionScopeArg::Once)]
+        scope: ApprovalDecisionScopeArg,
+        #[arg(long)]
+        ttl_ms: Option<i64>,
+        #[arg(long)]
+        reason: Option<String>,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -40,6 +55,8 @@ pub enum ApprovalsCommand {
         principal: Option<String>,
         #[arg(long, value_enum)]
         decision: Option<ApprovalDecisionArg>,
+        #[arg(long, value_enum)]
+        subject_type: Option<ApprovalSubjectTypeArg>,
     },
 }
 
@@ -49,6 +66,29 @@ pub enum ApprovalDecisionArg {
     Deny,
     Timeout,
     Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ApprovalResolveDecisionArg {
+    Allow,
+    Deny,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+pub enum ApprovalDecisionScopeArg {
+    #[default]
+    Once,
+    Session,
+    Timeboxed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ApprovalSubjectTypeArg {
+    Tool,
+    ChannelSend,
+    SecretAccess,
+    BrowserAction,
+    NodeCapability,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

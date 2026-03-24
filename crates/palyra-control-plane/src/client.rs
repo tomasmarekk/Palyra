@@ -231,6 +231,20 @@ impl ControlPlaneClient {
         .await
     }
 
+    pub async fn decide_approval(
+        &self,
+        approval_id: &str,
+        request: &ApprovalDecisionRequest,
+    ) -> Result<ApprovalDecisionEnvelope, ControlPlaneClientError> {
+        self.request_json(
+            Method::POST,
+            format!("console/v1/approvals/{}/decision", urlencoding(approval_id)),
+            Some(request),
+            true,
+        )
+        .await
+    }
+
     pub async fn upsert_auth_profile(
         &self,
         profile: &AuthProfileView,

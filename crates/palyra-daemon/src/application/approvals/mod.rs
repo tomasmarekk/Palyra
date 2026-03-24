@@ -335,7 +335,7 @@ pub(crate) async fn record_approval_resolved_journal_event(
     context: &RequestContext,
     session_id: &str,
     run_id: &str,
-    proposal_id: &str,
+    proposal_id: Option<&str>,
     approval_id: &str,
     decision: ApprovalDecision,
     decision_scope: ApprovalDecisionScope,
@@ -367,7 +367,7 @@ pub(crate) async fn record_approval_resolved_journal_event(
 }
 
 fn approval_resolved_journal_payload(
-    proposal_id: &str,
+    proposal_id: Option<&str>,
     approval_id: &str,
     decision: ApprovalDecision,
     decision_scope: ApprovalDecisionScope,
@@ -385,4 +385,46 @@ fn approval_resolved_journal_payload(
     })
     .to_string()
     .into_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    #[test]
+    fn approval_resolved_payload_includes_proposal_id_when_available() {
+        let payload = approval_resolved_journal_payload(
+            Some("01ARZ3NDEKTSV4RRFFQ69G5FA1"),
+            "01ARZ3NDEKTSV4RRFFQ69G5FA2",
+            ApprovalDecision::Allow,
+            ApprovalDecisionScope::Session,
+            Some(60_000),
+            "operator-approved",
+        );
+        let json: Value = serde_json::from_slice(payload.as_slice())
+            .expect("approval resolved payload should remain valid JSON");
+        assert_eq!(
+            json.get("proposal_id").and_then(Value::as_str),
+            Some("01ARZ3NDEKTSV4RRFFQ69G5FA1")
+        );
+    }
+
+    #[test]
+    fn approval_resolved_payload_allows_missing_proposal_id() {
+        let payload = approval_resolved_journal_payload(
+            None,
+            "01ARZ3NDEKTSV4RRFFQ69G5FA2",
+            ApprovalDecision::Deny,
+            ApprovalDecisionScope::Once,
+            None,
+            "operator-denied",
+        );
+        let json: Value = serde_json::from_slice(payload.as_slice())
+            .expect("approval resolved payload should remain valid JSON");
+        assert!(
+            json.get("proposal_id").is_some_and(Value::is_null),
+            "operator-driven approval audit should tolerate missing proposal ids"
+        );
+    }
 }

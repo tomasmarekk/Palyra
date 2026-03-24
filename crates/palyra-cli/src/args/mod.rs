@@ -27,7 +27,10 @@ mod support_bundle;
 
 pub use agent::AgentCommand;
 pub use agents::AgentsCommand;
-pub use approvals::{ApprovalDecisionArg, ApprovalExportFormatArg, ApprovalsCommand};
+pub use approvals::{
+    ApprovalDecisionArg, ApprovalDecisionScopeArg, ApprovalExportFormatArg,
+    ApprovalResolveDecisionArg, ApprovalSubjectTypeArg, ApprovalsCommand,
+};
 pub use auth::{
     AuthCommand, AuthCredentialArg, AuthOpenAiCommand, AuthProfilesCommand, AuthProviderArg,
     AuthScopeArg,

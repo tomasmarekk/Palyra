@@ -61,6 +61,24 @@ pub struct DeploymentPostureSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalDecisionRequest {
+    pub approved: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision_scope: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision_scope_ttl_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApprovalDecisionEnvelope {
+    pub approval: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dm_pairing: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecretMetadata {
     pub scope: String,
     pub key: String,

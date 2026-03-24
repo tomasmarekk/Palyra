@@ -385,7 +385,7 @@ async fn resolve_run_stream_tool_approval_outcome(
         request_context,
         session_id,
         run_id,
-        proposal_id,
+        Some(proposal_id),
         response.approval_id.as_str(),
         response.decision,
         response.decision_scope,

@@ -60,7 +60,7 @@ pub(crate) async fn console_approval_decision_handler(
     Path(approval_id): Path<String>,
     Json(payload): Json<ConsoleApprovalDecisionRequest>,
 ) -> Result<Json<Value>, Response> {
-    let _session = authorize_console_session(&state, &headers, true)?;
+    let session = authorize_console_session(&state, &headers, true)?;
     validate_canonical_id(approval_id.as_str()).map_err(|_| {
         runtime_status_response(tonic::Status::invalid_argument(
             "approval_id must be a canonical ULID",
@@ -112,7 +112,23 @@ pub(crate) async fn console_approval_decision_handler(
     } else {
         None
     };
-    sync_console_chat_approval_to_stream(&state, &resolved).await;
+    let forwarded_to_console_chat = sync_console_chat_approval_to_stream(&state, &resolved).await;
+    if !forwarded_to_console_chat {
+        crate::application::approvals::record_approval_resolved_journal_event(
+            &state.runtime,
+            &session.context,
+            resolved.session_id.as_str(),
+            resolved.run_id.as_str(),
+            None,
+            resolved.approval_id.as_str(),
+            resolved.decision.unwrap_or(ApprovalDecision::Error),
+            resolved.decision_scope.unwrap_or(ApprovalDecisionScope::Once),
+            resolved.decision_scope_ttl_ms,
+            resolved.decision_reason.as_deref().unwrap_or("approval resolved"),
+        )
+        .await
+        .map_err(runtime_status_response)?;
+    }
     Ok(Json(json!({
         "approval": resolved,
         "dm_pairing": pairing_outcome,

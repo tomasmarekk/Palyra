@@ -751,11 +751,11 @@ fn build_console_chat_message_envelope(
 pub(crate) async fn sync_console_chat_approval_to_stream(
     state: &AppState,
     record: &journal::ApprovalRecord,
-) {
+) -> bool {
     let approved = match record.decision {
         Some(ApprovalDecision::Allow) => true,
         Some(ApprovalDecision::Deny) => false,
-        _ => return,
+        _ => return false,
     };
 
     let stream = {
@@ -763,10 +763,10 @@ pub(crate) async fn sync_console_chat_approval_to_stream(
         streams.get(record.run_id.as_str()).cloned()
     };
     let Some(stream) = stream else {
-        return;
+        return false;
     };
     if stream.session_id != record.session_id {
-        return;
+        return false;
     }
 
     let proposal_id = {
@@ -774,7 +774,7 @@ pub(crate) async fn sync_console_chat_approval_to_stream(
         pending.remove(record.approval_id.as_str())
     };
     let Some(proposal_id) = proposal_id else {
-        return;
+        return false;
     };
 
     let reason = record.decision_reason.clone().unwrap_or_else(|| {
@@ -810,7 +810,9 @@ pub(crate) async fn sync_console_chat_approval_to_stream(
             approval_id = %record.approval_id,
             "failed to forward console approval decision to active chat stream"
         );
+        return false;
     }
+    true
 }
 
 fn approval_scope_to_proto(scope: Option<ApprovalDecisionScope>) -> i32 {
