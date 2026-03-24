@@ -645,7 +645,7 @@ fn build_onboarding_answers(
         answers.insert("auth_method".to_owned(), WizardValue::Choice(auth_method));
     }
     if let Some(api_key) = secrets.api_key {
-        answers.insert("openai_api_key".to_owned(), WizardValue::Text(api_key));
+        answers.insert("openai_api_key".to_owned(), WizardValue::SensitiveText(api_key));
     }
     if let Some(bind_profile) = request.options.bind_profile {
         answers.insert(
@@ -677,7 +677,7 @@ fn build_onboarding_answers(
     }
     if let Some(admin_token) = secrets.admin_token {
         answers.insert("store_admin_token".to_owned(), WizardValue::Bool(true));
-        answers.insert("admin_token".to_owned(), WizardValue::Text(admin_token));
+        answers.insert("admin_token".to_owned(), WizardValue::SensitiveText(admin_token));
     }
     if let Some(remote_verification) = request.options.remote_verification {
         answers.insert(
@@ -745,7 +745,7 @@ fn build_configure_answers(
             .insert("auth_method".to_owned(), WizardValue::Choice(auth_method_value(auth_method)));
     }
     if let Some(api_key) = secrets.api_key {
-        answers.insert("openai_api_key".to_owned(), WizardValue::Text(api_key));
+        answers.insert("openai_api_key".to_owned(), WizardValue::SensitiveText(api_key));
     }
     if let Some(bind_profile) = request.bind_profile {
         answers.insert(
@@ -773,7 +773,7 @@ fn build_configure_answers(
     }
     if let Some(value) = secrets.admin_token {
         answers.insert("store_admin_token".to_owned(), WizardValue::Bool(true));
-        answers.insert("admin_token".to_owned(), WizardValue::Text(value));
+        answers.insert("admin_token".to_owned(), WizardValue::SensitiveText(value));
     }
     if let Some(remote_verification) = request.remote_verification {
         answers.insert(
@@ -1715,10 +1715,10 @@ fn emit_onboarding_summary(summary: &OnboardingSummary, json_output: bool) -> Re
             summary.state_root
         );
         println!(
-            "onboarding.summary workspace_root={} auth_method={} dashboard_url={} health_status={:?}",
-            summary.workspace_root.as_deref().unwrap_or("none"),
+            "onboarding.summary workspace_root_configured={} auth_method={} dashboard_access={} health_status={:?}",
+            summary.workspace_root.is_some(),
             summary.auth_method,
-            summary.dashboard_url,
+            if summary.dashboard_url.is_empty() { "none" } else { "configured" },
             summary.health_status
         );
         println!(
@@ -1738,13 +1738,10 @@ fn emit_onboarding_summary(summary: &OnboardingSummary, json_output: bool) -> Re
             }
         );
         for check in &summary.health_checks {
-            println!(
-                "onboarding.health_check check={} status={} detail={}",
-                check.check, check.status, check.detail
-            );
+            println!("onboarding.health_check check={} status={}", check.check, check.status);
         }
-        for warning in &summary.warnings {
-            println!("onboarding.warning={warning}");
+        if !summary.warnings.is_empty() {
+            println!("onboarding.warning_count={}", summary.warnings.len());
         }
     }
     std::io::stdout().flush().context("stdout flush failed")

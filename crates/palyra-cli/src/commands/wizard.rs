@@ -94,13 +94,27 @@ impl WizardStep {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) enum WizardValue {
     None,
     Text(String),
+    SensitiveText(String),
     Bool(bool),
     Choice(String),
     Multi(Vec<String>),
+}
+
+impl fmt::Debug for WizardValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::None => f.write_str("None"),
+            Self::Text(value) => f.debug_tuple("Text").field(value).finish(),
+            Self::SensitiveText(_) => f.write_str("SensitiveText(<redacted>)"),
+            Self::Bool(value) => f.debug_tuple("Bool").field(value).finish(),
+            Self::Choice(value) => f.debug_tuple("Choice").field(value).finish(),
+            Self::Multi(values) => f.debug_tuple("Multi").field(values).finish(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,6 +189,7 @@ where
         loop {
             let value = match self.backend.execute_step(&step)? {
                 WizardValue::Text(value) => value,
+                WizardValue::SensitiveText(value) => value,
                 WizardValue::Choice(value) => value,
                 WizardValue::None if step.allow_empty => String::new(),
                 other => {
@@ -210,6 +225,7 @@ where
         match self.backend.execute_step(&step)? {
             WizardValue::Choice(value) => Ok(value),
             WizardValue::Text(value) => Ok(value),
+            WizardValue::SensitiveText(value) => Ok(value),
             other => Err(WizardError::Validation {
                 step_id: step.id.to_owned(),
                 message: format!("expected selection input, received {other:?}"),
@@ -314,11 +330,11 @@ impl WizardBackend for InteractiveWizardBackend {
                         return Err(WizardError::Cancelled { step_id: step.id.to_owned() });
                     }
                     if raw.is_empty() {
-                        return Ok(WizardValue::Text(
+                        return Ok(WizardValue::SensitiveText(
                             step.default_value.clone().unwrap_or_default(),
                         ));
                     }
-                    return Ok(WizardValue::Text(raw));
+                    return Ok(WizardValue::SensitiveText(raw));
                 }
                 if let Some(default_value) = step.default_value.as_ref() {
                     print!("> [{default_value}] ");
