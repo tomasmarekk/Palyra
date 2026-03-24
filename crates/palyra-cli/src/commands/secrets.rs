@@ -163,8 +163,8 @@ pub(crate) fn run_secrets(command: SecretsCommand) -> Result<()> {
         }
         SecretsCommand::Apply { path, offline, strict, json } => {
             let audit = build_secrets_audit_payload(path, offline)?;
-            let action_modes = build_secrets_apply_modes(&audit);
             if output::preferred_json(json) {
+                let action_modes = build_secrets_apply_modes(&audit);
                 output::print_json_pretty(
                     &serde_json::json!({
                         "audit": audit.summary,

@@ -1,4 +1,4 @@
-use std::process::ExitCode;
+use std::{io::Write, process::ExitCode};
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -59,6 +59,13 @@ where
     T: Serialize,
 {
     println!("{}", serde_json::to_string(value).context(error_context)?);
+    Ok(())
+}
+
+pub(crate) fn print_text_line(line: &str) -> Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(line.as_bytes()).context("stdout write failed")?;
+    stdout.write_all(b"\n").context("stdout write failed")?;
     Ok(())
 }
 
