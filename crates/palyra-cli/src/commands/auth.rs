@@ -832,7 +832,7 @@ fn normalize_openai_health_state(raw: &str) -> String {
 }
 
 fn sanitize_auth_message(raw: &str) -> String {
-    raw.trim().replace('\n', " ").replace('\r', " ")
+    raw.trim().replace(['\n', '\r'], " ")
 }
 
 fn load_secret_input(
