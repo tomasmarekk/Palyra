@@ -8,7 +8,7 @@
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "noEmit": true,
     "skipLibCheck": true,
-    "types": ["vite/client", "vite-plus/test/globals"]
+    "types": ["vite/client", "vite-plus/test/globals", "@testing-library/jest-dom"]
   },
   "include": ["src", "vite.config.ts", "vitest.setup.ts"],
   "exclude": ["dist", "node_modules", "coverage"]
