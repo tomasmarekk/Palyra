@@ -561,7 +561,7 @@ function Set-ExecutablePermissions {
     )
 
     if (-not $IsWindows) {
-        & chmod 755 -- $Path
+        Invoke-CommandQuiet -Command "chmod" -Arguments @("--", "755", $Path)
     }
 }
 
