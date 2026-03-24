@@ -39,9 +39,15 @@ fn assert_help_snapshot(args: &[&str], snapshot: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+const ROOT_HELP_SNAPSHOT: &str = include_str!("help_snapshots/root-help-windows.txt");
+
+#[cfg(not(windows))]
+const ROOT_HELP_SNAPSHOT: &str = include_str!("help_snapshots/root-help-unix.txt");
+
 #[test]
 fn root_help_snapshot_matches() -> Result<()> {
-    assert_help_snapshot(&["--help"], include_str!("help_snapshots/root-help.txt"))
+    assert_help_snapshot(&["--help"], ROOT_HELP_SNAPSHOT)
 }
 
 #[test]
