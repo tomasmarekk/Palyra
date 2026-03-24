@@ -8863,8 +8863,7 @@ fn spawn_interruptible_scripted_openai_server(
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_for_thread = Arc::clone(&shutdown);
     let handle = thread::spawn(move || {
-        let mut responses = responses.into_iter();
-        'accept_loop: while let Some(response_spec) = responses.next() {
+        'accept_loop: for response_spec in responses {
             loop {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
