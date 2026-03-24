@@ -1738,9 +1738,6 @@ fn emit_onboarding_summary(summary: &OnboardingSummary, json_output: bool) -> Re
                 summary.skipped_sections.join(",")
             }
         );
-        if !summary.health_checks.is_empty() {
-            println!("onboarding.health_check_count={}", summary.health_checks.len());
-        }
         if !summary.warnings.is_empty() {
             println!("onboarding.warning_count={}", summary.warnings.len());
         }
