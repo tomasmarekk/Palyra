@@ -5392,7 +5392,7 @@ async fn grpc_approvals_service_persists_and_exports_denied_tool_approval() -> R
         }]
     })
     .to_string();
-    let (openai_base_url, _request_count, server_handle) = spawn_scripted_openai_server(vec![
+    let (openai_base_url, request_count, server_handle) = spawn_scripted_openai_server(vec![
         ScriptedOpenAiResponse::immediate(200, response_body.clone()),
         ScriptedOpenAiResponse::immediate(200, response_body),
     ])?;
@@ -5471,6 +5471,8 @@ async fn grpc_approvals_service_persists_and_exports_denied_tool_approval() -> R
     }
     assert!(saw_deny_decision, "tool proposal should be denied after explicit approval rejection");
     let approval_id = captured_approval_id.context("approval stream should include approval_id")?;
+    drop(request_sender);
+    drop(response_stream);
 
     let mut list_request = tonic::Request::new(gateway_v1::ListApprovalsRequest {
         v: 1,
@@ -5546,7 +5548,13 @@ async fn grpc_approvals_service_persists_and_exports_denied_tool_approval() -> R
         .context("failed to call ExportApprovals")?
         .into_inner();
     let mut exported = Vec::new();
-    while let Some(chunk) = export_stream.next().await {
+    loop {
+        let next_chunk = tokio::time::timeout(Duration::from_secs(5), export_stream.next())
+            .await
+            .context("approval export NDJSON stream stalled")?;
+        let Some(chunk) = next_chunk else {
+            break;
+        };
         let chunk = chunk.context("failed to read ExportApprovals chunk")?;
         if !chunk.chunk.is_empty() {
             exported.extend_from_slice(chunk.chunk.as_slice());
@@ -5686,7 +5694,13 @@ async fn grpc_approvals_service_persists_and_exports_denied_tool_approval() -> R
         .context("failed to call ExportApprovals JSON")?
         .into_inner();
     let mut exported_json = Vec::new();
-    while let Some(chunk) = export_json_stream.next().await {
+    loop {
+        let next_chunk = tokio::time::timeout(Duration::from_secs(5), export_json_stream.next())
+            .await
+            .context("approval export JSON stream stalled")?;
+        let Some(chunk) = next_chunk else {
+            break;
+        };
         let chunk = chunk.context("failed to read ExportApprovals JSON chunk")?;
         if !chunk.chunk.is_empty() {
             exported_json.extend_from_slice(chunk.chunk.as_slice());
@@ -5740,7 +5754,14 @@ async fn grpc_approvals_service_persists_and_exports_denied_tool_approval() -> R
         .context("failed to call ExportApprovals empty JSON")?
         .into_inner();
     let mut exported_empty_json = Vec::new();
-    while let Some(chunk) = export_json_empty_stream.next().await {
+    loop {
+        let next_chunk =
+            tokio::time::timeout(Duration::from_secs(5), export_json_empty_stream.next())
+                .await
+                .context("approval export empty JSON stream stalled")?;
+        let Some(chunk) = next_chunk else {
+            break;
+        };
         let chunk = chunk.context("failed to read ExportApprovals empty JSON chunk")?;
         if !chunk.chunk.is_empty() {
             exported_empty_json.extend_from_slice(chunk.chunk.as_slice());
@@ -5754,6 +5775,13 @@ async fn grpc_approvals_service_persists_and_exports_denied_tool_approval() -> R
             .context("empty JSON export should still parse as an array")?;
     assert!(exported_empty_records.is_empty(), "empty JSON export should be represented as []");
 
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while request_count.load(Ordering::Relaxed) < 2 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .context("deny-path openai server did not receive the follow-up request in time")?;
     server_handle.join().expect("scripted openai server thread should exit");
     Ok(())
 }
