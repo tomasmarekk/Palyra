@@ -359,7 +359,23 @@ fn onboarding_wizard_writes_config_file() -> Result<()> {
     let config_path = workdir.path().join("config").join("palyra.toml");
     let config_path_string = config_path.to_string_lossy().to_string();
     let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
-        .args(["onboarding", "wizard", "--path", config_path_string.as_str()])
+        .args([
+            "onboarding",
+            "wizard",
+            "--path",
+            config_path_string.as_str(),
+            "--flow",
+            "quickstart",
+            "--non-interactive",
+            "--accept-risk",
+            "--auth-method",
+            "api-key",
+            "--api-key-env",
+            "OPENAI_API_KEY",
+            "--skip-channels",
+            "--skip-skills",
+        ])
+        .env("OPENAI_API_KEY", "sk-test-quickstart")
         .output()
         .context("failed to execute palyra onboarding wizard")?;
     assert!(
@@ -372,7 +388,11 @@ fn onboarding_wizard_writes_config_file() -> Result<()> {
     let written = std::fs::read_to_string(&config_path)
         .with_context(|| format!("failed to read written config {}", config_path.display()))?;
     assert!(written.contains("version = 1"), "expected config version marker");
-    assert!(written.contains("[orchestrator]"), "expected orchestrator section");
+    assert!(
+        written.contains("openai_api_key_vault_ref"),
+        "expected vault-backed OpenAI auth in onboarding config"
+    );
+    assert!(written.contains("workspace_root"), "expected workspace root in onboarding config");
     Ok(())
 }
 
@@ -422,6 +442,7 @@ fn spawn_palyrad_with_dynamic_ports() -> Result<(Child, u16, u16)> {
                 identity_store_dir.to_string_lossy().to_string(),
             )
             .env("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED", "true")
+            .env("PALYRA_MODEL_PROVIDER_KIND", "deterministic")
             .env("RUST_LOG", "info");
 
         let mut child = command.spawn().context("failed to spawn palyrad process")?;

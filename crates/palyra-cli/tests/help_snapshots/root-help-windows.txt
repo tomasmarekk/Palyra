@@ -17,6 +17,7 @@ Commands:
   browser
   completion      Generate shell completion scripts
   onboarding      [aliases: onboard]
+  configure       Safely reconfigure an existing installation
   gateway         Gateway and runtime diagnostics surface [aliases: daemon]
   dashboard       Resolve or open the operator dashboard URL
   support-bundle
@@ -65,6 +66,7 @@ Examples:
 
 Canonical command map:
   setup      Preferred bootstrap/init workflow (`init` remains as a compatibility alias)
+  configure  Guided reconfiguration workflow for an existing installation
   gateway    Preferred runtime/admin family (`daemon` remains as a compatibility alias)
   dashboard  Thin operator shortcut for dashboard URL discovery/open workflows
   onboarding Operator onboarding workflows (`onboard` remains as a compatibility alias)

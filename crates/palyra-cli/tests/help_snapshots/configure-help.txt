@@ -1,24 +1,12 @@
-Bootstrap a Palyra installation
+Safely reconfigure an existing installation
 
-Usage: palyra.exe setup [OPTIONS]
+Usage: palyra configure [OPTIONS]
 
 Options:
-      --mode <MODE>
-          [default: local]
-          [possible values: local, remote]
-
       --path <PATH>
 
-      --force
-
-      --tls-scaffold <TLS_SCAFFOLD>
-          [default: bring-your-own]
-          [possible values: none, bring-your-own, self-signed]
-
-      --wizard
-
-      --flow <FLOW>
-          [possible values: quickstart, manual, remote]
+      --section <SECTIONS>
+          [possible values: workspace, auth-model, gateway, daemon-service, channels, skills, health-security]
 
       --non-interactive
 
@@ -45,6 +33,9 @@ Options:
       --grpc-port <GRPC_PORT>
 
       --quic-port <QUIC_PORT>
+
+      --tls-scaffold <TLS_SCAFFOLD>
+          [possible values: none, bring-your-own, self-signed]
 
       --tls-cert-path <TLS_CERT_PATH>
 
@@ -99,10 +90,9 @@ Global Options:
       --no-color
 
 Examples:
-  palyra setup --mode local
-  palyra setup --mode local --wizard
-  palyra setup --mode remote --path ./config/palyra.toml --force
+  palyra configure
+  palyra configure --section workspace --section auth-model
+  palyra configure --non-interactive --section gateway --bind-profile public-tls --accept-risk
 
 Discoverability:
-  Use `palyra onboarding wizard --flow quickstart` for full guided onboarding.
-  Use `palyra gateway status` after setup to verify runtime health.
+  `configure` reuses the onboarding wizard engine to safely edit an existing installation.

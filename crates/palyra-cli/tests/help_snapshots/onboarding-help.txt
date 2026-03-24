@@ -1,0 +1,38 @@
+Usage: palyra onboarding [OPTIONS] <COMMAND>
+
+Commands:
+  wizard
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global Options:
+      --profile <PROFILE>
+
+      --config <CONFIG_PATH>
+
+      --state-root <STATE_ROOT>
+
+  -v, --verbose...
+          Increase logging verbosity (-v => debug, -vv => trace)
+
+      --log-level <LOG_LEVEL>
+          [default: info]
+          [possible values: error, warn, info, debug, trace]
+
+      --output-format <OUTPUT_FORMAT>
+          [default: text]
+          [possible values: text, json, ndjson]
+
+      --plain
+
+      --no-color
+
+Examples:
+  palyra onboarding wizard
+  palyra onboarding wizard --flow manual
+  palyra onboarding wizard --flow remote --non-interactive --accept-risk --remote-base-url https://dashboard.example.com/
+
+Discoverability:
+  Use `palyra setup --wizard` for bootstrap-first routing into the onboarding wizard.

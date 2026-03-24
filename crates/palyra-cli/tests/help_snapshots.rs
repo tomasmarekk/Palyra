@@ -56,6 +56,22 @@ fn setup_help_snapshot_matches() -> Result<()> {
 }
 
 #[test]
+fn onboarding_help_snapshot_matches() -> Result<()> {
+    assert_help_snapshot(
+        &["onboarding", "--help"],
+        include_str!("help_snapshots/onboarding-help.txt"),
+    )
+}
+
+#[test]
+fn configure_help_snapshot_matches() -> Result<()> {
+    assert_help_snapshot(
+        &["configure", "--help"],
+        include_str!("help_snapshots/configure-help.txt"),
+    )
+}
+
+#[test]
 fn gateway_help_snapshot_matches() -> Result<()> {
     assert_help_snapshot(&["gateway", "--help"], include_str!("help_snapshots/gateway-help.txt"))
 }

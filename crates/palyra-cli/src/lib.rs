@@ -65,11 +65,13 @@ use cli::{
     AgentCommand, AgentsCommand, ApprovalDecisionArg, ApprovalExportFormatArg, ApprovalsCommand,
     AuthCommand, AuthCredentialArg, AuthOpenAiCommand, AuthProfilesCommand, AuthProviderArg,
     AuthScopeArg, BrowserCommand, Cli, Command as CliCommand, CompletionShell, ConfigCommand,
-    CronCommand, CronConcurrencyPolicyArg, CronMisfirePolicyArg, CronScheduleTypeArg,
-    DaemonCommand, InitModeArg, InitTlsScaffoldArg, JournalCheckpointModeArg, MemoryCommand,
-    MemoryScopeArg, MemorySourceArg, ModelsCommand, OnboardingCommand, PatchCommand, PolicyCommand,
-    ProtocolCommand, SecretsCommand, SecurityCommand, SkillsCommand, SkillsPackageCommand,
-    SupportBundleCommand,
+    ConfigureSectionArg, CronCommand, CronConcurrencyPolicyArg, CronMisfirePolicyArg,
+    CronScheduleTypeArg, DaemonCommand, GatewayBindProfileArg, InitModeArg, InitTlsScaffoldArg,
+    JournalCheckpointModeArg, MemoryCommand, MemoryScopeArg, MemorySourceArg, ModelsCommand,
+    OnboardingAuthMethodArg, OnboardingCommand, OnboardingFlowArg, PatchCommand, PolicyCommand,
+    ProtocolCommand, RemoteVerificationModeArg, SecretsCommand, SecurityCommand,
+    SetupWizardOverridesArg, SkillsCommand, SkillsPackageCommand, SupportBundleCommand,
+    WizardOverridesArg,
 };
 #[cfg(not(windows))]
 use cli::{PairingClientKindArg, PairingCommand, PairingMethodArg};
@@ -214,8 +216,8 @@ fn run_cli() -> Result<()> {
     let _root_context = app::install_root_context(cli.root.clone())?;
     match cli.command {
         CliCommand::Version => print_version(),
-        CliCommand::Setup { mode, path, force, tls_scaffold } => {
-            commands::init::run_init(mode, path, force, tls_scaffold)
+        CliCommand::Setup { mode, path, force, tls_scaffold, wizard, wizard_options } => {
+            commands::setup::run_setup(mode, path, force, tls_scaffold, wizard, wizard_options)
         }
         CliCommand::Doctor { strict, json } => commands::doctor::run_doctor(strict, json),
         CliCommand::Status { url, grpc_url, admin, token, principal, device_id, channel } => {
@@ -231,6 +233,65 @@ fn run_cli() -> Result<()> {
         CliCommand::Browser { command } => commands::browser::run_browser(command),
         CliCommand::Completion { shell } => commands::completion::run_completion(shell),
         CliCommand::Onboarding { command } => commands::onboarding::run_onboarding(command),
+        CliCommand::Configure {
+            path,
+            sections,
+            non_interactive,
+            accept_risk,
+            json,
+            workspace_root,
+            auth_method,
+            api_key_env,
+            api_key_stdin,
+            api_key_prompt,
+            bind_profile,
+            daemon_port,
+            grpc_port,
+            quic_port,
+            tls_scaffold,
+            tls_cert_path,
+            tls_key_path,
+            remote_base_url,
+            admin_token_env,
+            admin_token_stdin,
+            admin_token_prompt,
+            remote_verification,
+            pinned_server_cert_sha256,
+            pinned_gateway_ca_sha256,
+            ssh_target,
+            skip_health,
+            skip_channels,
+            skip_skills,
+        } => commands::configure::run_configure(
+            path,
+            sections,
+            non_interactive,
+            accept_risk,
+            json,
+            workspace_root,
+            auth_method,
+            api_key_env,
+            api_key_stdin,
+            api_key_prompt,
+            bind_profile,
+            daemon_port,
+            grpc_port,
+            quic_port,
+            tls_scaffold,
+            tls_cert_path,
+            tls_key_path,
+            remote_base_url,
+            admin_token_env,
+            admin_token_stdin,
+            admin_token_prompt,
+            remote_verification,
+            pinned_server_cert_sha256,
+            pinned_gateway_ca_sha256,
+            ssh_target,
+            skip_health,
+            skip_channels,
+            skip_skills,
+        ),
         CliCommand::Gateway { command } => commands::daemon::run_daemon(command),
         CliCommand::Dashboard { path, verify_remote, identity_store_dir, open, json } => {
             commands::daemon::run_daemon(DaemonCommand::DashboardUrl {
@@ -2344,38 +2405,6 @@ fn resolve_onboarding_path(path: Option<String>) -> Result<PathBuf> {
             .with_context(|| format!("onboarding config path is invalid: {}", path));
     }
     Ok(PathBuf::from("palyra.toml"))
-}
-
-fn onboarding_template() -> &'static str {
-    "version = 1\n\
-\n\
-[deployment]\n\
-mode = \"remote_vps\"\n\
-dangerous_remote_bind_ack = false\n\
-\n\
-[daemon]\n\
-bind_addr = \"127.0.0.1\"\n\
-port = 7142\n\
-\n\
-[gateway]\n\
-grpc_bind_addr = \"127.0.0.1\"\n\
-grpc_port = 7443\n\
-quic_bind_addr = \"127.0.0.1\"\n\
-quic_port = 7444\n\
-quic_enabled = true\n\
-bind_profile = \"loopback_only\"\n\
-\n\
-[admin]\n\
-require_auth = true\n\
-\n\
-[tool_call.process_runner]\n\
-enabled = true\n\
-tier = \"b\"\n\
-allow_interpreters = false\n\
-egress_enforcement_mode = \"strict\"\n\
-\n\
-[orchestrator]\n\
-runloop_v1_enabled = true\n"
 }
 
 async fn fetch_grpc_health_with_retry(grpc_url: String) -> Result<gateway_v1::HealthResponse> {

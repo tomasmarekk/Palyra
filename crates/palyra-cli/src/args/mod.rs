@@ -9,6 +9,7 @@ mod browser;
 mod channels;
 mod completion;
 mod config;
+mod configure;
 mod cron;
 mod daemon;
 mod init;
@@ -39,12 +40,16 @@ pub use browser::BrowserCommand;
 pub use channels::{ChannelsCommand, ChannelsDiscordCommand, ChannelsRouterCommand};
 pub use completion::CompletionShell;
 pub use config::ConfigCommand;
+pub use configure::ConfigureSectionArg;
 pub use cron::{CronCommand, CronConcurrencyPolicyArg, CronMisfirePolicyArg, CronScheduleTypeArg};
 pub use daemon::{DaemonCommand, JournalCheckpointModeArg};
 pub use init::{InitModeArg, InitTlsScaffoldArg};
 pub use memory::{MemoryCommand, MemoryScopeArg, MemorySourceArg};
 pub use models::ModelsCommand;
-pub use onboarding::OnboardingCommand;
+pub use onboarding::{
+    GatewayBindProfileArg, OnboardingAuthMethodArg, OnboardingCommand, OnboardingFlowArg,
+    RemoteVerificationModeArg, SetupWizardOverridesArg, WizardOverridesArg,
+};
 #[cfg(not(windows))]
 pub use pairing::{PairingClientKindArg, PairingCommand, PairingMethodArg};
 pub use patch::PatchCommand;
@@ -65,6 +70,7 @@ Examples:
 
 Canonical command map:
   setup      Preferred bootstrap/init workflow (`init` remains as a compatibility alias)
+  configure  Guided reconfiguration workflow for an existing installation
   gateway    Preferred runtime/admin family (`daemon` remains as a compatibility alias)
   dashboard  Thin operator shortcut for dashboard URL discovery/open workflows
   onboarding Operator onboarding workflows (`onboard` remains as a compatibility alias)";
@@ -72,10 +78,30 @@ Canonical command map:
 const SETUP_AFTER_HELP: &str = "\
 Examples:
   palyra setup --mode local
+  palyra setup --mode local --wizard
   palyra setup --mode remote --path ./config/palyra.toml --force
 
 Discoverability:
+  Use `palyra onboarding wizard --flow quickstart` for full guided onboarding.
   Use `palyra gateway status` after setup to verify runtime health.";
+
+const ONBOARDING_AFTER_HELP: &str = "\
+Examples:
+  palyra onboarding wizard
+  palyra onboarding wizard --flow manual
+  palyra onboarding wizard --flow remote --non-interactive --accept-risk --remote-base-url https://dashboard.example.com/
+
+Discoverability:
+  Use `palyra setup --wizard` for bootstrap-first routing into the onboarding wizard.";
+
+const CONFIGURE_AFTER_HELP: &str = "\
+Examples:
+  palyra configure
+  palyra configure --section workspace --section auth-model
+  palyra configure --non-interactive --section gateway --bind-profile public-tls --accept-risk
+
+Discoverability:
+  `configure` reuses the onboarding wizard engine to safely edit an existing installation.";
 
 const GATEWAY_AFTER_HELP: &str = "\
 Examples:
@@ -181,6 +207,10 @@ pub enum Command {
         force: bool,
         #[arg(long, value_enum, default_value_t = InitTlsScaffoldArg::BringYourOwn)]
         tls_scaffold: InitTlsScaffoldArg,
+        #[arg(long, default_value_t = false)]
+        wizard: bool,
+        #[command(flatten)]
+        wizard_options: SetupWizardOverridesArg,
     },
     Doctor {
         #[arg(long, default_value_t = false)]
@@ -245,10 +275,72 @@ pub enum Command {
         #[arg(long, value_enum)]
         shell: CompletionShell,
     },
-    #[command(visible_alias = "onboard")]
+    #[command(visible_alias = "onboard", after_long_help = ONBOARDING_AFTER_HELP)]
     Onboarding {
         #[command(subcommand)]
         command: OnboardingCommand,
+    },
+    #[command(
+        about = "Safely reconfigure an existing installation",
+        after_long_help = CONFIGURE_AFTER_HELP
+    )]
+    Configure {
+        #[arg(long)]
+        path: Option<String>,
+        #[arg(long = "section", value_enum)]
+        sections: Vec<ConfigureSectionArg>,
+        #[arg(long, default_value_t = false)]
+        non_interactive: bool,
+        #[arg(long, default_value_t = false)]
+        accept_risk: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        #[arg(long)]
+        workspace_root: Option<String>,
+        #[arg(long, value_enum)]
+        auth_method: Option<OnboardingAuthMethodArg>,
+        #[arg(long)]
+        api_key_env: Option<String>,
+        #[arg(long, default_value_t = false)]
+        api_key_stdin: bool,
+        #[arg(long, default_value_t = false)]
+        api_key_prompt: bool,
+        #[arg(long, value_enum)]
+        bind_profile: Option<GatewayBindProfileArg>,
+        #[arg(long)]
+        daemon_port: Option<u16>,
+        #[arg(long)]
+        grpc_port: Option<u16>,
+        #[arg(long)]
+        quic_port: Option<u16>,
+        #[arg(long, value_enum)]
+        tls_scaffold: Option<InitTlsScaffoldArg>,
+        #[arg(long)]
+        tls_cert_path: Option<String>,
+        #[arg(long)]
+        tls_key_path: Option<String>,
+        #[arg(long)]
+        remote_base_url: Option<String>,
+        #[arg(long)]
+        admin_token_env: Option<String>,
+        #[arg(long, default_value_t = false)]
+        admin_token_stdin: bool,
+        #[arg(long, default_value_t = false)]
+        admin_token_prompt: bool,
+        #[arg(long, value_enum)]
+        remote_verification: Option<RemoteVerificationModeArg>,
+        #[arg(long)]
+        pinned_server_cert_sha256: Option<String>,
+        #[arg(long)]
+        pinned_gateway_ca_sha256: Option<String>,
+        #[arg(long)]
+        ssh_target: Option<String>,
+        #[arg(long, default_value_t = false)]
+        skip_health: bool,
+        #[arg(long, default_value_t = false)]
+        skip_channels: bool,
+        #[arg(long, default_value_t = false)]
+        skip_skills: bool,
     },
     #[command(
         visible_alias = "daemon",
