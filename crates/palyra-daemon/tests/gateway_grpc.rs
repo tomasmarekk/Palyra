@@ -5370,23 +5370,30 @@ async fn grpc_resolve_session_reset_clears_cached_tool_approval() -> Result<()> 
 
 #[tokio::test(flavor = "multi_thread")]
 async fn grpc_approvals_service_persists_and_exports_denied_tool_approval() -> Result<()> {
-    let embeddings_response = serde_json::json!({
+    let response_body = serde_json::json!({
         "data": [{
             "index": 0,
             "embedding": vec![0.0_f32; 3072],
         }],
         "model": "text-embedding-3-large",
+        "choices": [{
+            "message": {
+                "tool_calls": [{
+                    "function": {
+                        "name": "custom.noop",
+                        "arguments": serde_json::to_string(&serde_json::json!({
+                            "payload": "secret-token",
+                            "cookie": "sessionid=abc123",
+                        }))
+                        .context("failed to serialize deny-path tool arguments string")?,
+                    }
+                }]
+            }
+        }]
     })
     .to_string();
-    let response_body = openai_tool_call_response(
-        "custom.noop",
-        &serde_json::json!({
-            "payload": "secret-token",
-            "cookie": "sessionid=abc123",
-        }),
-    )?;
     let (openai_base_url, _request_count, server_handle) = spawn_scripted_openai_server(vec![
-        ScriptedOpenAiResponse::immediate(200, embeddings_response),
+        ScriptedOpenAiResponse::immediate(200, response_body.clone()),
         ScriptedOpenAiResponse::immediate(200, response_body),
     ])?;
     let (child, admin_port, grpc_port, _journal_db_path) =

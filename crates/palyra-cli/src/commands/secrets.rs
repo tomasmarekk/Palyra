@@ -48,68 +48,20 @@ pub(crate) struct SecretAuditSummary {
 #[derive(Debug, Serialize)]
 struct SecretsApplyPayload {
     audit: SecretAuditSummary,
-    actions: Vec<SecretsApplyAction>,
+    action_modes: Vec<SecretsApplyMode>,
 }
 
 #[derive(Debug, Serialize)]
-struct SecretsApplyAction {
-    component: String,
-    action: String,
+struct SecretsApplyMode {
     apply_mode: String,
-    reason: String,
+    affected_components: usize,
 }
 
 #[derive(Debug, Serialize)]
 struct SecretsConfigurePayload {
     component: String,
     path: String,
-    vault_ref: String,
     backups: usize,
-}
-
-#[derive(Debug, Serialize)]
-struct SecretsApplyOutput {
-    audit: SecretAuditSummary,
-    actions: Vec<SecretsApplyActionOutput>,
-}
-
-#[derive(Debug, Serialize)]
-struct SecretsApplyActionOutput {
-    component: String,
-    apply_mode: String,
-}
-
-#[derive(Debug, Serialize)]
-struct SecretsConfigureOutput {
-    component: String,
-    path: String,
-    backups: usize,
-    vault_ref_configured: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct SecretAuditOutput {
-    path: String,
-    runtime_profiles_inspected: bool,
-    runtime_error_present: bool,
-    references: Vec<SecretReferenceAuditOutput>,
-    findings: Vec<SecretAuditFindingOutput>,
-    summary: SecretAuditSummary,
-}
-
-#[derive(Debug, Serialize)]
-struct SecretReferenceAuditOutput {
-    component: String,
-    reference_kind: String,
-    status: String,
-}
-
-#[derive(Debug, Serialize)]
-struct SecretAuditFindingOutput {
-    severity: String,
-    code: String,
-    component: String,
-    reference_present: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -221,19 +173,19 @@ pub(crate) fn run_secrets(command: SecretsCommand) -> Result<()> {
             let payload = build_secrets_apply_payload(&audit);
             if output::preferred_json(json) {
                 output::print_json_pretty(
-                    &build_secrets_apply_output(&payload),
+                    &payload,
                     "failed to encode secrets apply payload as JSON",
                 )?;
             } else {
                 println!(
-                    "secrets.apply blocking_findings={} actions={}",
+                    "secrets.apply blocking_findings={} action_modes={}",
                     payload.audit.blocking_findings,
-                    payload.actions.len()
+                    payload.action_modes.len()
                 );
-                for action in payload.actions {
+                for action_mode in payload.action_modes {
                     println!(
-                        "secrets.apply.action component={} mode={}",
-                        action.component, action.apply_mode
+                        "secrets.apply.mode apply_mode={} affected_components={}",
+                        action_mode.apply_mode, action_mode.affected_components
                     );
                 }
             }
@@ -594,156 +546,90 @@ where
     write_document_with_backups(path_ref, &document, backups)
         .with_context(|| format!("failed to persist config {}", path_ref.display()))?;
 
-    Ok(SecretsConfigurePayload { component: component.to_owned(), path, vault_ref, backups })
+    Ok(SecretsConfigurePayload { component: component.to_owned(), path, backups })
 }
 
 fn emit_secret_configure_payload(
     payload: SecretsConfigurePayload,
     json_output: bool,
 ) -> Result<()> {
-    let output_payload = build_secret_configure_output(&payload);
     if json_output {
         output::print_json_pretty(
-            &output_payload,
+            &serde_json::json!({
+                "component": payload.component,
+                "path": payload.path,
+                "backups": payload.backups,
+                "vault_ref_configured": true,
+            }),
             "failed to encode secrets configure payload as JSON",
         )?;
     } else {
         println!(
-            "secrets.configure component={} path={} vault_ref_configured={} backups={}",
-            output_payload.component,
-            output_payload.path,
-            output_payload.vault_ref_configured,
-            output_payload.backups
+            "secrets.configure component={} path={} vault_ref_configured=true backups={}",
+            payload.component, payload.path, payload.backups
         );
     }
     std::io::stdout().flush().context("stdout flush failed")
 }
 
 fn emit_secrets_audit(payload: &SecretAuditPayload, json_output: bool) -> Result<()> {
-    let output_payload = build_secret_audit_output(payload);
     if json_output {
         output::print_json_pretty(
-            &output_payload,
+            &serde_json::json!({
+                "path": payload.path,
+                "runtime_profiles_inspected": payload.runtime_profiles_inspected,
+                "runtime_error_present": payload.runtime_error.is_some(),
+                "summary": {
+                    "total_references": payload.summary.total_references,
+                    "resolved_references": payload.summary.resolved_references,
+                    "blocking_findings": payload.summary.blocking_findings,
+                    "warning_findings": payload.summary.warning_findings,
+                    "info_findings": payload.summary.info_findings,
+                }
+            }),
             "failed to encode secrets audit payload as JSON",
         )?;
     } else {
         println!(
             "secrets.audit path={} references={} resolved={} blocking={} warnings={} info={} runtime_profiles_inspected={} runtime_error_present={}",
-            output_payload.path,
-            output_payload.summary.total_references,
-            output_payload.summary.resolved_references,
-            output_payload.summary.blocking_findings,
-            output_payload.summary.warning_findings,
-            output_payload.summary.info_findings,
-            output_payload.runtime_profiles_inspected,
-            output_payload.runtime_error_present
+            payload.path,
+            payload.summary.total_references,
+            payload.summary.resolved_references,
+            payload.summary.blocking_findings,
+            payload.summary.warning_findings,
+            payload.summary.info_findings,
+            payload.runtime_profiles_inspected,
+            payload.runtime_error.is_some()
         );
-        for reference in &output_payload.references {
-            println!(
-                "secrets.audit.reference component={} kind={} status={}",
-                reference.component, reference.reference_kind, reference.status
-            );
-        }
-        for finding in &output_payload.findings {
-            println!(
-                "secrets.audit.finding severity={} code={} component={} reference_present={}",
-                finding.severity, finding.code, finding.component, finding.reference_present
-            );
-        }
     }
     std::io::stdout().flush().context("stdout flush failed")
 }
 
-fn build_secrets_apply_output(payload: &SecretsApplyPayload) -> SecretsApplyOutput {
-    SecretsApplyOutput {
-        audit: payload.audit.clone(),
-        actions: payload
-            .actions
-            .iter()
-            .map(|action| SecretsApplyActionOutput {
-                component: action.component.clone(),
-                apply_mode: action.apply_mode.clone(),
-            })
-            .collect(),
-    }
-}
-
-fn build_secret_configure_output(payload: &SecretsConfigurePayload) -> SecretsConfigureOutput {
-    SecretsConfigureOutput {
-        component: payload.component.clone(),
-        path: payload.path.clone(),
-        backups: payload.backups,
-        vault_ref_configured: !payload.vault_ref.trim().is_empty(),
-    }
-}
-
-fn build_secret_audit_output(payload: &SecretAuditPayload) -> SecretAuditOutput {
-    SecretAuditOutput {
-        path: payload.path.clone(),
-        runtime_profiles_inspected: payload.runtime_profiles_inspected,
-        runtime_error_present: payload.runtime_error.is_some(),
-        references: payload
-            .references
-            .iter()
-            .map(|reference| SecretReferenceAuditOutput {
-                component: reference.component.clone(),
-                reference_kind: reference.reference_kind.clone(),
-                status: reference.status.clone(),
-            })
-            .collect(),
-        findings: payload
-            .findings
-            .iter()
-            .map(|finding| SecretAuditFindingOutput {
-                severity: finding.severity.clone(),
-                code: finding.code.clone(),
-                component: finding.component.clone(),
-                reference_present: finding.reference.is_some(),
-            })
-            .collect(),
-        summary: payload.summary.clone(),
-    }
-}
-
 fn build_secrets_apply_payload(audit: &SecretAuditPayload) -> SecretsApplyPayload {
-    let mut seen_actions = BTreeSet::<(String, String)>::new();
-    let mut actions = Vec::<SecretsApplyAction>::new();
+    let mut affected_components_by_mode = BTreeMap::<String, BTreeSet<String>>::new();
     for reference in &audit.references {
-        let (apply_mode, action, reason) = match reference.reference_kind.as_str() {
-            "model_provider_api_key" => (
-                "daemon_restart_required",
-                "restart palyrad so the model provider reloads the updated vault reference",
-                "model-provider API key vault refs are consumed through runtime config resolution",
-            ),
-            "browser_state_key" => (
-                "browserd_restart_required",
-                "restart palyra-browserd so encrypted browser state picks up the updated state key",
-                "browser state encryption keys are applied on browser service startup",
-            ),
-            kind if kind.starts_with("auth_profile_oauth_") => (
-                "live_refresh_supported",
-                "run `palyra auth openai refresh <profile-id>` or `palyra auth openai status` to validate the rotated credential",
-                "OAuth-backed auth profiles can be validated without rewriting daemon config",
-            ),
-            kind if kind.starts_with("auth_profile_") => (
-                "live_reference",
-                "run `palyra auth openai status` to confirm the runtime can still resolve the auth profile secret refs",
-                "auth profile secret refs are read through the auth runtime",
-            ),
+        let apply_mode = match reference.reference_kind.as_str() {
+            "model_provider_api_key" => "daemon_restart_required",
+            "browser_state_key" => "browserd_restart_required",
+            kind if kind.starts_with("auth_profile_oauth_") => "live_refresh_supported",
+            kind if kind.starts_with("auth_profile_") => "live_reference",
             _ => continue,
         };
-        let entry = (reference.component.clone(), apply_mode.to_owned());
-        if !seen_actions.insert(entry.clone()) {
-            continue;
-        }
-        actions.push(SecretsApplyAction {
-            component: entry.0,
-            action: action.to_owned(),
-            apply_mode: entry.1,
-            reason: reason.to_owned(),
-        });
+        affected_components_by_mode
+            .entry(apply_mode.to_owned())
+            .or_default()
+            .insert(reference.component.clone());
     }
-    SecretsApplyPayload { audit: audit.summary.clone(), actions }
+    SecretsApplyPayload {
+        audit: audit.summary.clone(),
+        action_modes: affected_components_by_mode
+            .into_iter()
+            .map(|(apply_mode, affected_components)| SecretsApplyMode {
+                apply_mode,
+                affected_components: affected_components.len(),
+            })
+            .collect(),
+    }
 }
 
 fn read_secret_bytes_from_stdin(value_stdin: bool) -> Result<Vec<u8>> {
@@ -874,11 +760,15 @@ mod tests {
 
     #[test]
     fn secret_audit_output_redacts_sensitive_fields() {
-        let output =
-            serde_json::to_string(&build_secret_audit_output(&sample_secret_audit_payload()))
-                .expect("audit output should serialize");
+        let payload = sample_secret_audit_payload();
+        let output = serde_json::to_string(&serde_json::json!({
+            "path": payload.path,
+            "runtime_profiles_inspected": payload.runtime_profiles_inspected,
+            "runtime_error_present": payload.runtime_error.is_some(),
+            "summary": payload.summary,
+        }))
+        .expect("audit output should serialize");
         assert!(output.contains("\"runtime_error_present\":true"));
-        assert!(output.contains("\"reference_present\":true"));
         assert!(!output.contains("vault://global/openai"));
         assert!(!output.contains("resolved from vault"));
         assert!(!output.contains("rotate vault"));
@@ -887,8 +777,7 @@ mod tests {
     #[test]
     fn secrets_apply_output_redacts_action_text() {
         let payload = build_secrets_apply_payload(&sample_secret_audit_payload());
-        let output =
-            serde_json::to_string(&build_secrets_apply_output(&payload)).expect("apply output");
+        let output = serde_json::to_string(&payload).expect("apply output");
         assert!(output.contains("\"apply_mode\":\"daemon_restart_required\""));
         assert!(!output.contains("restart palyrad"));
         assert!(!output.contains("vault://global/openai"));
@@ -899,11 +788,15 @@ mod tests {
         let payload = SecretsConfigurePayload {
             component: "model_provider".to_owned(),
             path: "palyra.toml".to_owned(),
-            vault_ref: "global/openai".to_owned(),
             backups: 2,
         };
-        let output =
-            serde_json::to_string(&build_secret_configure_output(&payload)).expect("serialize");
+        let output = serde_json::to_string(&serde_json::json!({
+            "component": payload.component,
+            "path": payload.path,
+            "backups": payload.backups,
+            "vault_ref_configured": true,
+        }))
+        .expect("serialize");
         assert!(output.contains("\"vault_ref_configured\":true"));
         assert!(!output.contains("global/openai"));
     }

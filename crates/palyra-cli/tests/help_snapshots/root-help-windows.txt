@@ -23,9 +23,11 @@ Commands:
   policy
   protocol
   config
+  models
   patch
   skills          [aliases: skill]
   secrets
+  security
   tunnel
 
 Options:
