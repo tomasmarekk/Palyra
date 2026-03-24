@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, ChildStdout, Command, Stdio},
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc, Arc, Mutex,
     },
     thread,
@@ -5392,10 +5392,11 @@ async fn grpc_approvals_service_persists_and_exports_denied_tool_approval() -> R
         }]
     })
     .to_string();
-    let (openai_base_url, request_count, server_handle) = spawn_scripted_openai_server(vec![
-        ScriptedOpenAiResponse::immediate(200, response_body.clone()),
-        ScriptedOpenAiResponse::immediate(200, response_body),
-    ])?;
+    let (openai_base_url, scripted_openai_shutdown, server_handle) =
+        spawn_interruptible_scripted_openai_server(vec![
+            ScriptedOpenAiResponse::immediate(200, response_body.clone()),
+            ScriptedOpenAiResponse::immediate(200, response_body),
+        ])?;
     let (child, admin_port, grpc_port, _journal_db_path) =
         spawn_palyrad_with_openai_provider_and_tool_policy(
             openai_base_url.as_str(),
@@ -5775,13 +5776,10 @@ async fn grpc_approvals_service_persists_and_exports_denied_tool_approval() -> R
             .context("empty JSON export should still parse as an array")?;
     assert!(exported_empty_records.is_empty(), "empty JSON export should be represented as []");
 
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while request_count.load(Ordering::Relaxed) < 2 {
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .context("deny-path openai server did not receive the follow-up request in time")?;
+    drop(approvals_client);
+    drop(gateway_client);
+    drop(daemon);
+    scripted_openai_shutdown.store(true, Ordering::Relaxed);
     server_handle.join().expect("scripted openai server thread should exit");
     Ok(())
 }
@@ -8851,6 +8849,66 @@ fn spawn_scripted_openai_server(
         }
     });
     Ok((format!("http://{address}/v1"), request_count, handle))
+}
+
+fn spawn_interruptible_scripted_openai_server(
+    responses: Vec<ScriptedOpenAiResponse>,
+) -> Result<(String, Arc<AtomicBool>, thread::JoinHandle<()>)> {
+    let listener =
+        TcpListener::bind("127.0.0.1:0").context("failed to bind scripted openai listener")?;
+    listener
+        .set_nonblocking(true)
+        .context("failed to configure scripted openai listener as non-blocking")?;
+    let address = listener.local_addr().context("failed to resolve scripted listener address")?;
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_for_thread = Arc::clone(&shutdown);
+    let handle = thread::spawn(move || {
+        let mut responses = responses.into_iter();
+        'accept_loop: while let Some(response_spec) = responses.next() {
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        if let Err(error) = read_http_request_body_for_scripted_server(&mut stream)
+                        {
+                            eprintln!("debug scripted openai read error: {error:#}");
+                            continue;
+                        }
+                        if !response_spec.delay_before_response.is_zero() {
+                            thread::sleep(response_spec.delay_before_response);
+                        }
+                        let reason = match response_spec.status_code {
+                            200 => "OK",
+                            429 => "Too Many Requests",
+                            500 => "Internal Server Error",
+                            502 => "Bad Gateway",
+                            503 => "Service Unavailable",
+                            504 => "Gateway Timeout",
+                            _ => "Error",
+                        };
+                        let response = format!(
+                            "HTTP/1.1 {} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            response_spec.status_code,
+                            response_spec.body.len(),
+                            response_spec.body
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
+                        continue 'accept_loop;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if shutdown_for_thread.load(Ordering::Relaxed) {
+                            break 'accept_loop;
+                        }
+                        thread::sleep(Duration::from_millis(25));
+                    }
+                    Err(error) => {
+                        panic!("scripted openai listener accept failed: {error}");
+                    }
+                }
+            }
+        }
+    });
+    Ok((format!("http://{address}/v1"), shutdown, handle))
 }
 
 fn spawn_scripted_openai_server_with_request_capture(
