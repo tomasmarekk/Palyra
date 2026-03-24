@@ -8964,6 +8964,9 @@ fn spawn_scripted_openai_server_with_request_capture(
 
 fn read_http_request_body_for_scripted_server(stream: &mut TcpStream) -> Result<Vec<u8>> {
     stream
+        .set_nonblocking(false)
+        .context("failed to configure scripted server stream as blocking")?;
+    stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .context("failed to configure scripted server read timeout")?;
     let mut reader = BufReader::new(stream);

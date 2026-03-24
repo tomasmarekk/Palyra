@@ -9,9 +9,21 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use tempfile::TempDir;
 
+fn configure_cli_env(command: &mut Command, workdir: &TempDir) {
+    command
+        .env("PALYRA_STATE_ROOT", workdir.path().join("state-root"))
+        .env("PALYRA_VAULT_DIR", workdir.path().join("vault"))
+        .env("PALYRA_VAULT_BACKEND", "encrypted_file")
+        .env("XDG_STATE_HOME", workdir.path().join("xdg-state"))
+        .env("HOME", workdir.path().join("home"))
+        .env("LOCALAPPDATA", workdir.path().join("localappdata"))
+        .env("APPDATA", workdir.path().join("appdata"));
+}
+
 fn run_cli(workdir: &TempDir, args: &[&str], envs: &[(&str, &str)]) -> Result<Output> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_palyra"));
     command.current_dir(workdir.path()).args(args);
+    configure_cli_env(&mut command, workdir);
     for (key, value) in envs {
         command.env(key, value);
     }

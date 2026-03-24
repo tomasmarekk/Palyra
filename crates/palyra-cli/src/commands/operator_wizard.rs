@@ -98,32 +98,22 @@ enum RemoteAccessPattern {
     VerifiedHttps,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 enum HealthStatus {
     ConfigReady,
     RemoteVerified,
+    #[default]
     Skipped,
     ManualFollowUpRequired,
 }
 
-impl Default for HealthStatus {
-    fn default() -> Self {
-        Self::Skipped
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 enum ServiceInstallMode {
+    #[default]
     NotNow,
     GuidanceOnly,
-}
-
-impl Default for ServiceInstallMode {
-    fn default() -> Self {
-        Self::NotNow
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,6 +142,15 @@ struct ApplyContext {
     identity_store_dir: PathBuf,
     vault_dir: PathBuf,
     tls_paths: Option<(PathBuf, PathBuf)>,
+}
+
+#[derive(Debug, Clone)]
+struct BindProfileConfig {
+    bind_profile: String,
+    tls_scaffold: Option<InitTlsScaffoldArg>,
+    tls_cert_path: Option<String>,
+    tls_key_path: Option<String>,
+    accept_risk: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -420,11 +419,13 @@ pub(crate) fn run_configure_wizard(request: ConfigureWizardRequest) -> Result<()
                 configure_bind_profile(
                     &mut wizard,
                     &mut document,
-                    bind_profile.as_str(),
-                    request.tls_scaffold,
-                    request.tls_cert_path.clone(),
-                    request.tls_key_path.clone(),
-                    request.accept_risk,
+                    BindProfileConfig {
+                        bind_profile: bind_profile.as_str().to_owned(),
+                        tls_scaffold: request.tls_scaffold,
+                        tls_cert_path: request.tls_cert_path.clone(),
+                        tls_key_path: request.tls_key_path.clone(),
+                        accept_risk: request.accept_risk,
+                    },
                     &mut warnings,
                 )?;
                 apply_port_updates(
@@ -525,17 +526,17 @@ pub(crate) fn run_configure_wizard(request: ConfigureWizardRequest) -> Result<()
         let changed = document != before;
         let section_restart_required = section_requires_restart(section, changed);
         if changed {
-            changed_sections.push(section.as_str().to_owned());
+            changed_sections.push(section.slug().to_owned());
             if section_restart_required {
-                restart_required.push(section.as_str().to_owned());
+                restart_required.push(section.slug().to_owned());
             }
         } else {
-            unchanged_sections.push(section.as_str().to_owned());
+            unchanged_sections.push(section.slug().to_owned());
         }
         let mut section_follow_up_checks = section_follow_up_checks(section, &document)?;
         follow_up_checks.extend(section_follow_up_checks.iter().cloned());
         section_changes.push(ConfigureSectionChange {
-            section: section.as_str().to_owned(),
+            section: section.slug().to_owned(),
             changed,
             before: before_snapshot,
             after: describe_configure_section(&document, section)?,
@@ -735,7 +736,7 @@ fn build_configure_answers(
         answers.insert(
             "configure_sections".to_owned(),
             WizardValue::Multi(
-                request.sections.iter().map(|value| value.as_str().to_owned()).collect(),
+                request.sections.iter().map(|value| value.slug().to_owned()).collect(),
             ),
         );
     }
@@ -1953,20 +1954,16 @@ fn apply_port_updates(
 fn configure_bind_profile(
     wizard: &mut WizardSession<'_, dyn WizardBackend>,
     document: &mut toml::Value,
-    bind_profile: &str,
-    tls_scaffold: Option<InitTlsScaffoldArg>,
-    tls_cert_path: Option<String>,
-    tls_key_path: Option<String>,
-    accept_risk: bool,
+    config: BindProfileConfig,
     warnings: &mut Vec<String>,
 ) -> Result<()> {
     set_value_at_path(
         document,
         "gateway.bind_profile",
-        toml::Value::String(bind_profile.to_owned()),
+        toml::Value::String(config.bind_profile.clone()),
     )?;
-    if bind_profile == "public_tls" {
-        if !accept_risk {
+    if config.bind_profile == "public_tls" {
+        if !config.accept_risk {
             let confirmed = wizard.confirm(confirm_step(
                 "public_bind_ack",
                 "Dangerous Bind Acknowledgement",
@@ -1985,9 +1982,9 @@ fn configure_bind_profile(
             toml::Value::Boolean(true),
         )?;
         set_value_at_path(document, "gateway.tls.enabled", toml::Value::Boolean(true))?;
-        let cert_path = match tls_cert_path {
+        let cert_path = match config.tls_cert_path {
             Some(path) => path,
-            None if matches!(tls_scaffold, Some(InitTlsScaffoldArg::SelfSigned | InitTlsScaffoldArg::BringYourOwn)) => wizard.text(
+            None if matches!(config.tls_scaffold, Some(InitTlsScaffoldArg::SelfSigned | InitTlsScaffoldArg::BringYourOwn)) => wizard.text(
                 text_step(
                     "tls_cert_path",
                     "TLS Certificate Path",
@@ -2000,9 +1997,9 @@ fn configure_bind_profile(
             )?,
             None => "./tls/gateway.crt".to_owned(),
         };
-        let key_path = match tls_key_path {
+        let key_path = match config.tls_key_path {
             Some(path) => path,
-            None if matches!(tls_scaffold, Some(InitTlsScaffoldArg::SelfSigned | InitTlsScaffoldArg::BringYourOwn)) => wizard.text(
+            None if matches!(config.tls_scaffold, Some(InitTlsScaffoldArg::SelfSigned | InitTlsScaffoldArg::BringYourOwn)) => wizard.text(
                 text_step(
                     "tls_key_path",
                     "TLS Key Path",
@@ -2809,11 +2806,11 @@ fn anyhow_from_wizard(error: WizardError) -> anyhow::Error {
 }
 
 trait ConfigureSectionLabel {
-    fn as_str(self) -> &'static str;
+    fn slug(self) -> &'static str;
 }
 
 impl ConfigureSectionLabel for ConfigureSectionArg {
-    fn as_str(self) -> &'static str {
+    fn slug(self) -> &'static str {
         match self {
             ConfigureSectionArg::Workspace => "workspace",
             ConfigureSectionArg::AuthModel => "auth-model",
