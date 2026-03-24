@@ -168,8 +168,8 @@ fn secrets_configure_openai_api_key_updates_config_and_audit() -> Result<()> {
     let configure_stdout =
         String::from_utf8(configure_output.stdout).context("stdout was not UTF-8")?;
     assert!(
-        configure_stdout.contains("\"vault_ref\": \"global/openai_api_key\""),
-        "configure output should report the stored vault ref: {configure_stdout}"
+        configure_stdout.contains("\"vault_ref_configured\": true"),
+        "configure output should confirm the vault ref was configured without echoing it: {configure_stdout}"
     );
 
     let config_toml = fs::read_to_string(&config_path).context("failed to read mutated config")?;
@@ -197,8 +197,12 @@ fn secrets_configure_openai_api_key_updates_config_and_audit() -> Result<()> {
         "audit should report zero blocking findings for configured secret refs: {audit_stdout}"
     );
     assert!(
-        audit_stdout.contains("\"reference\": \"global/openai_api_key\""),
-        "audit should include the configured secret reference: {audit_stdout}"
+        audit_stdout.contains("\"total_references\": 1"),
+        "audit should summarize the configured secret references: {audit_stdout}"
+    );
+    assert!(
+        audit_stdout.contains("\"resolved_references\": 1"),
+        "audit should summarize resolved secret references without echoing raw refs: {audit_stdout}"
     );
 
     let apply_output = run_cli(
