@@ -5370,12 +5370,25 @@ async fn grpc_resolve_session_reset_clears_cached_tool_approval() -> Result<()> 
 
 #[tokio::test(flavor = "multi_thread")]
 async fn grpc_approvals_service_persists_and_exports_denied_tool_approval() -> Result<()> {
-    let (openai_base_url, _request_count, server_handle) =
-        spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::immediate(
-            200,
-            r#"{"choices":[{"message":{"tool_calls":[{"function":{"name":"custom.noop","arguments":"{\"payload\":\"secret-token\",\"cookie\":\"sessionid=abc123\"}"}}]}}]}"#
-                .to_owned(),
-        )])?;
+    let embeddings_response = serde_json::json!({
+        "data": [{
+            "index": 0,
+            "embedding": vec![0.0_f32; 3072],
+        }],
+        "model": "text-embedding-3-large",
+    })
+    .to_string();
+    let response_body = openai_tool_call_response(
+        "custom.noop",
+        &serde_json::json!({
+            "payload": "secret-token",
+            "cookie": "sessionid=abc123",
+        }),
+    )?;
+    let (openai_base_url, _request_count, server_handle) = spawn_scripted_openai_server(vec![
+        ScriptedOpenAiResponse::immediate(200, embeddings_response),
+        ScriptedOpenAiResponse::immediate(200, response_body),
+    ])?;
     let (child, admin_port, grpc_port, _journal_db_path) =
         spawn_palyrad_with_openai_provider_and_tool_policy(
             openai_base_url.as_str(),
@@ -8259,6 +8272,8 @@ fn spawn_palyrad_with_openai_provider_and_tool_policy(
         .env("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", openai_base_url)
         .env("PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL", "true")
         .env("PALYRA_MODEL_PROVIDER_OPENAI_API_KEY", openai_api_key)
+        .env_remove("PALYRA_MODEL_PROVIDER_OPENAI_EMBEDDINGS_MODEL")
+        .env_remove("PALYRA_MODEL_PROVIDER_OPENAI_EMBEDDINGS_DIMS")
         .env("PALYRA_MODEL_PROVIDER_MAX_RETRIES", "0")
         .env("PALYRA_MODEL_PROVIDER_RETRY_BACKOFF_MS", "1")
         .env("PALYRA_MODEL_PROVIDER_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "1")
@@ -8774,7 +8789,8 @@ fn spawn_scripted_openai_server(
             let (mut stream, _) =
                 listener.accept().expect("scripted openai listener should accept connection");
             request_count_for_thread.fetch_add(1, Ordering::Relaxed);
-            if read_http_request_body_for_scripted_server(&mut stream).is_err() {
+            if let Err(error) = read_http_request_body_for_scripted_server(&mut stream) {
+                eprintln!("debug scripted openai read error: {error:#}");
                 continue;
             }
             if !response_spec.delay_before_response.is_zero() {
@@ -8819,7 +8835,10 @@ fn spawn_scripted_openai_server_with_request_capture(
             request_count_for_thread.fetch_add(1, Ordering::Relaxed);
             let request_body = match read_http_request_body_for_scripted_server(&mut stream) {
                 Ok(body) => body,
-                Err(_) => continue,
+                Err(error) => {
+                    eprintln!("debug scripted openai read error: {error:#}");
+                    continue;
+                }
             };
             if let Ok(parsed_body) = String::from_utf8(request_body) {
                 if let Ok(mut guard) = captured_request_bodies_for_thread.lock() {
