@@ -27,6 +27,9 @@ Expand-ZipArchiveSafely -ArchivePath $archivePath -DestinationPath $installRoot
 $cliBinary = Join-Path $installRoot (Resolve-ExecutableName -BaseName "palyra")
 $daemonBinary = Join-Path $installRoot (Resolve-ExecutableName -BaseName "palyrad")
 $browserBinary = Join-Path $installRoot (Resolve-ExecutableName -BaseName "palyra-browserd")
+Set-ExecutablePermissions -Path $cliBinary
+Set-ExecutablePermissions -Path $daemonBinary
+Set-ExecutablePermissions -Path $browserBinary
 
 $cliExposure = Install-PalyraCliExposure `
     -TargetBinaryPath $cliBinary `

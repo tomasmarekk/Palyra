@@ -3,7 +3,7 @@ use std::process::Command;
 use anyhow::{Context, Result};
 
 fn normalize_help_text(text: &str) -> String {
-    text.replace("palyra.exe", "palyra")
+    text.replace("\r\n", "\n").replace("palyra.exe", "palyra")
 }
 
 fn run_help(args: &[&str]) -> Result<String> {

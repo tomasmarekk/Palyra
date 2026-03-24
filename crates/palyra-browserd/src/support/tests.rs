@@ -3667,19 +3667,73 @@ fn spawn_chunked_http_server(
         let headers = format!(
                 "HTTP/1.1 {status_code} OK\r\nContent-Type: text/html\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
             );
-        stream.write_all(headers.as_bytes()).expect("server should write response headers");
-        stream.flush().expect("server should flush response headers");
+        if !write_chunked_test_bytes(
+            &mut stream,
+            headers.as_bytes(),
+            "server should write response headers",
+        ) {
+            return;
+        }
+        if !flush_chunked_test_stream(&mut stream, "server should flush response headers") {
+            return;
+        }
         for chunk in chunks {
             let prefix = format!("{:X}\r\n", chunk.len());
-            stream.write_all(prefix.as_bytes()).expect("server should write chunk length");
-            stream.write_all(chunk.as_bytes()).expect("server should write chunk body");
-            stream.write_all(b"\r\n").expect("server should terminate chunk");
-            stream.flush().expect("server should flush chunk");
+            if !write_chunked_test_bytes(
+                &mut stream,
+                prefix.as_bytes(),
+                "server should write chunk length",
+            ) {
+                return;
+            }
+            if !write_chunked_test_bytes(
+                &mut stream,
+                chunk.as_bytes(),
+                "server should write chunk body",
+            ) {
+                return;
+            }
+            if !write_chunked_test_bytes(&mut stream, b"\r\n", "server should terminate chunk") {
+                return;
+            }
+            if !flush_chunked_test_stream(&mut stream, "server should flush chunk") {
+                return;
+            }
         }
-        stream.write_all(b"0\r\n\r\n").expect("server should write chunked terminator");
-        stream.flush().expect("server should flush chunked terminator");
+        let _ = write_chunked_test_bytes(
+            &mut stream,
+            b"0\r\n\r\n",
+            "server should write chunked terminator",
+        );
+        let _ = flush_chunked_test_stream(&mut stream, "server should flush chunked terminator");
     });
     (format!("http://{address}/"), handle)
+}
+
+fn write_chunked_test_bytes(stream: &mut TcpStream, bytes: &[u8], context: &str) -> bool {
+    match stream.write_all(bytes) {
+        Ok(()) => true,
+        Err(error) if is_expected_chunked_test_disconnect(&error) => false,
+        Err(error) => panic!("{context}: {error}"),
+    }
+}
+
+fn flush_chunked_test_stream(stream: &mut TcpStream, context: &str) -> bool {
+    match stream.flush() {
+        Ok(()) => true,
+        Err(error) if is_expected_chunked_test_disconnect(&error) => false,
+        Err(error) => panic!("{context}: {error}"),
+    }
+}
+
+fn is_expected_chunked_test_disconnect(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::UnexpectedEof
+    )
 }
 
 fn spawn_static_http_server_with_request_budget(
