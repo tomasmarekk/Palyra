@@ -410,17 +410,26 @@ fn resolve_profile(
 }
 
 pub(crate) fn resolve_cli_state_root(explicit: Option<&str>) -> Result<PathBuf> {
+    resolve_cli_state_root_with(explicit, env::var("PALYRA_STATE_ROOT").ok(), default_state_root)
+}
+
+fn resolve_cli_state_root_with<F>(
+    explicit: Option<&str>,
+    env_state_root: Option<String>,
+    default_state_root_resolver: F,
+) -> Result<PathBuf>
+where
+    F: FnOnce() -> Result<PathBuf, IdentityStorePathError>,
+{
     if let Some(explicit) = normalize_optional_text(explicit) {
         return parse_config_path(explicit)
             .with_context(|| format!("state root path is invalid: {explicit}"));
     }
-    if let Ok(raw) = env::var("PALYRA_STATE_ROOT") {
-        if let Some(raw) = normalize_optional_text(Some(raw.as_str())) {
-            return parse_config_path(raw)
-                .with_context(|| "PALYRA_STATE_ROOT contains an invalid path");
-        }
+    if let Some(raw) = normalize_optional_text(env_state_root.as_deref()) {
+        return parse_config_path(raw)
+            .with_context(|| "PALYRA_STATE_ROOT contains an invalid path");
     }
-    default_state_root()
+    default_state_root_resolver()
         .or_else(fallback_cli_state_root)
         .context("failed to resolve default state root")
 }
@@ -558,12 +567,13 @@ fn normalize_owned_text(value: Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_root_context, resolve_cli_state_root, ConnectionDefaults, ConnectionOverrides,
-        RootOptions, CLI_PROFILES_PATH_ENV, CLI_PROFILE_ENV,
+        build_root_context, ConnectionDefaults, ConnectionOverrides, RootOptions,
+        CLI_PROFILES_PATH_ENV, CLI_PROFILE_ENV,
     };
     use crate::args::{LogLevelArg, OutputFormatArg};
     use anyhow::Result;
-    use std::{env, ffi::OsString, fs, sync::Mutex, sync::OnceLock};
+    use palyra_common::IdentityStorePathError;
+    use std::{env, fs, sync::Mutex, sync::OnceLock};
     use tempfile::tempdir;
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -584,13 +594,6 @@ mod tests {
             CLI_PROFILES_PATH_ENV,
         ] {
             env::remove_var(key);
-        }
-    }
-
-    fn restore_env_var(key: &str, value: Option<OsString>) {
-        match value {
-            Some(value) => env::set_var(key, value),
-            None => env::remove_var(key),
         }
     }
 
@@ -693,15 +696,9 @@ channel = "staging"
     #[cfg(windows)]
     #[test]
     fn state_root_falls_back_to_temp_when_windows_appdata_is_missing() -> Result<()> {
-        let _guard = env_lock().lock().expect("env lock");
-        clear_env();
-        let previous_local_appdata = env::var_os("LOCALAPPDATA");
-        let previous_appdata = env::var_os("APPDATA");
-        env::remove_var("LOCALAPPDATA");
-        env::remove_var("APPDATA");
-        let state_root = resolve_cli_state_root(None)?;
-        restore_env_var("LOCALAPPDATA", previous_local_appdata);
-        restore_env_var("APPDATA", previous_appdata);
+        let state_root = super::resolve_cli_state_root_with(None, None, || {
+            Err(IdentityStorePathError::AppDataNotSet)
+        })?;
         assert_eq!(state_root, env::temp_dir().join("Palyra"));
         Ok(())
     }
@@ -709,15 +706,9 @@ channel = "staging"
     #[cfg(not(windows))]
     #[test]
     fn state_root_falls_back_to_temp_when_home_is_missing() -> Result<()> {
-        let _guard = env_lock().lock().expect("env lock");
-        clear_env();
-        let previous_xdg_state_home = env::var_os("XDG_STATE_HOME");
-        let previous_home = env::var_os("HOME");
-        env::remove_var("XDG_STATE_HOME");
-        env::remove_var("HOME");
-        let state_root = resolve_cli_state_root(None)?;
-        restore_env_var("XDG_STATE_HOME", previous_xdg_state_home);
-        restore_env_var("HOME", previous_home);
+        let state_root = super::resolve_cli_state_root_with(None, None, || {
+            Err(IdentityStorePathError::HomeNotSet)
+        })?;
         assert_eq!(state_root, env::temp_dir().join("palyra"));
         Ok(())
     }
