@@ -48,6 +48,18 @@ pub(crate) struct GatewayServiceInstallRequest {
     pub(crate) start_now: bool,
 }
 
+struct GatewayServiceInstallContext<'a> {
+    service_root: &'a Path,
+    service_name: &'a str,
+    daemon_bin: &'a Path,
+    state_root: &'a Path,
+    config_path: Option<&'a Path>,
+    working_directory: &'a Path,
+    stdout_log_path: &'a Path,
+    stderr_log_path: &'a Path,
+    start_now: bool,
+}
+
 pub(crate) fn service_metadata_path(state_root: &Path) -> PathBuf {
     state_root.join("service").join("gateway-service.json")
 }
@@ -97,43 +109,24 @@ pub(crate) fn install_gateway_service(
         .map(|value| value.canonicalize().unwrap_or_else(|_| value.to_path_buf()));
     let working_directory =
         daemon_bin.parent().map(Path::to_path_buf).unwrap_or_else(|| request.state_root.clone());
+    let install_context = GatewayServiceInstallContext {
+        service_root: service_root.as_path(),
+        service_name: service_name.as_str(),
+        daemon_bin: daemon_bin.as_path(),
+        state_root: request.state_root.as_path(),
+        config_path: config_path.as_deref(),
+        working_directory: working_directory.as_path(),
+        stdout_log_path: stdout_log_path.as_path(),
+        stderr_log_path: stderr_log_path.as_path(),
+        start_now: request.start_now,
+    };
 
     #[cfg(windows)]
-    let (wrapper_path, definition_path, manager) = install_windows_task(
-        service_root.as_path(),
-        service_name.as_str(),
-        daemon_bin.as_path(),
-        request.state_root.as_path(),
-        config_path.as_deref(),
-        working_directory.as_path(),
-        stdout_log_path.as_path(),
-        stderr_log_path.as_path(),
-        request.start_now,
-    )?;
+    let (wrapper_path, definition_path, manager) = install_windows_task(&install_context)?;
     #[cfg(target_os = "macos")]
-    let (wrapper_path, definition_path, manager) = install_launch_agent(
-        service_root.as_path(),
-        service_name.as_str(),
-        daemon_bin.as_path(),
-        request.state_root.as_path(),
-        config_path.as_deref(),
-        working_directory.as_path(),
-        stdout_log_path.as_path(),
-        stderr_log_path.as_path(),
-        request.start_now,
-    )?;
+    let (wrapper_path, definition_path, manager) = install_launch_agent(&install_context)?;
     #[cfg(all(unix, not(target_os = "macos")))]
-    let (wrapper_path, definition_path, manager) = install_systemd_user_unit(
-        service_root.as_path(),
-        service_name.as_str(),
-        daemon_bin.as_path(),
-        request.state_root.as_path(),
-        config_path.as_deref(),
-        working_directory.as_path(),
-        stdout_log_path.as_path(),
-        stderr_log_path.as_path(),
-        request.start_now,
-    )?;
+    let (wrapper_path, definition_path, manager) = install_systemd_user_unit(&install_context)?;
 
     let metadata = GatewayServiceMetadata {
         schema_version: SERVICE_METADATA_SCHEMA_VERSION,
@@ -271,36 +264,28 @@ fn query_service_status_from_metadata(
 
 #[cfg(windows)]
 fn install_windows_task(
-    service_root: &Path,
-    service_name: &str,
-    daemon_bin: &Path,
-    state_root: &Path,
-    config_path: Option<&Path>,
-    working_directory: &Path,
-    stdout_log_path: &Path,
-    stderr_log_path: &Path,
-    start_now: bool,
+    context: &GatewayServiceInstallContext<'_>,
 ) -> Result<(PathBuf, PathBuf, String)> {
-    let wrapper_path = service_root.join("gateway-service.cmd");
+    let wrapper_path = context.service_root.join("gateway-service.cmd");
     let mut body = String::from("@echo off\r\nsetlocal\r\n");
-    if let Some(config_path) = config_path {
+    if let Some(config_path) = context.config_path {
         body.push_str(format!("set PALYRA_CONFIG={}\r\n", config_path.display()).as_str());
     }
-    body.push_str(format!("set PALYRA_STATE_ROOT={}\r\n", state_root.display()).as_str());
-    body.push_str(format!("cd /d \"{}\"\r\n", working_directory.display()).as_str());
+    body.push_str(format!("set PALYRA_STATE_ROOT={}\r\n", context.state_root.display()).as_str());
+    body.push_str(format!("cd /d \"{}\"\r\n", context.working_directory.display()).as_str());
     body.push_str(
         format!(
             "\"{}\" >> \"{}\" 2>> \"{}\"\r\n",
-            daemon_bin.display(),
-            stdout_log_path.display(),
-            stderr_log_path.display()
+            context.daemon_bin.display(),
+            context.stdout_log_path.display(),
+            context.stderr_log_path.display()
         )
         .as_str(),
     );
     fs::write(wrapper_path.as_path(), body.as_bytes()).with_context(|| {
         format!("failed to write Windows gateway wrapper {}", wrapper_path.display())
     })?;
-    let task_name = format!("\\{}", service_name);
+    let task_name = format!("\\{}", context.service_name);
     let query = Command::new("schtasks")
         .args(["/Query", "/TN", task_name.as_str()])
         .status()
@@ -330,7 +315,7 @@ fn install_windows_task(
             status.code().map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_owned())
         );
     }
-    if start_now {
+    if context.start_now {
         let _ = Command::new("schtasks").args(["/Run", "/TN", task_name.as_str()]).status();
     }
     Ok((wrapper_path.clone(), wrapper_path, "schtasks".to_owned()))
@@ -425,30 +410,22 @@ fn service_manager_uninstall(metadata: &GatewayServiceMetadata) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn install_launch_agent(
-    service_root: &Path,
-    service_name: &str,
-    daemon_bin: &Path,
-    state_root: &Path,
-    config_path: Option<&Path>,
-    working_directory: &Path,
-    stdout_log_path: &Path,
-    stderr_log_path: &Path,
-    start_now: bool,
+    context: &GatewayServiceInstallContext<'_>,
 ) -> Result<(PathBuf, PathBuf, String)> {
-    let wrapper_path = service_root.join("gateway-service.sh");
+    let wrapper_path = context.service_root.join("gateway-service.sh");
     write_unix_wrapper(
         wrapper_path.as_path(),
-        daemon_bin,
-        state_root,
-        config_path,
-        working_directory,
-        stdout_log_path,
-        stderr_log_path,
+        context.daemon_bin,
+        context.state_root,
+        context.config_path,
+        context.working_directory,
+        context.stdout_log_path,
+        context.stderr_log_path,
     )?;
     let agent_dir = home_dir()?.join("Library").join("LaunchAgents");
     fs::create_dir_all(agent_dir.as_path())
         .with_context(|| format!("failed to create {}", agent_dir.display()))?;
-    let definition_path = agent_dir.join(format!("{service_name}.plist"));
+    let definition_path = agent_dir.join(format!("{}.plist", context.service_name));
     let plist = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -473,10 +450,11 @@ fn install_launch_agent(
 </dict>
 </plist>
 "#,
+        service_name = context.service_name,
         wrapper = wrapper_path.display(),
-        working_directory = working_directory.display(),
-        stdout_log_path = stdout_log_path.display(),
-        stderr_log_path = stderr_log_path.display(),
+        working_directory = context.working_directory.display(),
+        stdout_log_path = context.stdout_log_path.display(),
+        stderr_log_path = context.stderr_log_path.display(),
     );
     fs::write(definition_path.as_path(), plist.as_bytes())
         .with_context(|| format!("failed to write {}", definition_path.display()))?;
@@ -489,10 +467,10 @@ fn install_launch_agent(
         &["bootstrap", domain.as_str(), definition_path.display().to_string().as_str()],
         "failed to bootstrap launch agent",
     )?;
-    if start_now {
+    if context.start_now {
         run_command(
             "launchctl",
-            &["kickstart", "-k", format!("{domain}/{service_name}").as_str()],
+            &["kickstart", "-k", format!("{domain}/{}", context.service_name).as_str()],
             "failed to start launch agent",
         )?;
     }
@@ -584,30 +562,22 @@ fn service_manager_uninstall(metadata: &GatewayServiceMetadata) -> Result<()> {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn install_systemd_user_unit(
-    service_root: &Path,
-    service_name: &str,
-    daemon_bin: &Path,
-    state_root: &Path,
-    config_path: Option<&Path>,
-    working_directory: &Path,
-    stdout_log_path: &Path,
-    stderr_log_path: &Path,
-    start_now: bool,
+    context: &GatewayServiceInstallContext<'_>,
 ) -> Result<(PathBuf, PathBuf, String)> {
-    let wrapper_path = service_root.join("gateway-service.sh");
+    let wrapper_path = context.service_root.join("gateway-service.sh");
     write_unix_wrapper(
         wrapper_path.as_path(),
-        daemon_bin,
-        state_root,
-        config_path,
-        working_directory,
-        stdout_log_path,
-        stderr_log_path,
+        context.daemon_bin,
+        context.state_root,
+        context.config_path,
+        context.working_directory,
+        context.stdout_log_path,
+        context.stderr_log_path,
     )?;
     let unit_dir = home_dir()?.join(".config").join("systemd").join("user");
     fs::create_dir_all(unit_dir.as_path())
         .with_context(|| format!("failed to create {}", unit_dir.display()))?;
-    let definition_path = unit_dir.join(format!("{service_name}.service"));
+    let definition_path = unit_dir.join(format!("{}.service", context.service_name));
     let unit = format!(
         r#"[Unit]
 Description=Palyra gateway daemon
@@ -624,7 +594,7 @@ RestartSec=5
 [Install]
 WantedBy=default.target
 "#,
-        working_directory.display(),
+        context.working_directory.display(),
         wrapper_path.display(),
     );
     fs::write(definition_path.as_path(), unit.as_bytes())
@@ -632,13 +602,13 @@ WantedBy=default.target
     run_command("systemctl", &["--user", "daemon-reload"], "failed to reload systemd user units")?;
     run_command(
         "systemctl",
-        &["--user", "enable", service_name],
+        &["--user", "enable", context.service_name],
         "failed to enable gateway service",
     )?;
-    if start_now {
+    if context.start_now {
         run_command(
             "systemctl",
-            &["--user", "restart", service_name],
+            &["--user", "restart", context.service_name],
             "failed to start gateway service",
         )?;
     }
