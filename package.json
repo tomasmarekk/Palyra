@@ -40,6 +40,7 @@
     "vite-plus": "0.1.12"
   },
   "overrides": {
+    "picomatch": "4.0.4",
     "vite": "npm:@voidzero-dev/vite-plus-core@0.1.12",
     "vitest": "npm:@voidzero-dev/vite-plus-test@0.1.12"
   }
