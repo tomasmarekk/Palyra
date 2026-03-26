@@ -6,20 +6,17 @@ pub(crate) mod connectors {
 
 use anyhow::{bail, Context, Result};
 use palyra_connector_discord::{
-    canonical_discord_channel_identity, canonical_discord_sender_identity, discord_token_vault_ref,
+    canonical_discord_channel_identity, canonical_discord_sender_identity,
     normalize_discord_account_id, normalize_discord_target,
 };
-use palyra_vault::VaultRef;
 use serde_json::{json, Value};
-use std::{
-    fs,
-    io::{IsTerminal, Read, Write},
-};
+use std::fs;
+use std::io::{IsTerminal, Read, Write};
 
 use crate::{
     args::{ChannelProviderArg, ChannelResolveEntityArg, ChannelsCommand},
     client::{channels as channels_client, message},
-    normalize_optional_text_arg, normalize_required_text_arg, open_cli_vault, output,
+    normalize_optional_text_arg, normalize_required_text_arg, output,
     output::channels as channels_output,
     prompt_secret_value,
 };
@@ -729,24 +726,23 @@ fn run_channel_lifecycle_disable(
             let normalized_account_id = normalize_discord_account_id(account_id.as_str())
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?;
             let connector_id = connectors::discord::connector_id(normalized_account_id.as_str())?;
-            let response = post_connector_action(
-                connector_id.as_str(),
-                "/enabled",
-                Some(json!({ "enabled": false })),
+            let response = post_discord_account_action(
+                normalized_account_id.as_str(),
+                action,
+                json!({ "keep_credential": keep_credential }),
                 url,
                 token,
                 principal,
                 device_id,
                 channel,
-                "failed to call channels disable endpoint",
+                if action == "logout" {
+                    "failed to call discord account logout endpoint"
+                } else {
+                    "failed to call discord account remove endpoint"
+                },
             )?;
-            let credential_deleted = if keep_credential {
-                false
-            } else {
-                delete_vault_secret(
-                    discord_token_vault_ref(normalized_account_id.as_str()).as_str(),
-                )?
-            };
+            let credential_deleted =
+                response.get("credential_deleted").and_then(Value::as_bool).unwrap_or(false);
             emit_channel_lifecycle_disable(
                 action,
                 provider,
@@ -1033,9 +1029,12 @@ fn emit_channel_lifecycle_disable(
             keep_credential,
             credential_deleted
         );
-        for line in channels_output::render_status_lines(
-            payload.pointer("/response").unwrap_or(&Value::Null),
-        ) {
+        let status_payload = payload
+            .pointer("/response/status")
+            .or_else(|| payload.pointer("/response/status_before_remove"))
+            .or_else(|| payload.pointer("/response"))
+            .unwrap_or(&Value::Null);
+        for line in channels_output::render_status_lines(status_payload) {
             println!("{line}");
         }
     }
@@ -1171,15 +1170,6 @@ fn normalize_generic_account_id(raw: &str, label: &str) -> Result<String> {
         bail!("{label} contains unsupported characters");
     }
     Ok(value.to_ascii_lowercase())
-}
-
-fn delete_vault_secret(vault_ref_raw: &str) -> Result<bool> {
-    let vault_ref = VaultRef::parse(vault_ref_raw)
-        .map_err(|error| anyhow::anyhow!("invalid vault ref '{}': {}", vault_ref_raw, error))?;
-    let vault = open_cli_vault().context("failed to initialize vault runtime")?;
-    vault.delete_secret(&vault_ref.scope, vault_ref.key.as_str()).map_err(|error| {
-        anyhow::anyhow!("failed to delete vault secret '{}': {}", vault_ref_raw, error)
-    })
 }
 
 fn unsupported_provider_action(
@@ -1372,6 +1362,34 @@ pub(crate) fn post_connector_action(
         client.post(endpoint)
     };
     channels_client::send_request(request, request_context, error_context)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn post_discord_account_action(
+    account_id: &str,
+    action: &str,
+    payload: Value,
+    url: Option<String>,
+    token: Option<String>,
+    principal: String,
+    device_id: String,
+    channel: Option<String>,
+    error_context: &'static str,
+) -> Result<Value> {
+    let request_context =
+        channels_client::resolve_request_context(url, token, principal, device_id, channel)?;
+    let endpoint = format!(
+        "{}/admin/v1/channels/discord/accounts/{}/{}",
+        request_context.base_url.trim_end_matches('/'),
+        account_id,
+        action
+    );
+    let client = channels_client::build_client()?;
+    channels_client::send_request(
+        client.post(endpoint).json(&payload),
+        request_context,
+        error_context,
+    )
 }
 
 fn emit_logs(connector_id: &str, response: Value, json_output: bool) -> Result<()> {

@@ -206,6 +206,11 @@ impl ChannelPlatform {
         self.supervisor.set_enabled(connector_id, enabled).map_err(ChannelPlatformError::from)
     }
 
+    pub fn remove_connector(&self, connector_id: &str) -> Result<(), ChannelPlatformError> {
+        self.ensure_operator_visible(connector_id)?;
+        self.supervisor.remove_connector(connector_id).map_err(ChannelPlatformError::from)
+    }
+
     pub fn logs(
         &self,
         connector_id: &str,

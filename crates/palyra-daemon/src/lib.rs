@@ -414,6 +414,12 @@ struct ChannelEnabledRequest {
     enabled: bool,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct DiscordAccountLifecycleRequest {
+    #[serde(default)]
+    keep_credential: Option<bool>,
+}
+
 #[derive(Debug, Deserialize)]
 struct ChannelTestRequest {
     text: String,

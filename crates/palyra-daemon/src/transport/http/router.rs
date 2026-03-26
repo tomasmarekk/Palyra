@@ -96,6 +96,14 @@ pub(crate) fn build_router(state: AppState) -> Router {
             post(admin::channels::connectors::discord::admin_discord_onboarding_apply_handler),
         )
         .route(
+            "/admin/v1/channels/discord/accounts/{account_id}/logout",
+            post(admin::channels::connectors::discord::admin_discord_account_logout_handler),
+        )
+        .route(
+            "/admin/v1/channels/discord/accounts/{account_id}/remove",
+            post(admin::channels::connectors::discord::admin_discord_account_remove_handler),
+        )
+        .route(
             "/admin/v1/skills/{skill_id}/quarantine",
             post(admin::skills::admin_skill_quarantine_handler),
         )
@@ -346,6 +354,14 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route(
             "/console/v1/channels/discord/onboarding/apply",
             post(console::channels::connectors::discord::console_discord_onboarding_apply_handler),
+        )
+        .route(
+            "/console/v1/channels/discord/accounts/{account_id}/logout",
+            post(console::channels::connectors::discord::console_discord_account_logout_handler),
+        )
+        .route(
+            "/console/v1/channels/discord/accounts/{account_id}/remove",
+            post(console::channels::connectors::discord::console_discord_account_remove_handler),
         )
         .route("/console/v1/skills", get(console::skills::console_skills_list_handler))
         .route("/console/v1/skills/install", post(console::skills::console_skills_install_handler))

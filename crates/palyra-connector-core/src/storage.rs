@@ -265,6 +265,26 @@ impl ConnectorStore {
         Ok(())
     }
 
+    pub fn delete_instance(&self, connector_id: &str) -> Result<(), ConnectorStoreError> {
+        let deleted = self.with_transaction(|transaction| {
+            transaction.execute(
+                "DELETE FROM inbound_dedupe WHERE connector_id = ?1",
+                params![connector_id],
+            )?;
+            transaction
+                .execute("DELETE FROM outbox WHERE connector_id = ?1", params![connector_id])?;
+            let changed = transaction.execute(
+                "DELETE FROM connector_instances WHERE connector_id = ?1",
+                params![connector_id],
+            )?;
+            Ok(changed)
+        })?;
+        if deleted == 0 {
+            return Err(ConnectorStoreError::NotFound(connector_id.to_owned()));
+        }
+        Ok(())
+    }
+
     pub fn set_instance_runtime_state(
         &self,
         connector_id: &str,
@@ -1431,6 +1451,39 @@ mod tests {
         assert!(
             ops_outcome.created,
             "same envelope id should still enqueue for a different connector"
+        );
+    }
+
+    #[test]
+    fn delete_instance_removes_runtime_state_but_keeps_audit_records() {
+        let (_tempdir, store) = open_store();
+        store.upsert_instance(&sample_spec(), 1_000).expect("instance should be created");
+        store
+            .record_inbound_dedupe_if_new("echo:default", "env-delete", 1_000, 10_000)
+            .expect("dedupe write should succeed");
+        store
+            .record_event("echo:default", "connector.test", "info", "test event", None, 1_000)
+            .expect("event should be recorded");
+        let request = sample_outbound("env-delete");
+        store.enqueue_outbox_if_absent(&request, 5, 1_000).expect("outbox enqueue should succeed");
+
+        store.delete_instance("echo:default").expect("delete should succeed");
+
+        assert!(
+            store.get_instance("echo:default").expect("instance lookup should succeed").is_none(),
+            "connector instance should be removed"
+        );
+        assert!(
+            store
+                .load_due_outbox(1_000, 10, Some("echo:default"), false)
+                .expect("outbox lookup should succeed")
+                .is_empty(),
+            "outbox records should be removed with the connector"
+        );
+        assert_eq!(
+            store.list_events("echo:default", 10).expect("event lookup should succeed").len(),
+            1,
+            "audit events should remain after connector removal"
         );
     }
 

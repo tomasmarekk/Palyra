@@ -258,6 +258,14 @@ impl ConnectorSupervisor {
         self.status(connector_id)
     }
 
+    pub fn remove_connector(&self, connector_id: &str) -> Result<(), ConnectorSupervisorError> {
+        let Some(_instance) = self.store.get_instance(connector_id)? else {
+            return Err(ConnectorSupervisorError::NotFound(connector_id.to_owned()));
+        };
+        self.store.delete_instance(connector_id)?;
+        Ok(())
+    }
+
     pub fn status(
         &self,
         connector_id: &str,
