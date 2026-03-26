@@ -71,15 +71,11 @@ pub(crate) async fn admin_discord_account_logout_handler(
                 "failed to parse discord token vault ref: {error}"
             )))
         })?;
-        state
-            .vault
-            .delete_secret(&parsed_ref.scope, parsed_ref.key.as_str())
-            .map(|deleted| deleted)
-            .map_err(|error| {
-                runtime_status_response(tonic::Status::internal(format!(
-                    "failed to delete discord token from vault: {error}"
-                )))
-            })?
+        state.vault.delete_secret(&parsed_ref.scope, parsed_ref.key.as_str()).map_err(|error| {
+            runtime_status_response(tonic::Status::internal(format!(
+                "failed to delete discord token from vault: {error}"
+            )))
+        })?
     };
     Ok(Json(json!({
         "action": "logout",
@@ -124,15 +120,11 @@ pub(crate) async fn admin_discord_account_remove_handler(
                 "failed to parse discord token vault ref: {error}"
             )))
         })?;
-        state
-            .vault
-            .delete_secret(&parsed_ref.scope, parsed_ref.key.as_str())
-            .map(|deleted| deleted)
-            .map_err(|error| {
-                runtime_status_response(tonic::Status::internal(format!(
-                    "failed to delete discord token from vault: {error}"
-                )))
-            })?
+        state.vault.delete_secret(&parsed_ref.scope, parsed_ref.key.as_str()).map_err(|error| {
+            runtime_status_response(tonic::Status::internal(format!(
+                "failed to delete discord token from vault: {error}"
+            )))
+        })?
     };
     let config_path = remove_discord_onboarding_config(normalized_account_id.as_str())?;
     state

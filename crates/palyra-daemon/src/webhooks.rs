@@ -270,7 +270,7 @@ impl WebhookRegistry {
         let record = WebhookIntegrationRecord {
             integration_id: normalized.integration_id.clone(),
             provider: normalized.provider,
-            display_name: normalized.display_name.unwrap_or_else(|| normalized.integration_id),
+            display_name: normalized.display_name.unwrap_or(normalized.integration_id),
             secret_vault_ref: normalized.secret_vault_ref,
             allowed_events: normalized.allowed_events,
             allowed_sources: normalized.allowed_sources,
