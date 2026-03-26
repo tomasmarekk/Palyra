@@ -45,6 +45,9 @@ run_fast_profile() {
   echo "Checking runtime artifact hygiene before local validation..."
   bash "$ROOT_DIR/scripts/check-runtime-artifacts.sh"
 
+  echo "Checking local-only tracked paths..."
+  bash "$ROOT_DIR/scripts/check-local-only-tracked-files.sh"
+
   echo "Checking desktop glib patch governance..."
   bash "$ROOT_DIR/scripts/check-desktop-glib-patch.sh"
 
@@ -61,6 +64,9 @@ run_full_profile() {
 
   echo "Checking runtime artifact hygiene before local validation..."
   bash "$ROOT_DIR/scripts/check-runtime-artifacts.sh"
+
+  echo "Checking local-only tracked paths..."
+  bash "$ROOT_DIR/scripts/check-local-only-tracked-files.sh"
 
   echo "Checking desktop glib patch governance..."
   bash "$ROOT_DIR/scripts/check-desktop-glib-patch.sh"
