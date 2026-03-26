@@ -797,7 +797,7 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    use palyra_vault::{VaultConfig, VaultScope};
+    use palyra_vault::{BackendPreference, VaultConfig, VaultScope};
 
     #[test]
     fn registry_persists_and_deletes_integrations() -> Result<(), Box<dyn std::error::Error>> {
@@ -810,6 +810,7 @@ mod tests {
         let vault = Vault::open_with_config(VaultConfig {
             root: Some(state_root.join("vault")),
             identity_store_root: Some(identity_root),
+            backend_preference: BackendPreference::EncryptedFile,
             ..VaultConfig::default()
         })?;
         vault.put_secret(&VaultScope::Global, "github_repo_a", b"super-secret")?;
