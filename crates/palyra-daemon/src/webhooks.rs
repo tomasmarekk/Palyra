@@ -104,7 +104,7 @@ pub struct WebhookDiagnosticsSnapshot {
 
 #[derive(Debug)]
 pub struct WebhookRegistry {
-    registry_path: PathBuf,
+    registry_path: RegistryPath,
     state: Mutex<RegistryDocument>,
 }
 
@@ -118,6 +118,21 @@ struct RegistryDocument {
 impl Default for RegistryDocument {
     fn default() -> Self {
         Self { version: REGISTRY_VERSION, webhooks: Vec::new() }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RegistryPath {
+    path: PathBuf,
+}
+
+impl RegistryPath {
+    fn as_path(&self) -> &Path {
+        self.path.as_path()
+    }
+
+    fn to_path_buf(&self) -> PathBuf {
+        self.path.clone()
     }
 }
 
@@ -160,13 +175,13 @@ pub enum WebhookRegistryError {
 impl WebhookRegistry {
     pub fn open(state_root: &Path) -> Result<Self, WebhookRegistryError> {
         let registry_path = resolve_registry_path(state_root)?;
-        let document = if registry_path.exists() {
-            let raw = fs::read_to_string(&registry_path).map_err(|source| {
-                WebhookRegistryError::ReadRegistry { path: registry_path.clone(), source }
+        let document = if registry_path.as_path().exists() {
+            let raw = fs::read_to_string(registry_path.as_path()).map_err(|source| {
+                WebhookRegistryError::ReadRegistry { path: registry_path.to_path_buf(), source }
             })?;
             let parsed = toml::from_str::<RegistryDocument>(&raw).map_err(|source| {
                 WebhookRegistryError::ParseRegistry {
-                    path: registry_path.clone(),
+                    path: registry_path.to_path_buf(),
                     source: Box::new(source),
                 }
             })?;
@@ -188,16 +203,20 @@ impl WebhookRegistry {
         filter: WebhookIntegrationListFilter,
         vault: &Vault,
     ) -> Result<Vec<control_plane::WebhookIntegrationView>, WebhookRegistryError> {
-        let normalized_provider = filter.provider.map(normalize_provider).transpose()?;
+        let normalized_provider = match filter.provider.as_deref() {
+            Some(provider) => Some(normalize_provider(provider)?),
+            None => None,
+        };
+        let enabled_filter = filter.enabled;
         let state = self.state.lock().map_err(|_| WebhookRegistryError::LockPoisoned)?;
-        let mut views = Vec::new();
+        let mut views = Vec::with_capacity(state.webhooks.len().min(MAX_WEBHOOK_COUNT));
         for record in state.webhooks.iter().take(MAX_WEBHOOK_COUNT) {
             let provider_matches = normalized_provider
                 .as_ref()
                 .map(|provider| provider == &record.provider)
                 .unwrap_or(true);
             let enabled_matches =
-                filter.enabled.map(|enabled| enabled == record.enabled).unwrap_or(true);
+                enabled_filter.map(|enabled| enabled == record.enabled).unwrap_or(true);
             if !provider_matches || !enabled_matches {
                 continue;
             }
@@ -630,7 +649,7 @@ fn normalize_identifier(
     raw: impl AsRef<str>,
     field: &'static str,
 ) -> Result<String, WebhookRegistryError> {
-    let normalized = raw.as_ref().trim().to_ascii_lowercase();
+    let normalized = raw.as_ref().trim();
     if normalized.is_empty() {
         return Err(WebhookRegistryError::InvalidField {
             field,
@@ -643,6 +662,7 @@ fn normalize_identifier(
             message: format!("value must be at most {MAX_IDENTIFIER_BYTES} bytes"),
         });
     }
+    let normalized = normalized.to_ascii_lowercase();
     if !normalized
         .chars()
         .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '-' | '_' | '.'))
@@ -657,7 +677,7 @@ fn normalize_identifier(
 }
 
 fn normalize_provider(raw: impl AsRef<str>) -> Result<String, WebhookRegistryError> {
-    let normalized = raw.as_ref().trim().to_ascii_lowercase();
+    let normalized = raw.as_ref().trim();
     if normalized.is_empty() {
         return Err(WebhookRegistryError::InvalidField {
             field: "provider",
@@ -670,6 +690,7 @@ fn normalize_provider(raw: impl AsRef<str>) -> Result<String, WebhookRegistryErr
             message: format!("provider must be at most {MAX_PROVIDER_BYTES} bytes"),
         });
     }
+    let normalized = normalized.to_ascii_lowercase();
     if !normalized
         .chars()
         .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '-' | '_' | '.'))
@@ -731,9 +752,10 @@ fn normalize_allowed_values(
 }
 
 fn persist_registry(
-    registry_path: &Path,
+    registry_path: &RegistryPath,
     document: &RegistryDocument,
 ) -> Result<(), WebhookRegistryError> {
+    let registry_path = registry_path.as_path();
     if let Some(parent) = registry_path.parent() {
         fs::create_dir_all(parent).map_err(|source| WebhookRegistryError::WriteRegistry {
             path: parent.to_path_buf(),
@@ -758,7 +780,7 @@ fn persist_registry(
     Ok(())
 }
 
-fn resolve_registry_path(state_root: &Path) -> Result<PathBuf, WebhookRegistryError> {
+fn resolve_registry_path(state_root: &Path) -> Result<RegistryPath, WebhookRegistryError> {
     ensure_owner_only_dir(state_root).map_err(|source| WebhookRegistryError::WriteRegistry {
         path: state_root.to_path_buf(),
         source: std::io::Error::other(source.to_string()),
@@ -778,7 +800,7 @@ fn resolve_registry_path(state_root: &Path) -> Result<PathBuf, WebhookRegistryEr
             source: std::io::Error::other("webhook registry path escapes the state root"),
         });
     }
-    Ok(registry_path)
+    Ok(RegistryPath { path: registry_path })
 }
 
 fn validate_registry_document(document: &RegistryDocument) -> Result<(), WebhookRegistryError> {
