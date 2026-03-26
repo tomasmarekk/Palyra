@@ -123,9 +123,7 @@ pub(crate) async fn run_agents_async(
                         binding.agent_id,
                         binding.principal,
                         text_or_none(binding.channel.as_str()),
-                        redacted_optional_identifier_for_output(
-                            binding.session_id.as_ref().map(|value| value.ulid.as_str()),
-                        ),
+                        redacted_identifier_presence(binding.session_id.as_ref()),
                         binding.updated_at_unix_ms
                     );
                 }
@@ -180,9 +178,7 @@ pub(crate) async fn run_agents_async(
                     binding.agent_id,
                     binding.principal,
                     text_or_none(binding.channel.as_str()),
-                    redacted_optional_identifier_for_output(
-                        binding.session_id.as_ref().map(|value| value.ulid.as_str()),
-                    ),
+                    redacted_identifier_presence(binding.session_id.as_ref()),
                     response.created
                 );
             }
@@ -407,9 +403,17 @@ fn agent_binding_to_json(binding: &gateway_v1::AgentBinding) -> Value {
         "agent_id": binding.agent_id,
         "principal": binding.principal,
         "channel": empty_to_none(binding.channel.clone()),
-        "session_id": redacted_identifier_json_value(binding.session_id.as_ref().map(|value| value.ulid.as_str())),
+        "session_id": if binding.session_id.is_some() { Value::String(REDACTED.to_owned()) } else { Value::Null },
         "updated_at_unix_ms": binding.updated_at_unix_ms,
     })
+}
+
+fn redacted_identifier_presence(value: Option<&common_v1::CanonicalId>) -> &'static str {
+    if value.is_some() {
+        REDACTED
+    } else {
+        "none"
+    }
 }
 
 fn text_or_none(value: &str) -> &str {

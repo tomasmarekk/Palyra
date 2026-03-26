@@ -731,18 +731,11 @@ impl App {
                             .unwrap_or_default();
                         PickerItem {
                             id: session_id.clone(),
-                            title: if session.session_label.trim().is_empty() {
-                                text_or_none(session.session_key.as_str()).to_owned()
-                            } else {
-                                session.session_label.clone()
-                            },
+                            title: display_session_identity(&session),
                             detail: format!(
-                                "{} | key={} | updated={}",
-                                redacted_identifier_for_output(session_id.as_str()),
-                                redacted_optional_text_for_output(Some(
-                                    session.session_key.as_str()
-                                )),
-                                session.updated_at_unix_ms
+                                "updated={} | archived={}",
+                                session.updated_at_unix_ms,
+                                session.archived_at_unix_ms > 0
                             ),
                         }
                     })
@@ -1328,28 +1321,16 @@ fn entry_style(kind: &EntryKind) -> Style {
 
 fn display_session_identity(session: &gateway_v1::SessionSummary) -> String {
     if !session.session_label.trim().is_empty() {
-        return format!(
-            "{} ({})",
-            session.session_label,
-            shorten_id(
-                session.session_id.as_ref().map(|value| value.ulid.as_str()).unwrap_or("unknown"),
-            )
-        );
+        return "labeled session".to_owned();
     }
     if !session.session_key.trim().is_empty() {
-        return format!(
-            "{} ({})",
-            session.session_key,
-            shorten_id(
-                session.session_id.as_ref().map(|value| value.ulid.as_str()).unwrap_or("unknown"),
-            )
-        );
+        return "keyed session".to_owned();
     }
-    session
-        .session_id
-        .as_ref()
-        .map(|value| shorten_id(value.ulid.as_str()))
-        .unwrap_or_else(|| "unknown".to_owned())
+    if session.session_id.is_some() {
+        "session".to_owned()
+    } else {
+        "unknown session".to_owned()
+    }
 }
 
 fn shorten_id(value: &str) -> String {
@@ -1367,14 +1348,6 @@ fn parse_toggle(value: Option<&str>, current: bool) -> Result<bool> {
 
 fn looks_like_canonical_ulid(value: &str) -> bool {
     value.len() == 26 && value.chars().all(|ch| ch.is_ascii_alphanumeric())
-}
-
-fn text_or_none(value: &str) -> &str {
-    if value.trim().is_empty() {
-        "none"
-    } else {
-        value
-    }
 }
 
 fn agent_resolution_source_label(raw: i32) -> &'static str {
@@ -1449,7 +1422,6 @@ fn format_shell_result(result: &ShellResult) -> String {
 mod tests {
     use super::{display_session_identity, parse_toggle};
     use crate::proto::palyra::{common::v1 as common_v1, gateway::v1 as gateway_v1};
-    use crate::redacted_identifier_for_output;
 
     #[test]
     fn parse_toggle_accepts_explicit_values() {
@@ -1471,9 +1443,6 @@ mod tests {
             archived_at_unix_ms: 0,
         };
         let display = display_session_identity(&summary);
-        assert!(display.contains("Ops Triage"));
-        assert!(
-            display.contains(redacted_identifier_for_output("01ARZ3NDEKTSV4RRFFQ69G5FAW").as_str())
-        );
+        assert_eq!(display, "labeled session");
     }
 }

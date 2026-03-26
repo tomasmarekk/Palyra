@@ -2556,8 +2556,8 @@ fn prompt_tool_approval_decision(
     let tool_label = if tool_name.is_empty() { "unknown" } else { tool_name };
     eprintln!(
         "agent.approval.required tool={} summary={}",
-        tool_label,
-        if summary.is_empty() { "<none>" } else { summary }
+        redacted_presence_for_output(tool_label != "unknown"),
+        redacted_presence_for_output(!summary.is_empty())
     );
     eprint!("agent.approval.prompt allow_once [y/N]: ");
     std::io::stderr().flush().context("stderr flush failed")?;
@@ -2697,14 +2697,13 @@ fn build_run_stream_request(input: &AgentRunInput) -> Result<common_v1::RunStrea
 }
 
 fn emit_agent_event_text(event: &common_v1::RunStreamEvent) -> Result<()> {
-    let run_id =
-        redacted_optional_identifier_for_output(event.run_id.as_ref().map(|id| id.ulid.as_str()));
+    let run_id = redacted_presence_for_output(event.run_id.is_some());
     match event.body.as_ref() {
         Some(common_v1::run_stream_event::Body::ModelToken(token)) => {
             println!(
                 "agent.token run_id={} token={} final={}",
                 run_id,
-                redacted_text_for_output(token.token.as_str()),
+                redacted_presence_for_output(!token.token.trim().is_empty()),
                 token.is_final
             );
         }
@@ -2713,17 +2712,15 @@ fn emit_agent_event_text(event: &common_v1::RunStreamEvent) -> Result<()> {
                 "agent.status run_id={} kind={} message={}",
                 run_id,
                 stream_status_kind_to_text(status.kind),
-                redacted_text_for_output(status.message.as_str())
+                redacted_presence_for_output(!status.message.trim().is_empty())
             );
         }
         Some(common_v1::run_stream_event::Body::ToolProposal(proposal)) => {
             println!(
                 "agent.tool.proposal run_id={} proposal_id={} tool_name={} approval_required={}",
                 run_id,
-                redacted_optional_identifier_for_output(
-                    proposal.proposal_id.as_ref().map(|value| value.ulid.as_str()),
-                ),
-                redacted_text_for_output(proposal.tool_name.as_str()),
+                redacted_presence_for_output(proposal.proposal_id.is_some()),
+                redacted_presence_for_output(!proposal.tool_name.trim().is_empty()),
                 proposal.approval_required
             );
         }
@@ -2731,13 +2728,9 @@ fn emit_agent_event_text(event: &common_v1::RunStreamEvent) -> Result<()> {
             println!(
                 "agent.tool.decision run_id={} proposal_id={} kind={} reason={} approval_required={} policy_enforced={}",
                 run_id,
-                decision
-                    .proposal_id
-                    .as_ref()
-                    .map(|value| redacted_identifier_for_output(value.ulid.as_str()))
-                    .unwrap_or_else(|| "none".to_owned()),
+                redacted_presence_for_output(decision.proposal_id.is_some()),
                 tool_decision_kind_to_text(decision.kind),
-                redacted_text_for_output(decision.reason.as_str()),
+                redacted_presence_for_output(!decision.reason.trim().is_empty()),
                 decision.approval_required,
                 decision.policy_enforced
             );
@@ -2746,77 +2739,49 @@ fn emit_agent_event_text(event: &common_v1::RunStreamEvent) -> Result<()> {
             println!(
                 "agent.tool.approval.request run_id={} proposal_id={} approval_id={} tool_name={} approval_required={} summary=\"{}\"",
                 run_id,
-                approval_request
-                    .proposal_id
-                    .as_ref()
-                    .map(|value| redacted_identifier_for_output(value.ulid.as_str()))
-                    .unwrap_or_else(|| "none".to_owned()),
-                approval_request
-                    .approval_id
-                    .as_ref()
-                    .map(|value| redacted_identifier_for_output(value.ulid.as_str()))
-                    .unwrap_or_else(|| "none".to_owned()),
-                redacted_text_for_output(approval_request.tool_name.as_str()),
+                redacted_presence_for_output(approval_request.proposal_id.is_some()),
+                redacted_presence_for_output(approval_request.approval_id.is_some()),
+                redacted_presence_for_output(!approval_request.tool_name.trim().is_empty()),
                 approval_request.approval_required,
-                redacted_text_for_output(approval_request.request_summary.as_str())
+                redacted_presence_for_output(!approval_request.request_summary.trim().is_empty())
             );
         }
         Some(common_v1::run_stream_event::Body::ToolApprovalResponse(approval_response)) => {
             println!(
                 "agent.tool.approval.response run_id={} proposal_id={} approval_id={} approved={} scope={} ttl_ms={} reason={}",
                 run_id,
-                approval_response
-                    .proposal_id
-                    .as_ref()
-                    .map(|value| redacted_identifier_for_output(value.ulid.as_str()))
-                    .unwrap_or_else(|| "none".to_owned()),
-                approval_response
-                    .approval_id
-                    .as_ref()
-                    .map(|value| redacted_identifier_for_output(value.ulid.as_str()))
-                    .unwrap_or_else(|| "none".to_owned()),
+                redacted_presence_for_output(approval_response.proposal_id.is_some()),
+                redacted_presence_for_output(approval_response.approval_id.is_some()),
                 approval_response.approved,
                 approval_scope_to_text(approval_response.decision_scope),
                 approval_response.decision_scope_ttl_ms,
-                redacted_text_for_output(approval_response.reason.as_str())
+                redacted_presence_for_output(!approval_response.reason.trim().is_empty())
             );
         }
         Some(common_v1::run_stream_event::Body::ToolResult(result)) => {
             println!(
                 "agent.tool.result run_id={} proposal_id={} success={} error={}",
                 run_id,
-                result
-                    .proposal_id
-                    .as_ref()
-                    .map(|value| redacted_identifier_for_output(value.ulid.as_str()))
-                    .unwrap_or_else(|| "none".to_owned()),
+                redacted_presence_for_output(result.proposal_id.is_some()),
                 result.success,
-                redacted_text_for_output(result.error.as_str())
+                redacted_presence_for_output(!result.error.trim().is_empty())
             );
         }
         Some(common_v1::run_stream_event::Body::ToolAttestation(attestation)) => {
             println!(
                 "agent.tool.attestation run_id={} proposal_id={} attestation_id={} timed_out={} executor={}",
                 run_id,
-                attestation
-                    .proposal_id
-                    .as_ref()
-                    .map(|value| redacted_identifier_for_output(value.ulid.as_str()))
-                    .unwrap_or_else(|| "none".to_owned()),
-                attestation
-                    .attestation_id
-                    .as_ref()
-                    .map(|value| redacted_identifier_for_output(value.ulid.as_str()))
-                    .unwrap_or_else(|| "none".to_owned()),
+                redacted_presence_for_output(attestation.proposal_id.is_some()),
+                redacted_presence_for_output(attestation.attestation_id.is_some()),
                 attestation.timed_out,
-                redacted_text_for_output(attestation.executor.as_str())
+                redacted_presence_for_output(!attestation.executor.trim().is_empty())
             );
         }
         Some(common_v1::run_stream_event::Body::A2uiUpdate(update)) => {
             println!(
                 "agent.a2ui.update run_id={} surface={} version={}",
                 run_id,
-                redacted_text_for_output(update.surface.as_str()),
+                redacted_presence_for_output(!update.surface.trim().is_empty()),
                 update.v
             );
         }
@@ -2824,13 +2789,9 @@ fn emit_agent_event_text(event: &common_v1::RunStreamEvent) -> Result<()> {
             println!(
                 "agent.journal.event run_id={} event_id={} kind={} actor={}",
                 run_id,
-                journal_event
-                    .event_id
-                    .as_ref()
-                    .map(|value| redacted_identifier_for_output(value.ulid.as_str()))
-                    .unwrap_or_else(|| "none".to_owned()),
+                redacted_presence_for_output(journal_event.event_id.is_some()),
                 journal_event.kind,
-                journal_event.actor
+                redacted_presence_for_output(journal_event.actor != 0)
             );
         }
         None => {
@@ -2841,114 +2802,112 @@ fn emit_agent_event_text(event: &common_v1::RunStreamEvent) -> Result<()> {
 }
 
 fn emit_acp_event_ndjson(event: &common_v1::RunStreamEvent) -> Result<()> {
-    let run_id =
-        event.run_id.as_ref().map(|id| id.ulid.clone()).unwrap_or_else(|| "unknown".to_owned());
+    let run_id = redacted_presence_for_output(event.run_id.is_some());
     let payload = match event.body.as_ref() {
         Some(common_v1::run_stream_event::Body::ModelToken(token)) => json!({
             "type": "model.token",
             "run_id": run_id,
-            "token": token.token,
+            "token": redacted_presence_json_value(!token.token.trim().is_empty()),
             "is_final": token.is_final,
         }),
         Some(common_v1::run_stream_event::Body::Status(status)) => json!({
             "type": "run.status",
             "run_id": run_id,
             "kind": stream_status_kind_to_text(status.kind),
-            "message": status.message,
+            "message": redacted_presence_json_value(!status.message.trim().is_empty()),
         }),
         Some(common_v1::run_stream_event::Body::ToolProposal(proposal)) => json!({
             "type": "tool.proposal",
             "run_id": run_id,
-            "proposal_id": proposal.proposal_id.as_ref().map(|value| value.ulid.clone()),
-            "tool_name": proposal.tool_name,
+            "proposal_id": redacted_presence_json_value(proposal.proposal_id.is_some()),
+            "tool_name": redacted_presence_json_value(!proposal.tool_name.trim().is_empty()),
             "approval_required": proposal.approval_required,
-            "input_json": proposal.input_json,
+            "input_json": redacted_presence_json_value(!proposal.input_json.is_empty()),
         }),
         Some(common_v1::run_stream_event::Body::ToolDecision(decision)) => json!({
             "type": "tool.decision",
             "run_id": run_id,
-            "proposal_id": decision.proposal_id.as_ref().map(|value| value.ulid.clone()),
+            "proposal_id": redacted_presence_json_value(decision.proposal_id.is_some()),
             "kind": tool_decision_kind_to_text(decision.kind),
-            "reason": decision.reason,
+            "reason": redacted_presence_json_value(!decision.reason.trim().is_empty()),
             "approval_required": decision.approval_required,
             "policy_enforced": decision.policy_enforced,
         }),
         Some(common_v1::run_stream_event::Body::ToolApprovalRequest(approval_request)) => json!({
             "type": "tool.approval.request",
             "run_id": run_id,
-            "proposal_id": approval_request.proposal_id.as_ref().map(|value| value.ulid.clone()),
-            "approval_id": approval_request.approval_id.as_ref().map(|value| value.ulid.clone()),
-            "tool_name": approval_request.tool_name,
+            "proposal_id": redacted_presence_json_value(approval_request.proposal_id.is_some()),
+            "approval_id": redacted_presence_json_value(approval_request.approval_id.is_some()),
+            "tool_name": redacted_presence_json_value(!approval_request.tool_name.trim().is_empty()),
             "approval_required": approval_request.approval_required,
-            "request_summary": approval_request.request_summary,
+            "request_summary": redacted_presence_json_value(
+                !approval_request.request_summary.trim().is_empty()
+            ),
             "prompt": approval_request.prompt.as_ref().map(|prompt| json!({
-                "title": prompt.title,
+                "title": redacted_presence_json_value(!prompt.title.trim().is_empty()),
                 "risk_level": approval_risk_to_text(prompt.risk_level),
-                "subject_id": prompt.subject_id,
-                "summary": prompt.summary,
-                "policy_explanation": prompt.policy_explanation,
+                "subject_id": redacted_presence_json_value(!prompt.subject_id.trim().is_empty()),
+                "summary": redacted_presence_json_value(!prompt.summary.trim().is_empty()),
+                "policy_explanation": redacted_presence_json_value(
+                    !prompt.policy_explanation.trim().is_empty()
+                ),
                 "timeout_seconds": prompt.timeout_seconds,
                 "options": prompt.options.iter().map(|option| json!({
-                    "option_id": option.option_id,
-                    "label": option.label,
-                    "description": option.description,
+                    "option_id": redacted_presence_json_value(!option.option_id.trim().is_empty()),
+                    "label": redacted_presence_json_value(!option.label.trim().is_empty()),
+                    "description": redacted_presence_json_value(!option.description.trim().is_empty()),
                     "default_selected": option.default_selected,
                     "decision_scope": approval_scope_to_text(option.decision_scope),
                     "timebox_ttl_ms": option.timebox_ttl_ms,
                 })).collect::<Vec<_>>(),
-                    "details_json": if prompt.details_json.is_empty() {
-                        json!({})
-                    } else {
-                        serde_json::from_slice::<serde_json::Value>(prompt.details_json.as_slice())
-                            .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(prompt.details_json.as_slice()).to_string() }))
-                    },
+                    "details_json": redacted_presence_json_value(!prompt.details_json.is_empty()),
             })),
-            "input_json": approval_request.input_json,
+            "input_json": redacted_presence_json_value(!approval_request.input_json.is_empty()),
         }),
         Some(common_v1::run_stream_event::Body::ToolApprovalResponse(approval_response)) => json!({
             "type": "tool.approval.response",
             "run_id": run_id,
-            "proposal_id": approval_response.proposal_id.as_ref().map(|value| value.ulid.clone()),
-            "approval_id": approval_response.approval_id.as_ref().map(|value| value.ulid.clone()),
+            "proposal_id": redacted_presence_json_value(approval_response.proposal_id.is_some()),
+            "approval_id": redacted_presence_json_value(approval_response.approval_id.is_some()),
             "approved": approval_response.approved,
-            "reason": approval_response.reason,
+            "reason": redacted_presence_json_value(!approval_response.reason.trim().is_empty()),
             "decision_scope": approval_scope_to_text(approval_response.decision_scope),
             "decision_scope_ttl_ms": approval_response.decision_scope_ttl_ms,
         }),
         Some(common_v1::run_stream_event::Body::ToolResult(result)) => json!({
             "type": "tool.result",
             "run_id": run_id,
-            "proposal_id": result.proposal_id.as_ref().map(|value| value.ulid.clone()),
+            "proposal_id": redacted_presence_json_value(result.proposal_id.is_some()),
             "success": result.success,
-            "output_json": result.output_json,
-            "error": result.error,
+            "output_json": redacted_presence_json_value(!result.output_json.is_empty()),
+            "error": redacted_presence_json_value(!result.error.trim().is_empty()),
         }),
         Some(common_v1::run_stream_event::Body::ToolAttestation(attestation)) => json!({
             "type": "tool.attestation",
             "run_id": run_id,
-            "proposal_id": attestation.proposal_id.as_ref().map(|value| value.ulid.clone()),
-            "attestation_id": attestation.attestation_id.as_ref().map(|value| value.ulid.clone()),
-            "execution_sha256": attestation.execution_sha256,
+            "proposal_id": redacted_presence_json_value(attestation.proposal_id.is_some()),
+            "attestation_id": redacted_presence_json_value(attestation.attestation_id.is_some()),
+            "execution_sha256": redacted_presence_json_value(!attestation.execution_sha256.trim().is_empty()),
             "executed_at_unix_ms": attestation.executed_at_unix_ms,
             "timed_out": attestation.timed_out,
-            "executor": attestation.executor,
+            "executor": redacted_presence_json_value(!attestation.executor.trim().is_empty()),
         }),
         Some(common_v1::run_stream_event::Body::A2uiUpdate(update)) => json!({
             "type": "a2ui.update",
             "run_id": run_id,
-            "surface": update.surface,
+            "surface": redacted_presence_json_value(!update.surface.trim().is_empty()),
             "version": update.v,
-            "patch_json": update.patch_json,
+            "patch_json": redacted_presence_json_value(!update.patch_json.is_empty()),
         }),
         Some(common_v1::run_stream_event::Body::JournalEvent(journal_event)) => json!({
             "type": "journal.event",
             "run_id": run_id,
-            "event_id": journal_event.event_id.as_ref().map(|value| value.ulid.clone()),
+            "event_id": redacted_presence_json_value(journal_event.event_id.is_some()),
             "kind": journal_event.kind,
-            "actor": journal_event.actor,
+            "actor": redacted_presence_json_value(journal_event.actor != 0),
             "timestamp_unix_ms": journal_event.timestamp_unix_ms,
-            "payload_json": journal_event.payload_json,
-            "hash": journal_event.hash,
+            "payload_json": redacted_presence_json_value(!journal_event.payload_json.is_empty()),
+            "hash": redacted_presence_json_value(!journal_event.hash.trim().is_empty()),
         }),
         None => json!({
             "type": "unknown",
@@ -4098,48 +4057,32 @@ fn sha256_hex(payload: &[u8]) -> String {
     output
 }
 
-pub(crate) fn redacted_identifier_for_output(value: &str) -> String {
-    if value.trim().is_empty() {
-        return "none".to_owned();
+pub(crate) fn redacted_presence_for_output(present: bool) -> String {
+    if present {
+        REDACTED.to_owned()
+    } else {
+        "none".to_owned()
     }
-    let fingerprint = sha256_hex(value.as_bytes());
-    format!("{REDACTED}#{}", &fingerprint[..12])
+}
+
+pub(crate) fn redacted_presence_json_value(present: bool) -> Value {
+    if present {
+        Value::String(REDACTED.to_owned())
+    } else {
+        Value::Null
+    }
+}
+
+pub(crate) fn redacted_identifier_for_output(value: &str) -> String {
+    redacted_presence_for_output(!value.trim().is_empty())
 }
 
 pub(crate) fn redacted_optional_identifier_for_output(value: Option<&str>) -> String {
-    value
-        .filter(|candidate| !candidate.trim().is_empty())
-        .map(redacted_identifier_for_output)
-        .unwrap_or_else(|| "none".to_owned())
-}
-
-pub(crate) fn redacted_text_for_output(value: &str) -> String {
-    if value.trim().is_empty() {
-        return "none".to_owned();
-    }
-    format!("{REDACTED}({} chars)", value.chars().count())
-}
-
-pub(crate) fn redacted_optional_text_for_output(value: Option<&str>) -> String {
-    value
-        .filter(|candidate| !candidate.trim().is_empty())
-        .map(redacted_text_for_output)
-        .unwrap_or_else(|| "none".to_owned())
+    redacted_presence_for_output(value.is_some_and(|candidate| !candidate.trim().is_empty()))
 }
 
 pub(crate) fn redacted_identifier_json_value(value: Option<&str>) -> Value {
-    match value.filter(|candidate| !candidate.trim().is_empty()) {
-        Some(value) => Value::String(redacted_identifier_for_output(value)),
-        None => Value::Null,
-    }
-}
-
-pub(crate) fn redacted_text_json_value(value: &str) -> Value {
-    if value.trim().is_empty() {
-        Value::Null
-    } else {
-        Value::String(redacted_text_for_output(value))
-    }
+    redacted_presence_json_value(value.is_some_and(|candidate| !candidate.trim().is_empty()))
 }
 
 fn parse_semver_triplet(raw: &str) -> Option<(u32, u32, u32)> {

@@ -35,7 +35,9 @@ pub(crate) async fn run_sessions_async(
                     "{}",
                     serde_json::to_string_pretty(&json!({
                         "sessions": response.sessions.iter().map(session_to_json).collect::<Vec<_>>(),
-                        "next_after_session_key": empty_to_none(response.next_after_session_key),
+                        "next_after_session_key": redacted_text_json_or_null(
+                            response.next_after_session_key.as_str()
+                        ),
                         "include_archived": include_archived,
                     }))?
                 );
@@ -53,19 +55,17 @@ pub(crate) async fn run_sessions_async(
                 println!(
                     "sessions.list count={} next_after={} include_archived={}",
                     response.sessions.len(),
-                    text_or_none(response.next_after_session_key.as_str()),
+                    redacted_text_or_none(!response.next_after_session_key.trim().is_empty()),
                     include_archived
                 );
                 for session in &response.sessions {
                     println!(
                         "session id={} key={} label={} updated_at_unix_ms={} last_run_id={} archived_at_unix_ms={}",
                         session_id_text(session),
-                        redacted_text_or_none(session.session_key.as_str()),
-                        redacted_text_or_none(session.session_label.as_str()),
+                        redacted_text_or_none(!session.session_key.trim().is_empty()),
+                        redacted_text_or_none(!session.session_label.trim().is_empty()),
                         session.updated_at_unix_ms,
-                        redacted_optional_identifier_for_output(
-                            session.last_run_id.as_ref().map(|value| value.ulid.as_str()),
-                        ),
+                        redacted_presence_for_output(session.last_run_id.is_some()),
                         optional_unix_ms_text(session.archived_at_unix_ms)
                     );
                 }
@@ -96,13 +96,11 @@ pub(crate) async fn run_sessions_async(
                 println!(
                     "sessions.show id={} key={} label={} created_at_unix_ms={} updated_at_unix_ms={} last_run_id={} archived_at_unix_ms={}",
                     session_id_text(&session),
-                    redacted_text_or_none(session.session_key.as_str()),
-                    redacted_text_or_none(session.session_label.as_str()),
+                    redacted_text_or_none(!session.session_key.trim().is_empty()),
+                    redacted_text_or_none(!session.session_label.trim().is_empty()),
                     session.created_at_unix_ms,
                     session.updated_at_unix_ms,
-                    redacted_optional_identifier_for_output(
-                        session.last_run_id.as_ref().map(|value| value.ulid.as_str()),
-                    ),
+                    redacted_presence_for_output(session.last_run_id.is_some()),
                     optional_unix_ms_text(session.archived_at_unix_ms)
                 );
             }
@@ -139,8 +137,8 @@ pub(crate) async fn run_sessions_async(
                 println!(
                     "sessions.resolve id={} key={} label={} created={} reset_applied={} archived_at_unix_ms={}",
                     session_id_text(&session),
-                    redacted_text_or_none(session.session_key.as_str()),
-                    redacted_text_or_none(session.session_label.as_str()),
+                    redacted_text_or_none(!session.session_key.trim().is_empty()),
+                    redacted_text_or_none(!session.session_label.trim().is_empty()),
                     response.created,
                     response.reset_applied,
                     optional_unix_ms_text(session.archived_at_unix_ms)
@@ -175,7 +173,7 @@ pub(crate) async fn run_sessions_async(
                 println!(
                     "sessions.rename id={} label={} updated_at_unix_ms={} archived_at_unix_ms={}",
                     session_id_text(&session),
-                    redacted_text_or_none(session.session_label.as_str()),
+                    redacted_text_or_none(!session.session_label.trim().is_empty()),
                     session.updated_at_unix_ms,
                     optional_unix_ms_text(session.archived_at_unix_ms)
                 );
@@ -243,7 +241,7 @@ pub(crate) async fn run_sessions_async(
                     println!(
                         "sessions.cleanup.dry_run id={} key={} archived_at_unix_ms={} would_archive={}",
                         session_id_text(&session),
-                        redacted_text_or_none(session.session_key.as_str()),
+                        redacted_text_or_none(!session.session_key.trim().is_empty()),
                         optional_unix_ms_text(session.archived_at_unix_ms),
                         session.archived_at_unix_ms == 0
                     );
@@ -264,7 +262,9 @@ pub(crate) async fn run_sessions_async(
                             "session": session_to_json(&session),
                             "cleaned": response.cleaned,
                             "newly_archived": response.newly_archived,
-                            "previous_session_key": empty_to_none(response.previous_session_key),
+                            "previous_session_key": redacted_text_json_or_null(
+                                &response.previous_session_key
+                            ),
                             "run_count": response.run_count,
                         }))?
                     );
@@ -274,7 +274,7 @@ pub(crate) async fn run_sessions_async(
                         session_id_text(&session),
                         response.cleaned,
                         response.newly_archived,
-                        redacted_text_or_none(response.previous_session_key.as_str()),
+                        redacted_text_or_none(!response.previous_session_key.trim().is_empty()),
                         optional_unix_ms_text(session.archived_at_unix_ms),
                         response.run_count
                     );
@@ -288,19 +288,19 @@ pub(crate) async fn run_sessions_async(
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&json!({
-                        "run_id": response.run_id.map(|value| value.ulid),
+                        "run_id": redacted_identifier_json_value(
+                            response.run_id.as_ref().map(|_| "present")
+                        ),
                         "cancel_requested": response.cancel_requested,
-                        "reason": empty_to_none(response.reason),
+                        "reason": redacted_text_json_or_null(response.reason.as_str()),
                     }))?
                 );
             } else {
                 println!(
                     "sessions.abort run_id={} cancel_requested={} reason={}",
-                    redacted_optional_identifier_for_output(
-                        response.run_id.as_ref().map(|value| value.ulid.as_str()),
-                    ),
+                    redacted_presence_for_output(response.run_id.is_some()),
                     response.cancel_requested,
-                    redacted_text_or_none(response.reason.as_str())
+                    redacted_text_or_none(!response.reason.trim().is_empty())
                 );
             }
         }
@@ -333,36 +333,50 @@ fn build_resolve_session_request(
 }
 
 fn session_id_text(session: &gateway_v1::SessionSummary) -> String {
-    redacted_optional_identifier_for_output(
-        session.session_id.as_ref().map(|value| value.ulid.as_str()),
-    )
+    if session.session_id.is_some() {
+        REDACTED.to_owned()
+    } else {
+        "none".to_owned()
+    }
 }
 
 fn session_to_json(session: &gateway_v1::SessionSummary) -> Value {
     json!({
-        "session_id": redacted_identifier_json_value(session.session_id.as_ref().map(|value| value.ulid.as_str())),
-        "session_key": redacted_text_json_value(session.session_key.as_str()),
-        "session_label": redacted_text_json_value(session.session_label.as_str()),
+        "session_id": if session.session_id.is_some() { Value::String(REDACTED.to_owned()) } else { Value::Null },
+        "session_key": redacted_presence_json_value(!session.session_key.trim().is_empty()),
+        "session_label": redacted_presence_json_value(!session.session_label.trim().is_empty()),
         "created_at_unix_ms": session.created_at_unix_ms,
         "updated_at_unix_ms": session.updated_at_unix_ms,
-        "last_run_id": redacted_identifier_json_value(session.last_run_id.as_ref().map(|value| value.ulid.as_str())),
+        "last_run_id": if session.last_run_id.is_some() { Value::String(REDACTED.to_owned()) } else { Value::Null },
         "archived_at_unix_ms": empty_unix_ms(session.archived_at_unix_ms),
     })
 }
 
-fn text_or_none(value: &str) -> &str {
-    if value.trim().is_empty() {
-        "none"
+fn redacted_text_or_none(present: bool) -> String {
+    redacted_presence_for_output(present)
+}
+
+fn redacted_presence_for_output(present: bool) -> String {
+    if present {
+        REDACTED.to_owned()
     } else {
-        value
+        "none".to_owned()
     }
 }
 
-fn redacted_text_or_none(value: &str) -> String {
-    if value.trim().is_empty() {
-        "none".to_owned()
+fn redacted_presence_json_value(present: bool) -> Value {
+    if present {
+        Value::String(REDACTED.to_owned())
     } else {
-        redacted_text_for_output(value)
+        Value::Null
+    }
+}
+
+fn redacted_text_json_or_null(value: &str) -> Value {
+    if value.trim().is_empty() {
+        Value::Null
+    } else {
+        Value::String(REDACTED.to_owned())
     }
 }
 

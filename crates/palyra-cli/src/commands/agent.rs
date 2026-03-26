@@ -224,12 +224,10 @@ async fn run_agent_interactive_async(
             .await?;
             eprintln!(
                 "agent.interactive.session key={} label={} updated_at_unix_ms={} last_run_id={}",
-                redacted_optional_text_for_output(Some(resolved_session.session_key.as_str())),
-                redacted_optional_text_for_output(Some(resolved_session.session_label.as_str())),
+                redacted_text_presence(resolved_session.session_key.as_str()),
+                redacted_text_presence(resolved_session.session_label.as_str()),
                 resolved_session.updated_at_unix_ms,
-                redacted_optional_identifier_for_output(
-                    resolved_session.last_run_id.as_ref().map(|value| value.ulid.as_str()),
-                )
+                redacted_identifier_presence(resolved_session.last_run_id.as_ref())
             );
             std::io::stderr().flush().context("stderr flush failed")?;
             continue;
@@ -261,15 +259,9 @@ async fn run_agent_interactive_async(
                 runtime.abort_run(run_id.clone(), Some("interactive_abort".to_owned())).await?;
             eprintln!(
                 "agent.interactive.abort run_id={} cancel_requested={} reason={}",
-                redacted_optional_identifier_for_output(
-                    response
-                        .run_id
-                        .as_ref()
-                        .map(|value| value.ulid.as_str())
-                        .or(Some(run_id.as_str())),
-                ),
+                if response.run_id.is_some() || !run_id.is_empty() { REDACTED } else { "none" },
                 response.cancel_requested,
-                redacted_optional_text_for_output(Some(response.reason.as_str()))
+                redacted_text_presence(response.reason.as_str())
             );
             std::io::stderr().flush().context("stderr flush failed")?;
             continue;
@@ -299,6 +291,22 @@ async fn run_agent_interactive_async(
         execute_agent_stream(connection.clone(), request, ndjson)?;
     }
     Ok(())
+}
+
+fn redacted_identifier_presence(value: Option<&common_v1::CanonicalId>) -> &'static str {
+    if value.is_some() {
+        REDACTED
+    } else {
+        "none"
+    }
+}
+
+fn redacted_text_presence(value: &str) -> &'static str {
+    if value.trim().is_empty() {
+        "none"
+    } else {
+        REDACTED
+    }
 }
 
 async fn ensure_interactive_session(
