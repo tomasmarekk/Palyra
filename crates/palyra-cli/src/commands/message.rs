@@ -51,6 +51,7 @@ async fn run_message_async(command: MessageCommand, runtime: OperatorRuntime) ->
             confirm,
             auto_reaction,
             thread_id,
+            reply_to_message_id,
             url,
             token,
             principal,
@@ -68,6 +69,7 @@ async fn run_message_async(command: MessageCommand, runtime: OperatorRuntime) ->
                     confirm,
                     auto_reaction: auto_reaction.and_then(normalize_optional_text_arg),
                     thread_id: thread_id.and_then(normalize_optional_text_arg),
+                    reply_to_message_id: reply_to_message_id.and_then(normalize_optional_text_arg),
                     url,
                     token,
                     principal,
@@ -84,6 +86,7 @@ async fn run_message_async(command: MessageCommand, runtime: OperatorRuntime) ->
             thread_id,
             confirm,
             auto_reaction,
+            reply_to_message_id,
             url,
             token,
             principal,
@@ -102,6 +105,7 @@ async fn run_message_async(command: MessageCommand, runtime: OperatorRuntime) ->
                     confirm,
                     auto_reaction: auto_reaction.and_then(normalize_optional_text_arg),
                     thread_id: Some(thread_id),
+                    reply_to_message_id: reply_to_message_id.and_then(normalize_optional_text_arg),
                     url,
                     token,
                     principal,
@@ -111,28 +115,129 @@ async fn run_message_async(command: MessageCommand, runtime: OperatorRuntime) ->
                 .await?;
             emit_send("thread", connector_id.as_str(), response, output::preferred_json(json))?;
         }
-        MessageCommand::Read { connector_id, message_id, json } => unsupported_message_action(
-            "read",
-            connector_id.as_str(),
-            Some(message_id.as_str()),
+        MessageCommand::Read {
+            connector_id,
+            message_id,
+            url,
+            token,
+            principal,
+            device_id,
+            channel,
+            json,
+        } => unsupported_message_action(
+            message::MessageActionSupportQuery {
+                action: message::MESSAGE_ACTION_READ.to_owned(),
+                connector_id,
+                detail: Some(message_id),
+                url,
+                token,
+                principal,
+                device_id,
+                channel,
+            },
             json,
         )?,
-        MessageCommand::Search { connector_id, query, json } => {
-            unsupported_message_action("search", connector_id.as_str(), Some(query.as_str()), json)?
-        }
-        MessageCommand::Edit { connector_id, message_id, text, json } => {
+        MessageCommand::Search {
+            connector_id,
+            query,
+            url,
+            token,
+            principal,
+            device_id,
+            channel,
+            json,
+        } => unsupported_message_action(
+            message::MessageActionSupportQuery {
+                action: message::MESSAGE_ACTION_SEARCH.to_owned(),
+                connector_id,
+                detail: Some(query),
+                url,
+                token,
+                principal,
+                device_id,
+                channel,
+            },
+            json,
+        )?,
+        MessageCommand::Edit {
+            connector_id,
+            message_id,
+            text,
+            url,
+            token,
+            principal,
+            device_id,
+            channel,
+            json,
+        } => {
             let detail = format!("message_id={message_id} text={text}");
-            unsupported_message_action("edit", connector_id.as_str(), Some(detail.as_str()), json)?
+            unsupported_message_action(
+                message::MessageActionSupportQuery {
+                    action: message::MESSAGE_ACTION_EDIT.to_owned(),
+                    connector_id,
+                    detail: Some(detail),
+                    url,
+                    token,
+                    principal,
+                    device_id,
+                    channel,
+                },
+                json,
+            )?
         }
-        MessageCommand::Delete { connector_id, message_id, json } => unsupported_message_action(
-            "delete",
-            connector_id.as_str(),
-            Some(message_id.as_str()),
+        MessageCommand::Delete {
+            connector_id,
+            message_id,
+            url,
+            token,
+            principal,
+            device_id,
+            channel,
+            json,
+        } => unsupported_message_action(
+            message::MessageActionSupportQuery {
+                action: message::MESSAGE_ACTION_DELETE.to_owned(),
+                connector_id,
+                detail: Some(message_id),
+                url,
+                token,
+                principal,
+                device_id,
+                channel,
+            },
             json,
         )?,
-        MessageCommand::React { connector_id, message_id, emoji, remove, json } => {
+        MessageCommand::React {
+            connector_id,
+            message_id,
+            emoji,
+            remove,
+            url,
+            token,
+            principal,
+            device_id,
+            channel,
+            json,
+        } => {
             let detail = format!("message_id={message_id} emoji={emoji} remove={remove}");
-            unsupported_message_action("react", connector_id.as_str(), Some(detail.as_str()), json)?
+            let action = if remove {
+                message::MESSAGE_ACTION_REACT_REMOVE
+            } else {
+                message::MESSAGE_ACTION_REACT_ADD
+            };
+            unsupported_message_action(
+                message::MessageActionSupportQuery {
+                    action: action.to_owned(),
+                    connector_id,
+                    detail: Some(detail),
+                    url,
+                    token,
+                    principal,
+                    device_id,
+                    channel,
+                },
+                json,
+            )?
         }
     }
 
@@ -181,24 +286,46 @@ fn emit_send(action: &str, connector_id: &str, response: Value, json_output: boo
     } else {
         let dispatch = response.get("dispatch").unwrap_or(&response);
         println!(
-            "message.{} connector_id={} target={} delivered={} retried={} dead_lettered={}",
+            "message.{} connector_id={} target={} delivered={} retried={} dead_lettered={} native_message_id={} thread_id={} reply_to={}",
             action,
             connector_id,
             dispatch.get("target").and_then(Value::as_str).unwrap_or("unknown"),
             dispatch.get("delivered").and_then(Value::as_u64).unwrap_or(0),
             dispatch.get("retried").and_then(Value::as_u64).unwrap_or(0),
-            dispatch.get("dead_lettered").and_then(Value::as_u64).unwrap_or(0)
+            dispatch.get("dead_lettered").and_then(Value::as_u64).unwrap_or(0),
+            dispatch
+                .get("native_message_id")
+                .and_then(Value::as_str)
+                .unwrap_or("none"),
+            dispatch.get("thread_id").and_then(Value::as_str).unwrap_or("none"),
+            dispatch
+                .get("in_reply_to_message_id")
+                .and_then(Value::as_str)
+                .unwrap_or("none")
         );
     }
     Ok(())
 }
 
 fn unsupported_message_action(
-    action: &str,
-    connector_id: &str,
-    detail: Option<&str>,
+    query: message::MessageActionSupportQuery,
     json_output: bool,
 ) -> Result<()> {
-    let _ = json_output;
-    message::unsupported_message_action(action, connector_id, detail)
+    let payload = message::unsupported_message_action(query)?;
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload)
+                .context("failed to encode unsupported message capability payload as JSON")?
+        );
+    } else {
+        println!(
+            "message.unsupported connector_id={} action={} supported={} reason={}",
+            payload.get("connector_id").and_then(Value::as_str).unwrap_or("unknown"),
+            payload.get("action").and_then(Value::as_str).unwrap_or("unknown"),
+            payload.get("supported").and_then(Value::as_bool).unwrap_or(false),
+            payload.get("reason").and_then(Value::as_str).unwrap_or("unknown"),
+        );
+    }
+    Ok(())
 }

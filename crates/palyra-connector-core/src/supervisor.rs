@@ -11,9 +11,9 @@ use thiserror::Error;
 
 use crate::{
     protocol::{
-        ConnectorAvailability, ConnectorInstanceSpec, ConnectorKind, ConnectorLiveness,
-        ConnectorReadiness, ConnectorStatusSnapshot, DeliveryOutcome, InboundMessageEvent,
-        OutboundMessageRequest, RetryClass, RouteInboundResult,
+        ConnectorAvailability, ConnectorCapabilitySet, ConnectorInstanceSpec, ConnectorKind,
+        ConnectorLiveness, ConnectorReadiness, ConnectorStatusSnapshot, DeliveryOutcome,
+        InboundMessageEvent, OutboundMessageRequest, RetryClass, RouteInboundResult,
     },
     storage::{
         ConnectorQueueSnapshot, ConnectorStore, ConnectorStoreError, DeadLetterRecord,
@@ -138,6 +138,10 @@ pub trait ConnectorAdapter: Send + Sync {
     fn kind(&self) -> ConnectorKind;
 
     fn availability(&self) -> ConnectorAvailability;
+
+    fn capabilities(&self) -> ConnectorCapabilitySet {
+        ConnectorCapabilitySet::for_connector(self.kind(), self.availability())
+    }
 
     fn split_outbound(
         &self,
@@ -266,6 +270,7 @@ impl ConnectorSupervisor {
             connector_id: instance.connector_id,
             kind: instance.kind,
             availability: self.connector_availability(instance.kind),
+            capabilities: self.connector_capabilities(instance.kind),
             principal: instance.principal,
             enabled: instance.enabled,
             readiness: instance.readiness,
@@ -288,6 +293,7 @@ impl ConnectorSupervisor {
                 connector_id: instance.connector_id,
                 kind: instance.kind,
                 availability: self.connector_availability(instance.kind),
+                capabilities: self.connector_capabilities(instance.kind),
                 principal: instance.principal,
                 enabled: instance.enabled,
                 readiness: instance.readiness,
@@ -338,6 +344,12 @@ impl ConnectorSupervisor {
             .get(&kind)
             .map(|adapter| adapter.availability())
             .unwrap_or_else(|| kind.default_availability())
+    }
+
+    fn connector_capabilities(&self, kind: ConnectorKind) -> ConnectorCapabilitySet {
+        self.adapters.get(&kind).map(|adapter| adapter.capabilities()).unwrap_or_else(|| {
+            ConnectorCapabilitySet::for_connector(kind, kind.default_availability())
+        })
     }
 
     fn build_runtime_metrics(

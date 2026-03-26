@@ -68,6 +68,7 @@ pub struct ChannelDiscordTestSendRequest {
     pub confirm: bool,
     pub auto_reaction: Option<String>,
     pub thread_id: Option<String>,
+    pub reply_to_message_id: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -79,6 +80,12 @@ pub struct ChannelDiscordTestSendOutcome {
     pub delivered: usize,
     pub retried: usize,
     pub dead_lettered: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_message_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_reply_to_message_id: Option<String>,
 }
 
 pub struct ChannelPlatform {
@@ -362,13 +369,19 @@ impl ChannelPlatform {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned);
+        let reply_to_message_id = request
+            .reply_to_message_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
 
         let outbound = OutboundMessageRequest {
             envelope_id: Ulid::new().to_string(),
             connector_id: connector_id.to_owned(),
             conversation_id: target.clone(),
             reply_thread_id: thread_id,
-            in_reply_to_message_id: None,
+            in_reply_to_message_id: reply_to_message_id,
             text: text.to_owned(),
             broadcast: false,
             auto_ack_text: None,
@@ -387,6 +400,10 @@ impl ChannelPlatform {
                 self.supervisor_config().immediate_drain_batch_size,
             )
             .await?;
+        let native_message_id = (drain.delivered > 0)
+            .then(|| self.find_native_message_id(connector_id, outbound.envelope_id.as_str()))
+            .transpose()?
+            .flatten();
         Ok(ChannelDiscordTestSendOutcome {
             envelope_id: outbound.envelope_id,
             connector_id: connector_id.to_owned(),
@@ -395,6 +412,9 @@ impl ChannelPlatform {
             delivered: drain.delivered,
             retried: drain.retried,
             dead_lettered: drain.dead_lettered,
+            native_message_id,
+            thread_id: outbound.reply_thread_id,
+            in_reply_to_message_id: outbound.in_reply_to_message_id,
         })
     }
 
@@ -449,6 +469,30 @@ impl ChannelPlatform {
 
     fn supervisor_config(&self) -> ConnectorSupervisorConfig {
         ConnectorSupervisorConfig::default()
+    }
+
+    fn find_native_message_id(
+        &self,
+        connector_id: &str,
+        envelope_id: &str,
+    ) -> Result<Option<String>, ChannelPlatformError> {
+        let logs =
+            self.supervisor.list_logs(connector_id, 32).map_err(ChannelPlatformError::from)?;
+        Ok(logs.into_iter().find_map(|event| {
+            if event.event_type != "outbox.delivered" {
+                return None;
+            }
+            let details = event.details?;
+            let matches_envelope = details
+                .get("envelope_id")
+                .and_then(Value::as_str)
+                .map(|value| value == envelope_id)
+                .unwrap_or(false);
+            if !matches_envelope {
+                return None;
+            }
+            details.get("native_message_id").and_then(Value::as_str).map(ToOwned::to_owned)
+        }))
     }
 
     fn ensure_operator_visible(

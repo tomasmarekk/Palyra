@@ -723,6 +723,8 @@ fn parse_message_send_with_thread_id() {
         "--confirm",
         "--thread-id",
         "thread-123",
+        "--reply-to-message-id",
+        "message-456",
         "--json",
     ]);
     assert_eq!(
@@ -735,11 +737,50 @@ fn parse_message_send_with_thread_id() {
                 confirm: true,
                 auto_reaction: None,
                 thread_id: Some("thread-123".to_owned()),
+                reply_to_message_id: Some("message-456".to_owned()),
                 url: None,
                 token: None,
                 principal: "user:local".to_owned(),
                 device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
                 channel: None,
+                json: true,
+            }
+        }
+    );
+}
+
+#[test]
+fn parse_message_read_with_connection_overrides() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "message",
+        "read",
+        "discord:default",
+        "--message-id",
+        "msg-123",
+        "--url",
+        "http://127.0.0.1:7142",
+        "--token",
+        "secret-token",
+        "--principal",
+        "user:test",
+        "--device-id",
+        "01TESTDEVICE0000000000000000",
+        "--channel",
+        "discord",
+        "--json",
+    ]);
+    assert_eq!(
+        parsed.command,
+        Command::Message {
+            command: MessageCommand::Read {
+                connector_id: "discord:default".to_owned(),
+                message_id: "msg-123".to_owned(),
+                url: Some("http://127.0.0.1:7142".to_owned()),
+                token: Some("secret-token".to_owned()),
+                principal: "user:test".to_owned(),
+                device_id: "01TESTDEVICE0000000000000000".to_owned(),
+                channel: Some("discord".to_owned()),
                 json: true,
             }
         }

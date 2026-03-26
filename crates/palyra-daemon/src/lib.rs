@@ -442,6 +442,8 @@ struct ChannelTestSendRequest {
     auto_reaction: Option<String>,
     #[serde(default)]
     thread_id: Option<String>,
+    #[serde(default)]
+    reply_to_message_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

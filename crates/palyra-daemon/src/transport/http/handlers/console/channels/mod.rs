@@ -255,6 +255,7 @@ pub(crate) async fn console_channel_test_send_handler(
                 confirm: payload.confirm.unwrap_or(false),
                 auto_reaction: payload.auto_reaction,
                 thread_id: payload.thread_id,
+                reply_to_message_id: payload.reply_to_message_id,
             },
         )
         .await

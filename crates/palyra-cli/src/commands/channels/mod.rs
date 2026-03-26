@@ -24,6 +24,43 @@ use crate::{
     prompt_secret_value,
 };
 
+#[derive(Debug, Clone)]
+struct ChannelAdminConnection {
+    url: Option<String>,
+    token: Option<String>,
+    principal: String,
+    device_id: String,
+    channel: Option<String>,
+}
+
+impl ChannelAdminConnection {
+    fn new(
+        url: Option<String>,
+        token: Option<String>,
+        principal: String,
+        device_id: String,
+        channel: Option<String>,
+    ) -> Self {
+        Self { url, token, principal, device_id, channel }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ChannelCapabilityQuery {
+    connector_id: Option<String>,
+    provider: Option<ChannelProviderArg>,
+    account_id: Option<String>,
+    connection: ChannelAdminConnection,
+}
+
+#[derive(Debug, Clone)]
+struct RouterPairingCodeRequest {
+    route_channel: String,
+    issued_by: Option<String>,
+    ttl_ms: Option<u64>,
+    connection: ChannelAdminConnection,
+}
+
 pub(crate) fn run(command: ChannelsCommand) -> Result<()> {
     match command {
         ChannelsCommand::Add {
@@ -180,16 +217,12 @@ pub(crate) fn run(command: ChannelsCommand) -> Result<()> {
             channel,
             json,
         } => {
-            let capabilities = build_channel_capabilities_payload(
+            let capabilities = build_channel_capabilities_payload(ChannelCapabilityQuery {
                 connector_id,
                 provider,
                 account_id,
-                url,
-                token,
-                principal,
-                device_id,
-                channel,
-            )?;
+                connection: ChannelAdminConnection::new(url, token, principal, device_id, channel),
+            })?;
             emit_channel_capabilities(capabilities, output::preferred_json(json))?;
         }
         ChannelsCommand::Resolve { provider, account_id, entity, value, json } => {
@@ -232,16 +265,12 @@ pub(crate) fn run(command: ChannelsCommand) -> Result<()> {
             json,
         } => {
             let route_channel = resolve_connector_selector(connector_id, provider, account_id)?;
-            let response = mint_router_pairing_code(
+            let response = mint_router_pairing_code(RouterPairingCodeRequest {
                 route_channel,
                 issued_by,
                 ttl_ms,
-                url,
-                token,
-                principal,
-                device_id,
-                channel,
-            )?;
+                connection: ChannelAdminConnection::new(url, token, principal, device_id, channel),
+            })?;
             channels_output::emit_router_pairing_code(response, output::preferred_json(json))?;
         }
         ChannelsCommand::Qr {
@@ -259,16 +288,12 @@ pub(crate) fn run(command: ChannelsCommand) -> Result<()> {
             json,
         } => {
             let route_channel = resolve_connector_selector(connector_id, provider, account_id)?;
-            let response = mint_router_pairing_code(
-                route_channel.clone(),
+            let response = mint_router_pairing_code(RouterPairingCodeRequest {
+                route_channel: route_channel.clone(),
                 issued_by,
                 ttl_ms,
-                url,
-                token,
-                principal,
-                device_id,
-                channel,
-            )?;
+                connection: ChannelAdminConnection::new(url, token, principal, device_id, channel),
+            })?;
             emit_channel_qr(route_channel, response, artifact, output::preferred_json(json))?;
         }
         ChannelsCommand::Discord { command } => connectors::discord::run(command)?,
@@ -744,16 +769,8 @@ fn run_channel_lifecycle_disable(
     }
 }
 
-fn build_channel_capabilities_payload(
-    connector_id: Option<String>,
-    provider: Option<ChannelProviderArg>,
-    account_id: Option<String>,
-    url: Option<String>,
-    token: Option<String>,
-    principal: String,
-    device_id: String,
-    channel: Option<String>,
-) -> Result<Value> {
+fn build_channel_capabilities_payload(query: ChannelCapabilityQuery) -> Result<Value> {
+    let ChannelCapabilityQuery { connector_id, provider, account_id, connection } = query;
     let resolved_connector_id = match (connector_id, provider, account_id) {
         (Some(connector_id), _, _) => connector_id,
         (None, Some(provider), account_id) => {
@@ -771,16 +788,23 @@ fn build_channel_capabilities_payload(
     let provider_name = provider_label(provider);
     let message_capabilities = message::load_capabilities(
         resolved_connector_id.as_str(),
-        url,
-        token,
-        principal,
-        device_id,
-        channel,
+        connection.url,
+        connection.token,
+        connection.principal,
+        connection.device_id,
+        connection.channel,
     )
     .unwrap_or_else(|_| message::MessageCapabilities {
         provider_kind: provider_name.to_owned(),
-        supported_actions: provider_supported_message_actions(provider),
-        unsupported_actions: message::UNSUPPORTED_MESSAGE_ACTIONS.to_vec(),
+        supported_actions: provider_supported_message_actions(provider)
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        unsupported_actions: message::UNSUPPORTED_MESSAGE_ACTIONS
+            .iter()
+            .map(|action| (*action).to_owned())
+            .collect(),
+        action_details: Vec::new(),
     });
 
     let lifecycle_actions = provider_supported_lifecycle_actions(provider);
@@ -882,27 +906,23 @@ fn fetch_router_pairings(
     )
 }
 
-fn mint_router_pairing_code(
-    route_channel: String,
-    issued_by: Option<String>,
-    ttl_ms: Option<u64>,
-    url: Option<String>,
-    token: Option<String>,
-    principal: String,
-    device_id: String,
-    channel: Option<String>,
-) -> Result<Value> {
-    let request_context =
-        channels_client::resolve_request_context(url, token, principal, device_id, channel)?;
+fn mint_router_pairing_code(request: RouterPairingCodeRequest) -> Result<Value> {
+    let request_context = channels_client::resolve_request_context(
+        request.connection.url,
+        request.connection.token,
+        request.connection.principal,
+        request.connection.device_id,
+        request.connection.channel,
+    )?;
     let endpoint = format!(
         "{}/admin/v1/channels/router/pairing-codes",
         request_context.base_url.trim_end_matches('/')
     );
     let client = channels_client::build_client()?;
     let payload = json!({
-        "channel": route_channel,
-        "issued_by": issued_by.and_then(normalize_optional_text_arg),
-        "ttl_ms": ttl_ms,
+        "channel": request.route_channel,
+        "issued_by": request.issued_by.and_then(normalize_optional_text_arg),
+        "ttl_ms": request.ttl_ms,
     });
     channels_client::send_request(
         client.post(endpoint).json(&payload),
