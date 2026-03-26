@@ -90,10 +90,10 @@ impl OperatorRuntime {
 
     pub(crate) async fn resolve_agent_for_context(
         &self,
-        request: gateway_v1::ResolveAgentForContextRequest,
+        input: AgentContextResolveInput,
     ) -> Result<gateway_v1::ResolveAgentForContextResponse> {
         let mut client = self.connect_gateway().await?;
-        client.resolve_agent_for_context(request).await
+        client.resolve_agent_for_context(input).await
     }
 
     pub(crate) async fn list_sessions(
@@ -108,10 +108,10 @@ impl OperatorRuntime {
 
     pub(crate) async fn resolve_session(
         &self,
-        request: gateway_v1::ResolveSessionRequest,
+        input: SessionResolveInput,
     ) -> Result<gateway_v1::ResolveSessionResponse> {
         let mut client = self.connect_gateway().await?;
-        client.resolve_session(request).await
+        client.resolve_session(input).await
     }
 
     pub(crate) async fn abort_run(
@@ -125,10 +125,10 @@ impl OperatorRuntime {
 
     pub(crate) async fn cleanup_session(
         &self,
-        request: gateway_v1::CleanupSessionRequest,
+        input: SessionCleanupInput,
     ) -> Result<gateway_v1::CleanupSessionResponse> {
         let mut client = self.connect_gateway().await?;
-        client.cleanup_session(request).await
+        client.cleanup_session(input).await
     }
 
     pub(crate) async fn start_run_stream(

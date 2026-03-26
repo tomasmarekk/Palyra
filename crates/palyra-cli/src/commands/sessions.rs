@@ -144,11 +144,8 @@ pub(crate) async fn run_sessions_async(
         }
         SessionsCommand::Rename { session_id, session_label, json: _ } => {
             let response = runtime
-                .resolve_session(gateway_v1::ResolveSessionRequest {
-                    v: CANONICAL_PROTOCOL_MAJOR,
-                    session_id: Some(common_v1::CanonicalId {
-                        ulid: resolve_or_generate_canonical_id(Some(session_id))?,
-                    }),
+                .resolve_session(SessionResolveInput {
+                    session_id: Some(resolve_required_canonical_id(session_id)?),
                     session_key: String::new(),
                     session_label,
                     require_existing: true,
@@ -177,11 +174,8 @@ pub(crate) async fn run_sessions_async(
         }
         SessionsCommand::Reset { session_id, json: _ } => {
             let response = runtime
-                .resolve_session(gateway_v1::ResolveSessionRequest {
-                    v: CANONICAL_PROTOCOL_MAJOR,
-                    session_id: Some(common_v1::CanonicalId {
-                        ulid: resolve_or_generate_canonical_id(Some(session_id))?,
-                    }),
+                .resolve_session(SessionResolveInput {
+                    session_id: Some(resolve_required_canonical_id(session_id)?),
                     session_key: String::new(),
                     session_label: String::new(),
                     require_existing: true,
@@ -212,8 +206,7 @@ pub(crate) async fn run_sessions_async(
             let request = build_cleanup_session_request(session_id, session_key)?;
             if dry_run {
                 let response = runtime
-                    .resolve_session(gateway_v1::ResolveSessionRequest {
-                        v: CANONICAL_PROTOCOL_MAJOR,
+                    .resolve_session(SessionResolveInput {
                         session_id: request.session_id.clone(),
                         session_key: request.session_key.clone(),
                         session_label: String::new(),
@@ -308,16 +301,12 @@ fn build_resolve_session_request(
     session_label: Option<String>,
     require_existing: bool,
     reset_session: bool,
-) -> Result<gateway_v1::ResolveSessionRequest> {
+) -> Result<SessionResolveInput> {
     if session_id.is_none() && session_key.is_none() {
         anyhow::bail!("session_id or session_key is required");
     }
-    Ok(gateway_v1::ResolveSessionRequest {
-        v: CANONICAL_PROTOCOL_MAJOR,
-        session_id: session_id
-            .map(|value| resolve_or_generate_canonical_id(Some(value)))
-            .transpose()?
-            .map(|ulid| common_v1::CanonicalId { ulid }),
+    Ok(SessionResolveInput {
+        session_id: resolve_optional_canonical_id(session_id)?,
         session_key: session_key.unwrap_or_default(),
         session_label: session_label.unwrap_or_default(),
         require_existing,
@@ -380,16 +369,12 @@ fn empty_unix_ms(value: i64) -> Option<i64> {
 fn build_cleanup_session_request(
     session_id: Option<String>,
     session_key: Option<String>,
-) -> Result<gateway_v1::CleanupSessionRequest> {
+) -> Result<SessionCleanupInput> {
     if session_id.is_none() && session_key.is_none() {
         anyhow::bail!("session_id or session_key is required");
     }
-    Ok(gateway_v1::CleanupSessionRequest {
-        v: CANONICAL_PROTOCOL_MAJOR,
-        session_id: session_id
-            .map(|value| resolve_or_generate_canonical_id(Some(value)))
-            .transpose()?
-            .map(|ulid| common_v1::CanonicalId { ulid }),
+    Ok(SessionCleanupInput {
+        session_id: resolve_optional_canonical_id(session_id)?,
         session_key: session_key.unwrap_or_default(),
     })
 }
@@ -401,7 +386,8 @@ mod tests {
     #[test]
     fn resolve_session_request_requires_identifier() {
         let error = build_resolve_session_request(None, None, None, false, false)
-            .expect_err("resolve session should require session_id or session_key");
+            .err()
+            .expect("resolve session should require session_id or session_key");
         assert!(
             error.to_string().contains("session_id or session_key is required"),
             "error should explain missing identity: {error}"
@@ -428,7 +414,8 @@ mod tests {
     #[test]
     fn cleanup_session_request_requires_identifier() {
         let error = build_cleanup_session_request(None, None)
-            .expect_err("cleanup session should require session_id or session_key");
+            .err()
+            .expect("cleanup session should require session_id or session_key");
         assert!(
             error.to_string().contains("session_id or session_key is required"),
             "error should explain missing identity: {error}"

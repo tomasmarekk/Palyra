@@ -82,19 +82,14 @@ pub(crate) async fn run_agents_async(
         } => {
             let ndjson = output::preferred_ndjson(json, ndjson);
             let response = client
-                .list_agent_bindings(gateway_v1::ListAgentBindingsRequest {
-                    v: CANONICAL_PROTOCOL_MAJOR,
+                .list_agent_bindings(AgentBindingsQueryInput {
                     agent_id: agent_id
                         .map(|value| normalize_agent_id_cli(value.as_str()))
                         .transpose()?
                         .unwrap_or_default(),
                     principal: principal.unwrap_or_default(),
                     channel: channel.unwrap_or_default(),
-                    session_id: session_id
-                        .map(|value| resolve_or_generate_canonical_id(Some(value)))
-                        .transpose()?
-                        .map(|ulid| common_v1::CanonicalId { ulid })
-                        .or(None),
+                    session_id: resolve_optional_canonical_id(session_id)?,
                     limit: limit.unwrap_or(250),
                 })
                 .await?;
@@ -282,8 +277,7 @@ pub(crate) async fn run_agents_async(
                 .agent
                 .context("GetAgent returned empty agent payload")?;
             let bindings = client
-                .list_agent_bindings(gateway_v1::ListAgentBindingsRequest {
-                    v: CANONICAL_PROTOCOL_MAJOR,
+                .list_agent_bindings(AgentBindingsQueryInput {
                     agent_id: normalized_agent_id.clone(),
                     principal: String::new(),
                     channel: String::new(),
@@ -354,14 +348,10 @@ pub(crate) async fn run_agents_async(
             json: _,
         } => {
             let response = client
-                .resolve_agent_for_context(gateway_v1::ResolveAgentForContextRequest {
-                    v: CANONICAL_PROTOCOL_MAJOR,
+                .resolve_agent_for_context(AgentContextResolveInput {
                     principal: principal.unwrap_or_else(|| connection.principal.clone()),
                     channel: channel.unwrap_or_else(|| connection.channel.clone()),
-                    session_id: session_id
-                        .map(|value| resolve_or_generate_canonical_id(Some(value)))
-                        .transpose()?
-                        .map(|ulid| common_v1::CanonicalId { ulid }),
+                    session_id: resolve_optional_canonical_id(session_id)?,
                     preferred_agent_id: preferred_agent_id
                         .map(|value| normalize_agent_id_cli(value.as_str()))
                         .transpose()?

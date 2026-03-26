@@ -1,4 +1,4 @@
-use crate::{app, args::TuiCommand, tui, Result};
+use crate::{app, args::TuiCommand, resolve_optional_canonical_id, tui, Result};
 
 pub(crate) fn run_tui(command: TuiCommand) -> Result<()> {
     let root_context = app::current_root_context()
@@ -16,7 +16,7 @@ pub(crate) fn run_tui(command: TuiCommand) -> Result<()> {
     )?;
     tui::run(tui::LaunchOptions {
         connection,
-        session_id: command.session_id,
+        session_id: resolve_optional_canonical_id(command.session_id)?,
         session_key: command.session_key,
         session_label: command.session_label,
         require_existing: command.require_existing,

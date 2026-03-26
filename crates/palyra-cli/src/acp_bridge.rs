@@ -14,7 +14,7 @@ use crate::{
     build_agent_run_input, build_run_stream_request, build_runtime,
     client::runtime::GatewayRuntimeClient,
     proto::palyra::{common::v1 as common_v1, gateway::v1 as gateway_v1},
-    AgentConnection, AgentRunInputArgs,
+    AgentConnection, AgentRunInputArgs, SessionResolveInput,
 };
 
 const META_SESSION_KEY: &str = "sessionKey";
@@ -216,8 +216,7 @@ impl PalyraAcpAgent {
             .await
             .map_err(acp_internal_error)?;
         let response = client
-            .resolve_session(gateway_v1::ResolveSessionRequest {
-                v: 1,
+            .resolve_session(SessionResolveInput {
                 session_id: None,
                 session_key: requested_session_key.clone(),
                 session_label: session_label.clone().unwrap_or_default(),

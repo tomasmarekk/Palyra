@@ -58,12 +58,7 @@ pub(crate) fn run_agent(command: AgentCommand) -> Result<()> {
                 app::ConnectionDefaults::USER,
             )?;
             let request = build_agent_run_input(AgentRunInputArgs {
-                session_id: session_id
-                    .map(|value| {
-                        resolve_or_generate_canonical_id(Some(value))
-                            .map(|ulid| common_v1::CanonicalId { ulid })
-                    })
-                    .transpose()?,
+                session_id: resolve_optional_canonical_id(session_id)?,
                 session_key,
                 session_label,
                 require_existing,
@@ -143,12 +138,7 @@ pub(crate) fn run_agent(command: AgentCommand) -> Result<()> {
 
             let input_prompt = resolve_prompt_input(prompt, prompt_stdin)?;
             let request = build_agent_run_input(AgentRunInputArgs {
-                session_id: session_id
-                    .map(|value| {
-                        resolve_or_generate_canonical_id(Some(value))
-                            .map(|ulid| common_v1::CanonicalId { ulid })
-                    })
-                    .transpose()?,
+                session_id: resolve_optional_canonical_id(session_id)?,
                 session_key,
                 session_label,
                 require_existing,
@@ -329,8 +319,7 @@ async fn ensure_interactive_session(
     reset_session: bool,
 ) -> Result<gateway_v1::SessionSummary> {
     let request = if let Some(existing_session) = session.as_ref() {
-        gateway_v1::ResolveSessionRequest {
-            v: CANONICAL_PROTOCOL_MAJOR,
+        SessionResolveInput {
             session_id: existing_session.session_id.clone(),
             session_key: String::new(),
             session_label: String::new(),
@@ -338,13 +327,8 @@ async fn ensure_interactive_session(
             reset_session,
         }
     } else {
-        gateway_v1::ResolveSessionRequest {
-            v: CANONICAL_PROTOCOL_MAJOR,
-            session_id: initial_session_id
-                .cloned()
-                .map(|value| resolve_or_generate_canonical_id(Some(value.clone())))
-                .transpose()?
-                .map(|ulid| common_v1::CanonicalId { ulid }),
+        SessionResolveInput {
+            session_id: resolve_optional_canonical_id(initial_session_id.cloned())?,
             session_key: initial_session_key.cloned().unwrap_or_default(),
             session_label: initial_session_label.cloned().unwrap_or_default(),
             require_existing,

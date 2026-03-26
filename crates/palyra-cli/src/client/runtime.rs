@@ -155,9 +155,16 @@ impl GatewayRuntimeClient {
 
     pub(crate) async fn list_agent_bindings(
         &mut self,
-        request: gateway_v1::ListAgentBindingsRequest,
+        input: AgentBindingsQueryInput,
     ) -> Result<gateway_v1::ListAgentBindingsResponse> {
-        let request = self.request(request)?;
+        let request = self.request(gateway_v1::ListAgentBindingsRequest {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            agent_id: input.agent_id,
+            principal: input.principal,
+            channel: input.channel,
+            session_id: input.session_id,
+            limit: input.limit,
+        })?;
         self.client
             .list_agent_bindings(request)
             .await
@@ -191,9 +198,16 @@ impl GatewayRuntimeClient {
 
     pub(crate) async fn resolve_agent_for_context(
         &mut self,
-        request: gateway_v1::ResolveAgentForContextRequest,
+        input: AgentContextResolveInput,
     ) -> Result<gateway_v1::ResolveAgentForContextResponse> {
-        let request = self.request(request)?;
+        let request = self.request(gateway_v1::ResolveAgentForContextRequest {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            principal: input.principal,
+            channel: input.channel,
+            session_id: input.session_id,
+            preferred_agent_id: input.preferred_agent_id,
+            persist_session_binding: input.persist_session_binding,
+        })?;
         self.client
             .resolve_agent_for_context(request)
             .await
@@ -222,9 +236,16 @@ impl GatewayRuntimeClient {
 
     pub(crate) async fn resolve_session(
         &mut self,
-        request: gateway_v1::ResolveSessionRequest,
+        input: SessionResolveInput,
     ) -> Result<gateway_v1::ResolveSessionResponse> {
-        let request = self.request(request)?;
+        let request = self.request(gateway_v1::ResolveSessionRequest {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            session_id: input.session_id,
+            session_key: input.session_key,
+            session_label: input.session_label,
+            require_existing: input.require_existing,
+            reset_session: input.reset_session,
+        })?;
         self.client
             .resolve_session(request)
             .await
@@ -251,9 +272,13 @@ impl GatewayRuntimeClient {
 
     pub(crate) async fn cleanup_session(
         &mut self,
-        request: gateway_v1::CleanupSessionRequest,
+        input: SessionCleanupInput,
     ) -> Result<gateway_v1::CleanupSessionResponse> {
-        let request = self.request(request)?;
+        let request = self.request(gateway_v1::CleanupSessionRequest {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            session_id: input.session_id,
+            session_key: input.session_key,
+        })?;
         self.client
             .cleanup_session(request)
             .await

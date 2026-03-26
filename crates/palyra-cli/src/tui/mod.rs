@@ -27,26 +27,12 @@ use crate::{
 #[derive(Clone)]
 pub(crate) struct LaunchOptions {
     pub(crate) connection: AgentConnection,
-    pub(crate) session_id: Option<String>,
+    pub(crate) session_id: Option<common_v1::CanonicalId>,
     pub(crate) session_key: Option<String>,
     pub(crate) session_label: Option<String>,
     pub(crate) require_existing: bool,
     pub(crate) allow_sensitive_tools: bool,
     pub(crate) include_archived_sessions: bool,
-}
-
-impl std::fmt::Debug for LaunchOptions {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LaunchOptions")
-            .field("connection", &"<redacted>")
-            .field("session_id", &self.session_id.is_some())
-            .field("session_key", &self.session_key.is_some())
-            .field("session_label", &self.session_label.is_some())
-            .field("require_existing", &self.require_existing)
-            .field("allow_sensitive_tools", &self.allow_sensitive_tools)
-            .field("include_archived_sessions", &self.include_archived_sessions)
-            .finish()
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,13 +178,8 @@ impl App {
     async fn bootstrap(options: LaunchOptions) -> Result<Self> {
         let runtime = OperatorRuntime::new(options.connection.clone());
         let response = runtime
-            .resolve_session(gateway_v1::ResolveSessionRequest {
-                v: CANONICAL_PROTOCOL_MAJOR,
-                session_id: options
-                    .session_id
-                    .map(|value| resolve_or_generate_canonical_id(Some(value)))
-                    .transpose()?
-                    .map(|ulid| common_v1::CanonicalId { ulid }),
+            .resolve_session(SessionResolveInput {
+                session_id: options.session_id,
                 session_key: options.session_key.unwrap_or_default(),
                 session_label: options.session_label.unwrap_or_default(),
                 require_existing: options.require_existing,
@@ -563,8 +544,7 @@ impl App {
     async fn switch_agent(&mut self, agent_id: String) -> Result<()> {
         let response = self
             .runtime
-            .resolve_agent_for_context(gateway_v1::ResolveAgentForContextRequest {
-                v: CANONICAL_PROTOCOL_MAJOR,
+            .resolve_agent_for_context(AgentContextResolveInput {
                 principal: self.runtime.connection().principal.clone(),
                 channel: self.runtime.connection().channel.clone(),
                 session_id: self.session.session_id.clone(),
@@ -594,19 +574,15 @@ impl App {
             return Ok(());
         }
         let request = if looks_like_canonical_ulid(reference.as_str()) {
-            gateway_v1::ResolveSessionRequest {
-                v: CANONICAL_PROTOCOL_MAJOR,
-                session_id: Some(common_v1::CanonicalId {
-                    ulid: resolve_or_generate_canonical_id(Some(reference))?,
-                }),
+            SessionResolveInput {
+                session_id: Some(resolve_required_canonical_id(reference)?),
                 session_key: String::new(),
                 session_label: String::new(),
                 require_existing: true,
                 reset_session: false,
             }
         } else {
-            gateway_v1::ResolveSessionRequest {
-                v: CANONICAL_PROTOCOL_MAJOR,
+            SessionResolveInput {
                 session_id: None,
                 session_key: reference,
                 session_label: String::new(),
@@ -635,8 +611,7 @@ impl App {
         }
         let response = self
             .runtime
-            .resolve_session(gateway_v1::ResolveSessionRequest {
-                v: CANONICAL_PROTOCOL_MAJOR,
+            .resolve_session(SessionResolveInput {
                 session_id: self.session.session_id.clone(),
                 session_key: String::new(),
                 session_label: String::new(),
@@ -818,8 +793,7 @@ impl App {
     ) -> Result<()> {
         let response = self
             .runtime
-            .resolve_agent_for_context(gateway_v1::ResolveAgentForContextRequest {
-                v: CANONICAL_PROTOCOL_MAJOR,
+            .resolve_agent_for_context(AgentContextResolveInput {
                 principal: self.runtime.connection().principal.clone(),
                 channel: self.runtime.connection().channel.clone(),
                 session_id: self.session.session_id.clone(),

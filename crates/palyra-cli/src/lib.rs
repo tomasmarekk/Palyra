@@ -2432,13 +2432,7 @@ fn parse_acp_shim_input_line(
         anyhow::bail!("NDJSON ACP input requires `prompt` field with non-empty text");
     }
     build_agent_run_input(AgentRunInputArgs {
-        session_id: parsed
-            .session_id
-            .map(|value| {
-                resolve_or_generate_canonical_id(Some(value))
-                    .map(|ulid| common_v1::CanonicalId { ulid })
-            })
-            .transpose()?,
+        session_id: resolve_optional_canonical_id(parsed.session_id)?,
         session_key: parsed.session_key,
         session_label: parsed.session_label,
         require_existing: parsed.require_existing.unwrap_or(false),
@@ -2505,8 +2499,7 @@ async fn prepare_agent_run_input(
     input: AgentRunInput,
 ) -> Result<ResolvedAgentRunInput> {
     let response = client
-        .resolve_session(gateway_v1::ResolveSessionRequest {
-            v: CANONICAL_PROTOCOL_MAJOR,
+        .resolve_session(SessionResolveInput {
             session_id: input.session_id.clone(),
             session_key: input.session_key.clone().unwrap_or_default(),
             session_label: input.session_label.clone().unwrap_or_default(),
@@ -2579,6 +2572,16 @@ fn resolve_or_generate_canonical_id(value: Option<String>) -> Result<String> {
     let resolved = value.unwrap_or_else(generate_canonical_ulid);
     validate_canonical_id(resolved.as_str()).context("invalid canonical ULID provided")?;
     Ok(resolved)
+}
+
+pub(crate) fn resolve_required_canonical_id(value: String) -> Result<common_v1::CanonicalId> {
+    resolve_or_generate_canonical_id(Some(value)).map(|ulid| common_v1::CanonicalId { ulid })
+}
+
+pub(crate) fn resolve_optional_canonical_id(
+    value: Option<String>,
+) -> Result<Option<common_v1::CanonicalId>> {
+    value.map(resolve_required_canonical_id).transpose()
 }
 
 fn generate_canonical_ulid() -> String {
@@ -3055,21 +3058,6 @@ struct AgentRunInput {
     allow_sensitive_tools: bool,
 }
 
-impl std::fmt::Debug for AgentRunInput {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AgentRunInput")
-            .field("session_id", &self.session_id.is_some())
-            .field("session_key", &self.session_key.is_some())
-            .field("session_label", &self.session_label.is_some())
-            .field("require_existing", &self.require_existing)
-            .field("reset_session", &self.reset_session)
-            .field("run_id", &REDACTED)
-            .field("prompt", &REDACTED)
-            .field("allow_sensitive_tools", &self.allow_sensitive_tools)
-            .finish()
-    }
-}
-
 #[derive(Clone)]
 struct ResolvedAgentRunInput {
     session: gateway_v1::SessionSummary,
@@ -3078,15 +3066,37 @@ struct ResolvedAgentRunInput {
     allow_sensitive_tools: bool,
 }
 
-impl std::fmt::Debug for ResolvedAgentRunInput {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ResolvedAgentRunInput")
-            .field("session", &"<redacted>")
-            .field("run_id", &REDACTED)
-            .field("prompt", &REDACTED)
-            .field("allow_sensitive_tools", &self.allow_sensitive_tools)
-            .finish()
-    }
+#[derive(Clone)]
+pub(crate) struct SessionResolveInput {
+    pub(crate) session_id: Option<common_v1::CanonicalId>,
+    pub(crate) session_key: String,
+    pub(crate) session_label: String,
+    pub(crate) require_existing: bool,
+    pub(crate) reset_session: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct SessionCleanupInput {
+    pub(crate) session_id: Option<common_v1::CanonicalId>,
+    pub(crate) session_key: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct AgentBindingsQueryInput {
+    pub(crate) agent_id: String,
+    pub(crate) principal: String,
+    pub(crate) channel: String,
+    pub(crate) session_id: Option<common_v1::CanonicalId>,
+    pub(crate) limit: u32,
+}
+
+#[derive(Clone)]
+pub(crate) struct AgentContextResolveInput {
+    pub(crate) principal: String,
+    pub(crate) channel: String,
+    pub(crate) session_id: Option<common_v1::CanonicalId>,
+    pub(crate) preferred_agent_id: String,
+    pub(crate) persist_session_binding: bool,
 }
 
 #[derive(Deserialize)]
@@ -6294,7 +6304,7 @@ mod cli_v1_tests {
             1,
             false,
         );
-        let error = result.expect_err("whitespace-only prompt must be rejected");
+        let error = result.err().expect("whitespace-only prompt must be rejected");
         assert!(error.to_string().contains("non-empty text"), "unexpected error message: {error}");
     }
 
