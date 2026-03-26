@@ -242,11 +242,7 @@ impl App {
                 app.status_line = format!("Connected; model catalog unavailable: {error}")
             }
         }
-        app.push_entry(
-            EntryKind::System,
-            "Session",
-            "Connected.",
-        );
+        app.push_entry(EntryKind::System, "Session", "Connected.");
         Ok(app)
     }
 
@@ -627,11 +623,7 @@ impl App {
             .context("ResolveSession returned empty session payload for tui switch")?;
         self.session = session;
         self.transcript.clear();
-        self.push_entry(
-            EntryKind::System,
-            "Session",
-            "Session switched.",
-        );
+        self.push_entry(EntryKind::System, "Session", "Session switched.");
         self.refresh_agent_identity(None, false).await?;
         self.status_line = "Session switched".to_owned();
         self.mode = Mode::Chat;
@@ -755,12 +747,7 @@ impl App {
                         }
                     })
                     .collect::<Vec<_>>();
-                PickerState {
-                    kind,
-                    title: "Session picker".to_owned(),
-                    selected: 0,
-                    items,
-                }
+                PickerState { kind, title: "Session picker".to_owned(), selected: 0, items }
             }
             PickerKind::Model => {
                 let models = self.runtime.list_models(None)?;

@@ -2527,11 +2527,10 @@ fn normalize_optional_owned_text(value: Option<String>) -> Option<String> {
     value.and_then(|value| empty_to_none(value.trim().to_owned()))
 }
 
-fn session_summary_reference(session: &gateway_v1::SessionSummary) -> Result<common_v1::CanonicalId> {
-    session
-        .session_id
-        .clone()
-        .context("resolved session is missing session_id")
+fn session_summary_reference(
+    session: &gateway_v1::SessionSummary,
+) -> Result<common_v1::CanonicalId> {
+    session.session_id.clone().context("resolved session is missing session_id")
 }
 
 #[derive(Debug, Clone)]
@@ -2662,9 +2661,10 @@ fn build_resolved_run_stream_request(
 
 fn build_run_stream_request(input: &AgentRunInput) -> Result<common_v1::RunStreamRequest> {
     let timestamp_unix_ms = now_unix_ms_i64()?;
-    let session_id = input.session_id.clone().unwrap_or_else(|| common_v1::CanonicalId {
-        ulid: generate_canonical_ulid(),
-    });
+    let session_id = input
+        .session_id
+        .clone()
+        .unwrap_or_else(|| common_v1::CanonicalId { ulid: generate_canonical_ulid() });
     Ok(common_v1::RunStreamRequest {
         v: RUN_STREAM_REQUEST_VERSION,
         session_id: Some(session_id),
