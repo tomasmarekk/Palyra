@@ -2577,8 +2577,7 @@ fn prompt_tool_approval_decision(
 
 fn resolve_or_generate_canonical_id(value: Option<String>) -> Result<String> {
     let resolved = value.unwrap_or_else(generate_canonical_ulid);
-    validate_canonical_id(resolved.as_str())
-        .with_context(|| format!("invalid canonical ULID: {}", resolved))?;
+    validate_canonical_id(resolved.as_str()).context("invalid canonical ULID provided")?;
     Ok(resolved)
 }
 
@@ -3060,11 +3059,8 @@ impl std::fmt::Debug for AgentRunInput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AgentRunInput")
             .field("session_id", &self.session_id.is_some())
-            .field("session_key", &self.session_key.as_ref().map(|value| !value.trim().is_empty()))
-            .field(
-                "session_label",
-                &self.session_label.as_ref().map(|value| !value.trim().is_empty()),
-            )
+            .field("session_key", &self.session_key.is_some())
+            .field("session_label", &self.session_label.is_some())
             .field("require_existing", &self.require_existing)
             .field("reset_session", &self.reset_session)
             .field("run_id", &REDACTED)

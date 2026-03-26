@@ -40,11 +40,8 @@ impl std::fmt::Debug for LaunchOptions {
         f.debug_struct("LaunchOptions")
             .field("connection", &"<redacted>")
             .field("session_id", &self.session_id.is_some())
-            .field("session_key", &self.session_key.as_ref().map(|value| !value.trim().is_empty()))
-            .field(
-                "session_label",
-                &self.session_label.as_ref().map(|value| !value.trim().is_empty()),
-            )
+            .field("session_key", &self.session_key.is_some())
+            .field("session_label", &self.session_label.is_some())
             .field("require_existing", &self.require_existing)
             .field("allow_sensitive_tools", &self.allow_sensitive_tools)
             .field("include_archived_sessions", &self.include_archived_sessions)
