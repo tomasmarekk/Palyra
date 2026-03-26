@@ -199,12 +199,14 @@ impl WebhookRegistry {
         let state = self.state.lock().map_err(|_| WebhookRegistryError::LockPoisoned)?;
         let mut views = Vec::with_capacity(MAX_WEBHOOK_COUNT);
         for record in state.webhooks.iter().take(MAX_WEBHOOK_COUNT) {
-            let provider_matches = normalized_provider
-                .as_ref()
-                .map(|provider| provider == &record.provider)
-                .unwrap_or(true);
-            let enabled_matches =
-                enabled_filter.map(|enabled| enabled == record.enabled).unwrap_or(true);
+            let provider_matches = match normalized_provider.as_ref() {
+                Some(provider) => provider == &record.provider,
+                None => true,
+            };
+            let enabled_matches = match enabled_filter {
+                Some(enabled) => enabled == record.enabled,
+                None => true,
+            };
             if !provider_matches || !enabled_matches {
                 continue;
             }
