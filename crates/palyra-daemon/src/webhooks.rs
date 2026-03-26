@@ -1,5 +1,6 @@
 use std::{
     fs,
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
@@ -105,6 +106,7 @@ pub struct WebhookDiagnosticsSnapshot {
 #[derive(Debug)]
 pub struct WebhookRegistry {
     registry_path: RegistryPath,
+    registry_file: Mutex<fs::File>,
     state: Mutex<RegistryDocument>,
 }
 
@@ -175,27 +177,13 @@ pub enum WebhookRegistryError {
 impl WebhookRegistry {
     pub fn open(state_root: &Path) -> Result<Self, WebhookRegistryError> {
         let registry_path = resolve_registry_path(state_root)?;
-        let document = if registry_path.as_path().exists() {
-            let raw = fs::read_to_string(registry_path.as_path()).map_err(|source| {
-                WebhookRegistryError::ReadRegistry { path: registry_path.to_path_buf(), source }
-            })?;
-            let parsed = toml::from_str::<RegistryDocument>(&raw).map_err(|source| {
-                WebhookRegistryError::ParseRegistry {
-                    path: registry_path.to_path_buf(),
-                    source: Box::new(source),
-                }
-            })?;
-            if parsed.version != REGISTRY_VERSION {
-                return Err(WebhookRegistryError::UnsupportedVersion(parsed.version));
-            }
-            validate_registry_document(&parsed)?;
-            parsed
-        } else {
-            let document = RegistryDocument::default();
-            persist_registry(&registry_path, &document)?;
-            document
-        };
-        Ok(Self { registry_path, state: Mutex::new(document) })
+        let mut registry_file = open_registry_file(&registry_path)?;
+        let document = load_registry_document(&registry_path, &mut registry_file)?;
+        Ok(Self {
+            registry_path,
+            registry_file: Mutex::new(registry_file),
+            state: Mutex::new(document),
+        })
     }
 
     pub fn list_views(
@@ -209,7 +197,7 @@ impl WebhookRegistry {
         };
         let enabled_filter = filter.enabled;
         let state = self.state.lock().map_err(|_| WebhookRegistryError::LockPoisoned)?;
-        let mut views = Vec::with_capacity(state.webhooks.len().min(MAX_WEBHOOK_COUNT));
+        let mut views = Vec::new();
         for record in state.webhooks.iter().take(MAX_WEBHOOK_COUNT) {
             let provider_matches = normalized_provider
                 .as_ref()
@@ -273,7 +261,7 @@ impl WebhookRegistry {
                 });
             }
             let view = self.view_from_record(existing, vault)?;
-            persist_registry(&self.registry_path, &state)?;
+            persist_registry(&self.registry_path, &self.registry_file, &state)?;
             return Ok(view);
         }
 
@@ -311,7 +299,7 @@ impl WebhookRegistry {
         let view = self.view_from_record(&record, vault)?;
         state.webhooks.push(record);
         state.webhooks.sort_by(|left, right| left.integration_id.cmp(&right.integration_id));
-        persist_registry(&self.registry_path, &state)?;
+        persist_registry(&self.registry_path, &self.registry_file, &state)?;
         Ok(view)
     }
 
@@ -343,7 +331,7 @@ impl WebhookRegistry {
         record.enabled = enabled;
         record.updated_at_unix_ms = unix_ms_now()?;
         let view = self.view_from_record(record, vault)?;
-        persist_registry(&self.registry_path, &state)?;
+        persist_registry(&self.registry_path, &self.registry_file, &state)?;
         Ok(view)
     }
 
@@ -354,7 +342,7 @@ impl WebhookRegistry {
         state.webhooks.retain(|record| record.integration_id != normalized);
         let deleted = state.webhooks.len() != before_len;
         if deleted {
-            persist_registry(&self.registry_path, &state)?;
+            persist_registry(&self.registry_path, &self.registry_file, &state)?;
         }
         Ok(deleted)
     }
@@ -467,7 +455,7 @@ impl WebhookRegistry {
         record.last_test_at_unix_ms = Some(now);
         record.updated_at_unix_ms = now;
         let integration = self.view_from_record(record, vault)?;
-        persist_registry(&self.registry_path, &state)?;
+        persist_registry(&self.registry_path, &self.registry_file, &state)?;
         Ok(WebhookIntegrationTestOutcome { integration, result })
     }
 
@@ -751,10 +739,7 @@ fn normalize_allowed_values(
     Ok(normalized)
 }
 
-fn persist_registry(
-    registry_path: &RegistryPath,
-    document: &RegistryDocument,
-) -> Result<(), WebhookRegistryError> {
+fn open_registry_file(registry_path: &RegistryPath) -> Result<fs::File, WebhookRegistryError> {
     let registry_path = registry_path.as_path();
     if let Some(parent) = registry_path.parent() {
         fs::create_dir_all(parent).map_err(|source| WebhookRegistryError::WriteRegistry {
@@ -766,12 +751,84 @@ fn persist_registry(
             source: std::io::Error::other(source.to_string()),
         })?;
     }
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(registry_path)
+        .map_err(|source| WebhookRegistryError::WriteRegistry {
+            path: registry_path.to_path_buf(),
+            source,
+        })?;
+    ensure_owner_only_file(registry_path).map_err(|source| {
+        WebhookRegistryError::WriteRegistry {
+            path: registry_path.to_path_buf(),
+            source: std::io::Error::other(source.to_string()),
+        }
+    })?;
+    Ok(file)
+}
+
+fn load_registry_document(
+    registry_path: &RegistryPath,
+    registry_file: &mut fs::File,
+) -> Result<RegistryDocument, WebhookRegistryError> {
+    registry_file.seek(SeekFrom::Start(0)).map_err(|source| {
+        WebhookRegistryError::ReadRegistry { path: registry_path.to_path_buf(), source }
+    })?;
+    let mut raw = String::new();
+    registry_file.read_to_string(&mut raw).map_err(|source| {
+        WebhookRegistryError::ReadRegistry { path: registry_path.to_path_buf(), source }
+    })?;
+    if raw.is_empty() {
+        let document = RegistryDocument::default();
+        write_registry_document(registry_path, registry_file, &document)?;
+        return Ok(document);
+    }
+    let parsed = toml::from_str::<RegistryDocument>(&raw).map_err(|source| {
+        WebhookRegistryError::ParseRegistry {
+            path: registry_path.to_path_buf(),
+            source: Box::new(source),
+        }
+    })?;
+    if parsed.version != REGISTRY_VERSION {
+        return Err(WebhookRegistryError::UnsupportedVersion(parsed.version));
+    }
+    validate_registry_document(&parsed)?;
+    Ok(parsed)
+}
+
+fn persist_registry(
+    registry_path: &RegistryPath,
+    registry_file: &Mutex<fs::File>,
+    document: &RegistryDocument,
+) -> Result<(), WebhookRegistryError> {
+    let mut registry_file = registry_file.lock().map_err(|_| WebhookRegistryError::LockPoisoned)?;
+    write_registry_document(registry_path, &mut registry_file, document)
+}
+
+fn write_registry_document(
+    registry_path: &RegistryPath,
+    registry_file: &mut fs::File,
+    document: &RegistryDocument,
+) -> Result<(), WebhookRegistryError> {
     let encoded = toml::to_string_pretty(document)?;
-    fs::write(registry_path, encoded).map_err(|source| WebhookRegistryError::WriteRegistry {
+    registry_file.set_len(0).map_err(|source| WebhookRegistryError::WriteRegistry {
         path: registry_path.to_path_buf(),
         source,
     })?;
-    ensure_owner_only_file(registry_path).map_err(|source| {
+    registry_file.seek(SeekFrom::Start(0)).map_err(|source| {
+        WebhookRegistryError::WriteRegistry { path: registry_path.to_path_buf(), source }
+    })?;
+    registry_file.write_all(encoded.as_bytes()).map_err(|source| {
+        WebhookRegistryError::WriteRegistry { path: registry_path.to_path_buf(), source }
+    })?;
+    registry_file.sync_all().map_err(|source| WebhookRegistryError::WriteRegistry {
+        path: registry_path.to_path_buf(),
+        source,
+    })?;
+    ensure_owner_only_file(registry_path.as_path()).map_err(|source| {
         WebhookRegistryError::WriteRegistry {
             path: registry_path.to_path_buf(),
             source: std::io::Error::other(source.to_string()),
