@@ -441,6 +441,7 @@ fn build_capability_profile_payload(
     })
 }
 
+#[allow(clippy::result_large_err)]
 fn install_skill_artifact_for_plugin_binding(
     artifact_path: PathBuf,
     allow_tofu: bool,
@@ -543,6 +544,7 @@ fn install_skill_artifact_for_plugin_binding(
     Ok(record)
 }
 
+#[allow(clippy::result_large_err)]
 fn load_trust_store_for_plugins(path: &FsPath) -> Result<SkillTrustStore, Response> {
     if !path.exists() {
         return Ok(SkillTrustStore::default());
@@ -555,6 +557,7 @@ fn load_trust_store_for_plugins(path: &FsPath) -> Result<SkillTrustStore, Respon
     })
 }
 
+#[allow(clippy::result_large_err)]
 fn save_trust_store_for_plugins(path: &FsPath, store: &SkillTrustStore) -> Result<(), Response> {
     store.save(path).map_err(|error| {
         runtime_status_response(tonic::Status::internal(format!(
