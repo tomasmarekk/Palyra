@@ -758,15 +758,14 @@ async fn run_browser_session_command(command: BrowserSessionCommand) -> Result<(
                 text.push('\n');
                 text.push_str(
                     format!(
-                        "session id={} principal={} channel={} tabs={} active_tab={} private_targets={} downloads={} profile_id={}",
-                        canonical_id_text(session.session_id.as_ref(), "session"),
+                        "session principal={} channel={} tabs={} has_active_tab={} private_targets={} downloads={} has_profile={}",
                         empty_as_dash(session.principal.as_str()),
                         empty_as_dash(session.channel.as_str()),
                         session.tab_count,
-                        canonical_id_text(session.active_tab_id.as_ref(), "tab"),
+                        session.active_tab_id.is_some(),
                         session.allow_private_targets,
                         session.downloads_enabled,
-                        canonical_id_text(session.profile_id.as_ref(), "profile"),
+                        session.profile_id.is_some(),
                     )
                     .as_str(),
                 );
