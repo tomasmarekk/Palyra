@@ -36,6 +36,8 @@ pub(crate) async fn console_diagnostics_handler(
 
     let browser_payload = collect_console_browser_diagnostics(&state).await;
     let skills_payload = collect_console_skills_diagnostics(&state).await;
+    let plugins_payload = collect_console_plugins_diagnostics();
+    let hooks_payload = collect_console_hooks_diagnostics();
     let media_payload = state.channels.media_snapshot().map_err(channel_platform_error_response)?;
     let webhook_payload = serde_json::to_value(
         state.webhooks.diagnostics_snapshot(state.vault.as_ref()).map_err(|error| {
@@ -75,6 +77,8 @@ pub(crate) async fn console_diagnostics_handler(
         "auth_profiles": auth_payload,
         "browserd": browser_payload,
         "skills": skills_payload,
+        "plugins": plugins_payload,
+        "hooks": hooks_payload,
         "webhooks": webhook_payload,
         "media": media_payload,
         "deployment": deployment_payload,
@@ -254,6 +258,74 @@ pub(crate) async fn collect_console_skills_diagnostics(state: &AppState) -> Valu
             "disabled": runtime_disabled,
             "errors": runtime_errors,
         },
+    })
+}
+
+pub(crate) fn collect_console_plugins_diagnostics() -> Value {
+    let plugins_root = match plugins::resolve_plugins_root() {
+        Ok(path) => path,
+        Err(error) => {
+            return json!({
+                "plugins_root": "unavailable",
+                "error": sanitize_http_error_message(error.to_string().as_str()),
+            });
+        }
+    };
+    let index = match plugins::load_plugin_bindings_index(plugins_root.as_path()) {
+        Ok(index) => index,
+        Err(error) => {
+            return json!({
+                "plugins_root": plugins_root,
+                "error": sanitize_http_error_message(error.to_string().as_str()),
+            });
+        }
+    };
+
+    let distinct_skills = index
+        .entries
+        .iter()
+        .map(|entry| entry.skill_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    json!({
+        "plugins_root": plugins_root,
+        "bindings_total": index.entries.len(),
+        "enabled_total": index.entries.iter().filter(|entry| entry.enabled).count(),
+        "disabled_total": index.entries.iter().filter(|entry| !entry.enabled).count(),
+        "distinct_skill_bindings": distinct_skills.len(),
+    })
+}
+
+pub(crate) fn collect_console_hooks_diagnostics() -> Value {
+    let hooks_root = match hooks::resolve_hooks_root() {
+        Ok(path) => path,
+        Err(error) => {
+            return json!({
+                "hooks_root": "unavailable",
+                "error": sanitize_http_error_message(error.to_string().as_str()),
+            });
+        }
+    };
+    let index = match hooks::load_hook_bindings_index(hooks_root.as_path()) {
+        Ok(index) => index,
+        Err(error) => {
+            return json!({
+                "hooks_root": hooks_root,
+                "error": sanitize_http_error_message(error.to_string().as_str()),
+            });
+        }
+    };
+
+    let distinct_events = index
+        .entries
+        .iter()
+        .map(|entry| entry.event.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    json!({
+        "hooks_root": hooks_root,
+        "bindings_total": index.entries.len(),
+        "enabled_total": index.entries.iter().filter(|entry| entry.enabled).count(),
+        "disabled_total": index.entries.iter().filter(|entry| !entry.enabled).count(),
+        "event_kinds": distinct_events.into_iter().collect::<Vec<_>>(),
     })
 }
 
@@ -1819,6 +1891,44 @@ pub(crate) fn build_capability_catalog() -> Result<control_plane::CapabilityCata
                 &["apps/web/src/App.test.tsx"],
                 &[],
                 None,
+            ),
+            capability_entry(
+                "plugins",
+                "plugins",
+                "extensions",
+                "Trusted plugin bindings over signed installed skills",
+                "palyrad",
+                &["backend", "cli"],
+                "direct_ui",
+                &["skills", "sandbox"],
+                &[
+                    "/console/v1/plugins",
+                    "/console/v1/plugins/{plugin_id}",
+                    "/console/v1/plugins/{plugin_id}/check",
+                    "/console/v1/plugins/{plugin_id}/enable",
+                ],
+                &["crates/palyra-daemon/tests/admin_surface.rs"],
+                &["cargo run -p palyra-cli -- plugins list --json"],
+                Some("Plugin bindings stay deny-by-default around skill trust, capability profiles, and runtime policy."),
+            ),
+            capability_entry(
+                "hooks",
+                "hooks",
+                "automation",
+                "Event-driven hook bindings over trusted plugins",
+                "palyrad",
+                &["backend", "cli"],
+                "direct_ui",
+                &["plugins", "audit"],
+                &[
+                    "/console/v1/hooks",
+                    "/console/v1/hooks/{hook_id}",
+                    "/console/v1/hooks/{hook_id}/check",
+                    "/console/v1/hooks/{hook_id}/enable",
+                ],
+                &["crates/palyra-daemon/tests/admin_surface.rs"],
+                &["cargo run -p palyra-cli -- hooks list --json"],
+                Some("Hooks bind explicit internal events to plugin bindings and keep dispatch audit-visible."),
             ),
             capability_entry(
                 "audit",

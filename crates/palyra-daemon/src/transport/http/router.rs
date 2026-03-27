@@ -412,6 +412,44 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/console/v1/skills/{skill_id}/enable",
             post(console::skills::console_skill_enable_handler),
         )
+        .route("/console/v1/plugins", get(console::plugins::console_plugins_list_handler))
+        .route(
+            "/console/v1/plugins/install-or-bind",
+            post(console::plugins::console_plugins_install_or_bind_handler),
+        )
+        .route("/console/v1/plugins/{plugin_id}", get(console::plugins::console_plugin_get_handler))
+        .route(
+            "/console/v1/plugins/{plugin_id}/check",
+            get(console::plugins::console_plugin_check_handler),
+        )
+        .route(
+            "/console/v1/plugins/{plugin_id}/enable",
+            post(console::plugins::console_plugin_enable_handler),
+        )
+        .route(
+            "/console/v1/plugins/{plugin_id}/disable",
+            post(console::plugins::console_plugin_disable_handler),
+        )
+        .route(
+            "/console/v1/plugins/{plugin_id}/delete",
+            post(console::plugins::console_plugin_delete_handler),
+        )
+        .route("/console/v1/hooks", get(console::hooks::console_hooks_list_handler))
+        .route("/console/v1/hooks/bind", post(console::hooks::console_hooks_bind_handler))
+        .route("/console/v1/hooks/{hook_id}", get(console::hooks::console_hook_get_handler))
+        .route("/console/v1/hooks/{hook_id}/check", get(console::hooks::console_hook_check_handler))
+        .route(
+            "/console/v1/hooks/{hook_id}/enable",
+            post(console::hooks::console_hook_enable_handler),
+        )
+        .route(
+            "/console/v1/hooks/{hook_id}/disable",
+            post(console::hooks::console_hook_disable_handler),
+        )
+        .route(
+            "/console/v1/hooks/{hook_id}/delete",
+            post(console::hooks::console_hook_delete_handler),
+        )
         .route(
             "/console/v1/browser/profiles",
             get(console::browser::console_browser_profiles_list_handler),

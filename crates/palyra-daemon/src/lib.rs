@@ -9,6 +9,7 @@ mod config;
 mod cron;
 pub mod domain;
 mod gateway;
+mod hooks;
 pub mod infra;
 mod journal;
 mod media;
@@ -18,6 +19,7 @@ mod observability;
 mod openai_auth;
 mod openai_surface;
 mod orchestrator;
+mod plugins;
 mod quic_runtime;
 mod sandbox_runner;
 pub mod support;
@@ -1722,8 +1724,24 @@ pub async fn run() -> Result<()> {
             scheduler_wake: Arc::clone(&scheduler_wake),
         },
     );
+    let hook_runtime_policy = wasm_plugin_runner::WasmPluginRunnerPolicy {
+        enabled: loaded.tool_call.wasm_runtime.enabled,
+        allow_inline_modules: loaded.tool_call.wasm_runtime.allow_inline_modules,
+        max_module_size_bytes: loaded.tool_call.wasm_runtime.max_module_size_bytes,
+        fuel_budget: loaded.tool_call.wasm_runtime.fuel_budget,
+        max_memory_bytes: loaded.tool_call.wasm_runtime.max_memory_bytes,
+        max_table_elements: loaded.tool_call.wasm_runtime.max_table_elements,
+        max_instances: loaded.tool_call.wasm_runtime.max_instances,
+        allowed_http_hosts: loaded.tool_call.wasm_runtime.allowed_http_hosts.clone(),
+        allowed_secrets: loaded.tool_call.wasm_runtime.allowed_secrets.clone(),
+        allowed_storage_prefixes: loaded.tool_call.wasm_runtime.allowed_storage_prefixes.clone(),
+        allowed_channels: loaded.tool_call.wasm_runtime.allowed_channels.clone(),
+    };
+    let hook_execution_timeout = Duration::from_millis(loaded.tool_call.execution_timeout_ms);
     let app = transport::http::router::build_router(state.clone());
     let _channel_worker_task = Arc::clone(&channels).spawn_worker();
+    let _hook_runtime_task =
+        hooks::spawn_hook_runtime(runtime.clone(), hook_runtime_policy, hook_execution_timeout);
 
     let admin_server = async move {
         axum::serve(admin_listener, app.into_make_service_with_connect_info::<SocketAddr>())

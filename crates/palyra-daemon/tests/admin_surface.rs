@@ -11,6 +11,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use base64::prelude::{Engine as _, BASE64_STANDARD};
+use palyra_skills::{build_signed_skill_artifact, ArtifactFile, SkillArtifactBuildRequest};
 use reqwest::blocking::Client;
 use reqwest::Url;
 use serde_json::{json, Value};
@@ -2687,6 +2688,197 @@ fn console_webhooks_support_secret_aware_lifecycle_and_diagnostics() -> Result<(
 }
 
 #[test]
+fn console_plugins_and_hooks_bind_installed_skills_and_dispatch_skill_events() -> Result<()> {
+    let config = r#"
+version = 1
+
+[tool_call]
+allowed_tools = ["palyra.plugin.run"]
+execution_timeout_ms = 4000
+
+[tool_call.wasm_runtime]
+enabled = true
+allow_inline_modules = false
+max_module_size_bytes = 131072
+fuel_budget = 500000
+max_memory_bytes = 1048576
+max_table_elements = 128
+max_instances = 1
+allowed_http_hosts = []
+allowed_secrets = []
+allowed_storage_prefixes = []
+allowed_channels = []
+"#;
+    let (child, admin_port) = spawn_palyrad_with_config_and_env(
+        config,
+        &[("PALYRA_ADMIN_BOUND_PRINCIPAL", CONSOLE_ADMIN_PRINCIPAL)],
+    )?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .context("failed to build HTTP client")?;
+    let (cookie, csrf_token) = login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
+    let artifact_path = unique_temp_skill_artifact_path();
+    fs::write(
+        &artifact_path,
+        build_test_skill_artifact("acme.hook_skill", "1.0.0")
+            .context("failed to build signed test skill artifact")?,
+    )
+    .with_context(|| format!("failed to write test skill artifact {}", artifact_path.display()))?;
+
+    let bound_plugin_response = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/plugins/install-or-bind"))
+        .header("Cookie", cookie.clone())
+        .header("x-palyra-csrf-token", csrf_token.clone())
+        .json(&json!({
+            "plugin_id": "acme-hook-plugin",
+            "artifact_path": artifact_path,
+            "module_path": "modules/module.wasm",
+            "entrypoint": "run",
+            "enabled": true
+        }))
+        .send()
+        .context("failed to bind plugin from signed skill artifact")?;
+    let bound_plugin_status = bound_plugin_response.status();
+    let bound_plugin_body =
+        bound_plugin_response.text().context("failed to read plugin bind error body")?;
+    anyhow::ensure!(
+        bound_plugin_status.is_success(),
+        "plugin install-or-bind returned status {} body {}",
+        bound_plugin_status,
+        bound_plugin_body
+    );
+    let bound_plugin = serde_json::from_str::<Value>(bound_plugin_body.as_str())
+        .context("failed to parse plugin bind response json")?;
+    assert_eq!(
+        bound_plugin.pointer("/binding/plugin_id").and_then(Value::as_str),
+        Some("acme-hook-plugin")
+    );
+    assert_eq!(
+        bound_plugin.pointer("/check/ready").and_then(Value::as_bool),
+        Some(true),
+        "plugin check should resolve the installed signed skill artifact"
+    );
+
+    let listed_plugins = client
+        .get(format!("http://127.0.0.1:{admin_port}/console/v1/plugins"))
+        .header("Cookie", cookie.clone())
+        .send()
+        .context("failed to list plugins")?
+        .error_for_status()
+        .context("plugin list returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse plugin list response json")?;
+    assert_eq!(
+        listed_plugins.get("count").and_then(Value::as_u64),
+        Some(1),
+        "plugin list should include the newly bound plugin"
+    );
+
+    let bound_hook = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/hooks/bind"))
+        .header("Cookie", cookie.clone())
+        .header("x-palyra-csrf-token", csrf_token.clone())
+        .json(&json!({
+            "hook_id": "acme-skill-enabled-hook",
+            "event": "skill:enabled",
+            "plugin_id": "acme-hook-plugin",
+            "enabled": true
+        }))
+        .send()
+        .context("failed to bind hook to plugin")?
+        .error_for_status()
+        .context("hook bind returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse hook bind response json")?;
+    assert_eq!(
+        bound_hook.pointer("/binding/hook_id").and_then(Value::as_str),
+        Some("acme-skill-enabled-hook")
+    );
+    assert_eq!(
+        bound_hook.pointer("/check/ready").and_then(Value::as_bool),
+        Some(true),
+        "hook check should confirm the referenced plugin exists and is enabled"
+    );
+
+    let plugin_delete_while_referenced = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/plugins/acme-hook-plugin/delete"))
+        .header("Cookie", cookie.clone())
+        .header("x-palyra-csrf-token", csrf_token.clone())
+        .send()
+        .context("failed to call plugin delete while hook still references it")?;
+    assert_eq!(
+        plugin_delete_while_referenced.status().as_u16(),
+        412,
+        "plugin delete should fail closed while hooks still reference the binding"
+    );
+
+    let enabled_skill = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/skills/acme.hook_skill/enable"))
+        .header("Cookie", cookie.clone())
+        .header("x-palyra-csrf-token", csrf_token.clone())
+        .json(&json!({
+            "version": "1.0.0",
+            "override": true,
+            "reason": "test-trigger"
+        }))
+        .send()
+        .context("failed to emit skill enabled event through console skill surface")?
+        .error_for_status()
+        .context("console skill enable returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse console skill enable response json")?;
+    assert_eq!(enabled_skill.get("status").and_then(Value::as_str), Some("active"));
+
+    let dispatched = wait_for_admin_journal_event(&client, admin_port, "hook.dispatched")
+        .context("hook runtime did not dispatch the plugin after skill:enabled event")?;
+    assert_eq!(
+        dispatched.pointer("/details/hook_id").and_then(Value::as_str),
+        Some("acme-skill-enabled-hook")
+    );
+    assert_eq!(
+        dispatched.pointer("/details/plugin_id").and_then(Value::as_str),
+        Some("acme-hook-plugin")
+    );
+    assert_eq!(
+        dispatched.pointer("/details/details/output/exit_code").and_then(Value::as_i64),
+        Some(7),
+        "hook dispatch journal event should include the wasm plugin exit code"
+    );
+
+    let deleted_hook = client
+        .post(format!(
+            "http://127.0.0.1:{admin_port}/console/v1/hooks/acme-skill-enabled-hook/delete"
+        ))
+        .header("Cookie", cookie.clone())
+        .header("x-palyra-csrf-token", csrf_token.clone())
+        .send()
+        .context("failed to delete hook binding")?
+        .error_for_status()
+        .context("hook delete returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse hook delete response json")?;
+    assert_eq!(deleted_hook.get("deleted").and_then(Value::as_bool), Some(true));
+
+    let deleted_plugin = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/plugins/acme-hook-plugin/delete"))
+        .header("Cookie", cookie.clone())
+        .header("x-palyra-csrf-token", csrf_token.clone())
+        .send()
+        .context("failed to delete plugin binding after hook removal")?
+        .error_for_status()
+        .context("plugin delete returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse plugin delete response json")?;
+    assert_eq!(deleted_plugin.get("deleted").and_then(Value::as_bool), Some(true));
+
+    Ok(())
+}
+
+#[test]
 fn console_config_migrate_and_recover_require_session_csrf_and_keep_secrets_redacted() -> Result<()>
 {
     let config_path = unique_temp_config_path();
@@ -3065,6 +3257,30 @@ fn spawn_palyrad_with_bound_console_principal(principal: &str) -> Result<(Child,
     spawn_palyrad_with_dynamic_ports_with_env(&[("PALYRA_ADMIN_BOUND_PRINCIPAL", principal)])
 }
 
+fn spawn_palyrad_with_config_and_env(
+    config_toml: &str,
+    extra_env: &[(&str, &str)],
+) -> Result<(Child, u16)> {
+    let mut last_error: Option<anyhow::Error> = None;
+    for attempt in 1..=PALYRAD_STARTUP_ATTEMPTS {
+        match spawn_palyrad_with_config_and_env_once(config_toml, extra_env) {
+            Ok(started) => return Ok(started),
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < PALYRAD_STARTUP_ATTEMPTS {
+                    thread::sleep(PALYRAD_STARTUP_RETRY_DELAY);
+                }
+            }
+        }
+    }
+    let Some(last_error) = last_error else {
+        anyhow::bail!("failed to spawn palyrad with custom config for admin surface tests");
+    };
+    Err(last_error).context(format!(
+        "failed to spawn palyrad with custom config after {PALYRAD_STARTUP_ATTEMPTS} startup attempts"
+    ))
+}
+
 fn spawn_palyrad_with_dynamic_ports_with_env(extra_env: &[(&str, &str)]) -> Result<(Child, u16)> {
     let mut last_error: Option<anyhow::Error> = None;
     for attempt in 1..=PALYRAD_STARTUP_ATTEMPTS {
@@ -3157,6 +3373,13 @@ fn header_value(headers: &reqwest::header::HeaderMap, name: &str) -> Result<Stri
 }
 
 fn spawn_palyrad_with_dynamic_ports_once(extra_env: &[(&str, &str)]) -> Result<(Child, u16)> {
+    spawn_palyrad_with_config_and_env_once("version = 1\n", extra_env)
+}
+
+fn spawn_palyrad_with_config_and_env_once(
+    config_toml: &str,
+    extra_env: &[(&str, &str)],
+) -> Result<(Child, u16)> {
     let state_root_dir = unique_temp_state_root_dir();
     let journal_db_path = unique_temp_journal_db_path();
     let identity_store_dir = state_root_dir.join("identity");
@@ -3167,7 +3390,7 @@ fn spawn_palyrad_with_dynamic_ports_once(extra_env: &[(&str, &str)]) -> Result<(
         format!("failed to create test identity dir {}", identity_store_dir.display())
     })?;
     prepare_test_vault_dir(&vault_dir)?;
-    write_test_config(&default_config_path, "version = 1\n")?;
+    write_test_config(&default_config_path, config_toml)?;
     let mut command = Command::new(env!("CARGO_BIN_EXE_palyrad"));
     command
         .args([
@@ -3198,6 +3421,43 @@ fn spawn_palyrad_with_dynamic_ports_once(extra_env: &[(&str, &str)]) -> Result<(
     Ok((child, admin_port))
 }
 
+fn wait_for_admin_journal_event(
+    client: &Client,
+    admin_port: u16,
+    event_name: &str,
+) -> Result<Value> {
+    let deadline = Instant::now() + Duration::from_secs(12);
+    while Instant::now() < deadline {
+        let response = client
+            .get(format!("http://127.0.0.1:{admin_port}/admin/v1/journal/recent?limit=64"))
+            .header("Authorization", format!("Bearer {ADMIN_TOKEN}"))
+            .header("x-palyra-principal", CONSOLE_ADMIN_PRINCIPAL)
+            .header("x-palyra-device-id", DEVICE_ID)
+            .header("x-palyra-channel", "cli")
+            .send()
+            .context("failed to poll admin journal recent for expected hook event")?
+            .error_for_status()
+            .context("admin journal recent poll returned non-success status")?
+            .json::<Value>()
+            .context("failed to parse admin journal recent response json")?;
+        if let Some(events) = response.get("events").and_then(Value::as_array) {
+            for event in events {
+                let Some(payload_json) = event.get("payload_json").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Ok(payload) = serde_json::from_str::<Value>(payload_json) else {
+                    continue;
+                };
+                if payload.get("event").and_then(Value::as_str) == Some(event_name) {
+                    return Ok(payload);
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    anyhow::bail!("timed out waiting for journal event {event_name}");
+}
+
 fn unique_temp_journal_db_path() -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3226,6 +3486,73 @@ fn unique_temp_config_path() -> PathBuf {
     let counter = TEMP_IDENTITY_COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir()
         .join(format!("palyra-admin-config-{nonce}-{}-{counter}.toml", std::process::id()))
+}
+
+fn unique_temp_skill_artifact_path() -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_nanos();
+    let counter = TEMP_IDENTITY_COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir()
+        .join(format!("palyra-admin-skill-{nonce}-{}-{counter}.palyra-skill", std::process::id()))
+}
+
+fn build_test_skill_artifact(skill_id: &str, version: &str) -> Result<Vec<u8>> {
+    let manifest_toml = format!(
+        r#"
+manifest_version = 1
+skill_id = "{skill_id}"
+name = "Hook Skill"
+version = "{version}"
+publisher = "acme"
+
+[entrypoints]
+[[entrypoints.tools]]
+id = "acme.hook_run"
+name = "hook_run"
+description = "Run the hook entrypoint"
+input_schema = {{ type = "object" }}
+output_schema = {{ type = "object" }}
+risk = {{ default_sensitive = false, requires_approval = false }}
+
+[capabilities.filesystem]
+read_roots = []
+write_roots = []
+
+[capabilities]
+http_egress_allowlist = []
+device_capabilities = []
+node_capabilities = []
+
+[capabilities.quotas]
+wall_clock_timeout_ms = 2000
+fuel_budget = 500000
+max_memory_bytes = 1048576
+
+[compat]
+required_protocol_major = 1
+min_palyra_version = "0.1.0"
+"#
+    );
+    let output =
+        build_signed_skill_artifact(SkillArtifactBuildRequest {
+            manifest_toml,
+            modules: vec![ArtifactFile {
+                path: "module.wasm".to_owned(),
+                bytes: br#"(module (func (export "run") (result i32) i32.const 7))"#.to_vec(),
+            }],
+            assets: Vec::new(),
+            sbom_cyclonedx_json:
+                br#"{"bomFormat":"CycloneDX","specVersion":"1.5","version":1,"components":[]}"#
+                    .to_vec(),
+            provenance_json:
+                br#"{"builder":{"id":"palyra-test"},"subject":[{"name":"modules/module.wasm"}]}"#
+                    .to_vec(),
+            signing_key: [7_u8; 32],
+        })
+        .context("failed to build signed test skill artifact")?;
+    Ok(output.artifact_bytes)
 }
 
 fn reserve_loopback_port() -> Result<u16> {

@@ -7,6 +7,10 @@ use std::{
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
 use palyra_plugins_runtime::{CapabilityGrantSet, RuntimeError, RuntimeLimits, WasmRuntime};
 use palyra_plugins_sdk::DEFAULT_RUNTIME_ENTRYPOINT;
+use palyra_skills::{
+    capability_grants_from_manifest, SkillCapabilityGrantSnapshot, SkillManifest,
+    SkillToolEntrypoint,
+};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -53,24 +57,40 @@ struct WasmPluginRunInput {
     skill_id: Option<String>,
     #[serde(default)]
     skill_version: Option<String>,
+    #[serde(default)]
+    module_path: Option<String>,
+    #[serde(default)]
+    tool_id: Option<String>,
     module_wat: Option<String>,
     module_base64: Option<String>,
     entrypoint: Option<String>,
     #[serde(default)]
-    capabilities: RequestedCapabilities,
+    capabilities: WasmPluginRequestedCapabilities,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct RequestedCapabilities {
+pub(crate) struct WasmPluginRequestedCapabilities {
     #[serde(default)]
-    http_hosts: Vec<String>,
+    pub(crate) http_hosts: Vec<String>,
     #[serde(default)]
-    secrets: Vec<String>,
+    pub(crate) secrets: Vec<String>,
     #[serde(default)]
-    storage_prefixes: Vec<String>,
+    pub(crate) storage_prefixes: Vec<String>,
     #[serde(default)]
-    channels: Vec<String>,
+    pub(crate) channels: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedInstalledSkillModule {
+    pub(crate) skill_id: String,
+    pub(crate) skill_version: String,
+    pub(crate) manifest: SkillManifest,
+    pub(crate) selected_tool: Option<SkillToolEntrypoint>,
+    pub(crate) capability_grants: SkillCapabilityGrantSnapshot,
+    pub(crate) module_path: String,
+    pub(crate) module_bytes: Vec<u8>,
+    pub(crate) entrypoint: String,
 }
 
 pub fn run_wasm_plugin(
@@ -88,122 +108,37 @@ pub fn run_wasm_plugin(
     let input = parse_input(input_json)?;
     validate_optional_metadata(input.skill_id.as_deref(), "skill_id")?;
     validate_optional_metadata(input.skill_version.as_deref(), "skill_version")?;
-    let module_bytes = decode_module_bytes(policy, &input)?;
-    let entrypoint = parse_entrypoint(input.entrypoint.as_deref())?;
-    let requested_http_hosts = normalize_host_allowlist(
-        input.capabilities.http_hosts.as_slice(),
-        "capabilities.http_hosts",
-    )?;
-    let requested_secrets = normalize_identifier_allowlist(
-        input.capabilities.secrets.as_slice(),
-        "capabilities.secrets",
-        "secret handle",
-    )?;
-    let requested_storage_prefixes = normalize_storage_prefix_allowlist(
-        input.capabilities.storage_prefixes.as_slice(),
-        "capabilities.storage_prefixes",
-    )?;
-    let requested_channels = normalize_identifier_allowlist(
-        input.capabilities.channels.as_slice(),
-        "capabilities.channels",
-        "channel handle",
-    )?;
-
-    let allowed_http_hosts = normalize_host_allowlist(
-        policy.allowed_http_hosts.as_slice(),
-        "policy.allowed_http_hosts",
-    )?;
-    let allowed_secrets = normalize_identifier_allowlist(
-        policy.allowed_secrets.as_slice(),
-        "policy.allowed_secrets",
-        "secret handle",
-    )?;
-    let allowed_storage_prefixes = normalize_storage_prefix_allowlist(
-        policy.allowed_storage_prefixes.as_slice(),
-        "policy.allowed_storage_prefixes",
-    )?;
-    let allowed_channels = normalize_identifier_allowlist(
-        policy.allowed_channels.as_slice(),
-        "policy.allowed_channels",
-        "channel handle",
-    )?;
-
-    ensure_capabilities_subset(
-        requested_http_hosts.as_slice(),
-        allowed_http_hosts.as_slice(),
-        "http_hosts",
-    )?;
-    ensure_capabilities_subset(
-        requested_secrets.as_slice(),
-        allowed_secrets.as_slice(),
-        "secrets",
-    )?;
-    ensure_capabilities_subset(
-        requested_storage_prefixes.as_slice(),
-        allowed_storage_prefixes.as_slice(),
-        "storage_prefixes",
-    )?;
-    ensure_capabilities_subset(
-        requested_channels.as_slice(),
-        allowed_channels.as_slice(),
-        "channels",
-    )?;
-
-    let limits = RuntimeLimits {
-        fuel_budget: policy.fuel_budget,
-        max_memory_bytes: usize::try_from(policy.max_memory_bytes).map_err(|_| {
-            WasmPluginRunError {
-                kind: WasmPluginRunErrorKind::InvalidInput,
-                message: "wasm runtime memory quota exceeds platform usize range".to_owned(),
-            }
-        })?,
-        max_table_elements: usize::try_from(policy.max_table_elements).map_err(|_| {
-            WasmPluginRunError {
-                kind: WasmPluginRunErrorKind::InvalidInput,
-                message: "wasm runtime table quota exceeds platform usize range".to_owned(),
-            }
-        })?,
-        max_instances: usize::try_from(policy.max_instances).map_err(|_| WasmPluginRunError {
-            kind: WasmPluginRunErrorKind::InvalidInput,
-            message: "wasm runtime instance quota exceeds platform usize range".to_owned(),
-        })?,
-    };
-    let grants = CapabilityGrantSet {
-        http_hosts: requested_http_hosts.clone(),
-        secret_keys: requested_secrets.clone(),
-        storage_prefixes: requested_storage_prefixes.clone(),
-        channels: requested_channels.clone(),
-    };
-    let runtime = WasmRuntime::new_with_limits(limits).map_err(map_runtime_error)?;
-    let started_at = Instant::now();
-    let execution = runtime
-        .execute_i32_entrypoint_with_timeout(
-            module_bytes.as_slice(),
-            entrypoint.as_str(),
-            &grants,
-            timeout,
-        )
-        .map_err(map_runtime_error)?;
-    let duration = started_at.elapsed();
-    let output_json = serde_json::to_vec(&json!({
-        "exit_code": execution.exit_code,
-        "entrypoint": entrypoint,
-        "duration_ms": duration_to_millis(duration),
-        "capabilities": {
-            "http_handles": execution.capability_handles.http_handles,
-            "secret_handles_count": execution.capability_handles.secret_handles.len(),
-            "storage_handles": execution.capability_handles.storage_handles,
-            "channel_handles": execution.capability_handles.channel_handles,
-            "granted_http_hosts": requested_http_hosts,
-            "granted_storage_prefixes": requested_storage_prefixes,
-            "granted_channels": requested_channels,
+    validate_optional_metadata(input.module_path.as_deref(), "module_path")?;
+    validate_optional_metadata(input.tool_id.as_deref(), "tool_id")?;
+    let resolved = resolve_module_source(policy, &input)?;
+    execute_module(
+        policy,
+        resolved.installed_skill.as_ref(),
+        resolved.module_bytes.as_slice(),
+        resolved.entrypoint.as_str(),
+        input.capabilities,
+        if resolved.execution_timeout.is_zero() {
+            timeout
+        } else {
+            timeout.min(resolved.execution_timeout)
         },
-    }))
-    .map_err(|error| WasmPluginRunError {
-        kind: WasmPluginRunErrorKind::RuntimeFailure,
-        message: format!("failed to serialize palyra.plugin.run output JSON: {error}"),
-    })?;
-    Ok(WasmPluginRunSuccess { output_json })
+    )
+}
+
+pub(crate) fn run_resolved_wasm_plugin(
+    policy: &WasmPluginRunnerPolicy,
+    resolved: &ResolvedInstalledSkillModule,
+    capabilities: WasmPluginRequestedCapabilities,
+    timeout: Duration,
+) -> Result<WasmPluginRunSuccess, WasmPluginRunError> {
+    execute_module(
+        policy,
+        Some(resolved),
+        resolved.module_bytes.as_slice(),
+        resolved.entrypoint.as_str(),
+        capabilities,
+        timeout,
+    )
 }
 
 fn parse_input(input_json: &[u8]) -> Result<WasmPluginRunInput, WasmPluginRunError> {
@@ -228,10 +163,17 @@ fn validate_optional_metadata(
     Ok(())
 }
 
-fn decode_module_bytes(
+struct ResolvedModuleSource {
+    module_bytes: Vec<u8>,
+    entrypoint: String,
+    execution_timeout: Duration,
+    installed_skill: Option<ResolvedInstalledSkillModule>,
+}
+
+fn resolve_module_source(
     policy: &WasmPluginRunnerPolicy,
     input: &WasmPluginRunInput,
-) -> Result<Vec<u8>, WasmPluginRunError> {
+) -> Result<ResolvedModuleSource, WasmPluginRunError> {
     if inline_module_payload_present(input) && !policy.allow_inline_modules {
         return Err(WasmPluginRunError {
             kind: WasmPluginRunErrorKind::InvalidInput,
@@ -240,31 +182,229 @@ fn decode_module_bytes(
         });
     }
 
-    let module_bytes = match (input.module_wat.as_ref(), input.module_base64.as_ref()) {
-        (Some(_), Some(_)) => {
-            return Err(WasmPluginRunError {
-                kind: WasmPluginRunErrorKind::InvalidInput,
-                message: "palyra.plugin.run accepts either module_wat or module_base64, not both"
+    if inline_module_payload_present(input)
+        && (input.module_path.is_some() || input.tool_id.is_some())
+    {
+        return Err(WasmPluginRunError {
+            kind: WasmPluginRunErrorKind::InvalidInput,
+            message:
+                "palyra.plugin.run module_path/tool_id can only be used with installed skill artifacts"
                     .to_owned(),
-            });
-        }
-        (Some(module_wat), None) => module_wat.as_bytes().to_vec(),
+        });
+    }
+
+    match (input.module_wat.as_ref(), input.module_base64.as_ref()) {
+        (Some(_), Some(_)) => Err(WasmPluginRunError {
+            kind: WasmPluginRunErrorKind::InvalidInput,
+            message: "palyra.plugin.run accepts either module_wat or module_base64, not both"
+                .to_owned(),
+        }),
+        (Some(module_wat), None) => Ok(ResolvedModuleSource {
+            module_bytes: module_wat.as_bytes().to_vec(),
+            entrypoint: parse_entrypoint(input.entrypoint.as_deref())?,
+            execution_timeout: Duration::ZERO,
+            installed_skill: None,
+        }),
         (None, Some(module_base64)) => {
-            BASE64_STANDARD.decode(module_base64.as_bytes()).map_err(|error| {
-                WasmPluginRunError {
-                    kind: WasmPluginRunErrorKind::InvalidInput,
-                    message: format!("palyra.plugin.run module_base64 is invalid: {error}"),
-                }
-            })?
+            let module_bytes =
+                BASE64_STANDARD.decode(module_base64.as_bytes()).map_err(|error| {
+                    WasmPluginRunError {
+                        kind: WasmPluginRunErrorKind::InvalidInput,
+                        message: format!("palyra.plugin.run module_base64 is invalid: {error}"),
+                    }
+                })?;
+            Ok(ResolvedModuleSource {
+                module_bytes,
+                entrypoint: parse_entrypoint(input.entrypoint.as_deref())?,
+                execution_timeout: Duration::ZERO,
+                installed_skill: None,
+            })
         }
         (None, None) => {
+            let skill_id = input.skill_id.as_deref().ok_or_else(|| WasmPluginRunError {
+                kind: WasmPluginRunErrorKind::InvalidInput,
+                message:
+                    "palyra.plugin.run requires skill_id when no inline module payload is supplied"
+                        .to_owned(),
+            })?;
+            let resolved = resolve_installed_skill_module(
+                skill_id,
+                input.skill_version.as_deref(),
+                input.module_path.as_deref(),
+                input.entrypoint.as_deref(),
+                input.tool_id.as_deref(),
+            )?;
+            Ok(ResolvedModuleSource {
+                module_bytes: resolved.module_bytes.clone(),
+                entrypoint: resolved.entrypoint.clone(),
+                execution_timeout: Duration::from_millis(
+                    resolved.manifest.capabilities.quotas.wall_clock_timeout_ms,
+                ),
+                installed_skill: Some(resolved),
+            })
+        }
+    }
+}
+
+fn inline_module_payload_present(input: &WasmPluginRunInput) -> bool {
+    input.module_wat.is_some() || input.module_base64.is_some()
+}
+
+pub(crate) fn resolve_installed_skill_module(
+    skill_id: &str,
+    skill_version: Option<&str>,
+    module_path: Option<&str>,
+    entrypoint: Option<&str>,
+    tool_id: Option<&str>,
+) -> Result<ResolvedInstalledSkillModule, WasmPluginRunError> {
+    let skills_root = crate::resolve_skills_root().map_err(|response| WasmPluginRunError {
+        kind: WasmPluginRunErrorKind::RuntimeFailure,
+        message: format!(
+            "failed to resolve installed skills root for palyra.plugin.run (http {})",
+            response.status()
+        ),
+    })?;
+    let index = crate::load_installed_skills_index(skills_root.as_path()).map_err(|response| {
+        WasmPluginRunError {
+            kind: WasmPluginRunErrorKind::RuntimeFailure,
+            message: format!(
+                "failed to load installed skills index for palyra.plugin.run (http {})",
+                response.status()
+            ),
+        }
+    })?;
+    let resolved_version =
+        crate::resolve_skill_version(&index, skill_id, skill_version).map_err(|response| {
+            WasmPluginRunError {
+                kind: WasmPluginRunErrorKind::InvalidInput,
+                message: format!(
+                    "failed to resolve installed skill version for palyra.plugin.run (http {})",
+                    response.status()
+                ),
+            }
+        })?;
+    let _record = index
+        .entries
+        .iter()
+        .find(|entry| entry.skill_id == skill_id && entry.version == resolved_version)
+        .cloned()
+        .ok_or_else(|| WasmPluginRunError {
+            kind: WasmPluginRunErrorKind::InvalidInput,
+            message: format!(
+                "installed skill artifact not found for {}@{}",
+                skill_id, resolved_version
+            ),
+        })?;
+    let artifact_path = crate::managed_skill_artifact_path(
+        skills_root.as_path(),
+        skill_id,
+        resolved_version.as_str(),
+    );
+    let artifact_bytes =
+        std::fs::read(artifact_path.as_path()).map_err(|error| WasmPluginRunError {
+            kind: WasmPluginRunErrorKind::RuntimeFailure,
+            message: format!(
+                "failed to read installed skill artifact {}: {error}",
+                artifact_path.display()
+            ),
+        })?;
+    let inspection =
+        palyra_skills::inspect_skill_artifact(artifact_bytes.as_slice()).map_err(|error| {
+            WasmPluginRunError {
+                kind: WasmPluginRunErrorKind::InvalidInput,
+                message: format!("installed skill artifact inspection failed: {error}"),
+            }
+        })?;
+    let selected_tool = select_tool_entrypoint(&inspection.manifest, tool_id)?;
+    let selected_module_path =
+        select_module_path(inspection.entries.keys().cloned().collect::<Vec<_>>(), module_path)?;
+    let module_bytes =
+        inspection.entries.get(selected_module_path.as_str()).cloned().ok_or_else(|| {
+            WasmPluginRunError {
+                kind: WasmPluginRunErrorKind::InvalidInput,
+                message: format!(
+                    "installed skill artifact is missing selected module '{}'",
+                    selected_module_path
+                ),
+            }
+        })?;
+    Ok(ResolvedInstalledSkillModule {
+        skill_id: skill_id.to_owned(),
+        skill_version: resolved_version,
+        manifest: inspection.manifest.clone(),
+        selected_tool,
+        capability_grants: capability_grants_from_manifest(&inspection.manifest),
+        module_path: selected_module_path,
+        module_bytes,
+        entrypoint: parse_entrypoint(entrypoint)?,
+    })
+}
+
+fn select_tool_entrypoint(
+    manifest: &SkillManifest,
+    tool_id: Option<&str>,
+) -> Result<Option<SkillToolEntrypoint>, WasmPluginRunError> {
+    let Some(tool_id) = tool_id.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    manifest.entrypoints.tools.iter().find(|tool| tool.id == tool_id).cloned().map(Some).ok_or_else(
+        || WasmPluginRunError {
+            kind: WasmPluginRunErrorKind::InvalidInput,
+            message: format!("skill artifact does not declare tool_id '{tool_id}'"),
+        },
+    )
+}
+
+fn select_module_path(
+    artifact_paths: Vec<String>,
+    requested: Option<&str>,
+) -> Result<String, WasmPluginRunError> {
+    let mut module_paths = artifact_paths
+        .into_iter()
+        .filter(|path| path.starts_with("modules/") && path.ends_with(".wasm"))
+        .collect::<Vec<_>>();
+    module_paths.sort();
+    module_paths.dedup();
+    if let Some(path) = requested.map(str::trim).filter(|value| !value.is_empty()) {
+        if path.contains('\0')
+            || path.contains("..")
+            || path.starts_with('/')
+            || path.starts_with('\\')
+            || !path.starts_with("modules/")
+            || !path.ends_with(".wasm")
+        {
             return Err(WasmPluginRunError {
                 kind: WasmPluginRunErrorKind::InvalidInput,
-                message: "palyra.plugin.run requires exactly one of module_wat or module_base64"
-                    .to_owned(),
+                message:
+                    "palyra.plugin.run module_path must reference a modules/*.wasm artifact entry"
+                        .to_owned(),
             });
         }
-    };
+        return module_paths.into_iter().find(|candidate| candidate == path).ok_or_else(|| {
+            WasmPluginRunError {
+                kind: WasmPluginRunErrorKind::InvalidInput,
+                message: format!("skill artifact does not contain module_path '{path}'"),
+            }
+        });
+    }
+    if module_paths.len() == 1 {
+        return Ok(module_paths.remove(0));
+    }
+    Err(WasmPluginRunError {
+        kind: WasmPluginRunErrorKind::InvalidInput,
+        message: "skill artifact contains multiple modules; specify module_path to select one"
+            .to_owned(),
+    })
+}
+
+fn execute_module(
+    policy: &WasmPluginRunnerPolicy,
+    installed_skill: Option<&ResolvedInstalledSkillModule>,
+    module_bytes: &[u8],
+    entrypoint: &str,
+    capabilities: WasmPluginRequestedCapabilities,
+    timeout: Duration,
+) -> Result<WasmPluginRunSuccess, WasmPluginRunError> {
     if module_bytes.is_empty() {
         return Err(WasmPluginRunError {
             kind: WasmPluginRunErrorKind::InvalidInput,
@@ -280,11 +420,154 @@ fn decode_module_bytes(
             ),
         });
     }
-    Ok(module_bytes)
+
+    let requested_http_hosts =
+        normalize_host_allowlist(capabilities.http_hosts.as_slice(), "capabilities.http_hosts")?;
+    let requested_secrets = normalize_identifier_allowlist(
+        capabilities.secrets.as_slice(),
+        "capabilities.secrets",
+        "secret handle",
+    )?;
+    let requested_storage_prefixes = normalize_storage_prefix_allowlist(
+        capabilities.storage_prefixes.as_slice(),
+        "capabilities.storage_prefixes",
+    )?;
+    let requested_channels = normalize_identifier_allowlist(
+        capabilities.channels.as_slice(),
+        "capabilities.channels",
+        "channel handle",
+    )?;
+
+    let allowed_http_hosts = effective_allowed_capabilities(
+        installed_skill.map(|skill| skill.capability_grants.http_hosts.as_slice()),
+        policy.allowed_http_hosts.as_slice(),
+        "policy.allowed_http_hosts",
+        normalize_host_allowlist,
+    )?;
+    let allowed_secrets = effective_allowed_capabilities(
+        installed_skill.map(|skill| skill.capability_grants.secret_keys.as_slice()),
+        policy.allowed_secrets.as_slice(),
+        "policy.allowed_secrets",
+        |values, source| normalize_identifier_allowlist(values, source, "secret handle"),
+    )?;
+    let allowed_storage_prefixes = effective_allowed_capabilities(
+        installed_skill.map(|skill| skill.capability_grants.storage_prefixes.as_slice()),
+        policy.allowed_storage_prefixes.as_slice(),
+        "policy.allowed_storage_prefixes",
+        normalize_storage_prefix_allowlist,
+    )?;
+    let allowed_channels = effective_allowed_capabilities(
+        installed_skill.map(|skill| skill.capability_grants.channels.as_slice()),
+        policy.allowed_channels.as_slice(),
+        "policy.allowed_channels",
+        |values, source| normalize_identifier_allowlist(values, source, "channel handle"),
+    )?;
+
+    ensure_capabilities_subset(
+        requested_http_hosts.as_slice(),
+        allowed_http_hosts.as_slice(),
+        "http_hosts",
+    )?;
+    ensure_capabilities_subset(
+        requested_secrets.as_slice(),
+        allowed_secrets.as_slice(),
+        "secrets",
+    )?;
+    ensure_capabilities_subset(
+        requested_storage_prefixes.as_slice(),
+        allowed_storage_prefixes.as_slice(),
+        "storage_prefixes",
+    )?;
+    ensure_capabilities_subset(
+        requested_channels.as_slice(),
+        allowed_channels.as_slice(),
+        "channels",
+    )?;
+
+    let limits = RuntimeLimits {
+        fuel_budget: installed_skill
+            .map(|skill| skill.manifest.capabilities.quotas.fuel_budget.min(policy.fuel_budget))
+            .unwrap_or(policy.fuel_budget),
+        max_memory_bytes: usize::try_from(
+            installed_skill
+                .map(|skill| {
+                    skill.manifest.capabilities.quotas.max_memory_bytes.min(policy.max_memory_bytes)
+                })
+                .unwrap_or(policy.max_memory_bytes),
+        )
+        .map_err(|_| WasmPluginRunError {
+            kind: WasmPluginRunErrorKind::InvalidInput,
+            message: "wasm runtime memory quota exceeds platform usize range".to_owned(),
+        })?,
+        max_table_elements: usize::try_from(policy.max_table_elements).map_err(|_| {
+            WasmPluginRunError {
+                kind: WasmPluginRunErrorKind::InvalidInput,
+                message: "wasm runtime table quota exceeds platform usize range".to_owned(),
+            }
+        })?,
+        max_instances: usize::try_from(policy.max_instances).map_err(|_| WasmPluginRunError {
+            kind: WasmPluginRunErrorKind::InvalidInput,
+            message: "wasm runtime instance quota exceeds platform usize range".to_owned(),
+        })?,
+    };
+    let grants = CapabilityGrantSet {
+        http_hosts: requested_http_hosts.clone(),
+        secret_keys: requested_secrets.clone(),
+        storage_prefixes: requested_storage_prefixes.clone(),
+        channels: requested_channels.clone(),
+    };
+    let runtime = WasmRuntime::new_with_limits(limits).map_err(map_runtime_error)?;
+    let effective_timeout = if let Some(skill) = installed_skill {
+        timeout.min(Duration::from_millis(skill.manifest.capabilities.quotas.wall_clock_timeout_ms))
+    } else {
+        timeout
+    };
+    let started_at = Instant::now();
+    let execution = runtime
+        .execute_i32_entrypoint_with_timeout(module_bytes, entrypoint, &grants, effective_timeout)
+        .map_err(map_runtime_error)?;
+    let duration = started_at.elapsed();
+    let output_json = serde_json::to_vec(&json!({
+        "exit_code": execution.exit_code,
+        "entrypoint": entrypoint,
+        "duration_ms": duration_to_millis(duration),
+        "resolved_from": if installed_skill.is_some() { "installed_skill_artifact" } else { "inline_module" },
+        "skill": installed_skill.map(|skill| json!({
+            "skill_id": skill.skill_id,
+            "version": skill.skill_version,
+            "module_path": skill.module_path,
+            "tool_id": skill.selected_tool.as_ref().map(|tool| tool.id.clone()),
+        })),
+        "capabilities": {
+            "http_handles": execution.capability_handles.http_handles,
+            "secret_handles_count": execution.capability_handles.secret_handles.len(),
+            "storage_handles": execution.capability_handles.storage_handles,
+            "channel_handles": execution.capability_handles.channel_handles,
+            "granted_http_hosts": requested_http_hosts,
+            "granted_storage_prefixes": requested_storage_prefixes,
+            "granted_channels": requested_channels,
+        },
+    }))
+    .map_err(|error| WasmPluginRunError {
+        kind: WasmPluginRunErrorKind::RuntimeFailure,
+        message: format!("failed to serialize palyra.plugin.run output JSON: {error}"),
+    })?;
+    Ok(WasmPluginRunSuccess { output_json })
 }
 
-fn inline_module_payload_present(input: &WasmPluginRunInput) -> bool {
-    input.module_wat.is_some() || input.module_base64.is_some()
+fn effective_allowed_capabilities(
+    skill_caps: Option<&[String]>,
+    policy_caps: &[String],
+    source_name: &str,
+    normalize: fn(&[String], &str) -> Result<Vec<String>, WasmPluginRunError>,
+) -> Result<Vec<String>, WasmPluginRunError> {
+    let mut policy_values = normalize(policy_caps, source_name)?;
+    if let Some(skill_caps) = skill_caps {
+        let skill_values = normalize(skill_caps, "skill.manifest.capabilities")?;
+        let skill_set = skill_values.iter().map(String::as_str).collect::<BTreeSet<_>>();
+        policy_values.retain(|candidate| skill_set.contains(candidate.as_str()));
+    }
+    Ok(policy_values)
 }
 
 fn parse_entrypoint(entrypoint: Option<&str>) -> Result<String, WasmPluginRunError> {
@@ -375,7 +658,7 @@ fn normalize_identifier_allowlist(
     for candidate in raw.iter().map(String::as_str).map(str::trim).filter(|value| !value.is_empty())
     {
         if !candidate.chars().all(|ch| {
-            ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-')
+            ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-' | '/')
         }) {
             return Err(WasmPluginRunError {
                 kind: WasmPluginRunErrorKind::InvalidInput,
