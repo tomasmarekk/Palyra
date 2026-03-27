@@ -78,7 +78,8 @@ use cli::{
     OnboardingAuthMethodArg, OnboardingCommand, OnboardingFlowArg, PatchCommand, PolicyCommand,
     ProtocolCommand, RemoteVerificationModeArg, SandboxCommand, SandboxRuntimeArg, SecretsCommand,
     SecurityCommand, SessionsCommand, SetupWizardOverridesArg, SkillsCommand, SkillsPackageCommand,
-    SupportBundleCommand, SystemCommand, WebhooksCommand, WizardOverridesArg,
+    SupportBundleCommand, SystemCommand, SystemEventCommand, SystemEventSeverityArg,
+    WebhooksCommand, WizardOverridesArg,
 };
 #[cfg(not(windows))]
 use cli::{PairingClientKindArg, PairingCommand, PairingMethodArg};

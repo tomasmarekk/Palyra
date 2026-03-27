@@ -14,8 +14,8 @@ use super::{
     PolicyCommand, ProtocolCommand, RemoteVerificationModeArg, ResetCommand, ResetScopeArg,
     SandboxCommand, SandboxRuntimeArg, SecretsCommand, SecretsConfigureCommand, SecurityCommand,
     SessionsCommand, SetupWizardOverridesArg, SkillsCommand, SkillsPackageCommand,
-    SupportBundleCommand, SystemCommand, TuiCommand, UninstallCommand, UpdateCommand,
-    WebhooksCommand, WizardOverridesArg,
+    SupportBundleCommand, SystemCommand, SystemEventCommand, SystemEventSeverityArg, TuiCommand,
+    UninstallCommand, UpdateCommand, WebhooksCommand, WizardOverridesArg,
 };
 #[cfg(not(windows))]
 use super::{PairingClientKindArg, PairingCommand, PairingMethodArg};
@@ -1133,10 +1133,42 @@ fn parse_system_commands() {
         Command::System { command: SystemCommand::Heartbeat { json: true } }
     );
 
-    let events = Cli::parse_from(["palyra", "system", "events", "--limit", "25"]);
+    let events = Cli::parse_from(["palyra", "system", "events", "list", "--limit", "25"]);
     assert_eq!(
         events.command,
-        Command::System { command: SystemCommand::Event { limit: Some(25), json: false } }
+        Command::System {
+            command: SystemCommand::Event {
+                command: SystemEventCommand::List { limit: Some(25), json: false }
+            }
+        }
+    );
+
+    let emit = Cli::parse_from([
+        "palyra",
+        "system",
+        "event",
+        "emit",
+        "operator.heartbeat",
+        "--message",
+        "manual probe",
+        "--severity",
+        "warn",
+        "--tag",
+        "ops",
+    ]);
+    assert_eq!(
+        emit.command,
+        Command::System {
+            command: SystemCommand::Event {
+                command: SystemEventCommand::Emit {
+                    event: "operator.heartbeat".to_owned(),
+                    message: Some("manual probe".to_owned()),
+                    severity: SystemEventSeverityArg::Warn,
+                    tag: vec!["ops".to_owned()],
+                    json: false,
+                }
+            }
+        }
     );
 }
 

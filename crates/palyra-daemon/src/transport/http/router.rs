@@ -513,6 +513,19 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/console/v1/browser/relay/actions",
             post(console::browser::console_browser_relay_action_handler),
         )
+        .route(
+            "/console/v1/system/heartbeat",
+            get(console::system::console_system_heartbeat_handler),
+        )
+        .route("/console/v1/system/presence", get(console::system::console_system_presence_handler))
+        .route(
+            "/console/v1/system/events",
+            get(console::system::console_system_events_list_handler),
+        )
+        .route(
+            "/console/v1/system/events/emit",
+            post(console::system::console_system_event_emit_handler),
+        )
         .route("/console/v1/audit/events", get(console::audit::console_audit_events_handler))
         .layer(DefaultBodyLimit::max(HTTP_MAX_REQUEST_BODY_BYTES))
         .route_layer(middleware::from_fn_with_state(

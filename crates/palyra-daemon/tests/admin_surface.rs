@@ -1595,6 +1595,126 @@ fn console_memory_status_and_index_surface_return_operator_payloads() -> Result<
 }
 
 #[test]
+fn console_system_surface_returns_presence_and_enforces_emit_csrf() -> Result<()> {
+    let (child, admin_port) = spawn_palyrad_with_bound_console_principal(CONSOLE_ADMIN_PRINCIPAL)?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("failed to build HTTP client")?;
+
+    let (cookie, csrf_token) = login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
+
+    let heartbeat_response = client
+        .get(format!("http://127.0.0.1:{admin_port}/console/v1/system/heartbeat"))
+        .header("Cookie", cookie.clone())
+        .send()
+        .context("failed to call system heartbeat endpoint")?
+        .error_for_status()
+        .context("system heartbeat endpoint returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse system heartbeat response json")?;
+    assert_eq!(
+        heartbeat_response.get("status").and_then(Value::as_str),
+        Some("ok"),
+        "system heartbeat should surface the daemon status"
+    );
+    assert!(
+        heartbeat_response.get("transport").is_some(),
+        "system heartbeat response should include transport payload"
+    );
+
+    let presence_response = client
+        .get(format!("http://127.0.0.1:{admin_port}/console/v1/system/presence"))
+        .header("Cookie", cookie.clone())
+        .send()
+        .context("failed to call system presence endpoint")?
+        .error_for_status()
+        .context("system presence endpoint returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse system presence response json")?;
+    assert!(
+        presence_response.pointer("/subsystems/gateway").is_some(),
+        "system presence should include gateway subsystem"
+    );
+    assert!(
+        presence_response.pointer("/subsystems/model_provider").is_some(),
+        "system presence should include model provider subsystem"
+    );
+
+    let initial_events = client
+        .get(format!("http://127.0.0.1:{admin_port}/console/v1/system/events?limit=5"))
+        .header("Cookie", cookie.clone())
+        .send()
+        .context("failed to call system events endpoint")?
+        .error_for_status()
+        .context("system events endpoint returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse system events response json")?;
+    assert!(
+        initial_events.get("events").is_some(),
+        "system events response should include events payload"
+    );
+
+    let missing_csrf = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/system/events/emit"))
+        .header("Cookie", cookie.clone())
+        .json(&serde_json::json!({
+            "name": "maintenance.pulse",
+            "summary": "operator confirmed runtime posture",
+            "details": { "source": "admin_surface" },
+        }))
+        .send()
+        .context("failed to call system event emit endpoint without csrf token")?;
+    assert_eq!(
+        missing_csrf.status().as_u16(),
+        403,
+        "system event emit endpoint must enforce csrf token"
+    );
+
+    let emitted = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/system/events/emit"))
+        .header("Cookie", cookie.clone())
+        .header("x-palyra-csrf-token", csrf_token)
+        .json(&serde_json::json!({
+            "name": "maintenance.pulse",
+            "summary": "operator confirmed runtime posture",
+            "details": { "source": "admin_surface" },
+        }))
+        .send()
+        .context("failed to call system event emit endpoint with csrf token")?
+        .error_for_status()
+        .context("system event emit endpoint returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse system event emit response json")?;
+    assert_eq!(
+        emitted.get("event").and_then(Value::as_str),
+        Some("system.operator.maintenance.pulse"),
+        "system event emit response should namespace operator events"
+    );
+
+    let filtered_events = client
+        .get(format!(
+            "http://127.0.0.1:{admin_port}/console/v1/system/events?event=system.operator.maintenance.pulse&limit=10"
+        ))
+        .header("Cookie", cookie)
+        .send()
+        .context("failed to query filtered system events")?
+        .error_for_status()
+        .context("filtered system events endpoint returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse filtered system events response json")?;
+    assert!(
+        filtered_events.get("returned_events").and_then(Value::as_u64).unwrap_or(0) >= 1,
+        "filtered system events should include the emitted operator event"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn admin_channel_queue_pause_resume_preserves_enabled_connector_state() -> Result<()> {
     let (child, admin_port) = spawn_palyrad_with_dynamic_ports()?;
     let mut daemon = ChildGuard::new(child);

@@ -80,7 +80,7 @@ pub use security::SecurityCommand;
 pub use sessions::SessionsCommand;
 pub use skills::{SkillsCommand, SkillsPackageCommand};
 pub use support_bundle::SupportBundleCommand;
-pub use system::SystemCommand;
+pub use system::{SystemCommand, SystemEventCommand, SystemEventSeverityArg};
 pub use tui::TuiCommand;
 pub use uninstall::UninstallCommand;
 pub use update::UpdateCommand;
