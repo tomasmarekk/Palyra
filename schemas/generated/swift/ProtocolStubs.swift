@@ -89,6 +89,12 @@ public enum PalyraBrowserV1 {
     public struct BrowserProfile: Equatable {
         public init() {}
     }
+    public struct BrowserSessionDetail: Equatable {
+        public init() {}
+    }
+    public struct BrowserSessionSummary: Equatable {
+        public init() {}
+    }
     public struct BrowserTab: Equatable {
         public init() {}
     }
@@ -137,10 +143,22 @@ public enum PalyraBrowserV1 {
     public struct GetPermissionsResponse: Equatable {
         public init() {}
     }
+    public struct GetSessionRequest: Equatable {
+        public init() {}
+    }
+    public struct GetSessionResponse: Equatable {
+        public init() {}
+    }
     public struct GetTitleRequest: Equatable {
         public init() {}
     }
     public struct GetTitleResponse: Equatable {
+        public init() {}
+    }
+    public struct InspectSessionRequest: Equatable {
+        public init() {}
+    }
+    public struct InspectSessionResponse: Equatable {
         public init() {}
     }
     public struct ListDownloadArtifactsRequest: Equatable {
@@ -153,6 +171,12 @@ public enum PalyraBrowserV1 {
         public init() {}
     }
     public struct ListProfilesResponse: Equatable {
+        public init() {}
+    }
+    public struct ListSessionsRequest: Equatable {
+        public init() {}
+    }
+    public struct ListSessionsResponse: Equatable {
         public init() {}
     }
     public struct ListTabsRequest: Equatable {
@@ -239,7 +263,19 @@ public enum PalyraBrowserV1 {
     public struct SessionBudget: Equatable {
         public init() {}
     }
+    public struct SessionCookieDomain: Equatable {
+        public init() {}
+    }
+    public struct SessionCookieEntry: Equatable {
+        public init() {}
+    }
     public struct SessionPermissions: Equatable {
+        public init() {}
+    }
+    public struct SessionStorageEntry: Equatable {
+        public init() {}
+    }
+    public struct SessionStorageOrigin: Equatable {
         public init() {}
     }
     public struct SetActiveProfileRequest: Equatable {
@@ -280,10 +316,13 @@ public enum PalyraBrowserV1 {
         func createSession()
         func deleteProfile()
         func getPermissions()
+        func getSession()
         func getTitle()
         func health()
+        func inspectSession()
         func listDownloadArtifacts()
         func listProfiles()
+        func listSessions()
         func listTabs()
         func navigate()
         func networkLog()

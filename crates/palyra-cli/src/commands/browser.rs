@@ -112,6 +112,50 @@ struct UnsupportedBrowserCapabilityPayload {
     suggestions: Vec<String>,
 }
 
+struct BrowserOpenArgs {
+    url: String,
+    principal: Option<String>,
+    channel: Option<String>,
+    allow_private_targets: bool,
+    allow_downloads: bool,
+    profile_id: Option<String>,
+    private_profile: bool,
+    timeout_ms: Option<u64>,
+}
+
+struct BrowserTypeArgs {
+    session_id: String,
+    selector: String,
+    text: String,
+    clear_existing: bool,
+    timeout_ms: Option<u64>,
+    capture_failure_screenshot: bool,
+    max_failure_screenshot_bytes: Option<u64>,
+    output: Option<String>,
+}
+
+struct BrowserWaitArgs {
+    session_id: String,
+    selector: Option<String>,
+    text: Option<String>,
+    timeout_ms: Option<u64>,
+    poll_interval_ms: Option<u64>,
+    capture_failure_screenshot: bool,
+    max_failure_screenshot_bytes: Option<u64>,
+    output: Option<String>,
+}
+
+struct BrowserSnapshotArgs {
+    session_id: String,
+    include_dom_snapshot: bool,
+    include_accessibility_tree: bool,
+    include_visible_text: bool,
+    max_dom_snapshot_bytes: Option<u64>,
+    max_accessibility_tree_bytes: Option<u64>,
+    max_visible_text_bytes: Option<u64>,
+    output: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BrowserOutputMode {
     Text,
@@ -142,17 +186,19 @@ async fn run_browser_async(command: BrowserCommand) -> Result<()> {
             profile_id,
             private_profile,
             timeout_ms,
-        } => run_browser_open(
-            url,
-            principal,
-            channel,
-            allow_private_targets,
-            allow_downloads,
-            profile_id,
-            private_profile,
-            timeout_ms,
-        )
-        .await,
+        } => {
+            run_browser_open(BrowserOpenArgs {
+                url,
+                principal,
+                channel,
+                allow_private_targets,
+                allow_downloads,
+                profile_id,
+                private_profile,
+                timeout_ms,
+            })
+            .await
+        }
         BrowserCommand::Session { command } => run_browser_session_command(command).await,
         BrowserCommand::Profiles { command } => run_browser_profiles_command(command).await,
         BrowserCommand::Tabs { session_id, command } => {
@@ -203,16 +249,16 @@ async fn run_browser_async(command: BrowserCommand) -> Result<()> {
             max_failure_screenshot_bytes,
             output,
         } => {
-            run_browser_type(
+            run_browser_type(BrowserTypeArgs {
                 session_id,
                 selector,
                 text,
-                false,
+                clear_existing: false,
                 timeout_ms,
                 capture_failure_screenshot,
                 max_failure_screenshot_bytes,
                 output,
-            )
+            })
             .await
         }
         BrowserCommand::Fill {
@@ -224,16 +270,16 @@ async fn run_browser_async(command: BrowserCommand) -> Result<()> {
             max_failure_screenshot_bytes,
             output,
         } => {
-            run_browser_type(
+            run_browser_type(BrowserTypeArgs {
                 session_id,
                 selector,
                 text,
-                true,
+                clear_existing: true,
                 timeout_ms,
                 capture_failure_screenshot,
                 max_failure_screenshot_bytes,
                 output,
-            )
+            })
             .await
         }
         BrowserCommand::Scroll {
@@ -264,7 +310,7 @@ async fn run_browser_async(command: BrowserCommand) -> Result<()> {
             max_failure_screenshot_bytes,
             output,
         } => {
-            run_browser_wait(
+            run_browser_wait(BrowserWaitArgs {
                 session_id,
                 selector,
                 text,
@@ -273,7 +319,7 @@ async fn run_browser_async(command: BrowserCommand) -> Result<()> {
                 capture_failure_screenshot,
                 max_failure_screenshot_bytes,
                 output,
-            )
+            })
             .await
         }
         BrowserCommand::Snapshot {
@@ -286,7 +332,7 @@ async fn run_browser_async(command: BrowserCommand) -> Result<()> {
             max_visible_text_bytes,
             output,
         } => {
-            run_browser_snapshot(
+            run_browser_snapshot(BrowserSnapshotArgs {
                 session_id,
                 include_dom_snapshot,
                 include_accessibility_tree,
@@ -295,7 +341,7 @@ async fn run_browser_async(command: BrowserCommand) -> Result<()> {
                 max_accessibility_tree_bytes,
                 max_visible_text_bytes,
                 output,
-            )
+            })
             .await
         }
         BrowserCommand::Screenshot { session_id, max_bytes, format, output } => {
@@ -569,16 +615,17 @@ fn run_browser_stop() -> Result<()> {
     )
 }
 
-async fn run_browser_open(
-    url: String,
-    principal: Option<String>,
-    channel: Option<String>,
-    allow_private_targets: bool,
-    allow_downloads: bool,
-    profile_id: Option<String>,
-    private_profile: bool,
-    timeout_ms: Option<u64>,
-) -> Result<()> {
+async fn run_browser_open(args: BrowserOpenArgs) -> Result<()> {
+    let BrowserOpenArgs {
+        url,
+        principal,
+        channel,
+        allow_private_targets,
+        allow_downloads,
+        profile_id,
+        private_profile,
+        timeout_ms,
+    } = args;
     let context =
         client::control_plane::connect_admin_console(app::ConnectionOverrides::default()).await?;
     let create = context
@@ -1178,16 +1225,17 @@ async fn run_browser_click(
     )
 }
 
-async fn run_browser_type(
-    session_id: String,
-    selector: String,
-    text: String,
-    clear_existing: bool,
-    timeout_ms: Option<u64>,
-    capture_failure_screenshot: bool,
-    max_failure_screenshot_bytes: Option<u64>,
-    output: Option<String>,
-) -> Result<()> {
+async fn run_browser_type(args: BrowserTypeArgs) -> Result<()> {
+    let BrowserTypeArgs {
+        session_id,
+        selector,
+        text,
+        clear_existing,
+        timeout_ms,
+        capture_failure_screenshot,
+        max_failure_screenshot_bytes,
+        output,
+    } = args;
     let context =
         client::control_plane::connect_admin_console(app::ConnectionOverrides::default()).await?;
     let envelope = context
@@ -1285,16 +1333,17 @@ async fn run_browser_scroll(
     )
 }
 
-async fn run_browser_wait(
-    session_id: String,
-    selector: Option<String>,
-    text: Option<String>,
-    timeout_ms: Option<u64>,
-    poll_interval_ms: Option<u64>,
-    capture_failure_screenshot: bool,
-    max_failure_screenshot_bytes: Option<u64>,
-    output: Option<String>,
-) -> Result<()> {
+async fn run_browser_wait(args: BrowserWaitArgs) -> Result<()> {
+    let BrowserWaitArgs {
+        session_id,
+        selector,
+        text,
+        timeout_ms,
+        poll_interval_ms,
+        capture_failure_screenshot,
+        max_failure_screenshot_bytes,
+        output,
+    } = args;
     let context =
         client::control_plane::connect_admin_console(app::ConnectionOverrides::default()).await?;
     let envelope = context
@@ -1341,16 +1390,17 @@ async fn run_browser_wait(
     )
 }
 
-async fn run_browser_snapshot(
-    session_id: String,
-    include_dom_snapshot: bool,
-    include_accessibility_tree: bool,
-    include_visible_text: bool,
-    max_dom_snapshot_bytes: Option<u64>,
-    max_accessibility_tree_bytes: Option<u64>,
-    max_visible_text_bytes: Option<u64>,
-    output: Option<String>,
-) -> Result<()> {
+async fn run_browser_snapshot(args: BrowserSnapshotArgs) -> Result<()> {
+    let BrowserSnapshotArgs {
+        session_id,
+        include_dom_snapshot,
+        include_accessibility_tree,
+        include_visible_text,
+        max_dom_snapshot_bytes,
+        max_accessibility_tree_bytes,
+        max_visible_text_bytes,
+        output,
+    } = args;
     let context =
         client::control_plane::connect_admin_console(app::ConnectionOverrides::default()).await?;
     let mut value = serde_json::to_value(

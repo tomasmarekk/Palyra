@@ -68,6 +68,10 @@ pub mod palyra_browser_v1 {
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct BrowserProfile;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct BrowserSessionDetail;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct BrowserSessionSummary;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct BrowserTab;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct ClickRequest;
@@ -100,9 +104,17 @@ pub mod palyra_browser_v1 {
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct GetPermissionsResponse;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct GetSessionRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct GetSessionResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct GetTitleRequest;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct GetTitleResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct InspectSessionRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct InspectSessionResponse;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct ListDownloadArtifactsRequest;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -111,6 +123,10 @@ pub mod palyra_browser_v1 {
     pub struct ListProfilesRequest;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct ListProfilesResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ListSessionsRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ListSessionsResponse;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct ListTabsRequest;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -168,7 +184,15 @@ pub mod palyra_browser_v1 {
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct SessionBudget;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct SessionCookieDomain;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct SessionCookieEntry;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct SessionPermissions;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct SessionStorageEntry;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct SessionStorageOrigin;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct SetActiveProfileRequest;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -197,10 +221,13 @@ pub mod palyra_browser_v1 {
         fn CreateSession(&self);
         fn DeleteProfile(&self);
         fn GetPermissions(&self);
+        fn GetSession(&self);
         fn GetTitle(&self);
         fn Health(&self);
+        fn InspectSession(&self);
         fn ListDownloadArtifacts(&self);
         fn ListProfiles(&self);
+        fn ListSessions(&self);
         fn ListTabs(&self);
         fn Navigate(&self);
         fn NetworkLog(&self);

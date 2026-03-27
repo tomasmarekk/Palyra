@@ -3985,7 +3985,7 @@ async fn browser_service_inspect_session_truncates_deterministically() {
                     status_code: 200,
                     timing_bucket: "lt_100ms".to_owned(),
                     latency_ms: 10 + index,
-                    captured_at_unix_ms: index as u64,
+                    captured_at_unix_ms: index,
                     headers: vec![NetworkLogHeaderInternal {
                         name: "x-request-id".to_owned(),
                         value: format!("req-{index}"),
