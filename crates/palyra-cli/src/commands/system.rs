@@ -330,7 +330,9 @@ fn system_event_severity_label(severity: SystemEventSeverityArg) -> &'static str
 
 #[cfg(test)]
 mod tests {
-    use super::{build_system_event_list_path, system_event_severity_label, validate_system_event_name};
+    use super::{
+        build_system_event_list_path, system_event_severity_label, validate_system_event_name,
+    };
     use crate::SystemEventSeverityArg;
 
     #[test]
