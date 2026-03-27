@@ -42,7 +42,17 @@ struct RuntimeSecuritySnapshot {
     used_runtime_posture: bool,
     deployment: Option<control_plane::DeploymentPostureSummary>,
     auth_summary: Option<SecurityAuthHealthSummary>,
+    browser: Option<SecurityBrowserRuntimeSnapshot>,
     error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SecurityBrowserRuntimeSnapshot {
+    enabled: Option<bool>,
+    health_status: Option<String>,
+    active_sessions: Option<u64>,
+    recent_relay_action_failures: Option<u64>,
+    recent_health_failures: Option<u64>,
 }
 
 struct LocalSecurityConfigSnapshot {
@@ -228,6 +238,73 @@ fn build_security_findings(
             remediation: "Set `tool_call.browser_service.auth_token` or keep the browser broker disabled until it is explicitly secured.".to_owned(),
         });
     }
+    if local_config.browser_service_enabled {
+        let health_status =
+            runtime.browser.as_ref().and_then(|browser| browser.health_status.as_deref());
+        if health_status.is_some_and(|status| status != "ok") {
+            let active_sessions =
+                runtime.browser.as_ref().and_then(|browser| browser.active_sessions).unwrap_or(0);
+            findings.push(SecurityFinding {
+                severity: "warning".to_owned(),
+                code: "browser_service_runtime_degraded".to_owned(),
+                component: "browser_service".to_owned(),
+                message: format!(
+                    "Browser service runtime health is reported as {} (active_sessions={}).",
+                    health_status.unwrap_or("unknown"),
+                    active_sessions
+                ),
+                remediation: "Run `palyra browser status` and inspect browserd health, endpoint wiring, and recent failures before relying on browser automation.".to_owned(),
+            });
+        }
+
+        let recent_health_failures = runtime
+            .browser
+            .as_ref()
+            .and_then(|browser| browser.recent_health_failures)
+            .unwrap_or(0);
+        if recent_health_failures > 0 {
+            findings.push(SecurityFinding {
+                severity: "warning".to_owned(),
+                code: "browser_service_recent_health_failures".to_owned(),
+                component: "browser_service".to_owned(),
+                message: format!(
+                    "Browser service diagnostics report {} recent health probe failure(s).",
+                    recent_health_failures
+                ),
+                remediation: "Inspect `palyra browser status` and the browserd logs to restore a stable health probe path.".to_owned(),
+            });
+        }
+
+        let recent_relay_failures = runtime
+            .browser
+            .as_ref()
+            .and_then(|browser| browser.recent_relay_action_failures)
+            .unwrap_or(0);
+        if recent_relay_failures > 0 {
+            findings.push(SecurityFinding {
+                severity: "warning".to_owned(),
+                code: "browser_service_recent_relay_failures".to_owned(),
+                component: "browser_service".to_owned(),
+                message: format!(
+                    "Browser service diagnostics report {} recent relay/action failure(s).",
+                    recent_relay_failures
+                ),
+                remediation: "Review browser policy, session budgets, and browserd diagnostics before allowing further automation runs.".to_owned(),
+            });
+        }
+
+        if runtime.used_runtime_posture
+            && runtime.browser.as_ref().and_then(|browser| browser.enabled) == Some(false)
+        {
+            findings.push(SecurityFinding {
+                severity: "warning".to_owned(),
+                code: "browser_service_runtime_disabled".to_owned(),
+                component: "browser_service".to_owned(),
+                message: "Browser service is enabled in local config but disabled in the active runtime posture.".to_owned(),
+                remediation: "Ensure the intended config is active, then verify browser broker enablement with `palyra browser status`.".to_owned(),
+            });
+        }
+    }
 
     if let Some(summary) = runtime.auth_summary.as_ref() {
         if summary.missing > 0 {
@@ -322,6 +399,7 @@ fn load_runtime_security_snapshot(offline: bool) -> Result<RuntimeSecuritySnapsh
             used_runtime_posture: false,
             deployment: None,
             auth_summary: None,
+            browser: None,
             error: None,
         });
     }
@@ -338,23 +416,26 @@ fn load_runtime_security_snapshot(offline: bool) -> Result<RuntimeSecuritySnapsh
                         used_runtime_posture: false,
                         deployment: None,
                         auth_summary: None,
+                        browser: None,
                         error: Some(redact_auth_error(error.to_string().as_str())),
                     };
                 }
             };
         let deployment = context.client.get_deployment_posture().await;
         let auth_health = context.client.get_auth_health(true, None).await;
-        match (deployment, auth_health) {
-            (Ok(deployment), Ok(auth_health)) => RuntimeSecuritySnapshot {
+        let diagnostics = context.client.get_diagnostics().await;
+        match (deployment, auth_health, diagnostics) {
+            (Ok(deployment), Ok(auth_health), Ok(diagnostics)) => RuntimeSecuritySnapshot {
                 used_runtime_posture: true,
                 deployment: Some(deployment),
                 auth_summary: serde_json::from_value::<SecurityAuthHealthSummary>(
                     auth_health.summary,
                 )
                 .ok(),
+                browser: extract_runtime_browser_security_snapshot(&diagnostics),
                 error: None,
             },
-            (deployment_result, auth_result) => {
+            (deployment_result, auth_result, diagnostics_result) => {
                 let mut errors = Vec::new();
                 if let Err(error) = deployment_result {
                     errors.push(redact_auth_error(error.to_string().as_str()));
@@ -362,16 +443,43 @@ fn load_runtime_security_snapshot(offline: bool) -> Result<RuntimeSecuritySnapsh
                 if let Err(error) = auth_result {
                     errors.push(redact_auth_error(error.to_string().as_str()));
                 }
+                if let Err(error) = diagnostics_result {
+                    errors.push(redact_auth_error(error.to_string().as_str()));
+                }
                 RuntimeSecuritySnapshot {
                     used_runtime_posture: false,
                     deployment: None,
                     auth_summary: None,
+                    browser: None,
                     error: Some(errors.join("; ")),
                 }
             }
         }
     });
     Ok(snapshot)
+}
+
+fn extract_runtime_browser_security_snapshot(
+    payload: &Value,
+) -> Option<SecurityBrowserRuntimeSnapshot> {
+    let browser = payload.get("browserd")?;
+    Some(SecurityBrowserRuntimeSnapshot {
+        enabled: browser.get("enabled").and_then(Value::as_bool),
+        health_status: browser
+            .pointer("/health/status")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        active_sessions: browser
+            .pointer("/sessions/active")
+            .and_then(Value::as_u64)
+            .or_else(|| browser.pointer("/health/active_sessions").and_then(Value::as_u64)),
+        recent_relay_action_failures: browser
+            .pointer("/failures/recent_relay_action_failures")
+            .and_then(Value::as_u64),
+        recent_health_failures: browser
+            .pointer("/failures/recent_health_failures")
+            .and_then(Value::as_u64),
+    })
 }
 
 fn load_local_security_config_snapshot(
@@ -484,6 +592,23 @@ mod tests {
                 auth_summary: None,
                 error: None,
             },
+            browser: DoctorBrowserSnapshot {
+                configured_enabled: false,
+                auth_token_configured: false,
+                endpoint: "http://127.0.0.1:7543".to_owned(),
+                connect_timeout_ms: Some(1500),
+                request_timeout_ms: Some(15000),
+                max_screenshot_bytes: Some(262_144),
+                max_title_bytes: Some(4096),
+                state_dir_configured: false,
+                state_key_vault_ref_configured: false,
+                diagnostics_fetched: false,
+                health_status: None,
+                active_sessions: None,
+                recent_relay_action_failures: None,
+                recent_health_failures: None,
+                error: None,
+            },
             sandbox: DoctorSandboxSnapshot {
                 tier_b_egress_allowlists_preflight_only: true,
                 tier_c_strict_offline_only: true,
@@ -541,6 +666,7 @@ mod tests {
             used_runtime_posture: false,
             deployment: None,
             auth_summary: None,
+            browser: None,
             error: None,
         };
         let findings = build_security_findings(&doctor, &local, &runtime, &minimal_secrets());
@@ -587,12 +713,53 @@ mod tests {
                 warnings: Vec::new(),
             }),
             auth_summary: None,
+            browser: None,
             error: None,
         };
         let findings = build_security_findings(&doctor, &local, &runtime, &minimal_secrets());
         assert!(
             findings.iter().any(|finding| finding.code == "remote_bind_without_tls"),
             "security audit should flag remote bind without TLS"
+        );
+    }
+
+    #[test]
+    fn security_audit_flags_browser_runtime_failures() {
+        let doctor = minimal_doctor();
+        let local = LocalSecurityConfigSnapshot {
+            path_exists: true,
+            provider_kind: "deterministic".to_owned(),
+            auth_profile_id: None,
+            api_key_vault_ref: None,
+            inline_api_key: false,
+            browser_service_enabled: true,
+            browser_service_auth_token_configured: true,
+        };
+        let runtime = RuntimeSecuritySnapshot {
+            used_runtime_posture: true,
+            deployment: None,
+            auth_summary: None,
+            browser: Some(SecurityBrowserRuntimeSnapshot {
+                enabled: Some(true),
+                health_status: Some("degraded".to_owned()),
+                active_sessions: Some(2),
+                recent_relay_action_failures: Some(3),
+                recent_health_failures: Some(1),
+            }),
+            error: None,
+        };
+        let findings = build_security_findings(&doctor, &local, &runtime, &minimal_secrets());
+        assert!(
+            findings.iter().any(|finding| finding.code == "browser_service_runtime_degraded"),
+            "security audit should flag degraded browser runtime health"
+        );
+        assert!(
+            findings.iter().any(|finding| finding.code == "browser_service_recent_relay_failures"),
+            "security audit should flag recent browser relay failures"
+        );
+        assert!(
+            findings.iter().any(|finding| finding.code == "browser_service_recent_health_failures"),
+            "security audit should flag recent browser health failures"
         );
     }
 }

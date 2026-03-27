@@ -45,7 +45,10 @@ pub use auth::{
     AuthScopeArg,
 };
 pub use backup::{BackupCommand, BackupComponentArg};
-pub use browser::BrowserCommand;
+pub use browser::{
+    BrowserCommand, BrowserPermissionsCommand, BrowserProfilesCommand, BrowserSessionCommand,
+    BrowserTabsCommand,
+};
 pub use channels::{
     ChannelProviderArg, ChannelResolveEntityArg, ChannelsCommand, ChannelsDiscordCommand,
     ChannelsRouterCommand,
@@ -198,6 +201,20 @@ Examples:
 
 Discoverability:
   `webhooks` manages secret-aware webhook integrations without exposing a public ingress surface by default.";
+
+const BROWSER_AFTER_HELP: &str = "\
+Examples:
+  palyra browser status
+  palyra browser start --wait-ms 15000
+  palyra browser profiles list
+  palyra browser session create --allow-domain docs.palyra.dev
+  palyra browser navigate <session-id> --url https://example.com/
+  palyra browser snapshot <session-id> --include-visible-text --output ./snapshot.json
+  palyra browser screenshot <session-id> --output ./page.png
+  palyra browser trace <session-id> --output ./trace.json
+
+Discoverability:
+  Session list/show/inspect talks directly to browserd. Mutating actions go through the control plane so policy and audit hooks stay intact.";
 
 const TUI_AFTER_HELP: &str = "\
 Examples:
@@ -394,6 +411,10 @@ pub enum Command {
         #[command(subcommand)]
         command: WebhooksCommand,
     },
+    #[command(
+        about = "Operate the browser service and browser-backed automation sessions",
+        after_long_help = BROWSER_AFTER_HELP
+    )]
     Browser {
         #[command(subcommand)]
         command: BrowserCommand,

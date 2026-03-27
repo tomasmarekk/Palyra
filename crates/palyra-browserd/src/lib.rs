@@ -97,10 +97,18 @@ const DEFAULT_MAX_OBSERVE_SNAPSHOT_BYTES: u64 = 64 * 1024;
 const DEFAULT_MAX_VISIBLE_TEXT_BYTES: u64 = 16 * 1024;
 const DEFAULT_MAX_NETWORK_LOG_ENTRIES: usize = 256;
 const DEFAULT_MAX_NETWORK_LOG_BYTES: u64 = 64 * 1024;
+const DEFAULT_MAX_INSPECT_COOKIE_BYTES: u64 = 8 * 1024;
+const DEFAULT_MAX_INSPECT_STORAGE_BYTES: u64 = 16 * 1024;
 const DEFAULT_MAX_TABS_PER_SESSION: usize = 32;
 const MAX_NETWORK_LOG_HEADER_COUNT: usize = 24;
 const MAX_NETWORK_LOG_HEADER_VALUE_BYTES: usize = 256;
 const MAX_NETWORK_LOG_URL_BYTES: usize = 2 * 1024;
+const MAX_INSPECT_COOKIE_VALUE_BYTES: usize = 512;
+const MAX_INSPECT_STORAGE_VALUE_BYTES: usize = 1_024;
+const MAX_INSPECT_ACTION_NAME_BYTES: usize = 64;
+const MAX_INSPECT_ACTION_SELECTOR_BYTES: usize = 256;
+const MAX_INSPECT_ACTION_OUTCOME_BYTES: usize = 256;
+const MAX_INSPECT_ACTION_ERROR_BYTES: usize = 512;
 const DEFAULT_ACTION_RETRY_INTERVAL_MS: u64 = 100;
 const CLEANUP_INTERVAL_MS: u64 = 15_000;
 const AUTHORIZATION_HEADER: &str = "authorization";
@@ -298,6 +306,85 @@ impl SessionPermissionsInternal {
         if let Some(value) = permission_setting_from_proto(location) {
             self.location = value;
         }
+    }
+}
+
+fn session_budget_to_proto(budget: &SessionBudget) -> browser_v1::SessionBudget {
+    browser_v1::SessionBudget {
+        max_navigation_timeout_ms: budget.max_navigation_timeout_ms,
+        max_session_lifetime_ms: budget.max_session_lifetime_ms,
+        max_screenshot_bytes: budget.max_screenshot_bytes,
+        max_response_bytes: budget.max_response_bytes,
+        max_action_timeout_ms: budget.max_action_timeout_ms,
+        max_type_input_bytes: budget.max_type_input_bytes,
+        max_actions_per_session: budget.max_actions_per_session,
+        max_actions_per_window: budget.max_actions_per_window,
+        action_rate_window_ms: budget.action_rate_window_ms,
+        max_action_log_entries: budget.max_action_log_entries as u64,
+        max_observe_snapshot_bytes: budget.max_observe_snapshot_bytes,
+        max_visible_text_bytes: budget.max_visible_text_bytes,
+        max_network_log_entries: budget.max_network_log_entries as u64,
+        max_network_log_bytes: budget.max_network_log_bytes,
+    }
+}
+
+fn instant_to_unix_ms(instant: Instant) -> u64 {
+    current_unix_ms()
+        .saturating_sub(u64::try_from(instant.elapsed().as_millis()).unwrap_or(u64::MAX))
+}
+
+fn session_summary_to_proto(
+    session_id: &str,
+    session: &BrowserSessionRecord,
+) -> browser_v1::BrowserSessionSummary {
+    let active_tab = session.active_tab();
+    browser_v1::BrowserSessionSummary {
+        v: CANONICAL_PROTOCOL_MAJOR,
+        session_id: Some(proto::palyra::common::v1::CanonicalId { ulid: session_id.to_owned() }),
+        principal: session.principal.clone(),
+        channel: session.channel.clone().unwrap_or_default(),
+        created_at_unix_ms: instant_to_unix_ms(session.created_at),
+        last_active_unix_ms: instant_to_unix_ms(session.last_active),
+        idle_ttl_ms: u64::try_from(session.idle_ttl.as_millis()).unwrap_or(u64::MAX),
+        age_ms: u64::try_from(session.created_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+        idle_for_ms: u64::try_from(session.last_active.elapsed().as_millis()).unwrap_or(u64::MAX),
+        action_count: session.action_count,
+        action_log_entries: u32::try_from(session.action_log.len()).unwrap_or(u32::MAX),
+        tab_count: u32::try_from(session.tabs.len()).unwrap_or(u32::MAX),
+        active_tab_id: Some(proto::palyra::common::v1::CanonicalId {
+            ulid: session.active_tab_id.clone(),
+        }),
+        active_tab_url: normalize_url_with_redaction(
+            active_tab.and_then(|tab| tab.last_url.as_deref()).unwrap_or_default(),
+        ),
+        active_tab_title: truncate_utf8_bytes(
+            active_tab.map(|tab| tab.last_title.as_str()).unwrap_or_default(),
+            session.budget.max_title_bytes as usize,
+        ),
+        allow_private_targets: session.allow_private_targets,
+        downloads_enabled: session.allow_downloads,
+        persistence_enabled: session.persistence.enabled,
+        persistence_id: session.persistence.persistence_id.clone().unwrap_or_default(),
+        state_restored: session.persistence.state_restored,
+        profile_id: session
+            .profile_id
+            .clone()
+            .map(|value| proto::palyra::common::v1::CanonicalId { ulid: value }),
+        private_profile: session.private_profile,
+        action_allowed_domains: session.action_allowed_domains.clone(),
+        permissions: Some(session.permissions.to_proto()),
+    }
+}
+
+fn session_detail_to_proto(
+    session_id: &str,
+    session: &BrowserSessionRecord,
+) -> browser_v1::BrowserSessionDetail {
+    browser_v1::BrowserSessionDetail {
+        v: CANONICAL_PROTOCOL_MAJOR,
+        summary: Some(session_summary_to_proto(session_id, session)),
+        effective_budget: Some(session_budget_to_proto(&session.budget)),
+        tabs: session.list_tabs(),
     }
 }
 
@@ -704,8 +791,11 @@ fn network_log_entry_to_proto(
             .into_iter()
             .map(|header| browser_v1::NetworkLogHeader {
                 v: CANONICAL_PROTOCOL_MAJOR,
-                name: header.name,
-                value: header.value,
+                name: truncate_utf8_bytes(header.name.to_ascii_lowercase().as_str(), 128),
+                value: sanitize_single_network_header(
+                    header.name.to_ascii_lowercase().as_str(),
+                    header.value.as_str(),
+                ),
             })
             .collect()
     } else {
@@ -713,7 +803,7 @@ fn network_log_entry_to_proto(
     };
     browser_v1::NetworkLogEntry {
         v: CANONICAL_PROTOCOL_MAJOR,
-        request_url: entry.request_url,
+        request_url: normalize_url_with_redaction(entry.request_url.as_str()),
         status_code: u32::from(entry.status_code),
         timing_bucket: entry.timing_bucket,
         latency_ms: entry.latency_ms,
@@ -821,6 +911,49 @@ fn contains_sensitive_material(raw: &str) -> bool {
     ]
     .iter()
     .any(|needle| lower.contains(needle))
+}
+
+fn is_sensitive_debug_key(raw_key: &str) -> bool {
+    let key = raw_key.trim().to_ascii_lowercase();
+    matches!(
+        key.as_str(),
+        "authorization"
+            | "cookie"
+            | "csrf"
+            | "jwt"
+            | "password"
+            | "passwd"
+            | "secret"
+            | "session"
+            | "session_id"
+            | "set-cookie"
+            | "token"
+    ) || key.contains("auth")
+        || key.contains("cookie")
+        || key.contains("password")
+        || key.contains("secret")
+        || key.contains("session")
+        || key.contains("token")
+}
+
+fn sanitize_debug_text(raw: &str, max_bytes: usize) -> String {
+    if raw.trim().is_empty() {
+        return String::new();
+    }
+    if contains_sensitive_material(raw) {
+        return "<redacted>".to_owned();
+    }
+    truncate_utf8_bytes(raw, max_bytes)
+}
+
+fn sanitize_debug_map_value(key: &str, raw_value: &str, max_bytes: usize) -> String {
+    if raw_value.trim().is_empty() {
+        return String::new();
+    }
+    if is_sensitive_debug_key(key) || contains_sensitive_material(raw_value) {
+        return "<redacted>".to_owned();
+    }
+    truncate_utf8_bytes(raw_value, max_bytes)
 }
 
 fn normalize_url_with_redaction(raw: &str) -> String {
@@ -1594,6 +1727,164 @@ fn clamp_storage_entries(
         }
     }
     clamped
+}
+
+fn action_log_entry_to_proto(
+    entry: &BrowserActionLogEntryInternal,
+) -> browser_v1::BrowserActionLogEntry {
+    browser_v1::BrowserActionLogEntry {
+        v: CANONICAL_PROTOCOL_MAJOR,
+        action_id: entry.action_id.clone(),
+        action_name: truncate_utf8_bytes(entry.action_name.as_str(), MAX_INSPECT_ACTION_NAME_BYTES),
+        selector: truncate_utf8_bytes(entry.selector.as_str(), MAX_INSPECT_ACTION_SELECTOR_BYTES),
+        success: entry.success,
+        outcome: sanitize_debug_text(entry.outcome.as_str(), MAX_INSPECT_ACTION_OUTCOME_BYTES),
+        error: sanitize_debug_text(entry.error.as_str(), MAX_INSPECT_ACTION_ERROR_BYTES),
+        started_at_unix_ms: entry.started_at_unix_ms,
+        completed_at_unix_ms: entry.completed_at_unix_ms,
+        attempts: entry.attempts,
+        page_url: normalize_url_with_redaction(entry.page_url.as_str()),
+    }
+}
+
+fn cookie_jar_to_proto(
+    cookie_jar: &HashMap<String, HashMap<String, String>>,
+) -> Vec<browser_v1::SessionCookieDomain> {
+    let mut domains = cookie_jar.iter().collect::<Vec<_>>();
+    domains.sort_by(|left, right| left.0.cmp(right.0));
+    domains
+        .into_iter()
+        .filter_map(|(domain, cookies)| {
+            let mut entries = cookies.iter().collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.0.cmp(right.0));
+            let cookies = entries
+                .into_iter()
+                .map(|(name, value)| browser_v1::SessionCookieEntry {
+                    v: CANONICAL_PROTOCOL_MAJOR,
+                    name: truncate_utf8_bytes(name.as_str(), 128),
+                    value: sanitize_debug_map_value(
+                        name.as_str(),
+                        value.as_str(),
+                        MAX_INSPECT_COOKIE_VALUE_BYTES,
+                    ),
+                })
+                .collect::<Vec<_>>();
+            if cookies.is_empty() {
+                None
+            } else {
+                Some(browser_v1::SessionCookieDomain {
+                    v: CANONICAL_PROTOCOL_MAJOR,
+                    domain: truncate_utf8_bytes(domain.as_str(), 256),
+                    cookies,
+                })
+            }
+        })
+        .collect()
+}
+
+fn storage_entries_to_proto(
+    storage_entries: &HashMap<String, HashMap<String, String>>,
+) -> Vec<browser_v1::SessionStorageOrigin> {
+    let mut origins = storage_entries.iter().collect::<Vec<_>>();
+    origins.sort_by(|left, right| left.0.cmp(right.0));
+    origins
+        .into_iter()
+        .filter_map(|(origin, entries)| {
+            let mut values = entries.iter().collect::<Vec<_>>();
+            values.sort_by(|left, right| left.0.cmp(right.0));
+            let entries = values
+                .into_iter()
+                .map(|(key, value)| browser_v1::SessionStorageEntry {
+                    v: CANONICAL_PROTOCOL_MAJOR,
+                    key: truncate_utf8_bytes(key.as_str(), 256),
+                    value: sanitize_debug_map_value(
+                        key.as_str(),
+                        value.as_str(),
+                        MAX_INSPECT_STORAGE_VALUE_BYTES,
+                    ),
+                })
+                .collect::<Vec<_>>();
+            if entries.is_empty() {
+                None
+            } else {
+                Some(browser_v1::SessionStorageOrigin {
+                    v: CANONICAL_PROTOCOL_MAJOR,
+                    origin: truncate_utf8_bytes(origin.as_str(), MAX_NETWORK_LOG_URL_BYTES),
+                    entries,
+                })
+            }
+        })
+        .collect()
+}
+
+fn estimate_cookie_payload_bytes(domains: &[browser_v1::SessionCookieDomain]) -> usize {
+    domains
+        .iter()
+        .map(|domain| {
+            domain.domain.len()
+                + domain
+                    .cookies
+                    .iter()
+                    .map(|cookie| cookie.name.len() + cookie.value.len() + 16)
+                    .sum::<usize>()
+                + 24
+        })
+        .sum::<usize>()
+        + 2
+}
+
+fn truncate_cookie_payload(
+    domains: &mut Vec<browser_v1::SessionCookieDomain>,
+    max_payload_bytes: usize,
+) -> bool {
+    let mut truncated = false;
+    while !domains.is_empty()
+        && estimate_cookie_payload_bytes(domains.as_slice()) > max_payload_bytes
+    {
+        if let Some(domain) = domains.last_mut() {
+            domain.cookies.pop();
+            if domain.cookies.is_empty() {
+                domains.pop();
+            }
+        }
+        truncated = true;
+    }
+    truncated
+}
+
+fn estimate_storage_payload_bytes(origins: &[browser_v1::SessionStorageOrigin]) -> usize {
+    origins
+        .iter()
+        .map(|origin| {
+            origin.origin.len()
+                + origin
+                    .entries
+                    .iter()
+                    .map(|entry| entry.key.len() + entry.value.len() + 16)
+                    .sum::<usize>()
+                + 24
+        })
+        .sum::<usize>()
+        + 2
+}
+
+fn truncate_storage_payload(
+    origins: &mut Vec<browser_v1::SessionStorageOrigin>,
+    max_payload_bytes: usize,
+) -> bool {
+    let mut truncated = false;
+    while !origins.is_empty()
+        && estimate_storage_payload_bytes(origins.as_slice()) > max_payload_bytes
+    {
+        if let Some(origin) = origins.last_mut() {
+            origin.entries.pop();
+            if origin.entries.is_empty() {
+                origins.pop();
+            }
+        }
+        truncated = true;
+    }
+    truncated
 }
 
 fn url_origin_key(raw_url: &str) -> Option<String> {

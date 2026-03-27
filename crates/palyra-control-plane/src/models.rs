@@ -120,6 +120,16 @@ impl SecretRevealEnvelope {
     }
 }
 
+fn decode_optional_base64(raw: Option<&str>) -> Option<Vec<u8>> {
+    raw.and_then(|value| {
+        if value.is_empty() {
+            None
+        } else {
+            BASE64_STANDARD.decode(value.as_bytes()).ok()
+        }
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigBackupRecord {
     pub index: usize,
@@ -501,6 +511,668 @@ pub struct ConsoleBrowserHandoffRequest {
 pub struct ConsoleBrowserHandoffEnvelope {
     pub handoff_url: String,
     pub expires_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserProfilesQuery {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserSessionBudget {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_navigation_timeout_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_session_lifetime_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_screenshot_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_response_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_action_timeout_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_type_input_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_actions_per_session: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_actions_per_window: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_rate_window_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_action_log_entries: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_observe_snapshot_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_visible_text_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_network_log_entries: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_network_log_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserPermissionSetting {
+    Unspecified,
+    Deny,
+    Allow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserSessionPermissions {
+    pub camera: BrowserPermissionSetting,
+    pub microphone: BrowserPermissionSetting,
+    pub location: BrowserPermissionSetting,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserActionLogEntry {
+    pub action_id: String,
+    pub action_name: String,
+    pub selector: String,
+    pub success: bool,
+    pub outcome: String,
+    pub error: String,
+    pub started_at_unix_ms: u64,
+    pub completed_at_unix_ms: u64,
+    pub attempts: u32,
+    pub page_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserNetworkLogHeader {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserNetworkLogEntry {
+    pub request_url: String,
+    pub status_code: u32,
+    pub timing_bucket: String,
+    pub latency_ms: u64,
+    pub captured_at_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<BrowserNetworkLogHeader>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserTabRecord {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tab_id: Option<String>,
+    pub url: String,
+    pub title: String,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserProfileRecord {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    pub principal: String,
+    pub name: String,
+    pub theme_color: String,
+    pub created_at_unix_ms: u64,
+    pub updated_at_unix_ms: u64,
+    pub last_used_unix_ms: u64,
+    pub persistence_enabled: bool,
+    pub private_profile: bool,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserDownloadArtifactRecord {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    pub source_url: String,
+    pub file_name: String,
+    pub mime_type: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+    pub created_at_unix_ms: u64,
+    pub quarantined: bool,
+    pub quarantine_reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserCreateProfileRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub theme_color: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persistence_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub private_profile: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserRenameProfileRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserProfileScopeRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserProfileListEnvelope {
+    pub contract: ContractDescriptor,
+    pub principal: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_profile_id: Option<String>,
+    #[serde(default)]
+    pub profiles: Vec<BrowserProfileRecord>,
+    pub page: PageInfo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserProfileEnvelope {
+    pub contract: ContractDescriptor,
+    pub profile: BrowserProfileRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserProfileDeleteEnvelope {
+    pub contract: ContractDescriptor,
+    pub principal: String,
+    pub profile_id: String,
+    pub deleted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_profile_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserDownloadArtifactsQuery {
+    pub session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    pub quarantined_only: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserDownloadArtifactListEnvelope {
+    pub contract: ContractDescriptor,
+    pub session_id: String,
+    #[serde(default)]
+    pub artifacts: Vec<BrowserDownloadArtifactRecord>,
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
+    pub page: PageInfo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserSessionCreateRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idle_ttl_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget: Option<BrowserSessionBudget>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_private_targets: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_downloads: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub action_allowed_domains: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persistence_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persistence_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub private_profile: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserSessionCreateEnvelope {
+    pub contract: ContractDescriptor,
+    pub principal: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub created_at_unix_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_budget: Option<BrowserSessionBudget>,
+    pub downloads_enabled: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub action_allowed_domains: Vec<String>,
+    pub persistence_enabled: bool,
+    pub persistence_id: String,
+    pub state_restored: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    pub private_profile: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserSessionCloseEnvelope {
+    pub contract: ContractDescriptor,
+    pub session_id: String,
+    pub closed: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserNavigateRequest {
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_redirects: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_redirects: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_private_targets: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserNavigateEnvelope {
+    pub contract: ContractDescriptor,
+    pub session_id: String,
+    pub success: bool,
+    pub final_url: String,
+    pub status_code: u32,
+    pub title: String,
+    pub body_bytes: u64,
+    pub latency_ms: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserClickRequest {
+    pub selector: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_retries: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_failure_screenshot: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_failure_screenshot_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserClickEnvelope {
+    pub contract: ContractDescriptor,
+    pub session_id: String,
+    pub success: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_log: Option<BrowserActionLogEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<BrowserDownloadArtifactRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_screenshot_mime_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_screenshot_base64: Option<String>,
+}
+
+impl BrowserClickEnvelope {
+    #[must_use]
+    pub fn decode_failure_screenshot(&self) -> Option<Vec<u8>> {
+        decode_optional_base64(self.failure_screenshot_base64.as_deref())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserTypeRequest {
+    pub selector: String,
+    #[serde(default)]
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clear_existing: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_failure_screenshot: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_failure_screenshot_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserTypeEnvelope {
+    pub contract: ContractDescriptor,
+    pub session_id: String,
+    pub success: bool,
+    pub typed_bytes: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_log: Option<BrowserActionLogEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_screenshot_mime_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_screenshot_base64: Option<String>,
+}
+
+impl BrowserTypeEnvelope {
+    #[must_use]
+    pub fn decode_failure_screenshot(&self) -> Option<Vec<u8>> {
+        decode_optional_base64(self.failure_screenshot_base64.as_deref())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserScrollRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta_x: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta_y: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_failure_screenshot: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_failure_screenshot_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserScrollEnvelope {
+    pub contract: ContractDescriptor,
+    pub session_id: String,
+    pub success: bool,
+    pub scroll_x: i64,
+    pub scroll_y: i64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_log: Option<BrowserActionLogEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_screenshot_mime_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_screenshot_base64: Option<String>,
+}
+
+impl BrowserScrollEnvelope {
+    #[must_use]
+    pub fn decode_failure_screenshot(&self) -> Option<Vec<u8>> {
+        decode_optional_base64(self.failure_screenshot_base64.as_deref())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserWaitForRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selector: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poll_interval_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_failure_screenshot: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_failure_screenshot_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserWaitForEnvelope {
+    pub contract: ContractDescriptor,
+    pub session_id: String,
+    pub success: bool,
+    pub waited_ms: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
+    pub matched_selector: String,
+    pub matched_text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_log: Option<BrowserActionLogEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_screenshot_mime_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_screenshot_base64: Option<String>,
+}
+
+impl BrowserWaitForEnvelope {
+    #[must_use]
+    pub fn decode_failure_screenshot(&self) -> Option<Vec<u8>> {
+        decode_optional_base64(self.failure_screenshot_base64.as_deref())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserTitleQuery {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_title_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserTitleEnvelope {
+    pub contract: ContractDescriptor,
+    pub session_id: String,
+    pub success: bool,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserScreenshotQuery {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserScreenshotEnvelope {
+    pub contract: ContractDescriptor,
+    pub session_id: String,
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_base64: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
+}
+
+impl BrowserScreenshotEnvelope {
+    #[must_use]
+    pub fn decode_image(&self) -> Option<Vec<u8>> {
+        decode_optional_base64(self.image_base64.as_deref())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserObserveQuery {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_dom_snapshot: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_accessibility_tree: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_visible_text: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_dom_snapshot_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_accessibility_tree_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_visible_text_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserObserveEnvelope {
+    pub contract: ContractDescriptor,
+    pub session_id: String,
+    pub success: bool,
+    pub dom_snapshot: String,
+    pub accessibility_tree: String,
+    pub visible_text: String,
+    pub dom_truncated: bool,
+    pub accessibility_tree_truncated: bool,
+    pub visible_text_truncated: bool,
+    pub page_url: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserNetworkLogQuery {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_headers: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_payload_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserNetworkLogEnvelope {
+    pub contract: ContractDescriptor,
+    pub session_id: String,
+    pub success: bool,
+    #[serde(default)]
+    pub entries: Vec<BrowserNetworkLogEntry>,
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
+    pub page: PageInfo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserTabListEnvelope {
+    pub contract: ContractDescriptor,
+    pub session_id: String,
+    pub success: bool,
+    #[serde(default)]
+    pub tabs: Vec<BrowserTabRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_tab_id: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
+    pub page: PageInfo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserOpenTabRequest {
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activate: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_redirects: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_redirects: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_private_targets: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserOpenTabEnvelope {
+    pub contract: ContractDescriptor,
+    pub session_id: String,
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tab: Option<BrowserTabRecord>,
+    pub navigated: bool,
+    pub status_code: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserTabMutationRequest {
+    pub tab_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserTabCloseRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tab_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserSwitchTabEnvelope {
+    pub contract: ContractDescriptor,
+    pub session_id: String,
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_tab: Option<BrowserTabRecord>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserCloseTabEnvelope {
+    pub contract: ContractDescriptor,
+    pub session_id: String,
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub closed_tab_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_tab: Option<BrowserTabRecord>,
+    pub tabs_remaining: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserPermissionsEnvelope {
+    pub contract: ContractDescriptor,
+    pub session_id: String,
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<BrowserSessionPermissions>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserSetPermissionsRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub camera: Option<BrowserPermissionSetting>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub microphone: Option<BrowserPermissionSetting>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<BrowserPermissionSetting>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reset_to_default: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserResetStateRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clear_cookies: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clear_storage: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reset_tabs: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reset_permissions: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserResetStateEnvelope {
+    pub contract: ContractDescriptor,
+    pub session_id: String,
+    pub success: bool,
+    pub cookies_cleared: u32,
+    pub storage_entries_cleared: u32,
+    pub tabs_closed: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<BrowserSessionPermissions>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -12,8 +12,9 @@ use tracing::info;
 
 use crate::{
     application::approvals::{
-        build_pending_tool_approval, record_approval_requested_journal_event,
-        record_approval_resolved_journal_event, resolve_cached_tool_approval_for_proposal,
+        approval_subject_type_for_tool, build_pending_tool_approval,
+        record_approval_requested_journal_event, record_approval_resolved_journal_event,
+        resolve_cached_tool_approval_for_proposal,
     },
     application::tool_security::{
         evaluate_tool_proposal_security, record_tool_proposal_decision_audit_trail,
@@ -26,7 +27,7 @@ use crate::{
         GatewayRuntimeState, RunStreamToolExecutionOutcome, ToolApprovalOutcome,
         ToolRuntimeExecutionContext, TOOL_APPROVAL_RESPONSE_TIMEOUT,
     },
-    journal::{ApprovalCreateRequest, ApprovalResolveRequest, ApprovalSubjectType},
+    journal::{ApprovalCreateRequest, ApprovalResolveRequest},
     orchestrator::RunStateMachine,
     tool_protocol::denied_execution_outcome,
     transport::grpc::auth::RequestContext,
@@ -269,7 +270,7 @@ async fn resolve_run_stream_tool_approval_outcome(
             principal: request_context.principal.clone(),
             device_id: request_context.device_id.clone(),
             channel: request_context.channel.clone(),
-            subject_type: ApprovalSubjectType::Tool,
+            subject_type: approval_subject_type_for_tool(tool_name),
             subject_id: pending_approval.prompt.subject_id.clone(),
             request_summary: pending_approval.request_summary.clone(),
             policy_snapshot: pending_approval.policy_snapshot.clone(),

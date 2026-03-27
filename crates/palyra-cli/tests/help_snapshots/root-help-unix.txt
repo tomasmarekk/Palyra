@@ -20,7 +20,7 @@ Commands:
   auth
   channels
   webhooks        Manage webhook-backed integrations
-  browser
+  browser         Operate the browser service and browser-backed automation sessions
   completion      Generate shell completion scripts
   onboarding      [aliases: onboard]
   configure       Safely reconfigure an existing installation

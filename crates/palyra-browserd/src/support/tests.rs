@@ -6,12 +6,14 @@ use super::{
     reset_dns_validation_tracking_for_tests, run_chromium_blocking, sha256_hex,
     store_dns_nxdomain_cache, update_profile_state_metadata,
     validate_restored_snapshot_against_profile, validate_target_url, validate_target_url_blocking,
-    Args, BrowserEngineMode, BrowserProfileRecord, BrowserRuntimeState, BrowserServiceImpl,
-    BrowserTabRecord, ChromiumSessionProxy, DnsValidationCache, PersistedSessionSnapshot,
-    PersistedStateStore, SessionPermissionsInternal, AUTHORIZATION_HEADER,
-    CANONICAL_PROTOCOL_MAJOR, CHROMIUM_NEW_TAB_RETRY_DELAY_MS, CHROMIUM_PATH_ENV,
-    DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS, DEFAULT_GRPC_PORT, DEFAULT_MAX_TABS_PER_SESSION,
-    MAX_RELAY_PAYLOAD_BYTES, ONE_BY_ONE_PNG, PROFILE_RECORD_SCHEMA_VERSION, STATE_KEY_LEN,
+    Args, BrowserActionLogEntryInternal, BrowserEngineMode, BrowserProfileRecord,
+    BrowserRuntimeState, BrowserServiceImpl, BrowserTabRecord, ChromiumSessionProxy,
+    DnsValidationCache, NetworkLogEntryInternal, NetworkLogHeaderInternal,
+    PersistedSessionSnapshot, PersistedStateStore, SessionPermissionsInternal,
+    AUTHORIZATION_HEADER, CANONICAL_PROTOCOL_MAJOR, CHROMIUM_NEW_TAB_RETRY_DELAY_MS,
+    CHROMIUM_PATH_ENV, DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS, DEFAULT_GRPC_PORT,
+    DEFAULT_MAX_TABS_PER_SESSION, MAX_RELAY_PAYLOAD_BYTES, ONE_BY_ONE_PNG,
+    PROFILE_RECORD_SCHEMA_VERSION, STATE_KEY_LEN,
 };
 use crate::proto;
 use crate::proto::palyra::browser::v1::browser_service_server::BrowserService;
@@ -68,6 +70,53 @@ fn resolve_chromium_path_for_tests() -> Option<PathBuf> {
         .ok()
         .map(PathBuf::from)
         .or_else(|| headless_chrome::browser::default_executable().ok())
+}
+
+fn simulated_runtime_for_tests() -> Arc<BrowserRuntimeState> {
+    Arc::new(
+        BrowserRuntimeState::new(&Args {
+            bind: "127.0.0.1".to_owned(),
+            port: 7143,
+            grpc_bind: "127.0.0.1".to_owned(),
+            grpc_port: 7543,
+            auth_token: None,
+            session_idle_ttl_ms: 60_000,
+            max_sessions: 16,
+            max_navigation_timeout_ms: 10_000,
+            max_session_lifetime_ms: 60_000,
+            max_screenshot_bytes: 128 * 1024,
+            max_response_bytes: 128 * 1024,
+            max_title_bytes: 4 * 1024,
+            engine_mode: BrowserEngineMode::Simulated,
+            chromium_path: None,
+            chromium_startup_timeout_ms: DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS,
+        })
+        .expect("runtime should initialize"),
+    )
+}
+
+async fn create_test_session(
+    service: &BrowserServiceImpl,
+    principal: &str,
+) -> browser_v1::CreateSessionResponse {
+    service
+        .create_session(Request::new(browser_v1::CreateSessionRequest {
+            v: 1,
+            principal: principal.to_owned(),
+            idle_ttl_ms: 10_000,
+            budget: None,
+            allow_private_targets: true,
+            allow_downloads: false,
+            action_allowed_domains: Vec::new(),
+            persistence_enabled: false,
+            persistence_id: String::new(),
+            profile_id: None,
+            private_profile: false,
+            channel: String::new(),
+        }))
+        .await
+        .expect("create_session should succeed")
+        .into_inner()
 }
 
 #[test]
@@ -3634,6 +3683,392 @@ async fn browser_service_download_allowlist_and_quarantine_artifacts() {
     assert!(
         listed.artifacts.iter().any(|artifact| artifact.quarantined),
         "download artifact list should include quarantined entries"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn browser_service_lists_and_gets_session_details() {
+    let runtime = simulated_runtime_for_tests();
+    let service = BrowserServiceImpl { runtime: Arc::clone(&runtime) };
+
+    let first = create_test_session(&service, "user:alpha").await;
+    let first_id = first
+        .session_id
+        .as_ref()
+        .map(|value| value.ulid.clone())
+        .expect("first session id should be present");
+    let second = create_test_session(&service, "user:beta").await;
+    let second_id = second
+        .session_id
+        .as_ref()
+        .map(|value| value.ulid.clone())
+        .expect("second session id should be present");
+
+    {
+        let now = Instant::now();
+        let mut sessions = runtime.sessions.lock().await;
+        let first_session =
+            sessions.get_mut(first_id.as_str()).expect("first session should exist for inspection");
+        first_session.last_active = now - Duration::from_secs(5);
+        first_session.channel = Some("alpha-channel".to_owned());
+        first_session.action_allowed_domains = vec!["example.com".to_owned()];
+        {
+            let first_tab =
+                first_session.active_tab_mut().expect("first session should have an active tab");
+            first_tab.last_url = Some("https://example.com/alpha".to_owned());
+            first_tab.last_title = "Alpha Session".to_owned();
+        }
+
+        let second_session =
+            sessions.get_mut(second_id.as_str()).expect("second session should exist for ordering");
+        second_session.last_active = now;
+    }
+
+    let listed = service
+        .list_sessions(Request::new(browser_v1::ListSessionsRequest {
+            v: 1,
+            principal: String::new(),
+            limit: 1,
+        }))
+        .await
+        .expect("list_sessions should execute")
+        .into_inner();
+    assert!(listed.truncated, "listing with limit=1 should report truncation");
+    assert_eq!(listed.sessions.len(), 1, "listing should clamp to requested limit");
+    assert_eq!(
+        listed.sessions[0].session_id.as_ref().map(|value| value.ulid.as_str()),
+        Some(second_id.as_str()),
+        "most recently active session should be listed first"
+    );
+
+    let filtered = service
+        .list_sessions(Request::new(browser_v1::ListSessionsRequest {
+            v: 1,
+            principal: "user:alpha".to_owned(),
+            limit: 10,
+        }))
+        .await
+        .expect("filtered list_sessions should execute")
+        .into_inner();
+    assert_eq!(filtered.sessions.len(), 1, "principal filter should narrow the result set");
+    let summary = filtered.sessions.first().expect("filtered session should be present");
+    assert_eq!(summary.principal, "user:alpha");
+    assert_eq!(summary.channel, "alpha-channel");
+    assert_eq!(summary.active_tab_title, "Alpha Session");
+    assert_eq!(summary.action_allowed_domains, vec!["example.com".to_owned()]);
+
+    let detailed = service
+        .get_session(Request::new(browser_v1::GetSessionRequest {
+            v: 1,
+            session_id: Some(proto::palyra::common::v1::CanonicalId { ulid: first_id }),
+        }))
+        .await
+        .expect("get_session should execute")
+        .into_inner();
+    assert!(detailed.success, "get_session should succeed for an active session");
+    let detail = detailed.session.expect("session detail should be returned");
+    let detail_summary = detail.summary.expect("session detail should include summary");
+    assert_eq!(detail_summary.principal, "user:alpha");
+    assert_eq!(detail_summary.channel, "alpha-channel");
+    assert_eq!(detail.tabs.len(), 1, "fresh sessions should expose their single active tab");
+    assert_eq!(
+        detail
+            .effective_budget
+            .expect("effective budget should be returned")
+            .max_network_log_entries,
+        runtime.default_budget.max_network_log_entries as u64
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn browser_service_inspect_session_redacts_debug_state() {
+    let runtime = simulated_runtime_for_tests();
+    let service = BrowserServiceImpl { runtime: Arc::clone(&runtime) };
+    let created = create_test_session(&service, "user:ops").await;
+    let session_id = created
+        .session_id
+        .as_ref()
+        .map(|value| value.ulid.clone())
+        .expect("session id should be present");
+
+    {
+        let mut sessions = runtime.sessions.lock().await;
+        let session = sessions
+            .get_mut(session_id.as_str())
+            .expect("session should exist for debug-state seeding");
+        {
+            let active_tab = session
+                .active_tab_mut()
+                .expect("session should retain an active tab for inspection");
+            active_tab.last_url =
+                Some("https://example.com/app?access_token=topsecret&safe=1".to_owned());
+            active_tab.last_title = "Debug Session".to_owned();
+            active_tab.last_page_body = "<html><body><main><button id=\"save\">Save</button><div>Visible debug text</div><form action=\"https://example.com/login?token=abc123\"></form></main></body></html>".to_owned();
+            active_tab.network_log.push_back(NetworkLogEntryInternal {
+                request_url: "https://example.com/api?access_token=topsecret&safe=1".to_owned(),
+                status_code: 200,
+                timing_bucket: "lt_100ms".to_owned(),
+                latency_ms: 42,
+                captured_at_unix_ms: 1,
+                headers: vec![NetworkLogHeaderInternal {
+                    name: "set-cookie".to_owned(),
+                    value: "session=abc123".to_owned(),
+                }],
+            });
+        }
+        session.cookie_jar.insert(
+            "example.com".to_owned(),
+            HashMap::from([
+                ("session".to_owned(), "abc123".to_owned()),
+                ("theme".to_owned(), "light".to_owned()),
+            ]),
+        );
+        session.storage_entries.insert(
+            "https://example.com".to_owned(),
+            HashMap::from([
+                ("token".to_owned(), "supersecret".to_owned()),
+                ("#email".to_owned(), "operator@example.com".to_owned()),
+            ]),
+        );
+        session.action_log.push_back(BrowserActionLogEntryInternal {
+            action_id: ulid::Ulid::new().to_string(),
+            action_name: "navigate".to_owned(),
+            selector: String::new(),
+            success: false,
+            outcome: "navigation_failed".to_owned(),
+            error: "token=supersecret".to_owned(),
+            started_at_unix_ms: 1,
+            completed_at_unix_ms: 2,
+            attempts: 1,
+            page_url: "https://example.com/app?access_token=topsecret&safe=1".to_owned(),
+        });
+    }
+
+    let inspected = service
+        .inspect_session(Request::new(browser_v1::InspectSessionRequest {
+            v: 1,
+            session_id: Some(proto::palyra::common::v1::CanonicalId { ulid: session_id }),
+            include_cookies: true,
+            include_storage: true,
+            include_action_log: true,
+            include_network_log: true,
+            include_page_snapshot: true,
+            max_cookie_bytes: 2 * 1024,
+            max_storage_bytes: 2 * 1024,
+            max_action_log_entries: 10,
+            max_network_log_entries: 10,
+            max_network_log_bytes: 4 * 1024,
+            max_dom_snapshot_bytes: 4 * 1024,
+            max_visible_text_bytes: 512,
+        }))
+        .await
+        .expect("inspect_session should execute")
+        .into_inner();
+    assert!(inspected.success, "inspect_session should succeed for seeded session state");
+    let inspected_summary = inspected
+        .session
+        .as_ref()
+        .and_then(|detail| detail.summary.as_ref())
+        .expect("inspect response should include session summary");
+    assert_eq!(inspected_summary.active_tab_title, "Debug Session");
+
+    let cookie_domains = inspected
+        .cookies
+        .iter()
+        .find(|domain| domain.domain == "example.com")
+        .expect("cookie inspection should include example.com");
+    assert!(
+        cookie_domains
+            .cookies
+            .iter()
+            .any(|cookie| cookie.name == "session" && cookie.value == "<redacted>"),
+        "session cookie values must be redacted"
+    );
+    assert!(
+        cookie_domains
+            .cookies
+            .iter()
+            .any(|cookie| cookie.name == "theme" && cookie.value == "light"),
+        "non-sensitive cookie values should remain visible"
+    );
+
+    let storage_origin = inspected
+        .storage
+        .iter()
+        .find(|origin| origin.origin == "https://example.com")
+        .expect("storage inspection should include the typed origin");
+    assert!(
+        storage_origin
+            .entries
+            .iter()
+            .any(|entry| entry.key == "token" && entry.value == "<redacted>"),
+        "sensitive storage keys must be redacted"
+    );
+    assert!(
+        storage_origin
+            .entries
+            .iter()
+            .any(|entry| entry.key == "#email" && entry.value == "operator@example.com"),
+        "non-sensitive storage values should remain visible"
+    );
+
+    assert_eq!(
+        inspected.action_log.first().map(|entry| entry.error.as_str()),
+        Some("<redacted>"),
+        "sensitive action log errors must be redacted"
+    );
+    let network_entry = inspected
+        .network_log
+        .first()
+        .expect("network log inspection should include the seeded entry");
+    assert!(
+        network_entry.request_url.contains("access_token=<redacted>"),
+        "network log URLs should be normalized and redacted: {}",
+        network_entry.request_url
+    );
+    assert!(
+        network_entry
+            .headers
+            .iter()
+            .any(|header| header.name == "set-cookie" && header.value == "<redacted>"),
+        "sensitive network log headers must be redacted"
+    );
+    assert!(
+        inspected.dom_snapshot.contains("token=<redacted>"),
+        "page snapshot should redact sensitive query parameters: {}",
+        inspected.dom_snapshot
+    );
+    assert!(
+        !inspected.dom_snapshot.contains("abc123") && !inspected.dom_snapshot.contains("topsecret"),
+        "page snapshot must not leak sensitive values: {}",
+        inspected.dom_snapshot
+    );
+    assert!(
+        inspected.visible_text.contains("Visible debug text"),
+        "visible text should expose useful debug context"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn browser_service_inspect_session_truncates_deterministically() {
+    let runtime = simulated_runtime_for_tests();
+    let service = BrowserServiceImpl { runtime: Arc::clone(&runtime) };
+    let created = create_test_session(&service, "user:ops").await;
+    let session_id = created
+        .session_id
+        .as_ref()
+        .map(|value| value.ulid.clone())
+        .expect("session id should be present");
+
+    {
+        let mut sessions = runtime.sessions.lock().await;
+        let session = sessions
+            .get_mut(session_id.as_str())
+            .expect("session should exist for truncation seeding");
+        {
+            let active_tab = session
+                .active_tab_mut()
+                .expect("session should retain an active tab for truncation test");
+            active_tab.last_url = Some("https://example.com/dashboard".to_owned());
+            active_tab.last_title = "Truncation Fixture".to_owned();
+            active_tab.last_page_body = format!(
+                "<html><body><main>{}</main></body></html>",
+                (0..24)
+                    .map(|index| format!(
+                        "<section id=\"section-{index}\"><button id=\"action-{index}\">Button {index}</button><p>Repeated truncation content {index}</p></section>"
+                    ))
+                    .collect::<String>()
+            );
+            for index in 0..4 {
+                active_tab.network_log.push_back(NetworkLogEntryInternal {
+                    request_url: format!("https://example.com/api/items/{index}?safe={index}"),
+                    status_code: 200,
+                    timing_bucket: "lt_100ms".to_owned(),
+                    latency_ms: 10 + index,
+                    captured_at_unix_ms: index as u64,
+                    headers: vec![NetworkLogHeaderInternal {
+                        name: "x-request-id".to_owned(),
+                        value: format!("req-{index}"),
+                    }],
+                });
+            }
+        }
+        session.cookie_jar.insert(
+            "example.com".to_owned(),
+            HashMap::from([
+                ("cookie-a".to_owned(), "a".repeat(48)),
+                ("cookie-b".to_owned(), "b".repeat(48)),
+                ("cookie-c".to_owned(), "c".repeat(48)),
+            ]),
+        );
+        session.storage_entries.insert(
+            "https://example.com".to_owned(),
+            HashMap::from([
+                ("field-a".to_owned(), "alpha".repeat(24)),
+                ("field-b".to_owned(), "beta".repeat(24)),
+                ("field-c".to_owned(), "gamma".repeat(24)),
+            ]),
+        );
+        for index in 0..3 {
+            session.action_log.push_back(BrowserActionLogEntryInternal {
+                action_id: ulid::Ulid::new().to_string(),
+                action_name: format!("action-{index}"),
+                selector: format!("#selector-{index}"),
+                success: true,
+                outcome: "completed".to_owned(),
+                error: String::new(),
+                started_at_unix_ms: index,
+                completed_at_unix_ms: index + 1,
+                attempts: 1,
+                page_url: "https://example.com/dashboard".to_owned(),
+            });
+        }
+    }
+
+    let request = browser_v1::InspectSessionRequest {
+        v: 1,
+        session_id: Some(proto::palyra::common::v1::CanonicalId { ulid: session_id }),
+        include_cookies: true,
+        include_storage: true,
+        include_action_log: true,
+        include_network_log: true,
+        include_page_snapshot: true,
+        max_cookie_bytes: 96,
+        max_storage_bytes: 128,
+        max_action_log_entries: 1,
+        max_network_log_entries: 2,
+        max_network_log_bytes: 128,
+        max_dom_snapshot_bytes: 64,
+        max_visible_text_bytes: 32,
+    };
+    let first = service
+        .inspect_session(Request::new(request.clone()))
+        .await
+        .expect("first inspect_session should execute")
+        .into_inner();
+    let second = service
+        .inspect_session(Request::new(request))
+        .await
+        .expect("second inspect_session should execute")
+        .into_inner();
+
+    assert!(first.cookies_truncated, "cookie payload should report truncation");
+    assert!(first.storage_truncated, "storage payload should report truncation");
+    assert!(first.action_log_truncated, "action log should report truncation");
+    assert!(first.network_log_truncated, "network log should report truncation");
+    assert!(first.dom_truncated, "DOM snapshot should report truncation");
+    assert!(first.visible_text_truncated, "visible text should report truncation");
+    assert_eq!(first.cookies, second.cookies, "cookie truncation must be deterministic");
+    assert_eq!(first.storage, second.storage, "storage truncation must be deterministic");
+    assert_eq!(first.action_log, second.action_log, "action log truncation must be deterministic");
+    assert_eq!(
+        first.network_log, second.network_log,
+        "network log truncation must be deterministic"
+    );
+    assert_eq!(first.dom_snapshot, second.dom_snapshot, "DOM truncation must be deterministic");
+    assert_eq!(
+        first.visible_text, second.visible_text,
+        "visible-text truncation must be deterministic"
     );
 }
 

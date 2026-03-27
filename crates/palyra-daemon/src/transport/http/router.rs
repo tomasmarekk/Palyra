@@ -432,6 +432,75 @@ pub(crate) fn build_router(state: AppState) -> Router {
             post(console::browser::console_browser_profile_activate_handler),
         )
         .route(
+            "/console/v1/browser/sessions",
+            post(console::browser::console_browser_session_create_handler),
+        )
+        .route(
+            "/console/v1/browser/sessions/{session_id}/close",
+            post(console::browser::console_browser_session_close_handler),
+        )
+        .route(
+            "/console/v1/browser/sessions/{session_id}/navigate",
+            post(console::browser::console_browser_navigate_handler),
+        )
+        .route(
+            "/console/v1/browser/sessions/{session_id}/click",
+            post(console::browser::console_browser_click_handler),
+        )
+        .route(
+            "/console/v1/browser/sessions/{session_id}/type",
+            post(console::browser::console_browser_type_handler),
+        )
+        .route(
+            "/console/v1/browser/sessions/{session_id}/scroll",
+            post(console::browser::console_browser_scroll_handler),
+        )
+        .route(
+            "/console/v1/browser/sessions/{session_id}/wait-for",
+            post(console::browser::console_browser_wait_for_handler),
+        )
+        .route(
+            "/console/v1/browser/sessions/{session_id}/title",
+            get(console::browser::console_browser_title_handler),
+        )
+        .route(
+            "/console/v1/browser/sessions/{session_id}/screenshot",
+            get(console::browser::console_browser_screenshot_handler),
+        )
+        .route(
+            "/console/v1/browser/sessions/{session_id}/observe",
+            get(console::browser::console_browser_observe_handler),
+        )
+        .route(
+            "/console/v1/browser/sessions/{session_id}/network-log",
+            get(console::browser::console_browser_network_log_handler),
+        )
+        .route(
+            "/console/v1/browser/sessions/{session_id}/reset-state",
+            post(console::browser::console_browser_reset_state_handler),
+        )
+        .route(
+            "/console/v1/browser/sessions/{session_id}/tabs",
+            get(console::browser::console_browser_tabs_list_handler),
+        )
+        .route(
+            "/console/v1/browser/sessions/{session_id}/tabs/open",
+            post(console::browser::console_browser_tab_open_handler),
+        )
+        .route(
+            "/console/v1/browser/sessions/{session_id}/tabs/switch",
+            post(console::browser::console_browser_tab_switch_handler),
+        )
+        .route(
+            "/console/v1/browser/sessions/{session_id}/tabs/close",
+            post(console::browser::console_browser_tab_close_handler),
+        )
+        .route(
+            "/console/v1/browser/sessions/{session_id}/permissions",
+            get(console::browser::console_browser_permissions_get_handler)
+                .post(console::browser::console_browser_permissions_set_handler),
+        )
+        .route(
             "/console/v1/browser/downloads",
             get(console::browser::console_browser_downloads_list_handler),
         )

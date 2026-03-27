@@ -47,8 +47,56 @@ pub(crate) fn run_doctor(strict: bool, json: bool) -> Result<()> {
             report.connectivity.daemon_url,
             report.connectivity.http.ok,
             report.connectivity.grpc.ok,
-            report.provider_auth.fetched
+            report.connectivity.admin.ok
         );
+        println!(
+            "doctor.browser enabled={} auth_token_configured={} endpoint={} connect_timeout_ms={} request_timeout_ms={} max_screenshot_bytes={} max_title_bytes={} state_dir_configured={} state_key_vault_ref_configured={} diagnostics_fetched={} health_status={} active_sessions={} recent_relay_failures={} recent_health_failures={}",
+            report.browser.configured_enabled,
+            report.browser.auth_token_configured,
+            report.browser.endpoint,
+            report
+                .browser
+                .connect_timeout_ms
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_owned()),
+            report
+                .browser
+                .request_timeout_ms
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_owned()),
+            report
+                .browser
+                .max_screenshot_bytes
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_owned()),
+            report
+                .browser
+                .max_title_bytes
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_owned()),
+            report.browser.state_dir_configured,
+            report.browser.state_key_vault_ref_configured,
+            report.browser.diagnostics_fetched,
+            report.browser.health_status.as_deref().unwrap_or("-"),
+            report
+                .browser
+                .active_sessions
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_owned()),
+            report
+                .browser
+                .recent_relay_action_failures
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_owned()),
+            report
+                .browser
+                .recent_health_failures
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_owned()),
+        );
+        if let Some(error) = report.browser.error.as_deref() {
+            println!("doctor.browser_error={error}");
+        }
         println!(
             "doctor.sandbox tier_b_preflight_only={} tier_c_strict_offline={} tier_c_windows_backend_supported={}",
             report.sandbox.tier_b_egress_allowlists_preflight_only,
@@ -108,6 +156,15 @@ pub(crate) fn run_doctor(strict: bool, json: bool) -> Result<()> {
         }
         if !report.deployment.warnings.is_empty() || !warning_checks.is_empty() {
             next_steps.push("palyra security audit --offline");
+        }
+        if report.browser.configured_enabled
+            && (!report.browser.auth_token_configured
+                || report.browser.error.is_some()
+                || report.browser.health_status.as_deref().is_some_and(|value| value != "ok")
+                || report.browser.recent_relay_action_failures.unwrap_or(0) > 0
+                || report.browser.recent_health_failures.unwrap_or(0) > 0)
+        {
+            next_steps.push("palyra browser status");
         }
         if !blocking_checks.is_empty()
             || !warning_checks.is_empty()

@@ -66,3 +66,26 @@ fn capability_entry_serializes_dashboard_exposure_when_present() {
     let serialized = serde_json::to_value(entry).expect("capability entry should serialize");
     assert_eq!(serialized.get("dashboard_exposure").and_then(Value::as_str), Some("cli_handoff"));
 }
+
+#[test]
+fn browser_screenshot_envelope_decodes_base64_image() {
+    let envelope = BrowserScreenshotEnvelope {
+        contract: ContractDescriptor {
+            contract_version: CONTROL_PLANE_CONTRACT_VERSION.to_owned(),
+        },
+        session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+        success: true,
+        mime_type: Some("image/png".to_owned()),
+        image_base64: Some(BASE64_STANDARD.encode(b"png-bytes")),
+        error: String::new(),
+    };
+
+    assert_eq!(envelope.decode_image().as_deref(), Some(b"png-bytes".as_slice()));
+}
+
+#[test]
+fn browser_permission_setting_serializes_as_snake_case() {
+    let value = serde_json::to_value(BrowserPermissionSetting::Allow)
+        .expect("permission setting should serialize");
+    assert_eq!(value, serde_json::json!("allow"));
+}

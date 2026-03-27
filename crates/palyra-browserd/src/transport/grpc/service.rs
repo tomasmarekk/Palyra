@@ -297,22 +297,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             v: CANONICAL_PROTOCOL_MAJOR,
             session_id: Some(proto::palyra::common::v1::CanonicalId { ulid: session_id }),
             created_at_unix_ms: current_unix_ms(),
-            effective_budget: Some(browser_v1::SessionBudget {
-                max_navigation_timeout_ms: budget.max_navigation_timeout_ms,
-                max_session_lifetime_ms: budget.max_session_lifetime_ms,
-                max_screenshot_bytes: budget.max_screenshot_bytes,
-                max_response_bytes: budget.max_response_bytes,
-                max_action_timeout_ms: budget.max_action_timeout_ms,
-                max_type_input_bytes: budget.max_type_input_bytes,
-                max_actions_per_session: budget.max_actions_per_session,
-                max_actions_per_window: budget.max_actions_per_window,
-                action_rate_window_ms: budget.action_rate_window_ms,
-                max_action_log_entries: budget.max_action_log_entries as u64,
-                max_observe_snapshot_bytes: budget.max_observe_snapshot_bytes,
-                max_visible_text_bytes: budget.max_visible_text_bytes,
-                max_network_log_entries: budget.max_network_log_entries as u64,
-                max_network_log_bytes: budget.max_network_log_bytes,
-            }),
+            effective_budget: Some(session_budget_to_proto(&budget)),
             downloads_enabled: payload.allow_downloads,
             action_allowed_domains,
             persistence_enabled,
@@ -352,6 +337,322 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             } else {
                 "session_not_found".to_owned()
             },
+        }))
+    }
+
+    async fn list_sessions(
+        &self,
+        request: Request<browser_v1::ListSessionsRequest>,
+    ) -> Result<Response<browser_v1::ListSessionsResponse>, Status> {
+        self.runtime.authorize(request.metadata()).await?;
+        let payload = request.into_inner();
+        let principal = normalize_optional_string(payload.principal.as_str());
+        let limit = if payload.limit == 0 {
+            self.runtime.max_sessions
+        } else {
+            usize::try_from(payload.limit).unwrap_or(usize::MAX).min(self.runtime.max_sessions)
+        };
+        let sessions = self.runtime.sessions.lock().await;
+        let mut records = sessions
+            .iter()
+            .filter(|(_, session)| {
+                principal.as_deref().map(|value| session.principal == value).unwrap_or(true)
+            })
+            .map(|(session_id, session)| (session_id.clone(), session.clone()))
+            .collect::<Vec<_>>();
+        drop(sessions);
+        records.sort_by(|left, right| {
+            right
+                .1
+                .last_active
+                .cmp(&left.1.last_active)
+                .then_with(|| right.1.created_at.cmp(&left.1.created_at))
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        let truncated = records.len() > limit;
+        let sessions = records
+            .into_iter()
+            .take(limit)
+            .map(|(session_id, session)| session_summary_to_proto(session_id.as_str(), &session))
+            .collect::<Vec<_>>();
+        Ok(Response::new(browser_v1::ListSessionsResponse {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            sessions,
+            truncated,
+            error: String::new(),
+        }))
+    }
+
+    async fn get_session(
+        &self,
+        request: Request<browser_v1::GetSessionRequest>,
+    ) -> Result<Response<browser_v1::GetSessionResponse>, Status> {
+        self.runtime.authorize(request.metadata()).await?;
+        let session_id = parse_session_id_from_proto(request.into_inner().session_id)
+            .map_err(Status::invalid_argument)?;
+        let session = {
+            let mut sessions = self.runtime.sessions.lock().await;
+            let Some(session) = sessions.get_mut(session_id.as_str()) else {
+                return Ok(Response::new(browser_v1::GetSessionResponse {
+                    v: CANONICAL_PROTOCOL_MAJOR,
+                    success: false,
+                    session: None,
+                    error: "session_not_found".to_owned(),
+                }));
+            };
+            session.last_active = Instant::now();
+            session.clone()
+        };
+
+        Ok(Response::new(browser_v1::GetSessionResponse {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            success: true,
+            session: Some(session_detail_to_proto(session_id.as_str(), &session)),
+            error: String::new(),
+        }))
+    }
+
+    async fn inspect_session(
+        &self,
+        request: Request<browser_v1::InspectSessionRequest>,
+    ) -> Result<Response<browser_v1::InspectSessionResponse>, Status> {
+        self.runtime.authorize(request.metadata()).await?;
+        let mut payload = request.into_inner();
+        let session_id = parse_session_id_from_proto(payload.session_id.take())
+            .map_err(Status::invalid_argument)?;
+        let default_include = !payload.include_cookies
+            && !payload.include_storage
+            && !payload.include_action_log
+            && !payload.include_network_log
+            && !payload.include_page_snapshot;
+        let include_cookies = payload.include_cookies || default_include;
+        let include_storage = payload.include_storage || default_include;
+        let include_action_log = payload.include_action_log || default_include;
+        let include_network_log = payload.include_network_log || default_include;
+        let include_page_snapshot = payload.include_page_snapshot || default_include;
+
+        if include_page_snapshot && self.runtime.engine_mode == BrowserEngineMode::Chromium {
+            let active_tab_id = {
+                let sessions = self.runtime.sessions.lock().await;
+                let Some(session) = sessions.get(session_id.as_str()) else {
+                    return Ok(Response::new(browser_v1::InspectSessionResponse {
+                        v: CANONICAL_PROTOCOL_MAJOR,
+                        success: false,
+                        session: None,
+                        cookies: Vec::new(),
+                        storage: Vec::new(),
+                        action_log: Vec::new(),
+                        network_log: Vec::new(),
+                        dom_snapshot: String::new(),
+                        visible_text: String::new(),
+                        page_url: String::new(),
+                        cookies_truncated: false,
+                        storage_truncated: false,
+                        action_log_truncated: false,
+                        network_log_truncated: false,
+                        dom_truncated: false,
+                        visible_text_truncated: false,
+                        error: "session_not_found".to_owned(),
+                    }));
+                };
+                session.active_tab_id.clone()
+            };
+            if let Ok(snapshot) = chromium_observe_snapshot(
+                self.runtime.as_ref(),
+                session_id.as_str(),
+                active_tab_id.as_str(),
+            )
+            .await
+            {
+                let mut sessions = self.runtime.sessions.lock().await;
+                if let Some(session) = sessions.get_mut(session_id.as_str()) {
+                    if let Some(tab) = session.tabs.get_mut(active_tab_id.as_str()) {
+                        tab.last_page_body = snapshot.page_body;
+                        tab.last_title = snapshot.title;
+                        tab.last_url = Some(snapshot.page_url);
+                    }
+                }
+            }
+        }
+
+        let session = {
+            let mut sessions = self.runtime.sessions.lock().await;
+            let Some(session) = sessions.get_mut(session_id.as_str()) else {
+                return Ok(Response::new(browser_v1::InspectSessionResponse {
+                    v: CANONICAL_PROTOCOL_MAJOR,
+                    success: false,
+                    session: None,
+                    cookies: Vec::new(),
+                    storage: Vec::new(),
+                    action_log: Vec::new(),
+                    network_log: Vec::new(),
+                    dom_snapshot: String::new(),
+                    visible_text: String::new(),
+                    page_url: String::new(),
+                    cookies_truncated: false,
+                    storage_truncated: false,
+                    action_log_truncated: false,
+                    network_log_truncated: false,
+                    dom_truncated: false,
+                    visible_text_truncated: false,
+                    error: "session_not_found".to_owned(),
+                }));
+            };
+            session.last_active = Instant::now();
+            session.clone()
+        };
+        let Some(active_tab) = session.active_tab() else {
+            return Ok(Response::new(browser_v1::InspectSessionResponse {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                success: false,
+                session: Some(session_detail_to_proto(session_id.as_str(), &session)),
+                cookies: Vec::new(),
+                storage: Vec::new(),
+                action_log: Vec::new(),
+                network_log: Vec::new(),
+                dom_snapshot: String::new(),
+                visible_text: String::new(),
+                page_url: String::new(),
+                cookies_truncated: false,
+                storage_truncated: false,
+                action_log_truncated: false,
+                network_log_truncated: false,
+                dom_truncated: false,
+                visible_text_truncated: false,
+                error: "active_tab_not_found".to_owned(),
+            }));
+        };
+
+        let cookie_payload_bytes = if payload.max_cookie_bytes == 0 {
+            session.budget.max_response_bytes.min(DEFAULT_MAX_INSPECT_COOKIE_BYTES)
+        } else {
+            payload.max_cookie_bytes.min(session.budget.max_response_bytes)
+        }
+        .max(1) as usize;
+        let storage_payload_bytes = if payload.max_storage_bytes == 0 {
+            session.budget.max_response_bytes.min(DEFAULT_MAX_INSPECT_STORAGE_BYTES)
+        } else {
+            payload.max_storage_bytes.min(session.budget.max_response_bytes)
+        }
+        .max(1) as usize;
+        let max_action_log_entries = if payload.max_action_log_entries == 0 {
+            session.budget.max_action_log_entries
+        } else {
+            usize::try_from(payload.max_action_log_entries)
+                .unwrap_or(usize::MAX)
+                .min(session.budget.max_action_log_entries)
+                .max(1)
+        };
+        let max_network_log_entries = if payload.max_network_log_entries == 0 {
+            session.budget.max_network_log_entries
+        } else {
+            usize::try_from(payload.max_network_log_entries)
+                .unwrap_or(usize::MAX)
+                .min(session.budget.max_network_log_entries)
+                .max(1)
+        };
+        let max_network_log_bytes = if payload.max_network_log_bytes == 0 {
+            session.budget.max_network_log_bytes
+        } else {
+            payload.max_network_log_bytes.min(session.budget.max_network_log_bytes)
+        }
+        .max(1) as usize;
+        let max_dom_snapshot_bytes = if payload.max_dom_snapshot_bytes == 0 {
+            session.budget.max_observe_snapshot_bytes
+        } else {
+            payload.max_dom_snapshot_bytes.min(session.budget.max_observe_snapshot_bytes)
+        }
+        .max(1) as usize;
+        let max_visible_text_bytes = if payload.max_visible_text_bytes == 0 {
+            session.budget.max_visible_text_bytes
+        } else {
+            payload.max_visible_text_bytes.min(session.budget.max_visible_text_bytes)
+        }
+        .max(1) as usize;
+
+        let mut cookies =
+            if include_cookies { cookie_jar_to_proto(&session.cookie_jar) } else { Vec::new() };
+        let cookies_truncated = if include_cookies {
+            truncate_cookie_payload(&mut cookies, cookie_payload_bytes)
+        } else {
+            false
+        };
+
+        let mut storage = if include_storage {
+            storage_entries_to_proto(&session.storage_entries)
+        } else {
+            Vec::new()
+        };
+        let storage_truncated = if include_storage {
+            truncate_storage_payload(&mut storage, storage_payload_bytes)
+        } else {
+            false
+        };
+
+        let (action_log, action_log_truncated) = if include_action_log {
+            let start = session.action_log.len().saturating_sub(max_action_log_entries);
+            (
+                session
+                    .action_log
+                    .iter()
+                    .skip(start)
+                    .map(action_log_entry_to_proto)
+                    .collect::<Vec<_>>(),
+                start > 0,
+            )
+        } else {
+            (Vec::new(), false)
+        };
+
+        let (network_log, network_log_truncated) = if include_network_log {
+            let start = active_tab.network_log.len().saturating_sub(max_network_log_entries);
+            let mut entries = active_tab
+                .network_log
+                .iter()
+                .skip(start)
+                .cloned()
+                .map(|entry| network_log_entry_to_proto(entry, true))
+                .collect::<Vec<_>>();
+            let truncated =
+                start > 0 || truncate_network_log_payload(&mut entries, max_network_log_bytes);
+            (entries, truncated)
+        } else {
+            (Vec::new(), false)
+        };
+
+        let page_url =
+            normalize_url_with_redaction(active_tab.last_url.as_deref().unwrap_or_default());
+        let ((dom_snapshot, dom_truncated), (visible_text, visible_text_truncated)) =
+            if include_page_snapshot && !active_tab.last_page_body.trim().is_empty() {
+                (
+                    build_dom_snapshot(active_tab.last_page_body.as_str(), max_dom_snapshot_bytes),
+                    build_visible_text_snapshot(
+                        active_tab.last_page_body.as_str(),
+                        max_visible_text_bytes,
+                    ),
+                )
+            } else {
+                ((String::new(), false), (String::new(), false))
+            };
+
+        Ok(Response::new(browser_v1::InspectSessionResponse {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            success: true,
+            session: Some(session_detail_to_proto(session_id.as_str(), &session)),
+            cookies,
+            storage,
+            action_log,
+            network_log,
+            dom_snapshot,
+            visible_text,
+            page_url,
+            cookies_truncated,
+            storage_truncated,
+            action_log_truncated,
+            network_log_truncated,
+            dom_truncated,
+            visible_text_truncated,
+            error: String::new(),
         }))
     }
 

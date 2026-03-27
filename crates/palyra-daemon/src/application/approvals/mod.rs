@@ -15,7 +15,7 @@ use crate::{
     },
     journal::{
         ApprovalDecision, ApprovalDecisionScope, ApprovalPolicySnapshot, ApprovalPromptOption,
-        ApprovalPromptRecord, ApprovalRiskLevel, JournalAppendRequest,
+        ApprovalPromptRecord, ApprovalRiskLevel, ApprovalSubjectType, JournalAppendRequest,
     },
     tool_protocol::{tool_policy_snapshot, ToolCallConfig, ToolDecision},
     transport::grpc::{auth::RequestContext, proto::palyra::common::v1 as common_v1},
@@ -142,6 +142,14 @@ pub(crate) fn build_tool_approval_subject_id(
         format!("tool:{tool_name}|skill:{}", skill_context.skill_id())
     } else {
         format!("tool:{tool_name}")
+    }
+}
+
+pub(crate) fn approval_subject_type_for_tool(tool_name: &str) -> ApprovalSubjectType {
+    if tool_name.starts_with("palyra.browser.") {
+        ApprovalSubjectType::BrowserAction
+    } else {
+        ApprovalSubjectType::Tool
     }
 }
 
@@ -297,11 +305,12 @@ fn approval_requested_journal_payload(
 ) -> Vec<u8> {
     let prompt_details_json = serde_json::from_str::<Value>(prompt.details_json.as_str())
         .unwrap_or_else(|_| json!({ "raw": prompt.details_json }));
+    let subject_type = approval_subject_type_for_tool(tool_name);
     json!({
         "event": "approval.requested",
         "proposal_id": proposal_id,
         "approval_id": approval_id,
-        "subject_type": "tool",
+        "subject_type": subject_type.as_str(),
         "subject_id": subject_id,
         "tool_name": tool_name,
         "request_summary": request_summary,
@@ -426,5 +435,44 @@ mod tests {
             json.get("proposal_id").is_some_and(Value::is_null),
             "operator-driven approval audit should tolerate missing proposal ids"
         );
+    }
+
+    #[test]
+    fn browser_tools_use_browser_action_subject_type() {
+        assert_eq!(
+            approval_subject_type_for_tool("palyra.browser.navigate"),
+            ApprovalSubjectType::BrowserAction
+        );
+        assert_eq!(approval_subject_type_for_tool("palyra.process.run"), ApprovalSubjectType::Tool);
+    }
+
+    #[test]
+    fn approval_requested_payload_uses_browser_subject_type_for_browser_tools() {
+        let prompt = ApprovalPromptRecord {
+            title: "Approve palyra.browser.navigate".to_owned(),
+            risk_level: ApprovalRiskLevel::High,
+            subject_id: "tool:palyra.browser.navigate".to_owned(),
+            summary: "Tool requested explicit approval".to_owned(),
+            options: Vec::new(),
+            timeout_seconds: 30,
+            details_json: "{}".to_owned(),
+            policy_explanation: "Sensitive tool actions require approval".to_owned(),
+        };
+        let payload = approval_requested_journal_payload(
+            "01ARZ3NDEKTSV4RRFFQ69G5FA1",
+            "01ARZ3NDEKTSV4RRFFQ69G5FA2",
+            "palyra.browser.navigate",
+            "tool:palyra.browser.navigate",
+            "{}",
+            &ApprovalPolicySnapshot {
+                policy_id: "policy".to_owned(),
+                policy_hash: "0".repeat(64),
+                evaluation_summary: "summary".to_owned(),
+            },
+            &prompt,
+        );
+        let json: Value = serde_json::from_slice(payload.as_slice())
+            .expect("approval requested payload should remain valid JSON");
+        assert_eq!(json.get("subject_type").and_then(Value::as_str), Some("browser_action"));
     }
 }

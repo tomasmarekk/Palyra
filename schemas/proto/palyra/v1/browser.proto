@@ -8,6 +8,9 @@ service BrowserService {
   rpc Health(BrowserHealthRequest) returns (BrowserHealthResponse);
   rpc CreateSession(CreateSessionRequest) returns (CreateSessionResponse);
   rpc CloseSession(CloseSessionRequest) returns (CloseSessionResponse);
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  rpc GetSession(GetSessionRequest) returns (GetSessionResponse);
+  rpc InspectSession(InspectSessionRequest) returns (InspectSessionResponse);
   rpc ListProfiles(ListProfilesRequest) returns (ListProfilesResponse);
   rpc CreateProfile(CreateProfileRequest) returns (CreateProfileResponse);
   rpc RenameProfile(RenameProfileRequest) returns (RenameProfileResponse);
@@ -111,6 +114,150 @@ message CloseSessionResponse {
   string reason = 3;
 
   reserved 4 to 12;
+}
+
+message ListSessionsRequest {
+  uint32 v = 1;
+  string principal = 2;
+  uint32 limit = 3;
+
+  reserved 4 to 10;
+}
+
+message BrowserSessionSummary {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId session_id = 2;
+  string principal = 3;
+  string channel = 4;
+  uint64 created_at_unix_ms = 5;
+  uint64 last_active_unix_ms = 6;
+  uint64 idle_ttl_ms = 7;
+  uint64 age_ms = 8;
+  uint64 idle_for_ms = 9;
+  uint64 action_count = 10;
+  uint32 action_log_entries = 11;
+  uint32 tab_count = 12;
+  palyra.common.v1.CanonicalId active_tab_id = 13;
+  string active_tab_url = 14;
+  string active_tab_title = 15;
+  bool allow_private_targets = 16;
+  bool downloads_enabled = 17;
+  bool persistence_enabled = 18;
+  string persistence_id = 19;
+  bool state_restored = 20;
+  palyra.common.v1.CanonicalId profile_id = 21;
+  bool private_profile = 22;
+  repeated string action_allowed_domains = 23;
+  SessionPermissions permissions = 24;
+
+  reserved 25 to 30;
+}
+
+message BrowserSessionDetail {
+  uint32 v = 1;
+  BrowserSessionSummary summary = 2;
+  SessionBudget effective_budget = 3;
+  repeated BrowserTab tabs = 4;
+
+  reserved 5 to 10;
+}
+
+message ListSessionsResponse {
+  uint32 v = 1;
+  repeated BrowserSessionSummary sessions = 2;
+  bool truncated = 3;
+  string error = 4;
+
+  reserved 5 to 10;
+}
+
+message GetSessionRequest {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId session_id = 2;
+
+  reserved 3 to 10;
+}
+
+message GetSessionResponse {
+  uint32 v = 1;
+  bool success = 2;
+  BrowserSessionDetail session = 3;
+  string error = 4;
+
+  reserved 5 to 10;
+}
+
+message SessionCookieEntry {
+  uint32 v = 1;
+  string name = 2;
+  string value = 3;
+
+  reserved 4 to 8;
+}
+
+message SessionCookieDomain {
+  uint32 v = 1;
+  string domain = 2;
+  repeated SessionCookieEntry cookies = 3;
+
+  reserved 4 to 8;
+}
+
+message SessionStorageEntry {
+  uint32 v = 1;
+  string key = 2;
+  string value = 3;
+
+  reserved 4 to 8;
+}
+
+message SessionStorageOrigin {
+  uint32 v = 1;
+  string origin = 2;
+  repeated SessionStorageEntry entries = 3;
+
+  reserved 4 to 8;
+}
+
+message InspectSessionRequest {
+  uint32 v = 1;
+  palyra.common.v1.CanonicalId session_id = 2;
+  bool include_cookies = 3;
+  bool include_storage = 4;
+  bool include_action_log = 5;
+  bool include_network_log = 6;
+  bool include_page_snapshot = 7;
+  uint64 max_cookie_bytes = 8;
+  uint64 max_storage_bytes = 9;
+  uint32 max_action_log_entries = 10;
+  uint32 max_network_log_entries = 11;
+  uint64 max_network_log_bytes = 12;
+  uint64 max_dom_snapshot_bytes = 13;
+  uint64 max_visible_text_bytes = 14;
+
+  reserved 15 to 20;
+}
+
+message InspectSessionResponse {
+  uint32 v = 1;
+  bool success = 2;
+  BrowserSessionDetail session = 3;
+  repeated SessionCookieDomain cookies = 4;
+  repeated SessionStorageOrigin storage = 5;
+  repeated BrowserActionLogEntry action_log = 6;
+  repeated NetworkLogEntry network_log = 7;
+  string dom_snapshot = 8;
+  string visible_text = 9;
+  string page_url = 10;
+  bool cookies_truncated = 11;
+  bool storage_truncated = 12;
+  bool action_log_truncated = 13;
+  bool network_log_truncated = 14;
+  bool dom_truncated = 15;
+  bool visible_text_truncated = 16;
+  string error = 17;
+
+  reserved 18 to 24;
 }
 
 message NavigateRequest {

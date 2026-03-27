@@ -42,6 +42,12 @@ pub mod proto {
                 tonic::include_proto!("palyra.auth.v1");
             }
         }
+
+        pub mod browser {
+            pub mod v1 {
+                tonic::include_proto!("palyra.browser.v1");
+            }
+        }
     }
 }
 
@@ -125,8 +131,8 @@ use tonic::Request;
 use ulid::Ulid;
 
 use crate::proto::palyra::{
-    auth::v1 as auth_v1, common::v1 as common_v1, cron::v1 as cron_v1, gateway::v1 as gateway_v1,
-    memory::v1 as memory_v1,
+    auth::v1 as auth_v1, browser::v1 as browser_v1, common::v1 as common_v1, cron::v1 as cron_v1,
+    gateway::v1 as gateway_v1, memory::v1 as memory_v1,
 };
 
 const MAX_HEALTH_ATTEMPTS: usize = 3;
@@ -144,6 +150,7 @@ const DEFAULT_GATEWAY_QUIC_ENABLED: bool = true;
 const DEFAULT_GATEWAY_BIND_PROFILE: &str = "loopback_only";
 const DEFAULT_DEPLOYMENT_MODE: &str = "local_desktop";
 pub(crate) const DEFAULT_DAEMON_URL: &str = "http://127.0.0.1:7142";
+const DEFAULT_BROWSER_SERVICE_ENDPOINT: &str = "http://127.0.0.1:7543";
 const DEFAULT_JOURNAL_DB_PATH: &str = "data/journal.sqlite3";
 const DEFAULT_BROWSER_URL: &str = "http://127.0.0.1:7143";
 const DEFAULT_CHANNEL: &str = "cli";
@@ -641,7 +648,9 @@ fn build_doctor_report(checks: &[DoctorCheck]) -> Result<DoctorReport> {
     let config = collect_doctor_config_snapshot();
     let identity = collect_doctor_identity_snapshot();
     let (connectivity, admin_payload, admin_error) = collect_doctor_connectivity_snapshot();
-    let provider_auth = collect_doctor_provider_auth_snapshot(admin_payload, admin_error);
+    let provider_auth =
+        collect_doctor_provider_auth_snapshot(admin_payload.as_ref(), admin_error.as_deref());
+    let browser = collect_doctor_browser_snapshot(admin_payload.as_ref(), admin_error.as_deref());
     let deployment = collect_doctor_deployment_snapshot();
 
     let required_checks_total = checks.iter().filter(|check| check.required).count();
@@ -668,6 +677,7 @@ fn build_doctor_report(checks: &[DoctorCheck]) -> Result<DoctorReport> {
         identity,
         connectivity,
         provider_auth,
+        browser,
         sandbox: DoctorSandboxSnapshot {
             tier_b_egress_allowlists_preflight_only: process_runner_tier_b_allowlist_config_ok(),
             tier_c_strict_offline_only: process_runner_tier_c_strict_offline_config_ok(),
@@ -838,15 +848,15 @@ fn collect_doctor_connectivity_snapshot(
 }
 
 fn collect_doctor_provider_auth_snapshot(
-    admin_payload: Option<Value>,
-    admin_error: Option<String>,
+    admin_payload: Option<&Value>,
+    admin_error: Option<&str>,
 ) -> DoctorProviderAuthSnapshot {
     let Some(payload) = admin_payload else {
         return DoctorProviderAuthSnapshot {
             fetched: false,
             model_provider: None,
             auth_summary: None,
-            error: admin_error,
+            error: admin_error.map(ToOwned::to_owned),
         };
     };
 
@@ -858,7 +868,135 @@ fn collect_doctor_provider_auth_snapshot(
     if let Some(summary) = auth_summary.as_mut() {
         redact_json_value_tree(summary, None);
     }
-    DoctorProviderAuthSnapshot { fetched: true, model_provider, auth_summary, error: admin_error }
+    DoctorProviderAuthSnapshot {
+        fetched: true,
+        model_provider,
+        auth_summary,
+        error: admin_error.map(ToOwned::to_owned),
+    }
+}
+
+fn collect_doctor_browser_snapshot(
+    admin_payload: Option<&Value>,
+    admin_error: Option<&str>,
+) -> DoctorBrowserSnapshot {
+    let parsed = read_doctor_root_file_config().ok().flatten();
+    let browser_service = parsed
+        .as_ref()
+        .and_then(|config| config.tool_call.as_ref())
+        .and_then(|tool_call| tool_call.browser_service.as_ref());
+
+    let mut configured_enabled = browser_service.and_then(|config| config.enabled).unwrap_or(false);
+    if let Ok(raw) = env::var("PALYRA_BROWSER_SERVICE_ENABLED") {
+        if let Ok(parsed_bool) = raw.trim().parse::<bool>() {
+            configured_enabled = parsed_bool;
+        }
+    }
+
+    let mut endpoint = browser_service
+        .and_then(|config| config.endpoint.as_ref())
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_BROWSER_SERVICE_ENDPOINT.to_owned());
+    if let Ok(raw) = env::var("PALYRA_BROWSER_SERVICE_ENDPOINT") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            endpoint = trimmed.to_owned();
+        }
+    }
+
+    let mut auth_token_configured = browser_service
+        .and_then(|config| config.auth_token.as_ref())
+        .map(|value| value.trim())
+        .is_some_and(|value| !value.is_empty());
+    if let Ok(raw) = env::var("PALYRA_BROWSER_SERVICE_AUTH_TOKEN") {
+        auth_token_configured = !raw.trim().is_empty();
+    }
+
+    let mut connect_timeout_ms = browser_service.and_then(|config| config.connect_timeout_ms);
+    if let Ok(raw) = env::var("PALYRA_BROWSER_SERVICE_CONNECT_TIMEOUT_MS") {
+        if let Ok(parsed_timeout) = raw.trim().parse::<u64>() {
+            connect_timeout_ms = Some(parsed_timeout);
+        }
+    }
+
+    let mut request_timeout_ms = browser_service.and_then(|config| config.request_timeout_ms);
+    if let Ok(raw) = env::var("PALYRA_BROWSER_SERVICE_REQUEST_TIMEOUT_MS") {
+        if let Ok(parsed_timeout) = raw.trim().parse::<u64>() {
+            request_timeout_ms = Some(parsed_timeout);
+        }
+    }
+
+    let mut max_screenshot_bytes = browser_service.and_then(|config| config.max_screenshot_bytes);
+    if let Ok(raw) = env::var("PALYRA_BROWSER_SERVICE_MAX_SCREENSHOT_BYTES") {
+        if let Ok(parsed_limit) = raw.trim().parse::<u64>() {
+            max_screenshot_bytes = Some(parsed_limit);
+        }
+    }
+
+    let mut max_title_bytes = browser_service.and_then(|config| config.max_title_bytes);
+    if let Ok(raw) = env::var("PALYRA_BROWSER_SERVICE_MAX_TITLE_BYTES") {
+        if let Ok(parsed_limit) = raw.trim().parse::<u64>() {
+            max_title_bytes = Some(parsed_limit);
+        }
+    }
+
+    let state_dir_configured = browser_service
+        .and_then(|config| config.state_dir.as_ref())
+        .map(|value| value.trim())
+        .is_some_and(|value| !value.is_empty())
+        || env::var("PALYRA_BROWSERD_STATE_DIR")
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .is_some_and(|value| !value.is_empty());
+    let state_key_vault_ref_configured = browser_service
+        .and_then(|config| config.state_key_vault_ref.as_ref())
+        .map(|value| value.trim())
+        .is_some_and(|value| !value.is_empty());
+
+    let browser_payload = admin_payload.and_then(|payload| payload.get("browserd"));
+    let diagnostics_fetched = browser_payload.is_some();
+    let health_status = browser_payload
+        .and_then(|payload| payload.pointer("/health/status"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let active_sessions = browser_payload
+        .and_then(|payload| payload.pointer("/sessions/active"))
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            browser_payload
+                .and_then(|payload| payload.pointer("/health/active_sessions"))
+                .and_then(Value::as_u64)
+        });
+    let recent_relay_action_failures = browser_payload
+        .and_then(|payload| payload.pointer("/failures/recent_relay_action_failures"))
+        .and_then(Value::as_u64);
+    let recent_health_failures = browser_payload
+        .and_then(|payload| payload.pointer("/failures/recent_health_failures"))
+        .and_then(Value::as_u64);
+    let error = if configured_enabled && !diagnostics_fetched {
+        admin_error.map(ToOwned::to_owned).or(Some("browser diagnostics unavailable".to_owned()))
+    } else {
+        None
+    };
+
+    DoctorBrowserSnapshot {
+        configured_enabled,
+        auth_token_configured,
+        endpoint,
+        connect_timeout_ms,
+        request_timeout_ms,
+        max_screenshot_bytes,
+        max_title_bytes,
+        state_dir_configured,
+        state_key_vault_ref_configured,
+        diagnostics_fetched,
+        health_status,
+        active_sessions,
+        recent_relay_action_failures,
+        recent_health_failures,
+        error,
+    }
 }
 
 fn collect_doctor_deployment_snapshot() -> DoctorDeploymentSnapshot {
@@ -5858,6 +5996,7 @@ struct DoctorReport {
     identity: DoctorIdentitySnapshot,
     connectivity: DoctorConnectivitySnapshot,
     provider_auth: DoctorProviderAuthSnapshot,
+    browser: DoctorBrowserSnapshot,
     sandbox: DoctorSandboxSnapshot,
     deployment: DoctorDeploymentSnapshot,
 }
@@ -5913,6 +6052,34 @@ struct DoctorProviderAuthSnapshot {
     model_provider: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     auth_summary: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorBrowserSnapshot {
+    configured_enabled: bool,
+    auth_token_configured: bool,
+    endpoint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    connect_timeout_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_timeout_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_screenshot_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_title_bytes: Option<u64>,
+    state_dir_configured: bool,
+    state_key_vault_ref_configured: bool,
+    diagnostics_fetched: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    health_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    active_sessions: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recent_relay_action_failures: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recent_health_failures: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
@@ -7285,13 +7452,14 @@ mod init_command_tests {
 #[cfg(test)]
 mod diagnostics_bundle_tests {
     use super::{
-        encode_support_bundle_with_cap, extract_support_bundle_error_message, DoctorConfigSnapshot,
-        DoctorConnectivityProbe, DoctorConnectivitySnapshot, DoctorDeploymentBindSnapshot,
-        DoctorDeploymentSnapshot, DoctorIdentitySnapshot, DoctorProviderAuthSnapshot, DoctorReport,
-        DoctorSandboxSnapshot, DoctorSummary, SupportBundle, SupportBundleBuildSnapshot,
-        SupportBundleConfigSnapshot, SupportBundleDiagnosticsSnapshot,
-        SupportBundleJournalErrorRecord, SupportBundleJournalSnapshot,
-        SupportBundleObservabilitySnapshot, SupportBundleTriageSnapshot,
+        encode_support_bundle_with_cap, extract_support_bundle_error_message,
+        DoctorBrowserSnapshot, DoctorConfigSnapshot, DoctorConnectivityProbe,
+        DoctorConnectivitySnapshot, DoctorDeploymentBindSnapshot, DoctorDeploymentSnapshot,
+        DoctorIdentitySnapshot, DoctorProviderAuthSnapshot, DoctorReport, DoctorSandboxSnapshot,
+        DoctorSummary, SupportBundle, SupportBundleBuildSnapshot, SupportBundleConfigSnapshot,
+        SupportBundleDiagnosticsSnapshot, SupportBundleJournalErrorRecord,
+        SupportBundleJournalSnapshot, SupportBundleObservabilitySnapshot,
+        SupportBundleTriageSnapshot,
     };
     use serde_json::{json, Value};
 
@@ -7329,6 +7497,23 @@ mod diagnostics_bundle_tests {
                 fetched: true,
                 model_provider: Some(json!({ "kind": "openai-compatible" })),
                 auth_summary: Some(json!({ "total_profiles": 1 })),
+                error: None,
+            },
+            browser: DoctorBrowserSnapshot {
+                configured_enabled: true,
+                auth_token_configured: true,
+                endpoint: "http://127.0.0.1:7543".to_owned(),
+                connect_timeout_ms: Some(1500),
+                request_timeout_ms: Some(15000),
+                max_screenshot_bytes: Some(262_144),
+                max_title_bytes: Some(4096),
+                state_dir_configured: false,
+                state_key_vault_ref_configured: false,
+                diagnostics_fetched: true,
+                health_status: Some("ok".to_owned()),
+                active_sessions: Some(1),
+                recent_relay_action_failures: Some(0),
+                recent_health_failures: Some(0),
                 error: None,
             },
             sandbox: DoctorSandboxSnapshot {

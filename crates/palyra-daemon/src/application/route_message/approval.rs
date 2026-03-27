@@ -5,11 +5,14 @@ use tracing::info;
 
 use crate::{
     application::{
-        approvals::{build_pending_tool_approval, record_approval_requested_journal_event},
+        approvals::{
+            approval_subject_type_for_tool, build_pending_tool_approval,
+            record_approval_requested_journal_event,
+        },
         run_stream::tape::append_tool_approval_request_tape_event,
     },
     gateway::{best_effort_mark_approval_error, GatewayRuntimeState, ToolSkillContext},
-    journal::{ApprovalCreateRequest, ApprovalSubjectType},
+    journal::ApprovalCreateRequest,
     transport::grpc::auth::RequestContext,
 };
 
@@ -45,7 +48,7 @@ pub(crate) async fn resolve_route_tool_approval_outcome(
             principal: route_request_context.principal.clone(),
             device_id: route_request_context.device_id.clone(),
             channel: route_request_context.channel.clone(),
-            subject_type: ApprovalSubjectType::Tool,
+            subject_type: approval_subject_type_for_tool(tool_name),
             subject_id: pending_approval.prompt.subject_id.clone(),
             request_summary: pending_approval.request_summary.clone(),
             policy_snapshot: pending_approval.policy_snapshot.clone(),

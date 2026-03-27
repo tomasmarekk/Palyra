@@ -756,6 +756,178 @@ struct ConsoleBrowserProfileScopeRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct ConsoleBrowserCreateSessionRequest {
+    principal: Option<String>,
+    #[serde(default)]
+    idle_ttl_ms: Option<u64>,
+    #[serde(default)]
+    budget: Option<control_plane::BrowserSessionBudget>,
+    #[serde(default)]
+    allow_private_targets: Option<bool>,
+    #[serde(default)]
+    allow_downloads: Option<bool>,
+    #[serde(default)]
+    action_allowed_domains: Vec<String>,
+    #[serde(default)]
+    persistence_enabled: Option<bool>,
+    #[serde(default)]
+    persistence_id: Option<String>,
+    #[serde(default)]
+    channel: Option<String>,
+    #[serde(default)]
+    profile_id: Option<String>,
+    #[serde(default)]
+    private_profile: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleBrowserNavigateRequest {
+    url: String,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    allow_redirects: Option<bool>,
+    #[serde(default)]
+    max_redirects: Option<u32>,
+    #[serde(default)]
+    allow_private_targets: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleBrowserClickRequest {
+    selector: String,
+    #[serde(default)]
+    max_retries: Option<u32>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    capture_failure_screenshot: Option<bool>,
+    #[serde(default)]
+    max_failure_screenshot_bytes: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleBrowserTypeRequest {
+    selector: String,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    clear_existing: Option<bool>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    capture_failure_screenshot: Option<bool>,
+    #[serde(default)]
+    max_failure_screenshot_bytes: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleBrowserScrollRequest {
+    #[serde(default)]
+    delta_x: Option<i64>,
+    #[serde(default)]
+    delta_y: Option<i64>,
+    #[serde(default)]
+    capture_failure_screenshot: Option<bool>,
+    #[serde(default)]
+    max_failure_screenshot_bytes: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleBrowserWaitForRequest {
+    #[serde(default)]
+    selector: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    poll_interval_ms: Option<u64>,
+    #[serde(default)]
+    capture_failure_screenshot: Option<bool>,
+    #[serde(default)]
+    max_failure_screenshot_bytes: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleBrowserTitleQuery {
+    max_title_bytes: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleBrowserScreenshotQuery {
+    max_bytes: Option<u64>,
+    format: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleBrowserObserveQuery {
+    include_dom_snapshot: Option<bool>,
+    include_accessibility_tree: Option<bool>,
+    include_visible_text: Option<bool>,
+    max_dom_snapshot_bytes: Option<u64>,
+    max_accessibility_tree_bytes: Option<u64>,
+    max_visible_text_bytes: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleBrowserNetworkLogQuery {
+    limit: Option<u32>,
+    include_headers: Option<bool>,
+    max_payload_bytes: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleBrowserOpenTabRequest {
+    url: String,
+    #[serde(default)]
+    activate: Option<bool>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    allow_redirects: Option<bool>,
+    #[serde(default)]
+    max_redirects: Option<u32>,
+    #[serde(default)]
+    allow_private_targets: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleBrowserTabMutationRequest {
+    tab_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleBrowserTabCloseRequest {
+    #[serde(default)]
+    tab_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleBrowserSetPermissionsRequest {
+    #[serde(default)]
+    camera: Option<control_plane::BrowserPermissionSetting>,
+    #[serde(default)]
+    microphone: Option<control_plane::BrowserPermissionSetting>,
+    #[serde(default)]
+    location: Option<control_plane::BrowserPermissionSetting>,
+    #[serde(default)]
+    reset_to_default: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleBrowserResetStateRequest {
+    #[serde(default)]
+    clear_cookies: Option<bool>,
+    #[serde(default)]
+    clear_storage: Option<bool>,
+    #[serde(default)]
+    reset_tabs: Option<bool>,
+    #[serde(default)]
+    reset_permissions: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ConsoleBrowserRelayTokenRequest {
     session_id: String,
     extension_id: String,

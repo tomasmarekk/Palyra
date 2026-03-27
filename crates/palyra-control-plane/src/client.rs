@@ -90,6 +90,380 @@ impl ControlPlaneClient {
             .await
     }
 
+    pub async fn list_browser_profiles(
+        &self,
+        query: &BrowserProfilesQuery,
+    ) -> Result<BrowserProfileListEnvelope, ControlPlaneClientError> {
+        self.request_json(
+            Method::GET,
+            build_query_path(
+                "console/v1/browser/profiles",
+                vec![("principal", query.principal.clone())],
+            ),
+            None::<&Value>,
+            false,
+        )
+        .await
+    }
+
+    pub async fn create_browser_profile(
+        &self,
+        request: &BrowserCreateProfileRequest,
+    ) -> Result<BrowserProfileEnvelope, ControlPlaneClientError> {
+        self.request_json(Method::POST, "console/v1/browser/profiles/create", Some(request), true)
+            .await
+    }
+
+    pub async fn rename_browser_profile(
+        &self,
+        profile_id: &str,
+        request: &BrowserRenameProfileRequest,
+    ) -> Result<BrowserProfileEnvelope, ControlPlaneClientError> {
+        self.request_json(
+            Method::POST,
+            format!("console/v1/browser/profiles/{}/rename", urlencoding(profile_id)),
+            Some(request),
+            true,
+        )
+        .await
+    }
+
+    pub async fn delete_browser_profile(
+        &self,
+        profile_id: &str,
+        request: &BrowserProfileScopeRequest,
+    ) -> Result<BrowserProfileDeleteEnvelope, ControlPlaneClientError> {
+        self.request_json(
+            Method::POST,
+            format!("console/v1/browser/profiles/{}/delete", urlencoding(profile_id)),
+            Some(request),
+            true,
+        )
+        .await
+    }
+
+    pub async fn activate_browser_profile(
+        &self,
+        profile_id: &str,
+        request: &BrowserProfileScopeRequest,
+    ) -> Result<BrowserProfileEnvelope, ControlPlaneClientError> {
+        self.request_json(
+            Method::POST,
+            format!("console/v1/browser/profiles/{}/activate", urlencoding(profile_id)),
+            Some(request),
+            true,
+        )
+        .await
+    }
+
+    pub async fn list_browser_download_artifacts(
+        &self,
+        query: &BrowserDownloadArtifactsQuery,
+    ) -> Result<BrowserDownloadArtifactListEnvelope, ControlPlaneClientError> {
+        self.request_json(
+            Method::GET,
+            build_query_path(
+                "console/v1/browser/downloads",
+                vec![
+                    ("session_id", Some(query.session_id.clone())),
+                    ("limit", query.limit.map(|value| value.to_string())),
+                    ("quarantined_only", query.quarantined_only.then(|| "true".to_owned())),
+                ],
+            ),
+            None::<&Value>,
+            false,
+        )
+        .await
+    }
+
+    pub async fn create_browser_session(
+        &self,
+        request: &BrowserSessionCreateRequest,
+    ) -> Result<BrowserSessionCreateEnvelope, ControlPlaneClientError> {
+        self.request_json(Method::POST, "console/v1/browser/sessions", Some(request), true).await
+    }
+
+    pub async fn close_browser_session(
+        &self,
+        session_id: &str,
+    ) -> Result<BrowserSessionCloseEnvelope, ControlPlaneClientError> {
+        self.request_json(
+            Method::POST,
+            format!("console/v1/browser/sessions/{}/close", urlencoding(session_id)),
+            None::<&Value>,
+            true,
+        )
+        .await
+    }
+
+    pub async fn navigate_browser_session(
+        &self,
+        session_id: &str,
+        request: &BrowserNavigateRequest,
+    ) -> Result<BrowserNavigateEnvelope, ControlPlaneClientError> {
+        self.request_json(
+            Method::POST,
+            format!("console/v1/browser/sessions/{}/navigate", urlencoding(session_id)),
+            Some(request),
+            true,
+        )
+        .await
+    }
+
+    pub async fn click_browser_session(
+        &self,
+        session_id: &str,
+        request: &BrowserClickRequest,
+    ) -> Result<BrowserClickEnvelope, ControlPlaneClientError> {
+        self.request_json(
+            Method::POST,
+            format!("console/v1/browser/sessions/{}/click", urlencoding(session_id)),
+            Some(request),
+            true,
+        )
+        .await
+    }
+
+    pub async fn type_browser_session(
+        &self,
+        session_id: &str,
+        request: &BrowserTypeRequest,
+    ) -> Result<BrowserTypeEnvelope, ControlPlaneClientError> {
+        self.request_json(
+            Method::POST,
+            format!("console/v1/browser/sessions/{}/type", urlencoding(session_id)),
+            Some(request),
+            true,
+        )
+        .await
+    }
+
+    pub async fn scroll_browser_session(
+        &self,
+        session_id: &str,
+        request: &BrowserScrollRequest,
+    ) -> Result<BrowserScrollEnvelope, ControlPlaneClientError> {
+        self.request_json(
+            Method::POST,
+            format!("console/v1/browser/sessions/{}/scroll", urlencoding(session_id)),
+            Some(request),
+            true,
+        )
+        .await
+    }
+
+    pub async fn wait_for_browser_session(
+        &self,
+        session_id: &str,
+        request: &BrowserWaitForRequest,
+    ) -> Result<BrowserWaitForEnvelope, ControlPlaneClientError> {
+        self.request_json(
+            Method::POST,
+            format!("console/v1/browser/sessions/{}/wait-for", urlencoding(session_id)),
+            Some(request),
+            true,
+        )
+        .await
+    }
+
+    pub async fn get_browser_title(
+        &self,
+        session_id: &str,
+        query: &BrowserTitleQuery,
+    ) -> Result<BrowserTitleEnvelope, ControlPlaneClientError> {
+        self.request_json(
+            Method::GET,
+            build_query_path(
+                format!("console/v1/browser/sessions/{}/title", urlencoding(session_id)).as_str(),
+                vec![("max_title_bytes", query.max_title_bytes.map(|value| value.to_string()))],
+            ),
+            None::<&Value>,
+            false,
+        )
+        .await
+    }
+
+    pub async fn get_browser_screenshot(
+        &self,
+        session_id: &str,
+        query: &BrowserScreenshotQuery,
+    ) -> Result<BrowserScreenshotEnvelope, ControlPlaneClientError> {
+        self.request_json(
+            Method::GET,
+            build_query_path(
+                format!("console/v1/browser/sessions/{}/screenshot", urlencoding(session_id))
+                    .as_str(),
+                vec![
+                    ("max_bytes", query.max_bytes.map(|value| value.to_string())),
+                    ("format", query.format.clone()),
+                ],
+            ),
+            None::<&Value>,
+            false,
+        )
+        .await
+    }
+
+    pub async fn observe_browser_session(
+        &self,
+        session_id: &str,
+        query: &BrowserObserveQuery,
+    ) -> Result<BrowserObserveEnvelope, ControlPlaneClientError> {
+        self.request_json(
+            Method::GET,
+            build_query_path(
+                format!("console/v1/browser/sessions/{}/observe", urlencoding(session_id)).as_str(),
+                vec![
+                    (
+                        "include_dom_snapshot",
+                        query.include_dom_snapshot.map(|value| value.to_string()),
+                    ),
+                    (
+                        "include_accessibility_tree",
+                        query.include_accessibility_tree.map(|value| value.to_string()),
+                    ),
+                    (
+                        "include_visible_text",
+                        query.include_visible_text.map(|value| value.to_string()),
+                    ),
+                    (
+                        "max_dom_snapshot_bytes",
+                        query.max_dom_snapshot_bytes.map(|value| value.to_string()),
+                    ),
+                    (
+                        "max_accessibility_tree_bytes",
+                        query.max_accessibility_tree_bytes.map(|value| value.to_string()),
+                    ),
+                    (
+                        "max_visible_text_bytes",
+                        query.max_visible_text_bytes.map(|value| value.to_string()),
+                    ),
+                ],
+            ),
+            None::<&Value>,
+            false,
+        )
+        .await
+    }
+
+    pub async fn get_browser_network_log(
+        &self,
+        session_id: &str,
+        query: &BrowserNetworkLogQuery,
+    ) -> Result<BrowserNetworkLogEnvelope, ControlPlaneClientError> {
+        self.request_json(
+            Method::GET,
+            build_query_path(
+                format!("console/v1/browser/sessions/{}/network-log", urlencoding(session_id))
+                    .as_str(),
+                vec![
+                    ("limit", query.limit.map(|value| value.to_string())),
+                    ("include_headers", query.include_headers.map(|value| value.to_string())),
+                    ("max_payload_bytes", query.max_payload_bytes.map(|value| value.to_string())),
+                ],
+            ),
+            None::<&Value>,
+            false,
+        )
+        .await
+    }
+
+    pub async fn list_browser_tabs(
+        &self,
+        session_id: &str,
+    ) -> Result<BrowserTabListEnvelope, ControlPlaneClientError> {
+        self.request_json(
+            Method::GET,
+            format!("console/v1/browser/sessions/{}/tabs", urlencoding(session_id)),
+            None::<&Value>,
+            false,
+        )
+        .await
+    }
+
+    pub async fn open_browser_tab(
+        &self,
+        session_id: &str,
+        request: &BrowserOpenTabRequest,
+    ) -> Result<BrowserOpenTabEnvelope, ControlPlaneClientError> {
+        self.request_json(
+            Method::POST,
+            format!("console/v1/browser/sessions/{}/tabs/open", urlencoding(session_id)),
+            Some(request),
+            true,
+        )
+        .await
+    }
+
+    pub async fn switch_browser_tab(
+        &self,
+        session_id: &str,
+        request: &BrowserTabMutationRequest,
+    ) -> Result<BrowserSwitchTabEnvelope, ControlPlaneClientError> {
+        self.request_json(
+            Method::POST,
+            format!("console/v1/browser/sessions/{}/tabs/switch", urlencoding(session_id)),
+            Some(request),
+            true,
+        )
+        .await
+    }
+
+    pub async fn close_browser_tab(
+        &self,
+        session_id: &str,
+        request: &BrowserTabCloseRequest,
+    ) -> Result<BrowserCloseTabEnvelope, ControlPlaneClientError> {
+        self.request_json(
+            Method::POST,
+            format!("console/v1/browser/sessions/{}/tabs/close", urlencoding(session_id)),
+            Some(request),
+            true,
+        )
+        .await
+    }
+
+    pub async fn get_browser_permissions(
+        &self,
+        session_id: &str,
+    ) -> Result<BrowserPermissionsEnvelope, ControlPlaneClientError> {
+        self.request_json(
+            Method::GET,
+            format!("console/v1/browser/sessions/{}/permissions", urlencoding(session_id)),
+            None::<&Value>,
+            false,
+        )
+        .await
+    }
+
+    pub async fn set_browser_permissions(
+        &self,
+        session_id: &str,
+        request: &BrowserSetPermissionsRequest,
+    ) -> Result<BrowserPermissionsEnvelope, ControlPlaneClientError> {
+        self.request_json(
+            Method::POST,
+            format!("console/v1/browser/sessions/{}/permissions", urlencoding(session_id)),
+            Some(request),
+            true,
+        )
+        .await
+    }
+
+    pub async fn reset_browser_state(
+        &self,
+        session_id: &str,
+        request: &BrowserResetStateRequest,
+    ) -> Result<BrowserResetStateEnvelope, ControlPlaneClientError> {
+        self.request_json(
+            Method::POST,
+            format!("console/v1/browser/sessions/{}/reset-state", urlencoding(session_id)),
+            Some(request),
+            true,
+        )
+        .await
+    }
+
     pub async fn get_diagnostics(&self) -> Result<Value, ControlPlaneClientError> {
         self.request_json(Method::GET, "console/v1/diagnostics", None::<&Value>, false).await
     }
@@ -519,5 +893,23 @@ impl ControlPlaneClient {
                 }
             }
         }
+    }
+}
+
+fn build_query_path(path: &str, pairs: Vec<(&str, Option<String>)>) -> String {
+    let query = pairs
+        .into_iter()
+        .filter_map(|(key, value)| {
+            value
+                .map(|candidate| candidate.trim().to_owned())
+                .filter(|candidate| !candidate.is_empty())
+                .map(|candidate| format!("{key}={}", urlencoding(candidate.as_str())))
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    if query.is_empty() {
+        path.to_owned()
+    } else {
+        format!("{path}?{query}")
     }
 }

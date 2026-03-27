@@ -4,17 +4,17 @@ use super::{
     AgentCommand, AgentsCommand, ApprovalDecisionArg, ApprovalDecisionScopeArg,
     ApprovalExportFormatArg, ApprovalResolveDecisionArg, ApprovalSubjectTypeArg, ApprovalsCommand,
     AuthCommand, AuthCredentialArg, AuthOpenAiCommand, AuthProfilesCommand, AuthProviderArg,
-    AuthScopeArg, BackupCommand, BackupComponentArg, BrowserCommand, ChannelProviderArg,
-    ChannelResolveEntityArg, ChannelsCommand, ChannelsDiscordCommand, ChannelsRouterCommand, Cli,
-    Command, CompletionShell, ConfigCommand, ConfigureSectionArg, CronCommand,
-    CronConcurrencyPolicyArg, CronMisfirePolicyArg, CronScheduleTypeArg, DaemonCommand,
-    GatewayBindProfileArg, InitModeArg, InitTlsScaffoldArg, JournalCheckpointModeArg,
-    MemoryCommand, MemoryScopeArg, MemorySourceArg, MessageCommand, ModelsCommand,
-    OnboardingAuthMethodArg, OnboardingCommand, OnboardingFlowArg, PatchCommand, PolicyCommand,
-    ProtocolCommand, RemoteVerificationModeArg, ResetCommand, ResetScopeArg, SecretsCommand,
-    SecretsConfigureCommand, SecurityCommand, SessionsCommand, SetupWizardOverridesArg,
-    SkillsCommand, SkillsPackageCommand, SupportBundleCommand, TuiCommand, UninstallCommand,
-    UpdateCommand, WebhooksCommand, WizardOverridesArg,
+    AuthScopeArg, BackupCommand, BackupComponentArg, BrowserCommand, BrowserPermissionsCommand,
+    BrowserSessionCommand, ChannelProviderArg, ChannelResolveEntityArg, ChannelsCommand,
+    ChannelsDiscordCommand, ChannelsRouterCommand, Cli, Command, CompletionShell, ConfigCommand,
+    ConfigureSectionArg, CronCommand, CronConcurrencyPolicyArg, CronMisfirePolicyArg,
+    CronScheduleTypeArg, DaemonCommand, GatewayBindProfileArg, InitModeArg, InitTlsScaffoldArg,
+    JournalCheckpointModeArg, MemoryCommand, MemoryScopeArg, MemorySourceArg, MessageCommand,
+    ModelsCommand, OnboardingAuthMethodArg, OnboardingCommand, OnboardingFlowArg, PatchCommand,
+    PolicyCommand, ProtocolCommand, RemoteVerificationModeArg, ResetCommand, ResetScopeArg,
+    SecretsCommand, SecretsConfigureCommand, SecurityCommand, SessionsCommand,
+    SetupWizardOverridesArg, SkillsCommand, SkillsPackageCommand, SupportBundleCommand, TuiCommand,
+    UninstallCommand, UpdateCommand, WebhooksCommand, WizardOverridesArg,
 };
 #[cfg(not(windows))]
 use super::{PairingClientKindArg, PairingCommand, PairingMethodArg};
@@ -2113,11 +2113,140 @@ fn parse_channels_router_mint_pairing_code() {
 
 #[test]
 fn parse_browser_status() {
-    let parsed = Cli::parse_from(["palyra", "browser", "status", "--url", "http://127.0.0.1:7143"]);
+    let parsed = Cli::parse_from([
+        "palyra",
+        "browser",
+        "status",
+        "--endpoint",
+        "http://127.0.0.1:7543",
+        "--health-url",
+        "http://127.0.0.1:7143",
+        "--token",
+        "browser-token",
+    ]);
     assert_eq!(
         parsed.command,
         Command::Browser {
-            command: BrowserCommand::Status { url: Some("http://127.0.0.1:7143".to_owned()) }
+            command: BrowserCommand::Status {
+                endpoint: Some("http://127.0.0.1:7543".to_owned()),
+                health_url: Some("http://127.0.0.1:7143".to_owned()),
+                token: Some("browser-token".to_owned()),
+            }
+        }
+    );
+}
+
+#[test]
+fn parse_browser_session_create() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "browser",
+        "session",
+        "create",
+        "--principal",
+        "user:browser",
+        "--channel",
+        "cli:test",
+        "--idle-ttl-ms",
+        "60000",
+        "--allow-private-targets",
+        "--allow-downloads",
+        "--allow-domain",
+        "example.com",
+        "--allow-domain",
+        "docs.palyra.dev",
+        "--persistence-enabled",
+        "--persistence-id",
+        "profile-cache",
+        "--profile-id",
+        "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "--private-profile",
+    ]);
+    assert_eq!(
+        parsed.command,
+        Command::Browser {
+            command: BrowserCommand::Session {
+                command: BrowserSessionCommand::Create {
+                    principal: Some("user:browser".to_owned()),
+                    channel: Some("cli:test".to_owned()),
+                    idle_ttl_ms: Some(60000),
+                    allow_private_targets: true,
+                    allow_downloads: true,
+                    action_allowed_domains: vec![
+                        "example.com".to_owned(),
+                        "docs.palyra.dev".to_owned(),
+                    ],
+                    persistence_enabled: true,
+                    persistence_id: Some("profile-cache".to_owned()),
+                    profile_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
+                    private_profile: true,
+                },
+            }
+        }
+    );
+}
+
+#[test]
+fn parse_browser_snapshot_with_output() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "browser",
+        "snapshot",
+        "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "--include-dom-snapshot",
+        "--include-visible-text",
+        "--max-dom-snapshot-bytes",
+        "8192",
+        "--max-visible-text-bytes",
+        "4096",
+        "--output",
+        "artifacts/browser-snapshot.json",
+    ]);
+    assert_eq!(
+        parsed.command,
+        Command::Browser {
+            command: BrowserCommand::Snapshot {
+                session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                include_dom_snapshot: true,
+                include_accessibility_tree: false,
+                include_visible_text: true,
+                max_dom_snapshot_bytes: Some(8192),
+                max_accessibility_tree_bytes: None,
+                max_visible_text_bytes: Some(4096),
+                output: Some("artifacts/browser-snapshot.json".to_owned()),
+            }
+        }
+    );
+}
+
+#[test]
+fn parse_browser_permissions_set() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "browser",
+        "permissions",
+        "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "set",
+        "--camera",
+        "allow",
+        "--microphone",
+        "deny",
+        "--location",
+        "default",
+        "--reset-to-default",
+    ]);
+    assert_eq!(
+        parsed.command,
+        Command::Browser {
+            command: BrowserCommand::Permissions {
+                session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                command: BrowserPermissionsCommand::Set {
+                    camera: Some("allow".to_owned()),
+                    microphone: Some("deny".to_owned()),
+                    location: Some("default".to_owned()),
+                    reset_to_default: true,
+                },
+            }
         }
     );
 }
