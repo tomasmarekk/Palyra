@@ -14,6 +14,7 @@ use palyra_control_plane as control_plane;
 use reqwest::{Client as AsyncClient, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tonic::{metadata::MetadataMap, transport::Endpoint, Request};
 
 use crate::args::{
@@ -669,7 +670,7 @@ async fn run_browser_open(args: BrowserOpenArgs) -> Result<()> {
         &payload,
         format!(
             "browser.open session_id={} success={} final_url={} status_code={}",
-            session_id,
+            redacted_browser_identifier_text(Some(session_id.as_str()), "session"),
             payload.pointer("/navigate/success").and_then(Value::as_bool).unwrap_or(false),
             payload.pointer("/navigate/final_url").and_then(Value::as_str).unwrap_or("-"),
             payload.pointer("/navigate/status_code").and_then(Value::as_u64).unwrap_or(0)
@@ -718,11 +719,11 @@ async fn run_browser_session_command(command: BrowserSessionCommand) -> Result<(
                 &value,
                 format!(
                     "browser.session.create session_id={} principal={} downloads_enabled={} persistence_enabled={} profile_id={}",
-                    envelope.session_id.as_deref().unwrap_or("-"),
+                    redacted_browser_identifier_text(envelope.session_id.as_deref(), "session"),
                     envelope.principal,
                     envelope.downloads_enabled,
                     envelope.persistence_enabled,
-                    envelope.profile_id.as_deref().unwrap_or("-")
+                    redacted_browser_identifier_text(envelope.profile_id.as_deref(), "profile")
                 ),
                 "failed to encode browser session create output",
             )
@@ -758,14 +759,14 @@ async fn run_browser_session_command(command: BrowserSessionCommand) -> Result<(
                 text.push_str(
                     format!(
                         "session id={} principal={} channel={} tabs={} active_tab={} private_targets={} downloads={} profile_id={}",
-                        canonical_id_text(session.session_id.as_ref()),
+                        canonical_id_text(session.session_id.as_ref(), "session"),
                         empty_as_dash(session.principal.as_str()),
                         empty_as_dash(session.channel.as_str()),
                         session.tab_count,
-                        canonical_id_text(session.active_tab_id.as_ref()),
+                        canonical_id_text(session.active_tab_id.as_ref(), "tab"),
                         session.allow_private_targets,
                         session.downloads_enabled,
-                        canonical_id_text(session.profile_id.as_ref()),
+                        canonical_id_text(session.profile_id.as_ref(), "profile"),
                     )
                     .as_str(),
                 );
@@ -832,7 +833,7 @@ async fn run_browser_session_command(command: BrowserSessionCommand) -> Result<(
                 &value,
                 format!(
                     "browser.session.inspect session_id={} cookies={} storage={} action_log={} network_log={} output={}",
-                    session_id,
+                    redacted_browser_identifier_text(Some(session_id.as_str()), "session"),
                     value.get("cookies").and_then(Value::as_array).map_or(0, Vec::len),
                     value.get("storage").and_then(Value::as_array).map_or(0, Vec::len),
                     value.get("action_log").and_then(Value::as_array).map_or(0, Vec::len),
@@ -857,7 +858,7 @@ async fn run_browser_session_command(command: BrowserSessionCommand) -> Result<(
                 &value,
                 format!(
                     "browser.session.close session_id={} closed={} reason={}",
-                    envelope.session_id,
+                    redacted_browser_identifier_text(Some(envelope.session_id.as_str()), "session"),
                     envelope.closed,
                     empty_as_dash(envelope.reason.as_str()),
                 ),
@@ -883,14 +884,14 @@ async fn run_browser_profiles_command(command: BrowserProfilesCommand) -> Result
                 "browser.profiles.list principal={} count={} active_profile_id={}",
                 envelope.principal,
                 envelope.profiles.len(),
-                envelope.active_profile_id.as_deref().unwrap_or("-"),
+                redacted_browser_identifier_text(envelope.active_profile_id.as_deref(), "profile",),
             );
             for profile in &envelope.profiles {
                 text.push('\n');
                 text.push_str(
                     format!(
                         "profile id={} name={} private={} persistence={} active={}",
-                        profile.profile_id.as_deref().unwrap_or("-"),
+                        redacted_browser_identifier_text(profile.profile_id.as_deref(), "profile",),
                         profile.name,
                         profile.private_profile,
                         profile.persistence_enabled,
@@ -925,7 +926,10 @@ async fn run_browser_profiles_command(command: BrowserProfilesCommand) -> Result
                 &value,
                 format!(
                     "browser.profiles.create profile_id={} name={} private={} active={}",
-                    envelope.profile.profile_id.as_deref().unwrap_or("-"),
+                    redacted_browser_identifier_text(
+                        envelope.profile.profile_id.as_deref(),
+                        "profile",
+                    ),
                     envelope.profile.name,
                     envelope.profile.private_profile,
                     envelope.profile.active,
@@ -948,7 +952,10 @@ async fn run_browser_profiles_command(command: BrowserProfilesCommand) -> Result
                 &value,
                 format!(
                     "browser.profiles.rename profile_id={} name={}",
-                    envelope.profile.profile_id.as_deref().unwrap_or("-"),
+                    redacted_browser_identifier_text(
+                        envelope.profile.profile_id.as_deref(),
+                        "profile",
+                    ),
                     envelope.profile.name,
                 ),
                 "failed to encode browser profile rename output",
@@ -969,9 +976,12 @@ async fn run_browser_profiles_command(command: BrowserProfilesCommand) -> Result
                 &value,
                 format!(
                     "browser.profiles.delete profile_id={} deleted={} active_profile_id={}",
-                    envelope.profile_id,
+                    redacted_browser_identifier_text(Some(envelope.profile_id.as_str()), "profile"),
                     envelope.deleted,
-                    envelope.active_profile_id.as_deref().unwrap_or("-"),
+                    redacted_browser_identifier_text(
+                        envelope.active_profile_id.as_deref(),
+                        "profile",
+                    ),
                 ),
                 "failed to encode browser profile delete output",
             )
@@ -991,7 +1001,10 @@ async fn run_browser_profiles_command(command: BrowserProfilesCommand) -> Result
                 &value,
                 format!(
                     "browser.profiles.activate profile_id={} name={} active={}",
-                    envelope.profile.profile_id.as_deref().unwrap_or("-"),
+                    redacted_browser_identifier_text(
+                        envelope.profile.profile_id.as_deref(),
+                        "profile",
+                    ),
                     envelope.profile.name,
                     envelope.profile.active,
                 ),
@@ -1015,16 +1028,16 @@ async fn run_browser_tabs_command(session_id: String, command: BrowserTabsComman
                 .context("failed to encode browser tabs list output")?;
             let mut text = format!(
                 "browser.tabs.list session_id={} count={} active_tab_id={}",
-                envelope.session_id,
+                redacted_browser_identifier_text(Some(envelope.session_id.as_str()), "session"),
                 envelope.tabs.len(),
-                envelope.active_tab_id.as_deref().unwrap_or("-"),
+                redacted_browser_identifier_text(envelope.active_tab_id.as_deref(), "tab"),
             );
             for tab in &envelope.tabs {
                 text.push('\n');
                 text.push_str(
                     format!(
                         "tab id={} active={} title={} url={}",
-                        tab.tab_id.as_deref().unwrap_or("-"),
+                        redacted_browser_identifier_text(tab.tab_id.as_deref(), "tab"),
                         tab.active,
                         empty_as_dash(tab.title.as_str()),
                         empty_as_dash(tab.url.as_str()),
@@ -1063,12 +1076,13 @@ async fn run_browser_tabs_command(session_id: String, command: BrowserTabsComman
                 &value,
                 format!(
                     "browser.tabs.open session_id={} tab_id={} success={} status_code={} navigated={}",
-                    envelope.session_id,
+                    redacted_browser_identifier_text(Some(envelope.session_id.as_str()), "session"),
                     envelope
                         .tab
                         .as_ref()
                         .and_then(|tab| tab.tab_id.as_deref())
-                        .unwrap_or("-"),
+                        .map(|value| redacted_browser_identifier_text(Some(value), "tab"))
+                        .unwrap_or_else(|| "-".to_owned()),
                     envelope.success,
                     envelope.status_code,
                     envelope.navigated,
@@ -1091,12 +1105,13 @@ async fn run_browser_tabs_command(session_id: String, command: BrowserTabsComman
                 &value,
                 format!(
                     "browser.tabs.switch session_id={} active_tab_id={} success={}",
-                    envelope.session_id,
+                    redacted_browser_identifier_text(Some(envelope.session_id.as_str()), "session"),
                     envelope
                         .active_tab
                         .as_ref()
                         .and_then(|tab| tab.tab_id.as_deref())
-                        .unwrap_or("-"),
+                        .map(|value| redacted_browser_identifier_text(Some(value), "tab"))
+                        .unwrap_or_else(|| "-".to_owned()),
                     envelope.success,
                 ),
                 "failed to encode browser tab switch output",
@@ -1117,14 +1132,15 @@ async fn run_browser_tabs_command(session_id: String, command: BrowserTabsComman
                 &value,
                 format!(
                     "browser.tabs.close session_id={} closed_tab_id={} tabs_remaining={} active_tab_id={}",
-                    envelope.session_id,
-                    envelope.closed_tab_id.as_deref().unwrap_or("-"),
+                    redacted_browser_identifier_text(Some(envelope.session_id.as_str()), "session"),
+                    redacted_browser_identifier_text(envelope.closed_tab_id.as_deref(), "tab"),
                     envelope.tabs_remaining,
                     envelope
                         .active_tab
                         .as_ref()
                         .and_then(|tab| tab.tab_id.as_deref())
-                        .unwrap_or("-"),
+                        .map(|value| redacted_browser_identifier_text(Some(value), "tab"))
+                        .unwrap_or_else(|| "-".to_owned()),
                 ),
                 "failed to encode browser tab close output",
             )
@@ -1162,7 +1178,7 @@ async fn run_browser_navigate(
         &value,
         format!(
             "browser.navigate session_id={} success={} status_code={} final_url={} title={}",
-            envelope.session_id,
+            redacted_browser_identifier_text(Some(envelope.session_id.as_str()), "session"),
             envelope.success,
             envelope.status_code,
             empty_as_dash(envelope.final_url.as_str()),
@@ -1215,7 +1231,7 @@ async fn run_browser_click(
         &value,
         format!(
             "browser.click session_id={} success={} selector={} action_id={} artifact={}",
-            envelope.session_id,
+            redacted_browser_identifier_text(Some(envelope.session_id.as_str()), "session"),
             envelope.success,
             selector,
             envelope.action_log.as_ref().map(|entry| entry.action_id.as_str()).unwrap_or("-"),
@@ -1272,7 +1288,7 @@ async fn run_browser_type(args: BrowserTypeArgs) -> Result<()> {
         format!(
             "browser.{} session_id={} success={} selector={} typed_bytes={} artifact={}",
             if clear_existing { "fill" } else { "type" },
-            envelope.session_id,
+            redacted_browser_identifier_text(Some(envelope.session_id.as_str()), "session"),
             envelope.success,
             selector,
             envelope.typed_bytes,
@@ -1323,7 +1339,7 @@ async fn run_browser_scroll(
         &value,
         format!(
             "browser.scroll session_id={} success={} scroll_x={} scroll_y={} artifact={}",
-            envelope.session_id,
+            redacted_browser_identifier_text(Some(envelope.session_id.as_str()), "session"),
             envelope.success,
             envelope.scroll_x,
             envelope.scroll_y,
@@ -1379,7 +1395,7 @@ async fn run_browser_wait(args: BrowserWaitArgs) -> Result<()> {
         &value,
         format!(
             "browser.wait session_id={} success={} waited_ms={} matched_selector={} matched_text={} artifact={}",
-            envelope.session_id,
+            redacted_browser_identifier_text(Some(envelope.session_id.as_str()), "session"),
             envelope.success,
             envelope.waited_ms,
             empty_as_dash(envelope.matched_selector.as_str()),
@@ -1428,7 +1444,7 @@ async fn run_browser_snapshot(args: BrowserSnapshotArgs) -> Result<()> {
         &value,
         format!(
             "browser.snapshot session_id={} page_url={} dom_truncated={} text_truncated={} output={}",
-            session_id,
+            redacted_browser_identifier_text(Some(session_id.as_str()), "session"),
             value.get("page_url").and_then(Value::as_str).unwrap_or("-"),
             value.get("dom_truncated").and_then(Value::as_bool).unwrap_or(false),
             value.get("visible_text_truncated").and_then(Value::as_bool).unwrap_or(false),
@@ -1473,7 +1489,7 @@ async fn run_browser_screenshot(
         &value,
         format!(
             "browser.screenshot session_id={} success={} mime_type={} output={}",
-            envelope.session_id,
+            redacted_browser_identifier_text(Some(envelope.session_id.as_str()), "session"),
             envelope.success,
             envelope.mime_type.as_deref().unwrap_or("-"),
             output_path.as_deref().unwrap_or("-"),
@@ -1498,7 +1514,7 @@ async fn run_browser_title(session_id: String, max_title_bytes: Option<u64>) -> 
         &value,
         format!(
             "browser.title session_id={} success={} title={}",
-            envelope.session_id,
+            redacted_browser_identifier_text(Some(envelope.session_id.as_str()), "session"),
             envelope.success,
             empty_as_dash(envelope.title.as_str()),
         ),
@@ -1530,7 +1546,7 @@ async fn run_browser_network(
         serde_json::to_value(&envelope).context("failed to encode browser network output")?;
     let mut text = format!(
         "browser.network session_id={} success={} entries={} truncated={}",
-        envelope.session_id,
+        redacted_browser_identifier_text(Some(envelope.session_id.as_str()), "session"),
         envelope.success,
         envelope.entries.len(),
         envelope.truncated,
@@ -1579,7 +1595,7 @@ async fn run_browser_storage(session_id: String, output: Option<String>) -> Resu
         &value,
         format!(
             "browser.storage session_id={} cookie_domains={} origins={} output={}",
-            session_id,
+            redacted_browser_identifier_text(Some(session_id.as_str()), "session"),
             value.get("cookies").and_then(Value::as_array).map_or(0, Vec::len),
             value.get("storage").and_then(Value::as_array).map_or(0, Vec::len),
             written.as_deref().unwrap_or("-"),
@@ -1635,7 +1651,7 @@ async fn run_browser_errors(
         &value,
         format!(
             "browser.errors session_id={} count={} output={}",
-            session_id,
+            redacted_browser_identifier_text(Some(session_id.as_str()), "session"),
             value.get("errors").and_then(Value::as_array).map_or(0, Vec::len),
             written.as_deref().unwrap_or("-"),
         ),
@@ -1672,7 +1688,7 @@ async fn run_browser_trace(session_id: String, output: Option<String>) -> Result
         &value,
         format!(
             "browser.trace session_id={} output={} action_log={} network_log={}",
-            session_id,
+            redacted_browser_identifier_text(Some(session_id.as_str()), "session"),
             written.as_deref().unwrap_or("-"),
             value.get("action_log").and_then(Value::as_array).map_or(0, Vec::len),
             value.get("network_log").and_then(Value::as_array).map_or(0, Vec::len),
@@ -1701,7 +1717,7 @@ async fn run_browser_downloads(
         serde_json::to_value(&envelope).context("failed to encode browser downloads output")?;
     let mut text = format!(
         "browser.downloads session_id={} count={} truncated={} quarantined_only={}",
-        envelope.session_id,
+        redacted_browser_identifier_text(Some(envelope.session_id.as_str()), "session"),
         envelope.artifacts.len(),
         envelope.truncated,
         quarantined_only,
@@ -1711,7 +1727,7 @@ async fn run_browser_downloads(
         text.push_str(
             format!(
                 "artifact id={} file={} size_bytes={} quarantined={} sha256={}",
-                artifact.artifact_id.as_deref().unwrap_or("-"),
+                redacted_browser_identifier_text(artifact.artifact_id.as_deref(), "artifact"),
                 artifact.file_name,
                 artifact.size_bytes,
                 artifact.quarantined,
@@ -1742,7 +1758,10 @@ async fn run_browser_permissions_command(
                 &value,
                 format!(
                     "browser.permissions.get session_id={} success={} camera={} microphone={} location={}",
-                    envelope.session_id,
+                    redacted_browser_identifier_text(
+                        Some(envelope.session_id.as_str()),
+                        "session",
+                    ),
                     envelope.success,
                     permission_setting_text(
                         envelope.permissions.as_ref().map(|value| value.camera)
@@ -1777,7 +1796,10 @@ async fn run_browser_permissions_command(
                 &value,
                 format!(
                     "browser.permissions.set session_id={} success={} camera={} microphone={} location={}",
-                    envelope.session_id,
+                    redacted_browser_identifier_text(
+                        Some(envelope.session_id.as_str()),
+                        "session",
+                    ),
                     envelope.success,
                     permission_setting_text(
                         envelope.permissions.as_ref().map(|value| value.camera)
@@ -1823,7 +1845,7 @@ async fn run_browser_reset_state(
         &value,
         format!(
             "browser.reset-state session_id={} success={} cookies_cleared={} storage_entries_cleared={} tabs_closed={}",
-            envelope.session_id,
+            redacted_browser_identifier_text(Some(envelope.session_id.as_str()), "session"),
             envelope.success,
             envelope.cookies_cleared,
             envelope.storage_entries_cleared,
@@ -1856,7 +1878,7 @@ fn emit_unsupported_browser_capability(
         format!(
             "browser.{} supported=false session_id={} detail={} output={}",
             capability,
-            session_id,
+            redacted_browser_identifier_text(Some(session_id), "session"),
             detail,
             written.as_deref().unwrap_or("-"),
         ),
@@ -1963,7 +1985,7 @@ async fn inspect_browser_session(
         "dom_truncated": response.dom_truncated,
         "visible_text_truncated": response.visible_text_truncated,
         "error": response.error,
-        "session_id": session_id,
+        "session_id": redacted_browser_identifier_json_value(Some(session_id), "session"),
     }))
 }
 
@@ -2272,8 +2294,16 @@ fn browser_output_mode() -> BrowserOutputMode {
 
 fn emit_browser_value(value: &Value, text: String, error_context: &'static str) -> Result<()> {
     match browser_output_mode() {
-        BrowserOutputMode::Json => output::print_json_pretty(value, error_context),
-        BrowserOutputMode::Ndjson => output::print_json_line(value, error_context),
+        BrowserOutputMode::Json => {
+            let mut redacted = value.clone();
+            redact_browser_output_value(&mut redacted, None);
+            output::print_json_pretty(&redacted, error_context)
+        }
+        BrowserOutputMode::Ndjson => {
+            let mut redacted = value.clone();
+            redact_browser_output_value(&mut redacted, None);
+            output::print_json_line(&redacted, error_context)
+        }
         BrowserOutputMode::Text => {
             print!("{text}");
             if !text.ends_with('\n') {
@@ -2361,7 +2391,10 @@ fn write_optional_json_output(
     let Some(path) = resolve_output_path(output, session_id, stem, "json", false)? else {
         return Ok(None);
     };
-    let payload = serde_json::to_vec_pretty(value).context("failed to encode browser artifact")?;
+    let mut redacted = value.clone();
+    redact_browser_output_value(&mut redacted, None);
+    let payload =
+        serde_json::to_vec_pretty(&redacted).context("failed to encode browser artifact")?;
     write_artifact_bytes(path.as_path(), payload.as_slice())?;
     Ok(Some(path.display().to_string()))
 }
@@ -2413,7 +2446,9 @@ fn resolve_output_path(
     if !allow_default {
         return Ok(None);
     }
-    let artifact_root = browser_cli_state_dir(true)?.join(BROWSER_ARTIFACT_DIR).join(session_id);
+    let artifact_root = browser_cli_state_dir(true)?
+        .join(BROWSER_ARTIFACT_DIR)
+        .join(browser_identifier_scope("session", session_id));
     fs::create_dir_all(artifact_root.as_path())
         .with_context(|| format!("failed to create {}", artifact_root.display()))?;
     Ok(Some(artifact_root.join(format!("{stem}.{extension}"))))
@@ -2450,8 +2485,68 @@ fn bool_option(value: bool) -> Option<bool> {
     value.then_some(true)
 }
 
-fn canonical_id_text(value: Option<&common_v1::CanonicalId>) -> &str {
-    value.map(|value| value.ulid.as_str()).unwrap_or("-")
+fn browser_identifier_scope(kind: &'static str, value: &str) -> String {
+    if value.trim().is_empty() {
+        return format!("{kind}-none");
+    }
+    let digest = Sha256::digest(value.as_bytes());
+    let mut suffix = String::with_capacity(12);
+    for byte in &digest[..6] {
+        suffix.push_str(format!("{byte:02x}").as_str());
+    }
+    format!("{kind}-{suffix}")
+}
+
+fn redacted_browser_identifier_text(value: Option<&str>, kind: &'static str) -> String {
+    value
+        .filter(|candidate| !candidate.trim().is_empty())
+        .map(|candidate| browser_identifier_scope(kind, candidate))
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+fn redacted_browser_identifier_json_value(value: Option<&str>, kind: &'static str) -> Value {
+    value
+        .filter(|candidate| !candidate.trim().is_empty())
+        .map(|candidate| Value::String(browser_identifier_scope(kind, candidate)))
+        .unwrap_or(Value::Null)
+}
+
+fn browser_identifier_kind_for_key(key: &str) -> Option<&'static str> {
+    match key {
+        "session_id" => Some("session"),
+        "active_tab_id" | "tab_id" | "closed_tab_id" => Some("tab"),
+        "profile_id" | "active_profile_id" => Some("profile"),
+        "artifact_id" => Some("artifact"),
+        "action_id" => Some("action"),
+        _ => None,
+    }
+}
+
+fn redact_browser_output_value(value: &mut Value, key_context: Option<&str>) {
+    match value {
+        Value::Object(map) => {
+            for (key, entry) in map.iter_mut() {
+                redact_browser_output_value(entry, Some(key.as_str()));
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_browser_output_value(item, key_context);
+            }
+        }
+        Value::String(text) => {
+            if let Some(kind) = key_context.and_then(browser_identifier_kind_for_key) {
+                if !text.trim().is_empty() {
+                    *text = browser_identifier_scope(kind, text.as_str());
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn canonical_id_text(value: Option<&common_v1::CanonicalId>, kind: &'static str) -> String {
+    redacted_browser_identifier_text(value.map(|value| value.ulid.as_str()), kind)
 }
 
 fn empty_as_dash(value: &str) -> &str {
@@ -2516,7 +2611,7 @@ fn permission_setting_text(value: Option<control_plane::BrowserPermissionSetting
 
 fn session_summary_value(summary: &browser_v1::BrowserSessionSummary) -> Value {
     json!({
-        "session_id": canonical_id_text(summary.session_id.as_ref()),
+        "session_id": canonical_id_text(summary.session_id.as_ref(), "session"),
         "principal": summary.principal,
         "channel": summary.channel,
         "created_at_unix_ms": summary.created_at_unix_ms,
@@ -2527,7 +2622,7 @@ fn session_summary_value(summary: &browser_v1::BrowserSessionSummary) -> Value {
         "action_count": summary.action_count,
         "action_log_entries": summary.action_log_entries,
         "tab_count": summary.tab_count,
-        "active_tab_id": canonical_id_text(summary.active_tab_id.as_ref()),
+        "active_tab_id": canonical_id_text(summary.active_tab_id.as_ref(), "tab"),
         "active_tab_url": summary.active_tab_url,
         "active_tab_title": summary.active_tab_title,
         "allow_private_targets": summary.allow_private_targets,
@@ -2536,7 +2631,7 @@ fn session_summary_value(summary: &browser_v1::BrowserSessionSummary) -> Value {
         "persistence_id": summary.persistence_id,
         "state_restored": summary.state_restored,
         "profile_id": if summary.profile_id.is_some() {
-            Value::String(canonical_id_text(summary.profile_id.as_ref()).to_owned())
+            Value::String(canonical_id_text(summary.profile_id.as_ref(), "profile"))
         } else {
             Value::Null
         },
@@ -2593,7 +2688,7 @@ fn proto_permission_setting_text(value: i32) -> &'static str {
 
 fn browser_tab_value(tab: &browser_v1::BrowserTab) -> Value {
     json!({
-        "tab_id": canonical_id_text(tab.tab_id.as_ref()),
+        "tab_id": canonical_id_text(tab.tab_id.as_ref(), "tab"),
         "url": tab.url,
         "title": tab.title,
         "active": tab.active,

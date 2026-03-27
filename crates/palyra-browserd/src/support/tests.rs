@@ -3692,23 +3692,16 @@ async fn browser_service_lists_and_gets_session_details() {
     let service = BrowserServiceImpl { runtime: Arc::clone(&runtime) };
 
     let first = create_test_session(&service, "user:alpha").await;
-    let first_id = first
-        .session_id
-        .as_ref()
-        .map(|value| value.ulid.clone())
-        .expect("first session id should be present");
+    let first_id = first.session_id.expect("first session id should be present");
     let second = create_test_session(&service, "user:beta").await;
-    let second_id = second
-        .session_id
-        .as_ref()
-        .map(|value| value.ulid.clone())
-        .expect("second session id should be present");
+    let second_id = second.session_id.expect("second session id should be present");
 
     {
         let now = Instant::now();
         let mut sessions = runtime.sessions.lock().await;
-        let first_session =
-            sessions.get_mut(first_id.as_str()).expect("first session should exist for inspection");
+        let first_session = sessions
+            .get_mut(first_id.ulid.as_str())
+            .expect("first session should exist for inspection");
         first_session.last_active = now - Duration::from_secs(5);
         first_session.channel = Some("alpha-channel".to_owned());
         first_session.action_allowed_domains = vec!["example.com".to_owned()];
@@ -3719,8 +3712,9 @@ async fn browser_service_lists_and_gets_session_details() {
             first_tab.last_title = "Alpha Session".to_owned();
         }
 
-        let second_session =
-            sessions.get_mut(second_id.as_str()).expect("second session should exist for ordering");
+        let second_session = sessions
+            .get_mut(second_id.ulid.as_str())
+            .expect("second session should exist for ordering");
         second_session.last_active = now;
     }
 
@@ -3737,7 +3731,7 @@ async fn browser_service_lists_and_gets_session_details() {
     assert_eq!(listed.sessions.len(), 1, "listing should clamp to requested limit");
     assert_eq!(
         listed.sessions[0].session_id.as_ref().map(|value| value.ulid.as_str()),
-        Some(second_id.as_str()),
+        Some(second_id.ulid.as_str()),
         "most recently active session should be listed first"
     );
 
@@ -3760,7 +3754,7 @@ async fn browser_service_lists_and_gets_session_details() {
     let detailed = service
         .get_session(Request::new(browser_v1::GetSessionRequest {
             v: 1,
-            session_id: Some(proto::palyra::common::v1::CanonicalId { ulid: first_id }),
+            session_id: Some(first_id),
         }))
         .await
         .expect("get_session should execute")
@@ -3785,16 +3779,12 @@ async fn browser_service_inspect_session_redacts_debug_state() {
     let runtime = simulated_runtime_for_tests();
     let service = BrowserServiceImpl { runtime: Arc::clone(&runtime) };
     let created = create_test_session(&service, "user:ops").await;
-    let session_id = created
-        .session_id
-        .as_ref()
-        .map(|value| value.ulid.clone())
-        .expect("session id should be present");
+    let session_id = created.session_id.expect("session id should be present");
 
     {
         let mut sessions = runtime.sessions.lock().await;
         let session = sessions
-            .get_mut(session_id.as_str())
+            .get_mut(session_id.ulid.as_str())
             .expect("session should exist for debug-state seeding");
         {
             let active_tab = session
@@ -3847,7 +3837,7 @@ async fn browser_service_inspect_session_redacts_debug_state() {
     let inspected = service
         .inspect_session(Request::new(browser_v1::InspectSessionRequest {
             v: 1,
-            session_id: Some(proto::palyra::common::v1::CanonicalId { ulid: session_id }),
+            session_id: Some(session_id),
             include_cookies: true,
             include_storage: true,
             include_action_log: true,
@@ -3954,16 +3944,12 @@ async fn browser_service_inspect_session_truncates_deterministically() {
     let runtime = simulated_runtime_for_tests();
     let service = BrowserServiceImpl { runtime: Arc::clone(&runtime) };
     let created = create_test_session(&service, "user:ops").await;
-    let session_id = created
-        .session_id
-        .as_ref()
-        .map(|value| value.ulid.clone())
-        .expect("session id should be present");
+    let session_id = created.session_id.expect("session id should be present");
 
     {
         let mut sessions = runtime.sessions.lock().await;
         let session = sessions
-            .get_mut(session_id.as_str())
+            .get_mut(session_id.ulid.as_str())
             .expect("session should exist for truncation seeding");
         {
             let active_tab = session
@@ -4027,7 +4013,7 @@ async fn browser_service_inspect_session_truncates_deterministically() {
 
     let request = browser_v1::InspectSessionRequest {
         v: 1,
-        session_id: Some(proto::palyra::common::v1::CanonicalId { ulid: session_id }),
+        session_id: Some(session_id),
         include_cookies: true,
         include_storage: true,
         include_action_log: true,

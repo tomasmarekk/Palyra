@@ -1607,13 +1607,53 @@ async fn record_browser_console_event(
     state: &AppState,
     context: &gateway::RequestContext,
     event: &str,
-    details: Value,
+    mut details: Value,
 ) -> Result<(), Response> {
+    redact_browser_console_event_details(&mut details, None);
     state
         .runtime
         .record_console_event(context, event, details)
         .await
         .map_err(runtime_status_response)
+}
+
+fn redact_browser_console_identifier(value: &str) -> String {
+    gateway::redact_session_id(value)
+}
+
+fn browser_console_identifier_key(key: &str) -> bool {
+    matches!(
+        key,
+        "session_id"
+            | "active_tab_id"
+            | "tab_id"
+            | "closed_tab_id"
+            | "profile_id"
+            | "active_profile_id"
+            | "artifact_id"
+            | "action_id"
+    )
+}
+
+fn redact_browser_console_event_details(value: &mut Value, key_context: Option<&str>) {
+    match value {
+        Value::Object(map) => {
+            for (key, entry) in map.iter_mut() {
+                redact_browser_console_event_details(entry, Some(key.as_str()));
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_browser_console_event_details(item, key_context);
+            }
+        }
+        Value::String(text) => {
+            if key_context.is_some_and(browser_console_identifier_key) && !text.trim().is_empty() {
+                *text = redact_browser_console_identifier(text.as_str());
+            }
+        }
+        _ => {}
+    }
 }
 
 #[allow(clippy::result_large_err)]
