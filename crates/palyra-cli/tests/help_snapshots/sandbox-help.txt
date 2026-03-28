@@ -1,10 +1,10 @@
-Create or verify portable operator backups
+Inspect effective process-runner and WASM sandbox policy surfaces
 
-Usage: palyra backup [OPTIONS] <COMMAND>
+Usage: palyra sandbox [OPTIONS] <COMMAND>
 
 Commands:
-  create
-  verify
+  list
+  explain
 
 Options:
   -h, --help
@@ -33,6 +33,9 @@ Global Options:
       --no-color
 
 Examples:
-  palyra backup create --output ./artifacts/palyra-backup.zip
-  palyra backup create --include workspace --workspace-root ./workspace --include-support-bundle
-  palyra backup verify --archive ./artifacts/palyra-backup.zip
+  palyra sandbox list
+  palyra sandbox explain --runtime process-runner
+  palyra sandbox explain --runtime wasm-runtime --json
+
+Discoverability:
+  `sandbox` reads the effective runtime policy snapshot from admin diagnostics. Use `palyra policy explain` for per-action Cedar decisions.

@@ -1,6 +1,6 @@
 Reset selected local runtime scopes
 
-Usage: palyra.exe reset [OPTIONS] --scope <SCOPES>
+Usage: palyra reset [OPTIONS] --scope <SCOPES>
 
 Options:
       --scope <SCOPES>

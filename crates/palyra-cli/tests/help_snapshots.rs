@@ -1,6 +1,23 @@
-use std::process::Command;
+use std::{env, fs, path::PathBuf, process::Command};
 
 use anyhow::{Context, Result};
+use palyra_cli::cli_parity::{CliParityMatrix, CliParitySnapshotSpec};
+
+const MATRIX_PATH: &str = "tests/cli_parity_matrix.toml";
+const HELP_SNAPSHOTS_DIR: &str = "tests/help_snapshots";
+const UPDATE_HELP_ENV: &str = "PALYRA_UPDATE_HELP_SNAPSHOTS";
+
+fn crate_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn load_matrix() -> Result<CliParityMatrix> {
+    let matrix_path = crate_root().join(MATRIX_PATH);
+    let matrix_text = fs::read_to_string(&matrix_path)
+        .with_context(|| format!("failed to read {}", matrix_path.display()))?;
+    toml::from_str(matrix_text.as_str())
+        .with_context(|| format!("failed to parse {}", matrix_path.display()))
+}
 
 fn normalize_help_text(text: &str) -> String {
     text.replace("\r\n", "\n").replace("palyra.exe", "palyra")
@@ -34,116 +51,75 @@ fn run_help(args: &[&str]) -> Result<String> {
     Ok(normalize_help_text(collapsed.join("\n").trim_end()))
 }
 
-fn assert_help_snapshot(args: &[&str], snapshot: &str) -> Result<()> {
-    assert_eq!(run_help(args)?, normalize_help_text(snapshot.trim_end()));
-    Ok(())
+fn snapshot_path(snapshot: &CliParitySnapshotSpec) -> Result<PathBuf> {
+    let file = snapshot
+        .expected_file()
+        .context("snapshot entry must resolve to a platform-specific file")?;
+    Ok(crate_root().join(HELP_SNAPSHOTS_DIR).join(file))
 }
 
-#[cfg(windows)]
-const ROOT_HELP_SNAPSHOT: &str = include_str!("help_snapshots/root-help-windows.txt");
-
-#[cfg(not(windows))]
-const ROOT_HELP_SNAPSHOT: &str = include_str!("help_snapshots/root-help-unix.txt");
-
-#[test]
-fn root_help_snapshot_matches() -> Result<()> {
-    assert_help_snapshot(&["--help"], ROOT_HELP_SNAPSHOT)
+fn snapshot_args(snapshot: &CliParitySnapshotSpec) -> Vec<&str> {
+    if snapshot.path == "palyra" {
+        return vec!["--help"];
+    }
+    let mut args = snapshot.path.split(' ').collect::<Vec<_>>();
+    args.push("--help");
+    args
 }
 
-#[test]
-fn acp_help_snapshot_matches() -> Result<()> {
-    assert_help_snapshot(&["acp", "--help"], include_str!("help_snapshots/acp-help.txt"))
-}
-
-#[test]
-fn acp_shim_help_snapshot_matches() -> Result<()> {
-    assert_help_snapshot(
-        &["acp", "shim", "--help"],
-        include_str!("help_snapshots/acp-shim-help.txt"),
-    )
+fn update_help_snapshots_enabled() -> bool {
+    env::var_os(UPDATE_HELP_ENV).is_some()
 }
 
 #[test]
-fn docs_help_snapshot_matches() -> Result<()> {
-    assert_help_snapshot(&["docs", "--help"], include_str!("help_snapshots/docs-help.txt"))
-}
+fn help_snapshots_match_cli_parity_matrix() -> Result<()> {
+    let matrix = load_matrix()?;
+    let mut failures = Vec::new();
 
-#[test]
-fn setup_help_snapshot_matches() -> Result<()> {
-    assert_help_snapshot(&["setup", "--help"], include_str!("help_snapshots/setup-help.txt"))
-}
+    for entry in matrix
+        .entries
+        .iter()
+        .filter_map(|entry| entry.snapshot.as_ref().map(|snapshot| (entry.path.as_str(), snapshot)))
+    {
+        let (path, snapshot) = entry;
+        let snapshot_path = snapshot_path(snapshot)?;
+        let actual = run_help(snapshot_args(snapshot).as_slice())?;
 
-#[test]
-fn health_help_snapshot_matches() -> Result<()> {
-    assert_help_snapshot(&["health", "--help"], include_str!("help_snapshots/health-help.txt"))
-}
+        if update_help_snapshots_enabled() {
+            if let Some(parent) = snapshot_path.parent() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!("failed to create help snapshot directory {}", parent.display())
+                })?;
+            }
+            fs::write(&snapshot_path, format!("{actual}\n"))
+                .with_context(|| format!("failed to write {}", snapshot_path.display()))?;
+            continue;
+        }
 
-#[test]
-fn logs_help_snapshot_matches() -> Result<()> {
-    assert_help_snapshot(&["logs", "--help"], include_str!("help_snapshots/logs-help.txt"))
-}
+        match fs::read_to_string(&snapshot_path) {
+            Ok(expected) => {
+                let normalized_expected = normalize_help_text(expected.trim_end());
+                if normalized_expected != actual {
+                    failures.push(format!(
+                        "{}: snapshot mismatch ({})",
+                        path,
+                        snapshot_path.display()
+                    ));
+                }
+            }
+            Err(error) => {
+                failures.push(format!(
+                    "{}: failed to read snapshot {} ({error})",
+                    path,
+                    snapshot_path.display()
+                ));
+            }
+        }
+    }
 
-#[test]
-fn onboarding_help_snapshot_matches() -> Result<()> {
-    assert_help_snapshot(
-        &["onboarding", "--help"],
-        include_str!("help_snapshots/onboarding-help.txt"),
-    )
-}
+    if failures.is_empty() {
+        return Ok(());
+    }
 
-#[test]
-fn configure_help_snapshot_matches() -> Result<()> {
-    assert_help_snapshot(
-        &["configure", "--help"],
-        include_str!("help_snapshots/configure-help.txt"),
-    )
-}
-
-#[test]
-fn gateway_help_snapshot_matches() -> Result<()> {
-    assert_help_snapshot(&["gateway", "--help"], include_str!("help_snapshots/gateway-help.txt"))
-}
-
-#[test]
-fn dashboard_help_snapshot_matches() -> Result<()> {
-    assert_help_snapshot(
-        &["dashboard", "--help"],
-        include_str!("help_snapshots/dashboard-help.txt"),
-    )
-}
-
-#[test]
-fn backup_help_snapshot_matches() -> Result<()> {
-    assert_help_snapshot(&["backup", "--help"], include_str!("help_snapshots/backup-help.txt"))
-}
-
-#[test]
-fn reset_help_snapshot_matches() -> Result<()> {
-    assert_help_snapshot(&["reset", "--help"], include_str!("help_snapshots/reset-help.txt"))
-}
-
-#[test]
-fn uninstall_help_snapshot_matches() -> Result<()> {
-    assert_help_snapshot(
-        &["uninstall", "--help"],
-        include_str!("help_snapshots/uninstall-help.txt"),
-    )
-}
-
-#[test]
-fn update_help_snapshot_matches() -> Result<()> {
-    assert_help_snapshot(&["update", "--help"], include_str!("help_snapshots/update-help.txt"))
-}
-
-#[test]
-fn completion_help_snapshot_matches() -> Result<()> {
-    assert_help_snapshot(
-        &["completion", "--help"],
-        include_str!("help_snapshots/completion-help.txt"),
-    )
-}
-
-#[test]
-fn webhooks_help_snapshot_matches() -> Result<()> {
-    assert_help_snapshot(&["webhooks", "--help"], include_str!("help_snapshots/webhooks-help.txt"))
+    Err(anyhow::anyhow!("CLI help snapshots drifted:\n{}", failures.join("\n")))
 }

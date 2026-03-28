@@ -1,6 +1,6 @@
 Remove an installed Palyra package and optional state
 
-Usage: palyra.exe uninstall [OPTIONS]
+Usage: palyra uninstall [OPTIONS]
 
 Options:
       --install-root <INSTALL_ROOT>

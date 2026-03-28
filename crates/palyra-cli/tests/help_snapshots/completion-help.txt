@@ -1,6 +1,6 @@
 Generate shell completion scripts
 
-Usage: palyra.exe completion [OPTIONS] --shell <SHELL>
+Usage: palyra completion [OPTIONS] --shell <SHELL>
 
 Options:
       --shell <SHELL>

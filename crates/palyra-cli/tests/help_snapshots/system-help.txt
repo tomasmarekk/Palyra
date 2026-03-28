@@ -1,10 +1,11 @@
-Create or verify portable operator backups
+Inspect runtime heartbeat, subsystem presence, and recent system events
 
-Usage: palyra backup [OPTIONS] <COMMAND>
+Usage: palyra system [OPTIONS] <COMMAND>
 
 Commands:
-  create
-  verify
+  heartbeat
+  presence
+  event      [aliases: events]
 
 Options:
   -h, --help
@@ -33,6 +34,9 @@ Global Options:
       --no-color
 
 Examples:
-  palyra backup create --output ./artifacts/palyra-backup.zip
-  palyra backup create --include workspace --workspace-root ./workspace --include-support-bundle
-  palyra backup verify --archive ./artifacts/palyra-backup.zip
+  palyra system heartbeat
+  palyra system presence --json
+  palyra system event --limit 50
+
+Discoverability:
+  `system` is the top-level operator view over runtime heartbeat, subsystem presence, and recent journal events.

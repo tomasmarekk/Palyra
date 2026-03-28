@@ -1,6 +1,6 @@
 Check or apply a packaged Palyra update
 
-Usage: palyra.exe update [OPTIONS]
+Usage: palyra update [OPTIONS]
 
 Options:
       --install-root <INSTALL_ROOT>

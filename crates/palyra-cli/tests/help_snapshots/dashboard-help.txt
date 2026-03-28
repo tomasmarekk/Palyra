@@ -1,6 +1,6 @@
 Resolve or open the operator dashboard URL
 
-Usage: palyra.exe dashboard [OPTIONS]
+Usage: palyra dashboard [OPTIONS]
 
 Options:
       --path <PATH>

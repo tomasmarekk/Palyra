@@ -1,0 +1,30 @@
+Usage: palyra cron update [OPTIONS] --id <ID>
+
+Options:
+      --id <ID>
+      --name <NAME>
+      --prompt <PROMPT>
+      --schedule-type <SCHEDULE_TYPE>            [possible values: cron, every, at]
+      --schedule <SCHEDULE>
+      --enabled <ENABLED>                        [possible values: true, false]
+      --concurrency <CONCURRENCY>                [possible values: forbid, replace, queue-one]
+      --retry-max-attempts <RETRY_MAX_ATTEMPTS>
+      --retry-backoff-ms <RETRY_BACKOFF_MS>
+      --misfire <MISFIRE>                        [possible values: skip, catch-up]
+      --jitter-ms <JITTER_MS>
+      --owner <OWNER>
+      --channel <CHANNEL>
+      --session-key <SESSION_KEY>
+      --session-label <SESSION_LABEL>
+      --json
+  -h, --help                                     Print help
+
+Global Options:
+      --profile <PROFILE>
+      --config <CONFIG_PATH>
+      --state-root <STATE_ROOT>
+  -v, --verbose...                     Increase logging verbosity (-v => debug, -vv => trace)
+      --log-level <LOG_LEVEL>          [default: info] [possible values: error, warn, info, debug, trace]
+      --output-format <OUTPUT_FORMAT>  [default: text] [possible values: text, json, ndjson]
+      --plain
+      --no-color

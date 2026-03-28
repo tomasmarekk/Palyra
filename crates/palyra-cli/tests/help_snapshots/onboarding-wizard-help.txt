@@ -1,25 +1,12 @@
-Bootstrap a Palyra installation
-
-Usage: palyra setup [OPTIONS]
+Usage: palyra onboarding wizard [OPTIONS]
 
 Options:
-      --mode <MODE>
-          [default: local]
-          [possible values: local, remote]
-
       --path <PATH>
 
       --force
 
-      --tls-scaffold <TLS_SCAFFOLD>
-          [default: bring-your-own]
-          [possible values: none, bring-your-own, self-signed]
-
-      --wizard
-
       --flow <FLOW>
           [possible values: quickstart, manual, remote]
-
       --non-interactive
 
       --accept-risk
@@ -30,7 +17,6 @@ Options:
 
       --auth-method <AUTH_METHOD>
           [possible values: api-key, skip, existing-config]
-
       --api-key-env <API_KEY_ENV>
 
       --api-key-stdin
@@ -39,13 +25,14 @@ Options:
 
       --bind-profile <BIND_PROFILE>
           [possible values: loopback-only, public-tls]
-
       --daemon-port <DAEMON_PORT>
 
       --grpc-port <GRPC_PORT>
 
       --quic-port <QUIC_PORT>
 
+      --tls-scaffold <TLS_SCAFFOLD>
+          [possible values: none, bring-your-own, self-signed]
       --tls-cert-path <TLS_CERT_PATH>
 
       --tls-key-path <TLS_KEY_PATH>
@@ -60,7 +47,6 @@ Options:
 
       --remote-verification <REMOTE_VERIFICATION>
           [possible values: none, server-cert, gateway-ca]
-
       --pinned-server-cert-sha256 <PINNED_SERVER_CERT_SHA256>
 
       --pinned-gateway-ca-sha256 <PINNED_GATEWAY_CA_SHA256>
@@ -74,35 +60,14 @@ Options:
       --skip-skills
 
   -h, --help
-          Print help (see a summary with '-h')
+          Print help
 
 Global Options:
       --profile <PROFILE>
-
       --config <CONFIG_PATH>
-
       --state-root <STATE_ROOT>
-
-  -v, --verbose...
-          Increase logging verbosity (-v => debug, -vv => trace)
-
-      --log-level <LOG_LEVEL>
-          [default: info]
-          [possible values: error, warn, info, debug, trace]
-
-      --output-format <OUTPUT_FORMAT>
-          [default: text]
-          [possible values: text, json, ndjson]
-
+  -v, --verbose...                     Increase logging verbosity (-v => debug, -vv => trace)
+      --log-level <LOG_LEVEL>          [default: info] [possible values: error, warn, info, debug, trace]
+      --output-format <OUTPUT_FORMAT>  [default: text] [possible values: text, json, ndjson]
       --plain
-
       --no-color
-
-Examples:
-  palyra setup --mode local
-  palyra setup --mode local --wizard
-  palyra setup --mode remote --path ./config/palyra.toml --force
-
-Discoverability:
-  Use `palyra onboarding wizard --flow quickstart` for full guided onboarding.
-  Use `palyra gateway status` after setup to verify runtime health.

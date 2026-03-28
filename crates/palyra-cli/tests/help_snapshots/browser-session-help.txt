@@ -1,0 +1,23 @@
+Manage browser sessions
+
+Usage: palyra browser session [OPTIONS] <COMMAND>
+
+Commands:
+  create   Create a browser session
+  list     List active browser sessions
+  show     Show session summary, budget, and tabs
+  inspect  Inspect bounded session debug state
+  close    Close a browser session
+
+Options:
+  -h, --help  Print help
+
+Global Options:
+      --profile <PROFILE>
+      --config <CONFIG_PATH>
+      --state-root <STATE_ROOT>
+  -v, --verbose...                     Increase logging verbosity (-v => debug, -vv => trace)
+      --log-level <LOG_LEVEL>          [default: info] [possible values: error, warn, info, debug, trace]
+      --output-format <OUTPUT_FORMAT>  [default: text] [possible values: text, json, ndjson]
+      --plain
+      --no-color

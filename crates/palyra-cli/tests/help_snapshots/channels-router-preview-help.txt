@@ -1,0 +1,31 @@
+Usage: palyra channels router preview [OPTIONS] --route-channel <ROUTE_CHANNEL> --text <TEXT>
+
+Options:
+      --route-channel <ROUTE_CHANNEL>
+      --text <TEXT>
+      --conversation-id <CONVERSATION_ID>
+      --sender-identity <SENDER_IDENTITY>
+      --sender-display <SENDER_DISPLAY>
+      --sender-verified
+      --is-direct-message
+      --requested-broadcast
+      --adapter-message-id <ADAPTER_MESSAGE_ID>
+      --adapter-thread-id <ADAPTER_THREAD_ID>
+      --max-payload-bytes <MAX_PAYLOAD_BYTES>
+      --url <URL>
+      --token <TOKEN>
+      --principal <PRINCIPAL>                    [default: user:local]
+      --device-id <DEVICE_ID>                    [default: 01ARZ3NDEKTSV4RRFFQ69G5FAV]
+      --channel <CHANNEL>
+      --json
+  -h, --help                                     Print help
+
+Global Options:
+      --profile <PROFILE>
+      --config <CONFIG_PATH>
+      --state-root <STATE_ROOT>
+  -v, --verbose...                     Increase logging verbosity (-v => debug, -vv => trace)
+      --log-level <LOG_LEVEL>          [default: info] [possible values: error, warn, info, debug, trace]
+      --output-format <OUTPUT_FORMAT>  [default: text] [possible values: text, json, ndjson]
+      --plain
+      --no-color

@@ -1,0 +1,932 @@
+version = 1
+
+[[entries]]
+path = "palyra"
+category = "root"
+status = "done"
+summary = "Root operator CLI entry point with canonical command map and global options."
+required_flags = ["profile", "config", "state-root", "log-level", "output-format", "plain", "no-color"]
+
+[entries.snapshot]
+path = "palyra"
+unix_file = "root-help-unix.txt"
+windows_file = "root-help-windows.txt"
+
+[[entries]]
+path = "version"
+category = "top_level"
+status = "done"
+summary = "Expose CLI build metadata."
+
+[entries.snapshot]
+path = "version"
+file = "version-help.txt"
+
+[[entries]]
+path = "setup"
+category = "canonical_family"
+status = "done"
+summary = "Canonical bootstrap workflow."
+required_aliases = ["init"]
+required_flags = ["mode", "path", "force", "wizard"]
+
+[entries.snapshot]
+path = "setup"
+file = "setup-help.txt"
+
+[[entries]]
+path = "doctor"
+category = "top_level"
+status = "done"
+summary = "Environment and runtime diagnostics."
+required_flags = ["strict", "json"]
+
+[entries.snapshot]
+path = "doctor"
+file = "doctor-help.txt"
+
+[[entries]]
+path = "health"
+category = "top_level"
+status = "done"
+summary = "HTTP and gRPC liveness/readiness probe surface."
+required_flags = ["url", "grpc-url"]
+
+[entries.snapshot]
+path = "health"
+file = "health-help.txt"
+
+[[entries]]
+path = "logs"
+category = "top_level"
+status = "done"
+summary = "Tail local gateway journal diagnostics."
+required_flags = ["db-path", "lines", "follow"]
+
+[entries.snapshot]
+path = "logs"
+file = "logs-help.txt"
+
+[[entries]]
+path = "status"
+category = "top_level"
+status = "done"
+summary = "Transport and admin status surface."
+
+[entries.snapshot]
+path = "status"
+file = "status-help.txt"
+
+[[entries]]
+path = "acp"
+category = "canonical_family"
+status = "done"
+summary = "Preferred ACP bridge entry point."
+required_flags = ["session-key", "session-label", "require-existing", "reset-session"]
+
+[entries.snapshot]
+path = "acp"
+file = "acp-help.txt"
+
+[[entries]]
+path = "agent"
+category = "top_level"
+status = "done"
+summary = "Single-agent interaction and compatibility workflows."
+
+[entries.snapshot]
+path = "agent"
+file = "agent-help.txt"
+
+[[entries]]
+path = "agents"
+category = "top_level"
+status = "done"
+summary = "Agent registry and identity management."
+
+[entries.snapshot]
+path = "agents"
+file = "agents-help.txt"
+
+[[entries]]
+path = "cron"
+category = "top_level"
+status = "done"
+summary = "Cron job management surface."
+
+[entries.snapshot]
+path = "cron"
+file = "cron-help.txt"
+
+[[entries]]
+path = "memory"
+category = "top_level"
+status = "done"
+summary = "Memory ingest, search, index, and purge workflows."
+
+[entries.snapshot]
+path = "memory"
+file = "memory-help.txt"
+
+[[entries]]
+path = "message"
+category = "top_level"
+status = "done"
+summary = "Channel message action surface."
+
+[entries.snapshot]
+path = "message"
+file = "message-help.txt"
+
+[[entries]]
+path = "approvals"
+category = "top_level"
+status = "done"
+summary = "Approval governance and audit workflows."
+
+[entries.snapshot]
+path = "approvals"
+file = "approvals-help.txt"
+
+[[entries]]
+path = "sessions"
+category = "top_level"
+status = "done"
+summary = "Session lifecycle and lookup workflows."
+
+[entries.snapshot]
+path = "sessions"
+file = "sessions-help.txt"
+
+[[entries]]
+path = "tui"
+category = "top_level"
+status = "done"
+summary = "Terminal operator client."
+
+[entries.snapshot]
+path = "tui"
+file = "tui-help.txt"
+
+[[entries]]
+path = "auth"
+category = "top_level"
+status = "done"
+summary = "Auth profile and OpenAI credential workflows."
+
+[entries.snapshot]
+path = "auth"
+file = "auth-help.txt"
+
+[[entries]]
+path = "channels"
+category = "top_level"
+status = "done"
+summary = "Provider-agnostic channel account lifecycle surface."
+
+[entries.snapshot]
+path = "channels"
+file = "channels-help.txt"
+
+[[entries]]
+path = "webhooks"
+category = "canonical_family"
+status = "done"
+summary = "Webhook-backed integration management."
+
+[entries.snapshot]
+path = "webhooks"
+file = "webhooks-help.txt"
+
+[[entries]]
+path = "docs"
+category = "canonical_family"
+status = "done"
+summary = "Offline docs and help discovery surface."
+
+[entries.snapshot]
+path = "docs"
+file = "docs-help.txt"
+
+[[entries]]
+path = "plugins"
+category = "canonical_family"
+status = "done"
+summary = "Trusted WASM plugin lifecycle surface."
+
+[entries.snapshot]
+path = "plugins"
+file = "plugins-help.txt"
+
+[[entries]]
+path = "hooks"
+category = "canonical_family"
+status = "done"
+summary = "Event-driven automation hooks."
+
+[entries.snapshot]
+path = "hooks"
+file = "hooks-help.txt"
+
+[[entries]]
+path = "devices"
+category = "top_level"
+status = "done"
+summary = "Paired device lifecycle and token workflows."
+
+[entries.snapshot]
+path = "devices"
+file = "devices-help.txt"
+
+[[entries]]
+path = "node"
+category = "top_level"
+status = "done"
+summary = "Headless node host lifecycle surface."
+
+[entries.snapshot]
+path = "node"
+file = "node-help.txt"
+
+[[entries]]
+path = "nodes"
+category = "top_level"
+status = "done"
+summary = "Fleet management and invoke workflows."
+
+[entries.snapshot]
+path = "nodes"
+file = "nodes-help.txt"
+
+[[entries]]
+path = "browser"
+category = "canonical_family"
+status = "done"
+summary = "Browser service and browser automation workflows."
+
+[entries.snapshot]
+path = "browser"
+file = "browser-help.txt"
+
+[[entries]]
+path = "system"
+category = "canonical_family"
+status = "done"
+summary = "Runtime heartbeat, presence, and system event surface."
+
+[entries.snapshot]
+path = "system"
+file = "system-help.txt"
+
+[[entries]]
+path = "sandbox"
+category = "canonical_family"
+status = "done"
+summary = "Process-runner and WASM sandbox explain surface."
+
+[entries.snapshot]
+path = "sandbox"
+file = "sandbox-help.txt"
+
+[[entries]]
+path = "completion"
+category = "top_level"
+status = "done"
+summary = "Shell completion generation."
+required_flags = ["shell"]
+
+[entries.snapshot]
+path = "completion"
+file = "completion-help.txt"
+
+[[entries]]
+path = "onboarding"
+category = "canonical_family"
+status = "done"
+summary = "Guided onboarding workflows."
+required_aliases = ["onboard"]
+
+[entries.snapshot]
+path = "onboarding"
+file = "onboarding-help.txt"
+
+[[entries]]
+path = "configure"
+category = "canonical_family"
+status = "done"
+summary = "Guided reconfiguration workflow."
+
+[entries.snapshot]
+path = "configure"
+file = "configure-help.txt"
+
+[[entries]]
+path = "gateway"
+category = "canonical_family"
+status = "done"
+summary = "Preferred runtime/admin family."
+required_aliases = ["daemon"]
+
+[entries.snapshot]
+path = "gateway"
+file = "gateway-help.txt"
+
+[[entries]]
+path = "dashboard"
+category = "canonical_family"
+status = "done"
+summary = "Dashboard URL discovery and open shortcut."
+
+[entries.snapshot]
+path = "dashboard"
+file = "dashboard-help.txt"
+
+[[entries]]
+path = "backup"
+category = "canonical_family"
+status = "done"
+summary = "Portable lifecycle backup surface."
+
+[entries.snapshot]
+path = "backup"
+file = "backup-help.txt"
+
+[[entries]]
+path = "reset"
+category = "canonical_family"
+status = "done"
+summary = "Destructive local recovery surface."
+
+[entries.snapshot]
+path = "reset"
+file = "reset-help.txt"
+
+[[entries]]
+path = "uninstall"
+category = "canonical_family"
+status = "done"
+summary = "Installer-aware package removal surface."
+
+[entries.snapshot]
+path = "uninstall"
+file = "uninstall-help.txt"
+
+[[entries]]
+path = "update"
+category = "canonical_family"
+status = "done"
+summary = "Packaged update and check orchestration."
+
+[entries.snapshot]
+path = "update"
+file = "update-help.txt"
+
+[[entries]]
+path = "support-bundle"
+category = "top_level"
+status = "done"
+summary = "Support bundle export workflows."
+
+[entries.snapshot]
+path = "support-bundle"
+file = "support-bundle-help.txt"
+
+[[entries]]
+path = "policy"
+category = "top_level"
+status = "done"
+summary = "Policy explain workflows."
+
+[entries.snapshot]
+path = "policy"
+file = "policy-help.txt"
+
+[[entries]]
+path = "protocol"
+category = "top_level"
+status = "done"
+summary = "Protocol validation and generation workflows."
+
+[entries.snapshot]
+path = "protocol"
+file = "protocol-help.txt"
+
+[[entries]]
+path = "config"
+category = "top_level"
+status = "done"
+summary = "Config inspection and mutation workflows."
+
+[entries.snapshot]
+path = "config"
+file = "config-help.txt"
+
+[[entries]]
+path = "models"
+category = "top_level"
+status = "done"
+summary = "Model provider discovery and selection surface."
+
+[entries.snapshot]
+path = "models"
+file = "models-help.txt"
+
+[[entries]]
+path = "patch"
+category = "top_level"
+status = "done"
+summary = "Workspace patch apply workflows."
+
+[entries.snapshot]
+path = "patch"
+file = "patch-help.txt"
+
+[[entries]]
+path = "skills"
+category = "top_level"
+status = "done"
+summary = "Skill lifecycle, audit, and package workflows."
+required_aliases = ["skill"]
+
+[entries.snapshot]
+path = "skills"
+file = "skills-help.txt"
+
+[[entries]]
+path = "secrets"
+category = "top_level"
+status = "done"
+summary = "Runtime secret management workflows."
+
+[entries.snapshot]
+path = "secrets"
+file = "secrets-help.txt"
+
+[[entries]]
+path = "security"
+category = "top_level"
+status = "done"
+summary = "Deployment security audit surface."
+
+[entries.snapshot]
+path = "security"
+file = "security-help.txt"
+
+[[entries]]
+path = "tunnel"
+category = "top_level"
+status = "done"
+summary = "SSH tunnel helper workflows."
+
+[entries.snapshot]
+path = "tunnel"
+file = "tunnel-help.txt"
+
+[[entries]]
+path = "pairing"
+category = "top_level"
+status = "done"
+summary = "Approval-based pairing workflows."
+
+[entries.snapshot]
+path = "pairing"
+file = "pairing-help.txt"
+
+[[entries]]
+path = "acp shim"
+category = "nested_surface"
+status = "done"
+summary = "Legacy NDJSON ACP compatibility shim."
+required_flags = ["session-id", "run-id", "prompt", "prompt-stdin", "ndjson-stdin"]
+
+[entries.snapshot]
+path = "acp shim"
+file = "acp-shim-help.txt"
+
+[[entries]]
+path = "auth profiles"
+category = "nested_surface"
+status = "done"
+summary = "Auth profile CRUD and health workflows."
+
+[entries.snapshot]
+path = "auth profiles"
+file = "auth-profiles-help.txt"
+
+[[entries]]
+path = "auth openai"
+category = "nested_surface"
+status = "done"
+summary = "OpenAI-first auth workflows."
+
+[entries.snapshot]
+path = "auth openai"
+file = "auth-openai-help.txt"
+
+[[entries]]
+path = "auth openai api-key"
+category = "nested_surface"
+status = "done"
+summary = "OpenAI API key bootstrap workflow."
+required_flags = ["profile-id", "api-key-stdin", "api-key-prompt", "set-default"]
+
+[entries.snapshot]
+path = "auth openai api-key"
+file = "auth-openai-api-key-help.txt"
+
+[[entries]]
+path = "auth profiles list"
+category = "nested_surface"
+status = "done"
+summary = "Auth profile listing surface."
+
+[entries.snapshot]
+path = "auth profiles list"
+file = "auth-profiles-list-help.txt"
+
+[[entries]]
+path = "browser session"
+category = "nested_surface"
+status = "done"
+summary = "Browser session lifecycle workflows."
+
+[entries.snapshot]
+path = "browser session"
+file = "browser-session-help.txt"
+
+[[entries]]
+path = "browser session create"
+category = "nested_surface"
+status = "done"
+summary = "Browser session creation contract."
+required_flags = ["allow-private-targets", "allow-downloads", "allow-domain", "persistence-enabled"]
+
+[entries.snapshot]
+path = "browser session create"
+file = "browser-session-create-help.txt"
+
+[[entries]]
+path = "browser profiles"
+category = "nested_surface"
+status = "done"
+summary = "Browser profile lifecycle workflows."
+
+[entries.snapshot]
+path = "browser profiles"
+file = "browser-profiles-help.txt"
+
+[[entries]]
+path = "browser profiles create"
+category = "nested_surface"
+status = "done"
+summary = "Browser profile creation contract."
+required_flags = ["name", "persistence-enabled", "private-profile"]
+
+[entries.snapshot]
+path = "browser profiles create"
+file = "browser-profiles-create-help.txt"
+
+[[entries]]
+path = "browser tabs"
+category = "nested_surface"
+status = "done"
+summary = "Browser tab lifecycle workflows."
+
+[entries.snapshot]
+path = "browser tabs"
+file = "browser-tabs-help.txt"
+
+[[entries]]
+path = "browser tabs open"
+category = "nested_surface"
+status = "done"
+summary = "Browser tab open contract."
+required_flags = ["url", "activate", "allow-private-targets"]
+
+[entries.snapshot]
+path = "browser tabs open"
+file = "browser-tabs-open-help.txt"
+
+[[entries]]
+path = "browser navigate"
+category = "nested_surface"
+status = "done"
+summary = "Browser navigate action contract."
+required_flags = ["url", "timeout-ms", "allow-redirects", "allow-private-targets"]
+
+[entries.snapshot]
+path = "browser navigate"
+file = "browser-navigate-help.txt"
+
+[[entries]]
+path = "browser snapshot"
+category = "nested_surface"
+status = "done"
+summary = "Browser snapshot action contract."
+required_flags = ["include-dom-snapshot", "include-visible-text", "output"]
+
+[entries.snapshot]
+path = "browser snapshot"
+file = "browser-snapshot-help.txt"
+
+[[entries]]
+path = "browser trace"
+category = "nested_surface"
+status = "done"
+summary = "Browser trace artifact export."
+required_flags = ["output"]
+
+[entries.snapshot]
+path = "browser trace"
+file = "browser-trace-help.txt"
+
+[[entries]]
+path = "channels discord"
+category = "nested_surface"
+status = "done"
+summary = "Discord account setup and verification workflows."
+
+[entries.snapshot]
+path = "channels discord"
+file = "channels-discord-help.txt"
+
+[[entries]]
+path = "channels discord setup"
+category = "nested_surface"
+status = "done"
+summary = "Discord account onboarding workflow."
+required_flags = ["account-id", "verify-channel-id", "json"]
+
+[entries.snapshot]
+path = "channels discord setup"
+file = "channels-discord-setup-help.txt"
+
+[[entries]]
+path = "channels discord verify"
+category = "nested_surface"
+status = "done"
+summary = "Discord outbound verification workflow."
+required_aliases = ["test-send"]
+required_flags = ["account-id", "to", "text", "confirm"]
+
+[entries.snapshot]
+path = "channels discord verify"
+file = "channels-discord-verify-help.txt"
+
+[[entries]]
+path = "channels router"
+category = "nested_surface"
+status = "done"
+summary = "Channel routing and pairing workflows."
+
+[entries.snapshot]
+path = "channels router"
+file = "channels-router-help.txt"
+
+[[entries]]
+path = "channels router preview"
+category = "nested_surface"
+status = "done"
+summary = "Channel routing preview contract."
+required_flags = ["route-channel", "text", "requested-broadcast"]
+
+[entries.snapshot]
+path = "channels router preview"
+file = "channels-router-preview-help.txt"
+
+[[entries]]
+path = "config list"
+category = "nested_surface"
+status = "done"
+summary = "List config values with compatibility alias."
+required_aliases = ["show"]
+required_flags = ["path", "show-secrets"]
+
+[entries.snapshot]
+path = "config list"
+file = "config-list-help.txt"
+
+[[entries]]
+path = "cron update"
+category = "nested_surface"
+status = "done"
+summary = "Cron update workflow with edit alias."
+required_aliases = ["edit"]
+required_flags = ["id"]
+
+[entries.snapshot]
+path = "cron update"
+file = "cron-update-help.txt"
+
+[[entries]]
+path = "cron add"
+category = "nested_surface"
+status = "done"
+summary = "Cron creation contract."
+required_flags = ["name", "prompt", "schedule-type", "schedule"]
+
+[entries.snapshot]
+path = "cron add"
+file = "cron-add-help.txt"
+
+[[entries]]
+path = "cron delete"
+category = "nested_surface"
+status = "done"
+summary = "Cron delete workflow with rm alias."
+required_aliases = ["rm"]
+required_flags = ["id"]
+
+[entries.snapshot]
+path = "cron delete"
+file = "cron-delete-help.txt"
+
+[[entries]]
+path = "cron logs"
+category = "nested_surface"
+status = "done"
+summary = "Cron run history workflow with runs alias."
+required_aliases = ["runs"]
+required_flags = ["id", "limit"]
+
+[entries.snapshot]
+path = "cron logs"
+file = "cron-logs-help.txt"
+
+[[entries]]
+path = "hooks bind"
+category = "nested_surface"
+status = "done"
+summary = "Hook binding workflow with install alias."
+required_aliases = ["install"]
+required_flags = ["event", "plugin-id", "disabled"]
+
+[entries.snapshot]
+path = "hooks bind"
+file = "hooks-bind-help.txt"
+
+[[entries]]
+path = "memory index"
+category = "nested_surface"
+status = "done"
+summary = "Memory reindex workflow."
+required_aliases = ["reindex"]
+required_flags = ["batch-size", "until-complete", "run-maintenance"]
+
+[entries.snapshot]
+path = "memory index"
+file = "memory-index-help.txt"
+
+[[entries]]
+path = "plugins install"
+category = "nested_surface"
+status = "done"
+summary = "Plugin bind/install workflow."
+required_aliases = ["bind"]
+required_flags = ["artifact", "allow-tofu", "allow-untrusted"]
+
+[entries.snapshot]
+path = "plugins install"
+file = "plugins-install-help.txt"
+
+[[entries]]
+path = "sessions show"
+category = "nested_surface"
+status = "done"
+summary = "Session show workflow with resume alias."
+required_aliases = ["resume"]
+required_flags = ["session-id", "session-key", "json"]
+
+[entries.snapshot]
+path = "sessions show"
+file = "sessions-show-help.txt"
+
+[[entries]]
+path = "skills package"
+category = "nested_surface"
+status = "done"
+summary = "Skill packaging and verification workflows."
+
+[entries.snapshot]
+path = "skills package"
+file = "skills-package-help.txt"
+
+[[entries]]
+path = "skills package build"
+category = "nested_surface"
+status = "done"
+summary = "Skill artifact build contract."
+required_flags = ["manifest", "sbom", "provenance", "output"]
+
+[entries.snapshot]
+path = "skills package build"
+file = "skills-package-build-help.txt"
+
+[[entries]]
+path = "support-bundle export"
+category = "nested_surface"
+status = "done"
+summary = "Support bundle export subcommand."
+required_flags = ["output", "max-bytes", "journal-hash-limit", "error-limit"]
+
+[entries.snapshot]
+path = "support-bundle export"
+file = "support-bundle-export-help.txt"
+
+[[entries]]
+path = "system event"
+category = "nested_surface"
+status = "done"
+summary = "System event surface with events alias."
+required_aliases = ["events"]
+
+[entries.snapshot]
+path = "system event"
+file = "system-event-help.txt"
+
+[[entries]]
+path = "node install"
+category = "nested_surface"
+status = "done"
+summary = "Node host install workflow."
+
+[entries.snapshot]
+path = "node install"
+file = "node-install-help.txt"
+
+[[entries]]
+path = "nodes invoke"
+category = "nested_surface"
+status = "done"
+summary = "Fleet capability invoke workflow."
+
+[entries.snapshot]
+path = "nodes invoke"
+file = "nodes-invoke-help.txt"
+
+[[entries]]
+path = "onboarding wizard"
+category = "nested_surface"
+status = "done"
+summary = "Wizard entry point for guided onboarding."
+required_flags = ["flow", "non-interactive", "accept-risk"]
+
+[entries.snapshot]
+path = "onboarding wizard"
+file = "onboarding-wizard-help.txt"
+
+[[entries]]
+path = "webhooks test"
+category = "nested_surface"
+status = "done"
+summary = "Webhook delivery verification workflow."
+
+[entries.snapshot]
+path = "webhooks test"
+file = "webhooks-test-help.txt"
+
+[[entries]]
+path = "browser console"
+category = "placeholder_surface"
+status = "partial"
+summary = "Console export placeholder is intentionally present but unsupported."
+notes = "M42 kept a structured placeholder so the CLI tree stays stable before real console export lands."
+required_flags = ["output"]
+
+[entries.snapshot]
+path = "browser console"
+file = "browser-console-help.txt"
+
+[[entries]]
+path = "browser pdf"
+category = "placeholder_surface"
+status = "partial"
+summary = "PDF export placeholder is intentionally present but unsupported."
+notes = "The command is discoverable and testable, but the implementation remains intentionally incomplete."
+required_flags = ["output"]
+
+[entries.snapshot]
+path = "browser pdf"
+file = "browser-pdf-help.txt"
+
+[[entries]]
+path = "browser select"
+category = "placeholder_surface"
+status = "partial"
+summary = "Select element helper is a structured unsupported placeholder."
+required_flags = ["selector", "value"]
+
+[entries.snapshot]
+path = "browser select"
+file = "browser-select-help.txt"
+
+[[entries]]
+path = "browser highlight"
+category = "placeholder_surface"
+status = "partial"
+summary = "Selector highlight helper is a structured unsupported placeholder."
+required_flags = ["selector"]
+
+[entries.snapshot]
+path = "browser highlight"
+file = "browser-highlight-help.txt"

@@ -1,0 +1,60 @@
+Launch the terminal operator client
+
+Usage: palyra tui [OPTIONS]
+
+Options:
+      --grpc-url <GRPC_URL>
+
+      --token <TOKEN>
+
+      --principal <PRINCIPAL>
+
+      --device-id <DEVICE_ID>
+
+      --channel <CHANNEL>
+
+      --session-id <SESSION_ID>
+
+      --session-key <SESSION_KEY>
+
+      --session-label <SESSION_LABEL>
+
+      --require-existing
+
+      --allow-sensitive-tools
+
+      --include-archived-sessions
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global Options:
+      --profile <PROFILE>
+
+      --config <CONFIG_PATH>
+
+      --state-root <STATE_ROOT>
+
+  -v, --verbose...
+          Increase logging verbosity (-v => debug, -vv => trace)
+
+      --log-level <LOG_LEVEL>
+          [default: info]
+          [possible values: error, warn, info, debug, trace]
+
+      --output-format <OUTPUT_FORMAT>
+          [default: text]
+          [possible values: text, json, ndjson]
+
+      --plain
+
+      --no-color
+
+Examples:
+  palyra tui
+  palyra tui --session-key ops:triage
+  palyra tui --allow-sensitive-tools --include-archived-sessions
+
+Keys:
+  Tab switches focus, F2/F3/F4 open agent/session/model pickers, F5 opens settings, Ctrl+R reloads data.
+  Enter sends input, `/` starts slash commands, `!` enters the local shell flow with explicit opt-in.

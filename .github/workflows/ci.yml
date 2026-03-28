@@ -234,6 +234,31 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+  cli-parity:
+    name: CLI parity acceptance
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7
+        with:
+          toolchain: 1.91.0
+
+      - name: Generate CLI parity report
+        run: cargo run -p palyra-cli --example render_cli_parity_report --locked -- crates/palyra-cli/tests/cli_parity_matrix.toml artifacts/cli-parity-acceptance-matrix.md
+
+      - name: Validate CLI parity acceptance
+        run: cargo test -p palyra-cli --test cli_parity --test help_snapshots --locked
+
+      - name: Upload CLI parity artifact
+        if: ${{ always() }}
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: cli-parity-acceptance-matrix
+          path: artifacts/cli-parity-acceptance-matrix.md
+
   protocol-contracts:
     name: Protocol contracts (Rust + Kotlin)
     runs-on: ubuntu-latest

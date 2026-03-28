@@ -1,6 +1,6 @@
 Gateway and runtime diagnostics surface
 
-Usage: palyra.exe gateway [OPTIONS] <COMMAND>
+Usage: palyra gateway [OPTIONS] <COMMAND>
 
 Commands:
   run

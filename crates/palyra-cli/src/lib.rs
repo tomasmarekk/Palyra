@@ -2,6 +2,7 @@ mod acp_bridge;
 pub mod app;
 pub mod args;
 mod cli;
+pub mod cli_parity;
 pub mod client;
 mod commands;
 pub mod domain;
