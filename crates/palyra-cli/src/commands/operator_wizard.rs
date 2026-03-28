@@ -1769,16 +1769,11 @@ fn emit_onboarding_summary(summary: &OnboardingSummary, json_output: bool) -> Re
             summary.service_install_mode.as_str(),
         );
         println!(
-            "onboarding.skills installed={} eligible={} quarantined={} runtime_unknown={} missing_secrets={}",
+            "onboarding.skills installed={} eligible={} quarantined={} runtime_unknown={}",
             summary.skills.installed_total,
             summary.skills.eligible_total,
             summary.skills.quarantined_total,
-            summary.skills.runtime_unknown_total,
-            if summary.skills.missing_secrets_total == 0 {
-                "none"
-            } else {
-                "present"
-            }
+            summary.skills.runtime_unknown_total
         );
         println!(
             "onboarding.risk_events={}",
@@ -2660,14 +2655,6 @@ fn describe_configure_section(
             format!(
                 "quarantined_total={}",
                 build_default_skills_inventory_snapshot().quarantined_total
-            ),
-            format!(
-                "missing_secrets={}",
-                if build_default_skills_inventory_snapshot().missing_secrets_total == 0 {
-                    "none"
-                } else {
-                    "present"
-                }
             ),
         ]),
         ConfigureSectionArg::HealthSecurity => Ok(vec![

@@ -4515,7 +4515,7 @@ fn load_skill_runtime_status_snapshot(skill_id: &str, version: &str) -> SkillRun
 }
 
 fn build_skill_eligibility_snapshot(
-    record: &InstalledSkillRecord,
+    _record: &InstalledSkillRecord,
     requirements: &SkillRequirementsSnapshot,
     runtime_status: &SkillRuntimeStatusSnapshot,
 ) -> SkillEligibilitySnapshot {
@@ -4535,9 +4535,6 @@ fn build_skill_eligibility_snapshot(
             requirements.min_palyra_version,
             env!("CARGO_PKG_VERSION")
         ));
-    }
-    if !record.missing_secrets.is_empty() {
-        reasons.push("missing required secrets".to_owned());
     }
     match runtime_status.status.as_str() {
         "quarantined" => reasons.push("skill is quarantined".to_owned()),

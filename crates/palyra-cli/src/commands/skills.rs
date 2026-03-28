@@ -1,13 +1,5 @@
 use crate::{client::skills as skills_client, output::skills as skills_output, *};
 
-fn redacted_presence<T>(items: &[T]) -> &'static str {
-    if items.is_empty() {
-        "none"
-    } else {
-        "present"
-    }
-}
-
 pub(crate) fn run_skills(command: SkillsCommand) -> Result<()> {
     match command {
         SkillsCommand::Package { command } => match command {
@@ -484,14 +476,13 @@ fn run_skills_install(command: SkillsInstallCommand) -> Result<()> {
         );
     } else {
         println!(
-            "{} skill_id={} version={} publisher={} trust={} source={} missing_secrets={} skills_root={} trust_store={}",
+            "{} skill_id={} version={} publisher={} trust={} source={} skills_root={} trust_store={}",
             event_kind,
             outcome.record.skill_id,
             outcome.record.version,
             outcome.record.publisher,
             outcome.record.trust_decision,
             outcome.record.source.reference,
-            redacted_presence(outcome.record.missing_secrets.as_slice()),
             skills_root.display(),
             trust_store_path.display()
         );
