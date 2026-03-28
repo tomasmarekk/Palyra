@@ -9,18 +9,17 @@ use super::{
     BrowserSessionCommand, ChannelProviderArg, ChannelResolveEntityArg, ChannelsCommand,
     ChannelsDiscordCommand, ChannelsRouterCommand, Cli, Command, CompletionShell, ConfigCommand,
     ConfigureSectionArg, CronCommand, CronConcurrencyPolicyArg, CronMisfirePolicyArg,
-    CronScheduleTypeArg, DaemonCommand, DocsCommand, GatewayBindProfileArg, HooksCommand,
-    InitModeArg, InitTlsScaffoldArg, JournalCheckpointModeArg, MemoryCommand, MemoryScopeArg,
-    MemorySourceArg, MessageCommand, ModelsCommand, OnboardingAuthMethodArg, OnboardingCommand,
-    OnboardingFlowArg, PatchCommand, PluginsCommand, PolicyCommand, ProtocolCommand,
-    RemoteVerificationModeArg, ResetCommand, ResetScopeArg, SandboxCommand, SandboxRuntimeArg,
-    SecretsCommand, SecretsConfigureCommand, SecurityCommand, SessionsCommand,
+    CronScheduleTypeArg, DaemonCommand, DevicesCommand, DocsCommand, GatewayBindProfileArg,
+    HooksCommand, InitModeArg, InitTlsScaffoldArg, JournalCheckpointModeArg, MemoryCommand,
+    MemoryScopeArg, MemorySourceArg, MessageCommand, ModelsCommand, NodeCommand, NodesCommand,
+    OnboardingAuthMethodArg, OnboardingCommand, OnboardingFlowArg, PairingClientKindArg,
+    PairingCommand, PairingMethodArg, PairingStateArg, PatchCommand, PluginsCommand, PolicyCommand,
+    ProtocolCommand, RemoteVerificationModeArg, ResetCommand, ResetScopeArg, SandboxCommand,
+    SandboxRuntimeArg, SecretsCommand, SecretsConfigureCommand, SecurityCommand, SessionsCommand,
     SetupWizardOverridesArg, SkillsCommand, SkillsPackageCommand, SupportBundleCommand,
     SystemCommand, SystemEventCommand, SystemEventSeverityArg, TuiCommand, UninstallCommand,
     UpdateCommand, WebhooksCommand, WizardOverridesArg,
 };
-#[cfg(not(windows))]
-use super::{PairingClientKindArg, PairingCommand, PairingMethodArg};
 
 #[test]
 fn parse_version_subcommand() {
@@ -4428,7 +4427,6 @@ fn parse_security_audit_offline_strict_json() {
 }
 
 #[test]
-#[cfg(not(windows))]
 fn parse_pairing_pair_with_defaults() {
     let parsed = Cli::parse_from([
         "palyra",
@@ -4460,7 +4458,6 @@ fn parse_pairing_pair_with_defaults() {
 }
 
 #[test]
-#[cfg(not(windows))]
 fn parse_pairing_pair_desktop_qr() {
     let parsed = Cli::parse_from([
         "palyra",
@@ -4499,7 +4496,6 @@ fn parse_pairing_pair_desktop_qr() {
 }
 
 #[test]
-#[cfg(not(windows))]
 fn parse_pairing_pair_with_proof_stdin() {
     let parsed = Cli::parse_from([
         "palyra",
@@ -4529,7 +4525,6 @@ fn parse_pairing_pair_with_proof_stdin() {
 }
 
 #[test]
-#[cfg(not(windows))]
 fn parse_pairing_pair_rejects_proof_without_insecure_ack() {
     let result = Cli::try_parse_from([
         "palyra",
@@ -4576,18 +4571,140 @@ fn parse_tui_with_session_key() {
 }
 
 #[test]
-#[cfg(windows)]
-fn parse_pairing_command_is_unavailable_on_windows() {
-    let result = Cli::try_parse_from([
+fn parse_pairing_list_with_filters() {
+    let parsed = Cli::parse_from([
         "palyra",
         "pairing",
-        "pair",
+        "list",
+        "--client-kind",
+        "node",
+        "--state",
+        "pending-approval",
+        "--json",
+    ]);
+    assert_eq!(
+        parsed.command,
+        Command::Pairing {
+            command: PairingCommand::List {
+                client_kind: Some("node".to_owned()),
+                state: Some(PairingStateArg::PendingApproval),
+                json: true,
+                ndjson: false,
+            }
+        }
+    );
+}
+
+#[test]
+fn parse_pairing_code_qr_with_ttl() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "pairing",
+        "code",
+        "--method",
+        "qr",
+        "--issued-by",
+        "ops:local",
+        "--ttl-ms",
+        "60000",
+        "--json",
+    ]);
+    assert_eq!(
+        parsed.command,
+        Command::Pairing {
+            command: PairingCommand::Code {
+                method: PairingMethodArg::Qr,
+                issued_by: Some("ops:local".to_owned()),
+                ttl_ms: Some(60_000),
+                json: true,
+            }
+        }
+    );
+}
+
+#[test]
+fn parse_devices_revoke_with_reason() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "devices",
+        "revoke",
+        "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "--reason",
+        "compromised",
+        "--json",
+    ]);
+    assert_eq!(
+        parsed.command,
+        Command::Devices {
+            command: DevicesCommand::Revoke {
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                reason: Some("compromised".to_owned()),
+                json: true,
+            }
+        }
+    );
+}
+
+#[test]
+fn parse_node_install_with_bootstrap_material() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "node",
+        "install",
+        "--grpc-url",
+        "https://127.0.0.1:7444",
+        "--gateway-ca-file",
+        "./gateway-ca.pem",
         "--device-id",
         "01ARZ3NDEKTSV4RRFFQ69G5FAV",
-        "--proof",
+        "--method",
+        "pin",
+        "--pairing-code",
         "123456",
-        "--allow-insecure-proof-arg",
-        "--approve",
+        "--start",
+        "--json",
     ]);
-    assert!(result.is_err(), "pairing command should not be exposed on windows");
+    assert_eq!(
+        parsed.command,
+        Command::Node {
+            command: NodeCommand::Install {
+                grpc_url: Some("https://127.0.0.1:7444".to_owned()),
+                gateway_ca_file: Some("./gateway-ca.pem".to_owned()),
+                device_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
+                method: Some(PairingMethodArg::Pin),
+                pairing_code: Some("123456".to_owned()),
+                start: true,
+                json: true,
+            }
+        }
+    );
+}
+
+#[test]
+fn parse_nodes_invoke_with_json_payload() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "nodes",
+        "invoke",
+        "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "system.health",
+        "--input-json",
+        "{\"verbose\":true}",
+        "--max-payload-bytes",
+        "4096",
+        "--json",
+    ]);
+    assert_eq!(
+        parsed.command,
+        Command::Nodes {
+            command: NodesCommand::Invoke {
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                capability: "system.health".to_owned(),
+                input_json: Some("{\"verbose\":true}".to_owned()),
+                input_stdin: false,
+                max_payload_bytes: Some(4096),
+                json: true,
+            }
+        }
+    );
 }

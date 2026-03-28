@@ -24,6 +24,9 @@ Commands:
   docs            Discover committed docs and CLI help snapshots locally
   plugins
   hooks
+  devices
+  node
+  nodes
   browser         Operate the browser service and browser-backed automation sessions
   system          Inspect runtime heartbeat, subsystem presence, and recent system events
   sandbox         Inspect effective process-runner and WASM sandbox policy surfaces

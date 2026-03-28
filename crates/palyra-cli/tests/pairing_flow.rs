@@ -1,13 +1,15 @@
 #[cfg(not(windows))]
-use std::io::Write;
-use std::process::Command;
-#[cfg(not(windows))]
-use std::process::Stdio;
+use std::{
+    io::Write,
+    process::{Command, Stdio},
+};
 
+#[cfg(not(windows))]
 use anyhow::{Context, Result};
 #[cfg(not(windows))]
 use tempfile::TempDir;
 
+#[cfg(not(windows))]
 const DEVICE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 
 #[test]
@@ -64,29 +66,6 @@ fn pairing_pair_outputs_verifiable_identity_and_rotation() -> Result<()> {
     assert!(!stdout.contains("signing_public_key_hex="));
     assert!(!stdout.contains("transcript_hash="));
     assert!(stdout.contains("pairing.rotation=simulated"));
-    Ok(())
-}
-
-#[cfg(windows)]
-#[test]
-fn pairing_command_is_unavailable_on_windows() -> Result<()> {
-    let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
-        .args([
-            "pairing",
-            "pair",
-            "--device-id",
-            DEVICE_ID,
-            "--proof",
-            "123456",
-            "--allow-insecure-proof-arg",
-            "--approve",
-        ])
-        .output()
-        .context("failed to execute palyra pairing pair on windows")?;
-
-    assert!(!output.status.success(), "pairing subcommand should be unavailable on windows");
-    let stderr = String::from_utf8(output.stderr).context("stderr was not UTF-8")?;
-    assert!(stderr.contains("unrecognized subcommand"), "unexpected stderr output: {stderr}");
     Ok(())
 }
 

@@ -257,6 +257,9 @@ fn approval_subject_type_filter_to_proto(value: Option<ApprovalSubjectTypeArg>) 
         Some(ApprovalSubjectTypeArg::NodeCapability) => {
             gateway_v1::ApprovalSubjectType::NodeCapability as i32
         }
+        Some(ApprovalSubjectTypeArg::DevicePairing) => {
+            gateway_v1::ApprovalSubjectType::DevicePairing as i32
+        }
         None => gateway_v1::ApprovalSubjectType::Unspecified as i32,
     }
 }

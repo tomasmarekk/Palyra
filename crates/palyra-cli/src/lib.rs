@@ -37,6 +37,12 @@ pub mod proto {
             }
         }
 
+        pub mod node {
+            pub mod v1 {
+                tonic::include_proto!("palyra.node.v1");
+            }
+        }
+
         pub mod auth {
             pub mod v1 {
                 tonic::include_proto!("palyra.auth.v1");
@@ -51,7 +57,6 @@ pub mod proto {
     }
 }
 
-#[cfg(not(windows))]
 use std::sync::Arc;
 use std::{
     collections::{BTreeMap, HashSet},
@@ -82,7 +87,6 @@ use cli::{
     SupportBundleCommand, SystemCommand, SystemEventCommand, SystemEventSeverityArg,
     WebhooksCommand, WizardOverridesArg,
 };
-#[cfg(not(windows))]
 use cli::{PairingClientKindArg, PairingCommand, PairingMethodArg};
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
 use palyra_common::default_identity_store_root;
@@ -105,9 +109,9 @@ use palyra_common::{
     },
     HealthResponse, CANONICAL_JSON_ENVELOPE_VERSION, CANONICAL_PROTOCOL_MAJOR,
 };
-use palyra_identity::{DeviceIdentity, FilesystemSecretStore, SecretStore};
-#[cfg(not(windows))]
-use palyra_identity::{IdentityManager, PairingClientKind, PairingMethod, DEFAULT_CERT_VALIDITY};
+use palyra_identity::{
+    DeviceIdentity, FilesystemSecretStore, PairingClientKind, PairingMethod, SecretStore,
+};
 use palyra_policy::{evaluate_with_config, PolicyDecision, PolicyEvaluationConfig, PolicyRequest};
 use palyra_skills::{
     audit_skill_artifact_security, build_signed_skill_artifact, inspect_skill_artifact,
@@ -245,10 +249,13 @@ fn run_cli() -> Result<()> {
         CliCommand::Memory { command } => commands::memory::run_memory(command),
         CliCommand::Message { command } => commands::message::run_message(command),
         CliCommand::Approvals { command } => commands::approvals::run_approvals(command),
+        CliCommand::Devices { command } => commands::devices::run_devices(command),
         CliCommand::Sessions { command } => commands::sessions::run_sessions(command),
         CliCommand::Tui { command } => commands::tui::run_tui(command),
         CliCommand::Auth { command } => commands::auth::run_auth(command),
         CliCommand::Channels { command } => commands::channels::run(command),
+        CliCommand::Node { command } => commands::node::run_node(command),
+        CliCommand::Nodes { command } => commands::nodes::run_nodes(command),
         CliCommand::Webhooks { command } => commands::webhooks::run_webhooks(command),
         CliCommand::Docs { command } => commands::docs::run_docs(command),
         CliCommand::Plugins { command } => commands::plugins::run_plugins(command),
@@ -342,11 +349,10 @@ fn run_cli() -> Result<()> {
         CliCommand::Skills { command } => commands::skills::run_skills(command),
         CliCommand::Secrets { command } => commands::secrets::run_secrets(command),
         CliCommand::Security { command } => commands::security::run_security(command),
+        CliCommand::Pairing { command } => commands::pairing::run_pairing(command),
         CliCommand::Tunnel { ssh, remote_port, local_port, open, identity_file } => {
             commands::tunnel::run_tunnel(ssh, remote_port, local_port, open, identity_file)
         }
-        #[cfg(not(windows))]
-        CliCommand::Pairing { command } => commands::pairing::run_pairing(command),
     }
 }
 
@@ -2334,6 +2340,7 @@ fn approval_subject_type_to_text(value: i32) -> &'static str {
         gateway_v1::ApprovalSubjectType::SecretAccess => "secret_access",
         gateway_v1::ApprovalSubjectType::BrowserAction => "browser_action",
         gateway_v1::ApprovalSubjectType::NodeCapability => "node_capability",
+        gateway_v1::ApprovalSubjectType::DevicePairing => "device_pairing",
         gateway_v1::ApprovalSubjectType::Unspecified => "unspecified",
     }
 }
@@ -3356,7 +3363,7 @@ fn redacted_dashboard_verification_report(
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct StoredGatewayCaState {
     certificate_pem: String,
 }
@@ -6016,7 +6023,6 @@ fn resolve_identity_store_root(store_dir: Option<String>) -> Result<PathBuf> {
     default_identity_store_root().context("failed to resolve default identity store root")
 }
 
-#[cfg(not(windows))]
 fn build_identity_store(store_root: &Path) -> Result<Arc<dyn SecretStore>> {
     let store = FilesystemSecretStore::new(store_root).with_context(|| {
         format!("failed to initialize secret store at {}", store_root.display())
@@ -6024,7 +6030,6 @@ fn build_identity_store(store_root: &Path) -> Result<Arc<dyn SecretStore>> {
     Ok(Arc::new(store))
 }
 
-#[cfg(not(windows))]
 fn build_pairing_method(method: PairingMethodArg, proof: &str) -> PairingMethod {
     match method {
         PairingMethodArg::Pin => PairingMethod::Pin { code: proof.to_owned() },
@@ -6032,7 +6037,6 @@ fn build_pairing_method(method: PairingMethodArg, proof: &str) -> PairingMethod 
     }
 }
 
-#[cfg(not(windows))]
 fn resolve_pairing_proof(
     proof: Option<String>,
     proof_stdin: bool,
@@ -6065,7 +6069,6 @@ fn resolve_pairing_proof(
     )
 }
 
-#[cfg(not(windows))]
 fn to_identity_client_kind(value: PairingClientKindArg) -> PairingClientKind {
     match value {
         PairingClientKindArg::Cli => PairingClientKind::Cli,

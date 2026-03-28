@@ -89,6 +89,7 @@ pub enum ApprovalSubjectTypeArg {
     SecretAccess,
     BrowserAction,
     NodeCapability,
+    DevicePairing,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

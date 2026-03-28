@@ -14,14 +14,16 @@ mod config;
 mod configure;
 mod cron;
 mod daemon;
+mod devices;
 mod docs;
 mod hooks;
 mod init;
 mod memory;
 mod message;
 mod models;
+mod node;
+mod nodes;
 mod onboarding;
-#[cfg(not(windows))]
 mod pairing;
 mod patch;
 mod plugins;
@@ -68,18 +70,20 @@ pub use config::ConfigCommand;
 pub use configure::ConfigureSectionArg;
 pub use cron::{CronCommand, CronConcurrencyPolicyArg, CronMisfirePolicyArg, CronScheduleTypeArg};
 pub use daemon::{DaemonCommand, JournalCheckpointModeArg};
+pub use devices::DevicesCommand;
 pub use docs::DocsCommand;
 pub use hooks::HooksCommand;
 pub use init::{InitModeArg, InitTlsScaffoldArg};
 pub use memory::{MemoryCommand, MemoryScopeArg, MemorySourceArg};
 pub use message::MessageCommand;
 pub use models::ModelsCommand;
+pub use node::NodeCommand;
+pub use nodes::NodesCommand;
 pub use onboarding::{
     GatewayBindProfileArg, OnboardingAuthMethodArg, OnboardingCommand, OnboardingFlowArg,
     RemoteVerificationModeArg, SetupWizardOverridesArg, WizardOverridesArg,
 };
-#[cfg(not(windows))]
-pub use pairing::{PairingClientKindArg, PairingCommand, PairingMethodArg};
+pub use pairing::{PairingClientKindArg, PairingCommand, PairingMethodArg, PairingStateArg};
 pub use patch::PatchCommand;
 pub use plugins::PluginsCommand;
 pub use policy::PolicyCommand;
@@ -500,6 +504,18 @@ pub enum Command {
         #[command(subcommand)]
         command: HooksCommand,
     },
+    Devices {
+        #[command(subcommand)]
+        command: DevicesCommand,
+    },
+    Node {
+        #[command(subcommand)]
+        command: NodeCommand,
+    },
+    Nodes {
+        #[command(subcommand)]
+        command: NodesCommand,
+    },
     #[command(
         about = "Operate the browser service and browser-backed automation sessions",
         after_long_help = BROWSER_AFTER_HELP
@@ -705,7 +721,6 @@ pub enum Command {
         #[arg(long)]
         identity_file: Option<String>,
     },
-    #[cfg(not(windows))]
     Pairing {
         #[command(subcommand)]
         command: PairingCommand,

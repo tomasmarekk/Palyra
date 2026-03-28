@@ -8,6 +8,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gateway_proto = proto_root.join("palyra/v1/gateway.proto");
     let cron_proto = proto_root.join("palyra/v1/cron.proto");
     let memory_proto = proto_root.join("palyra/v1/memory.proto");
+    let node_proto = proto_root.join("palyra/v1/node.proto");
     let auth_proto = proto_root.join("palyra/v1/auth.proto");
     let browser_proto = proto_root.join("palyra/v1/browser.proto");
     let common_proto = proto_root.join("palyra/v1/common.proto");
@@ -15,12 +16,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed={}", gateway_proto.display());
     println!("cargo:rerun-if-changed={}", cron_proto.display());
     println!("cargo:rerun-if-changed={}", memory_proto.display());
+    println!("cargo:rerun-if-changed={}", node_proto.display());
     println!("cargo:rerun-if-changed={}", auth_proto.display());
     println!("cargo:rerun-if-changed={}", browser_proto.display());
     println!("cargo:rerun-if-changed={}", common_proto.display());
 
     tonic_prost_build::configure().build_server(false).build_client(true).compile_protos(
-        &[gateway_proto, cron_proto, memory_proto, auth_proto, browser_proto, common_proto],
+        &[
+            gateway_proto,
+            cron_proto,
+            memory_proto,
+            node_proto,
+            auth_proto,
+            browser_proto,
+            common_proto,
+        ],
         &[proto_root],
     )?;
 
