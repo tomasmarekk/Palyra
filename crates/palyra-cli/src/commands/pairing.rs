@@ -130,7 +130,7 @@ async fn run_pairing_async(command: PairingCommand) -> Result<()> {
             store_dir,
             approve,
             simulate_rotation,
-        } => run_legacy_pairing(
+        } => run_legacy_pairing(LegacyPairingArgs {
             device_id,
             client_kind,
             method,
@@ -140,11 +140,11 @@ async fn run_pairing_async(command: PairingCommand) -> Result<()> {
             store_dir,
             approve,
             simulate_rotation,
-        ),
+        }),
     }
 }
 
-fn run_legacy_pairing(
+struct LegacyPairingArgs {
     device_id: String,
     client_kind: PairingClientKindArg,
     method: PairingMethodArg,
@@ -154,26 +154,28 @@ fn run_legacy_pairing(
     store_dir: Option<String>,
     approve: bool,
     simulate_rotation: bool,
-) -> Result<()> {
-    if !approve {
+}
+
+fn run_legacy_pairing(args: LegacyPairingArgs) -> Result<()> {
+    if !args.approve {
         anyhow::bail!(
             "decision=deny_by_default approval_required=true reason=pairing requires explicit --approve"
         );
     }
 
-    let store_root = resolve_identity_store_root(store_dir)?;
+    let store_root = resolve_identity_store_root(args.store_dir)?;
     let store = build_identity_store(&store_root)?;
     let mut manager = IdentityManager::with_store(store.clone())
         .context("failed to initialize identity manager")?;
-    let proof = resolve_pairing_proof(proof, proof_stdin, allow_insecure_proof_arg)?;
-    let pairing_method = build_pairing_method(method, &proof);
+    let proof = resolve_pairing_proof(args.proof, args.proof_stdin, args.allow_insecure_proof_arg)?;
+    let pairing_method = build_pairing_method(args.method, &proof);
 
     let started_at = SystemTime::now();
     let session = manager
-        .start_pairing(to_identity_client_kind(client_kind), pairing_method, started_at)
+        .start_pairing(to_identity_client_kind(args.client_kind), pairing_method, started_at)
         .context("failed to start pairing session")?;
     let device =
-        DeviceIdentity::generate(&device_id).context("failed to generate device identity")?;
+        DeviceIdentity::generate(&args.device_id).context("failed to generate device identity")?;
 
     let hello = manager
         .build_device_hello(&session, &device, &proof)
@@ -184,7 +186,7 @@ fn run_legacy_pairing(
         .context("failed to complete pairing handshake")?;
     if let Err(store_error) = device.store(store.as_ref()) {
         let rollback = manager.revoke_device(
-            &device_id,
+            &args.device_id,
             "device identity persistence failed after pairing",
             SystemTime::now(),
         );
@@ -202,13 +204,16 @@ fn run_legacy_pairing(
         "pairing.status=paired device_id={} client_kind={} method={} store_root={}",
         result.device.device_id,
         result.device.client_kind.as_str(),
-        method.as_str(),
+        args.method.as_str(),
         store_root.display(),
     );
 
-    if simulate_rotation {
+    if args.simulate_rotation {
         manager
-            .rotate_device_certificate_if_due(&device_id, SystemTime::now() + DEFAULT_CERT_VALIDITY)
+            .rotate_device_certificate_if_due(
+                &args.device_id,
+                SystemTime::now() + DEFAULT_CERT_VALIDITY,
+            )
             .context("failed to rotate certificate in simulation mode")?;
         println!("pairing.rotation=simulated rotated=true");
     }

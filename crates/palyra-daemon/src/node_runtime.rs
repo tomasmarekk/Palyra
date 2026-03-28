@@ -168,14 +168,9 @@ struct CapabilityRuntimeState {
     waiters_by_request_id: HashMap<String, oneshot::Sender<CapabilityExecutionResult>>,
 }
 
+#[derive(Default)]
 struct ReservedPairingCodeState {
     by_session_id: HashMap<String, DevicePairingCodeRecord>,
-}
-
-impl Default for ReservedPairingCodeState {
-    fn default() -> Self {
-        Self { by_session_id: HashMap::new() }
-    }
 }
 
 pub(crate) struct NodeRuntimeState {

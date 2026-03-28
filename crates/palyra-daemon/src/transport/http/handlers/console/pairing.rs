@@ -130,7 +130,8 @@ async fn resolve_node_pairing_decision(
         .ok_or_else(|| {
             runtime_status_response(tonic::Status::not_found("pairing request was not found"))
         })?;
-    let decision_scope = parse_pairing_decision_scope(payload.decision_scope.as_deref())?;
+    let decision_scope = parse_pairing_decision_scope(payload.decision_scope.as_deref())
+        .map_err(runtime_status_response)?;
     let reason = payload
         .reason
         .as_deref()
@@ -189,7 +190,9 @@ async fn resolve_node_pairing_decision(
     }))
 }
 
-fn parse_pairing_decision_scope(value: Option<&str>) -> Result<ApprovalDecisionScope, Response> {
+fn parse_pairing_decision_scope(
+    value: Option<&str>,
+) -> Result<ApprovalDecisionScope, tonic::Status> {
     let Some(raw) = value.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(ApprovalDecisionScope::Once);
     };
@@ -197,9 +200,9 @@ fn parse_pairing_decision_scope(value: Option<&str>) -> Result<ApprovalDecisionS
         "once" => Ok(ApprovalDecisionScope::Once),
         "session" => Ok(ApprovalDecisionScope::Session),
         "timeboxed" => Ok(ApprovalDecisionScope::Timeboxed),
-        _ => Err(runtime_status_response(tonic::Status::invalid_argument(
+        _ => Err(tonic::Status::invalid_argument(
             "decision_scope must be one of once|session|timeboxed",
-        ))),
+        )),
     }
 }
 
