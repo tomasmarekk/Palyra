@@ -579,6 +579,12 @@ pub mod palyra_node_v1 {
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct ExecuteCapabilityResponse;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct GetPairingRequestStatusRequest;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct GetPairingRequestStatusResponse;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct NodeCapabilityDispatch;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct NodeEventRequest;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct NodeEventResponse;
@@ -600,6 +606,7 @@ pub mod palyra_node_v1 {
         fn BeginPairingSession(&self);
         fn CompletePairingSession(&self);
         fn ExecuteCapability(&self);
+        fn GetPairingRequestStatus(&self);
         fn RegisterNode(&self);
         fn RevokeDevicePairing(&self);
         fn RotateDeviceCertificate(&self);

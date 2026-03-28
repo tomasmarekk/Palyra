@@ -805,6 +805,15 @@ public enum PalyraNodeV1 {
     public struct ExecuteCapabilityResponse: Equatable {
         public init() {}
     }
+    public struct GetPairingRequestStatusRequest: Equatable {
+        public init() {}
+    }
+    public struct GetPairingRequestStatusResponse: Equatable {
+        public init() {}
+    }
+    public struct NodeCapabilityDispatch: Equatable {
+        public init() {}
+    }
     public struct NodeEventRequest: Equatable {
         public init() {}
     }
@@ -836,6 +845,7 @@ public enum PalyraNodeV1 {
         func beginPairingSession()
         func completePairingSession()
         func executeCapability()
+        func getPairingRequestStatus()
         func registerNode()
         func revokeDevicePairing()
         func rotateDeviceCertificate()
