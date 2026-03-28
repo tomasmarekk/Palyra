@@ -174,7 +174,7 @@ struct ReservedPairingCodeState {
 }
 
 pub(crate) struct NodeRuntimeState {
-    state_path: CanonicalNodeRuntimeStatePath,
+    state_root: PathBuf,
     persisted: Mutex<PersistedNodeRuntimeState>,
     reserved_codes: Mutex<ReservedPairingCodeState>,
     capabilities: Mutex<CapabilityRuntimeState>,
@@ -182,47 +182,14 @@ pub(crate) struct NodeRuntimeState {
 
 impl std::fmt::Debug for NodeRuntimeState {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("NodeRuntimeState")
-            .field("state_path", &self.state_path.as_path())
-            .finish()
-    }
-}
-
-#[derive(Clone)]
-struct CanonicalNodeRuntimeStatePath {
-    path: PathBuf,
-}
-
-impl CanonicalNodeRuntimeStatePath {
-    fn resolve(state_root: &Path) -> Result<Self> {
-        anyhow::ensure!(
-            !state_root.as_os_str().is_empty(),
-            "node runtime state root must not be empty"
-        );
-        fs::create_dir_all(state_root).with_context(|| {
-            format!("failed to create node runtime state dir {}", state_root.display())
-        })?;
-        let canonical_state_root = fs::canonicalize(state_root).with_context(|| {
-            format!("failed to canonicalize node runtime state dir {}", state_root.display())
-        })?;
-        let path = canonical_state_root.join(NODE_RUNTIME_STATE_FILE_NAME);
-        let parent = path.parent().context("node runtime state path has no parent")?;
-        anyhow::ensure!(
-            parent == canonical_state_root,
-            "node runtime state path escapes the canonical state root"
-        );
-        Ok(Self { path })
-    }
-
-    fn as_path(&self) -> &Path {
-        self.path.as_path()
+        formatter.debug_struct("NodeRuntimeState").field("state_root", &self.state_root).finish()
     }
 }
 
 impl NodeRuntimeState {
     pub(crate) fn load(state_root: &Path) -> Result<Self> {
-        let state_path = CanonicalNodeRuntimeStatePath::resolve(state_root)?;
+        let state_root = resolve_canonical_state_root(state_root)?;
+        let state_path = state_root.join(NODE_RUNTIME_STATE_FILE_NAME);
         let persisted = if state_path.as_path().is_file() {
             let raw = fs::read(state_path.as_path()).with_context(|| {
                 format!("failed to read node runtime state {}", state_path.as_path().display())
@@ -234,7 +201,7 @@ impl NodeRuntimeState {
             PersistedNodeRuntimeState::default()
         };
         Ok(Self {
-            state_path,
+            state_root,
             persisted: Mutex::new(persisted),
             reserved_codes: Mutex::new(ReservedPairingCodeState::default()),
             capabilities: Mutex::new(CapabilityRuntimeState::default()),
@@ -553,13 +520,41 @@ impl NodeRuntimeState {
         let encoded = serde_json::to_vec_pretty(persisted).map_err(|error| {
             Status::internal(format!("failed to encode node runtime state: {error}"))
         })?;
-        fs::write(self.state_path.as_path(), encoded).map_err(|error| {
+        let canonical_state_root = fs::canonicalize(&self.state_root).map_err(|error| {
+            Status::internal(format!(
+                "failed to canonicalize node runtime state dir {}: {error}",
+                self.state_root.display()
+            ))
+        })?;
+        let state_path = canonical_state_root.join(NODE_RUNTIME_STATE_FILE_NAME);
+        let parent = state_path
+            .parent()
+            .ok_or_else(|| Status::internal("node runtime state path has no parent"))?;
+        if parent != canonical_state_root {
+            return Err(Status::internal(
+                "node runtime state path escapes the canonical state root",
+            ));
+        }
+        fs::write(&state_path, encoded).map_err(|error| {
             Status::internal(format!(
                 "failed to write node runtime state {}: {error}",
-                self.state_path.as_path().display()
+                state_path.display()
             ))
         })
     }
+}
+
+fn resolve_canonical_state_root(state_root: &Path) -> Result<PathBuf> {
+    anyhow::ensure!(
+        !state_root.as_os_str().is_empty(),
+        "node runtime state root must not be empty"
+    );
+    fs::create_dir_all(state_root).with_context(|| {
+        format!("failed to create node runtime state dir {}", state_root.display())
+    })?;
+    fs::canonicalize(state_root).with_context(|| {
+        format!("failed to canonicalize node runtime state dir {}", state_root.display())
+    })
 }
 
 fn generate_pairing_code(method: PairingCodeMethod) -> String {
@@ -635,7 +630,7 @@ pub(crate) fn parse_capability_result_payload(
 
 #[cfg(test)]
 mod tests {
-    use super::{CanonicalNodeRuntimeStatePath, NodeRuntimeState, NODE_RUNTIME_STATE_FILE_NAME};
+    use super::{resolve_canonical_state_root, NodeRuntimeState, NODE_RUNTIME_STATE_FILE_NAME};
     use tempfile::tempdir;
 
     #[test]
@@ -644,14 +639,11 @@ mod tests {
         let state_root = tempdir.path().join("runtime");
         std::fs::create_dir_all(&state_root).expect("state root should be created");
 
-        let state_path =
-            CanonicalNodeRuntimeStatePath::resolve(state_root.as_path()).expect("path should load");
-        let canonical_root = std::fs::canonicalize(&state_root).expect("root should canonicalize");
+        let canonical_root =
+            resolve_canonical_state_root(state_root.as_path()).expect("root should resolve");
+        let state_path = canonical_root.join(NODE_RUNTIME_STATE_FILE_NAME);
 
-        assert_eq!(
-            state_path.as_path(),
-            canonical_root.join(NODE_RUNTIME_STATE_FILE_NAME).as_path()
-        );
+        assert_eq!(state_path, canonical_root.join(NODE_RUNTIME_STATE_FILE_NAME));
     }
 
     #[test]
