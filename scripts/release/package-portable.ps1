@@ -47,6 +47,10 @@ if ($ArtifactKind -eq "desktop") {
 $resolvedDaemonBinary = Assert-FileExists -Path $DaemonBinaryPath -Label "Daemon binary"
 $resolvedBrowserBinary = Assert-FileExists -Path $BrowserBinaryPath -Label "Browser service binary"
 $resolvedCliBinary = Assert-FileExists -Path $CliBinaryPath -Label "CLI binary"
+$resolvedDocsRoot = Join-Path $repoRoot "docs"
+$resolvedHelpSnapshotsRoot = Join-Path $repoRoot "crates/palyra-cli/tests/help_snapshots"
+$null = Assert-FileExists -Path (Join-Path $resolvedDocsRoot "README.md") -Label "Operator docs index"
+$null = Assert-FileExists -Path (Join-Path $resolvedHelpSnapshotsRoot "docs-help.txt") -Label "CLI help snapshot bundle"
 $resolvedWebDistPath =
     if ([string]::IsNullOrWhiteSpace($WebDistPath)) {
         $null = Assert-FileExists -Path (Join-Path $repoRoot "apps/web/dist/index.html") -Label "Web dashboard bundle"
@@ -86,6 +90,8 @@ Copy-BinaryIntoPayload -SourcePath $resolvedCliBinary -LogicalName "palyra"
 
 Copy-Item -LiteralPath (Join-Path $repoRoot "LICENSE") -Destination (Join-Path $payloadRoot "LICENSE.txt") -Force
 Copy-Item -LiteralPath $resolvedWebDistPath -Destination (Join-Path $payloadRoot "web") -Recurse -Force
+Copy-Item -LiteralPath $resolvedDocsRoot -Destination (Join-Path $payloadRoot "docs") -Recurse -Force
+Copy-Item -LiteralPath $resolvedHelpSnapshotsRoot -Destination (Join-Path $payloadRoot "docs/help_snapshots") -Recurse -Force
 
 $installBody =
     if ($ArtifactKind -eq "desktop") {
@@ -98,7 +104,9 @@ Install
 1. Extract this archive into a dedicated directory.
 2. Keep `palyra-desktop-control-center`, `palyrad`, `palyra-browserd`, `palyra`, and the `web/` directory in the same directory.
 3. Treat `palyra` as a first-class entry point: either run it directly from this directory or expose it on your shell `PATH` with a shim or symlink.
-4. Launch the desktop control center binary from that directory.
+4. Review the installed operator surfaces with `palyra gateway --help`, `palyra browser --help`, `palyra docs --help`, `palyra update --help`, and `palyra uninstall --help`.
+5. Use `palyra docs search migration` for bundled offline operator and migration guidance.
+6. Launch the desktop control center binary from that directory.
 
 Update
 1. Close the running desktop control center and sidecars.
@@ -121,7 +129,10 @@ Install
 2. Treat `palyra` as a first-class entry point: either run it directly from this directory or expose it on your shell `PATH` with a shim or symlink.
 3. Run `palyra setup --mode remote --path <install-root>/config/palyra.toml --force`.
 4. Validate the generated config with `palyra config validate --path <install-root>/config/palyra.toml`.
-5. Start `palyrad` with `PALYRA_CONFIG=<install-root>/config/palyra.toml`.
+5. Review the installed operator surfaces with `palyra gateway --help`, `palyra browser --help`, `palyra node --help`, `palyra nodes --help`, `palyra docs --help`, `palyra update --help`, and `palyra uninstall --help`.
+6. Use `palyra docs search migration` for bundled offline operator and migration guidance.
+7. Start `palyrad` with `PALYRA_CONFIG=<install-root>/config/palyra.toml`.
+8. Start `palyra-browserd` only when browser automation is intentionally enabled by config.
 
 Update
 1. Stop `palyrad`.
@@ -152,18 +163,26 @@ Release notes for Palyra $Version
 
 - Portable desktop bundles now ship the desktop control center, `palyrad`, `palyra-browserd`, `palyra`, and the colocated `web/` dashboard bundle, with installer support for exposing `palyra` as a user-scoped command.
 - Portable headless packages now ship repeatable archive-based install/update flow with `palyra setup`, config initialization/migration validation, and installer support for exposing `palyra` as a user-scoped command.
+- Portable packages now bundle offline operator docs plus CLI help snapshots so `palyra docs` remains usable outside a source checkout.
+- Windows and macOS remain the supported v1 desktop runtime targets; the Linux desktop bundle continues as a release-regression/package artifact until the Tauri Linux dependency chain is unblocked.
 - Release artifacts now include SHA256 manifests, release manifests, provenance sidecars, and package-boundary validation.
-- Release packaging smoke validates archive layout plus post-install `palyra version`, `palyra --help`, and `palyra doctor --json`.
+- Release packaging smoke validates canonical lifecycle surfaces (`setup`, `gateway`, `onboarding wizard`) plus compatibility aliases (`init`, `daemon`, `onboard`) on installed packages before publication.
+- Installed packages expose release-ready browser, node, nodes, docs, update, and uninstall surfaces alongside the baseline diagnostics flows.
+- Browser parity remains transparent in release packaging: `browser console`, `browser pdf`, `browser select`, and `browser highlight` stay discoverable placeholders until their implementations land.
 "@
 
 $migrationNotesBody =
 @"
 Migration notes for Palyra $Version
 
+- Prefer `palyra setup` over `palyra init`; the alias remains supported for existing scripts, but new install and upgrade guidance uses `setup`.
+- Prefer `palyra gateway` over `palyra daemon`; the alias remains supported, while release docs and examples use `gateway`.
+- Guided onboarding remains under `palyra onboarding wizard`; `palyra onboard` stays as a shorthand compatibility alias for the onboarding family.
 - Desktop updates use archive replacement; keep the existing state root and replace only the install directory contents.
 - Headless updates require `palyra config migrate --path <config>` after unpacking new binaries and before restarting `palyrad`.
+- Use `palyra update --archive <zip> --dry-run` and `palyra uninstall --dry-run` to preview portable lifecycle operations before mutating an install.
 - Installer-driven CLI shims are user-scoped and reversible; uninstall cleanup should remove the shim only when it still points at the install being removed.
-- No state-root relocation is required for this release; support bundles and runtime databases stay outside the install directory.
+- No state-root relocation is required for this release; browser artifacts, support bundles, and runtime databases stay outside the install directory.
 "@
 
 Set-Content -LiteralPath (Join-Path $payloadRoot "README.txt") -Value $installBody -NoNewline

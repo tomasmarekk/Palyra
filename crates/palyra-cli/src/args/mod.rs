@@ -130,7 +130,7 @@ Canonical command map:
   reset      Destructive local recovery surface with explicit scope selection
   uninstall  Installer-aware package removal surface
   update     Package update/check orchestration surface
-  onboarding Operator onboarding workflows (`onboard` remains as a compatibility alias)
+  onboarding Operator onboarding workflows (`onboard` stays as the shorthand alias)
   webhooks   Webhook-backed integration management surface";
 
 const SETUP_AFTER_HELP: &str = "\
@@ -140,17 +140,17 @@ Examples:
   palyra setup --mode remote --path ./config/palyra.toml --force
 
 Discoverability:
-  Use `palyra onboarding wizard --flow quickstart` for full guided onboarding.
+  Use `palyra onboard wizard --flow quickstart` for the guided onboarding family.
   Use `palyra gateway status` after setup to verify runtime health.";
 
 const ONBOARDING_AFTER_HELP: &str = "\
 Examples:
-  palyra onboarding wizard
-  palyra onboarding wizard --flow manual
-  palyra onboarding wizard --flow remote --non-interactive --accept-risk --remote-base-url https://dashboard.example.com/
+  palyra onboard wizard
+  palyra onboard wizard --flow manual
+  palyra onboard wizard --flow remote --non-interactive --accept-risk --remote-base-url https://dashboard.example.com/
 
 Discoverability:
-  Use `palyra setup --wizard` for bootstrap-first routing into the onboarding wizard.";
+  Use `palyra setup --wizard` for bootstrap-first routing, or `palyra onboarding wizard` if you want the explicit long-form family name.";
 
 const CONFIGURE_AFTER_HELP: &str = "\
 Examples:
@@ -251,7 +251,7 @@ Examples:
   palyra docs show docs/architecture/browser-service-v1.md
 
 Discoverability:
-  `docs` indexes committed `docs/` markdown plus CLI help snapshots for local, offline lookup.";
+  `docs` indexes committed source docs in-repo and bundled docs/help snapshots from portable installs for local, offline lookup.";
 
 const BROWSER_AFTER_HELP: &str = "\
 Examples:
@@ -489,7 +489,7 @@ pub enum Command {
         command: WebhooksCommand,
     },
     #[command(
-        about = "Discover committed docs and CLI help snapshots locally",
+        about = "Discover bundled or committed operator docs and CLI help snapshots locally",
         after_long_help = DOCS_AFTER_HELP
     )]
     Docs {

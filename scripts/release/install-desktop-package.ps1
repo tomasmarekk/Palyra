@@ -57,6 +57,9 @@ try {
     Invoke-CommandQuiet -Command $cliExposure.command_path -Arguments @("--help")
     Invoke-CommandQuiet -Command "palyra" -Arguments @("version")
     Invoke-CommandQuiet -Command "palyra" -Arguments @("--help")
+    Invoke-CommandQuiet -Command "palyra" -Arguments @("gateway", "--help")
+    Invoke-CommandQuiet -Command "palyra" -Arguments @("browser", "--help")
+    Invoke-CommandQuiet -Command "palyra" -Arguments @("docs", "search", "migration")
     if ($null -ne $resolvedStateRoot) {
         Invoke-CommandQuiet -Command "palyra" -Arguments @("doctor", "--json")
     }

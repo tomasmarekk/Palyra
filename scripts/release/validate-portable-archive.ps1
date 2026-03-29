@@ -41,6 +41,8 @@ try {
         Assert-FileExists -Path (Join-Path $payloadRoot $requiredFile) -Label $requiredFile | Out-Null
     }
     Assert-FileExists -Path (Join-Path $payloadRoot "web/index.html") -Label "web/index.html" | Out-Null
+    Assert-FileExists -Path (Join-Path $payloadRoot "docs/README.md") -Label "docs/README.md" | Out-Null
+    Assert-FileExists -Path (Join-Path $payloadRoot "docs/help_snapshots/docs-help.txt") -Label "docs/help_snapshots/docs-help.txt" | Out-Null
 
     $requiredBinaries =
         if ($manifest.artifact_kind -eq "desktop") {

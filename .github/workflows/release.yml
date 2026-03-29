@@ -82,16 +82,23 @@ jobs:
 
           - Portable desktop release bundles now ship the desktop control center, `palyrad`, `palyra-browserd`, `palyra`, and the colocated `web/` dashboard bundle.
           - Portable headless release packages now ship repeatable archive-based install/update flow with config initialization and migration validation plus the colocated `web/` dashboard bundle.
+          - Windows and macOS remain the supported v1 desktop runtime targets; the Linux desktop bundle continues as a release-regression/package artifact until the Tauri Linux dependency chain is unblocked.
           - Release assets include SHA256 manifests, release manifests, provenance sidecars, and GitHub build attestations.
-          - Release packaging smoke now validates archive layout before release publication.
+          - Release packaging smoke now validates canonical lifecycle surfaces (`setup`, `gateway`, `onboarding wizard`) plus compatibility aliases (`init`, `daemon`, `onboard`) before release publication.
+          - Installed packages expose release-ready browser, node, nodes, docs, update, and uninstall surfaces alongside baseline diagnostics.
+          - Browser parity remains transparent in packaging: `browser console`, `browser pdf`, `browser select`, and `browser highlight` stay discoverable placeholders until their implementations land.
           "@.Trim()
 
           $migrationNotes = @"
           # Migration notes for Palyra $repoVersion
 
+          - Prefer `palyra setup` over `palyra init`; the alias remains supported for existing scripts, but new install and upgrade guidance uses `setup`.
+          - Prefer `palyra gateway` over `palyra daemon`; the alias remains supported, while release docs and examples use `gateway`.
+          - Guided onboarding remains under `palyra onboarding wizard`; `palyra onboard` stays as a shorthand compatibility alias for the onboarding family.
           - Desktop upgrades use archive replacement; stop the running app, replace the extracted install directory, and keep the existing state root.
           - Headless upgrades require `palyra config migrate --path <config>` after unpacking the new archive and before restarting `palyrad`.
-          - No state-root relocation is required; runtime databases and support bundles stay outside the install directory.
+          - Use `palyra update --archive <zip> --dry-run` and `palyra uninstall --dry-run` to preview portable lifecycle operations before mutating an install.
+          - No state-root relocation is required; runtime databases, browser artifacts, and support bundles stay outside the install directory.
           "@.Trim()
 
           Set-Content -LiteralPath $releaseNotesPath -Value $releaseNotes -NoNewline

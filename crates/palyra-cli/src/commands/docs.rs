@@ -1,5 +1,5 @@
 use std::{
-    fs,
+    env, fs,
     path::{Path, PathBuf},
 };
 
@@ -9,8 +9,16 @@ use serde::Serialize;
 use crate::DocsCommand;
 
 const DOCS_DIR: &str = "docs";
-const HELP_SNAPSHOTS_DIR: &str = "crates/palyra-cli/tests/help_snapshots";
+const HELP_SOURCE_DIR: &str = "crates/palyra-cli/tests/help_snapshots";
+const HELP_BUNDLED_DIR: &str = "docs/help_snapshots";
 const TOP_LEVEL_README: &str = "README.md";
+
+#[derive(Debug, Clone)]
+struct DocsLayout {
+    docs_root: PathBuf,
+    help_root: PathBuf,
+    readme_path: Option<PathBuf>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -182,17 +190,30 @@ fn emit_docs_show(index: &[IndexedDoc], requested: &str, json: bool) -> Result<(
 }
 
 fn build_docs_index() -> Result<Vec<IndexedDoc>> {
-    let repo_root = repo_root()?;
-    let docs_root = repo_root.join(DOCS_DIR);
-    let help_root = repo_root.join(HELP_SNAPSHOTS_DIR);
+    let layout = resolve_docs_layout()?;
 
     let mut entries = Vec::new();
-    index_tree(&docs_root, &docs_root, IndexedDocKind::Docs, &mut entries)?;
-    index_tree(&help_root, &help_root, IndexedDocKind::Help, &mut entries)?;
+    index_tree(
+        layout.docs_root.as_path(),
+        layout.docs_root.as_path(),
+        IndexedDocKind::Docs,
+        "docs",
+        &mut entries,
+    )?;
+    index_tree(
+        layout.help_root.as_path(),
+        layout.help_root.as_path(),
+        IndexedDocKind::Help,
+        "help",
+        &mut entries,
+    )?;
 
-    let readme_path = repo_root.join(TOP_LEVEL_README);
-    if readme_path.is_file() {
-        entries.push(load_indexed_doc(&repo_root, IndexedDocKind::Docs, readme_path.as_path())?);
+    if let Some(readme_path) = layout.readme_path.as_ref().filter(|path| path.is_file()) {
+        entries.push(load_indexed_doc(
+            IndexedDocKind::Docs,
+            readme_path.as_path(),
+            TOP_LEVEL_README.to_owned(),
+        )?);
     }
 
     entries.sort_by(|left, right| left.slug.cmp(&right.slug));
@@ -203,6 +224,7 @@ fn index_tree(
     root: &Path,
     current: &Path,
     kind: IndexedDocKind,
+    logical_prefix: &str,
     entries: &mut Vec<IndexedDoc>,
 ) -> Result<()> {
     for entry in fs::read_dir(current)
@@ -212,34 +234,44 @@ fn index_tree(
             .with_context(|| format!("failed to enumerate docs entry in {}", current.display()))?;
         let path = entry.path();
         if path.is_dir() {
-            index_tree(root, &path, kind, entries)?;
+            index_tree(root, &path, kind, logical_prefix, entries)?;
             continue;
         }
         if !is_indexable_doc_path(&path) {
             continue;
         }
-        entries.push(load_indexed_doc(root, kind, path.as_path())?);
+        let relative = path
+            .strip_prefix(root)
+            .with_context(|| format!("failed to relativize docs path {}", path.display()))?;
+        let normalized_relative = normalize_display_path(relative);
+        let logical_relative = if normalized_relative.is_empty() {
+            logical_prefix.to_owned()
+        } else {
+            format!("{logical_prefix}/{normalized_relative}")
+        };
+        entries.push(load_indexed_doc(kind, path.as_path(), logical_relative)?);
     }
     Ok(())
 }
 
-fn load_indexed_doc(repo_root: &Path, kind: IndexedDocKind, path: &Path) -> Result<IndexedDoc> {
+fn load_indexed_doc(
+    kind: IndexedDocKind,
+    path: &Path,
+    logical_relative: String,
+) -> Result<IndexedDoc> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("failed to read committed docs file {}", path.display()))?;
-    let relative = path
-        .strip_prefix(repo_root)
-        .with_context(|| format!("failed to relativize docs path {}", path.display()))?;
     Ok(IndexedDoc {
-        slug: doc_slug(relative, kind),
-        title: doc_title(relative, &content),
+        slug: doc_slug(logical_relative.as_str(), kind),
+        title: doc_title(path, &content),
         kind,
-        relative_path: normalize_display_path(relative),
+        relative_path: logical_relative,
         absolute_path: path.to_path_buf(),
         content,
     })
 }
 
-fn repo_root() -> Result<PathBuf> {
+fn source_repo_root() -> Result<PathBuf> {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest_dir
         .parent()
@@ -248,12 +280,47 @@ fn repo_root() -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("failed to resolve repository root from CLI manifest directory"))
 }
 
+fn resolve_docs_layout() -> Result<DocsLayout> {
+    let source_root = source_repo_root()?;
+    let source_docs = source_root.join(DOCS_DIR);
+    let source_help = source_root.join(HELP_SOURCE_DIR);
+    if source_docs.is_dir() && source_help.is_dir() {
+        return Ok(DocsLayout {
+            docs_root: source_docs,
+            help_root: source_help,
+            readme_path: Some(source_root.join(TOP_LEVEL_README)),
+        });
+    }
+
+    let current_exe = env::current_exe().context("failed to resolve current CLI executable")?;
+    let install_root = current_exe.parent().map(Path::to_path_buf).ok_or_else(|| {
+        anyhow!("failed to resolve install root from current CLI path {}", current_exe.display())
+    })?;
+    let bundled_docs = install_root.join(DOCS_DIR);
+    let bundled_help = install_root.join(HELP_BUNDLED_DIR);
+    if bundled_docs.is_dir() && bundled_help.is_dir() {
+        return Ok(DocsLayout {
+            docs_root: bundled_docs,
+            help_root: bundled_help,
+            readme_path: None,
+        });
+    }
+
+    bail!(
+        "docs index roots are unavailable; expected either source docs at {} and {} or bundled docs at {} and {}",
+        source_docs.display(),
+        source_help.display(),
+        bundled_docs.display(),
+        bundled_help.display()
+    )
+}
+
 fn is_indexable_doc_path(path: &Path) -> bool {
     matches!(path.extension().and_then(|value| value.to_str()), Some("md" | "txt"))
 }
 
-fn doc_slug(relative: &Path, kind: IndexedDocKind) -> String {
-    let mut without_extension = relative.to_path_buf();
+fn doc_slug(logical_relative: &str, kind: IndexedDocKind) -> String {
+    let mut without_extension = PathBuf::from(logical_relative);
     without_extension.set_extension("");
     let normalized = normalize_display_path(&without_extension);
     if normalized.eq_ignore_ascii_case("README") {
@@ -263,9 +330,7 @@ fn doc_slug(relative: &Path, kind: IndexedDocKind) -> String {
         return normalized[..normalized.len() - "/README".len()].to_ascii_lowercase();
     }
     if kind == IndexedDocKind::Help {
-        return normalized
-            .replacen("crates/palyra-cli/tests/help_snapshots/", "help/", 1)
-            .to_ascii_lowercase();
+        return normalized.to_ascii_lowercase();
     }
     normalized.trim_start_matches("docs/").to_ascii_lowercase()
 }
@@ -343,30 +408,26 @@ fn resolve_requested_doc_by_path<'a>(
     index: &'a [IndexedDoc],
     requested: &str,
 ) -> Result<Option<&'a IndexedDoc>> {
-    let repo_root = repo_root()?;
+    let layout = resolve_docs_layout()?;
     let candidate = PathBuf::from(requested);
-    let candidate = if candidate.is_absolute() { candidate } else { repo_root.join(candidate) };
+    let candidate =
+        if candidate.is_absolute() { candidate } else { env::current_dir()?.join(candidate) };
     if !candidate.exists() {
         return Ok(None);
     }
     let canonical = candidate
         .canonicalize()
         .with_context(|| format!("failed to canonicalize docs path {}", candidate.display()))?;
-    let docs_root = repo_root.join(DOCS_DIR).canonicalize().with_context(|| {
-        format!("failed to canonicalize docs directory {}", repo_root.join(DOCS_DIR).display())
+    let docs_root = layout.docs_root.canonicalize().with_context(|| {
+        format!("failed to canonicalize docs directory {}", layout.docs_root.display())
     })?;
-    let help_root = repo_root.join(HELP_SNAPSHOTS_DIR).canonicalize().with_context(|| {
-        format!(
-            "failed to canonicalize help snapshots directory {}",
-            repo_root.join(HELP_SNAPSHOTS_DIR).display()
-        )
+    let help_root = layout.help_root.canonicalize().with_context(|| {
+        format!("failed to canonicalize help snapshots directory {}", layout.help_root.display())
     })?;
-    let readme_path = repo_root.join(TOP_LEVEL_README).canonicalize().with_context(|| {
-        format!("failed to canonicalize {}", repo_root.join(TOP_LEVEL_README).display())
-    })?;
+    let readme_path = layout.readme_path.as_ref().and_then(|path| path.canonicalize().ok());
     let allowed = canonical.starts_with(&docs_root)
         || canonical.starts_with(&help_root)
-        || canonical == readme_path;
+        || readme_path.as_ref().is_some_and(|path| canonical == *path);
     if !allowed {
         bail!("docs show only allows committed docs/ and CLI help snapshot paths");
     }
@@ -391,7 +452,7 @@ fn match_count(haystack: &str, needle: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{doc_title, match_count, normalize_requested_doc};
+    use super::{doc_slug, doc_title, match_count, normalize_requested_doc, IndexedDocKind};
     use std::path::Path;
 
     #[test]
@@ -408,6 +469,11 @@ mod tests {
             doc_title(Path::new("docs/example.md"), "# Example Title\n\nBody"),
             "Example Title"
         );
+    }
+
+    #[test]
+    fn doc_slug_keeps_bundled_help_prefix() {
+        assert_eq!(doc_slug("help/docs-help.txt", IndexedDocKind::Help), "help/docs-help");
     }
 
     #[test]

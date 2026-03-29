@@ -30,9 +30,9 @@ Global Options:
       --no-color
 
 Examples:
-  palyra onboarding wizard
-  palyra onboarding wizard --flow manual
-  palyra onboarding wizard --flow remote --non-interactive --accept-risk --remote-base-url https://dashboard.example.com/
+  palyra onboard wizard
+  palyra onboard wizard --flow manual
+  palyra onboard wizard --flow remote --non-interactive --accept-risk --remote-base-url https://dashboard.example.com/
 
 Discoverability:
-  Use `palyra setup --wizard` for bootstrap-first routing into the onboarding wizard.
+  Use `palyra setup --wizard` for bootstrap-first routing, or `palyra onboarding wizard` if you want the explicit long-form family name.

@@ -58,12 +58,17 @@ try {
     Invoke-CommandQuiet -Command $cliBinary -Arguments @("version")
     Invoke-CommandQuiet -Command $daemonBinary -Arguments @("--help")
     Invoke-CommandQuiet -Command $browserBinary -Arguments @("--help")
-    Invoke-CommandQuiet -Command $cliBinary -Arguments @("init", "--mode", "remote", "--path", $resolvedConfigPath, "--force")
+    Invoke-CommandQuiet -Command $cliBinary -Arguments @("setup", "--mode", "remote", "--path", $resolvedConfigPath, "--force")
     Invoke-CommandQuiet -Command $cliBinary -Arguments @("config", "validate", "--path", $resolvedConfigPath)
     Invoke-CommandQuiet -Command $cliExposure.command_path -Arguments @("version")
     Invoke-CommandQuiet -Command $cliExposure.command_path -Arguments @("--help")
     Invoke-CommandQuiet -Command "palyra" -Arguments @("version")
     Invoke-CommandQuiet -Command "palyra" -Arguments @("--help")
+    Invoke-CommandQuiet -Command "palyra" -Arguments @("gateway", "--help")
+    Invoke-CommandQuiet -Command "palyra" -Arguments @("browser", "--help")
+    Invoke-CommandQuiet -Command "palyra" -Arguments @("node", "--help")
+    Invoke-CommandQuiet -Command "palyra" -Arguments @("nodes", "--help")
+    Invoke-CommandQuiet -Command "palyra" -Arguments @("docs", "search", "migration")
     Invoke-CommandQuiet -Command "palyra" -Arguments @("doctor", "--json")
 }
 finally {

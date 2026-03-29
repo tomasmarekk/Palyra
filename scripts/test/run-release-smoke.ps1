@@ -43,10 +43,33 @@ function Invoke-InstalledCliSmoke {
         [string]$ExpectedCommandRoot,
         [Parameter(Mandatory = $true)]
         [string]$StateRoot,
-        [string]$ConfigPath
+        [string]$ConfigPath,
+        [Parameter(Mandatory = $true)]
+        [string]$InstallRoot,
+        [Parameter(Mandatory = $true)]
+        [string]$ArchivePath
     )
 
     Assert-CommandResolvesFromRoot -CommandName "palyra" -ExpectedRoot $ExpectedCommandRoot
+
+    $helpCommands = @(
+        @("setup", "--help"),
+        @("init", "--help"),
+        @("onboarding", "--help"),
+        @("onboarding", "wizard", "--help"),
+        @("onboard", "wizard", "--help"),
+        @("gateway", "--help"),
+        @("daemon", "--help"),
+        @("dashboard", "--help"),
+        @("channels", "--help"),
+        @("browser", "--help"),
+        @("node", "--help"),
+        @("nodes", "--help"),
+        @("docs", "--help"),
+        @("update", "--help"),
+        @("uninstall", "--help"),
+        @("support-bundle", "--help")
+    )
 
     $previousStateRoot = $env:PALYRA_STATE_ROOT
     $previousConfigPath = $env:PALYRA_CONFIG
@@ -61,6 +84,25 @@ function Invoke-InstalledCliSmoke {
         Invoke-CommandQuiet -Command "palyra" -Arguments @("version")
         Invoke-CommandQuiet -Command "palyra" -Arguments @("--help")
         Invoke-CommandQuiet -Command "palyra" -Arguments @("doctor", "--json")
+        Invoke-CommandQuiet -Command "palyra" -Arguments @("docs", "search", "migration")
+        Invoke-CommandQuiet -Command "palyra" -Arguments @("docs", "show", "release-validation-checklist")
+        foreach ($command in $helpCommands) {
+            Invoke-CommandQuiet -Command "palyra" -Arguments $command
+        }
+        Invoke-CommandQuiet -Command "palyra" -Arguments @(
+            "update",
+            "--install-root",
+            $InstallRoot,
+            "--archive",
+            $ArchivePath,
+            "--dry-run"
+        )
+        Invoke-CommandQuiet -Command "palyra" -Arguments @(
+            "uninstall",
+            "--install-root",
+            $InstallRoot,
+            "--dry-run"
+        )
     }
     finally {
         if ($null -eq $previousStateRoot) {
@@ -146,7 +188,11 @@ $desktopInstallOutput = & (Join-Path $repoRoot "scripts/release/install-desktop-
     -Force
 $desktopInstallMetadata = Convert-KeyValueOutputToHashtable -Lines $desktopInstallOutput
 $resolvedDesktopCommandRoot = $desktopInstallMetadata["cli_command_root"]
-Invoke-InstalledCliSmoke -ExpectedCommandRoot $resolvedDesktopCommandRoot -StateRoot $desktopStateRoot
+Invoke-InstalledCliSmoke `
+    -ExpectedCommandRoot $resolvedDesktopCommandRoot `
+    -StateRoot $desktopStateRoot `
+    -InstallRoot $desktopInstallRoot `
+    -ArchivePath $desktopArchive
 
 $headlessInstallOutput = & (Join-Path $repoRoot "scripts/release/install-headless-package.ps1") `
     -ArchivePath $headlessArchive `
@@ -159,7 +205,12 @@ $headlessInstallOutput = & (Join-Path $repoRoot "scripts/release/install-headles
     -SkipSystemdUnit:$IsWindows
 $headlessInstallMetadata = Convert-KeyValueOutputToHashtable -Lines $headlessInstallOutput
 $resolvedHeadlessCommandRoot = $headlessInstallMetadata["cli_command_root"]
-Invoke-InstalledCliSmoke -ExpectedCommandRoot $resolvedHeadlessCommandRoot -StateRoot $headlessStateRoot -ConfigPath $headlessConfigPath
+Invoke-InstalledCliSmoke `
+    -ExpectedCommandRoot $resolvedHeadlessCommandRoot `
+    -StateRoot $headlessStateRoot `
+    -ConfigPath $headlessConfigPath `
+    -InstallRoot $headlessInstallRoot `
+    -ArchivePath $headlessArchive
 
 $provenancePath = Join-Path $outputRoot "release-provenance.json"
 & (Join-Path $repoRoot "scripts/release/generate-release-provenance.ps1") `
@@ -172,7 +223,12 @@ $provenancePath = Join-Path $outputRoot "release-provenance.json"
     -RemoveStateRoot | Out-Null
 
 Assert-CommandResolvesFromRoot -CommandName "palyra" -ExpectedRoot $resolvedHeadlessCommandRoot
-Invoke-InstalledCliSmoke -ExpectedCommandRoot $resolvedHeadlessCommandRoot -StateRoot $headlessStateRoot -ConfigPath $headlessConfigPath
+Invoke-InstalledCliSmoke `
+    -ExpectedCommandRoot $resolvedHeadlessCommandRoot `
+    -StateRoot $headlessStateRoot `
+    -ConfigPath $headlessConfigPath `
+    -InstallRoot $headlessInstallRoot `
+    -ArchivePath $headlessArchive
 
 & (Join-Path $repoRoot "scripts/release/uninstall-package.ps1") `
     -InstallRoot $headlessInstallRoot `

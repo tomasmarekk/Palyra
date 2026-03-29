@@ -104,5 +104,5 @@ Examples:
   palyra setup --mode remote --path ./config/palyra.toml --force
 
 Discoverability:
-  Use `palyra onboarding wizard --flow quickstart` for full guided onboarding.
+  Use `palyra onboard wizard --flow quickstart` for the guided onboarding family.
   Use `palyra gateway status` after setup to verify runtime health.

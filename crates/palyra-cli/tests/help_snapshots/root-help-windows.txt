@@ -21,7 +21,7 @@ Commands:
   auth
   channels
   webhooks        Manage webhook-backed integrations
-  docs            Discover committed docs and CLI help snapshots locally
+  docs            Discover bundled or committed operator docs and CLI help snapshots locally
   plugins
   hooks
   devices
@@ -105,5 +105,5 @@ Canonical command map:
   reset      Destructive local recovery surface with explicit scope selection
   uninstall  Installer-aware package removal surface
   update     Package update/check orchestration surface
-  onboarding Operator onboarding workflows (`onboard` remains as a compatibility alias)
+  onboarding Operator onboarding workflows (`onboard` stays as the shorthand alias)
   webhooks   Webhook-backed integration management surface

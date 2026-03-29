@@ -1,4 +1,4 @@
-Discover committed docs and CLI help snapshots locally
+Discover bundled or committed operator docs and CLI help snapshots locally
 
 Usage: palyra docs [OPTIONS] <COMMAND>
 
@@ -40,4 +40,4 @@ Examples:
   palyra docs show docs/architecture/browser-service-v1.md
 
 Discoverability:
-  `docs` indexes committed `docs/` markdown plus CLI help snapshots for local, offline lookup.
+  `docs` indexes committed source docs in-repo and bundled docs/help snapshots from portable installs for local, offline lookup.
