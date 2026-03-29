@@ -39,7 +39,7 @@ fi
 
 CARGO_BIN="$(resolve_cargo)"
 
-"$CARGO_BIN" build -p palyra-daemon --bin palyrad -p palyra-browserd -p palyra-cli --locked
+"$CARGO_BIN" build -p palyra-daemon --bin palyrad -p palyra-browserd --bin palyra-browserd -p palyra-cli --locked
 
 "$CARGO_BIN" test -p palyra-cli --test wizard_cli --locked -- --test-threads=1
 "$CARGO_BIN" test -p palyra-cli --test cli_v1_acp_shim --locked -- --test-threads=1
