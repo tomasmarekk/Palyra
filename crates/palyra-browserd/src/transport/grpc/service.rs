@@ -1924,8 +1924,11 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         }
         .min(session.budget.max_network_log_entries)
         .max(1);
-        let max_payload_bytes =
-            payload.max_payload_bytes.max(1).min(session.budget.max_network_log_bytes) as usize;
+        let max_payload_bytes = if payload.max_payload_bytes == 0 {
+            session.budget.max_network_log_bytes
+        } else {
+            payload.max_payload_bytes.min(session.budget.max_network_log_bytes)
+        } as usize;
 
         let start = tab.network_log.len().saturating_sub(limit);
         let mut truncated = start > 0;

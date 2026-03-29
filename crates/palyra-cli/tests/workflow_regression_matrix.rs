@@ -1,7 +1,7 @@
 use std::{
     fs,
-    io::{BufRead, BufReader, Read},
-    net::{SocketAddr, TcpStream},
+    io::{BufRead, BufReader, Read, Write},
+    net::{SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, ChildStderr, ChildStdout, Command, Output, Stdio},
     sync::mpsc,
@@ -11,6 +11,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use palyra_cli::proto::palyra::browser::v1 as browser_v1;
+use palyra_cli::proto::palyra::gateway::v1 as gateway_v1;
 use reqwest::blocking::Client as BlockingClient;
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -285,11 +286,13 @@ fn browser_channels_and_session_workflows_are_regression_tested() -> Result<()> 
     let base_url = format!("http://127.0.0.1:{admin_port}");
     let browser_endpoint = format!("http://127.0.0.1:{browser_grpc_port}");
     let browser_health_url = format!("http://127.0.0.1:{browser_health_port}");
+    let gateway_grpc_url = format!("http://127.0.0.1:{grpc_port}");
     let browser_config_path = workdir.path().join("browser-workflow").join("palyra.toml");
     write_browser_workflow_config(browser_config_path.as_path(), admin_port, grpc_port)?;
     let browser_config_path_string = browser_config_path.display().to_string();
     let browser_cli_env = browser_workflow_envs(
         browser_config_path_string.as_str(),
+        gateway_grpc_url.as_str(),
         browser_endpoint.as_str(),
         BROWSER_AUTH_TOKEN,
     );
@@ -345,6 +348,43 @@ fn browser_channels_and_session_workflows_are_regression_tested() -> Result<()> 
     assert_eq!(
         channel_refresh_payload.pointer("/connector/connector_id").and_then(Value::as_str),
         Some("discord:default")
+    );
+
+    let channel_verify_output = run_cli_json(
+        &workdir,
+        &[
+            "channels",
+            "discord",
+            "verify",
+            "--account-id",
+            "default",
+            "--to",
+            "channel:1234567890",
+            "--text",
+            "workflow regression verify",
+            "--confirm",
+            "--url",
+            base_url.as_str(),
+            "--token",
+            ADMIN_TOKEN,
+            "--principal",
+            "admin:local",
+            "--device-id",
+            DEVICE_ID,
+            "--channel",
+            "cli",
+        ],
+        &browser_cli_env,
+    )?;
+    let channel_verify_payload =
+        assert_json_success(channel_verify_output, "channels discord verify")?;
+    assert!(
+        channel_verify_payload.get("dispatch").is_some(),
+        "channels discord verify should return dispatch payload"
+    );
+    assert!(
+        channel_verify_payload.get("status").is_some(),
+        "channels discord verify should return status payload"
     );
 
     let browser_status_output = run_cli_json(
@@ -424,13 +464,6 @@ fn browser_channels_and_session_workflows_are_regression_tested() -> Result<()> 
         Some("cli")
     );
     assert_eq!(
-        sessions
-            .first()
-            .and_then(|session| session.get("allow_private_targets"))
-            .and_then(Value::as_bool),
-        Some(true)
-    );
-    assert_eq!(
         sessions.first().and_then(|session| session.get("profile_id")).and_then(Value::as_str),
         None
     );
@@ -455,46 +488,242 @@ fn browser_channels_and_session_workflows_are_regression_tested() -> Result<()> 
     assert_eq!(tabs_payload.get("success").and_then(Value::as_bool), Some(true));
     assert!(tabs_payload.get("tabs").and_then(Value::as_array).is_some_and(|tabs| tabs.len() == 1));
 
-    let permissions_get_output = run_cli_json(
-        &workdir,
-        &["browser", "permissions", session_id.as_str(), "get"],
-        &browser_cli_env,
+    let fixture = StaticHttpFixture::new(
+        "<!doctype html><html><head><title>Workflow Fixture</title></head><body><main><h1>Browser Matrix</h1><p id=\"status\">browser matrix ready</p></main></body></html>",
     )?;
-    let permissions_get_payload =
-        assert_json_success(permissions_get_output, "browser permissions get")?;
-    assert_eq!(permissions_get_payload.get("success").and_then(Value::as_bool), Some(true));
-
-    let permissions_set_output = run_cli_json(
+    let preflight_status = BlockingClient::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("failed to build fixture preflight client")?
+        .get(fixture.url())
+        .send()
+        .context("fixture preflight request should succeed")?
+        .error_for_status()
+        .context("fixture preflight response should be successful")?
+        .status();
+    assert!(preflight_status.is_success(), "fixture preflight should return success status");
+    let navigate_output = run_cli_json(
         &workdir,
         &[
             "browser",
-            "permissions",
+            "navigate",
             session_id.as_str(),
-            "set",
-            "--camera",
-            "allow",
-            "--microphone",
-            "deny",
-            "--location",
-            "allow",
+            "--url",
+            fixture.url(),
+            "--timeout-ms",
+            "2000",
+            "--allow-private-targets",
         ],
         &browser_cli_env,
     )?;
-    let permissions_set_payload =
-        assert_json_success(permissions_set_output, "browser permissions set")?;
-    assert_eq!(permissions_set_payload.get("success").and_then(Value::as_bool), Some(true));
+    let navigate_payload = assert_json_success(navigate_output, "browser navigate")?;
+    assert_eq!(navigate_payload.get("success").and_then(Value::as_bool), Some(true));
+    assert_eq!(navigate_payload.get("final_url").and_then(Value::as_str), Some(fixture.url()));
+    assert_eq!(navigate_payload.get("title").and_then(Value::as_str), Some("Workflow Fixture"));
+
+    let wait_output = run_cli_json(
+        &workdir,
+        &[
+            "browser",
+            "wait",
+            session_id.as_str(),
+            "--text",
+            "browser matrix ready",
+            "--timeout-ms",
+            "2000",
+        ],
+        &browser_cli_env,
+    )?;
+    let wait_payload = assert_json_success(wait_output, "browser wait")?;
+    assert_eq!(wait_payload.get("success").and_then(Value::as_bool), Some(true));
     assert_eq!(
-        permissions_set_payload.pointer("/permissions/camera").and_then(Value::as_str),
-        Some("allow")
+        wait_payload.get("matched_text").and_then(Value::as_str),
+        Some("browser matrix ready")
     );
+
+    let snapshot_path = workdir.path().join("artifacts").join("browser-snapshot.json");
+    let snapshot_path_string = snapshot_path.display().to_string();
+    let snapshot_output = run_cli_json(
+        &workdir,
+        &[
+            "browser",
+            "snapshot",
+            session_id.as_str(),
+            "--include-dom-snapshot",
+            "--include-visible-text",
+            "--output",
+            snapshot_path_string.as_str(),
+        ],
+        &browser_cli_env,
+    )?;
+    let snapshot_payload = assert_json_success(snapshot_output, "browser snapshot")?;
+    assert_eq!(snapshot_payload.get("success").and_then(Value::as_bool), Some(true));
     assert_eq!(
-        permissions_set_payload.pointer("/permissions/microphone").and_then(Value::as_str),
-        Some("deny")
+        snapshot_payload.get("output_path").and_then(Value::as_str),
+        Some(snapshot_path_string.as_str())
     );
+    assert!(snapshot_path.is_file(), "browser snapshot should write an artifact");
+    let snapshot_artifact = serde_json::from_slice::<Value>(
+        &fs::read(snapshot_path.as_path())
+            .with_context(|| format!("failed to read {}", snapshot_path.display()))?,
+    )
+    .context("browser snapshot artifact should contain valid JSON")?;
+    assert_eq!(snapshot_artifact.get("page_url").and_then(Value::as_str), Some(fixture.url()));
+
+    let screenshot_path = workdir.path().join("artifacts").join("browser-screenshot.png");
+    let screenshot_path_string = screenshot_path.display().to_string();
+    let screenshot_output = run_cli_json(
+        &workdir,
+        &[
+            "browser",
+            "screenshot",
+            session_id.as_str(),
+            "--output",
+            screenshot_path_string.as_str(),
+        ],
+        &browser_cli_env,
+    )?;
+    let screenshot_payload = assert_json_success(screenshot_output, "browser screenshot")?;
+    assert_eq!(screenshot_payload.get("success").and_then(Value::as_bool), Some(true));
     assert_eq!(
-        permissions_set_payload.pointer("/permissions/location").and_then(Value::as_str),
-        Some("allow")
+        screenshot_payload.get("output_path").and_then(Value::as_str),
+        Some(screenshot_path_string.as_str())
     );
+    assert_eq!(screenshot_payload.get("mime_type").and_then(Value::as_str), Some("image/png"));
+    assert!(screenshot_path.is_file(), "browser screenshot should write an artifact");
+    assert!(
+        fs::metadata(screenshot_path.as_path())
+            .with_context(|| format!("failed to stat {}", screenshot_path.display()))?
+            .len()
+            > 0
+    );
+
+    let network_output = run_cli_json(
+        &workdir,
+        &["browser", "network", session_id.as_str(), "--include-headers", "--limit", "10"],
+        &browser_cli_env,
+    )?;
+    let network_payload = assert_json_success(network_output, "browser network")?;
+    assert_eq!(network_payload.get("success").and_then(Value::as_bool), Some(true));
+    assert!(network_payload.get("entries").and_then(Value::as_array).is_some());
+    assert_eq!(network_payload.pointer("/page/limit").and_then(Value::as_u64), Some(10));
+
+    let trace_path = workdir.path().join("artifacts").join("browser-trace.json");
+    let trace_path_string = trace_path.display().to_string();
+    let trace_output = run_cli_json(
+        &workdir,
+        &["browser", "trace", session_id.as_str(), "--output", trace_path_string.as_str()],
+        &browser_cli_env,
+    )?;
+    let trace_payload = assert_json_success(trace_output, "browser trace")?;
+    assert_eq!(
+        trace_payload.get("output_path").and_then(Value::as_str),
+        Some(trace_path_string.as_str())
+    );
+    assert!(trace_path.is_file(), "browser trace should write an artifact");
+    let trace_artifact = serde_json::from_slice::<Value>(
+        &fs::read(trace_path.as_path())
+            .with_context(|| format!("failed to read {}", trace_path.display()))?,
+    )
+    .context("browser trace artifact should contain valid JSON")?;
+    assert!(
+        trace_artifact
+            .get("action_log")
+            .and_then(Value::as_array)
+            .is_some_and(|entries| !entries.is_empty()),
+        "browser trace should capture action log entries"
+    );
+    assert!(
+        trace_artifact
+            .get("network_log")
+            .and_then(Value::as_array)
+            .is_some_and(|entries| !entries.is_empty()),
+        "browser trace should capture network log entries"
+    );
+
+    let inspect_path = workdir.path().join("artifacts").join("browser-inspect.json");
+    let inspect_path_string = inspect_path.display().to_string();
+    let inspect_output = run_cli_json(
+        &workdir,
+        &[
+            "browser",
+            "session",
+            "inspect",
+            session_id.as_str(),
+            "--include-action-log",
+            "--include-network-log",
+            "--include-page-snapshot",
+            "--output",
+            inspect_path_string.as_str(),
+        ],
+        &browser_cli_env,
+    )?;
+    let inspect_payload = assert_json_success(inspect_output, "browser session inspect")?;
+    assert_eq!(
+        inspect_payload.get("output_path").and_then(Value::as_str),
+        Some(inspect_path_string.as_str())
+    );
+    assert!(inspect_path.is_file(), "browser session inspect should write an artifact");
+    let inspect_artifact = serde_json::from_slice::<Value>(
+        &fs::read(inspect_path.as_path())
+            .with_context(|| format!("failed to read {}", inspect_path.display()))?,
+    )
+    .context("browser session inspect artifact should contain valid JSON")?;
+    assert_eq!(
+        inspect_artifact.pointer("/session/summary/principal").and_then(Value::as_str),
+        Some("user:ops")
+    );
+    assert!(
+        inspect_artifact
+            .get("network_log")
+            .and_then(Value::as_array)
+            .is_some_and(|entries| !entries.is_empty()),
+        "browser session inspect should capture network log entries"
+    );
+
+    let sessions_resolve_output = run_cli_json(
+        &workdir,
+        &[
+            "sessions",
+            "resolve",
+            "--session-key",
+            "workflow:browser",
+            "--session-label",
+            "Workflow Browser",
+            "--json",
+        ],
+        &browser_cli_env,
+    )?;
+    let sessions_resolve_payload =
+        assert_json_success(sessions_resolve_output, "sessions resolve")?;
+    assert_eq!(sessions_resolve_payload.get("created").and_then(Value::as_bool), Some(true));
+    assert_eq!(sessions_resolve_payload.get("reset_applied").and_then(Value::as_bool), Some(false));
+    let gateway_session_id = resolve_gateway_session_id(
+        gateway_grpc_url.as_str(),
+        ADMIN_TOKEN,
+        "admin:local",
+        DEVICE_ID,
+        "cli",
+        "workflow:browser",
+    )?;
+
+    let sessions_show_output = run_cli_json(
+        &workdir,
+        &["sessions", "show", "--session-key", "workflow:browser", "--json"],
+        &browser_cli_env,
+    )?;
+    let sessions_show_payload = assert_json_success(sessions_show_output, "sessions show")?;
+    assert_eq!(sessions_show_payload.get("created").and_then(Value::as_bool), Some(false));
+    assert_eq!(sessions_show_payload.get("reset_applied").and_then(Value::as_bool), Some(false));
+    assert!(sessions_show_payload.get("session").is_some());
+
+    let sessions_reset_output = run_cli_json(
+        &workdir,
+        &["sessions", "reset", gateway_session_id.as_str(), "--json"],
+        &browser_cli_env,
+    )?;
+    let sessions_reset_payload = assert_json_success(sessions_reset_output, "sessions reset")?;
+    assert_eq!(sessions_reset_payload.get("reset_applied").and_then(Value::as_bool), Some(true));
 
     let browser_close_output = run_cli_json(
         &workdir,
@@ -509,12 +738,15 @@ fn browser_channels_and_session_workflows_are_regression_tested() -> Result<()> 
 
 fn browser_workflow_envs<'a>(
     config_path: &'a str,
+    gateway_grpc_url: &'a str,
     browser_grpc_url: &'a str,
     browser_auth_token: &'a str,
-) -> [(&'a str, &'a str); 5] {
+) -> [(&'a str, &'a str); 7] {
     [
         ("PALYRA_CONFIG", config_path),
         ("PALYRA_ADMIN_TOKEN", ADMIN_TOKEN),
+        ("PALYRA_ADMIN_BOUND_PRINCIPAL", "admin:local"),
+        ("PALYRA_GATEWAY_GRPC_URL", gateway_grpc_url),
         ("PALYRA_BROWSER_SERVICE_ENABLED", "true"),
         ("PALYRA_BROWSER_SERVICE_ENDPOINT", browser_grpc_url),
         ("PALYRA_BROWSER_SERVICE_AUTH_TOKEN", browser_auth_token),
@@ -632,6 +864,67 @@ fn seed_install_root(install_root: &Path) -> Result<()> {
     Ok(())
 }
 
+struct StaticHttpFixture {
+    url: String,
+    handle: Option<thread::JoinHandle<Result<()>>>,
+}
+
+impl StaticHttpFixture {
+    fn new(body: &str) -> Result<Self> {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").context("failed to bind fixture listener")?;
+        let address =
+            listener.local_addr().context("failed to resolve fixture listener address")?;
+        let body = body.to_owned();
+        let max_requests = 2usize;
+        let handle = thread::spawn(move || -> Result<()> {
+            for _ in 0..max_requests {
+                let (mut stream, _) =
+                    listener.accept().context("fixture listener failed to accept")?;
+                let _ = read_http_request(&mut stream)?;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .context("fixture listener failed to write response")?;
+                stream.flush().context("fixture listener failed to flush response")?;
+            }
+            Ok(())
+        });
+        Ok(Self { url: format!("http://{address}/"), handle: Some(handle) })
+    }
+
+    fn url(&self) -> &str {
+        self.url.as_str()
+    }
+}
+
+impl Drop for StaticHttpFixture {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn read_http_request(stream: &mut TcpStream) -> Result<Vec<u8>> {
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    loop {
+        let bytes_read = stream.read(&mut chunk).context("failed to read HTTP request bytes")?;
+        if bytes_read == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..bytes_read]);
+        if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+    }
+    Ok(buffer)
+}
+
 fn latest_browser_session_id(grpc_url: &str, auth_token: &str) -> Result<String> {
     let runtime = Runtime::new().context("failed to create Tokio runtime")?;
     runtime.block_on(async move {
@@ -661,6 +954,69 @@ fn latest_browser_session_id(grpc_url: &str, auth_token: &str) -> Result<String>
             .and_then(|summary| summary.session_id.as_ref())
             .map(|value| value.ulid.clone())
             .context("browser service returned no sessions after CLI create")
+    })
+}
+
+fn resolve_gateway_session_id(
+    grpc_url: &str,
+    admin_token: &str,
+    principal: &str,
+    device_id: &str,
+    command_channel: &str,
+    session_key: &str,
+) -> Result<String> {
+    let runtime = Runtime::new().context("failed to create Tokio runtime")?;
+    runtime.block_on(async move {
+        let grpc_channel = Endpoint::from_shared(grpc_url.to_owned())
+            .context("invalid gateway gRPC endpoint")?
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(5))
+            .connect()
+            .await
+            .context("failed to connect gateway gRPC endpoint")?;
+        let mut client =
+            gateway_v1::gateway_service_client::GatewayServiceClient::new(grpc_channel);
+        let mut request = Request::new(gateway_v1::ResolveSessionRequest {
+            v: 1,
+            session_id: None,
+            session_key: session_key.to_owned(),
+            session_label: String::new(),
+            require_existing: true,
+            reset_session: false,
+        });
+        request.metadata_mut().insert(
+            "authorization",
+            MetadataValue::try_from(format!("Bearer {admin_token}"))
+                .context("invalid authorization metadata")?,
+        );
+        request.metadata_mut().insert(
+            "x-palyra-principal",
+            MetadataValue::try_from(principal).context("invalid principal metadata")?,
+        );
+        request.metadata_mut().insert(
+            "x-palyra-device-id",
+            MetadataValue::try_from(device_id).context("invalid device-id metadata")?,
+        );
+        request.metadata_mut().insert(
+            "x-palyra-channel",
+            MetadataValue::try_from(command_channel).context("invalid channel metadata")?,
+        );
+        request.metadata_mut().insert(
+            "x-palyra-trace-id",
+            MetadataValue::try_from(Ulid::new().to_string())
+                .context("invalid trace-id metadata")?,
+        );
+        let response = client
+            .resolve_session(request)
+            .await
+            .context("resolve_session RPC failed")?
+            .into_inner();
+        response
+            .session
+            .as_ref()
+            .and_then(|session| session.session_id.as_ref())
+            .map(|value| value.ulid.clone())
+            .context("gateway returned no session_id for workflow session")
     })
 }
 
