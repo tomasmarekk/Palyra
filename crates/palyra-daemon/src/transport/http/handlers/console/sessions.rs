@@ -545,6 +545,7 @@ fn normalize_catalog_text(raw: &str, max_chars: usize) -> Option<String> {
     Some(truncated)
 }
 
+#[allow(clippy::result_large_err)]
 fn parse_session_catalog_cursor(raw: Option<&str>) -> Result<usize, Response> {
     let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(0);
