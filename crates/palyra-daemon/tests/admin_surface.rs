@@ -860,11 +860,7 @@ fn console_session_catalog_endpoints_require_session_and_csrf() -> Result<()> {
         .get(format!("http://127.0.0.1:{admin_port}/console/v1/sessions"))
         .send()
         .context("failed to call session catalog endpoint without session")?;
-    assert_eq!(
-        no_session.status().as_u16(),
-        403,
-        "session catalog endpoint must require session"
-    );
+    assert_eq!(no_session.status().as_u16(), 403, "session catalog endpoint must require session");
 
     let (cookie, csrf_token) = login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
 
@@ -906,9 +902,7 @@ fn console_session_catalog_endpoints_require_session_and_csrf() -> Result<()> {
     );
 
     let detail_response = client
-        .get(format!(
-            "http://127.0.0.1:{admin_port}/console/v1/sessions/{session_id}"
-        ))
+        .get(format!("http://127.0.0.1:{admin_port}/console/v1/sessions/{session_id}"))
         .header("Cookie", cookie.clone())
         .send()
         .context("failed to fetch session catalog detail")?
@@ -926,9 +920,7 @@ fn console_session_catalog_endpoints_require_session_and_csrf() -> Result<()> {
     );
 
     let archive_without_csrf = client
-        .post(format!(
-            "http://127.0.0.1:{admin_port}/console/v1/sessions/{session_id}/archive"
-        ))
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/sessions/{session_id}/archive"))
         .header("Cookie", cookie.clone())
         .send()
         .context("failed to archive session without csrf token")?;
@@ -939,9 +931,7 @@ fn console_session_catalog_endpoints_require_session_and_csrf() -> Result<()> {
     );
 
     let archive_response = client
-        .post(format!(
-            "http://127.0.0.1:{admin_port}/console/v1/sessions/{session_id}/archive"
-        ))
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/sessions/{session_id}/archive"))
         .header("Cookie", cookie.clone())
         .header("x-palyra-csrf-token", csrf_token.clone())
         .send()

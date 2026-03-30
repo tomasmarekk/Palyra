@@ -138,10 +138,8 @@ pub(crate) async fn console_sessions_list_handler(
 ) -> Result<Json<SessionCatalogListEnvelope>, Response> {
     let session = authorize_console_session(&state, &headers, false)?;
     let include_archived = query.include_archived.unwrap_or(false);
-    let limit = query
-        .limit
-        .unwrap_or(DEFAULT_SESSION_CATALOG_LIMIT)
-        .clamp(1, MAX_SESSION_CATALOG_LIMIT);
+    let limit =
+        query.limit.unwrap_or(DEFAULT_SESSION_CATALOG_LIMIT).clamp(1, MAX_SESSION_CATALOG_LIMIT);
     let cursor = parse_session_catalog_cursor(query.cursor.as_deref())?;
     let search = normalize_session_catalog_search(query.q.as_deref());
     let title_source = normalize_session_catalog_title_source(query.title_source.as_deref());
@@ -257,10 +255,7 @@ pub(crate) async fn console_session_detail_handler(
         .filter(|record| record.session_id == base.session_id && record.decision.is_none())
         .count();
     let record = build_session_catalog_record(&state, base, pending_approvals).await?;
-    Ok(Json(SessionCatalogDetailEnvelope {
-        contract: contract_descriptor(),
-        session: record,
-    }))
+    Ok(Json(SessionCatalogDetailEnvelope { contract: contract_descriptor(), session: record }))
 }
 
 pub(crate) async fn console_session_archive_handler(
@@ -290,7 +285,9 @@ pub(crate) async fn console_session_archive_handler(
         .map_err(runtime_status_response)?;
     let pending_approvals = approvals
         .iter()
-        .filter(|record| record.session_id == outcome.session.session_id && record.decision.is_none())
+        .filter(|record| {
+            record.session_id == outcome.session.session_id && record.decision.is_none()
+        })
         .count();
     let record = build_session_catalog_record(&state, outcome.session, pending_approvals).await?;
     Ok(Json(SessionCatalogMutationEnvelope {
@@ -421,11 +418,7 @@ async fn build_session_catalog_record(
     let tape_summary = if let Some(last_run_id) = session.last_run_id.as_ref() {
         match state
             .runtime
-            .orchestrator_tape_snapshot(
-                last_run_id.clone(),
-                None,
-                Some(SESSION_CATALOG_TAPE_LIMIT),
-            )
+            .orchestrator_tape_snapshot(last_run_id.clone(), None, Some(SESSION_CATALOG_TAPE_LIMIT))
             .await
         {
             Ok(snapshot) => summarize_session_tape(snapshot.events.as_slice()),
@@ -442,8 +435,10 @@ async fn build_session_catalog_record(
         .clone()
         .or_else(|| last_intent.clone())
         .or_else(|| tape_summary.first_user_message.clone());
-    let (title, title_source) = if let Some(label) =
-        session.session_label.as_deref().and_then(|value| normalize_catalog_text(value, SESSION_CATALOG_TITLE_LEN))
+    let (title, title_source) = if let Some(label) = session
+        .session_label
+        .as_deref()
+        .and_then(|value| normalize_catalog_text(value, SESSION_CATALOG_TITLE_LEN))
     {
         (label, "label".to_owned())
     } else if let Some(derived) = tape_summary
@@ -489,10 +484,7 @@ async fn build_session_catalog_record(
         last_run_state: run_snapshot.as_ref().map(|run| run.state.clone()),
         last_run_started_at_unix_ms: run_snapshot.as_ref().map(|run| run.started_at_unix_ms),
         prompt_tokens: run_snapshot.as_ref().map(|run| run.prompt_tokens).unwrap_or(0),
-        completion_tokens: run_snapshot
-            .as_ref()
-            .map(|run| run.completion_tokens)
-            .unwrap_or(0),
+        completion_tokens: run_snapshot.as_ref().map(|run| run.completion_tokens).unwrap_or(0),
         total_tokens: run_snapshot.as_ref().map(|run| run.total_tokens).unwrap_or(0),
         archived: session.archived_at_unix_ms.is_some(),
         archived_at_unix_ms: session.archived_at_unix_ms,
@@ -510,8 +502,10 @@ fn summarize_session_tape(events: &[journal::OrchestratorTapeRecord]) -> Session
         };
         match event.event_type.as_str() {
             "message.received" => {
-                let Some(text) =
-                    payload.get("text").and_then(Value::as_str).and_then(|value| normalize_catalog_text(value, SESSION_CATALOG_PREVIEW_LEN))
+                let Some(text) = payload
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .and_then(|value| normalize_catalog_text(value, SESSION_CATALOG_PREVIEW_LEN))
                 else {
                     continue;
                 };
@@ -563,9 +557,7 @@ fn parse_session_catalog_cursor(raw: Option<&str>) -> Result<usize, Response> {
 }
 
 fn normalize_session_catalog_search(raw: Option<&str>) -> Option<String> {
-    raw.map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.to_ascii_lowercase())
+    raw.map(str::trim).filter(|value| !value.is_empty()).map(|value| value.to_ascii_lowercase())
 }
 
 fn normalize_session_catalog_title_source(raw: Option<&str>) -> Option<String> {
