@@ -194,7 +194,9 @@ describe("ChatConsolePanel", () => {
       [`/control/chat?sessionId=${deepLinkedSession.session_id}&runId=${deepLinkedRunId}`],
     );
 
-    expect((await screen.findAllByRole("heading", { name: "Ops session" })).length).toBeGreaterThan(0);
+    expect((await screen.findAllByRole("heading", { name: "Ops session" })).length).toBeGreaterThan(
+      0,
+    );
     expect(await screen.findByText("deep-state")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("tab", { name: "Tape" }));
     expect(await screen.findByText(/deep-linked-marker/)).toBeInTheDocument();

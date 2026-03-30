@@ -92,10 +92,7 @@ export function ChatConsolePanel({
   const a2uiSurfaces = useMemo(() => Object.keys(a2uiDocuments), [a2uiDocuments]);
   const inspectorVisible = runDrawerOpen || runIds.length > 0;
   const actionableRunId =
-    activeRunId ??
-    (runDrawerId.trim().length > 0 ? runDrawerId.trim() : null) ??
-    runIds[0] ??
-    null;
+    activeRunId ?? (runDrawerId.trim().length > 0 ? runDrawerId.trim() : null) ?? runIds[0] ?? null;
 
   useEffect(() => {
     void sessions.refreshSessions(true);
@@ -155,7 +152,9 @@ export function ChatConsolePanel({
     setNotice(null);
     try {
       const response = await api.abortSessionRun(targetRunId);
-      setNotice(response.cancel_requested ? "Run cancellation requested." : "Run was already idle.");
+      setNotice(
+        response.cancel_requested ? "Run cancellation requested." : "Run was already idle.",
+      );
       await sessions.refreshSessions(false);
       if (runDrawerOpen && runDrawerId.trim() === targetRunId) {
         refreshRunDetails();

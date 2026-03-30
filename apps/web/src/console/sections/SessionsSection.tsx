@@ -42,7 +42,9 @@ export function SessionsSection({ app }: SessionsSectionProps) {
             <WorkspaceStatusChip tone={selected?.pending_approvals ? "warning" : "default"}>
               {selected?.pending_approvals ?? 0} pending approvals
             </WorkspaceStatusChip>
-            <WorkspaceStatusChip tone={workspaceToneForState(selected?.last_run_state ?? "unknown")}>
+            <WorkspaceStatusChip
+              tone={workspaceToneForState(selected?.last_run_state ?? "unknown")}
+            >
               {selected?.last_run_state ?? "No run selected"}
             </WorkspaceStatusChip>
           </>
@@ -107,7 +109,12 @@ export function SessionsSection({ app }: SessionsSectionProps) {
             value={catalog.sort}
             onChange={(value) =>
               catalog.setSort(
-                value as "updated_desc" | "updated_asc" | "created_desc" | "created_asc" | "title_asc",
+                value as
+                  | "updated_desc"
+                  | "updated_asc"
+                  | "created_desc"
+                  | "created_asc"
+                  | "title_asc",
               )
             }
           />

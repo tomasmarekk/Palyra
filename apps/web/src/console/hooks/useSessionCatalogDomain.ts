@@ -20,11 +20,7 @@ type UseSessionCatalogDomainArgs = {
   setNotice: (message: string | null) => void;
 };
 
-export function useSessionCatalogDomain({
-  api,
-  setError,
-  setNotice,
-}: UseSessionCatalogDomainArgs) {
+export function useSessionCatalogDomain({ api, setError, setNotice }: UseSessionCatalogDomainArgs) {
   const [busy, setBusy] = useState(false);
   const [entries, setEntries] = useState<SessionCatalogRecord[]>([]);
   const [summary, setSummary] = useState<SessionCatalogSummary | null>(null);
@@ -195,7 +191,9 @@ export function useSessionCatalogDomain({
     setNotice(null);
     try {
       const response = await api.abortSessionRun(runId);
-      setNotice(response.cancel_requested ? "Run cancellation requested." : "Run was already idle.");
+      setNotice(
+        response.cancel_requested ? "Run cancellation requested." : "Run was already idle.",
+      );
       await refreshSessions();
     } catch (error) {
       setError(toErrorMessage(error));
