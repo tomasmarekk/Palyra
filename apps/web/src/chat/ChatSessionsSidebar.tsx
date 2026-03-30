@@ -15,6 +15,7 @@ type ChatSessionsSidebarProps = {
   selectedSession: ChatSessionRecord | null;
   renameSession: () => void;
   resetSession: () => void;
+  archiveSession: () => void;
   sortedSessions: ChatSessionRecord[];
   activeSessionId: string;
   setActiveSessionId: (sessionId: string) => void;
@@ -30,6 +31,7 @@ export function ChatSessionsSidebar({
   selectedSession,
   renameSession,
   resetSession,
+  archiveSession,
   sortedSessions,
   activeSessionId,
   setActiveSessionId,
@@ -93,6 +95,14 @@ export function ChatSessionsSidebar({
             onPress={resetSession}
           >
             Reset
+          </ActionButton>
+          <ActionButton
+            isDisabled={selectedSession === null || sessionsBusy}
+            type="button"
+            variant="danger"
+            onPress={archiveSession}
+          >
+            Archive
           </ActionButton>
         </ActionCluster>
       </div>

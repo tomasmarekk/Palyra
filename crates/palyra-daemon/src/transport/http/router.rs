@@ -302,6 +302,19 @@ pub(crate) fn build_router(state: AppState) -> Router {
             get(console::support_bundle::console_support_bundle_job_get_handler),
         )
         .route("/console/v1/diagnostics", get(console::diagnostics::console_diagnostics_handler))
+        .route("/console/v1/sessions", get(console::sessions::console_sessions_list_handler))
+        .route(
+            "/console/v1/sessions/{session_id}",
+            get(console::sessions::console_session_detail_handler),
+        )
+        .route(
+            "/console/v1/sessions/{session_id}/archive",
+            post(console::sessions::console_session_archive_handler),
+        )
+        .route(
+            "/console/v1/sessions/runs/{run_id}/abort",
+            post(console::sessions::console_session_run_abort_handler),
+        )
         .route("/console/v1/chat/sessions", get(console::chat::console_chat_sessions_list_handler))
         .route(
             "/console/v1/chat/sessions",

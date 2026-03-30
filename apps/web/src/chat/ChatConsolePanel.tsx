@@ -1,5 +1,6 @@
 import { Chip } from "@heroui/react";
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 
 import type { ConsoleApiClient } from "../consoleApi";
 import {
@@ -33,10 +34,16 @@ export function ChatConsolePanel({
   setError,
   setNotice,
 }: ChatConsolePanelProps) {
+  const [searchParams] = useSearchParams();
+  const preferredSessionId = searchParams.get("sessionId");
+  const preferredRunId = searchParams.get("runId");
+  const deepLinkedRunRef = useRef<string | null>(null);
+  const [runActionBusy, setRunActionBusy] = useState(false);
   const sessions = useChatSessions({
     api,
     setError,
     setNotice,
+    preferredSessionId,
   });
 
   const {
@@ -84,6 +91,11 @@ export function ChatConsolePanel({
   );
   const a2uiSurfaces = useMemo(() => Object.keys(a2uiDocuments), [a2uiDocuments]);
   const inspectorVisible = runDrawerOpen || runIds.length > 0;
+  const actionableRunId =
+    activeRunId ??
+    (runDrawerId.trim().length > 0 ? runDrawerId.trim() : null) ??
+    runIds[0] ??
+    null;
 
   useEffect(() => {
     void sessions.refreshSessions(true);
@@ -92,6 +104,28 @@ export function ChatConsolePanel({
     };
   }, []);
 
+  useEffect(() => {
+    if (preferredRunId === null || preferredRunId.trim().length === 0) {
+      deepLinkedRunRef.current = null;
+      return;
+    }
+    if (sessions.activeSessionId.trim().length === 0) {
+      return;
+    }
+    if (
+      preferredSessionId !== null &&
+      preferredSessionId.trim().length > 0 &&
+      sessions.activeSessionId !== preferredSessionId
+    ) {
+      return;
+    }
+    if (deepLinkedRunRef.current === preferredRunId) {
+      return;
+    }
+    deepLinkedRunRef.current = preferredRunId;
+    openRunDetails(preferredRunId);
+  }, [openRunDetails, preferredRunId, preferredSessionId, sessions.activeSessionId]);
+
   async function resetSessionAndTranscript(): Promise<void> {
     const resetApplied = await sessions.resetSession();
     if (!resetApplied) {
@@ -99,6 +133,38 @@ export function ChatConsolePanel({
     }
     clearTranscriptState();
     setNotice("Session reset applied. Local transcript cleared.");
+  }
+
+  async function archiveSessionAndTranscript(): Promise<void> {
+    const archived = await sessions.archiveSession();
+    if (!archived) {
+      return;
+    }
+    clearTranscriptState();
+    setNotice("Session archived. Local transcript cleared.");
+  }
+
+  async function abortCurrentRun(): Promise<void> {
+    const targetRunId = actionableRunId;
+    if (targetRunId === null || targetRunId.trim().length === 0) {
+      setError("No run is available for cancellation.");
+      return;
+    }
+    setRunActionBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const response = await api.abortSessionRun(targetRunId);
+      setNotice(response.cancel_requested ? "Run cancellation requested." : "Run was already idle.");
+      await sessions.refreshSessions(false);
+      if (runDrawerOpen && runDrawerId.trim() === targetRunId) {
+        refreshRunDetails();
+      }
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "Unexpected failure.");
+    } finally {
+      setRunActionBusy(false);
+    }
   }
 
   return (
@@ -158,6 +224,14 @@ export function ChatConsolePanel({
             >
               Run details
             </ActionButton>
+            <ActionButton
+              isDisabled={runActionBusy || actionableRunId === null}
+              type="button"
+              variant="ghost"
+              onPress={() => void abortCurrentRun()}
+            >
+              {runActionBusy ? "Aborting..." : "Abort run"}
+            </ActionButton>
           </div>
         }
       />
@@ -188,6 +262,9 @@ export function ChatConsolePanel({
             }}
             resetSession={() => {
               void resetSessionAndTranscript();
+            }}
+            archiveSession={() => {
+              void archiveSessionAndTranscript();
             }}
             sortedSessions={sessions.sortedSessions}
             activeSessionId={sessions.activeSessionId}

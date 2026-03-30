@@ -8,6 +8,7 @@ type UseChatSessionsArgs = {
   api: ConsoleApiClient;
   setError: (next: string | null) => void;
   setNotice: (next: string | null) => void;
+  preferredSessionId?: string | null;
 };
 
 type UseChatSessionsResult = {
@@ -24,12 +25,14 @@ type UseChatSessionsResult = {
   createSession: () => Promise<void>;
   renameSession: () => Promise<void>;
   resetSession: () => Promise<boolean>;
+  archiveSession: () => Promise<boolean>;
 };
 
 export function useChatSessions({
   api,
   setError,
   setNotice,
+  preferredSessionId,
 }: UseChatSessionsArgs): UseChatSessionsResult {
   const [sessionsBusy, setSessionsBusy] = useState(false);
   const [sessions, setSessions] = useState<ChatSessionRecord[]>([]);
@@ -52,6 +55,16 @@ export function useChatSessions({
     }
     setSessionLabelDraft(selectedSession.session_label ?? "");
   }, [selectedSession]);
+
+  useEffect(() => {
+    const preferred = preferredSessionId?.trim() ?? "";
+    if (preferred.length === 0) {
+      return;
+    }
+    if (sessions.some((session) => session.session_id === preferred)) {
+      setActiveSessionId(preferred);
+    }
+  }, [preferredSessionId, sessions]);
 
   async function refreshSessions(ensureSession: boolean): Promise<void> {
     setSessionsBusy(true);
@@ -81,6 +94,13 @@ export function useChatSessions({
           nextSessions.some((session) => session.session_id === previous)
         ) {
           return previous;
+        }
+        const preferred = preferredSessionId?.trim() ?? "";
+        if (preferred.length > 0) {
+          const preferredSession = nextSessions.find((session) => session.session_id === preferred);
+          if (preferredSession !== undefined) {
+            return preferredSession.session_id;
+          }
         }
         return nextSessions[0].session_id;
       });
@@ -175,6 +195,28 @@ export function useChatSessions({
     }
   }
 
+  async function archiveSession(): Promise<boolean> {
+    if (activeSessionId.trim().length === 0) {
+      setError("Select a session first.");
+      return false;
+    }
+    setError(null);
+    setNotice(null);
+    setSessionsBusy(true);
+    try {
+      await api.archiveSession(activeSessionId);
+      setSessions((previous) => previous.filter((entry) => entry.session_id !== activeSessionId));
+      setActiveSessionId((previous) => (previous === activeSessionId ? "" : previous));
+      setNotice("Session archived.");
+      return true;
+    } catch (error) {
+      setError(toErrorMessage(error));
+      return false;
+    } finally {
+      setSessionsBusy(false);
+    }
+  }
+
   return {
     sessionsBusy,
     sortedSessions,
@@ -189,5 +231,6 @@ export function useChatSessions({
     createSession,
     renameSession,
     resetSession,
+    archiveSession,
   };
 }

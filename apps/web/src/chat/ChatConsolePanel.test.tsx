@@ -1,4 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import type { ReactElement } from "react";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
 import {
@@ -84,7 +86,7 @@ describe("ChatConsolePanel", () => {
       chatRunEvents,
     } as unknown as ConsoleApiClient;
 
-    render(
+    renderWithRouter(
       <ChatConsolePanel
         api={api}
         revealSensitiveValues={false}
@@ -157,7 +159,51 @@ describe("ChatConsolePanel", () => {
       expect(screen.queryByText("stale-one")).not.toBeInTheDocument();
     });
   }, 15_000);
+
+  it("honors deep-linked session and run query parameters", async () => {
+    const primarySession = sampleSession();
+    const deepLinkedSession = {
+      ...sampleSession(),
+      session_id: "01ARZ3NDEKTSV4RRFFQ69G5FB0",
+      session_label: "Ops session",
+      updated_at_unix_ms: 150,
+      last_run_id: "01ARZ3NDEKTSV4RRFFQ69G5RUN",
+    } satisfies ChatSessionRecord;
+    const deepLinkedRunId = deepLinkedSession.last_run_id ?? "01ARZ3NDEKTSV4RRFFQ69G5RUN";
+
+    const api = {
+      listChatSessions: vi.fn().mockResolvedValue({
+        sessions: [primarySession, deepLinkedSession],
+      }),
+      chatRunStatus: vi.fn().mockResolvedValue({
+        run: createRunStatus(deepLinkedRunId, "deep-state", 17, 250),
+      }),
+      chatRunEvents: vi.fn().mockResolvedValue({
+        run: createRunStatus(deepLinkedRunId, "deep-state", 17, 250),
+        tape: createRunTape(deepLinkedRunId, "deep-linked-marker"),
+      }),
+    } as unknown as ConsoleApiClient;
+
+    renderWithRouter(
+      <ChatConsolePanel
+        api={api}
+        revealSensitiveValues={false}
+        setError={vi.fn()}
+        setNotice={vi.fn()}
+      />,
+      [`/control/chat?sessionId=${deepLinkedSession.session_id}&runId=${deepLinkedRunId}`],
+    );
+
+    expect((await screen.findAllByRole("heading", { name: "Ops session" })).length).toBeGreaterThan(0);
+    expect(await screen.findByText("deep-state")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("tab", { name: "Tape" }));
+    expect(await screen.findByText(/deep-linked-marker/)).toBeInTheDocument();
+  });
 });
+
+function renderWithRouter(ui: ReactElement, initialEntries = ["/control/chat"]) {
+  return render(<MemoryRouter initialEntries={initialEntries}>{ui}</MemoryRouter>);
+}
 
 function sampleSession(): ChatSessionRecord {
   return {

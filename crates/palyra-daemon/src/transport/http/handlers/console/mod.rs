@@ -15,6 +15,7 @@ pub(crate) mod nodes;
 pub(crate) mod pairing;
 pub(crate) mod plugins;
 pub(crate) mod secrets;
+pub(crate) mod sessions;
 pub(crate) mod skills;
 pub(crate) mod support_bundle;
 pub(crate) mod system;

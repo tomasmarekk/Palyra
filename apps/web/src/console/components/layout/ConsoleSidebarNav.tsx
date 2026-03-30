@@ -20,7 +20,7 @@ export function ConsoleSidebarNav({ currentSection, onSelect }: ConsoleSidebarNa
           <div className="grid gap-1">
             <h2 className="text-lg font-semibold tracking-tight">Operator domains</h2>
             <p className="console-copy">
-              Chat, control, agent, and settings stay grouped as one working rail.
+              Chat, sessions, control, agent, and settings stay grouped as one working rail.
             </p>
           </div>
         </div>
@@ -77,6 +77,8 @@ function legacyNavigationLabel(section: Section): string | null {
   switch (section) {
     case "chat":
       return "Chat and Sessions";
+    case "sessions":
+      return "Session Catalog";
     case "cron":
       return "Cron";
     case "channels":
@@ -111,6 +113,14 @@ function NavigationGlyph({ section }: { section: Section }) {
         <svg {...commonProps}>
           <path d="M5 19V9l7-4 7 4v10" />
           <path d="M9 19v-5h6v5" />
+        </svg>
+      );
+    case "sessions":
+      return (
+        <svg {...commonProps}>
+          <rect x="5" y="6" width="14" height="12" rx="2" />
+          <path d="M8 10h8" />
+          <path d="M8 14h5" />
         </svg>
       );
     case "approvals":

@@ -26,6 +26,56 @@ export interface ChatSessionRecord {
   last_run_id?: string;
 }
 
+export interface SessionCatalogRecord extends ChatSessionRecord {
+  title: string;
+  title_source: string;
+  preview?: string;
+  preview_state: string;
+  last_intent?: string;
+  last_intent_state: string;
+  last_summary?: string;
+  last_summary_state: string;
+  branch_state: string;
+  parent_session_id?: string;
+  last_run_state?: string;
+  last_run_started_at_unix_ms?: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  archived: boolean;
+  archived_at_unix_ms?: number;
+  pending_approvals: number;
+}
+
+export interface SessionCatalogSummary {
+  active_sessions: number;
+  archived_sessions: number;
+  sessions_with_pending_approvals: number;
+  sessions_with_active_runs: number;
+}
+
+export interface SessionCatalogListEnvelope {
+  contract: ContractDescriptor;
+  sessions: SessionCatalogRecord[];
+  summary: SessionCatalogSummary;
+  query: {
+    limit: number;
+    cursor: number;
+    q?: string;
+    include_archived: boolean;
+    archived?: boolean;
+    sort: string;
+    title_source?: string;
+    has_pending_approvals?: boolean;
+  };
+  page: PageInfo;
+}
+
+export interface SessionCatalogDetailEnvelope {
+  contract: ContractDescriptor;
+  session: SessionCatalogRecord;
+}
+
 export interface ChatRunStatusRecord {
   run_id: string;
   session_id: string;
@@ -987,6 +1037,14 @@ export class ConsoleApiClient {
     return this.request(buildPathWithQuery("/console/v1/chat/sessions", params));
   }
 
+  async listSessionCatalog(params?: URLSearchParams): Promise<SessionCatalogListEnvelope> {
+    return this.request(buildPathWithQuery("/console/v1/sessions", params));
+  }
+
+  async getSessionCatalogEntry(sessionId: string): Promise<SessionCatalogDetailEnvelope> {
+    return this.request(`/console/v1/sessions/${encodeURIComponent(sessionId)}`);
+  }
+
   async resolveChatSession(payload: {
     session_id?: string;
     session_key?: string;
@@ -1024,6 +1082,35 @@ export class ConsoleApiClient {
     return this.request(
       `/console/v1/chat/sessions/${encodeURIComponent(sessionId)}/reset`,
       { method: "POST" },
+      { csrf: true },
+    );
+  }
+
+  async archiveSession(
+    sessionId: string,
+  ): Promise<{ session: SessionCatalogRecord; action: string; contract: ContractDescriptor }> {
+    return this.request(
+      `/console/v1/sessions/${encodeURIComponent(sessionId)}/archive`,
+      { method: "POST" },
+      { csrf: true },
+    );
+  }
+
+  async abortSessionRun(
+    runId: string,
+    payload: { reason?: string } = {},
+  ): Promise<{
+    contract: ContractDescriptor;
+    run_id: string;
+    cancel_requested: boolean;
+    reason: string;
+  }> {
+    return this.request(
+      `/console/v1/sessions/runs/${encodeURIComponent(runId)}/abort`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
       { csrf: true },
     );
   }

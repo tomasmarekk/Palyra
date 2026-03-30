@@ -31,7 +31,15 @@ export const CONSOLE_NAV_GROUPS: readonly NavigationGroup[] = [
   {
     id: "control",
     label: "Control",
-    items: resolveEntries(["overview", "approvals", "cron", "channels", "browser", "support"]),
+    items: resolveEntries([
+      "overview",
+      "sessions",
+      "approvals",
+      "cron",
+      "channels",
+      "browser",
+      "support",
+    ]),
   },
   {
     id: "agent",
@@ -48,6 +56,7 @@ export const CONSOLE_NAV_GROUPS: readonly NavigationGroup[] = [
 const SECTION_PATHS: Readonly<Record<Section, string>> = {
   overview: "/control/overview",
   chat: "/chat",
+  sessions: "/control/sessions",
   approvals: "/control/approvals",
   cron: "/control/automation",
   channels: "/control/channels",
@@ -68,6 +77,7 @@ const SECTION_PATH_ALIASES: Readonly<Record<string, Section>> = {
 const SECTION_GROUPS: Readonly<Record<Section, NavigationGroup["id"]>> = {
   overview: "control",
   chat: "chat",
+  sessions: "control",
   approvals: "control",
   cron: "control",
   channels: "control",

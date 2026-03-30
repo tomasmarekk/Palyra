@@ -846,6 +846,158 @@ fn console_chat_endpoints_require_session_and_csrf() -> Result<()> {
 }
 
 #[test]
+fn console_session_catalog_endpoints_require_session_and_csrf() -> Result<()> {
+    let (child, admin_port) = spawn_palyrad_with_bound_console_principal(CONSOLE_ADMIN_PRINCIPAL)?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("failed to build HTTP client")?;
+
+    let no_session = client
+        .get(format!("http://127.0.0.1:{admin_port}/console/v1/sessions"))
+        .send()
+        .context("failed to call session catalog endpoint without session")?;
+    assert_eq!(
+        no_session.status().as_u16(),
+        403,
+        "session catalog endpoint must require session"
+    );
+
+    let (cookie, csrf_token) = login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
+
+    let created_session = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/chat/sessions"))
+        .header("Cookie", cookie.clone())
+        .header("x-palyra-csrf-token", csrf_token.clone())
+        .json(&serde_json::json!({
+            "session_label": "ops-catalog-session",
+        }))
+        .send()
+        .context("failed to create chat session for catalog test")?
+        .error_for_status()
+        .context("chat session create for catalog test returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse created chat session response json")?;
+    let session_id = created_session
+        .get("session")
+        .and_then(|value| value.get("session_id"))
+        .and_then(Value::as_str)
+        .context("created chat session response should include session id")?;
+
+    let catalog_response = client
+        .get(format!("http://127.0.0.1:{admin_port}/console/v1/sessions"))
+        .header("Cookie", cookie.clone())
+        .send()
+        .context("failed to list session catalog with session cookie")?
+        .error_for_status()
+        .context("session catalog endpoint returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse session catalog response json")?;
+    assert!(
+        catalog_response.get("sessions").and_then(Value::as_array).is_some(),
+        "session catalog response should include sessions array"
+    );
+    assert!(
+        catalog_response.get("summary").is_some(),
+        "session catalog response should include summary payload"
+    );
+
+    let detail_response = client
+        .get(format!(
+            "http://127.0.0.1:{admin_port}/console/v1/sessions/{session_id}"
+        ))
+        .header("Cookie", cookie.clone())
+        .send()
+        .context("failed to fetch session catalog detail")?
+        .error_for_status()
+        .context("session catalog detail returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse session catalog detail response json")?;
+    assert_eq!(
+        detail_response
+            .get("session")
+            .and_then(|value| value.get("session_id"))
+            .and_then(Value::as_str),
+        Some(session_id),
+        "session catalog detail should return the requested session"
+    );
+
+    let archive_without_csrf = client
+        .post(format!(
+            "http://127.0.0.1:{admin_port}/console/v1/sessions/{session_id}/archive"
+        ))
+        .header("Cookie", cookie.clone())
+        .send()
+        .context("failed to archive session without csrf token")?;
+    assert_eq!(
+        archive_without_csrf.status().as_u16(),
+        403,
+        "session archive endpoint must enforce csrf token"
+    );
+
+    let archive_response = client
+        .post(format!(
+            "http://127.0.0.1:{admin_port}/console/v1/sessions/{session_id}/archive"
+        ))
+        .header("Cookie", cookie.clone())
+        .header("x-palyra-csrf-token", csrf_token.clone())
+        .send()
+        .context("failed to archive session with csrf token")?
+        .error_for_status()
+        .context("session archive endpoint returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse session archive response json")?;
+    assert_eq!(
+        archive_response.get("action").and_then(Value::as_str),
+        Some("archived"),
+        "session archive endpoint should report archived action"
+    );
+    assert_eq!(
+        archive_response
+            .get("session")
+            .and_then(|value| value.get("archived"))
+            .and_then(Value::as_bool),
+        Some(true),
+        "session archive endpoint should mark the session archived"
+    );
+
+    let unknown_run_id = "01ARZ3NDEKTSV4RRFFQ69G5FB8";
+    let abort_without_csrf = client
+        .post(format!(
+            "http://127.0.0.1:{admin_port}/console/v1/sessions/runs/{unknown_run_id}/abort"
+        ))
+        .header("Cookie", cookie.clone())
+        .json(&serde_json::json!({}))
+        .send()
+        .context("failed to cancel session run without csrf token")?;
+    assert_eq!(
+        abort_without_csrf.status().as_u16(),
+        403,
+        "session run abort endpoint must enforce csrf token"
+    );
+
+    let unknown_abort = client
+        .post(format!(
+            "http://127.0.0.1:{admin_port}/console/v1/sessions/runs/{unknown_run_id}/abort"
+        ))
+        .header("Cookie", cookie)
+        .header("x-palyra-csrf-token", csrf_token)
+        .json(&serde_json::json!({}))
+        .send()
+        .context("failed to cancel unknown session run")?;
+    assert_eq!(
+        unknown_abort.status().as_u16(),
+        404,
+        "unknown session run abort should return not-found"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn console_cron_workflow_create_disable_and_list_runs() -> Result<()> {
     let (child, admin_port) = spawn_palyrad_with_bound_console_principal(CONSOLE_ADMIN_PRINCIPAL)?;
     let mut daemon = ChildGuard::new(child);
