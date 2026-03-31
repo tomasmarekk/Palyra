@@ -1664,7 +1664,13 @@ describe("M35 web console app", () => {
       created_at_unix_ms: 100,
       updated_at_unix_ms: 100,
     };
-    let sessions = [] as Array<typeof sessionRecord & { last_run_id?: string }>;
+    const baseCatalogRecord = buildSessionCatalogRecord({
+      ...sessionRecord,
+      title: "Web session",
+      title_source: "label",
+      branch_state: "linear",
+    });
+    let sessions = [] as Array<typeof baseCatalogRecord>;
     const fetchMock = withM56Baseline((input: RequestInfo | URL, init?: RequestInit) => {
       const path = requestUrl(input);
       const method = (init?.method ?? "GET").toUpperCase();
@@ -1682,12 +1688,21 @@ describe("M35 web console app", () => {
         );
       }
 
-      if (path === "/console/v1/chat/sessions" && method === "GET") {
-        return Promise.resolve(jsonResponse({ sessions }));
+      if (path === "/console/v1/sessions" && method === "GET") {
+        return Promise.resolve(jsonResponse(buildSessionCatalogListEnvelope(sessions)));
+      }
+
+      if (path === "/console/v1/sessions/01ARZ3NDEKTSV4RRFFQ69G5FAV" && method === "GET") {
+        return Promise.resolve(
+          jsonResponse({
+            contract: { contract_version: "control-plane.v1" },
+            session: sessions[0] ?? baseCatalogRecord,
+          }),
+        );
       }
 
       if (path === "/console/v1/chat/sessions" && method === "POST") {
-        sessions = [sessionRecord];
+        sessions = [baseCatalogRecord];
         return Promise.resolve(
           jsonResponse({
             session: sessionRecord,
@@ -1702,7 +1717,20 @@ describe("M35 web console app", () => {
         method === "POST"
       ) {
         sessions = [
-          { ...sessionRecord, updated_at_unix_ms: 200, last_run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX" },
+          buildSessionCatalogRecord({
+            ...sessionRecord,
+            updated_at_unix_ms: 200,
+            last_run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+            title: "Web session",
+            title_source: "label",
+            preview: "run task",
+            preview_state: "present",
+            last_intent: "run task",
+            last_intent_state: "present",
+            branch_state: "linear",
+            last_run_state: "done",
+            last_run_started_at_unix_ms: 200,
+          }),
         ];
         return Promise.resolve(
           ndjsonResponse([
@@ -1800,6 +1828,20 @@ describe("M35 web console app", () => {
       created_at_unix_ms: 100,
       updated_at_unix_ms: 100,
     };
+    const catalogRecord = buildSessionCatalogRecord({
+      ...sessionRecord,
+      updated_at_unix_ms: 200,
+      last_run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+      title: "Web session",
+      title_source: "label",
+      preview: "Escaped payload check",
+      preview_state: "present",
+      last_intent: "Escaped payload check",
+      last_intent_state: "present",
+      branch_state: "linear",
+      last_run_state: "done",
+      last_run_started_at_unix_ms: 200,
+    });
     const fetchMock = withM56Baseline((input: RequestInfo | URL, init?: RequestInit) => {
       const path = requestUrl(input);
       const method = (init?.method ?? "GET").toUpperCase();
@@ -1817,18 +1859,8 @@ describe("M35 web console app", () => {
         );
       }
 
-      if (path === "/console/v1/chat/sessions" && method === "GET") {
-        return Promise.resolve(
-          jsonResponse({
-            sessions: [
-              {
-                ...sessionRecord,
-                updated_at_unix_ms: 200,
-                last_run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX",
-              },
-            ],
-          }),
-        );
+      if (path === "/console/v1/sessions" && method === "GET") {
+        return Promise.resolve(jsonResponse(buildSessionCatalogListEnvelope([catalogRecord])));
       }
 
       if (
@@ -1924,6 +1956,98 @@ function createQueuedFetch(responses: Response[]) {
     }
     return Promise.resolve(response);
   });
+}
+
+type SessionCatalogTestRecord = {
+  session_id: string;
+  session_key: string;
+  principal: string;
+  device_id: string;
+  channel?: string;
+  created_at_unix_ms: number;
+  updated_at_unix_ms: number;
+  last_run_id?: string;
+  title: string;
+  title_source: string;
+  preview?: string;
+  preview_state: string;
+  last_intent?: string;
+  last_intent_state: string;
+  last_summary?: string;
+  last_summary_state: string;
+  branch_state: string;
+  parent_session_id?: string;
+  last_run_state?: string;
+  last_run_started_at_unix_ms?: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  archived: boolean;
+  archived_at_unix_ms?: number;
+  pending_approvals: number;
+};
+
+type SessionCatalogTestRecordOverrides =
+  Pick<
+    SessionCatalogTestRecord,
+    | "session_id"
+    | "session_key"
+    | "principal"
+    | "device_id"
+    | "created_at_unix_ms"
+    | "updated_at_unix_ms"
+    | "title"
+    | "title_source"
+  > &
+    Partial<Omit<SessionCatalogTestRecord, "session_id" | "session_key" | "principal" | "device_id" | "created_at_unix_ms" | "updated_at_unix_ms" | "title" | "title_source">>;
+
+function buildSessionCatalogRecord(
+  overrides: SessionCatalogTestRecordOverrides,
+): SessionCatalogTestRecord {
+  return {
+    preview: undefined,
+    preview_state: "missing",
+    last_intent: undefined,
+    last_intent_state: "missing",
+    last_summary: undefined,
+    last_summary_state: "missing",
+    branch_state: "missing",
+    last_run_state: undefined,
+    last_run_started_at_unix_ms: undefined,
+    prompt_tokens: 0,
+    completion_tokens: 0,
+    total_tokens: 0,
+    archived: false,
+    archived_at_unix_ms: undefined,
+    pending_approvals: 0,
+    ...overrides,
+  };
+}
+
+function buildSessionCatalogListEnvelope(sessions: SessionCatalogTestRecord[]) {
+  return {
+    contract: { contract_version: "control-plane.v1" },
+    sessions,
+    summary: {
+      active_sessions: sessions.filter((session) => session.archived !== true).length,
+      archived_sessions: sessions.filter((session) => session.archived === true).length,
+      sessions_with_pending_approvals: sessions.filter(
+        (session) =>
+          typeof session.pending_approvals === "number" && session.pending_approvals > 0,
+      ).length,
+      sessions_with_active_runs: sessions.filter((session) => {
+        const state = typeof session.last_run_state === "string" ? session.last_run_state : "";
+        return state === "accepted" || state === "in_progress";
+      }).length,
+    },
+    query: {
+      limit: 50,
+      cursor: 0,
+      include_archived: false,
+      sort: "updated_desc",
+    },
+    page: { limit: 50, returned: sessions.length, has_more: false },
+  };
 }
 
 function jsonResponse(payload: unknown, status = 200): Response {

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import type { ConsoleApiClient, SessionCatalogRecord } from "../consoleApi";
 
@@ -45,6 +45,7 @@ export function useChatSessions({
   const [newSessionLabel, setNewSessionLabel] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
   const [includeArchived, setIncludeArchived] = useState(false);
+  const filtersHydratedRef = useRef(false);
 
   const sortedSessions = useMemo(() => {
     return [...sessions].sort((left, right) => right.updated_at_unix_ms - left.updated_at_unix_ms);
@@ -73,6 +74,10 @@ export function useChatSessions({
   }, [preferredSessionId, sessions]);
 
   useEffect(() => {
+    if (!filtersHydratedRef.current) {
+      filtersHydratedRef.current = true;
+      return;
+    }
     void refreshSessions(false);
   }, [includeArchived, searchQuery]);
 
