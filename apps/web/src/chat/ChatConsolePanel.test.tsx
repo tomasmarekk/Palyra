@@ -6,9 +6,9 @@ import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import {
   type ChatRunStatusRecord,
   type ChatRunTapeSnapshot,
-  type ChatSessionRecord,
   type ChatStreamLine,
   type ConsoleApiClient,
+  type SessionCatalogRecord,
 } from "../consoleApi";
 import { ChatConsolePanel } from "./ChatConsolePanel";
 
@@ -32,7 +32,22 @@ describe("ChatConsolePanel", () => {
 
     let runTwoStatusCalls = 0;
     let runTwoEventCalls = 0;
-    const listChatSessions = vi.fn().mockResolvedValue({ sessions: [session] });
+    const listSessionCatalog = vi.fn().mockResolvedValue({
+      sessions: [session],
+      summary: {
+        active_sessions: 1,
+        archived_sessions: 0,
+        sessions_with_pending_approvals: 0,
+        sessions_with_active_runs: 0,
+      },
+      query: {
+        limit: 50,
+        cursor: 0,
+        include_archived: false,
+        sort: "updated_desc",
+      },
+      page: { limit: 50, returned: 1, has_more: false },
+    });
     const streamChatMessage = vi.fn(
       (
         _sessionId: string,
@@ -80,7 +95,7 @@ describe("ChatConsolePanel", () => {
     });
 
     const api = {
-      listChatSessions,
+      listSessionCatalog,
       streamChatMessage,
       chatRunStatus,
       chatRunEvents,
@@ -166,14 +181,28 @@ describe("ChatConsolePanel", () => {
       ...sampleSession(),
       session_id: "01ARZ3NDEKTSV4RRFFQ69G5FB0",
       session_label: "Ops session",
+      title: "Ops session",
       updated_at_unix_ms: 150,
       last_run_id: "01ARZ3NDEKTSV4RRFFQ69G5RUN",
-    } satisfies ChatSessionRecord;
+    } satisfies SessionCatalogRecord;
     const deepLinkedRunId = deepLinkedSession.last_run_id ?? "01ARZ3NDEKTSV4RRFFQ69G5RUN";
 
     const api = {
-      listChatSessions: vi.fn().mockResolvedValue({
+      listSessionCatalog: vi.fn().mockResolvedValue({
         sessions: [primarySession, deepLinkedSession],
+        summary: {
+          active_sessions: 2,
+          archived_sessions: 0,
+          sessions_with_pending_approvals: 0,
+          sessions_with_active_runs: 1,
+        },
+        query: {
+          limit: 50,
+          cursor: 0,
+          include_archived: false,
+          sort: "updated_desc",
+        },
+        page: { limit: 50, returned: 2, has_more: false },
       }),
       chatRunStatus: vi.fn().mockResolvedValue({
         run: createRunStatus(deepLinkedRunId, "deep-state", 17, 250),
@@ -207,15 +236,29 @@ function renderWithRouter(ui: ReactElement, initialEntries = ["/control/chat"]) 
   return render(<MemoryRouter initialEntries={initialEntries}>{ui}</MemoryRouter>);
 }
 
-function sampleSession(): ChatSessionRecord {
+function sampleSession(): SessionCatalogRecord {
   return {
     session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
     session_key: "web",
+    title: "Inspect usage diagnostics",
+    title_source: "derived_intent",
+    preview: "Inspect usage diagnostics and operator status.",
+    preview_state: "computed",
+    last_intent: "Inspect usage diagnostics",
+    last_intent_state: "computed",
+    last_summary: "Operator status inspected.",
+    last_summary_state: "computed",
+    branch_state: "missing",
     principal: "admin:web-console",
     device_id: "device-1",
     channel: "web",
     created_at_unix_ms: 100,
     updated_at_unix_ms: 100,
+    prompt_tokens: 0,
+    completion_tokens: 0,
+    total_tokens: 0,
+    archived: false,
+    pending_approvals: 0,
   };
 }
 

@@ -426,8 +426,19 @@ message SessionSummary {
   int64 updated_at_unix_ms = 5;
   palyra.common.v1.CanonicalId last_run_id = 6;
   int64 archived_at_unix_ms = 7;
+  string title = 8;
+  string title_source = 9;
+  string title_generator_version = 10;
+  string preview = 11;
+  string preview_state = 12;
+  string last_intent = 13;
+  string last_summary = 14;
+  string match_snippet = 15;
+  string branch_state = 16;
+  palyra.common.v1.CanonicalId parent_session_id = 17;
+  string last_run_state = 18;
 
-  reserved 8 to 16;
+  reserved 19 to 28;
 }
 
 message ListSessionsRequest {
@@ -435,8 +446,9 @@ message ListSessionsRequest {
   string after_session_key = 2;
   uint32 limit = 3;
   bool include_archived = 4;
+  string q = 5;
 
-  reserved 5 to 10;
+  reserved 6 to 10;
 }
 
 message ListSessionsResponse {

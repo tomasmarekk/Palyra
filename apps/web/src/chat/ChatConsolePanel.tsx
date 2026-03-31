@@ -171,7 +171,7 @@ export function ChatConsolePanel({
       <PageHeader
         eyebrow="Chat"
         title={
-          sessions.selectedSession?.session_label?.trim() ||
+          sessions.selectedSession?.title ??
           (sessions.selectedSession
             ? shortId(sessions.selectedSession.session_id)
             : "Operator workspace")
@@ -253,6 +253,10 @@ export function ChatConsolePanel({
             createSession={() => {
               void sessions.createSession();
             }}
+            searchQuery={sessions.searchQuery}
+            setSearchQuery={sessions.setSearchQuery}
+            includeArchived={sessions.includeArchived}
+            setIncludeArchived={sessions.setIncludeArchived}
             sessionLabelDraft={sessions.sessionLabelDraft}
             setSessionLabelDraft={sessions.setSessionLabelDraft}
             selectedSession={sessions.selectedSession}
@@ -343,10 +347,14 @@ export function ChatConsolePanel({
                 {
                   label: "Session",
                   value:
-                    sessions.selectedSession?.session_label?.trim() ||
+                    sessions.selectedSession?.title ||
                     (sessions.selectedSession
                       ? shortId(sessions.selectedSession.session_id)
                       : "none"),
+                },
+                {
+                  label: "Preview",
+                  value: sessions.selectedSession?.preview ?? "n/a",
                 },
                 {
                   label: "Updated",

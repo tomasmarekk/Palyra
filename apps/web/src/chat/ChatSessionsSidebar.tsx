@@ -1,7 +1,13 @@
 import { Button } from "@heroui/react";
 
-import { ActionButton, ActionCluster, EmptyState, TextInputField } from "../console/components/ui";
-import type { ChatSessionRecord } from "../consoleApi";
+import {
+  ActionButton,
+  ActionCluster,
+  EmptyState,
+  SwitchField,
+  TextInputField,
+} from "../console/components/ui";
+import type { SessionCatalogRecord } from "../consoleApi";
 
 import { shortId } from "./chatShared";
 
@@ -10,13 +16,17 @@ type ChatSessionsSidebarProps = {
   newSessionLabel: string;
   setNewSessionLabel: (value: string) => void;
   createSession: () => void;
+  searchQuery: string;
+  setSearchQuery: (value: string) => void;
+  includeArchived: boolean;
+  setIncludeArchived: (value: boolean) => void;
   sessionLabelDraft: string;
   setSessionLabelDraft: (value: string) => void;
-  selectedSession: ChatSessionRecord | null;
+  selectedSession: SessionCatalogRecord | null;
   renameSession: () => void;
   resetSession: () => void;
   archiveSession: () => void;
-  sortedSessions: ChatSessionRecord[];
+  sortedSessions: SessionCatalogRecord[];
   activeSessionId: string;
   setActiveSessionId: (sessionId: string) => void;
 };
@@ -26,6 +36,10 @@ export function ChatSessionsSidebar({
   newSessionLabel,
   setNewSessionLabel,
   createSession,
+  searchQuery,
+  setSearchQuery,
+  includeArchived,
+  setIncludeArchived,
   sessionLabelDraft,
   setSessionLabelDraft,
   selectedSession,
@@ -53,6 +67,18 @@ export function ChatSessionsSidebar({
           value={newSessionLabel}
           onChange={setNewSessionLabel}
         />
+        <TextInputField
+          label="History search"
+          placeholder="title, preview, or snippet"
+          value={searchQuery}
+          onChange={setSearchQuery}
+        />
+        <SwitchField
+          checked={includeArchived}
+          description="Include archived sessions in search and resume results."
+          label="Show archived"
+          onChange={setIncludeArchived}
+        />
         <ActionCluster>
           <ActionButton
             isDisabled={sessionsBusy}
@@ -68,10 +94,17 @@ export function ChatSessionsSidebar({
       <div className="workspace-callout">
         <div className="workspace-panel__intro">
           <p className="workspace-kicker">Selected session</p>
-          <h3>
-            {selectedSession?.session_label?.trim() ||
-              (selectedSession ? shortId(selectedSession.session_id) : "None")}
-          </h3>
+          <h3>{selectedSession?.title ?? "None"}</h3>
+          {selectedSession !== null && (
+            <p className="chat-muted">
+              {selectedSession.title_source} ·{" "}
+              {selectedSession.archived ? "archived" : "active"} ·{" "}
+              {shortId(selectedSession.session_id)}
+            </p>
+          )}
+          {selectedSession?.preview !== undefined && (
+            <p className="chat-muted">{selectedSession.preview}</p>
+          )}
         </div>
         <TextInputField
           disabled={selectedSession === null || sessionsBusy}
@@ -117,9 +150,6 @@ export function ChatSessionsSidebar({
         ) : (
           sortedSessions.map((session) => {
             const active = session.session_id === activeSessionId;
-            const label = session.session_label?.trim().length
-              ? session.session_label
-              : shortId(session.session_id);
 
             return (
               <Button
@@ -132,9 +162,11 @@ export function ChatSessionsSidebar({
                 onPress={() => setActiveSessionId(session.session_id)}
               >
                 <span className="flex w-full flex-col items-start gap-1 text-left">
-                  <span className="chat-session-item__title">{label}</span>
+                  <span className="chat-session-item__title">{session.title}</span>
+                  {session.preview !== undefined && <small>{session.preview}</small>}
                   <small>
                     Updated {new Date(session.updated_at_unix_ms).toLocaleTimeString()} ·{" "}
+                    {session.archived ? "archived" : session.title_source} ·{" "}
                     {shortId(session.session_id)}
                   </small>
                 </span>

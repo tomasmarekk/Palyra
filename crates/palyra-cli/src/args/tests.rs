@@ -777,6 +777,33 @@ fn parse_sessions_rename_and_abort() {
 }
 
 #[test]
+fn parse_sessions_history_with_resume_first() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "sessions",
+        "history",
+        "--query",
+        "ops status",
+        "--include-archived",
+        "--resume-first",
+        "--json",
+    ]);
+    assert_eq!(
+        parsed.command,
+        Command::Sessions {
+            command: SessionsCommand::History {
+                query: Some("ops status".to_owned()),
+                limit: None,
+                include_archived: true,
+                resume_first: true,
+                json: true,
+                ndjson: false,
+            }
+        }
+    );
+}
+
+#[test]
 fn parse_sessions_cleanup_with_dry_run() {
     let parsed = Cli::parse_from([
         "palyra",

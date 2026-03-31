@@ -347,6 +347,7 @@ async fn load_scoped_sessions(
                 channel.map(str::to_owned),
                 include_archived,
                 Some(SESSION_CATALOG_FETCH_PAGE),
+                None,
             )
             .await?;
         sessions.append(&mut page);
@@ -532,7 +533,10 @@ fn summarize_session_tape(events: &[journal::OrchestratorTapeRecord]) -> Session
 }
 
 fn normalize_catalog_text(raw: &str, max_chars: usize) -> Option<String> {
-    let normalized = raw.replace(['\r', '\n'], " ");
+    let normalized = palyra_common::redaction::redact_url_segments_in_text(
+        palyra_common::redaction::redact_auth_error(raw).as_str(),
+    )
+    .replace(['\r', '\n'], " ");
     let trimmed = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
     if trimmed.is_empty() {
         return None;

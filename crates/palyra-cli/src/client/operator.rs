@@ -1,5 +1,7 @@
 use anyhow::{anyhow, Context, Result};
-use palyra_control_plane::{ApprovalDecisionEnvelope, ApprovalDecisionRequest};
+use palyra_control_plane::{
+    ApprovalDecisionEnvelope, ApprovalDecisionRequest, SessionCatalogListEnvelope,
+};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
@@ -101,9 +103,10 @@ impl OperatorRuntime {
         after_session_key: Option<String>,
         include_archived: bool,
         limit: Option<u32>,
+        q: Option<String>,
     ) -> Result<gateway_v1::ListSessionsResponse> {
         let mut client = self.connect_gateway().await?;
-        client.list_sessions(after_session_key, include_archived, limit).await
+        client.list_sessions(after_session_key, include_archived, limit, q).await
     }
 
     pub(crate) async fn resolve_session(
@@ -243,6 +246,22 @@ impl OperatorRuntime {
             )
             .await
             .with_context(|| format!("failed to resolve approval {approval_id}"))
+    }
+
+    pub(crate) async fn list_session_catalog(
+        &self,
+        query: Vec<(&str, Option<String>)>,
+    ) -> Result<SessionCatalogListEnvelope> {
+        let context = control_plane::connect_admin_console(app::ConnectionOverrides {
+            grpc_url: Some(self.connection.grpc_url.clone()),
+            daemon_url: None,
+            token: self.connection.token.clone(),
+            principal: Some(self.connection.principal.clone()),
+            device_id: Some(self.connection.device_id.clone()),
+            channel: Some(self.connection.channel.clone()),
+        })
+        .await?;
+        context.client.list_session_catalog(query).await.context("failed to list session catalog")
     }
 
     pub(crate) async fn message_capabilities(

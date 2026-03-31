@@ -468,6 +468,32 @@ impl ControlPlaneClient {
         self.request_json(Method::GET, "console/v1/diagnostics", None::<&Value>, false).await
     }
 
+    pub async fn list_session_catalog(
+        &self,
+        query: Vec<(&str, Option<String>)>,
+    ) -> Result<SessionCatalogListEnvelope, ControlPlaneClientError> {
+        self.request_json(
+            Method::GET,
+            build_query_path("console/v1/sessions", query),
+            None::<&Value>,
+            false,
+        )
+        .await
+    }
+
+    pub async fn get_session_catalog_entry(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionCatalogDetailEnvelope, ControlPlaneClientError> {
+        self.request_json(
+            Method::GET,
+            format!("console/v1/sessions/{}", urlencoding(session_id)),
+            None::<&Value>,
+            false,
+        )
+        .await
+    }
+
     pub async fn get_json_value(
         &self,
         path: impl AsRef<str>,

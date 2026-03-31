@@ -15,6 +15,24 @@ pub(crate) fn session_summary_message(
             .as_ref()
             .map(|run_id| common_v1::CanonicalId { ulid: run_id.clone() }),
         archived_at_unix_ms: session.archived_at_unix_ms.unwrap_or_default(),
+        title: session.title.clone(),
+        title_source: session.title_source.clone(),
+        title_generator_version: session.title_generator_version.clone().unwrap_or_default(),
+        preview: session.preview.clone().unwrap_or_default(),
+        preview_state: if session.preview.is_some() {
+            "computed".to_owned()
+        } else {
+            "missing".to_owned()
+        },
+        last_intent: session.last_intent.clone().unwrap_or_default(),
+        last_summary: session.last_summary.clone().unwrap_or_default(),
+        match_snippet: session.match_snippet.clone().unwrap_or_default(),
+        branch_state: session.branch_state.clone(),
+        parent_session_id: session
+            .parent_session_id
+            .as_ref()
+            .map(|session_id| common_v1::CanonicalId { ulid: session_id.clone() }),
+        last_run_state: session.last_run_state.clone().unwrap_or_default(),
     }
 }
 

@@ -503,6 +503,17 @@ impl App {
                     self.open_picker(PickerKind::Session).await?;
                 }
             }
+            "history" => {
+                let query = normalize_optional_text(parts.collect::<Vec<_>>().join(" "));
+                self.open_session_history_picker(query).await?;
+            }
+            "resume" => {
+                if let Some(reference) = parts.next() {
+                    self.switch_session(reference.to_owned()).await?;
+                } else {
+                    self.open_session_history_picker(None).await?;
+                }
+            }
             "model" => {
                 if let Some(model_id) = parts.next() {
                     self.set_model(model_id.to_owned()).await?;
@@ -658,6 +669,9 @@ impl App {
     }
 
     async fn open_picker(&mut self, kind: PickerKind) -> Result<()> {
+        if matches!(kind, PickerKind::Session) {
+            return self.open_session_history_picker(None).await;
+        }
         let picker = match kind {
             PickerKind::Agent => {
                 let response = self.runtime.list_agents(None, Some(100)).await?;
@@ -694,33 +708,7 @@ impl App {
                     items,
                 }
             }
-            PickerKind::Session => {
-                let response = self
-                    .runtime
-                    .list_sessions(None, self.include_archived_sessions, Some(100))
-                    .await?;
-                let items = response
-                    .sessions
-                    .into_iter()
-                    .map(|session| {
-                        let session_id = session
-                            .session_id
-                            .as_ref()
-                            .map(|value| value.ulid.clone())
-                            .unwrap_or_default();
-                        PickerItem {
-                            id: session_id.clone(),
-                            title: display_session_identity(&session),
-                            detail: format!(
-                                "updated={} | archived={}",
-                                session.updated_at_unix_ms,
-                                session.archived_at_unix_ms > 0
-                            ),
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                PickerState { kind, title: "Session picker".to_owned(), selected: 0, items }
-            }
+            PickerKind::Session => unreachable!(),
             PickerKind::Model => {
                 let models = self.runtime.list_models(None)?;
                 let current_model = models.status.text_model.clone();
@@ -751,6 +739,47 @@ impl App {
         };
         self.mode = Mode::Picker(kind);
         self.pending_picker = Some(picker);
+        Ok(())
+    }
+
+    async fn open_session_history_picker(&mut self, query: Option<String>) -> Result<()> {
+        let response = self
+            .runtime
+            .list_session_catalog(vec![
+                ("limit", Some("100".to_owned())),
+                ("sort", Some("updated_desc".to_owned())),
+                ("q", query.clone()),
+                ("include_archived", self.include_archived_sessions.then(|| "true".to_owned())),
+            ])
+            .await?;
+        let current_session_id =
+            self.session.session_id.as_ref().map(|value| value.ulid.as_str()).unwrap_or_default();
+        let items = response
+            .sessions
+            .into_iter()
+            .map(|session| PickerItem {
+                id: session.session_id.clone(),
+                title: session.title,
+                detail: format!(
+                    "{} | updated={} | {}",
+                    if session.archived { "archived" } else { session.title_source.as_str() },
+                    session.updated_at_unix_ms,
+                    session.preview.unwrap_or_else(|| "no preview".to_owned())
+                ),
+            })
+            .collect::<Vec<_>>();
+        let selected = items.iter().position(|item| item.id == current_session_id).unwrap_or(0);
+        self.mode = Mode::Picker(PickerKind::Session);
+        self.pending_picker = Some(PickerState {
+            kind: PickerKind::Session,
+            title: match query.as_deref() {
+                Some(value) if !value.trim().is_empty() => format!("Session history: {value}"),
+                _ => "Session history".to_owned(),
+            },
+            items,
+            selected,
+        });
+        self.status_line = "Session history ready".to_owned();
         Ok(())
     }
 
@@ -1130,8 +1159,9 @@ fn render_help_popup(frame: &mut Frame<'_>, area: Rect) {
     let popup = centered_rect(72, 14, area);
     let text = Text::from(vec![
         Line::from("Slash commands"),
-        Line::from("  /help /status /agent [/id] /session [/id-or-key] /model [/id]"),
-        Line::from("  /reset /abort [run_id] /settings /tools on|off /thinking on|off"),
+        Line::from("  /help /status /agent [/id] /session [/id-or-key] /history [query]"),
+        Line::from("  /resume [/id-or-key] /model [/id] /reset /abort [run_id] /settings"),
+        Line::from("  /tools on|off /thinking on|off"),
         Line::from("  /shell on|off /exit"),
         Line::default(),
         Line::from("Pickers"),
@@ -1291,16 +1321,28 @@ fn entry_style(kind: &EntryKind) -> Style {
 }
 
 fn display_session_identity(session: &gateway_v1::SessionSummary) -> String {
+    if !session.title.trim().is_empty() {
+        return session.title.clone();
+    }
     if !session.session_label.trim().is_empty() {
-        return "labeled session".to_owned();
+        return session.session_label.clone();
     }
     if !session.session_key.trim().is_empty() {
-        return "keyed session".to_owned();
+        return session.session_key.clone();
     }
     if session.session_id.is_some() {
         "session".to_owned()
     } else {
         "unknown session".to_owned()
+    }
+}
+
+fn normalize_optional_text(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
     }
 }
 
@@ -1408,12 +1450,14 @@ mod tests {
             }),
             session_key: "ops:triage".to_owned(),
             session_label: "Ops Triage".to_owned(),
+            title: "Auto title".to_owned(),
             created_at_unix_ms: 0,
             updated_at_unix_ms: 0,
             last_run_id: None,
             archived_at_unix_ms: 0,
+            ..Default::default()
         };
         let display = display_session_identity(&summary);
-        assert_eq!(display, "labeled session");
+        assert_eq!(display, "Auto title");
     }
 }

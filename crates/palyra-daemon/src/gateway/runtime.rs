@@ -2236,19 +2236,74 @@ impl GatewayRuntimeState {
         channel: Option<String>,
         include_archived: bool,
         requested_limit: Option<usize>,
+        search_query: Option<String>,
     ) -> Result<(Vec<OrchestratorSessionRecord>, Option<String>), Status> {
         let limit = requested_limit.unwrap_or(100).clamp(1, MAX_SESSIONS_PAGE_LIMIT);
-        let mut sessions = self
-            .journal_store
-            .list_orchestrator_sessions(
-                after_session_key.as_deref(),
-                principal.as_str(),
-                device_id.as_str(),
-                channel.as_deref(),
-                include_archived,
-                limit.saturating_add(1),
-            )
-            .map_err(|error| map_orchestrator_store_error("list orchestrator sessions", error))?;
+        let normalized_search = search_query
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_ascii_lowercase());
+        let mut sessions = if let Some(search) = normalized_search.as_deref() {
+            let mut matched = Vec::new();
+            let mut cursor = after_session_key.clone();
+            loop {
+                let page = self
+                    .journal_store
+                    .list_orchestrator_sessions(
+                        cursor.as_deref(),
+                        principal.as_str(),
+                        device_id.as_str(),
+                        channel.as_deref(),
+                        include_archived,
+                        MAX_SESSIONS_PAGE_LIMIT,
+                    )
+                    .map_err(|error| {
+                        map_orchestrator_store_error("list orchestrator sessions", error)
+                    })?;
+                if page.is_empty() {
+                    break;
+                }
+                cursor = page.last().map(|session| session.session_key.clone());
+                for mut session in page {
+                    let matched_field = [
+                        Some(session.title.as_str()),
+                        session.preview.as_deref(),
+                        session.last_intent.as_deref(),
+                        session.last_summary.as_deref(),
+                        session.last_run_state.as_deref(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .find(|value| value.to_ascii_lowercase().contains(search))
+                    .map(ToOwned::to_owned);
+                    if let Some(snippet) = matched_field {
+                        session.match_snippet = Some(snippet);
+                        matched.push(session);
+                        if matched.len() > limit {
+                            break;
+                        }
+                    }
+                }
+                if matched.len() > limit || cursor.is_none() {
+                    break;
+                }
+            }
+            matched
+        } else {
+            self.journal_store
+                .list_orchestrator_sessions(
+                    after_session_key.as_deref(),
+                    principal.as_str(),
+                    device_id.as_str(),
+                    channel.as_deref(),
+                    include_archived,
+                    limit.saturating_add(1),
+                )
+                .map_err(|error| {
+                    map_orchestrator_store_error("list orchestrator sessions", error)
+                })?
+        };
         let has_more = sessions.len() > limit;
         if has_more {
             sessions.truncate(limit);
@@ -2270,6 +2325,7 @@ impl GatewayRuntimeState {
         channel: Option<String>,
         include_archived: bool,
         requested_limit: Option<usize>,
+        search_query: Option<String>,
     ) -> Result<(Vec<OrchestratorSessionRecord>, Option<String>), Status> {
         let state = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
@@ -2280,6 +2336,7 @@ impl GatewayRuntimeState {
                 channel,
                 include_archived,
                 requested_limit,
+                search_query,
             )
         })
         .await

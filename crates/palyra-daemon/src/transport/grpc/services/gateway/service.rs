@@ -210,6 +210,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                 context.channel.clone(),
                 payload.include_archived,
                 requested_limit,
+                non_empty(payload.q),
             )
             .await?;
         Ok(Response::new(gateway_v1::ListSessionsResponse {

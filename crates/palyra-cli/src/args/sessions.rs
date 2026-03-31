@@ -14,6 +14,21 @@ pub enum SessionsCommand {
         #[arg(long, default_value_t = false, conflicts_with = "json")]
         ndjson: bool,
     },
+    #[command(visible_alias = "search")]
+    History {
+        #[arg(long)]
+        query: Option<String>,
+        #[arg(long)]
+        limit: Option<u32>,
+        #[arg(long, default_value_t = false)]
+        include_archived: bool,
+        #[arg(long, default_value_t = false)]
+        resume_first: bool,
+        #[arg(long, default_value_t = false, conflicts_with = "ndjson")]
+        json: bool,
+        #[arg(long, default_value_t = false, conflicts_with = "json")]
+        ndjson: bool,
+    },
     #[command(visible_alias = "resume")]
     Show {
         #[arg(long)]

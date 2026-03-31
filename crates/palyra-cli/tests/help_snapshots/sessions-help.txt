@@ -2,6 +2,7 @@ Usage: palyra sessions [OPTIONS] <COMMAND>
 
 Commands:
   list
+  history  [aliases: search]
   show     [aliases: resume]
   resolve
   rename

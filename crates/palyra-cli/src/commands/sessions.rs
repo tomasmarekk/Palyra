@@ -17,6 +17,7 @@ pub(crate) async fn run_sessions_async(
 ) -> Result<()> {
     let json = match &command {
         SessionsCommand::List { json, .. }
+        | SessionsCommand::History { json, .. }
         | SessionsCommand::Show { json, .. }
         | SessionsCommand::Resolve { json, .. }
         | SessionsCommand::Rename { json, .. }
@@ -24,12 +25,12 @@ pub(crate) async fn run_sessions_async(
         | SessionsCommand::Cleanup { json, .. }
         | SessionsCommand::Abort { json, .. } => output::preferred_json(*json),
     };
-    let runtime = client::operator::OperatorRuntime::new(connection);
+    let runtime = client::operator::OperatorRuntime::new(connection.clone());
 
     match command {
         SessionsCommand::List { after, limit, include_archived, json: _, ndjson } => {
             let ndjson = output::preferred_ndjson(json, ndjson);
-            let response = runtime.list_sessions(after, include_archived, limit).await?;
+            let response = runtime.list_sessions(after, include_archived, limit, None).await?;
             if json {
                 println!(
                     "{}",
@@ -60,12 +61,109 @@ pub(crate) async fn run_sessions_async(
                 );
                 for session in &response.sessions {
                     println!(
-                        "session key={} label={} updated_at_unix_ms={} last_run_id={} archived_at_unix_ms={}",
+                        "session title={} source={} preview={} key={} label={} updated_at_unix_ms={} last_run_state={} last_run_id={} archived_at_unix_ms={}",
+                        session_title_for_output(session),
+                        empty_to_none(session.title_source.as_str()),
+                        empty_to_none(session.preview.as_str()),
                         redacted_text_or_none(!session.session_key.trim().is_empty()),
                         redacted_text_or_none(!session.session_label.trim().is_empty()),
                         session.updated_at_unix_ms,
+                        empty_to_none(session.last_run_state.as_str()),
                         redacted_presence_for_output(session.last_run_id.is_some()),
                         optional_unix_ms_text(session.archived_at_unix_ms)
+                    );
+                }
+            }
+        }
+        SessionsCommand::History {
+            query,
+            limit,
+            include_archived,
+            resume_first,
+            json: _,
+            ndjson,
+        } => {
+            let ndjson = output::preferred_ndjson(json, ndjson);
+            let context = client::control_plane::connect_admin_console(app::ConnectionOverrides {
+                grpc_url: Some(connection.grpc_url.clone()),
+                daemon_url: None,
+                token: connection.token.clone(),
+                principal: Some(connection.principal.clone()),
+                device_id: Some(connection.device_id.clone()),
+                channel: Some(connection.channel.clone()),
+            })
+            .await?;
+            let limit = limit.unwrap_or(20).clamp(1, 100);
+            let response = context
+                .client
+                .list_session_catalog(vec![
+                    ("limit", Some(limit.to_string())),
+                    ("sort", Some("updated_desc".to_owned())),
+                    ("q", normalize_optional_text(query.clone())),
+                    ("include_archived", include_archived.then(|| "true".to_owned())),
+                ])
+                .await?;
+            if resume_first {
+                let Some(first) = response.sessions.first() else {
+                    anyhow::bail!("no session matched the requested history query");
+                };
+                let resumed = runtime
+                    .resolve_session(SessionResolveInput {
+                        session_id: Some(resolve_required_canonical_id(first.session_id.clone())?),
+                        session_key: String::new(),
+                        session_label: String::new(),
+                        require_existing: true,
+                        reset_session: false,
+                    })
+                    .await?;
+                let session =
+                    resumed.session.context("ResolveSession returned empty session payload")?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({
+                            "history_query": query,
+                            "matched_session": first,
+                            "session": session_to_json(&session),
+                        }))?
+                    );
+                } else {
+                    println!(
+                        "sessions.history.resume title={} preview={} archived={} session_id={} session_key={}",
+                        first.title,
+                        first.preview.as_deref().unwrap_or("none"),
+                        first.archived,
+                        REDACTED,
+                        redacted_text_or_none(!first.session_key.trim().is_empty())
+                    );
+                }
+            } else if json {
+                println!("{}", serde_json::to_string_pretty(&response)?);
+            } else if ndjson {
+                for session in &response.sessions {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&json!({
+                            "type": "session_history",
+                            "session": session,
+                        }))?
+                    );
+                }
+            } else {
+                println!(
+                    "sessions.history count={} include_archived={} query={}",
+                    response.sessions.len(),
+                    include_archived,
+                    normalize_optional_text(query).unwrap_or_else(|| "none".to_owned())
+                );
+                for session in &response.sessions {
+                    println!(
+                        "session title={} source={} archived={} pending_approvals={} preview={}",
+                        session.title,
+                        session.title_source,
+                        session.archived,
+                        session.pending_approvals,
+                        session.preview.as_deref().unwrap_or("none")
                     );
                 }
             }
@@ -93,11 +191,15 @@ pub(crate) async fn run_sessions_async(
                 );
             } else {
                 println!(
-                    "sessions.show key={} label={} created_at_unix_ms={} updated_at_unix_ms={} last_run_id={} archived_at_unix_ms={}",
+                    "sessions.show title={} source={} preview={} key={} label={} created_at_unix_ms={} updated_at_unix_ms={} last_run_state={} last_run_id={} archived_at_unix_ms={}",
+                    session_title_for_output(&session),
+                    empty_to_none(session.title_source.as_str()),
+                    empty_to_none(session.preview.as_str()),
                     redacted_text_or_none(!session.session_key.trim().is_empty()),
                     redacted_text_or_none(!session.session_label.trim().is_empty()),
                     session.created_at_unix_ms,
                     session.updated_at_unix_ms,
+                    empty_to_none(session.last_run_state.as_str()),
                     redacted_presence_for_output(session.last_run_id.is_some()),
                     optional_unix_ms_text(session.archived_at_unix_ms)
                 );
@@ -133,7 +235,10 @@ pub(crate) async fn run_sessions_async(
                 );
             } else {
                 println!(
-                    "sessions.resolve key={} label={} created={} reset_applied={} archived_at_unix_ms={}",
+                    "sessions.resolve title={} source={} preview={} key={} label={} created={} reset_applied={} archived_at_unix_ms={}",
+                    session_title_for_output(&session),
+                    empty_to_none(session.title_source.as_str()),
+                    empty_to_none(session.preview.as_str()),
                     redacted_text_or_none(!session.session_key.trim().is_empty()),
                     redacted_text_or_none(!session.session_label.trim().is_empty()),
                     response.created,
@@ -319,6 +424,21 @@ fn session_to_json(session: &gateway_v1::SessionSummary) -> Value {
         "session_id": if session.session_id.is_some() { Value::String(REDACTED.to_owned()) } else { Value::Null },
         "session_key": redacted_presence_json_value(!session.session_key.trim().is_empty()),
         "session_label": redacted_presence_json_value(!session.session_label.trim().is_empty()),
+        "title": empty_to_json_or_null(session.title.as_str()),
+        "title_source": empty_to_json_or_null(session.title_source.as_str()),
+        "title_generator_version": empty_to_json_or_null(session.title_generator_version.as_str()),
+        "preview": empty_to_json_or_null(session.preview.as_str()),
+        "preview_state": empty_to_json_or_null(session.preview_state.as_str()),
+        "last_intent": empty_to_json_or_null(session.last_intent.as_str()),
+        "last_summary": empty_to_json_or_null(session.last_summary.as_str()),
+        "match_snippet": empty_to_json_or_null(session.match_snippet.as_str()),
+        "branch_state": empty_to_json_or_null(session.branch_state.as_str()),
+        "parent_session_id": if session.parent_session_id.is_some() {
+            Value::String(REDACTED.to_owned())
+        } else {
+            Value::Null
+        },
+        "last_run_state": empty_to_json_or_null(session.last_run_state.as_str()),
         "created_at_unix_ms": session.created_at_unix_ms,
         "updated_at_unix_ms": session.updated_at_unix_ms,
         "last_run_id": if session.last_run_id.is_some() { Value::String(REDACTED.to_owned()) } else { Value::Null },
@@ -328,6 +448,10 @@ fn session_to_json(session: &gateway_v1::SessionSummary) -> Value {
 
 fn redacted_text_or_none(present: bool) -> String {
     redacted_presence_for_output(present)
+}
+
+fn normalize_optional_text(value: Option<String>) -> Option<String> {
+    value.map(|entry| entry.trim().to_owned()).filter(|entry| !entry.is_empty())
 }
 
 fn redacted_presence_for_output(present: bool) -> String {
@@ -364,6 +488,26 @@ fn empty_unix_ms(value: i64) -> Option<i64> {
     } else {
         None
     }
+}
+
+fn empty_to_none(value: &str) -> String {
+    if value.trim().is_empty() {
+        "none".to_owned()
+    } else {
+        value.to_owned()
+    }
+}
+
+fn empty_to_json_or_null(value: &str) -> Value {
+    if value.trim().is_empty() {
+        Value::Null
+    } else {
+        Value::String(value.to_owned())
+    }
+}
+
+fn session_title_for_output(session: &gateway_v1::SessionSummary) -> String {
+    empty_to_none(session.title.as_str())
 }
 
 fn build_cleanup_session_request(

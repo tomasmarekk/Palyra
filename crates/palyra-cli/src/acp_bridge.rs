@@ -313,7 +313,7 @@ impl PalyraAcpAgent {
         let mut client = GatewayRuntimeClient::connect(self.connection.clone())
             .await
             .map_err(acp_internal_error)?;
-        client.list_sessions(cursor, false, Some(100)).await.map_err(acp_internal_error)
+        client.list_sessions(cursor, false, Some(100), None).await.map_err(acp_internal_error)
     }
 
     async fn abort_run_for_session(&self, acp_session_id: &acp::SessionId) -> acp::Result<()> {
@@ -1056,6 +1056,7 @@ mod tests {
                     updated_at_unix_ms: 0,
                     last_run_id: None,
                     archived_at_unix_ms: 0,
+                    ..Default::default()
                 },
                 gateway_v1::SessionSummary {
                     session_id: Some(common_v1::CanonicalId {
@@ -1067,6 +1068,7 @@ mod tests {
                     updated_at_unix_ms: 0,
                     last_run_id: None,
                     archived_at_unix_ms: 0,
+                    ..Default::default()
                 },
             ],
             next_after_session_key: "  cursor-2  ".to_owned(),

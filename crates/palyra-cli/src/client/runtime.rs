@@ -220,12 +220,14 @@ impl GatewayRuntimeClient {
         after_session_key: Option<String>,
         include_archived: bool,
         limit: Option<u32>,
+        q: Option<String>,
     ) -> Result<gateway_v1::ListSessionsResponse> {
         let request = self.request(gateway_v1::ListSessionsRequest {
             v: CANONICAL_PROTOCOL_MAJOR,
             after_session_key: after_session_key.unwrap_or_default(),
             limit: limit.unwrap_or(100),
             include_archived,
+            q: q.unwrap_or_default(),
         })?;
         self.client
             .list_sessions(request)

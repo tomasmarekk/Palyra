@@ -1014,6 +1014,29 @@ pub struct OrchestratorSessionRecord {
     pub last_run_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub archived_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_title_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_title_generator_version: Option<String>,
+    pub title: String,
+    pub title_source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title_generator_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_intent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub match_snippet: Option<String>,
+    pub branch_state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_run_state: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -1686,6 +1709,18 @@ const MIGRATIONS: &[Migration] = &[
                 ON orchestrator_sessions(principal, device_id, channel, archived_at_unix_ms);
         "#,
     },
+    Migration {
+        version: 13,
+        name: "orchestrator_sessions_add_title_metadata",
+        sql: r#"
+            ALTER TABLE orchestrator_sessions
+                ADD COLUMN auto_title TEXT;
+            ALTER TABLE orchestrator_sessions
+                ADD COLUMN auto_title_source TEXT;
+            ALTER TABLE orchestrator_sessions
+                ADD COLUMN auto_title_generator_version TEXT;
+        "#,
+    },
 ];
 
 pub struct JournalStore {
@@ -2076,7 +2111,7 @@ impl JournalStore {
                 session.last_run_id = None;
             }
             return Ok(OrchestratorSessionResolveOutcome {
-                session,
+                session: hydrate_orchestrator_session(&guard, session, None)?,
                 created: false,
                 reset_applied: request.reset_session,
             });
@@ -2120,19 +2155,34 @@ impl JournalStore {
             ],
         )?;
 
+        let session = OrchestratorSessionRecord {
+            session_id: session_id.clone(),
+            session_key,
+            session_label,
+            principal: request.principal.clone(),
+            device_id: request.device_id.clone(),
+            channel: request.channel.clone(),
+            created_at_unix_ms: now,
+            updated_at_unix_ms: now,
+            last_run_id: None,
+            archived_at_unix_ms: None,
+            auto_title: None,
+            auto_title_source: None,
+            auto_title_generator_version: None,
+            title: String::new(),
+            title_source: String::new(),
+            title_generator_version: None,
+            preview: None,
+            last_intent: None,
+            last_summary: None,
+            match_snippet: None,
+            branch_state: "missing".to_owned(),
+            parent_session_id: None,
+            last_run_state: None,
+        };
+
         Ok(OrchestratorSessionResolveOutcome {
-            session: OrchestratorSessionRecord {
-                session_id: session_id.clone(),
-                session_key,
-                session_label,
-                principal: request.principal.clone(),
-                device_id: request.device_id.clone(),
-                channel: request.channel.clone(),
-                created_at_unix_ms: now,
-                updated_at_unix_ms: now,
-                last_run_id: None,
-                archived_at_unix_ms: None,
-            },
+            session: hydrate_orchestrator_session(&guard, session, None)?,
             created: true,
             reset_applied: false,
         })
@@ -2149,7 +2199,7 @@ impl JournalStore {
     ) -> Result<Vec<OrchestratorSessionRecord>, JournalError> {
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         let limit = limit.max(1);
-        load_orchestrator_sessions_page(
+        let sessions = load_orchestrator_sessions_page(
             &guard,
             after_session_key,
             principal,
@@ -2157,7 +2207,11 @@ impl JournalStore {
             channel,
             include_archived,
             limit,
-        )
+        )?;
+        sessions
+            .into_iter()
+            .map(|session| hydrate_orchestrator_session(&guard, session, None))
+            .collect()
     }
 
     pub fn summarize_orchestrator_usage(
@@ -2271,7 +2325,7 @@ impl JournalStore {
         let previous_session_key = session.session_key.clone();
         if session.archived_at_unix_ms.is_some() {
             return Ok(OrchestratorSessionCleanupOutcome {
-                session,
+                session: hydrate_orchestrator_session(&guard, session, None)?,
                 cleaned: false,
                 newly_archived: false,
                 previous_session_key,
@@ -2299,7 +2353,7 @@ impl JournalStore {
         session.archived_at_unix_ms = Some(now);
 
         Ok(OrchestratorSessionCleanupOutcome {
-            session,
+            session: hydrate_orchestrator_session(&guard, session, None)?,
             cleaned: true,
             newly_archived: true,
             previous_session_key,
@@ -4366,7 +4420,6 @@ fn enforce_owner_only_permissions(_path: &Path, _mode: u32) -> Result<(), Journa
     Ok(())
 }
 
-#[cfg(test)]
 fn load_orchestrator_tape(
     connection: &Connection,
     run_id: &str,
@@ -4419,6 +4472,211 @@ fn load_orchestrator_tape_page(
     Ok(tape)
 }
 
+const ORCHESTRATOR_SESSION_TITLE_LEN: usize = 72;
+const ORCHESTRATOR_SESSION_PREVIEW_LEN: usize = 180;
+const ORCHESTRATOR_AUTO_TITLE_GENERATOR_VERSION: &str = "phase2.session_title.v1";
+
+#[derive(Debug, Default)]
+struct OrchestratorSessionTranscriptSummary {
+    first_user_message: Option<String>,
+    latest_user_message: Option<String>,
+    latest_assistant_message: Option<String>,
+}
+
+fn hydrate_orchestrator_session(
+    connection: &Connection,
+    mut session: OrchestratorSessionRecord,
+    search_query: Option<&str>,
+) -> Result<OrchestratorSessionRecord, JournalError> {
+    let transcript = if let Some(last_run_id) = session.last_run_id.as_deref() {
+        summarize_orchestrator_session_transcript(
+            load_orchestrator_tape(connection, last_run_id)?.as_slice(),
+        )
+    } else {
+        OrchestratorSessionTranscriptSummary::default()
+    };
+    let last_run_state = session
+        .last_run_id
+        .as_deref()
+        .map(|run_id| load_orchestrator_run_state(connection, run_id))
+        .transpose()?
+        .flatten();
+    let auto_title_candidate = derive_orchestrator_auto_title(&transcript);
+    if session.auto_title.is_none() && auto_title_candidate.is_some() {
+        let auto_title = auto_title_candidate.clone().unwrap_or_default();
+        connection.execute(
+            r#"
+                UPDATE orchestrator_sessions
+                SET
+                    auto_title = ?2,
+                    auto_title_source = 'first_user_message',
+                    auto_title_generator_version = ?3
+                WHERE session_ulid = ?1
+                  AND (auto_title IS NULL OR TRIM(auto_title) = '')
+            "#,
+            params![
+                session.session_id.as_str(),
+                auto_title.as_str(),
+                ORCHESTRATOR_AUTO_TITLE_GENERATOR_VERSION,
+            ],
+        )?;
+        session.auto_title = Some(auto_title);
+        session.auto_title_source = Some("first_user_message".to_owned());
+        session.auto_title_generator_version =
+            Some(ORCHESTRATOR_AUTO_TITLE_GENERATOR_VERSION.to_owned());
+    }
+
+    let (title, title_source, title_generator_version) = if let Some(label) =
+        normalize_orchestrator_session_text(
+            session.session_label.as_deref().unwrap_or_default(),
+            ORCHESTRATOR_SESSION_TITLE_LEN,
+        ) {
+        (label, "label".to_owned(), None)
+    } else if let Some(auto_title) = session.auto_title.as_deref().and_then(|value| {
+        normalize_orchestrator_session_text(value, ORCHESTRATOR_SESSION_TITLE_LEN)
+    }) {
+        (
+            auto_title,
+            session.auto_title_source.clone().unwrap_or_else(|| "auto_title".to_owned()),
+            session.auto_title_generator_version.clone(),
+        )
+    } else {
+        (
+            normalize_orchestrator_session_text(
+                session.session_key.as_str(),
+                ORCHESTRATOR_SESSION_TITLE_LEN,
+            )
+            .unwrap_or_else(|| session.session_id.clone()),
+            "session_key".to_owned(),
+            None,
+        )
+    };
+    let preview = transcript
+        .latest_assistant_message
+        .clone()
+        .or_else(|| transcript.latest_user_message.clone())
+        .or_else(|| transcript.first_user_message.clone());
+
+    session.title = title;
+    session.title_source = title_source;
+    session.title_generator_version = title_generator_version;
+    session.preview = preview;
+    session.last_intent = transcript.latest_user_message;
+    session.last_summary = transcript.latest_assistant_message;
+    session.last_run_state = last_run_state;
+    session.match_snippet =
+        search_query.and_then(|query| build_orchestrator_session_match_snippet(&session, query));
+    Ok(session)
+}
+
+fn load_orchestrator_run_state(
+    connection: &Connection,
+    run_id: &str,
+) -> Result<Option<String>, JournalError> {
+    connection
+        .query_row(
+            "SELECT state FROM orchestrator_runs WHERE run_ulid = ?1",
+            params![run_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn summarize_orchestrator_session_transcript(
+    events: &[OrchestratorTapeRecord],
+) -> OrchestratorSessionTranscriptSummary {
+    let mut summary = OrchestratorSessionTranscriptSummary::default();
+
+    for event in events {
+        let payload = match serde_json::from_str::<serde_json::Value>(event.payload_json.as_str()) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        match event.event_type.as_str() {
+            "message.received" => {
+                let Some(text) =
+                    payload.get("text").and_then(serde_json::Value::as_str).and_then(|value| {
+                        normalize_orchestrator_session_text(value, ORCHESTRATOR_SESSION_PREVIEW_LEN)
+                    })
+                else {
+                    continue;
+                };
+                if summary.first_user_message.is_none() {
+                    summary.first_user_message = Some(text.clone());
+                }
+                summary.latest_user_message = Some(text);
+            }
+            "message.replied" => {
+                let Some(text) = payload
+                    .get("reply_text")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|value| {
+                        normalize_orchestrator_session_text(value, ORCHESTRATOR_SESSION_PREVIEW_LEN)
+                    })
+                else {
+                    continue;
+                };
+                summary.latest_assistant_message = Some(text);
+            }
+            _ => {}
+        }
+    }
+
+    summary
+}
+
+fn normalize_orchestrator_session_text(raw: &str, max_chars: usize) -> Option<String> {
+    let normalized = palyra_common::redaction::redact_url_segments_in_text(
+        palyra_common::redaction::redact_auth_error(raw).as_str(),
+    )
+    .replace(['\r', '\n'], " ");
+    let trimmed = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut truncated = trimmed.chars().take(max_chars.saturating_add(1)).collect::<String>();
+    if truncated.chars().count() > max_chars {
+        truncated = truncated.chars().take(max_chars).collect::<String>();
+        truncated.push_str("...");
+    }
+    Some(truncated)
+}
+
+fn derive_orchestrator_auto_title(
+    transcript: &OrchestratorSessionTranscriptSummary,
+) -> Option<String> {
+    let seed =
+        transcript.first_user_message.as_deref().or(transcript.latest_user_message.as_deref())?;
+    let meaningful =
+        transcript.latest_assistant_message.is_some() || seed.split_whitespace().count() >= 3;
+    if !meaningful {
+        return None;
+    }
+    normalize_orchestrator_session_text(seed, ORCHESTRATOR_SESSION_TITLE_LEN)
+}
+
+fn build_orchestrator_session_match_snippet(
+    session: &OrchestratorSessionRecord,
+    query: &str,
+) -> Option<String> {
+    let normalized = query.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+    [
+        Some(session.title.as_str()),
+        session.preview.as_deref(),
+        session.last_intent.as_deref(),
+        session.last_summary.as_deref(),
+        session.last_run_state.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|value| value.to_ascii_lowercase().contains(normalized.as_str()))
+    .map(ToOwned::to_owned)
+}
+
 fn map_orchestrator_session_row(
     row: &rusqlite::Row<'_>,
 ) -> Result<OrchestratorSessionRecord, rusqlite::Error> {
@@ -4433,6 +4691,19 @@ fn map_orchestrator_session_row(
         updated_at_unix_ms: row.get(7)?,
         last_run_id: row.get(8)?,
         archived_at_unix_ms: row.get(9)?,
+        auto_title: row.get(10)?,
+        auto_title_source: row.get(11)?,
+        auto_title_generator_version: row.get(12)?,
+        title: String::new(),
+        title_source: String::new(),
+        title_generator_version: None,
+        preview: None,
+        last_intent: None,
+        last_summary: None,
+        match_snippet: None,
+        branch_state: "missing".to_owned(),
+        parent_session_id: None,
+        last_run_state: None,
     })
 }
 
@@ -4452,7 +4723,10 @@ fn load_orchestrator_session_by_id(
                 created_at_unix_ms,
                 updated_at_unix_ms,
                 last_run_ulid,
-                archived_at_unix_ms
+                archived_at_unix_ms,
+                auto_title,
+                auto_title_source,
+                auto_title_generator_version
             FROM orchestrator_sessions
             WHERE session_ulid = ?1
             LIMIT 1
@@ -4480,7 +4754,10 @@ fn load_orchestrator_session_by_key(
                 created_at_unix_ms,
                 updated_at_unix_ms,
                 last_run_ulid,
-                archived_at_unix_ms
+                archived_at_unix_ms,
+                auto_title,
+                auto_title_source,
+                auto_title_generator_version
             FROM orchestrator_sessions
             WHERE session_key = ?1
             LIMIT 1
@@ -4508,7 +4785,10 @@ fn load_orchestrator_session_by_label(
                 created_at_unix_ms,
                 updated_at_unix_ms,
                 last_run_ulid,
-                archived_at_unix_ms
+                archived_at_unix_ms,
+                auto_title,
+                auto_title_source,
+                auto_title_generator_version
             FROM orchestrator_sessions
             WHERE session_label = ?1
               AND archived_at_unix_ms IS NULL
@@ -4543,7 +4823,10 @@ fn load_orchestrator_sessions_page(
                 created_at_unix_ms,
                 updated_at_unix_ms,
                 last_run_ulid,
-                archived_at_unix_ms
+                archived_at_unix_ms,
+                auto_title,
+                auto_title_source,
+                auto_title_generator_version
             FROM orchestrator_sessions
             WHERE (?1 IS NULL OR session_key > ?1)
               AND principal = ?2
@@ -7137,6 +7420,183 @@ mod tests {
             second_page.iter().map(|session| session.session_key.as_str()).collect::<Vec<_>>(),
             vec!["session:omega:visible"],
             "subsequent page should skip interleaved foreign sessions instead of leaking metadata"
+        );
+    }
+
+    #[test]
+    fn orchestrator_session_listing_derives_auto_title_and_preview() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+
+        upsert_orchestrator_session(&store, "01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        store
+            .start_orchestrator_run(&OrchestratorRunStartRequest {
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),
+                session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned(),
+            })
+            .expect("run should start");
+        store
+            .append_orchestrator_tape_event(&OrchestratorTapeAppendRequest {
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),
+                seq: 0,
+                event_type: "message.received".to_owned(),
+                payload_json: r#"{"text":"Investigate daemon health posture"}"#.to_owned(),
+            })
+            .expect("user intent should persist");
+        store
+            .append_orchestrator_tape_event(&OrchestratorTapeAppendRequest {
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),
+                seq: 1,
+                event_type: "message.replied".to_owned(),
+                payload_json: r#"{"reply_text":"Daemon health posture looks stable after the latest restart."}"#
+                    .to_owned(),
+            })
+            .expect("assistant summary should persist");
+
+        let sessions = store
+            .list_orchestrator_sessions(
+                None,
+                "user:ops",
+                "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                Some("cli"),
+                false,
+                10,
+            )
+            .expect("session listing should succeed");
+        let session = sessions
+            .into_iter()
+            .find(|entry| entry.session_id == "01ARZ3NDEKTSV4RRFFQ69G5FAW")
+            .expect("session should be present in scoped listing");
+        assert_eq!(session.title, "Investigate daemon health posture");
+        assert_eq!(session.title_source, "first_user_message");
+        assert_eq!(
+            session.title_generator_version.as_deref(),
+            Some("phase2.session_title.v1")
+        );
+        assert_eq!(
+            session.preview.as_deref(),
+            Some("Daemon health posture looks stable after the latest restart.")
+        );
+        assert_eq!(
+            session.last_intent.as_deref(),
+            Some("Investigate daemon health posture")
+        );
+        assert_eq!(
+            session.last_summary.as_deref(),
+            Some("Daemon health posture looks stable after the latest restart.")
+        );
+    }
+
+    #[test]
+    fn orchestrator_session_listing_prefers_manual_label_over_auto_title() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+
+        store
+            .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
+                session_id: "01ARZ3NDEKTSV4RRFFQ69G5FB0".to_owned(),
+                session_key: "ops:manual-label".to_owned(),
+                session_label: Some("Pinned ops session".to_owned()),
+                principal: "user:ops".to_owned(),
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                channel: Some("cli".to_owned()),
+            })
+            .expect("session should be upserted");
+        store
+            .start_orchestrator_run(&OrchestratorRunStartRequest {
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FB1".to_owned(),
+                session_id: "01ARZ3NDEKTSV4RRFFQ69G5FB0".to_owned(),
+            })
+            .expect("run should start");
+        store
+            .append_orchestrator_tape_event(&OrchestratorTapeAppendRequest {
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FB1".to_owned(),
+                seq: 0,
+                event_type: "message.received".to_owned(),
+                payload_json: r#"{"text":"Draft a fresh daemon incident summary"}"#.to_owned(),
+            })
+            .expect("user intent should persist");
+        store
+            .append_orchestrator_tape_event(&OrchestratorTapeAppendRequest {
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FB1".to_owned(),
+                seq: 1,
+                event_type: "message.replied".to_owned(),
+                payload_json: r#"{"reply_text":"Incident summary draft is ready."}"#.to_owned(),
+            })
+            .expect("assistant summary should persist");
+
+        let session = store
+            .list_orchestrator_sessions(
+                None,
+                "user:ops",
+                "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                Some("cli"),
+                false,
+                10,
+            )
+            .expect("session listing should succeed")
+            .into_iter()
+            .find(|entry| entry.session_id == "01ARZ3NDEKTSV4RRFFQ69G5FB0")
+            .expect("session should exist");
+        assert_eq!(session.title, "Pinned ops session");
+        assert_eq!(session.title_source, "label");
+        assert_eq!(
+            session.auto_title.as_deref(),
+            Some("Draft a fresh daemon incident summary")
+        );
+    }
+
+    #[test]
+    fn orchestrator_session_listing_redacts_secret_like_preview_content() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+
+        upsert_orchestrator_session(&store, "01ARZ3NDEKTSV4RRFFQ69G5FB2");
+        store
+            .start_orchestrator_run(&OrchestratorRunStartRequest {
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FB3".to_owned(),
+                session_id: "01ARZ3NDEKTSV4RRFFQ69G5FB2".to_owned(),
+            })
+            .expect("run should start");
+        store
+            .append_orchestrator_tape_event(&OrchestratorTapeAppendRequest {
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FB3".to_owned(),
+                seq: 0,
+                event_type: "message.received".to_owned(),
+                payload_json:
+                    r#"{"text":"Check callback https://example.test/callback?access_token=super-secret and token=abc123"}"#
+                        .to_owned(),
+            })
+            .expect("user intent should persist");
+
+        let session = store
+            .list_orchestrator_sessions(
+                None,
+                "user:ops",
+                "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                Some("cli"),
+                false,
+                10,
+            )
+            .expect("session listing should succeed")
+            .into_iter()
+            .find(|entry| entry.session_id == "01ARZ3NDEKTSV4RRFFQ69G5FB2")
+            .expect("session should exist");
+        let preview = session.preview.expect("preview should exist");
+        assert!(
+            preview.contains("access_token=<redacted>"),
+            "url query token should be redacted: {preview}"
+        );
+        assert!(
+            preview.contains("token=<redacted>"),
+            "inline token assignment should be redacted: {preview}"
+        );
+        assert!(
+            !preview.contains("super-secret") && !preview.contains("abc123"),
+            "raw secret-like values must not leak into previews: {preview}"
         );
     }
 

@@ -16,6 +16,7 @@ pub(crate) async fn console_chat_sessions_list_handler(
             session.context.channel.clone(),
             false,
             Some(limit),
+            None,
         )
         .await
         .map_err(runtime_status_response)?;

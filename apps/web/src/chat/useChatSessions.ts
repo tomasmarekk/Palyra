@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 
-import type { ChatSessionRecord, ConsoleApiClient } from "../consoleApi";
+import type { ConsoleApiClient, SessionCatalogRecord } from "../consoleApi";
 
 import { emptyToUndefined, toErrorMessage } from "./chatShared";
 
@@ -13,14 +13,18 @@ type UseChatSessionsArgs = {
 
 type UseChatSessionsResult = {
   sessionsBusy: boolean;
-  sortedSessions: ChatSessionRecord[];
+  sortedSessions: SessionCatalogRecord[];
   activeSessionId: string;
   setActiveSessionId: (sessionId: string) => void;
-  selectedSession: ChatSessionRecord | null;
+  selectedSession: SessionCatalogRecord | null;
   sessionLabelDraft: string;
   setSessionLabelDraft: (value: string) => void;
   newSessionLabel: string;
   setNewSessionLabel: (value: string) => void;
+  searchQuery: string;
+  setSearchQuery: (value: string) => void;
+  includeArchived: boolean;
+  setIncludeArchived: (value: boolean) => void;
   refreshSessions: (ensureSession: boolean) => Promise<void>;
   createSession: () => Promise<void>;
   renameSession: () => Promise<void>;
@@ -35,10 +39,12 @@ export function useChatSessions({
   preferredSessionId,
 }: UseChatSessionsArgs): UseChatSessionsResult {
   const [sessionsBusy, setSessionsBusy] = useState(false);
-  const [sessions, setSessions] = useState<ChatSessionRecord[]>([]);
+  const [sessions, setSessions] = useState<SessionCatalogRecord[]>([]);
   const [activeSessionId, setActiveSessionId] = useState("");
   const [sessionLabelDraft, setSessionLabelDraft] = useState("");
   const [newSessionLabel, setNewSessionLabel] = useState("");
+  const [searchQuery, setSearchQuery] = useState("");
+  const [includeArchived, setIncludeArchived] = useState(false);
 
   const sortedSessions = useMemo(() => {
     return [...sessions].sort((left, right) => right.updated_at_unix_ms - left.updated_at_unix_ms);
@@ -66,10 +72,23 @@ export function useChatSessions({
     }
   }, [preferredSessionId, sessions]);
 
+  useEffect(() => {
+    void refreshSessions(false);
+  }, [includeArchived, searchQuery]);
+
   async function refreshSessions(ensureSession: boolean): Promise<void> {
     setSessionsBusy(true);
     try {
-      const response = await api.listChatSessions();
+      const params = new URLSearchParams();
+      params.set("limit", "50");
+      params.set("sort", "updated_desc");
+      if (searchQuery.trim().length > 0) {
+        params.set("q", searchQuery.trim());
+      }
+      if (includeArchived) {
+        params.set("include_archived", "true");
+      }
+      const response = await api.listSessionCatalog(params);
       const nextSessions = [...response.sessions].sort(
         (left, right) => right.updated_at_unix_ms - left.updated_at_unix_ms,
       );
@@ -77,7 +96,8 @@ export function useChatSessions({
         const created = await api.resolveChatSession({
           session_label: emptyToUndefined(newSessionLabel),
         });
-        setSessions([created.session]);
+        const createdRecord = await api.getSessionCatalogEntry(created.session.session_id);
+        setSessions([createdRecord.session]);
         setActiveSessionId(created.session.session_id);
         setNewSessionLabel("");
         setNotice("New chat session created.");
@@ -119,13 +139,14 @@ export function useChatSessions({
       const response = await api.resolveChatSession({
         session_label: emptyToUndefined(newSessionLabel),
       });
+      const createdRecord = await api.getSessionCatalogEntry(response.session.session_id);
       setSessions((previous) => {
         const without = previous.filter(
-          (entry) => entry.session_id !== response.session.session_id,
+          (entry) => entry.session_id !== createdRecord.session.session_id,
         );
-        return [response.session, ...without];
+        return [createdRecord.session, ...without];
       });
-      setActiveSessionId(response.session.session_id);
+      setActiveSessionId(createdRecord.session.session_id);
       setNewSessionLabel("");
       setNotice("Chat session created.");
     } catch (error) {
@@ -151,12 +172,13 @@ export function useChatSessions({
       const response = await api.renameChatSession(activeSessionId, {
         session_label: sessionLabelDraft.trim(),
       });
+      const updatedRecord = await api.getSessionCatalogEntry(response.session.session_id);
       setSessions((previous) => {
         return previous.map((entry) => {
-          if (entry.session_id !== response.session.session_id) {
+          if (entry.session_id !== updatedRecord.session.session_id) {
             return entry;
           }
-          return response.session;
+          return updatedRecord.session;
         });
       });
       setNotice("Session label updated.");
@@ -177,12 +199,13 @@ export function useChatSessions({
     setSessionsBusy(true);
     try {
       const response = await api.resetChatSession(activeSessionId);
+      const updatedRecord = await api.getSessionCatalogEntry(response.session.session_id);
       setSessions((previous) => {
         return previous.map((entry) => {
-          if (entry.session_id !== response.session.session_id) {
+          if (entry.session_id !== updatedRecord.session.session_id) {
             return entry;
           }
-          return response.session;
+          return updatedRecord.session;
         });
       });
       setNotice("Session reset applied.");
@@ -227,6 +250,10 @@ export function useChatSessions({
     setSessionLabelDraft,
     newSessionLabel,
     setNewSessionLabel,
+    searchQuery,
+    setSearchQuery,
+    includeArchived,
+    setIncludeArchived,
     refreshSessions,
     createSession,
     renameSession,

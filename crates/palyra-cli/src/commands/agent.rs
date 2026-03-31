@@ -298,6 +298,7 @@ mod tests {
                 updated_at_unix_ms: 0,
                 last_run_id: None,
                 archived_at_unix_ms: 0,
+                ..Default::default()
             }),
             None,
             None,

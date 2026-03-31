@@ -402,6 +402,87 @@ pub struct PairingSummaryEnvelope {
     pub channels: Vec<PairingChannelSnapshot>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCatalogRecord {
+    pub session_id: String,
+    pub session_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_label: Option<String>,
+    pub title: String,
+    pub title_source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+    pub preview_state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_intent: Option<String>,
+    pub last_intent_state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_summary: Option<String>,
+    pub last_summary_state: String,
+    pub branch_state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    pub principal: String,
+    pub device_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    pub created_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_run_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_run_started_at_unix_ms: Option<i64>,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    pub archived: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archived_at_unix_ms: Option<i64>,
+    pub pending_approvals: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCatalogSummary {
+    pub active_sessions: usize,
+    pub archived_sessions: usize,
+    pub sessions_with_pending_approvals: usize,
+    pub sessions_with_active_runs: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCatalogQueryEcho {
+    pub limit: usize,
+    pub cursor: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub q: Option<String>,
+    pub include_archived: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archived: Option<bool>,
+    pub sort: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub has_pending_approvals: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCatalogListEnvelope {
+    pub contract: ContractDescriptor,
+    #[serde(default)]
+    pub sessions: Vec<SessionCatalogRecord>,
+    pub summary: SessionCatalogSummary,
+    pub query: SessionCatalogQueryEcho,
+    pub page: PageInfo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCatalogDetailEnvelope {
+    pub contract: ContractDescriptor,
+    pub session: SessionCatalogRecord,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogListQuery {
     #[serde(skip_serializing_if = "Option::is_none")]
