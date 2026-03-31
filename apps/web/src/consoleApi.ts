@@ -1344,10 +1344,7 @@ export class ConsoleApiClient {
     );
   }
 
-  async revokeDevice(
-    deviceId: string,
-    payload: { reason?: string } = {},
-  ): Promise<DeviceEnvelope> {
+  async revokeDevice(deviceId: string, payload: { reason?: string } = {}): Promise<DeviceEnvelope> {
     return this.request(
       `/console/v1/devices/${encodeURIComponent(deviceId)}/revoke`,
       {
@@ -1358,10 +1355,7 @@ export class ConsoleApiClient {
     );
   }
 
-  async removeDevice(
-    deviceId: string,
-    payload: { reason?: string } = {},
-  ): Promise<DeviceEnvelope> {
+  async removeDevice(deviceId: string, payload: { reason?: string } = {}): Promise<DeviceEnvelope> {
     return this.request(
       `/console/v1/devices/${encodeURIComponent(deviceId)}/remove`,
       {

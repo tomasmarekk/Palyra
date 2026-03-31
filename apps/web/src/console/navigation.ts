@@ -32,24 +32,12 @@ export const CONSOLE_NAV_GROUPS: readonly NavigationGroup[] = [
   {
     id: "control",
     label: "Observability",
-    items: resolveEntries([
-      "overview",
-      "sessions",
-      "usage",
-      "logs",
-      "inventory",
-      "support",
-    ]),
+    items: resolveEntries(["overview", "sessions", "usage", "logs", "inventory", "support"]),
   },
   {
     id: "operations",
     label: "Control",
-    items: resolveEntries([
-      "approvals",
-      "cron",
-      "channels",
-      "browser",
-    ]),
+    items: resolveEntries(["approvals", "cron", "channels", "browser"]),
   },
   {
     id: "agent",

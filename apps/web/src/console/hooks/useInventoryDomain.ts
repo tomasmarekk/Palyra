@@ -91,8 +91,13 @@ export function useInventoryDomain({
       setPendingPairings(response.pending_pairings);
       setSelectedDeviceId((previous) => {
         const requested =
-          (preferredSelection?.trim().length ?? 0) > 0 ? preferredSelection!.trim() : previous.trim();
-        if (requested.length > 0 && response.devices.some((record) => record.device_id === requested)) {
+          (preferredSelection?.trim().length ?? 0) > 0
+            ? preferredSelection!.trim()
+            : previous.trim();
+        if (
+          requested.length > 0 &&
+          response.devices.some((record) => record.device_id === requested)
+        ) {
           return requested;
         }
         return response.devices[0]?.device_id ?? "";

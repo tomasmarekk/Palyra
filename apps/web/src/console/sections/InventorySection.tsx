@@ -1,12 +1,7 @@
 import { useNavigate, useSearchParams } from "react-router-dom";
 
 import { getSectionPath } from "../navigation";
-import {
-  ActionButton,
-  SelectField,
-  TextAreaField,
-  TextInputField,
-} from "../components/ui";
+import { ActionButton, SelectField, TextAreaField, TextInputField } from "../components/ui";
 import {
   WorkspaceMetricCard,
   WorkspacePageHeader,
@@ -376,9 +371,7 @@ export function InventorySection({ app }: InventorySectionProps) {
                     <ActionButton
                       type="button"
                       variant="ghost"
-                      onPress={() =>
-                        void navigate(`${getSectionPath("approvals")}`)
-                      }
+                      onPress={() => void navigate(`${getSectionPath("approvals")}`)}
                     >
                       Open approvals
                     </ActionButton>

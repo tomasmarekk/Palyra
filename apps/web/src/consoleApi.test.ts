@@ -796,9 +796,7 @@ describe("ConsoleApiClient", () => {
     );
     expect(new Headers(calls[5]?.init?.headers).get("x-palyra-csrf-token")).toBe("csrf-1");
 
-    expect(requestUrl(calls[6]?.input)).toBe(
-      "/console/v1/nodes/01ARZ3NDEKTSV4RRFFQ69G5FAZ/invoke",
-    );
+    expect(requestUrl(calls[6]?.input)).toBe("/console/v1/nodes/01ARZ3NDEKTSV4RRFFQ69G5FAZ/invoke");
     expect(new Headers(calls[6]?.init?.headers).get("x-palyra-csrf-token")).toBe("csrf-1");
   });
 
