@@ -249,6 +249,15 @@ export function SessionsSection({ app }: SessionsSectionProps) {
               >
                 Open in chat
               </ActionButton>
+              <ActionButton
+                type="button"
+                variant="ghost"
+                onPress={() =>
+                  void navigate(`${getSectionPath("inventory")}?deviceId=${selected.device_id}`)
+                }
+              >
+                Open inventory
+              </ActionButton>
 
               <dl className="workspace-key-value-grid">
                 <div>

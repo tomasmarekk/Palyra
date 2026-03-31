@@ -680,6 +680,156 @@ export interface PairingSummaryEnvelope {
   channels: PairingChannelSnapshot[];
 }
 
+export type InventoryPresenceState = "ok" | "stale" | "degraded" | "offline";
+export type InventoryTrustState =
+  | "trusted"
+  | "pending"
+  | "revoked"
+  | "removed"
+  | "legacy"
+  | "unknown";
+export type NodePairingRequestState =
+  | "pending_approval"
+  | "approved"
+  | "rejected"
+  | "completed"
+  | "expired";
+
+export interface NodeCapabilityView {
+  name: string;
+  available: boolean;
+}
+
+export interface InventoryCapabilitySummary {
+  total: number;
+  available: number;
+  unavailable: number;
+}
+
+export interface InventoryActionAvailability {
+  can_rotate: boolean;
+  can_revoke: boolean;
+  can_remove: boolean;
+  can_invoke: boolean;
+}
+
+export interface NodePairingRequestView {
+  request_id: string;
+  session_id: string;
+  device_id: string;
+  client_kind: string;
+  method: "pin" | "qr";
+  code_issued_by: string;
+  requested_at_unix_ms: number;
+  expires_at_unix_ms: number;
+  approval_id: string;
+  state: NodePairingRequestState;
+  decision_reason?: string;
+  decision_scope_ttl_ms?: number;
+  identity_fingerprint: string;
+  transcript_hash_hex: string;
+  cert_expires_at_unix_ms?: number;
+}
+
+export interface InventoryDeviceRecord {
+  device_id: string;
+  client_kind: string;
+  device_status: string;
+  trust_state: InventoryTrustState;
+  presence_state: InventoryPresenceState;
+  paired_at_unix_ms: number;
+  updated_at_unix_ms: number;
+  registered_at_unix_ms?: number;
+  last_seen_at_unix_ms?: number;
+  heartbeat_age_ms?: number;
+  latest_session_id?: string;
+  pending_pairings: number;
+  issued_by: string;
+  approval_id: string;
+  identity_fingerprint: string;
+  transcript_hash_hex: string;
+  platform?: string;
+  capabilities: NodeCapabilityView[];
+  capability_summary: InventoryCapabilitySummary;
+  last_event_name?: string;
+  last_event_at_unix_ms?: number;
+  current_certificate_expires_at_unix_ms?: number;
+  revoked_reason?: string;
+  warnings: string[];
+  actions: InventoryActionAvailability;
+}
+
+export interface InventoryInstanceRecord {
+  instance_id: string;
+  label: string;
+  kind: string;
+  presence_state: InventoryPresenceState;
+  observed_at_unix_ms: number;
+  state_label: string;
+  detail?: string;
+  capability_summary: InventoryCapabilitySummary;
+}
+
+export interface InventorySummary {
+  devices: number;
+  trusted_devices: number;
+  pending_pairings: number;
+  ok_devices: number;
+  stale_devices: number;
+  degraded_devices: number;
+  offline_devices: number;
+  ok_instances: number;
+  stale_instances: number;
+  degraded_instances: number;
+  offline_instances: number;
+}
+
+export interface InventoryListEnvelope {
+  contract: ContractDescriptor;
+  generated_at_unix_ms: number;
+  summary: InventorySummary;
+  devices: InventoryDeviceRecord[];
+  pending_pairings: NodePairingRequestView[];
+  instances: InventoryInstanceRecord[];
+  page: PageInfo;
+}
+
+export interface InventoryDeviceDetailEnvelope {
+  contract: ContractDescriptor;
+  generated_at_unix_ms: number;
+  device: InventoryDeviceRecord;
+  pairings: NodePairingRequestView[];
+}
+
+export interface DeviceEnvelope {
+  contract: ContractDescriptor;
+  device: {
+    device_id: string;
+    client_kind: string;
+    status: string;
+    paired_at_unix_ms: number;
+    updated_at_unix_ms: number;
+    issued_by: string;
+    approval_id: string;
+    identity_fingerprint: string;
+    transcript_hash_hex: string;
+    current_certificate_fingerprint?: string;
+    current_certificate_expires_at_unix_ms?: number;
+    revoked_reason?: string;
+    revoked_at_unix_ms?: number;
+    removed_at_unix_ms?: number;
+  };
+}
+
+export interface NodeInvokeEnvelope {
+  contract: ContractDescriptor;
+  device_id: string;
+  capability: string;
+  success: boolean;
+  output_json?: JsonValue;
+  error: string;
+}
+
 export interface SupportBundleJob {
   job_id: string;
   state: "queued" | "running" | "succeeded" | "failed";
@@ -1133,6 +1283,14 @@ export class ConsoleApiClient {
     return this.request("/console/v1/pairing");
   }
 
+  async listInventory(): Promise<InventoryListEnvelope> {
+    return this.request("/console/v1/inventory");
+  }
+
+  async getInventoryDevice(deviceId: string): Promise<InventoryDeviceDetailEnvelope> {
+    return this.request(`/console/v1/inventory/${encodeURIComponent(deviceId)}`);
+  }
+
   async listAgents(params?: URLSearchParams): Promise<AgentListEnvelope> {
     return this.request(buildPathWithQuery("/console/v1/agents", params));
   }
@@ -1170,6 +1328,61 @@ export class ConsoleApiClient {
   }): Promise<PairingSummaryEnvelope> {
     return this.request(
       "/console/v1/pairing/codes",
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      { csrf: true },
+    );
+  }
+
+  async rotateDevice(deviceId: string): Promise<DeviceEnvelope> {
+    return this.request(
+      `/console/v1/devices/${encodeURIComponent(deviceId)}/rotate`,
+      { method: "POST" },
+      { csrf: true },
+    );
+  }
+
+  async revokeDevice(
+    deviceId: string,
+    payload: { reason?: string } = {},
+  ): Promise<DeviceEnvelope> {
+    return this.request(
+      `/console/v1/devices/${encodeURIComponent(deviceId)}/revoke`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      { csrf: true },
+    );
+  }
+
+  async removeDevice(
+    deviceId: string,
+    payload: { reason?: string } = {},
+  ): Promise<DeviceEnvelope> {
+    return this.request(
+      `/console/v1/devices/${encodeURIComponent(deviceId)}/remove`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      { csrf: true },
+    );
+  }
+
+  async invokeNode(
+    deviceId: string,
+    payload: {
+      capability: string;
+      input_json?: JsonValue;
+      max_payload_bytes?: number;
+      timeout_ms?: number;
+    },
+  ): Promise<NodeInvokeEnvelope> {
+    return this.request(
+      `/console/v1/nodes/${encodeURIComponent(deviceId)}/invoke`,
       {
         method: "POST",
         body: JSON.stringify(payload),

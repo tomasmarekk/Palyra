@@ -225,6 +225,17 @@ export function UsageSection({ app }: UsageSectionProps) {
                 >
                   Open latest run
                 </ActionButton>
+                <ActionButton
+                  type="button"
+                  variant="ghost"
+                  onPress={() =>
+                    void navigate(
+                      `${getSectionPath("inventory")}?deviceId=${detail.session.device_id}`,
+                    )
+                  }
+                >
+                  Open inventory
+                </ActionButton>
               </div>
 
               <dl className="workspace-key-value-grid">

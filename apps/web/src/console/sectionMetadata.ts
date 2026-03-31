@@ -8,6 +8,11 @@ export const CONSOLE_SECTIONS = [
     label: "Logs",
     detail: "Unified runtime stream across palyrad, browserd, and channels",
   },
+  {
+    id: "inventory",
+    label: "Inventory",
+    detail: "Nodes, devices, pending pairings, and runtime instances",
+  },
   { id: "approvals", label: "Approvals", detail: "Sensitive action gate" },
   { id: "cron", label: "Automation", detail: "Scheduled jobs, runs, and history" },
   { id: "channels", label: "Channels", detail: "Connectors, router, and Discord setup" },

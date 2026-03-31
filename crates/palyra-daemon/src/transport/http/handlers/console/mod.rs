@@ -10,6 +10,7 @@ pub(crate) mod cron;
 pub(crate) mod devices;
 pub(crate) mod diagnostics;
 pub(crate) mod hooks;
+pub(crate) mod inventory;
 pub(crate) mod logs;
 pub(crate) mod memory;
 pub(crate) mod nodes;

@@ -7,6 +7,7 @@ import { BrowserSection } from "./sections/BrowserSection";
 import { ChannelsSection } from "./sections/ChannelsSection";
 import { ConfigSection } from "./sections/ConfigSection";
 import { CronSection } from "./sections/CronSection";
+import { InventorySection } from "./sections/InventorySection";
 import { MemorySection } from "./sections/MemorySection";
 import { LogsSection } from "./sections/LogsSection";
 import { OperationsSection } from "./sections/OperationsSection";
@@ -46,6 +47,17 @@ export function ConsoleSectionContent({ app }: ConsoleSectionContentProps) {
     case "logs":
       return (
         <LogsSection
+          app={{
+            api: app.api,
+            setError: app.setError,
+            setNotice: app.setNotice,
+            revealSensitiveValues: app.revealSensitiveValues,
+          }}
+        />
+      );
+    case "inventory":
+      return (
+        <InventorySection
           app={{
             api: app.api,
             setError: app.setError,

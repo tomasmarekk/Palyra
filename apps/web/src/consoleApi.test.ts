@@ -639,6 +639,169 @@ describe("ConsoleApiClient", () => {
     );
   });
 
+  it("supports the inventory contract and CSRF-protected device actions", async () => {
+    const calls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
+    const responses = [
+      jsonResponse({
+        principal: "admin:web-console",
+        device_id: "device-1",
+        csrf_token: "csrf-1",
+        issued_at_unix_ms: 100,
+        expires_at_unix_ms: 200,
+      }),
+      jsonResponse({
+        contract: { contract_version: "control-plane.v1" },
+        generated_at_unix_ms: 100,
+        summary: {
+          devices: 1,
+          trusted_devices: 1,
+          pending_pairings: 1,
+          ok_devices: 1,
+          stale_devices: 0,
+          degraded_devices: 0,
+          offline_devices: 0,
+          ok_instances: 2,
+          stale_instances: 0,
+          degraded_instances: 1,
+          offline_instances: 0,
+        },
+        devices: [],
+        pending_pairings: [],
+        instances: [],
+        page: { limit: 1, returned: 0, has_more: false },
+      }),
+      jsonResponse({
+        contract: { contract_version: "control-plane.v1" },
+        generated_at_unix_ms: 100,
+        device: {
+          device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAZ",
+          client_kind: "node",
+          device_status: "paired",
+          trust_state: "trusted",
+          presence_state: "ok",
+          paired_at_unix_ms: 100,
+          updated_at_unix_ms: 100,
+          pending_pairings: 0,
+          issued_by: "admin:web-console",
+          approval_id: "approval-1",
+          identity_fingerprint: "fingerprint-1",
+          transcript_hash_hex: "hash-1",
+          capabilities: [{ name: "ping", available: true }],
+          capability_summary: { total: 1, available: 1, unavailable: 0 },
+          warnings: [],
+          actions: {
+            can_rotate: true,
+            can_revoke: true,
+            can_remove: true,
+            can_invoke: true,
+          },
+        },
+        pairings: [],
+      }),
+      jsonResponse({
+        contract: { contract_version: "control-plane.v1" },
+        device: {
+          device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAZ",
+          client_kind: "node",
+          status: "paired",
+          paired_at_unix_ms: 100,
+          updated_at_unix_ms: 101,
+          issued_by: "admin:web-console",
+          approval_id: "approval-1",
+          identity_fingerprint: "fingerprint-1",
+          transcript_hash_hex: "hash-1",
+        },
+      }),
+      jsonResponse({
+        contract: { contract_version: "control-plane.v1" },
+        device: {
+          device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAZ",
+          client_kind: "node",
+          status: "revoked",
+          paired_at_unix_ms: 100,
+          updated_at_unix_ms: 102,
+          issued_by: "admin:web-console",
+          approval_id: "approval-1",
+          identity_fingerprint: "fingerprint-1",
+          transcript_hash_hex: "hash-1",
+        },
+      }),
+      jsonResponse({
+        contract: { contract_version: "control-plane.v1" },
+        device: {
+          device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAZ",
+          client_kind: "node",
+          status: "removed",
+          paired_at_unix_ms: 100,
+          updated_at_unix_ms: 103,
+          issued_by: "admin:web-console",
+          approval_id: "approval-1",
+          identity_fingerprint: "fingerprint-1",
+          transcript_hash_hex: "hash-1",
+        },
+      }),
+      jsonResponse({
+        contract: { contract_version: "control-plane.v1" },
+        device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAZ",
+        capability: "ping",
+        success: true,
+        output_json: { ok: true },
+        error: "",
+      }),
+    ];
+    const fetcher: typeof fetch = (input, init) => {
+      calls.push({ input, init });
+      const response = responses.shift();
+      if (response === undefined) {
+        throw new Error("No response queued for fetch mock.");
+      }
+      return Promise.resolve(response);
+    };
+    const client = new ConsoleApiClient("", fetcher);
+
+    await client.login({
+      admin_token: "token",
+      principal: "admin:web-console",
+      device_id: "device-1",
+      channel: "web",
+    });
+    await client.listInventory();
+    await client.getInventoryDevice("01ARZ3NDEKTSV4RRFFQ69G5FAZ");
+    await client.rotateDevice("01ARZ3NDEKTSV4RRFFQ69G5FAZ");
+    await client.revokeDevice("01ARZ3NDEKTSV4RRFFQ69G5FAZ", { reason: "operator_revoke" });
+    await client.removeDevice("01ARZ3NDEKTSV4RRFFQ69G5FAZ", { reason: "operator_remove" });
+    await client.invokeNode("01ARZ3NDEKTSV4RRFFQ69G5FAZ", {
+      capability: "ping",
+      input_json: { echo: true },
+    });
+
+    expect(requestUrl(calls[1]?.input)).toBe("/console/v1/inventory");
+    expect(new Headers(calls[1]?.init?.headers).get("x-palyra-csrf-token")).toBeNull();
+
+    expect(requestUrl(calls[2]?.input)).toBe("/console/v1/inventory/01ARZ3NDEKTSV4RRFFQ69G5FAZ");
+    expect(new Headers(calls[2]?.init?.headers).get("x-palyra-csrf-token")).toBeNull();
+
+    expect(requestUrl(calls[3]?.input)).toBe(
+      "/console/v1/devices/01ARZ3NDEKTSV4RRFFQ69G5FAZ/rotate",
+    );
+    expect(new Headers(calls[3]?.init?.headers).get("x-palyra-csrf-token")).toBe("csrf-1");
+
+    expect(requestUrl(calls[4]?.input)).toBe(
+      "/console/v1/devices/01ARZ3NDEKTSV4RRFFQ69G5FAZ/revoke",
+    );
+    expect(new Headers(calls[4]?.init?.headers).get("x-palyra-csrf-token")).toBe("csrf-1");
+
+    expect(requestUrl(calls[5]?.input)).toBe(
+      "/console/v1/devices/01ARZ3NDEKTSV4RRFFQ69G5FAZ/remove",
+    );
+    expect(new Headers(calls[5]?.init?.headers).get("x-palyra-csrf-token")).toBe("csrf-1");
+
+    expect(requestUrl(calls[6]?.input)).toBe(
+      "/console/v1/nodes/01ARZ3NDEKTSV4RRFFQ69G5FAZ/invoke",
+    );
+    expect(new Headers(calls[6]?.init?.headers).get("x-palyra-csrf-token")).toBe("csrf-1");
+  });
+
   it("supports M52 control-plane domains with additive CSRF behavior", async () => {
     const calls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
     const responses = [

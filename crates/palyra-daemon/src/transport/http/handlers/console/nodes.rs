@@ -129,7 +129,7 @@ fn collect_nodes(state: &AppState) -> Result<Vec<control_plane::NodeRecord>, ton
     state.node_runtime.nodes()?.iter().map(|node| Ok(node_record_json(node))).collect()
 }
 
-fn node_record_json(node: &RegisteredNodeRecord) -> control_plane::NodeRecord {
+pub(crate) fn node_record_json(node: &RegisteredNodeRecord) -> control_plane::NodeRecord {
     control_plane::NodeRecord {
         device_id: node.device_id.clone(),
         platform: node.platform.clone(),

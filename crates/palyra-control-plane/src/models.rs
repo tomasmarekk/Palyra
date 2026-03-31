@@ -634,6 +634,132 @@ pub struct NodeInvokeEnvelope {
     pub error: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InventoryPresenceState {
+    Ok,
+    Stale,
+    Degraded,
+    Offline,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InventoryTrustState {
+    Trusted,
+    Pending,
+    Revoked,
+    Removed,
+    Legacy,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InventoryCapabilitySummary {
+    pub total: usize,
+    pub available: usize,
+    pub unavailable: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InventoryActionAvailability {
+    pub can_rotate: bool,
+    pub can_revoke: bool,
+    pub can_remove: bool,
+    pub can_invoke: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InventoryDeviceRecord {
+    pub device_id: String,
+    pub client_kind: String,
+    pub device_status: String,
+    pub trust_state: InventoryTrustState,
+    pub presence_state: InventoryPresenceState,
+    pub paired_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registered_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_seen_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heartbeat_age_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_session_id: Option<String>,
+    pub pending_pairings: usize,
+    pub issued_by: String,
+    pub approval_id: String,
+    pub identity_fingerprint: String,
+    pub transcript_hash_hex: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+    #[serde(default)]
+    pub capabilities: Vec<NodeCapabilityView>,
+    pub capability_summary: InventoryCapabilitySummary,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_event_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_event_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_certificate_expires_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revoked_reason: Option<String>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    pub actions: InventoryActionAvailability,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InventoryInstanceRecord {
+    pub instance_id: String,
+    pub label: String,
+    pub kind: String,
+    pub presence_state: InventoryPresenceState,
+    pub observed_at_unix_ms: i64,
+    pub state_label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    pub capability_summary: InventoryCapabilitySummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InventorySummary {
+    pub devices: usize,
+    pub trusted_devices: usize,
+    pub pending_pairings: usize,
+    pub ok_devices: usize,
+    pub stale_devices: usize,
+    pub degraded_devices: usize,
+    pub offline_devices: usize,
+    pub ok_instances: usize,
+    pub stale_instances: usize,
+    pub degraded_instances: usize,
+    pub offline_instances: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InventoryListEnvelope {
+    pub contract: ContractDescriptor,
+    pub generated_at_unix_ms: i64,
+    pub summary: InventorySummary,
+    #[serde(default)]
+    pub devices: Vec<InventoryDeviceRecord>,
+    #[serde(default)]
+    pub pending_pairings: Vec<NodePairingRequestView>,
+    #[serde(default)]
+    pub instances: Vec<InventoryInstanceRecord>,
+    pub page: PageInfo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InventoryDeviceDetailEnvelope {
+    pub contract: ContractDescriptor,
+    pub generated_at_unix_ms: i64,
+    pub device: InventoryDeviceRecord,
+    #[serde(default)]
+    pub pairings: Vec<NodePairingRequestView>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SupportBundleJobState {

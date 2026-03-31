@@ -3,7 +3,7 @@ import { CONSOLE_SECTIONS, type Section } from "./sectionMetadata";
 export type NavigationEntry = (typeof CONSOLE_SECTIONS)[number];
 
 export type NavigationGroup = {
-  id: "chat" | "control" | "agent" | "settings";
+  id: "chat" | "control" | "operations" | "agent" | "settings";
   items: readonly NavigationEntry[];
   label: string;
 };
@@ -13,7 +13,8 @@ const SECTION_LOOKUP: Readonly<Record<Section, NavigationEntry>> = Object.fromEn
 ) as Record<Section, NavigationEntry>;
 const NAV_GROUP_LABELS = {
   chat: "Chat",
-  control: "Control",
+  control: "Observability",
+  operations: "Control",
   agent: "Agent",
   settings: "Settings",
 } as const;
@@ -30,17 +31,24 @@ export const CONSOLE_NAV_GROUPS: readonly NavigationGroup[] = [
   },
   {
     id: "control",
-    label: "Control",
+    label: "Observability",
     items: resolveEntries([
       "overview",
       "sessions",
       "usage",
       "logs",
+      "inventory",
+      "support",
+    ]),
+  },
+  {
+    id: "operations",
+    label: "Control",
+    items: resolveEntries([
       "approvals",
       "cron",
       "channels",
       "browser",
-      "support",
     ]),
   },
   {
@@ -61,6 +69,7 @@ const SECTION_PATHS: Readonly<Record<Section, string>> = {
   sessions: "/control/sessions",
   usage: "/control/usage",
   logs: "/control/logs",
+  inventory: "/control/inventory",
   approvals: "/control/approvals",
   cron: "/control/automation",
   channels: "/control/channels",
@@ -84,10 +93,11 @@ const SECTION_GROUPS: Readonly<Record<Section, NavigationGroup["id"]>> = {
   sessions: "control",
   usage: "control",
   logs: "control",
-  approvals: "control",
-  cron: "control",
-  channels: "control",
-  browser: "control",
+  inventory: "control",
+  approvals: "operations",
+  cron: "operations",
+  channels: "operations",
+  browser: "operations",
   agents: "agent",
   memory: "agent",
   skills: "agent",

@@ -157,7 +157,7 @@ pub(crate) async fn console_devices_clear_handler(
     }))
 }
 
-fn collect_device_records(
+pub(crate) fn collect_device_records(
     state: &AppState,
 ) -> DeviceHandlerStatus<Vec<control_plane::DeviceRecord>> {
     let (paired_devices, revoked_devices) = {

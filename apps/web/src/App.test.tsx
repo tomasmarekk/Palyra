@@ -295,6 +295,213 @@ describe("M35 web console app", () => {
     expect(screen.getByText("browser.relay.action")).toBeInTheDocument();
   });
 
+  it("opens inventory from the logs detail and renders unified device and instance posture", async () => {
+    const fetchMock = withM56Baseline((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = requestUrl(input);
+      const method = (init?.method ?? "GET").toUpperCase();
+
+      if (path === "/console/v1/auth/session" && method === "GET") {
+        return jsonResponse({
+          principal: "admin:web-console",
+          device_id: "device-1",
+          channel: "web",
+          csrf_token: "csrf-1",
+          issued_at_unix_ms: 100,
+          expires_at_unix_ms: 300,
+        });
+      }
+
+      if (path.startsWith("/console/v1/logs") && method === "GET") {
+        return jsonResponse({
+          contract: { contract_version: "control-plane.v1" },
+          query: {
+            limit: 120,
+            direction: "before",
+            start_at_unix_ms: 0,
+            end_at_unix_ms: 100,
+          },
+          records: [
+            {
+              cursor: "100:browserd:relay-action-1",
+              source: "browserd",
+              source_kind: "browserd",
+              severity: "error",
+              message: "browser relay failed with token=<redacted>",
+              timestamp_unix_ms: 100,
+              session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAZ",
+              device_id: "01ARZ3NDEKTSV4RRFFQ69G5FB0",
+              event_name: "browser.relay.action",
+              structured_payload: {
+                event: "browser.relay.action",
+                error: "token=<redacted>",
+              },
+            },
+          ],
+          page: { limit: 120, returned: 1, has_more: false },
+          newest_cursor: "100:browserd:relay-action-1",
+          available_sources: ["browserd", "palyrad"],
+        });
+      }
+
+      if (path === "/console/v1/inventory" && method === "GET") {
+        return jsonResponse({
+          contract: { contract_version: "control-plane.v1" },
+          generated_at_unix_ms: 100,
+          summary: {
+            devices: 1,
+            trusted_devices: 1,
+            pending_pairings: 1,
+            ok_devices: 0,
+            stale_devices: 0,
+            degraded_devices: 1,
+            offline_devices: 0,
+            ok_instances: 2,
+            stale_instances: 0,
+            degraded_instances: 1,
+            offline_instances: 0,
+          },
+          devices: [
+            {
+              device_id: "01ARZ3NDEKTSV4RRFFQ69G5FB0",
+              client_kind: "node",
+              device_status: "paired",
+              trust_state: "trusted",
+              presence_state: "degraded",
+              paired_at_unix_ms: 90,
+              updated_at_unix_ms: 100,
+              last_seen_at_unix_ms: 95,
+              heartbeat_age_ms: 5000,
+              latest_session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAZ",
+              pending_pairings: 1,
+              issued_by: "admin:web-console",
+              approval_id: "approval-1",
+              identity_fingerprint: "fingerprint-1",
+              transcript_hash_hex: "hash-1",
+              platform: "windows",
+              capabilities: [{ name: "ping", available: true }],
+              capability_summary: { total: 1, available: 1, unavailable: 0 },
+              warnings: ["1 pairing requests still require completion"],
+              actions: {
+                can_rotate: true,
+                can_revoke: true,
+                can_remove: true,
+                can_invoke: true,
+              },
+            },
+          ],
+          pending_pairings: [
+            {
+              request_id: "01ARZ3NDEKTSV4RRFFQ69G5FB1",
+              session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAZ",
+              device_id: "01ARZ3NDEKTSV4RRFFQ69G5FB0",
+              client_kind: "node",
+              method: "pin",
+              code_issued_by: "admin:web-console",
+              requested_at_unix_ms: 95,
+              expires_at_unix_ms: 195,
+              approval_id: "approval-1",
+              state: "pending_approval",
+              identity_fingerprint: "fingerprint-1",
+              transcript_hash_hex: "hash-1",
+            },
+          ],
+          instances: [
+            {
+              instance_id: "browserd",
+              label: "Browser service",
+              kind: "browserd",
+              presence_state: "ok",
+              observed_at_unix_ms: 100,
+              state_label: "ok",
+              detail: "1 active sessions",
+              capability_summary: { total: 1, available: 1, unavailable: 0 },
+            },
+          ],
+          page: { limit: 1, returned: 1, has_more: false },
+        });
+      }
+
+      if (path === "/console/v1/inventory/01ARZ3NDEKTSV4RRFFQ69G5FB0" && method === "GET") {
+        return jsonResponse({
+          contract: { contract_version: "control-plane.v1" },
+          generated_at_unix_ms: 100,
+          device: {
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FB0",
+            client_kind: "node",
+            device_status: "paired",
+            trust_state: "trusted",
+            presence_state: "degraded",
+            paired_at_unix_ms: 90,
+            updated_at_unix_ms: 100,
+            last_seen_at_unix_ms: 95,
+            heartbeat_age_ms: 5000,
+            latest_session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAZ",
+            pending_pairings: 1,
+            issued_by: "admin:web-console",
+            approval_id: "approval-1",
+            identity_fingerprint: "fingerprint-1",
+            transcript_hash_hex: "hash-1",
+            platform: "windows",
+            capabilities: [{ name: "ping", available: true }],
+            capability_summary: { total: 1, available: 1, unavailable: 0 },
+            warnings: ["1 pairing requests still require completion"],
+            actions: {
+              can_rotate: true,
+              can_revoke: true,
+              can_remove: true,
+              can_invoke: true,
+            },
+          },
+          pairings: [
+            {
+              request_id: "01ARZ3NDEKTSV4RRFFQ69G5FB1",
+              session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAZ",
+              device_id: "01ARZ3NDEKTSV4RRFFQ69G5FB0",
+              client_kind: "node",
+              method: "pin",
+              code_issued_by: "admin:web-console",
+              requested_at_unix_ms: 95,
+              expires_at_unix_ms: 195,
+              approval_id: "approval-1",
+              state: "pending_approval",
+              identity_fingerprint: "fingerprint-1",
+              transcript_hash_hex: "hash-1",
+            },
+          ],
+        });
+      }
+
+      throw new Error(`Unhandled mocked request: ${method} ${path}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<App />);
+
+    await waitFor(
+      () => {
+        expect(
+          screen.getByRole("heading", { name: "Web Dashboard Operator Surface" }),
+        ).toBeInTheDocument();
+      },
+      { timeout: 4_000 },
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "Logs and Runtime Stream" }));
+    expect(await screen.findByRole("heading", { name: "Logs" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open inventory" }));
+
+    await waitFor(
+      () => {
+        expect(screen.getByRole("heading", { name: "Inventory" })).toBeInTheDocument();
+      },
+      { timeout: 4_000 },
+    );
+    expect(screen.getAllByText("01ARZ3NDEKTSV4RRFFQ69G5FB0").length).toBeGreaterThan(0);
+    expect(screen.getByText("Browser service")).toBeInTheDocument();
+    expect(screen.getByText("Invoke capability")).toBeInTheDocument();
+  });
+
   it("clears operator-scoped state on sign-out before next sign-in refresh completes", async () => {
     let releaseUserBApprovals: (() => void) | undefined;
     const userBApprovalsReady = new Promise<void>((resolve) => {

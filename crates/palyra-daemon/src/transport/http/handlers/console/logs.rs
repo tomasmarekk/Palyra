@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::BTreeSet;
 
 use super::diagnostics::{
@@ -35,7 +36,8 @@ pub(crate) async fn console_logs_list_handler(
 ) -> Result<Json<control_plane::LogListEnvelope>, Response> {
     let _session = authorize_console_session(&state, &headers, false)?;
     let limit = query.limit.unwrap_or(DEFAULT_LOG_LIMIT).clamp(1, MAX_LOG_LIMIT);
-    let direction = normalize_log_direction(query.direction.as_deref())?;
+    let direction =
+        normalize_log_direction(query.direction.as_deref()).map_err(runtime_status_response)?;
     let cursor = query.cursor.as_deref().and_then(parse_log_cursor);
     let source_filter = normalize_optional_query_text(query.source.as_deref());
     let severity_filter = normalize_optional_query_text(query.severity.as_deref());
@@ -62,7 +64,7 @@ pub(crate) async fn console_logs_list_handler(
             _ => log_record_sort_key(record) < *cursor,
         });
     }
-    records.sort_by(|left, right| log_record_sort_key(right).cmp(&log_record_sort_key(left)));
+    records.sort_by_key(|record| Reverse(log_record_sort_key(record)));
 
     let available_sources = records
         .iter()
@@ -103,7 +105,8 @@ pub(crate) async fn console_logs_export_handler(
 ) -> Result<impl IntoResponse, Response> {
     let _session = authorize_console_session(&state, &headers, false)?;
     let limit = query.limit.unwrap_or(DEFAULT_LOG_LIMIT).clamp(1, MAX_LOG_LIMIT);
-    let format = normalize_log_export_format(query.format.as_deref())?;
+    let format =
+        normalize_log_export_format(query.format.as_deref()).map_err(runtime_status_response)?;
     let mut records =
         collect_log_records(&state, limit.saturating_mul(LOG_SCAN_MULTIPLIER)).await?;
     let source_filter = normalize_optional_query_text(query.source.as_deref());
@@ -122,7 +125,7 @@ pub(crate) async fn console_logs_export_handler(
     if let Some(filter) = contains_filter.as_deref() {
         records.retain(|record| log_contains(record, filter));
     }
-    records.sort_by(|left, right| log_record_sort_key(right).cmp(&log_record_sort_key(left)));
+    records.sort_by_key(|record| Reverse(log_record_sort_key(record)));
     let available_sources = records
         .iter()
         .map(|record| record.source.clone())
@@ -243,23 +246,23 @@ async fn collect_log_records(
     Ok(records)
 }
 
-fn normalize_log_direction(raw: Option<&str>) -> Result<&'static str, Response> {
+fn normalize_log_direction(raw: Option<&str>) -> Result<&'static str, tonic::Status> {
     match normalize_optional_query_text(raw).as_deref() {
         None | Some("before") => Ok("before"),
         Some("after") => Ok("after"),
-        Some(_) => Err(runtime_status_response(tonic::Status::invalid_argument(
-            "log direction must be one of before|after",
-        ))),
+        Some(_) => {
+            Err(tonic::Status::invalid_argument("log direction must be one of before|after"))
+        }
     }
 }
 
-fn normalize_log_export_format(raw: Option<&str>) -> Result<&'static str, Response> {
+fn normalize_log_export_format(raw: Option<&str>) -> Result<&'static str, tonic::Status> {
     match normalize_optional_query_text(raw).as_deref() {
         None | Some("csv") => Ok("csv"),
         Some("json") => Ok("json"),
-        Some(_) => Err(runtime_status_response(tonic::Status::invalid_argument(
-            "log export format must be one of csv|json",
-        ))),
+        Some(_) => {
+            Err(tonic::Status::invalid_argument("log export format must be one of csv|json"))
+        }
     }
 }
 

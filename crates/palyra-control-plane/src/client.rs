@@ -1083,6 +1083,23 @@ impl ControlPlaneClient {
         .await
     }
 
+    pub async fn list_inventory(&self) -> Result<InventoryListEnvelope, ControlPlaneClientError> {
+        self.request_json(Method::GET, "console/v1/inventory", None::<&Value>, false).await
+    }
+
+    pub async fn get_inventory_device(
+        &self,
+        device_id: &str,
+    ) -> Result<InventoryDeviceDetailEnvelope, ControlPlaneClientError> {
+        self.request_json(
+            Method::GET,
+            format!("console/v1/inventory/{}", urlencoding(device_id)),
+            None::<&Value>,
+            false,
+        )
+        .await
+    }
+
     pub async fn list_devices(&self) -> Result<DeviceListEnvelope, ControlPlaneClientError> {
         self.request_json(Method::GET, "console/v1/devices", None::<&Value>, false).await
     }

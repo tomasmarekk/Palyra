@@ -225,9 +225,13 @@ export function LogsSection({ app }: LogsSectionProps) {
                   <ActionButton
                     type="button"
                     variant="ghost"
-                    onPress={() => void navigate(getSectionPath("access"))}
+                    onPress={() =>
+                      void navigate(
+                        `${getSectionPath("inventory")}?deviceId=${logs.selectedRecord?.device_id ?? ""}`,
+                      )
+                    }
                   >
-                    Open access
+                    Open inventory
                   </ActionButton>
                 ) : null}
               </div>
