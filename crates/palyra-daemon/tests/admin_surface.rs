@@ -877,7 +877,7 @@ fn console_session_catalog_endpoints_require_session_and_csrf() -> Result<()> {
         .context("chat session create for catalog test returned non-success status")?
         .json::<Value>()
         .context("failed to parse created chat session response json")?;
-    let session_id = created_session
+    let catalog_session_ref = created_session
         .get("session")
         .and_then(|value| value.get("session_id"))
         .and_then(Value::as_str)
@@ -902,7 +902,7 @@ fn console_session_catalog_endpoints_require_session_and_csrf() -> Result<()> {
     );
 
     let detail_response = client
-        .get(format!("http://127.0.0.1:{admin_port}/console/v1/sessions/{session_id}"))
+        .get(format!("http://127.0.0.1:{admin_port}/console/v1/sessions/{catalog_session_ref}"))
         .header("Cookie", cookie.clone())
         .send()
         .context("failed to fetch session catalog detail")?
@@ -915,12 +915,14 @@ fn console_session_catalog_endpoints_require_session_and_csrf() -> Result<()> {
             .get("session")
             .and_then(|value| value.get("session_id"))
             .and_then(Value::as_str),
-        Some(session_id),
+        Some(catalog_session_ref),
         "session catalog detail should return the requested session"
     );
 
     let archive_without_csrf = client
-        .post(format!("http://127.0.0.1:{admin_port}/console/v1/sessions/{session_id}/archive"))
+        .post(format!(
+            "http://127.0.0.1:{admin_port}/console/v1/sessions/{catalog_session_ref}/archive"
+        ))
         .header("Cookie", cookie.clone())
         .send()
         .context("failed to archive session without csrf token")?;
@@ -931,7 +933,9 @@ fn console_session_catalog_endpoints_require_session_and_csrf() -> Result<()> {
     );
 
     let archive_response = client
-        .post(format!("http://127.0.0.1:{admin_port}/console/v1/sessions/{session_id}/archive"))
+        .post(format!(
+            "http://127.0.0.1:{admin_port}/console/v1/sessions/{catalog_session_ref}/archive"
+        ))
         .header("Cookie", cookie.clone())
         .header("x-palyra-csrf-token", csrf_token.clone())
         .send()
@@ -1019,7 +1023,7 @@ fn console_usage_endpoints_support_empty_ranges_archived_sessions_and_export() -
         .context("chat session create for usage test returned non-success status")?
         .json::<Value>()
         .context("failed to parse created chat session response json")?;
-    let session_id = created_session
+    let usage_session_ref = created_session
         .get("session")
         .and_then(|value| value.get("session_id"))
         .and_then(Value::as_str)
@@ -1045,7 +1049,7 @@ fn console_usage_endpoints_support_empty_ranges_archived_sessions_and_export() -
     );
 
     let detail = client
-        .get(format!("http://127.0.0.1:{admin_port}/console/v1/usage/sessions/{session_id}"))
+        .get(format!("http://127.0.0.1:{admin_port}/console/v1/usage/sessions/{usage_session_ref}"))
         .header("Cookie", cookie.clone())
         .send()
         .context("failed to fetch usage session detail")?
@@ -1055,7 +1059,7 @@ fn console_usage_endpoints_support_empty_ranges_archived_sessions_and_export() -
         .context("failed to parse usage session detail response json")?;
     assert_eq!(
         detail.get("session").and_then(|value| value.get("session_id")).and_then(Value::as_str),
-        Some(session_id),
+        Some(usage_session_ref),
         "usage detail should resolve a session even when no runs were recorded yet"
     );
     assert_eq!(
@@ -1083,7 +1087,9 @@ fn console_usage_endpoints_support_empty_ranges_archived_sessions_and_export() -
     );
 
     let archive = client
-        .post(format!("http://127.0.0.1:{admin_port}/console/v1/sessions/{session_id}/archive"))
+        .post(format!(
+            "http://127.0.0.1:{admin_port}/console/v1/sessions/{usage_session_ref}/archive"
+        ))
         .header("Cookie", cookie.clone())
         .header("x-palyra-csrf-token", csrf_token)
         .send()
@@ -1100,7 +1106,7 @@ fn console_usage_endpoints_support_empty_ranges_archived_sessions_and_export() -
 
     let archived_detail = client
         .get(format!(
-            "http://127.0.0.1:{admin_port}/console/v1/usage/sessions/{session_id}?include_archived=true"
+            "http://127.0.0.1:{admin_port}/console/v1/usage/sessions/{usage_session_ref}?include_archived=true"
         ))
         .header("Cookie", cookie)
         .send()
