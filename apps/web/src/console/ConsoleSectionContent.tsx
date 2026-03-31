@@ -39,7 +39,9 @@ export function ConsoleSectionContent({ app }: ConsoleSectionContentProps) {
         <SessionsSection app={{ api: app.api, setError: app.setError, setNotice: app.setNotice }} />
       );
     case "usage":
-      return <UsageSection app={{ api: app.api, setError: app.setError, setNotice: app.setNotice }} />;
+      return (
+        <UsageSection app={{ api: app.api, setError: app.setError, setNotice: app.setNotice }} />
+      );
     case "approvals":
       return <ApprovalsSection app={app} />;
     case "cron":

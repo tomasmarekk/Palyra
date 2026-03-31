@@ -882,9 +882,7 @@ describe("M35 web console app", () => {
   });
 
   it("renders usage section with server-side filters, exports, and session drilldown", async () => {
-    const openMock = vi.fn(
-      (_url?: string | URL, _target?: string, _features?: string) => null,
-    );
+    const openMock = vi.fn((_url?: string | URL, _target?: string, _features?: string) => null);
     vi.stubGlobal("open", openMock);
 
     const usageSession = {
@@ -1056,10 +1054,7 @@ describe("M35 web console app", () => {
         );
       }
 
-      if (
-        path === "/console/v1/usage/sessions/01ARZ3NDEKTSV4RRFFQ69G5FAV" &&
-        method === "GET"
-      ) {
+      if (path === "/console/v1/usage/sessions/01ARZ3NDEKTSV4RRFFQ69G5FAV" && method === "GET") {
         return Promise.resolve(
           jsonResponse({
             contract: { contract_version: "control-plane.v1" },

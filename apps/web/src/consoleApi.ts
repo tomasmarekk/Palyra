@@ -1191,7 +1191,10 @@ export class ConsoleApiClient {
     return this.request(buildPathWithQuery("/console/v1/usage/sessions", params));
   }
 
-  async getUsageSessionDetail(sessionId: string, params?: URLSearchParams): Promise<UsageSessionDetailEnvelope> {
+  async getUsageSessionDetail(
+    sessionId: string,
+    params?: URLSearchParams,
+  ): Promise<UsageSessionDetailEnvelope> {
     return this.request(
       buildPathWithQuery(`/console/v1/usage/sessions/${encodeURIComponent(sessionId)}`, params),
     );

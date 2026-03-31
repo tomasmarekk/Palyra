@@ -545,9 +545,9 @@ describe("ConsoleApiClient", () => {
       "/api/console/v1/usage/models?start_at_unix_ms=0&end_at_unix_ms=100&bucket=hour",
     );
 
-    expect(
-      client.resolvePath("/console/v1/usage/export?dataset=timeline&format=csv"),
-    ).toBe("/api/console/v1/usage/export?dataset=timeline&format=csv");
+    expect(client.resolvePath("/console/v1/usage/export?dataset=timeline&format=csv")).toBe(
+      "/api/console/v1/usage/export?dataset=timeline&format=csv",
+    );
   });
 
   it("retries safe-read GET requests once after a transport failure", async () => {

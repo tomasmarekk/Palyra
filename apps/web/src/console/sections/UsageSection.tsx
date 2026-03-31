@@ -15,7 +15,10 @@ import {
   WorkspaceSectionCard,
   WorkspaceStatusChip,
 } from "../components/workspace/WorkspaceChrome";
-import { WorkspaceEmptyState, WorkspaceInlineNotice } from "../components/workspace/WorkspacePatterns";
+import {
+  WorkspaceEmptyState,
+  WorkspaceInlineNotice,
+} from "../components/workspace/WorkspacePatterns";
 import { useUsageDomain } from "../hooks/useUsageDomain";
 import { formatUnixMs } from "../shared";
 import type { ConsoleAppState } from "../useConsoleAppState";
@@ -44,10 +47,14 @@ export function UsageSection({ app }: UsageSectionProps) {
             <WorkspaceStatusChip tone={usage.busy ? "warning" : "success"}>
               {usage.busy ? "Refreshing" : "Aggregates ready"}
             </WorkspaceStatusChip>
-            <WorkspaceStatusChip tone={usage.summary?.cost_tracking_available ? "success" : "default"}>
+            <WorkspaceStatusChip
+              tone={usage.summary?.cost_tracking_available ? "success" : "default"}
+            >
               {usage.summary?.cost_tracking_available ? "Cost tracking live" : "Cost unavailable"}
             </WorkspaceStatusChip>
-            <WorkspaceStatusChip tone={(usage.summary?.totals.active_runs ?? 0) > 0 ? "accent" : "default"}>
+            <WorkspaceStatusChip
+              tone={(usage.summary?.totals.active_runs ?? 0) > 0 ? "accent" : "default"}
+            >
               {usage.summary?.totals.active_runs ?? 0} active runs
             </WorkspaceStatusChip>
           </>
@@ -92,10 +99,18 @@ export function UsageSection({ app }: UsageSectionProps) {
         title="Filters"
         actions={
           <>
-            <ActionButton type="button" variant="secondary" onPress={() => usage.exportDataset("timeline", "csv")}>
+            <ActionButton
+              type="button"
+              variant="secondary"
+              onPress={() => usage.exportDataset("timeline", "csv")}
+            >
               Export timeline CSV
             </ActionButton>
-            <ActionButton type="button" variant="ghost" onPress={() => usage.exportDataset("timeline", "json")}>
+            <ActionButton
+              type="button"
+              variant="ghost"
+              onPress={() => usage.exportDataset("timeline", "json")}
+            >
               Export timeline JSON
             </ActionButton>
           </>
@@ -159,7 +174,11 @@ export function UsageSection({ app }: UsageSectionProps) {
                 },
                 { key: "runs", label: "Runs", render: (row) => row.runs },
                 { key: "tokens", label: "Tokens", render: (row) => row.total_tokens },
-                { key: "latency", label: "Avg latency", render: (row) => formatLatency(row.average_latency_ms) },
+                {
+                  key: "latency",
+                  label: "Avg latency",
+                  render: (row) => formatLatency(row.average_latency_ms),
+                },
               ]}
               getRowId={(row) => String(row.bucket_start_unix_ms)}
               rows={timelinePreview}
@@ -183,7 +202,11 @@ export function UsageSection({ app }: UsageSectionProps) {
                 <ActionButton
                   type="button"
                   variant="secondary"
-                  onPress={() => void navigate(`${getSectionPath("sessions")}?sessionId=${detail.session.session_id}`)}
+                  onPress={() =>
+                    void navigate(
+                      `${getSectionPath("sessions")}?sessionId=${detail.session.session_id}`,
+                    )
+                  }
                 >
                   Open in sessions
                 </ActionButton>
@@ -225,7 +248,10 @@ export function UsageSection({ app }: UsageSectionProps) {
 
               {detail.cost_tracking_available ? null : (
                 <WorkspaceInlineNotice title="Cost placeholder" tone="default">
-                  <p>Pricing metadata is not persisted yet, so cost fields remain unavailable by contract.</p>
+                  <p>
+                    Pricing metadata is not persisted yet, so cost fields remain unavailable by
+                    contract.
+                  </p>
                 </WorkspaceInlineNotice>
               )}
 
@@ -235,12 +261,21 @@ export function UsageSection({ app }: UsageSectionProps) {
                   { key: "run", label: "Run", render: (row) => row.run_id },
                   { key: "state", label: "State", render: (row) => row.state },
                   { key: "tokens", label: "Tokens", render: (row) => row.total_tokens },
-                  { key: "latency", label: "Latency", render: (row) => formatLatency(row.average_latency_ms) },
+                  {
+                    key: "latency",
+                    label: "Latency",
+                    render: (row) => formatLatency(row.average_latency_ms),
+                  },
                 ]}
                 emptyDescription="This session has no runs in the selected window."
                 emptyTitle="No runs in scope"
                 getRowId={(row) => row.run_id}
-                rows={detail.runs.map((run) => ({ ...run, average_latency_ms: run.completed_at_unix_ms ? run.completed_at_unix_ms - run.started_at_unix_ms : undefined }))}
+                rows={detail.runs.map((run) => ({
+                  ...run,
+                  average_latency_ms: run.completed_at_unix_ms
+                    ? run.completed_at_unix_ms - run.started_at_unix_ms
+                    : undefined,
+                }))}
               />
             </div>
           )}
@@ -259,14 +294,22 @@ export function UsageSection({ app }: UsageSectionProps) {
               key: "session",
               label: "Session",
               render: (row: UsageSessionRecord) => (
-                <button className="workspace-link-button" onClick={() => usage.setSelectedSessionId(row.session_id)} type="button">
+                <button
+                  className="workspace-link-button"
+                  onClick={() => usage.setSelectedSessionId(row.session_id)}
+                  type="button"
+                >
                   {row.session_label ?? row.session_key}
                 </button>
               ),
             },
             { key: "tokens", label: "Tokens", render: (row) => row.total_tokens },
             { key: "runs", label: "Runs", render: (row) => row.runs },
-            { key: "latency", label: "Avg latency", render: (row) => formatLatency(row.average_latency_ms) },
+            {
+              key: "latency",
+              label: "Avg latency",
+              render: (row) => formatLatency(row.average_latency_ms),
+            },
           ]}
           getRowId={(row) => row.session_id}
         />
@@ -290,7 +333,11 @@ export function UsageSection({ app }: UsageSectionProps) {
             },
             { key: "tokens", label: "Tokens", render: (row) => row.total_tokens },
             { key: "sessions", label: "Sessions", render: (row) => row.session_count },
-            { key: "latency", label: "Avg latency", render: (row) => formatLatency(row.average_latency_ms) },
+            {
+              key: "latency",
+              label: "Avg latency",
+              render: (row) => formatLatency(row.average_latency_ms),
+            },
           ]}
           getRowId={(row) => row.agent_id}
         />
@@ -314,7 +361,11 @@ export function UsageSection({ app }: UsageSectionProps) {
             },
             { key: "tokens", label: "Tokens", render: (row) => row.total_tokens },
             { key: "agents", label: "Agents", render: (row) => row.agent_count },
-            { key: "latency", label: "Avg latency", render: (row) => formatLatency(row.average_latency_ms) },
+            {
+              key: "latency",
+              label: "Avg latency",
+              render: (row) => formatLatency(row.average_latency_ms),
+            },
           ]}
           getRowId={(row) => row.model_id}
         />
@@ -358,7 +409,11 @@ function UsageTableCard<T extends object>({
       }
     >
       {rows.length === 0 ? (
-        <WorkspaceEmptyState compact description="No records are available for the selected window." title="No data" />
+        <WorkspaceEmptyState
+          compact
+          description="No records are available for the selected window."
+          title="No data"
+        />
       ) : (
         <EntityTable ariaLabel={title} columns={columns} getRowId={getRowId} rows={rows} />
       )}

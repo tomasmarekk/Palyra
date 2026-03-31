@@ -29,9 +29,8 @@ export function useUsageDomain({ api, setError, setNotice }: UseUsageDomainArgs)
   const [agents, setAgents] = useState<UsageAgentRecord[]>([]);
   const [models, setModels] = useState<UsageModelRecord[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState("");
-  const [selectedSessionDetail, setSelectedSessionDetail] = useState<UsageSessionDetailEnvelope | null>(
-    null,
-  );
+  const [selectedSessionDetail, setSelectedSessionDetail] =
+    useState<UsageSessionDetailEnvelope | null>(null);
 
   const selectedSession = useMemo(
     () => sessions.find((entry) => entry.session_id === selectedSessionId) ?? null,
@@ -79,7 +78,10 @@ export function useUsageDomain({ api, setError, setNotice }: UseUsageDomainArgs)
       setAgents(nextAgents.agents);
       setModels(nextModels.models);
       setSelectedSessionId((previous) => {
-        if (previous.length > 0 && nextSessions.sessions.some((entry) => entry.session_id === previous)) {
+        if (
+          previous.length > 0 &&
+          nextSessions.sessions.some((entry) => entry.session_id === previous)
+        ) {
           return previous;
         }
         return nextSessions.sessions[0]?.session_id ?? "";
@@ -108,11 +110,18 @@ export function useUsageDomain({ api, setError, setNotice }: UseUsageDomainArgs)
     }
   }
 
-  function exportDataset(dataset: "timeline" | "sessions" | "agents" | "models", format: "csv" | "json") {
+  function exportDataset(
+    dataset: "timeline" | "sessions" | "agents" | "models",
+    format: "csv" | "json",
+  ) {
     const params = buildParams();
     params.set("dataset", dataset);
     params.set("format", format);
-    window.open(api.resolvePath(`/console/v1/usage/export?${params.toString()}`), "_blank", "noopener");
+    window.open(
+      api.resolvePath(`/console/v1/usage/export?${params.toString()}`),
+      "_blank",
+      "noopener",
+    );
     setNotice(`Export started for ${dataset} (${format.toUpperCase()}).`);
   }
 
