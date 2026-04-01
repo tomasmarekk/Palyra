@@ -1,7 +1,7 @@
 use std::{
     fs,
     net::SocketAddr,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     sync::Mutex,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -38,6 +38,50 @@ const DEFAULT_OUTBOUND_MAX_UPLOAD_BYTES: usize = 4 * 1024 * 1024;
 const RECENT_EVENT_LIMIT: usize = 10;
 const RETENTION_PRUNE_MIN_INTERVAL_MS: i64 = 30_000;
 const RETENTION_PRUNE_MAX_DEFERRED_INGESTS: u32 = 16;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ValidatedContentDigest(String);
+
+impl ValidatedContentDigest {
+    fn parse(value: &str) -> Result<Self, MediaStoreError> {
+        if !is_valid_sha256_hex(value)
+            || value.contains("..")
+            || value.contains('/')
+            || value.contains('\\')
+        {
+            return Err(MediaStoreError::Io(format!("media content digest '{value}' is invalid")));
+        }
+        Ok(Self(value.to_ascii_lowercase()))
+    }
+
+    fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    fn prefix_component(&self) -> &str {
+        &self.0[..2]
+    }
+
+    fn relative_path_string(&self) -> String {
+        format!("{}/{}", self.prefix_component(), self.as_str())
+    }
+
+    fn ensure_matches_storage_path(&self, storage_rel_path: &str) -> Result<(), MediaStoreError> {
+        let expected_rel_path = content_relative_path(self.as_str());
+        if storage_rel_path != expected_rel_path {
+            return Err(MediaStoreError::Io(format!(
+                "media content storage path '{}' does not match digest '{}'",
+                storage_rel_path,
+                self.as_str()
+            )));
+        }
+        Ok(())
+    }
+
+    fn storage_path(&self, content_root: &Path) -> PathBuf {
+        content_root.join(self.prefix_component()).join(self.as_str())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MediaRuntimeConfig {
@@ -494,11 +538,9 @@ impl MediaArtifactStore {
             return Ok(None);
         };
         drop(guard);
-        let storage_path = resolve_content_storage_path(
-            self.content_root.as_path(),
-            record.storage_rel_path.as_str(),
-            record.sha256.as_str(),
-        )?;
+        let content_digest = ValidatedContentDigest::parse(record.sha256.as_str())?;
+        content_digest.ensure_matches_storage_path(record.storage_rel_path.as_str())?;
+        let storage_path = content_digest.storage_path(self.content_root.as_path());
         let bytes = fs::read(storage_path.as_path()).map_err(|error| {
             MediaStoreError::Io(format!(
                 "failed to read media artifact '{}' from '{}' : {error}",
@@ -570,12 +612,9 @@ impl MediaArtifactStore {
         let now = current_unix_ms();
         let sha256 = sha256_hex(request.bytes);
         let artifact_id = ulid::Ulid::new().to_string();
-        let relative_path = content_relative_path(sha256.as_str());
-        let storage_path = resolve_content_storage_path(
-            self.content_root.as_path(),
-            relative_path.as_str(),
-            sha256.as_str(),
-        )?;
+        let content_digest = ValidatedContentDigest::parse(sha256.as_str())?;
+        let relative_path = content_digest.relative_path_string();
+        let storage_path = content_digest.storage_path(self.content_root.as_path());
         if let Some(parent) = storage_path.parent() {
             fs::create_dir_all(parent).map_err(|error| {
                 MediaStoreError::Io(format!(
@@ -994,12 +1033,9 @@ impl MediaArtifactStore {
         let size_bytes = u64::try_from(body.len()).unwrap_or(u64::MAX);
         let sha256 = sha256_hex(body.as_slice());
         let artifact_id = ulid::Ulid::new().to_string();
-        let relative_path = content_relative_path(sha256.as_str());
-        let storage_path = resolve_content_storage_path(
-            self.content_root.as_path(),
-            relative_path.as_str(),
-            sha256.as_str(),
-        )?;
+        let content_digest = ValidatedContentDigest::parse(sha256.as_str())?;
+        let relative_path = content_digest.relative_path_string();
+        let storage_path = content_digest.storage_path(self.content_root.as_path());
         if let Some(parent) = storage_path.parent() {
             fs::create_dir_all(parent).map_err(|error| {
                 MediaStoreError::Io(format!(
@@ -1349,10 +1385,12 @@ fn remove_artifact_locked(
             |row| row.get::<_, String>(0),
         )
         .optional()?;
-    let resolved_storage_path = storage_rel_path
-        .as_deref()
-        .map(|path| resolve_content_storage_path(content_root, path, content_sha256))
-        .transpose()?;
+    let content_digest = ValidatedContentDigest::parse(content_sha256)?;
+    if let Some(path) = storage_rel_path.as_deref() {
+        content_digest.ensure_matches_storage_path(path)?;
+    }
+    let resolved_storage_path =
+        storage_rel_path.as_ref().map(|_| content_digest.storage_path(content_root));
     connection
         .execute("DELETE FROM media_contents WHERE content_sha256 = ?1", params![content_sha256])?;
     if let Some(storage_path) = resolved_storage_path {
@@ -1697,34 +1735,15 @@ fn is_valid_sha256_hex(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+#[cfg(test)]
 fn resolve_content_storage_path(
     content_root: &Path,
     storage_rel_path: &str,
     expected_sha256: &str,
 ) -> Result<PathBuf, MediaStoreError> {
-    if !is_valid_sha256_hex(expected_sha256) {
-        return Err(MediaStoreError::Io(format!(
-            "media content digest '{}' is invalid",
-            expected_sha256
-        )));
-    }
-    let expected_rel_path = content_relative_path(expected_sha256);
-    if storage_rel_path != expected_rel_path {
-        return Err(MediaStoreError::Io(format!(
-            "media content storage path '{}' does not match digest '{}'",
-            storage_rel_path, expected_sha256
-        )));
-    }
-    let relative_path = Path::new(expected_rel_path.as_str());
-    if relative_path.is_absolute()
-        || relative_path.components().any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return Err(MediaStoreError::Io(format!(
-            "media content digest '{}' resolved to an invalid storage path",
-            expected_sha256
-        )));
-    }
-    Ok(content_root.join(relative_path))
+    let content_digest = ValidatedContentDigest::parse(expected_sha256)?;
+    content_digest.ensure_matches_storage_path(storage_rel_path)?;
+    Ok(content_digest.storage_path(content_root))
 }
 
 fn attachment_kind_for_content_type(content_type: &str) -> AttachmentKind {
