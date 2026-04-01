@@ -1627,16 +1627,20 @@ export class ConsoleApiClient {
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffered = "";
-    while (true) {
-      const chunk = await reader.read();
-      if (chunk.done) {
-        break;
+    try {
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done) {
+          break;
+        }
+        buffered += decoder.decode(chunk.value, { stream: true });
+        buffered = flushNdjsonBuffer(buffered, options.onLine);
       }
-      buffered += decoder.decode(chunk.value, { stream: true });
-      buffered = flushNdjsonBuffer(buffered, options.onLine);
+      buffered += decoder.decode();
+      flushNdjsonBuffer(buffered, options.onLine, true);
+    } finally {
+      reader.releaseLock();
     }
-    buffered += decoder.decode();
-    flushNdjsonBuffer(buffered, options.onLine, true);
   }
 
   async prepareRetry(

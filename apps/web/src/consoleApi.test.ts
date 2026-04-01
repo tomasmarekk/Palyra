@@ -1217,6 +1217,55 @@ describe("ConsoleApiClient", () => {
     expect(lines[2]).toMatchObject({ type: "complete", status: "done" });
   });
 
+  it("submits approval decisions with CSRF protection", async () => {
+    const calls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
+    const responses = [
+      jsonResponse({
+        principal: "admin:web-console",
+        device_id: "device-1",
+        csrf_token: "csrf-1",
+        issued_at_unix_ms: 100,
+        expires_at_unix_ms: 200,
+      }),
+      jsonResponse({
+        approval: {
+          approval_id: "A1",
+          decision: "allow",
+        },
+      }),
+    ];
+    const fetcher: typeof fetch = (input, init) => {
+      calls.push({ input, init });
+      const response = responses.shift();
+      if (response === undefined) {
+        throw new Error("No response queued for fetch mock.");
+      }
+      return Promise.resolve(response);
+    };
+
+    const client = new ConsoleApiClient("", fetcher);
+    await client.login({
+      admin_token: "token",
+      principal: "admin:web-console",
+      device_id: "device-1",
+      channel: "web",
+    });
+
+    await client.decideApproval("A1", {
+      approved: true,
+      reason: "safe",
+      decision_scope: "session",
+    });
+
+    expect(requestUrl(calls[1]?.input)).toBe("/console/v1/approvals/A1/decision");
+    const decisionHeaders = new Headers(calls[1]?.init?.headers);
+    expect(decisionHeaders.get("x-palyra-csrf-token")).toBe("csrf-1");
+    expect(decisionHeaders.get("content-type")).toBe("application/json");
+    const decisionBody = typeof calls[1]?.init?.body === "string" ? calls[1].init.body : "";
+    expect(decisionBody).toContain('"approved":true');
+    expect(decisionBody).toContain('"decision_scope":"session"');
+  });
+
   it("fails when stream emits invalid NDJSON line", async () => {
     const fetcher: typeof fetch = (input, init) => {
       if (requestUrl(input) === "/console/v1/auth/login") {

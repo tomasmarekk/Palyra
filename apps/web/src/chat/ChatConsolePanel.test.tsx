@@ -7,6 +7,8 @@ import { ChatComposer } from "./ChatComposer";
 import { ChatTranscript } from "./ChatTranscript";
 import {
   buildContextBudgetSummary,
+  DEFAULT_APPROVAL_SCOPE,
+  DEFAULT_APPROVAL_TTL_MS,
   parseSlashCommand,
   type ComposerAttachment,
   type TranscriptEntry,
@@ -103,6 +105,98 @@ describe("Chat web UX primitives", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Inspect payload" }));
     expect(inspectPayload).toHaveBeenCalledWith(payloadEntry);
+  });
+
+  it("renders inline approval controls and forwards approval decisions", () => {
+    const updateApprovalDraft = vi.fn();
+    const decideInlineApproval = vi.fn();
+
+    render(
+      <ChatTranscript
+        visibleTranscript={[
+          {
+            id: "approval-1",
+            kind: "approval_request",
+            created_at_unix_ms: 100,
+            run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+            title: "Approval request: palyra.fs.apply_patch",
+            text: "Needs approval",
+            approval_id: "A1",
+            proposal_id: "P1",
+            tool_name: "palyra.fs.apply_patch",
+          },
+        ]}
+        hiddenTranscriptItems={0}
+        transcriptBoxRef={{ current: null }}
+        approvalDrafts={{
+          A1: {
+            scope: DEFAULT_APPROVAL_SCOPE,
+            reason: "",
+            ttl_ms: DEFAULT_APPROVAL_TTL_MS,
+            busy: false,
+          },
+        }}
+        a2uiDocuments={{}}
+        selectedDetailId={null}
+        updateApprovalDraft={updateApprovalDraft}
+        decideInlineApproval={decideInlineApproval}
+        openRunDetails={vi.fn()}
+        inspectPayload={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("Approval required")).toBeInTheDocument();
+    expect(screen.getByText("Needs approval")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+    expect(decideInlineApproval).toHaveBeenCalledWith("A1", true);
+  });
+
+  it("renders escaped transcript text and keeps canvas iframes sandboxed", async () => {
+    render(
+      <ChatTranscript
+        visibleTranscript={[
+          {
+            id: "assistant-1",
+            kind: "assistant",
+            created_at_unix_ms: 100,
+            run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+            title: "Assistant",
+            text: "<img src='x' onerror='alert(1)'>",
+          },
+          {
+            id: "canvas-1",
+            kind: "canvas",
+            created_at_unix_ms: 101,
+            run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+            title: "Canvas",
+            canvas_url: "/canvas/v1/frame/01ARZ3NDEKTSV4RRFFQ69G5FB1?token=test-token",
+            text: "/canvas/v1/frame/01ARZ3NDEKTSV4RRFFQ69G5FB1?token=test-token",
+          },
+        ]}
+        hiddenTranscriptItems={0}
+        transcriptBoxRef={{ current: null }}
+        approvalDrafts={{}}
+        a2uiDocuments={{}}
+        selectedDetailId={null}
+        updateApprovalDraft={vi.fn()}
+        decideInlineApproval={vi.fn()}
+        openRunDetails={vi.fn()}
+        inspectPayload={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("<img src='x' onerror='alert(1)'>")).toBeInTheDocument();
+    expect(document.body.textContent ?? "").toContain("alert(1)");
+    expect(document.querySelector("img[src='x']")).toBeNull();
+
+    const frame = await screen.findByTitle("Canvas 01ARZ3NDEKTSV4RRFFQ69G5FAX");
+    expect(frame).toHaveAttribute("sandbox", "allow-scripts allow-same-origin");
+    expect(frame).toHaveAttribute(
+      "src",
+      "/canvas/v1/frame/01ARZ3NDEKTSV4RRFFQ69G5FB1?token=test-token",
+    );
+    expect(document.querySelector("iframe[src='/console/v1/diagnostics?token=evil']")).toBeNull();
   });
 });
 

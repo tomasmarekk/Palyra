@@ -124,9 +124,6 @@ function shouldAttemptDesktopSessionRecovery(): boolean {
   if (typeof window === "undefined") {
     return false;
   }
-  if (isJsdomRuntime()) {
-    return false;
-  }
   const hostname = window.location.hostname.trim().toLowerCase();
   return hostname === "127.0.0.1" || hostname === "localhost";
 }
@@ -625,26 +622,35 @@ export function useConsoleAppState() {
     let cancelled = false;
     const abortController = new AbortController();
     const recoverDesktopSession = async () => {
-      for (let attempt = 1; attempt <= DESKTOP_SESSION_RECOVERY_ATTEMPTS; attempt += 1) {
-        if (abortController.signal.aborted) {
-          return;
+      try {
+        for (let attempt = 1; attempt <= DESKTOP_SESSION_RECOVERY_ATTEMPTS; attempt += 1) {
+          if (abortController.signal.aborted) {
+            return;
+          }
+          try {
+            const current = await api.getSession();
+            if (cancelled) {
+              return;
+            }
+            setError(null);
+            applyConsoleSession(current);
+            return;
+          } catch (failure) {
+            if (!cancelled) {
+              setError(toErrorMessage(failure));
+            }
+            if (attempt >= DESKTOP_SESSION_RECOVERY_ATTEMPTS) {
+              return;
+            }
+            await waitForDelay(
+              DESKTOP_SESSION_RECOVERY_DELAY_MS * attempt,
+              abortController.signal,
+            );
+          }
         }
-        try {
-          const current = await api.getSession();
-          if (cancelled) {
-            return;
-          }
-          setError(null);
-          applyConsoleSession(current);
-          return;
-        } catch (failure) {
-          if (!cancelled) {
-            setError(toErrorMessage(failure));
-          }
-          if (attempt >= DESKTOP_SESSION_RECOVERY_ATTEMPTS) {
-            return;
-          }
-          await waitForDelay(DESKTOP_SESSION_RECOVERY_DELAY_MS * attempt, abortController.signal);
+      } catch (failure) {
+        if (!cancelled && !isAbortError(failure)) {
+          setError(toErrorMessage(failure));
         }
       }
     };
