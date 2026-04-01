@@ -1693,11 +1693,21 @@ fn content_relative_path(sha256: &str) -> String {
     format!("{prefix}/{sha256}")
 }
 
+fn is_valid_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn resolve_content_storage_path(
     content_root: &Path,
     storage_rel_path: &str,
     expected_sha256: &str,
 ) -> Result<PathBuf, MediaStoreError> {
+    if !is_valid_sha256_hex(expected_sha256) {
+        return Err(MediaStoreError::Io(format!(
+            "media content digest '{}' is invalid",
+            expected_sha256
+        )));
+    }
     let expected_rel_path = content_relative_path(expected_sha256);
     if storage_rel_path != expected_rel_path {
         return Err(MediaStoreError::Io(format!(
@@ -1705,13 +1715,13 @@ fn resolve_content_storage_path(
             storage_rel_path, expected_sha256
         )));
     }
-    let relative_path = Path::new(storage_rel_path);
+    let relative_path = Path::new(expected_rel_path.as_str());
     if relative_path.is_absolute()
         || relative_path.components().any(|component| !matches!(component, Component::Normal(_)))
     {
         return Err(MediaStoreError::Io(format!(
-            "media content storage path '{}' is invalid",
-            storage_rel_path
+            "media content digest '{}' resolved to an invalid storage path",
+            expected_sha256
         )));
     }
     Ok(content_root.join(relative_path))
@@ -1905,6 +1915,21 @@ mod tests {
         assert!(
             error.to_string().contains("does not match digest"),
             "digest mismatches should produce a clear validation error"
+        );
+    }
+
+    #[test]
+    fn resolve_content_storage_path_rejects_invalid_digest() {
+        let tempdir = TempDir::new().expect("tempdir should build");
+        let error = resolve_content_storage_path(
+            tempdir.path(),
+            "aa/not-a-real-digest",
+            "../not-a-valid-sha256",
+        )
+        .expect_err("invalid digests should be rejected before building a path");
+        assert!(
+            error.to_string().contains("digest '../not-a-valid-sha256' is invalid"),
+            "invalid digests should produce a clear validation error"
         );
     }
 
