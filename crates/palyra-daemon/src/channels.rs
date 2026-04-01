@@ -91,6 +91,16 @@ pub struct ChannelDiscordTestSendOutcome {
     pub in_reply_to_message_id: Option<String>,
 }
 
+pub struct ConsoleChatAttachmentStoreRequestView<'a> {
+    pub session_id: &'a str,
+    pub principal: &'a str,
+    pub device_id: &'a str,
+    pub channel: Option<&'a str>,
+    pub filename: &'a str,
+    pub declared_content_type: &'a str,
+    pub bytes: &'a [u8],
+}
+
 pub struct ChannelPlatform {
     supervisor: Arc<ConnectorSupervisor>,
     media_store: Arc<MediaArtifactStore>,
@@ -202,26 +212,20 @@ impl ChannelPlatform {
 
     pub fn store_console_chat_attachment(
         &self,
-        session_id: &str,
-        principal: &str,
-        device_id: &str,
-        channel: Option<&str>,
-        filename: &str,
-        declared_content_type: &str,
-        bytes: &[u8],
+        request: ConsoleChatAttachmentStoreRequestView<'_>,
     ) -> Result<MediaArtifactPayload, ChannelPlatformError> {
         let attachment_id = Ulid::new().to_string();
         self.media_store
             .store_console_attachment(ConsoleAttachmentStoreRequest {
                 connector_id: "console_chat",
-                session_id,
-                principal,
-                device_id,
-                channel,
+                session_id: request.session_id,
+                principal: request.principal,
+                device_id: request.device_id,
+                channel: request.channel,
                 attachment_id: attachment_id.as_str(),
-                filename,
-                declared_content_type,
-                bytes,
+                filename: request.filename,
+                declared_content_type: request.declared_content_type,
+                bytes: request.bytes,
             })
             .map_err(ChannelPlatformError::from)
     }

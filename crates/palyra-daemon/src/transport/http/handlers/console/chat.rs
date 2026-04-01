@@ -151,7 +151,8 @@ pub(crate) async fn console_chat_message_stream_handler(
         &session.context,
         session_id.as_str(),
         payload.attachments.as_slice(),
-    )?;
+    )
+    .map_err(|response| *response)?;
     let timestamp_unix_ms = unix_ms_now().map_err(|error| {
         runtime_status_response(tonic::Status::internal(format!(
             "failed to read system clock: {error}"
@@ -396,15 +397,15 @@ pub(crate) async fn console_chat_attachment_upload_handler(
     })?;
     let artifact = state
         .channels
-        .store_console_chat_attachment(
-            session_id.as_str(),
-            session.context.principal.as_str(),
-            session.context.device_id.as_str(),
-            session.context.channel.as_deref(),
-            filename.as_str(),
-            content_type.as_str(),
-            bytes.as_slice(),
-        )
+        .store_console_chat_attachment(channels::ConsoleChatAttachmentStoreRequestView {
+            session_id: session_id.as_str(),
+            principal: session.context.principal.as_str(),
+            device_id: session.context.device_id.as_str(),
+            channel: session.context.channel.as_deref(),
+            filename: filename.as_str(),
+            declared_content_type: content_type.as_str(),
+            bytes: bytes.as_slice(),
+        })
         .map_err(channel_platform_error_response)?;
     Ok(Json(json!({
         "attachment": console_chat_attachment_payload_to_json(&artifact),
@@ -924,18 +925,18 @@ fn load_console_chat_message_attachments(
     context: &gateway::RequestContext,
     session_id: &str,
     attachments: &[ConsoleChatAttachmentReference],
-) -> Result<Vec<common_v1::MessageAttachment>, Response> {
+) -> Result<Vec<common_v1::MessageAttachment>, Box<Response>> {
     let mut resolved = Vec::with_capacity(attachments.len());
     for attachment in attachments {
         let artifact_id = trim_to_option(attachment.artifact_id.clone()).ok_or_else(|| {
-            runtime_status_response(tonic::Status::invalid_argument(
+            Box::new(runtime_status_response(tonic::Status::invalid_argument(
                 "attachment artifact_id cannot be empty",
-            ))
+            )))
         })?;
         validate_canonical_id(artifact_id.as_str()).map_err(|_| {
-            runtime_status_response(tonic::Status::invalid_argument(
+            Box::new(runtime_status_response(tonic::Status::invalid_argument(
                 "attachment artifact_id must be a canonical ULID",
-            ))
+            )))
         })?;
         let payload = state
             .channels
@@ -948,9 +949,9 @@ fn load_console_chat_message_attachments(
             )
             .map_err(channel_platform_error_response)?
             .ok_or_else(|| {
-                runtime_status_response(tonic::Status::not_found(format!(
+                Box::new(runtime_status_response(tonic::Status::not_found(format!(
                     "console chat attachment not found: {artifact_id}"
-                )))
+                ))))
             })?;
         resolved.push(common_v1::MessageAttachment {
             kind: console_chat_attachment_kind(payload.content_type.as_str()) as i32,
