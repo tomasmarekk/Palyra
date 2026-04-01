@@ -1036,6 +1036,8 @@ pub struct OrchestratorSessionRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_origin_run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_run_state: Option<String>,
 }
 
@@ -1059,6 +1061,10 @@ pub struct OrchestratorSessionCleanupOutcome {
 pub struct OrchestratorRunStartRequest {
     pub run_id: String,
     pub session_id: String,
+    pub origin_kind: String,
+    pub origin_run_id: Option<String>,
+    pub triggered_by_principal: Option<String>,
+    pub parameter_delta_json: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1111,7 +1117,85 @@ pub struct OrchestratorRunStatusSnapshot {
     pub updated_at_unix_ms: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    pub origin_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub triggered_by_principal: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameter_delta_json: Option<String>,
     pub tape_events: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct OrchestratorQueuedInputRecord {
+    pub queued_input_id: String,
+    pub run_id: String,
+    pub session_id: String,
+    pub state: String,
+    pub text: String,
+    pub created_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_run_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrchestratorQueuedInputCreateRequest {
+    pub queued_input_id: String,
+    pub run_id: String,
+    pub session_id: String,
+    pub text: String,
+    pub origin_run_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrchestratorQueuedInputUpdateRequest {
+    pub queued_input_id: String,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct OrchestratorSessionPinRecord {
+    pub pin_id: String,
+    pub session_id: String,
+    pub run_id: String,
+    pub tape_seq: i64,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    pub created_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrchestratorSessionPinCreateRequest {
+    pub pin_id: String,
+    pub session_id: String,
+    pub run_id: String,
+    pub tape_seq: i64,
+    pub title: String,
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct OrchestratorSessionTranscriptRecord {
+    pub session_id: String,
+    pub run_id: String,
+    pub seq: i64,
+    pub event_type: String,
+    pub payload_json: String,
+    pub created_at_unix_ms: i64,
+    pub origin_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_run_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrchestratorSessionLineageUpdateRequest {
+    pub session_id: String,
+    pub branch_state: String,
+    pub parent_session_id: Option<String>,
+    pub branch_origin_run_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1721,6 +1805,68 @@ const MIGRATIONS: &[Migration] = &[
                 ADD COLUMN auto_title_generator_version TEXT;
         "#,
     },
+    Migration {
+        version: 14,
+        name: "orchestrator_session_lineage_and_run_metadata",
+        sql: r#"
+            ALTER TABLE orchestrator_sessions
+                ADD COLUMN branch_state TEXT NOT NULL DEFAULT 'root';
+            ALTER TABLE orchestrator_sessions
+                ADD COLUMN parent_session_ulid TEXT;
+            ALTER TABLE orchestrator_sessions
+                ADD COLUMN branch_origin_run_ulid TEXT;
+
+            ALTER TABLE orchestrator_runs
+                ADD COLUMN origin_kind TEXT NOT NULL DEFAULT 'manual';
+            ALTER TABLE orchestrator_runs
+                ADD COLUMN origin_run_ulid TEXT;
+            ALTER TABLE orchestrator_runs
+                ADD COLUMN triggered_by_principal TEXT;
+            ALTER TABLE orchestrator_runs
+                ADD COLUMN parameter_delta_json TEXT;
+
+            CREATE INDEX IF NOT EXISTS idx_orchestrator_sessions_parent
+                ON orchestrator_sessions(parent_session_ulid);
+            CREATE INDEX IF NOT EXISTS idx_orchestrator_runs_origin
+                ON orchestrator_runs(origin_run_ulid);
+        "#,
+    },
+    Migration {
+        version: 15,
+        name: "orchestrator_queue_and_pins",
+        sql: r#"
+            CREATE TABLE IF NOT EXISTS orchestrator_queued_inputs (
+                queued_input_ulid TEXT PRIMARY KEY,
+                run_ulid TEXT NOT NULL,
+                session_ulid TEXT NOT NULL,
+                state TEXT NOT NULL,
+                text TEXT NOT NULL,
+                origin_run_ulid TEXT,
+                created_at_unix_ms INTEGER NOT NULL,
+                updated_at_unix_ms INTEGER NOT NULL,
+                FOREIGN KEY(run_ulid) REFERENCES orchestrator_runs(run_ulid),
+                FOREIGN KEY(session_ulid) REFERENCES orchestrator_sessions(session_ulid)
+            );
+            CREATE INDEX IF NOT EXISTS idx_orchestrator_queued_inputs_run
+                ON orchestrator_queued_inputs(run_ulid, created_at_unix_ms);
+            CREATE INDEX IF NOT EXISTS idx_orchestrator_queued_inputs_session
+                ON orchestrator_queued_inputs(session_ulid, created_at_unix_ms);
+
+            CREATE TABLE IF NOT EXISTS orchestrator_session_pins (
+                pin_ulid TEXT PRIMARY KEY,
+                session_ulid TEXT NOT NULL,
+                run_ulid TEXT NOT NULL,
+                tape_seq INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                note TEXT,
+                created_at_unix_ms INTEGER NOT NULL,
+                FOREIGN KEY(session_ulid) REFERENCES orchestrator_sessions(session_ulid),
+                FOREIGN KEY(run_ulid) REFERENCES orchestrator_runs(run_ulid)
+            );
+            CREATE INDEX IF NOT EXISTS idx_orchestrator_session_pins_session
+                ON orchestrator_session_pins(session_ulid, created_at_unix_ms DESC);
+        "#,
+    },
 ];
 
 pub struct JournalStore {
@@ -2176,8 +2322,9 @@ impl JournalStore {
             last_intent: None,
             last_summary: None,
             match_snippet: None,
-            branch_state: "missing".to_owned(),
+            branch_state: "root".to_owned(),
             parent_session_id: None,
+            branch_origin_run_id: None,
             last_run_state: None,
         };
 
@@ -2382,10 +2529,23 @@ impl JournalStore {
                     prompt_tokens,
                     completion_tokens,
                     total_tokens,
-                    last_error
-                ) VALUES (?1, ?2, ?3, 0, NULL, ?4, ?4, NULL, ?4, 0, 0, 0, NULL)
+                    last_error,
+                    origin_kind,
+                    origin_run_ulid,
+                    triggered_by_principal,
+                    parameter_delta_json
+                ) VALUES (?1, ?2, ?3, 0, NULL, ?4, ?4, NULL, ?4, 0, 0, 0, NULL, ?5, ?6, ?7, ?8)
             "#,
-            params![request.run_id, request.session_id, RunLifecycleState::Accepted.as_str(), now,],
+            params![
+                request.run_id,
+                request.session_id,
+                RunLifecycleState::Accepted.as_str(),
+                now,
+                request.origin_kind,
+                request.origin_run_id,
+                request.triggered_by_principal,
+                request.parameter_delta_json,
+            ],
         ) {
             Ok(_) => {
                 guard.execute(
@@ -2600,7 +2760,11 @@ impl JournalStore {
                     runs.started_at_unix_ms,
                     runs.completed_at_unix_ms,
                     runs.updated_at_unix_ms,
-                    runs.last_error
+                    runs.last_error,
+                    runs.origin_kind,
+                    runs.origin_run_ulid,
+                    runs.triggered_by_principal,
+                    runs.parameter_delta_json
                 FROM orchestrator_runs AS runs
                 INNER JOIN orchestrator_sessions AS sessions
                     ON sessions.session_ulid = runs.session_ulid
@@ -2630,6 +2794,10 @@ impl JournalStore {
                     completed_at_unix_ms: row.get(13)?,
                     updated_at_unix_ms: row.get(14)?,
                     last_error: row.get(15)?,
+                    origin_kind: row.get(16)?,
+                    origin_run_id: row.get(17)?,
+                    triggered_by_principal: row.get(18)?,
+                    parameter_delta_json: row.get(19)?,
                     tape_events: 0,
                 })
             })
@@ -2643,6 +2811,272 @@ impl JournalStore {
             |row| row.get::<_, i64>(0),
         )? as u64;
         Ok(Some(snapshot))
+    }
+
+    pub fn update_orchestrator_session_lineage(
+        &self,
+        request: &OrchestratorSessionLineageUpdateRequest,
+    ) -> Result<(), JournalError> {
+        let now = current_unix_ms()?;
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let updated = guard.execute(
+            r#"
+                UPDATE orchestrator_sessions
+                SET
+                    branch_state = ?2,
+                    parent_session_ulid = ?3,
+                    branch_origin_run_ulid = ?4,
+                    updated_at_unix_ms = ?5
+                WHERE session_ulid = ?1
+            "#,
+            params![
+                request.session_id,
+                request.branch_state,
+                request.parent_session_id,
+                request.branch_origin_run_id,
+                now,
+            ],
+        )?;
+        if updated == 0 {
+            return Err(JournalError::SessionNotFound { selector: request.session_id.clone() });
+        }
+        Ok(())
+    }
+
+    pub fn list_orchestrator_session_transcript(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<OrchestratorSessionTranscriptRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let mut statement = guard.prepare(
+            r#"
+                SELECT
+                    runs.session_ulid,
+                    tape.run_ulid,
+                    tape.seq,
+                    tape.event_type,
+                    tape.payload_json,
+                    tape.created_at_unix_ms,
+                    COALESCE(runs.origin_kind, 'manual'),
+                    runs.origin_run_ulid
+                FROM orchestrator_tape AS tape
+                INNER JOIN orchestrator_runs AS runs
+                    ON runs.run_ulid = tape.run_ulid
+                WHERE runs.session_ulid = ?1
+                ORDER BY runs.started_at_unix_ms ASC, tape.seq ASC
+            "#,
+        )?;
+        let mut rows = statement.query(params![session_id])?;
+        let mut records = Vec::new();
+        while let Some(row) = rows.next()? {
+            records.push(OrchestratorSessionTranscriptRecord {
+                session_id: row.get(0)?,
+                run_id: row.get(1)?,
+                seq: row.get(2)?,
+                event_type: row.get(3)?,
+                payload_json: row.get(4)?,
+                created_at_unix_ms: row.get(5)?,
+                origin_kind: row.get(6)?,
+                origin_run_id: row.get(7)?,
+            });
+        }
+        Ok(records)
+    }
+
+    pub fn create_orchestrator_queued_input(
+        &self,
+        request: &OrchestratorQueuedInputCreateRequest,
+    ) -> Result<OrchestratorQueuedInputRecord, JournalError> {
+        let now = current_unix_ms()?;
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        guard.execute(
+            r#"
+                INSERT INTO orchestrator_queued_inputs (
+                    queued_input_ulid,
+                    run_ulid,
+                    session_ulid,
+                    state,
+                    text,
+                    origin_run_ulid,
+                    created_at_unix_ms,
+                    updated_at_unix_ms
+                ) VALUES (?1, ?2, ?3, 'pending', ?4, ?5, ?6, ?6)
+            "#,
+            params![
+                request.queued_input_id,
+                request.run_id,
+                request.session_id,
+                request.text,
+                request.origin_run_id,
+                now,
+            ],
+        )?;
+        Ok(OrchestratorQueuedInputRecord {
+            queued_input_id: request.queued_input_id.clone(),
+            run_id: request.run_id.clone(),
+            session_id: request.session_id.clone(),
+            state: "pending".to_owned(),
+            text: request.text.clone(),
+            created_at_unix_ms: now,
+            updated_at_unix_ms: now,
+            origin_run_id: request.origin_run_id.clone(),
+        })
+    }
+
+    pub fn update_orchestrator_queued_input_state(
+        &self,
+        request: &OrchestratorQueuedInputUpdateRequest,
+    ) -> Result<(), JournalError> {
+        let now = current_unix_ms()?;
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        guard.execute(
+            r#"
+                UPDATE orchestrator_queued_inputs
+                SET
+                    state = ?2,
+                    updated_at_unix_ms = ?3
+                WHERE queued_input_ulid = ?1
+            "#,
+            params![request.queued_input_id, request.state, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_orchestrator_queued_inputs(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<OrchestratorQueuedInputRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let mut statement = guard.prepare(
+            r#"
+                SELECT
+                    queued_input_ulid,
+                    run_ulid,
+                    session_ulid,
+                    state,
+                    text,
+                    created_at_unix_ms,
+                    updated_at_unix_ms,
+                    origin_run_ulid
+                FROM orchestrator_queued_inputs
+                WHERE session_ulid = ?1
+                ORDER BY created_at_unix_ms ASC
+            "#,
+        )?;
+        let mut rows = statement.query(params![session_id])?;
+        let mut records = Vec::new();
+        while let Some(row) = rows.next()? {
+            records.push(OrchestratorQueuedInputRecord {
+                queued_input_id: row.get(0)?,
+                run_id: row.get(1)?,
+                session_id: row.get(2)?,
+                state: row.get(3)?,
+                text: row.get(4)?,
+                created_at_unix_ms: row.get(5)?,
+                updated_at_unix_ms: row.get(6)?,
+                origin_run_id: row.get(7)?,
+            });
+        }
+        Ok(records)
+    }
+
+    pub fn create_orchestrator_session_pin(
+        &self,
+        request: &OrchestratorSessionPinCreateRequest,
+    ) -> Result<OrchestratorSessionPinRecord, JournalError> {
+        let now = current_unix_ms()?;
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let tape_exists = guard
+            .query_row(
+                r#"
+                    SELECT 1
+                    FROM orchestrator_tape
+                    WHERE run_ulid = ?1 AND seq = ?2
+                    LIMIT 1
+                "#,
+                params![request.run_id, request.tape_seq],
+                |_row| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !tape_exists {
+            return Err(JournalError::RunNotFound { run_id: request.run_id.clone() });
+        }
+        guard.execute(
+            r#"
+                INSERT INTO orchestrator_session_pins (
+                    pin_ulid,
+                    session_ulid,
+                    run_ulid,
+                    tape_seq,
+                    title,
+                    note,
+                    created_at_unix_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "#,
+            params![
+                request.pin_id,
+                request.session_id,
+                request.run_id,
+                request.tape_seq,
+                request.title,
+                request.note,
+                now,
+            ],
+        )?;
+        Ok(OrchestratorSessionPinRecord {
+            pin_id: request.pin_id.clone(),
+            session_id: request.session_id.clone(),
+            run_id: request.run_id.clone(),
+            tape_seq: request.tape_seq,
+            title: request.title.clone(),
+            note: request.note.clone(),
+            created_at_unix_ms: now,
+        })
+    }
+
+    pub fn list_orchestrator_session_pins(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<OrchestratorSessionPinRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let mut statement = guard.prepare(
+            r#"
+                SELECT
+                    pin_ulid,
+                    session_ulid,
+                    run_ulid,
+                    tape_seq,
+                    title,
+                    note,
+                    created_at_unix_ms
+                FROM orchestrator_session_pins
+                WHERE session_ulid = ?1
+                ORDER BY created_at_unix_ms DESC
+            "#,
+        )?;
+        let mut rows = statement.query(params![session_id])?;
+        let mut records = Vec::new();
+        while let Some(row) = rows.next()? {
+            records.push(OrchestratorSessionPinRecord {
+                pin_id: row.get(0)?,
+                session_id: row.get(1)?,
+                run_id: row.get(2)?,
+                tape_seq: row.get(3)?,
+                title: row.get(4)?,
+                note: row.get(5)?,
+                created_at_unix_ms: row.get(6)?,
+            });
+        }
+        Ok(records)
+    }
+
+    pub fn delete_orchestrator_session_pin(&self, pin_id: &str) -> Result<bool, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        Ok(guard.execute(
+            "DELETE FROM orchestrator_session_pins WHERE pin_ulid = ?1",
+            params![pin_id],
+        )? > 0)
     }
 
     pub fn create_cron_job(
@@ -4701,8 +5135,9 @@ fn map_orchestrator_session_row(
         last_intent: None,
         last_summary: None,
         match_snippet: None,
-        branch_state: "missing".to_owned(),
-        parent_session_id: None,
+        branch_state: row.get(13)?,
+        parent_session_id: row.get(14)?,
+        branch_origin_run_id: row.get(15)?,
         last_run_state: None,
     })
 }
@@ -4726,7 +5161,10 @@ fn load_orchestrator_session_by_id(
                 archived_at_unix_ms,
                 auto_title,
                 auto_title_source,
-                auto_title_generator_version
+                auto_title_generator_version,
+                branch_state,
+                parent_session_ulid,
+                branch_origin_run_ulid
             FROM orchestrator_sessions
             WHERE session_ulid = ?1
             LIMIT 1
@@ -4757,7 +5195,10 @@ fn load_orchestrator_session_by_key(
                 archived_at_unix_ms,
                 auto_title,
                 auto_title_source,
-                auto_title_generator_version
+                auto_title_generator_version,
+                branch_state,
+                parent_session_ulid,
+                branch_origin_run_ulid
             FROM orchestrator_sessions
             WHERE session_key = ?1
             LIMIT 1
@@ -4788,7 +5229,10 @@ fn load_orchestrator_session_by_label(
                 archived_at_unix_ms,
                 auto_title,
                 auto_title_source,
-                auto_title_generator_version
+                auto_title_generator_version,
+                branch_state,
+                parent_session_ulid,
+                branch_origin_run_ulid
             FROM orchestrator_sessions
             WHERE session_label = ?1
               AND archived_at_unix_ms IS NULL
@@ -4826,7 +5270,10 @@ fn load_orchestrator_sessions_page(
                 archived_at_unix_ms,
                 auto_title,
                 auto_title_source,
-                auto_title_generator_version
+                auto_title_generator_version,
+                branch_state,
+                parent_session_ulid,
+                branch_origin_run_ulid
             FROM orchestrator_sessions
             WHERE (?1 IS NULL OR session_key > ?1)
               AND principal = ?2

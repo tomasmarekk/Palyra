@@ -72,6 +72,9 @@ fn run_acp_shim(command: AcpShimArgs) -> Result<()> {
         run_id: command.run_id,
         prompt: input_prompt,
         allow_sensitive_tools: command.allow_sensitive_tools,
+        origin_kind: None,
+        origin_run_id: None,
+        parameter_delta_json: None,
     })?;
     run_agent_stream_as_acp(connection, request)
 }

@@ -829,6 +829,79 @@ fn parse_sessions_cleanup_with_dry_run() {
 }
 
 #[test]
+fn parse_sessions_retry_branch_search_and_export() {
+    let retry =
+        Cli::parse_from(["palyra", "sessions", "retry", "01ARZ3NDEKTSV4RRFFQ69G5FB2", "--json"]);
+    assert_eq!(
+        retry.command,
+        Command::Sessions {
+            command: SessionsCommand::Retry {
+                session_id: "01ARZ3NDEKTSV4RRFFQ69G5FB2".to_owned(),
+                json: true,
+            }
+        }
+    );
+
+    let branch = Cli::parse_from([
+        "palyra",
+        "sessions",
+        "branch",
+        "01ARZ3NDEKTSV4RRFFQ69G5FB3",
+        "--session-label",
+        "Investigate alternate plan",
+    ]);
+    assert_eq!(
+        branch.command,
+        Command::Sessions {
+            command: SessionsCommand::Branch {
+                session_id: "01ARZ3NDEKTSV4RRFFQ69G5FB3".to_owned(),
+                session_label: Some("Investigate alternate plan".to_owned()),
+                json: false,
+            }
+        }
+    );
+
+    let search = Cli::parse_from([
+        "palyra",
+        "sessions",
+        "transcript-search",
+        "01ARZ3NDEKTSV4RRFFQ69G5FB4",
+        "--query",
+        "follow-up",
+    ]);
+    assert_eq!(
+        search.command,
+        Command::Sessions {
+            command: SessionsCommand::TranscriptSearch {
+                session_id: "01ARZ3NDEKTSV4RRFFQ69G5FB4".to_owned(),
+                query: "follow-up".to_owned(),
+                json: false,
+            }
+        }
+    );
+
+    let export = Cli::parse_from([
+        "palyra",
+        "sessions",
+        "export",
+        "01ARZ3NDEKTSV4RRFFQ69G5FB5",
+        "--format",
+        "markdown",
+        "--json",
+    ]);
+    assert_eq!(
+        export.command,
+        Command::Sessions {
+            command: SessionsCommand::Export {
+                session_id: "01ARZ3NDEKTSV4RRFFQ69G5FB5".to_owned(),
+                format: "markdown".to_owned(),
+                json: true,
+            }
+        }
+    );
+}
+
+#[test]
 fn parse_message_send_with_thread_id() {
     let parsed = Cli::parse_from([
         "palyra",

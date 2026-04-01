@@ -83,4 +83,30 @@ pub enum SessionsCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    Retry {
+        session_id: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Branch {
+        session_id: String,
+        #[arg(long)]
+        session_label: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    TranscriptSearch {
+        session_id: String,
+        #[arg(long)]
+        query: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Export {
+        session_id: String,
+        #[arg(long, default_value = "json")]
+        format: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }

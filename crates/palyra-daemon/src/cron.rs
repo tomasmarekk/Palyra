@@ -1401,6 +1401,10 @@ async fn execute_single_job_attempt(
         reset_session: false,
         require_existing: false,
         tool_approval_response: None,
+        origin_kind: "manual".to_owned(),
+        origin_run_id: None,
+        parameter_delta_json: Vec::new(),
+        queued_input_id: None,
     }]));
     inject_scheduler_metadata(
         stream_request.metadata_mut(),
@@ -1516,6 +1520,10 @@ fn fallback_usage_snapshot(
         completed_at_unix_ms: None,
         updated_at_unix_ms: now,
         last_error: None,
+        origin_kind: "manual".to_owned(),
+        origin_run_id: None,
+        triggered_by_principal: Some(job.owner_principal.clone()),
+        parameter_delta_json: None,
         tape_events: 0,
     }
 }

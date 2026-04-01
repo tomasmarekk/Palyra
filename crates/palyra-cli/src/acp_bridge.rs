@@ -363,6 +363,9 @@ impl PalyraAcpAgent {
             run_id: None,
             prompt,
             allow_sensitive_tools: self.allow_sensitive_tools,
+            origin_kind: None,
+            origin_run_id: None,
+            parameter_delta_json: None,
         })
         .map_err(acp_internal_error)?;
         let mut initial_request =
@@ -837,6 +840,10 @@ fn build_tool_approval_stream_request(
             decision_scope,
             decision_scope_ttl_ms: decision_scope_ttl_ms.unwrap_or_default(),
         }),
+        origin_kind: String::new(),
+        origin_run_id: None,
+        parameter_delta_json: Vec::new(),
+        queued_input_id: None,
     })
 }
 

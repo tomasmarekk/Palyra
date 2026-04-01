@@ -66,6 +66,9 @@ pub(crate) fn run_agent(command: AgentCommand) -> Result<()> {
                 run_id,
                 prompt: input_prompt,
                 allow_sensitive_tools,
+                origin_kind: None,
+                origin_run_id: None,
+                parameter_delta_json: None,
             })?;
             execute_agent_stream(connection, request, output::preferred_ndjson(false, ndjson))
         }
@@ -222,6 +225,9 @@ async fn run_agent_interactive_async(
             run_id: None,
             prompt: prompt.to_owned(),
             allow_sensitive_tools,
+            origin_kind: None,
+            origin_run_id: None,
+            parameter_delta_json: None,
         })?;
         last_run_id = Some(request.run_id.clone());
         execute_agent_stream(connection.clone(), request, ndjson)?;

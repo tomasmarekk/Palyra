@@ -474,8 +474,8 @@ async fn build_session_catalog_record(
             .as_deref()
             .and_then(|value| normalize_catalog_text(value, SESSION_CATALOG_PREVIEW_LEN)),
         last_summary_state: preview_metadata_state(last_summary.as_deref()).to_owned(),
-        branch_state: "missing".to_owned(),
-        parent_session_id: None,
+        branch_state: session.branch_state,
+        parent_session_id: session.parent_session_id,
         principal: session.principal,
         device_id: session.device_id,
         channel: session.channel,

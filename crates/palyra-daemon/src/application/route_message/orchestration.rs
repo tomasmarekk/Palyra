@@ -128,6 +128,10 @@ pub(crate) async fn handle_routed_route_message(
         .start_orchestrator_run(OrchestratorRunStartRequest {
             run_id: run_id.clone(),
             session_id: session_id.clone(),
+            origin_kind: "manual".to_owned(),
+            origin_run_id: None,
+            triggered_by_principal: Some(route_request_context.principal.clone()),
+            parameter_delta_json: None,
         })
         .await?;
     runtime_state

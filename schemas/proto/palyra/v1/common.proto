@@ -267,8 +267,12 @@ message RunStreamRequest {
   bool reset_session = 8;
   bool require_existing = 9;
   ToolApprovalResponse tool_approval_response = 10;
+  string origin_kind = 11;
+  CanonicalId origin_run_id = 12;
+  bytes parameter_delta_json = 13;
+  CanonicalId queued_input_id = 14;
 
-  reserved 11 to 16;
+  reserved 15 to 16;
 }
 
 message ModelToken {

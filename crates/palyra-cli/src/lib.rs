@@ -2605,6 +2605,9 @@ fn parse_acp_shim_input_line(
         allow_sensitive_tools: parsed
             .allow_sensitive_tools
             .unwrap_or(default_allow_sensitive_tools),
+        origin_kind: None,
+        origin_run_id: None,
+        parameter_delta_json: None,
     })
 }
 
@@ -2642,6 +2645,9 @@ struct AgentRunInputArgs {
     run_id: Option<String>,
     prompt: String,
     allow_sensitive_tools: bool,
+    origin_kind: Option<String>,
+    origin_run_id: Option<String>,
+    parameter_delta_json: Option<String>,
 }
 
 fn build_agent_run_input(input: AgentRunInputArgs) -> Result<AgentRunInput> {
@@ -2654,6 +2660,9 @@ fn build_agent_run_input(input: AgentRunInputArgs) -> Result<AgentRunInput> {
         run_id: resolve_or_generate_canonical_id(input.run_id)?,
         prompt: input.prompt,
         allow_sensitive_tools: input.allow_sensitive_tools,
+        origin_kind: normalize_optional_owned_text(input.origin_kind),
+        origin_run_id: normalize_optional_owned_text(input.origin_run_id),
+        parameter_delta_json: normalize_optional_owned_text(input.parameter_delta_json),
     })
 }
 
@@ -2676,6 +2685,9 @@ async fn prepare_agent_run_input(
         run_id: input.run_id,
         prompt: input.prompt,
         allow_sensitive_tools: input.allow_sensitive_tools,
+        origin_kind: input.origin_kind,
+        origin_run_id: input.origin_run_id,
+        parameter_delta_json: input.parameter_delta_json,
     })
 }
 
@@ -2821,6 +2833,17 @@ fn build_resolved_run_stream_request(
         reset_session: false,
         require_existing: true,
         tool_approval_response: None,
+        origin_kind: input.origin_kind.clone().unwrap_or_default(),
+        origin_run_id: input
+            .origin_run_id
+            .as_ref()
+            .map(|ulid| common_v1::CanonicalId { ulid: ulid.clone() }),
+        parameter_delta_json: input
+            .parameter_delta_json
+            .as_ref()
+            .map(|value| value.as_bytes().to_vec())
+            .unwrap_or_default(),
+        queued_input_id: None,
     })
 }
 
@@ -2859,6 +2882,17 @@ fn build_run_stream_request(input: &AgentRunInput) -> Result<common_v1::RunStrea
         reset_session: input.reset_session,
         require_existing: input.require_existing,
         tool_approval_response: None,
+        origin_kind: input.origin_kind.clone().unwrap_or_default(),
+        origin_run_id: input
+            .origin_run_id
+            .as_ref()
+            .map(|ulid| common_v1::CanonicalId { ulid: ulid.clone() }),
+        parameter_delta_json: input
+            .parameter_delta_json
+            .as_ref()
+            .map(|value| value.as_bytes().to_vec())
+            .unwrap_or_default(),
+        queued_input_id: None,
     })
 }
 
@@ -3219,6 +3253,9 @@ struct AgentRunInput {
     run_id: String,
     prompt: String,
     allow_sensitive_tools: bool,
+    origin_kind: Option<String>,
+    origin_run_id: Option<String>,
+    parameter_delta_json: Option<String>,
 }
 
 #[derive(Clone)]
@@ -3227,6 +3264,9 @@ struct ResolvedAgentRunInput {
     run_id: String,
     prompt: String,
     allow_sensitive_tools: bool,
+    origin_kind: Option<String>,
+    origin_run_id: Option<String>,
+    parameter_delta_json: Option<String>,
 }
 
 #[derive(Clone)]

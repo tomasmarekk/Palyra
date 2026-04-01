@@ -23,7 +23,11 @@ pub(crate) async fn run_sessions_async(
         | SessionsCommand::Rename { json, .. }
         | SessionsCommand::Reset { json, .. }
         | SessionsCommand::Cleanup { json, .. }
-        | SessionsCommand::Abort { json, .. } => output::preferred_json(*json),
+        | SessionsCommand::Abort { json, .. }
+        | SessionsCommand::Retry { json, .. }
+        | SessionsCommand::Branch { json, .. }
+        | SessionsCommand::TranscriptSearch { json, .. }
+        | SessionsCommand::Export { json, .. } => output::preferred_json(*json),
     };
     let runtime = client::operator::OperatorRuntime::new(connection.clone());
 
@@ -395,6 +399,152 @@ pub(crate) async fn run_sessions_async(
                 );
             }
         }
+        SessionsCommand::Retry { session_id, json: _ } => {
+            let context = connect_sessions_admin_console(&connection).await?;
+            let payload = context
+                .client
+                .post_json_value(
+                    format!(
+                        "console/v1/chat/sessions/{}/retry",
+                        percent_encode_component(session_id.as_str())
+                    ),
+                    &json!({}),
+                )
+                .await?;
+            let prompt = json_required_string(&payload, "/text")?;
+            let origin_kind = json_optional_string(&payload, "/origin_kind");
+            let origin_run_id = json_optional_string(&payload, "/origin_run_id");
+            let parameter_delta_json = payload
+                .pointer("/parameter_delta")
+                .filter(|value| !value.is_null())
+                .map(serde_json::to_string)
+                .transpose()?;
+            let request = build_agent_run_input(AgentRunInputArgs {
+                session_id: Some(resolve_required_canonical_id(session_id.clone())?),
+                session_key: None,
+                session_label: None,
+                require_existing: true,
+                reset_session: false,
+                run_id: None,
+                prompt,
+                allow_sensitive_tools: false,
+                origin_kind,
+                origin_run_id,
+                parameter_delta_json,
+            })?;
+            let mut client = client::runtime::GatewayRuntimeClient::connect(connection).await?;
+            let _resolved = stream_agent_events_async(&mut client, request, |event| {
+                if json {
+                    emit_acp_event_ndjson(event)
+                } else {
+                    emit_agent_event_text(event)
+                }
+            })
+            .await?;
+        }
+        SessionsCommand::Branch { session_id, session_label, json: _ } => {
+            let context = connect_sessions_admin_console(&connection).await?;
+            let payload = context
+                .client
+                .post_json_value(
+                    format!(
+                        "console/v1/chat/sessions/{}/branch",
+                        percent_encode_component(session_id.as_str())
+                    ),
+                    &json!({
+                        "session_label": session_label,
+                    }),
+                )
+                .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+            } else {
+                let session = payload
+                    .pointer("/session")
+                    .context("branch response is missing session payload")?;
+                println!(
+                    "sessions.branch session_id={} title={} branch_state={} parent_session_id={} source_run_id={}",
+                    redacted_optional_identifier_for_output(
+                        session.pointer("/session_id").and_then(Value::as_str)
+                    ),
+                    json_optional_string_in(session, "/title").unwrap_or_else(|| "none".to_owned()),
+                    json_optional_string_in(session, "/branch_state")
+                        .unwrap_or_else(|| "none".to_owned()),
+                    redacted_optional_identifier_for_output(
+                        session.pointer("/parent_session_id").and_then(Value::as_str)
+                    ),
+                    redacted_optional_identifier_for_output(
+                        payload.pointer("/source_run_id").and_then(Value::as_str)
+                    )
+                );
+            }
+        }
+        SessionsCommand::TranscriptSearch { session_id, query, json: _ } => {
+            let context = connect_sessions_admin_console(&connection).await?;
+            let payload = context
+                .client
+                .get_json_value(format!(
+                    "console/v1/chat/sessions/{}/transcript/search?q={}",
+                    percent_encode_component(session_id.as_str()),
+                    percent_encode_component(query.as_str())
+                ))
+                .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+            } else {
+                let matches = payload
+                    .pointer("/matches")
+                    .and_then(Value::as_array)
+                    .context("transcript search response is missing matches array")?;
+                println!("sessions.transcript.search count={} query={}", matches.len(), query);
+                for entry in matches {
+                    println!(
+                        "match seq={} event_type={} origin_kind={} run_id={} snippet={}",
+                        entry.pointer("/seq").and_then(Value::as_i64).unwrap_or_default(),
+                        json_optional_string_in(entry, "/event_type")
+                            .unwrap_or_else(|| "unknown".to_owned()),
+                        json_optional_string_in(entry, "/origin_kind")
+                            .unwrap_or_else(|| "unknown".to_owned()),
+                        redacted_optional_identifier_for_output(
+                            entry.pointer("/run_id").and_then(Value::as_str)
+                        ),
+                        json_optional_string_in(entry, "/snippet")
+                            .unwrap_or_else(|| "none".to_owned())
+                    );
+                }
+            }
+        }
+        SessionsCommand::Export { session_id, format, json: _ } => {
+            let context = connect_sessions_admin_console(&connection).await?;
+            let normalized_format = match format.trim().to_ascii_lowercase().as_str() {
+                "json" => "json",
+                "markdown" | "md" => "markdown",
+                other => {
+                    anyhow::bail!("unsupported export format '{other}'; expected json or markdown")
+                }
+            };
+            let payload = context
+                .client
+                .get_json_value(format!(
+                    "console/v1/chat/sessions/{}/export?format={}",
+                    percent_encode_component(session_id.as_str()),
+                    normalized_format
+                ))
+                .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+            } else if normalized_format == "markdown" {
+                println!(
+                    "{}",
+                    json_required_string(&payload, "/content")
+                        .context("markdown export content is missing")?
+                );
+            } else {
+                let content =
+                    payload.pointer("/content").context("json export content is missing")?;
+                println!("{}", serde_json::to_string_pretty(content)?);
+            }
+        }
     }
 
     std::io::stdout().flush().context("stdout flush failed")
@@ -521,6 +671,52 @@ fn build_cleanup_session_request(
         session_id: resolve_optional_canonical_id(session_id)?,
         session_key: session_key.unwrap_or_default(),
     })
+}
+
+async fn connect_sessions_admin_console(
+    connection: &AgentConnection,
+) -> Result<client::control_plane::AdminConsoleContext> {
+    client::control_plane::connect_admin_console(app::ConnectionOverrides {
+        grpc_url: Some(connection.grpc_url.clone()),
+        daemon_url: None,
+        token: connection.token.clone(),
+        principal: Some(connection.principal.clone()),
+        device_id: Some(connection.device_id.clone()),
+        channel: Some(connection.channel.clone()),
+    })
+    .await
+}
+
+fn json_required_string(payload: &Value, pointer: &str) -> Result<String> {
+    payload
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .with_context(|| format!("response is missing required string at {pointer}"))
+}
+
+fn json_optional_string(payload: &Value, pointer: &str) -> Option<String> {
+    payload.pointer(pointer).and_then(Value::as_str).map(ToOwned::to_owned)
+}
+
+fn json_optional_string_in(payload: &Value, pointer: &str) -> Option<String> {
+    json_optional_string(payload, pointer)
+}
+
+fn percent_encode_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(char::from(*byte));
+            }
+            other => {
+                encoded.push('%');
+                encoded.push_str(format!("{other:02X}").as_str());
+            }
+        }
+    }
+    encoded
 }
 
 #[cfg(test)]

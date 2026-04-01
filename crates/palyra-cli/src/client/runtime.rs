@@ -60,6 +60,10 @@ impl GatewayRunStream {
             reset_session: false,
             require_existing: true,
             tool_approval_response: Some(response),
+            origin_kind: String::new(),
+            origin_run_id: None,
+            parameter_delta_json: Vec::new(),
+            queued_input_id: None,
         })
         .await
     }

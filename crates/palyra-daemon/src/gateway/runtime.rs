@@ -6,9 +6,12 @@ use crate::agents::{
 };
 use crate::application::auth::map_auth_profile_error;
 use crate::journal::{
-    MemoryEmbeddingsStatus, MemoryItemRecord, OrchestratorSessionCleanupOutcome,
-    OrchestratorSessionCleanupRequest, OrchestratorUsageQuery, OrchestratorUsageRunRecord,
-    OrchestratorUsageSessionRecord, OrchestratorUsageSummary,
+    MemoryEmbeddingsStatus, MemoryItemRecord, OrchestratorQueuedInputCreateRequest,
+    OrchestratorQueuedInputRecord, OrchestratorQueuedInputUpdateRequest,
+    OrchestratorSessionCleanupOutcome, OrchestratorSessionCleanupRequest,
+    OrchestratorSessionLineageUpdateRequest, OrchestratorSessionPinCreateRequest,
+    OrchestratorSessionPinRecord, OrchestratorSessionTranscriptRecord, OrchestratorUsageQuery,
+    OrchestratorUsageRunRecord, OrchestratorUsageSessionRecord, OrchestratorUsageSummary,
 };
 use palyra_auth::AuthHealthReport;
 use std::path::PathBuf;
@@ -2861,6 +2864,187 @@ impl GatewayRuntimeState {
         })
         .await
         .map_err(|_| Status::internal("orchestrator snapshot worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn update_orchestrator_session_lineage_blocking(
+        &self,
+        request: &OrchestratorSessionLineageUpdateRequest,
+    ) -> Result<(), Status> {
+        self.journal_store.update_orchestrator_session_lineage(request).map_err(|error| {
+            map_orchestrator_store_error("update orchestrator session lineage", error)
+        })
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn update_orchestrator_session_lineage(
+        self: &Arc<Self>,
+        request: OrchestratorSessionLineageUpdateRequest,
+    ) -> Result<(), Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.update_orchestrator_session_lineage_blocking(&request)
+        })
+        .await
+        .map_err(|_| Status::internal("orchestrator session lineage worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn list_orchestrator_session_transcript_blocking(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<OrchestratorSessionTranscriptRecord>, Status> {
+        self.journal_store.list_orchestrator_session_transcript(session_id).map_err(|error| {
+            map_orchestrator_store_error("load orchestrator session transcript", error)
+        })
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn list_orchestrator_session_transcript(
+        self: &Arc<Self>,
+        session_id: String,
+    ) -> Result<Vec<OrchestratorSessionTranscriptRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.list_orchestrator_session_transcript_blocking(session_id.as_str())
+        })
+        .await
+        .map_err(|_| Status::internal("orchestrator transcript worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn create_orchestrator_queued_input_blocking(
+        &self,
+        request: &OrchestratorQueuedInputCreateRequest,
+    ) -> Result<OrchestratorQueuedInputRecord, Status> {
+        self.journal_store.create_orchestrator_queued_input(request).map_err(|error| {
+            map_orchestrator_store_error("create queued orchestrator input", error)
+        })
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn create_orchestrator_queued_input(
+        self: &Arc<Self>,
+        request: OrchestratorQueuedInputCreateRequest,
+    ) -> Result<OrchestratorQueuedInputRecord, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.create_orchestrator_queued_input_blocking(&request)
+        })
+        .await
+        .map_err(|_| Status::internal("orchestrator queued input worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn update_orchestrator_queued_input_state_blocking(
+        &self,
+        request: &OrchestratorQueuedInputUpdateRequest,
+    ) -> Result<(), Status> {
+        self.journal_store.update_orchestrator_queued_input_state(request).map_err(|error| {
+            map_orchestrator_store_error("update queued orchestrator input", error)
+        })
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn update_orchestrator_queued_input_state(
+        self: &Arc<Self>,
+        request: OrchestratorQueuedInputUpdateRequest,
+    ) -> Result<(), Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.update_orchestrator_queued_input_state_blocking(&request)
+        })
+        .await
+        .map_err(|_| Status::internal("orchestrator queued input state worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn list_orchestrator_queued_inputs_blocking(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<OrchestratorQueuedInputRecord>, Status> {
+        self.journal_store
+            .list_orchestrator_queued_inputs(session_id)
+            .map_err(|error| map_orchestrator_store_error("load queued orchestrator inputs", error))
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn list_orchestrator_queued_inputs(
+        self: &Arc<Self>,
+        session_id: String,
+    ) -> Result<Vec<OrchestratorQueuedInputRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.list_orchestrator_queued_inputs_blocking(session_id.as_str())
+        })
+        .await
+        .map_err(|_| Status::internal("orchestrator queued input list worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn create_orchestrator_session_pin_blocking(
+        &self,
+        request: &OrchestratorSessionPinCreateRequest,
+    ) -> Result<OrchestratorSessionPinRecord, Status> {
+        self.journal_store
+            .create_orchestrator_session_pin(request)
+            .map_err(|error| map_orchestrator_store_error("create orchestrator session pin", error))
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn create_orchestrator_session_pin(
+        self: &Arc<Self>,
+        request: OrchestratorSessionPinCreateRequest,
+    ) -> Result<OrchestratorSessionPinRecord, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.create_orchestrator_session_pin_blocking(&request)
+        })
+        .await
+        .map_err(|_| Status::internal("orchestrator session pin worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn list_orchestrator_session_pins_blocking(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<OrchestratorSessionPinRecord>, Status> {
+        self.journal_store
+            .list_orchestrator_session_pins(session_id)
+            .map_err(|error| map_orchestrator_store_error("load orchestrator session pins", error))
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn list_orchestrator_session_pins(
+        self: &Arc<Self>,
+        session_id: String,
+    ) -> Result<Vec<OrchestratorSessionPinRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.list_orchestrator_session_pins_blocking(session_id.as_str())
+        })
+        .await
+        .map_err(|_| Status::internal("orchestrator session pin list worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn delete_orchestrator_session_pin_blocking(&self, pin_id: &str) -> Result<bool, Status> {
+        self.journal_store
+            .delete_orchestrator_session_pin(pin_id)
+            .map_err(|error| map_orchestrator_store_error("delete orchestrator session pin", error))
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn delete_orchestrator_session_pin(
+        self: &Arc<Self>,
+        pin_id: String,
+    ) -> Result<bool, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.delete_orchestrator_session_pin_blocking(pin_id.as_str())
+        })
+        .await
+        .map_err(|_| Status::internal("orchestrator session pin delete worker panicked"))?
     }
 
     #[allow(clippy::result_large_err)]

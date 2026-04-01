@@ -9,7 +9,7 @@ use std::{
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use reqwest::{redirect::Policy, Client as HttpClient, Url};
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -154,6 +154,19 @@ pub struct MediaArtifactPayload {
     pub bytes: Vec<u8>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ConsoleAttachmentStoreRequest<'a> {
+    pub connector_id: &'a str,
+    pub session_id: &'a str,
+    pub principal: &'a str,
+    pub device_id: &'a str,
+    pub channel: Option<&'a str>,
+    pub attachment_id: &'a str,
+    pub filename: &'a str,
+    pub declared_content_type: &'a str,
+    pub bytes: &'a [u8],
+}
+
 #[derive(Debug)]
 pub struct InboundAttachmentIngestRequest<'a> {
     pub connector_id: &'a str,
@@ -222,6 +235,14 @@ struct SniffedContent {
     content_type: String,
     width_px: Option<u32>,
     height_px: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ConsoleAttachmentOriginRecord {
+    principal: String,
+    device_id: String,
+    channel: Option<String>,
+    session_id: String,
 }
 
 pub struct MediaArtifactStore {
@@ -491,6 +512,208 @@ impl MediaArtifactStore {
             height_px: record.height_px,
             bytes,
         }))
+    }
+
+    pub fn store_console_attachment(
+        &self,
+        request: ConsoleAttachmentStoreRequest<'_>,
+    ) -> Result<MediaArtifactPayload, MediaStoreError> {
+        if request.bytes.is_empty() {
+            let _ = self.record_upload_failure(
+                request.connector_id,
+                None,
+                Some(request.filename),
+                "attachment.upload.empty",
+            );
+            return Err(MediaStoreError::InvalidAttachment(
+                "attachment bytes cannot be empty".to_owned(),
+            ));
+        }
+        if request.bytes.len() > self.config.outbound_max_upload_bytes {
+            let reason = format!(
+                "attachment.upload.too_large ({}/{})",
+                request.bytes.len(),
+                self.config.outbound_max_upload_bytes
+            );
+            let _ = self.record_upload_failure(
+                request.connector_id,
+                None,
+                Some(request.filename),
+                reason.clone(),
+            );
+            return Err(MediaStoreError::InvalidAttachment(reason));
+        }
+        let sniffed = sniff_content(request.bytes)?;
+        if !self
+            .config
+            .outbound_allowed_content_types
+            .iter()
+            .any(|allowed| allowed == &sniffed.content_type)
+        {
+            let reason = format!(
+                "attachment content type '{}' is blocked by upload policy",
+                sniffed.content_type
+            );
+            let _ = self.record_upload_failure(
+                request.connector_id,
+                None,
+                Some(request.filename),
+                reason.clone(),
+            );
+            return Err(MediaStoreError::InvalidAttachment(reason));
+        }
+
+        let now = current_unix_ms();
+        let sha256 = sha256_hex(request.bytes);
+        let artifact_id = ulid::Ulid::new().to_string();
+        let relative_path = content_relative_path(sha256.as_str());
+        let storage_path = self.content_root.join(relative_path.as_str());
+        if let Some(parent) = storage_path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                MediaStoreError::Io(format!(
+                    "failed to create media artifact parent '{}' : {error}",
+                    parent.display()
+                ))
+            })?;
+        }
+        if !storage_path.exists() {
+            fs::write(storage_path.as_path(), request.bytes).map_err(|error| {
+                MediaStoreError::Io(format!(
+                    "failed to persist media artifact '{}' : {error}",
+                    storage_path.display()
+                ))
+            })?;
+        }
+
+        let filename = sanitize_filename(request.filename, sniffed.content_type.as_str());
+        {
+            let guard = self.connection.lock().map_err(|_| {
+                MediaStoreError::Io(
+                    "media artifact db lock poisoned while storing console upload".to_owned(),
+                )
+            })?;
+            guard.execute(
+                r#"
+                INSERT INTO media_contents (
+                    content_sha256, storage_rel_path, size_bytes, created_at_unix_ms,
+                    last_accessed_at_unix_ms, ref_count
+                )
+                VALUES (?1, ?2, ?3, ?4, ?4, 1)
+                ON CONFLICT(content_sha256) DO UPDATE SET
+                    last_accessed_at_unix_ms = excluded.last_accessed_at_unix_ms,
+                    ref_count = media_contents.ref_count + 1
+                "#,
+                params![
+                    sha256,
+                    relative_path,
+                    i64::try_from(request.bytes.len()).unwrap_or(i64::MAX),
+                    now
+                ],
+            )?;
+            guard.execute(
+                r#"
+                INSERT INTO media_artifacts (
+                    artifact_id, connector_id, direction, envelope_id, conversation_id,
+                    adapter_message_id, attachment_id, kind, filename, declared_content_type,
+                    content_type, source_url, content_sha256, size_bytes, width_px, height_px,
+                    origin_json, policy_context_json, blocked_reason, created_at_unix_ms,
+                    last_accessed_at_unix_ms
+                )
+                VALUES (?1, ?2, 'outbound', ?3, ?3, NULL, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10, ?11, ?12, ?13, ?14, NULL, ?15, ?15)
+                "#,
+                params![
+                    artifact_id,
+                    request.connector_id,
+                    request.session_id,
+                    request.attachment_id,
+                    attachment_kind_label(attachment_kind_for_content_type(
+                        sniffed.content_type.as_str()
+                    )),
+                    filename,
+                    request.declared_content_type,
+                    sniffed.content_type,
+                    sha256,
+                    i64::try_from(request.bytes.len()).unwrap_or(i64::MAX),
+                    sniffed.width_px,
+                    sniffed.height_px,
+                    json!(ConsoleAttachmentOriginRecord {
+                        principal: request.principal.to_owned(),
+                        device_id: request.device_id.to_owned(),
+                        channel: request.channel.map(ToOwned::to_owned),
+                        session_id: request.session_id.to_owned(),
+                    })
+                    .to_string(),
+                    json!({
+                        "upload_action": "attachment.upload",
+                        "vision_action": if self.is_vision_eligible_content_type(sniffed.content_type.as_str()) {
+                            "attachment.vision"
+                        } else {
+                            ""
+                        },
+                    })
+                    .to_string(),
+                    now,
+                ],
+            )?;
+        }
+        self.record_upload_success(request.connector_id, artifact_id.as_str(), filename.as_str())?;
+        self.run_retention_housekeeping_if_due(now)?;
+        Ok(MediaArtifactPayload {
+            artifact_id,
+            filename,
+            content_type: sniffed.content_type,
+            size_bytes: u64::try_from(request.bytes.len()).unwrap_or(u64::MAX),
+            sha256,
+            width_px: sniffed.width_px,
+            height_px: sniffed.height_px,
+            bytes: request.bytes.to_vec(),
+        })
+    }
+
+    pub fn load_console_attachment(
+        &self,
+        artifact_id: &str,
+        session_id: &str,
+        principal: &str,
+        device_id: &str,
+        channel: Option<&str>,
+    ) -> Result<Option<MediaArtifactPayload>, MediaStoreError> {
+        let guard = self.connection.lock().map_err(|_| {
+            MediaStoreError::Io(
+                "media artifact db lock poisoned while validating console attachment".to_owned(),
+            )
+        })?;
+        let origin_json = guard
+            .query_row(
+                r#"
+                SELECT COALESCE(origin_json, '')
+                FROM media_artifacts
+                WHERE artifact_id = ?1
+                  AND connector_id = 'console_chat'
+                  AND direction = 'outbound'
+                  AND conversation_id = ?2
+                "#,
+                params![artifact_id, session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        drop(guard);
+        let Some(origin_json) = origin_json else {
+            return Ok(None);
+        };
+        let Ok(origin) =
+            serde_json::from_str::<ConsoleAttachmentOriginRecord>(origin_json.as_str())
+        else {
+            return Ok(None);
+        };
+        if origin.principal != principal
+            || origin.device_id != device_id
+            || origin.session_id != session_id
+            || origin.channel.as_deref() != channel
+        {
+            return Ok(None);
+        }
+        self.load_artifact_payload(artifact_id)
     }
 
     pub fn build_connector_snapshot(
@@ -1452,6 +1675,14 @@ fn looks_like_text(bytes: &[u8]) -> bool {
 fn content_relative_path(sha256: &str) -> String {
     let prefix = &sha256[..2.min(sha256.len())];
     format!("{prefix}/{sha256}")
+}
+
+fn attachment_kind_for_content_type(content_type: &str) -> AttachmentKind {
+    if content_type.starts_with("image/") {
+        AttachmentKind::Image
+    } else {
+        AttachmentKind::File
+    }
 }
 
 fn attachment_kind_label(kind: AttachmentKind) -> &'static str {

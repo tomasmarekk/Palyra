@@ -21,7 +21,10 @@ use tonic::metadata::MetadataValue;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::media::{InboundAttachmentIngestRequest, MediaArtifactStore, MediaRuntimeConfig};
+use crate::media::{
+    ConsoleAttachmentStoreRequest, InboundAttachmentIngestRequest, MediaArtifactPayload,
+    MediaArtifactStore, MediaRuntimeConfig,
+};
 use crate::transport::grpc::{
     auth::{GatewayAuthConfig, HEADER_CHANNEL, HEADER_DEVICE_ID, HEADER_PRINCIPAL},
     proto::palyra::{common::v1 as common_v1, gateway::v1 as gateway_v1},
@@ -195,6 +198,45 @@ impl ChannelPlatform {
                 "failed to serialize media diagnostics snapshot: {error}"
             ))
         })
+    }
+
+    pub fn store_console_chat_attachment(
+        &self,
+        session_id: &str,
+        principal: &str,
+        device_id: &str,
+        channel: Option<&str>,
+        filename: &str,
+        declared_content_type: &str,
+        bytes: &[u8],
+    ) -> Result<MediaArtifactPayload, ChannelPlatformError> {
+        let attachment_id = Ulid::new().to_string();
+        self.media_store
+            .store_console_attachment(ConsoleAttachmentStoreRequest {
+                connector_id: "console_chat",
+                session_id,
+                principal,
+                device_id,
+                channel,
+                attachment_id: attachment_id.as_str(),
+                filename,
+                declared_content_type,
+                bytes,
+            })
+            .map_err(ChannelPlatformError::from)
+    }
+
+    pub fn load_console_chat_attachment(
+        &self,
+        artifact_id: &str,
+        session_id: &str,
+        principal: &str,
+        device_id: &str,
+        channel: Option<&str>,
+    ) -> Result<Option<MediaArtifactPayload>, ChannelPlatformError> {
+        self.media_store
+            .load_console_attachment(artifact_id, session_id, principal, device_id, channel)
+            .map_err(ChannelPlatformError::from)
     }
 
     pub fn set_enabled(

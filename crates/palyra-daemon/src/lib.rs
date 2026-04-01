@@ -1030,12 +1030,70 @@ struct ConsoleChatMessageRequest {
     session_label: Option<String>,
     #[serde(default)]
     allow_sensitive_tools: Option<bool>,
+    #[serde(default)]
+    origin_kind: Option<String>,
+    #[serde(default)]
+    origin_run_id: Option<String>,
+    #[serde(default)]
+    parameter_delta: Option<Value>,
+    #[serde(default)]
+    queued_input_id: Option<String>,
+    #[serde(default)]
+    attachments: Vec<ConsoleChatAttachmentReference>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ConsoleChatRunEventsQuery {
     after_seq: Option<i64>,
     limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleChatQueueRequest {
+    text: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleChatRetryRequest {
+    #[serde(default)]
+    parameter_delta: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleChatBranchRequest {
+    #[serde(default)]
+    session_label: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleChatPinRequest {
+    run_id: String,
+    tape_seq: i64,
+    title: String,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleChatTranscriptSearchQuery {
+    q: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleChatTranscriptExportQuery {
+    format: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleChatAttachmentUploadRequest {
+    filename: String,
+    content_type: String,
+    bytes_base64: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ConsoleChatAttachmentReference {
+    artifact_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

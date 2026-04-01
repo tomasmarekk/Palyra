@@ -419,6 +419,33 @@ impl App {
         self.transcript.push(TranscriptEntry { kind, title: title.into(), body: body.into() });
     }
 
+    async fn start_prompt_run(
+        &mut self,
+        prompt: String,
+        origin_kind: Option<String>,
+        origin_run_id: Option<String>,
+        parameter_delta_json: Option<String>,
+    ) -> Result<()> {
+        let request = build_agent_run_input(AgentRunInputArgs {
+            session_id: self.session.session_id.clone(),
+            session_key: None,
+            session_label: None,
+            require_existing: true,
+            reset_session: false,
+            run_id: None,
+            prompt,
+            allow_sensitive_tools: self.allow_sensitive_tools,
+            origin_kind,
+            origin_run_id,
+            parameter_delta_json,
+        })?;
+        let stream = self.runtime.start_run_stream(request).await?;
+        self.last_run_id = Some(stream.run_id().to_owned());
+        self.active_stream = Some(stream);
+        self.scroll_offset = 0;
+        Ok(())
+    }
+
     async fn submit_input(&mut self) -> Result<()> {
         let value = self.input.trim().to_owned();
         self.input.clear();
@@ -437,21 +464,7 @@ impl App {
         }
         self.push_entry(EntryKind::User, "You", value.clone());
         self.status_line = "Running prompt".to_owned();
-        let request = build_agent_run_input(AgentRunInputArgs {
-            session_id: self.session.session_id.clone(),
-            session_key: None,
-            session_label: None,
-            require_existing: true,
-            reset_session: false,
-            run_id: None,
-            prompt: value,
-            allow_sensitive_tools: self.allow_sensitive_tools,
-        })?;
-        let stream = self.runtime.start_run_stream(request).await?;
-        self.last_run_id = Some(stream.run_id().to_owned());
-        self.active_stream = Some(stream);
-        self.scroll_offset = 0;
-        Ok(())
+        self.start_prompt_run(value, None, None, None).await
     }
 
     async fn handle_shell_request(&mut self, command: String) -> Result<()> {
@@ -489,6 +502,10 @@ impl App {
                 self.push_entry(EntryKind::System, "Status", self.status_summary());
                 self.status_line = "Status refreshed".to_owned();
             }
+            "new" => {
+                let label = normalize_optional_text(parts.collect::<Vec<_>>().join(" "));
+                self.create_session(label).await?;
+            }
             "agent" => {
                 if let Some(agent_id) = parts.next() {
                     self.switch_agent(agent_id.to_owned()).await?;
@@ -522,9 +539,42 @@ impl App {
                 }
             }
             "reset" => self.reset_session().await?,
+            "retry" => self.retry_last_turn().await?,
+            "branch" => {
+                let label = normalize_optional_text(parts.collect::<Vec<_>>().join(" "));
+                self.branch_from_current_session(label).await?;
+            }
+            "queue" => {
+                let queued_text = normalize_optional_text(parts.collect::<Vec<_>>().join(" "));
+                self.queue_follow_up(queued_text).await?;
+            }
             "abort" => {
                 let explicit = parts.next().map(ToOwned::to_owned);
                 self.abort_run(explicit).await?;
+            }
+            "usage" => {
+                self.push_entry(
+                    EntryKind::System,
+                    "Usage",
+                    "Detailed usage remains available in the web console and the `palyra usage` CLI surfaces.",
+                );
+                self.status_line = "Usage summary is not embedded in the TUI yet".to_owned();
+            }
+            "compact" => {
+                self.push_entry(
+                    EntryKind::System,
+                    "Compaction",
+                    "Compaction flows are not available in this phase; use reset, retry, or branch instead.",
+                );
+                self.status_line = "Compaction is not available in the TUI".to_owned();
+            }
+            "attach" => {
+                self.push_entry(
+                    EntryKind::System,
+                    "Attachments",
+                    "Attachment upload is currently available in the web chat composer. The TUI keeps the same `/attach` terminology but does not upload files yet.",
+                );
+                self.status_line = "Attachment upload is currently web-only".to_owned();
             }
             "settings" => self.mode = Mode::Settings,
             "tools" => self.show_tools = parse_toggle(parts.next(), self.show_tools)?,
@@ -665,6 +715,172 @@ impl App {
             ),
         );
         self.status_line = "Abort requested".to_owned();
+        Ok(())
+    }
+
+    async fn create_session(&mut self, session_label: Option<String>) -> Result<()> {
+        if self.active_stream.is_some() {
+            self.status_line = "Cannot create a new session while a run is active".to_owned();
+            return Ok(());
+        }
+        let response = self
+            .runtime
+            .resolve_session(SessionResolveInput {
+                session_id: None,
+                session_key: String::new(),
+                session_label: session_label.unwrap_or_default(),
+                require_existing: false,
+                reset_session: false,
+            })
+            .await?;
+        self.session = response
+            .session
+            .context("ResolveSession returned empty session payload for tui create")?;
+        self.transcript.clear();
+        self.last_run_id = None;
+        self.push_entry(EntryKind::System, "Session", "Created a new session.");
+        self.refresh_agent_identity(None, false).await?;
+        self.status_line = "Session created".to_owned();
+        Ok(())
+    }
+
+    async fn retry_last_turn(&mut self) -> Result<()> {
+        if self.active_stream.is_some() {
+            self.status_line = "Cannot retry while a run is active".to_owned();
+            return Ok(());
+        }
+        let session_id = self
+            .session
+            .session_id
+            .as_ref()
+            .map(|value| value.ulid.clone())
+            .context("active TUI session is missing a session_id")?;
+        let context = client::control_plane::connect_admin_console(app::ConnectionOverrides {
+            grpc_url: Some(self.runtime.connection().grpc_url.clone()),
+            daemon_url: None,
+            token: self.runtime.connection().token.clone(),
+            principal: Some(self.runtime.connection().principal.clone()),
+            device_id: Some(self.runtime.connection().device_id.clone()),
+            channel: Some(self.runtime.connection().channel.clone()),
+        })
+        .await?;
+        let payload = context
+            .client
+            .post_json_value(
+                format!(
+                    "console/v1/chat/sessions/{}/retry",
+                    percent_encode_component(session_id.as_str())
+                ),
+                &serde_json::json!({}),
+            )
+            .await?;
+        let prompt = payload
+            .pointer("/text")
+            .and_then(serde_json::Value::as_str)
+            .context("retry response is missing text")?
+            .to_owned();
+        let origin_kind = payload
+            .pointer("/origin_kind")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
+        let origin_run_id = payload
+            .pointer("/origin_run_id")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
+        let parameter_delta_json = payload
+            .pointer("/parameter_delta")
+            .filter(|value| !value.is_null())
+            .map(serde_json::to_string)
+            .transpose()?;
+        self.push_entry(EntryKind::System, "Retry", "Replaying the latest turn as a new run.");
+        self.status_line = "Retrying latest turn".to_owned();
+        self.start_prompt_run(prompt, origin_kind, origin_run_id, parameter_delta_json).await
+    }
+
+    async fn branch_from_current_session(&mut self, session_label: Option<String>) -> Result<()> {
+        if self.active_stream.is_some() {
+            self.status_line = "Cannot branch while a run is active".to_owned();
+            return Ok(());
+        }
+        let session_id = self
+            .session
+            .session_id
+            .as_ref()
+            .map(|value| value.ulid.clone())
+            .context("active TUI session is missing a session_id")?;
+        let context = client::control_plane::connect_admin_console(app::ConnectionOverrides {
+            grpc_url: Some(self.runtime.connection().grpc_url.clone()),
+            daemon_url: None,
+            token: self.runtime.connection().token.clone(),
+            principal: Some(self.runtime.connection().principal.clone()),
+            device_id: Some(self.runtime.connection().device_id.clone()),
+            channel: Some(self.runtime.connection().channel.clone()),
+        })
+        .await?;
+        let payload = context
+            .client
+            .post_json_value(
+                format!(
+                    "console/v1/chat/sessions/{}/branch",
+                    percent_encode_component(session_id.as_str())
+                ),
+                &serde_json::json!({ "session_label": session_label }),
+            )
+            .await?;
+        let next_session_id = payload
+            .pointer("/session/session_id")
+            .and_then(serde_json::Value::as_str)
+            .context("branch response is missing child session_id")?
+            .to_owned();
+        self.switch_session(next_session_id).await?;
+        self.push_entry(
+            EntryKind::System,
+            "Branch",
+            "Created a new active branch from the latest terminal run.",
+        );
+        self.status_line = "Branched into a new session".to_owned();
+        Ok(())
+    }
+
+    async fn queue_follow_up(&mut self, queued_text: Option<String>) -> Result<()> {
+        let text = match queued_text {
+            Some(text) => text,
+            None => {
+                self.status_line = "Usage: /queue <follow-up text>".to_owned();
+                return Ok(());
+            }
+        };
+        let Some(run_id) = self.active_stream.as_ref().map(|stream| stream.run_id().to_owned())
+        else {
+            self.status_line = "Queued follow-up requires an active run".to_owned();
+            return Ok(());
+        };
+        let context = client::control_plane::connect_admin_console(app::ConnectionOverrides {
+            grpc_url: Some(self.runtime.connection().grpc_url.clone()),
+            daemon_url: None,
+            token: self.runtime.connection().token.clone(),
+            principal: Some(self.runtime.connection().principal.clone()),
+            device_id: Some(self.runtime.connection().device_id.clone()),
+            channel: Some(self.runtime.connection().channel.clone()),
+        })
+        .await?;
+        let payload = context
+            .client
+            .post_json_value(
+                format!("console/v1/chat/runs/{}/queue", percent_encode_component(run_id.as_str())),
+                &serde_json::json!({ "text": text }),
+            )
+            .await?;
+        let queued_input_id = payload
+            .pointer("/queued_input/queued_input_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        self.push_entry(
+            EntryKind::System,
+            "Queue",
+            format!("Queued follow-up {} for the active run.", shorten_id(queued_input_id)),
+        );
+        self.status_line = "Queued follow-up recorded".to_owned();
         Ok(())
     }
 
@@ -844,8 +1060,13 @@ impl App {
 
     fn status_summary(&self) -> String {
         format!(
-            "session={} agent={} source={} model={} tools={} thinking={} shell={}",
+            "session={} branch={} agent={} source={} model={} tools={} thinking={} shell={} active_run={}",
             display_session_identity(&self.session),
+            if self.session.branch_state.trim().is_empty() {
+                "none"
+            } else {
+                self.session.branch_state.as_str()
+            },
             self.current_agent.as_ref().map(|agent| agent.agent_id.as_str()).unwrap_or("none"),
             self.current_agent_source,
             self.models
@@ -854,7 +1075,12 @@ impl App {
                 .unwrap_or("none"),
             self.show_tools,
             self.show_thinking,
-            self.local_shell_enabled
+            self.local_shell_enabled,
+            self.active_stream
+                .as_ref()
+                .map(|stream| stream.run_id())
+                .or(self.last_run_id.as_deref())
+                .unwrap_or("none")
         )
     }
 }
@@ -1159,10 +1385,14 @@ fn render_help_popup(frame: &mut Frame<'_>, area: Rect) {
     let popup = centered_rect(72, 14, area);
     let text = Text::from(vec![
         Line::from("Slash commands"),
-        Line::from("  /help /status /agent [/id] /session [/id-or-key] /history [query]"),
-        Line::from("  /resume [/id-or-key] /model [/id] /reset /abort [run_id] /settings"),
-        Line::from("  /tools on|off /thinking on|off"),
-        Line::from("  /shell on|off /exit"),
+        Line::from(
+            "  /help /status /new [label] /agent [/id] /session [/id-or-key] /history [query]",
+        ),
+        Line::from(
+            "  /resume [/id-or-key] /model [/id] /reset /retry /branch [label] /queue <text>",
+        ),
+        Line::from("  /abort [run_id] /usage /compact /attach /settings"),
+        Line::from("  /tools on|off /thinking on|off /shell on|off /exit"),
         Line::default(),
         Line::from("Pickers"),
         Line::from("  F2 agent  F3 session  F4 model"),
@@ -1171,7 +1401,7 @@ fn render_help_popup(frame: &mut Frame<'_>, area: Rect) {
         Line::from("Controls"),
         Line::from("  Tab focus  Enter submit/select  Esc close overlay  q quit"),
         Line::default(),
-        Line::from("Tool output and thinking visibility can be toggled without restart."),
+        Line::from("Retry, branch, and queue reuse the same HTTP contracts as the web console."),
     ]);
     frame.render_widget(Clear, popup);
     frame.render_widget(
@@ -1181,6 +1411,22 @@ fn render_help_popup(frame: &mut Frame<'_>, area: Rect) {
             .wrap(Wrap { trim: false }),
         popup,
     );
+}
+
+fn percent_encode_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(char::from(*byte));
+            }
+            other => {
+                encoded.push('%');
+                encoded.push_str(format!("{other:02X}").as_str());
+            }
+        }
+    }
+    encoded
 }
 
 fn render_approval_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {

@@ -247,7 +247,11 @@ pub(crate) async fn process_run_stream_message(
             runtime_state
                 .clear_tool_approval_cache_for_session(request_context, session_id.as_str());
         }
-        *previous_session_run_id = resolved_session.session.last_run_id.clone();
+        *previous_session_run_id = resolved_session
+            .session
+            .last_run_id
+            .clone()
+            .or(resolved_session.session.branch_origin_run_id.clone());
         if resolved_session.session.session_id != session_id {
             return Err(Status::failed_precondition(
                 "resolved session_id does not match RunStream session_id",
@@ -257,6 +261,13 @@ pub(crate) async fn process_run_stream_message(
             .start_orchestrator_run(OrchestratorRunStartRequest {
                 run_id: run_id.clone(),
                 session_id: session_id.clone(),
+                origin_kind: non_empty(message.origin_kind.clone())
+                    .unwrap_or_else(|| "manual".to_owned()),
+                origin_run_id: message.origin_run_id.as_ref().map(|value| value.ulid.clone()),
+                triggered_by_principal: Some(request_context.principal.clone()),
+                parameter_delta_json: (!message.parameter_delta_json.is_empty()).then(|| {
+                    String::from_utf8_lossy(message.parameter_delta_json.as_slice()).into_owned()
+                }),
             })
             .await?;
 

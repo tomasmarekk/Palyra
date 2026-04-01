@@ -345,8 +345,44 @@ pub(crate) fn build_router(state: AppState) -> Router {
             post(console::chat::console_chat_session_reset_handler),
         )
         .route(
+            "/console/v1/chat/sessions/{session_id}/attachments",
+            post(console::chat::console_chat_attachment_upload_handler),
+        )
+        .route(
             "/console/v1/chat/sessions/{session_id}/messages/stream",
             post(console::chat::console_chat_message_stream_handler),
+        )
+        .route(
+            "/console/v1/chat/sessions/{session_id}/retry",
+            post(console::chat::console_chat_retry_prepare_handler),
+        )
+        .route(
+            "/console/v1/chat/sessions/{session_id}/branch",
+            post(console::chat::console_chat_branch_handler),
+        )
+        .route(
+            "/console/v1/chat/sessions/{session_id}/transcript",
+            get(console::chat::console_chat_transcript_handler),
+        )
+        .route(
+            "/console/v1/chat/sessions/{session_id}/transcript/search",
+            get(console::chat::console_chat_transcript_search_handler),
+        )
+        .route(
+            "/console/v1/chat/sessions/{session_id}/export",
+            get(console::chat::console_chat_export_handler),
+        )
+        .route(
+            "/console/v1/chat/sessions/{session_id}/pins",
+            get(console::chat::console_chat_pins_list_handler),
+        )
+        .route(
+            "/console/v1/chat/sessions/{session_id}/pins",
+            post(console::chat::console_chat_pin_create_handler),
+        )
+        .route(
+            "/console/v1/chat/sessions/{session_id}/pins/{pin_id}",
+            post(console::chat::console_chat_pin_delete_handler),
         )
         .route(
             "/console/v1/chat/runs/{run_id}/events",
@@ -355,6 +391,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route(
             "/console/v1/chat/runs/{run_id}/status",
             get(console::chat::console_chat_run_status_handler),
+        )
+        .route(
+            "/console/v1/chat/runs/{run_id}/queue",
+            post(console::chat::console_chat_queue_handler),
         )
         .route("/console/v1/approvals", get(console::approvals::console_approvals_list_handler))
         .route(
