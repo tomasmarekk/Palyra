@@ -24,7 +24,8 @@ use ulid::Ulid;
 use crate::media::{
     ConsoleAttachmentStoreRequest, InboundAttachmentIngestRequest, MediaArtifactPayload,
     MediaArtifactStore, MediaDerivedArtifactRecord, MediaDerivedArtifactSelection,
-    MediaDerivedArtifactUpsertRequest, MediaDerivedStatsSnapshot, MediaRuntimeConfig,
+    MediaDerivedArtifactUpsertRequest, MediaDerivedStatsSnapshot,
+    MediaFailedDerivedArtifactUpsertRequest, MediaRuntimeConfig,
 };
 use crate::transport::grpc::{
     auth::{GatewayAuthConfig, HEADER_CHANNEL, HEADER_DEVICE_ID, HEADER_PRINCIPAL},
@@ -263,42 +264,11 @@ impl ChannelPlatform {
         self.media_store.upsert_derived_artifact(request).map_err(ChannelPlatformError::from)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn upsert_console_chat_failed_derived_artifact(
         &self,
-        source_artifact_id: &str,
-        attachment_id: Option<&str>,
-        session_id: Option<&str>,
-        principal: Option<&str>,
-        device_id: Option<&str>,
-        channel: Option<&str>,
-        filename: &str,
-        declared_content_type: &str,
-        source_content_hash: &str,
-        kind: crate::media_derived::DerivedArtifactKind,
-        parser_name: &str,
-        parser_version: &str,
-        background_task_id: Option<&str>,
-        failure_reason: &str,
+        request: MediaFailedDerivedArtifactUpsertRequest<'_>,
     ) -> Result<MediaDerivedArtifactRecord, ChannelPlatformError> {
-        self.media_store
-            .upsert_failed_derived_artifact(
-                source_artifact_id,
-                attachment_id,
-                session_id,
-                principal,
-                device_id,
-                channel,
-                filename,
-                declared_content_type,
-                source_content_hash,
-                kind,
-                parser_name,
-                parser_version,
-                background_task_id,
-                failure_reason,
-            )
-            .map_err(ChannelPlatformError::from)
+        self.media_store.upsert_failed_derived_artifact(request).map_err(ChannelPlatformError::from)
     }
 
     pub fn list_console_chat_derived_artifacts(

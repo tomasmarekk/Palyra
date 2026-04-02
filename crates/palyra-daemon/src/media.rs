@@ -252,6 +252,24 @@ pub struct MediaDerivedArtifactUpsertRequest<'a> {
 }
 
 #[derive(Debug, Clone)]
+pub struct MediaFailedDerivedArtifactUpsertRequest<'a> {
+    pub source_artifact_id: &'a str,
+    pub attachment_id: Option<&'a str>,
+    pub session_id: Option<&'a str>,
+    pub principal: Option<&'a str>,
+    pub device_id: Option<&'a str>,
+    pub channel: Option<&'a str>,
+    pub filename: &'a str,
+    pub declared_content_type: &'a str,
+    pub source_content_hash: &'a str,
+    pub kind: DerivedArtifactKind,
+    pub parser_name: &'a str,
+    pub parser_version: &'a str,
+    pub background_task_id: Option<&'a str>,
+    pub failure_reason: &'a str,
+}
+
+#[derive(Debug, Clone)]
 pub struct ConsoleAttachmentStoreRequest<'a> {
     pub connector_id: &'a str,
     pub session_id: &'a str,
@@ -980,20 +998,7 @@ impl MediaArtifactStore {
 
     pub fn upsert_failed_derived_artifact(
         &self,
-        source_artifact_id: &str,
-        attachment_id: Option<&str>,
-        session_id: Option<&str>,
-        principal: Option<&str>,
-        device_id: Option<&str>,
-        channel: Option<&str>,
-        filename: &str,
-        declared_content_type: &str,
-        source_content_hash: &str,
-        kind: DerivedArtifactKind,
-        parser_name: &str,
-        parser_version: &str,
-        background_task_id: Option<&str>,
-        failure_reason: &str,
+        request: MediaFailedDerivedArtifactUpsertRequest<'_>,
     ) -> Result<MediaDerivedArtifactRecord, MediaStoreError> {
         let now = current_unix_ms();
         let derived_artifact_id = ulid::Ulid::new().to_string();
@@ -1035,31 +1040,30 @@ impl MediaArtifactStore {
             "#,
             params![
                 derived_artifact_id,
-                source_artifact_id,
-                attachment_id,
-                session_id,
-                principal,
-                device_id,
-                channel,
-                filename,
-                declared_content_type,
-                kind.as_str(),
-                parser_name,
-                parser_version,
-                source_content_hash,
-                failure_reason,
-                background_task_id,
+                request.source_artifact_id,
+                request.attachment_id,
+                request.session_id,
+                request.principal,
+                request.device_id,
+                request.channel,
+                request.filename,
+                request.declared_content_type,
+                request.kind.as_str(),
+                request.parser_name,
+                request.parser_version,
+                request.source_content_hash,
+                request.failure_reason,
+                request.background_task_id,
                 now,
             ],
         )?;
         drop(guard);
-        self.get_derived_artifact_by_source_kind(source_artifact_id, kind.as_str())?.ok_or_else(
-            || {
+        self.get_derived_artifact_by_source_kind(request.source_artifact_id, request.kind.as_str())?
+            .ok_or_else(|| {
                 MediaStoreError::Io(
                     "failed derived artifact upsert did not return a persisted record".to_owned(),
                 )
-            },
-        )
+            })
     }
 
     pub fn list_session_derived_artifacts(

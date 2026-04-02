@@ -619,7 +619,8 @@ pub(crate) async fn console_chat_derived_artifact_detail_handler(
         &session.context,
         derived_artifact_id.as_str(),
         false,
-    )?;
+    )
+    .map_err(|response| *response)?;
     Ok(Json(json!({
         "derived_artifact": derived_artifact,
         "contract": contract_descriptor(),
@@ -638,7 +639,8 @@ pub(crate) async fn console_chat_derived_artifact_quarantine_handler(
         &session.context,
         derived_artifact_id.as_str(),
         false,
-    )?;
+    )
+    .map_err(|response| *response)?;
     let reason = payload.reason.and_then(trim_to_option);
     let derived_artifact = state
         .channels
@@ -667,7 +669,8 @@ pub(crate) async fn console_chat_derived_artifact_release_handler(
         &session.context,
         derived_artifact_id.as_str(),
         false,
-    )?;
+    )
+    .map_err(|response| *response)?;
     let derived_artifact = state
         .channels
         .release_derived_artifact(derived_artifact_id.as_str())
@@ -690,12 +693,9 @@ pub(crate) async fn console_chat_derived_artifact_recompute_handler(
     Path(derived_artifact_id): Path<String>,
 ) -> Result<Json<Value>, Response> {
     let session = authorize_console_session(&state, &headers, true)?;
-    let existing = load_console_derived_artifact(
-        &state,
-        &session.context,
-        derived_artifact_id.as_str(),
-        true,
-    )?;
+    let existing =
+        load_console_derived_artifact(&state, &session.context, derived_artifact_id.as_str(), true)
+            .map_err(|response| *response)?;
     let session_id = existing.session_id.clone().ok_or_else(|| {
         runtime_status_response(tonic::Status::failed_precondition(
             "derived artifact is not attached to a chat session",
@@ -830,12 +830,9 @@ pub(crate) async fn console_chat_derived_artifact_recompute_handler(
             return Err(runtime_status_response(tonic::Status::internal(error.to_string())));
         }
     };
-    let derived_artifact = load_console_derived_artifact(
-        &state,
-        &session.context,
-        derived_artifact_id.as_str(),
-        true,
-    )?;
+    let derived_artifact =
+        load_console_derived_artifact(&state, &session.context, derived_artifact_id.as_str(), true)
+            .map_err(|response| *response)?;
     Ok(Json(json!({
         "task": task,
         "derived_artifact": derived_artifact,
@@ -856,7 +853,8 @@ pub(crate) async fn console_chat_derived_artifact_purge_handler(
         &session.context,
         derived_artifact_id.as_str(),
         false,
-    )?;
+    )
+    .map_err(|response| *response)?;
     if let Some(memory_item_id) = existing.memory_item_id.as_deref() {
         let _ = state
             .runtime
@@ -2285,20 +2283,20 @@ fn load_console_derived_artifact(
     context: &gateway::RequestContext,
     derived_artifact_id: &str,
     require_device_match: bool,
-) -> Result<media::MediaDerivedArtifactRecord, Response> {
+) -> Result<media::MediaDerivedArtifactRecord, Box<Response>> {
     let record = state
         .channels
         .get_derived_artifact(derived_artifact_id)
-        .map_err(channel_platform_error_response)?
+        .map_err(|error| Box::new(channel_platform_error_response(error)))?
         .ok_or_else(|| {
-            runtime_status_response(tonic::Status::not_found(format!(
+            Box::new(runtime_status_response(tonic::Status::not_found(format!(
                 "derived artifact not found: {derived_artifact_id}"
-            )))
+            ))))
         })?;
     if !derived_artifact_matches_console_context(&record, context, require_device_match) {
-        return Err(runtime_status_response(tonic::Status::not_found(
+        return Err(Box::new(runtime_status_response(tonic::Status::not_found(
             "derived artifact not found for current console context",
-        )));
+        ))));
     }
     Ok(record)
 }
@@ -2815,20 +2813,23 @@ async fn derive_console_attachment_artifacts(
                     state
                         .channels
                         .upsert_console_chat_failed_derived_artifact(
-                            artifact.artifact_id.as_str(),
-                            Some(artifact.artifact_id.as_str()),
-                            Some(session_id),
-                            Some(session.context.principal.as_str()),
-                            Some(session.context.device_id.as_str()),
-                            session.context.channel.as_deref(),
-                            artifact.filename.as_str(),
-                            artifact.content_type.as_str(),
-                            artifact.sha256.as_str(),
-                            crate::media_derived::DerivedArtifactKind::ExtractedText,
-                            crate::media_derived::DOCUMENT_EXTRACTOR_PARSER_NAME,
-                            crate::media_derived::DOCUMENT_EXTRACTOR_PARSER_VERSION,
-                            Some(background_task_id),
-                            error.as_str(),
+                            media::MediaFailedDerivedArtifactUpsertRequest {
+                                source_artifact_id: artifact.artifact_id.as_str(),
+                                attachment_id: Some(artifact.artifact_id.as_str()),
+                                session_id: Some(session_id),
+                                principal: Some(session.context.principal.as_str()),
+                                device_id: Some(session.context.device_id.as_str()),
+                                channel: session.context.channel.as_deref(),
+                                filename: artifact.filename.as_str(),
+                                declared_content_type: artifact.content_type.as_str(),
+                                source_content_hash: artifact.sha256.as_str(),
+                                kind: crate::media_derived::DerivedArtifactKind::ExtractedText,
+                                parser_name: crate::media_derived::DOCUMENT_EXTRACTOR_PARSER_NAME,
+                                parser_version:
+                                    crate::media_derived::DOCUMENT_EXTRACTOR_PARSER_VERSION,
+                                background_task_id: Some(background_task_id),
+                                failure_reason: error.as_str(),
+                            },
                         )
                         .map_err(|error| error.to_string())?,
                 );
@@ -2881,20 +2882,24 @@ async fn derive_console_attachment_artifacts(
                         state
                             .channels
                             .upsert_console_chat_failed_derived_artifact(
-                                artifact.artifact_id.as_str(),
-                                Some(artifact.artifact_id.as_str()),
-                                Some(session_id),
-                                Some(session.context.principal.as_str()),
-                                Some(session.context.device_id.as_str()),
-                                session.context.channel.as_deref(),
-                                artifact.filename.as_str(),
-                                artifact.content_type.as_str(),
-                                artifact.sha256.as_str(),
-                                crate::media_derived::DerivedArtifactKind::Transcript,
-                                crate::media_derived::AUDIO_TRANSCRIBER_PARSER_NAME,
-                                crate::media_derived::AUDIO_TRANSCRIBER_PARSER_VERSION,
-                                Some(background_task_id),
-                                error.as_str(),
+                                media::MediaFailedDerivedArtifactUpsertRequest {
+                                    source_artifact_id: artifact.artifact_id.as_str(),
+                                    attachment_id: Some(artifact.artifact_id.as_str()),
+                                    session_id: Some(session_id),
+                                    principal: Some(session.context.principal.as_str()),
+                                    device_id: Some(session.context.device_id.as_str()),
+                                    channel: session.context.channel.as_deref(),
+                                    filename: artifact.filename.as_str(),
+                                    declared_content_type: artifact.content_type.as_str(),
+                                    source_content_hash: artifact.sha256.as_str(),
+                                    kind: crate::media_derived::DerivedArtifactKind::Transcript,
+                                    parser_name:
+                                        crate::media_derived::AUDIO_TRANSCRIBER_PARSER_NAME,
+                                    parser_version:
+                                        crate::media_derived::AUDIO_TRANSCRIBER_PARSER_VERSION,
+                                    background_task_id: Some(background_task_id),
+                                    failure_reason: error.as_str(),
+                                },
                             )
                             .map_err(|error| error.to_string())?,
                     );
@@ -2906,20 +2911,23 @@ async fn derive_console_attachment_artifacts(
                     state
                         .channels
                         .upsert_console_chat_failed_derived_artifact(
-                            artifact.artifact_id.as_str(),
-                            Some(artifact.artifact_id.as_str()),
-                            Some(session_id),
-                            Some(session.context.principal.as_str()),
-                            Some(session.context.device_id.as_str()),
-                            session.context.channel.as_deref(),
-                            artifact.filename.as_str(),
-                            artifact.content_type.as_str(),
-                            artifact.sha256.as_str(),
-                            crate::media_derived::DerivedArtifactKind::Transcript,
-                            crate::media_derived::AUDIO_TRANSCRIBER_PARSER_NAME,
-                            crate::media_derived::AUDIO_TRANSCRIBER_PARSER_VERSION,
-                            Some(background_task_id),
-                            failure_message.as_str(),
+                            media::MediaFailedDerivedArtifactUpsertRequest {
+                                source_artifact_id: artifact.artifact_id.as_str(),
+                                attachment_id: Some(artifact.artifact_id.as_str()),
+                                session_id: Some(session_id),
+                                principal: Some(session.context.principal.as_str()),
+                                device_id: Some(session.context.device_id.as_str()),
+                                channel: session.context.channel.as_deref(),
+                                filename: artifact.filename.as_str(),
+                                declared_content_type: artifact.content_type.as_str(),
+                                source_content_hash: artifact.sha256.as_str(),
+                                kind: crate::media_derived::DerivedArtifactKind::Transcript,
+                                parser_name: crate::media_derived::AUDIO_TRANSCRIBER_PARSER_NAME,
+                                parser_version:
+                                    crate::media_derived::AUDIO_TRANSCRIBER_PARSER_VERSION,
+                                background_task_id: Some(background_task_id),
+                                failure_reason: failure_message.as_str(),
+                            },
                         )
                         .map_err(|error| error.to_string())?,
                 );
