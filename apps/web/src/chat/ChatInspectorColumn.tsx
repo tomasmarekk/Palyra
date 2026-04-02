@@ -386,7 +386,8 @@ export function ChatInspectorColumn({
                   <div className="chat-ops-card__copy">
                     <strong>{artifact.mode}</strong>
                     <span>
-                      {formatApproxTokens(tokenDelta)} saved · {artifact.condensed_event_count} condensed
+                      {formatApproxTokens(tokenDelta)} saved · {artifact.condensed_event_count}{" "}
+                      condensed
                     </span>
                     <p>{artifact.summary_preview}</p>
                   </div>
@@ -435,7 +436,8 @@ export function ChatInspectorColumn({
                   <div className="chat-ops-card__copy">
                     <strong>{checkpoint.name}</strong>
                     <span>
-                      {describeBranchState(checkpoint.branch_state)} · restores {checkpoint.restore_count}
+                      {describeBranchState(checkpoint.branch_state)} · restores{" "}
+                      {checkpoint.restore_count}
                     </span>
                     <p>{checkpoint.note ?? "No note recorded for this checkpoint."}</p>
                   </div>

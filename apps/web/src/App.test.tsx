@@ -1569,9 +1569,7 @@ describe("M35 web console app", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Create checkpoint" }));
 
     await waitFor(() => {
-      expect(document.body).toHaveTextContent(
-        "Checkpoint created: Phase 4 Session checkpoint.",
-      );
+      expect(document.body).toHaveTextContent("Checkpoint created: Phase 4 Session checkpoint.");
     });
 
     const [, request] = findRequestCall(

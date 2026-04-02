@@ -13,21 +13,21 @@ import {
   buildDetailFromCheckpointRecord,
   buildDetailFromCompactionArtifact,
 } from "./chatConsoleUtils";
-import { emptyToUndefined, shortId, type ComposerAttachment, type TranscriptEntry } from "./chatShared";
+import {
+  emptyToUndefined,
+  shortId,
+  type ComposerAttachment,
+  type TranscriptEntry,
+} from "./chatShared";
 
-type UpsertSession = (
-  session: SessionCatalogRecord,
-  options?: { select?: boolean },
-) => void;
+type UpsertSession = (session: SessionCatalogRecord, options?: { select?: boolean }) => void;
 
 type AppendLocalEntry = (entry: TranscriptEntry) => void;
 
 type SetDetailPanel = (value: DetailPanelState | null) => void;
 
 type SetAttachments = (
-  next:
-    | ComposerAttachment[]
-    | ((previous: ComposerAttachment[]) => ComposerAttachment[]),
+  next: ComposerAttachment[] | ((previous: ComposerAttachment[]) => ComposerAttachment[]),
 ) => void;
 
 export async function runCompactionFlowAction(args: {

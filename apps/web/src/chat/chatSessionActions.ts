@@ -40,10 +40,7 @@ type SendMessage = (
 
 type AppendLocalEntry = (entry: TranscriptEntry) => void;
 
-type UpsertSession = (
-  session: SessionCatalogRecord,
-  options?: { select?: boolean },
-) => void;
+type UpsertSession = (session: SessionCatalogRecord, options?: { select?: boolean }) => void;
 
 export async function createNewSessionAction(args: {
   requestedLabel?: string;
@@ -379,7 +376,9 @@ export async function handleAttachmentFilesAction(args: {
   api: ConsoleApiClient;
   sessionId: string;
   files: readonly File[];
-  setAttachments: (value: ComposerAttachment[] | ((previous: ComposerAttachment[]) => ComposerAttachment[])) => void;
+  setAttachments: (
+    value: ComposerAttachment[] | ((previous: ComposerAttachment[]) => ComposerAttachment[]),
+  ) => void;
   setAttachmentBusy: (value: boolean) => void;
   setError: (value: string | null) => void;
   setNotice: (value: string | null) => void;

@@ -1386,7 +1386,9 @@ describe("ConsoleApiClient", () => {
     await client.getSessionCheckpoint("checkpoint-1");
     await client.restoreSessionCheckpoint("checkpoint-1", { session_label: "Checkpoint restore" });
 
-    expect(requestUrl(calls[1]?.input)).toBe("/console/v1/chat/sessions/session-1/compactions/preview");
+    expect(requestUrl(calls[1]?.input)).toBe(
+      "/console/v1/chat/sessions/session-1/compactions/preview",
+    );
     expect(new Headers(calls[1]?.init?.headers).get("x-palyra-csrf-token")).toBe("csrf-1");
 
     expect(requestUrl(calls[2]?.input)).toBe("/console/v1/chat/sessions/session-1/compactions");
@@ -1436,10 +1438,18 @@ describe("ConsoleApiClient", () => {
         contract: { contract_version: "control-plane.v1" },
       }),
       jsonResponse({ task, run: undefined, contract: { contract_version: "control-plane.v1" } }),
-      jsonResponse({ task: { ...task, state: "paused" }, action: "paused", contract: { contract_version: "control-plane.v1" } }),
+      jsonResponse({
+        task: { ...task, state: "paused" },
+        action: "paused",
+        contract: { contract_version: "control-plane.v1" },
+      }),
       jsonResponse({ task, action: "resumed", contract: { contract_version: "control-plane.v1" } }),
       jsonResponse({ task, action: "retried", contract: { contract_version: "control-plane.v1" } }),
-      jsonResponse({ task: { ...task, state: "cancelled" }, action: "cancelled", contract: { contract_version: "control-plane.v1" } }),
+      jsonResponse({
+        task: { ...task, state: "cancelled" },
+        action: "cancelled",
+        contract: { contract_version: "control-plane.v1" },
+      }),
     ];
     const fetcher: typeof fetch = (input, init) => {
       calls.push({ input, init });
@@ -1457,7 +1467,11 @@ describe("ConsoleApiClient", () => {
       device_id: "device-1",
       channel: "web",
     });
-    await client.listBackgroundTasks({ session_id: "session-1", include_completed: false, limit: 5 });
+    await client.listBackgroundTasks({
+      session_id: "session-1",
+      include_completed: false,
+      limit: 5,
+    });
     await client.createBackgroundTask("session-1", { text: "follow up later" });
     await client.getBackgroundTask("task-1");
     await client.pauseBackgroundTask("task-1");
@@ -1470,7 +1484,9 @@ describe("ConsoleApiClient", () => {
     );
     expect(new Headers(calls[1]?.init?.headers).get("x-palyra-csrf-token")).toBeNull();
 
-    expect(requestUrl(calls[2]?.input)).toBe("/console/v1/chat/sessions/session-1/background-tasks");
+    expect(requestUrl(calls[2]?.input)).toBe(
+      "/console/v1/chat/sessions/session-1/background-tasks",
+    );
     expect(new Headers(calls[2]?.init?.headers).get("x-palyra-csrf-token")).toBe("csrf-1");
 
     expect(requestUrl(calls[3]?.input)).toBe("/console/v1/chat/background-tasks/task-1");

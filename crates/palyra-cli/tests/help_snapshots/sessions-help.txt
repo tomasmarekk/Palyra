@@ -2,8 +2,8 @@ Usage: palyra sessions [OPTIONS] <COMMAND>
 
 Commands:
   list
-  history            [aliases: search]
-  show               [aliases: resume]
+  history             [aliases: search]
+  show                [aliases: resume]
   resolve
   rename
   reset
@@ -13,6 +13,19 @@ Commands:
   branch
   transcript-search
   export
+  compact-preview
+  compact-apply
+  compaction-show
+  checkpoint-create
+  checkpoint-show
+  checkpoint-restore
+  background-enqueue
+  background-list
+  background-show
+  background-pause
+  background-resume
+  background-retry
+  background-cancel
 
 Options:
   -h, --help  Print help

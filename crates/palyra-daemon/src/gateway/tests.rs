@@ -264,6 +264,24 @@ fn build_test_runtime_state(hash_chain_enabled: bool) -> std::sync::Arc<GatewayR
     build_test_runtime_state_with_http_fetch_private_targets(hash_chain_enabled, false)
 }
 
+fn upsert_test_orchestrator_session(
+    state: &std::sync::Arc<GatewayRuntimeState>,
+    context: &RequestContext,
+    session_id: &str,
+) {
+    state
+        .journal_store
+        .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
+            session_id: session_id.to_owned(),
+            session_key: format!("session:{session_id}"),
+            session_label: None,
+            principal: context.principal.clone(),
+            device_id: context.device_id.clone(),
+            channel: context.channel.clone(),
+        })
+        .expect("orchestrator session should be upserted for provider input test");
+}
+
 fn build_test_approval_request(subject_suffix: usize) -> ApprovalCreateRequest {
     ApprovalCreateRequest {
         approval_id: Ulid::new().to_string(),
@@ -921,6 +939,7 @@ async fn prepare_model_provider_input_collects_vision_inputs_for_image_attachmen
         device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
         channel: Some("cli".to_owned()),
     };
+    upsert_test_orchestrator_session(&state, &context, "01ARZ3NDEKTSV4RRFFQ69G5FB1");
     let attachments = vec![common_v1::MessageAttachment {
         kind: common_v1::message_attachment::AttachmentKind::Image as i32,
         declared_content_type: "image/png".to_owned(),
@@ -970,6 +989,7 @@ async fn prepare_model_provider_input_fallback_mode_returns_raw_input_when_tape_
         channel: Some("cli".to_owned()),
     };
     let session_id = "01ARZ3NDEKTSV4RRFFQ69G5FB2".to_owned();
+    upsert_test_orchestrator_session(&state, &context, session_id.as_str());
     state
         .ingest_memory_item(MemoryItemCreateRequest {
             memory_id: "01ARZ3NDEKTSV4RRFFQ69G5FB3".to_owned(),
@@ -1043,6 +1063,7 @@ async fn prepare_model_provider_input_fail_mode_propagates_tape_append_error() {
         channel: Some("cli".to_owned()),
     };
     let session_id = "01ARZ3NDEKTSV4RRFFQ69G5FB5".to_owned();
+    upsert_test_orchestrator_session(&state, &context, session_id.as_str());
     state
         .ingest_memory_item(MemoryItemCreateRequest {
             memory_id: "01ARZ3NDEKTSV4RRFFQ69G5FB6".to_owned(),

@@ -100,12 +100,14 @@ export function buildDetailFromBackgroundTask(
     payload: {
       task: {
         ...task,
-        payload_json: task.payload_json === undefined ? undefined : safeParseJsonString(task.payload_json),
+        payload_json:
+          task.payload_json === undefined ? undefined : safeParseJsonString(task.payload_json),
         notification_target_json:
           task.notification_target_json === undefined
             ? undefined
             : safeParseJsonString(task.notification_target_json),
-        result_json: task.result_json === undefined ? undefined : safeParseJsonString(task.result_json),
+        result_json:
+          task.result_json === undefined ? undefined : safeParseJsonString(task.result_json),
       } as unknown as JsonValue,
       run: run as unknown as JsonValue,
     },
