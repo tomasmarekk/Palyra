@@ -70,7 +70,10 @@ use crate::{
         OrchestratorUsageDelta, SkillStatusRecord, SkillStatusUpsertRequest,
     },
     media::MediaRuntimeConfig,
-    model_provider::{ModelProvider, ProviderError, ProviderRequest, ProviderStatusSnapshot},
+    model_provider::{
+        AudioTranscriptionRequest, AudioTranscriptionResponse, ModelProvider, ProviderError,
+        ProviderRequest, ProviderStatusSnapshot,
+    },
     orchestrator::{RunLifecycleState, RunStateMachine, RunTransition},
     tool_protocol::{
         execute_tool_call, tool_policy_snapshot, ToolCallConfig, ToolCallPolicySnapshot,

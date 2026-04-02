@@ -349,6 +349,34 @@ pub(crate) fn build_router(state: AppState) -> Router {
             post(console::chat::console_chat_attachment_upload_handler),
         )
         .route(
+            "/console/v1/chat/sessions/{session_id}/derived-artifacts",
+            get(console::chat::console_chat_derived_artifacts_handler),
+        )
+        .route(
+            "/console/v1/chat/attachments/{artifact_id}/derived-artifacts",
+            get(console::chat::console_chat_attachment_derived_artifacts_handler),
+        )
+        .route(
+            "/console/v1/chat/derived-artifacts/{derived_artifact_id}",
+            get(console::chat::console_chat_derived_artifact_detail_handler),
+        )
+        .route(
+            "/console/v1/chat/derived-artifacts/{derived_artifact_id}/quarantine",
+            post(console::chat::console_chat_derived_artifact_quarantine_handler),
+        )
+        .route(
+            "/console/v1/chat/derived-artifacts/{derived_artifact_id}/release",
+            post(console::chat::console_chat_derived_artifact_release_handler),
+        )
+        .route(
+            "/console/v1/chat/derived-artifacts/{derived_artifact_id}/recompute",
+            post(console::chat::console_chat_derived_artifact_recompute_handler),
+        )
+        .route(
+            "/console/v1/chat/derived-artifacts/{derived_artifact_id}/purge",
+            post(console::chat::console_chat_derived_artifact_purge_handler),
+        )
+        .route(
             "/console/v1/chat/sessions/{session_id}/messages/stream",
             post(console::chat::console_chat_message_stream_handler),
         )
@@ -469,6 +497,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
         )
         .route("/console/v1/cron/jobs/{job_id}/runs", get(console::cron::console_cron_runs_handler))
         .route("/console/v1/memory/status", get(console::memory::console_memory_status_handler))
+        .route(
+            "/console/v1/memory/derived-artifacts",
+            get(console::memory::console_memory_derived_artifacts_handler),
+        )
         .route("/console/v1/memory/index", post(console::memory::console_memory_index_handler))
         .route("/console/v1/memory/search", get(console::memory::console_memory_search_handler))
         .route("/console/v1/memory/search-all", get(console::memory::console_search_all_handler))

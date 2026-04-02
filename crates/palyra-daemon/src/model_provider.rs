@@ -18,6 +18,7 @@ use crate::orchestrator::{estimate_token_count, split_model_tokens, MAX_MODEL_TO
 
 const OPENAI_CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 const OPENAI_EMBEDDINGS_PATH: &str = "/embeddings";
+const OPENAI_AUDIO_TRANSCRIPTIONS_PATH: &str = "/audio/transcriptions";
 const OPENAI_RETRYABLE_STATUS_CODES: &[u16] = &[429, 500, 502, 503, 504];
 // Keep provider envelope above default wasm module quota (256KiB) including base64 and JSON overhead.
 const MAX_TOOL_ARGUMENT_BYTES: usize = 512 * 1024;
@@ -25,6 +26,7 @@ const MAX_EMBEDDINGS_BATCH_SIZE: usize = 64;
 const MAX_EMBEDDINGS_INPUT_BYTES: usize = 256 * 1024;
 const MAX_SINGLE_EMBEDDING_INPUT_BYTES: usize = 64 * 1024;
 const DEFAULT_DETERMINISTIC_EMBEDDINGS_DIMS: usize = 64;
+const DEFAULT_OPENAI_TRANSCRIPTION_MODEL: &str = "gpt-4o-mini-transcribe";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelProviderKind {
@@ -204,6 +206,33 @@ pub struct EmbeddingsResponse {
     pub retry_count: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioTranscriptionRequest {
+    pub file_name: String,
+    pub content_type: String,
+    pub bytes: Vec<u8>,
+    pub prompt: Option<String>,
+    pub language: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AudioTranscriptionSegment {
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub text: String,
+    pub confidence: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AudioTranscriptionResponse {
+    pub text: String,
+    pub language: Option<String>,
+    pub duration_ms: Option<u64>,
+    pub model_name: String,
+    pub retry_count: u32,
+    pub segments: Vec<AudioTranscriptionSegment>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
     #[error("model provider circuit breaker is open; retry after {retry_after_ms}ms")]
@@ -312,6 +341,10 @@ pub trait ModelProvider: Send + Sync {
         &'a self,
         request: ProviderRequest,
     ) -> Pin<Box<dyn Future<Output = Result<ProviderResponse, ProviderError>> + Send + 'a>>;
+    fn transcribe_audio<'a>(
+        &'a self,
+        request: AudioTranscriptionRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<AudioTranscriptionResponse, ProviderError>> + Send + 'a>>;
     fn status_snapshot(&self) -> ProviderStatusSnapshot;
 }
 
@@ -532,6 +565,21 @@ impl ModelProvider for DeterministicProvider {
         })
     }
 
+    fn transcribe_audio<'a>(
+        &'a self,
+        _request: AudioTranscriptionRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<AudioTranscriptionResponse, ProviderError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            Err(ProviderError::RequestFailed {
+                message: "deterministic model provider does not support audio transcription"
+                    .to_owned(),
+                retryable: false,
+                retry_count: 0,
+            })
+        })
+    }
+
     fn status_snapshot(&self) -> ProviderStatusSnapshot {
         ProviderStatusSnapshot {
             kind: self.config.kind.as_str().to_owned(),
@@ -683,6 +731,29 @@ struct OpenAiEmbeddingVector {
     #[serde(default)]
     index: Option<usize>,
     embedding: Vec<f32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiAudioTranscriptionResponse {
+    text: String,
+    #[serde(default)]
+    language: Option<String>,
+    #[serde(default)]
+    duration: Option<f64>,
+    #[serde(default)]
+    segments: Vec<OpenAiAudioTranscriptionSegment>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiAudioTranscriptionSegment {
+    #[serde(default)]
+    start: Option<f64>,
+    #[serde(default)]
+    end: Option<f64>,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    avg_logprob: Option<f64>,
 }
 
 #[derive(Debug)]
@@ -968,6 +1039,22 @@ impl OpenAiCompatibleProvider {
         )
     }
 
+    fn audio_transcriptions_endpoint(&self) -> String {
+        format!(
+            "{}{}",
+            self.config.openai_base_url.trim_end_matches('/'),
+            OPENAI_AUDIO_TRANSCRIPTIONS_PATH
+        )
+    }
+
+    fn transcription_model_name(&self) -> &str {
+        if self.config.openai_model.contains("transcribe") {
+            self.config.openai_model.as_str()
+        } else {
+            DEFAULT_OPENAI_TRANSCRIPTION_MODEL
+        }
+    }
+
     async fn request_once(
         &self,
         api_key: &str,
@@ -1064,6 +1151,91 @@ impl OpenAiCompatibleProvider {
             retry_count: 0,
         })
     }
+
+    async fn transcribe_audio_once(
+        &self,
+        api_key: &str,
+        request: &AudioTranscriptionRequest,
+    ) -> Result<AudioTranscriptionResponse, AttemptError> {
+        let file_part = reqwest::multipart::Part::bytes(request.bytes.clone())
+            .file_name(request.file_name.clone())
+            .mime_str(request.content_type.as_str())
+            .map_err(|error| {
+                AttemptError::request_failed(
+                    format!("invalid audio transcription content type: {error}"),
+                    false,
+                )
+            })?;
+        let mut form = reqwest::multipart::Form::new()
+            .text("model", self.transcription_model_name().to_owned())
+            .text("response_format", "verbose_json".to_owned())
+            .part("file", file_part);
+        if let Some(language) =
+            request.language.as_deref().map(str::trim).filter(|value| !value.is_empty())
+        {
+            form = form.text("language", language.to_owned());
+        }
+        if let Some(prompt) =
+            request.prompt.as_deref().map(str::trim).filter(|value| !value.is_empty())
+        {
+            form = form.text("prompt", prompt.to_owned());
+        }
+
+        let response = self
+            .client
+            .post(self.audio_transcriptions_endpoint())
+            .header("Authorization", format!("Bearer {api_key}"))
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|error| {
+                AttemptError::request_failed(
+                    format!("openai-compatible audio transcription request failed: {error}"),
+                    true,
+                )
+            })?;
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let retryable = OPENAI_RETRYABLE_STATUS_CODES.contains(&status);
+            let body_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<openai-compatible error body unavailable>".to_owned());
+            return Err(AttemptError::request_failed(
+                format!(
+                    "openai-compatible audio transcription endpoint returned HTTP {status}: {}",
+                    sanitize_remote_error(&body_text)
+                ),
+                retryable,
+            ));
+        }
+
+        let parsed =
+            response.json::<OpenAiAudioTranscriptionResponse>().await.map_err(|error| {
+                AttemptError::invalid_response(format!(
+                    "openai-compatible audio transcription response JSON parsing failed: {error}"
+                ))
+            })?;
+        let segments = parsed
+            .segments
+            .into_iter()
+            .filter(|segment| !segment.text.trim().is_empty())
+            .map(|segment| AudioTranscriptionSegment {
+                start_ms: segment.start.unwrap_or_default().max(0.0) as u64 * 1_000,
+                end_ms: segment.end.unwrap_or_default().max(0.0) as u64 * 1_000,
+                text: segment.text,
+                confidence: segment.avg_logprob.map(|value| value.exp()),
+            })
+            .collect::<Vec<_>>();
+        Ok(AudioTranscriptionResponse {
+            text: parsed.text,
+            language: parsed.language,
+            duration_ms: parsed.duration.map(|value| value.max(0.0) as u64 * 1_000),
+            model_name: self.transcription_model_name().to_owned(),
+            retry_count: 0,
+            segments,
+        })
+    }
 }
 
 impl ModelProvider for OpenAiCompatibleProvider {
@@ -1146,6 +1318,54 @@ impl ModelProvider for OpenAiCompatibleProvider {
                 elapsed_millis_since(started_at),
             );
             Err(exhausted_error)
+        })
+    }
+
+    fn transcribe_audio<'a>(
+        &'a self,
+        request: AudioTranscriptionRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<AudioTranscriptionResponse, ProviderError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let Some(api_key) = self.config.openai_api_key.as_ref() else {
+                return Err(ProviderError::MissingApiKey);
+            };
+            self.ensure_circuit_closed()?;
+
+            let mut retry_count = 0_u32;
+            for attempt in 0..=self.config.max_retries {
+                match self.transcribe_audio_once(api_key.as_str(), &request).await {
+                    Ok(mut response) => {
+                        self.record_success()?;
+                        response.retry_count = retry_count;
+                        return Ok(response);
+                    }
+                    Err(error) => {
+                        let can_retry = error.retryable && attempt < self.config.max_retries;
+                        if can_retry {
+                            tokio::time::sleep(self.backoff_for_retry(retry_count)).await;
+                            retry_count = retry_count.saturating_add(1);
+                            continue;
+                        }
+                        self.record_failure()?;
+                        return Err(if error.invalid_response {
+                            ProviderError::InvalidResponse { message: error.message, retry_count }
+                        } else {
+                            ProviderError::RequestFailed {
+                                message: error.message,
+                                retryable: error.retryable,
+                                retry_count,
+                            }
+                        });
+                    }
+                }
+            }
+
+            Err(ProviderError::RequestFailed {
+                message: "openai-compatible audio transcription exhausted retries".to_owned(),
+                retryable: true,
+                retry_count,
+            })
         })
     }
 

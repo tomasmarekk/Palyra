@@ -17,6 +17,11 @@ use sha2::{Digest, Sha256};
 use palyra_common::netguard;
 use palyra_connectors::{AttachmentKind, AttachmentRef};
 
+use crate::media_derived::{
+    select_prompt_chunks, DerivedArtifactAnchor, DerivedArtifactContent, DerivedArtifactKind,
+    DerivedArtifactWarning, DerivedSelectionCandidate,
+};
+
 const DEFAULT_ALLOWED_SOURCE_HOSTS: &[&str] =
     &["cdn.discordapp.com", "*.discordapp.com", "*.discordapp.net"];
 const DEFAULT_ALLOWED_DOWNLOAD_CONTENT_TYPES: &[&str] =
@@ -155,6 +160,97 @@ pub struct MediaArtifactPayload {
     pub bytes: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct MediaDerivedStatsSnapshot {
+    pub total: u64,
+    pub pending: u64,
+    pub succeeded: u64,
+    pub failed: u64,
+    pub quarantined: u64,
+    pub purged: u64,
+    pub recompute_required: u64,
+    pub orphaned: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MediaDerivedArtifactRecord {
+    pub derived_artifact_id: String,
+    pub source_artifact_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attachment_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    pub filename: String,
+    pub declared_content_type: String,
+    pub kind: String,
+    pub state: String,
+    pub parser_name: String,
+    pub parser_version: String,
+    pub source_content_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub processing_ms: Option<u64>,
+    pub warnings: Vec<DerivedArtifactWarning>,
+    pub anchors: Vec<DerivedArtifactAnchor>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quarantine_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_document_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_item_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background_task_id: Option<String>,
+    pub recompute_required: bool,
+    pub orphaned: bool,
+    pub created_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub purged_at_unix_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaDerivedArtifactSelection {
+    pub derived_artifact_id: String,
+    pub source_artifact_id: String,
+    pub kind: String,
+    pub citation: String,
+    pub label: String,
+    pub snippet: String,
+    pub score: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct MediaDerivedArtifactUpsertRequest<'a> {
+    pub source_artifact_id: &'a str,
+    pub attachment_id: Option<&'a str>,
+    pub session_id: Option<&'a str>,
+    pub principal: Option<&'a str>,
+    pub device_id: Option<&'a str>,
+    pub channel: Option<&'a str>,
+    pub filename: &'a str,
+    pub declared_content_type: &'a str,
+    pub source_content_hash: &'a str,
+    pub background_task_id: Option<&'a str>,
+    pub derived: &'a DerivedArtifactContent,
+}
+
 #[derive(Debug, Clone)]
 pub struct ConsoleAttachmentStoreRequest<'a> {
     pub connector_id: &'a str,
@@ -244,6 +340,11 @@ struct ConsoleAttachmentOriginRecord {
     device_id: String,
     channel: Option<String>,
     session_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct MediaDerivedArtifactRow {
+    record: MediaDerivedArtifactRecord,
 }
 
 pub struct MediaArtifactStore {
@@ -722,6 +823,625 @@ impl MediaArtifactStore {
         self.load_artifact_payload(artifact_id)
     }
 
+    pub fn list_console_attachment_payloads(
+        &self,
+        session_id: &str,
+        principal: &str,
+        device_id: &str,
+        channel: Option<&str>,
+    ) -> Result<Vec<MediaArtifactPayload>, MediaStoreError> {
+        let guard = self.connection.lock().map_err(|_| {
+            MediaStoreError::Io(
+                "media artifact db lock poisoned while listing console attachments".to_owned(),
+            )
+        })?;
+        let mut statement = guard.prepare(
+            r#"
+            SELECT artifact_id
+            FROM media_artifacts
+            WHERE connector_id = 'console_chat'
+              AND direction = 'outbound'
+              AND conversation_id = ?1
+            ORDER BY created_at_unix_ms ASC
+            "#,
+        )?;
+        let artifact_ids = statement
+            .query_map(params![session_id], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        drop(guard);
+        let mut payloads = Vec::new();
+        for artifact_id in artifact_ids {
+            if let Some(payload) = self.load_console_attachment(
+                artifact_id.as_str(),
+                session_id,
+                principal,
+                device_id,
+                channel,
+            )? {
+                payloads.push(payload);
+            }
+        }
+        Ok(payloads)
+    }
+
+    pub fn upsert_derived_artifact(
+        &self,
+        request: MediaDerivedArtifactUpsertRequest<'_>,
+    ) -> Result<MediaDerivedArtifactRecord, MediaStoreError> {
+        let now = current_unix_ms();
+        let derived_artifact_id = ulid::Ulid::new().to_string();
+        let warnings_json =
+            serde_json::to_string(&request.derived.warnings).unwrap_or_else(|_| "[]".to_owned());
+        let anchors_json =
+            serde_json::to_string(&request.derived.anchors).unwrap_or_else(|_| "[]".to_owned());
+        let guard = self.connection.lock().map_err(|_| {
+            MediaStoreError::Io(
+                "media artifact db lock poisoned while upserting derived artifact".to_owned(),
+            )
+        })?;
+        guard.execute(
+            r#"
+            INSERT INTO media_derived_artifacts (
+                derived_artifact_id,
+                source_artifact_id,
+                attachment_id,
+                session_id,
+                principal,
+                device_id,
+                channel,
+                filename,
+                declared_content_type,
+                kind,
+                state,
+                parser_name,
+                parser_version,
+                source_content_hash,
+                content_hash,
+                content_text,
+                summary_text,
+                language,
+                duration_ms,
+                processing_ms,
+                warnings_json,
+                anchors_json,
+                failure_reason,
+                quarantine_reason,
+                workspace_document_id,
+                memory_item_id,
+                background_task_id,
+                recompute_required,
+                orphaned,
+                created_at_unix_ms,
+                updated_at_unix_ms,
+                purged_at_unix_ms
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'succeeded', ?11, ?12, ?13, ?14, ?15,
+                ?16, ?17, ?18, ?19, ?20, ?21, NULL, NULL, NULL, NULL, ?22, 0, 0, ?23, ?23, NULL
+            )
+            ON CONFLICT(source_artifact_id, kind) DO UPDATE SET
+                state = 'succeeded',
+                parser_name = excluded.parser_name,
+                parser_version = excluded.parser_version,
+                source_content_hash = excluded.source_content_hash,
+                content_hash = excluded.content_hash,
+                content_text = excluded.content_text,
+                summary_text = excluded.summary_text,
+                language = excluded.language,
+                duration_ms = excluded.duration_ms,
+                processing_ms = excluded.processing_ms,
+                warnings_json = excluded.warnings_json,
+                anchors_json = excluded.anchors_json,
+                failure_reason = NULL,
+                quarantine_reason = NULL,
+                background_task_id = excluded.background_task_id,
+                recompute_required = 0,
+                orphaned = 0,
+                updated_at_unix_ms = excluded.updated_at_unix_ms,
+                purged_at_unix_ms = NULL
+            "#,
+            params![
+                derived_artifact_id,
+                request.source_artifact_id,
+                request.attachment_id,
+                request.session_id,
+                request.principal,
+                request.device_id,
+                request.channel,
+                request.filename,
+                request.declared_content_type,
+                request.derived.kind.as_str(),
+                request.derived.parser_name,
+                request.derived.parser_version,
+                request.source_content_hash,
+                request.derived.content_hash,
+                request.derived.content_text,
+                request.derived.summary_text,
+                request.derived.language,
+                request.derived.duration_ms.map(|value| i64::try_from(value).unwrap_or(i64::MAX)),
+                i64::try_from(request.derived.processing_ms).unwrap_or(i64::MAX),
+                warnings_json,
+                anchors_json,
+                request.background_task_id,
+                now,
+            ],
+        )?;
+        drop(guard);
+        self.get_derived_artifact_by_source_kind(
+            request.source_artifact_id,
+            request.derived.kind.as_str(),
+        )?
+        .ok_or_else(|| {
+            MediaStoreError::Io(
+                "derived artifact upsert did not return a persisted record".to_owned(),
+            )
+        })
+    }
+
+    pub fn upsert_failed_derived_artifact(
+        &self,
+        source_artifact_id: &str,
+        attachment_id: Option<&str>,
+        session_id: Option<&str>,
+        principal: Option<&str>,
+        device_id: Option<&str>,
+        channel: Option<&str>,
+        filename: &str,
+        declared_content_type: &str,
+        source_content_hash: &str,
+        kind: DerivedArtifactKind,
+        parser_name: &str,
+        parser_version: &str,
+        background_task_id: Option<&str>,
+        failure_reason: &str,
+    ) -> Result<MediaDerivedArtifactRecord, MediaStoreError> {
+        let now = current_unix_ms();
+        let derived_artifact_id = ulid::Ulid::new().to_string();
+        let guard = self.connection.lock().map_err(|_| {
+            MediaStoreError::Io(
+                "media artifact db lock poisoned while recording failed derived artifact"
+                    .to_owned(),
+            )
+        })?;
+        guard.execute(
+            r#"
+            INSERT INTO media_derived_artifacts (
+                derived_artifact_id, source_artifact_id, attachment_id, session_id, principal,
+                device_id, channel, filename, declared_content_type, kind, state, parser_name,
+                parser_version, source_content_hash, content_hash, content_text, summary_text,
+                language, duration_ms, processing_ms, warnings_json, anchors_json, failure_reason,
+                quarantine_reason, workspace_document_id, memory_item_id, background_task_id,
+                recompute_required, orphaned, created_at_unix_ms, updated_at_unix_ms, purged_at_unix_ms
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'failed', ?11, ?12, ?13, NULL, NULL,
+                NULL, NULL, NULL, NULL, '[]', '[]', ?14, NULL, NULL, NULL, ?15, 0, 0, ?16, ?16, NULL
+            )
+            ON CONFLICT(source_artifact_id, kind) DO UPDATE SET
+                state = 'failed',
+                parser_name = excluded.parser_name,
+                parser_version = excluded.parser_version,
+                source_content_hash = excluded.source_content_hash,
+                failure_reason = excluded.failure_reason,
+                content_hash = NULL,
+                content_text = NULL,
+                summary_text = NULL,
+                warnings_json = '[]',
+                anchors_json = '[]',
+                background_task_id = excluded.background_task_id,
+                recompute_required = 0,
+                orphaned = 0,
+                updated_at_unix_ms = excluded.updated_at_unix_ms,
+                purged_at_unix_ms = NULL
+            "#,
+            params![
+                derived_artifact_id,
+                source_artifact_id,
+                attachment_id,
+                session_id,
+                principal,
+                device_id,
+                channel,
+                filename,
+                declared_content_type,
+                kind.as_str(),
+                parser_name,
+                parser_version,
+                source_content_hash,
+                failure_reason,
+                background_task_id,
+                now,
+            ],
+        )?;
+        drop(guard);
+        self.get_derived_artifact_by_source_kind(source_artifact_id, kind.as_str())?.ok_or_else(
+            || {
+                MediaStoreError::Io(
+                    "failed derived artifact upsert did not return a persisted record".to_owned(),
+                )
+            },
+        )
+    }
+
+    pub fn list_session_derived_artifacts(
+        &self,
+        session_id: &str,
+        principal: &str,
+        device_id: &str,
+        channel: Option<&str>,
+    ) -> Result<Vec<MediaDerivedArtifactRecord>, MediaStoreError> {
+        let guard = self.connection.lock().map_err(|_| {
+            MediaStoreError::Io(
+                "media artifact db lock poisoned while listing session derived artifacts"
+                    .to_owned(),
+            )
+        })?;
+        let mut statement = guard.prepare(
+            r#"
+            SELECT *
+            FROM media_derived_artifacts
+            WHERE session_id = ?1
+              AND principal = ?2
+              AND device_id = ?3
+              AND COALESCE(channel, '') = COALESCE(?4, '')
+            ORDER BY created_at_unix_ms DESC
+            "#,
+        )?;
+        let rows = statement
+            .query_map(
+                params![session_id, principal, device_id, channel],
+                map_derived_artifact_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows.into_iter().map(|row| row.record).collect())
+    }
+
+    pub fn list_attachment_derived_artifacts(
+        &self,
+        source_artifact_id: &str,
+    ) -> Result<Vec<MediaDerivedArtifactRecord>, MediaStoreError> {
+        let guard = self.connection.lock().map_err(|_| {
+            MediaStoreError::Io(
+                "media artifact db lock poisoned while listing attachment derived artifacts"
+                    .to_owned(),
+            )
+        })?;
+        let mut statement = guard.prepare(
+            r#"
+            SELECT *
+            FROM media_derived_artifacts
+            WHERE source_artifact_id = ?1
+            ORDER BY created_at_unix_ms ASC
+            "#,
+        )?;
+        let rows = statement
+            .query_map(params![source_artifact_id], map_derived_artifact_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows.into_iter().map(|row| row.record).collect())
+    }
+
+    pub fn get_derived_artifact(
+        &self,
+        derived_artifact_id: &str,
+    ) -> Result<Option<MediaDerivedArtifactRecord>, MediaStoreError> {
+        let guard = self.connection.lock().map_err(|_| {
+            MediaStoreError::Io(
+                "media artifact db lock poisoned while loading derived artifact".to_owned(),
+            )
+        })?;
+        guard
+            .query_row(
+                "SELECT * FROM media_derived_artifacts WHERE derived_artifact_id = ?1",
+                params![derived_artifact_id],
+                map_derived_artifact_row,
+            )
+            .optional()
+            .map(|row| row.map(|value| value.record))
+            .map_err(Into::into)
+    }
+
+    pub fn get_derived_artifact_by_source_kind(
+        &self,
+        source_artifact_id: &str,
+        kind: &str,
+    ) -> Result<Option<MediaDerivedArtifactRecord>, MediaStoreError> {
+        let guard = self.connection.lock().map_err(|_| {
+            MediaStoreError::Io(
+                "media artifact db lock poisoned while loading derived artifact by source"
+                    .to_owned(),
+            )
+        })?;
+        guard
+            .query_row(
+                "SELECT * FROM media_derived_artifacts WHERE source_artifact_id = ?1 AND kind = ?2",
+                params![source_artifact_id, kind],
+                map_derived_artifact_row,
+            )
+            .optional()
+            .map(|row| row.map(|value| value.record))
+            .map_err(Into::into)
+    }
+
+    pub fn list_linked_derived_artifacts(
+        &self,
+        workspace_document_id: Option<&str>,
+        memory_item_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MediaDerivedArtifactRecord>, MediaStoreError> {
+        let Some(limit) = i64::try_from(limit.max(1)).ok() else {
+            return Ok(Vec::new());
+        };
+        let guard = self.connection.lock().map_err(|_| {
+            MediaStoreError::Io(
+                "media artifact db lock poisoned while listing linked derived artifacts".to_owned(),
+            )
+        })?;
+        let rows = match (workspace_document_id, memory_item_id) {
+            (Some(workspace_document_id), Some(memory_item_id)) => {
+                let mut statement = guard.prepare(
+                    r#"
+                    SELECT *
+                    FROM media_derived_artifacts
+                    WHERE workspace_document_id = ?1 OR memory_item_id = ?2
+                    ORDER BY updated_at_unix_ms DESC
+                    LIMIT ?3
+                    "#,
+                )?;
+                let rows = statement
+                    .query_map(
+                        params![workspace_document_id, memory_item_id, limit],
+                        map_derived_artifact_row,
+                    )?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows
+            }
+            (Some(workspace_document_id), None) => {
+                let mut statement = guard.prepare(
+                    r#"
+                    SELECT *
+                    FROM media_derived_artifacts
+                    WHERE workspace_document_id = ?1
+                    ORDER BY updated_at_unix_ms DESC
+                    LIMIT ?2
+                    "#,
+                )?;
+                let rows = statement
+                    .query_map(params![workspace_document_id, limit], map_derived_artifact_row)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows
+            }
+            (None, Some(memory_item_id)) => {
+                let mut statement = guard.prepare(
+                    r#"
+                    SELECT *
+                    FROM media_derived_artifacts
+                    WHERE memory_item_id = ?1
+                    ORDER BY updated_at_unix_ms DESC
+                    LIMIT ?2
+                    "#,
+                )?;
+                let rows = statement
+                    .query_map(params![memory_item_id, limit], map_derived_artifact_row)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows
+            }
+            (None, None) => return Ok(Vec::new()),
+        };
+        Ok(rows.into_iter().map(|row| row.record).collect())
+    }
+
+    pub fn link_derived_artifact_targets(
+        &self,
+        derived_artifact_id: &str,
+        workspace_document_id: Option<&str>,
+        memory_item_id: Option<&str>,
+    ) -> Result<(), MediaStoreError> {
+        let guard = self.connection.lock().map_err(|_| {
+            MediaStoreError::Io(
+                "media artifact db lock poisoned while linking derived artifact targets".to_owned(),
+            )
+        })?;
+        guard.execute(
+            r#"
+            UPDATE media_derived_artifacts
+            SET workspace_document_id = COALESCE(?2, workspace_document_id),
+                memory_item_id = COALESCE(?3, memory_item_id),
+                updated_at_unix_ms = ?4
+            WHERE derived_artifact_id = ?1
+            "#,
+            params![derived_artifact_id, workspace_document_id, memory_item_id, current_unix_ms()],
+        )?;
+        Ok(())
+    }
+
+    pub fn quarantine_derived_artifact(
+        &self,
+        derived_artifact_id: &str,
+        reason: Option<&str>,
+    ) -> Result<Option<MediaDerivedArtifactRecord>, MediaStoreError> {
+        let now = current_unix_ms();
+        let guard = self.connection.lock().map_err(|_| {
+            MediaStoreError::Io(
+                "media artifact db lock poisoned while quarantining derived artifact".to_owned(),
+            )
+        })?;
+        guard.execute(
+            r#"
+            UPDATE media_derived_artifacts
+            SET state = 'quarantined',
+                quarantine_reason = ?2,
+                updated_at_unix_ms = ?3
+            WHERE derived_artifact_id = ?1
+            "#,
+            params![derived_artifact_id, reason, now],
+        )?;
+        drop(guard);
+        self.get_derived_artifact(derived_artifact_id)
+    }
+
+    pub fn release_derived_artifact(
+        &self,
+        derived_artifact_id: &str,
+    ) -> Result<Option<MediaDerivedArtifactRecord>, MediaStoreError> {
+        let now = current_unix_ms();
+        let guard = self.connection.lock().map_err(|_| {
+            MediaStoreError::Io(
+                "media artifact db lock poisoned while releasing derived artifact".to_owned(),
+            )
+        })?;
+        guard.execute(
+            r#"
+            UPDATE media_derived_artifacts
+            SET state = CASE
+                    WHEN content_text IS NULL AND failure_reason IS NOT NULL THEN 'failed'
+                    WHEN content_text IS NULL THEN state
+                    ELSE 'succeeded'
+                END,
+                quarantine_reason = NULL,
+                updated_at_unix_ms = ?2
+            WHERE derived_artifact_id = ?1
+            "#,
+            params![derived_artifact_id, now],
+        )?;
+        drop(guard);
+        self.get_derived_artifact(derived_artifact_id)
+    }
+
+    pub fn mark_derived_artifact_recompute_required(
+        &self,
+        derived_artifact_id: &str,
+        required: bool,
+    ) -> Result<Option<MediaDerivedArtifactRecord>, MediaStoreError> {
+        let now = current_unix_ms();
+        let guard = self.connection.lock().map_err(|_| {
+            MediaStoreError::Io(
+                "media artifact db lock poisoned while updating derived recompute state".to_owned(),
+            )
+        })?;
+        guard.execute(
+            r#"
+            UPDATE media_derived_artifacts
+            SET recompute_required = ?2,
+                updated_at_unix_ms = ?3
+            WHERE derived_artifact_id = ?1
+            "#,
+            params![derived_artifact_id, i64::from(required), now],
+        )?;
+        drop(guard);
+        self.get_derived_artifact(derived_artifact_id)
+    }
+
+    pub fn purge_derived_artifact(
+        &self,
+        derived_artifact_id: &str,
+    ) -> Result<Option<MediaDerivedArtifactRecord>, MediaStoreError> {
+        let now = current_unix_ms();
+        let guard = self.connection.lock().map_err(|_| {
+            MediaStoreError::Io(
+                "media artifact db lock poisoned while purging derived artifact".to_owned(),
+            )
+        })?;
+        guard.execute(
+            r#"
+            UPDATE media_derived_artifacts
+            SET state = 'purged',
+                content_hash = NULL,
+                content_text = NULL,
+                summary_text = NULL,
+                language = NULL,
+                duration_ms = NULL,
+                processing_ms = NULL,
+                warnings_json = '[]',
+                anchors_json = '[]',
+                failure_reason = NULL,
+                quarantine_reason = NULL,
+                recompute_required = 0,
+                orphaned = 0,
+                updated_at_unix_ms = ?2,
+                purged_at_unix_ms = ?2
+            WHERE derived_artifact_id = ?1
+            "#,
+            params![derived_artifact_id, now],
+        )?;
+        drop(guard);
+        self.get_derived_artifact(derived_artifact_id)
+    }
+
+    pub fn derived_stats(&self) -> Result<MediaDerivedStatsSnapshot, MediaStoreError> {
+        let guard = self.connection.lock().map_err(|_| {
+            MediaStoreError::Io(
+                "media artifact db lock poisoned while building derived stats snapshot".to_owned(),
+            )
+        })?;
+        guard
+            .query_row(
+                r#"
+                SELECT
+                    COUNT(*),
+                    COALESCE(SUM(CASE WHEN state = 'pending' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN state = 'succeeded' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN state = 'failed' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN state = 'quarantined' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN state = 'purged' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN recompute_required = 1 THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN orphaned = 1 THEN 1 ELSE 0 END), 0)
+                FROM media_derived_artifacts
+                "#,
+                [],
+                |row| {
+                    Ok(MediaDerivedStatsSnapshot {
+                        total: u64::try_from(row.get::<_, i64>(0)?).unwrap_or_default(),
+                        pending: u64::try_from(row.get::<_, i64>(1)?).unwrap_or_default(),
+                        succeeded: u64::try_from(row.get::<_, i64>(2)?).unwrap_or_default(),
+                        failed: u64::try_from(row.get::<_, i64>(3)?).unwrap_or_default(),
+                        quarantined: u64::try_from(row.get::<_, i64>(4)?).unwrap_or_default(),
+                        purged: u64::try_from(row.get::<_, i64>(5)?).unwrap_or_default(),
+                        recompute_required: u64::try_from(row.get::<_, i64>(6)?)
+                            .unwrap_or_default(),
+                        orphaned: u64::try_from(row.get::<_, i64>(7)?).unwrap_or_default(),
+                    })
+                },
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn select_derived_prompt_chunks(
+        &self,
+        source_artifact_ids: &[String],
+        query: &str,
+        selection_budget_chars: Option<usize>,
+    ) -> Result<Vec<MediaDerivedArtifactSelection>, MediaStoreError> {
+        let mut source_records = Vec::new();
+        for source_artifact_id in source_artifact_ids {
+            source_records
+                .extend(self.list_attachment_derived_artifacts(source_artifact_id.as_str())?);
+        }
+        let candidates = source_records
+            .iter()
+            .filter(|record| record.state == "succeeded")
+            .filter_map(|record| {
+                Some(DerivedSelectionCandidate {
+                    derived_artifact_id: record.derived_artifact_id.as_str(),
+                    source_artifact_id: record.source_artifact_id.as_str(),
+                    kind: record.kind.as_str(),
+                    content_text: record.content_text.as_deref()?,
+                    anchors: record.anchors.as_slice(),
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(select_prompt_chunks(query, candidates.as_slice(), selection_budget_chars)
+            .into_iter()
+            .map(|chunk| MediaDerivedArtifactSelection {
+                derived_artifact_id: chunk.derived_artifact_id,
+                source_artifact_id: chunk.source_artifact_id,
+                kind: chunk.kind,
+                citation: chunk.citation,
+                label: chunk.label,
+                snippet: chunk.snippet,
+                score: chunk.score,
+            })
+            .collect())
+    }
+
     pub fn build_connector_snapshot(
         &self,
         connector_id: &str,
@@ -905,6 +1625,48 @@ impl MediaArtifactStore {
             );
             CREATE INDEX IF NOT EXISTS idx_media_events_connector_created
                 ON media_events(connector_id, created_at_unix_ms DESC);
+
+            CREATE TABLE IF NOT EXISTS media_derived_artifacts (
+                derived_artifact_id TEXT PRIMARY KEY,
+                source_artifact_id TEXT NOT NULL,
+                attachment_id TEXT,
+                session_id TEXT,
+                principal TEXT,
+                device_id TEXT,
+                channel TEXT,
+                filename TEXT NOT NULL,
+                declared_content_type TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                state TEXT NOT NULL,
+                parser_name TEXT NOT NULL,
+                parser_version TEXT NOT NULL,
+                source_content_hash TEXT NOT NULL,
+                content_hash TEXT,
+                content_text TEXT,
+                summary_text TEXT,
+                language TEXT,
+                duration_ms INTEGER,
+                processing_ms INTEGER,
+                warnings_json TEXT NOT NULL,
+                anchors_json TEXT NOT NULL,
+                failure_reason TEXT,
+                quarantine_reason TEXT,
+                workspace_document_id TEXT,
+                memory_item_id TEXT,
+                background_task_id TEXT,
+                recompute_required INTEGER NOT NULL DEFAULT 0,
+                orphaned INTEGER NOT NULL DEFAULT 0,
+                created_at_unix_ms INTEGER NOT NULL,
+                updated_at_unix_ms INTEGER NOT NULL,
+                purged_at_unix_ms INTEGER,
+                FOREIGN KEY(source_artifact_id) REFERENCES media_artifacts(artifact_id) ON DELETE CASCADE
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_media_derived_source_kind
+                ON media_derived_artifacts(source_artifact_id, kind);
+            CREATE INDEX IF NOT EXISTS idx_media_derived_session
+                ON media_derived_artifacts(session_id, created_at_unix_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_media_derived_state
+                ON media_derived_artifacts(state, recompute_required, updated_at_unix_ms DESC);
             "#,
         )?;
         Ok(())
@@ -1289,6 +2051,53 @@ impl MediaArtifactStore {
     fn is_vision_eligible_content_type(&self, content_type: &str) -> bool {
         self.config.vision_allowed_content_types.iter().any(|allowed| allowed == content_type)
     }
+}
+
+fn map_derived_artifact_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<MediaDerivedArtifactRow, rusqlite::Error> {
+    let warnings_json: String = row.get(20)?;
+    let anchors_json: String = row.get(21)?;
+    Ok(MediaDerivedArtifactRow {
+        record: MediaDerivedArtifactRecord {
+            derived_artifact_id: row.get(0)?,
+            source_artifact_id: row.get(1)?,
+            attachment_id: row.get(2)?,
+            session_id: row.get(3)?,
+            principal: row.get(4)?,
+            device_id: row.get(5)?,
+            channel: row.get(6)?,
+            filename: row.get(7)?,
+            declared_content_type: row.get(8)?,
+            kind: row.get(9)?,
+            state: row.get(10)?,
+            parser_name: row.get(11)?,
+            parser_version: row.get(12)?,
+            source_content_hash: row.get(13)?,
+            content_hash: row.get(14)?,
+            content_text: row.get(15)?,
+            summary_text: row.get(16)?,
+            language: row.get(17)?,
+            duration_ms: row
+                .get::<_, Option<i64>>(18)?
+                .map(|value| u64::try_from(value.max(0)).unwrap_or_default()),
+            processing_ms: row
+                .get::<_, Option<i64>>(19)?
+                .map(|value| u64::try_from(value.max(0)).unwrap_or_default()),
+            warnings: serde_json::from_str(warnings_json.as_str()).unwrap_or_default(),
+            anchors: serde_json::from_str(anchors_json.as_str()).unwrap_or_default(),
+            failure_reason: row.get(22)?,
+            quarantine_reason: row.get(23)?,
+            workspace_document_id: row.get(24)?,
+            memory_item_id: row.get(25)?,
+            background_task_id: row.get(26)?,
+            recompute_required: row.get::<_, i64>(27)? > 0,
+            orphaned: row.get::<_, i64>(28)? > 0,
+            created_at_unix_ms: row.get(29)?,
+            updated_at_unix_ms: row.get(30)?,
+            purged_at_unix_ms: row.get(31)?,
+        },
+    })
 }
 
 fn current_usage_locked(connection: &Connection) -> Result<MediaUsageSnapshot, MediaStoreError> {
@@ -1883,11 +2692,14 @@ mod tests {
         net::TcpListener,
     };
 
+    use crate::media_derived::{DerivedArtifactContent, DerivedArtifactKind};
+
     use super::{
         content_relative_path, read_response_body_with_limit, resolve_content_storage_path,
-        should_prune_retention_after_ingest, sniff_content, InboundAttachmentIngestRequest,
-        MediaArtifactStore, MediaMaintenanceState, MediaRuntimeConfig,
-        RETENTION_PRUNE_MAX_DEFERRED_INGESTS, RETENTION_PRUNE_MIN_INTERVAL_MS,
+        should_prune_retention_after_ingest, sniff_content, ConsoleAttachmentStoreRequest,
+        InboundAttachmentIngestRequest, MediaArtifactStore, MediaDerivedArtifactUpsertRequest,
+        MediaMaintenanceState, MediaRuntimeConfig, RETENTION_PRUNE_MAX_DEFERRED_INGESTS,
+        RETENTION_PRUNE_MIN_INTERVAL_MS,
     };
 
     #[test]
@@ -1962,6 +2774,106 @@ mod tests {
             store.build_connector_snapshot("discord:default").expect("snapshot should succeed");
         assert_eq!(snapshot.usage.artifact_count, 0);
         assert_eq!(snapshot.policy.max_attachments_per_message, 4);
+    }
+
+    #[test]
+    fn derived_stats_return_zeroes_for_empty_store() {
+        let tempdir = TempDir::new().expect("tempdir should build");
+        let store = MediaArtifactStore::open(
+            tempdir.path().join("media.sqlite3"),
+            tempdir.path().join("media"),
+            MediaRuntimeConfig::default(),
+        )
+        .expect("media store should initialize");
+
+        let stats = store.derived_stats().expect("derived stats should succeed for an empty store");
+
+        assert_eq!(stats.total, 0);
+        assert_eq!(stats.pending, 0);
+        assert_eq!(stats.succeeded, 0);
+        assert_eq!(stats.failed, 0);
+        assert_eq!(stats.quarantined, 0);
+        assert_eq!(stats.purged, 0);
+        assert_eq!(stats.recompute_required, 0);
+        assert_eq!(stats.orphaned, 0);
+    }
+
+    #[test]
+    fn purge_derived_artifact_preserves_lineage_and_updates_stats() {
+        let tempdir = TempDir::new().expect("tempdir should build");
+        let store = MediaArtifactStore::open(
+            tempdir.path().join("media.sqlite3"),
+            tempdir.path().join("media"),
+            MediaRuntimeConfig { outbound_upload_enabled: true, ..MediaRuntimeConfig::default() },
+        )
+        .expect("media store should initialize");
+        let attachment = store
+            .store_console_attachment(ConsoleAttachmentStoreRequest {
+                connector_id: "discord:default",
+                session_id: "session-1",
+                principal: "operator",
+                device_id: "device-1",
+                channel: Some("discord:channel:test"),
+                attachment_id: "attachment-1",
+                filename: "notes.txt",
+                declared_content_type: "text/plain",
+                bytes: b"hello world from a derived artifact",
+            })
+            .expect("console attachment should store successfully");
+        let derived = DerivedArtifactContent {
+            kind: DerivedArtifactKind::ExtractedText,
+            parser_name: "attachment-document-extractor".to_owned(),
+            parser_version: "1".to_owned(),
+            content_text: "hello world from a derived artifact".to_owned(),
+            content_hash: "content-hash-1".to_owned(),
+            summary_text: "hello world from a derived artifact".to_owned(),
+            language: Some("en".to_owned()),
+            duration_ms: None,
+            processing_ms: 12,
+            warnings: Vec::new(),
+            anchors: Vec::new(),
+        };
+
+        let record = store
+            .upsert_derived_artifact(MediaDerivedArtifactUpsertRequest {
+                source_artifact_id: attachment.artifact_id.as_str(),
+                attachment_id: Some("attachment-1"),
+                session_id: Some("session-1"),
+                principal: Some("operator"),
+                device_id: Some("device-1"),
+                channel: Some("discord:channel:test"),
+                filename: "notes.txt",
+                declared_content_type: "text/plain",
+                source_content_hash: attachment.sha256.as_str(),
+                background_task_id: Some("task-1"),
+                derived: &derived,
+            })
+            .expect("derived artifact should persist");
+        let stats_before_purge =
+            store.derived_stats().expect("derived stats should succeed after persisting a record");
+        assert_eq!(stats_before_purge.total, 1);
+        assert_eq!(stats_before_purge.succeeded, 1);
+
+        let purged = store
+            .purge_derived_artifact(record.derived_artifact_id.as_str())
+            .expect("purge should succeed")
+            .expect("purge should return the updated record");
+
+        assert_eq!(purged.state, "purged");
+        assert_eq!(purged.source_artifact_id, attachment.artifact_id);
+        assert!(purged.content_text.is_none());
+        assert!(purged.summary_text.is_none());
+        assert!(purged.content_hash.is_none());
+        assert!(
+            purged.purged_at_unix_ms.is_some(),
+            "purged records should keep an explicit purge timestamp"
+        );
+
+        let stats_after_purge =
+            store.derived_stats().expect("derived stats should succeed after purge");
+        assert_eq!(stats_after_purge.total, 1);
+        assert_eq!(stats_after_purge.succeeded, 0);
+        assert_eq!(stats_after_purge.purged, 1);
     }
 
     #[test]

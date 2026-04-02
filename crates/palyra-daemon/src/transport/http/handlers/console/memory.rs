@@ -29,6 +29,7 @@ pub(crate) async fn console_memory_status_handler(
         })
         .await
         .map_err(runtime_status_response)?;
+    let derived = state.channels.derived_stats().map_err(channel_platform_error_response)?;
     let maintenance_interval_ms =
         i64::try_from(MEMORY_MAINTENANCE_INTERVAL.as_millis()).unwrap_or(i64::MAX);
     Ok(Json(json!({
@@ -55,6 +56,40 @@ pub(crate) async fn console_memory_status_handler(
                 .collect::<Vec<_>>(),
             "recent_documents": workspace_preview,
         },
+        "derived": derived,
+    })))
+}
+
+pub(crate) async fn console_memory_derived_artifacts_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ConsoleMemoryDerivedArtifactsQuery>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, false)?;
+    let workspace_document_id = query.workspace_document_id.and_then(trim_to_option);
+    let memory_item_id = query.memory_item_id.and_then(trim_to_option);
+    if workspace_document_id.is_none() && memory_item_id.is_none() {
+        return Err(runtime_status_response(tonic::Status::invalid_argument(
+            "workspace_document_id or memory_item_id must be provided",
+        )));
+    }
+    let derived_artifacts = state
+        .channels
+        .list_linked_derived_artifacts(
+            workspace_document_id.as_deref(),
+            memory_item_id.as_deref(),
+            query.limit.unwrap_or(24).clamp(1, 128),
+        )
+        .map_err(channel_platform_error_response)?
+        .into_iter()
+        .filter(|record| record.principal.as_deref() == Some(session.context.principal.as_str()))
+        .filter(|record| record.channel.as_deref() == session.context.channel.as_deref())
+        .collect::<Vec<_>>();
+    Ok(Json(json!({
+        "workspace_document_id": workspace_document_id,
+        "memory_item_id": memory_item_id,
+        "derived_artifacts": derived_artifacts,
+        "contract": contract_descriptor(),
     })))
 }
 

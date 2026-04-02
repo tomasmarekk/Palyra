@@ -2229,6 +2229,38 @@ impl GatewayRuntimeState {
     }
 
     #[allow(clippy::result_large_err)]
+    pub async fn execute_audio_transcription(
+        self: &Arc<Self>,
+        request: AudioTranscriptionRequest,
+    ) -> Result<AudioTranscriptionResponse, Status> {
+        self.counters.model_provider_requests.fetch_add(1, Ordering::Relaxed);
+        match self.model_provider.transcribe_audio(request).await {
+            Ok(response) => {
+                if response.retry_count > 0 {
+                    self.counters
+                        .model_provider_retry_attempts
+                        .fetch_add(response.retry_count as u64, Ordering::Relaxed);
+                }
+                Ok(response)
+            }
+            Err(error) => {
+                self.counters.model_provider_failures.fetch_add(1, Ordering::Relaxed);
+                if error.retry_count() > 0 {
+                    self.counters
+                        .model_provider_retry_attempts
+                        .fetch_add(error.retry_count() as u64, Ordering::Relaxed);
+                }
+                if error.is_circuit_open() {
+                    self.counters
+                        .model_provider_circuit_open_rejections
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Err(map_provider_error(error))
+            }
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
     fn resolve_orchestrator_session_blocking(
         &self,
         request: &OrchestratorSessionResolveRequest,

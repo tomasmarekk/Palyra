@@ -14,6 +14,7 @@ mod hooks;
 pub mod infra;
 mod journal;
 mod media;
+mod media_derived;
 mod model_provider;
 mod node_rpc;
 mod node_runtime;
@@ -1269,6 +1270,30 @@ struct ConsoleChatPinRequest {
 #[derive(Debug, Deserialize)]
 struct ConsoleChatTranscriptSearchQuery {
     q: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ConsoleChatDerivedArtifactsQuery {
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ConsoleMemoryDerivedArtifactsQuery {
+    #[serde(default)]
+    workspace_document_id: Option<String>,
+    #[serde(default)]
+    memory_item_id: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ConsoleDerivedArtifactLifecycleRequest {
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

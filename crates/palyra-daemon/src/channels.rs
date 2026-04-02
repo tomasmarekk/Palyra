@@ -23,7 +23,8 @@ use ulid::Ulid;
 
 use crate::media::{
     ConsoleAttachmentStoreRequest, InboundAttachmentIngestRequest, MediaArtifactPayload,
-    MediaArtifactStore, MediaRuntimeConfig,
+    MediaArtifactStore, MediaDerivedArtifactRecord, MediaDerivedArtifactSelection,
+    MediaDerivedArtifactUpsertRequest, MediaDerivedStatsSnapshot, MediaRuntimeConfig,
 };
 use crate::transport::grpc::{
     auth::{GatewayAuthConfig, HEADER_CHANNEL, HEADER_DEVICE_ID, HEADER_PRINCIPAL},
@@ -241,6 +242,172 @@ impl ChannelPlatform {
         self.media_store
             .load_console_attachment(artifact_id, session_id, principal, device_id, channel)
             .map_err(ChannelPlatformError::from)
+    }
+
+    pub fn list_console_chat_attachments(
+        &self,
+        session_id: &str,
+        principal: &str,
+        device_id: &str,
+        channel: Option<&str>,
+    ) -> Result<Vec<MediaArtifactPayload>, ChannelPlatformError> {
+        self.media_store
+            .list_console_attachment_payloads(session_id, principal, device_id, channel)
+            .map_err(ChannelPlatformError::from)
+    }
+
+    pub fn upsert_console_chat_derived_artifact(
+        &self,
+        request: MediaDerivedArtifactUpsertRequest<'_>,
+    ) -> Result<MediaDerivedArtifactRecord, ChannelPlatformError> {
+        self.media_store.upsert_derived_artifact(request).map_err(ChannelPlatformError::from)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_console_chat_failed_derived_artifact(
+        &self,
+        source_artifact_id: &str,
+        attachment_id: Option<&str>,
+        session_id: Option<&str>,
+        principal: Option<&str>,
+        device_id: Option<&str>,
+        channel: Option<&str>,
+        filename: &str,
+        declared_content_type: &str,
+        source_content_hash: &str,
+        kind: crate::media_derived::DerivedArtifactKind,
+        parser_name: &str,
+        parser_version: &str,
+        background_task_id: Option<&str>,
+        failure_reason: &str,
+    ) -> Result<MediaDerivedArtifactRecord, ChannelPlatformError> {
+        self.media_store
+            .upsert_failed_derived_artifact(
+                source_artifact_id,
+                attachment_id,
+                session_id,
+                principal,
+                device_id,
+                channel,
+                filename,
+                declared_content_type,
+                source_content_hash,
+                kind,
+                parser_name,
+                parser_version,
+                background_task_id,
+                failure_reason,
+            )
+            .map_err(ChannelPlatformError::from)
+    }
+
+    pub fn list_console_chat_derived_artifacts(
+        &self,
+        session_id: &str,
+        principal: &str,
+        device_id: &str,
+        channel: Option<&str>,
+    ) -> Result<Vec<MediaDerivedArtifactRecord>, ChannelPlatformError> {
+        self.media_store
+            .list_session_derived_artifacts(session_id, principal, device_id, channel)
+            .map_err(ChannelPlatformError::from)
+    }
+
+    pub fn list_attachment_derived_artifacts(
+        &self,
+        source_artifact_id: &str,
+    ) -> Result<Vec<MediaDerivedArtifactRecord>, ChannelPlatformError> {
+        self.media_store
+            .list_attachment_derived_artifacts(source_artifact_id)
+            .map_err(ChannelPlatformError::from)
+    }
+
+    pub fn get_derived_artifact(
+        &self,
+        derived_artifact_id: &str,
+    ) -> Result<Option<MediaDerivedArtifactRecord>, ChannelPlatformError> {
+        self.media_store
+            .get_derived_artifact(derived_artifact_id)
+            .map_err(ChannelPlatformError::from)
+    }
+
+    pub fn list_linked_derived_artifacts(
+        &self,
+        workspace_document_id: Option<&str>,
+        memory_item_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MediaDerivedArtifactRecord>, ChannelPlatformError> {
+        self.media_store
+            .list_linked_derived_artifacts(workspace_document_id, memory_item_id, limit)
+            .map_err(ChannelPlatformError::from)
+    }
+
+    pub fn link_derived_artifact_targets(
+        &self,
+        derived_artifact_id: &str,
+        workspace_document_id: Option<&str>,
+        memory_item_id: Option<&str>,
+    ) -> Result<(), ChannelPlatformError> {
+        self.media_store
+            .link_derived_artifact_targets(
+                derived_artifact_id,
+                workspace_document_id,
+                memory_item_id,
+            )
+            .map_err(ChannelPlatformError::from)
+    }
+
+    pub fn select_console_chat_derived_chunks(
+        &self,
+        source_artifact_ids: &[String],
+        query: &str,
+        selection_budget_chars: Option<usize>,
+    ) -> Result<Vec<MediaDerivedArtifactSelection>, ChannelPlatformError> {
+        self.media_store
+            .select_derived_prompt_chunks(source_artifact_ids, query, selection_budget_chars)
+            .map_err(ChannelPlatformError::from)
+    }
+
+    pub fn quarantine_derived_artifact(
+        &self,
+        derived_artifact_id: &str,
+        reason: Option<&str>,
+    ) -> Result<Option<MediaDerivedArtifactRecord>, ChannelPlatformError> {
+        self.media_store
+            .quarantine_derived_artifact(derived_artifact_id, reason)
+            .map_err(ChannelPlatformError::from)
+    }
+
+    pub fn release_derived_artifact(
+        &self,
+        derived_artifact_id: &str,
+    ) -> Result<Option<MediaDerivedArtifactRecord>, ChannelPlatformError> {
+        self.media_store
+            .release_derived_artifact(derived_artifact_id)
+            .map_err(ChannelPlatformError::from)
+    }
+
+    pub fn mark_derived_artifact_recompute_required(
+        &self,
+        derived_artifact_id: &str,
+        required: bool,
+    ) -> Result<Option<MediaDerivedArtifactRecord>, ChannelPlatformError> {
+        self.media_store
+            .mark_derived_artifact_recompute_required(derived_artifact_id, required)
+            .map_err(ChannelPlatformError::from)
+    }
+
+    pub fn purge_derived_artifact(
+        &self,
+        derived_artifact_id: &str,
+    ) -> Result<Option<MediaDerivedArtifactRecord>, ChannelPlatformError> {
+        self.media_store
+            .purge_derived_artifact(derived_artifact_id)
+            .map_err(ChannelPlatformError::from)
+    }
+
+    pub fn derived_stats(&self) -> Result<MediaDerivedStatsSnapshot, ChannelPlatformError> {
+        self.media_store.derived_stats().map_err(ChannelPlatformError::from)
     }
 
     pub fn set_enabled(

@@ -23,6 +23,7 @@ use crate::{
         OrchestratorSessionResolveRequest, OrchestratorTapeAppendRequest, OrchestratorTapeRecord,
         WorkspaceSearchHit, WorkspaceSearchRequest,
     },
+    media::MediaDerivedArtifactSelection,
     media::MediaRuntimeConfig,
     model_provider::ProviderImageInput,
     transport::grpc::{auth::RequestContext, proto::palyra::common::v1 as common_v1},
@@ -86,6 +87,17 @@ struct ExplicitRecallSelection {
 struct ParameterDeltaEnvelope {
     #[serde(default)]
     explicit_recall: Option<ExplicitRecallSelection>,
+    #[serde(default)]
+    attachment_recall: Option<AttachmentRecallSelection>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct AttachmentRecallSelection {
+    query: String,
+    #[serde(default)]
+    source_artifact_ids: Vec<String>,
+    #[serde(default)]
+    chunks: Vec<MediaDerivedArtifactSelection>,
 }
 
 fn build_provider_image_inputs(
@@ -337,6 +349,52 @@ async fn build_explicit_recall_prompt(
         selected_workspace_hits.as_slice(),
         prompt_input_text,
     )))
+}
+
+fn parse_attachment_recall_selection(
+    parameter_delta_json: Option<&str>,
+) -> Option<AttachmentRecallSelection> {
+    let raw = parameter_delta_json?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    serde_json::from_str::<ParameterDeltaEnvelope>(raw)
+        .ok()
+        .and_then(|value| value.attachment_recall)
+}
+
+#[allow(clippy::result_large_err)]
+async fn build_attachment_recall_prompt(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    parameter_delta_json: Option<&str>,
+    prompt_input_text: &str,
+) -> Result<Option<String>, Status> {
+    let Some(selection) = parse_attachment_recall_selection(parameter_delta_json) else {
+        return Ok(None);
+    };
+    if selection.query.trim().is_empty() || selection.chunks.is_empty() {
+        return Ok(None);
+    }
+
+    let chunks = selection.chunks.into_iter().take(6).collect::<Vec<_>>();
+    let payload_json = json!({
+        "query": selection.query,
+        "source_artifact_ids": selection.source_artifact_ids,
+        "chunks": chunks,
+    })
+    .to_string();
+    runtime_state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: *tape_seq,
+            event_type: "attachment_recall".to_owned(),
+            payload_json,
+        })
+        .await?;
+    *tape_seq = tape_seq.saturating_add(1);
+    Ok(Some(render_attachment_recall_prompt(chunks.as_slice(), prompt_input_text)))
 }
 
 fn extract_previous_run_turn_from_tape_event(
@@ -634,6 +692,18 @@ pub(crate) async fn prepare_model_provider_input(
         input_with_recent_context.as_str(),
     )
     .await?;
+    let input_with_attachment_recall = match build_attachment_recall_prompt(
+        runtime_state,
+        run_id,
+        tape_seq,
+        parameter_delta_json,
+        input_with_compaction.as_str(),
+    )
+    .await?
+    {
+        Some(value) => value,
+        None => input_with_compaction,
+    };
     if let Some(provider_input_text) = build_explicit_recall_prompt(
         runtime_state,
         context,
@@ -641,7 +711,7 @@ pub(crate) async fn prepare_model_provider_input(
         tape_seq,
         session_id,
         parameter_delta_json,
-        input_with_compaction.as_str(),
+        input_with_attachment_recall.as_str(),
     )
     .await?
     {
@@ -657,7 +727,7 @@ pub(crate) async fn prepare_model_provider_input(
         tape_seq,
         session_id,
         input_text,
-        input_with_compaction.as_str(),
+        input_with_attachment_recall.as_str(),
     )
     .await
     {
@@ -674,7 +744,7 @@ pub(crate) async fn prepare_model_provider_input(
                     status_message = %error.message(),
                     "{warn_message}"
                 );
-                input_with_compaction
+                input_with_attachment_recall
             }
         },
     };
@@ -746,6 +816,32 @@ fn render_explicit_recall_prompt(
     }
     prompt.push_str(input_text);
     prompt
+}
+
+fn render_attachment_recall_prompt(
+    chunks: &[MediaDerivedArtifactSelection],
+    input_text: &str,
+) -> String {
+    let mut block = String::from("<attachment_context>\n");
+    for (index, chunk) in chunks.iter().enumerate() {
+        let snippet = chunk.snippet.replace(['\r', '\n'], " ").trim().to_owned();
+        block.push_str(
+            format!(
+                "{}. attachment_id={} derived_id={} kind={} citation={} label={} snippet={}\n",
+                index + 1,
+                chunk.source_artifact_id,
+                chunk.derived_artifact_id,
+                chunk.kind,
+                chunk.citation,
+                chunk.label,
+                truncate_with_ellipsis(snippet, 320),
+            )
+            .as_str(),
+        );
+    }
+    block.push_str("</attachment_context>\n\n");
+    block.push_str(input_text);
+    block
 }
 
 pub(crate) fn memory_auto_inject_tape_payload(query: &str, hits: &[MemorySearchHit]) -> String {

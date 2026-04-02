@@ -158,6 +158,13 @@ pub(crate) async fn console_chat_message_stream_handler(
         payload.attachments.as_slice(),
     )
     .map_err(|response| *response)?;
+    let parameter_delta = build_console_attachment_parameter_delta(
+        &state,
+        payload.parameter_delta.as_ref(),
+        text.as_str(),
+        attachments.as_slice(),
+    )
+    .map_err(|response| *response)?;
     let timestamp_unix_ms = unix_ms_now().map_err(|error| {
         runtime_status_response(tonic::Status::internal(format!(
             "failed to read system clock: {error}"
@@ -201,8 +208,7 @@ pub(crate) async fn console_chat_message_stream_handler(
             .origin_run_id
             .and_then(trim_to_option)
             .map(|ulid| common_v1::CanonicalId { ulid }),
-        parameter_delta_json: payload
-            .parameter_delta
+        parameter_delta_json: parameter_delta
             .as_ref()
             .and_then(|value| serde_json::to_vec(value).ok())
             .unwrap_or_default(),
@@ -412,8 +418,482 @@ pub(crate) async fn console_chat_attachment_upload_handler(
             bytes: bytes.as_slice(),
         })
         .map_err(channel_platform_error_response)?;
+    let task = state
+        .runtime
+        .create_orchestrator_background_task(journal::OrchestratorBackgroundTaskCreateRequest {
+            task_id: Ulid::new().to_string(),
+            task_kind: "attachment_derivation".to_owned(),
+            session_id: session_id.clone(),
+            parent_run_id: None,
+            target_run_id: None,
+            queued_input_id: None,
+            owner_principal: session.context.principal.clone(),
+            device_id: session.context.device_id.clone(),
+            channel: session.context.channel.clone(),
+            state: "queued".to_owned(),
+            priority: 50,
+            max_attempts: 1,
+            budget_tokens: estimate_console_chat_attachment_tokens(&artifact),
+            not_before_unix_ms: None,
+            expires_at_unix_ms: None,
+            notification_target_json: None,
+            input_text: Some(filename.clone()),
+            payload_json: Some(
+                json!({
+                    "source_artifact_id": artifact.artifact_id,
+                    "content_type": artifact.content_type,
+                    "filename": artifact.filename,
+                })
+                .to_string(),
+            ),
+        })
+        .await
+        .map_err(runtime_status_response)?;
+    let task_started_at = unix_ms_now().map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "failed to read system clock: {error}"
+        )))
+    })?;
+    state
+        .runtime
+        .update_orchestrator_background_task(journal::OrchestratorBackgroundTaskUpdateRequest {
+            task_id: task.task_id.clone(),
+            state: Some("running".to_owned()),
+            started_at_unix_ms: Some(Some(task_started_at)),
+            ..Default::default()
+        })
+        .await
+        .map_err(runtime_status_response)?;
+    let derived_artifacts = match derive_console_attachment_artifacts(
+        &state,
+        &session,
+        session_id.as_str(),
+        &artifact,
+        task.task_id.as_str(),
+    )
+    .await
+    {
+        Ok(records) => {
+            let completed_at_unix_ms = unix_ms_now().map_err(|error| {
+                runtime_status_response(tonic::Status::internal(format!(
+                    "failed to read system clock: {error}"
+                )))
+            })?;
+            state
+                .runtime
+                .update_orchestrator_background_task(
+                    journal::OrchestratorBackgroundTaskUpdateRequest {
+                        task_id: task.task_id.clone(),
+                        state: Some("succeeded".to_owned()),
+                        completed_at_unix_ms: Some(Some(completed_at_unix_ms)),
+                        result_json: Some(Some(
+                            json!({
+                                "derived_count": records.len(),
+                                "artifact_id": artifact.artifact_id,
+                            })
+                            .to_string(),
+                        )),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(runtime_status_response)?;
+            records
+        }
+        Err(error) => {
+            let completed_at_unix_ms = unix_ms_now().map_err(|clock_error| {
+                runtime_status_response(tonic::Status::internal(format!(
+                    "failed to read system clock: {clock_error}"
+                )))
+            })?;
+            state
+                .runtime
+                .update_orchestrator_background_task(
+                    journal::OrchestratorBackgroundTaskUpdateRequest {
+                        task_id: task.task_id.clone(),
+                        state: Some("failed".to_owned()),
+                        increment_attempt_count: true,
+                        completed_at_unix_ms: Some(Some(completed_at_unix_ms)),
+                        last_error: Some(Some(error.to_string())),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(runtime_status_response)?;
+            return Err(runtime_status_response(tonic::Status::internal(error.to_string())));
+        }
+    };
     Ok(Json(json!({
         "attachment": console_chat_attachment_payload_to_json(&artifact),
+        "derived_artifacts": derived_artifacts,
+        "task": task,
+        "contract": contract_descriptor(),
+    })))
+}
+
+pub(crate) async fn console_chat_derived_artifacts_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    Query(query): Query<ConsoleChatDerivedArtifactsQuery>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, false)?;
+    let session_record =
+        load_console_chat_session(&state, &session.context, session_id.as_str(), true).await?;
+    let kind_filter = query.kind.and_then(trim_to_option).map(|value| value.to_ascii_lowercase());
+    let state_filter = query.state.and_then(trim_to_option).map(|value| value.to_ascii_lowercase());
+    let derived_artifacts = state
+        .channels
+        .list_console_chat_derived_artifacts(
+            session_record.session_id.as_str(),
+            session.context.principal.as_str(),
+            session.context.device_id.as_str(),
+            session.context.channel.as_deref(),
+        )
+        .map_err(channel_platform_error_response)?
+        .into_iter()
+        .filter(|record| {
+            kind_filter
+                .as_deref()
+                .map(|expected| record.kind.eq_ignore_ascii_case(expected))
+                .unwrap_or(true)
+        })
+        .filter(|record| {
+            state_filter
+                .as_deref()
+                .map(|expected| record.state.eq_ignore_ascii_case(expected))
+                .unwrap_or(true)
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({
+        "session": session_record,
+        "derived_artifacts": derived_artifacts,
+        "contract": contract_descriptor(),
+    })))
+}
+
+pub(crate) async fn console_chat_attachment_derived_artifacts_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(artifact_id): Path<String>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, false)?;
+    validate_canonical_id(artifact_id.as_str()).map_err(|_| {
+        runtime_status_response(tonic::Status::invalid_argument(
+            "artifact_id must be a canonical ULID",
+        ))
+    })?;
+    let derived_artifacts = filter_console_derived_artifact_records(
+        state
+            .channels
+            .list_attachment_derived_artifacts(artifact_id.as_str())
+            .map_err(channel_platform_error_response)?,
+        &session.context,
+        true,
+    );
+    if derived_artifacts.is_empty() {
+        return Err(runtime_status_response(tonic::Status::not_found(
+            "attachment derived artifacts not found for current console context",
+        )));
+    }
+    Ok(Json(json!({
+        "source_artifact_id": artifact_id,
+        "derived_artifacts": derived_artifacts,
+        "contract": contract_descriptor(),
+    })))
+}
+
+pub(crate) async fn console_chat_derived_artifact_detail_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(derived_artifact_id): Path<String>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, false)?;
+    validate_canonical_id(derived_artifact_id.as_str()).map_err(|_| {
+        runtime_status_response(tonic::Status::invalid_argument(
+            "derived_artifact_id must be a canonical ULID",
+        ))
+    })?;
+    let derived_artifact = load_console_derived_artifact(
+        &state,
+        &session.context,
+        derived_artifact_id.as_str(),
+        false,
+    )?;
+    Ok(Json(json!({
+        "derived_artifact": derived_artifact,
+        "contract": contract_descriptor(),
+    })))
+}
+
+pub(crate) async fn console_chat_derived_artifact_quarantine_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(derived_artifact_id): Path<String>,
+    Json(payload): Json<ConsoleDerivedArtifactLifecycleRequest>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    let _existing = load_console_derived_artifact(
+        &state,
+        &session.context,
+        derived_artifact_id.as_str(),
+        false,
+    )?;
+    let reason = payload.reason.and_then(trim_to_option);
+    let derived_artifact = state
+        .channels
+        .quarantine_derived_artifact(derived_artifact_id.as_str(), reason.as_deref())
+        .map_err(channel_platform_error_response)?
+        .ok_or_else(|| {
+            runtime_status_response(tonic::Status::not_found(format!(
+                "derived artifact not found: {derived_artifact_id}"
+            )))
+        })?;
+    Ok(Json(json!({
+        "derived_artifact": derived_artifact,
+        "action": "quarantine",
+        "contract": contract_descriptor(),
+    })))
+}
+
+pub(crate) async fn console_chat_derived_artifact_release_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(derived_artifact_id): Path<String>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    let _existing = load_console_derived_artifact(
+        &state,
+        &session.context,
+        derived_artifact_id.as_str(),
+        false,
+    )?;
+    let derived_artifact = state
+        .channels
+        .release_derived_artifact(derived_artifact_id.as_str())
+        .map_err(channel_platform_error_response)?
+        .ok_or_else(|| {
+            runtime_status_response(tonic::Status::not_found(format!(
+                "derived artifact not found: {derived_artifact_id}"
+            )))
+        })?;
+    Ok(Json(json!({
+        "derived_artifact": derived_artifact,
+        "action": "release",
+        "contract": contract_descriptor(),
+    })))
+}
+
+pub(crate) async fn console_chat_derived_artifact_recompute_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(derived_artifact_id): Path<String>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    let existing = load_console_derived_artifact(
+        &state,
+        &session.context,
+        derived_artifact_id.as_str(),
+        true,
+    )?;
+    let session_id = existing.session_id.clone().ok_or_else(|| {
+        runtime_status_response(tonic::Status::failed_precondition(
+            "derived artifact is not attached to a chat session",
+        ))
+    })?;
+    state
+        .channels
+        .mark_derived_artifact_recompute_required(derived_artifact_id.as_str(), true)
+        .map_err(channel_platform_error_response)?;
+    let source_attachment = state
+        .channels
+        .load_console_chat_attachment(
+            existing.source_artifact_id.as_str(),
+            session_id.as_str(),
+            session.context.principal.as_str(),
+            session.context.device_id.as_str(),
+            session.context.channel.as_deref(),
+        )
+        .map_err(channel_platform_error_response)?
+        .ok_or_else(|| {
+            runtime_status_response(tonic::Status::not_found(format!(
+                "source attachment not found for derived artifact: {}",
+                existing.source_artifact_id
+            )))
+        })?;
+    let task = state
+        .runtime
+        .create_orchestrator_background_task(journal::OrchestratorBackgroundTaskCreateRequest {
+            task_id: Ulid::new().to_string(),
+            task_kind: "attachment_recompute".to_owned(),
+            session_id: session_id.clone(),
+            parent_run_id: None,
+            target_run_id: None,
+            queued_input_id: None,
+            owner_principal: session.context.principal.clone(),
+            device_id: session.context.device_id.clone(),
+            channel: session.context.channel.clone(),
+            state: "queued".to_owned(),
+            priority: 40,
+            max_attempts: 1,
+            budget_tokens: estimate_console_chat_attachment_tokens(&source_attachment),
+            not_before_unix_ms: None,
+            expires_at_unix_ms: None,
+            notification_target_json: None,
+            input_text: Some(existing.filename.clone()),
+            payload_json: Some(
+                json!({
+                    "source_artifact_id": existing.source_artifact_id,
+                    "derived_artifact_id": existing.derived_artifact_id,
+                    "kind": existing.kind,
+                })
+                .to_string(),
+            ),
+        })
+        .await
+        .map_err(runtime_status_response)?;
+    let started_at_unix_ms = unix_ms_now().map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "failed to read system clock: {error}"
+        )))
+    })?;
+    state
+        .runtime
+        .update_orchestrator_background_task(journal::OrchestratorBackgroundTaskUpdateRequest {
+            task_id: task.task_id.clone(),
+            state: Some("running".to_owned()),
+            started_at_unix_ms: Some(Some(started_at_unix_ms)),
+            ..Default::default()
+        })
+        .await
+        .map_err(runtime_status_response)?;
+    let derived_artifacts = match derive_console_attachment_artifacts(
+        &state,
+        &session,
+        session_id.as_str(),
+        &source_attachment,
+        task.task_id.as_str(),
+    )
+    .await
+    {
+        Ok(records) => {
+            let completed_at_unix_ms = unix_ms_now().map_err(|error| {
+                runtime_status_response(tonic::Status::internal(format!(
+                    "failed to read system clock: {error}"
+                )))
+            })?;
+            state
+                .runtime
+                .update_orchestrator_background_task(
+                    journal::OrchestratorBackgroundTaskUpdateRequest {
+                        task_id: task.task_id.clone(),
+                        state: Some("succeeded".to_owned()),
+                        completed_at_unix_ms: Some(Some(completed_at_unix_ms)),
+                        result_json: Some(Some(
+                            json!({
+                                "source_artifact_id": existing.source_artifact_id,
+                                "derived_count": records.len(),
+                            })
+                            .to_string(),
+                        )),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(runtime_status_response)?;
+            records
+        }
+        Err(error) => {
+            let completed_at_unix_ms = unix_ms_now().map_err(|clock_error| {
+                runtime_status_response(tonic::Status::internal(format!(
+                    "failed to read system clock: {clock_error}"
+                )))
+            })?;
+            state
+                .runtime
+                .update_orchestrator_background_task(
+                    journal::OrchestratorBackgroundTaskUpdateRequest {
+                        task_id: task.task_id.clone(),
+                        state: Some("failed".to_owned()),
+                        increment_attempt_count: true,
+                        completed_at_unix_ms: Some(Some(completed_at_unix_ms)),
+                        last_error: Some(Some(error.to_string())),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(runtime_status_response)?;
+            state
+                .channels
+                .mark_derived_artifact_recompute_required(derived_artifact_id.as_str(), true)
+                .map_err(channel_platform_error_response)?;
+            return Err(runtime_status_response(tonic::Status::internal(error.to_string())));
+        }
+    };
+    let derived_artifact = load_console_derived_artifact(
+        &state,
+        &session.context,
+        derived_artifact_id.as_str(),
+        true,
+    )?;
+    Ok(Json(json!({
+        "task": task,
+        "derived_artifact": derived_artifact,
+        "derived_artifacts": derived_artifacts,
+        "action": "recompute",
+        "contract": contract_descriptor(),
+    })))
+}
+
+pub(crate) async fn console_chat_derived_artifact_purge_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(derived_artifact_id): Path<String>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    let existing = load_console_derived_artifact(
+        &state,
+        &session.context,
+        derived_artifact_id.as_str(),
+        false,
+    )?;
+    if let Some(memory_item_id) = existing.memory_item_id.as_deref() {
+        let _ = state
+            .runtime
+            .delete_memory_item(
+                memory_item_id.to_owned(),
+                session.context.principal.clone(),
+                session.context.channel.clone(),
+            )
+            .await;
+    }
+    if let Some(session_id) = existing.session_id.as_deref() {
+        let _ = state
+            .runtime
+            .soft_delete_workspace_document(journal::WorkspaceDocumentDeleteRequest {
+                principal: session.context.principal.clone(),
+                channel: session.context.channel.clone(),
+                agent_id: None,
+                session_id: Some(session_id.to_owned()),
+                path: format!(
+                    "attachments/{}/{}/{}.md",
+                    session_id, existing.source_artifact_id, existing.kind
+                ),
+            })
+            .await;
+    }
+    let derived_artifact = state
+        .channels
+        .purge_derived_artifact(derived_artifact_id.as_str())
+        .map_err(channel_platform_error_response)?
+        .ok_or_else(|| {
+            runtime_status_response(tonic::Status::not_found(format!(
+                "derived artifact not found: {derived_artifact_id}"
+            )))
+        })?;
+    Ok(Json(json!({
+        "derived_artifact": derived_artifact,
+        "action": "purge",
         "contract": contract_descriptor(),
     })))
 }
@@ -1374,9 +1854,32 @@ pub(crate) async fn console_chat_transcript_handler(
         })
         .await
         .map_err(runtime_status_response)?;
+    let attachments = state
+        .channels
+        .list_console_chat_attachments(
+            session_record.session_id.as_str(),
+            session.context.principal.as_str(),
+            session.context.device_id.as_str(),
+            session.context.channel.as_deref(),
+        )
+        .map_err(channel_platform_error_response)?;
+    let derived_artifacts = state
+        .channels
+        .list_console_chat_derived_artifacts(
+            session_record.session_id.as_str(),
+            session.context.principal.as_str(),
+            session.context.device_id.as_str(),
+            session.context.channel.as_deref(),
+        )
+        .map_err(channel_platform_error_response)?;
     Ok(Json(json!({
         "session": session_record,
         "records": transcript,
+        "attachments": attachments
+            .iter()
+            .map(console_chat_attachment_payload_to_json)
+            .collect::<Vec<_>>(),
+        "derived_artifacts": derived_artifacts,
         "pins": pins,
         "compactions": compactions,
         "checkpoints": checkpoints,
@@ -1651,6 +2154,77 @@ fn load_console_chat_message_attachments(
     Ok(resolved)
 }
 
+fn build_console_attachment_parameter_delta(
+    state: &AppState,
+    parameter_delta: Option<&Value>,
+    query_text: &str,
+    attachments: &[common_v1::MessageAttachment],
+) -> Result<Option<Value>, Box<Response>> {
+    let artifact_ids = attachments
+        .iter()
+        .filter_map(|attachment| attachment.artifact_id.as_ref().map(|value| value.ulid.clone()))
+        .collect::<Vec<_>>();
+    if artifact_ids.is_empty() {
+        return Ok(parameter_delta.cloned());
+    }
+    let trimmed_query = query_text.trim();
+    if trimmed_query.is_empty() {
+        return Ok(parameter_delta.cloned());
+    }
+    let selected_chunks = state
+        .channels
+        .select_console_chat_derived_chunks(artifact_ids.as_slice(), trimmed_query, Some(1_600))
+        .map_err(|error| Box::new(channel_platform_error_response(error)))?;
+    if selected_chunks.is_empty() {
+        return Ok(parameter_delta.cloned());
+    }
+    let mut next_delta = parameter_delta.cloned().unwrap_or_else(|| json!({}));
+    if !next_delta.is_object() {
+        next_delta = json!({ "prior_parameter_delta": next_delta });
+    }
+    if let Some(object) = next_delta.as_object_mut() {
+        object.insert(
+            "attachment_recall".to_owned(),
+            json!({
+                "query": trimmed_query,
+                "source_artifact_ids": artifact_ids,
+                "chunks": selected_chunks,
+            }),
+        );
+    }
+    Ok(Some(next_delta))
+}
+
+fn derived_artifact_matches_console_context(
+    record: &media::MediaDerivedArtifactRecord,
+    context: &gateway::RequestContext,
+    require_device_match: bool,
+) -> bool {
+    if record.principal.as_deref() != Some(context.principal.as_str()) {
+        return false;
+    }
+    if record.channel.as_deref() != context.channel.as_deref() {
+        return false;
+    }
+    if require_device_match {
+        return record.device_id.as_deref() == Some(context.device_id.as_str());
+    }
+    true
+}
+
+fn filter_console_derived_artifact_records(
+    records: Vec<media::MediaDerivedArtifactRecord>,
+    context: &gateway::RequestContext,
+    require_device_match: bool,
+) -> Vec<media::MediaDerivedArtifactRecord> {
+    records
+        .into_iter()
+        .filter(|record| {
+            derived_artifact_matches_console_context(record, context, require_device_match)
+        })
+        .collect()
+}
+
 async fn load_console_chat_session(
     state: &AppState,
     context: &gateway::RequestContext,
@@ -1704,6 +2278,29 @@ async fn load_console_background_task(
         )));
     }
     Ok(task)
+}
+
+fn load_console_derived_artifact(
+    state: &AppState,
+    context: &gateway::RequestContext,
+    derived_artifact_id: &str,
+    require_device_match: bool,
+) -> Result<media::MediaDerivedArtifactRecord, Response> {
+    let record = state
+        .channels
+        .get_derived_artifact(derived_artifact_id)
+        .map_err(channel_platform_error_response)?
+        .ok_or_else(|| {
+            runtime_status_response(tonic::Status::not_found(format!(
+                "derived artifact not found: {derived_artifact_id}"
+            )))
+        })?;
+    if !derived_artifact_matches_console_context(&record, context, require_device_match) {
+        return Err(runtime_status_response(tonic::Status::not_found(
+            "derived artifact not found for current console context",
+        )));
+    }
+    Ok(record)
 }
 
 fn is_terminal_run_state(state: &str) -> bool {
@@ -2145,6 +2742,266 @@ async fn build_console_gateway_client(
         format!("failed to connect to gateway endpoint '{}': {error}", state.grpc_url)
     })?;
     Ok(gateway_v1::gateway_service_client::GatewayServiceClient::new(channel))
+}
+
+async fn derive_console_attachment_artifacts(
+    state: &AppState,
+    session: &ConsoleSession,
+    session_id: &str,
+    artifact: &media::MediaArtifactPayload,
+    background_task_id: &str,
+) -> Result<Vec<media::MediaDerivedArtifactRecord>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut persisted = Vec::new();
+    let metadata = crate::media_derived::build_metadata_summary_content(
+        artifact.filename.as_str(),
+        artifact.content_type.as_str(),
+        artifact.size_bytes,
+        artifact.sha256.as_str(),
+        artifact.width_px,
+        artifact.height_px,
+    );
+    let metadata_record = state
+        .channels
+        .upsert_console_chat_derived_artifact(media::MediaDerivedArtifactUpsertRequest {
+            source_artifact_id: artifact.artifact_id.as_str(),
+            attachment_id: Some(artifact.artifact_id.as_str()),
+            session_id: Some(session_id),
+            principal: Some(session.context.principal.as_str()),
+            device_id: Some(session.context.device_id.as_str()),
+            channel: session.context.channel.as_deref(),
+            filename: artifact.filename.as_str(),
+            declared_content_type: artifact.content_type.as_str(),
+            source_content_hash: artifact.sha256.as_str(),
+            background_task_id: Some(background_task_id),
+            derived: &metadata,
+        })
+        .map_err(|error| error.to_string())?;
+    index_derived_artifact_targets(state, session, session_id, artifact, &metadata_record).await?;
+    persisted.push(metadata_record);
+
+    if crate::media_derived::supports_document_extraction(artifact.content_type.as_str()) {
+        match crate::media_derived::extract_document_content(
+            &crate::media_derived::AttachmentTextExtractionRequest {
+                filename: artifact.filename.as_str(),
+                content_type: artifact.content_type.as_str(),
+                bytes: artifact.bytes.as_slice(),
+            },
+        ) {
+            Ok(derived) => {
+                let record = state
+                    .channels
+                    .upsert_console_chat_derived_artifact(
+                        media::MediaDerivedArtifactUpsertRequest {
+                            source_artifact_id: artifact.artifact_id.as_str(),
+                            attachment_id: Some(artifact.artifact_id.as_str()),
+                            session_id: Some(session_id),
+                            principal: Some(session.context.principal.as_str()),
+                            device_id: Some(session.context.device_id.as_str()),
+                            channel: session.context.channel.as_deref(),
+                            filename: artifact.filename.as_str(),
+                            declared_content_type: artifact.content_type.as_str(),
+                            source_content_hash: artifact.sha256.as_str(),
+                            background_task_id: Some(background_task_id),
+                            derived: &derived,
+                        },
+                    )
+                    .map_err(|error| error.to_string())?;
+                index_derived_artifact_targets(state, session, session_id, artifact, &record)
+                    .await?;
+                persisted.push(record);
+            }
+            Err(error) => {
+                persisted.push(
+                    state
+                        .channels
+                        .upsert_console_chat_failed_derived_artifact(
+                            artifact.artifact_id.as_str(),
+                            Some(artifact.artifact_id.as_str()),
+                            Some(session_id),
+                            Some(session.context.principal.as_str()),
+                            Some(session.context.device_id.as_str()),
+                            session.context.channel.as_deref(),
+                            artifact.filename.as_str(),
+                            artifact.content_type.as_str(),
+                            artifact.sha256.as_str(),
+                            crate::media_derived::DerivedArtifactKind::ExtractedText,
+                            crate::media_derived::DOCUMENT_EXTRACTOR_PARSER_NAME,
+                            crate::media_derived::DOCUMENT_EXTRACTOR_PARSER_VERSION,
+                            Some(background_task_id),
+                            error.as_str(),
+                        )
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+        }
+    }
+
+    if crate::media_derived::supports_audio_transcription(artifact.content_type.as_str()) {
+        let transcription_started_at = std::time::Instant::now();
+        match state
+            .runtime
+            .execute_audio_transcription(crate::model_provider::AudioTranscriptionRequest {
+                file_name: artifact.filename.clone(),
+                content_type: artifact.content_type.clone(),
+                bytes: artifact.bytes.clone(),
+                prompt: None,
+                language: None,
+            })
+            .await
+        {
+            Ok(response) => match crate::media_derived::build_transcription_content(
+                response,
+                transcription_started_at.elapsed().as_millis() as u64,
+            ) {
+                Ok(derived) => {
+                    let record = state
+                        .channels
+                        .upsert_console_chat_derived_artifact(
+                            media::MediaDerivedArtifactUpsertRequest {
+                                source_artifact_id: artifact.artifact_id.as_str(),
+                                attachment_id: Some(artifact.artifact_id.as_str()),
+                                session_id: Some(session_id),
+                                principal: Some(session.context.principal.as_str()),
+                                device_id: Some(session.context.device_id.as_str()),
+                                channel: session.context.channel.as_deref(),
+                                filename: artifact.filename.as_str(),
+                                declared_content_type: artifact.content_type.as_str(),
+                                source_content_hash: artifact.sha256.as_str(),
+                                background_task_id: Some(background_task_id),
+                                derived: &derived,
+                            },
+                        )
+                        .map_err(|error| error.to_string())?;
+                    index_derived_artifact_targets(state, session, session_id, artifact, &record)
+                        .await?;
+                    persisted.push(record);
+                }
+                Err(error) => {
+                    persisted.push(
+                        state
+                            .channels
+                            .upsert_console_chat_failed_derived_artifact(
+                                artifact.artifact_id.as_str(),
+                                Some(artifact.artifact_id.as_str()),
+                                Some(session_id),
+                                Some(session.context.principal.as_str()),
+                                Some(session.context.device_id.as_str()),
+                                session.context.channel.as_deref(),
+                                artifact.filename.as_str(),
+                                artifact.content_type.as_str(),
+                                artifact.sha256.as_str(),
+                                crate::media_derived::DerivedArtifactKind::Transcript,
+                                crate::media_derived::AUDIO_TRANSCRIBER_PARSER_NAME,
+                                crate::media_derived::AUDIO_TRANSCRIBER_PARSER_VERSION,
+                                Some(background_task_id),
+                                error.as_str(),
+                            )
+                            .map_err(|error| error.to_string())?,
+                    );
+                }
+            },
+            Err(error) => {
+                let failure_message = error.message().to_owned();
+                persisted.push(
+                    state
+                        .channels
+                        .upsert_console_chat_failed_derived_artifact(
+                            artifact.artifact_id.as_str(),
+                            Some(artifact.artifact_id.as_str()),
+                            Some(session_id),
+                            Some(session.context.principal.as_str()),
+                            Some(session.context.device_id.as_str()),
+                            session.context.channel.as_deref(),
+                            artifact.filename.as_str(),
+                            artifact.content_type.as_str(),
+                            artifact.sha256.as_str(),
+                            crate::media_derived::DerivedArtifactKind::Transcript,
+                            crate::media_derived::AUDIO_TRANSCRIBER_PARSER_NAME,
+                            crate::media_derived::AUDIO_TRANSCRIBER_PARSER_VERSION,
+                            Some(background_task_id),
+                            failure_message.as_str(),
+                        )
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+        }
+    }
+
+    Ok(persisted)
+}
+
+async fn index_derived_artifact_targets(
+    state: &AppState,
+    session: &ConsoleSession,
+    session_id: &str,
+    artifact: &media::MediaArtifactPayload,
+    record: &media::MediaDerivedArtifactRecord,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let Some(content_text) = record.content_text.as_deref() else {
+        return Ok(());
+    };
+
+    if let Some(memory_item_id) = record.memory_item_id.as_deref() {
+        let _ = state
+            .runtime
+            .delete_memory_item(
+                memory_item_id.to_owned(),
+                session.context.principal.clone(),
+                session.context.channel.clone(),
+            )
+            .await;
+    }
+
+    let workspace_content = format!(
+        "source_artifact_id: {}\nkind: {}\nfilename: {}\ncontent_type: {}\n\n{}",
+        artifact.artifact_id, record.kind, artifact.filename, artifact.content_type, content_text
+    );
+    let workspace_record = state
+        .runtime
+        .upsert_workspace_document(journal::WorkspaceDocumentWriteRequest {
+            document_id: record.workspace_document_id.clone(),
+            principal: session.context.principal.clone(),
+            channel: session.context.channel.clone(),
+            agent_id: None,
+            session_id: Some(session_id.to_owned()),
+            path: format!("attachments/{}/{}/{}.md", session_id, artifact.artifact_id, record.kind),
+            title: Some(format!("{} ({})", artifact.filename, record.kind)),
+            content_text: workspace_content.clone(),
+            template_id: None,
+            template_version: None,
+            template_content_hash: None,
+            source_memory_id: None,
+            manual_override: false,
+        })
+        .await?;
+    let memory_id = record.memory_item_id.clone().unwrap_or_else(|| Ulid::new().to_string());
+    let _memory_item = state
+        .runtime
+        .ingest_memory_item(journal::MemoryItemCreateRequest {
+            memory_id: memory_id.clone(),
+            principal: session.context.principal.clone(),
+            channel: session.context.channel.clone(),
+            session_id: Some(session_id.to_owned()),
+            source: journal::MemorySource::Import,
+            content_text: workspace_content,
+            tags: vec![
+                "attachment".to_owned(),
+                format!("artifact:{}", artifact.artifact_id),
+                format!("derived:{}", record.kind),
+            ],
+            confidence: None,
+            ttl_unix_ms: None,
+        })
+        .await?;
+    state
+        .channels
+        .link_derived_artifact_targets(
+            record.derived_artifact_id.as_str(),
+            Some(workspace_record.document_id.as_str()),
+            Some(memory_id.as_str()),
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 fn build_console_chat_message_envelope(
