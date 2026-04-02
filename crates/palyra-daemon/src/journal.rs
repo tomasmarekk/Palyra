@@ -6266,7 +6266,7 @@ fn load_workspace_document_by_id(
         "#,
     )?;
     statement
-        .query_row(params![document_id], |row| map_workspace_document_row(row))
+        .query_row(params![document_id], map_workspace_document_row)
         .optional()
         .map_err(Into::into)
 }
