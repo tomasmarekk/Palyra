@@ -2,9 +2,11 @@ import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } f
 import { useSearchParams } from "react-router-dom";
 
 import type {
+  ChatAttachmentRecord,
   ChatBackgroundTaskRecord,
   ChatCheckpointRecord,
   ChatCompactionArtifactRecord,
+  MediaDerivedArtifactRecord,
   ChatPinRecord,
   ChatQueuedInputRecord,
   ChatTranscriptRecord,
@@ -14,6 +16,7 @@ import type {
 import { type DetailPanelState, type TranscriptSearchMatch } from "./ChatInspectorColumn";
 import { ChatConsoleWorkspaceView } from "./ChatConsoleWorkspaceView";
 import {
+  buildDetailFromDerivedArtifact,
   buildDetailFromLiveEntry,
   buildDetailFromSearchMatch,
   buildDetailFromTranscriptRecord,
@@ -80,6 +83,10 @@ export function ChatConsolePanel({
   const [commandBusy, setCommandBusy] = useState<string | null>(null);
   const [transcriptBusy, setTranscriptBusy] = useState(false);
   const [transcriptRecords, setTranscriptRecords] = useState<ChatTranscriptRecord[]>([]);
+  const [sessionAttachments, setSessionAttachments] = useState<ChatAttachmentRecord[]>([]);
+  const [sessionDerivedArtifacts, setSessionDerivedArtifacts] = useState<
+    MediaDerivedArtifactRecord[]
+  >([]);
   const [sessionPins, setSessionPins] = useState<ChatPinRecord[]>([]);
   const [compactions, setCompactions] = useState<ChatCompactionArtifactRecord[]>([]);
   const [checkpoints, setCheckpoints] = useState<ChatCheckpointRecord[]>([]);
@@ -244,6 +251,8 @@ export function ChatConsolePanel({
 
     if (sessionId.length === 0) {
       setTranscriptRecords([]);
+      setSessionAttachments([]);
+      setSessionDerivedArtifacts([]);
       setSessionPins([]);
       setCompactions([]);
       setCheckpoints([]);
@@ -260,6 +269,8 @@ export function ChatConsolePanel({
       }
       sessions.upsertSession(response.session);
       setTranscriptRecords(response.records);
+      setSessionAttachments(response.attachments);
+      setSessionDerivedArtifacts(response.derived_artifacts);
       setSessionPins(response.pins);
       setCompactions(response.compactions);
       setCheckpoints(response.checkpoints);
@@ -349,6 +360,8 @@ export function ChatConsolePanel({
     if (sessionId.length === 0) {
       sessionSwitchRef.current = "";
       setTranscriptRecords([]);
+      setSessionAttachments([]);
+      setSessionDerivedArtifacts([]);
       setSessionPins([]);
       setCompactions([]);
       setCheckpoints([]);
@@ -367,6 +380,8 @@ export function ChatConsolePanel({
       setDetailPanel(null);
       setTranscriptSearchResults([]);
       setAttachments([]);
+      setSessionAttachments([]);
+      setSessionDerivedArtifacts([]);
       setPhase4BusyKey(null);
       resetRecallPreview();
     }
@@ -405,6 +420,8 @@ export function ChatConsolePanel({
     setDetailPanel(null);
     setTranscriptSearchResults([]);
     setAttachments([]);
+    setSessionAttachments([]);
+    setSessionDerivedArtifacts([]);
     void refreshSessionTranscript();
     setNotice("Session reset applied. Local transcript cleared.");
   }
@@ -418,6 +435,8 @@ export function ChatConsolePanel({
     setDetailPanel(null);
     setTranscriptSearchResults([]);
     setAttachments([]);
+    setSessionAttachments([]);
+    setSessionDerivedArtifacts([]);
     setNotice("Session archived. Local transcript cleared.");
   }
 
@@ -452,7 +471,7 @@ export function ChatConsolePanel({
       {
         attachments: attachments.map((attachment) => ({ artifact_id: attachment.artifact_id })),
         attachment_summaries: attachments.map((attachment) => ({
-          id: attachment.local_id,
+          id: attachment.artifact_id,
           filename: attachment.filename,
           kind: attachment.kind,
           size_bytes: attachment.size_bytes,
@@ -844,6 +863,53 @@ export function ChatConsolePanel({
     setDetailPanel(buildDetailFromSearchMatch(match));
   }
 
+  function inspectDerivedArtifact(derivedArtifactId: string): void {
+    const derivedArtifact = sessionDerivedArtifacts.find(
+      (record) => record.derived_artifact_id === derivedArtifactId,
+    );
+    if (derivedArtifact === undefined) {
+      setError("Derived artifact is no longer available.");
+      return;
+    }
+    const attachment = sessionAttachments.find(
+      (record) => record.artifact_id === derivedArtifact.source_artifact_id,
+    );
+    setDetailPanel(buildDetailFromDerivedArtifact(derivedArtifact, attachment));
+  }
+
+  async function runDerivedArtifactAction(
+    derivedArtifactId: string,
+    action: "recompute" | "quarantine" | "release" | "purge",
+  ): Promise<void> {
+    setPhase4BusyKey(`derived:${action}:${derivedArtifactId}`);
+    setError(null);
+    setNotice(null);
+    try {
+      switch (action) {
+        case "recompute":
+          await api.recomputeDerivedArtifact(derivedArtifactId);
+          break;
+        case "quarantine":
+          await api.quarantineDerivedArtifact(derivedArtifactId, {
+            reason: "Quarantined from chat session surface.",
+          });
+          break;
+        case "release":
+          await api.releaseDerivedArtifact(derivedArtifactId);
+          break;
+        case "purge":
+          await api.purgeDerivedArtifact(derivedArtifactId);
+          break;
+      }
+      await refreshSessionTranscript();
+      setNotice(`Derived artifact action applied: ${action}.`);
+    } catch (error) {
+      setError(toErrorMessage(error));
+    } finally {
+      setPhase4BusyKey(null);
+    }
+  }
+
   return (
     <main className="workspace-page chat-workspace">
       <input
@@ -1031,6 +1097,8 @@ export function ChatConsolePanel({
         transcriptBusy={transcriptBusy}
         transcriptProps={{
           visibleTranscript,
+          sessionAttachments,
+          sessionDerivedArtifacts,
           hiddenTranscriptItems,
           transcriptBoxRef,
           approvalDrafts,
@@ -1042,6 +1110,10 @@ export function ChatConsolePanel({
           },
           openRunDetails,
           inspectPayload: inspectLiveEntry,
+          inspectDerivedArtifact,
+          runDerivedArtifactAction: (derivedArtifactId, action) => {
+            void runDerivedArtifactAction(derivedArtifactId, action);
+          },
         }}
       />
     </main>

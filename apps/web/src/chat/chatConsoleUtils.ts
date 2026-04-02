@@ -1,11 +1,13 @@
 import type {
   ChatBackgroundTaskRecord,
+  ChatAttachmentRecord,
   ChatCheckpointRecord,
   ChatCompactionArtifactRecord,
   ChatRunStatusRecord,
   ChatTranscriptRecord,
   ConsoleApiClient,
   JsonValue,
+  MediaDerivedArtifactRecord,
 } from "../consoleApi";
 
 import type { DetailPanelState, TranscriptSearchMatch } from "./ChatInspectorColumn";
@@ -114,6 +116,26 @@ export function buildDetailFromBackgroundTask(
   };
 }
 
+export function buildDetailFromDerivedArtifact(
+  derivedArtifact: MediaDerivedArtifactRecord,
+  attachment?: ChatAttachmentRecord,
+): DetailPanelState {
+  return {
+    id: `derived-${derivedArtifact.derived_artifact_id}`,
+    title: `${derivedArtifact.kind} · ${derivedArtifact.filename}`,
+    subtitle: `${derivedArtifact.state} · ${derivedArtifact.parser_name}@${derivedArtifact.parser_version}`,
+    body:
+      derivedArtifact.summary_text ??
+      derivedArtifact.failure_reason ??
+      derivedArtifact.quarantine_reason ??
+      derivedArtifact.content_text,
+    payload: {
+      derived_artifact: derivedArtifact as unknown as JsonValue,
+      attachment: attachment as unknown as JsonValue,
+    },
+  };
+}
+
 export function downloadTextFile(filename: string, content: string, mimeType: string): void {
   const blob = new Blob([content], { type: mimeType });
   const href = URL.createObjectURL(blob);
@@ -157,6 +179,7 @@ export async function uploadComposerAttachments(
       local_id: `${response.attachment.artifact_id}-${Date.now()}`,
       ...response.attachment,
       preview_url: response.attachment.kind === "image" ? dataUrl : undefined,
+      derived_artifacts: response.derived_artifacts,
     });
   }
   return nextAttachments;

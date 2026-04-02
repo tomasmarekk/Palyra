@@ -1,10 +1,13 @@
 import { ActionButton, EmptyState, StatusChip } from "../console/components/ui";
 import { A2uiRenderer, type A2uiDocument } from "../a2ui";
+import type { ChatAttachmentRecord, MediaDerivedArtifactRecord } from "../consoleApi";
 
 import { ApprovalRequestControls, type ApprovalDraft, type TranscriptEntry } from "./chatShared";
 
 type ChatTranscriptProps = {
   visibleTranscript: TranscriptEntry[];
+  sessionAttachments?: ChatAttachmentRecord[];
+  sessionDerivedArtifacts?: MediaDerivedArtifactRecord[];
   hiddenTranscriptItems: number;
   transcriptBoxRef: React.RefObject<HTMLDivElement | null>;
   approvalDrafts: Record<string, ApprovalDraft>;
@@ -14,10 +17,17 @@ type ChatTranscriptProps = {
   decideInlineApproval: (approvalId: string, approved: boolean) => void;
   openRunDetails: (runId: string) => void;
   inspectPayload: (entry: TranscriptEntry) => void;
+  inspectDerivedArtifact?: (derivedArtifactId: string) => void;
+  runDerivedArtifactAction?: (
+    derivedArtifactId: string,
+    action: "recompute" | "quarantine" | "release" | "purge",
+  ) => void;
 };
 
 export function ChatTranscript({
   visibleTranscript,
+  sessionAttachments = [],
+  sessionDerivedArtifacts = [],
   hiddenTranscriptItems,
   transcriptBoxRef,
   approvalDrafts,
@@ -27,7 +37,10 @@ export function ChatTranscript({
   decideInlineApproval,
   openRunDetails,
   inspectPayload,
+  inspectDerivedArtifact = () => undefined,
+  runDerivedArtifactAction = () => undefined,
 }: ChatTranscriptProps) {
+  const derivedBySource = groupDerivedArtifactsBySource(sessionDerivedArtifacts);
   return (
     <>
       {hiddenTranscriptItems > 0 && (
@@ -36,6 +49,100 @@ export function ChatTranscript({
           rendered.
         </p>
       )}
+
+      {sessionAttachments.length > 0 ? (
+        <div className="chat-attachment-list" aria-label="Session attachments">
+          {sessionAttachments.map((attachment) => {
+            const derivedArtifacts = derivedBySource.get(attachment.artifact_id) ?? [];
+            return (
+              <article key={attachment.artifact_id} className="chat-attachment-card">
+                <div className="chat-attachment-card__icon">{attachment.kind}</div>
+                <div className="chat-attachment-card__copy">
+                  <strong>{attachment.filename}</strong>
+                  <span>
+                    {attachment.kind} · {attachment.size_bytes.toLocaleString()} bytes ·{" "}
+                    {attachment.declared_content_type}
+                  </span>
+                  {derivedArtifacts.length > 0 ? (
+                    <div className="workspace-inline-actions">
+                      {derivedArtifacts.map((derivedArtifact) => (
+                        <StatusChip
+                          key={derivedArtifact.derived_artifact_id}
+                          tone={toneForDerivedArtifactState(derivedArtifact.state)}
+                        >
+                          {derivedArtifact.kind} · {derivedArtifact.state}
+                        </StatusChip>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="chat-muted">Derived output not available yet.</p>
+                  )}
+                </div>
+                <div className="chat-entry-actions">
+                  {derivedArtifacts.map((derivedArtifact) => (
+                    <div key={derivedArtifact.derived_artifact_id} className="workspace-inline-actions">
+                      <ActionButton
+                        size="sm"
+                        type="button"
+                        variant="secondary"
+                        onPress={() => inspectDerivedArtifact(derivedArtifact.derived_artifact_id)}
+                      >
+                        Open {derivedArtifact.kind}
+                      </ActionButton>
+                      <ActionButton
+                        size="sm"
+                        type="button"
+                        variant="ghost"
+                        onPress={() =>
+                          runDerivedArtifactAction(derivedArtifact.derived_artifact_id, "recompute")
+                        }
+                      >
+                        Recompute
+                      </ActionButton>
+                      {derivedArtifact.state === "quarantined" ? (
+                        <ActionButton
+                          size="sm"
+                          type="button"
+                          variant="ghost"
+                          onPress={() =>
+                            runDerivedArtifactAction(derivedArtifact.derived_artifact_id, "release")
+                          }
+                        >
+                          Release
+                        </ActionButton>
+                      ) : (
+                        <ActionButton
+                          size="sm"
+                          type="button"
+                          variant="ghost"
+                          onPress={() =>
+                            runDerivedArtifactAction(
+                              derivedArtifact.derived_artifact_id,
+                              "quarantine",
+                            )
+                          }
+                        >
+                          Quarantine
+                        </ActionButton>
+                      )}
+                      <ActionButton
+                        size="sm"
+                        type="button"
+                        variant="danger"
+                        onPress={() =>
+                          runDerivedArtifactAction(derivedArtifact.derived_artifact_id, "purge")
+                        }
+                      >
+                        Purge
+                      </ActionButton>
+                    </div>
+                  ))}
+                </div>
+              </article>
+            );
+          })}
+        </div>
+      ) : null}
 
       <div className="chat-transcript" ref={transcriptBoxRef} role="log" aria-live="polite">
         {visibleTranscript.length === 0 ? (
@@ -149,4 +256,32 @@ export function ChatTranscript({
       </div>
     </>
   );
+}
+
+function groupDerivedArtifactsBySource(
+  derivedArtifacts: readonly MediaDerivedArtifactRecord[],
+): Map<string, MediaDerivedArtifactRecord[]> {
+  const grouped = new Map<string, MediaDerivedArtifactRecord[]>();
+  for (const derivedArtifact of derivedArtifacts) {
+    const existing = grouped.get(derivedArtifact.source_artifact_id) ?? [];
+    existing.push(derivedArtifact);
+    grouped.set(derivedArtifact.source_artifact_id, existing);
+  }
+  return grouped;
+}
+
+function toneForDerivedArtifactState(
+  state: string,
+): "default" | "accent" | "success" | "warning" | "danger" {
+  switch (state) {
+    case "succeeded":
+      return "success";
+    case "quarantined":
+      return "warning";
+    case "failed":
+    case "purged":
+      return "danger";
+    default:
+      return "default";
+  }
 }

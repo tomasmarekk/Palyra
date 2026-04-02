@@ -302,6 +302,19 @@ export function ChatComposer({
                     {attachment.kind} · {attachment.size_bytes.toLocaleString()} bytes ·{" "}
                     {attachment.budget_tokens.toLocaleString()} token budget
                   </span>
+                  {attachment.derived_artifacts !== undefined &&
+                  attachment.derived_artifacts.length > 0 ? (
+                    <div className="workspace-inline-actions">
+                      {attachment.derived_artifacts.map((derivedArtifact) => (
+                        <StatusChip
+                          key={derivedArtifact.derived_artifact_id}
+                          tone={toneForDerivedArtifactState(derivedArtifact.state)}
+                        >
+                          {derivedArtifact.kind} · {derivedArtifact.state}
+                        </StatusChip>
+                      ))}
+                    </div>
+                  ) : null}
                 </div>
                 <ActionButton
                   size="sm"
@@ -416,4 +429,20 @@ function formatPreviewScore(hit: Record<string, unknown>): string {
   }
   const breakdownScore = readNumberValue(readRecord(hit, "breakdown"), "final_score");
   return breakdownScore === undefined ? "n/a" : breakdownScore.toFixed(2);
+}
+
+function toneForDerivedArtifactState(
+  state: string,
+): "default" | "accent" | "success" | "warning" | "danger" {
+  switch (state) {
+    case "succeeded":
+      return "success";
+    case "quarantined":
+      return "warning";
+    case "failed":
+    case "purged":
+      return "danger";
+    default:
+      return "default";
+  }
 }

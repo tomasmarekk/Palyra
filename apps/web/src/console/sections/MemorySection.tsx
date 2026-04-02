@@ -47,6 +47,7 @@ type MemorySectionProps = {
     | "memoryWorkspaceSearchQuery"
     | "setMemoryWorkspaceSearchQuery"
     | "memoryWorkspaceHits"
+    | "memoryDerivedArtifacts"
     | "memorySearchAllQuery"
     | "setMemorySearchAllQuery"
     | "memorySearchAllResults"
@@ -76,10 +77,13 @@ type GroupedResultsSectionProps = {
 
 export function MemorySection({ app }: MemorySectionProps) {
   const [confirmingPurge, setConfirmingPurge] = useState(false);
+  const [selectedDerivedArtifactId, setSelectedDerivedArtifactId] = useState<string | null>(null);
   const usage = readObject(app.memoryStatus ?? {}, "usage");
   const retention = readObject(app.memoryStatus ?? {}, "retention");
   const maintenance = readObject(app.memoryStatus ?? {}, "maintenance");
   const workspace = readObject(app.memoryStatus ?? {}, "workspace");
+  const derived = readObject(app.memoryStatus ?? {}, "derived");
+  const derivedRecord = derived ?? EMPTY_OBJECT;
   const workspaceRoots = readStringArray(workspace, "roots");
   const curatedPaths = readStringArray(workspace, "curated_paths");
   const selectedDocument = useMemo(
@@ -113,6 +117,15 @@ export function MemorySection({ app }: MemorySectionProps) {
   const unifiedMemoryHits = readObjectArray(unifiedGroups, "memory");
   const unifiedCounts =
     readObject(app.memorySearchAllResults ?? EMPTY_OBJECT, "counts") ?? EMPTY_OBJECT;
+  const selectedDerivedArtifact = useMemo(
+    () =>
+      app.memoryDerivedArtifacts.find(
+        (artifact) => readString(artifact, "derived_artifact_id") === selectedDerivedArtifactId,
+      ) ?? null,
+    [app.memoryDerivedArtifacts, selectedDerivedArtifactId],
+  );
+  const selectedDerivedWarnings = readObjectArray(selectedDerivedArtifact, "warnings");
+  const selectedDerivedAnchors = readObjectArray(selectedDerivedArtifact, "anchors");
 
   return (
     <main className="workspace-page">
@@ -129,6 +142,11 @@ export function MemorySection({ app }: MemorySectionProps) {
             </WorkspaceStatusChip>
             <WorkspaceStatusChip tone={app.memoryHits.length > 0 ? "success" : "default"}>
               {app.memoryHits.length} recall hits
+            </WorkspaceStatusChip>
+            <WorkspaceStatusChip
+              tone={(readNumber(derivedRecord, "failed") ?? 0) > 0 ? "warning" : "default"}
+            >
+              {readNumber(derivedRecord, "total") ?? 0} derived artifacts
             </WorkspaceStatusChip>
             <WorkspaceStatusChip
               tone={
@@ -181,6 +199,12 @@ export function MemorySection({ app }: MemorySectionProps) {
           detail="Workspace docs surfaced in the recent-docs panel."
           label="Recent docs"
           value={app.memoryWorkspaceDocuments.length}
+        />
+        <WorkspaceMetricCard
+          detail="Derived attachment artifacts currently tracked across extraction and transcription."
+          label="Derived artifacts"
+          tone={(readNumber(derivedRecord, "failed") ?? 0) > 0 ? "warning" : "accent"}
+          value={readNumber(derivedRecord, "total") ?? 0}
         />
         <WorkspaceMetricCard
           detail="Retention policy remains visible so recall and purge stay deliberate."
@@ -287,6 +311,177 @@ export function MemorySection({ app }: MemorySectionProps) {
                 })}
               </div>
             )}
+          </WorkspaceSectionCard>
+          <WorkspaceSectionCard
+            description="Keep extraction/transcription health visible so quarantined, failed, or purged derived artifacts do not silently disappear from operator workflows."
+            title="Derived artifact health"
+          >
+            <dl className="workspace-key-value-grid">
+              <div>
+                <dt>Succeeded</dt>
+                <dd>{readNumber(derivedRecord, "succeeded") ?? 0}</dd>
+              </div>
+              <div>
+                <dt>Failed</dt>
+                <dd>{readNumber(derivedRecord, "failed") ?? 0}</dd>
+              </div>
+              <div>
+                <dt>Quarantined</dt>
+                <dd>{readNumber(derivedRecord, "quarantined") ?? 0}</dd>
+              </div>
+              <div>
+                <dt>Purged</dt>
+                <dd>{readNumber(derivedRecord, "purged") ?? 0}</dd>
+              </div>
+              <div>
+                <dt>Needs recompute</dt>
+                <dd>{readNumber(derivedRecord, "recompute_required") ?? 0}</dd>
+              </div>
+              <div>
+                <dt>Orphaned</dt>
+                <dd>{readNumber(derivedRecord, "orphaned") ?? 0}</dd>
+              </div>
+            </dl>
+          </WorkspaceSectionCard>
+          <WorkspaceSectionCard
+            description="When a workspace document was generated from an attachment, its derived extraction and transcription outputs stay visible here with parser provenance and lifecycle state."
+            title="Linked derived artifacts"
+          >
+            {app.memoryDerivedArtifacts.length === 0 ? (
+              <WorkspaceEmptyState
+                compact
+                description="Open a workspace document backed by an attachment-derived document to inspect linked extraction and transcription outputs."
+                title="No linked derived artifacts"
+              />
+            ) : (
+              <div className="chat-ops-list">
+                {app.memoryDerivedArtifacts.map((artifact, index) => (
+                  <article
+                    key={readString(artifact, "derived_artifact_id") ?? `derived-${index}`}
+                    className="chat-ops-card"
+                  >
+                    <div className="chat-ops-card__copy">
+                      <strong>{readString(artifact, "filename") ?? `derived-${index + 1}`}</strong>
+                      <span>
+                        {readString(artifact, "kind") ?? "derived"} ·{" "}
+                        {readString(artifact, "state") ?? "unknown"} ·{" "}
+                        {readString(artifact, "parser_name") ?? "parser"}@
+                        {readString(artifact, "parser_version") ?? "n/a"}
+                      </span>
+                      <p>
+                        {readString(artifact, "summary_text") ??
+                          readString(artifact, "failure_reason") ??
+                          readString(artifact, "quarantine_reason") ??
+                          readString(artifact, "content_text") ??
+                          "No preview returned."}
+                      </p>
+                    </div>
+                    <div className="chat-ops-card__actions">
+                      <WorkspaceStatusChip
+                        tone={workspaceToneForState(readString(artifact, "state") ?? "draft")}
+                      >
+                        {readString(artifact, "state") ?? "unknown"}
+                      </WorkspaceStatusChip>
+                      <ActionButton
+                        size="sm"
+                        type="button"
+                        variant="secondary"
+                        onPress={() =>
+                          setSelectedDerivedArtifactId(
+                            readString(artifact, "derived_artifact_id") ?? null,
+                          )
+                        }
+                      >
+                        Open
+                      </ActionButton>
+                      <span className="chat-muted">
+                        {formatUnixMs(readNumber(artifact, "updated_at_unix_ms"))}
+                      </span>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            )}
+            {selectedDerivedArtifact !== null ? (
+              <div className="workspace-stack">
+                <div className="workspace-panel__intro">
+                  <p className="workspace-kicker">Inspector</p>
+                  <h3>
+                    {readString(selectedDerivedArtifact, "kind") ?? "derived artifact"} ·{" "}
+                    {readString(selectedDerivedArtifact, "filename") ?? "artifact"}
+                  </h3>
+                  <p className="chat-muted">
+                    {readString(selectedDerivedArtifact, "state") ?? "unknown"} ·{" "}
+                    {readString(selectedDerivedArtifact, "parser_name") ?? "parser"}@
+                    {readString(selectedDerivedArtifact, "parser_version") ?? "n/a"}
+                  </p>
+                </div>
+                <dl className="workspace-key-value-grid">
+                  <div>
+                    <dt>Source artifact</dt>
+                    <dd>{readString(selectedDerivedArtifact, "source_artifact_id") ?? "n/a"}</dd>
+                  </div>
+                  <div>
+                    <dt>Attachment</dt>
+                    <dd>{readString(selectedDerivedArtifact, "attachment_id") ?? "n/a"}</dd>
+                  </div>
+                  <div>
+                    <dt>Workspace doc</dt>
+                    <dd>{readString(selectedDerivedArtifact, "workspace_document_id") ?? "n/a"}</dd>
+                  </div>
+                  <div>
+                    <dt>Memory item</dt>
+                    <dd>{readString(selectedDerivedArtifact, "memory_item_id") ?? "n/a"}</dd>
+                  </div>
+                  <div>
+                    <dt>Background task</dt>
+                    <dd>{readString(selectedDerivedArtifact, "background_task_id") ?? "n/a"}</dd>
+                  </div>
+                  <div>
+                    <dt>Updated</dt>
+                    <dd>
+                      {formatUnixMs(readNumber(selectedDerivedArtifact, "updated_at_unix_ms"))}
+                    </dd>
+                  </div>
+                </dl>
+                {selectedDerivedWarnings.length > 0 ? (
+                  <WorkspaceInlineNotice title="Parser warnings" tone="warning">
+                    <ul className="chat-list">
+                      {selectedDerivedWarnings.map((warning, index) => (
+                        <li key={readString(warning, "code") ?? `warning-${index}`}>
+                          <strong>{readString(warning, "code") ?? "warning"}</strong>:{" "}
+                          {readString(warning, "message") ?? "No warning message returned."}
+                        </li>
+                      ))}
+                    </ul>
+                  </WorkspaceInlineNotice>
+                ) : null}
+                {selectedDerivedAnchors.length > 0 ? (
+                  <div className="workspace-stack">
+                    <div className="workspace-panel__intro">
+                      <p className="workspace-kicker">Anchors</p>
+                      <h3>Structured provenance</h3>
+                    </div>
+                    <WorkspaceTable ariaLabel="Derived artifact anchors" columns={["Label", "Kind", "Locator"]}>
+                      {selectedDerivedAnchors.map((anchor, index) => (
+                        <tr key={readString(anchor, "label") ?? `anchor-${index}`}>
+                          <td>{readString(anchor, "label") ?? `Anchor ${index + 1}`}</td>
+                          <td>{readString(anchor, "kind") ?? "section"}</td>
+                          <td>{readString(anchor, "locator") ?? "n/a"}</td>
+                        </tr>
+                      ))}
+                    </WorkspaceTable>
+                  </div>
+                ) : null}
+                <pre className="chat-detail-panel__payload">
+                  {readString(selectedDerivedArtifact, "content_text") ??
+                    readString(selectedDerivedArtifact, "summary_text") ??
+                    readString(selectedDerivedArtifact, "failure_reason") ??
+                    readString(selectedDerivedArtifact, "quarantine_reason") ??
+                    "No derived content returned."}
+                </pre>
+              </div>
+            ) : null}
           </WorkspaceSectionCard>
           <WorkspaceSectionCard
             description="Read or write a workspace document directly from the console. Path is the durable identifier, title stays operator-friendly."

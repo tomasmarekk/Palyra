@@ -202,6 +202,100 @@ describe("Chat web UX primitives", () => {
     );
     expect(document.querySelector("iframe[src='/console/v1/diagnostics?token=evil']")).toBeNull();
   });
+
+  it("renders derived attachment actions and forwards lifecycle callbacks", () => {
+    const inspectDerivedArtifact = vi.fn();
+    const runDerivedArtifactAction = vi.fn();
+
+    render(
+      <ChatTranscript
+        visibleTranscript={[]}
+        sessionAttachments={[
+          {
+            artifact_id: "01ARZ3NDEKTSV4RRFFQ69G5FAA",
+            attachment_id: "att-1",
+            filename: "meeting-notes.txt",
+            declared_content_type: "text/plain",
+            content_hash: "sha256:abc",
+            size_bytes: 2_048,
+            kind: "file",
+            budget_tokens: 512,
+          },
+        ]}
+        sessionDerivedArtifacts={[
+          {
+            derived_artifact_id: "01ARZ3NDEKTSV4RRFFQ69G5FZZ",
+            source_artifact_id: "01ARZ3NDEKTSV4RRFFQ69G5FAA",
+            attachment_id: "att-1",
+            session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            principal: "operator",
+            device_id: "device-1",
+            channel: "discord:channel:test",
+            filename: "meeting-notes.txt",
+            declared_content_type: "text/plain",
+            kind: "extracted_text",
+            state: "succeeded",
+            parser_name: "attachment-document-extractor",
+            parser_version: "1",
+            source_content_hash: "sha256:abc",
+            content_hash: "sha256:def",
+            content_text: "Structured meeting notes",
+            summary_text: "Structured meeting notes",
+            language: "en",
+            duration_ms: undefined,
+            processing_ms: 12,
+            warnings: [],
+            anchors: [],
+            failure_reason: undefined,
+            quarantine_reason: undefined,
+            workspace_document_id: undefined,
+            memory_item_id: undefined,
+            background_task_id: "01ARZ3NDEKTSV4RRFFQ69G5FXY",
+            recompute_required: false,
+            orphaned: false,
+            created_at_unix_ms: 100,
+            updated_at_unix_ms: 120,
+            purged_at_unix_ms: undefined,
+          },
+        ]}
+        hiddenTranscriptItems={0}
+        transcriptBoxRef={{ current: null }}
+        approvalDrafts={{}}
+        a2uiDocuments={{}}
+        selectedDetailId={null}
+        updateApprovalDraft={vi.fn()}
+        decideInlineApproval={vi.fn()}
+        openRunDetails={vi.fn()}
+        inspectPayload={vi.fn()}
+        inspectDerivedArtifact={inspectDerivedArtifact}
+        runDerivedArtifactAction={runDerivedArtifactAction}
+      />,
+    );
+
+    expect(screen.getByText("meeting-notes.txt")).toBeInTheDocument();
+    expect(screen.getByText("extracted_text · succeeded")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open extracted_text" }));
+    expect(inspectDerivedArtifact).toHaveBeenCalledWith("01ARZ3NDEKTSV4RRFFQ69G5FZZ");
+
+    fireEvent.click(screen.getByRole("button", { name: "Recompute" }));
+    expect(runDerivedArtifactAction).toHaveBeenCalledWith(
+      "01ARZ3NDEKTSV4RRFFQ69G5FZZ",
+      "recompute",
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Quarantine" }));
+    expect(runDerivedArtifactAction).toHaveBeenCalledWith(
+      "01ARZ3NDEKTSV4RRFFQ69G5FZZ",
+      "quarantine",
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Purge" }));
+    expect(runDerivedArtifactAction).toHaveBeenCalledWith(
+      "01ARZ3NDEKTSV4RRFFQ69G5FZZ",
+      "purge",
+    );
+  });
 });
 
 function sampleAttachment(): ComposerAttachment {

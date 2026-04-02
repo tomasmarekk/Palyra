@@ -445,6 +445,7 @@ export function useConsoleAppState() {
   const [memorySearchAllQuery, setMemorySearchAllQuery] = useState("");
   const [memorySearchAllResults, setMemorySearchAllResults] = useState<JsonObject | null>(null);
   const [memoryRecallPreview, setMemoryRecallPreview] = useState<JsonObject | null>(null);
+  const [memoryDerivedArtifacts, setMemoryDerivedArtifacts] = useState<JsonObject[]>([]);
 
   const [skillsBusy, setSkillsBusy] = useState(false);
   const [skillsEntries, setSkillsEntries] = useState<JsonObject[]>([]);
@@ -1112,7 +1113,10 @@ export function useConsoleAppState() {
       setMemoryWorkspaceNextPath(response.document.path);
       setMemoryWorkspaceTitle(response.document.title);
       setMemoryWorkspaceContent(response.document.content_text);
-      await loadWorkspaceDocumentVersions(response.document.path);
+      await Promise.all([
+        loadWorkspaceDocumentVersions(response.document.path),
+        loadWorkspaceDerivedArtifacts(response.document.document_id),
+      ]);
     } catch (failure) {
       setError(toErrorMessage(failure));
     } finally {
@@ -1146,6 +1150,7 @@ export function useConsoleAppState() {
       await Promise.all([
         refreshWorkspaceDocuments(),
         loadWorkspaceDocumentVersions(response.document.path),
+        loadWorkspaceDerivedArtifacts(response.document.document_id),
         refreshMemoryStatus(),
       ]);
     } catch (failure) {
@@ -1168,6 +1173,23 @@ export function useConsoleAppState() {
       setError(toErrorMessage(failure));
     } finally {
       setMemoryBusy(false);
+    }
+  }
+
+  async function loadWorkspaceDerivedArtifacts(documentId: string): Promise<void> {
+    const trimmed = documentId.trim();
+    if (trimmed.length === 0) {
+      setMemoryDerivedArtifacts([]);
+      return;
+    }
+    try {
+      const response = await api.listMemoryDerivedArtifacts({
+        workspace_document_id: trimmed,
+        limit: 24,
+      });
+      setMemoryDerivedArtifacts(toJsonObjectArray(response.derived_artifacts as unknown as JsonValue[]));
+    } catch (failure) {
+      setError(toErrorMessage(failure));
     }
   }
 
@@ -1913,6 +1935,7 @@ export function useConsoleAppState() {
     memoryWorkspaceSearchQuery,
     setMemoryWorkspaceSearchQuery,
     memoryWorkspaceHits,
+    memoryDerivedArtifacts,
     memorySearchAllQuery,
     setMemorySearchAllQuery,
     memorySearchAllResults,

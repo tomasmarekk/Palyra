@@ -8,7 +8,7 @@ import {
   SelectField,
   TextInputField,
 } from "../console/components/ui";
-import type { JsonValue, SessionCatalogRecord } from "../consoleApi";
+import type { JsonValue, MediaDerivedArtifactRecord, SessionCatalogRecord } from "../consoleApi";
 
 const SENSITIVE_KEY_PATTERN =
   /(secret|token|password|cookie|authorization|credential|api[-_]?key|private[-_]?key|vault[-_]?ref)/i;
@@ -45,6 +45,7 @@ export interface ComposerAttachment {
   readonly kind: "image" | "file" | "audio" | "video";
   readonly budget_tokens: number;
   readonly preview_url?: string;
+  readonly derived_artifacts?: readonly MediaDerivedArtifactRecord[];
 }
 
 export interface ContextBudgetSummary {

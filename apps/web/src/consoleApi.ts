@@ -419,6 +419,58 @@ export interface ChatAttachmentRecord {
   budget_tokens: number;
 }
 
+export interface MediaDerivedStatsSnapshot {
+  total: number;
+  pending: number;
+  succeeded: number;
+  failed: number;
+  quarantined: number;
+  purged: number;
+  recompute_required: number;
+  orphaned: number;
+}
+
+export interface MediaDerivedArtifactRecord {
+  derived_artifact_id: string;
+  source_artifact_id: string;
+  attachment_id?: string;
+  session_id?: string;
+  principal?: string;
+  device_id?: string;
+  channel?: string;
+  filename: string;
+  declared_content_type: string;
+  kind: string;
+  state: string;
+  parser_name: string;
+  parser_version: string;
+  source_content_hash: string;
+  content_hash?: string;
+  content_text?: string;
+  summary_text?: string;
+  language?: string;
+  duration_ms?: number;
+  processing_ms?: number;
+  warnings: Array<{ code: string; message: string }>;
+  anchors: Array<{
+    kind: string;
+    label: string;
+    locator?: string;
+    start_char: number;
+    end_char: number;
+  }>;
+  failure_reason?: string;
+  quarantine_reason?: string;
+  workspace_document_id?: string;
+  memory_item_id?: string;
+  background_task_id?: string;
+  recompute_required: boolean;
+  orphaned: boolean;
+  created_at_unix_ms: number;
+  updated_at_unix_ms: number;
+  purged_at_unix_ms?: number;
+}
+
 export interface WorkspaceDocumentRecord {
   document_id: string;
   principal: string;
@@ -1877,6 +1929,8 @@ export class ConsoleApiClient {
   async getSessionTranscript(sessionId: string): Promise<{
     session: SessionCatalogRecord;
     records: ChatTranscriptRecord[];
+    attachments: ChatAttachmentRecord[];
+    derived_artifacts: MediaDerivedArtifactRecord[];
     pins: ChatPinRecord[];
     compactions: ChatCompactionArtifactRecord[];
     checkpoints: ChatCheckpointRecord[];
@@ -2156,13 +2210,116 @@ export class ConsoleApiClient {
       content_type: string;
       bytes_base64: string;
     },
-  ): Promise<{ attachment: ChatAttachmentRecord; contract: ContractDescriptor }> {
+  ): Promise<{
+    attachment: ChatAttachmentRecord;
+    derived_artifacts: MediaDerivedArtifactRecord[];
+    task: ChatBackgroundTaskRecord;
+    contract: ContractDescriptor;
+  }> {
     return this.request(
       `/console/v1/chat/sessions/${encodeURIComponent(sessionId)}/attachments`,
       {
         method: "POST",
         body: JSON.stringify(payload),
       },
+      { csrf: true },
+    );
+  }
+
+  async listSessionDerivedArtifacts(
+    sessionId: string,
+    params?: { kind?: string; state?: string },
+  ): Promise<{
+    session: SessionCatalogRecord;
+    derived_artifacts: MediaDerivedArtifactRecord[];
+    contract: ContractDescriptor;
+  }> {
+    const query = new URLSearchParams();
+    if (params?.kind?.trim()) {
+      query.set("kind", params.kind.trim());
+    }
+    if (params?.state?.trim()) {
+      query.set("state", params.state.trim());
+    }
+    return this.request(
+      buildPathWithQuery(
+        `/console/v1/chat/sessions/${encodeURIComponent(sessionId)}/derived-artifacts`,
+        query,
+      ),
+    );
+  }
+
+  async listAttachmentDerivedArtifacts(artifactId: string): Promise<{
+    source_artifact_id: string;
+    derived_artifacts: MediaDerivedArtifactRecord[];
+    contract: ContractDescriptor;
+  }> {
+    return this.request(
+      `/console/v1/chat/attachments/${encodeURIComponent(artifactId)}/derived-artifacts`,
+    );
+  }
+
+  async getDerivedArtifact(derivedArtifactId: string): Promise<{
+    derived_artifact: MediaDerivedArtifactRecord;
+    contract: ContractDescriptor;
+  }> {
+    return this.request(
+      `/console/v1/chat/derived-artifacts/${encodeURIComponent(derivedArtifactId)}`,
+    );
+  }
+
+  async quarantineDerivedArtifact(
+    derivedArtifactId: string,
+    payload: { reason?: string } = {},
+  ): Promise<{
+    derived_artifact: MediaDerivedArtifactRecord;
+    action: string;
+    contract: ContractDescriptor;
+  }> {
+    return this.request(
+      `/console/v1/chat/derived-artifacts/${encodeURIComponent(derivedArtifactId)}/quarantine`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      { csrf: true },
+    );
+  }
+
+  async releaseDerivedArtifact(derivedArtifactId: string): Promise<{
+    derived_artifact: MediaDerivedArtifactRecord;
+    action: string;
+    contract: ContractDescriptor;
+  }> {
+    return this.request(
+      `/console/v1/chat/derived-artifacts/${encodeURIComponent(derivedArtifactId)}/release`,
+      { method: "POST" },
+      { csrf: true },
+    );
+  }
+
+  async recomputeDerivedArtifact(derivedArtifactId: string): Promise<{
+    task: ChatBackgroundTaskRecord;
+    derived_artifact: MediaDerivedArtifactRecord;
+    derived_artifacts: MediaDerivedArtifactRecord[];
+    action: string;
+    contract: ContractDescriptor;
+  }> {
+    return this.request(
+      `/console/v1/chat/derived-artifacts/${encodeURIComponent(derivedArtifactId)}/recompute`,
+      { method: "POST" },
+      { csrf: true },
+    );
+  }
+
+  async purgeDerivedArtifact(derivedArtifactId: string): Promise<{
+    derived_artifact: MediaDerivedArtifactRecord;
+    action: string;
+    contract: ContractDescriptor;
+  }> {
+    return this.request(
+      `/console/v1/chat/derived-artifacts/${encodeURIComponent(derivedArtifactId)}/purge`,
+      { method: "POST" },
       { csrf: true },
     );
   }
@@ -2634,6 +2791,29 @@ export class ConsoleApiClient {
       },
       { csrf: true },
     );
+  }
+
+  async listMemoryDerivedArtifacts(params: {
+    workspace_document_id?: string;
+    memory_item_id?: string;
+    limit?: number;
+  }): Promise<{
+    workspace_document_id?: string;
+    memory_item_id?: string;
+    derived_artifacts: MediaDerivedArtifactRecord[];
+    contract: ContractDescriptor;
+  }> {
+    const query = new URLSearchParams();
+    if (params.workspace_document_id?.trim()) {
+      query.set("workspace_document_id", params.workspace_document_id.trim());
+    }
+    if (params.memory_item_id?.trim()) {
+      query.set("memory_item_id", params.memory_item_id.trim());
+    }
+    if (params.limit !== undefined) {
+      query.set("limit", String(params.limit));
+    }
+    return this.request(buildPathWithQuery("/console/v1/memory/derived-artifacts", query));
   }
 
   async searchAll(params?: URLSearchParams): Promise<UnifiedSearchEnvelope> {
