@@ -27,6 +27,7 @@ import { DEFAULT_CRON_FORM, DEFAULT_LOGIN_FORM, type CronForm, type LoginForm } 
 import {
   emptyToUndefined,
   parseInteger,
+  readObject,
   readString,
   skillMetadata,
   toErrorMessage,
@@ -148,6 +149,12 @@ function clearDesktopHandoffTokenFromAddressBar(): void {
   current.searchParams.delete(DESKTOP_HANDOFF_QUERY_PARAM);
   const next = `${current.pathname}${current.search}${current.hash}`;
   window.history.replaceState(window.history.state, "", next);
+}
+
+function toWorkspaceSlug(value: string): string {
+  const normalized = value.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-");
+  const slug = normalized.replace(/^-+|-+$/g, "");
+  return slug.length > 0 ? slug : "promoted-memory";
 }
 
 export function useConsoleAppState() {
@@ -424,6 +431,17 @@ export function useConsoleAppState() {
   const [memoryHits, setMemoryHits] = useState<JsonObject[]>([]);
   const [memoryStatusBusy, setMemoryStatusBusy] = useState(false);
   const [memoryStatus, setMemoryStatus] = useState<JsonObject | null>(null);
+  const [memoryWorkspaceDocuments, setMemoryWorkspaceDocuments] = useState<JsonObject[]>([]);
+  const [memoryWorkspacePath, setMemoryWorkspacePath] = useState("README.md");
+  const [memoryWorkspaceNextPath, setMemoryWorkspaceNextPath] = useState("README.md");
+  const [memoryWorkspaceTitle, setMemoryWorkspaceTitle] = useState("");
+  const [memoryWorkspaceContent, setMemoryWorkspaceContent] = useState("");
+  const [memoryWorkspaceVersions, setMemoryWorkspaceVersions] = useState<JsonObject[]>([]);
+  const [memoryWorkspaceSearchQuery, setMemoryWorkspaceSearchQuery] = useState("");
+  const [memoryWorkspaceHits, setMemoryWorkspaceHits] = useState<JsonObject[]>([]);
+  const [memorySearchAllQuery, setMemorySearchAllQuery] = useState("");
+  const [memorySearchAllResults, setMemorySearchAllResults] = useState<JsonObject | null>(null);
+  const [memoryRecallPreview, setMemoryRecallPreview] = useState<JsonObject | null>(null);
 
   const [skillsBusy, setSkillsBusy] = useState(false);
   const [skillsEntries, setSkillsEntries] = useState<JsonObject[]>([]);
@@ -701,6 +719,7 @@ export function useConsoleAppState() {
     }
     if (section === "memory") {
       void refreshMemoryStatus();
+      void refreshWorkspaceDocuments();
     }
     if (section === "skills") {
       void refreshSkills();
@@ -758,6 +777,16 @@ export function useConsoleAppState() {
     setMemoryHits([]);
     setMemoryStatusBusy(false);
     setMemoryStatus(null);
+    setMemoryWorkspaceDocuments([]);
+    setMemoryWorkspacePath("README.md");
+    setMemoryWorkspaceTitle("");
+    setMemoryWorkspaceContent("");
+    setMemoryWorkspaceVersions([]);
+    setMemoryWorkspaceSearchQuery("");
+    setMemoryWorkspaceHits([]);
+    setMemorySearchAllQuery("");
+    setMemorySearchAllResults(null);
+    setMemoryRecallPreview(null);
 
     setSkillsBusy(false);
     setSkillsEntries([]);
@@ -1013,15 +1042,293 @@ export function useConsoleAppState() {
     setError(null);
     try {
       const response = await api.getMemoryStatus();
-      setMemoryStatus({
-        usage: response.usage,
-        retention: response.retention,
-        maintenance: response.maintenance,
-      });
+      setMemoryStatus(response as unknown as JsonObject);
+      if (response.workspace?.recent_documents !== undefined) {
+        setMemoryWorkspaceDocuments(
+          toJsonObjectArray(response.workspace.recent_documents as unknown as JsonValue[]),
+        );
+      }
     } catch (failure) {
       setError(toErrorMessage(failure));
     } finally {
       setMemoryStatusBusy(false);
+    }
+  }
+
+  async function refreshWorkspaceDocuments(): Promise<void> {
+    setMemoryBusy(true);
+    setError(null);
+    try {
+      const params = new URLSearchParams();
+      params.set("limit", "24");
+      const response = await api.listWorkspaceDocuments(params);
+      const documents = toJsonObjectArray(response.documents as unknown as JsonValue[]);
+      setMemoryWorkspaceDocuments(documents);
+      if (memoryWorkspaceTitle.trim().length === 0 && memoryWorkspaceContent.trim().length === 0) {
+        const firstPath = readString(documents[0], "path");
+        if (firstPath !== null) {
+          void selectWorkspaceDocument(firstPath);
+        }
+      }
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setMemoryBusy(false);
+    }
+  }
+
+  async function loadWorkspaceDocumentVersions(path: string): Promise<void> {
+    const trimmed = path.trim();
+    if (trimmed.length === 0) {
+      setMemoryWorkspaceVersions([]);
+      return;
+    }
+    try {
+      const params = new URLSearchParams();
+      params.set("path", trimmed);
+      params.set("limit", "12");
+      const response = await api.getWorkspaceDocumentVersions(params);
+      setMemoryWorkspaceVersions(toJsonObjectArray(response.versions as unknown as JsonValue[]));
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    }
+  }
+
+  async function selectWorkspaceDocument(path: string): Promise<void> {
+    const trimmed = path.trim();
+    if (trimmed.length === 0) {
+      return;
+    }
+    setMemoryBusy(true);
+    setError(null);
+    try {
+      const params = new URLSearchParams();
+      params.set("path", trimmed);
+      const response = await api.getWorkspaceDocument(params);
+      setMemoryWorkspacePath(response.document.path);
+      setMemoryWorkspaceNextPath(response.document.path);
+      setMemoryWorkspaceTitle(response.document.title);
+      setMemoryWorkspaceContent(response.document.content_text);
+      await loadWorkspaceDocumentVersions(response.document.path);
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setMemoryBusy(false);
+    }
+  }
+
+  async function saveWorkspaceDocument(event?: FormEvent<HTMLFormElement>): Promise<void> {
+    event?.preventDefault();
+    if (memoryWorkspacePath.trim().length === 0) {
+      setError("Workspace path cannot be empty.");
+      return;
+    }
+    if (memoryWorkspaceContent.trim().length === 0) {
+      setError("Workspace content cannot be empty.");
+      return;
+    }
+    setMemoryBusy(true);
+    setError(null);
+    try {
+      const response = await api.writeWorkspaceDocument({
+        path: memoryWorkspacePath.trim(),
+        title: emptyToUndefined(memoryWorkspaceTitle),
+        content_text: memoryWorkspaceContent,
+        manual_override: true,
+      });
+      setMemoryWorkspacePath(response.document.path);
+      setMemoryWorkspaceNextPath(response.document.path);
+      setMemoryWorkspaceTitle(response.document.title);
+      setNotice(`Saved ${response.document.path}.`);
+      await Promise.all([
+        refreshWorkspaceDocuments(),
+        loadWorkspaceDocumentVersions(response.document.path),
+        refreshMemoryStatus(),
+      ]);
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setMemoryBusy(false);
+    }
+  }
+
+  async function bootstrapWorkspace(forceRepair = false): Promise<void> {
+    setMemoryBusy(true);
+    setError(null);
+    try {
+      const response = await api.bootstrapWorkspace({ force_repair: forceRepair });
+      setNotice(
+        `Workspace bootstrap ran. Created ${response.bootstrap.created_paths.length}, updated ${response.bootstrap.updated_paths.length}, skipped ${response.bootstrap.skipped_paths.length}.`,
+      );
+      await Promise.all([refreshMemoryStatus(), refreshWorkspaceDocuments()]);
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setMemoryBusy(false);
+    }
+  }
+
+  async function toggleWorkspaceDocumentPinned(path: string, pinned: boolean): Promise<void> {
+    if (path.trim().length === 0) {
+      setError("Workspace document path is missing.");
+      return;
+    }
+    setMemoryBusy(true);
+    setError(null);
+    try {
+      await api.pinWorkspaceDocument({ path: path.trim(), pinned });
+      setNotice(pinned ? `Pinned ${path.trim()}.` : `Unpinned ${path.trim()}.`);
+      await Promise.all([refreshMemoryStatus(), refreshWorkspaceDocuments()]);
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setMemoryBusy(false);
+    }
+  }
+
+  async function moveWorkspaceDocument(): Promise<void> {
+    const currentPath = memoryWorkspacePath.trim();
+    const nextPath = memoryWorkspaceNextPath.trim();
+    if (currentPath.length === 0 || nextPath.length === 0) {
+      setError("Both current and next workspace paths are required.");
+      return;
+    }
+    if (currentPath === nextPath) {
+      setNotice("Workspace path is already current.");
+      return;
+    }
+    setMemoryBusy(true);
+    setError(null);
+    try {
+      const response = await api.moveWorkspaceDocument({
+        path: currentPath,
+        next_path: nextPath,
+      });
+      setMemoryWorkspacePath(response.document.path);
+      setMemoryWorkspaceNextPath(response.document.path);
+      setMemoryWorkspaceTitle(response.document.title);
+      setNotice(`Moved ${currentPath} to ${response.document.path}.`);
+      await Promise.all([
+        refreshWorkspaceDocuments(),
+        loadWorkspaceDocumentVersions(response.document.path),
+        refreshMemoryStatus(),
+      ]);
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setMemoryBusy(false);
+    }
+  }
+
+  async function deleteWorkspaceDocument(path?: string): Promise<void> {
+    const targetPath = (path ?? memoryWorkspacePath).trim();
+    if (targetPath.length === 0) {
+      setError("Workspace document path is missing.");
+      return;
+    }
+    setMemoryBusy(true);
+    setError(null);
+    try {
+      await api.deleteWorkspaceDocument({ path: targetPath });
+      setNotice(`Deleted ${targetPath}.`);
+      if (targetPath === memoryWorkspacePath.trim()) {
+        setMemoryWorkspacePath("notes/new-doc.md");
+        setMemoryWorkspaceNextPath("notes/new-doc.md");
+        setMemoryWorkspaceTitle("");
+        setMemoryWorkspaceContent("");
+        setMemoryWorkspaceVersions([]);
+      }
+      await Promise.all([refreshWorkspaceDocuments(), refreshMemoryStatus()]);
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setMemoryBusy(false);
+    }
+  }
+
+  function promoteMemoryHitToWorkspaceDraft(hit: JsonObject): void {
+    const item = readObject(hit, "item") ?? {};
+    const memoryId = readString(hit, "memory_id") ?? readString(item, "memory_id");
+    const sourceChannel =
+      readString(hit, "channel") ?? readString(item, "channel") ?? "memory";
+    const content =
+      readString(hit, "snippet") ??
+      readString(hit, "content") ??
+      readString(item, "content_text") ??
+      "";
+    const safeStem = toWorkspaceSlug(memoryId ?? sourceChannel);
+    const nextPath = `projects/${safeStem}.md`;
+    setMemoryWorkspacePath(nextPath);
+    setMemoryWorkspaceNextPath(nextPath);
+    setMemoryWorkspaceTitle(memoryId ?? `Promoted ${sourceChannel}`);
+    setMemoryWorkspaceContent(content);
+    setNotice(`Prepared workspace draft ${nextPath} from ${memoryId ?? sourceChannel}.`);
+  }
+
+  async function searchWorkspaceDocuments(event?: FormEvent<HTMLFormElement>): Promise<void> {
+    event?.preventDefault();
+    if (memoryWorkspaceSearchQuery.trim().length === 0) {
+      setError("Workspace query cannot be empty.");
+      return;
+    }
+    setMemoryBusy(true);
+    setError(null);
+    try {
+      const params = new URLSearchParams();
+      params.set("query", memoryWorkspaceSearchQuery.trim());
+      const response = await api.searchWorkspaceDocuments(params);
+      setMemoryWorkspaceHits(toJsonObjectArray(response.hits as unknown as JsonValue[]));
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setMemoryBusy(false);
+    }
+  }
+
+  async function previewMemoryRecall(event?: FormEvent<HTMLFormElement>): Promise<void> {
+    event?.preventDefault();
+    if (memoryQuery.trim().length === 0) {
+      setError("Recall query cannot be empty.");
+      return;
+    }
+    setMemoryBusy(true);
+    setError(null);
+    try {
+      const response = await api.previewRecall({
+        query: memoryQuery.trim(),
+        channel: emptyToUndefined(memoryChannel),
+        memory_top_k: 4,
+        workspace_top_k: 4,
+      });
+      setMemoryRecallPreview(response as unknown as JsonObject);
+      setMemoryHits(toJsonObjectArray(response.memory_hits));
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setMemoryBusy(false);
+    }
+  }
+
+  async function searchAllMemorySources(event?: FormEvent<HTMLFormElement>): Promise<void> {
+    event?.preventDefault();
+    if (memorySearchAllQuery.trim().length === 0) {
+      setError("Unified search query cannot be empty.");
+      return;
+    }
+    setMemoryBusy(true);
+    setError(null);
+    try {
+      const params = new URLSearchParams();
+      params.set("q", memorySearchAllQuery.trim());
+      if (memoryChannel.trim().length > 0) {
+        params.set("channel", memoryChannel.trim());
+      }
+      const response = await api.searchAll(params);
+      setMemorySearchAllResults(response as unknown as JsonObject);
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setMemoryBusy(false);
     }
   }
 
@@ -1591,8 +1898,36 @@ export function useConsoleAppState() {
     memoryHits,
     memoryStatusBusy,
     memoryStatus,
+    memoryWorkspaceDocuments,
+    memoryWorkspacePath,
+    setMemoryWorkspacePath,
+    memoryWorkspaceNextPath,
+    setMemoryWorkspaceNextPath,
+    memoryWorkspaceTitle,
+    setMemoryWorkspaceTitle,
+    memoryWorkspaceContent,
+    setMemoryWorkspaceContent,
+    memoryWorkspaceVersions,
+    memoryWorkspaceSearchQuery,
+    setMemoryWorkspaceSearchQuery,
+    memoryWorkspaceHits,
+    memorySearchAllQuery,
+    setMemorySearchAllQuery,
+    memorySearchAllResults,
+    memoryRecallPreview,
     refreshMemoryStatus,
+    refreshWorkspaceDocuments,
     searchMemory,
+    selectWorkspaceDocument,
+    saveWorkspaceDocument,
+    bootstrapWorkspace,
+    moveWorkspaceDocument,
+    deleteWorkspaceDocument,
+    toggleWorkspaceDocumentPinned,
+    searchWorkspaceDocuments,
+    previewMemoryRecall,
+    searchAllMemorySources,
+    promoteMemoryHitToWorkspaceDraft,
     purgeMemory,
     skillsBusy,
     skillsEntries,

@@ -419,6 +419,174 @@ struct ConsoleMemoryIndexRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct ConsoleWorkspaceDocumentsQuery {
+    #[serde(default)]
+    prefix: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    channel: Option<String>,
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    include_deleted: Option<bool>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleWorkspaceDocumentQuery {
+    path: String,
+    #[serde(default)]
+    channel: Option<String>,
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    include_deleted: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleWorkspaceDocumentWriteRequest {
+    #[serde(default)]
+    document_id: Option<String>,
+    path: String,
+    #[serde(default)]
+    title: Option<String>,
+    content_text: String,
+    #[serde(default)]
+    channel: Option<String>,
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    template_id: Option<String>,
+    #[serde(default)]
+    template_version: Option<i64>,
+    #[serde(default)]
+    template_content_hash: Option<String>,
+    #[serde(default)]
+    source_memory_id: Option<String>,
+    #[serde(default)]
+    manual_override: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleWorkspaceDocumentMoveRequest {
+    path: String,
+    next_path: String,
+    #[serde(default)]
+    channel: Option<String>,
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleWorkspaceDocumentDeleteRequest {
+    path: String,
+    #[serde(default)]
+    channel: Option<String>,
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleWorkspaceDocumentPinRequest {
+    path: String,
+    pinned: bool,
+    #[serde(default)]
+    channel: Option<String>,
+    #[serde(default)]
+    agent_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleWorkspaceDocumentVersionsQuery {
+    path: String,
+    #[serde(default)]
+    channel: Option<String>,
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleWorkspaceBootstrapRequest {
+    #[serde(default)]
+    channel: Option<String>,
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    force_repair: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleWorkspaceSearchQuery {
+    query: String,
+    #[serde(default)]
+    channel: Option<String>,
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    prefix: Option<String>,
+    #[serde(default)]
+    top_k: Option<usize>,
+    #[serde(default)]
+    min_score: Option<f64>,
+    #[serde(default)]
+    include_historical: Option<bool>,
+    #[serde(default)]
+    include_quarantined: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleRecallPreviewRequest {
+    query: String,
+    #[serde(default)]
+    channel: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    memory_top_k: Option<usize>,
+    #[serde(default)]
+    workspace_top_k: Option<usize>,
+    #[serde(default)]
+    min_score: Option<f64>,
+    #[serde(default)]
+    workspace_prefix: Option<String>,
+    #[serde(default)]
+    include_workspace_historical: Option<bool>,
+    #[serde(default)]
+    include_workspace_quarantined: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleSearchAllQuery {
+    q: String,
+    #[serde(default)]
+    channel: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    top_k: Option<usize>,
+    #[serde(default)]
+    min_score: Option<f64>,
+    #[serde(default)]
+    workspace_prefix: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ChannelLogsQuery {
     limit: Option<usize>,
 }

@@ -67,6 +67,172 @@ pub enum MemoryCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    Workspace {
+        #[command(subcommand)]
+        command: MemoryWorkspaceCommand,
+    },
+    Recall {
+        query: String,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long)]
+        agent_id: Option<String>,
+        #[arg(long)]
+        memory_top_k: Option<u32>,
+        #[arg(long)]
+        workspace_top_k: Option<u32>,
+        #[arg(long)]
+        min_score: Option<String>,
+        #[arg(long)]
+        workspace_prefix: Option<String>,
+        #[arg(long, default_value_t = false)]
+        include_workspace_historical: bool,
+        #[arg(long, default_value_t = false)]
+        include_workspace_quarantined: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    #[command(name = "search-all")]
+    SearchAll {
+        query: String,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long)]
+        agent_id: Option<String>,
+        #[arg(long)]
+        top_k: Option<u32>,
+        #[arg(long)]
+        min_score: Option<String>,
+        #[arg(long)]
+        workspace_prefix: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum MemoryWorkspaceCommand {
+    List {
+        #[arg(long)]
+        prefix: Option<String>,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long)]
+        agent_id: Option<String>,
+        #[arg(long, default_value_t = false)]
+        include_deleted: bool,
+        #[arg(long)]
+        limit: Option<u32>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Get {
+        path: String,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long)]
+        agent_id: Option<String>,
+        #[arg(long, default_value_t = false)]
+        include_deleted: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Write {
+        path: String,
+        content: String,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long)]
+        agent_id: Option<String>,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long, default_value_t = false)]
+        manual_override: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Move {
+        path: String,
+        next_path: String,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long)]
+        agent_id: Option<String>,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Delete {
+        path: String,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long)]
+        agent_id: Option<String>,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Pin {
+        path: String,
+        #[arg(long, default_value_t = true)]
+        pinned: bool,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long)]
+        agent_id: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Versions {
+        path: String,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long)]
+        agent_id: Option<String>,
+        #[arg(long)]
+        limit: Option<u32>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Bootstrap {
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long)]
+        agent_id: Option<String>,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long, default_value_t = false)]
+        force_repair: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Search {
+        query: String,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long)]
+        agent_id: Option<String>,
+        #[arg(long)]
+        prefix: Option<String>,
+        #[arg(long)]
+        top_k: Option<u32>,
+        #[arg(long)]
+        min_score: Option<String>,
+        #[arg(long, default_value_t = false)]
+        include_historical: bool,
+        #[arg(long, default_value_t = false)]
+        include_quarantined: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

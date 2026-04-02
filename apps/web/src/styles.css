@@ -888,9 +888,15 @@ pre {
 }
 
 .chat-composer__slash,
-.chat-composer__attachments {
+.chat-composer__attachments,
+.chat-composer__recall {
   display: grid;
   gap: 0.85rem;
+}
+
+.chat-composer__recall-preview {
+  max-height: 14rem;
+  overflow: auto;
 }
 
 .chat-composer__drop-hint {

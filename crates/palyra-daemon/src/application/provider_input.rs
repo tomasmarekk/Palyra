@@ -1,6 +1,7 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use base64::Engine as _;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tonic::Status;
 use tracing::warn;
@@ -14,7 +15,7 @@ use crate::{
     },
     journal::{
         MemorySearchHit, MemorySearchRequest, MemorySource, OrchestratorTapeAppendRequest,
-        OrchestratorTapeRecord,
+        OrchestratorTapeRecord, WorkspaceSearchHit, WorkspaceSearchRequest,
     },
     media::MediaRuntimeConfig,
     model_provider::ProviderImageInput,
@@ -38,11 +39,41 @@ pub(crate) struct PrepareModelProviderInputRequest<'a> {
     pub(crate) tape_seq: &'a mut i64,
     pub(crate) session_id: &'a str,
     pub(crate) previous_run_id: Option<&'a str>,
+    pub(crate) parameter_delta_json: Option<&'a str>,
     pub(crate) input_text: &'a str,
     pub(crate) attachments: &'a [common_v1::MessageAttachment],
     pub(crate) memory_ingest_reason: &'a str,
     pub(crate) memory_prompt_failure_mode: MemoryPromptFailureMode,
     pub(crate) channel_for_log: &'a str,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ExplicitRecallSelection {
+    query: String,
+    #[serde(default)]
+    channel: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    min_score: Option<f64>,
+    #[serde(default)]
+    workspace_prefix: Option<String>,
+    #[serde(default)]
+    include_workspace_historical: bool,
+    #[serde(default)]
+    include_workspace_quarantined: bool,
+    #[serde(default)]
+    memory_item_ids: Vec<String>,
+    #[serde(default)]
+    workspace_document_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ParameterDeltaEnvelope {
+    #[serde(default)]
+    explicit_recall: Option<ExplicitRecallSelection>,
 }
 
 fn build_provider_image_inputs(
@@ -177,6 +208,125 @@ async fn build_memory_augmented_prompt(
     Ok(render_memory_augmented_prompt(selected_hits.as_slice(), prompt_input_text))
 }
 
+fn parse_explicit_recall_selection(
+    parameter_delta_json: Option<&str>,
+) -> Option<ExplicitRecallSelection> {
+    let raw = parameter_delta_json?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    serde_json::from_str::<ParameterDeltaEnvelope>(raw).ok().and_then(|value| value.explicit_recall)
+}
+
+fn select_memory_hits(hits: Vec<MemorySearchHit>, selected_ids: &[String]) -> Vec<MemorySearchHit> {
+    let mut by_id =
+        hits.into_iter().map(|hit| (hit.item.memory_id.clone(), hit)).collect::<HashMap<_, _>>();
+    selected_ids.iter().filter_map(|memory_id| by_id.remove(memory_id)).collect()
+}
+
+fn select_workspace_hits(
+    hits: Vec<WorkspaceSearchHit>,
+    selected_ids: &[String],
+) -> Vec<WorkspaceSearchHit> {
+    let mut by_id = hits
+        .into_iter()
+        .map(|hit| (hit.document.document_id.clone(), hit))
+        .collect::<HashMap<_, _>>();
+    selected_ids.iter().filter_map(|document_id| by_id.remove(document_id)).collect()
+}
+
+#[allow(clippy::result_large_err)]
+async fn build_explicit_recall_prompt(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: &RequestContext,
+    run_id: &str,
+    tape_seq: &mut i64,
+    session_id: &str,
+    parameter_delta_json: Option<&str>,
+    prompt_input_text: &str,
+) -> Result<Option<String>, Status> {
+    let Some(selection) = parse_explicit_recall_selection(parameter_delta_json) else {
+        return Ok(None);
+    };
+    let recall_query = selection.query.trim();
+    if recall_query.is_empty() {
+        return Ok(None);
+    }
+    let min_score = selection.min_score.unwrap_or(MEMORY_AUTO_INJECT_MIN_SCORE);
+    let recall_channel = selection.channel.clone().or(context.channel.clone());
+    let recall_session_id = selection.session_id.clone().or_else(|| Some(session_id.to_owned()));
+
+    let mut selected_memory_hits = Vec::new();
+    if !selection.memory_item_ids.is_empty() {
+        let candidate_hits = runtime_state
+            .search_memory(MemorySearchRequest {
+                principal: context.principal.clone(),
+                channel: recall_channel.clone(),
+                session_id: recall_session_id.clone(),
+                query: recall_query.to_owned(),
+                top_k: selection.memory_item_ids.len().saturating_mul(4).clamp(8, 32),
+                min_score,
+                tags: Vec::new(),
+                sources: Vec::new(),
+            })
+            .await?;
+        selected_memory_hits =
+            select_memory_hits(candidate_hits, selection.memory_item_ids.as_slice());
+    }
+
+    let mut selected_workspace_hits = Vec::new();
+    if !selection.workspace_document_ids.is_empty() {
+        let candidate_hits = runtime_state
+            .search_workspace_documents(WorkspaceSearchRequest {
+                principal: context.principal.clone(),
+                channel: recall_channel,
+                agent_id: selection.agent_id.clone(),
+                query: recall_query.to_owned(),
+                prefix: selection.workspace_prefix.clone(),
+                top_k: selection.workspace_document_ids.len().saturating_mul(4).clamp(8, 32),
+                min_score,
+                include_historical: selection.include_workspace_historical,
+                include_quarantined: selection.include_workspace_quarantined,
+            })
+            .await?;
+        selected_workspace_hits =
+            select_workspace_hits(candidate_hits, selection.workspace_document_ids.as_slice());
+        let recalled_at_unix_ms = crate::gateway::current_unix_ms();
+        for hit in &selected_workspace_hits {
+            runtime_state
+                .record_workspace_document_recall(
+                    hit.document.document_id.clone(),
+                    recalled_at_unix_ms,
+                )
+                .await?;
+        }
+    }
+
+    if selected_memory_hits.is_empty() && selected_workspace_hits.is_empty() {
+        return Ok(None);
+    }
+
+    runtime_state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: *tape_seq,
+            event_type: "explicit_recall".to_owned(),
+            payload_json: json!({
+                "query": recall_query,
+                "memory_hits": selected_memory_hits,
+                "workspace_hits": selected_workspace_hits,
+            })
+            .to_string(),
+        })
+        .await?;
+    *tape_seq = tape_seq.saturating_add(1);
+    Ok(Some(render_explicit_recall_prompt(
+        selected_memory_hits.as_slice(),
+        selected_workspace_hits.as_slice(),
+        prompt_input_text,
+    )))
+}
+
 fn extract_previous_run_turn_from_tape_event(
     event: &OrchestratorTapeRecord,
 ) -> Option<(&'static str, String)> {
@@ -251,6 +401,7 @@ pub(crate) async fn prepare_model_provider_input(
         tape_seq,
         session_id,
         previous_run_id,
+        parameter_delta_json,
         input_text,
         attachments,
         memory_ingest_reason,
@@ -286,6 +437,22 @@ pub(crate) async fn prepare_model_provider_input(
                 input_text.to_owned()
             }
         };
+    if let Some(provider_input_text) = build_explicit_recall_prompt(
+        runtime_state,
+        context,
+        run_id,
+        tape_seq,
+        session_id,
+        parameter_delta_json,
+        input_with_recent_context.as_str(),
+    )
+    .await?
+    {
+        return Ok(PreparedModelProviderInput {
+            provider_input_text,
+            vision_inputs: build_provider_image_inputs(attachments, &runtime_state.config.media),
+        });
+    }
     let provider_input_text = match build_memory_augmented_prompt(
         runtime_state,
         context,
@@ -321,6 +488,11 @@ pub(crate) async fn prepare_model_provider_input(
 }
 
 pub(crate) fn render_memory_augmented_prompt(hits: &[MemorySearchHit], input_text: &str) -> String {
+    let block = render_memory_recall_block(hits);
+    format!("{block}\n\n{input_text}")
+}
+
+fn render_memory_recall_block(hits: &[MemorySearchHit]) -> String {
     let mut context_lines = Vec::with_capacity(hits.len());
     for (index, hit) in hits.iter().enumerate() {
         let snippet = hit.snippet.replace(['\r', '\n'], " ").trim().to_owned();
@@ -337,7 +509,46 @@ pub(crate) fn render_memory_augmented_prompt(hits: &[MemorySearchHit], input_tex
     let mut block = String::from("<memory_context>\n");
     block.push_str(context_lines.join("\n").as_str());
     block.push_str("\n</memory_context>");
-    format!("{block}\n\n{input_text}")
+    block
+}
+
+fn render_explicit_recall_prompt(
+    memory_hits: &[MemorySearchHit],
+    workspace_hits: &[WorkspaceSearchHit],
+    input_text: &str,
+) -> String {
+    let mut sections = Vec::new();
+    if !memory_hits.is_empty() {
+        sections.push(render_memory_recall_block(memory_hits));
+    }
+    if !workspace_hits.is_empty() {
+        let mut block = String::from("<workspace_context>\n");
+        for (index, hit) in workspace_hits.iter().enumerate() {
+            let snippet = hit.snippet.replace(['\r', '\n'], " ").trim().to_owned();
+            block.push_str(
+                format!(
+                    "{}. document_id={} path={} version={} reason={} risk_state={} snippet={}\n",
+                    index + 1,
+                    hit.document.document_id,
+                    hit.document.path,
+                    hit.version,
+                    hit.reason,
+                    hit.document.risk_state,
+                    truncate_with_ellipsis(snippet, 256),
+                )
+                .as_str(),
+            );
+        }
+        block.push_str("</workspace_context>");
+        sections.push(block);
+    }
+    let mut prompt = sections.join("\n\n");
+    if !prompt.is_empty() {
+        prompt.push('\n');
+        prompt.push('\n');
+    }
+    prompt.push_str(input_text);
+    prompt
 }
 
 pub(crate) fn memory_auto_inject_tape_payload(query: &str, hits: &[MemorySearchHit]) -> String {

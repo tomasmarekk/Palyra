@@ -1,3 +1,4 @@
+use crate::args::MemoryWorkspaceCommand;
 use crate::*;
 
 pub(crate) fn run_memory(command: MemoryCommand) -> Result<()> {
@@ -5,9 +6,11 @@ pub(crate) fn run_memory(command: MemoryCommand) -> Result<()> {
         .ok_or_else(|| anyhow!("CLI root context is unavailable for memory command"))?;
     let runtime = build_runtime()?;
     match command {
-        MemoryCommand::Status { .. } | MemoryCommand::Index { .. } => {
-            runtime.block_on(run_memory_admin_async(command))
-        }
+        MemoryCommand::Status { .. }
+        | MemoryCommand::Index { .. }
+        | MemoryCommand::Workspace { .. }
+        | MemoryCommand::Recall { .. }
+        | MemoryCommand::SearchAll { .. } => runtime.block_on(run_memory_admin_async(command)),
         other => {
             let connection = root_context.resolve_grpc_connection(
                 app::ConnectionOverrides::default(),
@@ -224,7 +227,11 @@ pub(crate) async fn run_memory_async(
                 );
             }
         }
-        MemoryCommand::Status { .. } | MemoryCommand::Index { .. } => {
+        MemoryCommand::Status { .. }
+        | MemoryCommand::Index { .. }
+        | MemoryCommand::Workspace { .. }
+        | MemoryCommand::Recall { .. }
+        | MemoryCommand::SearchAll { .. } => {
             unreachable!("memory admin commands are handled by run_memory_admin_async")
         }
     }
@@ -252,8 +259,342 @@ async fn run_memory_admin_async(command: MemoryCommand) -> Result<()> {
                 context.client.post_json_value("console/v1/memory/index", &request).await?;
             emit_memory_index(&payload, output::preferred_json(json))
         }
+        MemoryCommand::Workspace { command } => match command {
+            MemoryWorkspaceCommand::List {
+                prefix,
+                channel,
+                agent_id,
+                include_deleted,
+                limit,
+                json,
+            } => {
+                let path = build_console_query_path(
+                    "console/v1/memory/workspace/documents",
+                    vec![
+                        ("prefix", prefix),
+                        ("channel", channel),
+                        ("agent_id", agent_id),
+                        ("include_deleted", include_deleted.then(|| "true".to_owned())),
+                        ("limit", limit.map(|value| value.to_string())),
+                    ],
+                );
+                let payload = context.client.get_json_value(path.as_str()).await?;
+                emit_admin_payload(
+                    "workspace.list",
+                    &payload,
+                    output::preferred_json(json),
+                    &["/documents"],
+                )
+            }
+            MemoryWorkspaceCommand::Get { path, channel, agent_id, include_deleted, json } => {
+                let path = build_console_query_path(
+                    "console/v1/memory/workspace/document",
+                    vec![
+                        ("path", Some(path)),
+                        ("channel", channel),
+                        ("agent_id", agent_id),
+                        ("include_deleted", include_deleted.then(|| "true".to_owned())),
+                    ],
+                );
+                let payload = context.client.get_json_value(path.as_str()).await?;
+                emit_admin_payload(
+                    "workspace.get",
+                    &payload,
+                    output::preferred_json(json),
+                    &["/document"],
+                )
+            }
+            MemoryWorkspaceCommand::Write {
+                path,
+                content,
+                title,
+                channel,
+                agent_id,
+                session,
+                manual_override,
+                json,
+            } => {
+                let request = json!({
+                    "path": path,
+                    "content_text": content,
+                    "title": title,
+                    "channel": channel,
+                    "agent_id": agent_id,
+                    "session_id": session,
+                    "manual_override": manual_override,
+                });
+                let payload = context
+                    .client
+                    .post_json_value("console/v1/memory/workspace/document", &request)
+                    .await?;
+                emit_admin_payload(
+                    "workspace.write",
+                    &payload,
+                    output::preferred_json(json),
+                    &["/document"],
+                )
+            }
+            MemoryWorkspaceCommand::Move { path, next_path, channel, agent_id, session, json } => {
+                let request = json!({
+                    "path": path,
+                    "next_path": next_path,
+                    "channel": channel,
+                    "agent_id": agent_id,
+                    "session_id": session,
+                });
+                let payload = context
+                    .client
+                    .post_json_value("console/v1/memory/workspace/document/move", &request)
+                    .await?;
+                emit_admin_payload(
+                    "workspace.move",
+                    &payload,
+                    output::preferred_json(json),
+                    &["/document"],
+                )
+            }
+            MemoryWorkspaceCommand::Delete { path, channel, agent_id, session, json } => {
+                let request = json!({
+                    "path": path,
+                    "channel": channel,
+                    "agent_id": agent_id,
+                    "session_id": session,
+                });
+                let payload = context
+                    .client
+                    .post_json_value("console/v1/memory/workspace/document/delete", &request)
+                    .await?;
+                emit_admin_payload(
+                    "workspace.delete",
+                    &payload,
+                    output::preferred_json(json),
+                    &["/document"],
+                )
+            }
+            MemoryWorkspaceCommand::Pin { path, pinned, channel, agent_id, json } => {
+                let request = json!({
+                    "path": path,
+                    "pinned": pinned,
+                    "channel": channel,
+                    "agent_id": agent_id,
+                });
+                let payload = context
+                    .client
+                    .post_json_value("console/v1/memory/workspace/document/pin", &request)
+                    .await?;
+                emit_admin_payload(
+                    "workspace.pin",
+                    &payload,
+                    output::preferred_json(json),
+                    &["/document"],
+                )
+            }
+            MemoryWorkspaceCommand::Versions { path, channel, agent_id, limit, json } => {
+                let path = build_console_query_path(
+                    "console/v1/memory/workspace/document/versions",
+                    vec![
+                        ("path", Some(path)),
+                        ("channel", channel),
+                        ("agent_id", agent_id),
+                        ("limit", limit.map(|value| value.to_string())),
+                    ],
+                );
+                let payload = context.client.get_json_value(path.as_str()).await?;
+                emit_admin_payload(
+                    "workspace.versions",
+                    &payload,
+                    output::preferred_json(json),
+                    &["/versions"],
+                )
+            }
+            MemoryWorkspaceCommand::Bootstrap {
+                channel,
+                agent_id,
+                session,
+                force_repair,
+                json,
+            } => {
+                let request = json!({
+                    "channel": channel,
+                    "agent_id": agent_id,
+                    "session_id": session,
+                    "force_repair": force_repair,
+                });
+                let payload = context
+                    .client
+                    .post_json_value("console/v1/memory/workspace/bootstrap", &request)
+                    .await?;
+                emit_admin_payload(
+                    "workspace.bootstrap",
+                    &payload,
+                    output::preferred_json(json),
+                    &["/bootstrap"],
+                )
+            }
+            MemoryWorkspaceCommand::Search {
+                query,
+                channel,
+                agent_id,
+                prefix,
+                top_k,
+                min_score,
+                include_historical,
+                include_quarantined,
+                json,
+            } => {
+                let min_score = parse_float_arg(
+                    min_score,
+                    "memory workspace search --min-score",
+                    0.0,
+                    1.0,
+                    Some(0.0),
+                )?;
+                let path = build_console_query_path(
+                    "console/v1/memory/workspace/search",
+                    vec![
+                        ("query", Some(query)),
+                        ("channel", channel),
+                        ("agent_id", agent_id),
+                        ("prefix", prefix),
+                        ("top_k", top_k.map(|value| value.to_string())),
+                        ("min_score", Some(min_score.to_string())),
+                        ("include_historical", include_historical.then(|| "true".to_owned())),
+                        ("include_quarantined", include_quarantined.then(|| "true".to_owned())),
+                    ],
+                );
+                let payload = context.client.get_json_value(path.as_str()).await?;
+                emit_admin_payload(
+                    "workspace.search",
+                    &payload,
+                    output::preferred_json(json),
+                    &["/hits"],
+                )
+            }
+        },
+        MemoryCommand::Recall {
+            query,
+            session,
+            channel,
+            agent_id,
+            memory_top_k,
+            workspace_top_k,
+            min_score,
+            workspace_prefix,
+            include_workspace_historical,
+            include_workspace_quarantined,
+            json,
+        } => {
+            let min_score =
+                parse_float_arg(min_score, "memory recall --min-score", 0.0, 1.0, Some(0.0))?;
+            let request = json!({
+                "query": query,
+                "session_id": session,
+                "channel": channel,
+                "agent_id": agent_id,
+                "memory_top_k": memory_top_k,
+                "workspace_top_k": workspace_top_k,
+                "min_score": min_score,
+                "workspace_prefix": workspace_prefix,
+                "include_workspace_historical": include_workspace_historical,
+                "include_workspace_quarantined": include_workspace_quarantined,
+            });
+            let payload = context
+                .client
+                .post_json_value("console/v1/memory/recall/preview", &request)
+                .await?;
+            emit_admin_payload(
+                "memory.recall",
+                &payload,
+                output::preferred_json(json),
+                &["/memory_hits", "/workspace_hits", "/prompt_preview"],
+            )
+        }
+        MemoryCommand::SearchAll {
+            query,
+            session,
+            channel,
+            agent_id,
+            top_k,
+            min_score,
+            workspace_prefix,
+            json,
+        } => {
+            let min_score =
+                parse_float_arg(min_score, "memory search-all --min-score", 0.0, 1.0, Some(0.0))?;
+            let path = build_console_query_path(
+                "console/v1/memory/search-all",
+                vec![
+                    ("q", Some(query)),
+                    ("session_id", session),
+                    ("channel", channel),
+                    ("agent_id", agent_id),
+                    ("top_k", top_k.map(|value| value.to_string())),
+                    ("min_score", Some(min_score.to_string())),
+                    ("workspace_prefix", workspace_prefix),
+                ],
+            );
+            let payload = context.client.get_json_value(path.as_str()).await?;
+            emit_admin_payload(
+                "memory.search_all",
+                &payload,
+                output::preferred_json(json),
+                &["/groups"],
+            )
+        }
         _ => unreachable!("memory user-scoped commands are handled by run_memory_async"),
     }
+}
+
+fn emit_admin_payload(
+    label: &str,
+    payload: &Value,
+    json_output: bool,
+    pointers: &[&str],
+) -> Result<()> {
+    if json_output {
+        return output::print_json_pretty(payload, "failed to encode memory admin payload as JSON");
+    }
+    println!("{label}");
+    for pointer in pointers {
+        if let Some(value) = payload.pointer(pointer) {
+            println!("{pointer}={}", serde_json::to_string(value)?);
+        }
+    }
+    std::io::stdout().flush().context("stdout flush failed")
+}
+
+fn build_console_query_path(base: &str, params: Vec<(&str, Option<String>)>) -> String {
+    let parts = params
+        .into_iter()
+        .filter_map(|(key, value)| value.map(|value| (key, value)))
+        .map(|(key, value)| {
+            format!(
+                "{}={}",
+                percent_encode_component(key),
+                percent_encode_component(value.as_str())
+            )
+        })
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return base.to_owned();
+    }
+    format!("{base}?{}", parts.join("&"))
+}
+
+fn percent_encode_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(char::from(*byte));
+            }
+            other => {
+                encoded.push('%');
+                encoded.push_str(format!("{other:02X}").as_str());
+            }
+        }
+    }
+    encoded
 }
 
 fn emit_memory_status(payload: &Value, json_output: bool) -> Result<()> {

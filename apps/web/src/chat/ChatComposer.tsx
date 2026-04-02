@@ -5,8 +5,10 @@ import {
   ActionCluster,
   AppForm,
   InlineNotice,
+  StatusChip,
   TextAreaField,
 } from "../console/components/ui";
+import type { RecallPreviewEnvelope } from "../consoleApi";
 
 import type {
   ComposerAttachment,
@@ -37,6 +39,10 @@ type ChatComposerProps = {
   slashCommandMatches: readonly SlashCommandDefinition[];
   useSlashCommand: (command: SlashCommandDefinition) => void;
   contextBudget: ContextBudgetSummary;
+  recallPreview: RecallPreviewEnvelope | null;
+  recallPreviewBusy: boolean;
+  recallPreviewStale: boolean;
+  refreshRecallPreview: () => void;
 };
 
 export function ChatComposer({
@@ -61,6 +67,10 @@ export function ChatComposer({
   slashCommandMatches,
   useSlashCommand,
   contextBudget,
+  recallPreview,
+  recallPreviewBusy,
+  recallPreviewStale,
+  refreshRecallPreview,
 }: ChatComposerProps) {
   const [dragActive, setDragActive] = useState(false);
   const dragDepthRef = useRef(0);
@@ -70,6 +80,20 @@ export function ChatComposer({
     : showSlashPalette && parsedSlashCommand !== null
       ? "Run command"
       : "Send";
+  const previewVisible =
+    activeSessionId.trim().length > 0 &&
+    composerText.trim().length > 0 &&
+    !showSlashPalette;
+  const previewWorkspaceHits = recallPreview?.workspace_hits.slice(0, 2) ?? [];
+  const previewMemoryHits: Record<string, unknown>[] = [];
+  for (const hit of recallPreview?.memory_hits ?? []) {
+    if (isRecord(hit)) {
+      previewMemoryHits.push(hit);
+    }
+    if (previewMemoryHits.length >= 2) {
+      break;
+    }
+  }
 
   function pushFiles(files: FileList | readonly File[] | null | undefined): void {
     if (files === null || files === undefined) {
@@ -106,6 +130,87 @@ export function ChatComposer({
         <InlineNotice tone={contextBudget.tone === "danger" ? "danger" : "warning"}>
           {contextBudget.warning}
         </InlineNotice>
+      ) : null}
+
+      {previewVisible ? (
+        <div className="chat-composer__recall">
+          <div className="workspace-panel__intro">
+            <p className="workspace-kicker">Recall preview</p>
+            <h3>Context that will be attached to the next prompt</h3>
+            <p className="chat-muted">
+              Inspect retrieved workspace docs and memory before send. Refresh if you want to
+              force a fresh preview for the current draft.
+            </p>
+          </div>
+          <div className="workspace-inline-actions">
+            <StatusChip tone={recallPreviewBusy ? "warning" : "default"}>
+              {recallPreviewBusy ? "Refreshing..." : "Preview ready"}
+            </StatusChip>
+            <StatusChip tone={previewWorkspaceHits.length > 0 ? "accent" : "default"}>
+              {recallPreview?.workspace_hits.length ?? 0} workspace refs
+            </StatusChip>
+            <StatusChip tone={previewMemoryHits.length > 0 ? "success" : "default"}>
+              {recallPreview?.memory_hits.length ?? 0} memory refs
+            </StatusChip>
+            <StatusChip tone={recallPreviewStale ? "warning" : "default"}>
+              {recallPreviewStale ? "Draft changed" : "In sync"}
+            </StatusChip>
+            <ActionButton
+              isDisabled={recallPreviewBusy}
+              type="button"
+              variant="secondary"
+              onPress={refreshRecallPreview}
+            >
+              {recallPreviewBusy ? "Refreshing..." : "Refresh recall"}
+            </ActionButton>
+          </div>
+
+          {recallPreview === null ? (
+            <p className="chat-muted">Recall preview will appear once the current draft is evaluated.</p>
+          ) : (
+            <>
+              <div className="chat-ops-list">
+                {previewWorkspaceHits.map((hit, index) => (
+                  <article
+                    key={`${hit.document.document_id}-${hit.chunk_index}-${index}`}
+                    className="chat-ops-card"
+                  >
+                    <div className="chat-ops-card__copy">
+                      <strong>{hit.document.title}</strong>
+                      <span>{hit.document.path}</span>
+                      <p>{hit.snippet}</p>
+                    </div>
+                    <div className="chat-ops-card__actions">
+                      <StatusChip tone="accent">{hit.score.toFixed(2)}</StatusChip>
+                    </div>
+                  </article>
+                ))}
+                {previewMemoryHits.map((hit, index) => (
+                  <article key={memoryPreviewKey(hit, index)} className="chat-ops-card">
+                    <div className="chat-ops-card__copy">
+                      <strong>{memoryPreviewKey(hit, index)}</strong>
+                      <span>{readStringValue(hit, "channel") ?? "memory"}</span>
+                      <p>
+                        {readStringValue(hit, "snippet") ??
+                          readStringValue(hit, "content") ??
+                          readStringValue(readRecord(hit, "item"), "content_text") ??
+                          "No snippet returned."}
+                      </p>
+                    </div>
+                    <div className="chat-ops-card__actions">
+                      <StatusChip tone="success">
+                        {formatPreviewScore(hit)}
+                      </StatusChip>
+                    </div>
+                  </article>
+                ))}
+              </div>
+              <pre className="chat-composer__recall-preview">
+                {recallPreview.prompt_preview}
+              </pre>
+            </>
+          )}
+        </div>
       ) : null}
 
       <TextAreaField
@@ -270,4 +375,43 @@ export function ChatComposer({
       </ActionCluster>
     </AppForm>
   );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function readRecord(
+  source: Record<string, unknown>,
+  key: string,
+): Record<string, unknown> | undefined {
+  const value = source[key];
+  return isRecord(value) ? value : undefined;
+}
+
+function readStringValue(source: Record<string, unknown> | undefined, key: string): string | undefined {
+  const value = source?.[key];
+  return typeof value === "string" ? value : undefined;
+}
+
+function readNumberValue(source: Record<string, unknown> | undefined, key: string): number | undefined {
+  const value = source?.[key];
+  return typeof value === "number" ? value : undefined;
+}
+
+function memoryPreviewKey(hit: Record<string, unknown>, index: number): string {
+  return (
+    readStringValue(hit, "memory_id") ??
+    readStringValue(readRecord(hit, "item"), "memory_id") ??
+    `memory-preview-${index + 1}`
+  );
+}
+
+function formatPreviewScore(hit: Record<string, unknown>): string {
+  const directScore = readNumberValue(hit, "score");
+  if (directScore !== undefined) {
+    return directScore.toFixed(2);
+  }
+  const breakdownScore = readNumberValue(readRecord(hit, "breakdown"), "final_score");
+  return breakdownScore === undefined ? "n/a" : breakdownScore.toFixed(2);
 }

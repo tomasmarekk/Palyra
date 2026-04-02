@@ -1,6 +1,11 @@
 use crate::gateway::current_unix_ms;
+use crate::gateway::ListOrchestratorSessionsRequest;
 use crate::journal::MemoryRetentionPolicy;
 use crate::*;
+use crate::{
+    application::provider_input::render_memory_augmented_prompt,
+    domain::workspace::{curated_workspace_roots, curated_workspace_templates},
+};
 
 pub(crate) async fn console_memory_status_handler(
     State(state): State<AppState>,
@@ -12,6 +17,18 @@ pub(crate) async fn console_memory_status_handler(
     let embeddings_status =
         state.runtime.memory_embeddings_status().await.map_err(runtime_status_response)?;
     let memory_config = state.runtime.memory_config_snapshot();
+    let workspace_preview = state
+        .runtime
+        .list_workspace_documents(journal::WorkspaceDocumentListFilter {
+            principal: _session.context.principal.clone(),
+            channel: _session.context.channel.clone(),
+            agent_id: None,
+            prefix: None,
+            include_deleted: false,
+            limit: 8,
+        })
+        .await
+        .map_err(runtime_status_response)?;
     let maintenance_interval_ms =
         i64::try_from(MEMORY_MAINTENANCE_INTERVAL.as_millis()).unwrap_or(i64::MAX);
     Ok(Json(json!({
@@ -29,7 +46,15 @@ pub(crate) async fn console_memory_status_handler(
             "last_vacuum_at_unix_ms": maintenance_status.last_vacuum_at_unix_ms,
             "next_vacuum_due_at_unix_ms": maintenance_status.next_vacuum_due_at_unix_ms,
             "next_run_at_unix_ms": maintenance_status.next_maintenance_run_at_unix_ms,
-        }
+        },
+        "workspace": {
+            "roots": curated_workspace_roots(),
+            "curated_paths": curated_workspace_templates()
+                .into_iter()
+                .map(|template| template.path)
+                .collect::<Vec<_>>(),
+            "recent_documents": workspace_preview,
+        },
     })))
 }
 
@@ -199,6 +224,521 @@ pub(crate) async fn console_memory_purge_handler(
     Ok(Json(json!({ "deleted_count": deleted_count })))
 }
 
+pub(crate) async fn console_workspace_documents_list_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ConsoleWorkspaceDocumentsQuery>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, false)?;
+    let records = state
+        .runtime
+        .list_workspace_documents(journal::WorkspaceDocumentListFilter {
+            principal: session.context.principal.clone(),
+            channel: query.channel.or(session.context.channel),
+            agent_id: query.agent_id.and_then(trim_to_option),
+            prefix: query.prefix.and_then(trim_to_option).or(query.path.and_then(trim_to_option)),
+            include_deleted: query.include_deleted.unwrap_or(false),
+            limit: query.limit.unwrap_or(32).clamp(1, 128),
+        })
+        .await
+        .map_err(runtime_status_response)?;
+    Ok(Json(json!({
+        "documents": records,
+        "roots": curated_workspace_roots(),
+        "contract": contract_descriptor(),
+    })))
+}
+
+pub(crate) async fn console_workspace_document_get_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ConsoleWorkspaceDocumentQuery>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, false)?;
+    let path = trim_to_option(query.path).ok_or_else(|| {
+        runtime_status_response(tonic::Status::invalid_argument("path cannot be empty"))
+    })?;
+    let record = state
+        .runtime
+        .workspace_document_by_path(
+            session.context.principal.clone(),
+            query.channel.or(session.context.channel),
+            query.agent_id.and_then(trim_to_option),
+            path.clone(),
+            query.include_deleted.unwrap_or(false),
+        )
+        .await
+        .map_err(runtime_status_response)?
+        .ok_or_else(|| {
+            runtime_status_response(tonic::Status::not_found(format!(
+                "workspace document not found: {path}"
+            )))
+        })?;
+    Ok(Json(json!({
+        "document": record,
+        "contract": contract_descriptor(),
+    })))
+}
+
+pub(crate) async fn console_workspace_document_write_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<ConsoleWorkspaceDocumentWriteRequest>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    let path = trim_to_option(payload.path).ok_or_else(|| {
+        runtime_status_response(tonic::Status::invalid_argument("path cannot be empty"))
+    })?;
+    let content_text = trim_to_option(payload.content_text).ok_or_else(|| {
+        runtime_status_response(tonic::Status::invalid_argument("content_text cannot be empty"))
+    })?;
+    let session_id = payload.session_id.and_then(trim_to_option);
+    if let Some(session_id) = session_id.as_deref() {
+        validate_canonical_id(session_id).map_err(|_| {
+            runtime_status_response(tonic::Status::invalid_argument(
+                "session_id must be a canonical ULID",
+            ))
+        })?;
+    }
+    let document = state
+        .runtime
+        .upsert_workspace_document(journal::WorkspaceDocumentWriteRequest {
+            document_id: payload.document_id.and_then(trim_to_option),
+            principal: session.context.principal.clone(),
+            channel: payload.channel.or(session.context.channel),
+            agent_id: payload.agent_id.and_then(trim_to_option),
+            session_id,
+            path,
+            title: payload.title.and_then(trim_to_option),
+            content_text,
+            template_id: payload.template_id.and_then(trim_to_option),
+            template_version: payload.template_version,
+            template_content_hash: payload.template_content_hash.and_then(trim_to_option),
+            source_memory_id: payload.source_memory_id.and_then(trim_to_option),
+            manual_override: payload.manual_override.unwrap_or(false),
+        })
+        .await
+        .map_err(runtime_status_response)?;
+    Ok(Json(json!({
+        "document": document,
+        "contract": contract_descriptor(),
+    })))
+}
+
+pub(crate) async fn console_workspace_document_move_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<ConsoleWorkspaceDocumentMoveRequest>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    let path = trim_to_option(payload.path).ok_or_else(|| {
+        runtime_status_response(tonic::Status::invalid_argument("path cannot be empty"))
+    })?;
+    let next_path = trim_to_option(payload.next_path).ok_or_else(|| {
+        runtime_status_response(tonic::Status::invalid_argument("next_path cannot be empty"))
+    })?;
+    let session_id = payload.session_id.and_then(trim_to_option);
+    if let Some(session_id) = session_id.as_deref() {
+        validate_canonical_id(session_id).map_err(|_| {
+            runtime_status_response(tonic::Status::invalid_argument(
+                "session_id must be a canonical ULID",
+            ))
+        })?;
+    }
+    let document = state
+        .runtime
+        .move_workspace_document(journal::WorkspaceDocumentMoveRequest {
+            principal: session.context.principal.clone(),
+            channel: payload.channel.or(session.context.channel),
+            agent_id: payload.agent_id.and_then(trim_to_option),
+            session_id,
+            path,
+            next_path,
+        })
+        .await
+        .map_err(runtime_status_response)?;
+    Ok(Json(json!({
+        "document": document,
+        "contract": contract_descriptor(),
+    })))
+}
+
+pub(crate) async fn console_workspace_document_delete_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<ConsoleWorkspaceDocumentDeleteRequest>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    let path = trim_to_option(payload.path).ok_or_else(|| {
+        runtime_status_response(tonic::Status::invalid_argument("path cannot be empty"))
+    })?;
+    let session_id = payload.session_id.and_then(trim_to_option);
+    if let Some(session_id) = session_id.as_deref() {
+        validate_canonical_id(session_id).map_err(|_| {
+            runtime_status_response(tonic::Status::invalid_argument(
+                "session_id must be a canonical ULID",
+            ))
+        })?;
+    }
+    let document = state
+        .runtime
+        .soft_delete_workspace_document(journal::WorkspaceDocumentDeleteRequest {
+            principal: session.context.principal.clone(),
+            channel: payload.channel.or(session.context.channel),
+            agent_id: payload.agent_id.and_then(trim_to_option),
+            session_id,
+            path,
+        })
+        .await
+        .map_err(runtime_status_response)?;
+    Ok(Json(json!({
+        "document": document,
+        "contract": contract_descriptor(),
+    })))
+}
+
+pub(crate) async fn console_workspace_document_versions_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ConsoleWorkspaceDocumentVersionsQuery>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, false)?;
+    let path = trim_to_option(query.path).ok_or_else(|| {
+        runtime_status_response(tonic::Status::invalid_argument("path cannot be empty"))
+    })?;
+    let document = state
+        .runtime
+        .workspace_document_by_path(
+            session.context.principal.clone(),
+            query.channel.or(session.context.channel.clone()),
+            query.agent_id.and_then(trim_to_option),
+            path.clone(),
+            true,
+        )
+        .await
+        .map_err(runtime_status_response)?
+        .ok_or_else(|| {
+            runtime_status_response(tonic::Status::not_found(format!(
+                "workspace document not found: {path}"
+            )))
+        })?;
+    let versions = state
+        .runtime
+        .list_workspace_document_versions(
+            document.document_id.clone(),
+            query.limit.unwrap_or(20).clamp(1, 100),
+        )
+        .await
+        .map_err(runtime_status_response)?;
+    Ok(Json(json!({
+        "document": document,
+        "versions": versions,
+        "contract": contract_descriptor(),
+    })))
+}
+
+pub(crate) async fn console_workspace_document_pin_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<ConsoleWorkspaceDocumentPinRequest>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    let path = trim_to_option(payload.path).ok_or_else(|| {
+        runtime_status_response(tonic::Status::invalid_argument("path cannot be empty"))
+    })?;
+    let document = state
+        .runtime
+        .set_workspace_document_pinned(
+            session.context.principal.clone(),
+            payload.channel.or(session.context.channel),
+            payload.agent_id.and_then(trim_to_option),
+            path.clone(),
+            payload.pinned,
+        )
+        .await
+        .map_err(runtime_status_response)?
+        .ok_or_else(|| {
+            runtime_status_response(tonic::Status::not_found(format!(
+                "workspace document not found: {path}"
+            )))
+        })?;
+    Ok(Json(json!({
+        "document": document,
+        "contract": contract_descriptor(),
+    })))
+}
+
+pub(crate) async fn console_workspace_bootstrap_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<ConsoleWorkspaceBootstrapRequest>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    let session_id = payload.session_id.and_then(trim_to_option);
+    if let Some(session_id) = session_id.as_deref() {
+        validate_canonical_id(session_id).map_err(|_| {
+            runtime_status_response(tonic::Status::invalid_argument(
+                "session_id must be a canonical ULID",
+            ))
+        })?;
+    }
+    let outcome = state
+        .runtime
+        .bootstrap_workspace(journal::WorkspaceBootstrapRequest {
+            principal: session.context.principal.clone(),
+            channel: payload.channel.or(session.context.channel),
+            agent_id: payload.agent_id.and_then(trim_to_option),
+            session_id,
+            force_repair: payload.force_repair.unwrap_or(false),
+        })
+        .await
+        .map_err(runtime_status_response)?;
+    Ok(Json(json!({
+        "bootstrap": outcome,
+        "roots": curated_workspace_roots(),
+        "contract": contract_descriptor(),
+    })))
+}
+
+pub(crate) async fn console_workspace_search_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ConsoleWorkspaceSearchQuery>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, false)?;
+    let search_query = query.query.trim();
+    if search_query.is_empty() {
+        return Err(runtime_status_response(tonic::Status::invalid_argument(
+            "query cannot be empty",
+        )));
+    }
+    let min_score = query.min_score.unwrap_or(0.0);
+    if !min_score.is_finite() || !(0.0..=1.0).contains(&min_score) {
+        return Err(runtime_status_response(tonic::Status::invalid_argument(
+            "min_score must be in range 0.0..=1.0",
+        )));
+    }
+    let hits = state
+        .runtime
+        .search_workspace_documents(journal::WorkspaceSearchRequest {
+            principal: session.context.principal.clone(),
+            channel: query.channel.or(session.context.channel),
+            agent_id: query.agent_id.and_then(trim_to_option),
+            query: search_query.to_owned(),
+            prefix: query.prefix.and_then(trim_to_option),
+            top_k: query.top_k.unwrap_or(8).clamp(1, 32),
+            min_score,
+            include_historical: query.include_historical.unwrap_or(false),
+            include_quarantined: query.include_quarantined.unwrap_or(false),
+        })
+        .await
+        .map_err(runtime_status_response)?;
+    Ok(Json(json!({
+        "hits": hits,
+        "contract": contract_descriptor(),
+    })))
+}
+
+pub(crate) async fn console_recall_preview_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<ConsoleRecallPreviewRequest>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, false)?;
+    let query_text = payload.query.trim();
+    if query_text.is_empty() {
+        return Err(runtime_status_response(tonic::Status::invalid_argument(
+            "query cannot be empty",
+        )));
+    }
+    let min_score = payload.min_score.unwrap_or(0.0);
+    if !min_score.is_finite() || !(0.0..=1.0).contains(&min_score) {
+        return Err(runtime_status_response(tonic::Status::invalid_argument(
+            "min_score must be in range 0.0..=1.0",
+        )));
+    }
+    let session_scope = payload.session_id.and_then(trim_to_option);
+    if let Some(session_scope) = session_scope.as_deref() {
+        validate_canonical_id(session_scope).map_err(|_| {
+            runtime_status_response(tonic::Status::invalid_argument(
+                "session_id must be a canonical ULID",
+            ))
+        })?;
+    }
+    let recall_channel = payload.channel.clone().or(session.context.channel.clone());
+    let recall_agent_id = payload.agent_id.clone().and_then(trim_to_option);
+    let workspace_prefix = payload.workspace_prefix.clone().and_then(trim_to_option);
+    let memory_hits = if payload.memory_top_k.unwrap_or(4) == 0 {
+        Vec::new()
+    } else {
+        state
+            .runtime
+            .search_memory(journal::MemorySearchRequest {
+                principal: session.context.principal.clone(),
+                channel: recall_channel.clone(),
+                session_id: session_scope.clone(),
+                query: query_text.to_owned(),
+                top_k: payload.memory_top_k.unwrap_or(4).clamp(1, 16),
+                min_score,
+                tags: Vec::new(),
+                sources: Vec::new(),
+            })
+            .await
+            .map_err(runtime_status_response)?
+    };
+    let workspace_hits = if payload.workspace_top_k.unwrap_or(4) == 0 {
+        Vec::new()
+    } else {
+        state
+            .runtime
+            .search_workspace_documents(journal::WorkspaceSearchRequest {
+                principal: session.context.principal.clone(),
+                channel: recall_channel.clone(),
+                agent_id: recall_agent_id.clone(),
+                query: query_text.to_owned(),
+                prefix: workspace_prefix.clone(),
+                top_k: payload.workspace_top_k.unwrap_or(4).clamp(1, 16),
+                min_score,
+                include_historical: payload.include_workspace_historical.unwrap_or(false),
+                include_quarantined: payload.include_workspace_quarantined.unwrap_or(false),
+            })
+            .await
+            .map_err(runtime_status_response)?
+    };
+    let parameter_delta = json!({
+        "explicit_recall": {
+            "query": query_text,
+            "channel": recall_channel,
+            "session_id": session_scope,
+            "agent_id": recall_agent_id,
+            "min_score": min_score,
+            "workspace_prefix": workspace_prefix,
+            "include_workspace_historical": payload.include_workspace_historical.unwrap_or(false),
+            "include_workspace_quarantined": payload.include_workspace_quarantined.unwrap_or(false),
+            "memory_item_ids": memory_hits
+                .iter()
+                .map(|hit| hit.item.memory_id.clone())
+                .collect::<Vec<_>>(),
+            "workspace_document_ids": workspace_hits
+                .iter()
+                .map(|hit| hit.document.document_id.clone())
+                .collect::<Vec<_>>(),
+        }
+    });
+    Ok(Json(json!({
+        "query": query_text,
+        "memory_hits": memory_hits,
+        "workspace_hits": workspace_hits,
+        "parameter_delta": parameter_delta,
+        "prompt_preview": render_recall_preview_prompt(
+            query_text,
+            memory_hits.as_slice(),
+            workspace_hits.as_slice(),
+        ),
+        "contract": contract_descriptor(),
+    })))
+}
+
+pub(crate) async fn console_search_all_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ConsoleSearchAllQuery>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, false)?;
+    let search_query = query.q.trim();
+    if search_query.is_empty() {
+        return Err(runtime_status_response(tonic::Status::invalid_argument("q cannot be empty")));
+    }
+    let min_score = query.min_score.unwrap_or(0.0);
+    if !min_score.is_finite() || !(0.0..=1.0).contains(&min_score) {
+        return Err(runtime_status_response(tonic::Status::invalid_argument(
+            "min_score must be in range 0.0..=1.0",
+        )));
+    }
+    let session_scope = query.session_id.and_then(trim_to_option);
+    if let Some(session_scope) = session_scope.as_deref() {
+        validate_canonical_id(session_scope).map_err(|_| {
+            runtime_status_response(tonic::Status::invalid_argument(
+                "session_id must be a canonical ULID",
+            ))
+        })?;
+    }
+    let top_k = query.top_k.unwrap_or(8).clamp(1, 24);
+    let channel = query.channel.or(session.context.channel.clone());
+    let memory_hits = state
+        .runtime
+        .search_memory(journal::MemorySearchRequest {
+            principal: session.context.principal.clone(),
+            channel: channel.clone(),
+            session_id: session_scope.clone(),
+            query: search_query.to_owned(),
+            top_k,
+            min_score,
+            tags: Vec::new(),
+            sources: Vec::new(),
+        })
+        .await
+        .map_err(runtime_status_response)?;
+    let workspace_hits = state
+        .runtime
+        .search_workspace_documents(journal::WorkspaceSearchRequest {
+            principal: session.context.principal.clone(),
+            channel: channel.clone(),
+            agent_id: query.agent_id.and_then(trim_to_option),
+            query: search_query.to_owned(),
+            prefix: query.workspace_prefix.and_then(trim_to_option),
+            top_k,
+            min_score,
+            include_historical: false,
+            include_quarantined: false,
+        })
+        .await
+        .map_err(runtime_status_response)?;
+    let sessions = state
+        .runtime
+        .list_orchestrator_sessions(ListOrchestratorSessionsRequest {
+            after_session_key: None,
+            principal: session.context.principal.clone(),
+            device_id: session.context.device_id.clone(),
+            channel,
+            include_archived: false,
+            requested_limit: Some(top_k),
+            search_query: Some(search_query.to_owned()),
+        })
+        .await
+        .map_err(runtime_status_response)?;
+    let session_count = sessions.0.len();
+    let session_hits = sessions
+        .0
+        .into_iter()
+        .map(|record| {
+            json!({
+                "source_type": "session",
+                "session_id": record.session_id,
+                "title": record.title,
+                "preview": record.preview,
+                "updated_at_unix_ms": record.updated_at_unix_ms,
+                "match_snippet": record.match_snippet,
+                "last_run_state": record.last_run_state,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({
+        "query": search_query,
+        "groups": {
+            "sessions": session_hits,
+            "workspace": workspace_hits,
+            "memory": memory_hits,
+        },
+        "counts": {
+            "sessions": session_count,
+            "workspace": workspace_hits.len(),
+            "memory": memory_hits.len(),
+        },
+        "contract": contract_descriptor(),
+    })))
+}
+
 #[allow(clippy::result_large_err)]
 async fn run_memory_maintenance_now(
     state: &AppState,
@@ -223,4 +763,52 @@ async fn run_memory_maintenance_now(
         )
         .await
         .map_err(runtime_status_response)
+}
+
+fn render_recall_preview_prompt(
+    query: &str,
+    memory_hits: &[journal::MemorySearchHit],
+    workspace_hits: &[journal::WorkspaceSearchHit],
+) -> String {
+    let mut sections = Vec::new();
+    if !memory_hits.is_empty() {
+        sections.push(render_memory_augmented_prompt(memory_hits, query));
+    }
+    if !workspace_hits.is_empty() {
+        let mut block = String::from("<workspace_recall>\n");
+        for (index, hit) in workspace_hits.iter().enumerate() {
+            let snippet = preview_text(hit.snippet.as_str(), 220);
+            block.push_str(
+                format!(
+                    "{}. document_id={} path={} version={} reason={} risk_state={} snippet={}\n",
+                    index + 1,
+                    hit.document.document_id,
+                    hit.document.path,
+                    hit.version,
+                    hit.reason,
+                    hit.document.risk_state,
+                    snippet
+                )
+                .as_str(),
+            );
+        }
+        block.push_str("</workspace_recall>\n");
+        block.push_str(query);
+        sections.push(block);
+    }
+    if sections.is_empty() {
+        return query.to_owned();
+    }
+    sections.join("\n\n")
+}
+
+fn preview_text(raw: &str, max_chars: usize) -> String {
+    let normalized = raw.replace(['\r', '\n'], " ");
+    let trimmed = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    if trimmed.chars().count() <= max_chars {
+        return trimmed;
+    }
+    let mut truncated = trimmed.chars().take(max_chars).collect::<String>();
+    truncated.push_str("...");
+    truncated
 }

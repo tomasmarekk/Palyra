@@ -330,6 +330,94 @@ export interface ChatAttachmentRecord {
   budget_tokens: number;
 }
 
+export interface WorkspaceDocumentRecord {
+  document_id: string;
+  principal: string;
+  channel?: string;
+  agent_id?: string;
+  latest_session_id?: string;
+  path: string;
+  parent_path?: string;
+  title: string;
+  kind: string;
+  document_class: string;
+  state: string;
+  prompt_binding: string;
+  risk_state: string;
+  risk_reasons: string[];
+  pinned: boolean;
+  manual_override: boolean;
+  template_id?: string;
+  template_version?: number;
+  source_memory_id?: string;
+  latest_version: number;
+  content_text: string;
+  content_hash: string;
+  created_at_unix_ms: number;
+  updated_at_unix_ms: number;
+  deleted_at_unix_ms?: number;
+  last_recalled_at_unix_ms?: number;
+}
+
+export interface WorkspaceDocumentVersionRecord {
+  version_ulid: string;
+  document_id: string;
+  version: number;
+  event_type: string;
+  path: string;
+  title?: string;
+  kind: string;
+  document_class: string;
+  prompt_binding: string;
+  risk_state: string;
+  risk_reasons: string[];
+  content_text: string;
+  content_hash: string;
+  created_at_unix_ms: number;
+  source_session_id?: string;
+}
+
+export interface WorkspaceSearchHit {
+  reason: string;
+  snippet: string;
+  score: number;
+  version: number;
+  chunk_index: number;
+  chunk_count: number;
+  document: WorkspaceDocumentRecord;
+}
+
+export interface WorkspaceBootstrapOutcome {
+  ran_at_unix_ms: number;
+  created_paths: string[];
+  updated_paths: string[];
+  skipped_paths: string[];
+}
+
+export interface RecallPreviewEnvelope {
+  query: string;
+  memory_hits: JsonValue[];
+  workspace_hits: WorkspaceSearchHit[];
+  parameter_delta: JsonValue;
+  prompt_preview: string;
+  contract: ContractDescriptor;
+}
+
+export interface UnifiedSearchEnvelope {
+  query: string;
+  groups: {
+    sessions: JsonValue[];
+    workspace: WorkspaceSearchHit[];
+    memory: JsonValue[];
+  };
+  counts: {
+    sessions: number;
+    workspace: number;
+    memory: number;
+  };
+  contract: ContractDescriptor;
+}
+
 export interface ChatStreamMetaLine {
   type: "meta";
   run_id: string;
@@ -2111,8 +2199,156 @@ export class ConsoleApiClient {
     usage: JsonValue;
     retention: JsonValue;
     maintenance: JsonValue;
+    workspace?: {
+      roots: string[];
+      curated_paths: string[];
+      recent_documents: WorkspaceDocumentRecord[];
+    };
   }> {
     return this.request("/console/v1/memory/status");
+  }
+
+  async listWorkspaceDocuments(
+    params?: URLSearchParams,
+  ): Promise<{ documents: WorkspaceDocumentRecord[]; roots: string[]; contract: ContractDescriptor }> {
+    return this.request(buildPathWithQuery("/console/v1/memory/workspace/documents", params));
+  }
+
+  async getWorkspaceDocument(
+    params: URLSearchParams,
+  ): Promise<{ document: WorkspaceDocumentRecord; contract: ContractDescriptor }> {
+    return this.request(buildPathWithQuery("/console/v1/memory/workspace/document", params));
+  }
+
+  async writeWorkspaceDocument(payload: {
+    document_id?: string;
+    path: string;
+    title?: string;
+    content_text: string;
+    channel?: string;
+    agent_id?: string;
+    session_id?: string;
+    template_id?: string;
+    template_version?: number;
+    template_content_hash?: string;
+    source_memory_id?: string;
+    manual_override?: boolean;
+  }): Promise<{ document: WorkspaceDocumentRecord; contract: ContractDescriptor }> {
+    return this.request(
+      "/console/v1/memory/workspace/document",
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      { csrf: true },
+    );
+  }
+
+  async moveWorkspaceDocument(payload: {
+    path: string;
+    next_path: string;
+    channel?: string;
+    agent_id?: string;
+    session_id?: string;
+  }): Promise<{ document: WorkspaceDocumentRecord; contract: ContractDescriptor }> {
+    return this.request(
+      "/console/v1/memory/workspace/document/move",
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      { csrf: true },
+    );
+  }
+
+  async deleteWorkspaceDocument(payload: {
+    path: string;
+    channel?: string;
+    agent_id?: string;
+    session_id?: string;
+  }): Promise<{ document: WorkspaceDocumentRecord; contract: ContractDescriptor }> {
+    return this.request(
+      "/console/v1/memory/workspace/document/delete",
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      { csrf: true },
+    );
+  }
+
+  async pinWorkspaceDocument(payload: {
+    path: string;
+    pinned: boolean;
+    channel?: string;
+    agent_id?: string;
+  }): Promise<{ document: WorkspaceDocumentRecord; contract: ContractDescriptor }> {
+    return this.request(
+      "/console/v1/memory/workspace/document/pin",
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      { csrf: true },
+    );
+  }
+
+  async getWorkspaceDocumentVersions(
+    params: URLSearchParams,
+  ): Promise<{
+    document: WorkspaceDocumentRecord;
+    versions: WorkspaceDocumentVersionRecord[];
+    contract: ContractDescriptor;
+  }> {
+    return this.request(buildPathWithQuery("/console/v1/memory/workspace/document/versions", params));
+  }
+
+  async bootstrapWorkspace(payload: {
+    channel?: string;
+    agent_id?: string;
+    session_id?: string;
+    force_repair?: boolean;
+  }): Promise<{ bootstrap: WorkspaceBootstrapOutcome; roots: string[]; contract: ContractDescriptor }> {
+    return this.request(
+      "/console/v1/memory/workspace/bootstrap",
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      { csrf: true },
+    );
+  }
+
+  async searchWorkspaceDocuments(
+    params?: URLSearchParams,
+  ): Promise<{ hits: WorkspaceSearchHit[]; contract: ContractDescriptor }> {
+    return this.request(buildPathWithQuery("/console/v1/memory/workspace/search", params));
+  }
+
+  async previewRecall(payload: {
+    query: string;
+    channel?: string;
+    session_id?: string;
+    agent_id?: string;
+    memory_top_k?: number;
+    workspace_top_k?: number;
+    min_score?: number;
+    workspace_prefix?: string;
+    include_workspace_historical?: boolean;
+    include_workspace_quarantined?: boolean;
+  }): Promise<RecallPreviewEnvelope> {
+    return this.request(
+      "/console/v1/memory/recall/preview",
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      { csrf: true },
+    );
+  }
+
+  async searchAll(params?: URLSearchParams): Promise<UnifiedSearchEnvelope> {
+    return this.request(buildPathWithQuery("/console/v1/memory/search-all", params));
   }
 
   async purgeMemory(payload: {

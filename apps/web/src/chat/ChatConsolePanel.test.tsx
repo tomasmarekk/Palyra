@@ -59,6 +59,10 @@ describe("Chat web UX primitives", () => {
           draft_text: "Inspect backlog after deploy and summarize the risky items.",
           attachments: [attachment],
         })}
+        recallPreview={null}
+        recallPreviewBusy={false}
+        recallPreviewStale={false}
+        refreshRecallPreview={vi.fn()}
       />,
     );
 

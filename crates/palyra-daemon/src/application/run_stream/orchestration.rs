@@ -227,6 +227,8 @@ pub(crate) async fn process_run_stream_message(
         }
     }
 
+    let parameter_delta_json = (!message.parameter_delta_json.is_empty())
+        .then(|| String::from_utf8_lossy(message.parameter_delta_json.as_slice()).into_owned());
     if active_run_id.is_none() {
         run_state
             .transition(RunTransition::Accept)
@@ -265,9 +267,7 @@ pub(crate) async fn process_run_stream_message(
                     .unwrap_or_else(|| "manual".to_owned()),
                 origin_run_id: message.origin_run_id.as_ref().map(|value| value.ulid.clone()),
                 triggered_by_principal: Some(request_context.principal.clone()),
-                parameter_delta_json: (!message.parameter_delta_json.is_empty()).then(|| {
-                    String::from_utf8_lossy(message.parameter_delta_json.as_slice()).into_owned()
-                }),
+                parameter_delta_json: parameter_delta_json.clone(),
             })
             .await?;
 
@@ -309,6 +309,7 @@ pub(crate) async fn process_run_stream_message(
             tape_seq,
             session_id: session_id_for_message.as_str(),
             previous_run_id: previous_run_id_for_context.as_deref(),
+            parameter_delta_json: parameter_delta_json.as_deref(),
             input_text: input_text.as_str(),
             attachments: input_content.attachments.as_slice(),
             memory_ingest_reason: "run_stream_user_input",

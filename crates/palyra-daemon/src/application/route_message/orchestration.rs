@@ -251,6 +251,7 @@ pub(crate) async fn handle_routed_route_message(
             tape_seq: &mut tape_seq,
             session_id: session_id.as_str(),
             previous_run_id: previous_run_id_for_context.as_deref(),
+            parameter_delta_json: None,
             input_text: input.text.as_str(),
             attachments: content.attachments.as_slice(),
             memory_ingest_reason: "route_message_user_input",

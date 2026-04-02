@@ -256,6 +256,29 @@ describe("M56 runtime and operations surfaces", () => {
         if (request.path === "/console/v1/memory/status" && request.method === "GET") {
           return jsonResponse(memoryStatusFixture());
         }
+        if (request.path === "/console/v1/memory/workspace/documents" && request.method === "GET") {
+          return jsonResponse({
+            contract: { contract_version: "2025-02-01" },
+            roots: ["workspace"],
+            documents: [],
+          });
+        }
+        if (request.path === "/console/v1/memory/recall/preview" && request.method === "POST") {
+          return jsonResponse({
+            contract: { contract_version: "2025-02-01" },
+            query: "paired sender",
+            memory_hits: memoryHitsFixture().hits,
+            workspace_hits: [],
+            parameter_delta: {
+              explicit_recall: {
+                query: "paired sender",
+                memory_ids: ["mem-1"],
+                workspace_document_ids: [],
+              },
+            },
+            prompt_preview: "paired sender prefers concise replies",
+          });
+        }
         if (request.path === "/console/v1/memory/search" && request.method === "GET") {
           return jsonResponse(memoryHitsFixture());
         }
@@ -344,7 +367,9 @@ describe("M56 runtime and operations surfaces", () => {
       expect(await screen.findByRole("heading", { name: "Memory" })).toBeInTheDocument();
       fireEvent.change(screen.getByLabelText("Query"), { target: { value: "paired sender" } });
       fireEvent.click(screen.getByRole("button", { name: "Search" }));
-      expect(await screen.findByText(/paired sender prefers concise replies/)).toBeInTheDocument();
+      expect(
+        (await screen.findAllByText(/paired sender prefers concise replies/)).length,
+      ).toBeGreaterThan(0);
       fireEvent.click(screen.getByRole("button", { name: "Purge memory" }));
       const purgeDialog = await screen.findByRole("alertdialog", { name: "Purge memory" });
       fireEvent.click(within(purgeDialog).getByRole("button", { name: "Purge memory" }));

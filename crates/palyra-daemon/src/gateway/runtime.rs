@@ -12,6 +12,10 @@ use crate::journal::{
     OrchestratorSessionLineageUpdateRequest, OrchestratorSessionPinCreateRequest,
     OrchestratorSessionPinRecord, OrchestratorSessionTranscriptRecord, OrchestratorUsageQuery,
     OrchestratorUsageRunRecord, OrchestratorUsageSessionRecord, OrchestratorUsageSummary,
+    WorkspaceBootstrapOutcome, WorkspaceBootstrapRequest, WorkspaceDocumentDeleteRequest,
+    WorkspaceDocumentListFilter, WorkspaceDocumentMoveRequest, WorkspaceDocumentRecord,
+    WorkspaceDocumentVersionRecord, WorkspaceDocumentWriteRequest, WorkspaceSearchHit,
+    WorkspaceSearchRequest,
 };
 use palyra_auth::AuthHealthReport;
 use std::path::PathBuf;
@@ -4185,6 +4189,188 @@ impl GatewayRuntimeState {
             }
         }
         Ok(results)
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn workspace_document_by_path(
+        self: &Arc<Self>,
+        principal: String,
+        channel: Option<String>,
+        agent_id: Option<String>,
+        path: String,
+        include_deleted: bool,
+    ) -> Result<Option<WorkspaceDocumentRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state
+                .journal_store
+                .workspace_document_by_path(
+                    principal.as_str(),
+                    channel.as_deref(),
+                    agent_id.as_deref(),
+                    path.as_str(),
+                    include_deleted,
+                )
+                .map_err(|error| map_memory_store_error("load workspace document", error))
+        })
+        .await
+        .map_err(|_| Status::internal("workspace document worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn list_workspace_documents(
+        self: &Arc<Self>,
+        filter: WorkspaceDocumentListFilter,
+    ) -> Result<Vec<WorkspaceDocumentRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state
+                .journal_store
+                .list_workspace_documents(&filter)
+                .map_err(|error| map_memory_store_error("list workspace documents", error))
+        })
+        .await
+        .map_err(|_| Status::internal("workspace document list worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn upsert_workspace_document(
+        self: &Arc<Self>,
+        request: WorkspaceDocumentWriteRequest,
+    ) -> Result<WorkspaceDocumentRecord, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state
+                .journal_store
+                .upsert_workspace_document(&request)
+                .map_err(|error| map_memory_store_error("upsert workspace document", error))
+        })
+        .await
+        .map_err(|_| Status::internal("workspace document write worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn move_workspace_document(
+        self: &Arc<Self>,
+        request: WorkspaceDocumentMoveRequest,
+    ) -> Result<WorkspaceDocumentRecord, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state
+                .journal_store
+                .move_workspace_document(&request)
+                .map_err(|error| map_memory_store_error("move workspace document", error))
+        })
+        .await
+        .map_err(|_| Status::internal("workspace document move worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn soft_delete_workspace_document(
+        self: &Arc<Self>,
+        request: WorkspaceDocumentDeleteRequest,
+    ) -> Result<WorkspaceDocumentRecord, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state
+                .journal_store
+                .soft_delete_workspace_document(&request)
+                .map_err(|error| map_memory_store_error("delete workspace document", error))
+        })
+        .await
+        .map_err(|_| Status::internal("workspace document delete worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn list_workspace_document_versions(
+        self: &Arc<Self>,
+        document_id: String,
+        limit: usize,
+    ) -> Result<Vec<WorkspaceDocumentVersionRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state
+                .journal_store
+                .list_workspace_document_versions(document_id.as_str(), limit)
+                .map_err(|error| map_memory_store_error("list workspace document versions", error))
+        })
+        .await
+        .map_err(|_| Status::internal("workspace document versions worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn set_workspace_document_pinned(
+        self: &Arc<Self>,
+        principal: String,
+        channel: Option<String>,
+        agent_id: Option<String>,
+        path: String,
+        pinned: bool,
+    ) -> Result<Option<WorkspaceDocumentRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state
+                .journal_store
+                .set_workspace_document_pinned(
+                    principal.as_str(),
+                    channel.as_deref(),
+                    agent_id.as_deref(),
+                    path.as_str(),
+                    pinned,
+                )
+                .map_err(|error| map_memory_store_error("pin workspace document", error))
+        })
+        .await
+        .map_err(|_| Status::internal("workspace document pin worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn record_workspace_document_recall(
+        self: &Arc<Self>,
+        document_id: String,
+        recalled_at_unix_ms: i64,
+    ) -> Result<(), Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state
+                .journal_store
+                .record_workspace_document_recall(document_id.as_str(), recalled_at_unix_ms)
+                .map_err(|error| map_memory_store_error("record workspace recall", error))
+        })
+        .await
+        .map_err(|_| Status::internal("workspace recall worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn bootstrap_workspace(
+        self: &Arc<Self>,
+        request: WorkspaceBootstrapRequest,
+    ) -> Result<WorkspaceBootstrapOutcome, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state
+                .journal_store
+                .bootstrap_workspace(&request)
+                .map_err(|error| map_memory_store_error("bootstrap workspace", error))
+        })
+        .await
+        .map_err(|_| Status::internal("workspace bootstrap worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn search_workspace_documents(
+        self: &Arc<Self>,
+        request: WorkspaceSearchRequest,
+    ) -> Result<Vec<WorkspaceSearchHit>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state
+                .journal_store
+                .search_workspace_documents(&request)
+                .map_err(|error| map_memory_store_error("search workspace documents", error))
+        })
+        .await
+        .map_err(|_| Status::internal("workspace search worker panicked"))?
     }
 
     pub fn record_cron_trigger_fired(&self) {
