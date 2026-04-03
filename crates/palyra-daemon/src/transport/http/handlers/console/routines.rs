@@ -1112,15 +1112,17 @@ async fn dispatch_single_routine(
     if !routine.job.enabled {
         return register_terminal_routine_run(
             state,
-            routine.job.job_id.as_str(),
-            trigger_kind,
-            trigger_reason,
-            &trigger_payload,
-            trigger_dedupe_key,
-            routine.metadata.delivery.clone(),
-            CronRunStatus::Skipped,
-            RoutineRunOutcomeKind::Skipped,
-            "routine is disabled",
+            TerminalRoutineRunRequest {
+                routine_id: routine.job.job_id.as_str(),
+                trigger_kind,
+                trigger_reason,
+                trigger_payload: &trigger_payload,
+                trigger_dedupe_key,
+                delivery: routine.metadata.delivery.clone(),
+                status: CronRunStatus::Skipped,
+                outcome_override: RoutineRunOutcomeKind::Skipped,
+                message: "routine is disabled",
+            },
         )
         .await;
     }
@@ -1145,15 +1147,17 @@ async fn dispatch_single_routine(
         .await?;
         let mut response = register_terminal_routine_run(
             state,
-            routine.job.job_id.as_str(),
-            trigger_kind,
-            trigger_reason,
-            &trigger_payload,
-            trigger_dedupe_key,
-            routine.metadata.delivery.clone(),
-            CronRunStatus::Denied,
-            RoutineRunOutcomeKind::Denied,
-            "routine approval is required before the first run",
+            TerminalRoutineRunRequest {
+                routine_id: routine.job.job_id.as_str(),
+                trigger_kind,
+                trigger_reason,
+                trigger_payload: &trigger_payload,
+                trigger_dedupe_key,
+                delivery: routine.metadata.delivery.clone(),
+                status: CronRunStatus::Denied,
+                outcome_override: RoutineRunOutcomeKind::Denied,
+                message: "routine approval is required before the first run",
+            },
         )
         .await?;
         if let Some(object) = response.as_object_mut() {
@@ -1174,15 +1178,17 @@ async fn dispatch_single_routine(
         if seen {
             return register_terminal_routine_run(
                 state,
-                routine.job.job_id.as_str(),
-                trigger_kind,
-                trigger_reason,
-                &trigger_payload,
-                Some(dedupe_key.to_owned()),
-                routine.metadata.delivery.clone(),
-                CronRunStatus::Skipped,
-                RoutineRunOutcomeKind::Throttled,
-                "duplicate trigger dedupe key already processed",
+                TerminalRoutineRunRequest {
+                    routine_id: routine.job.job_id.as_str(),
+                    trigger_kind,
+                    trigger_reason,
+                    trigger_payload: &trigger_payload,
+                    trigger_dedupe_key: Some(dedupe_key.to_owned()),
+                    delivery: routine.metadata.delivery.clone(),
+                    status: CronRunStatus::Skipped,
+                    outcome_override: RoutineRunOutcomeKind::Throttled,
+                    message: "duplicate trigger dedupe key already processed",
+                },
             )
             .await;
         }
@@ -1201,15 +1207,17 @@ async fn dispatch_single_routine(
         }) {
             return register_terminal_routine_run(
                 state,
-                routine.job.job_id.as_str(),
-                trigger_kind,
-                trigger_reason,
-                &trigger_payload,
-                trigger_dedupe_key,
-                routine.metadata.delivery.clone(),
-                CronRunStatus::Skipped,
-                RoutineRunOutcomeKind::Throttled,
-                "routine cooldown window is still active",
+                TerminalRoutineRunRequest {
+                    routine_id: routine.job.job_id.as_str(),
+                    trigger_kind,
+                    trigger_reason,
+                    trigger_payload: &trigger_payload,
+                    trigger_dedupe_key,
+                    delivery: routine.metadata.delivery.clone(),
+                    status: CronRunStatus::Skipped,
+                    outcome_override: RoutineRunOutcomeKind::Throttled,
+                    message: "routine cooldown window is still active",
+                },
             )
             .await;
         }
@@ -1217,15 +1225,17 @@ async fn dispatch_single_routine(
     if is_in_quiet_hours(routine.metadata.quiet_hours.as_ref(), now_unix_ms)? {
         return register_terminal_routine_run(
             state,
-            routine.job.job_id.as_str(),
-            trigger_kind,
-            trigger_reason,
-            &trigger_payload,
-            trigger_dedupe_key,
-            routine.metadata.delivery.clone(),
-            CronRunStatus::Skipped,
-            RoutineRunOutcomeKind::Skipped,
-            "routine quiet hours suppress execution",
+            TerminalRoutineRunRequest {
+                routine_id: routine.job.job_id.as_str(),
+                trigger_kind,
+                trigger_reason,
+                trigger_payload: &trigger_payload,
+                trigger_dedupe_key,
+                delivery: routine.metadata.delivery.clone(),
+                status: CronRunStatus::Skipped,
+                outcome_override: RoutineRunOutcomeKind::Skipped,
+                message: "routine quiet hours suppress execution",
+            },
         )
         .await;
     }
@@ -1351,30 +1361,34 @@ fn compare_optional_matchers(expected: Option<&str>, actual: Option<&str>) -> bo
         .is_none_or(|expected| actual.is_some_and(|actual| expected.eq_ignore_ascii_case(actual)))
 }
 
-async fn register_terminal_routine_run(
-    state: &AppState,
-    routine_id: &str,
+struct TerminalRoutineRunRequest<'a> {
+    routine_id: &'a str,
     trigger_kind: RoutineTriggerKind,
     trigger_reason: Option<String>,
-    trigger_payload: &Value,
+    trigger_payload: &'a Value,
     trigger_dedupe_key: Option<String>,
     delivery: RoutineDeliveryConfig,
     status: CronRunStatus,
     outcome_override: RoutineRunOutcomeKind,
-    message: &str,
+    message: &'a str,
+}
+
+async fn register_terminal_routine_run(
+    state: &AppState,
+    request: TerminalRoutineRunRequest<'_>,
 ) -> Result<Value, Response> {
     let run_id = Ulid::new().to_string();
     state
         .runtime
         .start_cron_run(CronRunStartRequest {
             run_id: run_id.clone(),
-            job_id: routine_id.to_owned(),
+            job_id: request.routine_id.to_owned(),
             attempt: 1,
             session_id: None,
             orchestrator_run_id: None,
-            status,
+            status: request.status,
             error_kind: Some("routine_gate".to_owned()),
-            error_message_redacted: Some(message.to_owned()),
+            error_message_redacted: Some(request.message.to_owned()),
         })
         .await
         .map_err(runtime_status_response)?;
@@ -1382,9 +1396,9 @@ async fn register_terminal_routine_run(
         .runtime
         .finalize_cron_run(CronRunFinalizeRequest {
             run_id: run_id.clone(),
-            status,
+            status: request.status,
             error_kind: Some("routine_gate".to_owned()),
-            error_message_redacted: Some(message.to_owned()),
+            error_message_redacted: Some(request.message.to_owned()),
             model_tokens_in: 0,
             model_tokens_out: 0,
             tool_calls: 0,
@@ -1398,26 +1412,28 @@ async fn register_terminal_routine_run(
         .routines
         .upsert_run_metadata(RoutineRunMetadataUpsert {
             run_id: run_id.clone(),
-            routine_id: routine_id.to_owned(),
-            trigger_kind,
-            trigger_reason,
-            trigger_payload_json: serde_json::to_string(trigger_payload).map_err(|error| {
-                runtime_status_response(tonic::Status::internal(format!(
-                    "failed to serialize trigger payload: {error}"
-                )))
-            })?,
-            trigger_dedupe_key,
-            delivery,
-            outcome_override: Some(outcome_override),
-            outcome_message: Some(message.to_owned()),
+            routine_id: request.routine_id.to_owned(),
+            trigger_kind: request.trigger_kind,
+            trigger_reason: request.trigger_reason,
+            trigger_payload_json: serde_json::to_string(request.trigger_payload).map_err(
+                |error| {
+                    runtime_status_response(tonic::Status::internal(format!(
+                        "failed to serialize trigger payload: {error}"
+                    )))
+                },
+            )?,
+            trigger_dedupe_key: request.trigger_dedupe_key,
+            delivery: request.delivery,
+            outcome_override: Some(request.outcome_override),
+            outcome_message: Some(request.message.to_owned()),
             output_delivered: Some(false),
         })
         .map_err(routine_registry_error_response)?;
     Ok(json!({
-        "routine_id": routine_id,
+        "routine_id": request.routine_id,
         "run_id": run_id,
-        "status": status.as_str(),
-        "message": message,
+        "status": request.status.as_str(),
+        "message": request.message,
     }))
 }
 
@@ -1461,6 +1477,7 @@ fn routine_view_from_parts(job: &CronJobRecord, metadata: &RoutineMetadataRecord
     })
 }
 
+#[allow(clippy::result_large_err)]
 fn resolve_routine_schedule(
     payload: &ConsoleRoutineUpsertRequest,
     trigger_kind: RoutineTriggerKind,
@@ -1583,6 +1600,7 @@ fn parse_routine_trigger_kind(value: &str) -> Result<RoutineTriggerKind, tonic::
     })
 }
 
+#[allow(clippy::result_large_err)]
 fn parse_schedule_type(value: &str) -> Result<CronScheduleType, Response> {
     CronScheduleType::from_str(value).ok_or_else(|| {
         runtime_status_response(tonic::Status::invalid_argument(
@@ -1591,6 +1609,7 @@ fn parse_schedule_type(value: &str) -> Result<CronScheduleType, Response> {
     })
 }
 
+#[allow(clippy::result_large_err)]
 fn parse_concurrency_policy(value: Option<&str>) -> Result<CronConcurrencyPolicy, Response> {
     let normalized = value.map(str::trim).filter(|value| !value.is_empty()).unwrap_or("forbid");
     CronConcurrencyPolicy::from_str(normalized).ok_or_else(|| {
@@ -1600,6 +1619,7 @@ fn parse_concurrency_policy(value: Option<&str>) -> Result<CronConcurrencyPolicy
     })
 }
 
+#[allow(clippy::result_large_err)]
 fn parse_retry_policy(
     max_attempts: Option<u32>,
     backoff_ms: Option<u64>,
@@ -1610,6 +1630,7 @@ fn parse_retry_policy(
     })
 }
 
+#[allow(clippy::result_large_err)]
 fn parse_misfire_policy(value: Option<&str>) -> Result<CronMisfirePolicy, Response> {
     let normalized = value.map(str::trim).filter(|value| !value.is_empty()).unwrap_or("skip");
     CronMisfirePolicy::from_str(normalized).ok_or_else(|| {
@@ -1619,6 +1640,7 @@ fn parse_misfire_policy(value: Option<&str>) -> Result<CronMisfirePolicy, Respon
     })
 }
 
+#[allow(clippy::result_large_err)]
 fn parse_delivery(
     mode: Option<&str>,
     channel: Option<String>,
@@ -1646,6 +1668,7 @@ fn parse_delivery(
     Ok(RoutineDeliveryConfig { mode, channel })
 }
 
+#[allow(clippy::result_large_err)]
 fn parse_quiet_hours(
     start: Option<&str>,
     end: Option<&str>,
@@ -1672,6 +1695,7 @@ fn parse_quiet_hours(
     Ok(Some(RoutineQuietHours { start_minute_of_day, end_minute_of_day, timezone }))
 }
 
+#[allow(clippy::result_large_err)]
 fn parse_time_of_day_to_minutes(value: &str) -> Result<u16, Response> {
     let (hour, minute) = value.split_once(':').ok_or_else(|| {
         runtime_status_response(tonic::Status::invalid_argument(
@@ -1696,6 +1720,7 @@ fn parse_time_of_day_to_minutes(value: &str) -> Result<u16, Response> {
     Ok(hour * 60 + minute)
 }
 
+#[allow(clippy::result_large_err)]
 fn parse_approval_policy(value: Option<&str>) -> Result<RoutineApprovalPolicy, Response> {
     let normalized = value.map(str::trim).filter(|value| !value.is_empty()).unwrap_or("none");
     let mode = RoutineApprovalMode::from_str(normalized).ok_or_else(|| {
@@ -1706,6 +1731,7 @@ fn parse_approval_policy(value: Option<&str>) -> Result<RoutineApprovalPolicy, R
     Ok(RoutineApprovalPolicy { mode })
 }
 
+#[allow(clippy::result_large_err)]
 fn normalize_owner_principal(
     requested: &Option<String>,
     session_principal: &str,
@@ -1734,6 +1760,7 @@ fn normalize_optional_text(value: Option<&str>) -> Option<String> {
     value.map(str::trim).filter(|value| !value.is_empty()).map(ToOwned::to_owned)
 }
 
+#[allow(clippy::result_large_err)]
 fn ensure_job_owner(job: &CronJobRecord, principal: &str) -> Result<(), Response> {
     if job.owner_principal != principal {
         return Err(runtime_status_response(tonic::Status::permission_denied(
@@ -1743,6 +1770,7 @@ fn ensure_job_owner(job: &CronJobRecord, principal: &str) -> Result<(), Response
     Ok(())
 }
 
+#[allow(clippy::result_large_err)]
 fn parse_timezone_mode(value: Option<&str>) -> Result<CronTimezoneMode, Response> {
     match value.map(str::trim).filter(|value| !value.is_empty()) {
         Some("local") | None => Ok(CronTimezoneMode::Local),
@@ -1753,6 +1781,7 @@ fn parse_timezone_mode(value: Option<&str>) -> Result<CronTimezoneMode, Response
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn is_in_quiet_hours(
     quiet_hours: Option<&RoutineQuietHours>,
     now_unix_ms: i64,

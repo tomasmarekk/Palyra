@@ -1349,9 +1349,9 @@ fn parse_time_components(
 }
 
 fn humanize_duration(duration_ms: u64) -> String {
-    if duration_ms % (60 * 60 * 1_000) == 0 {
+    if duration_ms.is_multiple_of(60 * 60 * 1_000) {
         format!("{} hour(s)", duration_ms / (60 * 60 * 1_000))
-    } else if duration_ms % (60 * 1_000) == 0 {
+    } else if duration_ms.is_multiple_of(60 * 1_000) {
         format!("{} minute(s)", duration_ms / (60 * 1_000))
     } else {
         format!("{} ms", duration_ms)
