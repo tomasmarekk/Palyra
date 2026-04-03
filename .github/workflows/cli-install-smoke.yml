@@ -45,6 +45,14 @@ jobs:
         shell: pwsh
         run: ./scripts/test/run-cli-install-smoke.ps1
 
+      - name: Upload CLI install smoke report
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: cli-install-smoke-report-${{ matrix.os }}
+          path: target/release-artifacts/cli-install-smoke/report
+          if-no-files-found: warn
+
       - name: Upload CLI install smoke artifacts on failure
         if: failure()
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
