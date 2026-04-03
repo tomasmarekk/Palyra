@@ -86,7 +86,7 @@ function legacyNavigationLabel(section: Section): string | null {
     case "inventory":
       return "Inventory and Runtime Health";
     case "cron":
-      return "Cron";
+      return "Routines";
     case "channels":
       return "Channels and Router";
     case "support":

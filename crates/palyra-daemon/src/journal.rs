@@ -265,7 +265,7 @@ pub struct CronJobUpdatePatch {
     pub queued_run: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CronJobRecord {
     pub job_id: String,
     pub name: String,

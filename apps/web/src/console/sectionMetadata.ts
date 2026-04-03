@@ -14,7 +14,11 @@ export const CONSOLE_SECTIONS = [
     detail: "Nodes, devices, pending pairings, and runtime instances",
   },
   { id: "approvals", label: "Approvals", detail: "Sensitive action gate" },
-  { id: "cron", label: "Automation", detail: "Scheduled jobs, runs, and history" },
+  {
+    id: "cron",
+    label: "Routines",
+    detail: "Scheduled and event-driven automations, runs, templates, and approvals",
+  },
   { id: "channels", label: "Channels", detail: "Connectors, router, and Discord setup" },
   { id: "browser", label: "Browser", detail: "Profiles, relay, and downloads" },
   { id: "agents", label: "Agents", detail: "Registry, defaults, and workspace setup" },

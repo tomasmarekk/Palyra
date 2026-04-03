@@ -32,6 +32,17 @@ pub(crate) struct ConsoleHookBindRequest {
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConsoleHookToggleRequest {}
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ConsoleHookFireRequest {
+    #[serde(default)]
+    event: Option<String>,
+    #[serde(default)]
+    payload: Option<Value>,
+    #[serde(default)]
+    dedupe_key: Option<String>,
+}
+
 pub(crate) async fn console_hooks_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -226,6 +237,55 @@ pub(crate) async fn console_hook_delete_handler(
         "contract": contract_descriptor(),
         "deleted": true,
         "binding": binding,
+    })))
+}
+
+pub(crate) async fn console_hook_fire_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(hook_id): Path<String>,
+    Json(payload): Json<ConsoleHookFireRequest>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    let hooks_root = resolve_hooks_root().map_err(internal_console_error)?;
+    let index = load_hook_bindings_index(hooks_root.as_path()).map_err(internal_console_error)?;
+    let binding = hook_binding(&index, hook_id.as_str()).map_err(not_found_console_error)?;
+    let owner_principal = binding
+        .operator
+        .owner_principal
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(session.context.principal.as_str());
+    if owner_principal != session.context.principal {
+        return Err(runtime_status_response(tonic::Status::permission_denied(
+            "hook owner principal does not match authenticated session principal",
+        )));
+    }
+    let event = payload
+        .event
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(binding.event.as_str());
+    let normalized_event = normalize_hook_event(event).map_err(internal_console_error)?;
+    let dispatches = super::routines::dispatch_hook_event_routines(
+        &state,
+        session.context.principal.as_str(),
+        binding.hook_id.as_str(),
+        normalized_event,
+        json!({
+            "hook_id": binding.hook_id,
+            "event": normalized_event,
+            "plugin_id": binding.plugin_id,
+            "payload": payload.payload.unwrap_or_else(|| json!({})),
+        }),
+        payload.dedupe_key,
+    )
+    .await?;
+    Ok(Json(json!({
+        "contract": contract_descriptor(),
+        "binding": binding,
+        "dispatches": dispatches,
     })))
 }
 

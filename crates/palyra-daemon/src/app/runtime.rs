@@ -18,6 +18,7 @@ use crate::{
     gateway::{self, GatewayAuthConfig, GatewayRuntimeState},
     node_runtime::NodeRuntimeState,
     observability::ObservabilityState,
+    routines,
     webhooks,
 };
 use palyra_identity::IdentityManager;
@@ -29,6 +30,7 @@ pub(crate) struct AppStateBuildContext {
     pub(crate) identity_manager: Arc<Mutex<IdentityManager>>,
     pub(crate) channels: Arc<channels::ChannelPlatform>,
     pub(crate) webhooks: Arc<webhooks::WebhookRegistry>,
+    pub(crate) routines: Arc<routines::RoutineRegistry>,
     pub(crate) vault: Arc<Vault>,
     pub(crate) auth_runtime: Arc<gateway::AuthRuntimeState>,
     pub(crate) auth: GatewayAuthConfig,
@@ -48,6 +50,7 @@ pub(crate) fn build_app_state(
         identity_manager: context.identity_manager,
         channels: context.channels,
         webhooks: context.webhooks,
+        routines: context.routines,
         vault: context.vault,
         tool_allowed_tools: loaded.tool_call.allowed_tools.clone(),
         browser_service_config: build_browser_service_runtime_config(

@@ -79,11 +79,11 @@ describe("ConsoleApiClient", () => {
       every_interval_ms: 60000,
     });
 
-    expect(requestUrl(calls[1]?.input)).toBe("/console/v1/cron/jobs");
+    expect(requestUrl(calls[1]?.input)).toBe("/console/v1/routines");
     const getHeaders = new Headers(calls[1]?.init?.headers);
     expect(getHeaders.get("x-palyra-csrf-token")).toBeNull();
 
-    expect(requestUrl(calls[2]?.input)).toBe("/console/v1/cron/jobs");
+    expect(requestUrl(calls[2]?.input)).toBe("/console/v1/routines");
     const postHeaders = new Headers(calls[2]?.init?.headers);
     expect(postHeaders.get("x-palyra-csrf-token")).toBe("csrf-1");
     expect(calls[2]?.init?.credentials).toBe("include");
@@ -103,6 +103,55 @@ describe("ConsoleApiClient", () => {
         every_interval_ms: 60000,
       }),
     ).rejects.toThrow("Missing CSRF token");
+  });
+
+  it("uses routines endpoints for templates, previews, import-export, dispatch, and system events", async () => {
+    const calls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
+    const responses = [
+      jsonResponse({
+        principal: "admin:web-console",
+        device_id: "device-1",
+        csrf_token: "csrf-1",
+        issued_at_unix_ms: 100,
+        expires_at_unix_ms: 200,
+      }),
+      jsonResponse({ version: 1, templates: [] }),
+      jsonResponse({ preview: { schedule_type: "every" } }),
+      jsonResponse({ export: { schema_id: "palyra.routine.export" } }),
+      jsonResponse({ routine: { routine_id: "R1" }, imported_from: "R0" }),
+      jsonResponse({ routine_id: "R1", run_id: "run-1", status: "queued", message: "queued" }),
+      jsonResponse({ status: "emitted", event: "system.operator.nightly", routine_dispatches: [] }),
+    ];
+    const fetcher: typeof fetch = (input, init) => {
+      calls.push({ input, init });
+      const response = responses.shift();
+      if (response === undefined) {
+        throw new Error("No response queued for fetch mock.");
+      }
+      return Promise.resolve(response);
+    };
+
+    const client = new ConsoleApiClient("", fetcher);
+    await client.login({
+      admin_token: "token",
+      principal: "admin:web-console",
+      device_id: "device-1",
+      channel: "web",
+    });
+    await client.listRoutineTemplates();
+    await client.previewRoutineSchedule({ phrase: "every 2h", timezone: "utc" });
+    await client.exportRoutine("R1");
+    await client.importRoutine({ export: { schema_id: "palyra.routine.export" } });
+    await client.dispatchRoutine("R1", { trigger_kind: "manual", trigger_payload: {} });
+    await client.emitSystemEvent({ name: "nightly", details: { ok: true } });
+
+    expect(requestUrl(calls[1]?.input)).toBe("/console/v1/routines/templates");
+    expect(requestUrl(calls[2]?.input)).toBe("/console/v1/routines/schedule-preview");
+    expect(new Headers(calls[2]?.init?.headers).get("x-palyra-csrf-token")).toBe("csrf-1");
+    expect(requestUrl(calls[3]?.input)).toBe("/console/v1/routines/R1/export");
+    expect(requestUrl(calls[4]?.input)).toBe("/console/v1/routines/import");
+    expect(requestUrl(calls[5]?.input)).toBe("/console/v1/routines/R1/dispatch");
+    expect(requestUrl(calls[6]?.input)).toBe("/console/v1/system/events/emit");
   });
 
   it("uses GET without CSRF and POST with CSRF for channel operations", async () => {
@@ -1080,7 +1129,7 @@ describe("ConsoleApiClient", () => {
     await client.deleteBrowserProfile("profile-1");
     await client.listBrowserDownloads();
 
-    expect(requestUrl(calls[1]?.input)).toBe("/console/v1/cron/jobs/cron-1/runs");
+    expect(requestUrl(calls[1]?.input)).toBe("/console/v1/routines/cron-1/runs");
     expect(new Headers(calls[1]?.init?.headers).get("x-palyra-csrf-token")).toBeNull();
 
     expect(requestUrl(calls[2]?.input)).toBe("/console/v1/channels/router/rules");

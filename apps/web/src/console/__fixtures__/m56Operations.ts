@@ -83,7 +83,25 @@ export function secretRevealFixture() {
 
 export function cronJobsFixture() {
   return {
-    jobs: [{ job_id: "cron-1", name: "nightly", enabled: true }],
+    routines: [
+      {
+        routine_id: "cron-1",
+        job_id: "cron-1",
+        name: "nightly",
+        enabled: true,
+        trigger_kind: "schedule",
+        schedule_type: "every",
+        schedule_payload: { interval_ms: 3600000 },
+        delivery_mode: "same_channel",
+        channel: "web",
+        last_run: {
+          run_id: "cron-run-1",
+          outcome_kind: "success_with_output",
+          status: "succeeded",
+          outcome_message: "queued",
+        },
+      },
+    ],
   };
 }
 
@@ -92,10 +110,12 @@ export function cronRunsFixture() {
     runs: [
       {
         run_id: "cron-run-1",
-        job_id: "cron-1",
-        state: "succeeded",
+        routine_id: "cron-1",
+        status: "succeeded",
+        outcome_kind: "success_with_output",
+        outcome_message: "queued",
         started_at_unix_ms: 1700000003000,
-        completed_at_unix_ms: 1700000004000,
+        finished_at_unix_ms: 1700000004000,
       },
     ],
   };

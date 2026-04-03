@@ -657,8 +657,19 @@ describe("M35 web console app", () => {
     expect(headers.get("x-palyra-csrf-token")).toBe("csrf-1");
   });
 
-  it("supports cron create and disable workflow from UI", async () => {
-    const cronJobs = [{ job_id: "J1", name: "job-one", enabled: true }];
+  it("supports routine create and pause workflow from UI", async () => {
+    const cronJobs = [
+      {
+        routine_id: "J1",
+        job_id: "J1",
+        name: "job-one",
+        enabled: true,
+        trigger_kind: "schedule",
+        schedule_type: "every",
+        schedule_payload: { interval_ms: 60000 },
+        delivery_mode: "same_channel",
+      },
+    ];
     const fetchMock = withM56Baseline((input: RequestInfo | URL, init?: RequestInit) => {
       const path = requestUrl(input);
       const method = (init?.method ?? "GET").toUpperCase();
@@ -676,18 +687,29 @@ describe("M35 web console app", () => {
         );
       }
 
-      if (path === "/console/v1/cron/jobs" && method === "GET") {
-        return Promise.resolve(jsonResponse({ jobs: cronJobs }));
+      if (path === "/console/v1/routines" && method === "GET") {
+        return Promise.resolve(jsonResponse({ routines: cronJobs }));
       }
 
-      if (path === "/console/v1/cron/jobs" && method === "POST") {
-        cronJobs.push({ job_id: "J2", name: "web-job", enabled: true });
-        return Promise.resolve(jsonResponse({ job: { job_id: "J2" } }));
+      if (path === "/console/v1/routines" && method === "POST") {
+        cronJobs.push({
+          routine_id: "J2",
+          job_id: "J2",
+          name: "web-job",
+          enabled: true,
+          trigger_kind: "schedule",
+          schedule_type: "every",
+          schedule_payload: { interval_ms: 60000 },
+          delivery_mode: "same_channel",
+        });
+        return Promise.resolve(jsonResponse({ routine: { routine_id: "J2", job_id: "J2" } }));
       }
 
-      if (path === "/console/v1/cron/jobs/J1/enabled" && method === "POST") {
+      if (path === "/console/v1/routines/J1/enabled" && method === "POST") {
         cronJobs[0] = { ...cronJobs[0], enabled: false };
-        return Promise.resolve(jsonResponse({ job: { job_id: "J1", enabled: false } }));
+        return Promise.resolve(
+          jsonResponse({ routine: { routine_id: "J1", job_id: "J1", enabled: false } }),
+        );
       }
 
       throw new Error(`Unhandled mocked request: ${method} ${path}`);
@@ -695,32 +717,32 @@ describe("M35 web console app", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "Cron" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Routines" }));
     expect((await screen.findAllByText("job-one")).length).toBeGreaterThan(0);
 
-    fireEvent.click(screen.getByRole("button", { name: "New automation" }));
+    fireEvent.click(screen.getByRole("button", { name: "New routine" }));
     fireEvent.change(screen.getByLabelText("Name"), { target: { value: "web-job" } });
     fireEvent.change(screen.getByLabelText("Prompt"), {
       target: { value: "run from web console" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Create automation" }));
+    fireEvent.click(screen.getByRole("button", { name: "Create routine" }));
 
     await waitFor(() => {
-      expect(screen.getByText("Cron job created.")).toBeInTheDocument();
+      expect(screen.getByText("Routine created.")).toBeInTheDocument();
     });
 
-    fireEvent.click((await screen.findAllByRole("button", { name: /^Disable / }))[0]);
+    fireEvent.click((await screen.findAllByRole("button", { name: "Pause" }))[0]);
 
     await waitFor(() => {
-      expect(screen.getByText("Cron job disabled.")).toBeInTheDocument();
+      expect(screen.getByText("Routine paused.")).toBeInTheDocument();
     });
 
-    const [, createRequest] = findRequestCall(fetchMock, "/console/v1/cron/jobs", "POST");
+    const [, createRequest] = findRequestCall(fetchMock, "/console/v1/routines", "POST");
     expect(createRequest?.method).toBe("POST");
 
     const [, toggleRequest] = findRequestCall(
       fetchMock,
-      "/console/v1/cron/jobs/J1/enabled",
+      "/console/v1/routines/J1/enabled",
       "POST",
     );
     expect(toggleRequest?.method).toBe("POST");

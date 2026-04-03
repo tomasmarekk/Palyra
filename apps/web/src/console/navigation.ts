@@ -59,7 +59,7 @@ const SECTION_PATHS: Readonly<Record<Section, string>> = {
   logs: "/control/logs",
   inventory: "/control/inventory",
   approvals: "/control/approvals",
-  cron: "/control/automation",
+  cron: "/control/routines",
   channels: "/control/channels",
   browser: "/control/browser",
   agents: "/agent/agents",
@@ -74,6 +74,7 @@ const SECTION_PATHS: Readonly<Record<Section, string>> = {
 };
 const SECTION_PATH_ALIASES: Readonly<Record<string, Section>> = {
   "/control": "overview",
+  "/control/automation": "cron",
 };
 const SECTION_GROUPS: Readonly<Record<Section, NavigationGroup["id"]>> = {
   overview: "control",

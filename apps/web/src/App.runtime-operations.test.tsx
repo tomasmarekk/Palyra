@@ -42,16 +42,16 @@ describe("M56 runtime and operations surfaces", () => {
   const runtimeWorkflowTimeoutMs = 30_000;
 
   it(
-    "surfaces operations handoffs and executes cron plus channels workflows",
+    "surfaces operations handoffs and executes routines plus channels workflows",
     async () => {
       const fetchMock = createFetchRouter(routeBaseRequests, (request) => {
-        if (request.path === "/console/v1/cron/jobs" && request.method === "GET") {
+        if (request.path === "/console/v1/routines" && request.method === "GET") {
           return jsonResponse(cronJobsFixture());
         }
-        if (request.path === "/console/v1/cron/jobs/cron-1/run-now" && request.method === "POST") {
+        if (request.path === "/console/v1/routines/cron-1/run-now" && request.method === "POST") {
           return jsonResponse({ run_id: "cron-run-1", status: "queued", message: "queued" });
         }
-        if (request.path === "/console/v1/cron/jobs/cron-1/runs" && request.method === "GET") {
+        if (request.path === "/console/v1/routines/cron-1/runs" && request.method === "GET") {
           return jsonResponse(cronRunsFixture());
         }
         if (request.path === "/console/v1/channels" && request.method === "GET") {
@@ -166,14 +166,14 @@ describe("M56 runtime and operations surfaces", () => {
       expect(await screen.findByText(/message\.routed/)).toBeInTheDocument();
       expect(await screen.findByText("Diagnostics snapshot")).toBeInTheDocument();
 
-      fireEvent.click(screen.getByRole("button", { name: "Cron" }));
-      expect(await screen.findByRole("heading", { name: "Cron" })).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Routines" }));
+      expect(await screen.findByRole("heading", { name: "Routines" })).toBeInTheDocument();
       expect((await screen.findAllByText("nightly")).length).toBeGreaterThan(0);
       fireEvent.click(screen.getByRole("button", { name: /Run .* now/ }));
       await waitFor(() => {
-        expect(screen.getByText("Run-now dispatched.")).toBeInTheDocument();
+        expect(screen.getByText("Routine dispatched as run cron-run-1.")).toBeInTheDocument();
       });
-      expect(await screen.findByText(/cron-run-1/)).toBeInTheDocument();
+      expect((await screen.findAllByText(/cron-run-1/)).length).toBeGreaterThan(0);
 
       fireEvent.click(screen.getByRole("button", { name: "Channels and Router" }));
       expect(await screen.findByRole("heading", { name: "Channels" })).toBeInTheDocument();

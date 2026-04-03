@@ -21,6 +21,7 @@ use crate::{
     node_runtime::NodeRuntimeState,
     observability::ObservabilityState,
     openai_auth::OpenAiOAuthAttemptStateRecord,
+    routines,
     webhooks,
 };
 
@@ -32,6 +33,7 @@ pub(crate) struct AppState {
     pub(crate) identity_manager: Arc<Mutex<IdentityManager>>,
     pub(crate) channels: Arc<channels::ChannelPlatform>,
     pub(crate) webhooks: Arc<webhooks::WebhookRegistry>,
+    pub(crate) routines: Arc<routines::RoutineRegistry>,
     pub(crate) vault: Arc<Vault>,
     pub(crate) tool_allowed_tools: Vec<String>,
     pub(crate) browser_service_config: gateway::BrowserServiceRuntimeConfig,

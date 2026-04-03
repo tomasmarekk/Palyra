@@ -953,7 +953,7 @@ export function useConsoleAppState() {
         channel: emptyToUndefined(cronForm.channel),
       });
       setCronForm(DEFAULT_CRON_FORM);
-      setNotice("Cron job created.");
+      setNotice("Routine saved.");
       await refreshCron();
     } catch (failure) {
       setError(toErrorMessage(failure));
@@ -971,7 +971,7 @@ export function useConsoleAppState() {
     setError(null);
     try {
       await api.setCronJobEnabled(jobId, enabled);
-      setNotice(`Cron job ${enabled ? "enabled" : "disabled"}.`);
+      setNotice(`Routine ${enabled ? "enabled" : "disabled"}.`);
       await refreshCron();
     } catch (failure) {
       setError(toErrorMessage(failure));
@@ -993,7 +993,7 @@ export function useConsoleAppState() {
       setCronJobId(jobId);
       const runs = await api.listCronRuns(jobId);
       setCronRuns(toJsonObjectArray(runs.runs));
-      setNotice("Run-now dispatched.");
+      setNotice("Routine run-now dispatched.");
     } catch (failure) {
       setError(toErrorMessage(failure));
     } finally {
@@ -1003,7 +1003,7 @@ export function useConsoleAppState() {
 
   async function refreshCronRuns(): Promise<void> {
     if (cronJobId.trim().length === 0) {
-      setError("Select a cron job before loading runs.");
+      setError("Select a routine before loading runs.");
       return;
     }
     setCronBusy(true);

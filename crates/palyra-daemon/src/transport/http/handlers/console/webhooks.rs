@@ -8,6 +8,18 @@ pub(crate) struct ConsoleWebhooksListQuery {
     enabled: Option<bool>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ConsoleWebhookDispatchRequest {
+    event: String,
+    #[serde(default)]
+    payload: Option<Value>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    dedupe_key: Option<String>,
+}
+
 pub(crate) async fn console_webhooks_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -145,6 +157,51 @@ pub(crate) async fn console_webhook_test_handler(
         integration: outcome.integration,
         result: outcome.result,
     }))
+}
+
+pub(crate) async fn console_webhook_dispatch_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(integration_id): Path<String>,
+    Json(payload): Json<ConsoleWebhookDispatchRequest>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    let integration = state
+        .webhooks
+        .get_view(integration_id.as_str(), state.vault.as_ref())
+        .map_err(webhook_registry_error_response)?
+        .ok_or_else(|| {
+            runtime_status_response(tonic::Status::not_found("webhook integration not found"))
+        })?;
+    let event = payload.event.trim();
+    if event.is_empty() {
+        return Err(validation_error_response(
+            "event",
+            "required",
+            "event is required for webhook dispatch",
+        ));
+    }
+    let dispatches = super::routines::dispatch_webhook_event_routines(
+        &state,
+        session.context.principal.as_str(),
+        integration.integration_id.as_str(),
+        integration.provider.as_str(),
+        event,
+        json!({
+            "integration_id": integration.integration_id,
+            "provider": integration.provider,
+            "event": event,
+            "source": payload.source,
+            "payload": payload.payload.unwrap_or_else(|| json!({})),
+        }),
+        payload.dedupe_key,
+    )
+    .await?;
+    Ok(Json(json!({
+        "contract": contract_descriptor(),
+        "integration": integration,
+        "dispatches": dispatches,
+    })))
 }
 
 fn webhook_registry_error_response(error: webhooks::WebhookRegistryError) -> Response {

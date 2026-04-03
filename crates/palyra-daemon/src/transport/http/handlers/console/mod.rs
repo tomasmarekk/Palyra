@@ -16,6 +16,7 @@ pub(crate) mod memory;
 pub(crate) mod nodes;
 pub(crate) mod pairing;
 pub(crate) mod plugins;
+pub(crate) mod routines;
 pub(crate) mod secrets;
 pub(crate) mod sessions;
 pub(crate) mod skills;

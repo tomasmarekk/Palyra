@@ -246,6 +246,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/console/v1/webhooks/{integration_id}/test",
             post(console::webhooks::console_webhook_test_handler),
         )
+        .route(
+            "/console/v1/webhooks/{integration_id}/dispatch",
+            post(console::webhooks::console_webhook_dispatch_handler),
+        )
         .route("/console/v1/pairing", get(console::pairing::console_pairing_summary_handler))
         .route(
             "/console/v1/pairing/requests",
@@ -496,6 +500,48 @@ pub(crate) fn build_router(state: AppState) -> Router {
             post(console::cron::console_cron_run_now_handler),
         )
         .route("/console/v1/cron/jobs/{job_id}/runs", get(console::cron::console_cron_runs_handler))
+        .route("/console/v1/routines", get(console::routines::console_routines_list_handler))
+        .route("/console/v1/routines", post(console::routines::console_routine_upsert_handler))
+        .route(
+            "/console/v1/routines/templates",
+            get(console::routines::console_routine_templates_handler),
+        )
+        .route(
+            "/console/v1/routines/schedule-preview",
+            post(console::routines::console_routine_schedule_preview_handler),
+        )
+        .route(
+            "/console/v1/routines/import",
+            post(console::routines::console_routine_import_handler),
+        )
+        .route(
+            "/console/v1/routines/{routine_id}",
+            get(console::routines::console_routine_get_handler),
+        )
+        .route(
+            "/console/v1/routines/{routine_id}/export",
+            get(console::routines::console_routine_export_handler),
+        )
+        .route(
+            "/console/v1/routines/{routine_id}/delete",
+            post(console::routines::console_routine_delete_handler),
+        )
+        .route(
+            "/console/v1/routines/{routine_id}/enabled",
+            post(console::routines::console_routine_set_enabled_handler),
+        )
+        .route(
+            "/console/v1/routines/{routine_id}/run-now",
+            post(console::routines::console_routine_run_now_handler),
+        )
+        .route(
+            "/console/v1/routines/{routine_id}/runs",
+            get(console::routines::console_routine_runs_handler),
+        )
+        .route(
+            "/console/v1/routines/{routine_id}/dispatch",
+            post(console::routines::console_routine_dispatch_handler),
+        )
         .route("/console/v1/memory/status", get(console::memory::console_memory_status_handler))
         .route(
             "/console/v1/memory/derived-artifacts",
@@ -681,6 +727,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route(
             "/console/v1/hooks/{hook_id}/delete",
             post(console::hooks::console_hook_delete_handler),
+        )
+        .route(
+            "/console/v1/hooks/{hook_id}/fire",
+            post(console::hooks::console_hook_fire_handler),
         )
         .route(
             "/console/v1/browser/profiles",

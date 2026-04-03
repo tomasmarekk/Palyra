@@ -273,11 +273,23 @@ pub(crate) async fn console_system_event_emit_handler(
         .record_console_event(&session.context, event.as_str(), event_details.clone())
         .await
         .map_err(runtime_status_response)?;
+    let mut routine_payload = event_details.clone();
+    if let Some(object) = routine_payload.as_object_mut() {
+        object.insert("event".to_owned(), Value::String(event.clone()));
+    }
+    let routine_dispatches = super::routines::dispatch_system_event_routines(
+        &state,
+        session.context.principal.as_str(),
+        event.as_str(),
+        routine_payload,
+    )
+    .await?;
 
     Ok(Json(json!({
         "status": "emitted",
         "event": event,
         "details": event_details,
+        "routine_dispatches": routine_dispatches,
     })))
 }
 

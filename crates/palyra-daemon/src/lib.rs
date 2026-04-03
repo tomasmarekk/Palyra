@@ -24,6 +24,7 @@ mod openai_surface;
 mod orchestrator;
 mod plugins;
 mod quic_runtime;
+mod routines;
 mod sandbox_runner;
 pub mod support;
 mod tool_protocol;
@@ -1633,6 +1634,10 @@ pub async fn run() -> Result<()> {
         webhooks::WebhookRegistry::open(runtime_state_root.as_path())
             .context("failed to initialize webhook registry state")?,
     );
+    let routine_registry = Arc::new(
+        routines::RoutineRegistry::open(runtime_state_root.as_path())
+            .context("failed to initialize routine registry state")?,
+    );
     let auth_runtime = Arc::new(gateway::AuthRuntimeState::new(
         Arc::clone(&auth_registry),
         Arc::new(HttpOAuthRefreshAdapter::default()) as Arc<dyn OAuthRefreshAdapter>,
@@ -2028,6 +2033,7 @@ pub async fn run() -> Result<()> {
             identity_manager: Arc::clone(&identity_runtime.manager),
             channels: Arc::clone(&channels),
             webhooks: Arc::clone(&webhook_registry),
+            routines: Arc::clone(&routine_registry),
             vault: Arc::clone(&vault),
             auth_runtime: Arc::clone(&auth_runtime),
             auth: auth.clone(),

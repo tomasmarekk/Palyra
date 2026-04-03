@@ -2348,7 +2348,8 @@ export class ConsoleApiClient {
   }
 
   async listCronJobs(params?: URLSearchParams): Promise<{ jobs: JsonValue[] }> {
-    return this.request(buildPathWithQuery("/console/v1/cron/jobs", params));
+    const response = await this.listRoutines(params);
+    return { jobs: response.routines };
   }
 
   async createCronJob(payload: {
@@ -2360,9 +2361,46 @@ export class ConsoleApiClient {
     at_timestamp_rfc3339?: string;
     enabled?: boolean;
     channel?: string;
-  }): Promise<{ job: JsonValue }> {
+  }): Promise<{ job: JsonValue; approval?: JsonValue }> {
+    const response = await this.upsertRoutine({
+      ...payload,
+      trigger_kind: "schedule",
+    });
+    return { job: response.routine, approval: response.approval };
+  }
+
+  async setCronJobEnabled(jobId: string, enabled: boolean): Promise<{
+    job: JsonValue;
+    approval?: JsonValue;
+  }> {
+    const response = await this.setRoutineEnabled(jobId, enabled);
+    return { job: response.routine, approval: response.approval };
+  }
+
+  async runCronJobNow(
+    jobId: string,
+  ): Promise<{ run_id?: string; status: string; message: string }> {
+    return this.runRoutineNow(jobId);
+  }
+
+  async listCronRuns(jobId: string, params?: URLSearchParams): Promise<{ runs: JsonValue[] }> {
+    return this.listRoutineRuns(jobId, params);
+  }
+
+  async listRoutines(params?: URLSearchParams): Promise<{ routines: JsonValue[] }> {
+    return this.request(buildPathWithQuery("/console/v1/routines", params));
+  }
+
+  async getRoutine(routineId: string): Promise<{ routine: JsonValue }> {
+    return this.request(`/console/v1/routines/${encodeURIComponent(routineId)}`);
+  }
+
+  async upsertRoutine(payload: Record<string, JsonValue | undefined>): Promise<{
+    routine: JsonValue;
+    approval?: JsonValue;
+  }> {
     return this.request(
-      "/console/v1/cron/jobs",
+      "/console/v1/routines",
       {
         method: "POST",
         body: JSON.stringify(payload),
@@ -2371,9 +2409,20 @@ export class ConsoleApiClient {
     );
   }
 
-  async setCronJobEnabled(jobId: string, enabled: boolean): Promise<{ job: JsonValue }> {
+  async deleteRoutine(routineId: string): Promise<{ deleted: boolean; routine_id: string }> {
     return this.request(
-      `/console/v1/cron/jobs/${encodeURIComponent(jobId)}/enabled`,
+      `/console/v1/routines/${encodeURIComponent(routineId)}/delete`,
+      { method: "POST" },
+      { csrf: true },
+    );
+  }
+
+  async setRoutineEnabled(routineId: string, enabled: boolean): Promise<{
+    routine: JsonValue;
+    approval?: JsonValue;
+  }> {
+    return this.request(
+      `/console/v1/routines/${encodeURIComponent(routineId)}/enabled`,
       {
         method: "POST",
         body: JSON.stringify({ enabled }),
@@ -2382,19 +2431,140 @@ export class ConsoleApiClient {
     );
   }
 
-  async runCronJobNow(
-    jobId: string,
+  async runRoutineNow(
+    routineId: string,
   ): Promise<{ run_id?: string; status: string; message: string }> {
     return this.request(
-      `/console/v1/cron/jobs/${encodeURIComponent(jobId)}/run-now`,
+      `/console/v1/routines/${encodeURIComponent(routineId)}/run-now`,
       { method: "POST" },
       { csrf: true },
     );
   }
 
-  async listCronRuns(jobId: string, params?: URLSearchParams): Promise<{ runs: JsonValue[] }> {
+  async listRoutineRuns(
+    routineId: string,
+    params?: URLSearchParams,
+  ): Promise<{ runs: JsonValue[] }> {
     return this.request(
-      buildPathWithQuery(`/console/v1/cron/jobs/${encodeURIComponent(jobId)}/runs`, params),
+      buildPathWithQuery(`/console/v1/routines/${encodeURIComponent(routineId)}/runs`, params),
+    );
+  }
+
+  async dispatchRoutine(
+    routineId: string,
+    payload: {
+      trigger_kind?: string;
+      trigger_reason?: string;
+      trigger_payload?: JsonValue;
+      trigger_dedupe_key?: string;
+    },
+  ): Promise<{ routine_id: string; run_id?: string; status: string; message: string }> {
+    return this.request(
+      `/console/v1/routines/${encodeURIComponent(routineId)}/dispatch`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      { csrf: true },
+    );
+  }
+
+  async listRoutineTemplates(): Promise<{ version: number; templates: JsonValue[] }> {
+    return this.request("/console/v1/routines/templates");
+  }
+
+  async previewRoutineSchedule(payload: {
+    phrase: string;
+    timezone?: "local" | "utc";
+  }): Promise<{ preview: JsonValue }> {
+    return this.request(
+      "/console/v1/routines/schedule-preview",
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      { csrf: true },
+    );
+  }
+
+  async exportRoutine(routineId: string): Promise<{ export: JsonValue }> {
+    return this.request(`/console/v1/routines/${encodeURIComponent(routineId)}/export`);
+  }
+
+  async importRoutine(payload: {
+    export: JsonValue;
+    routine_id?: string;
+    enabled?: boolean;
+  }): Promise<{ routine: JsonValue; approval?: JsonValue; imported_from: string }> {
+    return this.request(
+      "/console/v1/routines/import",
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      { csrf: true },
+    );
+  }
+
+  async dispatchHookRoutineTrigger(payload: {
+    hook_id: string;
+    event?: string;
+    payload?: JsonValue;
+    dedupe_key?: string;
+  }): Promise<{ binding: JsonValue; dispatches: JsonValue[] }> {
+    return this.request(
+      `/console/v1/hooks/${encodeURIComponent(payload.hook_id)}/fire`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          event: payload.event,
+          payload: payload.payload,
+          dedupe_key: payload.dedupe_key,
+        }),
+      },
+      { csrf: true },
+    );
+  }
+
+  async dispatchWebhookRoutineTrigger(payload: {
+    integration_id: string;
+    event: string;
+    payload?: JsonValue;
+    source?: string;
+    dedupe_key?: string;
+  }): Promise<{ integration: JsonValue; dispatches: JsonValue[] }> {
+    return this.request(
+      `/console/v1/webhooks/${encodeURIComponent(payload.integration_id)}/dispatch`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          event: payload.event,
+          payload: payload.payload,
+          source: payload.source,
+          dedupe_key: payload.dedupe_key,
+        }),
+      },
+      { csrf: true },
+    );
+  }
+
+  async emitSystemEvent(payload: {
+    name: string;
+    summary?: string;
+    details?: JsonValue;
+  }): Promise<{
+    status: string;
+    event: string;
+    details: JsonValue;
+    routine_dispatches: JsonValue[];
+  }> {
+    return this.request(
+      "/console/v1/system/events/emit",
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      { csrf: true },
     );
   }
 
