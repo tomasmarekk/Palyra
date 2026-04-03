@@ -30,6 +30,7 @@ mod plugins;
 mod policy;
 mod protocol;
 mod reset;
+mod routines;
 mod sandbox;
 mod secrets;
 mod security;
@@ -89,6 +90,10 @@ pub use plugins::PluginsCommand;
 pub use policy::PolicyCommand;
 pub use protocol::ProtocolCommand;
 pub use reset::{ResetCommand, ResetScopeArg};
+pub use routines::{
+    RoutineApprovalModeArg, RoutineDeliveryModeArg, RoutinePreviewTimezoneArg,
+    RoutineTriggerKindArg, RoutinesCommand,
+};
 pub use sandbox::{SandboxCommand, SandboxRuntimeArg};
 pub use secrets::{SecretsCommand, SecretsConfigureCommand};
 pub use security::SecurityCommand;
@@ -122,6 +127,7 @@ Canonical command map:
   docs       Local committed docs/help discovery surface
   gateway    Preferred runtime/admin family (`daemon` remains as a compatibility alias)
   dashboard  Thin operator shortcut for dashboard URL discovery/open workflows
+  routines   Unified automation surface for schedules, hooks, webhooks, and system events
   backup     Portable lifecycle backup/create verification surface
   system     Runtime heartbeat, presence, and recent system-event observability
   sandbox    Effective isolation/runtime policy explain surface for process and WASM tooling
@@ -230,6 +236,25 @@ Examples:
 
 Discoverability:
   `webhooks` manages secret-aware webhook integrations without exposing a public ingress surface by default.";
+
+const ROUTINES_AFTER_HELP: &str = "\
+Examples:
+  palyra routines list
+  palyra routines create-from-template --template-id heartbeat
+  palyra routines upsert --name \"Daily report\" --prompt \"Summarize incidents\" --trigger-kind schedule --natural-language-schedule \"every weekday at 9\"
+  palyra routines schedule-preview \"každý pracovní den v 9\"
+
+Discoverability:
+  `routines` is the first-class automation surface. Use `cron` only for schedule-only compatibility flows.";
+
+const CRON_AFTER_HELP: &str = "\
+Examples:
+  palyra cron list
+  palyra cron add --name \"Health summary\" --prompt \"Summarize status\" --schedule-type cron --schedule \"*/5 * * * *\"
+  palyra cron run-now --id 01ARZ3NDEKTSV4RRFFQ69G5FB0
+
+Compatibility:
+  `cron` remains available for schedule-only automation. Internally it is backed by unified routines; use `palyra routines` for delivery policies, quiet hours, approvals, templates, and event-driven triggers.";
 
 const ACP_AFTER_HELP: &str = "\
 Examples:
@@ -447,6 +472,18 @@ pub enum Command {
         #[command(subcommand)]
         command: AgentsCommand,
     },
+    #[command(
+        about = "Manage unified automation routines across schedules and event triggers",
+        after_long_help = ROUTINES_AFTER_HELP
+    )]
+    Routines {
+        #[command(subcommand)]
+        command: RoutinesCommand,
+    },
+    #[command(
+        about = "Manage schedule-only cron workflows through the routines compatibility layer",
+        after_long_help = CRON_AFTER_HELP
+    )]
     Cron {
         #[command(subcommand)]
         command: CronCommand,

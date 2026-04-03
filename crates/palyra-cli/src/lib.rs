@@ -78,13 +78,12 @@ use cli::{
     AcpCommand, AgentCommand, AgentsCommand, ApprovalDecisionArg, ApprovalExportFormatArg,
     ApprovalsCommand, AuthCommand, AuthCredentialArg, AuthOpenAiCommand, AuthProfilesCommand,
     AuthProviderArg, AuthScopeArg, BrowserCommand, Cli, Command as CliCommand, CompletionShell,
-    ConfigCommand, ConfigureSectionArg, CronCommand, CronConcurrencyPolicyArg,
-    CronMisfirePolicyArg, CronScheduleTypeArg, DaemonCommand, DocsCommand, GatewayBindProfileArg,
-    HooksCommand, InitModeArg, InitTlsScaffoldArg, JournalCheckpointModeArg, MemoryCommand,
-    MemoryScopeArg, MemorySourceArg, ModelsCommand, OnboardingAuthMethodArg, OnboardingCommand,
-    OnboardingFlowArg, PatchCommand, PluginsCommand, PolicyCommand, ProtocolCommand,
-    RemoteVerificationModeArg, SandboxCommand, SandboxRuntimeArg, SecretsCommand, SecurityCommand,
-    SessionsCommand, SetupWizardOverridesArg, SkillsCommand, SkillsPackageCommand,
+    ConfigCommand, ConfigureSectionArg, CronCommand, DaemonCommand, DocsCommand,
+    GatewayBindProfileArg, HooksCommand, InitModeArg, InitTlsScaffoldArg, JournalCheckpointModeArg,
+    MemoryCommand, MemoryScopeArg, MemorySourceArg, ModelsCommand, OnboardingAuthMethodArg,
+    OnboardingCommand, OnboardingFlowArg, PatchCommand, PluginsCommand, PolicyCommand,
+    ProtocolCommand, RemoteVerificationModeArg, SandboxCommand, SandboxRuntimeArg, SecretsCommand,
+    SecurityCommand, SessionsCommand, SetupWizardOverridesArg, SkillsCommand, SkillsPackageCommand,
     SupportBundleCommand, SystemCommand, SystemEventCommand, SystemEventSeverityArg,
     WebhooksCommand, WizardOverridesArg,
 };
@@ -139,7 +138,7 @@ use tonic::Request;
 use ulid::Ulid;
 
 use crate::proto::palyra::{
-    auth::v1 as auth_v1, browser::v1 as browser_v1, common::v1 as common_v1, cron::v1 as cron_v1,
+    auth::v1 as auth_v1, browser::v1 as browser_v1, common::v1 as common_v1,
     gateway::v1 as gateway_v1, memory::v1 as memory_v1,
 };
 
@@ -246,6 +245,7 @@ fn run_cli() -> Result<()> {
         CliCommand::Acp { command } => commands::acp::run_acp(command),
         CliCommand::Agent { command } => commands::agent::run_agent(command),
         CliCommand::Agents { command } => commands::agents::run_agents(command),
+        CliCommand::Routines { command } => commands::routines::run_routines(command),
         CliCommand::Cron { command } => commands::cron::run_cron(command),
         CliCommand::Memory { command } => commands::memory::run_memory(command),
         CliCommand::Message { command } => commands::message::run_message(command),
@@ -1982,115 +1982,6 @@ fn auth_refresh_metrics_to_json(value: &auth_v1::AuthRefreshMetrics) -> serde_js
     })
 }
 
-async fn update_cron_enabled(
-    client: &mut cron_v1::cron_service_client::CronServiceClient<tonic::transport::Channel>,
-    connection: &AgentConnection,
-    id: String,
-    enabled: bool,
-) -> Result<cron_v1::UpdateJobResponse> {
-    validate_canonical_id(id.as_str()).context("cron job id must be a canonical ULID")?;
-    let mut request = Request::new(cron_v1::UpdateJobRequest {
-        v: CANONICAL_PROTOCOL_MAJOR,
-        job_id: Some(common_v1::CanonicalId { ulid: id }),
-        name: None,
-        prompt: None,
-        owner_principal: None,
-        channel: None,
-        session_key: None,
-        session_label: None,
-        schedule: None,
-        enabled: Some(enabled),
-        concurrency_policy: None,
-        retry_policy: None,
-        misfire_policy: None,
-        jitter_ms: None,
-    });
-    inject_run_stream_metadata(request.metadata_mut(), connection)?;
-    let response =
-        client.update_job(request).await.context("failed to call cron UpdateJob")?.into_inner();
-    Ok(response)
-}
-
-fn build_cron_schedule(
-    schedule_type: CronScheduleTypeArg,
-    schedule: String,
-) -> Result<cron_v1::Schedule> {
-    match schedule_type {
-        CronScheduleTypeArg::Cron => Ok(cron_v1::Schedule {
-            r#type: cron_v1::ScheduleType::Cron as i32,
-            spec: Some(cron_v1::schedule::Spec::Cron(cron_v1::CronSchedule {
-                expression: schedule,
-            })),
-        }),
-        CronScheduleTypeArg::Every => Ok(cron_v1::Schedule {
-            r#type: cron_v1::ScheduleType::Every as i32,
-            spec: Some(cron_v1::schedule::Spec::Every(cron_v1::EverySchedule {
-                interval_ms: parse_interval_ms(schedule.as_str())?,
-            })),
-        }),
-        CronScheduleTypeArg::At => Ok(cron_v1::Schedule {
-            r#type: cron_v1::ScheduleType::At as i32,
-            spec: Some(cron_v1::schedule::Spec::At(cron_v1::AtSchedule {
-                timestamp_rfc3339: schedule,
-            })),
-        }),
-    }
-}
-
-fn parse_interval_ms(raw: &str) -> Result<u64> {
-    let value = raw.trim();
-    if value.is_empty() {
-        anyhow::bail!("every schedule value cannot be empty");
-    }
-    if let Some(stripped) = value.strip_suffix("ms") {
-        let parsed = stripped
-            .trim()
-            .parse::<u64>()
-            .context("every schedule milliseconds must be a positive integer")?;
-        if parsed == 0 {
-            anyhow::bail!("every schedule interval must be greater than zero");
-        }
-        return Ok(parsed);
-    }
-    if let Some(stripped) = value.strip_suffix('s') {
-        let parsed = stripped
-            .trim()
-            .parse::<u64>()
-            .context("every schedule seconds must be a positive integer")?;
-        if parsed == 0 {
-            anyhow::bail!("every schedule interval must be greater than zero");
-        }
-        return Ok(parsed.saturating_mul(1_000));
-    }
-    if let Some(stripped) = value.strip_suffix('m') {
-        let parsed = stripped
-            .trim()
-            .parse::<u64>()
-            .context("every schedule minutes must be a positive integer")?;
-        if parsed == 0 {
-            anyhow::bail!("every schedule interval must be greater than zero");
-        }
-        return Ok(parsed.saturating_mul(60_000));
-    }
-    if let Some(stripped) = value.strip_suffix('h') {
-        let parsed = stripped
-            .trim()
-            .parse::<u64>()
-            .context("every schedule hours must be a positive integer")?;
-        if parsed == 0 {
-            anyhow::bail!("every schedule interval must be greater than zero");
-        }
-        return Ok(parsed.saturating_mul(3_600_000));
-    }
-    let parsed = value.parse::<u64>().context(
-        "every schedule value must be integer milliseconds or include one of suffixes: ms,s,m,h",
-    )?;
-    if parsed == 0 {
-        anyhow::bail!("every schedule interval must be greater than zero");
-    }
-    Ok(parsed)
-}
-
 fn parse_float_arg(
     raw: Option<String>,
     name: &str,
@@ -2112,80 +2003,11 @@ fn parse_float_arg(
     anyhow::bail!("{name} is required")
 }
 
-fn cron_concurrency_to_proto(value: CronConcurrencyPolicyArg) -> i32 {
-    match value {
-        CronConcurrencyPolicyArg::Forbid => cron_v1::ConcurrencyPolicy::Forbid as i32,
-        CronConcurrencyPolicyArg::Replace => cron_v1::ConcurrencyPolicy::Replace as i32,
-        CronConcurrencyPolicyArg::QueueOne => cron_v1::ConcurrencyPolicy::QueueOne as i32,
-    }
-}
-
-fn cron_misfire_to_proto(value: CronMisfirePolicyArg) -> i32 {
-    match value {
-        CronMisfirePolicyArg::Skip => cron_v1::MisfirePolicy::Skip as i32,
-        CronMisfirePolicyArg::CatchUp => cron_v1::MisfirePolicy::CatchUp as i32,
-    }
-}
-
-fn cron_job_to_json(job: &cron_v1::Job) -> serde_json::Value {
-    json!({
-        "job_id": job.job_id.as_ref().map(|value| value.ulid.clone()),
-        "name": job.name,
-        "prompt": job.prompt,
-        "owner_principal": job.owner_principal,
-        "channel": job.channel,
-        "session_key": job.session_key,
-        "session_label": job.session_label,
-        "schedule": job.schedule.as_ref().map(|schedule| json!({
-            "type": schedule.r#type,
-            "spec": match schedule.spec.as_ref() {
-                Some(cron_v1::schedule::Spec::Cron(value)) => json!({ "cron": { "expression": value.expression } }),
-                Some(cron_v1::schedule::Spec::Every(value)) => json!({ "every": { "interval_ms": value.interval_ms } }),
-                Some(cron_v1::schedule::Spec::At(value)) => json!({ "at": { "timestamp_rfc3339": value.timestamp_rfc3339 } }),
-                None => json!(null),
-            },
-        })),
-        "enabled": job.enabled,
-        "concurrency_policy": job.concurrency_policy,
-        "retry_policy": job.retry_policy.as_ref().map(|value| json!({
-            "max_attempts": value.max_attempts,
-            "backoff_ms": value.backoff_ms,
-        })),
-        "misfire_policy": job.misfire_policy,
-        "jitter_ms": job.jitter_ms,
-        "next_run_at_unix_ms": job.next_run_at_unix_ms,
-        "last_run_at_unix_ms": job.last_run_at_unix_ms,
-        "created_at_unix_ms": job.created_at_unix_ms,
-        "updated_at_unix_ms": job.updated_at_unix_ms,
-    })
-}
-
 fn optional_ulid_json_value(value: &Option<common_v1::CanonicalId>) -> Value {
     match value {
         Some(identifier) => Value::String(identifier.ulid.clone()),
         None => Value::Null,
     }
-}
-
-fn cron_run_to_json(run: &cron_v1::JobRun) -> serde_json::Value {
-    let session_reference = optional_ulid_json_value(&run.session_id);
-    let orchestrator_reference = optional_ulid_json_value(&run.orchestrator_run_id);
-    json!({
-        "run_id": run.run_id.as_ref().map(|value| value.ulid.clone()),
-        "job_id": run.job_id.as_ref().map(|value| value.ulid.clone()),
-        "session_id": session_reference,
-        "orchestrator_run_id": orchestrator_reference,
-        "attempt": run.attempt,
-        "started_at_unix_ms": run.started_at_unix_ms,
-        "finished_at_unix_ms": run.finished_at_unix_ms,
-        "status": run.status,
-        "error_kind": run.error_kind,
-        "error_message_redacted": run.error_message_redacted,
-        "model_tokens_in": run.model_tokens_in,
-        "model_tokens_out": run.model_tokens_out,
-        "tool_calls": run.tool_calls,
-        "tool_denies": run.tool_denies,
-    })
 }
 
 fn resolve_memory_scope(

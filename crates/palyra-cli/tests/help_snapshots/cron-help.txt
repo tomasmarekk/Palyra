@@ -1,3 +1,5 @@
+Manage schedule-only cron workflows through the routines compatibility layer
+
 Usage: palyra cron [OPTIONS] <COMMAND>
 
 Commands:
@@ -13,14 +15,35 @@ Commands:
   logs     [aliases: runs]
 
 Options:
-  -h, --help  Print help
+  -h, --help
+          Print help (see a summary with '-h')
 
 Global Options:
       --profile <PROFILE>
+
       --config <CONFIG_PATH>
+
       --state-root <STATE_ROOT>
-  -v, --verbose...                     Increase logging verbosity (-v => debug, -vv => trace)
-      --log-level <LOG_LEVEL>          [default: info] [possible values: error, warn, info, debug, trace]
-      --output-format <OUTPUT_FORMAT>  [default: text] [possible values: text, json, ndjson]
+
+  -v, --verbose...
+          Increase logging verbosity (-v => debug, -vv => trace)
+
+      --log-level <LOG_LEVEL>
+          [default: info]
+          [possible values: error, warn, info, debug, trace]
+
+      --output-format <OUTPUT_FORMAT>
+          [default: text]
+          [possible values: text, json, ndjson]
+
       --plain
+
       --no-color
+
+Examples:
+  palyra cron list
+  palyra cron add --name "Health summary" --prompt "Summarize status" --schedule-type cron --schedule "*/5 * * * *"
+  palyra cron run-now --id 01ARZ3NDEKTSV4RRFFQ69G5FB0
+
+Compatibility:
+  `cron` remains available for schedule-only automation. Internally it is backed by unified routines; use `palyra routines` for delivery policies, quiet hours, approvals, templates, and event-driven triggers.

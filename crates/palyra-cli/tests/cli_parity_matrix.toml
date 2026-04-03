@@ -112,11 +112,21 @@ file = "agents-help.txt"
 path = "cron"
 category = "top_level"
 status = "done"
-summary = "Cron job management surface."
+summary = "Schedule-only compatibility surface backed by unified routines."
 
 [entries.snapshot]
 path = "cron"
 file = "cron-help.txt"
+
+[[entries]]
+path = "routines"
+category = "top_level"
+status = "done"
+summary = "Unified automation surface for schedules, hooks, webhooks, and system events."
+
+[entries.snapshot]
+path = "routines"
+file = "routines-help.txt"
 
 [[entries]]
 path = "memory"
@@ -745,13 +755,70 @@ file = "cron-delete-help.txt"
 path = "cron logs"
 category = "nested_surface"
 status = "done"
-summary = "Cron run history workflow with runs alias."
+summary = "Cron run history compatibility workflow with runs alias."
 required_aliases = ["runs"]
 required_flags = ["id", "limit"]
 
 [entries.snapshot]
 path = "cron logs"
 file = "cron-logs-help.txt"
+
+[[entries]]
+path = "routines upsert"
+category = "nested_surface"
+status = "done"
+summary = "Unified routine upsert contract for schedule and event-driven triggers."
+required_aliases = ["apply"]
+required_flags = ["name", "prompt", "trigger-kind"]
+
+[entries.snapshot]
+path = "routines upsert"
+file = "routines-upsert-help.txt"
+
+[[entries]]
+path = "routines create-from-template"
+category = "nested_surface"
+status = "done"
+summary = "Template-backed routine creation workflow."
+required_flags = ["template-id"]
+
+[entries.snapshot]
+path = "routines create-from-template"
+file = "routines-create-from-template-help.txt"
+
+[[entries]]
+path = "routines import"
+category = "nested_surface"
+status = "done"
+summary = "Routine import workflow from bundle file or stdin."
+
+[entries.snapshot]
+path = "routines import"
+file = "routines-import-help.txt"
+
+[[entries]]
+path = "routines logs"
+category = "nested_surface"
+status = "done"
+summary = "Routine run history workflow with runs alias."
+required_aliases = ["runs"]
+required_flags = ["id", "limit"]
+
+[entries.snapshot]
+path = "routines logs"
+file = "routines-logs-help.txt"
+
+[[entries]]
+path = "routines delete"
+category = "nested_surface"
+status = "done"
+summary = "Routine delete workflow with rm alias."
+required_aliases = ["rm"]
+required_flags = ["id"]
+
+[entries.snapshot]
+path = "routines delete"
+file = "routines-delete-help.txt"
 
 [[entries]]
 path = "hooks bind"

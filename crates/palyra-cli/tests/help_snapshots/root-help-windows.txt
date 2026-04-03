@@ -12,7 +12,8 @@ Commands:
   acp             Run the ACP stdio bridge and legacy compatibility shim
   agent
   agents
-  cron
+  routines        Manage unified automation routines across schedules and event triggers
+  cron            Manage schedule-only cron workflows through the routines compatibility layer
   memory
   message
   approvals
@@ -97,6 +98,7 @@ Canonical command map:
   docs       Local committed docs/help discovery surface
   gateway    Preferred runtime/admin family (`daemon` remains as a compatibility alias)
   dashboard  Thin operator shortcut for dashboard URL discovery/open workflows
+  routines   Unified automation surface for schedules, hooks, webhooks, and system events
   backup     Portable lifecycle backup/create verification surface
   system     Runtime heartbeat, presence, and recent system-event observability
   sandbox    Effective isolation/runtime policy explain surface for process and WASM tooling

@@ -31,6 +31,7 @@ pub mod plugins;
 pub mod policy;
 pub mod protocol;
 pub mod reset;
+pub mod routines;
 pub mod sandbox;
 pub mod secrets;
 pub mod security;

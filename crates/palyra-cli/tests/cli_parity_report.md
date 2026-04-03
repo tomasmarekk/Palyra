@@ -7,19 +7,19 @@ It distinguishes expected parity posture (`done` / `partial` / `intentional_devi
 
 ## Summary
 
-- Total entries: `88`
-- Verified entries: `88`
+- Total entries: `94`
+- Verified entries: `94`
 - Regression entries: `0`
-- Help snapshot coverage: `88` entries
+- Help snapshot coverage: `94` entries
 
 ### Expected parity status counts
 
-- `done`: `84`
+- `done`: `90`
 - `partial`: `4`
 
 ### Validation status counts
 
-- `verified`: `88`
+- `verified`: `94`
 
 ## Entries
 
@@ -36,6 +36,7 @@ It distinguishes expected parity posture (`done` / `partial` / `intentional_devi
 | `agent` | `top_level` | `done` | `verified` | `agent-help.txt` | - | - | - |
 | `agents` | `top_level` | `done` | `verified` | `agents-help.txt` | - | - | - |
 | `cron` | `top_level` | `done` | `verified` | `cron-help.txt` | - | - | - |
+| `routines` | `top_level` | `done` | `verified` | `routines-help.txt` | - | - | - |
 | `memory` | `top_level` | `done` | `verified` | `memory-help.txt` | - | - | - |
 | `message` | `top_level` | `done` | `verified` | `message-help.txt` | - | - | - |
 | `approvals` | `top_level` | `done` | `verified` | `approvals-help.txt` | - | - | - |
@@ -97,6 +98,11 @@ It distinguishes expected parity posture (`done` / `partial` / `intentional_devi
 | `cron add` | `nested_surface` | `done` | `verified` | `cron-add-help.txt` | - | `--name`, `--prompt`, `--schedule-type`, `--schedule` | - |
 | `cron delete` | `nested_surface` | `done` | `verified` | `cron-delete-help.txt` | `rm` | `--id` | - |
 | `cron logs` | `nested_surface` | `done` | `verified` | `cron-logs-help.txt` | `runs` | `--id`, `--limit` | - |
+| `routines upsert` | `nested_surface` | `done` | `verified` | `routines-upsert-help.txt` | `apply` | `--name`, `--prompt`, `--trigger-kind` | - |
+| `routines create-from-template` | `nested_surface` | `done` | `verified` | `routines-create-from-template-help.txt` | - | `--template-id` | - |
+| `routines import` | `nested_surface` | `done` | `verified` | `routines-import-help.txt` | - | - | - |
+| `routines logs` | `nested_surface` | `done` | `verified` | `routines-logs-help.txt` | `runs` | `--id`, `--limit` | - |
+| `routines delete` | `nested_surface` | `done` | `verified` | `routines-delete-help.txt` | `rm` | `--id` | - |
 | `hooks bind` | `nested_surface` | `done` | `verified` | `hooks-bind-help.txt` | `install` | `--event`, `--plugin-id`, `--disabled` | - |
 | `memory index` | `nested_surface` | `done` | `verified` | `memory-index-help.txt` | `reindex` | `--batch-size`, `--until-complete`, `--run-maintenance` | - |
 | `plugins install` | `nested_surface` | `done` | `verified` | `plugins-install-help.txt` | `bind` | `--artifact`, `--allow-tofu`, `--allow-untrusted` | - |

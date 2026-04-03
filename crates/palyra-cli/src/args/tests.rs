@@ -14,11 +14,13 @@ use super::{
     MemoryScopeArg, MemorySourceArg, MessageCommand, ModelsCommand, NodeCommand, NodesCommand,
     OnboardingAuthMethodArg, OnboardingCommand, OnboardingFlowArg, PairingClientKindArg,
     PairingCommand, PairingMethodArg, PairingStateArg, PatchCommand, PluginsCommand, PolicyCommand,
-    ProtocolCommand, RemoteVerificationModeArg, ResetCommand, ResetScopeArg, SandboxCommand,
-    SandboxRuntimeArg, SecretsCommand, SecretsConfigureCommand, SecurityCommand, SessionsCommand,
-    SetupWizardOverridesArg, SkillsCommand, SkillsPackageCommand, SupportBundleCommand,
-    SystemCommand, SystemEventCommand, SystemEventSeverityArg, TuiCommand, UninstallCommand,
-    UpdateCommand, WebhooksCommand, WizardOverridesArg,
+    ProtocolCommand, RemoteVerificationModeArg, ResetCommand, ResetScopeArg,
+    RoutineApprovalModeArg, RoutineDeliveryModeArg, RoutinePreviewTimezoneArg,
+    RoutineTriggerKindArg, RoutinesCommand, SandboxCommand, SandboxRuntimeArg, SecretsCommand,
+    SecretsConfigureCommand, SecurityCommand, SessionsCommand, SetupWizardOverridesArg,
+    SkillsCommand, SkillsPackageCommand, SupportBundleCommand, SystemCommand, SystemEventCommand,
+    SystemEventSeverityArg, TuiCommand, UninstallCommand, UpdateCommand, WebhooksCommand,
+    WizardOverridesArg,
 };
 
 #[test]
@@ -1247,6 +1249,150 @@ fn parse_cron_aliases() {
 
     let rm = Cli::parse_from(["palyra", "cron", "rm", "--id", "01ARZ3NDEKTSV4RRFFQ69G5FB0"]);
     assert!(matches!(rm.command, Command::Cron { command: CronCommand::Delete { .. } }));
+}
+
+#[test]
+fn parse_routines_upsert() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "routines",
+        "upsert",
+        "--id",
+        "01ARZ3NDEKTSV4RRFFQ69G5FB0",
+        "--name",
+        "Daily report",
+        "--prompt",
+        "Summarize incidents",
+        "--trigger-kind",
+        "schedule",
+        "--natural-language-schedule",
+        "every weekday at 9",
+        "--enabled",
+        "true",
+        "--concurrency",
+        "queue-one",
+        "--retry-max-attempts",
+        "2",
+        "--retry-backoff-ms",
+        "5000",
+        "--misfire",
+        "catch-up",
+        "--jitter-ms",
+        "250",
+        "--delivery-mode",
+        "specific-channel",
+        "--delivery-channel",
+        "ops:summary",
+        "--quiet-hours-start",
+        "22:00",
+        "--quiet-hours-end",
+        "06:00",
+        "--quiet-hours-timezone",
+        "utc",
+        "--cooldown-ms",
+        "120000",
+        "--approval-mode",
+        "before-first-run",
+        "--template-id",
+        "daily-report",
+        "--json",
+    ]);
+    assert_eq!(
+        parsed.command,
+        Command::Routines {
+            command: RoutinesCommand::Upsert {
+                id: Some("01ARZ3NDEKTSV4RRFFQ69G5FB0".to_owned()),
+                name: "Daily report".to_owned(),
+                prompt: "Summarize incidents".to_owned(),
+                trigger_kind: RoutineTriggerKindArg::Schedule,
+                owner: None,
+                channel: None,
+                session_key: None,
+                session_label: None,
+                enabled: Some(true),
+                natural_language_schedule: Some("every weekday at 9".to_owned()),
+                schedule_type: None,
+                schedule: None,
+                trigger_payload: None,
+                trigger_payload_stdin: false,
+                concurrency: CronConcurrencyPolicyArg::QueueOne,
+                retry_max_attempts: 2,
+                retry_backoff_ms: 5000,
+                misfire: CronMisfirePolicyArg::CatchUp,
+                jitter_ms: 250,
+                delivery_mode: RoutineDeliveryModeArg::SpecificChannel,
+                delivery_channel: Some("ops:summary".to_owned()),
+                quiet_hours_start: Some("22:00".to_owned()),
+                quiet_hours_end: Some("06:00".to_owned()),
+                quiet_hours_timezone: Some(RoutinePreviewTimezoneArg::Utc),
+                cooldown_ms: 120000,
+                approval_mode: RoutineApprovalModeArg::BeforeFirstRun,
+                template_id: Some("daily-report".to_owned()),
+                json: true,
+            }
+        }
+    );
+}
+
+#[test]
+fn parse_routines_template_and_import() {
+    let template = Cli::parse_from([
+        "palyra",
+        "routines",
+        "create-from-template",
+        "--template-id",
+        "heartbeat",
+        "--name",
+        "Morning heartbeat",
+        "--delivery-channel",
+        "ops:summary",
+    ]);
+    assert_eq!(
+        template.command,
+        Command::Routines {
+            command: RoutinesCommand::CreateFromTemplate {
+                template_id: "heartbeat".to_owned(),
+                id: None,
+                name: Some("Morning heartbeat".to_owned()),
+                prompt: None,
+                owner: None,
+                channel: None,
+                session_key: None,
+                session_label: None,
+                enabled: None,
+                natural_language_schedule: None,
+                delivery_channel: Some("ops:summary".to_owned()),
+                trigger_payload: None,
+                trigger_payload_stdin: false,
+                json: false,
+            }
+        }
+    );
+
+    let import = Cli::parse_from([
+        "palyra",
+        "routines",
+        "import",
+        "--file",
+        "routine.json",
+        "--id",
+        "01ARZ3NDEKTSV4RRFFQ69G5FB0",
+        "--enabled",
+        "false",
+        "--json",
+    ]);
+    assert_eq!(
+        import.command,
+        Command::Routines {
+            command: RoutinesCommand::Import {
+                file: Some("routine.json".to_owned()),
+                stdin: false,
+                id: Some("01ARZ3NDEKTSV4RRFFQ69G5FB0".to_owned()),
+                enabled: Some(false),
+                json: true,
+            }
+        }
+    );
 }
 
 #[test]

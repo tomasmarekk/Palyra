@@ -1,0 +1,71 @@
+Usage: palyra routines upsert [OPTIONS] --name <NAME> --prompt <PROMPT> --trigger-kind <TRIGGER_KIND>
+
+Options:
+      --id <ID>
+
+      --name <NAME>
+
+      --prompt <PROMPT>
+
+      --trigger-kind <TRIGGER_KIND>
+          [possible values: schedule, hook, webhook, system-event, manual]
+      --owner <OWNER>
+
+      --channel <CHANNEL>
+
+      --session-key <SESSION_KEY>
+
+      --session-label <SESSION_LABEL>
+
+      --enabled <ENABLED>
+          [possible values: true, false]
+      --natural-language-schedule <NATURAL_LANGUAGE_SCHEDULE>
+
+      --schedule-type <SCHEDULE_TYPE>
+          [possible values: cron, every, at]
+      --schedule <SCHEDULE>
+
+      --trigger-payload <TRIGGER_PAYLOAD>
+
+      --trigger-payload-stdin
+
+      --concurrency <CONCURRENCY>
+          [default: forbid] [possible values: forbid, replace, queue-one]
+      --retry-max-attempts <RETRY_MAX_ATTEMPTS>
+          [default: 1]
+      --retry-backoff-ms <RETRY_BACKOFF_MS>
+          [default: 1000]
+      --misfire <MISFIRE>
+          [default: skip] [possible values: skip, catch-up]
+      --jitter-ms <JITTER_MS>
+          [default: 0]
+      --delivery-mode <DELIVERY_MODE>
+          [default: same-channel] [possible values: same-channel, specific-channel, local-only, logs-only]
+      --delivery-channel <DELIVERY_CHANNEL>
+
+      --quiet-hours-start <QUIET_HOURS_START>
+
+      --quiet-hours-end <QUIET_HOURS_END>
+
+      --quiet-hours-timezone <QUIET_HOURS_TIMEZONE>
+          [possible values: local, utc]
+      --cooldown-ms <COOLDOWN_MS>
+          [default: 0]
+      --approval-mode <APPROVAL_MODE>
+          [default: none] [possible values: none, before-enable, before-first-run]
+      --template-id <TEMPLATE_ID>
+
+      --json
+
+  -h, --help
+          Print help
+
+Global Options:
+      --profile <PROFILE>
+      --config <CONFIG_PATH>
+      --state-root <STATE_ROOT>
+  -v, --verbose...                     Increase logging verbosity (-v => debug, -vv => trace)
+      --log-level <LOG_LEVEL>          [default: info] [possible values: error, warn, info, debug, trace]
+      --output-format <OUTPUT_FORMAT>  [default: text] [possible values: text, json, ndjson]
+      --plain
+      --no-color
