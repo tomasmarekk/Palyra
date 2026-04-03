@@ -10,10 +10,10 @@ use crate::{
     cron::{self, CronTimezoneMode},
     gateway::proto::palyra::cron::v1 as cron_v1,
     journal::{
-        ApprovalCreateRequest, ApprovalPolicySnapshot, ApprovalPromptOption,
-        ApprovalPromptRecord, ApprovalRiskLevel, CronConcurrencyPolicy, CronJobCreateRequest,
-        CronJobRecord, CronJobUpdatePatch, CronMisfirePolicy, CronRetryPolicy,
-        CronRunFinalizeRequest, CronRunStartRequest, CronRunStatus, CronScheduleType,
+        ApprovalCreateRequest, ApprovalPolicySnapshot, ApprovalPromptOption, ApprovalPromptRecord,
+        ApprovalRiskLevel, CronConcurrencyPolicy, CronJobCreateRequest, CronJobRecord,
+        CronJobUpdatePatch, CronMisfirePolicy, CronRetryPolicy, CronRunFinalizeRequest,
+        CronRunStartRequest, CronRunStatus, CronScheduleType,
     },
     routines::{
         build_routine_export_bundle, default_outcome_from_cron_status, join_run_metadata,
@@ -215,20 +215,25 @@ pub(crate) async fn console_routines_list_handler(
     filtered.sort_by(|left, right| {
         read_string_value(left, "routine_id").cmp(&read_string_value(right, "routine_id"))
     });
-    if let Some(after_routine_id) = query
-        .after_routine_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
+    if let Some(after_routine_id) =
+        query.after_routine_id.as_deref().map(str::trim).filter(|value| !value.is_empty())
     {
-        filtered.retain(|routine| read_string_value(routine, "routine_id").as_str() > after_routine_id);
+        filtered
+            .retain(|routine| read_string_value(routine, "routine_id").as_str() > after_routine_id);
     }
     let has_more = filtered.len() > limit;
     if has_more {
         filtered.truncate(limit);
     }
-    let next_after_routine_id =
-        if has_more { filtered.last().and_then(|routine| routine.get("routine_id")).and_then(Value::as_str).map(ToOwned::to_owned) } else { None };
+    let next_after_routine_id = if has_more {
+        filtered
+            .last()
+            .and_then(|routine| routine.get("routine_id"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+    } else {
+        None
+    };
 
     Ok(Json(json!({
         "routines": filtered,
@@ -243,9 +248,12 @@ pub(crate) async fn console_routine_get_handler(
     Path(routine_id): Path<String>,
 ) -> Result<Json<Value>, Response> {
     let session = authorize_console_session(&state, &headers, false)?;
-    let routine =
-        load_routine_view_for_owner(&state, routine_id.as_str(), session.context.principal.as_str())
-            .await?;
+    let routine = load_routine_view_for_owner(
+        &state,
+        routine_id.as_str(),
+        session.context.principal.as_str(),
+    )
+    .await?;
     Ok(Json(json!({ "routine": routine })))
 }
 
@@ -255,9 +263,12 @@ pub(crate) async fn console_routine_export_handler(
     Path(routine_id): Path<String>,
 ) -> Result<Json<Value>, Response> {
     let session = authorize_console_session(&state, &headers, false)?;
-    let routine =
-        load_routine_parts_for_owner(&state, routine_id.as_str(), session.context.principal.as_str())
-            .await?;
+    let routine = load_routine_parts_for_owner(
+        &state,
+        routine_id.as_str(),
+        session.context.principal.as_str(),
+    )
+    .await?;
     let export = build_routine_export_bundle(&routine.job, &routine.metadata)
         .map_err(routine_registry_error_response)?;
     Ok(Json(json!({ "export": export })))
@@ -283,7 +294,8 @@ pub(crate) async fn console_routine_import_handler(
         }
     };
     let owner_principal = session.context.principal.clone();
-    let channel = normalize_channel(Some(bundle.job.channel.as_str()), session.context.channel.as_deref());
+    let channel =
+        normalize_channel(Some(bundle.job.channel.as_str()), session.context.channel.as_deref());
     let requested_enabled = payload.enabled.unwrap_or(bundle.job.enabled);
     let approval_required = requested_enabled
         && bundle.routine.approval_policy.mode == RoutineApprovalMode::BeforeEnable
@@ -366,18 +378,15 @@ pub(crate) async fn console_routine_upsert_handler(
             value.to_owned()
         }
     };
-    let trigger_kind =
-        parse_routine_trigger_kind(payload.trigger_kind.as_str()).map_err(runtime_status_response)?;
+    let trigger_kind = parse_routine_trigger_kind(payload.trigger_kind.as_str())
+        .map_err(runtime_status_response)?;
     let owner_principal =
         normalize_owner_principal(&payload.owner_principal, session.context.principal.as_str())?;
     let channel = normalize_channel(payload.channel.as_deref(), session.context.channel.as_deref());
     let enabled = payload.enabled.unwrap_or(true);
 
-    let existing_job = state
-        .runtime
-        .cron_job(routine_id.clone())
-        .await
-        .map_err(runtime_status_response)?;
+    let existing_job =
+        state.runtime.cron_job(routine_id.clone()).await.map_err(runtime_status_response)?;
     if let Some(job) = existing_job.as_ref() {
         ensure_job_owner(job, session.context.principal.as_str())?;
     }
@@ -391,8 +400,7 @@ pub(crate) async fn console_routine_upsert_handler(
     )?;
     let approval_policy = parse_approval_policy(payload.approval_mode.as_deref())?;
     let concurrency_policy = parse_concurrency_policy(payload.concurrency_policy.as_deref())?;
-    let retry_policy =
-        parse_retry_policy(payload.retry_max_attempts, payload.retry_backoff_ms)?;
+    let retry_policy = parse_retry_policy(payload.retry_max_attempts, payload.retry_backoff_ms)?;
     let misfire_policy = parse_misfire_policy(payload.misfire_policy.as_deref())?;
     let approval_required = enabled
         && approval_policy.mode == RoutineApprovalMode::BeforeEnable
@@ -477,9 +485,12 @@ pub(crate) async fn console_routine_delete_handler(
     Path(routine_id): Path<String>,
 ) -> Result<Json<Value>, Response> {
     let session = authorize_console_session(&state, &headers, true)?;
-    let routine =
-        load_routine_parts_for_owner(&state, routine_id.as_str(), session.context.principal.as_str())
-            .await?;
+    let routine = load_routine_parts_for_owner(
+        &state,
+        routine_id.as_str(),
+        session.context.principal.as_str(),
+    )
+    .await?;
     let deleted = state
         .runtime
         .delete_cron_job(routine.job.job_id.clone())
@@ -502,9 +513,12 @@ pub(crate) async fn console_routine_set_enabled_handler(
     Json(payload): Json<ConsoleRoutineEnabledRequest>,
 ) -> Result<Json<Value>, Response> {
     let session = authorize_console_session(&state, &headers, true)?;
-    let routine =
-        load_routine_parts_for_owner(&state, routine_id.as_str(), session.context.principal.as_str())
-            .await?;
+    let routine = load_routine_parts_for_owner(
+        &state,
+        routine_id.as_str(),
+        session.context.principal.as_str(),
+    )
+    .await?;
     let approval_required = payload.enabled
         && routine.metadata.approval_policy.mode == RoutineApprovalMode::BeforeEnable
         && !routine_approval_granted(
@@ -573,9 +587,12 @@ pub(crate) async fn console_routine_runs_handler(
     Query(query): Query<ConsoleRoutineRunsQuery>,
 ) -> Result<Json<Value>, Response> {
     let session = authorize_console_session(&state, &headers, false)?;
-    let routine =
-        load_routine_parts_for_owner(&state, routine_id.as_str(), session.context.principal.as_str())
-            .await?;
+    let routine = load_routine_parts_for_owner(
+        &state,
+        routine_id.as_str(),
+        session.context.principal.as_str(),
+    )
+    .await?;
     let limit = query.limit.unwrap_or(DEFAULT_ROUTINE_PAGE_LIMIT).clamp(1, MAX_ROUTINE_PAGE_LIMIT);
     let (runs, next_after_run_id) = state
         .runtime
@@ -705,10 +722,7 @@ pub(crate) async fn dispatch_webhook_event_routines(
 ) -> Result<Vec<Value>, Response> {
     let mut trigger_payload = payload;
     if let Some(object) = trigger_payload.as_object_mut() {
-        object.insert(
-            "integration_id".to_owned(),
-            Value::String(integration_id.to_owned()),
-        );
+        object.insert("integration_id".to_owned(), Value::String(integration_id.to_owned()));
         object.insert("provider".to_owned(), Value::String(provider.to_owned()));
         object.insert("event".to_owned(), Value::String(event.to_owned()));
     }
@@ -790,14 +804,10 @@ async fn routine_views_for_principal(
     jobs: Vec<CronJobRecord>,
     principal: &str,
 ) -> Result<Vec<Value>, Response> {
-    let job_map =
-        jobs.into_iter().map(|job| (job.job_id.clone(), job)).collect::<HashMap<_, _>>();
+    let job_map = jobs.into_iter().map(|job| (job.job_id.clone(), job)).collect::<HashMap<_, _>>();
     let mut routines = Vec::new();
-    for metadata in state
-        .routines
-        .list_routines()
-        .map_err(routine_registry_error_response)?
-        .into_iter()
+    for metadata in
+        state.routines.list_routines().map_err(routine_registry_error_response)?.into_iter()
     {
         let Some(job) = job_map.get(metadata.routine_id.as_str()) else {
             continue;
@@ -852,9 +862,7 @@ async fn load_routine_parts_for_owner(
         .await
         .map_err(runtime_status_response)?
         .ok_or_else(|| {
-            runtime_status_response(tonic::Status::not_found(
-                "routine backing cron job not found",
-            ))
+            runtime_status_response(tonic::Status::not_found("routine backing cron job not found"))
         })?;
     ensure_job_owner(&job, principal)?;
     Ok(RoutineParts { job, metadata })
@@ -952,10 +960,7 @@ fn routine_approval_subject_id(routine_id: &str, mode: RoutineApprovalMode) -> S
     format!("routine:{routine_id}:{}", mode.as_str())
 }
 
-async fn routine_approval_granted(
-    state: &AppState,
-    subject_id: String,
-) -> Result<bool, Response> {
+async fn routine_approval_granted(state: &AppState, subject_id: String) -> Result<bool, Response> {
     let (approvals, _) = state
         .runtime
         .list_approval_records(
@@ -1275,8 +1280,7 @@ async fn dispatch_matching_routines(
     trigger_dedupe_key: Option<String>,
 ) -> Result<Vec<Value>, Response> {
     let jobs = synchronize_schedule_routines(state).await?;
-    let job_map =
-        jobs.into_iter().map(|job| (job.job_id.clone(), job)).collect::<HashMap<_, _>>();
+    let job_map = jobs.into_iter().map(|job| (job.job_id.clone(), job)).collect::<HashMap<_, _>>();
     let routines = state
         .routines
         .list_routines()
@@ -1289,7 +1293,8 @@ async fn dispatch_matching_routines(
         let Some(job) = job_map.get(metadata.routine_id.as_str()) else {
             continue;
         };
-        if job.owner_principal != principal || !routine_matches_trigger(&metadata, &trigger_payload) {
+        if job.owner_principal != principal || !routine_matches_trigger(&metadata, &trigger_payload)
+        {
             continue;
         }
         let outcome = dispatch_single_routine(
@@ -1308,10 +1313,8 @@ async fn dispatch_matching_routines(
 }
 
 fn routine_matches_trigger(metadata: &RoutineMetadataRecord, payload: &Value) -> bool {
-    let configured =
-        serde_json::from_str::<Value>(metadata.trigger_payload_json.as_str()).unwrap_or_else(|_| {
-            json!({})
-        });
+    let configured = serde_json::from_str::<Value>(metadata.trigger_payload_json.as_str())
+        .unwrap_or_else(|_| json!({}));
     match metadata.trigger_kind {
         RoutineTriggerKind::SystemEvent => compare_optional_matchers(
             configured.get("event").and_then(Value::as_str),
@@ -1344,7 +1347,8 @@ fn routine_matches_trigger(metadata: &RoutineMetadataRecord, payload: &Value) ->
 }
 
 fn compare_optional_matchers(expected: Option<&str>, actual: Option<&str>) -> bool {
-    expected.is_none_or(|expected| actual.is_some_and(|actual| expected.eq_ignore_ascii_case(actual)))
+    expected
+        .is_none_or(|expected| actual.is_some_and(|actual| expected.eq_ignore_ascii_case(actual)))
 }
 
 async fn register_terminal_routine_run(
@@ -1487,11 +1491,14 @@ fn resolve_routine_schedule(
             next_run_at_unix_ms: preview.next_run_at_unix_ms,
         });
     }
-    let schedule =
-        build_console_schedule(payload.schedule_type.as_deref(), payload).map_err(runtime_status_response)?;
-    let normalized =
-        cron::normalize_schedule(Some(schedule), unix_ms_now().map_err(internal_console_error)?, timezone_mode)
-            .map_err(runtime_status_response)?;
+    let schedule = build_console_schedule(payload.schedule_type.as_deref(), payload)
+        .map_err(runtime_status_response)?;
+    let normalized = cron::normalize_schedule(
+        Some(schedule),
+        unix_ms_now().map_err(internal_console_error)?,
+        timezone_mode,
+    )
+    .map_err(runtime_status_response)?;
     Ok(ScheduleResolution {
         schedule_type: normalized.schedule_type,
         schedule_payload_json: normalized.schedule_payload_json,
@@ -1556,9 +1563,7 @@ fn build_console_schedule(
                 })),
             })
         }
-        _ => Err(tonic::Status::invalid_argument(
-            "schedule_type must be one of cron|every|at",
-        )),
+        _ => Err(tonic::Status::invalid_argument("schedule_type must be one of cron|every|at")),
     }
 }
 
@@ -1618,7 +1623,8 @@ fn parse_delivery(
     mode: Option<&str>,
     channel: Option<String>,
 ) -> Result<RoutineDeliveryConfig, Response> {
-    let normalized_mode = mode.map(str::trim).filter(|value| !value.is_empty()).unwrap_or("same_channel");
+    let normalized_mode =
+        mode.map(str::trim).filter(|value| !value.is_empty()).unwrap_or("same_channel");
     let mode = RoutineDeliveryMode::from_str(normalized_mode).ok_or_else(|| {
         runtime_status_response(tonic::Status::invalid_argument(
             "delivery_mode must be one of same_channel|specific_channel|local_only|logs_only",
@@ -1626,7 +1632,11 @@ fn parse_delivery(
     })?;
     let channel = channel.and_then(|value| {
         let trimmed = value.trim();
-        if trimmed.is_empty() { None } else { Some(trimmed.to_owned()) }
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
+        }
     });
     if matches!(mode, RoutineDeliveryMode::SpecificChannel) && channel.is_none() {
         return Err(runtime_status_response(tonic::Status::invalid_argument(
@@ -1644,25 +1654,22 @@ fn parse_quiet_hours(
     let Some(start) = start.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(None);
     };
-    let end = end
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            runtime_status_response(tonic::Status::invalid_argument(
-                "quiet_hours_end is required when quiet_hours_start is provided",
-            ))
-        })?;
+    let end = end.map(str::trim).filter(|value| !value.is_empty()).ok_or_else(|| {
+        runtime_status_response(tonic::Status::invalid_argument(
+            "quiet_hours_end is required when quiet_hours_start is provided",
+        ))
+    })?;
     let start_minute_of_day = parse_time_of_day_to_minutes(start)?;
     let end_minute_of_day = parse_time_of_day_to_minutes(end)?;
     let timezone = timezone.and_then(|value| {
         let trimmed = value.trim();
-        if trimmed.is_empty() { None } else { Some(trimmed.to_ascii_lowercase()) }
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_ascii_lowercase())
+        }
     });
-    Ok(Some(RoutineQuietHours {
-        start_minute_of_day,
-        end_minute_of_day,
-        timezone,
-    }))
+    Ok(Some(RoutineQuietHours { start_minute_of_day, end_minute_of_day, timezone }))
 }
 
 fn parse_time_of_day_to_minutes(value: &str) -> Result<u16, Response> {
@@ -1705,7 +1712,9 @@ fn normalize_owner_principal(
 ) -> Result<String, Response> {
     match requested.as_deref().map(str::trim) {
         Some("") | None => Ok(session_principal.to_owned()),
-        Some(owner_principal) if owner_principal == session_principal => Ok(owner_principal.to_owned()),
+        Some(owner_principal) if owner_principal == session_principal => {
+            Ok(owner_principal.to_owned())
+        }
         Some(_) => Err(runtime_status_response(tonic::Status::permission_denied(
             "owner_principal must match authenticated session principal",
         ))),
@@ -1744,16 +1753,17 @@ fn parse_timezone_mode(value: Option<&str>) -> Result<CronTimezoneMode, Response
     }
 }
 
-fn is_in_quiet_hours(quiet_hours: Option<&RoutineQuietHours>, now_unix_ms: i64) -> Result<bool, Response> {
+fn is_in_quiet_hours(
+    quiet_hours: Option<&RoutineQuietHours>,
+    now_unix_ms: i64,
+) -> Result<bool, Response> {
     let Some(quiet_hours) = quiet_hours else {
         return Ok(false);
     };
     let minute_of_day = match quiet_hours.timezone.as_deref().unwrap_or("local") {
         "utc" => {
-            let value = chrono::Utc
-                .timestamp_millis_opt(now_unix_ms)
-                .single()
-                .ok_or_else(|| {
+            let value =
+                chrono::Utc.timestamp_millis_opt(now_unix_ms).single().ok_or_else(|| {
                     runtime_status_response(tonic::Status::internal(
                         "failed to resolve UTC quiet-hour timestamp",
                     ))
@@ -1761,10 +1771,8 @@ fn is_in_quiet_hours(quiet_hours: Option<&RoutineQuietHours>, now_unix_ms: i64) 
             value.hour() as u16 * 60 + value.minute() as u16
         }
         "local" => {
-            let value = chrono::Local
-                .timestamp_millis_opt(now_unix_ms)
-                .single()
-                .ok_or_else(|| {
+            let value =
+                chrono::Local.timestamp_millis_opt(now_unix_ms).single().ok_or_else(|| {
                     runtime_status_response(tonic::Status::internal(
                         "failed to resolve local quiet-hour timestamp",
                     ))
@@ -1853,10 +1861,7 @@ mod tests {
         let response =
             parse_delivery(Some("specific_channel"), None).expect_err("channel should be required");
         assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
-        let delivery = parse_delivery(
-            Some("specific_channel"),
-            Some("ops:routines".to_owned()),
-        )
+        let delivery = parse_delivery(Some("specific_channel"), Some("ops:routines".to_owned()))
             .expect("delivery should parse");
         assert_eq!(delivery.mode, RoutineDeliveryMode::SpecificChannel);
     }
@@ -1881,8 +1886,11 @@ mod tests {
             .single()
             .expect("timestamp should build")
             .timestamp_millis();
-        assert!(is_in_quiet_hours(Some(&quiet_hours), late_evening).expect("quiet hours should evaluate"));
-        assert!(is_in_quiet_hours(Some(&quiet_hours), morning).expect("quiet hours should evaluate"));
+        assert!(is_in_quiet_hours(Some(&quiet_hours), late_evening)
+            .expect("quiet hours should evaluate"));
+        assert!(
+            is_in_quiet_hours(Some(&quiet_hours), morning).expect("quiet hours should evaluate")
+        );
         assert!(!is_in_quiet_hours(Some(&quiet_hours), noon).expect("quiet hours should evaluate"));
     }
 

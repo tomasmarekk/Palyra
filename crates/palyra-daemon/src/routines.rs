@@ -7,12 +7,12 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use chrono::{DateTime, Duration as ChronoDuration, TimeZone, Utc};
 use crate::{
     cron::{self, CronTimezoneMode},
     gateway::proto::palyra::cron::v1 as cron_v1,
     journal::{CronJobRecord, CronRunRecord, CronRunStatus},
 };
+use chrono::{DateTime, Duration as ChronoDuration, TimeZone, Utc};
 use palyra_common::{default_state_root, IdentityStorePathError};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -381,8 +381,7 @@ pub enum RoutineRegistryError {
 impl RoutineRegistry {
     pub fn open(state_root: &Path) -> Result<Self, RoutineRegistryError> {
         let routines_root = resolve_routines_root(Some(state_root))?;
-        let definitions_path =
-            RegistryPath { path: routines_root.join(ROUTINES_REGISTRY_FILE) };
+        let definitions_path = RegistryPath { path: routines_root.join(ROUTINES_REGISTRY_FILE) };
         let run_metadata_path = RegistryPath { path: routines_root.join(ROUTINE_RUNS_FILE) };
         let mut definitions_file = open_registry_file(&definitions_path)?;
         let definitions = load_registry_document(&definitions_path, &mut definitions_file)?;
@@ -399,7 +398,8 @@ impl RoutineRegistry {
     }
 
     pub fn list_routines(&self) -> Result<Vec<RoutineMetadataRecord>, RoutineRegistryError> {
-        let definitions = self.definitions.lock().map_err(|_| RoutineRegistryError::LockPoisoned)?;
+        let definitions =
+            self.definitions.lock().map_err(|_| RoutineRegistryError::LockPoisoned)?;
         Ok(definitions.routines.clone())
     }
 
@@ -408,7 +408,8 @@ impl RoutineRegistry {
         routine_id: &str,
     ) -> Result<Option<RoutineMetadataRecord>, RoutineRegistryError> {
         let normalized = normalize_identifier(routine_id, "routine_id")?;
-        let definitions = self.definitions.lock().map_err(|_| RoutineRegistryError::LockPoisoned)?;
+        let definitions =
+            self.definitions.lock().map_err(|_| RoutineRegistryError::LockPoisoned)?;
         Ok(definitions.routines.iter().find(|entry| entry.routine_id == normalized).cloned())
     }
 
@@ -420,10 +421,8 @@ impl RoutineRegistry {
         let normalized = normalize_routine_metadata_upsert(request, now)?;
         let mut definitions =
             self.definitions.lock().map_err(|_| RoutineRegistryError::LockPoisoned)?;
-        if let Some(existing) = definitions
-            .routines
-            .iter_mut()
-            .find(|entry| entry.routine_id == normalized.routine_id)
+        if let Some(existing) =
+            definitions.routines.iter_mut().find(|entry| entry.routine_id == normalized.routine_id)
         {
             existing.trigger_kind = normalized.trigger_kind;
             existing.trigger_payload_json = normalized.trigger_payload_json;
@@ -484,10 +483,8 @@ impl RoutineRegistry {
         let schedule_ids =
             cron_jobs.iter().map(|job| job.job_id.clone()).collect::<BTreeSet<String>>();
         for job in cron_jobs {
-            if let Some(existing) = definitions
-                .routines
-                .iter_mut()
-                .find(|entry| entry.routine_id == job.job_id)
+            if let Some(existing) =
+                definitions.routines.iter_mut().find(|entry| entry.routine_id == job.job_id)
             {
                 if existing.trigger_kind != RoutineTriggerKind::Schedule {
                     continue;
@@ -510,7 +507,8 @@ impl RoutineRegistry {
             });
         }
         definitions.routines.retain(|entry| {
-            entry.trigger_kind != RoutineTriggerKind::Schedule || schedule_ids.contains(&entry.routine_id)
+            entry.trigger_kind != RoutineTriggerKind::Schedule
+                || schedule_ids.contains(&entry.routine_id)
         });
         definitions.routines.sort_by(|left, right| left.routine_id.cmp(&right.routine_id));
         let document = RoutineRegistryDocument {
@@ -642,7 +640,9 @@ pub fn default_outcome_from_cron_status(status: CronRunStatus) -> RoutineRunOutc
         CronRunStatus::Skipped => RoutineRunOutcomeKind::Skipped,
         CronRunStatus::Denied => RoutineRunOutcomeKind::Denied,
         CronRunStatus::Failed => RoutineRunOutcomeKind::Failed,
-        CronRunStatus::Accepted | CronRunStatus::Running => RoutineRunOutcomeKind::SuccessWithOutput,
+        CronRunStatus::Accepted | CronRunStatus::Running => {
+            RoutineRunOutcomeKind::SuccessWithOutput
+        }
     }
 }
 
@@ -651,10 +651,9 @@ pub fn join_run_metadata(
     run: &CronRunRecord,
     metadata: Option<&RoutineRunMetadataRecord>,
 ) -> Value {
-    let outcome_kind =
-        metadata.and_then(|entry| entry.outcome_override).unwrap_or_else(|| {
-            default_outcome_from_cron_status(run.status)
-        });
+    let outcome_kind = metadata
+        .and_then(|entry| entry.outcome_override)
+        .unwrap_or_else(|| default_outcome_from_cron_status(run.status));
     json!({
         "routine_id": routine_id,
         "run_id": run.run_id,
@@ -945,10 +944,7 @@ fn normalize_payload_json(
     serde_json::to_string(&parsed).map_err(Into::into)
 }
 
-fn normalize_identifier(
-    raw: &str,
-    field: &'static str,
-) -> Result<String, RoutineRegistryError> {
+fn normalize_identifier(raw: &str, field: &'static str) -> Result<String, RoutineRegistryError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(RoutineRegistryError::InvalidField {
@@ -1014,10 +1010,7 @@ fn open_registry_file(path: &RegistryPath) -> Result<fs::File, RoutineRegistryEr
         .create(true)
         .truncate(false)
         .open(path.as_path())
-        .map_err(|source| RoutineRegistryError::WriteRegistry {
-            path: path.to_path_buf(),
-            source,
-        })
+        .map_err(|source| RoutineRegistryError::WriteRegistry { path: path.to_path_buf(), source })
 }
 
 fn load_registry_document(
@@ -1088,10 +1081,8 @@ where
         path: path.to_path_buf(),
         source,
     })?;
-    file.sync_all().map_err(|source| RoutineRegistryError::WriteRegistry {
-        path: path.to_path_buf(),
-        source,
-    })
+    file.sync_all()
+        .map_err(|source| RoutineRegistryError::WriteRegistry { path: path.to_path_buf(), source })
 }
 
 trait HasSchemaVersion {
@@ -1154,13 +1145,12 @@ fn parse_relative_phrase(
         _ => return Ok(None),
     };
     let duration_ms = parse_duration_to_ms(quantity, unit, "phrase")?;
-    let now = Utc
-        .timestamp_millis_opt(now_unix_ms)
-        .single()
-        .ok_or_else(|| RoutineRegistryError::InvalidField {
+    let now = Utc.timestamp_millis_opt(now_unix_ms).single().ok_or_else(|| {
+        RoutineRegistryError::InvalidField {
             field: "phrase",
             message: "current timestamp could not be resolved".to_owned(),
-        })?;
+        }
+    })?;
     let target = now
         .checked_add_signed(ChronoDuration::milliseconds(duration_ms as i64))
         .ok_or_else(|| RoutineRegistryError::InvalidField {
@@ -1169,7 +1159,10 @@ fn parse_relative_phrase(
         })?;
     Ok(Some(ParsedNaturalLanguageSchedule {
         normalized_text: target.to_rfc3339(),
-        explanation: format!("Interpreted as a one-time run {} from now.", humanize_duration(duration_ms)),
+        explanation: format!(
+            "Interpreted as a one-time run {} from now.",
+            humanize_duration(duration_ms)
+        ),
         schedule: cron_v1::Schedule {
             r#type: cron_v1::ScheduleType::At as i32,
             spec: Some(cron_v1::schedule::Spec::At(cron_v1::AtSchedule {
@@ -1187,7 +1180,9 @@ fn parse_interval_phrase(
     let (quantity, unit) = match tokens.as_slice() {
         ["every", compact] => split_compact_duration(compact).unwrap_or(("", "")),
         ["every", quantity, unit] => (*quantity, *unit),
-        ["každé", compact] | ["kazde", compact] => split_compact_duration(compact).unwrap_or(("", "")),
+        ["každé", compact] | ["kazde", compact] => {
+            split_compact_duration(compact).unwrap_or(("", ""))
+        }
         ["každé", quantity, unit] | ["kazde", quantity, unit] => (*quantity, *unit),
         _ => return Ok(None),
     };
@@ -1206,12 +1201,13 @@ fn parse_interval_phrase(
     }
     Ok(Some(ParsedNaturalLanguageSchedule {
         normalized_text: format!("every {}", humanize_duration(interval_ms)),
-        explanation: format!("Interpreted as a repeating interval of {}.", humanize_duration(interval_ms)),
+        explanation: format!(
+            "Interpreted as a repeating interval of {}.",
+            humanize_duration(interval_ms)
+        ),
         schedule: cron_v1::Schedule {
             r#type: cron_v1::ScheduleType::Every as i32,
-            spec: Some(cron_v1::schedule::Spec::Every(cron_v1::EverySchedule {
-                interval_ms,
-            })),
+            spec: Some(cron_v1::schedule::Spec::Every(cron_v1::EverySchedule { interval_ms })),
         },
     }))
 }
@@ -1233,7 +1229,8 @@ fn parse_weekday_phrase(
     let expression = format!("{} {} * * 1-5", time.minute, time.hour);
     Ok(Some(ParsedNaturalLanguageSchedule {
         normalized_text: format!("weekdays at {:02}:{:02}", time.hour, time.minute),
-        explanation: "Interpreted as every weekday at a fixed local/UTC wall clock time.".to_owned(),
+        explanation: "Interpreted as every weekday at a fixed local/UTC wall clock time."
+            .to_owned(),
         schedule: cron_v1::Schedule {
             r#type: cron_v1::ScheduleType::Cron as i32,
             spec: Some(cron_v1::schedule::Spec::Cron(cron_v1::CronSchedule { expression })),
@@ -1312,12 +1309,10 @@ fn parse_duration_to_ms(
             })
         }
     };
-    quantity
-        .checked_mul(multiplier)
-        .ok_or_else(|| RoutineRegistryError::InvalidField {
-            field,
-            message: "duration is too large".to_owned(),
-        })
+    quantity.checked_mul(multiplier).ok_or_else(|| RoutineRegistryError::InvalidField {
+        field,
+        message: "duration is too large".to_owned(),
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1391,7 +1386,8 @@ mod tests {
     #[test]
     fn resolve_routines_root_creates_directory() {
         let root = temp_state_root();
-        let routines_root = resolve_routines_root(Some(root.as_path())).expect("root should resolve");
+        let routines_root =
+            resolve_routines_root(Some(root.as_path())).expect("root should resolve");
         assert!(routines_root.exists(), "routines directory should exist");
     }
 
@@ -1446,10 +1442,7 @@ mod tests {
         let payload =
             serde_json::from_str::<serde_json::Value>(&shadow_manual_schedule_payload_json())
                 .expect("payload should parse");
-        assert_eq!(
-            payload,
-            json!({ "timestamp_rfc3339": "2100-01-01T00:00:00Z" })
-        );
+        assert_eq!(payload, json!({ "timestamp_rfc3339": "2100-01-01T00:00:00Z" }));
         let _ = CronScheduleType::At;
     }
 
@@ -1459,10 +1452,7 @@ mod tests {
             default_outcome_from_cron_status(CronRunStatus::Succeeded).as_str(),
             "success_with_output"
         );
-        assert_eq!(
-            default_outcome_from_cron_status(CronRunStatus::Skipped).as_str(),
-            "skipped"
-        );
+        assert_eq!(default_outcome_from_cron_status(CronRunStatus::Skipped).as_str(), "skipped");
     }
 
     #[test]

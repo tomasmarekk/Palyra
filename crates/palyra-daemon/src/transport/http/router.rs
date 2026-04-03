@@ -728,10 +728,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/console/v1/hooks/{hook_id}/delete",
             post(console::hooks::console_hook_delete_handler),
         )
-        .route(
-            "/console/v1/hooks/{hook_id}/fire",
-            post(console::hooks::console_hook_fire_handler),
-        )
+        .route("/console/v1/hooks/{hook_id}/fire", post(console::hooks::console_hook_fire_handler))
         .route(
             "/console/v1/browser/profiles",
             get(console::browser::console_browser_profiles_list_handler),

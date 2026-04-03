@@ -18,8 +18,7 @@ use crate::{
     gateway::{self, GatewayAuthConfig, GatewayRuntimeState},
     node_runtime::NodeRuntimeState,
     observability::ObservabilityState,
-    routines,
-    webhooks,
+    routines, webhooks,
 };
 use palyra_identity::IdentityManager;
 use palyra_vault::Vault;

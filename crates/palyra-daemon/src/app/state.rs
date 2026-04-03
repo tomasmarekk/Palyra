@@ -21,8 +21,7 @@ use crate::{
     node_runtime::NodeRuntimeState,
     observability::ObservabilityState,
     openai_auth::OpenAiOAuthAttemptStateRecord,
-    routines,
-    webhooks,
+    routines, webhooks,
 };
 
 #[derive(Clone)]
