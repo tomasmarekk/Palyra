@@ -14,18 +14,41 @@ use support::cli_harness::{
 const SERVER_CERT_PIN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const GATEWAY_CA_PIN: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
+struct InstallSmokeContext {
+    archive_path: std::path::PathBuf,
+    install_root: std::path::PathBuf,
+    config_path: std::path::PathBuf,
+    state_root: std::path::PathBuf,
+}
+
+fn install_smoke_context() -> Result<Option<InstallSmokeContext>> {
+    if std::env::var_os("PALYRA_BIN_UNDER_TEST").is_none() {
+        eprintln!(
+            "skipping installed smoke test because PALYRA_BIN_UNDER_TEST is not configured"
+        );
+        return Ok(None);
+    }
+
+    Ok(Some(InstallSmokeContext {
+        archive_path: required_env_path("PALYRA_INSTALL_ARCHIVE_PATH")?,
+        install_root: required_env_path("PALYRA_INSTALL_ROOT")?,
+        config_path: required_env_path("PALYRA_CONFIG_UNDER_TEST")?,
+        state_root: required_env_path("PALYRA_STATE_ROOT_UNDER_TEST")?,
+    }))
+}
+
 #[test]
 fn installed_binary_runs_baseline_smoke_commands() -> Result<()> {
-    let archive_path = required_env_path("PALYRA_INSTALL_ARCHIVE_PATH")?;
-    let install_root = required_env_path("PALYRA_INSTALL_ROOT")?;
-    let config_path = required_env_path("PALYRA_CONFIG_UNDER_TEST")?;
-    let state_root = required_env_path("PALYRA_STATE_ROOT_UNDER_TEST")?;
+    let Some(context) = install_smoke_context()? else {
+        return Ok(());
+    };
     let binary_path = palyra_bin()
         .canonicalize()
         .with_context(|| format!("failed to resolve {}", palyra_bin().display()))?;
-    let install_root_resolved = install_root
+    let install_root_resolved = context
+        .install_root
         .canonicalize()
-        .with_context(|| format!("failed to resolve {}", install_root.display()))?;
+        .with_context(|| format!("failed to resolve {}", context.install_root.display()))?;
 
     assert!(
         binary_path.starts_with(&install_root_resolved),
@@ -36,10 +59,10 @@ fn installed_binary_runs_baseline_smoke_commands() -> Result<()> {
 
     let workdir = temp_workdir()?;
     let workdir_path = workdir.path();
-    let config_path_string = config_path.display().to_string();
-    let install_root_string = install_root.display().to_string();
-    let archive_path_string = archive_path.display().to_string();
-    let state_root_string = state_root.display().to_string();
+    let config_path_string = context.config_path.display().to_string();
+    let install_root_string = context.install_root.display().to_string();
+    let archive_path_string = context.archive_path.display().to_string();
+    let state_root_string = context.state_root.display().to_string();
     let envs = [
         ("PALYRA_CONFIG", config_path_string.as_str()),
         ("PALYRA_STATE_ROOT", state_root_string.as_str()),
@@ -128,6 +151,10 @@ fn installed_binary_runs_baseline_smoke_commands() -> Result<()> {
 
 #[test]
 fn installed_binary_runs_noninteractive_setup_and_configure_flows() -> Result<()> {
+    if install_smoke_context()?.is_none() {
+        return Ok(());
+    }
+
     let workdir = temp_workdir()?;
     let workdir_path = workdir.path();
     let local_config = workdir_path.join("config").join("palyra.toml");
@@ -252,6 +279,10 @@ fn installed_binary_runs_noninteractive_setup_and_configure_flows() -> Result<()
 
 #[test]
 fn installed_binary_roundtrips_secret_values() -> Result<()> {
+    if install_smoke_context()?.is_none() {
+        return Ok(());
+    }
+
     let workdir = temp_workdir()?;
     let workdir_path = workdir.path();
     let secret_bytes = b"sk-installed-secret\nline-2\n";
@@ -285,10 +316,14 @@ fn installed_binary_roundtrips_secret_values() -> Result<()> {
 
 #[test]
 fn installed_smoke_requires_explicit_binary_override_in_install_context() -> Result<()> {
-    let install_root = required_env_path("PALYRA_INSTALL_ROOT")?;
-    let install_root_resolved = install_root
+    let Some(context) = install_smoke_context()? else {
+        return Ok(());
+    };
+
+    let install_root_resolved = context
+        .install_root
         .canonicalize()
-        .with_context(|| format!("failed to resolve {}", install_root.display()))?;
+        .with_context(|| format!("failed to resolve {}", context.install_root.display()))?;
     let binary_path = palyra_bin();
     let resolved = binary_path
         .canonicalize()
@@ -301,7 +336,7 @@ fn installed_smoke_requires_explicit_binary_override_in_install_context() -> Res
         resolved.display()
     );
 
-    let metadata_path = install_root.join("install-metadata.json");
+    let metadata_path = context.install_root.join("install-metadata.json");
     let metadata = serde_json::from_slice::<Value>(
         fs::read(&metadata_path)
             .with_context(|| format!("failed to read {}", metadata_path.display()))?
