@@ -2369,7 +2369,10 @@ export class ConsoleApiClient {
     return { job: response.routine, approval: response.approval };
   }
 
-  async setCronJobEnabled(jobId: string, enabled: boolean): Promise<{
+  async setCronJobEnabled(
+    jobId: string,
+    enabled: boolean,
+  ): Promise<{
     job: JsonValue;
     approval?: JsonValue;
   }> {
@@ -2417,7 +2420,10 @@ export class ConsoleApiClient {
     );
   }
 
-  async setRoutineEnabled(routineId: string, enabled: boolean): Promise<{
+  async setRoutineEnabled(
+    routineId: string,
+    enabled: boolean,
+  ): Promise<{
     routine: JsonValue;
     approval?: JsonValue;
   }> {
@@ -2548,11 +2554,7 @@ export class ConsoleApiClient {
     );
   }
 
-  async emitSystemEvent(payload: {
-    name: string;
-    summary?: string;
-    details?: JsonValue;
-  }): Promise<{
+  async emitSystemEvent(payload: { name: string; summary?: string; details?: JsonValue }): Promise<{
     status: string;
     event: string;
     details: JsonValue;

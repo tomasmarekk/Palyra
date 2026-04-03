@@ -140,7 +140,9 @@ export function CronSection({ app }: CronSectionProps) {
   async function loadTemplates(): Promise<void> {
     try {
       const response = await app.api.listRoutineTemplates();
-      setTemplates(Array.isArray(response.templates) ? response.templates.filter(isJsonObject) : []);
+      setTemplates(
+        Array.isArray(response.templates) ? response.templates.filter(isJsonObject) : [],
+      );
     } catch (failure) {
       app.setError(toErrorMessage(failure));
     }
@@ -177,9 +179,10 @@ export function CronSection({ app }: CronSectionProps) {
         await app.refreshCronRuns();
       }
       setShowEditor(false);
-      const approvalId = response.approval !== undefined && isJsonObject(response.approval)
-        ? readString(response.approval, "approval_id")
-        : null;
+      const approvalId =
+        response.approval !== undefined && isJsonObject(response.approval)
+          ? readString(response.approval, "approval_id")
+          : null;
       app.setNotice(
         approvalId === null
           ? `Routine ${editorMode === "create" ? "created" : "updated"}.`
@@ -221,9 +224,10 @@ export function CronSection({ app }: CronSectionProps) {
     await runBusyAction(async () => {
       const response = await app.api.setRoutineEnabled(routineId, enabled);
       await app.refreshCron();
-      const approvalId = response.approval !== undefined && isJsonObject(response.approval)
-        ? readString(response.approval, "approval_id")
-        : null;
+      const approvalId =
+        response.approval !== undefined && isJsonObject(response.approval)
+          ? readString(response.approval, "approval_id")
+          : null;
       app.setNotice(
         approvalId === null
           ? `Routine ${enabled ? "enabled" : "paused"}.`
@@ -396,7 +400,11 @@ export function CronSection({ app }: CronSectionProps) {
             <ActionButton variant="secondary" onPress={openCreateEditor}>
               New routine
             </ActionButton>
-            <ActionButton variant="secondary" onPress={() => void app.refreshCron()} isDisabled={busy}>
+            <ActionButton
+              variant="secondary"
+              onPress={() => void app.refreshCron()}
+              isDisabled={busy}
+            >
               {busy ? "Refreshing..." : "Refresh routines"}
             </ActionButton>
           </ActionCluster>
@@ -404,19 +412,106 @@ export function CronSection({ app }: CronSectionProps) {
       />
 
       <section className="workspace-metric-grid workspace-metric-grid--compact">
-        <WorkspaceMetricCard label="Scheduled" value={scheduleCount} detail="Cron-compatible paths now map onto routines." tone={scheduleCount > 0 ? "success" : "default"} />
-        <WorkspaceMetricCard label="Selected" value={selectedRoutineId ?? "None"} detail={selectedRoutine === null ? "Pick a routine to inspect runtime state." : routineSummary(selectedRoutine)} tone={selectedRoutine === null ? "default" : "accent"} />
-        <WorkspaceMetricCard label="Last outcome" value={readString(selectedLastRun, "outcome_kind") ?? "never_run"} detail={readString(selectedLastRun, "outcome_message") ?? "Skipped, throttled, and silent runs stay explicit."} tone={workspaceToneForState(readString(selectedLastRun, "outcome_kind"))} />
+        <WorkspaceMetricCard
+          label="Scheduled"
+          value={scheduleCount}
+          detail="Cron-compatible paths now map onto routines."
+          tone={scheduleCount > 0 ? "success" : "default"}
+        />
+        <WorkspaceMetricCard
+          label="Selected"
+          value={selectedRoutineId ?? "None"}
+          detail={
+            selectedRoutine === null
+              ? "Pick a routine to inspect runtime state."
+              : routineSummary(selectedRoutine)
+          }
+          tone={selectedRoutine === null ? "default" : "accent"}
+        />
+        <WorkspaceMetricCard
+          label="Last outcome"
+          value={readString(selectedLastRun, "outcome_kind") ?? "never_run"}
+          detail={
+            readString(selectedLastRun, "outcome_message") ??
+            "Skipped, throttled, and silent runs stay explicit."
+          }
+          tone={workspaceToneForState(readString(selectedLastRun, "outcome_kind"))}
+        />
       </section>
 
       <section className="workspace-two-column">
-        <WorkspaceSectionCard title="Routine catalog" description="List-first surface for selection, enablement, and manual run-now execution.">
+        <WorkspaceSectionCard
+          title="Routine catalog"
+          description="List-first surface for selection, enablement, and manual run-now execution."
+        >
           <EntityTable
             ariaLabel="Routine catalog"
             columns={[
-              { key: "routine", label: "Routine", isRowHeader: true, render: (row) => <div className="workspace-stack"><strong>{row.name}</strong><span className="chat-muted">{row.triggerKind} · next {row.nextRun}</span></div> },
-              { key: "state", label: "State", render: (row) => <div className="workspace-inline"><WorkspaceStatusChip tone={row.enabled ? "success" : "default"}>{row.enabled ? "enabled" : "paused"}</WorkspaceStatusChip><WorkspaceStatusChip tone={workspaceToneForState(row.lastOutcome)}>{row.lastOutcome}</WorkspaceStatusChip></div> },
-              { key: "actions", label: "Actions", align: "end", render: (row) => <ActionCluster><ActionButton variant="secondary" size="sm" onPress={() => app.setCronJobId(row.routineId)}>Select</ActionButton><ActionButton variant="secondary" size="sm" onPress={() => openEditEditor(row.record)}>Edit</ActionButton><ActionButton size="sm" onPress={() => void toggleRoutine(row.record, !row.enabled)} isDisabled={busy}>{row.enabled ? "Pause" : "Enable"}</ActionButton><ActionButton variant="secondary" size="sm" onPress={() => void runSelectedRoutine(row.record)} isDisabled={busy}>Run now</ActionButton></ActionCluster> },
+              {
+                key: "routine",
+                label: "Routine",
+                isRowHeader: true,
+                render: (row) => (
+                  <div className="workspace-stack">
+                    <strong>{row.name}</strong>
+                    <span className="chat-muted">
+                      {row.triggerKind} · next {row.nextRun}
+                    </span>
+                  </div>
+                ),
+              },
+              {
+                key: "state",
+                label: "State",
+                render: (row) => (
+                  <div className="workspace-inline">
+                    <WorkspaceStatusChip tone={row.enabled ? "success" : "default"}>
+                      {row.enabled ? "enabled" : "paused"}
+                    </WorkspaceStatusChip>
+                    <WorkspaceStatusChip tone={workspaceToneForState(row.lastOutcome)}>
+                      {row.lastOutcome}
+                    </WorkspaceStatusChip>
+                  </div>
+                ),
+              },
+              {
+                key: "actions",
+                label: "Actions",
+                align: "end",
+                render: (row) => (
+                  <ActionCluster>
+                    <ActionButton
+                      variant="secondary"
+                      size="sm"
+                      onPress={() => app.setCronJobId(row.routineId)}
+                    >
+                      Select
+                    </ActionButton>
+                    <ActionButton
+                      variant="secondary"
+                      size="sm"
+                      onPress={() => openEditEditor(row.record)}
+                    >
+                      Edit
+                    </ActionButton>
+                    <ActionButton
+                      size="sm"
+                      onPress={() => void toggleRoutine(row.record, !row.enabled)}
+                      isDisabled={busy}
+                    >
+                      {row.enabled ? "Pause" : "Enable"}
+                    </ActionButton>
+                    <ActionButton
+                      variant="secondary"
+                      size="sm"
+                      onPress={() => void runSelectedRoutine(row.record)}
+                      isDisabled={busy}
+                    >
+                      Run now
+                    </ActionButton>
+                  </ActionCluster>
+                ),
+              },
             ]}
             rows={routineRows}
             getRowId={(row) => row.routineId}
@@ -425,83 +520,392 @@ export function CronSection({ app }: CronSectionProps) {
           />
         </WorkspaceSectionCard>
 
-        <WorkspaceSectionCard title={editorMode === "create" ? "New routine" : "Edit routine"} description="Single editor for trigger kind, scheduling, delivery, quiet hours, and approvals.">
+        <WorkspaceSectionCard
+          title={editorMode === "create" ? "New routine" : "Edit routine"}
+          description="Single editor for trigger kind, scheduling, delivery, quiet hours, and approvals."
+        >
           {!showEditor ? (
-            <EmptyState compact title="Routine editor collapsed" description="Open the editor when you are ready to create or update a routine." action={<ActionButton variant="secondary" onPress={openCreateEditor}>Open routine editor</ActionButton>} />
+            <EmptyState
+              compact
+              title="Routine editor collapsed"
+              description="Open the editor when you are ready to create or update a routine."
+              action={
+                <ActionButton variant="secondary" onPress={openCreateEditor}>
+                  Open routine editor
+                </ActionButton>
+              }
+            />
           ) : (
             <AppForm onSubmit={(event) => void saveRoutine(event)}>
               <div className="workspace-form-grid">
-                <TextInputField label="Name" value={routineForm.name} onChange={(name) => setRoutineForm((current) => ({ ...current, name }))} required />
-                <TextInputField label="Channel" value={routineForm.channel} onChange={(channel) => setRoutineForm((current) => ({ ...current, channel }))} />
-                <SelectField label="Trigger kind" value={routineForm.triggerKind} onChange={(triggerKind) => setRoutineForm((current) => ({ ...current, triggerKind: triggerKind as RoutineEditorForm["triggerKind"] }))} options={TRIGGER_OPTIONS} />
-                <SelectField label="Delivery" value={routineForm.deliveryMode} onChange={(deliveryMode) => setRoutineForm((current) => ({ ...current, deliveryMode: deliveryMode as RoutineEditorForm["deliveryMode"] }))} options={DELIVERY_OPTIONS} />
-                <TextInputField label="Delivery channel" value={routineForm.deliveryChannel} onChange={(deliveryChannel) => setRoutineForm((current) => ({ ...current, deliveryChannel }))} />
-                <TextInputField label="Template id" value={routineForm.templateId} onChange={(templateId) => setRoutineForm((current) => ({ ...current, templateId }))} />
+                <TextInputField
+                  label="Name"
+                  value={routineForm.name}
+                  onChange={(name) => setRoutineForm((current) => ({ ...current, name }))}
+                  required
+                />
+                <TextInputField
+                  label="Channel"
+                  value={routineForm.channel}
+                  onChange={(channel) => setRoutineForm((current) => ({ ...current, channel }))}
+                />
+                <SelectField
+                  label="Trigger kind"
+                  value={routineForm.triggerKind}
+                  onChange={(triggerKind) =>
+                    setRoutineForm((current) => ({
+                      ...current,
+                      triggerKind: triggerKind as RoutineEditorForm["triggerKind"],
+                    }))
+                  }
+                  options={TRIGGER_OPTIONS}
+                />
+                <SelectField
+                  label="Delivery"
+                  value={routineForm.deliveryMode}
+                  onChange={(deliveryMode) =>
+                    setRoutineForm((current) => ({
+                      ...current,
+                      deliveryMode: deliveryMode as RoutineEditorForm["deliveryMode"],
+                    }))
+                  }
+                  options={DELIVERY_OPTIONS}
+                />
+                <TextInputField
+                  label="Delivery channel"
+                  value={routineForm.deliveryChannel}
+                  onChange={(deliveryChannel) =>
+                    setRoutineForm((current) => ({ ...current, deliveryChannel }))
+                  }
+                />
+                <TextInputField
+                  label="Template id"
+                  value={routineForm.templateId}
+                  onChange={(templateId) =>
+                    setRoutineForm((current) => ({ ...current, templateId }))
+                  }
+                />
               </div>
-              <TextAreaField label="Prompt" rows={4} value={routineForm.prompt} onChange={(prompt) => setRoutineForm((current) => ({ ...current, prompt }))} required />
+              <TextAreaField
+                label="Prompt"
+                rows={4}
+                value={routineForm.prompt}
+                onChange={(prompt) => setRoutineForm((current) => ({ ...current, prompt }))}
+                required
+              />
               {routineForm.triggerKind === "schedule" ? (
                 <>
                   <div className="workspace-form-grid">
-                    <TextInputField label="Natural-language schedule" value={routineForm.naturalLanguageSchedule} onChange={(naturalLanguageSchedule) => setRoutineForm((current) => ({ ...current, naturalLanguageSchedule }))} />
-                    <SelectField label="Structured schedule" value={routineForm.scheduleType} onChange={(scheduleType) => setRoutineForm((current) => ({ ...current, scheduleType: scheduleType as RoutineEditorForm["scheduleType"] }))} options={SCHEDULE_OPTIONS} />
-                    <TextInputField label="Every interval (ms)" value={routineForm.everyIntervalMs} onChange={(everyIntervalMs) => setRoutineForm((current) => ({ ...current, everyIntervalMs }))} />
-                    <TextInputField label="Cron expression" value={routineForm.cronExpression} onChange={(cronExpression) => setRoutineForm((current) => ({ ...current, cronExpression }))} />
-                    <TextInputField label="At timestamp" value={routineForm.atTimestampRfc3339} onChange={(atTimestampRfc3339) => setRoutineForm((current) => ({ ...current, atTimestampRfc3339 }))} />
-                    <ActionButton variant="secondary" type="button" onPress={() => void previewNaturalLanguageSchedule()} isDisabled={previewBusy}>{previewBusy ? "Previewing..." : "Preview phrase"}</ActionButton>
+                    <TextInputField
+                      label="Natural-language schedule"
+                      value={routineForm.naturalLanguageSchedule}
+                      onChange={(naturalLanguageSchedule) =>
+                        setRoutineForm((current) => ({ ...current, naturalLanguageSchedule }))
+                      }
+                    />
+                    <SelectField
+                      label="Structured schedule"
+                      value={routineForm.scheduleType}
+                      onChange={(scheduleType) =>
+                        setRoutineForm((current) => ({
+                          ...current,
+                          scheduleType: scheduleType as RoutineEditorForm["scheduleType"],
+                        }))
+                      }
+                      options={SCHEDULE_OPTIONS}
+                    />
+                    <TextInputField
+                      label="Every interval (ms)"
+                      value={routineForm.everyIntervalMs}
+                      onChange={(everyIntervalMs) =>
+                        setRoutineForm((current) => ({ ...current, everyIntervalMs }))
+                      }
+                    />
+                    <TextInputField
+                      label="Cron expression"
+                      value={routineForm.cronExpression}
+                      onChange={(cronExpression) =>
+                        setRoutineForm((current) => ({ ...current, cronExpression }))
+                      }
+                    />
+                    <TextInputField
+                      label="At timestamp"
+                      value={routineForm.atTimestampRfc3339}
+                      onChange={(atTimestampRfc3339) =>
+                        setRoutineForm((current) => ({ ...current, atTimestampRfc3339 }))
+                      }
+                    />
+                    <ActionButton
+                      variant="secondary"
+                      type="button"
+                      onPress={() => void previewNaturalLanguageSchedule()}
+                      isDisabled={previewBusy}
+                    >
+                      {previewBusy ? "Previewing..." : "Preview phrase"}
+                    </ActionButton>
                   </div>
-                  {schedulePreview !== null ? <InlineNotice title="Schedule preview" tone="accent">{readString(schedulePreview, "explanation") ?? "Preview unavailable"} Next run {formatUnixMs(readNumber(schedulePreview, "next_run_at_unix_ms"))}.</InlineNotice> : null}
+                  {schedulePreview !== null ? (
+                    <InlineNotice title="Schedule preview" tone="accent">
+                      {readString(schedulePreview, "explanation") ?? "Preview unavailable"} Next run{" "}
+                      {formatUnixMs(readNumber(schedulePreview, "next_run_at_unix_ms"))}.
+                    </InlineNotice>
+                  ) : null}
                 </>
               ) : (
                 <>
                   <div className="workspace-form-grid">
-                    {routineForm.triggerKind === "hook" ? <TextInputField label="Hook id" value={routineForm.hookId} onChange={(hookId) => setRoutineForm((current) => ({ ...current, hookId }))} /> : null}
-                    {routineForm.triggerKind === "webhook" ? <><TextInputField label="Integration id" value={routineForm.webhookIntegrationId} onChange={(webhookIntegrationId) => setRoutineForm((current) => ({ ...current, webhookIntegrationId }))} /><TextInputField label="Provider" value={routineForm.webhookProvider} onChange={(webhookProvider) => setRoutineForm((current) => ({ ...current, webhookProvider }))} /></> : null}
-                    {routineForm.triggerKind === "hook" || routineForm.triggerKind === "webhook" || routineForm.triggerKind === "system_event" ? <TextInputField label={routineForm.triggerKind === "system_event" ? "System event" : "Event matcher"} value={routineForm.eventName} onChange={(eventName) => setRoutineForm((current) => ({ ...current, eventName }))} /> : null}
+                    {routineForm.triggerKind === "hook" ? (
+                      <TextInputField
+                        label="Hook id"
+                        value={routineForm.hookId}
+                        onChange={(hookId) => setRoutineForm((current) => ({ ...current, hookId }))}
+                      />
+                    ) : null}
+                    {routineForm.triggerKind === "webhook" ? (
+                      <>
+                        <TextInputField
+                          label="Integration id"
+                          value={routineForm.webhookIntegrationId}
+                          onChange={(webhookIntegrationId) =>
+                            setRoutineForm((current) => ({ ...current, webhookIntegrationId }))
+                          }
+                        />
+                        <TextInputField
+                          label="Provider"
+                          value={routineForm.webhookProvider}
+                          onChange={(webhookProvider) =>
+                            setRoutineForm((current) => ({ ...current, webhookProvider }))
+                          }
+                        />
+                      </>
+                    ) : null}
+                    {routineForm.triggerKind === "hook" ||
+                    routineForm.triggerKind === "webhook" ||
+                    routineForm.triggerKind === "system_event" ? (
+                      <TextInputField
+                        label={
+                          routineForm.triggerKind === "system_event"
+                            ? "System event"
+                            : "Event matcher"
+                        }
+                        value={routineForm.eventName}
+                        onChange={(eventName) =>
+                          setRoutineForm((current) => ({ ...current, eventName }))
+                        }
+                      />
+                    ) : null}
                   </div>
-                  <TextAreaField label="Trigger payload matcher" rows={4} value={routineForm.triggerPayloadText} onChange={(triggerPayloadText) => setRoutineForm((current) => ({ ...current, triggerPayloadText }))} />
+                  <TextAreaField
+                    label="Trigger payload matcher"
+                    rows={4}
+                    value={routineForm.triggerPayloadText}
+                    onChange={(triggerPayloadText) =>
+                      setRoutineForm((current) => ({ ...current, triggerPayloadText }))
+                    }
+                  />
                 </>
               )}
               <div className="workspace-form-grid">
-                <SelectField label="Concurrency" value={routineForm.concurrencyPolicy} onChange={(concurrencyPolicy) => setRoutineForm((current) => ({ ...current, concurrencyPolicy: concurrencyPolicy as RoutineEditorForm["concurrencyPolicy"] }))} options={CONCURRENCY_OPTIONS} />
-                <TextInputField label="Retry max attempts" value={routineForm.retryMaxAttempts} onChange={(retryMaxAttempts) => setRoutineForm((current) => ({ ...current, retryMaxAttempts }))} />
-                <TextInputField label="Retry backoff (ms)" value={routineForm.retryBackoffMs} onChange={(retryBackoffMs) => setRoutineForm((current) => ({ ...current, retryBackoffMs }))} />
-                <SelectField label="Misfire" value={routineForm.misfirePolicy} onChange={(misfirePolicy) => setRoutineForm((current) => ({ ...current, misfirePolicy: misfirePolicy as RoutineEditorForm["misfirePolicy"] }))} options={MISFIRE_OPTIONS} />
-                <TextInputField label="Jitter (ms)" value={routineForm.jitterMs} onChange={(jitterMs) => setRoutineForm((current) => ({ ...current, jitterMs }))} />
-                <TextInputField label="Cooldown (ms)" value={routineForm.cooldownMs} onChange={(cooldownMs) => setRoutineForm((current) => ({ ...current, cooldownMs }))} />
-                <TextInputField label="Quiet hours start" value={routineForm.quietHoursStart} onChange={(quietHoursStart) => setRoutineForm((current) => ({ ...current, quietHoursStart }))} />
-                <TextInputField label="Quiet hours end" value={routineForm.quietHoursEnd} onChange={(quietHoursEnd) => setRoutineForm((current) => ({ ...current, quietHoursEnd }))} />
-                <SelectField label="Quiet timezone" value={routineForm.quietHoursTimezone} onChange={(quietHoursTimezone) => setRoutineForm((current) => ({ ...current, quietHoursTimezone: quietHoursTimezone as RoutineEditorForm["quietHoursTimezone"] }))} options={TIMEZONE_OPTIONS} />
-                <SelectField label="Approval" value={routineForm.approvalMode} onChange={(approvalMode) => setRoutineForm((current) => ({ ...current, approvalMode: approvalMode as RoutineEditorForm["approvalMode"] }))} options={APPROVAL_OPTIONS} />
+                <SelectField
+                  label="Concurrency"
+                  value={routineForm.concurrencyPolicy}
+                  onChange={(concurrencyPolicy) =>
+                    setRoutineForm((current) => ({
+                      ...current,
+                      concurrencyPolicy:
+                        concurrencyPolicy as RoutineEditorForm["concurrencyPolicy"],
+                    }))
+                  }
+                  options={CONCURRENCY_OPTIONS}
+                />
+                <TextInputField
+                  label="Retry max attempts"
+                  value={routineForm.retryMaxAttempts}
+                  onChange={(retryMaxAttempts) =>
+                    setRoutineForm((current) => ({ ...current, retryMaxAttempts }))
+                  }
+                />
+                <TextInputField
+                  label="Retry backoff (ms)"
+                  value={routineForm.retryBackoffMs}
+                  onChange={(retryBackoffMs) =>
+                    setRoutineForm((current) => ({ ...current, retryBackoffMs }))
+                  }
+                />
+                <SelectField
+                  label="Misfire"
+                  value={routineForm.misfirePolicy}
+                  onChange={(misfirePolicy) =>
+                    setRoutineForm((current) => ({
+                      ...current,
+                      misfirePolicy: misfirePolicy as RoutineEditorForm["misfirePolicy"],
+                    }))
+                  }
+                  options={MISFIRE_OPTIONS}
+                />
+                <TextInputField
+                  label="Jitter (ms)"
+                  value={routineForm.jitterMs}
+                  onChange={(jitterMs) => setRoutineForm((current) => ({ ...current, jitterMs }))}
+                />
+                <TextInputField
+                  label="Cooldown (ms)"
+                  value={routineForm.cooldownMs}
+                  onChange={(cooldownMs) =>
+                    setRoutineForm((current) => ({ ...current, cooldownMs }))
+                  }
+                />
+                <TextInputField
+                  label="Quiet hours start"
+                  value={routineForm.quietHoursStart}
+                  onChange={(quietHoursStart) =>
+                    setRoutineForm((current) => ({ ...current, quietHoursStart }))
+                  }
+                />
+                <TextInputField
+                  label="Quiet hours end"
+                  value={routineForm.quietHoursEnd}
+                  onChange={(quietHoursEnd) =>
+                    setRoutineForm((current) => ({ ...current, quietHoursEnd }))
+                  }
+                />
+                <SelectField
+                  label="Quiet timezone"
+                  value={routineForm.quietHoursTimezone}
+                  onChange={(quietHoursTimezone) =>
+                    setRoutineForm((current) => ({
+                      ...current,
+                      quietHoursTimezone:
+                        quietHoursTimezone as RoutineEditorForm["quietHoursTimezone"],
+                    }))
+                  }
+                  options={TIMEZONE_OPTIONS}
+                />
+                <SelectField
+                  label="Approval"
+                  value={routineForm.approvalMode}
+                  onChange={(approvalMode) =>
+                    setRoutineForm((current) => ({
+                      ...current,
+                      approvalMode: approvalMode as RoutineEditorForm["approvalMode"],
+                    }))
+                  }
+                  options={APPROVAL_OPTIONS}
+                />
               </div>
-              <SwitchField label="Enabled" checked={routineForm.enabled} onChange={(enabled) => setRoutineForm((current) => ({ ...current, enabled }))} />
-              <ActionCluster><ActionButton type="submit" isDisabled={busy}>{busy ? "Saving..." : editorMode === "create" ? "Create routine" : "Save routine"}</ActionButton><ActionButton type="button" variant="secondary" onPress={openCreateEditor} isDisabled={busy}>Reset form</ActionButton></ActionCluster>
+              <SwitchField
+                label="Enabled"
+                checked={routineForm.enabled}
+                onChange={(enabled) => setRoutineForm((current) => ({ ...current, enabled }))}
+              />
+              <ActionCluster>
+                <ActionButton type="submit" isDisabled={busy}>
+                  {busy ? "Saving..." : editorMode === "create" ? "Create routine" : "Save routine"}
+                </ActionButton>
+                <ActionButton
+                  type="button"
+                  variant="secondary"
+                  onPress={openCreateEditor}
+                  isDisabled={busy}
+                >
+                  Reset form
+                </ActionButton>
+              </ActionCluster>
             </AppForm>
           )}
         </WorkspaceSectionCard>
       </section>
 
       <section className="workspace-two-column workspace-two-column--history">
-        <WorkspaceSectionCard title="Selected routine" description="Inspect delivery, trigger payload, cooldown, and approval posture before changing anything.">
-          {selectedRoutine === null ? <EmptyState compact title="No routine selected" description="Select a routine to inspect its configuration and run posture." /> : <>
-            <KeyValueList items={[
-              { label: "Routine id", value: selectedRoutineId ?? "n/a" },
-              { label: "Trigger", value: selectedTriggerKind },
-              { label: "Summary", value: routineSummary(selectedRoutine) },
-              { label: "Delivery", value: `${readString(selectedRoutine, "delivery_mode") ?? "same_channel"}${readString(selectedRoutine, "delivery_channel") ? ` -> ${readString(selectedRoutine, "delivery_channel")}` : ""}` },
-              { label: "Approval", value: readString(selectedRoutine, "approval_mode") ?? "none" },
-              { label: "Cooldown", value: millisecondsSummary(readNumber(selectedRoutine, "cooldown_ms")) },
-              { label: "Last outcome", value: readString(selectedLastRun, "outcome_kind") ?? "never_run" },
-            ]} />
-            <TextAreaField label="Trigger payload" readOnly rows={4} value={formatJson(selectedTriggerPayload)} onChange={() => undefined} />
-          </>}
+        <WorkspaceSectionCard
+          title="Selected routine"
+          description="Inspect delivery, trigger payload, cooldown, and approval posture before changing anything."
+        >
+          {selectedRoutine === null ? (
+            <EmptyState
+              compact
+              title="No routine selected"
+              description="Select a routine to inspect its configuration and run posture."
+            />
+          ) : (
+            <>
+              <KeyValueList
+                items={[
+                  { label: "Routine id", value: selectedRoutineId ?? "n/a" },
+                  { label: "Trigger", value: selectedTriggerKind },
+                  { label: "Summary", value: routineSummary(selectedRoutine) },
+                  {
+                    label: "Delivery",
+                    value: `${readString(selectedRoutine, "delivery_mode") ?? "same_channel"}${readString(selectedRoutine, "delivery_channel") ? ` -> ${readString(selectedRoutine, "delivery_channel")}` : ""}`,
+                  },
+                  {
+                    label: "Approval",
+                    value: readString(selectedRoutine, "approval_mode") ?? "none",
+                  },
+                  {
+                    label: "Cooldown",
+                    value: millisecondsSummary(readNumber(selectedRoutine, "cooldown_ms")),
+                  },
+                  {
+                    label: "Last outcome",
+                    value: readString(selectedLastRun, "outcome_kind") ?? "never_run",
+                  },
+                ]}
+              />
+              <TextAreaField
+                label="Trigger payload"
+                readOnly
+                rows={4}
+                value={formatJson(selectedTriggerPayload)}
+                onChange={() => undefined}
+              />
+            </>
+          )}
         </WorkspaceSectionCard>
-        <WorkspaceSectionCard title="Run history" description="Recent routine runs keep skipped, throttled, and silent outcomes distinct.">
+        <WorkspaceSectionCard
+          title="Run history"
+          description="Recent routine runs keep skipped, throttled, and silent outcomes distinct."
+        >
           <EntityTable
             ariaLabel="Routine run history"
             columns={[
-              { key: "run", label: "Run", isRowHeader: true, render: (run) => <div className="workspace-stack"><strong>{readString(run, "run_id") ?? "unknown"}</strong><span className="chat-muted">{formatUnixMs(readNumber(run, "started_at_unix_ms"))}</span></div> },
-              { key: "outcome", label: "Outcome", render: (run) => <div className="workspace-inline"><WorkspaceStatusChip tone={workspaceToneForState(readString(run, "outcome_kind"))}>{readString(run, "outcome_kind") ?? "unknown"}</WorkspaceStatusChip><WorkspaceStatusChip tone={workspaceToneForState(readString(run, "status"))}>{readString(run, "status") ?? "unknown"}</WorkspaceStatusChip></div> },
-              { key: "summary", label: "Summary", render: (run) => readString(run, "outcome_message") ?? readString(run, "trigger_reason") ?? "No explanation recorded." },
+              {
+                key: "run",
+                label: "Run",
+                isRowHeader: true,
+                render: (run) => (
+                  <div className="workspace-stack">
+                    <strong>{readString(run, "run_id") ?? "unknown"}</strong>
+                    <span className="chat-muted">
+                      {formatUnixMs(readNumber(run, "started_at_unix_ms"))}
+                    </span>
+                  </div>
+                ),
+              },
+              {
+                key: "outcome",
+                label: "Outcome",
+                render: (run) => (
+                  <div className="workspace-inline">
+                    <WorkspaceStatusChip
+                      tone={workspaceToneForState(readString(run, "outcome_kind"))}
+                    >
+                      {readString(run, "outcome_kind") ?? "unknown"}
+                    </WorkspaceStatusChip>
+                    <WorkspaceStatusChip tone={workspaceToneForState(readString(run, "status"))}>
+                      {readString(run, "status") ?? "unknown"}
+                    </WorkspaceStatusChip>
+                  </div>
+                ),
+              },
+              {
+                key: "summary",
+                label: "Summary",
+                render: (run) =>
+                  readString(run, "outcome_message") ??
+                  readString(run, "trigger_reason") ??
+                  "No explanation recorded.",
+              },
             ]}
             rows={app.cronRuns}
             getRowId={(run) => readString(run, "run_id") ?? "run"}
@@ -512,13 +916,54 @@ export function CronSection({ app }: CronSectionProps) {
       </section>
 
       <section className="workspace-two-column">
-        <WorkspaceSectionCard title="Template pack" description="Bootstrap common routines from built-in heartbeat, report, follow-up, change-check, and ingest templates.">
+        <WorkspaceSectionCard
+          title="Template pack"
+          description="Bootstrap common routines from built-in heartbeat, report, follow-up, change-check, and ingest templates."
+        >
           <EntityTable
             ariaLabel="Routine templates"
             columns={[
-              { key: "template", label: "Template", isRowHeader: true, render: (template) => <div className="workspace-stack"><strong>{readString(template, "title") ?? readString(template, "template_id")}</strong><span className="chat-muted">{readString(template, "description") ?? "No description"}</span></div> },
-              { key: "defaults", label: "Defaults", render: (template) => `${readString(template, "trigger_kind") ?? "manual"} · ${readString(template, "natural_language_schedule") ?? "manual trigger"}` },
-              { key: "actions", label: "Actions", align: "end", render: (template) => <ActionButton variant="secondary" size="sm" onPress={() => { setEditorMode("create"); setRoutineForm(applyTemplateToForm(template, defaultRoutineForm(app.session?.channel))); setShowEditor(true); }}>Use template</ActionButton> },
+              {
+                key: "template",
+                label: "Template",
+                isRowHeader: true,
+                render: (template) => (
+                  <div className="workspace-stack">
+                    <strong>
+                      {readString(template, "title") ?? readString(template, "template_id")}
+                    </strong>
+                    <span className="chat-muted">
+                      {readString(template, "description") ?? "No description"}
+                    </span>
+                  </div>
+                ),
+              },
+              {
+                key: "defaults",
+                label: "Defaults",
+                render: (template) =>
+                  `${readString(template, "trigger_kind") ?? "manual"} · ${readString(template, "natural_language_schedule") ?? "manual trigger"}`,
+              },
+              {
+                key: "actions",
+                label: "Actions",
+                align: "end",
+                render: (template) => (
+                  <ActionButton
+                    variant="secondary"
+                    size="sm"
+                    onPress={() => {
+                      setEditorMode("create");
+                      setRoutineForm(
+                        applyTemplateToForm(template, defaultRoutineForm(app.session?.channel)),
+                      );
+                      setShowEditor(true);
+                    }}
+                  >
+                    Use template
+                  </ActionButton>
+                ),
+              },
             ]}
             rows={templates}
             getRowId={(template) => readString(template, "template_id") ?? "template"}
@@ -527,18 +972,73 @@ export function CronSection({ app }: CronSectionProps) {
           />
         </WorkspaceSectionCard>
 
-        <WorkspaceSectionCard title="Import, export, and trigger test" description="Portable bundles and adapter test firing stay inside the same routine surface.">
-          <ActionCluster><ActionButton variant="secondary" size="sm" onPress={() => void exportSelectedRoutine()} isDisabled={busy || selectedRoutineId === null}>Export selected</ActionButton><ActionButton variant="secondary" size="sm" onPress={() => void fireSelectedRoutineTrigger()} isDisabled={busy || selectedRoutineId === null}>{selectedTriggerKind === "schedule" ? "Run selected now" : "Fire selected trigger"}</ActionButton></ActionCluster>
-          <TextAreaField label="Export bundle" readOnly rows={5} value={exportText} onChange={() => undefined} />
-          <TextAreaField label="Import bundle" rows={5} value={importText} onChange={setImportText} />
-          <SwitchField label="Enable imported routine" checked={importEnabled} onChange={setImportEnabled} />
-          <ActionButton onPress={() => void importRoutineBundle()} isDisabled={busy}>Import routine</ActionButton>
-          <TextAreaField label="Trigger payload" rows={4} value={dispatchPayloadText} onChange={setDispatchPayloadText} />
+        <WorkspaceSectionCard
+          title="Import, export, and trigger test"
+          description="Portable bundles and adapter test firing stay inside the same routine surface."
+        >
+          <ActionCluster>
+            <ActionButton
+              variant="secondary"
+              size="sm"
+              onPress={() => void exportSelectedRoutine()}
+              isDisabled={busy || selectedRoutineId === null}
+            >
+              Export selected
+            </ActionButton>
+            <ActionButton
+              variant="secondary"
+              size="sm"
+              onPress={() => void fireSelectedRoutineTrigger()}
+              isDisabled={busy || selectedRoutineId === null}
+            >
+              {selectedTriggerKind === "schedule" ? "Run selected now" : "Fire selected trigger"}
+            </ActionButton>
+          </ActionCluster>
+          <TextAreaField
+            label="Export bundle"
+            readOnly
+            rows={5}
+            value={exportText}
+            onChange={() => undefined}
+          />
+          <TextAreaField
+            label="Import bundle"
+            rows={5}
+            value={importText}
+            onChange={setImportText}
+          />
+          <SwitchField
+            label="Enable imported routine"
+            checked={importEnabled}
+            onChange={setImportEnabled}
+          />
+          <ActionButton onPress={() => void importRoutineBundle()} isDisabled={busy}>
+            Import routine
+          </ActionButton>
+          <TextAreaField
+            label="Trigger payload"
+            rows={4}
+            value={dispatchPayloadText}
+            onChange={setDispatchPayloadText}
+          />
           <div className="workspace-form-grid">
-            <TextInputField label="Trigger reason" value={dispatchReason} onChange={setDispatchReason} />
-            <TextInputField label="Dedupe key" value={dispatchDedupeKey} onChange={setDispatchDedupeKey} />
+            <TextInputField
+              label="Trigger reason"
+              value={dispatchReason}
+              onChange={setDispatchReason}
+            />
+            <TextInputField
+              label="Dedupe key"
+              value={dispatchDedupeKey}
+              onChange={setDispatchDedupeKey}
+            />
           </div>
-          {selectedTriggerKind === "schedule" ? <InlineNotice title="Schedule routines" tone="default">Schedule routines use run-now. Hook, webhook, and system-event routines can fire their adapter path directly from this panel.</InlineNotice> : null}
+          {selectedTriggerKind === "schedule" ? (
+            <InlineNotice title="Schedule routines" tone="default">
+              Schedule routines use run-now. Hook, webhook, and system-event routines can fire their
+              adapter path directly from this panel.
+            </InlineNotice>
+          ) : null}
         </WorkspaceSectionCard>
       </section>
     </main>

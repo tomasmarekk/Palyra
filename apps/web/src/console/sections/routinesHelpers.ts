@@ -152,10 +152,15 @@ export function routineFormFromRecord(
     sessionKey: readString(routine, "session_key") ?? "",
     sessionLabel: readString(routine, "session_label") ?? "",
     concurrencyPolicy:
-      (readString(routine, "concurrency_policy") as RoutineEditorForm["concurrencyPolicy"] | null) ??
-      form.concurrencyPolicy,
-    retryMaxAttempts: String(readNumber(readObject(routine, "retry_policy") ?? {}, "max_attempts") ?? 1),
-    retryBackoffMs: String(readNumber(readObject(routine, "retry_policy") ?? {}, "backoff_ms") ?? 1000),
+      (readString(routine, "concurrency_policy") as
+        | RoutineEditorForm["concurrencyPolicy"]
+        | null) ?? form.concurrencyPolicy,
+    retryMaxAttempts: String(
+      readNumber(readObject(routine, "retry_policy") ?? {}, "max_attempts") ?? 1,
+    ),
+    retryBackoffMs: String(
+      readNumber(readObject(routine, "retry_policy") ?? {}, "backoff_ms") ?? 1000,
+    ),
     misfirePolicy:
       (readString(routine, "misfire_policy") as RoutineEditorForm["misfirePolicy"] | null) ??
       form.misfirePolicy,
@@ -177,15 +182,15 @@ export function routineFormFromRecord(
     hookId: readString(triggerPayload, "hook_id") ?? "",
     webhookIntegrationId: readString(triggerPayload, "integration_id") ?? "",
     webhookProvider: readString(triggerPayload, "provider") ?? "",
-    eventName:
-      readString(triggerPayload, "event") ??
-      readString(triggerPayload, "name") ??
-      "",
+    eventName: readString(triggerPayload, "event") ?? readString(triggerPayload, "name") ?? "",
     triggerPayloadText: formatJson(triggerPayload),
   };
 }
 
-export function applyTemplateToForm(template: JsonObject, base: RoutineEditorForm): RoutineEditorForm {
+export function applyTemplateToForm(
+  template: JsonObject,
+  base: RoutineEditorForm,
+): RoutineEditorForm {
   return {
     ...base,
     name: readString(template, "default_name") ?? base.name,

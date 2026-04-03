@@ -740,11 +740,7 @@ describe("M35 web console app", () => {
     const [, createRequest] = findRequestCall(fetchMock, "/console/v1/routines", "POST");
     expect(createRequest?.method).toBe("POST");
 
-    const [, toggleRequest] = findRequestCall(
-      fetchMock,
-      "/console/v1/routines/J1/enabled",
-      "POST",
-    );
+    const [, toggleRequest] = findRequestCall(fetchMock, "/console/v1/routines/J1/enabled", "POST");
     expect(toggleRequest?.method).toBe("POST");
     expect(requestBody(toggleRequest?.body)).toContain('"enabled":false');
   });
