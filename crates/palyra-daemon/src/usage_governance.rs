@@ -12,10 +12,8 @@ use crate::journal::{
     UsagePricingRecord, UsageRoutingDecisionCreateRequest, UsageRoutingDecisionRecord,
 };
 use crate::{
-    gateway::GatewayRuntimeState,
-    model_provider::ProviderStatusSnapshot,
-    orchestrator::estimate_token_count,
-    transport::grpc::auth::RequestContext,
+    gateway::GatewayRuntimeState, model_provider::ProviderStatusSnapshot,
+    orchestrator::estimate_token_count, transport::grpc::auth::RequestContext,
 };
 
 const ALERT_MIN_COST_SPIKE_USD: f64 = 0.50;
@@ -192,7 +190,9 @@ pub(crate) struct UsageEnrichedRun<'a> {
     pub cost_estimate: PricingEstimate,
 }
 
-pub(crate) fn parse_routing_mode_override(parameter_delta_json: Option<&str>) -> Option<RoutingMode> {
+pub(crate) fn parse_routing_mode_override(
+    parameter_delta_json: Option<&str>,
+) -> Option<RoutingMode> {
     let raw = parameter_delta_json?.trim();
     if raw.is_empty() {
         return None;
@@ -224,10 +224,8 @@ pub(crate) async fn plan_usage_routing(
     let pricing = runtime_state.list_usage_pricing_records().await?;
     let provider_kind = provider_snapshot.kind.as_str();
     let provider_id = if provider_kind == "openai_compatible" { "openai" } else { "palyra" };
-    let default_model_id = provider_snapshot
-        .openai_model
-        .clone()
-        .unwrap_or_else(|| "deterministic".to_owned());
+    let default_model_id =
+        provider_snapshot.openai_model.clone().unwrap_or_else(|| "deterministic".to_owned());
     let mode = if runtime_state.config.smart_routing.enabled {
         parse_routing_mode_override(parameter_delta_json)
             .unwrap_or_else(|| runtime_state.config.smart_routing.effective_mode())
@@ -394,9 +392,7 @@ pub(crate) fn estimate_cost_for_model(
             && entry.provider_id == provider_id
             && entry.model_id == model_id
             && entry.effective_from_unix_ms <= observed_at_unix_ms
-            && entry
-                .effective_to_unix_ms
-                .is_none_or(|value| value > observed_at_unix_ms)
+            && entry.effective_to_unix_ms.is_none_or(|value| value > observed_at_unix_ms)
     }) else {
         return PricingEstimate::unavailable();
     };
@@ -407,7 +403,8 @@ pub(crate) fn estimate_cost_for_model(
         .output_cost_per_million_usd
         .map(|rate| (completion_tokens as f64 / 1_000_000.0) * rate);
     let fixed_component = record.fixed_request_cost_usd.unwrap_or(0.0);
-    let total = prompt_component.unwrap_or(0.0) + completion_component.unwrap_or(0.0) + fixed_component;
+    let total =
+        prompt_component.unwrap_or(0.0) + completion_component.unwrap_or(0.0) + fixed_component;
     let total = (total * 100_000.0).round() / 100_000.0;
 
     PricingEstimate {
@@ -431,12 +428,12 @@ pub(crate) fn evaluate_budget_policies(
         .filter(|policy| policy.enabled)
         .map(|policy| {
             let consumed_value = match policy.metric_kind.as_str() {
-                "total_tokens" => Some(runs.iter().map(|entry| entry.run.total_tokens).sum::<u64>() as f64),
+                "total_tokens" => {
+                    Some(runs.iter().map(|entry| entry.run.total_tokens).sum::<u64>() as f64)
+                }
                 "estimated_cost_usd" => {
-                    let total = runs
-                        .iter()
-                        .filter_map(|entry| entry.cost_estimate.upper_usd)
-                        .sum::<f64>();
+                    let total =
+                        runs.iter().filter_map(|entry| entry.cost_estimate.upper_usd).sum::<f64>();
                     Some(total)
                 }
                 _ => None,
@@ -447,7 +444,8 @@ pub(crate) fn evaluate_budget_policies(
                 _ => None,
             };
             let subject_id = usage_budget_subject_id(policy.policy_id.as_str());
-            let approved_override = approved_subjects.get(subject_id.as_str()).copied().unwrap_or(false);
+            let approved_override =
+                approved_subjects.get(subject_id.as_str()).copied().unwrap_or(false);
 
             let status = if let (Some(projected), Some(hard_limit)) =
                 (projected_value, policy.hard_limit_value)
@@ -555,13 +553,9 @@ pub(crate) fn decide_routing(context: RoutingDecisionContext<'_>) -> RoutingDeci
         })
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| {
-        let left_cost = left
-            .input_cost_per_million_usd
-            .unwrap_or(f64::MAX)
+        let left_cost = left.input_cost_per_million_usd.unwrap_or(f64::MAX)
             + left.output_cost_per_million_usd.unwrap_or(f64::MAX);
-        let right_cost = right
-            .input_cost_per_million_usd
-            .unwrap_or(f64::MAX)
+        let right_cost = right.input_cost_per_million_usd.unwrap_or(f64::MAX)
             + right.output_cost_per_million_usd.unwrap_or(f64::MAX);
         left_cost.total_cmp(&right_cost)
     });
@@ -674,10 +668,7 @@ pub(crate) fn build_model_mix(runs: &[UsageEnrichedRun<'_>]) -> Vec<UsageModelMi
     }
     let mut rows = groups.into_values().collect::<Vec<_>>();
     rows.sort_by(|left, right| {
-        right
-            .total_tokens
-            .cmp(&left.total_tokens)
-            .then_with(|| left.model_id.cmp(&right.model_id))
+        right.total_tokens.cmp(&left.total_tokens).then_with(|| left.model_id.cmp(&right.model_id))
     });
     rows
 }
@@ -685,11 +676,12 @@ pub(crate) fn build_model_mix(runs: &[UsageEnrichedRun<'_>]) -> Vec<UsageModelMi
 pub(crate) fn build_scope_mix(runs: &[UsageEnrichedRun<'_>]) -> Vec<UsageScopeMixRecord> {
     let mut groups = HashMap::<String, UsageScopeMixRecord>::new();
     for entry in runs {
-        let scope = if entry.run.origin_kind == "background" || entry.run.background_task_id.is_some() {
-            "background".to_owned()
-        } else {
-            "foreground".to_owned()
-        };
+        let scope =
+            if entry.run.origin_kind == "background" || entry.run.background_task_id.is_some() {
+                "background".to_owned()
+            } else {
+                "foreground".to_owned()
+            };
         let row = groups.entry(scope.clone()).or_insert_with(|| UsageScopeMixRecord {
             scope,
             runs: 0,
@@ -717,7 +709,9 @@ pub(crate) fn build_tool_mix(tool_counts: &HashMap<String, u64>) -> Vec<UsageToo
             proposals: *proposals,
         })
         .collect::<Vec<_>>();
-    rows.sort_by(|left, right| right.proposals.cmp(&left.proposals).then_with(|| left.tool_name.cmp(&right.tool_name)));
+    rows.sort_by(|left, right| {
+        right.proposals.cmp(&left.proposals).then_with(|| left.tool_name.cmp(&right.tool_name))
+    });
     rows
 }
 
@@ -741,7 +735,10 @@ pub(crate) fn build_alert_candidates(
         .sum::<f64>();
 
     let mut alerts = Vec::new();
-    if first_half_cost > ALERT_MIN_COST_SPIKE_USD && second_half_cost > 0.0 && first_half_cost > second_half_cost * 2.0 {
+    if first_half_cost > ALERT_MIN_COST_SPIKE_USD
+        && second_half_cost > 0.0
+        && first_half_cost > second_half_cost * 2.0
+    {
         alerts.push(UsageAlertCandidate {
             alert_kind: "cost_spike".to_owned(),
             severity: "warning".to_owned(),
@@ -871,15 +868,12 @@ pub(crate) async fn request_usage_budget_override(
 
     let session_id = session_id.map(ToOwned::to_owned).unwrap_or_else(|| Ulid::new().to_string());
     let run_id = run_id.map(ToOwned::to_owned).unwrap_or_else(|| Ulid::new().to_string());
-    let request_summary = if let Some(reason) = requested_reason.filter(|value| !value.trim().is_empty()) {
-        format!(
-            "Budget override requested for policy {}: {}",
-            policy.policy_id,
-            reason.trim()
-        )
-    } else {
-        format!("Budget override requested for policy {}", policy.policy_id)
-    };
+    let request_summary =
+        if let Some(reason) = requested_reason.filter(|value| !value.trim().is_empty()) {
+            format!("Budget override requested for policy {}: {}", policy.policy_id, reason.trim())
+        } else {
+            format!("Budget override requested for policy {}", policy.policy_id)
+        };
 
     runtime_state
         .create_approval_record(ApprovalCreateRequest {
@@ -895,16 +889,15 @@ pub(crate) async fn request_usage_budget_override(
             policy_snapshot: ApprovalPolicySnapshot {
                 policy_id: "usage_budget_policy.v1".to_owned(),
                 policy_hash: "phase7".to_owned(),
-                evaluation_summary:
-                    "budget hard limit exceeded; explicit override required".to_owned(),
+                evaluation_summary: "budget hard limit exceeded; explicit override required"
+                    .to_owned(),
             },
             prompt: ApprovalPromptRecord {
                 title: "Approve usage budget override".to_owned(),
                 risk_level: ApprovalRiskLevel::High,
                 subject_id,
-                summary:
-                    "A run exceeded a hard budget limit and needs an explicit override."
-                        .to_owned(),
+                summary: "A run exceeded a hard budget limit and needs an explicit override."
+                    .to_owned(),
                 options: vec![
                     ApprovalPromptOption {
                         option_id: "allow_once".to_owned(),
@@ -966,12 +959,11 @@ pub(crate) async fn load_budget_override_approvals(
 
 fn is_active_budget_override_allow(record: &ApprovalRecord) -> bool {
     record.decision == Some(ApprovalDecision::Allow)
-        && !record
-            .decision_scope_ttl_ms
-            .zip(record.resolved_at_unix_ms)
-            .is_some_and(|(ttl_ms, resolved_at)| {
+        && !record.decision_scope_ttl_ms.zip(record.resolved_at_unix_ms).is_some_and(
+            |(ttl_ms, resolved_at)| {
                 resolved_at.saturating_add(ttl_ms) <= crate::gateway::current_unix_ms()
-            })
+            },
+        )
 }
 
 fn provider_health_state(snapshot: &ProviderStatusSnapshot) -> &'static str {
@@ -984,7 +976,12 @@ fn provider_health_state(snapshot: &ProviderStatusSnapshot) -> &'static str {
     }
 }
 
-fn complexity_score(prompt_text: &str, prompt_tokens_estimate: u64, json_mode: bool, vision_inputs: usize) -> f64 {
+fn complexity_score(
+    prompt_text: &str,
+    prompt_tokens_estimate: u64,
+    json_mode: bool,
+    vision_inputs: usize,
+) -> f64 {
     let length_component = (prompt_text.len() as f64 / 4_000.0).clamp(0.0, 1.0);
     let token_component = (prompt_tokens_estimate as f64 / 3_000.0).clamp(0.0, 1.0);
     let json_component = if json_mode { 0.2 } else { 0.0 };
@@ -994,6 +991,10 @@ fn complexity_score(prompt_text: &str, prompt_tokens_estimate: u64, json_mode: b
         .filter(|keyword| prompt_text.to_ascii_lowercase().contains(**keyword))
         .count() as f64
         * 0.05;
-    (length_component * 0.35 + token_component * 0.35 + json_component + vision_component + keyword_component)
+    (length_component * 0.35
+        + token_component * 0.35
+        + json_component
+        + vision_component
+        + keyword_component)
         .clamp(0.0, 1.0)
 }

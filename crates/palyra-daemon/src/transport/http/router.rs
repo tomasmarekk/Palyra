@@ -320,8 +320,14 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/console/v1/usage/agents", get(console::usage::console_usage_agents_handler))
         .route("/console/v1/usage/models", get(console::usage::console_usage_models_handler))
         .route("/console/v1/usage/insights", get(console::usage::console_usage_insights_handler))
-        .route("/console/v1/usage/pricing", post(console::usage::console_usage_pricing_upsert_handler))
-        .route("/console/v1/usage/budgets", post(console::usage::console_usage_budget_policy_upsert_handler))
+        .route(
+            "/console/v1/usage/pricing",
+            post(console::usage::console_usage_pricing_upsert_handler),
+        )
+        .route(
+            "/console/v1/usage/budgets",
+            post(console::usage::console_usage_budget_policy_upsert_handler),
+        )
         .route(
             "/console/v1/usage/budgets/{policy_id}/override-request",
             post(console::usage::console_usage_budget_override_request_handler),

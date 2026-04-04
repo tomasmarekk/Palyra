@@ -234,7 +234,8 @@ fn load_smart_routing_runtime_config() -> usage_governance::SmartRoutingRuntimeC
     let default_mode = std::env::var(SMART_ROUTING_MODE_ENV)
         .ok()
         .and_then(|value| {
-            usage_governance::RoutingMode::parse(value.as_str()).map(|mode| mode.as_str().to_owned())
+            usage_governance::RoutingMode::parse(value.as_str())
+                .map(|mode| mode.as_str().to_owned())
         })
         .unwrap_or_else(|| usage_governance::RoutingMode::Suggest.as_str().to_owned());
     usage_governance::SmartRoutingRuntimeConfig { enabled, default_mode }

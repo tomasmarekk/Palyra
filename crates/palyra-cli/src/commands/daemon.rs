@@ -1270,8 +1270,7 @@ fn build_gateway_usage_cost_value(db_path: Option<String>, days: u32) -> Result<
     let mut totals_total = 0_i64;
     let mut totals_estimated_cost = 0.0_f64;
     let mut total_estimated_runs = 0_i64;
-    let mut daily_map =
-        std::collections::BTreeMap::<String, (i64, i64, i64, i64, f64, i64)>::new();
+    let mut daily_map = std::collections::BTreeMap::<String, (i64, i64, i64, i64, f64, i64)>::new();
     let mut daily = Vec::new();
     while let Some(row) = rows.next()? {
         let run_id = row.get::<_, String>(0)?;
@@ -1284,11 +1283,9 @@ fn build_gateway_usage_cost_value(db_path: Option<String>, days: u32) -> Result<
         totals_completion += completion_tokens;
         totals_total += total_tokens;
         let run_date = connection
-            .query_row(
-                "SELECT date(?1 / 1000, 'unixepoch')",
-                [started_at_unix_ms],
-                |date_row| date_row.get::<_, String>(0),
-            )
+            .query_row("SELECT date(?1 / 1000, 'unixepoch')", [started_at_unix_ms], |date_row| {
+                date_row.get::<_, String>(0)
+            })
             .context("failed to derive run date for usage-cost output")?;
         let mut estimated_cost = Value::Null;
         let mut estimated_cost_raw = 0.0_f64;

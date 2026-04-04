@@ -3364,9 +3364,8 @@ impl JournalStore {
                 now,
             ],
         )?;
-        load_usage_pricing_record_by_id(&guard, request.pricing_id.as_str())?.ok_or_else(|| {
-            JournalError::Sqlite(rusqlite::Error::QueryReturnedNoRows)
-        })
+        load_usage_pricing_record_by_id(&guard, request.pricing_id.as_str())?
+            .ok_or_else(|| JournalError::Sqlite(rusqlite::Error::QueryReturnedNoRows))
     }
 
     pub fn create_usage_routing_decision(
@@ -3427,9 +3426,8 @@ impl JournalStore {
                 now,
             ],
         )?;
-        load_usage_routing_decision_by_id(&guard, request.decision_id.as_str())?.ok_or_else(|| {
-            JournalError::Sqlite(rusqlite::Error::QueryReturnedNoRows)
-        })
+        load_usage_routing_decision_by_id(&guard, request.decision_id.as_str())?
+            .ok_or_else(|| JournalError::Sqlite(rusqlite::Error::QueryReturnedNoRows))
     }
 
     pub fn list_usage_routing_decisions(
@@ -3492,9 +3490,8 @@ impl JournalStore {
                 now,
             ],
         )?;
-        load_usage_budget_policy_by_id(&guard, request.policy_id.as_str())?.ok_or_else(|| {
-            JournalError::Sqlite(rusqlite::Error::QueryReturnedNoRows)
-        })
+        load_usage_budget_policy_by_id(&guard, request.policy_id.as_str())?
+            .ok_or_else(|| JournalError::Sqlite(rusqlite::Error::QueryReturnedNoRows))
     }
 
     pub fn list_usage_budget_policies(
@@ -3588,9 +3585,8 @@ impl JournalStore {
                 )?;
             }
         }
-        load_usage_alert_by_dedupe_key(&guard, request.dedupe_key.as_str())?.ok_or_else(|| {
-            JournalError::Sqlite(rusqlite::Error::QueryReturnedNoRows)
-        })
+        load_usage_alert_by_dedupe_key(&guard, request.dedupe_key.as_str())?
+            .ok_or_else(|| JournalError::Sqlite(rusqlite::Error::QueryReturnedNoRows))
     }
 
     pub fn list_usage_alerts(
@@ -8902,10 +8898,7 @@ fn load_usage_pricing_record_by_id(
             WHERE pricing_ulid = ?1
         "#,
     )?;
-    statement
-        .query_row(params![pricing_id], map_usage_pricing_row)
-        .optional()
-        .map_err(Into::into)
+    statement.query_row(params![pricing_id], map_usage_pricing_row).optional().map_err(Into::into)
 }
 
 fn load_usage_pricing_records(
@@ -9195,10 +9188,7 @@ fn load_usage_alert_by_dedupe_key(
             WHERE dedupe_key = ?1
         "#,
     )?;
-    statement
-        .query_row(params![dedupe_key], map_usage_alert_row)
-        .optional()
-        .map_err(Into::into)
+    statement.query_row(params![dedupe_key], map_usage_alert_row).optional().map_err(Into::into)
 }
 
 fn load_usage_alerts(
@@ -9298,10 +9288,7 @@ fn load_latest_approval_by_subject(
             LIMIT 1
         "#,
     )?;
-    statement
-        .query_row(params![subject_id], map_approval_row)
-        .optional()
-        .map_err(Into::into)
+    statement.query_row(params![subject_id], map_approval_row).optional().map_err(Into::into)
 }
 
 fn empty_usage_timeline_bucket(

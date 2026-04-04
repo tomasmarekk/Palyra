@@ -1180,10 +1180,7 @@ fn console_usage_insights_expose_budget_governance_and_override_requests() -> Re
         .json::<Value>()
         .context("failed to parse usage insights response json")?;
     assert_eq!(
-        insights
-            .get("routing")
-            .and_then(|value| value.get("default_mode"))
-            .and_then(Value::as_str),
+        insights.get("routing").and_then(|value| value.get("default_mode")).and_then(Value::as_str),
         Some("suggest"),
         "usage insights should surface the runtime default routing mode"
     );

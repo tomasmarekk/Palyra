@@ -354,8 +354,7 @@ pub(crate) async fn console_usage_sessions_handler(
     let page =
         build_page_info(limit, sessions.len().saturating_sub(cursor).min(limit), next_cursor);
     let sessions = sessions.into_iter().skip(cursor).take(limit).collect::<Vec<_>>();
-    let cost_tracking_available =
-        sessions.iter().any(|entry| entry.estimated_cost_usd.is_some());
+    let cost_tracking_available = sessions.iter().any(|entry| entry.estimated_cost_usd.is_some());
 
     Ok(Json(UsageSessionsEnvelope {
         contract: contract_descriptor(),
@@ -546,11 +545,8 @@ pub(crate) async fn console_usage_insights_handler(
         .list_orchestrator_usage_runs(resolved.query.clone(), 500)
         .await
         .map_err(runtime_status_response)?;
-    let pricing = state
-        .runtime
-        .list_usage_pricing_records()
-        .await
-        .map_err(runtime_status_response)?;
+    let pricing =
+        state.runtime.list_usage_pricing_records().await.map_err(runtime_status_response)?;
     let routing_decisions = state
         .runtime
         .list_usage_routing_decisions(journal::UsageRoutingDecisionsFilter {
@@ -603,9 +599,8 @@ pub(crate) async fn console_usage_insights_handler(
             let provider_kind_value = routing
                 .map(|record| record.provider_kind.as_str())
                 .unwrap_or(provider_kind.as_str());
-            let provider_id_value = routing
-                .map(|record| record.provider_id.as_str())
-                .unwrap_or(provider_id.as_str());
+            let provider_id_value =
+                routing.map(|record| record.provider_id.as_str()).unwrap_or(provider_id.as_str());
             let cost_estimate = estimate_cost_for_model(
                 pricing.as_slice(),
                 provider_kind_value,
@@ -626,10 +621,8 @@ pub(crate) async fn console_usage_insights_handler(
         .collect::<Vec<_>>();
     let approved_subjects =
         load_budget_override_approvals(&state.runtime, budget_policies.as_slice()).await;
-    let total_estimated_cost = enriched_runs
-        .iter()
-        .filter_map(|entry| entry.cost_estimate.upper_usd)
-        .sum::<f64>();
+    let total_estimated_cost =
+        enriched_runs.iter().filter_map(|entry| entry.cost_estimate.upper_usd).sum::<f64>();
     let cost_projection = PricingEstimate {
         lower_usd: Some(total_estimated_cost),
         upper_usd: Some(total_estimated_cost),
@@ -709,7 +702,11 @@ pub(crate) async fn console_usage_insights_handler(
         timeline: summary.timeline,
         pricing: UsageInsightsPricingSummary {
             known_entries: pricing.len(),
-            estimated_models: pricing.iter().map(|entry| entry.model_id.as_str()).collect::<HashSet<_>>().len(),
+            estimated_models: pricing
+                .iter()
+                .map(|entry| entry.model_id.as_str())
+                .collect::<HashSet<_>>()
+                .len(),
             estimate_only: pricing.iter().any(|entry| entry.precision != "exact"),
         },
         health: UsageInsightsHealthSummary {
@@ -813,7 +810,9 @@ pub(crate) async fn console_usage_budget_override_request_handler(
         .map_err(runtime_status_response)?
         .into_iter()
         .find(|entry| entry.policy_id == policy_id)
-        .ok_or_else(|| runtime_status_response(tonic::Status::not_found("budget policy was not found")))?;
+        .ok_or_else(|| {
+            runtime_status_response(tonic::Status::not_found("budget policy was not found"))
+        })?;
     let approval = request_usage_budget_override(
         &state.runtime,
         &session.context,
@@ -998,7 +997,9 @@ fn default_usage_currency() -> String {
     "USD".to_owned()
 }
 
-fn model_provider_health_state(snapshot: &crate::model_provider::ProviderStatusSnapshot) -> &'static str {
+fn model_provider_health_state(
+    snapshot: &crate::model_provider::ProviderStatusSnapshot,
+) -> &'static str {
     if snapshot.circuit_breaker.open || snapshot.runtime_metrics.error_count > 0 {
         "degraded"
     } else if snapshot.api_key_configured || snapshot.auth_profile_id.is_some() {
@@ -1014,15 +1015,13 @@ async fn load_usage_tool_mix(
 ) -> Vec<UsageToolMixRecord> {
     let mut run_ids_by_session = HashMap::<String, HashSet<String>>::new();
     for run in runs {
-        run_ids_by_session
-            .entry(run.session_id.clone())
-            .or_default()
-            .insert(run.run_id.clone());
+        run_ids_by_session.entry(run.session_id.clone()).or_default().insert(run.run_id.clone());
     }
 
     let mut tool_counts = HashMap::<String, u64>::new();
     for (session_id, run_ids) in run_ids_by_session {
-        let transcript = match state.runtime.list_orchestrator_session_transcript(session_id).await {
+        let transcript = match state.runtime.list_orchestrator_session_transcript(session_id).await
+        {
             Ok(records) => records,
             Err(_) => continue,
         };
@@ -1036,10 +1035,7 @@ async fn load_usage_tool_mix(
             let tool_name = serde_json::from_str::<Value>(record.payload_json.as_str())
                 .ok()
                 .and_then(|payload| {
-                    payload
-                        .get("tool_name")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned)
+                    payload.get("tool_name").and_then(Value::as_str).map(ToOwned::to_owned)
                 });
             let Some(tool_name) = tool_name else {
                 continue;
