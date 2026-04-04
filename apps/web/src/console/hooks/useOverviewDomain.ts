@@ -14,20 +14,23 @@ export function useOverviewDomain({ api, setError }: UseOverviewDomainArgs) {
   const [overviewDeployment, setOverviewDeployment] = useState<JsonObject | null>(null);
   const [overviewApprovals, setOverviewApprovals] = useState<JsonObject[]>([]);
   const [overviewDiagnostics, setOverviewDiagnostics] = useState<JsonObject | null>(null);
-  const [overviewUsageInsights, setOverviewUsageInsights] = useState<UsageInsightsEnvelope | null>(null);
+  const [overviewUsageInsights, setOverviewUsageInsights] = useState<UsageInsightsEnvelope | null>(
+    null,
+  );
   const [overviewSupportJobs, setOverviewSupportJobs] = useState<JsonObject[]>([]);
 
   async function refreshOverview(): Promise<void> {
     setOverviewBusy(true);
     setError(null);
-    const [catalog, deployment, approvals, diagnostics, usageInsights, jobs] = await Promise.allSettled([
-      api.getCapabilityCatalog(),
-      api.getDeploymentPosture(),
-      api.listApprovals(),
-      api.getDiagnostics(),
-      api.getUsageInsights(),
-      api.listSupportBundleJobs(),
-    ]);
+    const [catalog, deployment, approvals, diagnostics, usageInsights, jobs] =
+      await Promise.allSettled([
+        api.getCapabilityCatalog(),
+        api.getDeploymentPosture(),
+        api.listApprovals(),
+        api.getDiagnostics(),
+        api.getUsageInsights(),
+        api.listSupportBundleJobs(),
+      ]);
 
     if (catalog.status === "fulfilled") {
       setOverviewCatalog(

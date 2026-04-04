@@ -200,10 +200,7 @@ export function OperationsSection({ app }: OperationsSectionProps) {
                 description="Refresh overview to load routing decisions, budget evaluations, and active alerts."
               />
             ) : (
-              <WorkspaceTable
-                ariaLabel="Routing telemetry"
-                columns={["Metric", "Value", "Detail"]}
-              >
+              <WorkspaceTable ariaLabel="Routing telemetry" columns={["Metric", "Value", "Detail"]}>
                 <tr>
                   <td>Default routing mode</td>
                   <td>{usageInsights.routing.default_mode}</td>

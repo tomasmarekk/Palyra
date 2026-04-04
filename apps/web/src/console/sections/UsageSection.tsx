@@ -91,7 +91,12 @@ export function UsageSection({ app }: UsageSectionProps) {
         <WorkspaceMetricCard
           detail="Estimated cost is always marked as an estimate and never pretends to be exact."
           label="Estimated cost"
-          value={formatUsd(usage.insights?.model_mix.reduce((total, row) => total + (row.estimated_cost_usd ?? 0), 0))}
+          value={formatUsd(
+            usage.insights?.model_mix.reduce(
+              (total, row) => total + (row.estimated_cost_usd ?? 0),
+              0,
+            ),
+          )}
         />
         <WorkspaceMetricCard
           detail="Average completed-run latency. In-progress runs stay excluded."
@@ -175,7 +180,10 @@ export function UsageSection({ app }: UsageSectionProps) {
               <div>
                 <dt>Budget signals</dt>
                 <dd>
-                  {usage.insights.budgets.evaluations.filter((entry) => entry.status !== "ok").length}
+                  {
+                    usage.insights.budgets.evaluations.filter((entry) => entry.status !== "ok")
+                      .length
+                  }
                 </dd>
               </div>
             </dl>
@@ -190,7 +198,11 @@ export function UsageSection({ app }: UsageSectionProps) {
                 ariaLabel="Budget evaluations"
                 columns={[
                   { key: "policy", label: "Policy", render: (row) => row.policy_id },
-                  { key: "scope", label: "Scope", render: (row) => `${row.scope_kind}:${row.scope_id}` },
+                  {
+                    key: "scope",
+                    label: "Scope",
+                    render: (row) => `${row.scope_kind}:${row.scope_id}`,
+                  },
                   { key: "status", label: "Status", render: (row) => row.status },
                   { key: "message", label: "Message", render: (row) => row.message },
                   {
@@ -235,7 +247,11 @@ export function UsageSection({ app }: UsageSectionProps) {
                 columns={[
                   { key: "kind", label: "Kind", render: (row) => row.alert_kind },
                   { key: "severity", label: "Severity", render: (row) => row.severity },
-                  { key: "scope", label: "Scope", render: (row) => `${row.scope_kind}:${row.scope_id}` },
+                  {
+                    key: "scope",
+                    label: "Scope",
+                    render: (row) => `${row.scope_kind}:${row.scope_id}`,
+                  },
                   { key: "summary", label: "Summary", render: (row) => row.summary },
                 ]}
                 getRowId={(row) => row.alert_id}
@@ -493,7 +509,11 @@ export function UsageSection({ app }: UsageSectionProps) {
               { key: "model", label: "Model", render: (row) => row.model_id },
               { key: "source", label: "Source", render: (row) => row.source },
               { key: "runs", label: "Runs", render: (row) => row.runs },
-              { key: "cost", label: "Est. cost", render: (row) => formatUsd(row.estimated_cost_usd) },
+              {
+                key: "cost",
+                label: "Est. cost",
+                render: (row) => formatUsd(row.estimated_cost_usd),
+              },
             ]}
             getRowId={(row) => `${row.model_id}-${row.source}`}
           />
@@ -508,7 +528,11 @@ export function UsageSection({ app }: UsageSectionProps) {
               { key: "scope", label: "Scope", render: (row) => row.scope },
               { key: "runs", label: "Runs", render: (row) => row.runs },
               { key: "tokens", label: "Tokens", render: (row) => row.total_tokens },
-              { key: "cost", label: "Est. cost", render: (row) => formatUsd(row.estimated_cost_usd) },
+              {
+                key: "cost",
+                label: "Est. cost",
+                render: (row) => formatUsd(row.estimated_cost_usd),
+              },
             ]}
             getRowId={(row) => row.scope}
           />

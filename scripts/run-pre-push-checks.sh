@@ -38,7 +38,17 @@ cleanup_runtime_artifacts() {
   bash "$ROOT_DIR/scripts/clean-runtime-artifacts.sh" >/dev/null
 }
 
+run_js_workspace_checks() {
+  echo "Ensuring JS workspace tooling..."
+  bash "$ROOT_DIR/scripts/test/ensure-js-workspace.sh"
+
+  echo "Running Vite+ check..."
+  npm run js:check
+}
+
 run_fast_profile() {
+  run_js_workspace_checks
+
   echo "Running rustfmt check..."
   "$CARGO_BIN" fmt --all --check
 
@@ -59,6 +69,8 @@ run_fast_profile() {
 }
 
 run_full_profile() {
+  run_js_workspace_checks
+
   echo "Running rustfmt check..."
   "$CARGO_BIN" fmt --all --check
 
