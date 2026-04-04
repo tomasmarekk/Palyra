@@ -129,6 +129,11 @@ struct App {
     settings_selected: usize,
 }
 
+const BUILT_IN_DELEGATION_PROFILES: &[&str] =
+    &["research", "synthesis", "review", "patching", "triage"];
+const BUILT_IN_DELEGATION_TEMPLATES: &[&str] =
+    &["compare_variants", "research_then_synthesize", "review_and_patch", "multi_source_triage"];
+
 pub(crate) fn run(options: LaunchOptions) -> Result<()> {
     let runtime = build_runtime()?;
     runtime.block_on(async move {
@@ -547,6 +552,10 @@ impl App {
             "queue" => {
                 let queued_text = normalize_optional_text(parts.collect::<Vec<_>>().join(" "));
                 self.queue_follow_up(queued_text).await?;
+            }
+            "delegate" => {
+                let arguments = parts.map(ToOwned::to_owned).collect::<Vec<_>>();
+                self.delegate_background_run(arguments).await?;
             }
             "checkpoint" => {
                 let arguments = parts.map(ToOwned::to_owned).collect::<Vec<_>>();
@@ -1213,6 +1222,64 @@ impl App {
         Ok(())
     }
 
+    async fn delegate_background_run(&mut self, arguments: Vec<String>) -> Result<()> {
+        let Some(selector) = arguments.first().map(String::as_str) else {
+            self.status_line = format!(
+                "Usage: /delegate <profile-or-template> <text> (profiles: {} | templates: {})",
+                BUILT_IN_DELEGATION_PROFILES.join(", "),
+                BUILT_IN_DELEGATION_TEMPLATES.join(", ")
+            );
+            return Ok(());
+        };
+        let text = normalize_optional_text(
+            arguments.iter().skip(1).cloned().collect::<Vec<_>>().join(" "),
+        );
+        let Some(text) = text else {
+            self.status_line = "Usage: /delegate <profile-or-template> <text>".to_owned();
+            return Ok(());
+        };
+        let selector = selector.trim().to_ascii_lowercase();
+        let delegation = if BUILT_IN_DELEGATION_TEMPLATES.contains(&selector.as_str()) {
+            serde_json::json!({ "template_id": selector })
+        } else if BUILT_IN_DELEGATION_PROFILES.contains(&selector.as_str()) {
+            serde_json::json!({ "profile_id": selector })
+        } else {
+            self.status_line = format!(
+                "Unknown delegation selector '{}'. Profiles: {}. Templates: {}.",
+                selector,
+                BUILT_IN_DELEGATION_PROFILES.join(", "),
+                BUILT_IN_DELEGATION_TEMPLATES.join(", ")
+            );
+            return Ok(());
+        };
+        let session_id = self.active_session_id()?;
+        let context = self.connect_admin_console().await?;
+        let payload = context
+            .client
+            .post_json_value(
+                format!(
+                    "console/v1/chat/sessions/{}/background-tasks",
+                    percent_encode_component(session_id.as_str())
+                ),
+                &serde_json::json!({
+                    "text": text,
+                    "delegation": delegation,
+                }),
+            )
+            .await?;
+        let task_id = payload
+            .pointer("/task/task_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        self.push_entry(
+            EntryKind::System,
+            "Delegation",
+            format!("Queued delegated child task {} via {}.", shorten_id(task_id), selector),
+        );
+        self.status_line = "Delegated background task queued".to_owned();
+        Ok(())
+    }
+
     async fn open_picker(&mut self, kind: PickerKind) -> Result<()> {
         if matches!(kind, PickerKind::Session) {
             return self.open_session_history_picker(None).await;
@@ -1721,9 +1788,11 @@ fn render_help_popup(frame: &mut Frame<'_>, area: Rect) {
             "  /resume [/id-or-key] /model [/id] /reset /retry /branch [label] /queue <text>",
         ),
         Line::from(
-            "  /checkpoint save|list|restore  /background list|add|show|pause|resume|retry|cancel",
+            "  /delegate <profile-or-template> <text>  /checkpoint save|list|restore",
         ),
-        Line::from("  /abort [run_id] /usage /compact [apply] /attach /settings"),
+        Line::from(
+            "  /background list|add|show|pause|resume|retry|cancel  /abort [run_id] /usage /compact [apply] /attach /settings",
+        ),
         Line::from("  /tools on|off /thinking on|off /shell on|off /exit"),
         Line::default(),
         Line::from("Context references"),
@@ -1740,7 +1809,7 @@ fn render_help_popup(frame: &mut Frame<'_>, area: Rect) {
         Line::from("  Tab focus  Enter submit/select  Esc close overlay  q quit"),
         Line::default(),
         Line::from(
-            "Retry, branch, compaction, checkpoints, and background tasks reuse the console HTTP contracts.",
+            "Retry, branch, delegation, compaction, checkpoints, and background tasks reuse the console HTTP contracts.",
         ),
     ]);
     frame.render_widget(Clear, popup);

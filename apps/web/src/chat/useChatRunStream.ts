@@ -8,6 +8,7 @@ import {
   type A2uiDocument,
 } from "../a2ui";
 import type {
+  ChatRunLineage,
   ChatRunStatusRecord,
   ChatRunTapeSnapshot,
   ChatStreamEventEnvelope,
@@ -68,6 +69,7 @@ type UseChatRunStreamResult = {
   runDrawerId: string;
   runStatus: ChatRunStatusRecord | null;
   runTape: ChatRunTapeSnapshot | null;
+  runLineage: ChatRunLineage | null;
   transcriptBoxRef: React.RefObject<HTMLDivElement | null>;
   approvalDrafts: Record<string, ApprovalDraft>;
   a2uiDocuments: Record<string, A2uiDocument>;
@@ -109,6 +111,7 @@ export function useChatRunStream({
   const [runDrawerId, setRunDrawerId] = useState("");
   const [runStatus, setRunStatus] = useState<ChatRunStatusRecord | null>(null);
   const [runTape, setRunTape] = useState<ChatRunTapeSnapshot | null>(null);
+  const [runLineage, setRunLineage] = useState<ChatRunLineage | null>(null);
 
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const transcriptRef = useRef<TranscriptEntry[]>([]);
@@ -185,6 +188,7 @@ export function useChatRunStream({
     setRunDrawerId("");
     setRunStatus(null);
     setRunTape(null);
+    setRunLineage(null);
     a2uiDocumentsRef.current = {};
     setA2uiDocuments({});
     setApprovalDrafts({});
@@ -674,6 +678,7 @@ export function useChatRunStream({
       }
       setRunStatus(statusResponse.run);
       setRunTape(eventsResponse.tape);
+      setRunLineage(eventsResponse.lineage ?? statusResponse.lineage);
     } catch (error) {
       if (requestSeq !== runDetailsRequestSeqRef.current) {
         return;
@@ -713,6 +718,7 @@ export function useChatRunStream({
     runDrawerId,
     runStatus,
     runTape,
+    runLineage,
     transcriptBoxRef,
     approvalDrafts,
     a2uiDocuments,

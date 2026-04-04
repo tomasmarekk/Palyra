@@ -6,6 +6,7 @@ import type {
   ChatQueuedInputRecord,
   ChatCheckpointRecord,
   ChatCompactionArtifactRecord,
+  ChatRunLineage,
   ChatRunStatusRecord,
   ChatRunTapeSnapshot,
   ChatTranscriptRecord,
@@ -87,6 +88,7 @@ type ChatInspectorColumnProps = {
   runDrawerBusy: boolean;
   runStatus: ChatRunStatusRecord | null;
   runTape: ChatRunTapeSnapshot | null;
+  runLineage: ChatRunLineage | null;
   refreshRunDetails: () => void;
   closeRunDrawer: () => void;
 };
@@ -133,6 +135,7 @@ export function ChatInspectorColumn({
   runDrawerBusy,
   runStatus,
   runTape,
+  runLineage,
   refreshRunDetails,
   closeRunDrawer,
 }: ChatInspectorColumnProps) {
@@ -519,7 +522,12 @@ export function ChatInspectorColumn({
                   <div className="chat-ops-card__copy">
                     <strong>{task.state}</strong>
                     <span>
-                      {task.task_kind} · {task.attempt_count}/{task.max_attempts} attempts
+                      {task.task_kind}
+                      {task.delegation !== undefined
+                        ? ` · ${task.delegation.display_name} (${task.delegation.execution_mode})`
+                        : ""}
+                      {" · "}
+                      {task.attempt_count}/{task.max_attempts} attempts
                     </span>
                     <p>{task.input_text ?? task.last_error ?? "No task text or error recorded."}</p>
                   </div>
@@ -656,6 +664,7 @@ export function ChatInspectorColumn({
             runDrawerBusy={runDrawerBusy}
             runStatus={runStatus}
             runTape={runTape}
+            runLineage={runLineage}
             revealSensitiveValues={revealSensitiveValues}
             refreshRun={refreshRunDetails}
             close={closeRunDrawer}

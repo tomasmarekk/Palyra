@@ -6,9 +6,11 @@ import type {
   ChatBackgroundTaskRecord,
   ChatCheckpointRecord,
   ChatCompactionArtifactRecord,
+  ChatDelegationCatalog,
   MediaDerivedArtifactRecord,
   ChatPinRecord,
   ChatQueuedInputRecord,
+  ChatRunStatusRecord,
   ChatTranscriptRecord,
   ConsoleApiClient,
 } from "../consoleApi";
@@ -45,6 +47,7 @@ import {
   abortCurrentRunAction,
   branchCurrentSessionAction,
   createNewSessionAction,
+  delegateWorkAction,
   deletePinAction,
   exportTranscriptAction,
   pinTranscriptRecordAction,
@@ -85,11 +88,13 @@ export function ChatConsolePanel({
   const [sessionDerivedArtifacts, setSessionDerivedArtifacts] = useState<
     MediaDerivedArtifactRecord[]
   >([]);
+  const [sessionRuns, setSessionRuns] = useState<ChatRunStatusRecord[]>([]);
   const [sessionPins, setSessionPins] = useState<ChatPinRecord[]>([]);
   const [compactions, setCompactions] = useState<ChatCompactionArtifactRecord[]>([]);
   const [checkpoints, setCheckpoints] = useState<ChatCheckpointRecord[]>([]);
   const [queuedInputs, setQueuedInputs] = useState<ChatQueuedInputRecord[]>([]);
   const [backgroundTasks, setBackgroundTasks] = useState<ChatBackgroundTaskRecord[]>([]);
+  const [delegationCatalog, setDelegationCatalog] = useState<ChatDelegationCatalog | null>(null);
   const [transcriptSearchQuery, setTranscriptSearchQuery] = useState("");
   const [transcriptSearchBusy, setTranscriptSearchBusy] = useState(false);
   const [transcriptSearchResults, setTranscriptSearchResults] = useState<TranscriptSearchMatch[]>(
@@ -121,6 +126,7 @@ export function ChatConsolePanel({
     runDrawerId,
     runStatus,
     runTape,
+    runLineage,
     transcriptBoxRef,
     approvalDrafts,
     a2uiDocuments,
@@ -154,9 +160,22 @@ export function ChatConsolePanel({
     [visibleTranscript],
   );
   const a2uiSurfaces = useMemo(() => Object.keys(a2uiDocuments), [a2uiDocuments]);
-  const inspectorVisible = runDrawerOpen || runIds.length > 0;
+  const knownRunIds = useMemo(() => {
+    const ordered = new Set<string>();
+    for (const runId of runIds) {
+      ordered.add(runId);
+    }
+    for (const run of [...sessionRuns].reverse()) {
+      ordered.add(run.run_id);
+    }
+    return Array.from(ordered);
+  }, [runIds, sessionRuns]);
+  const inspectorVisible = runDrawerOpen || knownRunIds.length > 0;
   const actionableRunId =
-    activeRunId ?? (runDrawerId.trim().length > 0 ? runDrawerId.trim() : null) ?? runIds[0] ?? null;
+    activeRunId ??
+    (runDrawerId.trim().length > 0 ? runDrawerId.trim() : null) ??
+    knownRunIds[0] ??
+    null;
   const toolPayloadCount = useMemo(() => {
     return visibleTranscript.filter((entry) => entry.payload !== undefined).length;
   }, [visibleTranscript]);
@@ -252,10 +271,18 @@ export function ChatConsolePanel({
 
   useEffect(() => {
     void sessions.refreshSessions(true);
+    void api
+      .getDelegationCatalog()
+      .then((response) => {
+        setDelegationCatalog(response.catalog);
+      })
+      .catch((error) => {
+        setError(toErrorMessage(error));
+      });
     return () => {
       dispose();
     };
-  }, []);
+  }, [api, dispose, sessions.refreshSessions, setError]);
 
   useEffect(() => {
     if (preferredRunId === null || preferredRunId.trim().length === 0) {
@@ -288,6 +315,7 @@ export function ChatConsolePanel({
       setTranscriptRecords([]);
       setSessionAttachments([]);
       setSessionDerivedArtifacts([]);
+      setSessionRuns([]);
       setSessionPins([]);
       setCompactions([]);
       setCheckpoints([]);
@@ -306,6 +334,7 @@ export function ChatConsolePanel({
       setTranscriptRecords(response.records);
       setSessionAttachments(response.attachments);
       setSessionDerivedArtifacts(response.derived_artifacts);
+      setSessionRuns(response.runs);
       setSessionPins(response.pins);
       setCompactions(response.compactions);
       setCheckpoints(response.checkpoints);
@@ -329,6 +358,7 @@ export function ChatConsolePanel({
       setTranscriptRecords([]);
       setSessionAttachments([]);
       setSessionDerivedArtifacts([]);
+      setSessionRuns([]);
       setSessionPins([]);
       setCompactions([]);
       setCheckpoints([]);
@@ -474,6 +504,21 @@ export function ChatConsolePanel({
           return;
         }
         await queueFollowUpText(command.args);
+        return;
+      case "delegate":
+        await delegateWorkAction({
+          api,
+          sessionId: sessions.activeSessionId.trim(),
+          raw: command.args,
+          delegationCatalog,
+          upsertSession: sessions.upsertSession,
+          refreshSessionTranscript,
+          appendLocalEntry,
+          setComposerText,
+          setCommandBusy,
+          setError,
+          setNotice,
+        });
         return;
       case "history":
         sessions.setSearchQuery(command.args);
@@ -823,7 +868,7 @@ export function ChatConsolePanel({
         inspectorProps={{
           pendingApprovalCount,
           a2uiSurfaces,
-          runIds,
+          runIds: knownRunIds,
           selectedSession: sessions.selectedSession,
           selectedSessionLineage,
           contextBudgetEstimatedTokens: contextBudget.estimated_total_tokens,
@@ -902,6 +947,7 @@ export function ChatConsolePanel({
           runDrawerBusy,
           runStatus,
           runTape,
+          runLineage,
           refreshRunDetails,
           closeRunDrawer,
         }}
@@ -909,7 +955,7 @@ export function ChatConsolePanel({
           void abortCurrentRun();
         }}
         onOpenRunDetails={() => {
-          const targetRunId = activeRunId ?? runIds[0] ?? null;
+          const targetRunId = activeRunId ?? knownRunIds[0] ?? null;
           if (targetRunId === null) {
             setError("No run is available for inspection.");
             return;

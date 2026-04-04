@@ -414,9 +414,91 @@ export interface ChatRunStatusRecord {
   last_error?: string;
   origin_kind: string;
   origin_run_id?: string;
+  parent_run_id?: string;
   triggered_by_principal?: string;
   parameter_delta_json?: string;
+  delegation?: ChatDelegationSnapshot;
+  merge_result?: ChatDelegationMergeResult;
   tape_events: number;
+}
+
+export interface ChatDelegationMergeContract {
+  strategy: string;
+  approval_required: boolean;
+}
+
+export interface ChatDelegationSnapshot {
+  profile_id: string;
+  display_name: string;
+  description?: string;
+  template_id?: string;
+  role: string;
+  execution_mode: "serial" | "parallel";
+  group_id: string;
+  model_profile: string;
+  tool_allowlist: string[];
+  skill_allowlist: string[];
+  memory_scope: string;
+  budget_tokens: number;
+  max_attempts: number;
+  merge_contract: ChatDelegationMergeContract;
+  agent_id?: string;
+}
+
+export interface ChatDelegationMergeProvenanceRecord {
+  child_run_id: string;
+  kind: string;
+  label: string;
+  excerpt: string;
+  tool_name?: string;
+  requires_approval: boolean;
+}
+
+export interface ChatDelegationMergeResult {
+  status: string;
+  strategy: string;
+  summary_text: string;
+  warnings: string[];
+  approval_required: boolean;
+  provenance: ChatDelegationMergeProvenanceRecord[];
+  merged_at_unix_ms?: number;
+}
+
+export interface ChatDelegationProfileDefinition {
+  profile_id: string;
+  display_name: string;
+  description: string;
+  role: string;
+  model_profile: string;
+  tool_allowlist: string[];
+  skill_allowlist: string[];
+  memory_scope: string;
+  budget_tokens: number;
+  max_attempts: number;
+  execution_mode: "serial" | "parallel";
+  merge_contract: ChatDelegationMergeContract;
+}
+
+export interface ChatDelegationTemplateDefinition {
+  template_id: string;
+  display_name: string;
+  description: string;
+  primary_profile_id: string;
+  recommended_profiles: string[];
+  execution_mode: "serial" | "parallel";
+  merge_strategy: string;
+  examples: string[];
+}
+
+export interface ChatDelegationCatalog {
+  profiles: ChatDelegationProfileDefinition[];
+  templates: ChatDelegationTemplateDefinition[];
+}
+
+export interface ChatRunLineage {
+  focus_run_id: string;
+  root_run_id: string;
+  runs: ChatRunStatusRecord[];
 }
 
 export interface ChatRunTapeRecord {
@@ -542,6 +624,7 @@ export interface ChatBackgroundTaskRecord {
   attempt_count: number;
   max_attempts: number;
   budget_tokens: number;
+  delegation?: ChatDelegationSnapshot;
   not_before_unix_ms?: number;
   expires_at_unix_ms?: number;
   notification_target_json?: string;
@@ -2006,14 +2089,16 @@ export class ConsoleApiClient {
     );
   }
 
-  async chatRunStatus(runId: string): Promise<{ run: ChatRunStatusRecord }> {
+  async chatRunStatus(
+    runId: string,
+  ): Promise<{ run: ChatRunStatusRecord; lineage: ChatRunLineage }> {
     return this.request(`/console/v1/chat/runs/${encodeURIComponent(runId)}/status`);
   }
 
   async chatRunEvents(
     runId: string,
     params?: URLSearchParams,
-  ): Promise<{ run: ChatRunStatusRecord; tape: ChatRunTapeSnapshot }> {
+  ): Promise<{ run: ChatRunStatusRecord; tape: ChatRunTapeSnapshot; lineage: ChatRunLineage }> {
     return this.request(
       buildPathWithQuery(`/console/v1/chat/runs/${encodeURIComponent(runId)}/events`, params),
     );
@@ -2090,6 +2175,13 @@ export class ConsoleApiClient {
     );
   }
 
+  async getDelegationCatalog(): Promise<{
+    catalog: ChatDelegationCatalog;
+    contract: ContractDescriptor;
+  }> {
+    return this.request("/console/v1/chat/delegation/catalog");
+  }
+
   async prepareRetry(
     sessionId: string,
     payload: { parameter_delta?: JsonValue } = {},
@@ -2153,6 +2245,7 @@ export class ConsoleApiClient {
     compactions: ChatCompactionArtifactRecord[];
     checkpoints: ChatCheckpointRecord[];
     queued_inputs: ChatQueuedInputRecord[];
+    runs: ChatRunStatusRecord[];
     background_tasks: ChatBackgroundTaskRecord[];
     contract: ContractDescriptor;
   }> {
@@ -2278,6 +2371,26 @@ export class ConsoleApiClient {
       expires_at_unix_ms?: number;
       notification_target?: JsonValue;
       parameter_delta?: JsonValue;
+      delegation?: {
+        profile_id?: string;
+        template_id?: string;
+        group_id?: string;
+        execution_mode?: "serial" | "parallel";
+        manifest?: {
+          profile_id?: string;
+          display_name?: string;
+          description?: string;
+          role?: string;
+          model_profile?: string;
+          tool_allowlist?: string[];
+          skill_allowlist?: string[];
+          memory_scope?: string;
+          budget_tokens?: number;
+          max_attempts?: number;
+          merge_strategy?: string;
+          approval_required?: boolean;
+        };
+      };
     },
   ): Promise<{
     session: SessionCatalogRecord;

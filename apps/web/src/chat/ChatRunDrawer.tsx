@@ -7,7 +7,12 @@ import {
   SelectField,
   SectionCard,
 } from "../console/components/ui";
-import type { ChatRunStatusRecord, ChatRunTapeSnapshot } from "../consoleApi";
+import type {
+  ChatRunLineage,
+  ChatRunStatusRecord,
+  ChatRunTapeSnapshot,
+  JsonValue,
+} from "../consoleApi";
 import { Tabs } from "@heroui/react";
 
 import { PrettyJsonBlock, parseTapePayload, shortId, toPrettyJson } from "./chatShared";
@@ -20,6 +25,7 @@ type ChatRunDrawerProps = {
   runDrawerBusy: boolean;
   runStatus: ChatRunStatusRecord | null;
   runTape: ChatRunTapeSnapshot | null;
+  runLineage: ChatRunLineage | null;
   revealSensitiveValues: boolean;
   refreshRun: () => void;
   close: () => void;
@@ -33,6 +39,7 @@ export function ChatRunDrawer({
   runDrawerBusy,
   runStatus,
   runTape,
+  runLineage,
   revealSensitiveValues,
   refreshRun,
   close,
@@ -81,6 +88,10 @@ export function ChatRunDrawer({
                   Status
                   <Tabs.Indicator />
                 </Tabs.Tab>
+                <Tabs.Tab id="lineage">
+                  Lineage
+                  <Tabs.Indicator />
+                </Tabs.Tab>
                 <Tabs.Tab id="tape">
                   Tape
                   <Tabs.Indicator />
@@ -108,8 +119,27 @@ export function ChatRunDrawer({
                             : "none",
                       },
                       {
+                        label: "Parent run",
+                        value:
+                          runStatus.parent_run_id !== undefined
+                            ? shortId(runStatus.parent_run_id)
+                            : "none",
+                      },
+                      {
                         label: "Triggered by",
                         value: runStatus.triggered_by_principal ?? "n/a",
+                      },
+                      {
+                        label: "Delegation profile",
+                        value: runStatus.delegation?.display_name ?? "none",
+                      },
+                      {
+                        label: "Execution mode",
+                        value: runStatus.delegation?.execution_mode ?? "n/a",
+                      },
+                      {
+                        label: "Merge strategy",
+                        value: runStatus.merge_result?.strategy ?? "n/a",
                       },
                       { label: "Prompt tokens", value: runStatus.prompt_tokens },
                       { label: "Completion tokens", value: runStatus.completion_tokens },
@@ -134,11 +164,76 @@ export function ChatRunDrawer({
                       />
                     </SectionCard>
                   ) : null}
+                  {runStatus.delegation !== undefined ? (
+                    <SectionCard
+                      description="Delegated child runs keep the resolved profile, scope, and budget snapshot here."
+                      title="Delegation"
+                      variant="transparent"
+                    >
+                      <PrettyJsonBlock
+                        revealSensitiveValues={revealSensitiveValues}
+                        value={runStatus.delegation as unknown as JsonValue}
+                      />
+                    </SectionCard>
+                  ) : null}
+                  {runStatus.merge_result !== undefined ? (
+                    <SectionCard
+                      description="Merged child-run output stays attached to the child run with provenance."
+                      title="Merge result"
+                      variant="transparent"
+                    >
+                      <PrettyJsonBlock
+                        revealSensitiveValues={revealSensitiveValues}
+                        value={runStatus.merge_result as unknown as JsonValue}
+                      />
+                    </SectionCard>
+                  ) : null}
                   {runStatus.last_error !== undefined && runStatus.last_error.length > 0 ? (
                     <InlineNotice title="Run error" tone="danger">
                       {runStatus.last_error}
                     </InlineNotice>
                   ) : null}
+                </SectionCard>
+              )}
+            </Tabs.Panel>
+            <Tabs.Panel className="pt-4" id="lineage">
+              {runLineage === null ? (
+                <EmptyState
+                  compact
+                  description="Refresh a run to load its lineage tree."
+                  title="No lineage loaded"
+                />
+              ) : (
+                <SectionCard
+                  title={`Run lineage (${runLineage.runs.length})`}
+                  variant="transparent"
+                >
+                  <KeyValueList
+                    items={[
+                      { label: "Focus run", value: shortId(runLineage.focus_run_id) },
+                      { label: "Root run", value: shortId(runLineage.root_run_id) },
+                    ]}
+                  />
+                  <div className="chat-tape-list">
+                    {buildLineageRows(runLineage).map((row) => (
+                      <article
+                        key={row.run.run_id}
+                        className="chat-tape-item"
+                        style={{ marginInlineStart: `${row.depth * 18}px` }}
+                      >
+                        <header>
+                          <strong>{shortId(row.run.run_id)}</strong>
+                          <span>{row.run.state}</span>
+                        </header>
+                        <p className="chat-muted">
+                          {row.run.delegation?.display_name ?? row.run.origin_kind}
+                          {row.run.parent_run_id !== undefined
+                            ? ` · parent ${shortId(row.run.parent_run_id)}`
+                            : ""}
+                        </p>
+                      </article>
+                    ))}
+                  </div>
                 </SectionCard>
               )}
             </Tabs.Panel>
@@ -175,4 +270,33 @@ export function ChatRunDrawer({
       )}
     </aside>
   );
+}
+
+function buildLineageRows(
+  lineage: ChatRunLineage,
+): Array<{ run: ChatRunStatusRecord; depth: number }> {
+  const runsById = new Map(lineage.runs.map((run) => [run.run_id, run] as const));
+  return lineage.runs.map((run) => ({
+    run,
+    depth: computeLineageDepth(run, runsById),
+  }));
+}
+
+function computeLineageDepth(
+  run: ChatRunStatusRecord,
+  runsById: ReadonlyMap<string, ChatRunStatusRecord>,
+): number {
+  let depth = 0;
+  let cursor = run.parent_run_id;
+  const visited = new Set<string>();
+  while (cursor !== undefined && visited.has(cursor) === false) {
+    visited.add(cursor);
+    const parent = runsById.get(cursor);
+    if (parent === undefined) {
+      break;
+    }
+    depth += 1;
+    cursor = parent.parent_run_id;
+  }
+  return depth;
 }

@@ -108,6 +108,13 @@ export const CHAT_SLASH_COMMANDS: readonly SlashCommandDefinition[] = [
     example: "/queue After the deploy check the error budget delta.",
   },
   {
+    name: "delegate",
+    synopsis: "/delegate <profile-or-template> <text>",
+    description:
+      "Spawn a delegated child run using a built-in profile or template and merge the result back with provenance.",
+    example: "/delegate research_then_synthesize Summarize the daemon migration impact.",
+  },
+  {
     name: "history",
     synopsis: "/history [query]",
     description: "Filter the session rail to find older sessions quickly.",

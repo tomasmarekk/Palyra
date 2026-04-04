@@ -18,6 +18,10 @@ describe("chatShared helpers", () => {
       name: "compact",
       args: "apply",
     });
+    expect(parseSlashCommand("/delegate review_and_patch Inspect the failing lint job")).toEqual({
+      name: "delegate",
+      args: "review_and_patch Inspect the failing lint job",
+    });
     expect(parseSlashCommand("/help")).toEqual({
       name: "help",
       args: "",

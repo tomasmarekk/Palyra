@@ -1,4 +1,5 @@
 import type {
+  ChatDelegationCatalog,
   ChatTranscriptRecord,
   ConsoleApiClient,
   JsonValue,
@@ -234,6 +235,92 @@ export async function queueFollowUpTextAction(args: {
     args.setComposerText("");
     await args.refreshSessionTranscript();
     args.setNotice("Queued follow-up stored.");
+  } catch (error) {
+    args.setError(toErrorMessage(error));
+  } finally {
+    args.setCommandBusy(null);
+  }
+}
+
+export async function delegateWorkAction(args: {
+  api: ConsoleApiClient;
+  sessionId: string;
+  raw: string;
+  delegationCatalog: ChatDelegationCatalog | null;
+  upsertSession: UpsertSession;
+  refreshSessionTranscript: () => Promise<void>;
+  appendLocalEntry: AppendLocalEntry;
+  setComposerText: SetComposerText;
+  setCommandBusy: SetCommandBusy;
+  setError: (value: string | null) => void;
+  setNotice: (value: string | null) => void;
+}): Promise<void> {
+  if (args.sessionId.length === 0) {
+    args.setError("Select a session before delegating work.");
+    return;
+  }
+  if (args.delegationCatalog === null) {
+    args.setError("Delegation catalog is still loading.");
+    return;
+  }
+
+  const trimmed = args.raw.trim();
+  if (trimmed.length === 0) {
+    const available = [
+      ...args.delegationCatalog.templates.map((template) => template.template_id),
+      ...args.delegationCatalog.profiles.map((profile) => profile.profile_id),
+    ].slice(0, 6);
+    args.setError(
+      available.length > 0
+        ? `Use /delegate <profile-or-template> <text>. Available: ${available.join(", ")}.`
+        : "Use /delegate <profile-or-template> <text>.",
+    );
+    return;
+  }
+
+  const [selector, ...promptParts] = trimmed.split(/\s+/);
+  const prompt = promptParts.join(" ").trim();
+  if (prompt.length === 0) {
+    args.setError("Provide the delegated task text after the profile or template name.");
+    return;
+  }
+
+  const normalizedSelector = selector.trim().toLowerCase();
+  const template = args.delegationCatalog.templates.find(
+    (candidate) => candidate.template_id.toLowerCase() === normalizedSelector,
+  );
+  const profile = args.delegationCatalog.profiles.find(
+    (candidate) => candidate.profile_id.toLowerCase() === normalizedSelector,
+  );
+  if (template === undefined && profile === undefined) {
+    args.setError(`Unknown delegation profile or template '${selector}'.`);
+    return;
+  }
+
+  args.setCommandBusy("delegate");
+  args.setError(null);
+  args.setNotice(null);
+  try {
+    const response = await args.api.createBackgroundTask(args.sessionId, {
+      text: prompt,
+      delegation:
+        template !== undefined
+          ? { template_id: template.template_id }
+          : { profile_id: profile!.profile_id },
+    });
+    args.upsertSession(response.session);
+    await args.refreshSessionTranscript();
+    args.appendLocalEntry({
+      id: `delegated-${response.task.task_id}-${Date.now()}`,
+      kind: "status",
+      session_id: args.sessionId,
+      created_at_unix_ms: Date.now(),
+      title: "Delegated child run queued",
+      text: `${template?.display_name ?? profile?.display_name ?? selector}: ${prompt}`,
+      payload: response.task as unknown as JsonValue,
+    });
+    args.setComposerText("");
+    args.setNotice(`Delegated child run queued via ${selector}.`);
   } catch (error) {
     args.setError(toErrorMessage(error));
   } finally {
