@@ -30,7 +30,7 @@ use crate::{
         auth::RequestContext,
         proto::palyra::{common::v1 as common_v1, gateway::v1 as gateway_v1},
     },
-    usage_governance::plan_usage_routing,
+    usage_governance::{plan_usage_routing, UsageRoutingPlanRequest},
 };
 
 use super::response::{
@@ -266,19 +266,19 @@ pub(crate) async fn handle_routed_route_message(
 
     let routing_scope_kind = if route_agent_id.is_some() { "agent" } else { "session" };
     let routing_scope_id = route_agent_id.as_deref().unwrap_or(session_id.as_str());
-    let routing_decision = plan_usage_routing(
+    let routing_decision = plan_usage_routing(UsageRoutingPlanRequest {
         runtime_state,
-        &route_request_context,
-        run_id.as_str(),
-        session_id.as_str(),
-        None,
-        input.text.as_str(),
-        json_mode_requested,
-        prepared_provider_input.vision_inputs.len(),
-        routing_scope_kind,
-        routing_scope_id,
-        &runtime_state.model_provider_status_snapshot(),
-    )
+        request_context: &route_request_context,
+        run_id: run_id.as_str(),
+        session_id: session_id.as_str(),
+        parameter_delta_json: None,
+        prompt_text: input.text.as_str(),
+        json_mode: json_mode_requested,
+        vision_inputs: prepared_provider_input.vision_inputs.len(),
+        scope_kind: routing_scope_kind,
+        scope_id: routing_scope_id,
+        provider_snapshot: &runtime_state.model_provider_status_snapshot(),
+    })
     .await?;
 
     let provider_response = runtime_state

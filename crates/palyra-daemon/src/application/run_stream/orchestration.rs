@@ -24,7 +24,7 @@ use crate::{
     model_provider::{ProviderRequest, ProviderResponse},
     orchestrator::{is_cancel_command, RunLifecycleState, RunStateMachine, RunTransition},
     transport::grpc::{auth::RequestContext, proto::palyra::common::v1 as common_v1},
-    usage_governance::plan_usage_routing,
+    usage_governance::{plan_usage_routing, UsageRoutingPlanRequest},
 };
 
 use super::tape::send_status_with_tape;
@@ -355,19 +355,19 @@ pub(crate) async fn process_run_stream_message(
     )
     .await?;
 
-    let routing_decision = plan_usage_routing(
+    let routing_decision = plan_usage_routing(UsageRoutingPlanRequest {
         runtime_state,
         request_context,
-        run_id.as_str(),
-        session_id.as_str(),
-        parameter_delta_json.as_deref(),
-        input_text.as_str(),
-        json_mode_requested,
-        prepared_provider_input.vision_inputs.len(),
-        "session",
-        session_id_for_message.as_str(),
-        &runtime_state.model_provider_status_snapshot(),
-    )
+        run_id: run_id.as_str(),
+        session_id: session_id.as_str(),
+        parameter_delta_json: parameter_delta_json.as_deref(),
+        prompt_text: input_text.as_str(),
+        json_mode: json_mode_requested,
+        vision_inputs: prepared_provider_input.vision_inputs.len(),
+        scope_kind: "session",
+        scope_id: session_id_for_message.as_str(),
+        provider_snapshot: &runtime_state.model_provider_status_snapshot(),
+    })
     .await?;
 
     let provider_response = match execute_run_stream_provider_request(

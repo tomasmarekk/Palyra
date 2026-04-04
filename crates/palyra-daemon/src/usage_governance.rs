@@ -190,6 +190,20 @@ pub(crate) struct UsageEnrichedRun<'a> {
     pub cost_estimate: PricingEstimate,
 }
 
+pub(crate) struct UsageRoutingPlanRequest<'a> {
+    pub runtime_state: &'a Arc<GatewayRuntimeState>,
+    pub request_context: &'a RequestContext,
+    pub run_id: &'a str,
+    pub session_id: &'a str,
+    pub parameter_delta_json: Option<&'a str>,
+    pub prompt_text: &'a str,
+    pub json_mode: bool,
+    pub vision_inputs: usize,
+    pub scope_kind: &'a str,
+    pub scope_id: &'a str,
+    pub provider_snapshot: &'a ProviderStatusSnapshot,
+}
+
 pub(crate) fn parse_routing_mode_override(
     parameter_delta_json: Option<&str>,
 ) -> Option<RoutingMode> {
@@ -209,53 +223,49 @@ pub(crate) fn usage_budget_subject_id(policy_id: &str) -> String {
 
 #[allow(clippy::result_large_err)]
 pub(crate) async fn plan_usage_routing(
-    runtime_state: &Arc<GatewayRuntimeState>,
-    request_context: &RequestContext,
-    run_id: &str,
-    session_id: &str,
-    parameter_delta_json: Option<&str>,
-    prompt_text: &str,
-    json_mode: bool,
-    vision_inputs: usize,
-    scope_kind: &str,
-    scope_id: &str,
-    provider_snapshot: &ProviderStatusSnapshot,
+    request: UsageRoutingPlanRequest<'_>,
 ) -> Result<RoutingDecision, Status> {
-    let pricing = runtime_state.list_usage_pricing_records().await?;
-    let provider_kind = provider_snapshot.kind.as_str();
+    let pricing = request.runtime_state.list_usage_pricing_records().await?;
+    let provider_kind = request.provider_snapshot.kind.as_str();
     let provider_id = if provider_kind == "openai_compatible" { "openai" } else { "palyra" };
-    let default_model_id =
-        provider_snapshot.openai_model.clone().unwrap_or_else(|| "deterministic".to_owned());
-    let mode = if runtime_state.config.smart_routing.enabled {
-        parse_routing_mode_override(parameter_delta_json)
-            .unwrap_or_else(|| runtime_state.config.smart_routing.effective_mode())
+    let default_model_id = request
+        .provider_snapshot
+        .openai_model
+        .clone()
+        .unwrap_or_else(|| "deterministic".to_owned());
+    let mode = if request.runtime_state.config.smart_routing.enabled {
+        parse_routing_mode_override(request.parameter_delta_json)
+            .unwrap_or_else(|| request.runtime_state.config.smart_routing.effective_mode())
     } else {
         RoutingMode::Suggest
     };
-    let budget_policies = runtime_state
+    let budget_policies = request
+        .runtime_state
         .list_usage_budget_policies(crate::journal::UsageBudgetPoliciesFilter {
             enabled_only: true,
             scope_kind: None,
             scope_id: None,
         })
         .await?;
-    let historical_runs = runtime_state
+    let historical_runs = request
+        .runtime_state
         .list_orchestrator_usage_runs(
             crate::journal::OrchestratorUsageQuery {
                 start_at_unix_ms: 0,
                 end_at_unix_ms: crate::gateway::current_unix_ms(),
                 bucket_width_ms: 24 * 60 * 60 * 1_000,
-                principal: request_context.principal.clone(),
-                device_id: request_context.device_id.clone(),
-                channel: request_context.channel.clone(),
+                principal: request.request_context.principal.clone(),
+                device_id: request.request_context.device_id.clone(),
+                channel: request.request_context.channel.clone(),
                 include_archived: true,
-                session_id: Some(session_id.to_owned()),
+                session_id: Some(request.session_id.to_owned()),
             },
             250,
         )
         .await
         .unwrap_or_default();
-    let approved_subjects = load_budget_override_approvals(runtime_state, &budget_policies).await;
+    let approved_subjects =
+        load_budget_override_approvals(request.runtime_state, &budget_policies).await;
     let enriched_runs = historical_runs
         .iter()
         .map(|run| {
@@ -281,15 +291,15 @@ pub(crate) async fn plan_usage_routing(
         .iter()
         .map(|entry| entry.total_tokens)
         .sum::<u64>()
-        .saturating_add(estimate_token_count(prompt_text));
+        .saturating_add(estimate_token_count(request.prompt_text));
     let projected_cost = estimate_cost_for_model(
         pricing.as_slice(),
         provider_kind,
         provider_id,
         default_model_id.as_str(),
         crate::gateway::current_unix_ms(),
-        estimate_token_count(prompt_text),
-        estimate_token_count(prompt_text) / 2,
+        estimate_token_count(request.prompt_text),
+        estimate_token_count(request.prompt_text) / 2,
     );
     let budget_evaluations = evaluate_budget_policies(
         budget_policies.as_slice(),
@@ -299,30 +309,31 @@ pub(crate) async fn plan_usage_routing(
         &approved_subjects,
     );
     let decision = decide_routing(RoutingDecisionContext {
-        scope_kind,
-        scope_id,
+        scope_kind: request.scope_kind,
+        scope_id: request.scope_id,
         mode,
         provider_id,
         provider_kind,
         default_model_id: default_model_id.as_str(),
-        prompt_text,
-        prompt_tokens_estimate: estimate_token_count(prompt_text),
-        json_mode,
-        vision_inputs,
-        provider_health_state: provider_health_state(provider_snapshot),
+        prompt_text: request.prompt_text,
+        prompt_tokens_estimate: estimate_token_count(request.prompt_text),
+        json_mode: request.json_mode,
+        vision_inputs: request.vision_inputs,
+        provider_health_state: provider_health_state(request.provider_snapshot),
         pricing: pricing.as_slice(),
         budgets: budget_evaluations.as_slice(),
     });
-    let _ = runtime_state
+    let _ = request
+        .runtime_state
         .create_usage_routing_decision(UsageRoutingDecisionCreateRequest {
             decision_id: Ulid::new().to_string(),
-            run_id: run_id.to_owned(),
-            session_id: session_id.to_owned(),
-            principal: request_context.principal.clone(),
-            device_id: request_context.device_id.clone(),
-            channel: request_context.channel.clone(),
-            scope_kind: scope_kind.to_owned(),
-            scope_id: scope_id.to_owned(),
+            run_id: request.run_id.to_owned(),
+            session_id: request.session_id.to_owned(),
+            principal: request.request_context.principal.clone(),
+            device_id: request.request_context.device_id.clone(),
+            channel: request.request_context.channel.clone(),
+            scope_kind: request.scope_kind.to_owned(),
+            scope_id: request.scope_id.to_owned(),
             mode: decision.mode.clone(),
             default_model_id: decision.default_model_id.clone(),
             recommended_model_id: decision.recommended_model_id.clone(),
@@ -356,11 +367,11 @@ pub(crate) async fn plan_usage_routing(
             .unwrap_or_else(|| "unknown".to_owned());
         if let Some(policy) = budget_policies.iter().find(|entry| entry.policy_id == policy_id) {
             let _ = request_usage_budget_override(
-                runtime_state,
-                request_context,
+                request.runtime_state,
+                request.request_context,
                 policy,
-                Some(session_id),
-                Some(run_id),
+                Some(request.session_id),
+                Some(request.run_id),
                 Some(decision.recommended_model_id.as_str()),
                 Some("routing plan exceeded an approval-gated hard budget limit"),
             )
