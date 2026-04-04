@@ -12,14 +12,15 @@ use crate::journal::{
     OrchestratorCheckpointRecord, OrchestratorCheckpointRestoreMarkRequest,
     OrchestratorCompactionArtifactCreateRequest, OrchestratorCompactionArtifactRecord,
     OrchestratorQueuedInputCreateRequest, OrchestratorQueuedInputRecord,
-    OrchestratorQueuedInputUpdateRequest, OrchestratorSessionCleanupOutcome,
-    OrchestratorSessionCleanupRequest, OrchestratorSessionLineageUpdateRequest,
-    OrchestratorSessionPinCreateRequest, OrchestratorSessionPinRecord,
-    OrchestratorSessionTranscriptRecord, OrchestratorUsageQuery, OrchestratorUsageRunRecord,
-    OrchestratorUsageSessionRecord, OrchestratorUsageSummary, WorkspaceBootstrapOutcome,
-    WorkspaceBootstrapRequest, WorkspaceDocumentDeleteRequest, WorkspaceDocumentListFilter,
-    WorkspaceDocumentMoveRequest, WorkspaceDocumentRecord, WorkspaceDocumentVersionRecord,
-    WorkspaceDocumentWriteRequest, WorkspaceSearchHit, WorkspaceSearchRequest,
+    OrchestratorQueuedInputUpdateRequest, OrchestratorRunMetadataUpdateRequest,
+    OrchestratorSessionCleanupOutcome, OrchestratorSessionCleanupRequest,
+    OrchestratorSessionLineageUpdateRequest, OrchestratorSessionPinCreateRequest,
+    OrchestratorSessionPinRecord, OrchestratorSessionTranscriptRecord, OrchestratorUsageQuery,
+    OrchestratorUsageRunRecord, OrchestratorUsageSessionRecord, OrchestratorUsageSummary,
+    WorkspaceBootstrapOutcome, WorkspaceBootstrapRequest, WorkspaceDocumentDeleteRequest,
+    WorkspaceDocumentListFilter, WorkspaceDocumentMoveRequest, WorkspaceDocumentRecord,
+    WorkspaceDocumentVersionRecord, WorkspaceDocumentWriteRequest, WorkspaceSearchHit,
+    WorkspaceSearchRequest,
 };
 use crate::usage_governance::SmartRoutingRuntimeConfig;
 use palyra_auth::AuthHealthReport;
@@ -2766,6 +2767,29 @@ impl GatewayRuntimeState {
     }
 
     #[allow(clippy::result_large_err)]
+    fn update_orchestrator_run_metadata_blocking(
+        &self,
+        request: &OrchestratorRunMetadataUpdateRequest,
+    ) -> Result<(), Status> {
+        self.journal_store.update_orchestrator_run_metadata(request).map_err(|error| {
+            map_orchestrator_store_error("update orchestrator run metadata", error)
+        })
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn update_orchestrator_run_metadata(
+        self: &Arc<Self>,
+        request: OrchestratorRunMetadataUpdateRequest,
+    ) -> Result<(), Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.update_orchestrator_run_metadata_blocking(&request)
+        })
+        .await
+        .map_err(|_| Status::internal("orchestrator run metadata worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
     fn update_orchestrator_run_state_blocking(
         &self,
         run_id: &str,
@@ -3129,6 +3153,29 @@ impl GatewayRuntimeState {
         })
         .await
         .map_err(|_| Status::internal("orchestrator snapshot worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn list_orchestrator_session_runs_blocking(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<OrchestratorRunStatusSnapshot>, Status> {
+        self.journal_store
+            .list_orchestrator_session_runs(session_id)
+            .map_err(|error| map_orchestrator_store_error("list orchestrator session runs", error))
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn list_orchestrator_session_runs(
+        self: &Arc<Self>,
+        session_id: String,
+    ) -> Result<Vec<OrchestratorRunStatusSnapshot>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.list_orchestrator_session_runs_blocking(session_id.as_str())
+        })
+        .await
+        .map_err(|_| Status::internal("orchestrator session runs worker panicked"))?
     }
 
     #[allow(clippy::result_large_err)]

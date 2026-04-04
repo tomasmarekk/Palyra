@@ -8,6 +8,7 @@ mod channel_router;
 mod channels;
 mod config;
 mod cron;
+mod delegation;
 pub mod domain;
 mod gateway;
 mod hooks;
@@ -1356,6 +1357,8 @@ struct ConsoleChatBackgroundTaskCreateRequest {
     notification_target: Option<Value>,
     #[serde(default)]
     parameter_delta: Option<Value>,
+    #[serde(default)]
+    delegation: Option<crate::delegation::DelegationRequestInput>,
 }
 
 #[derive(Debug, Deserialize)]

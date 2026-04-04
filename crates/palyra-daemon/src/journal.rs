@@ -11,12 +11,13 @@ use std::os::unix::fs::PermissionsExt;
 
 use palyra_a2ui::{apply_patch_document, parse_patch_document};
 use rusqlite::{params, params_from_iter, Connection, ErrorCode, OptionalExtension, Transaction};
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
 use crate::{
+    delegation::{DelegationMergeResult, DelegationSnapshot},
     domain::workspace::{
         curated_workspace_templates, normalize_workspace_path,
         scan_workspace_content_for_prompt_injection, validate_workspace_content,
@@ -1281,10 +1282,24 @@ pub struct OrchestratorRunStatusSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin_run_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub triggered_by_principal: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parameter_delta_json: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<DelegationSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merge_result: Option<DelegationMergeResult>,
     pub tape_events: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct OrchestratorRunMetadataUpdateRequest {
+    pub run_id: String,
+    pub parent_run_id: Option<Option<String>>,
+    pub delegation: Option<Option<DelegationSnapshot>>,
+    pub merge_result: Option<Option<DelegationMergeResult>>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -1415,6 +1430,8 @@ pub struct OrchestratorBackgroundTaskRecord {
     pub max_attempts: u64,
     pub budget_tokens: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<DelegationSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub not_before_unix_ms: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at_unix_ms: Option<i64>,
@@ -1451,6 +1468,7 @@ pub struct OrchestratorBackgroundTaskCreateRequest {
     pub priority: i64,
     pub max_attempts: u64,
     pub budget_tokens: u64,
+    pub delegation: Option<DelegationSnapshot>,
     pub not_before_unix_ms: Option<i64>,
     pub expires_at_unix_ms: Option<i64>,
     pub notification_target_json: Option<String>,
@@ -2756,7 +2774,47 @@ const MIGRATIONS: &[Migration] = &[
                 ON usage_alerts(scope_kind, scope_id, last_observed_at_unix_ms DESC);
         "#,
     },
+    Migration {
+        version: 19,
+        name: "delegation_child_runs_phase8",
+        sql: r#"
+            ALTER TABLE orchestrator_runs
+                ADD COLUMN parent_run_ulid TEXT;
+            ALTER TABLE orchestrator_runs
+                ADD COLUMN delegation_json TEXT;
+            ALTER TABLE orchestrator_runs
+                ADD COLUMN merge_result_json TEXT;
+            CREATE INDEX IF NOT EXISTS idx_orchestrator_runs_parent
+                ON orchestrator_runs(parent_run_ulid);
+
+            ALTER TABLE orchestrator_background_tasks
+                ADD COLUMN delegation_json TEXT;
+        "#,
+    },
 ];
+
+fn serialize_json_field<T: Serialize>(
+    value: &T,
+    _field: &'static str,
+) -> Result<String, JournalError> {
+    serde_json::to_string(value).map_err(JournalError::from)
+}
+
+fn parse_optional_json_column<T: DeserializeOwned>(
+    raw: Option<String>,
+    field: &'static str,
+) -> rusqlite::Result<Option<T>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    serde_json::from_str::<T>(raw.as_str()).map(Some).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            raw.len(),
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::other(format!("failed to decode {field}: {error}"))),
+        )
+    })
+}
 
 pub struct JournalStore {
     config: JournalConfig,
@@ -3774,6 +3832,65 @@ impl JournalStore {
         }
     }
 
+    pub fn update_orchestrator_run_metadata(
+        &self,
+        request: &OrchestratorRunMetadataUpdateRequest,
+    ) -> Result<(), JournalError> {
+        let now = current_unix_ms()?;
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let parent_run_id = request.parent_run_id.clone().flatten();
+        let clear_parent_run_id = request.parent_run_id.is_some() && parent_run_id.is_none();
+        let delegation_json = request
+            .delegation
+            .clone()
+            .flatten()
+            .map(|value| serialize_json_field(&value, "delegation_json"))
+            .transpose()?;
+        let clear_delegation_json = request.delegation.is_some() && delegation_json.is_none();
+        let merge_result_json = request
+            .merge_result
+            .clone()
+            .flatten()
+            .map(|value| serialize_json_field(&value, "merge_result_json"))
+            .transpose()?;
+        let clear_merge_result_json = request.merge_result.is_some() && merge_result_json.is_none();
+
+        let updated = guard.execute(
+            r#"
+                UPDATE orchestrator_runs
+                SET
+                    parent_run_ulid = CASE
+                        WHEN ?3 = 1 THEN NULL
+                        ELSE COALESCE(?2, parent_run_ulid)
+                    END,
+                    delegation_json = CASE
+                        WHEN ?5 = 1 THEN NULL
+                        ELSE COALESCE(?4, delegation_json)
+                    END,
+                    merge_result_json = CASE
+                        WHEN ?7 = 1 THEN NULL
+                        ELSE COALESCE(?6, merge_result_json)
+                    END,
+                    updated_at_unix_ms = ?8
+                WHERE run_ulid = ?1
+            "#,
+            params![
+                request.run_id,
+                parent_run_id,
+                if clear_parent_run_id { 1_i64 } else { 0_i64 },
+                delegation_json,
+                if clear_delegation_json { 1_i64 } else { 0_i64 },
+                merge_result_json,
+                if clear_merge_result_json { 1_i64 } else { 0_i64 },
+                now,
+            ],
+        )?;
+        if updated == 0 {
+            return Err(JournalError::RunNotFound { run_id: request.run_id.clone() });
+        }
+        Ok(())
+    }
+
     pub fn update_orchestrator_run_state(
         &self,
         run_id: &str,
@@ -3962,8 +4079,11 @@ impl JournalStore {
                     runs.last_error,
                     runs.origin_kind,
                     runs.origin_run_ulid,
+                    runs.parent_run_ulid,
                     runs.triggered_by_principal,
-                    runs.parameter_delta_json
+                    runs.parameter_delta_json,
+                    runs.delegation_json,
+                    runs.merge_result_json
                 FROM orchestrator_runs AS runs
                 INNER JOIN orchestrator_sessions AS sessions
                     ON sessions.session_ulid = runs.session_ulid
@@ -3995,8 +4115,11 @@ impl JournalStore {
                     last_error: row.get(15)?,
                     origin_kind: row.get(16)?,
                     origin_run_id: row.get(17)?,
-                    triggered_by_principal: row.get(18)?,
-                    parameter_delta_json: row.get(19)?,
+                    parent_run_id: row.get(18)?,
+                    triggered_by_principal: row.get(19)?,
+                    parameter_delta_json: row.get(20)?,
+                    delegation: parse_optional_json_column(row.get(21)?, "delegation_json")?,
+                    merge_result: parse_optional_json_column(row.get(22)?, "merge_result_json")?,
                     tape_events: 0,
                 })
             })
@@ -4010,6 +4133,82 @@ impl JournalStore {
             |row| row.get::<_, i64>(0),
         )? as u64;
         Ok(Some(snapshot))
+    }
+
+    pub fn list_orchestrator_session_runs(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<OrchestratorRunStatusSnapshot>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let mut statement = guard.prepare(
+            r#"
+                SELECT
+                    runs.run_ulid,
+                    runs.session_ulid,
+                    runs.state,
+                    runs.cancel_requested,
+                    runs.cancel_reason,
+                    sessions.principal,
+                    sessions.device_id,
+                    sessions.channel,
+                    runs.prompt_tokens,
+                    runs.completion_tokens,
+                    runs.total_tokens,
+                    runs.created_at_unix_ms,
+                    runs.started_at_unix_ms,
+                    runs.completed_at_unix_ms,
+                    runs.updated_at_unix_ms,
+                    runs.last_error,
+                    runs.origin_kind,
+                    runs.origin_run_ulid,
+                    runs.parent_run_ulid,
+                    runs.triggered_by_principal,
+                    runs.parameter_delta_json,
+                    runs.delegation_json,
+                    runs.merge_result_json,
+                    (SELECT COUNT(*) FROM orchestrator_tape WHERE run_ulid = runs.run_ulid) AS tape_events
+                FROM orchestrator_runs AS runs
+                INNER JOIN orchestrator_sessions AS sessions
+                    ON sessions.session_ulid = runs.session_ulid
+                WHERE runs.session_ulid = ?1
+                ORDER BY runs.started_at_unix_ms ASC, runs.created_at_unix_ms ASC, runs.run_ulid ASC
+            "#,
+        )?;
+        let mut rows = statement.query(params![session_id])?;
+        let mut records = Vec::new();
+        while let Some(row) = rows.next()? {
+            let raw_state: String = row.get(2)?;
+            let normalized_state = RunLifecycleState::from_str(raw_state.as_str())
+                .map(|state| state.as_str().to_owned())
+                .unwrap_or(raw_state);
+            records.push(OrchestratorRunStatusSnapshot {
+                run_id: row.get(0)?,
+                session_id: row.get(1)?,
+                state: normalized_state,
+                cancel_requested: row.get::<_, i64>(3)? == 1,
+                cancel_reason: row.get(4)?,
+                principal: row.get(5)?,
+                device_id: row.get(6)?,
+                channel: row.get(7)?,
+                prompt_tokens: row.get::<_, i64>(8)? as u64,
+                completion_tokens: row.get::<_, i64>(9)? as u64,
+                total_tokens: row.get::<_, i64>(10)? as u64,
+                created_at_unix_ms: row.get(11)?,
+                started_at_unix_ms: row.get(12)?,
+                completed_at_unix_ms: row.get(13)?,
+                updated_at_unix_ms: row.get(14)?,
+                last_error: row.get(15)?,
+                origin_kind: row.get(16)?,
+                origin_run_id: row.get(17)?,
+                parent_run_id: row.get(18)?,
+                triggered_by_principal: row.get(19)?,
+                parameter_delta_json: row.get(20)?,
+                delegation: parse_optional_json_column(row.get(21)?, "delegation_json")?,
+                merge_result: parse_optional_json_column(row.get(22)?, "merge_result_json")?,
+                tape_events: row.get::<_, i64>(23)?.max(0) as u64,
+            });
+        }
+        Ok(records)
     }
 
     pub fn update_orchestrator_session_lineage(
@@ -4687,6 +4886,11 @@ impl JournalStore {
         let now = current_unix_ms()?;
         let max_attempts = u64_to_sqlite(request.max_attempts, "max_attempts")?;
         let budget_tokens = u64_to_sqlite(request.budget_tokens, "budget_tokens")?;
+        let delegation_json = request
+            .delegation
+            .as_ref()
+            .map(|value| serialize_json_field(value, "delegation_json"))
+            .transpose()?;
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         guard.execute(
             r#"
@@ -4705,6 +4909,7 @@ impl JournalStore {
                     attempt_count,
                     max_attempts,
                     budget_tokens,
+                    delegation_json,
                     not_before_unix_ms,
                     expires_at_unix_ms,
                     notification_target_json,
@@ -4717,7 +4922,7 @@ impl JournalStore {
                     started_at_unix_ms,
                     completed_at_unix_ms
                 ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12, ?13, ?14, ?15, ?16, ?17, ?18, NULL, NULL, ?19, ?19, NULL, NULL
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, NULL, NULL, ?20, ?20, NULL, NULL
                 )
             "#,
             params![
@@ -4734,6 +4939,7 @@ impl JournalStore {
                 request.priority,
                 max_attempts,
                 budget_tokens,
+                delegation_json,
                 request.not_before_unix_ms,
                 request.expires_at_unix_ms,
                 request.notification_target_json,
@@ -4757,6 +4963,7 @@ impl JournalStore {
             attempt_count: 0,
             max_attempts: request.max_attempts,
             budget_tokens: request.budget_tokens,
+            delegation: request.delegation.clone(),
             not_before_unix_ms: request.not_before_unix_ms,
             expires_at_unix_ms: request.expires_at_unix_ms,
             notification_target_json: request.notification_target_json.clone(),
@@ -4866,6 +5073,7 @@ impl JournalStore {
                     attempt_count,
                     max_attempts,
                     budget_tokens,
+                    delegation_json,
                     not_before_unix_ms,
                     expires_at_unix_ms,
                     notification_target_json,
@@ -4924,17 +5132,18 @@ impl JournalStore {
                 attempt_count: row.get::<_, i64>(11)?.max(0) as u64,
                 max_attempts: row.get::<_, i64>(12)?.max(0) as u64,
                 budget_tokens: row.get::<_, i64>(13)?.max(0) as u64,
-                not_before_unix_ms: row.get(14)?,
-                expires_at_unix_ms: row.get(15)?,
-                notification_target_json: row.get(16)?,
-                input_text: row.get(17)?,
-                payload_json: row.get(18)?,
-                last_error: row.get(19)?,
-                result_json: row.get(20)?,
-                created_at_unix_ms: row.get(21)?,
-                updated_at_unix_ms: row.get(22)?,
-                started_at_unix_ms: row.get(23)?,
-                completed_at_unix_ms: row.get(24)?,
+                delegation: parse_optional_json_column(row.get(14)?, "delegation_json")?,
+                not_before_unix_ms: row.get(15)?,
+                expires_at_unix_ms: row.get(16)?,
+                notification_target_json: row.get(17)?,
+                input_text: row.get(18)?,
+                payload_json: row.get(19)?,
+                last_error: row.get(20)?,
+                result_json: row.get(21)?,
+                created_at_unix_ms: row.get(22)?,
+                updated_at_unix_ms: row.get(23)?,
+                started_at_unix_ms: row.get(24)?,
+                completed_at_unix_ms: row.get(25)?,
             });
         }
         Ok(records)
@@ -4963,6 +5172,7 @@ impl JournalStore {
                         attempt_count,
                         max_attempts,
                         budget_tokens,
+                        delegation_json,
                         not_before_unix_ms,
                         expires_at_unix_ms,
                         notification_target_json,
@@ -4994,17 +5204,18 @@ impl JournalStore {
                         attempt_count: row.get::<_, i64>(11)?.max(0) as u64,
                         max_attempts: row.get::<_, i64>(12)?.max(0) as u64,
                         budget_tokens: row.get::<_, i64>(13)?.max(0) as u64,
-                        not_before_unix_ms: row.get(14)?,
-                        expires_at_unix_ms: row.get(15)?,
-                        notification_target_json: row.get(16)?,
-                        input_text: row.get(17)?,
-                        payload_json: row.get(18)?,
-                        last_error: row.get(19)?,
-                        result_json: row.get(20)?,
-                        created_at_unix_ms: row.get(21)?,
-                        updated_at_unix_ms: row.get(22)?,
-                        started_at_unix_ms: row.get(23)?,
-                        completed_at_unix_ms: row.get(24)?,
+                        delegation: parse_optional_json_column(row.get(14)?, "delegation_json")?,
+                        not_before_unix_ms: row.get(15)?,
+                        expires_at_unix_ms: row.get(16)?,
+                        notification_target_json: row.get(17)?,
+                        input_text: row.get(18)?,
+                        payload_json: row.get(19)?,
+                        last_error: row.get(20)?,
+                        result_json: row.get(21)?,
+                        created_at_unix_ms: row.get(22)?,
+                        updated_at_unix_ms: row.get(23)?,
+                        started_at_unix_ms: row.get(24)?,
+                        completed_at_unix_ms: row.get(25)?,
                     })
                 },
             )

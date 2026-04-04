@@ -423,6 +423,17 @@ pub(crate) async fn console_chat_context_reference_preview_handler(
     })))
 }
 
+pub(crate) async fn console_chat_delegation_catalog_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, Response> {
+    let _session = authorize_console_session(&state, &headers, false)?;
+    Ok(Json(json!({
+        "catalog": crate::delegation::built_in_delegation_catalog(),
+        "contract": contract_descriptor(),
+    })))
+}
+
 pub(crate) async fn console_chat_attachment_upload_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -476,6 +487,7 @@ pub(crate) async fn console_chat_attachment_upload_handler(
             priority: 50,
             max_attempts: 1,
             budget_tokens: estimate_console_chat_attachment_tokens(&artifact),
+            delegation: None,
             not_before_unix_ms: None,
             expires_at_unix_ms: None,
             notification_target_json: None,
@@ -779,6 +791,7 @@ pub(crate) async fn console_chat_derived_artifact_recompute_handler(
             priority: 40,
             max_attempts: 1,
             budget_tokens: estimate_console_chat_attachment_tokens(&source_attachment),
+            delegation: None,
             not_before_unix_ms: None,
             expires_at_unix_ms: None,
             notification_target_json: None,
@@ -962,7 +975,11 @@ pub(crate) async fn console_chat_run_status_handler(
             "chat run does not belong to the authenticated console session context",
         )));
     }
-    Ok(Json(json!({ "run": run })))
+    let lineage = load_console_run_lineage(&state, &session.context, &run).await?;
+    Ok(Json(json!({
+        "run": run,
+        "lineage": lineage,
+    })))
 }
 
 pub(crate) async fn console_chat_run_events_handler(
@@ -995,9 +1012,11 @@ pub(crate) async fn console_chat_run_events_handler(
         .orchestrator_tape_snapshot(run_id, query.after_seq, query.limit)
         .await
         .map_err(runtime_status_response)?;
+    let lineage = load_console_run_lineage(&state, &session.context, &run).await?;
     Ok(Json(json!({
         "run": run,
         "tape": tape,
+        "lineage": lineage,
     })))
 }
 
@@ -1512,11 +1531,61 @@ pub(crate) async fn console_chat_background_task_create_handler(
     let text = trim_to_option(payload.text).ok_or_else(|| {
         runtime_status_response(tonic::Status::invalid_argument("text cannot be empty"))
     })?;
+    let requested_budget_tokens = payload
+        .budget_tokens
+        .unwrap_or_else(|| crate::orchestrator::estimate_token_count(text.as_str()));
+    let requested_max_attempts = payload.max_attempts.unwrap_or(3).clamp(1, 16);
+    let delegation = if let Some(request) = payload.delegation.as_ref() {
+        let parent_run_id = session_record.last_run_id.clone().ok_or_else(|| {
+            runtime_status_response(tonic::Status::failed_precondition(
+                "delegation requires a parent run in the current session",
+            ))
+        })?;
+        let resolved_agent = state
+            .runtime
+            .resolve_agent_for_context(crate::agents::AgentResolveRequest {
+                principal: session.context.principal.clone(),
+                channel: session.context.channel.clone(),
+                session_id: Some(session_record.session_id.clone()),
+                preferred_agent_id: None,
+                persist_session_binding: false,
+            })
+            .await
+            .map_err(runtime_status_response)?;
+        Some(
+            crate::delegation::resolve_delegation_request(
+                request,
+                &crate::delegation::DelegationParentContext {
+                    parent_run_id: Some(parent_run_id),
+                    agent_id: Some(resolved_agent.agent.agent_id),
+                    parent_model_profile: Some(resolved_agent.agent.default_model_profile),
+                    parent_tool_allowlist: resolved_agent.agent.default_tool_allowlist,
+                    parent_skill_allowlist: resolved_agent.agent.default_skill_allowlist,
+                    parent_budget_tokens: Some(requested_budget_tokens),
+                },
+            )
+            .map_err(runtime_status_response)?,
+        )
+    } else {
+        None
+    };
+    let task_budget_tokens =
+        delegation.as_ref().map(|value| value.budget_tokens).unwrap_or(requested_budget_tokens);
+    let task_max_attempts =
+        delegation.as_ref().map(|value| value.max_attempts).unwrap_or(requested_max_attempts);
+    let payload_json = build_console_background_task_payload_json(
+        payload.parameter_delta.as_ref(),
+        delegation.as_ref(),
+    )?;
     let task = state
         .runtime
         .create_orchestrator_background_task(journal::OrchestratorBackgroundTaskCreateRequest {
             task_id: Ulid::new().to_string(),
-            task_kind: "background_prompt".to_owned(),
+            task_kind: if delegation.is_some() {
+                "delegation_prompt".to_owned()
+            } else {
+                "background_prompt".to_owned()
+            },
             session_id: session_record.session_id.clone(),
             parent_run_id: session_record.last_run_id.clone(),
             target_run_id: None,
@@ -1526,10 +1595,9 @@ pub(crate) async fn console_chat_background_task_create_handler(
             channel: session.context.channel.clone(),
             state: "queued".to_owned(),
             priority: payload.priority.unwrap_or(0).clamp(-10, 10),
-            max_attempts: payload.max_attempts.unwrap_or(3).clamp(1, 16),
-            budget_tokens: payload
-                .budget_tokens
-                .unwrap_or_else(|| crate::orchestrator::estimate_token_count(text.as_str())),
+            max_attempts: task_max_attempts,
+            budget_tokens: task_budget_tokens,
+            delegation,
             not_before_unix_ms: payload.not_before_unix_ms,
             expires_at_unix_ms: payload.expires_at_unix_ms,
             notification_target_json: payload
@@ -1543,10 +1611,7 @@ pub(crate) async fn console_chat_background_task_create_handler(
                     )))
                 })?,
             input_text: Some(text),
-            payload_json: payload
-                .parameter_delta
-                .as_ref()
-                .map(|parameter_delta| json!({ "parameter_delta": parameter_delta }).to_string()),
+            payload_json,
         })
         .await
         .map_err(runtime_status_response)?;
@@ -1894,6 +1959,11 @@ pub(crate) async fn console_chat_transcript_handler(
         })
         .await
         .map_err(runtime_status_response)?;
+    let runs = state
+        .runtime
+        .list_orchestrator_session_runs(session_record.session_id.clone())
+        .await
+        .map_err(runtime_status_response)?;
     let attachments = state
         .channels
         .list_console_chat_attachments(
@@ -1924,6 +1994,7 @@ pub(crate) async fn console_chat_transcript_handler(
         "compactions": compactions,
         "checkpoints": checkpoints,
         "queued_inputs": queued_inputs,
+        "runs": runs,
         "background_tasks": background_tasks,
         "contract": contract_descriptor(),
     })))
@@ -3233,4 +3304,69 @@ fn approval_scope_to_proto(scope: Option<ApprovalDecisionScope>) -> i32 {
         ApprovalDecisionScope::Session => common_v1::ApprovalDecisionScope::Session as i32,
         ApprovalDecisionScope::Timeboxed => common_v1::ApprovalDecisionScope::Timeboxed as i32,
     }
+}
+
+fn build_console_background_task_payload_json(
+    parameter_delta: Option<&Value>,
+    delegation: Option<&crate::delegation::DelegationSnapshot>,
+) -> Result<Option<String>, Response> {
+    if parameter_delta.is_none() && delegation.is_none() {
+        return Ok(None);
+    }
+    let mut payload = serde_json::Map::new();
+    if let Some(parameter_delta) = parameter_delta.cloned() {
+        payload.insert("parameter_delta".to_owned(), parameter_delta);
+    }
+    if let Some(delegation) = delegation {
+        let delegation_value = serde_json::to_value(delegation).map_err(|error| {
+            runtime_status_response(tonic::Status::internal(format!(
+                "failed to encode delegation background payload: {error}"
+            )))
+        })?;
+        payload.insert("delegation".to_owned(), delegation_value);
+    }
+    Ok(Some(Value::Object(payload).to_string()))
+}
+
+async fn load_console_run_lineage(
+    state: &AppState,
+    context: &gateway::RequestContext,
+    run: &journal::OrchestratorRunStatusSnapshot,
+) -> Result<Value, Response> {
+    let runs = state
+        .runtime
+        .list_orchestrator_session_runs(run.session_id.clone())
+        .await
+        .map_err(runtime_status_response)?;
+    if runs.iter().any(|candidate| !run_matches_console_context(candidate, context)) {
+        return Err(runtime_status_response(tonic::Status::permission_denied(
+            "chat lineage does not belong to the authenticated console session context",
+        )));
+    }
+    Ok(build_console_run_lineage_payload(run.run_id.as_str(), runs.as_slice()))
+}
+
+fn build_console_run_lineage_payload(
+    focus_run_id: &str,
+    runs: &[journal::OrchestratorRunStatusSnapshot],
+) -> Value {
+    let parents = runs
+        .iter()
+        .map(|run| (run.run_id.clone(), run.parent_run_id.clone()))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut current_run_id = focus_run_id.to_owned();
+    let mut root_run_id = focus_run_id.to_owned();
+    let mut seen = std::collections::HashSet::new();
+    while seen.insert(current_run_id.clone()) {
+        let Some(Some(parent_run_id)) = parents.get(current_run_id.as_str()) else {
+            break;
+        };
+        root_run_id = parent_run_id.clone();
+        current_run_id = parent_run_id.clone();
+    }
+    json!({
+        "focus_run_id": focus_run_id,
+        "root_run_id": root_run_id,
+        "runs": runs,
+    })
 }

@@ -1541,8 +1541,11 @@ fn fallback_usage_snapshot(
         last_error: None,
         origin_kind: "manual".to_owned(),
         origin_run_id: None,
+        parent_run_id: None,
         triggered_by_principal: Some(job.owner_principal.clone()),
         parameter_delta_json: None,
+        delegation: None,
+        merge_result: None,
         tape_events: 0,
     }
 }

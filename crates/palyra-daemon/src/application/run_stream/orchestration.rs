@@ -1,10 +1,12 @@
 use std::{sync::Arc, time::Duration};
 
+use serde_json::Value;
 use tokio::{
     sync::mpsc,
     time::{interval, MissedTickBehavior},
 };
 use tonic::{Status, Streaming};
+use tracing::warn;
 
 use crate::{
     application::provider_events::{
@@ -13,13 +15,14 @@ use crate::{
     application::provider_input::{
         prepare_model_provider_input, MemoryPromptFailureMode, PrepareModelProviderInputRequest,
     },
+    delegation::DelegationSnapshot,
     gateway::{
         canonical_id, ingest_memory_best_effort, non_empty, security_requests_json_mode,
         GatewayRuntimeState, CANCELLED_REASON,
     },
     journal::{
-        MemorySource, OrchestratorCancelRequest, OrchestratorRunStartRequest,
-        OrchestratorSessionResolveRequest, OrchestratorUsageDelta,
+        MemorySource, OrchestratorCancelRequest, OrchestratorRunMetadataUpdateRequest,
+        OrchestratorRunStartRequest, OrchestratorSessionResolveRequest, OrchestratorUsageDelta,
     },
     model_provider::{ProviderRequest, ProviderResponse},
     orchestrator::{is_cancel_command, RunLifecycleState, RunStateMachine, RunTransition},
@@ -84,6 +87,50 @@ pub(crate) async fn transition_run_stream_to_cancelled(
         let _ = sender.send(Err(error)).await;
     }
     Ok(())
+}
+
+async fn persist_run_stream_delegation_metadata(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    origin_run_id: Option<&common_v1::CanonicalId>,
+    parameter_delta_json: Option<&str>,
+) -> Result<(), Status> {
+    let Some(parameter_delta_json) = parameter_delta_json else {
+        return Ok(());
+    };
+    let parsed = match serde_json::from_str::<Value>(parameter_delta_json) {
+        Ok(value) => value,
+        Err(error) => {
+            warn!(
+                run_id = %run_id,
+                error = %error,
+                "ignoring non-JSON parameter_delta while inspecting delegation metadata"
+            );
+            return Ok(());
+        }
+    };
+    let Some(delegation_json) = parsed.get("delegation") else {
+        return Ok(());
+    };
+    let delegation = match serde_json::from_value::<DelegationSnapshot>(delegation_json.clone()) {
+        Ok(value) => value,
+        Err(error) => {
+            warn!(
+                run_id = %run_id,
+                error = %error,
+                "ignoring invalid delegation snapshot inside parameter_delta"
+            );
+            return Ok(());
+        }
+    };
+    runtime_state
+        .update_orchestrator_run_metadata(OrchestratorRunMetadataUpdateRequest {
+            run_id: run_id.to_owned(),
+            parent_run_id: Some(origin_run_id.map(|value| value.ulid.clone())),
+            delegation: Some(Some(delegation)),
+            merge_result: None,
+        })
+        .await
 }
 
 #[allow(clippy::result_large_err)]
@@ -271,6 +318,13 @@ pub(crate) async fn process_run_stream_message(
                 parameter_delta_json: parameter_delta_json.clone(),
             })
             .await?;
+        persist_run_stream_delegation_metadata(
+            runtime_state,
+            run_id.as_str(),
+            message.origin_run_id.as_ref(),
+            parameter_delta_json.as_deref(),
+        )
+        .await?;
 
         *active_session_id = Some(session_id.clone());
         *active_run_id = Some(run_id.clone());
