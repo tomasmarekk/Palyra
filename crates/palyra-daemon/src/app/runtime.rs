@@ -9,9 +9,8 @@ use tokio::sync::Notify;
 
 use super::state::{
     AdminRateLimitEntry, AppState, CanvasRateLimitEntry, CompatApiRateLimitEntry,
-    ConsoleBrowserHandoff,
-    ConsoleChatRunStream, ConsoleRelayToken, ConsoleSession, DeploymentRuntimeSnapshot,
-    RemoteAdminAccessAttempt,
+    ConsoleBrowserHandoff, ConsoleChatRunStream, ConsoleRelayToken, ConsoleSession,
+    DeploymentRuntimeSnapshot, RemoteAdminAccessAttempt,
 };
 use crate::{
     access_control::AccessRegistry,

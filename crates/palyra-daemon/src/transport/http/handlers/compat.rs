@@ -270,10 +270,7 @@ async fn prepare_compat_run(
             .resolve_workspace_access_for_token(&token, required_scope)
             .map_err(access_registry_to_compat_response)?;
         if let Some(workspace_access) = workspace_access {
-            (
-                workspace_access.runtime_principal,
-                workspace_access.runtime_device_id,
-            )
+            (workspace_access.runtime_principal, workspace_access.runtime_device_id)
         } else {
             (token.principal.clone(), token.token_id.clone())
         }
@@ -299,9 +296,7 @@ async fn prepare_compat_run(
     request_sender
         .send(common_v1::RunStreamRequest {
             v: palyra_common::CANONICAL_PROTOCOL_MAJOR,
-            session_id: Some(common_v1::CanonicalId {
-                ulid: session.session.session_id.clone(),
-            }),
+            session_id: Some(common_v1::CanonicalId { ulid: session.session.session_id.clone() }),
             run_id: Some(common_v1::CanonicalId { ulid: run_id.clone() }),
             input: Some(build_compat_message_envelope(
                 session.session.session_id.as_str(),
@@ -354,20 +349,9 @@ async fn execute_compat_run(
     state: &AppState,
     prepared: CompatPreparedRun,
 ) -> Result<CompatExecutionResult, Response> {
-    let CompatPreparedRun {
-        run_id,
-        session_id,
-        request_sender,
-        run_request,
-        ..
-    } = prepared;
+    let CompatPreparedRun { run_id, session_id, request_sender, run_request, .. } = prepared;
     let gateway_client = build_compat_gateway_endpoint(state).map_err(|error| {
-        compat_error_response(
-            StatusCode::BAD_GATEWAY,
-            "server_error",
-            "gateway_unavailable",
-            error,
-        )
+        compat_error_response(StatusCode::BAD_GATEWAY, "server_error", "gateway_unavailable", error)
     })?;
     let channel = gateway_client.connect().await.map_err(|error| {
         compat_error_response(
@@ -449,12 +433,7 @@ async fn execute_compat_run(
             error,
         ));
     }
-    Ok(CompatExecutionResult {
-        content,
-        tool_calls,
-        finish_reason,
-        snapshot,
-    })
+    Ok(CompatExecutionResult { content, tool_calls, finish_reason, snapshot })
 }
 
 fn build_compat_chat_completion_payload(result: &CompatExecutionResult) -> Value {
@@ -750,22 +729,17 @@ fn build_compat_chat_streaming_response(state: AppState, prepared: CompatPrepare
     });
 
     let mut response = Response::new(Body::from_stream(ReceiverStream::new(receiver)));
-    response.headers_mut().insert(
-        CONTENT_TYPE,
-        HeaderValue::from_static("text/event-stream; charset=utf-8"),
-    );
     response
         .headers_mut()
-        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream; charset=utf-8"));
+    response.headers_mut().insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
 }
 
 fn build_compat_models(provider: model_provider::ProviderStatusSnapshot) -> Vec<Value> {
     let mut models = Vec::new();
-    let chat_model = provider
-        .openai_model
-        .clone()
-        .unwrap_or_else(|| format!("palyra-{}", provider.kind));
+    let chat_model =
+        provider.openai_model.clone().unwrap_or_else(|| format!("palyra-{}", provider.kind));
     models.push(json!({
         "id": chat_model,
         "object": "model",
@@ -798,11 +772,10 @@ fn validate_compat_requested_model(
     provider: &model_provider::ProviderStatusSnapshot,
     requested_model: Option<&str>,
 ) -> Result<String, Response> {
-    let available = provider
-        .openai_model
-        .clone()
-        .unwrap_or_else(|| format!("palyra-{}", provider.kind));
-    let Some(requested_model) = requested_model.and_then(|value| trim_to_option(value.to_owned())) else {
+    let available =
+        provider.openai_model.clone().unwrap_or_else(|| format!("palyra-{}", provider.kind));
+    let Some(requested_model) = requested_model.and_then(|value| trim_to_option(value.to_owned()))
+    else {
         return Ok(available);
     };
     if requested_model == available {
@@ -860,11 +833,9 @@ fn render_compat_message_content(content: &CompatMessageContent) -> String {
         CompatMessageContent::Parts(parts) => parts
             .iter()
             .filter_map(|part| match part.kind.as_str() {
-                "text" | "input_text" | "output_text" => part
-                    .text
-                    .clone()
-                    .or_else(|| part.input_text.clone())
-                    .and_then(trim_to_option),
+                "text" | "input_text" | "output_text" => {
+                    part.text.clone().or_else(|| part.input_text.clone()).and_then(trim_to_option)
+                }
                 "image_url" | "input_image" => Some("[image content omitted]".to_owned()),
                 _ => None,
             })
@@ -929,13 +900,7 @@ fn derive_compat_session_key(
     if let Some(user) = user.and_then(|value| trim_to_option(value.to_owned())) {
         let normalized = user
             .chars()
-            .map(|ch| {
-                if ch.is_ascii_alphanumeric() {
-                    ch.to_ascii_lowercase()
-                } else {
-                    '-'
-                }
-            })
+            .map(|ch| if ch.is_ascii_alphanumeric() { ch.to_ascii_lowercase() } else { '-' })
             .collect::<String>()
             .trim_matches('-')
             .to_owned();
@@ -955,9 +920,7 @@ fn build_compat_message_envelope(
 ) -> common_v1::MessageEnvelope {
     common_v1::MessageEnvelope {
         v: palyra_common::CANONICAL_PROTOCOL_MAJOR,
-        envelope_id: Some(common_v1::CanonicalId {
-            ulid: Ulid::new().to_string(),
-        }),
+        envelope_id: Some(common_v1::CanonicalId { ulid: Ulid::new().to_string() }),
         timestamp_unix_ms,
         origin: Some(common_v1::EnvelopeOrigin {
             r#type: common_v1::envelope_origin::OriginType::Channel as i32,
@@ -967,10 +930,7 @@ fn build_compat_message_envelope(
             sender_handle: sender_handle.to_owned(),
             sender_verified: true,
         }),
-        content: Some(common_v1::MessageContent {
-            text,
-            attachments: Vec::new(),
-        }),
+        content: Some(common_v1::MessageContent { text, attachments: Vec::new() }),
         security: None,
         max_payload_bytes: 0,
     }
@@ -1017,12 +977,10 @@ fn enforce_compat_rate_limit(
     rate_limit_per_minute: u32,
 ) -> Result<(), Response> {
     let mut buckets = lock_compat_rate_limit_map(&state.compat_api_rate_limit);
-    let bucket = buckets
-        .entry(token_id.to_owned())
-        .or_insert_with(|| CompatApiRateLimitEntry {
-            window_started_at: Instant::now(),
-            requests_in_window: 0,
-        });
+    let bucket = buckets.entry(token_id.to_owned()).or_insert_with(|| CompatApiRateLimitEntry {
+        window_started_at: Instant::now(),
+        requests_in_window: 0,
+    });
     if bucket.window_started_at.elapsed() >= Duration::from_secs(60) {
         bucket.window_started_at = Instant::now();
         bucket.requests_in_window = 0;
@@ -1079,12 +1037,8 @@ async fn auto_deny_compat_tool_approval(
     let _ = request_sender
         .send(common_v1::RunStreamRequest {
             v: palyra_common::CANONICAL_PROTOCOL_MAJOR,
-            session_id: Some(common_v1::CanonicalId {
-                ulid: session_id.to_owned(),
-            }),
-            run_id: Some(common_v1::CanonicalId {
-                ulid: run_id.to_owned(),
-            }),
+            session_id: Some(common_v1::CanonicalId { ulid: session_id.to_owned() }),
+            run_id: Some(common_v1::CanonicalId { ulid: run_id.to_owned() }),
             input: None,
             allow_sensitive_tools: false,
             session_key: String::new(),
@@ -1104,9 +1058,7 @@ fn build_compat_gateway_endpoint(state: &AppState) -> Result<tonic::transport::E
     tonic::transport::Endpoint::from_shared(state.grpc_url.clone())
         .map_err(|error| format!("invalid gateway endpoint: {error}"))
         .map(|endpoint| {
-            endpoint
-                .connect_timeout(Duration::from_secs(2))
-                .timeout(Duration::from_secs(90))
+            endpoint.connect_timeout(Duration::from_secs(2)).timeout(Duration::from_secs(90))
         })
 }
 
@@ -1173,18 +1125,12 @@ fn access_registry_to_compat_response(error: AccessRegistryError) -> Response {
             "feature_disabled",
             format!("feature '{feature}' is disabled for the compat API"),
         ),
-        AccessRegistryError::AccessDenied(message) => compat_error_response(
-            StatusCode::FORBIDDEN,
-            "access_error",
-            "access_denied",
-            message,
-        ),
-        AccessRegistryError::InvalidField { field, message } => compat_error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            field,
-            message,
-        ),
+        AccessRegistryError::AccessDenied(message) => {
+            compat_error_response(StatusCode::FORBIDDEN, "access_error", "access_denied", message)
+        }
+        AccessRegistryError::InvalidField { field, message } => {
+            compat_error_response(StatusCode::BAD_REQUEST, "invalid_request_error", field, message)
+        }
         other => compat_error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "server_error",
@@ -1204,11 +1150,7 @@ fn compat_error_response(
     (status, Json(body)).into_response()
 }
 
-fn compat_error_payload(
-    error_type: &str,
-    code: &str,
-    message: impl Into<String>,
-) -> Value {
+fn compat_error_payload(error_type: &str, code: &str, message: impl Into<String>) -> Value {
     json!({
         "error": {
             "message": message.into(),
@@ -1240,10 +1182,7 @@ fn json_string_from_bytes(bytes: &[u8]) -> String {
         .unwrap_or_else(|_| String::from_utf8_lossy(bytes).into_owned())
 }
 
-async fn send_sse_data(
-    sender: &mpsc::Sender<Result<Bytes, Infallible>>,
-    payload: Value,
-) -> bool {
+async fn send_sse_data(sender: &mpsc::Sender<Result<Bytes, Infallible>>, payload: Value) -> bool {
     let mut encoded = b"data: ".to_vec();
     let Ok(mut body) = serde_json::to_vec(&payload) else {
         return true;
@@ -1254,10 +1193,7 @@ async fn send_sse_data(
 }
 
 async fn send_sse_done(sender: &mpsc::Sender<Result<Bytes, Infallible>>) -> bool {
-    sender
-        .send(Ok(Bytes::from_static(b"data: [DONE]\n\n")))
-        .await
-        .is_ok()
+    sender.send(Ok(Bytes::from_static(b"data: [DONE]\n\n"))).await.is_ok()
 }
 
 fn internal_clock_error_response(error: impl std::fmt::Display) -> Response {

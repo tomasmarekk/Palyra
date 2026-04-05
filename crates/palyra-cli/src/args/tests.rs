@@ -8,15 +8,14 @@ use super::{
     AuthProviderArg, AuthScopeArg, BackupCommand, BackupComponentArg, BrowserCommand,
     BrowserPermissionsCommand, BrowserSessionCommand, ChannelProviderArg, ChannelResolveEntityArg,
     ChannelsCommand, ChannelsDiscordCommand, ChannelsRouterCommand, Cli, Command, CompletionShell,
-    ConfigCommand,
-    ConfigureSectionArg, CronCommand, CronConcurrencyPolicyArg, CronMisfirePolicyArg,
-    CronScheduleTypeArg, DaemonCommand, DevicesCommand, DocsCommand, GatewayBindProfileArg,
-    HooksCommand, InitModeArg, InitTlsScaffoldArg, JournalCheckpointModeArg, MemoryCommand,
-    MemoryScopeArg, MemorySourceArg, MessageCommand, ModelsCommand, NodeCommand, NodesCommand,
-    OnboardingAuthMethodArg, OnboardingCommand, OnboardingFlowArg, PairingClientKindArg,
-    PairingCommand, PairingMethodArg, PairingStateArg, PatchCommand, PluginsCommand, PolicyCommand,
-    ProtocolCommand, RemoteVerificationModeArg, ResetCommand, ResetScopeArg,
-    RoutineApprovalModeArg, RoutineDeliveryModeArg, RoutinePreviewTimezoneArg,
+    ConfigCommand, ConfigureSectionArg, CronCommand, CronConcurrencyPolicyArg,
+    CronMisfirePolicyArg, CronScheduleTypeArg, DaemonCommand, DevicesCommand, DocsCommand,
+    GatewayBindProfileArg, HooksCommand, InitModeArg, InitTlsScaffoldArg, JournalCheckpointModeArg,
+    MemoryCommand, MemoryScopeArg, MemorySourceArg, MessageCommand, ModelsCommand, NodeCommand,
+    NodesCommand, OnboardingAuthMethodArg, OnboardingCommand, OnboardingFlowArg,
+    PairingClientKindArg, PairingCommand, PairingMethodArg, PairingStateArg, PatchCommand,
+    PluginsCommand, PolicyCommand, ProtocolCommand, RemoteVerificationModeArg, ResetCommand,
+    ResetScopeArg, RoutineApprovalModeArg, RoutineDeliveryModeArg, RoutinePreviewTimezoneArg,
     RoutineTriggerKindArg, RoutinesCommand, SandboxCommand, SandboxRuntimeArg, SecretsCommand,
     SecretsConfigureCommand, SecurityCommand, SessionsCommand, SetupWizardOverridesArg,
     SkillsCommand, SkillsPackageCommand, SupportBundleCommand, SystemCommand, SystemEventCommand,
@@ -1998,10 +1997,7 @@ fn parse_auth_access_backfill_dry_run() {
         parsed.command,
         Command::Auth {
             command: AuthCommand::Access {
-                command: AuthAccessCommand::Backfill {
-                    dry_run: true,
-                    json: true,
-                },
+                command: AuthAccessCommand::Backfill { dry_run: true, json: true },
             },
         }
     );

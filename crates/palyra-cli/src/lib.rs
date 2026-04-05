@@ -77,16 +77,15 @@ use clap::{CommandFactory, Parser};
 use cli::{
     AcpCommand, AgentCommand, AgentsCommand, ApprovalDecisionArg, ApprovalExportFormatArg,
     ApprovalsCommand, AuthAccessCommand, AuthCommand, AuthCredentialArg, AuthOpenAiCommand,
-    AuthProfilesCommand, AuthProviderArg, AuthScopeArg, BrowserCommand, Cli,
-    Command as CliCommand, CompletionShell, ConfigCommand, ConfigureSectionArg, CronCommand,
-    DaemonCommand, DocsCommand, GatewayBindProfileArg, HooksCommand, InitModeArg,
-    InitTlsScaffoldArg, JournalCheckpointModeArg, MemoryCommand, MemoryScopeArg,
-    MemorySourceArg, ModelsCommand, OnboardingAuthMethodArg, OnboardingCommand,
-    OnboardingFlowArg, PatchCommand, PluginsCommand, PolicyCommand, ProtocolCommand,
-    RemoteVerificationModeArg, SandboxCommand, SandboxRuntimeArg, SecretsCommand,
-    SecurityCommand, SessionsCommand, SetupWizardOverridesArg, SkillsCommand,
-    SkillsPackageCommand, SupportBundleCommand, SystemCommand, SystemEventCommand,
-    SystemEventSeverityArg, WebhooksCommand, WizardOverridesArg, WorkspaceRoleArg,
+    AuthProfilesCommand, AuthProviderArg, AuthScopeArg, BrowserCommand, Cli, Command as CliCommand,
+    CompletionShell, ConfigCommand, ConfigureSectionArg, CronCommand, DaemonCommand, DocsCommand,
+    GatewayBindProfileArg, HooksCommand, InitModeArg, InitTlsScaffoldArg, JournalCheckpointModeArg,
+    MemoryCommand, MemoryScopeArg, MemorySourceArg, ModelsCommand, OnboardingAuthMethodArg,
+    OnboardingCommand, OnboardingFlowArg, PatchCommand, PluginsCommand, PolicyCommand,
+    ProtocolCommand, RemoteVerificationModeArg, SandboxCommand, SandboxRuntimeArg, SecretsCommand,
+    SecurityCommand, SessionsCommand, SetupWizardOverridesArg, SkillsCommand, SkillsPackageCommand,
+    SupportBundleCommand, SystemCommand, SystemEventCommand, SystemEventSeverityArg,
+    WebhooksCommand, WizardOverridesArg, WorkspaceRoleArg,
 };
 use cli::{PairingClientKindArg, PairingCommand, PairingMethodArg};
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
@@ -1105,11 +1104,8 @@ fn collect_doctor_access_snapshot() -> DoctorAccessSnapshot {
         }
     };
 
-    let feature_flags = value
-        .get("feature_flags")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    let feature_flags =
+        value.get("feature_flags").and_then(Value::as_array).cloned().unwrap_or_default();
     let compat_api_enabled = doctor_access_flag_enabled(feature_flags.as_slice(), "compat_api");
     let api_tokens_enabled = doctor_access_flag_enabled(feature_flags.as_slice(), "api_tokens");
     let team_mode_enabled = doctor_access_flag_enabled(feature_flags.as_slice(), "team_mode");
@@ -1119,9 +1115,11 @@ fn collect_doctor_access_snapshot() -> DoctorAccessSnapshot {
 
     let missing_flags = ["compat_api", "api_tokens", "team_mode", "rbac", "staged_rollout"]
         .into_iter()
-        .filter(|key| !feature_flags.iter().any(|entry| {
-            entry.get("key").and_then(Value::as_str).is_some_and(|value| value == *key)
-        }))
+        .filter(|key| {
+            !feature_flags.iter().any(|entry| {
+                entry.get("key").and_then(Value::as_str).is_some_and(|value| value == *key)
+            })
+        })
         .count();
     let workspaces_missing_runtime = value
         .get("workspaces")
@@ -1149,7 +1147,10 @@ fn collect_doctor_access_snapshot() -> DoctorAccessSnapshot {
             tokens
                 .iter()
                 .filter(|token| {
-                    token.get("scopes").and_then(Value::as_array).is_none_or(|value| value.is_empty())
+                    token
+                        .get("scopes")
+                        .and_then(Value::as_array)
+                        .is_none_or(|value| value.is_empty())
                 })
                 .count()
         })
@@ -7906,8 +7907,8 @@ mod init_command_tests {
 #[cfg(test)]
 mod diagnostics_bundle_tests {
     use super::{
-        encode_support_bundle_with_cap, extract_support_bundle_error_message,
-        DoctorAccessSnapshot, DoctorBrowserSnapshot, DoctorConfigSnapshot, DoctorConnectivityProbe,
+        encode_support_bundle_with_cap, extract_support_bundle_error_message, DoctorAccessSnapshot,
+        DoctorBrowserSnapshot, DoctorConfigSnapshot, DoctorConnectivityProbe,
         DoctorConnectivitySnapshot, DoctorDeploymentBindSnapshot, DoctorDeploymentSnapshot,
         DoctorIdentitySnapshot, DoctorProviderAuthSnapshot, DoctorReport, DoctorSandboxSnapshot,
         DoctorSummary, SkillsInventorySnapshot, SupportBundle, SupportBundleBuildSnapshot,

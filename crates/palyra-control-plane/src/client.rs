@@ -1009,16 +1009,14 @@ impl ControlPlaneClient {
     }
 
     pub async fn get_access_snapshot(&self) -> Result<Value, ControlPlaneClientError> {
-        self.request_json(Method::GET, "console/v1/access", None::<&Value>, false)
-            .await
+        self.request_json(Method::GET, "console/v1/access", None::<&Value>, false).await
     }
 
     pub async fn run_access_backfill(
         &self,
         request: &Value,
     ) -> Result<Value, ControlPlaneClientError> {
-        self.request_json(Method::POST, "console/v1/access/backfill", Some(request), true)
-            .await
+        self.request_json(Method::POST, "console/v1/access/backfill", Some(request), true).await
     }
 
     pub async fn set_access_feature_flag(
@@ -1036,21 +1034,14 @@ impl ControlPlaneClient {
     }
 
     pub async fn list_access_api_tokens(&self) -> Result<Value, ControlPlaneClientError> {
-        self.request_json(
-            Method::GET,
-            "console/v1/access/api-tokens",
-            None::<&Value>,
-            false,
-        )
-        .await
+        self.request_json(Method::GET, "console/v1/access/api-tokens", None::<&Value>, false).await
     }
 
     pub async fn create_access_api_token(
         &self,
         request: &Value,
     ) -> Result<Value, ControlPlaneClientError> {
-        self.request_json(Method::POST, "console/v1/access/api-tokens", Some(request), true)
-            .await
+        self.request_json(Method::POST, "console/v1/access/api-tokens", Some(request), true).await
     }
 
     pub async fn rotate_access_api_token(
@@ -1083,63 +1074,45 @@ impl ControlPlaneClient {
         &self,
         request: &Value,
     ) -> Result<Value, ControlPlaneClientError> {
-        self.request_json(Method::POST, "console/v1/access/workspaces", Some(request), true)
-            .await
+        self.request_json(Method::POST, "console/v1/access/workspaces", Some(request), true).await
     }
 
     pub async fn create_access_invitation(
         &self,
         request: &Value,
     ) -> Result<Value, ControlPlaneClientError> {
-        self.request_json(Method::POST, "console/v1/access/invitations", Some(request), true)
-            .await
+        self.request_json(Method::POST, "console/v1/access/invitations", Some(request), true).await
     }
 
     pub async fn accept_access_invitation(
         &self,
         request: &Value,
     ) -> Result<Value, ControlPlaneClientError> {
-        self.request_json(
-            Method::POST,
-            "console/v1/access/invitations/accept",
-            Some(request),
-            true,
-        )
-        .await
+        self.request_json(Method::POST, "console/v1/access/invitations/accept", Some(request), true)
+            .await
     }
 
     pub async fn update_access_membership_role(
         &self,
         request: &Value,
     ) -> Result<Value, ControlPlaneClientError> {
-        self.request_json(
-            Method::POST,
-            "console/v1/access/memberships/role",
-            Some(request),
-            true,
-        )
-        .await
+        self.request_json(Method::POST, "console/v1/access/memberships/role", Some(request), true)
+            .await
     }
 
     pub async fn remove_access_membership(
         &self,
         request: &Value,
     ) -> Result<Value, ControlPlaneClientError> {
-        self.request_json(
-            Method::POST,
-            "console/v1/access/memberships/remove",
-            Some(request),
-            true,
-        )
-        .await
+        self.request_json(Method::POST, "console/v1/access/memberships/remove", Some(request), true)
+            .await
     }
 
     pub async fn upsert_access_share(
         &self,
         request: &Value,
     ) -> Result<Value, ControlPlaneClientError> {
-        self.request_json(Method::POST, "console/v1/access/shares", Some(request), true)
-            .await
+        self.request_json(Method::POST, "console/v1/access/shares", Some(request), true).await
     }
 
     pub async fn get_pairing_summary(

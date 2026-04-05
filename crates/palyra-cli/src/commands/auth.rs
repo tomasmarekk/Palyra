@@ -286,8 +286,8 @@ async fn run_auth_access_async(command: AuthCommand) -> Result<()> {
     let AuthCommand::Access { command } = command else {
         anyhow::bail!("auth access dispatch received an incompatible auth command");
     };
-    let context = client::control_plane::connect_admin_console(app::ConnectionOverrides::default())
-        .await?;
+    let context =
+        client::control_plane::connect_admin_console(app::ConnectionOverrides::default()).await?;
     match command {
         AuthAccessCommand::Status { json } => {
             let payload = context
@@ -305,12 +305,7 @@ async fn run_auth_access_async(command: AuthCommand) -> Result<()> {
                 .context("failed to run access backfill")?;
             emit_access_payload(payload, json)?;
         }
-        AuthAccessCommand::Feature {
-            feature_key,
-            enabled,
-            stage,
-            json,
-        } => {
+        AuthAccessCommand::Feature { feature_key, enabled, stage, json } => {
             let payload = context
                 .client
                 .set_access_feature_flag(
@@ -344,17 +339,15 @@ async fn run_auth_access_async(command: AuthCommand) -> Result<()> {
         } => {
             let payload = context
                 .client
-                .create_access_api_token(
-                    &json!({
-                        "label": label,
-                        "principal": principal,
-                        "workspace_id": workspace_id,
-                        "role": workspace_role_arg_to_text(role),
-                        "scopes": scope,
-                        "expires_at_unix_ms": expires_at_unix_ms,
-                        "rate_limit_per_minute": rate_limit_per_minute,
-                    }),
-                )
+                .create_access_api_token(&json!({
+                    "label": label,
+                    "principal": principal,
+                    "workspace_id": workspace_id,
+                    "role": workspace_role_arg_to_text(role),
+                    "scopes": scope,
+                    "expires_at_unix_ms": expires_at_unix_ms,
+                    "rate_limit_per_minute": rate_limit_per_minute,
+                }))
                 .await
                 .context("failed to create access API token")?;
             emit_access_payload(payload, json)?;
@@ -375,19 +368,13 @@ async fn run_auth_access_async(command: AuthCommand) -> Result<()> {
                 .with_context(|| format!("failed to revoke access API token {token_id}"))?;
             emit_access_payload(payload, json)?;
         }
-        AuthAccessCommand::WorkspaceCreate {
-            team_name,
-            workspace_name,
-            json,
-        } => {
+        AuthAccessCommand::WorkspaceCreate { team_name, workspace_name, json } => {
             let payload = context
                 .client
-                .create_access_workspace(
-                    &json!({
-                        "team_name": team_name,
-                        "workspace_name": workspace_name,
-                    }),
-                )
+                .create_access_workspace(&json!({
+                    "team_name": team_name,
+                    "workspace_name": workspace_name,
+                }))
                 .await
                 .context("failed to create access workspace")?;
             emit_access_payload(payload, json)?;
@@ -401,22 +388,17 @@ async fn run_auth_access_async(command: AuthCommand) -> Result<()> {
         } => {
             let payload = context
                 .client
-                .create_access_invitation(
-                    &json!({
-                        "workspace_id": workspace_id,
-                        "invited_identity": invited_identity,
-                        "role": workspace_role_arg_to_text(role),
-                        "expires_at_unix_ms": expires_at_unix_ms,
-                    }),
-                )
+                .create_access_invitation(&json!({
+                    "workspace_id": workspace_id,
+                    "invited_identity": invited_identity,
+                    "role": workspace_role_arg_to_text(role),
+                    "expires_at_unix_ms": expires_at_unix_ms,
+                }))
                 .await
                 .context("failed to create access invitation")?;
             emit_access_payload(payload, json)?;
         }
-        AuthAccessCommand::InviteAccept {
-            invitation_token,
-            json,
-        } => {
+        AuthAccessCommand::InviteAccept { invitation_token, json } => {
             let payload = context
                 .client
                 .accept_access_invitation(&json!({ "invitation_token": invitation_token }))
@@ -424,38 +406,25 @@ async fn run_auth_access_async(command: AuthCommand) -> Result<()> {
                 .context("failed to accept access invitation")?;
             emit_access_payload(payload, json)?;
         }
-        AuthAccessCommand::MembershipRole {
-            workspace_id,
-            member_principal,
-            role,
-            json,
-        } => {
+        AuthAccessCommand::MembershipRole { workspace_id, member_principal, role, json } => {
             let payload = context
                 .client
-                .update_access_membership_role(
-                    &json!({
-                        "workspace_id": workspace_id,
-                        "member_principal": member_principal,
-                        "role": workspace_role_arg_to_text(role),
-                    }),
-                )
+                .update_access_membership_role(&json!({
+                    "workspace_id": workspace_id,
+                    "member_principal": member_principal,
+                    "role": workspace_role_arg_to_text(role),
+                }))
                 .await
                 .context("failed to update workspace membership role")?;
             emit_access_payload(payload, json)?;
         }
-        AuthAccessCommand::MembershipRemove {
-            workspace_id,
-            member_principal,
-            json,
-        } => {
+        AuthAccessCommand::MembershipRemove { workspace_id, member_principal, json } => {
             let payload = context
                 .client
-                .remove_access_membership(
-                    &json!({
-                        "workspace_id": workspace_id,
-                        "member_principal": member_principal,
-                    }),
-                )
+                .remove_access_membership(&json!({
+                    "workspace_id": workspace_id,
+                    "member_principal": member_principal,
+                }))
                 .await
                 .context("failed to remove workspace membership")?;
             emit_access_payload(payload, json)?;
@@ -469,14 +438,12 @@ async fn run_auth_access_async(command: AuthCommand) -> Result<()> {
         } => {
             let payload = context
                 .client
-                .upsert_access_share(
-                    &json!({
-                        "workspace_id": workspace_id,
-                        "resource_kind": resource_kind,
-                        "resource_id": resource_id,
-                        "access_level": access_level,
-                    }),
-                )
+                .upsert_access_share(&json!({
+                    "workspace_id": workspace_id,
+                    "resource_kind": resource_kind,
+                    "resource_id": resource_id,
+                    "access_level": access_level,
+                }))
                 .await
                 .context("failed to upsert access share")?;
             emit_access_payload(payload, json)?;

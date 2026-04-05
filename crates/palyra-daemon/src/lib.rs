@@ -1,9 +1,9 @@
 #![recursion_limit = "256"]
 
+mod access_control;
 mod agents;
 pub mod app;
 pub mod application;
-mod access_control;
 mod background_queue;
 mod channel_router;
 mod channels;

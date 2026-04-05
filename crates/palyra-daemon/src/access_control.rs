@@ -531,10 +531,8 @@ impl AccessRegistry {
             .filter(|workspace| visible_workspace_ids.contains(workspace.workspace_id.as_str()))
             .cloned()
             .collect::<Vec<_>>();
-        let visible_team_ids = workspaces
-            .iter()
-            .map(|workspace| workspace.team_id.clone())
-            .collect::<BTreeSet<_>>();
+        let visible_team_ids =
+            workspaces.iter().map(|workspace| workspace.team_id.clone()).collect::<BTreeSet<_>>();
         AccessRegistrySnapshot {
             version: self.data.version,
             feature_flags: self.data.feature_flags.clone(),
@@ -587,12 +585,8 @@ impl AccessRegistry {
                     || workspace.runtime_device_id.trim().is_empty()
             })
             .count();
-        let api_tokens_missing_scopes = self
-            .data
-            .api_tokens
-            .iter()
-            .filter(|token| token.scopes.is_empty())
-            .count();
+        let api_tokens_missing_scopes =
+            self.data.api_tokens.iter().filter(|token| token.scopes.is_empty()).count();
         let orphaned_memberships = self
             .data
             .memberships
@@ -975,11 +969,8 @@ impl AccessRegistry {
                 "personal API token rotation requires the owning principal".to_owned(),
             ));
         }
-        if let Some(record) = self
-            .data
-            .api_tokens
-            .iter_mut()
-            .find(|record| record.token_id == token_id)
+        if let Some(record) =
+            self.data.api_tokens.iter_mut().find(|record| record.token_id == token_id)
         {
             record.revoked_at_unix_ms = Some(now);
             record.updated_at_unix_ms = now;
@@ -1311,11 +1302,8 @@ impl AccessRegistry {
                 "invitation was issued for a different principal".to_owned(),
             ));
         }
-        if let Some(record) = self
-            .data
-            .invitations
-            .iter_mut()
-            .find(|record| record.token_hash_sha256 == hash)
+        if let Some(record) =
+            self.data.invitations.iter_mut().find(|record| record.token_hash_sha256 == hash)
         {
             record.accepted_at_unix_ms = Some(now);
             record.accepted_by_principal = Some(actor_principal.to_owned());
@@ -1336,7 +1324,9 @@ impl AccessRegistry {
             .iter()
             .find(|workspace| workspace.workspace_id == membership.workspace_id)
             .cloned()
-            .ok_or_else(|| AccessRegistryError::WorkspaceNotFound(membership.workspace_id.clone()))?;
+            .ok_or_else(|| {
+                AccessRegistryError::WorkspaceNotFound(membership.workspace_id.clone())
+            })?;
         let team = self
             .data
             .teams
@@ -1378,7 +1368,8 @@ impl AccessRegistry {
                 .memberships
                 .iter_mut()
                 .find(|membership| {
-                    membership.workspace_id == workspace_id && membership.principal == member_principal
+                    membership.workspace_id == workspace_id
+                        && membership.principal == member_principal
                 })
                 .ok_or_else(|| {
                     AccessRegistryError::AccessDenied(format!(
@@ -1463,7 +1454,8 @@ impl AccessRegistry {
             request.workspace_id.as_str(),
             PERMISSION_SHARING_MANAGE,
         )?;
-        let resource_kind = normalize_required_text(request.resource_kind.as_str(), "resource_kind")?;
+        let resource_kind =
+            normalize_required_text(request.resource_kind.as_str(), "resource_kind")?;
         let resource_id = normalize_required_text(request.resource_id.as_str(), "resource_id")?;
         let access_level = normalize_required_text(request.access_level.as_str(), "access_level")?;
         if let Some(existing) = self.data.shares.iter_mut().find(|share| {
@@ -1502,7 +1494,9 @@ impl AccessRegistry {
             .data
             .memberships
             .iter()
-            .find(|membership| membership.workspace_id == workspace_id && membership.principal == principal)
+            .find(|membership| {
+                membership.workspace_id == workspace_id && membership.principal == principal
+            })
             .ok_or_else(|| {
                 AccessRegistryError::AccessDenied(format!(
                     "principal '{principal}' is not a member of workspace '{workspace_id}'"
@@ -1546,8 +1540,12 @@ impl AccessRegistry {
         let Some(workspace_id) = token.workspace_id.as_deref() else {
             return Ok(None);
         };
-        self.authorize_workspace_permission(token.principal.as_str(), workspace_id, required_permission)
-            .map(Some)
+        self.authorize_workspace_permission(
+            token.principal.as_str(),
+            workspace_id,
+            required_permission,
+        )
+        .map(Some)
     }
 
     fn workspace_role_for_principal(
@@ -1558,7 +1556,9 @@ impl AccessRegistry {
         self.data
             .memberships
             .iter()
-            .find(|membership| membership.workspace_id == workspace_id && membership.principal == principal)
+            .find(|membership| {
+                membership.workspace_id == workspace_id && membership.principal == principal
+            })
             .map(|membership| membership.role)
             .ok_or_else(|| {
                 AccessRegistryError::AccessDenied(format!(
@@ -1589,7 +1589,9 @@ impl AccessRegistry {
                         .count(),
                     error_events: events
                         .iter()
-                        .filter(|event| event.outcome.contains("error") || event.outcome == "denied")
+                        .filter(|event| {
+                            event.outcome.contains("error") || event.outcome == "denied"
+                        })
                         .count(),
                     latest_at_unix_ms: events.iter().map(|event| event.recorded_at_unix_ms).max(),
                 }
@@ -1753,11 +1755,13 @@ fn repair_access_registry_data(data: &mut AccessRegistryFile) -> AccessBackfillR
             changed = true;
         }
         if workspace.runtime_principal.trim().is_empty() {
-            workspace.runtime_principal = workspace_runtime_principal(workspace.workspace_id.as_str());
+            workspace.runtime_principal =
+                workspace_runtime_principal(workspace.workspace_id.as_str());
             changed = true;
         }
         if workspace.runtime_device_id.trim().is_empty() {
-            workspace.runtime_device_id = workspace_runtime_device_id(workspace.workspace_id.as_str());
+            workspace.runtime_device_id =
+                workspace_runtime_device_id(workspace.workspace_id.as_str());
             changed = true;
         }
         if changed {
@@ -1837,10 +1841,7 @@ fn repair_access_registry_data(data: &mut AccessRegistryFile) -> AccessBackfillR
     }
 }
 
-fn normalize_required_text(
-    raw: &str,
-    field: &'static str,
-) -> Result<String, AccessRegistryError> {
+fn normalize_required_text(raw: &str, field: &'static str) -> Result<String, AccessRegistryError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(AccessRegistryError::InvalidField {
@@ -2025,10 +2026,22 @@ mod tests {
         let temp = tempdir().expect("tempdir should exist");
         let mut registry = AccessRegistry::open(temp.path()).expect("registry should open");
         registry
-            .set_feature_flag(FEATURE_COMPAT_API, true, Some("admin_only".to_owned()), "user:ops", 1)
+            .set_feature_flag(
+                FEATURE_COMPAT_API,
+                true,
+                Some("admin_only".to_owned()),
+                "user:ops",
+                1,
+            )
             .expect("compat api should enable");
         registry
-            .set_feature_flag(FEATURE_API_TOKENS, true, Some("admin_only".to_owned()), "user:ops", 2)
+            .set_feature_flag(
+                FEATURE_API_TOKENS,
+                true,
+                Some("admin_only".to_owned()),
+                "user:ops",
+                2,
+            )
             .expect("api tokens should enable");
         let created = registry
             .create_api_token(
@@ -2141,25 +2154,19 @@ mod tests {
             !before.backfill_required,
             "open() should already run non-destructive schema backfills"
         );
-        let report = registry
-            .run_backfill("user:ops", false, 100)
-            .expect("backfill should succeed");
+        let report =
+            registry.run_backfill("user:ops", false, 100).expect("backfill should succeed");
         assert_eq!(report.changed_records, 0, "second repair pass should be idempotent");
         let snapshot = registry.snapshot("user:ops");
         assert_eq!(snapshot.rollout.external_api_safe_mode, true);
         assert!(
-            snapshot
-                .feature_flags
-                .iter()
-                .any(|flag| flag.key == FEATURE_STAGED_ROLLOUT),
+            snapshot.feature_flags.iter().any(|flag| flag.key == FEATURE_STAGED_ROLLOUT),
             "backfill should restore missing rollout package flags"
         );
         assert_eq!(snapshot.api_tokens[0].rate_limit_per_minute, 10);
-        assert!(
-            snapshot.api_tokens[0]
-                .scopes
-                .iter()
-                .any(|scope| scope == PERMISSION_COMPAT_CHAT_CREATE)
-        );
+        assert!(snapshot.api_tokens[0]
+            .scopes
+            .iter()
+            .any(|scope| scope == PERMISSION_COMPAT_CHAT_CREATE));
     }
 }
