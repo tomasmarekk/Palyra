@@ -3,6 +3,7 @@
 mod agents;
 pub mod app;
 pub mod application;
+mod access_control;
 mod background_queue;
 mod channel_router;
 mod channels;
@@ -1668,6 +1669,10 @@ pub async fn run() -> Result<()> {
         routines::RoutineRegistry::open(runtime_state_root.as_path())
             .context("failed to initialize routine registry state")?,
     );
+    let access_registry = Arc::new(Mutex::new(
+        access_control::AccessRegistry::open(runtime_state_root.as_path())
+            .context("failed to initialize access registry state")?,
+    ));
     let auth_runtime = Arc::new(gateway::AuthRuntimeState::new(
         Arc::clone(&auth_registry),
         Arc::new(HttpOAuthRefreshAdapter::default()) as Arc<dyn OAuthRefreshAdapter>,
@@ -2070,6 +2075,7 @@ pub async fn run() -> Result<()> {
             auth: auth.clone(),
             grpc_url: grpc_url.clone(),
             scheduler_wake: Arc::clone(&scheduler_wake),
+            access_registry: Arc::clone(&access_registry),
         },
     );
     let hook_runtime_policy = wasm_plugin_runner::WasmPluginRunnerPolicy {

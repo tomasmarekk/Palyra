@@ -54,6 +54,10 @@ pub(crate) async fn console_diagnostics_handler(
     let memory_status =
         state.runtime.memory_maintenance_status().await.map_err(runtime_status_response)?;
     let memory_runtime_config = state.runtime.memory_config_snapshot();
+    let access_snapshot = {
+        let registry = super::access::lock_access_registry(&state.access_registry);
+        registry.snapshot(session.context.principal.as_str())
+    };
     let deployment_payload = collect_console_deployment_diagnostics(&state);
     let observability_payload =
         build_observability_payload(&state, &auth_payload, &media_payload).await?;
@@ -81,6 +85,12 @@ pub(crate) async fn console_diagnostics_handler(
         "hooks": hooks_payload,
         "webhooks": webhook_payload,
         "media": media_payload,
+        "access": {
+            "feature_flags": access_snapshot.feature_flags,
+            "migration": access_snapshot.migration,
+            "rollout": access_snapshot.rollout,
+            "telemetry": access_snapshot.telemetry,
+        },
         "deployment": deployment_payload,
         "observability": observability_payload,
         "memory": {

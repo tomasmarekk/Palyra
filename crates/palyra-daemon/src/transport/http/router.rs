@@ -8,7 +8,7 @@ use axum::{
 use crate::{
     app::state::AppState,
     transport::http::{
-        handlers::{admin, canvas, console, health, web_ui},
+        handlers::{admin, canvas, compat, console, health, web_ui},
         middleware as http_middleware,
     },
     HTTP_MAX_REQUEST_BODY_BYTES,
@@ -132,6 +132,59 @@ pub(crate) fn build_router(state: AppState) -> Router {
             http_middleware::admin_console_security_headers_middleware,
         ));
     let console_routes = Router::new()
+        .route("/console/v1/access", get(console::access::console_access_snapshot_handler))
+        .route(
+            "/console/v1/access/backfill",
+            post(console::access::console_access_backfill_handler),
+        )
+        .route(
+            "/console/v1/access/memberships",
+            get(console::access::console_access_memberships_handler),
+        )
+        .route(
+            "/console/v1/access/features/{feature_key}",
+            post(console::access::console_access_feature_flag_set_handler),
+        )
+        .route(
+            "/console/v1/access/api-tokens",
+            get(console::access::console_access_api_tokens_list_handler),
+        )
+        .route(
+            "/console/v1/access/api-tokens",
+            post(console::access::console_access_api_token_create_handler),
+        )
+        .route(
+            "/console/v1/access/api-tokens/{token_id}/rotate",
+            post(console::access::console_access_api_token_rotate_handler),
+        )
+        .route(
+            "/console/v1/access/api-tokens/{token_id}/revoke",
+            post(console::access::console_access_api_token_revoke_handler),
+        )
+        .route(
+            "/console/v1/access/workspaces",
+            post(console::access::console_access_workspace_create_handler),
+        )
+        .route(
+            "/console/v1/access/invitations",
+            post(console::access::console_access_invitation_create_handler),
+        )
+        .route(
+            "/console/v1/access/invitations/accept",
+            post(console::access::console_access_invitation_accept_handler),
+        )
+        .route(
+            "/console/v1/access/memberships/role",
+            post(console::access::console_access_membership_role_handler),
+        )
+        .route(
+            "/console/v1/access/memberships/remove",
+            post(console::access::console_access_membership_remove_handler),
+        )
+        .route(
+            "/console/v1/access/shares",
+            post(console::access::console_access_share_upsert_handler),
+        )
         .route("/console/v1/auth/login", post(console::auth::console_login_handler))
         .route("/console/v1/auth/logout", post(console::auth::console_logout_handler))
         .route("/console/v1/auth/session", get(console::auth::console_session_handler))
@@ -895,9 +948,21 @@ pub(crate) fn build_router(state: AppState) -> Router {
             http_middleware::canvas_rate_limit_middleware,
         ))
         .route_layer(middleware::from_fn(http_middleware::canvas_security_headers_middleware));
+    let compat_routes = Router::new()
+        .route("/v1/models", get(compat::compat_models_handler))
+        .route(
+            "/v1/chat/completions",
+            post(compat::compat_chat_completions_handler),
+        )
+        .route("/v1/responses", post(compat::compat_responses_handler))
+        .layer(DefaultBodyLimit::max(HTTP_MAX_REQUEST_BODY_BYTES))
+        .route_layer(middleware::from_fn(
+            http_middleware::admin_console_security_headers_middleware,
+        ));
     Router::new()
         .route("/runtime", get(health::dashboard_handoff_handler))
         .route("/healthz", get(health::health_handler))
+        .merge(compat_routes)
         .merge(canvas_routes)
         .merge(admin_routes)
         .merge(console_routes)

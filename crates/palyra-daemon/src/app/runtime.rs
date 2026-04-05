@@ -8,11 +8,13 @@ use std::{
 use tokio::sync::Notify;
 
 use super::state::{
-    AdminRateLimitEntry, AppState, CanvasRateLimitEntry, ConsoleBrowserHandoff,
+    AdminRateLimitEntry, AppState, CanvasRateLimitEntry, CompatApiRateLimitEntry,
+    ConsoleBrowserHandoff,
     ConsoleChatRunStream, ConsoleRelayToken, ConsoleSession, DeploymentRuntimeSnapshot,
     RemoteAdminAccessAttempt,
 };
 use crate::{
+    access_control::AccessRegistry,
     channels,
     config::{BrowserServiceConfig, LoadedConfig},
     gateway::{self, GatewayAuthConfig, GatewayRuntimeState},
@@ -35,6 +37,7 @@ pub(crate) struct AppStateBuildContext {
     pub(crate) auth: GatewayAuthConfig,
     pub(crate) grpc_url: String,
     pub(crate) scheduler_wake: Arc<Notify>,
+    pub(crate) access_registry: Arc<Mutex<AccessRegistry>>,
 }
 
 pub(crate) fn build_app_state(
@@ -59,6 +62,9 @@ pub(crate) fn build_app_state(
         auth: context.auth,
         admin_rate_limit: Arc::new(Mutex::new(HashMap::<IpAddr, AdminRateLimitEntry>::new())),
         canvas_rate_limit: Arc::new(Mutex::new(HashMap::<IpAddr, CanvasRateLimitEntry>::new())),
+        compat_api_rate_limit: Arc::new(Mutex::new(
+            HashMap::<String, CompatApiRateLimitEntry>::new(),
+        )),
         cron_timezone_mode: loaded.cron.timezone,
         grpc_url: context.grpc_url,
         scheduler_wake: context.scheduler_wake,
@@ -73,6 +79,7 @@ pub(crate) fn build_app_state(
         observability: Arc::new(ObservabilityState::default()),
         deployment: build_deployment_runtime_snapshot(loaded, dangerous_remote_bind_ack_env),
         remote_admin_access: Arc::new(Mutex::new(None::<RemoteAdminAccessAttempt>)),
+        access_registry: context.access_registry,
     }
 }
 

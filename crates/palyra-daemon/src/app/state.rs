@@ -15,6 +15,7 @@ use tokio::sync::{mpsc, Notify};
 
 use crate::gateway::proto::palyra::common::v1 as common_v1;
 use crate::{
+    access_control::AccessRegistry,
     channels,
     cron::CronTimezoneMode,
     gateway::{self, GatewayAuthConfig, GatewayRuntimeState},
@@ -40,6 +41,7 @@ pub(crate) struct AppState {
     pub(crate) auth: GatewayAuthConfig,
     pub(crate) admin_rate_limit: Arc<Mutex<HashMap<IpAddr, AdminRateLimitEntry>>>,
     pub(crate) canvas_rate_limit: Arc<Mutex<HashMap<IpAddr, CanvasRateLimitEntry>>>,
+    pub(crate) compat_api_rate_limit: Arc<Mutex<HashMap<String, CompatApiRateLimitEntry>>>,
     pub(crate) cron_timezone_mode: CronTimezoneMode,
     pub(crate) grpc_url: String,
     pub(crate) scheduler_wake: Arc<Notify>,
@@ -52,6 +54,7 @@ pub(crate) struct AppState {
     pub(crate) observability: Arc<ObservabilityState>,
     pub(crate) deployment: DeploymentRuntimeSnapshot,
     pub(crate) remote_admin_access: Arc<Mutex<Option<RemoteAdminAccessAttempt>>>,
+    pub(crate) access_registry: Arc<Mutex<AccessRegistry>>,
 }
 
 #[derive(Debug, Clone)]
@@ -136,6 +139,12 @@ pub(crate) struct AdminRateLimitEntry {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CanvasRateLimitEntry {
+    pub(crate) window_started_at: Instant,
+    pub(crate) requests_in_window: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CompatApiRateLimitEntry {
     pub(crate) window_started_at: Instant,
     pub(crate) requests_in_window: u32,
 }
