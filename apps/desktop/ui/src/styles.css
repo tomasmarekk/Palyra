@@ -267,6 +267,129 @@ samp {
   padding-right: 0.25rem;
 }
 
+.desktop-root--companion {
+  padding-bottom: 3rem;
+}
+
+.desktop-stack {
+  display: grid;
+  gap: 1rem;
+}
+
+.desktop-stack--compact {
+  gap: 0.5rem;
+}
+
+.desktop-inline-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.desktop-list {
+  margin: 0;
+  padding-left: 1rem;
+  display: grid;
+  gap: 0.55rem;
+}
+
+.desktop-list-button {
+  width: 100%;
+  display: grid;
+  gap: 0.5rem;
+  padding: 0.9rem 1rem;
+  border: 1px solid color-mix(in oklab, var(--border) 72%, transparent);
+  border-radius: var(--field-radius);
+  background: color-mix(in oklab, var(--surface-secondary) 88%, transparent);
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    border-color 120ms ease,
+    background-color 120ms ease,
+    transform 120ms ease;
+}
+
+.desktop-list-button:hover,
+.desktop-list-button:focus-visible {
+  border-color: color-mix(in oklab, var(--accent) 48%, transparent);
+  background: color-mix(in oklab, var(--accent) 10%, var(--surface-secondary));
+  transform: translateY(-1px);
+}
+
+.desktop-list-button.is-active {
+  border-color: color-mix(in oklab, var(--accent) 56%, transparent);
+  background: color-mix(in oklab, var(--accent) 14%, var(--surface-secondary));
+}
+
+.desktop-transcript {
+  max-height: min(28rem, 52vh);
+}
+
+.desktop-transcript-entry,
+.desktop-timeline-item,
+.desktop-capability-card,
+.desktop-code-block {
+  border: 1px solid color-mix(in oklab, var(--border) 72%, transparent);
+  border-radius: var(--field-radius);
+  background: color-mix(in oklab, var(--surface-secondary) 88%, transparent);
+  padding: 0.9rem 1rem;
+}
+
+.desktop-transcript-entry {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.desktop-transcript-entry--default {
+  border-color: color-mix(in oklab, var(--border) 72%, transparent);
+}
+
+.desktop-transcript-entry--success {
+  border-color: color-mix(in oklab, var(--success) 38%, transparent);
+  background: color-mix(in oklab, var(--success) 8%, var(--surface-secondary));
+}
+
+.desktop-transcript-entry--warning {
+  border-color: color-mix(in oklab, var(--warning) 42%, transparent);
+  background: color-mix(in oklab, var(--warning) 10%, var(--surface-secondary));
+}
+
+.desktop-transcript-entry--danger {
+  border-color: color-mix(in oklab, var(--danger) 42%, transparent);
+  background: color-mix(in oklab, var(--danger) 10%, var(--surface-secondary));
+}
+
+.desktop-timeline-item {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.desktop-timeline-item.is-unread {
+  border-color: color-mix(in oklab, var(--accent) 56%, transparent);
+}
+
+.desktop-capability-grid {
+  display: grid;
+  gap: 0.85rem;
+  grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+}
+
+.desktop-capability-card {
+  display: grid;
+  gap: 0.55rem;
+}
+
+.desktop-code-block {
+  overflow: auto;
+  font-size: 0.85rem;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .desktop-attention-list {
   margin: 0;
   padding-left: 1rem;

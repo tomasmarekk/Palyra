@@ -4,6 +4,15 @@ use anyhow::Result;
 use tauri::{AppHandle, Manager, State};
 use tokio::sync::Mutex;
 
+use super::companion::{
+    build_companion_handoff_url, build_companion_snapshot, decide_companion_approval,
+    fetch_companion_transcript, resolve_companion_chat_session, send_companion_chat_message,
+    DesktopCompanionApprovalDecisionRequest, DesktopCompanionNotificationsRequest,
+    DesktopCompanionOpenDashboardRequest, DesktopCompanionPreferencesRequest,
+    DesktopCompanionResolveSessionRequest, DesktopCompanionRolloutRequest,
+    DesktopCompanionSendMessageRequest, DesktopCompanionSendMessageResult,
+    DesktopCompanionSnapshot, DesktopSessionTranscriptEnvelope,
+};
 use super::features::onboarding::connectors::discord::{
     apply_discord_onboarding, run_discord_onboarding_preflight, verify_discord_connector,
     DiscordControlPlaneInputs, DiscordOnboardingApplySnapshot, DiscordOnboardingPreflightSnapshot,
@@ -96,6 +105,24 @@ pub(crate) async fn get_desktop_refresh_payload(
 }
 
 #[tauri::command]
+pub(crate) async fn get_desktop_companion_snapshot(
+    state: State<'_, DesktopAppState>,
+) -> Result<DesktopCompanionSnapshot, String> {
+    let inputs = {
+        let mut supervisor = state.supervisor.lock().await;
+        supervisor.capture_companion_inputs()
+    };
+    let mut snapshot = build_companion_snapshot(inputs).await.map_err(command_error)?;
+    {
+        let mut supervisor = state.supervisor.lock().await;
+        supervisor
+            .reconcile_companion_snapshot(&mut snapshot)
+            .map_err(command_error)?;
+    }
+    Ok(snapshot)
+}
+
+#[tauri::command]
 pub(crate) async fn acknowledge_onboarding_welcome(
     state: State<'_, DesktopAppState>,
 ) -> Result<ActionResult, String> {
@@ -132,6 +159,54 @@ pub(crate) async fn set_browser_service_enabled(
     supervisor.set_browser_service_enabled(enabled).map_err(command_error)?;
     let message = if enabled { "browser sidecar enabled" } else { "browser sidecar disabled" };
     Ok(ActionResult { ok: true, message: message.to_owned() })
+}
+
+#[tauri::command]
+pub(crate) async fn update_desktop_companion_preferences(
+    state: State<'_, DesktopAppState>,
+    payload: DesktopCompanionPreferencesRequest,
+) -> Result<ActionResult, String> {
+    let mut supervisor = state.supervisor.lock().await;
+    supervisor
+        .update_companion_preferences(&payload)
+        .map_err(command_error)?;
+    Ok(ActionResult { ok: true, message: "desktop companion preferences updated".to_owned() })
+}
+
+#[tauri::command]
+pub(crate) async fn update_desktop_companion_rollout(
+    state: State<'_, DesktopAppState>,
+    payload: DesktopCompanionRolloutRequest,
+) -> Result<ActionResult, String> {
+    let mut supervisor = state.supervisor.lock().await;
+    supervisor
+        .update_companion_rollout(&payload)
+        .map_err(command_error)?;
+    Ok(ActionResult { ok: true, message: "desktop companion rollout updated".to_owned() })
+}
+
+#[tauri::command]
+pub(crate) async fn mark_desktop_companion_notifications_read(
+    state: State<'_, DesktopAppState>,
+    payload: DesktopCompanionNotificationsRequest,
+) -> Result<ActionResult, String> {
+    let mut supervisor = state.supervisor.lock().await;
+    supervisor
+        .mark_companion_notifications_read(payload.ids.as_deref())
+        .map_err(command_error)?;
+    Ok(ActionResult { ok: true, message: "desktop companion notifications updated".to_owned() })
+}
+
+#[tauri::command]
+pub(crate) async fn remove_desktop_companion_offline_draft(
+    state: State<'_, DesktopAppState>,
+    draft_id: String,
+) -> Result<ActionResult, String> {
+    let mut supervisor = state.supervisor.lock().await;
+    supervisor
+        .remove_companion_offline_draft(draft_id.as_str())
+        .map_err(command_error)?;
+    Ok(ActionResult { ok: true, message: "desktop companion offline draft removed".to_owned() })
 }
 
 #[tauri::command]
@@ -216,6 +291,37 @@ pub(crate) async fn open_dashboard(
 }
 
 #[tauri::command]
+pub(crate) async fn open_desktop_companion_handoff(
+    state: State<'_, DesktopAppState>,
+    payload: DesktopCompanionOpenDashboardRequest,
+) -> Result<ActionResult, String> {
+    let (dashboard_inputs, companion_inputs) = {
+        let mut supervisor = state.supervisor.lock().await;
+        (
+            supervisor.capture_dashboard_open_inputs(),
+            supervisor.capture_companion_inputs(),
+        )
+    };
+    let control_center_snapshot =
+        build_companion_snapshot(companion_inputs).await.map_err(command_error)?.control_center;
+    let handoff_url = build_companion_handoff_url(
+        &dashboard_inputs.http_client,
+        &dashboard_inputs.runtime,
+        dashboard_inputs.admin_token.as_str(),
+        &control_center_snapshot,
+        &payload,
+    )
+    .await
+    .map_err(command_error)?;
+    let mut supervisor = state.supervisor.lock().await;
+    let opened = supervisor
+        .open_dashboard(handoff_url.as_str())
+        .map_err(command_error)?;
+    let _ = supervisor.mark_dashboard_handoff_complete();
+    Ok(ActionResult { ok: true, message: format!("opened {opened}") })
+}
+
+#[tauri::command]
 pub(crate) async fn export_support_bundle(
     state: State<'_, DesktopAppState>,
 ) -> Result<SupportBundleExportResult, String> {
@@ -241,6 +347,133 @@ pub(crate) async fn export_support_bundle(
             Err(message)
         }
     }
+}
+
+#[tauri::command]
+pub(crate) async fn resolve_desktop_companion_chat_session(
+    state: State<'_, DesktopAppState>,
+    payload: DesktopCompanionResolveSessionRequest,
+) -> Result<serde_json::Value, String> {
+    let (http_client, runtime, admin_token) = {
+        let supervisor = state.supervisor.lock().await;
+        (
+            supervisor.http_client.clone(),
+            supervisor.runtime.clone(),
+            supervisor.admin_token.clone(),
+        )
+    };
+    let session = resolve_companion_chat_session(&http_client, &runtime, admin_token.as_str(), &payload)
+        .await
+        .map_err(command_error)?;
+    {
+        let mut supervisor = state.supervisor.lock().await;
+        let request = DesktopCompanionPreferencesRequest {
+            active_section: None,
+            active_session_id: Some(session.session_id.clone()),
+            active_device_id: None,
+            last_run_id: None,
+        };
+        let _ = supervisor.update_companion_preferences(&request);
+    }
+    serde_json::to_value(session).map_err(command_error)
+}
+
+#[tauri::command]
+pub(crate) async fn get_desktop_companion_session_transcript(
+    state: State<'_, DesktopAppState>,
+    session_id: String,
+) -> Result<DesktopSessionTranscriptEnvelope, String> {
+    let (http_client, runtime, admin_token) = {
+        let supervisor = state.supervisor.lock().await;
+        (
+            supervisor.http_client.clone(),
+            supervisor.runtime.clone(),
+            supervisor.admin_token.clone(),
+        )
+    };
+    fetch_companion_transcript(&http_client, &runtime, admin_token.as_str(), session_id.as_str())
+        .await
+        .map_err(command_error)
+}
+
+#[tauri::command]
+pub(crate) async fn send_desktop_companion_chat_message(
+    state: State<'_, DesktopAppState>,
+    payload: DesktopCompanionSendMessageRequest,
+) -> Result<DesktopCompanionSendMessageResult, String> {
+    let (http_client, runtime, admin_token) = {
+        let supervisor = state.supervisor.lock().await;
+        (
+            supervisor.http_client.clone(),
+            supervisor.runtime.clone(),
+            supervisor.admin_token.clone(),
+        )
+    };
+    match send_companion_chat_message(&http_client, &runtime, admin_token.as_str(), &payload).await
+    {
+        Ok(mut result) => {
+            let mut supervisor = state.supervisor.lock().await;
+            let request = DesktopCompanionPreferencesRequest {
+                active_section: Some(super::DesktopCompanionSection::Chat),
+                active_session_id: Some(payload.session_id.clone()),
+                active_device_id: None,
+                last_run_id: result.run_id.clone(),
+            };
+            let _ = supervisor.update_companion_preferences(&request);
+            if let Some(draft_id) = payload.draft_id.as_deref() {
+                let _ = supervisor.remove_companion_offline_draft(draft_id);
+            }
+            if let (Some(run_id), Some(status)) = (result.run_id.as_deref(), result.status.as_deref())
+            {
+                let _ = supervisor.record_companion_run_completion(
+                    run_id,
+                    status,
+                    payload.session_id.as_str(),
+                );
+            }
+            result.message = format!("desktop companion sent a message to session {}", payload.session_id);
+            Ok(result)
+        }
+        Err(error) => {
+            if payload.queue_on_failure {
+                let mut supervisor = state.supervisor.lock().await;
+                let draft_id = supervisor
+                    .record_companion_offline_draft(
+                        Some(payload.session_id.as_str()),
+                        payload.text.as_str(),
+                        error.to_string().as_str(),
+                    )
+                    .map_err(command_error)?;
+                return Ok(DesktopCompanionSendMessageResult {
+                    queued_offline: true,
+                    queued_draft_id: Some(draft_id),
+                    run_id: None,
+                    status: Some("queued_offline".to_owned()),
+                    message: "Desktop queued the message locally because the control plane is unavailable.".to_owned(),
+                });
+            }
+            Err(command_error(error))
+        }
+    }
+}
+
+#[tauri::command]
+pub(crate) async fn decide_desktop_companion_approval(
+    state: State<'_, DesktopAppState>,
+    payload: DesktopCompanionApprovalDecisionRequest,
+) -> Result<serde_json::Value, String> {
+    let (http_client, runtime, admin_token) = {
+        let supervisor = state.supervisor.lock().await;
+        (
+            supervisor.http_client.clone(),
+            supervisor.runtime.clone(),
+            supervisor.admin_token.clone(),
+        )
+    };
+    let response = decide_companion_approval(&http_client, &runtime, admin_token.as_str(), &payload)
+        .await
+        .map_err(command_error)?;
+    Ok(response)
 }
 
 #[tauri::command]
@@ -550,14 +783,24 @@ pub(crate) fn run() {
             get_settings,
             get_onboarding_status,
             get_desktop_refresh_payload,
+            get_desktop_companion_snapshot,
             acknowledge_onboarding_welcome,
             set_onboarding_state_root_command,
             set_browser_service_enabled,
+            update_desktop_companion_preferences,
+            update_desktop_companion_rollout,
+            mark_desktop_companion_notifications_read,
+            remove_desktop_companion_offline_draft,
             start_palyra,
             stop_palyra,
             restart_palyra,
             open_dashboard,
+            open_desktop_companion_handoff,
             export_support_bundle,
+            resolve_desktop_companion_chat_session,
+            get_desktop_companion_session_transcript,
+            send_desktop_companion_chat_message,
+            decide_desktop_companion_approval,
             get_openai_auth_status,
             connect_openai_api_key_command,
             start_openai_oauth_bootstrap_command,

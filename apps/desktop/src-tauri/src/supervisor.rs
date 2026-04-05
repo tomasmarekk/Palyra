@@ -273,7 +273,7 @@ impl ControlCenter {
         })
     }
 
-    fn save_state_file(&self) -> Result<()> {
+    pub(crate) fn save_state_file(&self) -> Result<()> {
         let encoded = serde_json::to_string_pretty(&self.persisted)
             .context("failed to encode desktop state file")?;
         fs::write(self.state_file_path.as_path(), encoded).with_context(|| {

@@ -1,6 +1,8 @@
-# Desktop Control Center
+# Desktop Companion
 
-`apps/desktop` now hosts the **Palyra Desktop Control Center** implemented with Tauri.
+`apps/desktop` hosts the **Palyra Desktop Companion** implemented with Tauri. The current desktop
+runtime keeps the original control-center supervision features, but now layers a companion shell on
+top of the same local supervisor and `/console/v1` control-plane APIs.
 
 ## Platform support (v1)
 
@@ -16,15 +18,56 @@
 
 - Starts/stops/restarts `palyrad` sidecar process.
 - Optionally starts/stops/restarts `palyra-browserd` sidecar process.
-- Shows a minimal launcher and monitor surface with:
+- Shows a runtime launcher and monitor surface with:
   - gateway version + git hash,
   - uptime,
   - dashboard URL + access mode (`local`/`remote`),
   - gateway and browserd process state,
   - browser service status.
+- Hosts the desktop companion shell with:
+  - session-aware chat,
+  - approval inbox actions,
+  - desktop/system notifications,
+  - inventory and capability detail,
+  - reconnect-safe offline drafts,
+  - onboarding and rollout state summary.
 - Shows the current warning/diagnostics queue sourced from `/console/v1/diagnostics`.
-- Opens the discovered web dashboard target in the default browser (local or configured remote URL).
-- Does not re-embed the old onboarding/OpenAI/Discord/support/log/settings desktop workflows.
+- Opens the discovered web dashboard target in the default browser with scoped handoff to chat,
+  approvals, inventory/access, or overview routes.
+- Persists local companion state so active section, selected session/device, notifications, rollout
+  flags, and offline drafts survive restarts.
+
+## Companion architecture
+
+- Native Tauri surface:
+  - sidecar supervision,
+  - local persisted state,
+  - native window reveal and notification permission handling,
+  - secure browser handoff built on the existing admin-token + CSRF console session flow.
+- Shared control-plane contracts:
+  - desktop reads the same chat session catalog, transcript, approvals, and inventory APIs as the
+    web console,
+  - desktop handoff targets the browser console instead of reimplementing every advanced surface.
+- Persisted local state:
+  - rollout flags: `companion_shell_enabled`, `desktop_notifications_enabled`,
+    `offline_drafts_enabled`, `release_channel`,
+  - companion preferences: active section, session, device, and latest run,
+  - bounded notifications and bounded offline draft queue.
+- Trust model:
+  - desktop companion never bypasses existing approval or browser handoff trust boundaries,
+  - offline drafts are stored locally and only sent after explicit operator action.
+
+## Rollout and reconnect behavior
+
+- The richer shell is feature-flagged by local persisted rollout state instead of replacing the
+  supervisor contract outright.
+- Connection state is surfaced as `connected`, `reconnecting`, or `offline` from companion refresh
+  results plus local runtime expectations.
+- Desktop notifications are informative only; they do not auto-approve or auto-send anything.
+- Offline drafts are bounded, local-only, and removed only after successful resend or explicit
+  operator discard.
+- Browser handoff preserves the current `sessionId`, `deviceId`, and optional `runId` whenever a
+  destination route supports that context.
 
 ## Portable release layout
 
@@ -103,6 +146,39 @@ For UI-only iteration without launching the desktop runtime, use:
 ```bash
 vp run desktop-ui:dev
 ```
+
+Validate the desktop companion changes with:
+
+```bash
+npm --prefix ui run typecheck
+npm --prefix ui run build
+cargo check --manifest-path src-tauri/Cargo.toml
+cargo test --manifest-path src-tauri/Cargo.toml --locked
+```
+
+## QA checklist
+
+- Windows/macOS launch:
+  - desktop window opens and can reveal itself after startup,
+  - `start`, `stop`, `restart`, and `Open dashboard` still work.
+- Companion shell:
+  - session list loads,
+  - chat transcript refresh works,
+  - sending while online creates a run and refreshes transcript,
+  - sending while control plane is unavailable queues an offline draft instead of silently losing
+    input.
+- Approval flow:
+  - pending approvals are visible on desktop,
+  - approve/deny actions call the same protected API as the browser console,
+  - browser handoff keeps session/run context.
+- Access/inventory:
+  - device capability summary renders,
+  - degraded or stale devices remain visible,
+  - handoff to browser access/chat routes preserves the selected device/session.
+- Rollout and onboarding:
+  - release channel and rollout flags are visible,
+  - notification permission can be requested,
+  - reconnect transitions produce readable notifications without auto-sending queued drafts.
 
 ## File layout
 

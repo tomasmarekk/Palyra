@@ -17,6 +17,192 @@ use super::{
 };
 
 const DESKTOP_ONBOARDING_EVENT_LIMIT: usize = 40;
+const DESKTOP_COMPANION_NOTIFICATION_LIMIT: usize = 40;
+const DESKTOP_COMPANION_OFFLINE_DRAFT_LIMIT: usize = 20;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DesktopCompanionSection {
+    Home,
+    Chat,
+    Approvals,
+    Access,
+    Onboarding,
+}
+
+impl Default for DesktopCompanionSection {
+    fn default() -> Self {
+        Self::Home
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DesktopCompanionNotificationKind {
+    Approval,
+    Connection,
+    Run,
+    Draft,
+    Trust,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct DesktopCompanionNotification {
+    pub(crate) notification_id: String,
+    pub(crate) kind: DesktopCompanionNotificationKind,
+    pub(crate) title: String,
+    pub(crate) detail: String,
+    pub(crate) created_at_unix_ms: i64,
+    pub(crate) read: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct DesktopCompanionOfflineDraft {
+    pub(crate) draft_id: String,
+    pub(crate) session_id: Option<String>,
+    pub(crate) text: String,
+    pub(crate) reason: String,
+    pub(crate) created_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct DesktopCompanionRolloutState {
+    pub(crate) companion_shell_enabled: bool,
+    pub(crate) desktop_notifications_enabled: bool,
+    pub(crate) offline_drafts_enabled: bool,
+    pub(crate) release_channel: String,
+}
+
+impl Default for DesktopCompanionRolloutState {
+    fn default() -> Self {
+        Self {
+            companion_shell_enabled: true,
+            desktop_notifications_enabled: true,
+            offline_drafts_enabled: true,
+            release_channel: "preview".to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct DesktopCompanionState {
+    pub(crate) active_section: DesktopCompanionSection,
+    pub(crate) active_session_id: Option<String>,
+    pub(crate) active_device_id: Option<String>,
+    pub(crate) last_run_id: Option<String>,
+    pub(crate) last_connection_state: String,
+    pub(crate) last_connected_at_unix_ms: Option<i64>,
+    pub(crate) last_pending_approval_count: usize,
+    pub(crate) notifications: Vec<DesktopCompanionNotification>,
+    pub(crate) offline_drafts: Vec<DesktopCompanionOfflineDraft>,
+    pub(crate) rollout: DesktopCompanionRolloutState,
+}
+
+impl Default for DesktopCompanionState {
+    fn default() -> Self {
+        Self {
+            active_section: DesktopCompanionSection::Home,
+            active_session_id: None,
+            active_device_id: None,
+            last_run_id: None,
+            last_connection_state: "unknown".to_owned(),
+            last_connected_at_unix_ms: None,
+            last_pending_approval_count: 0,
+            notifications: Vec::new(),
+            offline_drafts: Vec::new(),
+            rollout: DesktopCompanionRolloutState::default(),
+        }
+    }
+}
+
+impl DesktopCompanionState {
+    pub(crate) fn set_active_section(&mut self, next: DesktopCompanionSection) {
+        self.active_section = next;
+    }
+
+    pub(crate) fn set_active_session_id(&mut self, next: Option<&str>) {
+        self.active_session_id =
+            next.and_then(normalize_optional_text).map(str::to_owned);
+    }
+
+    pub(crate) fn set_active_device_id(&mut self, next: Option<&str>) {
+        self.active_device_id =
+            next.and_then(normalize_optional_text).map(str::to_owned);
+    }
+
+    pub(crate) fn set_last_run_id(&mut self, next: Option<&str>) {
+        self.last_run_id = next.and_then(normalize_optional_text).map(str::to_owned);
+    }
+
+    pub(crate) fn push_notification(
+        &mut self,
+        kind: DesktopCompanionNotificationKind,
+        title: impl Into<String>,
+        detail: impl Into<String>,
+        created_at_unix_ms: i64,
+    ) {
+        self.notifications.push(DesktopCompanionNotification {
+            notification_id: Ulid::new().to_string(),
+            kind,
+            title: title.into(),
+            detail: detail.into(),
+            created_at_unix_ms,
+            read: false,
+        });
+        if self.notifications.len() > DESKTOP_COMPANION_NOTIFICATION_LIMIT {
+            let overflow = self
+                .notifications
+                .len()
+                .saturating_sub(DESKTOP_COMPANION_NOTIFICATION_LIMIT);
+            self.notifications.drain(0..overflow);
+        }
+    }
+
+    pub(crate) fn mark_notifications_read(&mut self, ids: Option<&[String]>) {
+        for notification in &mut self.notifications {
+            let should_mark = match ids {
+                None => true,
+                Some(values) => values
+                    .iter()
+                    .any(|candidate| candidate == &notification.notification_id),
+            };
+            if should_mark {
+                notification.read = true;
+            }
+        }
+    }
+
+    pub(crate) fn queue_offline_draft(
+        &mut self,
+        session_id: Option<&str>,
+        text: &str,
+        reason: &str,
+        created_at_unix_ms: i64,
+    ) -> String {
+        let draft_id = Ulid::new().to_string();
+        self.offline_drafts.push(DesktopCompanionOfflineDraft {
+            draft_id: draft_id.clone(),
+            session_id: session_id.and_then(normalize_optional_text).map(str::to_owned),
+            text: text.to_owned(),
+            reason: reason.to_owned(),
+            created_at_unix_ms,
+        });
+        if self.offline_drafts.len() > DESKTOP_COMPANION_OFFLINE_DRAFT_LIMIT {
+            let overflow = self
+                .offline_drafts
+                .len()
+                .saturating_sub(DESKTOP_COMPANION_OFFLINE_DRAFT_LIMIT);
+            self.offline_drafts.drain(0..overflow);
+        }
+        draft_id
+    }
+
+    pub(crate) fn remove_offline_draft(&mut self, draft_id: &str) {
+        self.offline_drafts.retain(|draft| draft.draft_id != draft_id);
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -158,6 +344,7 @@ pub(crate) struct DesktopStateFile {
     pub(crate) browser_service_enabled: bool,
     pub(crate) runtime_state_root: Option<String>,
     pub(crate) onboarding: DesktopOnboardingState,
+    pub(crate) companion: DesktopCompanionState,
 }
 
 impl DesktopStateFile {
@@ -167,6 +354,7 @@ impl DesktopStateFile {
             browser_service_enabled: true,
             runtime_state_root: None,
             onboarding: DesktopOnboardingState::default(),
+            companion: DesktopCompanionState::default(),
         }
     }
 
@@ -210,6 +398,8 @@ struct PersistedDesktopStateEnvelope {
     runtime_state_root: Option<String>,
     #[serde(default)]
     onboarding: DesktopOnboardingState,
+    #[serde(default)]
+    companion: DesktopCompanionState,
 }
 
 impl Default for PersistedDesktopStateEnvelope {
@@ -221,6 +411,7 @@ impl Default for PersistedDesktopStateEnvelope {
             browser_service_enabled: default_browser_service_enabled(),
             runtime_state_root: None,
             onboarding: DesktopOnboardingState::default(),
+            companion: DesktopCompanionState::default(),
         }
     }
 }
@@ -236,6 +427,7 @@ impl PersistedDesktopStateEnvelope {
             )
             .map(str::to_owned),
             onboarding: self.onboarding,
+            companion: self.companion,
         }
     }
 }
@@ -372,4 +564,73 @@ fn persist_desktop_state_file(path: &Path, state: &DesktopStateFile, label: &str
 
 fn generate_secret_token() -> String {
     format!("{}{}", Ulid::new(), Ulid::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DesktopCompanionNotificationKind, DesktopCompanionState,
+        DESKTOP_COMPANION_NOTIFICATION_LIMIT, DESKTOP_COMPANION_OFFLINE_DRAFT_LIMIT,
+    };
+
+    #[test]
+    fn companion_notifications_can_be_marked_read_selectively() {
+        let mut state = DesktopCompanionState::default();
+        state.push_notification(
+            DesktopCompanionNotificationKind::Run,
+            "Run finished",
+            "detail",
+            1,
+        );
+        state.push_notification(
+            DesktopCompanionNotificationKind::Approval,
+            "Approval waiting",
+            "detail",
+            2,
+        );
+
+        let first_id = state.notifications[0].notification_id.clone();
+        state.mark_notifications_read(Some(&[first_id]));
+
+        assert!(state.notifications[0].read);
+        assert!(!state.notifications[1].read);
+    }
+
+    #[test]
+    fn companion_offline_draft_queue_stays_bounded() {
+        let mut state = DesktopCompanionState::default();
+        for index in 0..(DESKTOP_COMPANION_OFFLINE_DRAFT_LIMIT + 3) {
+            let text = format!("draft-{index}");
+            state.queue_offline_draft(Some("session-1"), text.as_str(), "offline", index as i64);
+        }
+
+        assert_eq!(state.offline_drafts.len(), DESKTOP_COMPANION_OFFLINE_DRAFT_LIMIT);
+        assert!(
+            state
+                .offline_drafts
+                .iter()
+                .all(|draft| draft.text != "draft-0" && draft.text != "draft-1" && draft.text != "draft-2")
+        );
+    }
+
+    #[test]
+    fn companion_notification_list_stays_bounded() {
+        let mut state = DesktopCompanionState::default();
+        for index in 0..(DESKTOP_COMPANION_NOTIFICATION_LIMIT + 2) {
+            state.push_notification(
+                DesktopCompanionNotificationKind::Connection,
+                format!("notification-{index}"),
+                "detail",
+                index as i64,
+            );
+        }
+
+        assert_eq!(state.notifications.len(), DESKTOP_COMPANION_NOTIFICATION_LIMIT);
+        assert!(
+            state
+                .notifications
+                .iter()
+                .all(|entry| entry.title != "notification-0" && entry.title != "notification-1")
+        );
+    }
 }
