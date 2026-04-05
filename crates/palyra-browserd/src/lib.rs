@@ -14,7 +14,7 @@ pub(crate) use engine::*;
 pub(crate) use persistence::*;
 pub(crate) use security::*;
 pub(crate) use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     ffi::{OsStr, OsString},
     fs,
     io::Write,
@@ -584,22 +584,11 @@ impl BrowserSessionRecord {
         let mut tabs = HashMap::new();
         for mut tab in snapshot.tabs.into_iter().take(self.budget.max_tabs_per_session) {
             if validate_canonical_id(tab.tab_id.as_str()).is_ok() {
-                tab.network_log = tab
-                    .network_log
-                    .into_iter()
-                    .take(self.budget.max_network_log_entries)
-                    .collect::<VecDeque<_>>();
-                while tab
-                    .network_log
-                    .iter()
-                    .map(estimate_network_log_entry_internal_bytes)
-                    .sum::<usize>()
-                    > self.budget.max_network_log_bytes as usize
-                {
-                    if tab.network_log.pop_front().is_none() {
-                        break;
-                    }
-                }
+                tab.network_log = clamp_network_log_entries(
+                    tab.network_log,
+                    self.budget.max_network_log_entries,
+                    self.budget.max_network_log_bytes,
+                );
                 tabs.insert(tab.tab_id.clone(), tab);
             }
         }
@@ -614,8 +603,9 @@ impl BrowserSessionRecord {
                 .into_iter()
                 .filter(|tab_id| tabs.contains_key(tab_id.as_str()))
                 .collect::<Vec<_>>();
+            let mut seen_tab_ids = tab_order.iter().cloned().collect::<HashSet<_>>();
             for tab_id in tabs.keys() {
-                if !tab_order.iter().any(|existing| existing == tab_id) {
+                if seen_tab_ids.insert(tab_id.clone()) {
                     tab_order.push(tab_id.clone());
                 }
             }
@@ -757,16 +747,57 @@ fn append_network_log_entries(
     max_entries: usize,
     max_bytes: u64,
 ) {
+    let mut total_bytes =
+        tab.network_log.iter().map(estimate_network_log_entry_internal_bytes).sum::<usize>();
     for entry in entries {
+        total_bytes = total_bytes.saturating_add(estimate_network_log_entry_internal_bytes(entry));
         tab.network_log.push_back(entry.clone());
     }
-    while tab.network_log.len() > max_entries {
-        tab.network_log.pop_front();
+    trim_network_log_to_budget(
+        &mut tab.network_log,
+        &mut total_bytes,
+        max_entries,
+        max_bytes as usize,
+    );
+}
+
+fn clamp_network_log_entries<I>(
+    entries: I,
+    max_entries: usize,
+    max_bytes: u64,
+) -> VecDeque<NetworkLogEntryInternal>
+where
+    I: IntoIterator<Item = NetworkLogEntryInternal>,
+{
+    let mut network_log = VecDeque::new();
+    let mut total_bytes = 0usize;
+    for entry in entries.into_iter().take(max_entries) {
+        total_bytes = total_bytes.saturating_add(estimate_network_log_entry_internal_bytes(&entry));
+        network_log.push_back(entry);
     }
-    while tab.network_log.iter().map(estimate_network_log_entry_internal_bytes).sum::<usize>()
-        > max_bytes as usize
-    {
-        if tab.network_log.pop_front().is_none() {
+    trim_network_log_to_budget(&mut network_log, &mut total_bytes, max_entries, max_bytes as usize);
+    network_log
+}
+
+fn trim_network_log_to_budget(
+    network_log: &mut VecDeque<NetworkLogEntryInternal>,
+    total_bytes: &mut usize,
+    max_entries: usize,
+    max_bytes: usize,
+) {
+    while network_log.len() > max_entries {
+        if let Some(entry) = network_log.pop_front() {
+            *total_bytes =
+                total_bytes.saturating_sub(estimate_network_log_entry_internal_bytes(&entry));
+        } else {
+            break;
+        }
+    }
+    while *total_bytes > max_bytes {
+        if let Some(entry) = network_log.pop_front() {
+            *total_bytes =
+                total_bytes.saturating_sub(estimate_network_log_entry_internal_bytes(&entry));
+        } else {
             break;
         }
     }

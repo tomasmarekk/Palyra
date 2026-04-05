@@ -2568,6 +2568,91 @@ fn apply_snapshot_clamps_cookie_and_storage_state() {
 }
 
 #[test]
+fn apply_snapshot_clamps_network_log_and_preserves_missing_tab_append() {
+    let mut session = test_session_record();
+    session.budget.max_network_log_entries = 4;
+    let first_tab_id = ulid::Ulid::new().to_string();
+    let second_tab_id = ulid::Ulid::new().to_string();
+
+    let mut first_tab = BrowserTabRecord::new(first_tab_id.clone());
+    let retained_entry = NetworkLogEntryInternal {
+        request_url: "https://example.com/api/retained".to_owned(),
+        status_code: 200,
+        timing_bucket: "lt_100ms".to_owned(),
+        latency_ms: 10,
+        captured_at_unix_ms: 2,
+        headers: vec![NetworkLogHeaderInternal {
+            name: "x-request-id".to_owned(),
+            value: "req-retained".to_owned(),
+        }],
+    };
+    let newest_entry = NetworkLogEntryInternal {
+        request_url: "https://example.com/api/newest".to_owned(),
+        status_code: 200,
+        timing_bucket: "lt_100ms".to_owned(),
+        latency_ms: 12,
+        captured_at_unix_ms: 3,
+        headers: vec![NetworkLogHeaderInternal {
+            name: "x-request-id".to_owned(),
+            value: "req-newest".to_owned(),
+        }],
+    };
+    let trimmed_entry = NetworkLogEntryInternal {
+        request_url: "https://example.com/api/trimmed".to_owned(),
+        status_code: 200,
+        timing_bucket: "lt_100ms".to_owned(),
+        latency_ms: 8,
+        captured_at_unix_ms: 1,
+        headers: vec![NetworkLogHeaderInternal {
+            name: "x-request-id".to_owned(),
+            value: "req-trimmed".to_owned(),
+        }],
+    };
+    first_tab.network_log.extend([
+        trimmed_entry.clone(),
+        retained_entry.clone(),
+        newest_entry.clone(),
+    ]);
+    session.budget.max_network_log_bytes =
+        (super::estimate_network_log_entry_internal_bytes(&retained_entry)
+            + super::estimate_network_log_entry_internal_bytes(&newest_entry)) as u64;
+
+    let second_tab = BrowserTabRecord::new(second_tab_id.clone());
+    let snapshot = PersistedSessionSnapshot {
+        v: CANONICAL_PROTOCOL_MAJOR,
+        principal: "user:ops".to_owned(),
+        channel: None,
+        tabs: vec![first_tab, second_tab],
+        tab_order: vec![second_tab_id.clone(), second_tab_id.clone()],
+        active_tab_id: second_tab_id.clone(),
+        permissions: SessionPermissionsInternal::default(),
+        cookie_jar: HashMap::new(),
+        storage_entries: HashMap::new(),
+        state_revision: 1,
+        saved_at_unix_ms: 1_737_000_000_000,
+    };
+
+    session.apply_snapshot(snapshot);
+
+    let restored_first_tab =
+        session.tabs.get(first_tab_id.as_str()).expect("first tab should be restored");
+    assert_eq!(
+        restored_first_tab
+            .network_log
+            .iter()
+            .map(|entry| entry.request_url.as_str())
+            .collect::<Vec<_>>(),
+        vec![retained_entry.request_url.as_str(), newest_entry.request_url.as_str(),],
+        "snapshot restore should trim oldest network log entries first"
+    );
+    assert_eq!(
+        session.tab_order,
+        vec![second_tab_id.clone(), second_tab_id, first_tab_id],
+        "restore should keep persisted tab order entries and append only missing tabs"
+    );
+}
+
+#[test]
 fn persisted_snapshot_hash_is_stable_for_equivalent_hashmap_content() {
     let mut first_tab = BrowserTabRecord::new("tab-1".to_owned());
     first_tab.typed_inputs.insert("search".to_owned(), "palyra".to_owned());
