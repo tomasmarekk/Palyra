@@ -34,7 +34,7 @@ use crate::{
 };
 
 use super::{
-    orchestration::transition_run_stream_to_cancelled,
+    cancellation::transition_run_stream_to_cancelled,
     tape::{
         send_tool_approval_request_with_tape, send_tool_approval_response_with_tape,
         send_tool_attestation_with_tape, send_tool_decision_with_tape,
