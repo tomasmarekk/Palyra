@@ -397,12 +397,7 @@ export function collectCanvasFrameUrls(value: JsonValue): string[] {
       continue;
     }
     if (isJsonObject(current.value)) {
-      enqueueCanvasScanEntries(
-        Object.values(current.value),
-        current.depth + 1,
-        pending,
-        visited,
-      );
+      enqueueCanvasScanEntries(Object.values(current.value), current.depth + 1, pending, visited);
     }
   }
 
