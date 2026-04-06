@@ -222,7 +222,9 @@ impl App {
         match app.runtime.list_models(None) {
             Ok(models) => app.models = Some(models),
             Err(error) => {
-                app.status_line = format!("Connected; model catalog unavailable: {error}")
+                app.status_line = sanitize_terminal_text(
+                    format!("Connected; model catalog unavailable: {error}").as_str(),
+                )
             }
         }
         app.push_entry(EntryKind::System, "Session", "Connected.");
@@ -250,7 +252,8 @@ impl App {
                 }
                 Ok(Err(error)) => {
                     self.active_stream = None;
-                    self.status_line = format!("Run failed: {error}");
+                    self.status_line =
+                        sanitize_terminal_text(format!("Run failed: {error}").as_str());
                     self.push_entry(EntryKind::System, "Run error", error.to_string());
                     break;
                 }
@@ -271,7 +274,7 @@ impl App {
                 }
             }
             Some(common_v1::run_stream_event::Body::Status(status)) => {
-                self.status_line = status.message.clone();
+                self.status_line = sanitize_terminal_text(status.message.as_str());
                 if self.show_thinking {
                     self.push_entry(
                         EntryKind::Thinking,
@@ -306,14 +309,20 @@ impl App {
                     );
                 }
             }
-            Some(common_v1::run_stream_event::Body::ToolApprovalRequest(approval)) => {
-                self.status_line = format!(
-                    "Approval required for {}",
-                    if approval.tool_name.trim().is_empty() {
-                        "tool"
-                    } else {
-                        approval.tool_name.as_str()
-                    }
+            Some(common_v1::run_stream_event::Body::ToolApprovalRequest(mut approval)) => {
+                approval.tool_name = sanitize_terminal_text(approval.tool_name.as_str());
+                approval.request_summary =
+                    sanitize_terminal_text(approval.request_summary.as_str());
+                self.status_line = sanitize_terminal_text(
+                    format!(
+                        "Approval required for {}",
+                        if approval.tool_name.trim().is_empty() {
+                            "tool"
+                        } else {
+                            approval.tool_name.as_str()
+                        }
+                    )
+                    .as_str(),
                 );
                 if self.show_tools {
                     self.push_entry(
@@ -407,21 +416,22 @@ impl App {
 
     fn append_assistant_token(&mut self, run_id: &str, token: &str) {
         let title = format!("Assistant ({})", shorten_id(run_id));
+        let token = sanitize_terminal_text(token);
         if let Some(last) = self.transcript.last_mut() {
             if matches!(last.kind, EntryKind::Assistant) && last.title == title {
-                last.body.push_str(token);
+                last.body.push_str(token.as_str());
                 return;
             }
         }
-        self.transcript.push(TranscriptEntry {
-            kind: EntryKind::Assistant,
-            title,
-            body: token.to_owned(),
-        });
+        self.transcript.push(TranscriptEntry { kind: EntryKind::Assistant, title, body: token });
     }
 
-    fn push_entry<T: Into<String>, U: Into<String>>(&mut self, kind: EntryKind, title: T, body: U) {
-        self.transcript.push(TranscriptEntry { kind, title: title.into(), body: body.into() });
+    fn push_entry<T: AsRef<str>, U: AsRef<str>>(&mut self, kind: EntryKind, title: T, body: U) {
+        self.transcript.push(TranscriptEntry {
+            kind,
+            title: sanitize_terminal_text(title.as_ref()),
+            body: sanitize_terminal_text(body.as_ref()),
+        });
     }
 
     async fn start_prompt_run(
@@ -1719,7 +1729,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ),
         Span::raw("  "),
         Span::styled("Status ", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
-        Span::raw(app.status_line.as_str()),
+        Span::raw(sanitize_terminal_text(app.status_line.as_str())),
     ]);
     frame.render_widget(Paragraph::new(connection_line), top);
     frame.render_widget(Paragraph::new(status_line), bottom);
@@ -1847,10 +1857,10 @@ fn render_approval_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     "Tool ",
                     Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(approval.tool_name.as_str()),
+                Span::raw(sanitize_terminal_text(approval.tool_name.as_str())),
             ]),
             Line::default(),
-            Line::from(approval.request_summary.as_str()),
+            Line::from(sanitize_terminal_text(approval.request_summary.as_str())),
             Line::default(),
             Line::from("y / Enter = allow once"),
             Line::from("n / Esc   = deny"),
@@ -2065,6 +2075,40 @@ fn truncate_text(mut value: String, limit: usize) -> String {
     value
 }
 
+fn sanitize_terminal_text(value: &str) -> String {
+    let mut sanitized = String::with_capacity(value.len());
+    let mut just_saw_carriage_return = false;
+    for ch in value.chars() {
+        match ch {
+            '\n' => {
+                if !just_saw_carriage_return {
+                    sanitized.push('\n');
+                }
+                just_saw_carriage_return = false;
+            }
+            '\r' => {
+                if !sanitized.ends_with('\n') {
+                    sanitized.push('\n');
+                }
+                just_saw_carriage_return = true;
+            }
+            '\u{1b}' => {
+                sanitized.push_str("<ESC>");
+                just_saw_carriage_return = false;
+            }
+            ch if ch.is_control() => {
+                sanitized.push_str(format!("<U+{:04X}>", ch as u32).as_str());
+                just_saw_carriage_return = false;
+            }
+            ch => {
+                sanitized.push(ch);
+                just_saw_carriage_return = false;
+            }
+        }
+    }
+    sanitized
+}
+
 fn format_shell_result(result: &ShellResult) -> String {
     let mut body = format!(
         "exit_code={}\n",
@@ -2088,8 +2132,48 @@ fn format_shell_result(result: &ShellResult) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{display_session_identity, parse_toggle};
+    use super::{display_session_identity, parse_toggle, sanitize_terminal_text, App, Focus, Mode};
     use crate::proto::palyra::{common::v1 as common_v1, gateway::v1 as gateway_v1};
+
+    fn test_app() -> App {
+        App {
+            runtime: crate::client::operator::OperatorRuntime::new(crate::AgentConnection {
+                grpc_url: "http://127.0.0.1:7142".to_owned(),
+                token: None,
+                principal: "tester".to_owned(),
+                device_id: "dev-1".to_owned(),
+                channel: "cli".to_owned(),
+                trace_id: "trace-1".to_owned(),
+            }),
+            session: gateway_v1::SessionSummary::default(),
+            current_agent: None,
+            current_agent_source: "test",
+            models: None,
+            input: String::new(),
+            transcript: Vec::new(),
+            active_stream: None,
+            pending_approval: None,
+            pending_shell_command: None,
+            pending_picker: None,
+            focus: Focus::Input,
+            mode: Mode::Chat,
+            show_tools: true,
+            show_thinking: true,
+            local_shell_enabled: false,
+            allow_sensitive_tools: false,
+            include_archived_sessions: false,
+            last_run_id: None,
+            scroll_offset: 0,
+            status_line: String::new(),
+            settings_selected: 0,
+        }
+    }
+
+    #[test]
+    fn sanitize_terminal_text_replaces_control_characters() {
+        let sanitized = sanitize_terminal_text("ok\x1b[31mwarn\x07\r\nnext\tline");
+        assert_eq!(sanitized, "ok<ESC>[31mwarn<U+0007>\nnext<U+0009>line");
+    }
 
     #[test]
     fn parse_toggle_accepts_explicit_values() {
@@ -2114,5 +2198,63 @@ mod tests {
         };
         let display = display_session_identity(&summary);
         assert_eq!(display, "Auto title");
+    }
+
+    #[test]
+    fn handle_stream_event_sanitizes_status_and_assistant_output() {
+        let mut app = test_app();
+        app.handle_stream_event(common_v1::RunStreamEvent {
+            run_id: Some(common_v1::CanonicalId { ulid: "01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned() }),
+            body: Some(common_v1::run_stream_event::Body::Status(common_v1::StreamStatus {
+                kind: 0,
+                message: "phase\x1b[2J\r\nnext".to_owned(),
+            })),
+            ..Default::default()
+        })
+        .expect("status event should be accepted");
+        app.handle_stream_event(common_v1::RunStreamEvent {
+            run_id: Some(common_v1::CanonicalId { ulid: "01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned() }),
+            body: Some(common_v1::run_stream_event::Body::ModelToken(common_v1::ModelToken {
+                token: "hello\x1b]52;c;ZXZpbA==\x07".to_owned(),
+                is_final: false,
+            })),
+            ..Default::default()
+        })
+        .expect("token event should be accepted");
+
+        assert_eq!(app.status_line, "phase<ESC>[2J\nnext");
+        assert_eq!(app.transcript.len(), 2);
+        assert_eq!(app.transcript[0].body, "phase<ESC>[2J\nnext");
+        assert_eq!(app.transcript[1].body, "hello<ESC>]52;c;ZXZpbA==<U+0007>");
+        assert!(app
+            .transcript
+            .iter()
+            .flat_map(|entry| entry.title.chars().chain(entry.body.chars()))
+            .all(|ch| !ch.is_control() || ch == '\n'));
+    }
+
+    #[test]
+    fn handle_stream_event_sanitizes_approval_requests_before_storage() {
+        let mut app = test_app();
+        app.handle_stream_event(common_v1::RunStreamEvent {
+            run_id: Some(common_v1::CanonicalId { ulid: "01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned() }),
+            body: Some(common_v1::run_stream_event::Body::ToolApprovalRequest(
+                common_v1::ToolApprovalRequest {
+                    tool_name: "shell\x1b[31m".to_owned(),
+                    request_summary: "run\x07 dangerous\rcommand".to_owned(),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        })
+        .expect("approval event should be accepted");
+
+        let approval = app.pending_approval.as_ref().expect("approval should be stored");
+        assert_eq!(app.status_line, "Approval required for shell<ESC>[31m");
+        assert_eq!(approval.tool_name, "shell<ESC>[31m");
+        assert_eq!(approval.request_summary, "run<U+0007> dangerous\ncommand");
+        assert_eq!(app.transcript.len(), 1);
+        assert_eq!(app.transcript[0].title, "Approval requested: shell<ESC>[31m");
+        assert_eq!(app.transcript[0].body, "run<U+0007> dangerous\ncommand");
     }
 }
