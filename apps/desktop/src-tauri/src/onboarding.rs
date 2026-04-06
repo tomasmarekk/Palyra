@@ -776,7 +776,10 @@ fn suggested_actions(step: DesktopOnboardingStep) -> Vec<String> {
             "Export a support bundle if the environment keeps failing.".to_owned(),
         ],
         DesktopOnboardingStep::StateRoot => {
-            vec!["Confirm the default runtime root or choose another absolute path.".to_owned()]
+            vec![
+                "Confirm the default runtime root or choose another path inside the desktop state directory."
+                    .to_owned(),
+            ]
         }
         DesktopOnboardingStep::GatewayInit => vec![
             "Start or restart the local runtime from the desktop action bar.".to_owned(),

@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -359,16 +359,10 @@ impl DesktopStateFile {
     }
 
     pub(crate) fn resolve_runtime_root(&self, default_root: &Path) -> Result<PathBuf> {
-        match normalize_optional_text(self.runtime_state_root.as_deref().unwrap_or_default()) {
-            Some(raw) => {
-                let candidate = PathBuf::from(raw);
-                if !candidate.is_absolute() {
-                    return Err(anyhow!("desktop runtime state root must be an absolute path"));
-                }
-                Ok(candidate)
-            }
-            None => Ok(default_root.to_path_buf()),
-        }
+        validate_runtime_state_root_override(
+            normalize_optional_text(self.runtime_state_root.as_deref().unwrap_or_default()),
+            default_root,
+        )
     }
 
     pub(crate) fn normalized_runtime_state_root(&self) -> Option<String> {
@@ -381,6 +375,53 @@ impl Default for DesktopStateFile {
     fn default() -> Self {
         Self::new_default()
     }
+}
+
+pub(crate) fn validate_runtime_state_root_override(
+    candidate: Option<&str>,
+    default_root: &Path,
+) -> Result<PathBuf> {
+    let Some(raw) = candidate.and_then(normalize_optional_text) else {
+        return Ok(default_root.to_path_buf());
+    };
+    let parsed = PathBuf::from(raw);
+    if !parsed.is_absolute() {
+        return Err(anyhow!("desktop runtime state root must be an absolute path"));
+    }
+    if parsed.components().any(|component| matches!(component, Component::ParentDir)) {
+        return Err(anyhow!(
+            "desktop runtime state root must not contain parent traversal"
+        ));
+    }
+
+    let allowed_root = default_root.parent().ok_or_else(|| {
+        anyhow!(
+            "desktop runtime state root validation requires a desktop state directory parent"
+        )
+    })?;
+    let canonical_allowed_root = fs::canonicalize(allowed_root).with_context(|| {
+        format!(
+            "failed to resolve desktop state directory {}",
+            allowed_root.display()
+        )
+    })?;
+    let existing_ancestor = parsed
+        .ancestors()
+        .find(|ancestor| ancestor.exists())
+        .ok_or_else(|| anyhow!("desktop runtime state root must include an existing filesystem root"))?;
+    let canonical_existing_ancestor = fs::canonicalize(existing_ancestor).with_context(|| {
+        format!(
+            "failed to resolve desktop runtime state root ancestor {}",
+            existing_ancestor.display()
+        )
+    })?;
+    if !canonical_existing_ancestor.starts_with(canonical_allowed_root.as_path()) {
+        return Err(anyhow!(
+            "desktop runtime state root must stay within the desktop state directory {}",
+            canonical_allowed_root.display()
+        ));
+    }
+    Ok(parsed)
 }
 
 #[derive(Debug, Clone, Deserialize)]

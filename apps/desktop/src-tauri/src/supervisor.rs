@@ -22,7 +22,7 @@ use super::{
     load_or_initialize_state_file, sanitize_log_line, DesktopOnboardingStep, DesktopSecretStore,
     DesktopStateFile, BROWSER_GRPC_PORT, BROWSER_HEALTH_PORT, CONSOLE_PRINCIPAL,
     GATEWAY_ADMIN_PORT, GATEWAY_GRPC_PORT, GATEWAY_QUIC_PORT, LOG_EVENT_CHANNEL_CAPACITY,
-    LOOPBACK_HOST, MAX_LOG_LINES_PER_SERVICE,
+    LOOPBACK_HOST, MAX_LOG_LINES_PER_SERVICE, validate_runtime_state_root_override,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -935,20 +935,6 @@ mod tests {
             "unexpected error: {error}"
         );
     }
-}
-
-pub(crate) fn validate_runtime_state_root_override(
-    candidate: Option<&str>,
-    default_root: &Path,
-) -> Result<PathBuf> {
-    let Some(raw) = candidate.and_then(normalize_optional_text) else {
-        return Ok(default_root.to_path_buf());
-    };
-    let parsed = PathBuf::from(raw);
-    if !parsed.is_absolute() {
-        bail!("desktop runtime state root must be an absolute path");
-    }
-    Ok(parsed)
 }
 
 pub(crate) fn resolve_binary_path(binary_name: &str, env_override: &str) -> Result<PathBuf> {

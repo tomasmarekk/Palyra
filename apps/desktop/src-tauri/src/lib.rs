@@ -33,8 +33,9 @@ mod supervisor;
 use snapshot::sanitize_log_line;
 
 pub(crate) use desktop_state::{
-    load_or_initialize_state_file, resolve_desktop_state_root, DesktopCompanionSection,
-    DesktopOnboardingStep, DesktopSecretStore, DesktopStateFile,
+    load_or_initialize_state_file, resolve_desktop_state_root,
+    validate_runtime_state_root_override, DesktopCompanionSection, DesktopOnboardingStep,
+    DesktopSecretStore, DesktopStateFile,
 };
 pub(crate) use features::onboarding::connectors::discord::DiscordOnboardingRequest;
 pub(crate) use onboarding::{build_desktop_refresh_payload, build_onboarding_status};

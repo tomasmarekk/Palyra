@@ -31,9 +31,9 @@ use super::{
     collect_redacted_errors, compute_backoff_ms, executable_file_name,
     load_or_initialize_state_file, mpsc, parse_discord_status, parse_remote_dashboard_base_url,
     resolve_binary_path, resolve_desktop_state_root, sanitize_log_line, try_enqueue_log_event,
-    BrowserStatusSnapshot, Client, ControlCenter, DashboardAccessMode, DesktopOnboardingStep,
-    DesktopSecretStore, DesktopStateFile, LogEvent, LogStream, ManagedService, RuntimeConfig,
-    ServiceKind, Ulid, LOG_EVENT_CHANNEL_CAPACITY,
+    validate_runtime_state_root_override, BrowserStatusSnapshot, Client, ControlCenter,
+    DashboardAccessMode, DesktopOnboardingStep, DesktopSecretStore, DesktopStateFile, LogEvent,
+    LogStream, ManagedService, RuntimeConfig, ServiceKind, Ulid, LOG_EVENT_CHANNEL_CAPACITY,
 };
 
 fn env_lock() -> &'static Mutex<()> {
@@ -706,6 +706,71 @@ fn desktop_state_root_rejects_relative_palyra_state_root_override() {
     let error = resolve_desktop_state_root()
         .expect_err("relative PALYRA_STATE_ROOT should be rejected");
     assert!(error.to_string().contains("must be an absolute path"));
+}
+
+#[test]
+fn runtime_state_root_override_accepts_desktop_managed_subdirectory() {
+    let fixture = TempFixtureDir::new();
+    let default_runtime_root = fixture.path().join("runtime");
+    let custom_runtime_root = fixture.path().join("runtime-alt");
+    std::fs::create_dir_all(default_runtime_root.as_path())
+        .expect("default runtime root should exist for validation");
+
+    let resolved = validate_runtime_state_root_override(
+        Some(custom_runtime_root.to_string_lossy().as_ref()),
+        default_runtime_root.as_path(),
+    )
+    .expect("desktop-managed runtime subdirectory should be accepted");
+
+    assert_eq!(resolved, custom_runtime_root);
+}
+
+#[test]
+fn runtime_state_root_override_rejects_paths_outside_desktop_state_directory() {
+    let fixture = TempFixtureDir::new();
+    let default_runtime_root = fixture.path().join("runtime");
+    let escaped_runtime_root =
+        std::env::temp_dir().join(format!("palyra-desktop-escape-{}", Ulid::new()));
+    std::fs::create_dir_all(default_runtime_root.as_path())
+        .expect("default runtime root should exist for validation");
+
+    let error = validate_runtime_state_root_override(
+        Some(escaped_runtime_root.to_string_lossy().as_ref()),
+        default_runtime_root.as_path(),
+    )
+    .expect_err("paths outside the desktop state directory must be rejected");
+
+    assert!(
+        error
+            .to_string()
+            .contains("must stay within the desktop state directory"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn desktop_state_file_rejects_runtime_root_escape_on_reload() {
+    let fixture = TempFixtureDir::new();
+    let default_runtime_root = fixture.path().join("runtime");
+    let escaped_runtime_root =
+        std::env::temp_dir().join(format!("palyra-desktop-reload-escape-{}", Ulid::new()));
+    std::fs::create_dir_all(default_runtime_root.as_path())
+        .expect("default runtime root should exist for reload validation");
+
+    let state_file = DesktopStateFile {
+        runtime_state_root: Some(escaped_runtime_root.to_string_lossy().into_owned()),
+        ..DesktopStateFile::default()
+    };
+    let error = state_file
+        .resolve_runtime_root(default_runtime_root.as_path())
+        .expect_err("persisted runtime root escapes must be rejected on reload");
+
+    assert!(
+        error
+            .to_string()
+            .contains("must stay within the desktop state directory"),
+        "unexpected error: {error}"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
