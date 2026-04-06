@@ -12,6 +12,8 @@ use std::{
 
 use serde_json::json;
 
+use crate::companion::DesktopCompanionRolloutRequest;
+
 use super::commands::initialize_control_center;
 use super::features::onboarding::connectors::discord::{
     apply_discord_onboarding, run_discord_onboarding_preflight, verify_discord_connector,
@@ -235,6 +237,28 @@ fn sanitize_log_line_redacts_sensitive_assignments_and_url_query_tokens() {
     assert!(!sanitized.contains("token=abc"));
     assert!(sanitized.contains("token=<redacted>"));
     assert!(sanitized.contains("mode=ok"));
+}
+
+#[test]
+fn companion_offline_draft_queueing_respects_rollout_toggle() {
+    let fixture = TempFixtureDir::new();
+    let mut control_center = build_test_control_center(fixture.path());
+    assert!(
+        control_center.companion_offline_drafts_enabled(),
+        "offline drafts should be enabled by default"
+    );
+    control_center
+        .update_companion_rollout(&DesktopCompanionRolloutRequest {
+            companion_shell_enabled: None,
+            desktop_notifications_enabled: None,
+            offline_drafts_enabled: Some(false),
+            release_channel: None,
+        })
+        .expect("rollout update should persist");
+    assert!(
+        !control_center.companion_offline_drafts_enabled(),
+        "offline draft queueing should disable when rollout toggle is false"
+    );
 }
 
 #[test]

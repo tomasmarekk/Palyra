@@ -437,6 +437,9 @@ pub(crate) async fn send_desktop_companion_chat_message(
         Err(error) => {
             if payload.queue_on_failure {
                 let mut supervisor = state.supervisor.lock().await;
+                if !supervisor.companion_offline_drafts_enabled() {
+                    return Err(command_error(error));
+                }
                 let draft_id = supervisor
                     .record_companion_offline_draft(
                         Some(payload.session_id.as_str()),

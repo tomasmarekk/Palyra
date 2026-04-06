@@ -232,6 +232,10 @@ pub(crate) struct DesktopResolvedChatSessionRecord {
 }
 
 impl ControlCenter {
+    pub(crate) fn companion_offline_drafts_enabled(&self) -> bool {
+        self.persisted.companion.rollout.offline_drafts_enabled
+    }
+
     pub(crate) fn capture_companion_inputs(&mut self) -> DesktopCompanionInputs {
         DesktopCompanionInputs {
             refresh_inputs: self.capture_onboarding_status_inputs(),
