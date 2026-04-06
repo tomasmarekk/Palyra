@@ -4084,6 +4084,97 @@ async fn grpc_memory_get_hides_ttl_expired_item() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn grpc_memory_search_hides_ttl_expired_cached_item() -> Result<()> {
+    let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut memory_client =
+        memory_v1::memory_service_client::MemoryServiceClient::connect(endpoint)
+            .await
+            .context("failed to connect memory gRPC client")?;
+
+    let now_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system time should be after unix epoch")?
+        .as_millis() as i64;
+    let mut ingest_request = tonic::Request::new(memory_v1::IngestMemoryRequest {
+        v: 1,
+        source: memory_v1::MemorySource::Manual as i32,
+        content_text: "cached expiring rollback checklist".to_owned(),
+        channel: "cli".to_owned(),
+        session_id: Some(common_v1::CanonicalId { ulid: SESSION_ID.to_owned() }),
+        tags: Vec::new(),
+        confidence: 0.8,
+        ttl_unix_ms: now_unix_ms.saturating_add(120),
+    });
+    authorize_metadata(ingest_request.metadata_mut())?;
+    let memory_id = memory_client
+        .ingest_memory(ingest_request)
+        .await
+        .context("failed to ingest expiring memory item for cache test")?
+        .into_inner()
+        .item
+        .and_then(|item| item.memory_id)
+        .map(|id| id.ulid)
+        .context("expiring ingest should return memory id")?;
+
+    let mut first_search_request = tonic::Request::new(memory_v1::SearchMemoryRequest {
+        v: 1,
+        query: "rollback checklist".to_owned(),
+        channel: "cli".to_owned(),
+        session_id: Some(common_v1::CanonicalId { ulid: SESSION_ID.to_owned() }),
+        top_k: 5,
+        min_score: 0.0,
+        tags: Vec::new(),
+        sources: Vec::new(),
+        include_score_breakdown: false,
+    });
+    authorize_metadata(first_search_request.metadata_mut())?;
+    let first_search = memory_client
+        .search_memory(first_search_request)
+        .await
+        .context("first memory search should populate cache")?
+        .into_inner();
+    assert!(
+        first_search.hits.iter().any(|hit| {
+            hit.item.as_ref().and_then(|item| item.memory_id.as_ref()).map(|id| id.ulid.as_str())
+                == Some(memory_id.as_str())
+        }),
+        "first search should return the expiring memory item before TTL elapses"
+    );
+
+    tokio::time::sleep(Duration::from_millis(220)).await;
+
+    let mut second_search_request = tonic::Request::new(memory_v1::SearchMemoryRequest {
+        v: 1,
+        query: "rollback checklist".to_owned(),
+        channel: "cli".to_owned(),
+        session_id: Some(common_v1::CanonicalId { ulid: SESSION_ID.to_owned() }),
+        top_k: 5,
+        min_score: 0.0,
+        tags: Vec::new(),
+        sources: Vec::new(),
+        include_score_breakdown: false,
+    });
+    authorize_metadata(second_search_request.metadata_mut())?;
+    let second_search = memory_client
+        .search_memory(second_search_request)
+        .await
+        .context("second memory search should revalidate cache TTL")?
+        .into_inner();
+    assert!(
+        second_search.hits.iter().all(|hit| {
+            hit.item.as_ref().and_then(|item| item.memory_id.as_ref()).map(|id| id.ulid.as_str())
+                != Some(memory_id.as_str())
+        }),
+        "expired memory item must not be served from the memory search cache"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn grpc_vault_get_blocks_selected_sensitive_ref_even_with_approval_header() -> Result<()> {
     let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
     let mut daemon = ChildGuard::new(child);

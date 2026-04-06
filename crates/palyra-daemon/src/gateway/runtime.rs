@@ -152,6 +152,12 @@ pub(crate) struct CachedHttpFetchEntry {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct CachedMemorySearchEntry {
+    pub(crate) hits: Vec<MemorySearchHit>,
+    pub(crate) expires_at_unix_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct ToolSkillContext {
     pub(crate) skill_id: String,
     pub(crate) version: Option<String>,
@@ -279,7 +285,7 @@ pub struct GatewayRuntimeState {
     model_provider: Arc<dyn ModelProvider>,
     pub(crate) vault: Arc<Vault>,
     pub(crate) memory_config: RwLock<MemoryRuntimeConfig>,
-    pub(crate) memory_search_cache: Mutex<HashMap<String, Vec<MemorySearchHit>>>,
+    pub(crate) memory_search_cache: Mutex<HashMap<String, CachedMemorySearchEntry>>,
     pub(crate) http_fetch_cache: Mutex<HashMap<String, CachedHttpFetchEntry>>,
     tool_approval_cache: Mutex<HashMap<String, CachedToolApprovalDecision>>,
     pub(crate) vault_rate_limit: Mutex<HashMap<String, VaultRateLimitEntry>>,
@@ -852,6 +858,10 @@ impl RuntimeCounters {
 }
 
 impl GatewayRuntimeState {
+    fn cached_memory_search_expires_at(hits: &[MemorySearchHit]) -> Option<i64> {
+        hits.iter().filter_map(|hit| hit.item.ttl_unix_ms).min()
+    }
+
     #[cfg(test)]
     pub fn new(
         config: GatewayRuntimeConfigSnapshot,
@@ -4696,12 +4706,35 @@ impl GatewayRuntimeState {
     ) -> Result<Vec<MemorySearchHit>, Status> {
         self.counters.memory_search_requests.fetch_add(1, Ordering::Relaxed);
         let cache_key = memory_search_cache_key(&request);
+        let now_unix_ms = current_unix_ms();
         let cached_hits = match self.memory_search_cache.lock() {
-            Ok(cache) => cache.get(cache_key.as_str()).cloned(),
+            Ok(mut cache) => match cache.get(cache_key.as_str()) {
+                Some(entry)
+                    if entry
+                        .expires_at_unix_ms
+                        .is_some_and(|expires_at| expires_at <= now_unix_ms) =>
+                {
+                    cache.remove(cache_key.as_str());
+                    None
+                }
+                Some(entry) => Some(entry.hits.clone()),
+                None => None,
+            },
             Err(poisoned) => {
                 warn!("memory search cache lock poisoned while reading cache");
-                let cache = poisoned.into_inner();
-                cache.get(cache_key.as_str()).cloned()
+                let mut cache = poisoned.into_inner();
+                match cache.get(cache_key.as_str()) {
+                    Some(entry)
+                        if entry
+                            .expires_at_unix_ms
+                            .is_some_and(|expires_at| expires_at <= now_unix_ms) =>
+                    {
+                        cache.remove(cache_key.as_str());
+                        None
+                    }
+                    Some(entry) => Some(entry.hits.clone()),
+                    None => None,
+                }
             }
         };
         if let Some(cached) = cached_hits {
@@ -4734,7 +4767,13 @@ impl GatewayRuntimeState {
                         cache.remove(first_key.as_str());
                     }
                 }
-                cache.insert(cache_key, results.clone());
+                cache.insert(
+                    cache_key,
+                    CachedMemorySearchEntry {
+                        hits: results.clone(),
+                        expires_at_unix_ms: Self::cached_memory_search_expires_at(&results),
+                    },
+                );
             }
             Err(poisoned) => {
                 warn!("memory search cache lock poisoned while writing cache");
@@ -4744,7 +4783,13 @@ impl GatewayRuntimeState {
                         cache.remove(first_key.as_str());
                     }
                 }
-                cache.insert(cache_key, results.clone());
+                cache.insert(
+                    cache_key,
+                    CachedMemorySearchEntry {
+                        hits: results.clone(),
+                        expires_at_unix_ms: Self::cached_memory_search_expires_at(&results),
+                    },
+                );
             }
         }
         Ok(results)

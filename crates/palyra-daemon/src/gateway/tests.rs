@@ -28,11 +28,12 @@ use super::vault::vault_get_requires_approval;
 use super::{
     best_effort_mark_approval_error, common_v1, constant_time_eq,
     enforce_vault_get_approval_policy, enforce_vault_scope_access, ingest_memory_best_effort,
-    resolve_cron_job_channel_for_create, workspace_patch_metrics_from_output, GatewayAuthConfig,
-    GatewayJournalConfigSnapshot, GatewayRuntimeConfigSnapshot, GatewayRuntimeState,
-    MemoryRuntimeConfig, ProviderRequest, RequestContext, ToolApprovalOutcome, HEADER_CHANNEL,
-    HEADER_DEVICE_ID, HEADER_PRINCIPAL, MAX_APPROVAL_PAGE_LIMIT,
-    VAULT_RATE_LIMIT_MAX_PRINCIPAL_BUCKETS, VAULT_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW,
+    resolve_cron_job_channel_for_create, workspace_patch_metrics_from_output,
+    CachedMemorySearchEntry, GatewayAuthConfig, GatewayJournalConfigSnapshot,
+    GatewayRuntimeConfigSnapshot, GatewayRuntimeState, MemoryRuntimeConfig, ProviderRequest,
+    RequestContext, ToolApprovalOutcome, HEADER_CHANNEL, HEADER_DEVICE_ID, HEADER_PRINCIPAL,
+    MAX_APPROVAL_PAGE_LIMIT, VAULT_RATE_LIMIT_MAX_PRINCIPAL_BUCKETS,
+    VAULT_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW,
 };
 use crate::application::{
     approvals::{apply_tool_approval_outcome, approval_risk_for_tool},
@@ -1657,7 +1658,10 @@ fn clear_memory_search_cache_recovers_from_poisoned_lock() {
             .memory_search_cache
             .lock()
             .expect("cache lock should be available before poisoning");
-        cache.insert("seed".to_owned(), Vec::new());
+        cache.insert(
+            "seed".to_owned(),
+            CachedMemorySearchEntry { hits: Vec::new(), expires_at_unix_ms: None },
+        );
     }
 
     let poisoned_state = std::sync::Arc::clone(&state);
