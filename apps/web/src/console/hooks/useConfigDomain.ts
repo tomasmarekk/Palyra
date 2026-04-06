@@ -244,15 +244,16 @@ export function useConfigDomain({ api, setError, setNotice }: UseConfigDomainArg
     }
   }
 
-  async function loadSecretMetadata(): Promise<void> {
-    if (configSecretKey.trim().length === 0) {
+  async function loadSecretMetadata(secretKey?: string): Promise<void> {
+    const resolvedSecretKey = (secretKey ?? configSecretKey).trim();
+    if (resolvedSecretKey.length === 0) {
       setError("Secret key cannot be empty.");
       return;
     }
     setConfigBusy(true);
     setError(null);
     try {
-      const response = await api.getSecretMetadata(configSecretsScope, configSecretKey.trim());
+      const response = await api.getSecretMetadata(configSecretsScope, resolvedSecretKey);
       setConfigSecretMetadata(
         isJsonObject(response.secret as unknown as JsonValue)
           ? (response.secret as unknown as JsonObject)
@@ -283,7 +284,7 @@ export function useConfigDomain({ api, setError, setNotice }: UseConfigDomainArg
       setNotice("Secret stored.");
       setConfigSecretValue("");
       await refreshSecrets();
-      await loadSecretMetadata();
+      await loadSecretMetadata(configSecretKey);
     } catch (failure) {
       setError(toErrorMessage(failure));
     } finally {
@@ -291,8 +292,9 @@ export function useConfigDomain({ api, setError, setNotice }: UseConfigDomainArg
     }
   }
 
-  async function revealSecretValue(): Promise<void> {
-    if (configSecretKey.trim().length === 0) {
+  async function revealSecretValue(secretKey?: string): Promise<void> {
+    const resolvedSecretKey = (secretKey ?? configSecretKey).trim();
+    if (resolvedSecretKey.length === 0) {
       setError("Secret key cannot be empty.");
       return;
     }
@@ -302,7 +304,7 @@ export function useConfigDomain({ api, setError, setNotice }: UseConfigDomainArg
     try {
       const response = await api.revealSecret({
         scope: configSecretsScope,
-        key: configSecretKey.trim(),
+        key: resolvedSecretKey,
         reveal: true,
       });
       setConfigSecretReveal(

@@ -147,6 +147,48 @@ describe("M56 config, access, and support surfaces", () => {
     },
   );
 
+  it("uses the clicked secrets row key for inspect and reveal actions", async () => {
+    const inspectedKeys: string[] = [];
+    const revealedKeys: string[] = [];
+    const fetchMock = createFetchRouter(
+      (request) => routeOverviewRequests(request),
+      (request) => {
+        if (request.path === "/console/v1/secrets" && request.method === "GET") {
+          expect(request.url.searchParams.get("scope")).toBe("global");
+          return jsonResponse(secretMetadataListFixture());
+        }
+        if (request.path === "/console/v1/secrets/metadata" && request.method === "GET") {
+          inspectedKeys.push(request.url.searchParams.get("key") ?? "");
+          return jsonResponse(secretMetadataFixture());
+        }
+        if (request.path === "/console/v1/secrets/reveal" && request.method === "POST") {
+          const body = JSON.parse(request.body) as { key?: string };
+          revealedKeys.push(body.key ?? "");
+          return jsonResponse(secretRevealFixture());
+        }
+        return undefined;
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Secrets" }));
+    expect(await screen.findByRole("heading", { name: "Secrets" })).toBeInTheDocument();
+
+    fireEvent.change(screen.getAllByLabelText("Key")[0], { target: { value: "stale_secret" } });
+    fireEvent.click(screen.getByRole("button", { name: "Inspect" }));
+    await waitFor(() => {
+      expect(inspectedKeys).toEqual(["openai_api_key"]);
+    });
+
+    fireEvent.change(screen.getAllByLabelText("Key")[0], { target: { value: "another_stale" } });
+    fireEvent.click(screen.getAllByRole("button", { name: "Reveal" })[0]);
+    await waitFor(() => {
+      expect(revealedKeys).toEqual(["openai_api_key"]);
+    });
+  });
+
   it("surfaces access CLI handoffs and support bundle recovery workflows", async () => {
     let pairingSummary = pairingSummaryFixture();
     let nodePairings: ReturnType<typeof nodePairingListFixture> = nodePairingListFixture();

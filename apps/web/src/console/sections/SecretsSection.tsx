@@ -152,7 +152,7 @@ export function SecretsSection({ app }: SecretsSectionProps) {
                             variant="secondary"
                             onPress={() => {
                               app.setConfigSecretKey(key);
-                              void app.loadSecretMetadata();
+                              void app.loadSecretMetadata(key);
                             }}
                             isDisabled={app.configBusy}
                           >
@@ -163,7 +163,7 @@ export function SecretsSection({ app }: SecretsSectionProps) {
                             variant="secondary"
                             onPress={() => {
                               app.setConfigSecretKey(key);
-                              void app.revealSecretValue();
+                              void app.revealSecretValue(key);
                             }}
                             isDisabled={app.configBusy}
                           >
