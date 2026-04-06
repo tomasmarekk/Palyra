@@ -297,6 +297,11 @@ pub(crate) async fn console_routine_import_handler(
     let channel =
         normalize_channel(Some(bundle.job.channel.as_str()), session.context.channel.as_deref());
     let requested_enabled = payload.enabled.unwrap_or(bundle.job.enabled);
+    let existing_job =
+        state.runtime.cron_job(routine_id.clone()).await.map_err(runtime_status_response)?;
+    if let Some(job) = existing_job.as_ref() {
+        ensure_job_owner(job, session.context.principal.as_str())?;
+    }
     let approval_required = requested_enabled
         && bundle.routine.approval_policy.mode == RoutineApprovalMode::BeforeEnable
         && !routine_approval_granted(
@@ -306,7 +311,7 @@ pub(crate) async fn console_routine_import_handler(
         .await?;
     let job_record = persist_routine_job(
         &state,
-        state.runtime.cron_job(routine_id.clone()).await.map_err(runtime_status_response)?,
+        existing_job,
         RoutineJobUpsert {
             routine_id: routine_id.clone(),
             name: bundle.job.name.clone(),

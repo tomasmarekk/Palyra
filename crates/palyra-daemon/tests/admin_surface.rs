@@ -1409,6 +1409,82 @@ fn console_cron_endpoints_enforce_owner_principal_boundaries() -> Result<()> {
 }
 
 #[test]
+fn console_routine_import_rejects_existing_job_owned_by_another_principal() -> Result<()> {
+    let (child, admin_port) =
+        spawn_palyrad_with_dynamic_ports_with_env(&[("PALYRA_ADMIN_REQUIRE_AUTH", "false")])?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(4))
+        .build()
+        .context("failed to build HTTP client")?;
+    let (owner_cookie, owner_csrf_token) =
+        login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
+    let (auditor_cookie, auditor_csrf_token) =
+        login_console_session(&client, admin_port, CONSOLE_AUDITOR_PRINCIPAL)?;
+
+    let created_routine = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/routines"))
+        .header("Cookie", owner_cookie.clone())
+        .header("x-palyra-csrf-token", owner_csrf_token.clone())
+        .json(&serde_json::json!({
+            "name": "owner-boundary-routine",
+            "prompt": "owner routine boundary validation",
+            "trigger_kind": "schedule",
+            "schedule_type": "every",
+            "every_interval_ms": 60000,
+            "enabled": true,
+            "channel": "web",
+        }))
+        .send()
+        .context("failed to create owner-boundary routine from console endpoint")?
+        .error_for_status()
+        .context("owner-boundary routine create returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse owner-boundary routine create response json")?;
+    let routine_id = created_routine
+        .get("routine")
+        .and_then(|routine| routine.get("routine_id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("owner-boundary routine create missing routine.routine_id"))?
+        .to_owned();
+
+    let exported_bundle = client
+        .get(format!("http://127.0.0.1:{admin_port}/console/v1/routines/{routine_id}/export"))
+        .header("Cookie", owner_cookie)
+        .send()
+        .with_context(|| format!("failed to export owner-boundary routine {routine_id}"))?
+        .error_for_status()
+        .with_context(|| {
+            format!("owner-boundary routine export {routine_id} returned non-success status")
+        })?
+        .json::<Value>()
+        .with_context(|| format!("failed to parse owner-boundary routine export {routine_id}"))?
+        .get("export")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("owner-boundary routine export missing export payload"))?;
+
+    let forbidden_import = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/routines/import"))
+        .header("Cookie", auditor_cookie)
+        .header("x-palyra-csrf-token", auditor_csrf_token)
+        .json(&serde_json::json!({
+            "routine_id": routine_id,
+            "export": exported_bundle,
+        }))
+        .send()
+        .context("failed to import owner-boundary routine as non-owner principal")?;
+    assert_eq!(
+        forbidden_import.status().as_u16(),
+        403,
+        "console routine import must reject existing jobs owned by another principal"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn console_browser_relay_action_rejects_body_token_without_authorization_header() -> Result<()> {
     let (child, admin_port) = spawn_palyrad_with_bound_console_principal(CONSOLE_ADMIN_PRINCIPAL)?;
     let mut daemon = ChildGuard::new(child);
