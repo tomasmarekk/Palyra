@@ -20,6 +20,7 @@ pub const AUDIO_TRANSCRIBER_PARSER_VERSION: &str = "1";
 const DEFAULT_SUMMARY_MAX_CHARS: usize = 320;
 const DEFAULT_CHUNK_TARGET_CHARS: usize = 420;
 const DEFAULT_SELECTION_BUDGET_CHARS: usize = 1_600;
+const MAX_ZIP_TEXT_ENTRY_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -640,12 +641,23 @@ fn read_zip_text<R: Read + std::io::Seek>(
     archive: &mut ZipArchive<R>,
     path: &str,
 ) -> Result<String, String> {
-    let mut file = archive
+    let file = archive
         .by_name(path)
         .map_err(|error| format!("zip entry '{path}' missing or unreadable: {error}"))?;
+    if file.size() > MAX_ZIP_TEXT_ENTRY_BYTES {
+        return Err(format!(
+            "zip entry '{path}' exceeds max decompressed text bytes ({MAX_ZIP_TEXT_ENTRY_BYTES})"
+        ));
+    }
     let mut text = String::new();
-    file.read_to_string(&mut text)
+    file.take(MAX_ZIP_TEXT_ENTRY_BYTES + 1)
+        .read_to_string(&mut text)
         .map_err(|error| format!("zip entry '{path}' is not valid UTF-8 text: {error}"))?;
+    if text.len() as u64 > MAX_ZIP_TEXT_ENTRY_BYTES {
+        return Err(format!(
+            "zip entry '{path}' exceeds max decompressed text bytes ({MAX_ZIP_TEXT_ENTRY_BYTES})"
+        ));
+    }
     Ok(text)
 }
 
@@ -859,4 +871,60 @@ fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hex::encode(hasher.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        extract_document_content, AttachmentTextExtractionRequest, MAX_ZIP_TEXT_ENTRY_BYTES,
+    };
+    use std::io::{Cursor, Write};
+    use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
+
+    #[test]
+    fn extract_document_content_reads_docx_text_within_zip_entry_budget() {
+        let bytes = build_zip_document(
+            "word/document.xml",
+            r#"<w:document><w:body><w:p><w:r><w:t>Hello world from docx</w:t></w:r></w:p></w:body></w:document>"#,
+        );
+        let extracted = extract_document_content(&AttachmentTextExtractionRequest {
+            filename: "report.docx",
+            content_type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            bytes: bytes.as_slice(),
+        })
+        .expect("docx extraction should succeed");
+
+        assert!(
+            extracted.content_text.contains("Hello world from docx"),
+            "docx extractor should preserve text content"
+        );
+    }
+
+    #[test]
+    fn extract_document_content_rejects_docx_zip_entries_over_budget() {
+        let large_text = "A".repeat(MAX_ZIP_TEXT_ENTRY_BYTES as usize + 1);
+        let xml = format!(
+            "<w:document><w:body><w:p><w:r><w:t>{large_text}</w:t></w:r></w:p></w:body></w:document>"
+        );
+        let bytes = build_zip_document("word/document.xml", xml.as_str());
+        let error = extract_document_content(&AttachmentTextExtractionRequest {
+            filename: "bomb.docx",
+            content_type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            bytes: bytes.as_slice(),
+        })
+        .expect_err("oversized docx xml should be rejected");
+
+        assert!(
+            error.contains("exceeds max decompressed text bytes"),
+            "expected decompression budget error, got: {error}"
+        );
+    }
+
+    fn build_zip_document(path: &str, body: &str) -> Vec<u8> {
+        let mut writer = ZipWriter::new(Cursor::new(Vec::<u8>::new()));
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        writer.start_file(path, options).expect("zip start_file");
+        writer.write_all(body.as_bytes()).expect("zip write body");
+        writer.finish().expect("zip finish").into_inner()
+    }
 }
