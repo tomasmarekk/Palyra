@@ -171,6 +171,7 @@ pub enum WorkspacePathError {
     SegmentTooLong(String),
     Traversal,
     AbsolutePath,
+    ControlCharacter(String),
     RootNotAllowed(String),
     SensitiveSegment(String),
     InvalidExtension(String),
@@ -186,6 +187,9 @@ impl std::fmt::Display for WorkspacePathError {
             }
             Self::Traversal => formatter.write_str("workspace path traversal is not allowed"),
             Self::AbsolutePath => formatter.write_str("absolute workspace paths are not allowed"),
+            Self::ControlCharacter(segment) => {
+                write!(formatter, "workspace path segment contains control characters: {segment}")
+            }
             Self::RootNotAllowed(root) => {
                 write!(formatter, "workspace root is not allowed: {root}")
             }
@@ -356,6 +360,9 @@ pub fn normalize_workspace_path(path: &str) -> Result<WorkspacePathInfo, Workspa
         if current == ".." {
             return Err(WorkspacePathError::Traversal);
         }
+        if current.chars().any(char::is_control) {
+            return Err(WorkspacePathError::ControlCharacter(current.to_owned()));
+        }
         if current.len() > WORKSPACE_MAX_SEGMENT_BYTES {
             return Err(WorkspacePathError::SegmentTooLong(current.to_owned()));
         }
@@ -454,6 +461,13 @@ mod tests {
     fn normalize_workspace_path_rejects_sensitive_roots() {
         let error = normalize_workspace_path(".git/config").expect_err("sensitive root must fail");
         assert!(matches!(error, WorkspacePathError::SensitiveSegment(_)));
+    }
+
+    #[test]
+    fn normalize_workspace_path_rejects_control_characters() {
+        let error = normalize_workspace_path("projects/notes\nignore.md")
+            .expect_err("control characters must fail");
+        assert!(matches!(error, WorkspacePathError::ControlCharacter(_)));
     }
 
     #[test]
