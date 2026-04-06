@@ -223,9 +223,18 @@ fn index_tree(
     {
         let entry = entry
             .with_context(|| format!("failed to enumerate docs entry in {}", current.display()))?;
+        let file_type = entry.file_type().with_context(|| {
+            format!("failed to inspect docs entry type in {}", current.display())
+        })?;
+        if file_type.is_symlink() {
+            continue;
+        }
         let path = entry.path();
-        if path.is_dir() {
+        if file_type.is_dir() {
             index_tree(root, &path, kind, logical_prefix, entries)?;
+            continue;
+        }
+        if !file_type.is_file() {
             continue;
         }
         if !is_indexable_doc_path(&path) {
@@ -438,6 +447,13 @@ mod tests {
     };
     use std::{fs, path::Path};
 
+    #[cfg(unix)]
+    use super::index_tree;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+    #[cfg(unix)]
+    use tempfile::tempdir;
+
     #[test]
     fn normalize_requested_doc_accepts_windows_style_paths() {
         assert_eq!(
@@ -498,5 +514,28 @@ mod tests {
             .expect_err("paths outside docs roots should not resolve");
         assert!(error.to_string().contains("no committed docs/help entry matched"));
         fs::remove_file(temp_path).expect("temp file should be removable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn index_tree_skips_symlinked_docs_entries() {
+        let temp_dir = tempdir().expect("tempdir should initialize");
+        let docs_root = temp_dir.path().join("docs");
+        let external_root = temp_dir.path().join("external");
+        fs::create_dir_all(&docs_root).expect("docs root should be created");
+        fs::create_dir_all(&external_root).expect("external root should be created");
+        fs::write(docs_root.join("safe.md"), "# safe").expect("safe doc should be written");
+        let external_secret = external_root.join("secret.md");
+        fs::write(&external_secret, "# secret").expect("external secret should be written");
+        symlink(&external_secret, docs_root.join("secret.md"))
+            .expect("symlinked doc fixture should be created");
+
+        let mut entries = Vec::new();
+        index_tree(&docs_root, &docs_root, IndexedDocKind::Docs, "docs", &mut entries)
+            .expect("index should succeed");
+
+        assert_eq!(entries.len(), 1, "symlinked docs entry should be ignored");
+        assert_eq!(entries[0].relative_path, "docs/safe.md");
+        assert_eq!(entries[0].title, "safe");
     }
 }
