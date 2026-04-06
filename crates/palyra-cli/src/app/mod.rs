@@ -430,25 +430,25 @@ where
             .with_context(|| "PALYRA_STATE_ROOT contains an invalid path");
     }
     default_state_root_resolver()
-        .or_else(fallback_cli_state_root)
+        .map_err(missing_default_state_root_error)
         .context("failed to resolve default state root")
 }
 
 #[cfg(windows)]
-fn fallback_cli_state_root(
-    error: IdentityStorePathError,
-) -> Result<PathBuf, IdentityStorePathError> {
+fn missing_default_state_root_error(error: IdentityStorePathError) -> anyhow::Error {
     match error {
-        IdentityStorePathError::AppDataNotSet => Ok(env::temp_dir().join("Palyra")),
+        IdentityStorePathError::AppDataNotSet => anyhow::anyhow!(
+            "LOCALAPPDATA and APPDATA are unset; set PALYRA_STATE_ROOT or pass --state-root explicitly"
+        ),
     }
 }
 
 #[cfg(not(windows))]
-fn fallback_cli_state_root(
-    error: IdentityStorePathError,
-) -> Result<PathBuf, IdentityStorePathError> {
+fn missing_default_state_root_error(error: IdentityStorePathError) -> anyhow::Error {
     match error {
-        IdentityStorePathError::HomeNotSet => Ok(env::temp_dir().join("palyra")),
+        IdentityStorePathError::HomeNotSet => {
+            anyhow::anyhow!("HOME is unset; set PALYRA_STATE_ROOT or pass --state-root explicitly")
+        }
     }
 }
 
@@ -747,21 +747,21 @@ admin_token_env = "PALYRA_PROFILE_ADMIN_TOKEN"
 
     #[cfg(windows)]
     #[test]
-    fn state_root_falls_back_to_temp_when_windows_appdata_is_missing() -> Result<()> {
-        let state_root = super::resolve_cli_state_root_with(None, None, || {
+    fn state_root_requires_explicit_override_when_windows_appdata_is_missing() {
+        let error = super::resolve_cli_state_root_with(None, None, || {
             Err(IdentityStorePathError::AppDataNotSet)
-        })?;
-        assert_eq!(state_root, env::temp_dir().join("Palyra"));
-        Ok(())
+        })
+        .expect_err("missing appdata should require an explicit state root");
+        assert!(error.to_string().contains("PALYRA_STATE_ROOT"), "unexpected error: {error}");
     }
 
     #[cfg(not(windows))]
     #[test]
-    fn state_root_falls_back_to_temp_when_home_is_missing() -> Result<()> {
-        let state_root = super::resolve_cli_state_root_with(None, None, || {
+    fn state_root_requires_explicit_override_when_home_is_missing() {
+        let error = super::resolve_cli_state_root_with(None, None, || {
             Err(IdentityStorePathError::HomeNotSet)
-        })?;
-        assert_eq!(state_root, env::temp_dir().join("palyra"));
-        Ok(())
+        })
+        .expect_err("missing HOME should require an explicit state root");
+        assert!(error.to_string().contains("PALYRA_STATE_ROOT"), "unexpected error: {error}");
     }
 }
