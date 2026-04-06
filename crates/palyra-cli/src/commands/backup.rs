@@ -140,6 +140,7 @@ fn run_backup_create(
                 &mut writer,
                 options,
                 config_path.as_path(),
+                None,
                 format!("config/{file_name}").as_str(),
                 output_path.as_path(),
                 &mut entries,
@@ -377,11 +378,20 @@ fn add_directory_to_zip(
             if path == output_path {
                 continue;
             }
-            if path.is_dir() {
+            let file_type = child
+                .file_type()
+                .with_context(|| format!("failed to inspect backup entry {}", path.display()))?;
+            if file_type.is_symlink() {
+                anyhow::bail!(
+                    "backup source contains unsupported symlink entry: {}",
+                    path.display()
+                );
+            }
+            if file_type.is_dir() {
                 stack.push(path);
                 continue;
             }
-            if path.is_file() {
+            if file_type.is_file() {
                 let relative = path
                     .strip_prefix(source_root.as_path())
                     .with_context(|| {
@@ -396,6 +406,7 @@ fn add_directory_to_zip(
                     writer,
                     options,
                     path.as_path(),
+                    Some(source_root.as_path()),
                     archive_path.as_str(),
                     output_path,
                     entries,
@@ -410,11 +421,17 @@ fn add_file_to_zip(
     writer: &mut ZipWriter<fs::File>,
     options: SimpleFileOptions,
     source_path: &Path,
+    allowed_root: Option<&Path>,
     archive_path: &str,
     output_path: &Path,
     entries: &mut Vec<BackupEntry>,
 ) -> Result<()> {
     let source_path = support::lifecycle::canonicalize_lossy(source_path)?;
+    if let Some(allowed_root) = allowed_root {
+        if !support::lifecycle::path_starts_with(source_path.as_path(), allowed_root) {
+            anyhow::bail!("backup source escapes the allowed root: {}", source_path.display());
+        }
+    }
     if source_path == output_path {
         return Ok(());
     }
@@ -512,6 +529,8 @@ fn emit_backup_verify_report(report: &BackupVerifyReport) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
     use tempfile::tempdir;
 
     #[test]
@@ -549,6 +568,75 @@ mod tests {
         let loaded = read_backup_manifest(&mut archive)?;
         assert_eq!(loaded.entries.len(), 1);
         assert_eq!(loaded.entries[0].sha256, crate::sha256_hex(b"abc"));
+        Ok(())
+    }
+
+    #[test]
+    fn add_file_to_zip_rejects_sources_outside_allowed_root() -> Result<()> {
+        let temp = tempdir()?;
+        let allowed_root = temp.path().join("allowed");
+        let outside_root = temp.path().join("outside");
+        fs::create_dir_all(allowed_root.as_path())?;
+        fs::create_dir_all(outside_root.as_path())?;
+
+        let outside_file = outside_root.join("secret.txt");
+        fs::write(outside_file.as_path(), b"secret")?;
+
+        let archive_path = temp.path().join("backup.zip");
+        let file = fs::File::create(archive_path.as_path())?;
+        let mut writer = ZipWriter::new(file);
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        let mut entries = Vec::new();
+
+        let error = add_file_to_zip(
+            &mut writer,
+            options,
+            outside_file.as_path(),
+            Some(allowed_root.as_path()),
+            "state/secret.txt",
+            archive_path.as_path(),
+            &mut entries,
+        )
+        .expect_err("outside sources must be rejected");
+        assert!(
+            error.to_string().contains("escapes the allowed root"),
+            "unexpected error: {error}"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn add_directory_to_zip_rejects_symlink_entries() -> Result<()> {
+        let temp = tempdir()?;
+        let source_root = temp.path().join("state");
+        let outside_root = temp.path().join("outside");
+        fs::create_dir_all(source_root.as_path())?;
+        fs::create_dir_all(outside_root.as_path())?;
+
+        let outside_file = outside_root.join("secret.txt");
+        fs::write(outside_file.as_path(), b"secret")?;
+        symlink(outside_file.as_path(), source_root.join("leak.txt").as_path())?;
+
+        let archive_path = temp.path().join("backup.zip");
+        let file = fs::File::create(archive_path.as_path())?;
+        let mut writer = ZipWriter::new(file);
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        let mut entries = Vec::new();
+
+        let error = add_directory_to_zip(
+            &mut writer,
+            options,
+            source_root.as_path(),
+            "state",
+            archive_path.as_path(),
+            &mut entries,
+        )
+        .expect_err("symlink entries must be rejected");
+        assert!(
+            error.to_string().contains("unsupported symlink entry"),
+            "unexpected error: {error}"
+        );
         Ok(())
     }
 }
