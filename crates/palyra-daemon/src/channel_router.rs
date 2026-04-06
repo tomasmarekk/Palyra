@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    fmt::Write as _,
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -1298,20 +1299,24 @@ fn normalize_non_empty(value: &str) -> Option<String> {
 }
 
 fn normalize_session_component(value: &str) -> String {
-    let mut normalized = String::with_capacity(value.len());
-    for ch in value.trim().chars() {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return "default".to_owned();
+    }
+
+    let mut normalized = String::with_capacity(trimmed.len());
+    for ch in trimmed.chars() {
         if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
-            normalized.push(ch.to_ascii_lowercase());
-        } else {
-            normalized.push('_');
+            normalized.push(ch);
+            continue;
+        }
+
+        let mut utf8 = [0_u8; 4];
+        for byte in ch.encode_utf8(&mut utf8).as_bytes() {
+            let _ = write!(&mut normalized, "~{byte:02x}");
         }
     }
-    let collapsed = normalized.trim_matches('_');
-    if collapsed.is_empty() {
-        "default".to_owned()
-    } else {
-        collapsed.to_owned()
-    }
+    normalized
 }
 
 fn current_unix_ms() -> i64 {
@@ -1329,9 +1334,9 @@ fn sha256_hex(payload: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        BroadcastStrategy, ChannelRouter, ChannelRouterConfig, ChannelRoutingRule,
-        DirectMessagePolicy, InboundMessage, PairingApprovalOutcome, PairingConsumeOutcome,
-        RetryDisposition, RouteOutcome,
+        normalize_session_component, BroadcastStrategy, ChannelRouter, ChannelRouterConfig,
+        ChannelRoutingRule, DirectMessagePolicy, InboundMessage, PairingApprovalOutcome,
+        PairingConsumeOutcome, RetryDisposition, RouteOutcome,
     };
 
     fn baseline_config() -> ChannelRouterConfig {
@@ -1411,10 +1416,24 @@ mod tests {
             panic!("mention hit should route");
         };
         assert_eq!(routed.plan.channel, "slack");
-        assert_eq!(routed.plan.route_key, "channel:slack:conversation:c01team");
-        assert_eq!(routed.plan.session_key, "channel:slack:conversation:c01team");
+        assert_eq!(routed.plan.route_key, "channel:slack:conversation:C01TEAM");
+        assert_eq!(routed.plan.session_key, "channel:slack:conversation:C01TEAM");
         assert_eq!(routed.plan.response_prefix.as_deref(), Some("[bot] "));
         routed.lease.release();
+    }
+
+    #[test]
+    fn session_component_encoding_avoids_normalization_collisions() {
+        assert_eq!(normalize_session_component("support:team"), "support~3ateam");
+        assert_eq!(normalize_session_component("support_team"), "support_team");
+        assert_ne!(
+            normalize_session_component("support:team"),
+            normalize_session_component("support_team")
+        );
+        assert_ne!(
+            normalize_session_component("CaseSensitive"),
+            normalize_session_component("casesensitive")
+        );
     }
 
     #[test]
@@ -1549,7 +1568,7 @@ mod tests {
         let RouteOutcome::Routed(routed) = outcome else {
             panic!("sender-isolated route should be accepted");
         };
-        assert_eq!(routed.plan.session_key, "channel:slack:conversation:c01team:sender:u123");
+        assert_eq!(routed.plan.session_key, "channel:slack:conversation:C01TEAM:sender:U123");
         routed.lease.release();
     }
 
