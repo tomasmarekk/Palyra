@@ -1560,8 +1560,16 @@ fn push_csv_row(buffer: &mut String, values: &[String]) {
 }
 
 fn csv_escape(value: &str) -> String {
-    let escaped = value.replace('"', "\"\"");
+    let escaped = neutralize_csv_formula(value).replace('"', "\"\"");
     format!("\"{escaped}\"")
+}
+
+fn neutralize_csv_formula(value: &str) -> String {
+    if matches!(value.chars().next(), Some('=' | '+' | '-' | '@' | '\t' | '\r' | '\n')) {
+        format!("'{value}")
+    } else {
+        value.to_owned()
+    }
 }
 
 fn optional_u64(value: Option<u64>) -> String {
@@ -1578,4 +1586,18 @@ fn optional_f64(value: Option<f64>) -> String {
 
 fn current_unix_ms() -> Result<i64, std::time::SystemTimeError> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::csv_escape;
+
+    #[test]
+    fn csv_escape_neutralizes_formula_prefixes() {
+        assert_eq!(csv_escape("=SUM(A1:A2)"), "\"'=SUM(A1:A2)\"");
+        assert_eq!(csv_escape("+cmd"), "\"'+cmd\"");
+        assert_eq!(csv_escape("-10"), "\"'-10\"");
+        assert_eq!(csv_escape("@user"), "\"'@user\"");
+        assert_eq!(csv_escape("safe"), "\"safe\"");
+    }
 }
