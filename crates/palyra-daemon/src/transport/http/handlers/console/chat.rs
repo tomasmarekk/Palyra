@@ -1842,6 +1842,21 @@ pub(crate) async fn console_chat_queue_handler(
             "queued follow-up requires an active run stream",
         ))
     })?;
+    let run = state
+        .runtime
+        .orchestrator_run_status_snapshot(run_id.clone())
+        .await
+        .map_err(runtime_status_response)?
+        .ok_or_else(|| {
+            runtime_status_response(tonic::Status::not_found(format!(
+                "orchestrator run not found: {run_id}"
+            )))
+        })?;
+    if !run_matches_console_context(&run, &session.context) {
+        return Err(runtime_status_response(tonic::Status::permission_denied(
+            "chat run does not belong to the authenticated console session context",
+        )));
+    }
     if !lock_console_chat_pending_approvals(&stream.pending_approvals).is_empty() {
         return Err(runtime_status_response(tonic::Status::failed_precondition(
             "cannot queue a follow-up while approval decisions are still pending",
@@ -3370,4 +3385,69 @@ fn build_console_run_lineage_payload(
         "root_run_id": root_run_id,
         "runs": runs,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run_matches_console_context;
+    use crate::{gateway, journal};
+
+    #[test]
+    fn run_matches_console_context_rejects_mismatched_principal() {
+        let run = sample_run_status();
+        let context = gateway::RequestContext {
+            principal: "admin:web-auditor".to_owned(),
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            channel: Some("web".to_owned()),
+        };
+
+        assert!(
+            !run_matches_console_context(&run, &context),
+            "run ownership check must reject mismatched principals"
+        );
+    }
+
+    #[test]
+    fn run_matches_console_context_accepts_matching_console_context() {
+        let run = sample_run_status();
+        let context = gateway::RequestContext {
+            principal: "admin:web-console".to_owned(),
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            channel: Some("web".to_owned()),
+        };
+
+        assert!(
+            run_matches_console_context(&run, &context),
+            "run ownership check should allow the originating console context"
+        );
+    }
+
+    fn sample_run_status() -> journal::OrchestratorRunStatusSnapshot {
+        journal::OrchestratorRunStatusSnapshot {
+            run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),
+            session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAY".to_owned(),
+            state: "running".to_owned(),
+            cancel_requested: false,
+            cancel_reason: None,
+            principal: "admin:web-console".to_owned(),
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            channel: Some("web".to_owned()),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            created_at_unix_ms: 1,
+            started_at_unix_ms: 1,
+            completed_at_unix_ms: None,
+            updated_at_unix_ms: 1,
+            last_error: None,
+            origin_kind: "console".to_owned(),
+            origin_run_id: None,
+            parent_run_id: None,
+            triggered_by_principal: None,
+            parameter_delta_json: None,
+            delegation: None,
+            merge_result: None,
+            tape_events: 0,
+        }
+    }
 }
