@@ -22,6 +22,9 @@ export const DEFAULT_APPROVAL_TTL_MS = "300000";
 export const CONTEXT_BUDGET_SOFT_LIMIT = 12_000;
 export const CONTEXT_BUDGET_HARD_LIMIT = 16_000;
 const CANVAS_FRAME_PATH_SEGMENTS = ["canvas", "v1", "frame"] as const;
+const MAX_CANVAS_SCAN_DEPTH = 12;
+const MAX_CANVAS_SCAN_VISITS = 128;
+const MAX_CANVAS_SCAN_RESULTS = 8;
 
 export interface TranscriptAttachmentSummary {
   readonly id: string;
@@ -362,25 +365,64 @@ export function applyAssistantTokenBatch(
 }
 
 export function collectCanvasFrameUrls(value: JsonValue): string[] {
-  if (typeof value === "string") {
-    const normalized = normalizeCanvasFrameUrl(value);
-    return normalized === null ? [] : [normalized];
-  }
-  if (Array.isArray(value)) {
-    const rows: string[] = [];
-    for (const entry of value) {
-      rows.push(...collectCanvasFrameUrls(entry));
+  const rows: string[] = [];
+  const seen = new Set<string>();
+  const pending: Array<{ value: JsonValue; depth: number }> = [{ value, depth: 0 }];
+  let visited = 0;
+
+  while (
+    pending.length > 0 &&
+    visited < MAX_CANVAS_SCAN_VISITS &&
+    rows.length < MAX_CANVAS_SCAN_RESULTS
+  ) {
+    const current = pending.pop();
+    if (current === undefined) {
+      break;
     }
-    return rows;
-  }
-  if (isJsonObject(value)) {
-    const rows: string[] = [];
-    for (const entry of Object.values(value)) {
-      rows.push(...collectCanvasFrameUrls(entry));
+    visited += 1;
+
+    if (typeof current.value === "string") {
+      const normalized = normalizeCanvasFrameUrl(current.value);
+      if (normalized !== null && !seen.has(normalized)) {
+        seen.add(normalized);
+        rows.push(normalized);
+      }
+      continue;
     }
-    return rows;
+    if (current.depth >= MAX_CANVAS_SCAN_DEPTH) {
+      continue;
+    }
+    if (Array.isArray(current.value)) {
+      enqueueCanvasScanEntries(current.value, current.depth + 1, pending, visited);
+      continue;
+    }
+    if (isJsonObject(current.value)) {
+      enqueueCanvasScanEntries(
+        Object.values(current.value),
+        current.depth + 1,
+        pending,
+        visited,
+      );
+    }
   }
-  return [];
+
+  return rows;
+}
+
+function enqueueCanvasScanEntries(
+  values: readonly JsonValue[],
+  depth: number,
+  pending: Array<{ value: JsonValue; depth: number }>,
+  visited: number,
+): void {
+  const remainingBudget = MAX_CANVAS_SCAN_VISITS - visited - pending.length;
+  if (remainingBudget <= 0) {
+    return;
+  }
+  const childLimit = Math.min(values.length, remainingBudget);
+  for (let index = childLimit - 1; index >= 0; index -= 1) {
+    pending.push({ value: values[index], depth });
+  }
 }
 
 export function normalizeCanvasFrameUrl(raw: string): string | null {

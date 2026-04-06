@@ -1,8 +1,12 @@
+// @vitest-environment jsdom
+
 import { describe, expect, it } from "vite-plus/test";
 
+import type { JsonValue } from "../consoleApi";
 import {
   buildContextBudgetSummary,
   buildSessionLineageHint,
+  collectCanvasFrameUrls,
   describeBranchState,
   parseCompactCommandMode,
   parseSlashCommand,
@@ -83,5 +87,56 @@ describe("chatShared helpers", () => {
         pending_approvals: 0,
       }),
     ).toMatch(/Active branch from .* at run/i);
+  });
+});
+
+describe("collectCanvasFrameUrls", () => {
+  it("deduplicates nested canvas urls and ignores invalid entries", () => {
+    const payload: JsonValue = {
+      primary: "/canvas/v1/frame/01ARZ3NDEKTSV4RRFFQ69G5FB1?token=one",
+      nested: [
+        "/canvas/v1/frame/01ARZ3NDEKTSV4RRFFQ69G5FB1?token=one",
+        {
+          secondary: "/canvas/v1/frame/01ARZ3NDEKTSV4RRFFQ69G5FB2?token=two",
+          invalid: [
+            "https://evil.example/canvas/v1/frame/01ARZ3NDEKTSV4RRFFQ69G5FB3?token=bad",
+            "/canvas/v1/frame/01ARZ3NDEKTSV4RRFFQ69G5FB4",
+          ],
+        },
+      ],
+    };
+
+    expect(collectCanvasFrameUrls(payload)).toEqual([
+      "/canvas/v1/frame/01ARZ3NDEKTSV4RRFFQ69G5FB1?token=one",
+      "/canvas/v1/frame/01ARZ3NDEKTSV4RRFFQ69G5FB2?token=two",
+    ]);
+  });
+
+  it("caps discovered canvas urls per payload", () => {
+    const payload: JsonValue = Array.from({ length: 20 }, (_, index) => {
+      return `/canvas/v1/frame/01ARZ3NDEKTSV4RRFFQ69G${String(index).padStart(5, "0")}?token=t${index}`;
+    });
+
+    expect(collectCanvasFrameUrls(payload)).toEqual(
+      Array.from({ length: 8 }, (_, index) => {
+        return `/canvas/v1/frame/01ARZ3NDEKTSV4RRFFQ69G${String(index).padStart(5, "0")}?token=t${index}`;
+      }),
+    );
+  });
+
+  it("stays bounded on deeply nested payloads", () => {
+    let deepPayload: JsonValue = "/canvas/v1/frame/01ARZ3NDEKTSV4RRFFQ69G9ZZ?token=deep";
+    for (let index = 0; index < 20_000; index += 1) {
+      deepPayload = { nested: deepPayload };
+    }
+    const payload: JsonValue = {
+      top: "/canvas/v1/frame/01ARZ3NDEKTSV4RRFFQ69G5FB5?token=top",
+      deep: deepPayload,
+    };
+
+    expect(() => collectCanvasFrameUrls(payload)).not.toThrow();
+    expect(collectCanvasFrameUrls(payload)).toEqual([
+      "/canvas/v1/frame/01ARZ3NDEKTSV4RRFFQ69G5FB5?token=top",
+    ]);
   });
 });
