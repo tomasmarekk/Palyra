@@ -484,14 +484,22 @@ fn non_empty_string_option(value: String) -> Option<String> {
 }
 
 fn csv_escape(raw: &str) -> String {
-    let escaped = raw.replace('"', "\"\"");
+    let escaped = neutralize_csv_formula(raw).replace('"', "\"\"");
     format!("\"{escaped}\"")
+}
+
+fn neutralize_csv_formula(raw: &str) -> String {
+    if matches!(raw.chars().next(), Some('=' | '+' | '-' | '@' | '\t' | '\r' | '\n')) {
+        format!("'{raw}")
+    } else {
+        raw.to_owned()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_journal_log_source, decode_redacted_log_payload, log_record_sort_key,
+        classify_journal_log_source, csv_escape, decode_redacted_log_payload, log_record_sort_key,
         map_connector_event_log_record, map_journal_log_record, normalize_log_export_format,
         parse_log_cursor, LogSortKey,
     };
@@ -593,5 +601,14 @@ mod tests {
             normalize_log_export_format(Some("xml")).is_err(),
             "unsupported formats must fail closed"
         );
+    }
+
+    #[test]
+    fn csv_escape_neutralizes_formula_prefixes() {
+        assert_eq!(csv_escape("=SUM(A1:A2)"), "\"'=SUM(A1:A2)\"");
+        assert_eq!(csv_escape("+cmd"), "\"'+cmd\"");
+        assert_eq!(csv_escape("-10"), "\"'-10\"");
+        assert_eq!(csv_escape("@user"), "\"'@user\"");
+        assert_eq!(csv_escape("safe"), "\"safe\"");
     }
 }
