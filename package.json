@@ -36,14 +36,14 @@
     "browser-extension:test": "vp run @palyra/browser-extension#test"
   },
   "devDependencies": {
-    "@voidzero-dev/vite-plus-core": "0.1.15",
+    "@voidzero-dev/vite-plus-core": "0.1.16",
     "jsdom": "29.0.1",
-    "vite-plus": "0.1.15",
-    "vitest": "npm:@voidzero-dev/vite-plus-test@0.1.15"
+    "vite-plus": "0.1.16",
+    "vitest": "npm:@voidzero-dev/vite-plus-test@0.1.16"
   },
   "overrides": {
     "picomatch": "4.0.4",
-    "vite": "npm:@voidzero-dev/vite-plus-core@0.1.15",
-    "vitest": "npm:@voidzero-dev/vite-plus-test@0.1.15"
+    "vite": "npm:@voidzero-dev/vite-plus-core@0.1.16",
+    "vitest": "npm:@voidzero-dev/vite-plus-test@0.1.16"
   }
 }
