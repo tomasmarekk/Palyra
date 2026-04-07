@@ -6,8 +6,9 @@ Arguments:
   <SESSION_ID>
 
 Options:
+      --principal <PRINCIPAL>
       --output <OUTPUT>
-  -h, --help             Print help
+  -h, --help                   Print help
 
 Global Options:
       --profile <PROFILE>
