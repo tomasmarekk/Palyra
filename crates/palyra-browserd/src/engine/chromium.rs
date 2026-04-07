@@ -1008,6 +1008,7 @@ pub(crate) async fn type_with_chromium(
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{clamp_chromium_snapshot, ChromiumObserveSnapshot};
 

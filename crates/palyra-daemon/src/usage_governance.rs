@@ -1035,6 +1035,7 @@ pub(crate) async fn load_budget_override_approvals(
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
         latest_routing_decisions_by_run_id, select_routing_models, RoutingDecisionContext,
