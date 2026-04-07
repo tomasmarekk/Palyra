@@ -4293,13 +4293,17 @@ async fn browser_service_inspect_session_truncates_deterministically() {
         max_dom_snapshot_bytes: 64,
         max_visible_text_bytes: 32,
     };
+    let mut first_request = Request::new(request.clone());
+    insert_principal(&mut first_request, "user:ops");
     let first = service
-        .inspect_session(Request::new(request.clone()))
+        .inspect_session(first_request)
         .await
         .expect("first inspect_session should execute")
         .into_inner();
+    let mut second_request = Request::new(request);
+    insert_principal(&mut second_request, "user:ops");
     let second = service
-        .inspect_session(Request::new(request))
+        .inspect_session(second_request)
         .await
         .expect("second inspect_session should execute")
         .into_inner();

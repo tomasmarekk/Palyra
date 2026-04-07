@@ -32,6 +32,8 @@ const BROWSER_SERVICE_METADATA_FILE_NAME: &str = "browser-service.json";
 const BROWSER_SERVICE_STDOUT_LOG_FILE_NAME: &str = "browserd.stdout.log";
 const BROWSER_SERVICE_STDERR_LOG_FILE_NAME: &str = "browserd.stderr.log";
 const BROWSER_ARTIFACT_DIR: &str = "browser-artifacts";
+const BROWSER_CALLER_PRINCIPAL_HEADER: &str = "x-palyra-principal";
+const BROWSER_PROBE_PRINCIPAL: &str = "admin:browser-probe";
 
 #[cfg(windows)]
 const DETACHED_PROCESS: u32 = 0x0000_0008;
@@ -354,13 +356,15 @@ async fn run_browser_async(command: BrowserCommand) -> Result<()> {
         BrowserCommand::Network { session_id, limit, include_headers, max_payload_bytes } => {
             run_browser_network(session_id, limit, include_headers, max_payload_bytes).await
         }
-        BrowserCommand::Storage { session_id, output } => {
-            run_browser_storage(session_id, output).await
+        BrowserCommand::Storage { session_id, principal, output } => {
+            run_browser_storage(session_id, principal, output).await
         }
-        BrowserCommand::Errors { session_id, limit, output } => {
-            run_browser_errors(session_id, limit, output).await
+        BrowserCommand::Errors { session_id, principal, limit, output } => {
+            run_browser_errors(session_id, principal, limit, output).await
         }
-        BrowserCommand::Trace { session_id, output } => run_browser_trace(session_id, output).await,
+        BrowserCommand::Trace { session_id, principal, output } => {
+            run_browser_trace(session_id, principal, output).await
+        }
         BrowserCommand::Downloads { session_id, limit, quarantined_only } => {
             run_browser_downloads(session_id, limit, quarantined_only).await
         }
@@ -731,6 +735,8 @@ async fn run_browser_session_command(command: BrowserSessionCommand) -> Result<(
         BrowserSessionCommand::List { principal, limit } => {
             let resolved = resolve_browser_config(None, None, None)?;
             let mut client = connect_browser_service(&resolved.connection).await?;
+            let caller_principal =
+                resolve_browser_caller_principal(principal.clone(), app::ConnectionDefaults::USER)?;
             let response = client
                 .list_sessions(browser_request(
                     browser_v1::ListSessionsRequest {
@@ -739,6 +745,7 @@ async fn run_browser_session_command(command: BrowserSessionCommand) -> Result<(
                         limit: limit.unwrap_or_default(),
                     },
                     resolved.connection.auth_token.as_deref(),
+                    caller_principal.as_str(),
                 )?)
                 .await
                 .context("failed to list browser sessions")?
@@ -772,8 +779,9 @@ async fn run_browser_session_command(command: BrowserSessionCommand) -> Result<(
             }
             emit_browser_value(&value, text, "failed to encode browser session list output")
         }
-        BrowserSessionCommand::Show { session_id } => {
-            let detail = get_browser_session_detail(session_id.as_str()).await?;
+        BrowserSessionCommand::Show { session_id, principal } => {
+            let detail =
+                get_browser_session_detail(session_id.as_str(), principal.as_deref()).await?;
             let value = session_detail_value(&detail);
             let text = format!(
                 "browser.session.show session_id={} tabs={} private_targets={} downloads={} profile_id={}",
@@ -787,6 +795,7 @@ async fn run_browser_session_command(command: BrowserSessionCommand) -> Result<(
         }
         BrowserSessionCommand::Inspect {
             session_id,
+            principal,
             include_cookies,
             include_storage,
             include_action_log,
@@ -803,6 +812,7 @@ async fn run_browser_session_command(command: BrowserSessionCommand) -> Result<(
         } => {
             let mut value = inspect_browser_session(
                 session_id.as_str(),
+                principal.as_deref(),
                 browser_v1::InspectSessionRequest {
                     v: CANONICAL_PROTOCOL_MAJOR,
                     session_id: Some(resolve_required_canonical_id(session_id.clone())?),
@@ -1566,9 +1576,14 @@ async fn run_browser_network(
     emit_browser_value(&value, text, "failed to encode browser network output")
 }
 
-async fn run_browser_storage(session_id: String, output: Option<String>) -> Result<()> {
+async fn run_browser_storage(
+    session_id: String,
+    principal: Option<String>,
+    output: Option<String>,
+) -> Result<()> {
     let mut value = inspect_browser_session(
         session_id.as_str(),
+        principal.as_deref(),
         browser_v1::InspectSessionRequest {
             v: CANONICAL_PROTOCOL_MAJOR,
             session_id: Some(resolve_required_canonical_id(session_id.clone())?),
@@ -1605,11 +1620,13 @@ async fn run_browser_storage(session_id: String, output: Option<String>) -> Resu
 
 async fn run_browser_errors(
     session_id: String,
+    principal: Option<String>,
     limit: Option<u32>,
     output: Option<String>,
 ) -> Result<()> {
     let mut value = inspect_browser_session(
         session_id.as_str(),
+        principal.as_deref(),
         browser_v1::InspectSessionRequest {
             v: CANONICAL_PROTOCOL_MAJOR,
             session_id: Some(resolve_required_canonical_id(session_id.clone())?),
@@ -1658,9 +1675,14 @@ async fn run_browser_errors(
     )
 }
 
-async fn run_browser_trace(session_id: String, output: Option<String>) -> Result<()> {
+async fn run_browser_trace(
+    session_id: String,
+    principal: Option<String>,
+    output: Option<String>,
+) -> Result<()> {
     let mut value = inspect_browser_session(
         session_id.as_str(),
+        principal.as_deref(),
         browser_v1::InspectSessionRequest {
             v: CANONICAL_PROTOCOL_MAJOR,
             session_id: Some(resolve_required_canonical_id(session_id.clone())?),
@@ -1897,9 +1919,14 @@ async fn connect_browser_service(
     Ok(browser_v1::browser_service_client::BrowserServiceClient::new(channel))
 }
 
-fn browser_request<T>(payload: T, auth_token: Option<&str>) -> Result<Request<T>> {
+fn browser_request<T>(
+    payload: T,
+    auth_token: Option<&str>,
+    caller_principal: &str,
+) -> Result<Request<T>> {
     let mut request = Request::new(payload);
     apply_browser_service_auth(request.metadata_mut(), auth_token)?;
+    apply_browser_service_caller_principal(request.metadata_mut(), caller_principal)?;
     Ok(request)
 }
 
@@ -1915,6 +1942,34 @@ fn apply_browser_service_auth(metadata: &mut MetadataMap, auth_token: Option<&st
     Ok(())
 }
 
+fn apply_browser_service_caller_principal(
+    metadata: &mut MetadataMap,
+    caller_principal: &str,
+) -> Result<()> {
+    let caller_principal = caller_principal.trim();
+    if caller_principal.is_empty() {
+        anyhow::bail!("browser caller principal must not be empty");
+    }
+    metadata.insert(
+        BROWSER_CALLER_PRINCIPAL_HEADER,
+        caller_principal.parse().context("invalid browser caller principal metadata")?,
+    );
+    Ok(())
+}
+
+fn resolve_browser_caller_principal(
+    override_principal: Option<String>,
+    defaults: app::ConnectionDefaults,
+) -> Result<String> {
+    let root_context = app::current_root_context()
+        .ok_or_else(|| anyhow!("CLI root context is unavailable for browser command"))?;
+    let connection = root_context.resolve_grpc_connection(
+        app::ConnectionOverrides { principal: override_principal, ..Default::default() },
+        defaults,
+    )?;
+    Ok(connection.principal)
+}
+
 async fn probe_browser_grpc(connection: &BrowserServiceConnection) -> Result<()> {
     let mut client = connect_browser_service(connection).await?;
     client
@@ -1925,14 +1980,22 @@ async fn probe_browser_grpc(connection: &BrowserServiceConnection) -> Result<()>
                 limit: 1,
             },
             connection.auth_token.as_deref(),
+            BROWSER_PROBE_PRINCIPAL,
         )?)
         .await
         .context("failed to call browser ListSessions")?;
     Ok(())
 }
 
-async fn get_browser_session_detail(session_id: &str) -> Result<browser_v1::BrowserSessionDetail> {
+async fn get_browser_session_detail(
+    session_id: &str,
+    principal: Option<&str>,
+) -> Result<browser_v1::BrowserSessionDetail> {
     let resolved = resolve_browser_config(None, None, None)?;
+    let caller_principal = resolve_browser_caller_principal(
+        principal.map(str::to_owned),
+        app::ConnectionDefaults::USER,
+    )?;
     let mut client = connect_browser_service(&resolved.connection).await?;
     let response = client
         .get_session(browser_request(
@@ -1941,6 +2004,7 @@ async fn get_browser_session_detail(session_id: &str) -> Result<browser_v1::Brow
                 session_id: Some(resolve_required_canonical_id(session_id.to_owned())?),
             },
             resolved.connection.auth_token.as_deref(),
+            caller_principal.as_str(),
         )?)
         .await
         .context("failed to fetch browser session")?
@@ -1953,12 +2017,21 @@ async fn get_browser_session_detail(session_id: &str) -> Result<browser_v1::Brow
 
 async fn inspect_browser_session(
     session_id: &str,
+    principal: Option<&str>,
     request: browser_v1::InspectSessionRequest,
 ) -> Result<Value> {
     let resolved = resolve_browser_config(None, None, None)?;
+    let caller_principal = resolve_browser_caller_principal(
+        principal.map(str::to_owned),
+        app::ConnectionDefaults::USER,
+    )?;
     let mut client = connect_browser_service(&resolved.connection).await?;
     let response = client
-        .inspect_session(browser_request(request, resolved.connection.auth_token.as_deref())?)
+        .inspect_session(browser_request(
+            request,
+            resolved.connection.auth_token.as_deref(),
+            caller_principal.as_str(),
+        )?)
         .await
         .context("failed to inspect browser session")?
         .into_inner();

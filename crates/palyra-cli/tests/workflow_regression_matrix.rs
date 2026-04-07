@@ -405,8 +405,11 @@ fn browser_channels_and_session_workflows_are_regression_tested() -> Result<()> 
     assert_eq!(browser_status_payload.get("health_ok").and_then(Value::as_bool), Some(true));
     assert_eq!(browser_status_payload.get("grpc_ok").and_then(Value::as_bool), Some(true));
 
-    let session_list_before =
-        run_cli_json(&workdir, &["browser", "session", "list"], &browser_cli_env)?;
+    let session_list_before = run_cli_json(
+        &workdir,
+        &["browser", "session", "list", "--principal", "user:ops"],
+        &browser_cli_env,
+    )?;
     let session_list_before_payload =
         assert_json_success(session_list_before, "browser session list before")?;
     assert_eq!(
@@ -441,10 +444,14 @@ fn browser_channels_and_session_workflows_are_regression_tested() -> Result<()> 
         .and_then(Value::as_str)
         .context("browser session create should return redacted session_id text")?;
     assert!(redacted_session_id.starts_with("session-"));
-    let session_id = latest_browser_session_id(browser_endpoint.as_str(), BROWSER_AUTH_TOKEN)?;
+    let session_id =
+        latest_browser_session_id(browser_endpoint.as_str(), BROWSER_AUTH_TOKEN, "user:ops")?;
 
-    let session_list_after =
-        run_cli_json(&workdir, &["browser", "session", "list"], &browser_cli_env)?;
+    let session_list_after = run_cli_json(
+        &workdir,
+        &["browser", "session", "list", "--principal", "user:ops"],
+        &browser_cli_env,
+    )?;
     let session_list_after_payload =
         assert_json_success(session_list_after, "browser session list after")?;
     assert_eq!(
@@ -470,7 +477,7 @@ fn browser_channels_and_session_workflows_are_regression_tested() -> Result<()> 
 
     let session_show_output = run_cli_json(
         &workdir,
-        &["browser", "session", "show", session_id.as_str()],
+        &["browser", "session", "show", session_id.as_str(), "--principal", "user:ops"],
         &browser_cli_env,
     )?;
     let session_show_payload = assert_json_success(session_show_output, "browser session show")?;
@@ -612,7 +619,15 @@ fn browser_channels_and_session_workflows_are_regression_tested() -> Result<()> 
     let trace_path_string = trace_path.display().to_string();
     let trace_output = run_cli_json(
         &workdir,
-        &["browser", "trace", session_id.as_str(), "--output", trace_path_string.as_str()],
+        &[
+            "browser",
+            "trace",
+            session_id.as_str(),
+            "--principal",
+            "user:ops",
+            "--output",
+            trace_path_string.as_str(),
+        ],
         &browser_cli_env,
     )?;
     let trace_payload = assert_json_success(trace_output, "browser trace")?;
@@ -650,6 +665,8 @@ fn browser_channels_and_session_workflows_are_regression_tested() -> Result<()> 
             "session",
             "inspect",
             session_id.as_str(),
+            "--principal",
+            "user:ops",
             "--include-action-log",
             "--include-network-log",
             "--include-page-snapshot",
@@ -925,7 +942,7 @@ fn read_http_request(stream: &mut TcpStream) -> Result<Vec<u8>> {
     Ok(buffer)
 }
 
-fn latest_browser_session_id(grpc_url: &str, auth_token: &str) -> Result<String> {
+fn latest_browser_session_id(grpc_url: &str, auth_token: &str, principal: &str) -> Result<String> {
     let runtime = Runtime::new().context("failed to create Tokio runtime")?;
     runtime.block_on(async move {
         let channel = Endpoint::from_shared(grpc_url.to_owned())
@@ -945,6 +962,10 @@ fn latest_browser_session_id(grpc_url: &str, auth_token: &str) -> Result<String>
             "authorization",
             MetadataValue::try_from(format!("Bearer {auth_token}"))
                 .context("invalid authorization metadata")?,
+        );
+        request.metadata_mut().insert(
+            "x-palyra-principal",
+            MetadataValue::try_from(principal).context("invalid principal metadata")?,
         );
         let response =
             client.list_sessions(request).await.context("list_sessions RPC failed")?.into_inner();
