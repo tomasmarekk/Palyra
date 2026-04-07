@@ -2,6 +2,7 @@
   "name": "@palyra/workspace",
   "version": "0.1.0",
   "private": true,
+  "license": "SEE LICENSE IN LICENSE",
   "packageManager": "npm@10.9.3",
   "engines": {
     "node": ">=22.18.0",

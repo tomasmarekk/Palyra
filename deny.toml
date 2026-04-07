@@ -11,7 +11,7 @@ allow = [
   "Apache-2.0",
   "Apache-2.0 WITH LLVM-exception",
   "MIT",
-  "FSL-1.1-ALv2",
+  "LicenseRef-Palyra-Community-Source-1.1",
   "BSD-2-Clause",
   "BSD-3-Clause",
   "ISC",
@@ -28,64 +28,76 @@ exceptions = [
 
 [[licenses.clarify]]
 crate = "palyra-a2ui"
-expression = "FSL-1.1-ALv2"
-license-files = [{ path = "../../LICENSE", hash = 0x18b96a4b }]
+expression = "LicenseRef-Palyra-Community-Source-1.1"
+license-files = [{ path = "../../LICENSE", hash = 0x3f578910 }]
 [[licenses.clarify]]
 crate = "palyra-auth"
-expression = "FSL-1.1-ALv2"
-license-files = [{ path = "../../LICENSE", hash = 0x18b96a4b }]
+expression = "LicenseRef-Palyra-Community-Source-1.1"
+license-files = [{ path = "../../LICENSE", hash = 0x3f578910 }]
 [[licenses.clarify]]
 crate = "palyra-browserd"
-expression = "FSL-1.1-ALv2"
-license-files = [{ path = "../../LICENSE", hash = 0x18b96a4b }]
+expression = "LicenseRef-Palyra-Community-Source-1.1"
+license-files = [{ path = "../../LICENSE", hash = 0x3f578910 }]
 [[licenses.clarify]]
 crate = "palyra-cli"
-expression = "FSL-1.1-ALv2"
-license-files = [{ path = "../../LICENSE", hash = 0x18b96a4b }]
+expression = "LicenseRef-Palyra-Community-Source-1.1"
+license-files = [{ path = "../../LICENSE", hash = 0x3f578910 }]
 [[licenses.clarify]]
 crate = "palyra-common"
-expression = "FSL-1.1-ALv2"
-license-files = [{ path = "../../LICENSE", hash = 0x18b96a4b }]
+expression = "LicenseRef-Palyra-Community-Source-1.1"
+license-files = [{ path = "../../LICENSE", hash = 0x3f578910 }]
+[[licenses.clarify]]
+crate = "palyra-control-plane"
+expression = "LicenseRef-Palyra-Community-Source-1.1"
+license-files = [{ path = "../../LICENSE", hash = 0x3f578910 }]
+[[licenses.clarify]]
+crate = "palyra-connector-core"
+expression = "LicenseRef-Palyra-Community-Source-1.1"
+license-files = [{ path = "../../LICENSE", hash = 0x3f578910 }]
+[[licenses.clarify]]
+crate = "palyra-connector-discord"
+expression = "LicenseRef-Palyra-Community-Source-1.1"
+license-files = [{ path = "../../LICENSE", hash = 0x3f578910 }]
 [[licenses.clarify]]
 crate = "palyra-connectors"
-expression = "FSL-1.1-ALv2"
-license-files = [{ path = "../../LICENSE", hash = 0x18b96a4b }]
+expression = "LicenseRef-Palyra-Community-Source-1.1"
+license-files = [{ path = "../../LICENSE", hash = 0x3f578910 }]
 [[licenses.clarify]]
 crate = "palyra-daemon"
-expression = "FSL-1.1-ALv2"
-license-files = [{ path = "../../LICENSE", hash = 0x18b96a4b }]
+expression = "LicenseRef-Palyra-Community-Source-1.1"
+license-files = [{ path = "../../LICENSE", hash = 0x3f578910 }]
 [[licenses.clarify]]
 crate = "palyra-identity"
-expression = "FSL-1.1-ALv2"
-license-files = [{ path = "../../LICENSE", hash = 0x18b96a4b }]
+expression = "LicenseRef-Palyra-Community-Source-1.1"
+license-files = [{ path = "../../LICENSE", hash = 0x3f578910 }]
 [[licenses.clarify]]
 crate = "palyra-plugins-runtime"
-expression = "FSL-1.1-ALv2"
-license-files = [{ path = "../../../LICENSE", hash = 0x18b96a4b }]
+expression = "LicenseRef-Palyra-Community-Source-1.1"
+license-files = [{ path = "../../../LICENSE", hash = 0x3f578910 }]
 [[licenses.clarify]]
 crate = "palyra-plugins-sdk"
-expression = "FSL-1.1-ALv2"
-license-files = [{ path = "../../../LICENSE", hash = 0x18b96a4b }]
+expression = "LicenseRef-Palyra-Community-Source-1.1"
+license-files = [{ path = "../../../LICENSE", hash = 0x3f578910 }]
 [[licenses.clarify]]
 crate = "palyra-policy"
-expression = "FSL-1.1-ALv2"
-license-files = [{ path = "../../LICENSE", hash = 0x18b96a4b }]
+expression = "LicenseRef-Palyra-Community-Source-1.1"
+license-files = [{ path = "../../LICENSE", hash = 0x3f578910 }]
 [[licenses.clarify]]
 crate = "palyra-sandbox"
-expression = "FSL-1.1-ALv2"
-license-files = [{ path = "../../LICENSE", hash = 0x18b96a4b }]
+expression = "LicenseRef-Palyra-Community-Source-1.1"
+license-files = [{ path = "../../LICENSE", hash = 0x3f578910 }]
 [[licenses.clarify]]
 crate = "palyra-skills"
-expression = "FSL-1.1-ALv2"
-license-files = [{ path = "../../LICENSE", hash = 0x18b96a4b }]
+expression = "LicenseRef-Palyra-Community-Source-1.1"
+license-files = [{ path = "../../LICENSE", hash = 0x3f578910 }]
 [[licenses.clarify]]
 crate = "palyra-transport-quic"
-expression = "FSL-1.1-ALv2"
-license-files = [{ path = "../../LICENSE", hash = 0x18b96a4b }]
+expression = "LicenseRef-Palyra-Community-Source-1.1"
+license-files = [{ path = "../../LICENSE", hash = 0x3f578910 }]
 [[licenses.clarify]]
 crate = "palyra-vault"
-expression = "FSL-1.1-ALv2"
-license-files = [{ path = "../../LICENSE", hash = 0x18b96a4b }]
+expression = "LicenseRef-Palyra-Community-Source-1.1"
+license-files = [{ path = "../../LICENSE", hash = 0x3f578910 }]
 
 [bans]
 multiple-versions = "warn"
