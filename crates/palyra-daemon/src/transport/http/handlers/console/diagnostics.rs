@@ -1588,6 +1588,10 @@ pub(crate) async fn run_support_bundle_export_command(
         resolve_console_cli_binary_path().map_err(|error| sanitize_http_error_message(&error))?;
     let support_bundle_root =
         resolve_support_bundle_root().map_err(|error| sanitize_http_error_message(&error))?;
+    let state_root = support_bundle_root
+        .parent()
+        .map(FsPath::to_path_buf)
+        .unwrap_or_else(|| support_bundle_root.clone());
     fs::create_dir_all(support_bundle_root.as_path()).map_err(|error| {
         sanitize_http_error_message(
             format!(
@@ -1615,6 +1619,7 @@ pub(crate) async fn run_support_bundle_export_command(
         .arg("export")
         .arg("--output")
         .arg(output_path.as_os_str())
+        .env("PALYRA_STATE_ROOT", state_root)
         .env("PALYRA_DAEMON_URL", format!("http://127.0.0.1:{admin_port}"));
     if let Some(token) = admin_token.filter(|token| !token.trim().is_empty()) {
         command.env("PALYRA_ADMIN_TOKEN", token);
