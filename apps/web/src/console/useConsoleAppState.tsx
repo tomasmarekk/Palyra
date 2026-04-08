@@ -19,6 +19,7 @@ import { useChannelCoreState } from "../features/channels/core/useChannelCoreSta
 import { createDiscordChannelDomain } from "../features/channels/connectors/discord/domain";
 import { useDiscordChannelState } from "../features/channels/connectors/discord/useDiscordChannelState";
 import { useAuthDomain } from "./hooks/useAuthDomain";
+import { useBrowserDomain } from "./hooks/useBrowserDomain";
 import { useConfigDomain } from "./hooks/useConfigDomain";
 import { useOverviewDomain } from "./hooks/useOverviewDomain";
 import { useSupportDomain } from "./hooks/useSupportDomain";
@@ -461,35 +462,16 @@ export function useConsoleAppState() {
   const [diagnosticsBusy, setDiagnosticsBusy] = useState(false);
   const [diagnosticsSnapshot, setDiagnosticsSnapshot] = useState<JsonObject | null>(null);
 
-  const [browserBusy, setBrowserBusy] = useState(false);
-  const [browserPrincipal, setBrowserPrincipal] = useState("");
-  const [browserProfiles, setBrowserProfiles] = useState<JsonObject[]>([]);
-  const [browserActiveProfileId, setBrowserActiveProfileId] = useState("");
-  const [browserProfileName, setBrowserProfileName] = useState("");
-  const [browserProfileTheme, setBrowserProfileTheme] = useState("");
-  const [browserProfilePersistence, setBrowserProfilePersistence] = useState(true);
-  const [browserProfilePrivate, setBrowserProfilePrivate] = useState(false);
-  const [browserRenameProfileId, setBrowserRenameProfileId] = useState("");
-  const [browserRenameName, setBrowserRenameName] = useState("");
-  const [browserRelaySessionId, setBrowserRelaySessionId] = useState("");
-  const [browserRelayExtensionId, setBrowserRelayExtensionId] = useState("com.palyra.extension");
-  const [browserRelayTtlMs, setBrowserRelayTtlMs] = useState("300000");
-  const [browserRelayToken, setBrowserRelayToken] = useState("");
-  const [browserRelayTokenExpiry, setBrowserRelayTokenExpiry] = useState<number | null>(null);
-  const [browserRelayAction, setBrowserRelayAction] = useState<
-    "open_tab" | "capture_selection" | "send_page_snapshot"
-  >("capture_selection");
-  const [browserRelayOpenTabUrl, setBrowserRelayOpenTabUrl] = useState("");
-  const [browserRelaySelector, setBrowserRelaySelector] = useState("body");
-  const [browserRelayResult, setBrowserRelayResult] = useState<JsonValue | null>(null);
-  const [browserDownloadsSessionId, setBrowserDownloadsSessionId] = useState("");
-  const [browserDownloadsQuarantinedOnly, setBrowserDownloadsQuarantinedOnly] = useState(false);
-  const [browserDownloads, setBrowserDownloads] = useState<JsonObject[]>([]);
-
   const overviewDomain = useOverviewDomain({ api, setError });
   const authDomain = useAuthDomain({ api, setError, setNotice });
   const configDomain = useConfigDomain({ api, setError, setNotice });
   const supportDomain = useSupportDomain({ api, setError, setNotice });
+  const { resetBrowserDomain, ...browserDomain } = useBrowserDomain({
+    api,
+    setError,
+    setNotice,
+    setSection,
+  });
   const {
     overviewBusy,
     overviewCatalog,
@@ -601,7 +583,7 @@ export function useConsoleAppState() {
       deviceId: current.device_id,
       channel: current.channel ?? previous.channel,
     }));
-    setBrowserPrincipal((previous) =>
+    browserDomain.setBrowserPrincipal((previous) =>
       previous.trim().length === 0 ? current.principal : previous,
     );
   }
@@ -757,7 +739,11 @@ export function useConsoleAppState() {
       void refreshSkills();
     }
     if (section === "browser") {
-      void refreshBrowserProfiles();
+      void browserDomain.refreshBrowserProfiles();
+      void browserDomain.refreshBrowserSessions();
+      if (browserDomain.browserSessionId.trim().length > 0) {
+        void browserDomain.inspectBrowserSessionWorkspace();
+      }
     }
     if (section === "config") {
       void refreshConfigSurface();
@@ -834,28 +820,7 @@ export function useConsoleAppState() {
     setDiagnosticsBusy(false);
     setDiagnosticsSnapshot(null);
 
-    setBrowserBusy(false);
-    setBrowserPrincipal("");
-    setBrowserProfiles([]);
-    setBrowserActiveProfileId("");
-    setBrowserProfileName("");
-    setBrowserProfileTheme("");
-    setBrowserProfilePersistence(true);
-    setBrowserProfilePrivate(false);
-    setBrowserRenameProfileId("");
-    setBrowserRenameName("");
-    setBrowserRelaySessionId("");
-    setBrowserRelayExtensionId("com.palyra.extension");
-    setBrowserRelayTtlMs("300000");
-    setBrowserRelayToken("");
-    setBrowserRelayTokenExpiry(null);
-    setBrowserRelayAction("capture_selection");
-    setBrowserRelayOpenTabUrl("");
-    setBrowserRelaySelector("body");
-    setBrowserRelayResult(null);
-    setBrowserDownloadsSessionId("");
-    setBrowserDownloadsQuarantinedOnly(false);
-    setBrowserDownloads([]);
+    resetBrowserDomain();
 
     resetConfigDomain();
     resetSupportDomain();
@@ -877,7 +842,7 @@ export function useConsoleAppState() {
       });
       resetOperatorScopedState();
       setSession(next);
-      setBrowserPrincipal(next.principal);
+      browserDomain.setBrowserPrincipal(next.principal);
       setLoginForm((previous: LoginForm) => ({
         ...previous,
         adminToken: "",
@@ -1488,268 +1453,6 @@ export function useConsoleAppState() {
     }
   }
 
-  async function refreshBrowserProfiles(): Promise<void> {
-    setBrowserBusy(true);
-    setError(null);
-    try {
-      const params = new URLSearchParams();
-      if (browserPrincipal.trim().length > 0) {
-        params.set("principal", browserPrincipal.trim());
-      }
-      const response = await api.listBrowserProfiles(params);
-      setBrowserProfiles(toJsonObjectArray(response.profiles));
-      setBrowserActiveProfileId(response.active_profile_id ?? "");
-      setBrowserPrincipal((previous) => {
-        if (previous.trim().length > 0) {
-          return previous;
-        }
-        return response.principal;
-      });
-    } catch (failure) {
-      setError(toErrorMessage(failure));
-    } finally {
-      setBrowserBusy(false);
-    }
-  }
-
-  async function createBrowserProfile(event: React.FormEvent<HTMLFormElement>): Promise<void> {
-    event.preventDefault();
-    if (browserProfileName.trim().length === 0) {
-      setError("Profile name cannot be empty.");
-      return;
-    }
-    setBrowserBusy(true);
-    setError(null);
-    try {
-      await api.createBrowserProfile({
-        principal: emptyToUndefined(browserPrincipal),
-        name: browserProfileName.trim(),
-        theme_color: emptyToUndefined(browserProfileTheme),
-        persistence_enabled: browserProfilePersistence,
-        private_profile: browserProfilePrivate,
-      });
-      setBrowserProfileName("");
-      setBrowserProfileTheme("");
-      setBrowserProfilePrivate(false);
-      setNotice("Browser profile created.");
-      await refreshBrowserProfiles();
-    } catch (failure) {
-      setError(toErrorMessage(failure));
-    } finally {
-      setBrowserBusy(false);
-    }
-  }
-
-  async function renameBrowserProfile(): Promise<void> {
-    if (browserRenameProfileId.trim().length === 0) {
-      setError("Select a browser profile to rename.");
-      return;
-    }
-    if (browserRenameName.trim().length === 0) {
-      setError("New profile name cannot be empty.");
-      return;
-    }
-    setBrowserBusy(true);
-    setError(null);
-    try {
-      await api.renameBrowserProfile(browserRenameProfileId.trim(), {
-        principal: emptyToUndefined(browserPrincipal),
-        name: browserRenameName.trim(),
-      });
-      setNotice("Browser profile renamed.");
-      setBrowserRenameName("");
-      await refreshBrowserProfiles();
-    } catch (failure) {
-      setError(toErrorMessage(failure));
-    } finally {
-      setBrowserBusy(false);
-    }
-  }
-
-  async function activateBrowserProfile(profile: JsonObject): Promise<void> {
-    const profileId = readString(profile, "profile_id");
-    if (profileId === null) {
-      setError("Profile payload missing profile_id.");
-      return;
-    }
-    setBrowserBusy(true);
-    setError(null);
-    try {
-      await api.activateBrowserProfile(profileId, {
-        principal: emptyToUndefined(browserPrincipal),
-      });
-      setNotice("Browser profile activated.");
-      await refreshBrowserProfiles();
-    } catch (failure) {
-      setError(toErrorMessage(failure));
-    } finally {
-      setBrowserBusy(false);
-    }
-  }
-
-  async function deleteBrowserProfile(profile: JsonObject): Promise<void> {
-    const profileId = readString(profile, "profile_id");
-    if (profileId === null) {
-      setError("Profile payload missing profile_id.");
-      return;
-    }
-    const profileName = readString(profile, "name") ?? profileId;
-    if (shouldConfirmBrowserDeletion()) {
-      const confirmed = window.confirm(
-        `Delete browser profile '${profileName}'? This cannot be undone.`,
-      );
-      if (!confirmed) {
-        setNotice("Browser profile deletion canceled.");
-        return;
-      }
-    }
-    setBrowserBusy(true);
-    setError(null);
-    try {
-      await api.deleteBrowserProfile(profileId, {
-        principal: emptyToUndefined(browserPrincipal),
-      });
-      setNotice("Browser profile deleted.");
-      await refreshBrowserProfiles();
-    } catch (failure) {
-      setError(toErrorMessage(failure));
-    } finally {
-      setBrowserBusy(false);
-    }
-  }
-
-  async function mintBrowserRelayToken(): Promise<void> {
-    if (browserRelaySessionId.trim().length === 0) {
-      setError("Relay token issuance requires session_id.");
-      return;
-    }
-    if (browserRelayExtensionId.trim().length === 0) {
-      setError("Relay token issuance requires extension_id.");
-      return;
-    }
-    setBrowserBusy(true);
-    setError(null);
-    try {
-      const response = await api.mintBrowserRelayToken({
-        session_id: browserRelaySessionId.trim(),
-        extension_id: browserRelayExtensionId.trim(),
-        ttl_ms: parseInteger(browserRelayTtlMs) ?? undefined,
-      });
-      setBrowserRelayToken(response.relay_token);
-      setBrowserRelayTokenExpiry(response.expires_at_unix_ms);
-      setNotice("Browser relay token minted. Keep it private and short-lived.");
-    } catch (failure) {
-      setError(toErrorMessage(failure));
-    } finally {
-      setBrowserBusy(false);
-    }
-  }
-
-  async function dispatchBrowserRelayAction(): Promise<void> {
-    if (browserRelaySessionId.trim().length === 0) {
-      setError("Relay action requires session_id.");
-      return;
-    }
-    if (browserRelayExtensionId.trim().length === 0) {
-      setError("Relay action requires extension_id.");
-      return;
-    }
-    if (browserRelayAction === "open_tab" && browserRelayOpenTabUrl.trim().length === 0) {
-      setError("Open tab relay action requires URL.");
-      return;
-    }
-    if (browserRelayAction === "capture_selection" && browserRelaySelector.trim().length === 0) {
-      setError("Capture selection relay action requires selector.");
-      return;
-    }
-    setBrowserBusy(true);
-    setError(null);
-    try {
-      const payload: {
-        relay_token?: string;
-        session_id: string;
-        extension_id: string;
-        action: "open_tab" | "capture_selection" | "send_page_snapshot";
-        open_tab?: { url: string; activate?: boolean; timeout_ms?: number };
-        capture_selection?: { selector: string; max_selection_bytes?: number };
-        page_snapshot?: {
-          include_dom_snapshot?: boolean;
-          include_visible_text?: boolean;
-          max_dom_snapshot_bytes?: number;
-          max_visible_text_bytes?: number;
-        };
-        max_payload_bytes?: number;
-      } = {
-        relay_token: emptyToUndefined(browserRelayToken),
-        session_id: browserRelaySessionId.trim(),
-        extension_id: browserRelayExtensionId.trim(),
-        action: browserRelayAction,
-        max_payload_bytes: 16384,
-      };
-
-      if (browserRelayAction === "open_tab") {
-        payload.open_tab = {
-          url: browserRelayOpenTabUrl.trim(),
-          activate: true,
-          timeout_ms: 6000,
-        };
-      }
-      if (browserRelayAction === "capture_selection") {
-        payload.capture_selection = {
-          selector: browserRelaySelector.trim(),
-          max_selection_bytes: 2048,
-        };
-      }
-      if (browserRelayAction === "send_page_snapshot") {
-        payload.page_snapshot = {
-          include_dom_snapshot: true,
-          include_visible_text: true,
-          max_dom_snapshot_bytes: 4096,
-          max_visible_text_bytes: 4096,
-        };
-      }
-      const response = await api.relayBrowserAction(payload, browserRelayToken);
-      setBrowserRelayResult(response as JsonObject);
-      if (response.success) {
-        setNotice(`Relay action '${response.action}' completed.`);
-      } else {
-        setError(response.error.length > 0 ? response.error : "Relay action failed.");
-      }
-    } catch (failure) {
-      setError(toErrorMessage(failure));
-    } finally {
-      setBrowserBusy(false);
-    }
-  }
-
-  async function refreshBrowserDownloads(): Promise<void> {
-    if (browserDownloadsSessionId.trim().length === 0) {
-      setError("Downloads query requires session_id.");
-      return;
-    }
-    setBrowserBusy(true);
-    setError(null);
-    try {
-      const params = new URLSearchParams();
-      params.set("session_id", browserDownloadsSessionId.trim());
-      params.set("limit", "50");
-      if (browserDownloadsQuarantinedOnly) {
-        params.set("quarantined_only", "true");
-      }
-      const response = await api.listBrowserDownloads(params);
-      setBrowserDownloads(toJsonObjectArray(response.artifacts));
-      if (response.error.length > 0) {
-        setNotice(`Downloads listed with note: ${response.error}`);
-      } else {
-        setNotice("Downloads refreshed.");
-      }
-    } catch (failure) {
-      setError(toErrorMessage(failure));
-    } finally {
-      setBrowserBusy(false);
-    }
-  }
-
   async function refreshAudit(): Promise<void> {
     setAuditBusy(true);
     setError(null);
@@ -1997,51 +1700,7 @@ export function useConsoleAppState() {
     refreshSkills,
     installSkill,
     executeSkillAction,
-    browserBusy,
-    browserPrincipal,
-    setBrowserPrincipal,
-    browserProfiles,
-    browserActiveProfileId,
-    browserProfileName,
-    setBrowserProfileName,
-    browserProfileTheme,
-    setBrowserProfileTheme,
-    browserProfilePersistence,
-    setBrowserProfilePersistence,
-    browserProfilePrivate,
-    setBrowserProfilePrivate,
-    browserRenameProfileId,
-    setBrowserRenameProfileId,
-    browserRenameName,
-    setBrowserRenameName,
-    browserRelaySessionId,
-    setBrowserRelaySessionId,
-    browserRelayExtensionId,
-    setBrowserRelayExtensionId,
-    browserRelayTtlMs,
-    setBrowserRelayTtlMs,
-    browserRelayToken,
-    browserRelayTokenExpiry,
-    browserRelayAction,
-    setBrowserRelayAction,
-    browserRelayOpenTabUrl,
-    setBrowserRelayOpenTabUrl,
-    browserRelaySelector,
-    setBrowserRelaySelector,
-    browserRelayResult,
-    browserDownloadsSessionId,
-    setBrowserDownloadsSessionId,
-    browserDownloadsQuarantinedOnly,
-    setBrowserDownloadsQuarantinedOnly,
-    browserDownloads,
-    refreshBrowserProfiles,
-    createBrowserProfile,
-    activateBrowserProfile,
-    deleteBrowserProfile,
-    renameBrowserProfile,
-    mintBrowserRelayToken,
-    dispatchBrowserRelayAction,
-    refreshBrowserDownloads,
+    ...browserDomain,
     auditBusy,
     auditFilterContains,
     setAuditFilterContains,
@@ -2150,23 +1809,6 @@ export function useConsoleAppState() {
 }
 
 export type ConsoleAppState = ReturnType<typeof useConsoleAppState>;
-
-function shouldConfirmBrowserDeletion(): boolean {
-  if (typeof window === "undefined" || typeof window.confirm !== "function") {
-    return false;
-  }
-  if (isJsdomRuntime()) {
-    return false;
-  }
-  return true;
-}
-
-function isJsdomRuntime(): boolean {
-  if (typeof navigator === "undefined") {
-    return false;
-  }
-  return navigator.userAgent.toLowerCase().includes("jsdom");
-}
 
 function waitForDelay(delayMs: number, signal?: AbortSignal): Promise<void> {
   if (signal?.aborted) {

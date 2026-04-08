@@ -1,6 +1,5 @@
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
-
 import type {
   ChatAttachmentRecord,
   ChatBackgroundTaskRecord,
@@ -65,6 +64,7 @@ interface ChatConsolePanelProps {
   readonly revealSensitiveValues: boolean;
   readonly setError: (next: string | null) => void;
   readonly setNotice: (next: string | null) => void;
+  readonly openBrowserSessionWorkbench: (sessionId: string) => void;
 }
 
 export function ChatConsolePanel({
@@ -72,6 +72,7 @@ export function ChatConsolePanel({
   revealSensitiveValues,
   setError,
   setNotice,
+  openBrowserSessionWorkbench,
 }: ChatConsolePanelProps) {
   const [searchParams] = useSearchParams();
   const preferredSessionId = searchParams.get("sessionId");
@@ -944,6 +945,7 @@ export function ChatConsolePanel({
           runLineage,
           refreshRunDetails,
           closeRunDrawer,
+          openBrowserSessionWorkbench,
         }}
         onAbortRun={() => {
           void abortCurrentRun();

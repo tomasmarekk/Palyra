@@ -3978,6 +3978,264 @@ export class ConsoleApiClient {
     return this.request(buildPathWithQuery("/console/v1/browser/downloads", params));
   }
 
+  async listBrowserSessions(params?: URLSearchParams): Promise<{
+    principal: string;
+    truncated: boolean;
+    error: string;
+    page: PageInfo;
+    sessions: JsonValue[];
+  }> {
+    return this.request(buildPathWithQuery("/console/v1/browser/sessions", params));
+  }
+
+  async getBrowserSession(sessionId: string): Promise<{
+    session_id: string;
+    success: boolean;
+    error: string;
+    session: JsonValue | null;
+  }> {
+    return this.request(`/console/v1/browser/sessions/${encodeURIComponent(sessionId)}`);
+  }
+
+  async inspectBrowserSession(
+    sessionId: string,
+    params?: URLSearchParams,
+  ): Promise<{
+    session_id: string;
+    success: boolean;
+    error: string;
+    session: JsonValue | null;
+    cookies: JsonValue[];
+    storage: JsonValue[];
+    action_log: JsonValue[];
+    network_log: JsonValue[];
+    dom_snapshot: string;
+    visible_text: string;
+    page_url: string;
+    cookies_truncated: boolean;
+    storage_truncated: boolean;
+    action_log_truncated: boolean;
+    network_log_truncated: boolean;
+    dom_truncated: boolean;
+    visible_text_truncated: boolean;
+    console_log: JsonValue[];
+    console_log_truncated: boolean;
+    page_diagnostics: JsonValue | null;
+  }> {
+    return this.request(
+      buildPathWithQuery(
+        `/console/v1/browser/sessions/${encodeURIComponent(sessionId)}/inspect`,
+        params,
+      ),
+    );
+  }
+
+  async createBrowserSession(payload: {
+    principal?: string;
+    channel?: string;
+    idle_ttl_ms?: number;
+    allow_private_targets?: boolean;
+    allow_downloads?: boolean;
+    persistence_enabled?: boolean;
+    persistence_id?: string;
+    profile_id?: string;
+    private_profile?: boolean;
+    action_allowed_domains?: string[];
+    budget?: JsonValue;
+  }): Promise<{
+    session_id?: string;
+    channel?: string;
+    created_at_unix_ms: number;
+    downloads_enabled: boolean;
+    persistence_enabled: boolean;
+    persistence_id: string;
+    state_restored: boolean;
+    profile_id?: string;
+    private_profile: boolean;
+    effective_budget?: JsonValue;
+    action_allowed_domains: string[];
+  }> {
+    return this.request(
+      "/console/v1/browser/sessions",
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      { csrf: true },
+    );
+  }
+
+  async closeBrowserSession(sessionId: string): Promise<{
+    session_id: string;
+    closed: boolean;
+    reason: string;
+  }> {
+    return this.request(
+      `/console/v1/browser/sessions/${encodeURIComponent(sessionId)}/close`,
+      { method: "POST" },
+      { csrf: true },
+    );
+  }
+
+  async navigateBrowserSession(
+    sessionId: string,
+    payload: {
+      url: string;
+      timeout_ms?: number;
+      allow_redirects?: boolean;
+      max_redirects?: number;
+      allow_private_targets?: boolean;
+    },
+  ): Promise<JsonValue> {
+    return this.request(
+      `/console/v1/browser/sessions/${encodeURIComponent(sessionId)}/navigate`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      { csrf: true },
+    );
+  }
+
+  async clickBrowserSession(
+    sessionId: string,
+    payload: {
+      selector: string;
+      max_retries?: number;
+      timeout_ms?: number;
+      capture_failure_screenshot?: boolean;
+      max_failure_screenshot_bytes?: number;
+    },
+  ): Promise<JsonValue> {
+    return this.request(
+      `/console/v1/browser/sessions/${encodeURIComponent(sessionId)}/click`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      { csrf: true },
+    );
+  }
+
+  async typeBrowserSession(
+    sessionId: string,
+    payload: {
+      selector: string;
+      text: string;
+      clear_existing?: boolean;
+      timeout_ms?: number;
+      capture_failure_screenshot?: boolean;
+      max_failure_screenshot_bytes?: number;
+    },
+  ): Promise<JsonValue> {
+    return this.request(
+      `/console/v1/browser/sessions/${encodeURIComponent(sessionId)}/type`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      { csrf: true },
+    );
+  }
+
+  async pressBrowserSession(
+    sessionId: string,
+    payload: {
+      key: string;
+      timeout_ms?: number;
+      capture_failure_screenshot?: boolean;
+      max_failure_screenshot_bytes?: number;
+    },
+  ): Promise<JsonValue> {
+    return this.request(
+      `/console/v1/browser/sessions/${encodeURIComponent(sessionId)}/press`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      { csrf: true },
+    );
+  }
+
+  async selectBrowserSession(
+    sessionId: string,
+    payload: {
+      selector: string;
+      value: string;
+      timeout_ms?: number;
+      capture_failure_screenshot?: boolean;
+      max_failure_screenshot_bytes?: number;
+    },
+  ): Promise<JsonValue> {
+    return this.request(
+      `/console/v1/browser/sessions/${encodeURIComponent(sessionId)}/select`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      { csrf: true },
+    );
+  }
+
+  async highlightBrowserSession(
+    sessionId: string,
+    payload: {
+      selector: string;
+      timeout_ms?: number;
+      duration_ms?: number;
+      capture_failure_screenshot?: boolean;
+      max_failure_screenshot_bytes?: number;
+    },
+  ): Promise<JsonValue> {
+    return this.request(
+      `/console/v1/browser/sessions/${encodeURIComponent(sessionId)}/highlight`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      { csrf: true },
+    );
+  }
+
+  async getBrowserConsoleLog(
+    sessionId: string,
+    params?: URLSearchParams,
+  ): Promise<{
+    success: boolean;
+    entries: JsonValue[];
+    truncated: boolean;
+    page_diagnostics?: JsonValue | null;
+    error: string;
+    page: PageInfo;
+  }> {
+    return this.request(
+      buildPathWithQuery(
+        `/console/v1/browser/sessions/${encodeURIComponent(sessionId)}/console`,
+        params,
+      ),
+    );
+  }
+
+  async getBrowserPdf(
+    sessionId: string,
+    params?: URLSearchParams,
+  ): Promise<{
+    success: boolean;
+    mime_type?: string;
+    size_bytes: number;
+    sha256?: string;
+    artifact?: JsonValue | null;
+    pdf_base64?: string;
+    error: string;
+  }> {
+    return this.request(
+      buildPathWithQuery(
+        `/console/v1/browser/sessions/${encodeURIComponent(sessionId)}/pdf`,
+        params,
+      ),
+    );
+  }
+
   async mintBrowserRelayToken(payload: {
     session_id: string;
     extension_id: string;

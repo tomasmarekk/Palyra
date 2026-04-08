@@ -91,6 +91,7 @@ type ChatInspectorColumnProps = {
   runLineage: ChatRunLineage | null;
   refreshRunDetails: () => void;
   closeRunDrawer: () => void;
+  openBrowserSessionWorkbench: (sessionId: string) => void;
 };
 
 export function ChatInspectorColumn({
@@ -138,8 +139,10 @@ export function ChatInspectorColumn({
   runLineage,
   refreshRunDetails,
   closeRunDrawer,
+  openBrowserSessionWorkbench,
 }: ChatInspectorColumnProps) {
   const phase4Busy = phase4BusyKey !== null;
+  const browserSessionIds = extractBrowserSessionIds(runTape);
 
   return (
     <div className="chat-inspector-column">
@@ -200,6 +203,31 @@ export function ChatInspectorColumn({
             ))}
           </ul>
         )}
+        {browserSessionIds.length > 0 ? (
+          <div className="chat-ops-list">
+            <div className="workspace-panel__intro">
+              <p className="workspace-kicker">Browser handoff</p>
+              <h3>{browserSessionIds.length} traced sessions</h3>
+            </div>
+            {browserSessionIds.map((sessionId) => (
+              <article key={sessionId} className="chat-ops-card">
+                <div className="chat-ops-card__copy">
+                  <strong>{shortId(sessionId)}</strong>
+                  <span>{sessionId}</span>
+                  <p>Open the browser workbench on the same session without losing chat context.</p>
+                </div>
+                <ActionButton
+                  size="sm"
+                  type="button"
+                  variant="secondary"
+                  onPress={() => openBrowserSessionWorkbench(sessionId)}
+                >
+                  Open browser detail
+                </ActionButton>
+              </article>
+            ))}
+          </div>
+        ) : null}
       </SectionCard>
 
       <SectionCard
@@ -685,4 +713,51 @@ export function ChatInspectorColumn({
       )}
     </div>
   );
+}
+
+function extractBrowserSessionIds(runTape: ChatRunTapeSnapshot | null): string[] {
+  if (runTape === null || runTape.events.length === 0) {
+    return [];
+  }
+
+  const sessionIds = new Set<string>();
+
+  for (const event of runTape.events) {
+    if (event.payload_json.trim().length === 0) {
+      continue;
+    }
+
+    try {
+      collectSessionIds(JSON.parse(event.payload_json) as JsonValue, sessionIds);
+    } catch {
+      // Ignore malformed payload snapshots in the sidebar helper.
+    }
+  }
+
+  return Array.from(sessionIds);
+}
+
+function collectSessionIds(value: JsonValue, sessionIds: Set<string>): void {
+  if (
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean" ||
+    value === null
+  ) {
+    return;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectSessionIds(item, sessionIds);
+    }
+    return;
+  }
+
+  for (const [key, nestedValue] of Object.entries(value)) {
+    if (key === "session_id" && typeof nestedValue === "string" && nestedValue.trim().length > 0) {
+      sessionIds.add(nestedValue);
+    }
+    collectSessionIds(nestedValue, sessionIds);
+  }
 }

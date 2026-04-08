@@ -436,7 +436,7 @@ describe("M56 runtime and operations surfaces", () => {
         expect(screen.getByText("Browser profile deleted.")).toBeInTheDocument();
       });
 
-      fireEvent.change(screen.getAllByLabelText("Session ID")[1], {
+      fireEvent.change(screen.getAllByLabelText("Relay session ID")[1], {
         target: { value: "browser-session-1" },
       });
       fireEvent.click(screen.getByRole("button", { name: "Mint relay token" }));
@@ -452,7 +452,7 @@ describe("M56 runtime and operations surfaces", () => {
       ).toBeInTheDocument();
       expect(screen.getByText(/selected_text/)).toBeInTheDocument();
 
-      fireEvent.change(screen.getAllByLabelText("Session ID")[0], {
+      fireEvent.change(screen.getAllByLabelText("Downloads session ID")[1], {
         target: { value: "browser-session-1" },
       });
       fireEvent.click(screen.getByRole("button", { name: "Load downloads" }));

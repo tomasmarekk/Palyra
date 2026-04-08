@@ -1167,7 +1167,7 @@ describe("M35 web console app", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Browser" }));
     expect(await screen.findByRole("heading", { name: "Browser" })).toBeInTheDocument();
 
-    fireEvent.change(screen.getAllByLabelText("Session ID")[1], {
+    fireEvent.change(screen.getAllByLabelText("Relay session ID")[1], {
       target: { value: "01ARZ3NDEKTSV4RRFFQ69G5FAV" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Mint relay token" }));
