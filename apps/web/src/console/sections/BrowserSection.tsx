@@ -75,7 +75,9 @@ export function BrowserSection({ app }: BrowserSectionProps) {
   const observability = asJsonObject(diagnostics?.observability);
   const selfHealing = asJsonObject(observability?.self_healing);
   const activeIncidents = Array.isArray(selfHealing?.active_incidents)
-    ? selfHealing.active_incidents.map(asJsonObject).filter((value): value is JsonObject => value !== null)
+    ? selfHealing.active_incidents
+        .map(asJsonObject)
+        .filter((value): value is JsonObject => value !== null)
     : [];
   const browserIncidents = activeIncidents.filter(
     (incident) => readString(incident, "domain") === "browser",

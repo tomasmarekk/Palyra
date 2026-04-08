@@ -309,9 +309,7 @@ export function OperationsSection({ app }: OperationsSectionProps) {
                     columns={["Domain", "Severity", "State", "Summary", "Updated"]}
                   >
                     {activeIncidents.slice(0, 8).map((incident, index) => (
-                      <tr
-                        key={`${readString(incident, "incident_id") ?? "incident"}-${index}`}
-                      >
+                      <tr key={`${readString(incident, "incident_id") ?? "incident"}-${index}`}>
                         <td>{readString(incident, "domain") ?? "unknown"}</td>
                         <td>{readString(incident, "severity") ?? "unknown"}</td>
                         <td>{readString(incident, "state") ?? "unknown"}</td>
@@ -328,9 +326,7 @@ export function OperationsSection({ app }: OperationsSectionProps) {
                     columns={["When", "Feature", "Status", "Incident", "Detail"]}
                   >
                     {recentRemediationAttempts.slice(0, 8).map((attempt, index) => (
-                      <tr
-                        key={`${readString(attempt, "attempt_id") ?? "attempt"}-${index}`}
-                      >
+                      <tr key={`${readString(attempt, "attempt_id") ?? "attempt"}-${index}`}>
                         <td>{formatUnixMs(readNumber(attempt, "recorded_at_unix_ms")) ?? "n/a"}</td>
                         <td>{readString(attempt, "feature") ?? "unknown"}</td>
                         <td>{readString(attempt, "status") ?? "unknown"}</td>
