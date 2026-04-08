@@ -56,6 +56,8 @@ export function OperationsSection({ app }: OperationsSectionProps) {
   const recentFailures = readJsonObjectArray(observability?.recent_failures);
   const connector = readObject(observability ?? {}, "connector");
   const browser = readObject(observability ?? {}, "browser");
+  const doctorRecovery = readObject(observability ?? {}, "doctor_recovery");
+  const latestDoctorRecovery = readObject(doctorRecovery ?? {}, "last_job");
   const browserFailureSamples = toStringArray(
     Array.isArray(browser?.recent_failure_samples) ? browser.recent_failure_samples : [],
   );
@@ -130,6 +132,16 @@ export function OperationsSection({ app }: OperationsSectionProps) {
           value={usageInsights?.alerts.length ?? 0}
           detail={usageInsights?.routing.default_mode ?? "No routing posture loaded."}
           tone={(usageInsights?.alerts.length ?? 0) > 0 ? "warning" : "default"}
+        />
+        <WorkspaceMetricCard
+          label="Recovery jobs"
+          value={readNumber(doctorRecovery ?? {}, "failed") ?? 0}
+          detail={
+            latestDoctorRecovery === null
+              ? "No recovery summary published."
+              : (readString(latestDoctorRecovery, "mode") ?? "Latest mode unavailable")
+          }
+          tone={workspaceToneForState(readString(latestDoctorRecovery ?? {}, "state") ?? "unknown")}
         />
       </section>
 
@@ -238,6 +250,24 @@ export function OperationsSection({ app }: OperationsSectionProps) {
               entries={groupedCapabilities.internal_only}
               emptyMessage="No internal-only capability notes are currently published for diagnostics."
             />
+          </WorkspaceSectionCard>
+
+          <WorkspaceSectionCard
+            title="Recovery telemetry"
+            description="The last queued doctor recovery job is summarized here so operations can verify preview/apply/rollback state without leaving diagnostics."
+          >
+            {latestDoctorRecovery === null ? (
+              <WorkspaceEmptyState
+                compact
+                title="No recovery telemetry loaded"
+                description="Queue a doctor preview from Support to publish recovery telemetry."
+              />
+            ) : (
+              <PrettyJsonBlock
+                value={latestDoctorRecovery}
+                revealSensitiveValues={app.revealSensitiveValues}
+              />
+            )}
           </WorkspaceSectionCard>
 
           <WorkspaceSectionCard

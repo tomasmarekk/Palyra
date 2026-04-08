@@ -51,6 +51,7 @@ pub(crate) struct AppState {
     pub(crate) relay_tokens: Arc<Mutex<HashMap<String, ConsoleRelayToken>>>,
     pub(crate) console_chat_streams: Arc<Mutex<HashMap<String, ConsoleChatRunStream>>>,
     pub(crate) support_bundle_jobs: Arc<Mutex<HashMap<String, control_plane::SupportBundleJob>>>,
+    pub(crate) doctor_jobs: Arc<Mutex<HashMap<String, control_plane::DoctorRecoveryJob>>>,
     pub(crate) observability: Arc<ObservabilityState>,
     pub(crate) deployment: DeploymentRuntimeSnapshot,
     pub(crate) remote_admin_access: Arc<Mutex<Option<RemoteAdminAccessAttempt>>>,

@@ -1359,6 +1359,32 @@ impl ControlPlaneClient {
         .await
     }
 
+    pub async fn list_doctor_recovery_jobs(
+        &self,
+    ) -> Result<DoctorRecoveryJobListEnvelope, ControlPlaneClientError> {
+        self.request_json(Method::GET, "console/v1/doctor/jobs", None::<&Value>, false).await
+    }
+
+    pub async fn create_doctor_recovery_job(
+        &self,
+        request: &DoctorRecoveryCreateRequest,
+    ) -> Result<DoctorRecoveryJobEnvelope, ControlPlaneClientError> {
+        self.request_json(Method::POST, "console/v1/doctor/jobs", Some(request), true).await
+    }
+
+    pub async fn get_doctor_recovery_job(
+        &self,
+        job_id: &str,
+    ) -> Result<DoctorRecoveryJobEnvelope, ControlPlaneClientError> {
+        self.request_json(
+            Method::GET,
+            format!("console/v1/doctor/jobs/{}", urlencoding(job_id)),
+            None::<&Value>,
+            false,
+        )
+        .await
+    }
+
     async fn request_json<T, B>(
         &self,
         method: Method,

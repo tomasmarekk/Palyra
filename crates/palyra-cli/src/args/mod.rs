@@ -409,11 +409,24 @@ pub enum Command {
         #[command(flatten)]
         wizard_options: SetupWizardOverridesArg,
     },
+    #[command(about = "Run diagnostics, repair previews, and rollback workflows")]
     Doctor {
         #[arg(long, default_value_t = false)]
         strict: bool,
         #[arg(long, default_value_t = false)]
         json: bool,
+        #[arg(long, default_value_t = false)]
+        repair: bool,
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        #[arg(long, default_value_t = false)]
+        force: bool,
+        #[arg(long = "only")]
+        only: Vec<String>,
+        #[arg(long = "skip")]
+        skip: Vec<String>,
+        #[arg(long)]
+        rollback_run: Option<String>,
     },
     #[command(
         about = "Run a narrow liveness/readiness probe across HTTP and gRPC gateway surfaces",

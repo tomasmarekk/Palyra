@@ -75,6 +75,7 @@ pub(crate) fn build_app_state(
         relay_tokens: Arc::new(Mutex::new(HashMap::<String, ConsoleRelayToken>::new())),
         console_chat_streams: Arc::new(Mutex::new(HashMap::<String, ConsoleChatRunStream>::new())),
         support_bundle_jobs: Arc::new(Mutex::new(HashMap::new())),
+        doctor_jobs: Arc::new(Mutex::new(HashMap::new())),
         observability: Arc::new(ObservabilityState::default()),
         deployment: build_deployment_runtime_snapshot(loaded, dangerous_remote_bind_ack_env),
         remote_admin_access: Arc::new(Mutex::new(None::<RemoteAdminAccessAttempt>)),

@@ -216,6 +216,62 @@ export function supportBundleJobFixture(jobId = "support-job-1") {
   };
 }
 
+export function doctorRecoveryJobsFixture() {
+  return {
+    contract: controlPlaneContract(),
+    jobs: [
+      {
+        job_id: "doctor-job-1",
+        state: "queued",
+        requested_at_unix_ms: 1700000002600,
+        command: ["doctor", "--json", "--repair", "--dry-run"],
+        command_output: "",
+      },
+      {
+        job_id: "doctor-job-0",
+        state: "succeeded",
+        requested_at_unix_ms: 1700000001200,
+        completed_at_unix_ms: 1700000002000,
+        command: ["doctor", "--json", "--repair", "--dry-run"],
+        report: {
+          mode: "repair_preview",
+          recovery: {
+            requested: true,
+            dry_run: true,
+            force: false,
+            run_id: "01HRECOVERYRUN0",
+            backup_manifest_path: "state/recovery/runs/01HRECOVERYRUN0/manifest.json",
+            planned_steps: [{ id: "config.initialize" }, { id: "node_runtime.normalize" }],
+            applied_steps: [],
+            available_runs: [
+              {
+                run_id: "01HRECOVERYRUN0",
+                rollback_command: "cargo run -p palyra-cli -- doctor --rollback-run 01HRECOVERYRUN0",
+              },
+            ],
+            next_steps: ["Review the preview before applying repairs."],
+          },
+        },
+        command_output: "{\\n  \\\"mode\\\": \\\"repair_preview\\\"\\n}",
+      },
+    ],
+    page: {
+      limit: 20,
+      returned: 2,
+      has_more: false,
+    },
+  };
+}
+
+export function doctorRecoveryJobFixture(jobId = "doctor-job-1") {
+  return {
+    contract: controlPlaneContract(),
+    job:
+      doctorRecoveryJobsFixture().jobs.find((entry) => entry.job_id === jobId) ??
+      doctorRecoveryJobsFixture().jobs[0],
+  };
+}
+
 export function nodePairingListFixture() {
   return {
     contract: controlPlaneContract(),
@@ -483,6 +539,29 @@ export function diagnosticsFixture() {
           requested_at_unix_ms: 1699999999000,
           completed_at_unix_ms: 1700000001000,
           output_path: "state/support-bundles/support-job-0.zip",
+        },
+      },
+      doctor_recovery: {
+        queued: 1,
+        running: 0,
+        succeeded: 1,
+        failed: 0,
+        last_job: {
+          job_id: "doctor-job-0",
+          state: "succeeded",
+          requested_at_unix_ms: 1700000001200,
+          completed_at_unix_ms: 1700000002000,
+          command: ["doctor", "--json", "--repair", "--dry-run"],
+          mode: "repair_preview",
+          requested: true,
+          dry_run: true,
+          force: false,
+          run_id: "01HRECOVERYRUN0",
+          backup_manifest_path: "state/recovery/runs/01HRECOVERYRUN0/manifest.json",
+          planned_step_count: 2,
+          applied_step_count: 0,
+          available_run_count: 1,
+          next_steps: ["Review the preview before applying repairs."],
         },
       },
       connector: {

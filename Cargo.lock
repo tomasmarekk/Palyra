@@ -2976,6 +2976,7 @@ dependencies = [
  "protoc-bin-vendored",
  "ratatui",
  "reqwest",
+ "ring",
  "rpassword",
  "rusqlite",
  "serde",

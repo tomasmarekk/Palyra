@@ -1585,6 +1585,29 @@ export interface SupportBundleJobListEnvelope {
   page: PageInfo;
 }
 
+export interface DoctorRecoveryJob {
+  job_id: string;
+  state: "queued" | "running" | "succeeded" | "failed";
+  requested_at_unix_ms: number;
+  started_at_unix_ms?: number;
+  completed_at_unix_ms?: number;
+  command: string[];
+  report?: JsonValue;
+  command_output: string;
+  error?: string;
+}
+
+export interface DoctorRecoveryJobEnvelope {
+  contract: ContractDescriptor;
+  job: DoctorRecoveryJob;
+}
+
+export interface DoctorRecoveryJobListEnvelope {
+  contract: ContractDescriptor;
+  jobs: DoctorRecoveryJob[];
+  page: PageInfo;
+}
+
 export interface AgentRecord {
   agent_id: string;
   display_name: string;
@@ -2378,6 +2401,33 @@ export class ConsoleApiClient {
 
   async getSupportBundleJob(jobId: string): Promise<SupportBundleJobEnvelope> {
     return this.request(`/console/v1/support-bundle/jobs/${encodeURIComponent(jobId)}`);
+  }
+
+  async listDoctorRecoveryJobs(params?: URLSearchParams): Promise<DoctorRecoveryJobListEnvelope> {
+    return this.request(buildPathWithQuery("/console/v1/doctor/jobs", params));
+  }
+
+  async createDoctorRecoveryJob(payload: {
+    retain_jobs?: number;
+    repair?: boolean;
+    dry_run?: boolean;
+    force?: boolean;
+    only?: string[];
+    skip?: string[];
+    rollback_run?: string;
+  }): Promise<DoctorRecoveryJobEnvelope> {
+    return this.request(
+      "/console/v1/doctor/jobs",
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      { csrf: true },
+    );
+  }
+
+  async getDoctorRecoveryJob(jobId: string): Promise<DoctorRecoveryJobEnvelope> {
+    return this.request(`/console/v1/doctor/jobs/${encodeURIComponent(jobId)}`);
   }
 
   async listApprovals(params?: URLSearchParams): Promise<{ approvals: JsonValue[] }> {

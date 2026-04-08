@@ -361,6 +361,12 @@ struct ConsoleSupportBundleJobsQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct ConsoleDoctorJobsQuery {
+    after_job_id: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ConsoleApprovalsQuery {
     after_approval_id: Option<String>,
     limit: Option<usize>,

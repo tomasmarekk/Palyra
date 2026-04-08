@@ -888,6 +888,48 @@ pub struct SupportBundleJobListEnvelope {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DoctorRecoveryJobState {
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DoctorRecoveryJob {
+    pub job_id: String,
+    pub state: DoctorRecoveryJobState,
+    pub requested_at_unix_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at_unix_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub report: Option<Value>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub command_output: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DoctorRecoveryJobEnvelope {
+    pub contract: ContractDescriptor,
+    pub job: DoctorRecoveryJob,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DoctorRecoveryJobListEnvelope {
+    pub contract: ContractDescriptor,
+    #[serde(default)]
+    pub jobs: Vec<DoctorRecoveryJob>,
+    pub page: PageInfo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilityCatalog {
     pub contract: ContractDescriptor,
     pub version: String,
@@ -2024,6 +2066,24 @@ pub struct SupportBundleCreateRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DoctorRecoveryCreateRequest {
+    #[serde(default = "default_doctor_recovery_jobs")]
+    pub retain_jobs: usize,
+    #[serde(default)]
+    pub repair: bool,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub force: bool,
+    #[serde(default)]
+    pub only: Vec<String>,
+    #[serde(default)]
+    pub skip: Vec<String>,
+    #[serde(default)]
+    pub rollback_run: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderAuthActionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
@@ -2094,5 +2154,9 @@ const fn default_recover_backup() -> usize {
 }
 
 const fn default_support_bundle_backups() -> usize {
+    16
+}
+
+const fn default_doctor_recovery_jobs() -> usize {
     16
 }

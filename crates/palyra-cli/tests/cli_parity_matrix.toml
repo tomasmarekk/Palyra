@@ -39,7 +39,7 @@ path = "doctor"
 category = "top_level"
 status = "done"
 summary = "Environment and runtime diagnostics."
-required_flags = ["strict", "json"]
+required_flags = ["strict", "json", "repair", "dry-run", "force", "only", "skip", "rollback-run"]
 
 [entries.snapshot]
 path = "doctor"

@@ -1,9 +1,17 @@
+Run diagnostics, repair previews, and rollback workflows
+
 Usage: palyra doctor [OPTIONS]
 
 Options:
       --strict
       --json
-  -h, --help    Print help
+      --repair
+      --dry-run
+      --force
+      --only <ONLY>
+      --skip <SKIP>
+      --rollback-run <ROLLBACK_RUN>
+  -h, --help                         Print help
 
 Global Options:
       --profile <PROFILE>

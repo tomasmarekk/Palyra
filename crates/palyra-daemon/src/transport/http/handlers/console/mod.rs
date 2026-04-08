@@ -10,6 +10,7 @@ pub(crate) mod config;
 pub(crate) mod cron;
 pub(crate) mod devices;
 pub(crate) mod diagnostics;
+pub(crate) mod doctor;
 pub(crate) mod hooks;
 pub(crate) mod inventory;
 pub(crate) mod logs;

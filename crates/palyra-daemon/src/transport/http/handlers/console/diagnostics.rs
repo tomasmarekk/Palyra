@@ -360,6 +360,7 @@ pub(crate) async fn build_observability_payload(
     let connector = build_connector_observability(state, media_payload).map_err(|error| *error)?;
     let browser = collect_console_browser_action_diagnostics(state).await;
     let support_bundle = build_support_bundle_observability(state);
+    let doctor_recovery = build_doctor_recovery_observability(state);
     let recent_failures = state.observability.recent_failures();
     let failure_classes = build_failure_class_summary(recent_failures.as_slice());
 
@@ -369,6 +370,7 @@ pub(crate) async fn build_observability_payload(
         "dashboard": serde_json::to_value(state.observability.dashboard_mutation_snapshot())
             .unwrap_or_else(|_| json!({})),
         "support_bundle": support_bundle,
+        "doctor_recovery": doctor_recovery,
         "connector": connector,
         "browser": browser,
         "chat": {
@@ -563,6 +565,92 @@ pub(crate) fn build_support_bundle_observability(state: &AppState) -> Value {
             "output_path": job.output_path,
             "error": job.error,
         })),
+    })
+}
+
+pub(crate) fn build_doctor_recovery_observability(state: &AppState) -> Value {
+    let jobs = lock_doctor_jobs(&state.doctor_jobs);
+    let mut queued = 0_u64;
+    let mut running = 0_u64;
+    let mut succeeded = 0_u64;
+    let mut failed = 0_u64;
+    let latest_job = jobs
+        .values()
+        .cloned()
+        .inspect(|job| match job.state {
+            control_plane::DoctorRecoveryJobState::Queued => queued = queued.saturating_add(1),
+            control_plane::DoctorRecoveryJobState::Running => running = running.saturating_add(1),
+            control_plane::DoctorRecoveryJobState::Succeeded => {
+                succeeded = succeeded.saturating_add(1);
+            }
+            control_plane::DoctorRecoveryJobState::Failed => failed = failed.saturating_add(1),
+        })
+        .max_by(|left, right| left.requested_at_unix_ms.cmp(&right.requested_at_unix_ms));
+    json!({
+        "queued": queued,
+        "running": running,
+        "succeeded": succeeded,
+        "failed": failed,
+        "last_job": latest_job.map(|job| build_doctor_recovery_job_summary(&job)),
+    })
+}
+
+fn build_doctor_recovery_job_summary(job: &control_plane::DoctorRecoveryJob) -> Value {
+    let report = job.report.as_ref();
+    let recovery = report.and_then(|value| value.get("recovery"));
+    let planned_step_count =
+        recovery.and_then(|value| value.get("planned_steps")).and_then(Value::as_array).map(Vec::len);
+    let applied_step_count =
+        recovery.and_then(|value| value.get("applied_steps")).and_then(Value::as_array).map(Vec::len);
+    let available_run_count = recovery
+        .and_then(|value| value.get("available_runs"))
+        .and_then(Value::as_array)
+        .map(Vec::len);
+    json!({
+        "job_id": job.job_id,
+        "state": match job.state {
+            control_plane::DoctorRecoveryJobState::Queued => "queued",
+            control_plane::DoctorRecoveryJobState::Running => "running",
+            control_plane::DoctorRecoveryJobState::Succeeded => "succeeded",
+            control_plane::DoctorRecoveryJobState::Failed => "failed",
+        },
+        "requested_at_unix_ms": job.requested_at_unix_ms,
+        "started_at_unix_ms": job.started_at_unix_ms,
+        "completed_at_unix_ms": job.completed_at_unix_ms,
+        "command": job.command.clone(),
+        "mode": report
+            .and_then(|value| value.get("mode"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        "requested": recovery
+            .and_then(|value| value.get("requested"))
+            .and_then(Value::as_bool),
+        "dry_run": recovery
+            .and_then(|value| value.get("dry_run"))
+            .and_then(Value::as_bool),
+        "force": recovery
+            .and_then(|value| value.get("force"))
+            .and_then(Value::as_bool),
+        "rollback_run": recovery
+            .and_then(|value| value.get("rollback_run"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        "run_id": recovery
+            .and_then(|value| value.get("run_id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        "backup_manifest_path": recovery
+            .and_then(|value| value.get("backup_manifest_path"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        "planned_step_count": planned_step_count,
+        "applied_step_count": applied_step_count,
+        "available_run_count": available_run_count,
+        "next_steps": recovery
+            .and_then(|value| value.get("next_steps"))
+            .cloned()
+            .unwrap_or_else(|| json!([])),
+        "error": job.error.clone(),
     })
 }
 
@@ -1459,12 +1547,33 @@ pub(crate) fn lock_support_bundle_jobs(
     jobs.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+pub(crate) fn lock_doctor_jobs(
+    jobs: &Arc<Mutex<HashMap<String, control_plane::DoctorRecoveryJob>>>,
+) -> std::sync::MutexGuard<'_, HashMap<String, control_plane::DoctorRecoveryJob>> {
+    jobs.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 pub(crate) fn list_support_bundle_jobs(
     state: &AppState,
     after_job_id: Option<&str>,
     limit: usize,
 ) -> Vec<control_plane::SupportBundleJob> {
     let jobs = lock_support_bundle_jobs(&state.support_bundle_jobs);
+    let mut entries = jobs.values().cloned().collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.job_id.cmp(&right.job_id));
+    entries
+        .into_iter()
+        .filter(|job| after_job_id.is_none_or(|after| job.job_id.as_str() > after))
+        .take(limit)
+        .collect()
+}
+
+pub(crate) fn list_doctor_jobs(
+    state: &AppState,
+    after_job_id: Option<&str>,
+    limit: usize,
+) -> Vec<control_plane::DoctorRecoveryJob> {
+    let jobs = lock_doctor_jobs(&state.doctor_jobs);
     let mut entries = jobs.values().cloned().collect::<Vec<_>>();
     entries.sort_by(|left, right| left.job_id.cmp(&right.job_id));
     entries
@@ -1578,6 +1687,197 @@ pub(crate) async fn run_support_bundle_job(
         }
         finished.remove(0);
     }
+}
+
+#[allow(clippy::result_large_err)]
+pub(crate) fn create_doctor_job(
+    state: &AppState,
+    payload: control_plane::DoctorRecoveryCreateRequest,
+) -> Result<control_plane::DoctorRecoveryJob, Response> {
+    let job_id = Ulid::new().to_string();
+    let requested_at_unix_ms = unix_ms_now().map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "failed to read system clock: {error}"
+        )))
+    })?;
+    let command = build_doctor_command_args(&payload);
+    let job = control_plane::DoctorRecoveryJob {
+        job_id: job_id.clone(),
+        state: control_plane::DoctorRecoveryJobState::Queued,
+        requested_at_unix_ms,
+        started_at_unix_ms: None,
+        completed_at_unix_ms: None,
+        command: command.clone(),
+        report: None,
+        command_output: String::new(),
+        error: None,
+    };
+    {
+        let mut jobs = lock_doctor_jobs(&state.doctor_jobs);
+        jobs.insert(job_id.clone(), job.clone());
+    }
+
+    let retain_jobs = payload.retain_jobs.max(1);
+    let config_path = std::env::var("PALYRA_CONFIG").ok().filter(|value| !value.trim().is_empty());
+    let support_bundle_root =
+        resolve_support_bundle_root().map_err(|error| runtime_status_response(tonic::Status::internal(error)))?;
+    let state_root = support_bundle_root
+        .parent()
+        .map(FsPath::to_path_buf)
+        .unwrap_or_else(|| support_bundle_root.clone());
+    let jobs = Arc::clone(&state.doctor_jobs);
+    tokio::spawn(async move {
+        run_doctor_job(jobs, job_id, command, state_root, config_path, retain_jobs).await;
+    });
+
+    Ok(job)
+}
+
+pub(crate) async fn run_doctor_job(
+    jobs: Arc<Mutex<HashMap<String, control_plane::DoctorRecoveryJob>>>,
+    job_id: String,
+    command: Vec<String>,
+    state_root: PathBuf,
+    config_path: Option<String>,
+    retain_jobs: usize,
+) {
+    let started_at = unix_ms_now().unwrap_or_default();
+    {
+        let mut guard = lock_doctor_jobs(&jobs);
+        if let Some(job) = guard.get_mut(job_id.as_str()) {
+            job.state = control_plane::DoctorRecoveryJobState::Running;
+            job.started_at_unix_ms = Some(started_at);
+        }
+    }
+
+    let result = run_doctor_command(command.as_slice(), state_root.as_path(), config_path.as_deref()).await;
+    let completed_at = unix_ms_now().unwrap_or_default();
+    let mut guard = lock_doctor_jobs(&jobs);
+    if let Some(job) = guard.get_mut(job_id.as_str()) {
+        job.completed_at_unix_ms = Some(completed_at);
+        match result {
+            Ok((report, command_output)) => {
+                job.state = control_plane::DoctorRecoveryJobState::Succeeded;
+                job.report = Some(report);
+                job.command_output = command_output;
+                job.error = None;
+            }
+            Err(failure) => {
+                job.state = control_plane::DoctorRecoveryJobState::Failed;
+                job.command_output = failure.command_output;
+                job.error = Some(failure.error);
+            }
+        }
+    }
+
+    let mut finished = guard.values().cloned().collect::<Vec<_>>();
+    finished.sort_by(|left, right| left.requested_at_unix_ms.cmp(&right.requested_at_unix_ms));
+    while finished.len() > retain_jobs {
+        if let Some(first) = finished.first() {
+            guard.remove(first.job_id.as_str());
+        }
+        finished.remove(0);
+    }
+}
+
+fn build_doctor_command_args(payload: &control_plane::DoctorRecoveryCreateRequest) -> Vec<String> {
+    let mut command = vec!["doctor".to_owned(), "--json".to_owned()];
+    if payload.repair {
+        command.push("--repair".to_owned());
+    }
+    if payload.dry_run {
+        command.push("--dry-run".to_owned());
+    }
+    if payload.force {
+        command.push("--force".to_owned());
+    }
+    for value in &payload.only {
+        command.push("--only".to_owned());
+        command.push(value.clone());
+    }
+    for value in &payload.skip {
+        command.push("--skip".to_owned());
+        command.push(value.clone());
+    }
+    if let Some(run_id) = payload.rollback_run.as_ref().filter(|value| !value.trim().is_empty()) {
+        command.push("--rollback-run".to_owned());
+        command.push(run_id.clone());
+    }
+    command
+}
+
+struct DoctorCommandFailure {
+    error: String,
+    command_output: String,
+}
+
+async fn run_doctor_command(
+    command_args: &[String],
+    state_root: &FsPath,
+    config_path: Option<&str>,
+) -> Result<(Value, String), DoctorCommandFailure> {
+    let cli_path = resolve_console_cli_binary_path().map_err(|error| DoctorCommandFailure {
+        error: sanitize_http_error_message(&error),
+        command_output: String::new(),
+    })?;
+    let mut command = TokioCommand::new(cli_path.as_path());
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+    command.env_clear();
+    if let Ok(path) = std::env::var("PATH") {
+        command.env("PATH", path);
+    }
+    command.env("LANG", "C").env("LC_ALL", "C");
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("PALYRA_STATE_ROOT", state_root)
+        .args(command_args);
+    if let Some(config_path) = config_path {
+        command.env("PALYRA_CONFIG", config_path);
+    }
+
+    let output = command.output().await.map_err(|error| DoctorCommandFailure {
+        error: sanitize_http_error_message(&format!("failed to run doctor recovery command: {error}")),
+        command_output: String::new(),
+    })?;
+    let stdout_raw = String::from_utf8_lossy(output.stdout.as_slice()).into_owned();
+    let stderr_raw = String::from_utf8_lossy(output.stderr.as_slice()).into_owned();
+    let command_output = [
+        sanitize_http_error_message(stdout_raw.as_str()),
+        sanitize_http_error_message(stderr_raw.as_str()),
+    ]
+    .into_iter()
+    .filter(|value| !value.trim().is_empty())
+    .collect::<Vec<_>>()
+    .join("\n");
+    if !output.status.success() {
+        return Err(DoctorCommandFailure {
+            error: sanitize_http_error_message(
+                format!(
+                    "doctor recovery command failed (status={}): {}",
+                    output
+                        .status
+                        .code()
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "unknown".to_owned()),
+                    command_output
+                )
+                .as_str(),
+            ),
+            command_output,
+        });
+    }
+    let report = serde_json::from_str::<Value>(stdout_raw.trim()).map_err(|error| {
+        DoctorCommandFailure {
+            error: sanitize_http_error_message(
+                format!("doctor recovery command returned invalid JSON: {error}").as_str(),
+            ),
+            command_output: command_output.clone(),
+        }
+    })?;
+    Ok((report, command_output))
 }
 
 pub(crate) async fn run_support_bundle_export_command(

@@ -44,6 +44,14 @@ export function useSupportDomain({ api, setError, setNotice }: UseSupportDomainA
   const [supportBundleJobs, setSupportBundleJobs] = useState<JsonObject[]>([]);
   const [supportSelectedBundleJobId, setSupportSelectedBundleJobId] = useState("");
   const [supportSelectedBundleJob, setSupportSelectedBundleJob] = useState<JsonObject | null>(null);
+  const [supportDoctorRetainJobs, setSupportDoctorRetainJobs] = useState("16");
+  const [supportDoctorOnly, setSupportDoctorOnly] = useState("");
+  const [supportDoctorSkip, setSupportDoctorSkip] = useState("");
+  const [supportDoctorRollbackRunId, setSupportDoctorRollbackRunId] = useState("");
+  const [supportDoctorForce, setSupportDoctorForce] = useState(false);
+  const [supportDoctorJobs, setSupportDoctorJobs] = useState<JsonObject[]>([]);
+  const [supportSelectedDoctorJobId, setSupportSelectedDoctorJobId] = useState("");
+  const [supportSelectedDoctorJob, setSupportSelectedDoctorJob] = useState<JsonObject | null>(null);
 
   async function refreshSupport(): Promise<void> {
     setSupportBusy(true);
@@ -53,12 +61,14 @@ export function useSupportDomain({ api, setError, setNotice }: UseSupportDomainA
         pairingResponse,
         nodePairingResponse,
         jobsResponse,
+        doctorJobsResponse,
         deploymentResponse,
         diagnosticsResponse,
       ] = await Promise.all([
         api.getPairingSummary(),
         api.listNodePairingRequests(),
         api.listSupportBundleJobs(),
+        api.listDoctorRecoveryJobs(),
         api.getDeploymentPosture(),
         api.getDiagnostics(),
       ]);
@@ -70,6 +80,7 @@ export function useSupportDomain({ api, setError, setNotice }: UseSupportDomainA
       setSupportNodePairingCodes(nodePairingResponse.codes);
       setSupportNodePairingRequests(nodePairingResponse.requests);
       setSupportBundleJobs(toJsonObjectArray(jobsResponse.jobs as unknown as JsonValue[]));
+      setSupportDoctorJobs(toJsonObjectArray(doctorJobsResponse.jobs as unknown as JsonValue[]));
       setSupportDeployment(
         isJsonObject(deploymentResponse as unknown as JsonValue)
           ? (deploymentResponse as unknown as JsonObject)
@@ -86,6 +97,15 @@ export function useSupportDomain({ api, setError, setNotice }: UseSupportDomainA
         setSupportSelectedBundleJob(
           isJsonObject(jobResponse.job as unknown as JsonValue)
             ? (jobResponse.job as unknown as JsonObject)
+            : null,
+        );
+      }
+      const nextSelectedDoctorJobId = supportSelectedDoctorJobId.trim();
+      if (nextSelectedDoctorJobId.length > 0) {
+        const doctorJobResponse = await api.getDoctorRecoveryJob(nextSelectedDoctorJobId);
+        setSupportSelectedDoctorJob(
+          isJsonObject(doctorJobResponse.job as unknown as JsonValue)
+            ? (doctorJobResponse.job as unknown as JsonObject)
             : null,
         );
       }
@@ -213,6 +233,89 @@ export function useSupportDomain({ api, setError, setNotice }: UseSupportDomainA
     }
   }
 
+  async function queueDoctorRecoveryPreview(): Promise<void> {
+    await createDoctorRecoveryJob({ repair: true, dry_run: true });
+  }
+
+  async function queueDoctorRecoveryApply(): Promise<void> {
+    await createDoctorRecoveryJob({ repair: true, dry_run: false });
+  }
+
+  async function queueDoctorRollbackPreview(): Promise<void> {
+    await createDoctorRecoveryJob({ repair: false, dry_run: true });
+  }
+
+  async function queueDoctorRollbackApply(): Promise<void> {
+    await createDoctorRecoveryJob({ repair: false, dry_run: false });
+  }
+
+  async function createDoctorRecoveryJob(mode: {
+    repair: boolean;
+    dry_run: boolean;
+  }): Promise<void> {
+    const retainJobs = parseInteger(supportDoctorRetainJobs);
+    if (retainJobs === null || retainJobs <= 0) {
+      setError("Recovery retain jobs must be a positive integer.");
+      return;
+    }
+    const rollbackRun = emptyToUndefined(supportDoctorRollbackRunId);
+    if (!mode.repair && rollbackRun === undefined) {
+      setError("Rollback preview/apply requires a recovery run ID.");
+      return;
+    }
+    setSupportBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const response = await api.createDoctorRecoveryJob({
+        retain_jobs: retainJobs,
+        repair: mode.repair,
+        dry_run: mode.dry_run,
+        force: supportDoctorForce,
+        only: mode.repair ? parseSupportFilterList(supportDoctorOnly) : undefined,
+        skip: mode.repair ? parseSupportFilterList(supportDoctorSkip) : undefined,
+        rollback_run: mode.repair ? undefined : rollbackRun,
+      });
+      const createdJob = isJsonObject(response.job as unknown as JsonValue)
+        ? (response.job as unknown as JsonObject)
+        : null;
+      const jobId = readString(createdJob ?? {}, "job_id") ?? "";
+      setSupportSelectedDoctorJob(createdJob);
+      setSupportSelectedDoctorJobId(jobId);
+      setNotice(
+        `${mode.repair ? "Recovery" : "Rollback"} doctor job queued: ${jobId || "unknown"}.`,
+      );
+      await refreshSupport();
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setSupportBusy(false);
+    }
+  }
+
+  async function loadDoctorRecoveryJob(): Promise<void> {
+    const jobId = supportSelectedDoctorJobId.trim();
+    if (jobId.length === 0) {
+      setError("Doctor recovery job ID cannot be empty.");
+      return;
+    }
+    setSupportBusy(true);
+    setError(null);
+    try {
+      const response = await api.getDoctorRecoveryJob(jobId);
+      setSupportSelectedDoctorJob(
+        isJsonObject(response.job as unknown as JsonValue)
+          ? (response.job as unknown as JsonObject)
+          : null,
+      );
+      setNotice("Doctor recovery job refreshed.");
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setSupportBusy(false);
+    }
+  }
+
   function resetSupportDomain(): void {
     setSupportBusy(false);
     setSupportPairingSummary(null);
@@ -229,6 +332,14 @@ export function useSupportDomain({ api, setError, setNotice }: UseSupportDomainA
     setSupportBundleJobs([]);
     setSupportSelectedBundleJobId("");
     setSupportSelectedBundleJob(null);
+    setSupportDoctorRetainJobs("16");
+    setSupportDoctorOnly("");
+    setSupportDoctorSkip("");
+    setSupportDoctorRollbackRunId("");
+    setSupportDoctorForce(false);
+    setSupportDoctorJobs([]);
+    setSupportSelectedDoctorJobId("");
+    setSupportSelectedDoctorJob(null);
   }
 
   return {
@@ -254,12 +365,42 @@ export function useSupportDomain({ api, setError, setNotice }: UseSupportDomainA
     supportSelectedBundleJobId,
     setSupportSelectedBundleJobId,
     supportSelectedBundleJob,
+    supportDoctorRetainJobs,
+    setSupportDoctorRetainJobs,
+    supportDoctorOnly,
+    setSupportDoctorOnly,
+    supportDoctorSkip,
+    setSupportDoctorSkip,
+    supportDoctorRollbackRunId,
+    setSupportDoctorRollbackRunId,
+    supportDoctorForce,
+    setSupportDoctorForce,
+    supportDoctorJobs,
+    supportSelectedDoctorJobId,
+    setSupportSelectedDoctorJobId,
+    supportSelectedDoctorJob,
     refreshSupport,
     mintSupportPairingCode,
     approveSupportPairingRequest,
     rejectSupportPairingRequest,
     createSupportBundle,
     loadSupportBundleJob,
+    queueDoctorRecoveryPreview,
+    queueDoctorRecoveryApply,
+    queueDoctorRollbackPreview,
+    queueDoctorRollbackApply,
+    loadDoctorRecoveryJob,
     resetSupportDomain,
   };
+}
+
+function parseSupportFilterList(raw: string): string[] {
+  return Array.from(
+    new Set(
+      raw
+        .split(/[\r\n,]+/u)
+        .map((value) => value.trim())
+        .filter((value) => value.length > 0),
+    ),
+  );
 }

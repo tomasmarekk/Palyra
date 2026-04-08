@@ -6,6 +6,9 @@ import {
   auditEventsFixture,
   capabilityCatalogFixture,
   deploymentPostureFixture,
+  diagnosticsFixture,
+  doctorRecoveryJobFixture,
+  doctorRecoveryJobsFixture,
   inventoryDeviceDetailFixture,
   inventoryListFixture,
   nodePairingListFixture,
@@ -194,9 +197,10 @@ describe("M56 config, access, and support surfaces", () => {
     let nodePairings: ReturnType<typeof nodePairingListFixture> = nodePairingListFixture();
     let inventory = inventoryListFixture();
     const supportJobs = supportBundleJobsFixture().jobs.slice();
+    const doctorJobs = doctorRecoveryJobsFixture().jobs.slice();
 
     const fetchMock = createFetchRouter(
-      (request) => routeOverviewRequests(request, supportJobs),
+      (request) => routeOverviewRequests(request, supportJobs, doctorJobs),
       (request) => {
         if (request.path === "/console/v1/pairing" && request.method === "GET") {
           return jsonResponse(pairingSummary);
@@ -306,6 +310,46 @@ describe("M56 config, access, and support surfaces", () => {
         ) {
           return jsonResponse(supportBundleJobFixture("support-job-2"));
         }
+        if (request.path === "/console/v1/doctor/jobs" && request.method === "POST") {
+          doctorJobs.unshift({
+            job_id: "doctor-job-2",
+            state: "queued",
+            requested_at_unix_ms: 1700000005200,
+            command: ["doctor", "--json", "--repair", "--dry-run"],
+            command_output: "",
+          });
+          return jsonResponse({
+            contract: doctorRecoveryJobFixture().contract,
+            job: doctorJobs[0],
+          });
+        }
+        if (request.path === "/console/v1/doctor/jobs/doctor-job-2" && request.method === "GET") {
+          return jsonResponse({
+            contract: doctorRecoveryJobFixture().contract,
+            job: {
+              job_id: "doctor-job-2",
+              state: "succeeded",
+              requested_at_unix_ms: 1700000005200,
+              completed_at_unix_ms: 1700000006200,
+              command: ["doctor", "--json", "--repair", "--dry-run"],
+              report: {
+                mode: "repair_preview",
+                recovery: {
+                  requested: true,
+                  dry_run: true,
+                  force: false,
+                  run_id: "01HRECOVERYRUN2",
+                  backup_manifest_path: "state/recovery/runs/01HRECOVERYRUN2/manifest.json",
+                  planned_steps: [{ id: "config.initialize" }],
+                  applied_steps: [],
+                  available_runs: [{ run_id: "01HRECOVERYRUN2" }],
+                  next_steps: ["Apply repairs after reviewing the preview."],
+                },
+              },
+              command_output: "{\\n  \\\"mode\\\": \\\"repair_preview\\\"\\n}",
+            },
+          });
+        }
         return undefined;
       },
     );
@@ -350,7 +394,9 @@ describe("M56 config, access, and support surfaces", () => {
     expect(screen.getAllByText("Bundle reliability").length).toBeGreaterThan(0);
     expect(screen.getByText("Triage playbook")).toBeInTheDocument();
     expect(
-      screen.getByText("docs/operations/observability-supportability-v1.md"),
+      screen.getByText(
+        "docs-codebase/docs-tree/web_console_operator_dashboard/console_sections_and_navigation/support_recovery.md",
+      ),
     ).toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText("Retain jobs"), { target: { value: "8" } });
@@ -366,6 +412,22 @@ describe("M56 config, access, and support surfaces", () => {
         "Remote gateway exposure requires explicit verification and operator acknowledgement.",
       );
     });
+
+    fireEvent.change(screen.getByLabelText("Retain recovery jobs"), { target: { value: "6" } });
+    fireEvent.change(screen.getByLabelText("Only checks"), {
+      target: { value: "config.initialize,node_runtime.normalize" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Queue preview" }));
+    await waitFor(() => {
+      expect(screen.getByText("Recovery doctor job queued: doctor-job-2.")).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Load recovery job" }));
+    await waitFor(() => {
+      expect(document.body).toHaveTextContent("01HRECOVERYRUN2");
+    });
+    expect(screen.getByText("Planned steps")).toBeInTheDocument();
+    expect(screen.getByText("Next steps")).toBeInTheDocument();
   }, 20_000);
 
   it("renders every published CLI handoff from the capability catalog without fake direct actions", async () => {
@@ -392,7 +454,11 @@ describe("M56 config, access, and support surfaces", () => {
   });
 });
 
-function routeOverviewRequests(request: MockRequest, jobs = supportBundleJobsFixture().jobs) {
+function routeOverviewRequests(
+  request: MockRequest,
+  jobs = supportBundleJobsFixture().jobs,
+  doctorJobs = doctorRecoveryJobsFixture().jobs,
+) {
   if (request.path === "/console/v1/auth/session" && request.method === "GET") {
     return sessionResponse();
   }
@@ -408,8 +474,14 @@ function routeOverviewRequests(request: MockRequest, jobs = supportBundleJobsFix
       jobs,
     });
   }
+  if (request.path === "/console/v1/doctor/jobs" && request.method === "GET") {
+    return jsonResponse({
+      ...doctorRecoveryJobsFixture(),
+      jobs: doctorJobs,
+    });
+  }
   if (request.path === "/console/v1/diagnostics" && request.method === "GET") {
-    return jsonResponse({});
+    return jsonResponse(diagnosticsFixture());
   }
   if (request.path === "/console/v1/audit/events" && request.method === "GET") {
     return jsonResponse(auditEventsFixture());

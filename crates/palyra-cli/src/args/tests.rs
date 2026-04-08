@@ -85,13 +85,67 @@ fn parse_init_remote_with_overrides() {
 #[test]
 fn parse_doctor_strict() {
     let parsed = Cli::parse_from(["palyra", "doctor", "--strict"]);
-    assert_eq!(parsed.command, Command::Doctor { strict: true, json: false });
+    assert_eq!(
+        parsed.command,
+        Command::Doctor {
+            strict: true,
+            json: false,
+            repair: false,
+            dry_run: false,
+            force: false,
+            only: Vec::new(),
+            skip: Vec::new(),
+            rollback_run: None,
+        }
+    );
 }
 
 #[test]
 fn parse_doctor_json() {
     let parsed = Cli::parse_from(["palyra", "doctor", "--json"]);
-    assert_eq!(parsed.command, Command::Doctor { strict: false, json: true });
+    assert_eq!(
+        parsed.command,
+        Command::Doctor {
+            strict: false,
+            json: true,
+            repair: false,
+            dry_run: false,
+            force: false,
+            only: Vec::new(),
+            skip: Vec::new(),
+            rollback_run: None,
+        }
+    );
+}
+
+#[test]
+fn parse_doctor_repair_preview_filters() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "doctor",
+        "--repair",
+        "--dry-run",
+        "--force",
+        "--only",
+        "config.schema_version",
+        "--skip",
+        "stale_runtime.cleanup",
+        "--rollback-run",
+        "01ARZ3NDEKTSV4RRFFQ69G5FB0",
+    ]);
+    assert_eq!(
+        parsed.command,
+        Command::Doctor {
+            strict: false,
+            json: false,
+            repair: true,
+            dry_run: true,
+            force: true,
+            only: vec!["config.schema_version".to_owned()],
+            skip: vec!["stale_runtime.cleanup".to_owned()],
+            rollback_run: Some("01ARZ3NDEKTSV4RRFFQ69G5FB0".to_owned()),
+        }
+    );
 }
 
 #[test]

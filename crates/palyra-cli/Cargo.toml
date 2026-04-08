@@ -30,6 +30,7 @@ palyra-vault = { version = "0.1.0", path = "../palyra-vault" }
 prost.workspace = true
 ratatui.workspace = true
 reqwest.workspace = true
+ring.workspace = true
 rpassword.workspace = true
 rusqlite.workspace = true
 serde.workspace = true

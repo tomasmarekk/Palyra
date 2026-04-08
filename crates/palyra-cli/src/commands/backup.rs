@@ -282,6 +282,7 @@ fn build_embedded_support_bundle(generated_at_unix_ms: i64) -> Result<SupportBun
             arch: std::env::consts::ARCH.to_owned(),
         },
         doctor,
+        recovery: Some(commands::doctor::build_doctor_support_bundle_value()?),
         config: build_support_bundle_config_snapshot(),
         observability: build_support_bundle_observability_snapshot(&diagnostics),
         triage: build_support_bundle_triage_snapshot(),

@@ -234,7 +234,25 @@ fn run_cli() -> Result<()> {
         CliCommand::Setup { mode, path, force, tls_scaffold, wizard, wizard_options } => {
             commands::setup::run_setup(mode, path, force, tls_scaffold, wizard, wizard_options)
         }
-        CliCommand::Doctor { strict, json } => commands::doctor::run_doctor(strict, json),
+        CliCommand::Doctor {
+            strict,
+            json,
+            repair,
+            dry_run,
+            force,
+            only,
+            skip,
+            rollback_run,
+        } => commands::doctor::run_doctor(
+            strict,
+            json,
+            repair,
+            dry_run,
+            force,
+            only,
+            skip,
+            rollback_run,
+        ),
         CliCommand::Health { url, grpc_url } => commands::health::run_health(url, grpc_url),
         CliCommand::Logs { db_path, lines, follow, poll_interval_ms } => {
             commands::logs::run_logs(db_path, lines, follow, poll_interval_ms)
@@ -1677,7 +1695,9 @@ fn build_support_bundle_observability_snapshot(
 
 fn build_support_bundle_triage_snapshot() -> SupportBundleTriageSnapshot {
     SupportBundleTriageSnapshot {
-        playbook: "docs/operations/observability-supportability-v1.md".to_owned(),
+        playbook:
+            "docs-codebase/docs-tree/web_console_operator_dashboard/console_sections_and_navigation/support_recovery.md"
+                .to_owned(),
         failure_classes: vec![
             "config_failure".to_owned(),
             "upstream_provider_failure".to_owned(),
@@ -6573,6 +6593,8 @@ struct SupportBundle {
     build: SupportBundleBuildSnapshot,
     platform: SupportBundlePlatformSnapshot,
     doctor: DoctorReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery: Option<Value>,
     config: SupportBundleConfigSnapshot,
     observability: SupportBundleObservabilitySnapshot,
     triage: SupportBundleTriageSnapshot,
@@ -8054,6 +8076,16 @@ mod diagnostics_bundle_tests {
                 arch: "x86_64".to_owned(),
             },
             doctor: minimal_doctor_report(),
+            recovery: Some(json!({
+                "schema_version": 1,
+                "mode": "repair_preview",
+                "planned_steps": [
+                    {
+                        "id": "config.schema_version",
+                        "kind": "config_version_migration"
+                    }
+                ]
+            })),
             config: SupportBundleConfigSnapshot {
                 path: Some("palyra.toml".to_owned()),
                 redacted_document: Some(json!({
@@ -8078,7 +8110,9 @@ mod diagnostics_bundle_tests {
                 ])),
             },
             triage: SupportBundleTriageSnapshot {
-                playbook: "docs/operations/observability-supportability-v1.md".to_owned(),
+                playbook:
+                    "docs-codebase/docs-tree/web_console_operator_dashboard/console_sections_and_navigation/support_recovery.md"
+                        .to_owned(),
                 failure_classes: vec![
                     "config_failure".to_owned(),
                     "upstream_provider_failure".to_owned(),

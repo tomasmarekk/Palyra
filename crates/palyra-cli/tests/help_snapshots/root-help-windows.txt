@@ -5,7 +5,7 @@ Usage: palyra [OPTIONS] <COMMAND>
 Commands:
   version         Show CLI build metadata
   setup           Bootstrap a Palyra installation [aliases: init]
-  doctor
+  doctor          Run diagnostics, repair previews, and rollback workflows
   health          Run a narrow liveness/readiness probe across HTTP and gRPC gateway surfaces
   logs            Tail local gateway journal diagnostics
   status          Show transport and admin status across HTTP/gRPC surfaces
