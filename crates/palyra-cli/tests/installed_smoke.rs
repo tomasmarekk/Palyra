@@ -74,8 +74,8 @@ fn installed_binary_runs_baseline_smoke_commands() -> Result<()> {
         "palyra doctor --json",
     )?;
     assert!(
-        doctor_payload.get("checks").and_then(Value::as_array).is_some(),
-        "doctor output should include checks array: {doctor_payload}"
+        doctor_payload.pointer("/diagnostics/checks").and_then(Value::as_array).is_some(),
+        "doctor output should include diagnostics.checks array: {doctor_payload}"
     );
 
     assert_success(
