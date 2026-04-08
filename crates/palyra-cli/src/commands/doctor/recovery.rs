@@ -45,15 +45,15 @@ const DOCTOR_ROUTINE_REGISTRY_VERSION: u32 = 1;
 const DOCTOR_SUPPORT_BUNDLE_MANIFEST_LIMIT: usize = 5;
 
 #[derive(Clone, Debug)]
-struct DoctorCommandRequest {
-    strict: bool,
-    json: bool,
-    repair: bool,
-    dry_run: bool,
-    force: bool,
-    only: Vec<String>,
-    skip: Vec<String>,
-    rollback_run: Option<String>,
+pub(crate) struct DoctorCommandRequest {
+    pub(crate) strict: bool,
+    pub(crate) json: bool,
+    pub(crate) repair: bool,
+    pub(crate) dry_run: bool,
+    pub(crate) force: bool,
+    pub(crate) only: Vec<String>,
+    pub(crate) skip: Vec<String>,
+    pub(crate) rollback_run: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -254,18 +254,7 @@ enum DoctorRepairKind {
     },
 }
 
-pub(crate) fn run_doctor(
-    strict: bool,
-    json: bool,
-    repair: bool,
-    dry_run: bool,
-    force: bool,
-    only: Vec<String>,
-    skip: Vec<String>,
-    rollback_run: Option<String>,
-) -> Result<()> {
-    let request =
-        DoctorCommandRequest { strict, json, repair, dry_run, force, only, skip, rollback_run };
+pub(crate) fn run_doctor(request: DoctorCommandRequest) -> Result<()> {
     let execution = build_doctor_execution(&request)?;
     if request.json {
         let encoded = serde_json::to_string_pretty(&execution)

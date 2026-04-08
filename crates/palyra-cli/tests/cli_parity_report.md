@@ -28,7 +28,7 @@ It distinguishes expected parity posture (`done` / `partial` / `intentional_devi
 | `palyra` | `root` | `done` | `verified` | `unix: root-help-unix.txt; windows: root-help-windows.txt` | - | `--profile`, `--config`, `--state-root`, `--log-level`, `--output-format`, `--plain`, `--no-color` | - |
 | `version` | `top_level` | `done` | `verified` | `version-help.txt` | - | - | - |
 | `setup` | `canonical_family` | `done` | `verified` | `setup-help.txt` | `init` | `--mode`, `--path`, `--force`, `--wizard` | - |
-| `doctor` | `top_level` | `done` | `verified` | `doctor-help.txt` | - | `--strict`, `--json` | - |
+| `doctor` | `top_level` | `done` | `verified` | `doctor-help.txt` | - | `--strict`, `--json`, `--repair`, `--dry-run`, `--force`, `--only`, `--skip`, `--rollback-run` | - |
 | `health` | `top_level` | `done` | `verified` | `health-help.txt` | - | `--url`, `--grpc-url` | - |
 | `logs` | `top_level` | `done` | `verified` | `logs-help.txt` | - | `--db-path`, `--lines`, `--follow` | - |
 | `status` | `top_level` | `done` | `verified` | `status-help.txt` | - | - | - |
