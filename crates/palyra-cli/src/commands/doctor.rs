@@ -14,14 +14,5 @@ pub(crate) fn run_doctor(
     skip: Vec<String>,
     rollback_run: Option<String>,
 ) -> Result<()> {
-    recovery::run_doctor(
-        strict,
-        json,
-        repair,
-        dry_run,
-        force,
-        only,
-        skip,
-        rollback_run,
-    )
+    recovery::run_doctor(strict, json, repair, dry_run, force, only, skip, rollback_run)
 }

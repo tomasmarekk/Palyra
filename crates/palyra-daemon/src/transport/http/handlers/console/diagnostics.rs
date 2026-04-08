@@ -598,10 +598,14 @@ pub(crate) fn build_doctor_recovery_observability(state: &AppState) -> Value {
 fn build_doctor_recovery_job_summary(job: &control_plane::DoctorRecoveryJob) -> Value {
     let report = job.report.as_ref();
     let recovery = report.and_then(|value| value.get("recovery"));
-    let planned_step_count =
-        recovery.and_then(|value| value.get("planned_steps")).and_then(Value::as_array).map(Vec::len);
-    let applied_step_count =
-        recovery.and_then(|value| value.get("applied_steps")).and_then(Value::as_array).map(Vec::len);
+    let planned_step_count = recovery
+        .and_then(|value| value.get("planned_steps"))
+        .and_then(Value::as_array)
+        .map(Vec::len);
+    let applied_step_count = recovery
+        .and_then(|value| value.get("applied_steps"))
+        .and_then(Value::as_array)
+        .map(Vec::len);
     let available_run_count = recovery
         .and_then(|value| value.get("available_runs"))
         .and_then(Value::as_array)
@@ -1719,8 +1723,8 @@ pub(crate) fn create_doctor_job(
 
     let retain_jobs = payload.retain_jobs.max(1);
     let config_path = std::env::var("PALYRA_CONFIG").ok().filter(|value| !value.trim().is_empty());
-    let support_bundle_root =
-        resolve_support_bundle_root().map_err(|error| runtime_status_response(tonic::Status::internal(error)))?;
+    let support_bundle_root = resolve_support_bundle_root()
+        .map_err(|error| runtime_status_response(tonic::Status::internal(error)))?;
     let state_root = support_bundle_root
         .parent()
         .map(FsPath::to_path_buf)
@@ -1750,7 +1754,8 @@ pub(crate) async fn run_doctor_job(
         }
     }
 
-    let result = run_doctor_command(command.as_slice(), state_root.as_path(), config_path.as_deref()).await;
+    let result =
+        run_doctor_command(command.as_slice(), state_root.as_path(), config_path.as_deref()).await;
     let completed_at = unix_ms_now().unwrap_or_default();
     let mut guard = lock_doctor_jobs(&jobs);
     if let Some(job) = guard.get_mut(job_id.as_str()) {
@@ -1839,7 +1844,9 @@ async fn run_doctor_command(
     }
 
     let output = command.output().await.map_err(|error| DoctorCommandFailure {
-        error: sanitize_http_error_message(&format!("failed to run doctor recovery command: {error}")),
+        error: sanitize_http_error_message(&format!(
+            "failed to run doctor recovery command: {error}"
+        )),
         command_output: String::new(),
     })?;
     let stdout_raw = String::from_utf8_lossy(output.stdout.as_slice()).into_owned();
@@ -1869,14 +1876,13 @@ async fn run_doctor_command(
             command_output,
         });
     }
-    let report = serde_json::from_str::<Value>(stdout_raw.trim()).map_err(|error| {
-        DoctorCommandFailure {
+    let report =
+        serde_json::from_str::<Value>(stdout_raw.trim()).map_err(|error| DoctorCommandFailure {
             error: sanitize_http_error_message(
                 format!("doctor recovery command returned invalid JSON: {error}").as_str(),
             ),
             command_output: command_output.clone(),
-        }
-    })?;
+        })?;
     Ok((report, command_output))
 }
 

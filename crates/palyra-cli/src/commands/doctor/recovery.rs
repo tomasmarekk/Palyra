@@ -176,25 +176,71 @@ struct DoctorRepairPlan {
 
 #[derive(Clone, Debug)]
 enum DoctorRepairKind {
-    InitializeMissingConfig { path: PathBuf },
-    MigrateConfigVersion { path: PathBuf },
-    RestoreConfigBackup { path: PathBuf, backup_path: PathBuf },
-    ReinitializeConfig { path: PathBuf },
-    GenerateBrowserAuthToken { path: PathBuf },
-    NormalizeAuthRegistry { path: PathBuf, quarantine_unknown_root_keys: Vec<(String, TomlValue)> },
-    RestoreAuthRegistryBackup { path: PathBuf, backup_path: PathBuf },
-    ReinitializeAuthRegistry { path: PathBuf },
-    GatewayRemoteVerificationManual { path: PathBuf },
-    NormalizeCliProfiles { path: PathBuf, quarantine_unknown_root_keys: Vec<(String, TomlValue)> },
-    RestoreCliProfilesBackup { path: PathBuf, backup_path: PathBuf },
-    ReinitializeCliProfiles { path: PathBuf },
-    NormalizeRoutineRegistry { path: PathBuf, top_level_array_key: &'static str },
-    NormalizeNodeRuntime { path: PathBuf },
-    RestoreNodeRuntimeBackup { path: PathBuf, backup_path: PathBuf },
-    ReinitializeNodeRuntime { path: PathBuf },
-    BackfillAccessRegistry { path: PathBuf },
-    RestoreAccessRegistryBackup { path: PathBuf, backup_path: PathBuf },
-    ReinitializeAccessRegistry { path: PathBuf },
+    InitializeMissingConfig {
+        path: PathBuf,
+    },
+    MigrateConfigVersion {
+        path: PathBuf,
+    },
+    RestoreConfigBackup {
+        path: PathBuf,
+        backup_path: PathBuf,
+    },
+    ReinitializeConfig {
+        path: PathBuf,
+    },
+    GenerateBrowserAuthToken {
+        path: PathBuf,
+    },
+    NormalizeAuthRegistry {
+        path: PathBuf,
+        quarantine_unknown_root_keys: Vec<(String, TomlValue)>,
+    },
+    RestoreAuthRegistryBackup {
+        path: PathBuf,
+        backup_path: PathBuf,
+    },
+    ReinitializeAuthRegistry {
+        path: PathBuf,
+    },
+    GatewayRemoteVerificationManual {
+        path: PathBuf,
+    },
+    NormalizeCliProfiles {
+        path: PathBuf,
+        quarantine_unknown_root_keys: Vec<(String, TomlValue)>,
+    },
+    RestoreCliProfilesBackup {
+        path: PathBuf,
+        backup_path: PathBuf,
+    },
+    ReinitializeCliProfiles {
+        path: PathBuf,
+    },
+    NormalizeRoutineRegistry {
+        path: PathBuf,
+        top_level_array_key: &'static str,
+    },
+    NormalizeNodeRuntime {
+        path: PathBuf,
+    },
+    RestoreNodeRuntimeBackup {
+        path: PathBuf,
+        backup_path: PathBuf,
+    },
+    ReinitializeNodeRuntime {
+        path: PathBuf,
+    },
+    BackfillAccessRegistry {
+        path: PathBuf,
+    },
+    RestoreAccessRegistryBackup {
+        path: PathBuf,
+        backup_path: PathBuf,
+    },
+    ReinitializeAccessRegistry {
+        path: PathBuf,
+    },
     NormalizeBrowserProfileRegistry {
         registry_path: PathBuf,
         master_key: [u8; DOCTOR_BROWSER_STATE_KEY_LEN],
@@ -203,7 +249,9 @@ enum DoctorRepairKind {
         registry_path: PathBuf,
         master_key: [u8; DOCTOR_BROWSER_STATE_KEY_LEN],
     },
-    CleanupArtifacts { paths: Vec<PathBuf> },
+    CleanupArtifacts {
+        paths: Vec<PathBuf>,
+    },
 }
 
 pub(crate) fn run_doctor(
@@ -216,16 +264,8 @@ pub(crate) fn run_doctor(
     skip: Vec<String>,
     rollback_run: Option<String>,
 ) -> Result<()> {
-    let request = DoctorCommandRequest {
-        strict,
-        json,
-        repair,
-        dry_run,
-        force,
-        only,
-        skip,
-        rollback_run,
-    };
+    let request =
+        DoctorCommandRequest { strict, json, repair, dry_run, force, only, skip, rollback_run };
     let execution = build_doctor_execution(&request)?;
     if request.json {
         let encoded = serde_json::to_string_pretty(&execution)
@@ -278,7 +318,9 @@ pub(crate) fn build_doctor_support_bundle_value() -> Result<JsonValue> {
 
 fn build_doctor_execution(request: &DoctorCommandRequest) -> Result<DoctorExecutionReport> {
     if request.rollback_run.is_some() && request.repair {
-        anyhow::bail!("doctor repair apply and rollback cannot be requested in the same invocation");
+        anyhow::bail!(
+            "doctor repair apply and rollback cannot be requested in the same invocation"
+        );
     }
     if request.rollback_run.is_some() && !request.only.is_empty() {
         anyhow::bail!("doctor rollback does not support --only filters");
@@ -298,7 +340,12 @@ fn build_doctor_execution(request: &DoctorCommandRequest) -> Result<DoctorExecut
     };
 
     let mode = if let Some(run_id) = request.rollback_run.as_deref() {
-        let rollback = execute_rollback(environment.state_root.as_path(), run_id, request.force, request.dry_run)?;
+        let rollback = execute_rollback(
+            environment.state_root.as_path(),
+            run_id,
+            request.force,
+            request.dry_run,
+        )?;
         recovery.applied_steps = rollback.applied_steps;
         recovery.backup_manifest_path = rollback.manifest_path;
         recovery.next_steps = rollback.next_steps;
@@ -311,11 +358,18 @@ fn build_doctor_execution(request: &DoctorCommandRequest) -> Result<DoctorExecut
         let plans = evaluate_repair_plans(&environment)?;
         let plans = plans
             .into_iter()
-            .filter(|entry| step_selected(entry.step.id.as_str(), request.only.as_slice(), request.skip.as_slice()))
+            .filter(|entry| {
+                step_selected(
+                    entry.step.id.as_str(),
+                    request.only.as_slice(),
+                    request.skip.as_slice(),
+                )
+            })
             .collect::<Vec<_>>();
         recovery.planned_steps = plans.iter().map(|entry| entry.step.clone()).collect();
         if request.dry_run {
-            recovery.next_steps = build_repair_next_steps_preview(recovery.planned_steps.as_slice());
+            recovery.next_steps =
+                build_repair_next_steps_preview(recovery.planned_steps.as_slice());
             DoctorExecutionMode::RepairPreview
         } else {
             let apply_result = apply_repair_plans(&environment, plans.as_slice(), request.force)?;
@@ -380,7 +434,9 @@ fn evaluate_config_repairs(environment: &DoctorEnvironment) -> Result<Vec<Doctor
                 kind: "config_initialize".to_owned(),
                 severity: DoctorSeverity::Warning,
                 title: "Initialize missing config".to_owned(),
-                description: "Create a minimal versioned config document so the install can parse again.".to_owned(),
+                description:
+                    "Create a minimal versioned config document so the install can parse again."
+                        .to_owned(),
                 impact: "Writes a new versioned config file at the configured path.".to_owned(),
                 local_only: true,
                 security_sensitive: false,
@@ -409,7 +465,8 @@ fn evaluate_config_repairs(environment: &DoctorEnvironment) -> Result<Vec<Doctor
                             "Update config schema metadata from version {} to {}.",
                             migration.source_version, migration.target_version
                         ),
-                        impact: "Rewrites the config document without changing operator values.".to_owned(),
+                        impact: "Rewrites the config document without changing operator values."
+                            .to_owned(),
                         local_only: true,
                         security_sensitive: false,
                         requires_force: false,
@@ -475,7 +532,9 @@ fn evaluate_config_repairs(environment: &DoctorEnvironment) -> Result<Vec<Doctor
     Ok(plans)
 }
 
-fn evaluate_auth_registry_repairs(environment: &DoctorEnvironment) -> Result<Vec<DoctorRepairPlan>> {
+fn evaluate_auth_registry_repairs(
+    environment: &DoctorEnvironment,
+) -> Result<Vec<DoctorRepairPlan>> {
     let path = resolve_auth_registry_path(environment);
     if !path.exists() {
         return Ok(Vec::new());
@@ -652,20 +711,16 @@ fn evaluate_gateway_remote_verification_repair(path: &Path) -> Result<Option<Doc
     let Some(_remote_base_url) = remote_base_url else {
         return Ok(None);
     };
-    let pinned_server = get_value_at_path(
-        &document,
-        "gateway_access.pinned_server_cert_fingerprint_sha256",
-    )?
-    .and_then(TomlValue::as_str)
-    .map(str::trim)
-    .filter(|value| !value.is_empty());
-    let pinned_gateway_ca = get_value_at_path(
-        &document,
-        "gateway_access.pinned_gateway_ca_fingerprint_sha256",
-    )?
-    .and_then(TomlValue::as_str)
-    .map(str::trim)
-    .filter(|value| !value.is_empty());
+    let pinned_server =
+        get_value_at_path(&document, "gateway_access.pinned_server_cert_fingerprint_sha256")?
+            .and_then(TomlValue::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+    let pinned_gateway_ca =
+        get_value_at_path(&document, "gateway_access.pinned_gateway_ca_fingerprint_sha256")?
+            .and_then(TomlValue::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
 
     let (title, description, warnings) = if pinned_server.is_some() && pinned_gateway_ca.is_some() {
         (
@@ -690,7 +745,8 @@ fn evaluate_gateway_remote_verification_repair(path: &Path) -> Result<Option<Doc
             severity: DoctorSeverity::Warning,
             title,
             description,
-            impact: "Prevents support workflows from masking a remote onboarding trust mismatch.".to_owned(),
+            impact: "Prevents support workflows from masking a remote onboarding trust mismatch."
+                .to_owned(),
             local_only: true,
             security_sensitive: true,
             requires_force: false,
@@ -698,9 +754,7 @@ fn evaluate_gateway_remote_verification_repair(path: &Path) -> Result<Option<Doc
             changed_objects: vec![display_path(path)],
             warnings,
         },
-        kind: DoctorRepairKind::GatewayRemoteVerificationManual {
-            path: path.to_path_buf(),
-        },
+        kind: DoctorRepairKind::GatewayRemoteVerificationManual { path: path.to_path_buf() },
     }))
 }
 
@@ -734,7 +788,10 @@ fn evaluate_cli_profiles_repairs(environment: &DoctorEnvironment) -> Result<Vec<
                         ],
                         warnings: Vec::new(),
                     },
-                    kind: DoctorRepairKind::RestoreCliProfilesBackup { path, backup_path: latest_backup },
+                    kind: DoctorRepairKind::RestoreCliProfilesBackup {
+                        path,
+                        backup_path: latest_backup,
+                    },
                 }
             } else {
                 DoctorRepairPlan {
@@ -779,11 +836,8 @@ fn evaluate_cli_profiles_repairs(environment: &DoctorEnvironment) -> Result<Vec<
             }]);
         }
     };
-    let allowed_keys = BTreeSet::from([
-        "version".to_owned(),
-        "default_profile".to_owned(),
-        "profiles".to_owned(),
-    ]);
+    let allowed_keys =
+        BTreeSet::from(["version".to_owned(), "default_profile".to_owned(), "profiles".to_owned()]);
     let unknown_root_keys = root
         .keys()
         .filter(|key| !allowed_keys.contains((*key).to_owned().as_str()))
@@ -827,7 +881,9 @@ fn evaluate_cli_profiles_repairs(environment: &DoctorEnvironment) -> Result<Vec<
     }])
 }
 
-fn evaluate_routine_registry_repairs(environment: &DoctorEnvironment) -> Result<Vec<DoctorRepairPlan>> {
+fn evaluate_routine_registry_repairs(
+    environment: &DoctorEnvironment,
+) -> Result<Vec<DoctorRepairPlan>> {
     let mut plans = Vec::new();
     for (path, id, description, top_level_array_key) in [
         (
@@ -897,7 +953,8 @@ fn evaluate_node_runtime_repairs(environment: &DoctorEnvironment) -> Result<Vec<
                         severity: DoctorSeverity::Blocking,
                         title: "Restore latest node runtime backup".to_owned(),
                         description: sanitize_diagnostic_error(error.to_string().as_str()),
-                        impact: "Restores the node runtime state from the latest rotated backup.".to_owned(),
+                        impact: "Restores the node runtime state from the latest rotated backup."
+                            .to_owned(),
                         local_only: true,
                         security_sensitive: false,
                         requires_force: false,
@@ -908,7 +965,10 @@ fn evaluate_node_runtime_repairs(environment: &DoctorEnvironment) -> Result<Vec<
                         ],
                         warnings: Vec::new(),
                     },
-                    kind: DoctorRepairKind::RestoreNodeRuntimeBackup { path, backup_path: latest_backup },
+                    kind: DoctorRepairKind::RestoreNodeRuntimeBackup {
+                        path,
+                        backup_path: latest_backup,
+                    },
                 }
             } else {
                 DoctorRepairPlan {
@@ -957,7 +1017,9 @@ fn evaluate_node_runtime_repairs(environment: &DoctorEnvironment) -> Result<Vec<
     }])
 }
 
-fn evaluate_access_registry_repairs(environment: &DoctorEnvironment) -> Result<Vec<DoctorRepairPlan>> {
+fn evaluate_access_registry_repairs(
+    environment: &DoctorEnvironment,
+) -> Result<Vec<DoctorRepairPlan>> {
     let path = environment.state_root.join(DOCTOR_ACCESS_REGISTRY_FILE_NAME);
     if !path.exists() {
         return Ok(Vec::new());
@@ -976,7 +1038,8 @@ fn evaluate_access_registry_repairs(environment: &DoctorEnvironment) -> Result<V
                         severity: DoctorSeverity::Blocking,
                         title: "Restore latest access registry backup".to_owned(),
                         description: sanitize_diagnostic_error(error.to_string().as_str()),
-                        impact: "Restores the access registry from the latest rotated backup.".to_owned(),
+                        impact: "Restores the access registry from the latest rotated backup."
+                            .to_owned(),
                         local_only: true,
                         security_sensitive: false,
                         requires_force: false,
@@ -987,7 +1050,10 @@ fn evaluate_access_registry_repairs(environment: &DoctorEnvironment) -> Result<V
                         ],
                         warnings: Vec::new(),
                     },
-                    kind: DoctorRepairKind::RestoreAccessRegistryBackup { path, backup_path: latest_backup },
+                    kind: DoctorRepairKind::RestoreAccessRegistryBackup {
+                        path,
+                        backup_path: latest_backup,
+                    },
                 }
             } else {
                 DoctorRepairPlan {
@@ -1051,8 +1117,9 @@ fn evaluate_browser_profile_registry_repairs(
     if !registry_path.exists() {
         return Ok(Vec::new());
     }
-    let encrypted = fs::read(registry_path.as_path())
-        .with_context(|| format!("failed to read browser profile registry {}", registry_path.display()))?;
+    let encrypted = fs::read(registry_path.as_path()).with_context(|| {
+        format!("failed to read browser profile registry {}", registry_path.display())
+    })?;
     let decrypted = decrypt_browser_state_blob(&master_key, encrypted.as_slice());
     let decrypted = match decrypted {
         Ok(bytes) => bytes,
@@ -1124,7 +1191,9 @@ fn evaluate_browser_profile_registry_repairs(
     }])
 }
 
-fn evaluate_stale_artifact_cleanup(environment: &DoctorEnvironment) -> Result<Option<DoctorRepairPlan>> {
+fn evaluate_stale_artifact_cleanup(
+    environment: &DoctorEnvironment,
+) -> Result<Option<DoctorRepairPlan>> {
     let mut candidates = scan_stale_artifacts(environment.state_root.as_path())?;
     let browser_state_dir = resolve_browser_state_dir(environment.state_root.as_path())?;
     if browser_state_dir != environment.state_root {
@@ -1185,7 +1254,11 @@ fn apply_repair_plans(
                 .iter()
                 .map(|entry| DoctorAppliedStep {
                     id: entry.step.id.clone(),
-                    outcome: if entry.step.apply_supported { "no_change".to_owned() } else { "manual".to_owned() },
+                    outcome: if entry.step.apply_supported {
+                        "no_change".to_owned()
+                    } else {
+                        "manual".to_owned()
+                    },
                     message: if entry.step.apply_supported {
                         "No repair action was required.".to_owned()
                     } else {
@@ -1240,7 +1313,10 @@ fn apply_repair_plans(
     })
 }
 
-fn apply_repair_plan(manager: &DoctorRecoveryRunWriter, plan: &DoctorRepairPlan) -> Result<DoctorAppliedStep> {
+fn apply_repair_plan(
+    manager: &DoctorRecoveryRunWriter,
+    plan: &DoctorRepairPlan,
+) -> Result<DoctorAppliedStep> {
     match &plan.kind {
         DoctorRepairKind::InitializeMissingConfig { path } => {
             let document = empty_versioned_config_document()?;
@@ -1272,7 +1348,11 @@ fn apply_repair_plan(manager: &DoctorRecoveryRunWriter, plan: &DoctorRepairPlan)
             let document = empty_versioned_config_document()?;
             let encoded = serialize_document_pretty(&document)?;
             manager.write_string(plan.step.id.as_str(), path.as_path(), encoded.as_str(), true)?;
-            Ok(applied_step_ok(plan, "Quarantined the unreadable config and wrote a minimal versioned config.".to_owned()))
+            Ok(applied_step_ok(
+                plan,
+                "Quarantined the unreadable config and wrote a minimal versioned config."
+                    .to_owned(),
+            ))
         }
         DoctorRepairKind::GenerateBrowserAuthToken { path } => {
             let (mut document, _) = load_or_init_document(path.as_path())?;
@@ -1283,7 +1363,10 @@ fn apply_repair_plan(manager: &DoctorRecoveryRunWriter, plan: &DoctorRepairPlan)
             )?;
             let encoded = serialize_document_pretty(&document)?;
             manager.write_string(plan.step.id.as_str(), path.as_path(), encoded.as_str(), true)?;
-            Ok(applied_step_ok(plan, "Generated and persisted a browser relay auth token.".to_owned()))
+            Ok(applied_step_ok(
+                plan,
+                "Generated and persisted a browser relay auth token.".to_owned(),
+            ))
         }
         DoctorRepairKind::NormalizeAuthRegistry { path, quarantine_unknown_root_keys } => {
             let raw = fs::read_to_string(path.as_path())
@@ -1298,8 +1381,8 @@ fn apply_repair_plan(manager: &DoctorRecoveryRunWriter, plan: &DoctorRepairPlan)
             if !root.contains_key("profiles") {
                 root.insert("profiles".to_owned(), TomlValue::Array(Vec::new()));
             }
-            let encoded =
-                toml::to_string_pretty(&document).context("failed to serialize auth registry document")?;
+            let encoded = toml::to_string_pretty(&document)
+                .context("failed to serialize auth registry document")?;
             manager.write_string(plan.step.id.as_str(), path.as_path(), encoded.as_str(), false)?;
             if !quarantine_unknown_root_keys.is_empty() {
                 let quarantine_document = TomlValue::Table(
@@ -1405,7 +1488,12 @@ fn apply_repair_plan(manager: &DoctorRecoveryRunWriter, plan: &DoctorRepairPlan)
             let normalized = normalize_routine_registry_json(value, top_level_array_key);
             let encoded = serde_json::to_vec_pretty(&normalized)
                 .context("failed to serialize routine registry")?;
-            manager.write_bytes(plan.step.id.as_str(), path.as_path(), encoded.as_slice(), false)?;
+            manager.write_bytes(
+                plan.step.id.as_str(),
+                path.as_path(),
+                encoded.as_slice(),
+                false,
+            )?;
             Ok(applied_step_ok(plan, "Normalized routine registry schema.".to_owned()))
         }
         DoctorRepairKind::NormalizeNodeRuntime { path } => {
@@ -1416,12 +1504,20 @@ fn apply_repair_plan(manager: &DoctorRecoveryRunWriter, plan: &DoctorRepairPlan)
             let normalized = normalize_node_runtime_json(value, now_unix_ms_i64()?);
             let encoded = serde_json::to_vec_pretty(&normalized.value)
                 .context("failed to encode node runtime state")?;
-            manager.write_bytes(plan.step.id.as_str(), path.as_path(), encoded.as_slice(), false)?;
+            manager.write_bytes(
+                plan.step.id.as_str(),
+                path.as_path(),
+                encoded.as_slice(),
+                false,
+            )?;
             Ok(applied_step_ok(plan, "Normalized node runtime state.".to_owned()))
         }
         DoctorRepairKind::RestoreNodeRuntimeBackup { path, backup_path } => {
             restore_from_backup_entry(manager, plan, path.as_path(), backup_path.as_path(), false)?;
-            Ok(applied_step_ok(plan, "Restored node runtime state from the latest backup.".to_owned()))
+            Ok(applied_step_ok(
+                plan,
+                "Restored node runtime state from the latest backup.".to_owned(),
+            ))
         }
         DoctorRepairKind::ReinitializeNodeRuntime { path } => {
             if path.exists() {
@@ -1439,7 +1535,12 @@ fn apply_repair_plan(manager: &DoctorRecoveryRunWriter, plan: &DoctorRepairPlan)
                 "nodes": {}
             }))
             .context("failed to encode empty node runtime state")?;
-            manager.write_bytes(plan.step.id.as_str(), path.as_path(), encoded.as_slice(), false)?;
+            manager.write_bytes(
+                plan.step.id.as_str(),
+                path.as_path(),
+                encoded.as_slice(),
+                false,
+            )?;
             Ok(applied_step_ok(plan, "Reinitialized node runtime state.".to_owned()))
         }
         DoctorRepairKind::BackfillAccessRegistry { path } => {
@@ -1450,7 +1551,12 @@ fn apply_repair_plan(manager: &DoctorRecoveryRunWriter, plan: &DoctorRepairPlan)
             let normalized = normalize_access_registry_json(value, now_unix_ms_i64()?);
             let encoded = serde_json::to_vec_pretty(&normalized.value)
                 .context("failed to encode access registry")?;
-            manager.write_bytes(plan.step.id.as_str(), path.as_path(), encoded.as_slice(), false)?;
+            manager.write_bytes(
+                plan.step.id.as_str(),
+                path.as_path(),
+                encoded.as_slice(),
+                false,
+            )?;
             Ok(applied_step_ok(plan, "Backfilled access registry defaults.".to_owned()))
         }
         DoctorRepairKind::RestoreAccessRegistryBackup { path, backup_path } => {
@@ -1468,8 +1574,16 @@ fn apply_repair_plan(manager: &DoctorRecoveryRunWriter, plan: &DoctorRepairPlan)
             }
             let encoded = serde_json::to_vec_pretty(&default_access_registry_json())
                 .context("failed to encode default access registry")?;
-            manager.write_bytes(plan.step.id.as_str(), path.as_path(), encoded.as_slice(), false)?;
-            Ok(applied_step_ok(plan, "Reinitialized access registry with fail-closed defaults.".to_owned()))
+            manager.write_bytes(
+                plan.step.id.as_str(),
+                path.as_path(),
+                encoded.as_slice(),
+                false,
+            )?;
+            Ok(applied_step_ok(
+                plan,
+                "Reinitialized access registry with fail-closed defaults.".to_owned(),
+            ))
         }
         DoctorRepairKind::NormalizeBrowserProfileRegistry { registry_path, master_key } => {
             let encrypted = fs::read(registry_path.as_path()).with_context(|| {
@@ -1482,7 +1596,12 @@ fn apply_repair_plan(manager: &DoctorRecoveryRunWriter, plan: &DoctorRepairPlan)
             let encoded = serde_json::to_vec(&normalized.value)
                 .context("failed to encode browser profile registry")?;
             let encrypted = encrypt_browser_state_blob(master_key, encoded.as_slice())?;
-            manager.write_bytes(plan.step.id.as_str(), registry_path.as_path(), encrypted.as_slice(), true)?;
+            manager.write_bytes(
+                plan.step.id.as_str(),
+                registry_path.as_path(),
+                encrypted.as_slice(),
+                true,
+            )?;
             Ok(applied_step_ok(plan, "Normalized browser profile registry.".to_owned()))
         }
         DoctorRepairKind::ReinitializeBrowserProfileRegistry { registry_path, master_key } => {
@@ -1501,7 +1620,12 @@ fn apply_repair_plan(manager: &DoctorRecoveryRunWriter, plan: &DoctorRepairPlan)
             }))
             .context("failed to encode empty browser profile registry")?;
             let encrypted = encrypt_browser_state_blob(master_key, encoded.as_slice())?;
-            manager.write_bytes(plan.step.id.as_str(), registry_path.as_path(), encrypted.as_slice(), true)?;
+            manager.write_bytes(
+                plan.step.id.as_str(),
+                registry_path.as_path(),
+                encrypted.as_slice(),
+                true,
+            )?;
             Ok(applied_step_ok(plan, "Reinitialized browser profile registry.".to_owned()))
         }
         DoctorRepairKind::CleanupArtifacts { paths } => {
@@ -1541,12 +1665,16 @@ fn execute_rollback(
     force: bool,
     dry_run: bool,
 ) -> Result<DoctorRollbackResult> {
-    let manifest_path =
-        state_root.join(DOCTOR_RECOVERY_RUNS_RELATIVE_DIR).join(run_id).join(DOCTOR_RECOVERY_MANIFEST_FILE_NAME);
+    let manifest_path = state_root
+        .join(DOCTOR_RECOVERY_RUNS_RELATIVE_DIR)
+        .join(run_id)
+        .join(DOCTOR_RECOVERY_MANIFEST_FILE_NAME);
     let raw = fs::read_to_string(manifest_path.as_path())
         .with_context(|| format!("failed to read recovery manifest {}", manifest_path.display()))?;
-    let manifest = serde_json::from_str::<DoctorRecoveryManifest>(raw.as_str())
-        .with_context(|| format!("failed to parse recovery manifest {}", manifest_path.display()))?;
+    let manifest =
+        serde_json::from_str::<DoctorRecoveryManifest>(raw.as_str()).with_context(|| {
+            format!("failed to parse recovery manifest {}", manifest_path.display())
+        })?;
     let mut applied_steps = Vec::new();
     if dry_run {
         for entry in manifest.entries {
@@ -1567,11 +1695,7 @@ fn execute_rollback(
 
     for entry in manifest.entries {
         let target = PathBuf::from(entry.target_path.as_str());
-        let current_hash = if target.exists() {
-            Some(hash_file(target.as_path())?)
-        } else {
-            None
-        };
+        let current_hash = if target.exists() { Some(hash_file(target.as_path())?) } else { None };
         if !force && current_hash != entry.after_sha256 {
             applied_steps.push(DoctorAppliedStep {
                 id: format!("rollback:{}", entry.step_id),
@@ -1581,15 +1705,19 @@ fn execute_rollback(
                     display_path(target.as_path())
                 ),
                 changed_objects: vec![display_path(target.as_path())],
-                warnings: vec!["Re-run with --force only after confirming there are no newer manual changes.".to_owned()],
+                warnings: vec![
+                    "Re-run with --force only after confirming there are no newer manual changes."
+                        .to_owned(),
+                ],
             });
             continue;
         }
         match entry.change_type.as_str() {
             "created" | "deleted" => {
                 if target.exists() {
-                    fs::remove_file(target.as_path())
-                        .with_context(|| format!("failed to remove rollback target {}", target.display()))?;
+                    fs::remove_file(target.as_path()).with_context(|| {
+                        format!("failed to remove rollback target {}", target.display())
+                    })?;
                 }
             }
             _ => {
@@ -1627,8 +1755,9 @@ struct DoctorRecoveryRunWriter {
 impl DoctorRecoveryRunWriter {
     fn new(environment: &DoctorEnvironment, run_id: &str) -> Result<Arc<Self>> {
         let run_dir = environment.state_root.join(DOCTOR_RECOVERY_RUNS_RELATIVE_DIR).join(run_id);
-        fs::create_dir_all(run_dir.join("backups"))
-            .with_context(|| format!("failed to create recovery run directory {}", run_dir.display()))?;
+        fs::create_dir_all(run_dir.join("backups")).with_context(|| {
+            format!("failed to create recovery run directory {}", run_dir.display())
+        })?;
         let writer = Arc::new(Self {
             manifest_path: run_dir.join(DOCTOR_RECOVERY_MANIFEST_FILE_NAME),
             manifest: Mutex::new(DoctorRecoveryManifest {
@@ -1636,7 +1765,10 @@ impl DoctorRecoveryRunWriter {
                 run_id: run_id.to_owned(),
                 created_at_unix_ms: environment.generated_at_unix_ms,
                 state_root: display_path(environment.state_root.as_path()),
-                config_path: environment.config_path.as_ref().map(|path| display_path(path.as_path())),
+                config_path: environment
+                    .config_path
+                    .as_ref()
+                    .map(|path| display_path(path.as_path())),
                 completed: false,
                 steps: Vec::new(),
                 applied_steps: Vec::new(),
@@ -1669,39 +1801,73 @@ impl DoctorRecoveryRunWriter {
         self.persist()
     }
 
-    fn write_string(&self, step_id: &str, path: &Path, content: &str, secret_aware: bool) -> Result<()> {
+    fn write_string(
+        &self,
+        step_id: &str,
+        path: &Path,
+        content: &str,
+        secret_aware: bool,
+    ) -> Result<()> {
         self.write_bytes(step_id, path, content.as_bytes(), secret_aware)
     }
 
-    fn write_bytes(&self, step_id: &str, path: &Path, content: &[u8], secret_aware: bool) -> Result<()> {
+    fn write_bytes(
+        &self,
+        step_id: &str,
+        path: &Path,
+        content: &[u8],
+        secret_aware: bool,
+    ) -> Result<()> {
         let before = snapshot_file(path)?;
         let backup_path = self.persist_backup(step_id, path, before.as_ref())?;
         write_bytes_atomic(path, content)?;
-        self.record_entry(step_id, path, backup_path, before, Some(sha256_hex(content)), secret_aware)
+        self.record_entry(
+            step_id,
+            path,
+            backup_path,
+            before,
+            Some(sha256_hex(content)),
+            secret_aware,
+        )
     }
 
     fn remove_file(&self, step_id: &str, path: &Path, secret_aware: bool) -> Result<()> {
         let before = snapshot_file(path)?;
         let backup_path = self.persist_backup(step_id, path, before.as_ref())?;
         if path.exists() {
-            fs::remove_file(path).with_context(|| format!("failed to remove stale artifact {}", path.display()))?;
+            fs::remove_file(path)
+                .with_context(|| format!("failed to remove stale artifact {}", path.display()))?;
         }
         self.record_entry(step_id, path, backup_path, before, None, secret_aware)
     }
 
-    fn move_existing_file(&self, step_id: &str, path: &Path, destination: &Path, secret_aware: bool) -> Result<()> {
+    fn move_existing_file(
+        &self,
+        step_id: &str,
+        path: &Path,
+        destination: &Path,
+        secret_aware: bool,
+    ) -> Result<()> {
         if !path.exists() {
             return Ok(());
         }
         let before = snapshot_file(path)?;
         let backup_path = self.persist_backup(step_id, path, before.as_ref())?;
-        let bytes = fs::read(path).with_context(|| format!("failed to read quarantine source {}", path.display()))?;
+        let bytes = fs::read(path)
+            .with_context(|| format!("failed to read quarantine source {}", path.display()))?;
         write_bytes_atomic(destination, bytes.as_slice())?;
-        fs::remove_file(path).with_context(|| format!("failed to remove original quarantined file {}", path.display()))?;
+        fs::remove_file(path).with_context(|| {
+            format!("failed to remove original quarantined file {}", path.display())
+        })?;
         self.record_entry(step_id, path, backup_path, before, None, secret_aware)
     }
 
-    fn persist_backup(&self, step_id: &str, path: &Path, snapshot: Option<&FileSnapshot>) -> Result<Option<PathBuf>> {
+    fn persist_backup(
+        &self,
+        step_id: &str,
+        path: &Path,
+        snapshot: Option<&FileSnapshot>,
+    ) -> Result<Option<PathBuf>> {
         let Some(snapshot) = snapshot else {
             return Ok(None);
         };
@@ -1759,8 +1925,8 @@ impl DoctorRecoveryRunWriter {
             .lock()
             .map_err(|_| anyhow::anyhow!("recovery manifest lock poisoned"))?
             .clone();
-        let encoded = serde_json::to_vec_pretty(&manifest)
-            .context("failed to encode recovery manifest")?;
+        let encoded =
+            serde_json::to_vec_pretty(&manifest).context("failed to encode recovery manifest")?;
         write_bytes_atomic(self.manifest_path.as_path(), encoded.as_slice())
     }
 }
@@ -1775,12 +1941,14 @@ fn snapshot_file(path: &Path) -> Result<Option<FileSnapshot>> {
     if !path.exists() {
         return Ok(None);
     }
-    let bytes = fs::read(path).with_context(|| format!("failed to read snapshot source {}", path.display()))?;
+    let bytes = fs::read(path)
+        .with_context(|| format!("failed to read snapshot source {}", path.display()))?;
     Ok(Some(FileSnapshot { sha256: sha256_hex(bytes.as_slice()), bytes }))
 }
 
 fn hash_file(path: &Path) -> Result<String> {
-    let bytes = fs::read(path).with_context(|| format!("failed to read hash source {}", path.display()))?;
+    let bytes =
+        fs::read(path).with_context(|| format!("failed to read hash source {}", path.display()))?;
     Ok(sha256_hex(bytes.as_slice()))
 }
 
@@ -1794,11 +1962,13 @@ fn write_bytes_atomic(path: &Path, content: &[u8]) -> Result<()> {
         .with_context(|| format!("failed to write tmp file {}", tmp_path.display()))?;
     if path.exists() {
         let rollback_path = path.with_extension(format!("{}.rollback", Ulid::new()));
-        fs::rename(path, rollback_path.as_path())
-            .with_context(|| format!("failed to stage existing file {} for atomic write", path.display()))?;
+        fs::rename(path, rollback_path.as_path()).with_context(|| {
+            format!("failed to stage existing file {} for atomic write", path.display())
+        })?;
         if let Err(error) = fs::rename(tmp_path.as_path(), path) {
             let _ = fs::rename(rollback_path.as_path(), path);
-            return Err(error).with_context(|| format!("failed to install atomic file {}", path.display()));
+            return Err(error)
+                .with_context(|| format!("failed to install atomic file {}", path.display()));
         }
         let _ = fs::remove_file(rollback_path.as_path());
     } else {
@@ -1809,7 +1979,8 @@ fn write_bytes_atomic(path: &Path, content: &[u8]) -> Result<()> {
 }
 
 fn empty_versioned_config_document() -> Result<TomlValue> {
-    let (document, _) = parse_document_with_migration("").context("failed to create empty versioned config")?;
+    let (document, _) =
+        parse_document_with_migration("").context("failed to create empty versioned config")?;
     Ok(document)
 }
 
@@ -1817,8 +1988,8 @@ fn load_or_init_document(path: &Path) -> Result<(TomlValue, ConfigMigrationInfo)
     if path.exists() {
         return load_document_from_existing_path(path);
     }
-    let (document, migration) = parse_document_with_migration("")
-        .context("failed to create empty config document")?;
+    let (document, migration) =
+        parse_document_with_migration("").context("failed to create empty config document")?;
     Ok((document, migration))
 }
 
@@ -1857,10 +2028,7 @@ fn normalize_node_runtime_json(value: JsonValue, now_unix_ms: i64) -> Normalized
     if let Some(codes) = object.get_mut("active_pairing_codes").and_then(JsonValue::as_object_mut) {
         let original_len = codes.len();
         codes.retain(|_, record| {
-            record
-                .get("expires_at_unix_ms")
-                .and_then(JsonValue::as_i64)
-                .unwrap_or(i64::MAX)
+            record.get("expires_at_unix_ms").and_then(JsonValue::as_i64).unwrap_or(i64::MAX)
                 > now_unix_ms
         });
         expired_codes = original_len.saturating_sub(codes.len());
@@ -1881,8 +2049,10 @@ fn normalize_node_runtime_json(value: JsonValue, now_unix_ms: i64) -> Normalized
             let state = request.get("state").and_then(JsonValue::as_str).unwrap_or_default();
             if expired && matches!(state, "pending_approval" | "approved") {
                 request["state"] = JsonValue::String("expired".to_owned());
-                if request.get("decision_reason").is_none() || request["decision_reason"].is_null() {
-                    request["decision_reason"] = JsonValue::String("pairing request expired".to_owned());
+                if request.get("decision_reason").is_none() || request["decision_reason"].is_null()
+                {
+                    request["decision_reason"] =
+                        JsonValue::String("pairing request expired".to_owned());
                 }
                 expired_requests += 1;
                 changed = true;
@@ -1893,7 +2063,12 @@ fn normalize_node_runtime_json(value: JsonValue, now_unix_ms: i64) -> Normalized
         object.insert("nodes".to_owned(), JsonValue::Object(Default::default()));
         changed = true;
     }
-    NormalizedNodeRuntime { value: JsonValue::Object(object), changed, expired_codes, expired_requests }
+    NormalizedNodeRuntime {
+        value: JsonValue::Object(object),
+        changed,
+        expired_codes,
+        expired_requests,
+    }
 }
 
 struct NormalizedAccessRegistry {
@@ -1905,18 +2080,25 @@ struct NormalizedAccessRegistry {
 fn normalize_access_registry_json(value: JsonValue, now_unix_ms: i64) -> NormalizedAccessRegistry {
     let mut changed = false;
     let mut object = value.as_object().cloned().unwrap_or_default();
-    if !matches!(object.get("version").and_then(JsonValue::as_u64), Some(value) if value == DOCTOR_ACCESS_REGISTRY_VERSION as u64) {
-        object.insert("version".to_owned(), JsonValue::Number(serde_json::Number::from(DOCTOR_ACCESS_REGISTRY_VERSION)));
+    if !matches!(object.get("version").and_then(JsonValue::as_u64), Some(value) if value == DOCTOR_ACCESS_REGISTRY_VERSION as u64)
+    {
+        object.insert(
+            "version".to_owned(),
+            JsonValue::Number(serde_json::Number::from(DOCTOR_ACCESS_REGISTRY_VERSION)),
+        );
         changed = true;
     }
-    for key in ["api_tokens", "teams", "workspaces", "memberships", "invitations", "shares", "telemetry"] {
+    for key in
+        ["api_tokens", "teams", "workspaces", "memberships", "invitations", "shares", "telemetry"]
+    {
         if !matches!(object.get(key), Some(JsonValue::Array(_))) {
             object.insert(key.to_owned(), JsonValue::Array(Vec::new()));
             changed = true;
         }
     }
     let default_flags = default_access_feature_flags();
-    let mut current_flags = object.get("feature_flags").and_then(JsonValue::as_array).cloned().unwrap_or_default();
+    let mut current_flags =
+        object.get("feature_flags").and_then(JsonValue::as_array).cloned().unwrap_or_default();
     let existing_keys = current_flags
         .iter()
         .filter_map(|record| record.get("key").and_then(JsonValue::as_str))
@@ -1924,7 +2106,8 @@ fn normalize_access_registry_json(value: JsonValue, now_unix_ms: i64) -> Normali
         .collect::<BTreeSet<_>>();
     let mut missing_feature_flags = Vec::new();
     for default_flag in default_flags {
-        let key = default_flag.get("key").and_then(JsonValue::as_str).unwrap_or_default().to_owned();
+        let key =
+            default_flag.get("key").and_then(JsonValue::as_str).unwrap_or_default().to_owned();
         if !existing_keys.contains(key.as_str()) {
             current_flags.push(default_flag);
             missing_feature_flags.push(key);
@@ -1932,7 +2115,10 @@ fn normalize_access_registry_json(value: JsonValue, now_unix_ms: i64) -> Normali
         }
     }
     object.insert("feature_flags".to_owned(), JsonValue::Array(current_flags));
-    object.insert("last_backfill_at_unix_ms".to_owned(), JsonValue::Number(serde_json::Number::from(now_unix_ms)));
+    object.insert(
+        "last_backfill_at_unix_ms".to_owned(),
+        JsonValue::Number(serde_json::Number::from(now_unix_ms)),
+    );
     NormalizedAccessRegistry { value: JsonValue::Object(object), changed, missing_feature_flags }
 }
 
@@ -1973,8 +2159,12 @@ fn normalize_browser_profile_registry_json(value: JsonValue) -> NormalizedBrowse
     let mut repaired_profile_records = 0;
     let mut removed_active_pointers = 0;
     let mut object = value.as_object().cloned().unwrap_or_default();
-    if !matches!(object.get("v").and_then(JsonValue::as_u64), Some(value) if value == DOCTOR_BROWSER_PROFILE_REGISTRY_VERSION as u64) {
-        object.insert("v".to_owned(), JsonValue::Number(serde_json::Number::from(DOCTOR_BROWSER_PROFILE_REGISTRY_VERSION)));
+    if !matches!(object.get("v").and_then(JsonValue::as_u64), Some(value) if value == DOCTOR_BROWSER_PROFILE_REGISTRY_VERSION as u64)
+    {
+        object.insert(
+            "v".to_owned(),
+            JsonValue::Number(serde_json::Number::from(DOCTOR_BROWSER_PROFILE_REGISTRY_VERSION)),
+        );
         changed = true;
     }
     if !matches!(object.get("profiles"), Some(JsonValue::Array(_))) {
@@ -1987,7 +2177,9 @@ fn normalize_browser_profile_registry_json(value: JsonValue) -> NormalizedBrowse
             let Some(record) = profile.as_object_mut() else {
                 continue;
             };
-            let Some(profile_id) = record.get("profile_id").and_then(JsonValue::as_str).map(str::to_owned) else {
+            let Some(profile_id) =
+                record.get("profile_id").and_then(JsonValue::as_str).map(str::to_owned)
+            else {
                 continue;
             };
             let principal = record
@@ -2004,7 +2196,9 @@ fn normalize_browser_profile_registry_json(value: JsonValue) -> NormalizedBrowse
             {
                 record.insert(
                     "state_schema_version".to_owned(),
-                    JsonValue::Number(serde_json::Number::from(DOCTOR_BROWSER_PROFILE_RECORD_VERSION)),
+                    JsonValue::Number(serde_json::Number::from(
+                        DOCTOR_BROWSER_PROFILE_RECORD_VERSION,
+                    )),
                 );
                 repaired_profile_records += 1;
                 changed = true;
@@ -2013,10 +2207,15 @@ fn normalize_browser_profile_registry_json(value: JsonValue) -> NormalizedBrowse
         }
     }
     if !matches!(object.get("active_profile_by_principal"), Some(JsonValue::Object(_))) {
-        object.insert("active_profile_by_principal".to_owned(), JsonValue::Object(Default::default()));
+        object.insert(
+            "active_profile_by_principal".to_owned(),
+            JsonValue::Object(Default::default()),
+        );
         changed = true;
     }
-    if let Some(active) = object.get_mut("active_profile_by_principal").and_then(JsonValue::as_object_mut) {
+    if let Some(active) =
+        object.get_mut("active_profile_by_principal").and_then(JsonValue::as_object_mut)
+    {
         active.retain(|principal, profile_id| {
             let keep = profile_id
                 .as_str()
@@ -2070,7 +2269,10 @@ fn resolve_browser_state_dir(state_root: &Path) -> Result<PathBuf> {
     Ok(state_root.join(DOCTOR_BROWSER_STATE_DIR_RELATIVE_PATH))
 }
 
-fn encrypt_browser_state_blob(key: &[u8; DOCTOR_BROWSER_STATE_KEY_LEN], plaintext: &[u8]) -> Result<Vec<u8>> {
+fn encrypt_browser_state_blob(
+    key: &[u8; DOCTOR_BROWSER_STATE_KEY_LEN],
+    plaintext: &[u8],
+) -> Result<Vec<u8>> {
     let unbound_key = UnboundKey::new(&CHACHA20_POLY1305, key)
         .map_err(|_| anyhow::anyhow!("failed to initialize browser state cipher"))?;
     let key = LessSafeKey::new(unbound_key);
@@ -2082,15 +2284,19 @@ fn encrypt_browser_state_blob(key: &[u8; DOCTOR_BROWSER_STATE_KEY_LEN], plaintex
     let mut in_out = plaintext.to_vec();
     key.seal_in_place_append_tag(nonce, Aad::empty(), &mut in_out)
         .map_err(|_| anyhow::anyhow!("failed to encrypt browser state"))?;
-    let mut output =
-        Vec::with_capacity(DOCTOR_BROWSER_STATE_FILE_MAGIC.len() + DOCTOR_BROWSER_STATE_NONCE_LEN + in_out.len());
+    let mut output = Vec::with_capacity(
+        DOCTOR_BROWSER_STATE_FILE_MAGIC.len() + DOCTOR_BROWSER_STATE_NONCE_LEN + in_out.len(),
+    );
     output.extend_from_slice(DOCTOR_BROWSER_STATE_FILE_MAGIC);
     output.extend_from_slice(&nonce_bytes);
     output.extend_from_slice(in_out.as_slice());
     Ok(output)
 }
 
-fn decrypt_browser_state_blob(key: &[u8; DOCTOR_BROWSER_STATE_KEY_LEN], encrypted: &[u8]) -> Result<Vec<u8>> {
+fn decrypt_browser_state_blob(
+    key: &[u8; DOCTOR_BROWSER_STATE_KEY_LEN],
+    encrypted: &[u8],
+) -> Result<Vec<u8>> {
     if encrypted.len() < DOCTOR_BROWSER_STATE_FILE_MAGIC.len() + DOCTOR_BROWSER_STATE_NONCE_LEN {
         anyhow::bail!("browser profile registry payload is too short");
     }
@@ -2102,8 +2308,9 @@ fn decrypt_browser_state_blob(key: &[u8; DOCTOR_BROWSER_STATE_KEY_LEN], encrypte
         &encrypted[DOCTOR_BROWSER_STATE_FILE_MAGIC.len()
             ..DOCTOR_BROWSER_STATE_FILE_MAGIC.len() + DOCTOR_BROWSER_STATE_NONCE_LEN],
     );
-    let mut in_out =
-        encrypted[DOCTOR_BROWSER_STATE_FILE_MAGIC.len() + DOCTOR_BROWSER_STATE_NONCE_LEN..].to_vec();
+    let mut in_out = encrypted
+        [DOCTOR_BROWSER_STATE_FILE_MAGIC.len() + DOCTOR_BROWSER_STATE_NONCE_LEN..]
+        .to_vec();
     let unbound_key = UnboundKey::new(&CHACHA20_POLY1305, key)
         .map_err(|_| anyhow::anyhow!("failed to initialize browser state cipher"))?;
     let key = LessSafeKey::new(unbound_key);
@@ -2118,11 +2325,15 @@ fn scan_stale_artifacts(root: &Path) -> Result<Vec<PathBuf>> {
     if !root.exists() || !root.is_dir() {
         return Ok(stale);
     }
-    let entries = fs::read_dir(root).with_context(|| format!("failed to enumerate runtime dir {}", root.display()))?;
+    let entries = fs::read_dir(root)
+        .with_context(|| format!("failed to enumerate runtime dir {}", root.display()))?;
     for entry in entries {
-        let entry = entry.with_context(|| format!("failed to inspect entry in {}", root.display()))?;
+        let entry =
+            entry.with_context(|| format!("failed to inspect entry in {}", root.display()))?;
         let path = entry.path();
-        let metadata = entry.metadata().with_context(|| format!("failed to stat runtime entry {}", path.display()))?;
+        let metadata = entry
+            .metadata()
+            .with_context(|| format!("failed to stat runtime entry {}", path.display()))?;
         if metadata.is_dir() {
             stale.extend(scan_nested_stale_artifacts(path.as_path(), 1)?);
         } else if is_stale_artifact(path.as_path(), &metadata) {
@@ -2142,9 +2353,12 @@ fn scan_nested_stale_artifacts(root: &Path, depth: usize) -> Result<Vec<PathBuf>
         Err(_) => return Ok(stale),
     };
     for entry in entries {
-        let entry = entry.with_context(|| format!("failed to inspect entry in {}", root.display()))?;
+        let entry =
+            entry.with_context(|| format!("failed to inspect entry in {}", root.display()))?;
         let path = entry.path();
-        let metadata = entry.metadata().with_context(|| format!("failed to stat runtime entry {}", path.display()))?;
+        let metadata = entry
+            .metadata()
+            .with_context(|| format!("failed to stat runtime entry {}", path.display()))?;
         if metadata.is_dir() {
             stale.extend(scan_nested_stale_artifacts(path.as_path(), depth + 1)?);
         } else if is_stale_artifact(path.as_path(), &metadata) {
@@ -2164,7 +2378,11 @@ fn is_stale_artifact(path: &Path, metadata: &fs::Metadata) -> bool {
     if name.ends_with(".tmp") {
         return age.is_some_and(|value| value >= DOCTOR_STALE_TMP_MAX_AGE);
     }
-    if name.ends_with(".lock") || name.ends_with(".pid") || name.ends_with(".sock") || name.ends_with(".socket") {
+    if name.ends_with(".lock")
+        || name.ends_with(".pid")
+        || name.ends_with(".sock")
+        || name.ends_with(".socket")
+    {
         return age.is_some_and(|value| value >= DOCTOR_STALE_RUNTIME_MAX_AGE);
     }
     false
@@ -2179,8 +2397,12 @@ fn collect_recovery_runs(state_root: &Path) -> Vec<DoctorRecoveryRunSummary> {
     let mut runs = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path().join(DOCTOR_RECOVERY_MANIFEST_FILE_NAME);
-        let Ok(raw) = fs::read_to_string(path.as_path()) else { continue; };
-        let Ok(manifest) = serde_json::from_str::<DoctorRecoveryManifest>(raw.as_str()) else { continue; };
+        let Ok(raw) = fs::read_to_string(path.as_path()) else {
+            continue;
+        };
+        let Ok(manifest) = serde_json::from_str::<DoctorRecoveryManifest>(raw.as_str()) else {
+            continue;
+        };
         runs.push(DoctorRecoveryRunSummary {
             rollback_command: format!("palyra doctor --rollback-run {}", manifest.run_id),
             run_id: manifest.run_id,
@@ -2298,9 +2520,7 @@ fn render_doctor_text(execution: &DoctorExecutionReport) {
     if execution.recovery.requested {
         println!(
             "doctor.recovery requested=true mode={:?} dry_run={} force={}",
-            execution.mode,
-            execution.recovery.dry_run,
-            execution.recovery.force
+            execution.mode, execution.recovery.dry_run, execution.recovery.force
         );
         for step in execution.recovery.planned_steps.as_slice() {
             println!(
@@ -2358,10 +2578,7 @@ fn toml_json_to_string(value: JsonValue) -> Result<String> {
 
 fn dedupe_strings(values: Vec<String>) -> Vec<String> {
     let mut seen = BTreeSet::new();
-    values
-        .into_iter()
-        .filter(|value| seen.insert(value.clone()))
-        .collect::<Vec<_>>()
+    values.into_iter().filter(|value| seen.insert(value.clone())).collect::<Vec<_>>()
 }
 
 fn display_path(path: &Path) -> String {
@@ -2406,11 +2623,7 @@ mod tests {
         assert!(normalized.changed);
         assert!(!normalized.missing_feature_flags.is_empty());
         assert_eq!(
-            normalized
-                .value
-                .get("feature_flags")
-                .and_then(JsonValue::as_array)
-                .map(Vec::len),
+            normalized.value.get("feature_flags").and_then(JsonValue::as_array).map(Vec::len),
             Some(default_access_feature_flags().len())
         );
     }
@@ -2437,17 +2650,16 @@ mod tests {
             state_root.join(DOCTOR_AUTH_REGISTRY_FILE_NAME),
             "profiles = []\nlegacy = \"value\"\n",
         )?;
-        let environment = DoctorEnvironment { state_root, config_path: None, generated_at_unix_ms: 100 };
+        let environment =
+            DoctorEnvironment { state_root, config_path: None, generated_at_unix_ms: 100 };
         let plans = evaluate_auth_registry_repairs(&environment)?;
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].step.id, "auth_registry.schema_version");
-        assert!(
-            plans[0]
-                .step
-                .changed_objects
-                .iter()
-                .any(|value| value.ends_with("auth_profiles.unknown.toml"))
-        );
+        assert!(plans[0]
+            .step
+            .changed_objects
+            .iter()
+            .any(|value| value.ends_with("auth_profiles.unknown.toml")));
         Ok(())
     }
 
@@ -2527,7 +2739,8 @@ remote_base_url = "https://dashboard.example.test/"
         let target = state_root.join("sample.txt");
         fs::create_dir_all(&state_root)?;
         fs::write(&target, b"before")?;
-        let environment = DoctorEnvironment { state_root, config_path: None, generated_at_unix_ms: 100 };
+        let environment =
+            DoctorEnvironment { state_root, config_path: None, generated_at_unix_ms: 100 };
         let writer = DoctorRecoveryRunWriter::new(&environment, "01TESTRUN")?;
         writer.write_string("sample.step", target.as_path(), "after", false)?;
         writer.complete(
@@ -2540,9 +2753,9 @@ remote_base_url = "https://dashboard.example.test/"
             }],
             &["palyra doctor --rollback-run 01TESTRUN".to_owned()],
         )?;
-        let manifest = serde_json::from_str::<DoctorRecoveryManifest>(
-            &fs::read_to_string(writer.manifest_path())?,
-        )?;
+        let manifest = serde_json::from_str::<DoctorRecoveryManifest>(&fs::read_to_string(
+            writer.manifest_path(),
+        )?)?;
         assert!(manifest.completed);
         assert_eq!(manifest.entries.len(), 1);
         assert_eq!(manifest.applied_steps.len(), 1);

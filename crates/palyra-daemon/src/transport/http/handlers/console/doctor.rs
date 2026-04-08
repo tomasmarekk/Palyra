@@ -38,6 +38,8 @@ pub(crate) async fn console_doctor_job_get_handler(
         let jobs = lock_doctor_jobs(&state.doctor_jobs);
         jobs.get(job_id.as_str()).cloned()
     }
-    .ok_or_else(|| runtime_status_response(tonic::Status::not_found("doctor recovery job not found")))?;
+    .ok_or_else(|| {
+        runtime_status_response(tonic::Status::not_found("doctor recovery job not found"))
+    })?;
     Ok(Json(control_plane::DoctorRecoveryJobEnvelope { contract: contract_descriptor(), job }))
 }

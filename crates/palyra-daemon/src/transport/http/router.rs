@@ -359,10 +359,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
             get(console::support_bundle::console_support_bundle_job_get_handler),
         )
         .route("/console/v1/doctor/jobs", get(console::doctor::console_doctor_jobs_list_handler))
-        .route(
-            "/console/v1/doctor/jobs",
-            post(console::doctor::console_doctor_job_create_handler),
-        )
+        .route("/console/v1/doctor/jobs", post(console::doctor::console_doctor_job_create_handler))
         .route(
             "/console/v1/doctor/jobs/{job_id}",
             get(console::doctor::console_doctor_job_get_handler),
