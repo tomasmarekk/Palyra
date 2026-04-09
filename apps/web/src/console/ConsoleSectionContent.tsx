@@ -43,7 +43,14 @@ export function ConsoleSectionContent({ app }: ConsoleSectionContentProps) {
       );
     case "usage":
       return (
-        <UsageSection app={{ api: app.api, setError: app.setError, setNotice: app.setNotice }} />
+        <UsageSection
+          app={{
+            api: app.api,
+            setError: app.setError,
+            setNotice: app.setNotice,
+            diagnosticsSnapshot: app.diagnosticsSnapshot,
+          }}
+        />
       );
     case "logs":
       return (

@@ -84,24 +84,17 @@ export function useAuthDomain({ api, setError, setNotice }: UseAuthDomainArgs) {
   }, []);
 
   async function loadAuthState(): Promise<void> {
-    const profileParams = new URLSearchParams();
-    profileParams.set("provider_kind", "openai");
     const healthParams = new URLSearchParams();
     healthParams.set("include_profiles", "true");
 
     const [profilesResponse, healthResponse, providerResponse] = await Promise.all([
-      api.listAuthProfiles(profileParams),
+      api.listAuthProfiles(),
       api.getAuthHealth(healthParams),
       api.getOpenAiProviderState(),
     ]);
 
-    setAuthProfiles(
-      profilesResponse.profiles.filter((profile) => profile.provider.kind === "openai"),
-    );
-    setAuthHealth({
-      ...healthResponse,
-      profiles: healthResponse.profiles.filter((profile) => profile.provider === "openai"),
-    });
+    setAuthProfiles(profilesResponse.profiles);
+    setAuthHealth(healthResponse);
     setAuthProviderState(providerResponse);
   }
 

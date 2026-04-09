@@ -20,20 +20,32 @@ import {
   WorkspaceInlineNotice,
 } from "../components/workspace/WorkspacePatterns";
 import { useUsageDomain } from "../hooks/useUsageDomain";
+import { parseRoutingExplanation, readProviderRegistrySummary } from "../providerRegistry";
 import { formatUnixMs } from "../shared";
 import type { ConsoleAppState } from "../useConsoleAppState";
 
 type UsageSectionProps = {
-  app: Pick<ConsoleAppState, "api" | "setError" | "setNotice">;
+  app: Pick<ConsoleAppState, "api" | "setError" | "setNotice" | "diagnosticsSnapshot">;
 };
 
 export function UsageSection({ app }: UsageSectionProps) {
   const navigate = useNavigate();
   const usage = useUsageDomain(app);
   const detail = usage.selectedSessionDetail;
+  const providerRegistry = readProviderRegistrySummary(app.diagnosticsSnapshot);
   const timelinePreview = useMemo(
     () => (usage.summary?.timeline ?? []).slice(-8).reverse(),
     [usage.summary?.timeline],
+  );
+  const recentRoutingDecisions = useMemo(
+    () =>
+      (usage.insights?.routing.recent_decisions ?? [])
+        .slice(0, 8)
+        .map((decision) => ({
+          ...decision,
+          explanation: parseRoutingExplanation(decision.explanation_json),
+        })),
+    [usage.insights?.routing.recent_decisions],
   );
 
   return (
@@ -102,6 +114,18 @@ export function UsageSection({ app }: UsageSectionProps) {
           detail="Average completed-run latency. In-progress runs stay excluded."
           label="Avg latency"
           value={formatLatency(usage.summary?.totals.average_latency_ms)}
+        />
+        <WorkspaceMetricCard
+          detail="Registry-backed failover posture for the active provider fleet."
+          label="Failover"
+          tone={providerRegistry?.failoverEnabled ? "accent" : "default"}
+          value={
+            providerRegistry === null
+              ? "n/a"
+              : providerRegistry.failoverEnabled
+                ? "enabled"
+                : "disabled"
+          }
         />
       </section>
 
@@ -186,7 +210,27 @@ export function UsageSection({ app }: UsageSectionProps) {
                   }
                 </dd>
               </div>
+              <div>
+                <dt>Runtime provider</dt>
+                <dd>{providerRegistry?.providerId ?? providerRegistry?.providerKind ?? "n/a"}</dd>
+              </div>
+              <div>
+                <dt>Default chat model</dt>
+                <dd>{providerRegistry?.defaultChatModelId ?? "n/a"}</dd>
+              </div>
             </dl>
+            {providerRegistry !== null ? (
+              <WorkspaceInlineNotice
+                title="Registry posture"
+                tone={providerRegistry.failoverEnabled ? "accent" : "default"}
+              >
+                <p>
+                  {providerRegistry.providers.length} providers, {providerRegistry.models.length}{" "}
+                  models, failover {providerRegistry.failoverEnabled ? "enabled" : "disabled"},
+                  response cache {providerRegistry.responseCacheEnabled ? "enabled" : "disabled"}.
+                </p>
+              </WorkspaceInlineNotice>
+            ) : null}
             {usage.insights.budgets.evaluations.length === 0 ? (
               <WorkspaceEmptyState
                 compact
@@ -556,9 +600,9 @@ export function UsageSection({ app }: UsageSectionProps) {
 
           <WorkspaceSectionCard
             title="Recent routing decisions"
-            description="Stored routing decisions keep the selected model and budget outcome visible without opening raw audit records."
+            description="Stored routing decisions now surface provider, model delta, and a compact routing explanation instead of leaving operators in raw JSON."
           >
-            {usage.insights.routing.recent_decisions.length === 0 ? (
+            {recentRoutingDecisions.length === 0 ? (
               <WorkspaceEmptyState
                 compact
                 title="No routing decisions loaded"
@@ -571,14 +615,35 @@ export function UsageSection({ app }: UsageSectionProps) {
                   { key: "run", label: "Run", render: (row) => row.run_id },
                   { key: "mode", label: "Mode", render: (row) => row.mode },
                   {
+                    key: "provider",
+                    label: "Provider",
+                    render: (row) => `${row.provider_kind}:${row.provider_id}`,
+                  },
+                  {
                     key: "model",
                     label: "Model",
-                    render: (row) => `${row.actual_model_id} (${row.default_model_id})`,
+                    render: (row) => (
+                      <div className="workspace-stack">
+                        <strong>{row.actual_model_id}</strong>
+                        <small className="text-muted">default {row.default_model_id}</small>
+                      </div>
+                    ),
                   },
-                  { key: "budget", label: "Budget", render: (row) => row.budget_outcome ?? "ok" },
+                  {
+                    key: "explanation",
+                    label: "Explanation",
+                    render: (row) =>
+                      row.explanation.explanation.slice(0, 2).join(" / ") || "No explanation",
+                  },
+                  {
+                    key: "budget",
+                    label: "Budget",
+                    render: (row) =>
+                      row.explanation.budgetOutcome ?? row.budget_outcome ?? "ok",
+                  },
                 ]}
                 getRowId={(row) => row.decision_id}
-                rows={usage.insights.routing.recent_decisions.slice(0, 8)}
+                rows={recentRoutingDecisions}
               />
             )}
           </WorkspaceSectionCard>

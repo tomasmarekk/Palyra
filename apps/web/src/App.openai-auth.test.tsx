@@ -21,6 +21,11 @@ describe("M54 web auth surface", () => {
       if (request.path === "/console/v1/approvals" && request.method === "GET") {
         return Promise.resolve(jsonResponse({ approvals: [] }));
       }
+      if (request.path === "/console/v1/diagnostics" && request.method === "GET") {
+        return Promise.resolve(
+          jsonResponse(diagnosticsSnapshot(state.profiles, state.defaultProfileId)),
+        );
+      }
       if (request.path === "/console/v1/auth/profiles" && request.method === "GET") {
         return Promise.resolve(jsonResponse(authProfilesEnvelope(state.profiles)));
       }
@@ -108,6 +113,11 @@ describe("M54 web auth surface", () => {
       if (request.path === "/console/v1/approvals" && request.method === "GET") {
         return Promise.resolve(jsonResponse({ approvals: [] }));
       }
+      if (request.path === "/console/v1/diagnostics" && request.method === "GET") {
+        return Promise.resolve(
+          jsonResponse(diagnosticsSnapshot(state.profiles, state.defaultProfileId)),
+        );
+      }
       if (request.path === "/console/v1/auth/profiles" && request.method === "GET") {
         return Promise.resolve(jsonResponse(authProfilesEnvelope(state.profiles)));
       }
@@ -182,6 +192,11 @@ describe("M54 web auth surface", () => {
       }
       if (request.path === "/console/v1/approvals" && request.method === "GET") {
         return Promise.resolve(jsonResponse({ approvals: [] }));
+      }
+      if (request.path === "/console/v1/diagnostics" && request.method === "GET") {
+        return Promise.resolve(
+          jsonResponse(diagnosticsSnapshot(state.profiles, state.defaultProfileId)),
+        );
       }
       if (request.path === "/console/v1/auth/profiles" && request.method === "GET") {
         return Promise.resolve(jsonResponse(authProfilesEnvelope(state.profiles)));
@@ -295,6 +310,11 @@ describe("M54 web auth surface", () => {
       }
       if (request.path === "/console/v1/approvals" && request.method === "GET") {
         return Promise.resolve(jsonResponse({ approvals: [] }));
+      }
+      if (request.path === "/console/v1/diagnostics" && request.method === "GET") {
+        return Promise.resolve(
+          jsonResponse(diagnosticsSnapshot(state.profiles, state.defaultProfileId)),
+        );
       }
       if (request.path === "/console/v1/auth/profiles" && request.method === "GET") {
         return Promise.resolve(jsonResponse(authProfilesEnvelope(state.profiles)));
@@ -415,6 +435,11 @@ describe("M54 web auth surface", () => {
       }
       if (request.path === "/console/v1/approvals" && request.method === "GET") {
         return Promise.resolve(jsonResponse({ approvals: [] }));
+      }
+      if (request.path === "/console/v1/diagnostics" && request.method === "GET") {
+        return Promise.resolve(
+          jsonResponse(diagnosticsSnapshot(state.profiles, state.defaultProfileId)),
+        );
       }
       if (request.path === "/console/v1/auth/profiles" && request.method === "GET") {
         return Promise.resolve(jsonResponse(authProfilesEnvelope(state.profiles)));
@@ -579,6 +604,90 @@ describe("M54 web auth surface", () => {
     expect(reconnectBody).toContain('"profile_id":"openai-oauth"');
     expect(revokeBody).toContain('"profile_id":"openai-oauth"');
   }, 20_000);
+
+  it("shows multi-provider inventory and limits interactive actions to the OpenAI control plane", async () => {
+    const state = createAuthSurfaceState();
+    state.defaultProfileId = "openai-api";
+    state.profiles = [
+      createApiKeyProfile({
+        profile_id: "openai-api",
+        profile_name: "api-primary",
+      }),
+      createApiKeyProfile({
+        profile_id: "anthropic-api",
+        profile_name: "claude-primary",
+        provider_kind: "anthropic",
+      }),
+    ];
+    state.healthProfiles = [
+      createHealthProfile({
+        profile_id: "openai-api",
+        profile_name: "api-primary",
+        credential_type: "api_key",
+        state: "static",
+        reason: "OpenAI API key validated.",
+        provider: "openai",
+      }),
+      createHealthProfile({
+        profile_id: "anthropic-api",
+        profile_name: "claude-primary",
+        credential_type: "api_key",
+        state: "static",
+        reason: "Anthropic API key validated.",
+        provider: "anthropic",
+      }),
+    ];
+
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const request = requestDescriptor(input, init);
+      if (request.path === "/console/v1/auth/session" && request.method === "GET") {
+        return Promise.resolve(sessionResponse());
+      }
+      if (request.path === "/console/v1/approvals" && request.method === "GET") {
+        return Promise.resolve(jsonResponse({ approvals: [] }));
+      }
+      if (request.path === "/console/v1/diagnostics" && request.method === "GET") {
+        return Promise.resolve(
+          jsonResponse(diagnosticsSnapshot(state.profiles, state.defaultProfileId)),
+        );
+      }
+      if (request.path === "/console/v1/auth/profiles" && request.method === "GET") {
+        return Promise.resolve(jsonResponse(authProfilesEnvelope(state.profiles)));
+      }
+      if (request.path === "/console/v1/auth/health" && request.method === "GET") {
+        return Promise.resolve(jsonResponse(authHealthEnvelope(state.healthProfiles)));
+      }
+      if (request.path === "/console/v1/auth/providers/openai" && request.method === "GET") {
+        return Promise.resolve(
+          jsonResponse(providerStateEnvelope(state.profiles, state.defaultProfileId)),
+        );
+      }
+      throw new Error(`Unhandled mocked request: ${request.method} ${request.path}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Profiles" }));
+
+    await waitFor(
+      () => {
+        expect(document.body).toHaveTextContent("claude-primary");
+        expect(document.body).toHaveTextContent("Provider registry");
+      },
+      { timeout: 5_000 },
+    );
+
+    fireEvent.click((await screen.findAllByRole("button", { name: /^Inspect / }))[1]);
+
+    expect(await screen.findByText("Web actions limited")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /interactive browser actions are still limited to the OpenAI control-plane surface/i,
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Rotate API key" })).not.toBeInTheDocument();
+    expect(document.body).toHaveTextContent("anthropic");
+  }, 20_000);
 });
 
 function sessionResponse(): Response {
@@ -617,7 +726,8 @@ function authProfilesEnvelope(profiles: unknown[]) {
 }
 
 function authHealthEnvelope(profiles: unknown[]) {
-  const typedProfiles = profiles as Array<{ state: string }>;
+  const typedProfiles = profiles as Array<{ state: string; provider?: string }>;
+  const providers = [...new Set(typedProfiles.map((profile) => profile.provider ?? "openai"))];
   return {
     contract: controlPlaneContract(),
     summary: {
@@ -646,16 +756,19 @@ function authHealthEnvelope(profiles: unknown[]) {
       failures: typedProfiles.filter(
         (profile) => profile.state !== "ok" && profile.state !== "static",
       ).length,
-      by_provider: [
-        {
-          provider: "openai",
-          attempts: 1,
-          successes: typedProfiles.filter((profile) => profile.state === "ok").length,
-          failures: typedProfiles.filter(
-            (profile) => profile.state !== "ok" && profile.state !== "static",
-          ).length,
-        },
-      ],
+      by_provider: providers.map((provider) => ({
+        provider,
+        attempts: 1,
+        successes: typedProfiles.filter(
+          (profile) => (profile.provider ?? "openai") === provider && profile.state === "ok",
+        ).length,
+        failures: typedProfiles.filter(
+          (profile) =>
+            (profile.provider ?? "openai") === provider &&
+            profile.state !== "ok" &&
+            profile.state !== "static",
+        ).length,
+      })),
     },
   };
 }
@@ -683,15 +796,21 @@ function providerStateEnvelope(profiles: unknown[], defaultProfileId?: string) {
   };
 }
 
-function createApiKeyProfile(overrides: { profile_id: string; profile_name: string }) {
+function createApiKeyProfile(overrides: {
+  profile_id: string;
+  profile_name: string;
+  provider_kind?: string;
+}) {
+  const providerKind = overrides.provider_kind ?? "openai";
+  const providerPrefix = providerKind === "anthropic" ? "anthropic" : "openai";
   return {
     profile_id: overrides.profile_id,
-    provider: { kind: "openai" },
+    provider: { kind: providerKind },
     profile_name: overrides.profile_name,
     scope: { kind: "global" },
     credential: {
       type: "api_key",
-      api_key_vault_ref: "vault://openai/api-key",
+      api_key_vault_ref: `vault://${providerPrefix}/api-key`,
     },
     created_at_unix_ms: 100_000,
     updated_at_unix_ms: 100_500,
@@ -730,10 +849,11 @@ function createHealthProfile(overrides: {
   credential_type: string;
   state: string;
   reason: string;
+  provider?: string;
 }) {
   return {
     profile_id: overrides.profile_id,
-    provider: "openai",
+    provider: overrides.provider ?? "openai",
     profile_name: overrides.profile_name,
     scope: "global",
     credential_type: overrides.credential_type,
@@ -759,6 +879,134 @@ function createCallbackState(overrides: {
     profile_id: overrides.profile_id,
     completed_at_unix_ms: overrides.completed_at_unix_ms,
     expires_at_unix_ms: overrides.state === "pending" ? 200_000 : undefined,
+  };
+}
+
+function diagnosticsSnapshot(profiles: unknown[], defaultProfileId?: string) {
+  const typedProfiles = profiles as Array<{ profile_id: string; provider?: { kind?: string } }>;
+  const openAiProfileId = typedProfiles.find(
+    (profile) => profile.provider?.kind === "openai",
+  )?.profile_id;
+  const anthropicProfileId = typedProfiles.find(
+    (profile) => profile.provider?.kind === "anthropic",
+  )?.profile_id;
+
+  return {
+    contract: controlPlaneContract(),
+    model_provider: {
+      kind: openAiProfileId ? "openai_compatible" : "anthropic",
+      provider_id: openAiProfileId ? "openai-primary" : "anthropic-primary",
+      model_id: openAiProfileId ? "gpt-4.1-mini" : "claude-3-7-sonnet",
+      credential_source: defaultProfileId ? "auth_profile" : "unconfigured",
+      api_key_configured: Boolean(defaultProfileId),
+      health: {
+        status: defaultProfileId ? "ok" : "warning",
+      },
+      registry: {
+        default_chat_model_id: openAiProfileId ? "gpt-4.1-mini" : "claude-3-7-sonnet",
+        default_embeddings_model_id: "text-embedding-3-large",
+        failover_enabled: true,
+        response_cache_enabled: true,
+        providers: [
+          {
+            provider_id: "openai-primary",
+            display_name: "OpenAI primary",
+            kind: "openai_compatible",
+            enabled: true,
+            endpoint_base_url: "https://api.openai.com/v1",
+            auth_profile_id: openAiProfileId,
+            credential_source: openAiProfileId ? "auth_profile" : "unconfigured",
+            health: {
+              status: openAiProfileId ? "ok" : "missing",
+              message: openAiProfileId
+                ? "OpenAI credentials are ready."
+                : "OpenAI profile missing.",
+            },
+            discovery: {
+              status: "ready",
+              discovered_model_ids: ["gpt-4.1-mini", "text-embedding-3-large"],
+            },
+            runtime_metrics: {
+              error_rate_bps: 12,
+              avg_latency_ms: 820,
+            },
+            circuit_breaker: {
+              open: false,
+            },
+          },
+          {
+            provider_id: "anthropic-primary",
+            display_name: "Anthropic primary",
+            kind: "anthropic",
+            enabled: true,
+            endpoint_base_url: "https://api.anthropic.com",
+            auth_profile_id: anthropicProfileId,
+            credential_source: anthropicProfileId ? "auth_profile" : "unconfigured",
+            health: {
+              status: anthropicProfileId ? "ok" : "missing",
+              message: anthropicProfileId
+                ? "Anthropic credentials are ready."
+                : "Anthropic profile missing.",
+            },
+            discovery: {
+              status: "ready",
+              discovered_model_ids: ["claude-3-7-sonnet"],
+            },
+            runtime_metrics: {
+              error_rate_bps: 4,
+              avg_latency_ms: 960,
+            },
+            circuit_breaker: {
+              open: false,
+            },
+          },
+        ],
+        models: [
+          {
+            model_id: "gpt-4.1-mini",
+            provider_id: "openai-primary",
+            role: "chat",
+            enabled: true,
+            capabilities: {
+              tool_calls: true,
+              json_mode: true,
+              vision: true,
+              audio_transcribe: false,
+              embeddings: false,
+              max_context_tokens: 128000,
+            },
+          },
+          {
+            model_id: "text-embedding-3-large",
+            provider_id: "openai-primary",
+            role: "embeddings",
+            enabled: true,
+            capabilities: {
+              tool_calls: false,
+              json_mode: false,
+              vision: false,
+              audio_transcribe: false,
+              embeddings: true,
+              max_context_tokens: 8192,
+            },
+          },
+          {
+            model_id: "claude-3-7-sonnet",
+            provider_id: "anthropic-primary",
+            role: "chat",
+            enabled: true,
+            capabilities: {
+              tool_calls: true,
+              json_mode: true,
+              vision: true,
+              audio_transcribe: false,
+              embeddings: false,
+              max_context_tokens: 200000,
+            },
+          },
+        ],
+      },
+    },
   };
 }
 

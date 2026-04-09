@@ -21,6 +21,7 @@ import {
   WorkspaceTable,
   workspaceToneForState,
 } from "../components/workspace/WorkspacePatterns";
+import { readProviderRegistrySummary } from "../providerRegistry";
 import { formatUnixMs, readNumber, type JsonObject } from "../shared";
 import type { ConsoleAppState } from "../useConsoleAppState";
 
@@ -32,6 +33,7 @@ type AuthSectionProps = {
     | "authProfiles"
     | "authHealth"
     | "authProviderState"
+    | "diagnosticsSnapshot"
     | "authApiKeyDraft"
     | "setAuthApiKeyDraft"
     | "authOAuthDraft"
@@ -71,6 +73,8 @@ export function AuthSection({ app }: AuthSectionProps) {
     profiles[0] ??
     null;
   const summary = summarizeAuthHealth(app.authHealth?.profiles ?? []);
+  const providerRegistry = readProviderRegistrySummary(app.diagnosticsSnapshot);
+  const providerCount = new Set(profiles.map((profile) => profile.provider.kind)).size;
 
   return (
     <main className="workspace-page">
@@ -122,6 +126,12 @@ export function AuthSection({ app }: AuthSectionProps) {
           }
         />
         <WorkspaceMetricCard
+          label="Providers"
+          value={providerCount}
+          detail="Profile inventory spans every provider kind currently published by auth."
+          tone={providerCount > 1 ? "accent" : "default"}
+        />
+        <WorkspaceMetricCard
           label="OAuth bootstrap"
           value={app.authProviderState?.bootstrap_supported ? "Ready" : "Unavailable"}
           detail={app.authProviderState?.note ?? "Provider contract posture."}
@@ -142,8 +152,8 @@ export function AuthSection({ app }: AuthSectionProps) {
               />
             ) : (
               <WorkspaceTable
-                ariaLabel="OpenAI profiles"
-                columns={["Profile", "Scope", "Credential", "State", "Actions"]}
+                ariaLabel="Provider auth profiles"
+                columns={["Profile", "Provider", "Scope", "Credential", "State", "Actions"]}
               >
                 {profiles.map((profile) => {
                   const health = healthById.get(profile.profile_id);
@@ -161,6 +171,7 @@ export function AuthSection({ app }: AuthSectionProps) {
                           <span className="chat-muted">{profile.profile_id}</span>
                         </div>
                       </td>
+                      <td>{profile.provider.kind}</td>
                       <td>{scopeLabel}</td>
                       <td>{profile.credential.type === "oauth" ? "OAuth" : "API key"}</td>
                       <td>
@@ -238,6 +249,58 @@ export function AuthSection({ app }: AuthSectionProps) {
               </div>
             </WorkspaceInlineNotice>
           ) : null}
+
+          <WorkspaceSectionCard
+            title="Provider registry"
+            description="Auth inventory is now grounded in the same provider registry the runtime uses for routing and failover."
+          >
+            {providerRegistry === null ? (
+              <WorkspaceEmptyState
+                compact
+                title="No provider diagnostics loaded"
+                description="Diagnostics publish provider health, discovery, and registry bindings when available."
+              />
+            ) : (
+              <div className="workspace-stack">
+                <dl className="workspace-key-value-grid">
+                  <div>
+                    <dt>Runtime provider</dt>
+                    <dd>{providerRegistry.providerKind}</dd>
+                  </div>
+                  <div>
+                    <dt>Default chat model</dt>
+                    <dd>{providerRegistry.defaultChatModelId ?? "n/a"}</dd>
+                  </div>
+                  <div>
+                    <dt>Failover</dt>
+                    <dd>{providerRegistry.failoverEnabled ? "enabled" : "disabled"}</dd>
+                  </div>
+                  <div>
+                    <dt>Response cache</dt>
+                    <dd>{providerRegistry.responseCacheEnabled ? "enabled" : "disabled"}</dd>
+                  </div>
+                </dl>
+                <WorkspaceTable
+                  ariaLabel="Provider registry health"
+                  columns={["Provider", "Kind", "Health", "Discovery", "Binding"]}
+                >
+                  {providerRegistry.providers.map((provider) => (
+                    <tr key={provider.providerId}>
+                      <td>{provider.displayName}</td>
+                      <td>{provider.kind}</td>
+                      <td>
+                        <WorkspaceStatusChip tone={workspaceToneForState(provider.healthState)}>
+                          {provider.healthState}
+                        </WorkspaceStatusChip>
+                      </td>
+                      <td>{provider.discoveryStatus}</td>
+                      <td>{provider.authProfileId ?? provider.credentialSource ?? "unbound"}</td>
+                    </tr>
+                  ))}
+                </WorkspaceTable>
+              </div>
+            )}
+          </WorkspaceSectionCard>
         </div>
       </section>
 
@@ -272,6 +335,8 @@ type SelectedProfileCardProps = {
 function SelectedProfileCard({ app, profile, health }: SelectedProfileCardProps) {
   const isDefault = profile.profile_id === app.authProviderState?.default_profile_id;
   const oauthCredential = profile.credential.type === "oauth" ? profile.credential : null;
+  const providerKind = profile.provider.kind;
+  const isOpenAiProfile = providerKind === "openai";
 
   return (
     <div className="workspace-stack">
@@ -291,6 +356,10 @@ function SelectedProfileCard({ app, profile, health }: SelectedProfileCardProps)
         <div>
           <dt>Profile id</dt>
           <dd>{profile.profile_id}</dd>
+        </div>
+        <div>
+          <dt>Provider</dt>
+          <dd>{providerKind}</dd>
         </div>
         <div>
           <dt>Updated</dt>
@@ -385,55 +454,64 @@ function SelectedProfileCard({ app, profile, health }: SelectedProfileCardProps)
         </WorkspaceInlineNotice>
       ) : null}
 
-      <div className="workspace-inline">
-        {!isDefault && app.authProviderState?.default_selection_supported && (
-          <ActionButton
-            type="button"
-            variant="secondary"
-            onPress={() => void app.setOpenAiDefaultProfile(profile.profile_id)}
-            isDisabled={app.authBusy}
-          >
-            Set as default
-          </ActionButton>
-        )}
-        {profile.credential.type === "oauth" ? (
-          <>
+      {isOpenAiProfile ? (
+        <div className="workspace-inline">
+          {!isDefault && app.authProviderState?.default_selection_supported && (
             <ActionButton
               type="button"
               variant="secondary"
-              onPress={() => void app.reconnectOpenAiProfile(profile.profile_id)}
-              isDisabled={app.authBusy || !app.authProviderState?.reconnect_supported}
-            >
-              Reconnect
-            </ActionButton>
-            <ActionButton
-              type="button"
-              variant="secondary"
-              onPress={() => void app.refreshOpenAiProfile(profile.profile_id)}
+              onPress={() => void app.setOpenAiDefaultProfile(profile.profile_id)}
               isDisabled={app.authBusy}
             >
-              Refresh token
+              Set as default
             </ActionButton>
-          </>
-        ) : (
+          )}
+          {profile.credential.type === "oauth" ? (
+            <>
+              <ActionButton
+                type="button"
+                variant="secondary"
+                onPress={() => void app.reconnectOpenAiProfile(profile.profile_id)}
+                isDisabled={app.authBusy || !app.authProviderState?.reconnect_supported}
+              >
+                Reconnect
+              </ActionButton>
+              <ActionButton
+                type="button"
+                variant="secondary"
+                onPress={() => void app.refreshOpenAiProfile(profile.profile_id)}
+                isDisabled={app.authBusy}
+              >
+                Refresh token
+              </ActionButton>
+            </>
+          ) : (
+            <ActionButton
+              type="button"
+              variant="secondary"
+              onPress={() => app.prepareApiKeyRotation(profile)}
+              isDisabled={app.authBusy}
+            >
+              Rotate API key
+            </ActionButton>
+          )}
           <ActionButton
             type="button"
-            variant="secondary"
-            onPress={() => app.prepareApiKeyRotation(profile)}
-            isDisabled={app.authBusy}
+            variant="danger"
+            onPress={() => void app.revokeOpenAiProfile(profile.profile_id)}
+            isDisabled={app.authBusy || !app.authProviderState?.revoke_supported}
           >
-            Rotate API key
+            Revoke
           </ActionButton>
-        )}
-        <ActionButton
-          type="button"
-          variant="danger"
-          onPress={() => void app.revokeOpenAiProfile(profile.profile_id)}
-          isDisabled={app.authBusy || !app.authProviderState?.revoke_supported}
-        >
-          Revoke
-        </ActionButton>
-      </div>
+        </div>
+      ) : (
+        <WorkspaceInlineNotice title="Web actions limited" tone="default">
+          <p>
+            This profile participates in registry-aware routing and validation, but interactive
+            browser actions are still limited to the OpenAI control-plane surface.
+          </p>
+        </WorkspaceInlineNotice>
+      )}
     </div>
   );
 }

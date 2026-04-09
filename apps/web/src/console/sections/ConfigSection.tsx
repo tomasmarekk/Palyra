@@ -22,6 +22,7 @@ import {
   toStringArray,
   type JsonObject,
 } from "../shared";
+import { readProviderRegistrySummary } from "../providerRegistry";
 import type { ConsoleAppState } from "../useConsoleAppState";
 
 type ConfigTab = "inspect" | "validate" | "mutate" | "recover";
@@ -47,6 +48,7 @@ type ConfigSectionProps = {
     | "configRecoverBackup"
     | "setConfigRecoverBackup"
     | "configDeploymentPosture"
+    | "diagnosticsSnapshot"
     | "revealSensitiveValues"
     | "refreshConfigSurface"
     | "inspectConfigSurface"
@@ -70,6 +72,7 @@ export function ConfigSection({ app }: ConfigSectionProps) {
           typeof entry === "object" && entry !== null && !Array.isArray(entry),
       )
     : [];
+  const providerRegistry = readProviderRegistrySummary(app.diagnosticsSnapshot);
 
   return (
     <main className="workspace-page">
@@ -130,6 +133,12 @@ export function ConfigSection({ app }: ConfigSectionProps) {
           tone={app.configLastMutation === null ? "default" : "warning"}
           value={readString(app.configLastMutation ?? {}, "operation") ?? "none"}
         />
+        <WorkspaceMetricCard
+          detail="Default chat model currently published by the runtime registry."
+          label="Default chat model"
+          tone={providerRegistry?.defaultChatModelId ? "accent" : "default"}
+          value={providerRegistry?.defaultChatModelId ?? "n/a"}
+        />
       </section>
 
       {warnings.length > 0 ? (
@@ -160,63 +169,151 @@ export function ConfigSection({ app }: ConfigSectionProps) {
         </Tabs.ListContainer>
 
         <Tabs.Panel className="pt-4" id="inspect">
-          <section className="workspace-two-column">
-            <WorkspaceSectionCard
-              description="Read the current document safely and keep migration as an explicit operator action."
-              title="Inspect and migrate"
-            >
-              <div className="workspace-stack">
-                <div className="workspace-form-grid">
-                  <TextInputField
-                    label="Path"
-                    value={app.configInspectPath}
-                    onChange={app.setConfigInspectPath}
-                  />
-                  <TextInputField
-                    label="Backups"
-                    value={app.configBackups}
-                    onChange={app.setConfigBackups}
-                  />
+          <div className="workspace-stack">
+            <section className="workspace-two-column">
+              <WorkspaceSectionCard
+                description="Read the current document safely and keep migration as an explicit operator action."
+                title="Inspect and migrate"
+              >
+                <div className="workspace-stack">
+                  <div className="workspace-form-grid">
+                    <TextInputField
+                      label="Path"
+                      value={app.configInspectPath}
+                      onChange={app.setConfigInspectPath}
+                    />
+                    <TextInputField
+                      label="Backups"
+                      value={app.configBackups}
+                      onChange={app.setConfigBackups}
+                    />
+                  </div>
+                  <div className="workspace-inline">
+                    <ActionButton
+                      isDisabled={app.configBusy}
+                      type="button"
+                      variant="primary"
+                      onPress={() => void app.inspectConfigSurface()}
+                    >
+                      Inspect
+                    </ActionButton>
+                    <ActionButton
+                      isDisabled={app.configBusy}
+                      type="button"
+                      variant="secondary"
+                      onPress={() => void app.migrateConfigSurface()}
+                    >
+                      Migrate
+                    </ActionButton>
+                  </div>
                 </div>
-                <div className="workspace-inline">
-                  <ActionButton
-                    isDisabled={app.configBusy}
-                    type="button"
-                    variant="primary"
-                    onPress={() => void app.inspectConfigSurface()}
-                  >
-                    Inspect
-                  </ActionButton>
-                  <ActionButton
-                    isDisabled={app.configBusy}
-                    type="button"
-                    variant="secondary"
-                    onPress={() => void app.migrateConfigSurface()}
-                  >
-                    Migrate
-                  </ActionButton>
-                </div>
-              </div>
-            </WorkspaceSectionCard>
+              </WorkspaceSectionCard>
 
-            <WorkspaceSectionCard
-              description="Document view stays redacted by default and no longer competes with secrets management on the same page."
-              title="Redacted snapshot"
-            >
-              {app.configInspectSnapshot === null ? (
-                <WorkspaceEmptyState
-                  compact
-                  description="Run inspect to load the current config document."
-                  title="No snapshot loaded"
-                />
-              ) : (
-                <PrettyJsonBlock
-                  revealSensitiveValues={app.revealSensitiveValues}
-                  value={app.configInspectSnapshot}
-                />
-              )}
-            </WorkspaceSectionCard>
-          </section>
+              <WorkspaceSectionCard
+                description="Document view stays redacted by default and no longer competes with secrets management on the same page."
+                title="Redacted snapshot"
+              >
+                {app.configInspectSnapshot === null ? (
+                  <WorkspaceEmptyState
+                    compact
+                    description="Run inspect to load the current config document."
+                    title="No snapshot loaded"
+                  />
+                ) : (
+                  <PrettyJsonBlock
+                    revealSensitiveValues={app.revealSensitiveValues}
+                    value={app.configInspectSnapshot}
+                  />
+                )}
+              </WorkspaceSectionCard>
+            </section>
+
+            <section className="workspace-two-column">
+              <WorkspaceSectionCard
+                description="Runtime defaults and safety switches come from diagnostics so config review matches the active routing posture."
+                title="Registry defaults"
+              >
+                {providerRegistry === null ? (
+                  <WorkspaceEmptyState
+                    compact
+                    description="Open diagnostics-backed sections to publish provider registry details."
+                    title="No registry diagnostics loaded"
+                  />
+                ) : (
+                  <dl className="workspace-key-value-grid">
+                    <div>
+                      <dt>Runtime provider</dt>
+                      <dd>{providerRegistry.providerKind}</dd>
+                    </div>
+                    <div>
+                      <dt>Provider id</dt>
+                      <dd>{providerRegistry.providerId ?? "n/a"}</dd>
+                    </div>
+                    <div>
+                      <dt>Default chat</dt>
+                      <dd>{providerRegistry.defaultChatModelId ?? "n/a"}</dd>
+                    </div>
+                    <div>
+                      <dt>Default embeddings</dt>
+                      <dd>{providerRegistry.defaultEmbeddingsModelId ?? "n/a"}</dd>
+                    </div>
+                    <div>
+                      <dt>Failover</dt>
+                      <dd>{providerRegistry.failoverEnabled ? "enabled" : "disabled"}</dd>
+                    </div>
+                    <div>
+                      <dt>Response cache</dt>
+                      <dd>{providerRegistry.responseCacheEnabled ? "enabled" : "disabled"}</dd>
+                    </div>
+                  </dl>
+                )}
+              </WorkspaceSectionCard>
+
+              <WorkspaceSectionCard
+                description="Published provider bindings and model roles make it obvious what the registry can actually route."
+                title="Registry inventory"
+              >
+                {providerRegistry === null ? (
+                  <WorkspaceEmptyState
+                    compact
+                    description="Diagnostics must publish the provider registry before inventory is available here."
+                    title="No registry inventory"
+                  />
+                ) : providerRegistry.models.length === 0 ? (
+                  <WorkspaceEmptyState
+                    compact
+                    description="The current diagnostics snapshot does not expose any models yet."
+                    title="No models published"
+                  />
+                ) : (
+                  <WorkspaceTable
+                    ariaLabel="Provider registry models"
+                    columns={["Model", "Provider", "Role", "Capabilities", "Limits"]}
+                  >
+                    {providerRegistry.models.map((model) => (
+                      <tr key={model.modelId}>
+                        <td>{model.modelId}</td>
+                        <td>{model.providerId}</td>
+                        <td>{model.role}</td>
+                        <td>
+                          {[
+                            model.toolCalls ? "tools" : null,
+                            model.jsonMode ? "json" : null,
+                            model.vision ? "vision" : null,
+                            model.audioTranscribe ? "audio" : null,
+                            model.embeddings ? "embed" : null,
+                          ]
+                            .filter((value): value is string => value !== null)
+                            .join(", ") || "n/a"}
+                        </td>
+                        <td>{model.maxContextTokens?.toLocaleString() ?? "n/a"}</td>
+                      </tr>
+                    ))}
+                  </WorkspaceTable>
+                )}
+              </WorkspaceSectionCard>
+            </section>
+          </div>
         </Tabs.Panel>
 
         <Tabs.Panel className="pt-4" id="validate">

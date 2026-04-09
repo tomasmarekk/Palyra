@@ -748,12 +748,14 @@ export function useConsoleAppState() {
     if (section === "config") {
       void refreshConfigSurface();
     }
+    if (section === "auth" || section === "config" || section === "usage" || section === "operations") {
+      void refreshDiagnostics();
+    }
     if (section === "secrets") {
       void refreshSecrets();
     }
     if (section === "operations") {
       void refreshAudit();
-      void refreshDiagnostics();
     }
     if (section === "access" || section === "support") {
       void refreshSupport();
