@@ -3,7 +3,10 @@ use std::{
     io::{Read, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream},
     path::PathBuf,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex, MutexGuard, OnceLock,
+    },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -19,6 +22,7 @@ use crate::journal::{
     ApprovalSubjectType, JournalAppendRequest, JournalConfig, JournalStore,
     MemoryItemCreateRequest, MemoryItemRecord, MemoryScoreBreakdown, MemorySearchHit,
     MemorySearchRequest, MemorySource, OrchestratorRunStartRequest,
+    OrchestratorSessionResolveRequest,
     OrchestratorSessionUpsertRequest, OrchestratorTapeAppendRequest,
 };
 use tonic::Code;
@@ -47,6 +51,9 @@ use crate::application::{
         prepare_model_provider_input, render_memory_augmented_prompt, MemoryPromptFailureMode,
         PrepareModelProviderInputRequest,
     },
+    session_compaction::{
+        apply_session_compaction, configure_test_write_failure_path, SessionCompactionApplyRequest,
+    },
     route_message::approval::resolve_route_tool_approval_outcome,
     route_message::response::parse_route_message_structured_output,
     service_authorization::{
@@ -72,9 +79,17 @@ use crate::transport::grpc::auth::{
 };
 
 static TEMP_JOURNAL_COUNTER: AtomicU64 = AtomicU64::new(0);
+static SESSION_COMPACTION_TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 const PARITY_REDIRECT_CREDENTIALS_URL: &str =
     include_str!("../../../../fixtures/parity/redirect-credentials-url.txt");
 const PARITY_TRICKY_DOM_HTML: &str = include_str!("../../../../fixtures/parity/tricky-dom.html");
+
+fn lock_session_compaction_test_guard() -> MutexGuard<'static, ()> {
+    SESSION_COMPACTION_TEST_MUTEX
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("session compaction test guard should lock")
+}
 
 fn unique_temp_journal_path() -> PathBuf {
     let nonce = SystemTime::now()
@@ -286,6 +301,83 @@ fn upsert_test_orchestrator_session(
             channel: context.channel.clone(),
         })
         .expect("orchestrator session should be upserted for provider input test");
+}
+
+fn seed_phase4_compaction_fixture(
+    state: &std::sync::Arc<GatewayRuntimeState>,
+    session_id: &str,
+    run_id: &str,
+) {
+    state
+        .journal_store
+        .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
+            session_id: session_id.to_owned(),
+            session_key: format!("session:{session_id}"),
+            session_label: Some("Phase 4 continuity".to_owned()),
+            principal: "user:ops".to_owned(),
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            channel: Some("cli".to_owned()),
+        })
+        .expect("orchestrator session should be upserted");
+    state
+        .journal_store
+        .start_orchestrator_run(&OrchestratorRunStartRequest {
+            run_id: run_id.to_owned(),
+            session_id: session_id.to_owned(),
+            origin_kind: String::new(),
+            origin_run_id: None,
+            triggered_by_principal: None,
+            parameter_delta_json: None,
+        })
+        .expect("orchestrator run should start");
+    for (seq, text) in [
+        "Decision: keep compaction audit records in the journal.",
+        "Next action: write durable continuity into HEARTBEAT.md.",
+        "Use GH CLI for GitHub operations in this repo.",
+        "Open loop: verify the continuity gate after release.",
+        "Decision: preserve deterministic fixtures for continuity tests.",
+        "Next action: keep the projects inbox aligned with follow-up work.",
+        "Recent context one.",
+        "Recent context two.",
+        "Recent context three.",
+        "Recent context four.",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        state
+            .journal_store
+            .append_orchestrator_tape_event(&OrchestratorTapeAppendRequest {
+                run_id: run_id.to_owned(),
+                seq: seq as i64,
+                event_type: if seq % 2 == 0 {
+                    "message.received".to_owned()
+                } else {
+                    "message.replied".to_owned()
+                },
+                payload_json: if seq % 2 == 0 {
+                    json!({ "text": text }).to_string()
+                } else {
+                    json!({ "reply_text": text }).to_string()
+                },
+            })
+            .expect("phase 4 tape event should persist");
+    }
+}
+
+struct TestWriteFailurePathGuard;
+
+impl TestWriteFailurePathGuard {
+    fn set(path: &str) -> Self {
+        configure_test_write_failure_path(Some(path));
+        Self
+    }
+}
+
+impl Drop for TestWriteFailurePathGuard {
+    fn drop(&mut self) {
+        configure_test_write_failure_path(None);
+    }
 }
 
 fn build_test_approval_request(subject_suffix: usize) -> ApprovalCreateRequest {
@@ -2569,7 +2661,7 @@ async fn memory_search_tool_channel_scope_requires_authenticated_channel_context
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn model_token_tape_compaction_stub_emits_marker_event() {
+async fn model_token_tape_compaction_emits_real_lifecycle_event() {
     let state = build_test_runtime_state(false);
     state
         .journal_store
@@ -2593,22 +2685,244 @@ async fn model_token_tape_compaction_stub_emits_marker_event() {
             parameter_delta_json: None,
         })
         .expect("orchestrator run should start");
+    for (seq, text) in [
+        "Decision: keep compaction audit records in the journal.",
+        "Next action: write durable continuity into HEARTBEAT.md.",
+        "Use GH CLI for GitHub operations in this repo.",
+        "Investigate the remaining open question later?",
+        "Recent context one.",
+        "Recent context two.",
+        "Recent context three.",
+        "Recent context four.",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        state
+            .journal_store
+            .append_orchestrator_tape_event(&OrchestratorTapeAppendRequest {
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),
+                seq: seq as i64,
+                event_type: if seq % 2 == 0 {
+                    "message.received".to_owned()
+                } else {
+                    "message.replied".to_owned()
+                },
+                payload_json: if seq % 2 == 0 {
+                    json!({ "text": text }).to_string()
+                } else {
+                    json!({ "reply_text": text }).to_string()
+                },
+            })
+            .expect("tape event seed should persist");
+    }
 
-    let mut tape_seq = 0_i64;
-    super::compact_model_token_tape_stub(&state, "01ARZ3NDEKTSV4RRFFQ69G5FAX", &mut tape_seq)
+    let mut tape_seq = 8_i64;
+    let request_context = RequestContext {
+        principal: "user:ops".to_owned(),
+        device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+        channel: Some("cli".to_owned()),
+    };
+    super::compact_model_token_tape_stub(
+        &state,
+        &request_context,
+        "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+        "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+        &mut tape_seq,
+    )
         .await
-        .expect("compaction stub should append marker tape event");
-    assert_eq!(tape_seq, 1);
+        .expect("compaction lifecycle should append tape event");
+    assert_eq!(tape_seq, 9);
 
     let tape = state
         .journal_store
         .orchestrator_tape("01ARZ3NDEKTSV4RRFFQ69G5FAX")
         .expect("orchestrator tape should be queryable");
-    assert_eq!(tape.len(), 1);
-    assert_eq!(tape[0].event_type, "model_token_compaction");
+    let latest = tape.last().expect("compaction event should be appended");
+    assert_eq!(latest.event_type, "session.compaction");
     assert!(
-        tape[0].payload_json.contains("token_cap_reached"),
-        "marker payload should describe compaction trigger"
+        latest.payload_json.contains("session.compaction"),
+        "payload should describe the new lifecycle event"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_compaction_apply_persists_durable_writes_and_quality_gates() {
+    let _test_guard = lock_session_compaction_test_guard();
+    configure_test_write_failure_path(None);
+    let state = build_test_runtime_state(false);
+    let session_id = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
+    let run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAX";
+    seed_phase4_compaction_fixture(&state, session_id, run_id);
+    let session = state
+        .journal_store
+        .resolve_orchestrator_session(&OrchestratorSessionResolveRequest {
+            session_id: Some(session_id.to_owned()),
+            session_key: None,
+            session_label: None,
+            principal: "user:ops".to_owned(),
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            channel: Some("cli".to_owned()),
+            require_existing: true,
+            reset_session: false,
+        })
+        .expect("session should resolve")
+        .session;
+
+    let execution = apply_session_compaction(SessionCompactionApplyRequest {
+        runtime_state: &state,
+        session: &session,
+        actor_principal: "user:ops",
+        run_id: Some(run_id),
+        mode: "automatic",
+        trigger_reason: Some("test_quality_gate"),
+        trigger_policy: Some("test_policy"),
+        accept_candidate_ids: &[],
+        reject_candidate_ids: &[],
+    })
+    .await
+    .expect("compaction apply should succeed");
+
+    let artifact_summary = serde_json::from_str::<Value>(&execution.artifact.summary_json)
+        .expect("artifact summary should be valid JSON");
+    assert!(
+        artifact_summary
+            .pointer("/quality_gates/decision_count")
+            .and_then(Value::as_u64)
+            .unwrap_or_default()
+            >= 1,
+        "quality gates should count preserved decisions"
+    );
+    assert!(
+        artifact_summary
+            .pointer("/quality_gates/next_action_count")
+            .and_then(Value::as_u64)
+            .unwrap_or_default()
+            >= 1,
+        "quality gates should count preserved next actions"
+    );
+    assert_eq!(
+        artifact_summary
+            .pointer("/quality_gates/applied_write_count")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        artifact_summary
+            .pointer("/writes")
+            .and_then(Value::as_array)
+            .map(|writes| writes.len() as u64)
+            .unwrap_or_default(),
+        "quality gates should track the applied write count"
+    );
+
+    let memory_doc = state
+        .workspace_document_by_path(
+            "user:ops".to_owned(),
+            Some("cli".to_owned()),
+            None,
+            "MEMORY.md".to_owned(),
+            false,
+        )
+        .await
+        .expect("memory doc lookup should succeed")
+        .expect("memory doc should be written");
+    assert!(
+        memory_doc.content_text.contains("Use GH CLI for GitHub operations in this repo."),
+        "durable memory facts should be written into curated docs"
+    );
+
+    let artifacts = state
+        .list_orchestrator_compaction_artifacts(session_id.to_owned())
+        .await
+        .expect("artifact list should succeed");
+    assert_eq!(artifacts.len(), 1, "one compaction artifact should be stored");
+
+    let checkpoints = state
+        .list_orchestrator_checkpoints(session_id.to_owned())
+        .await
+        .expect("checkpoint list should succeed");
+    assert_eq!(checkpoints.len(), 1, "one checkpoint should be stored");
+    assert_eq!(
+        checkpoints[0].referenced_compaction_ids_json,
+        format!(r#"["{}"]"#, execution.artifact.artifact_id),
+        "checkpoint should reference the compaction artifact"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_compaction_apply_rolls_back_workspace_writes_on_partial_failure() {
+    let _test_guard = lock_session_compaction_test_guard();
+    configure_test_write_failure_path(None);
+    let state = build_test_runtime_state(false);
+    let session_id = "01ARZ3NDEKTSV4RRFFQ69G5FB1";
+    let run_id = "01ARZ3NDEKTSV4RRFFQ69G5FB2";
+    seed_phase4_compaction_fixture(&state, session_id, run_id);
+    let session = state
+        .journal_store
+        .resolve_orchestrator_session(&OrchestratorSessionResolveRequest {
+            session_id: Some(session_id.to_owned()),
+            session_key: None,
+            session_label: None,
+            principal: "user:ops".to_owned(),
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            channel: Some("cli".to_owned()),
+            require_existing: true,
+            reset_session: false,
+        })
+        .expect("session should resolve")
+        .session;
+
+    let _failure_guard = TestWriteFailurePathGuard::set("context/current-focus.md");
+    let error = apply_session_compaction(SessionCompactionApplyRequest {
+        runtime_state: &state,
+        session: &session,
+        actor_principal: "user:ops",
+        run_id: Some(run_id),
+        mode: "automatic",
+        trigger_reason: Some("test_rollback"),
+        trigger_policy: Some("test_policy"),
+        accept_candidate_ids: &[],
+        reject_candidate_ids: &[],
+    })
+    .await
+    .expect_err("compaction apply should fail on the injected second write");
+
+    assert!(
+        error
+            .message()
+            .contains("injected test failure for context/current-focus.md"),
+        "error should expose the injected failure path"
+    );
+
+    let memory_doc = state
+        .workspace_document_by_path(
+            "user:ops".to_owned(),
+            Some("cli".to_owned()),
+            None,
+            "MEMORY.md".to_owned(),
+            false,
+        )
+        .await
+        .expect("memory doc lookup should succeed");
+    assert!(
+        memory_doc.is_none(),
+        "rollback should remove earlier durable writes when a later write fails"
+    );
+
+    let artifacts = state
+        .list_orchestrator_compaction_artifacts(session_id.to_owned())
+        .await
+        .expect("artifact list should succeed");
+    assert!(
+        artifacts.is_empty(),
+        "no compaction artifact should persist after a failed write phase"
+    );
+    let checkpoints = state
+        .list_orchestrator_checkpoints(session_id.to_owned())
+        .await
+        .expect("checkpoint list should succeed");
+    assert!(
+        checkpoints.is_empty(),
+        "no checkpoint should persist after a failed write phase"
     );
 }
 

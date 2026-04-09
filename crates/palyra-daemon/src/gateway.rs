@@ -671,19 +671,19 @@ pub(crate) async fn finalize_run_failure(
 #[cfg(test)]
 pub(crate) async fn compact_model_token_tape_stub(
     runtime_state: &Arc<GatewayRuntimeState>,
+    request_context: &crate::transport::grpc::auth::RequestContext,
+    session_id: &str,
     run_id: &str,
     tape_seq: &mut i64,
 ) -> Result<(), Status> {
-    runtime_state
-        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
-            run_id: run_id.to_owned(),
-            seq: *tape_seq,
-            event_type: "model_token_compaction".to_owned(),
-            payload_json: model_token_compaction_tape_payload(MAX_MODEL_TOKEN_TAPE_EVENTS_PER_RUN),
-        })
-        .await?;
-    *tape_seq += 1;
-    Ok(())
+    crate::application::run_stream::tape::compact_model_token_tape(
+        runtime_state,
+        request_context,
+        session_id,
+        run_id,
+        tape_seq,
+    )
+    .await
 }
 
 #[cfg(test)]

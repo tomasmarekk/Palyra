@@ -96,6 +96,8 @@ pub(crate) async fn process_provider_event_for_surface(
                     send_model_token_with_tape(
                         context.sender,
                         runtime_state,
+                        context.request_context,
+                        session_id,
                         run_id,
                         tape_seq,
                         context.model_token_tape_events,

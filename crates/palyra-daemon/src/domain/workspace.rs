@@ -27,6 +27,71 @@ const PROMPT_INJECTION_WARNING_PATTERNS: &[&str] = &[
     "steal cookie",
     "disable guardrails",
 ];
+const PALYRA_MANAGED_BLOCK_PREFIX: &str = "<!-- PALYRA:BEGIN ";
+const PALYRA_MANAGED_BLOCK_SUFFIX: &str = " -->";
+const PALYRA_MANAGED_BLOCK_END_PREFIX: &str = "<!-- PALYRA:END ";
+const PALYRA_MANAGED_ITEM_PREFIX: &str = "<!-- PALYRA:ITEM ";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceManagedEntry {
+    pub entry_id: String,
+    pub label: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceManagedBlockUpdate {
+    pub block_id: String,
+    pub heading: String,
+    pub entries: Vec<WorkspaceManagedEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceManagedBlockDiff {
+    pub before_hash: String,
+    pub after_hash: String,
+    pub added_lines: usize,
+    pub removed_lines: usize,
+    pub before_preview: String,
+    pub after_preview: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceManagedBlockOutcome {
+    pub content_text: String,
+    pub action: String,
+    pub inserted_entry_ids: Vec<String>,
+    pub preserved_entry_ids: Vec<String>,
+    pub diff: WorkspaceManagedBlockDiff,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceManagedBlockError {
+    UnterminatedBlock { block_id: String },
+    MissingBlockStart { block_id: String },
+    MalformedItem { block_id: String, line: String },
+}
+
+impl std::fmt::Display for WorkspaceManagedBlockError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnterminatedBlock { block_id } => {
+                write!(formatter, "managed block is missing an end marker: {block_id}")
+            }
+            Self::MissingBlockStart { block_id } => {
+                write!(formatter, "managed block end marker has no matching start: {block_id}")
+            }
+            Self::MalformedItem { block_id, line } => {
+                write!(
+                    formatter,
+                    "managed block contains manual or malformed content: {block_id} ({line})"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for WorkspaceManagedBlockError {}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -227,6 +292,11 @@ fn current_daily_filename() -> String {
     format!("daily/{:04}-{:02}-{:02}.md", now.year(), now.month(), now.day())
 }
 
+#[must_use]
+pub fn current_daily_workspace_path() -> String {
+    current_daily_filename()
+}
+
 fn root_document_template(
     template_id: &'static str,
     path: &str,
@@ -305,6 +375,59 @@ pub fn curated_workspace_templates() -> Vec<WorkspaceTemplate> {
 #[must_use]
 pub fn curated_workspace_roots() -> &'static [&'static str] {
     &["README.md", "MEMORY.md", "HEARTBEAT.md", "context", "daily", "projects"]
+}
+
+pub fn apply_workspace_managed_block(
+    current_content: &str,
+    update: &WorkspaceManagedBlockUpdate,
+) -> Result<WorkspaceManagedBlockOutcome, WorkspaceManagedBlockError> {
+    let before_content = current_content.trim_end_matches('\n').to_owned();
+    let before_hash = crate::sha256_hex(before_content.as_bytes());
+    let existing = parse_existing_block(current_content, update.block_id.as_str())?;
+    let mut merged_entries = existing.entries.clone();
+    let mut inserted_entry_ids = Vec::new();
+
+    for entry in &update.entries {
+        if merged_entries.iter().any(|existing| existing.entry_id == entry.entry_id) {
+            continue;
+        }
+        merged_entries.push(entry.clone());
+        inserted_entry_ids.push(entry.entry_id.clone());
+    }
+    merged_entries.sort_by(|left, right| {
+        left.label
+            .cmp(&right.label)
+            .then_with(|| left.content.cmp(&right.content))
+            .then_with(|| left.entry_id.cmp(&right.entry_id))
+    });
+    let preserved_entry_ids = existing.entries.iter().map(|entry| entry.entry_id.clone()).collect();
+    let rendered_block = render_managed_block(update.heading.as_str(), update.block_id.as_str(), &merged_entries);
+    let next_content = match existing.range {
+        Some((start, end)) => {
+            let mut content = String::new();
+            content.push_str(&current_content[..start]);
+            content.push_str(rendered_block.as_str());
+            content.push_str(&current_content[end..]);
+            normalize_workspace_document_content(content)
+        }
+        None => append_managed_block(current_content, rendered_block.as_str()),
+    };
+    let after_hash = crate::sha256_hex(next_content.as_bytes());
+    let diff = build_managed_block_diff(before_content.as_str(), next_content.as_str(), before_hash, after_hash);
+    let action = match existing.range {
+        Some(_) if inserted_entry_ids.is_empty() && before_content == next_content => "noop",
+        Some(_) => "updated_block",
+        None => "created_block",
+    }
+    .to_owned();
+
+    Ok(WorkspaceManagedBlockOutcome {
+        content_text: next_content,
+        action,
+        inserted_entry_ids,
+        preserved_entry_ids,
+        diff,
+    })
 }
 
 #[must_use]
@@ -447,6 +570,163 @@ pub fn normalize_workspace_path(path: &str) -> Result<WorkspacePathInfo, Workspa
     Ok(path_info)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedManagedBlock {
+    range: Option<(usize, usize)>,
+    entries: Vec<WorkspaceManagedEntry>,
+}
+
+fn parse_existing_block(
+    current_content: &str,
+    block_id: &str,
+) -> Result<ParsedManagedBlock, WorkspaceManagedBlockError> {
+    let begin_marker = format!("{PALYRA_MANAGED_BLOCK_PREFIX}{block_id}{PALYRA_MANAGED_BLOCK_SUFFIX}");
+    let end_marker =
+        format!("{PALYRA_MANAGED_BLOCK_END_PREFIX}{block_id}{PALYRA_MANAGED_BLOCK_SUFFIX}");
+    let begin = current_content.find(begin_marker.as_str());
+    let end = current_content.find(end_marker.as_str());
+
+    match (begin, end) {
+        (None, None) => Ok(ParsedManagedBlock { range: None, entries: Vec::new() }),
+        (Some(_), None) => {
+            Err(WorkspaceManagedBlockError::UnterminatedBlock { block_id: block_id.to_owned() })
+        }
+        (None, Some(_)) => {
+            Err(WorkspaceManagedBlockError::MissingBlockStart { block_id: block_id.to_owned() })
+        }
+        (Some(begin_start), Some(end_start)) => {
+            let after_begin = begin_start + begin_marker.len();
+            let block_end = end_start + end_marker.len();
+            let inner = current_content[after_begin..end_start]
+                .trim_matches(|character| character == '\r' || character == '\n');
+            let mut entries = Vec::new();
+            let mut pending_item_id: Option<String> = None;
+            for raw_line in inner.lines() {
+                let line = raw_line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if let Some(item_id) = line
+                    .strip_prefix(PALYRA_MANAGED_ITEM_PREFIX)
+                    .and_then(|value| value.strip_suffix(PALYRA_MANAGED_BLOCK_SUFFIX))
+                {
+                    pending_item_id = Some(item_id.trim().to_owned());
+                    continue;
+                }
+                let Some(item_id) = pending_item_id.take() else {
+                    return Err(WorkspaceManagedBlockError::MalformedItem {
+                        block_id: block_id.to_owned(),
+                        line: line.to_owned(),
+                    });
+                };
+                let Some(rest) = line.strip_prefix("- [") else {
+                    return Err(WorkspaceManagedBlockError::MalformedItem {
+                        block_id: block_id.to_owned(),
+                        line: line.to_owned(),
+                    });
+                };
+                let Some((label, content)) = rest.split_once("] ") else {
+                    return Err(WorkspaceManagedBlockError::MalformedItem {
+                        block_id: block_id.to_owned(),
+                        line: line.to_owned(),
+                    });
+                };
+                entries.push(WorkspaceManagedEntry {
+                    entry_id: item_id,
+                    label: label.to_owned(),
+                    content: content.trim().to_owned(),
+                });
+            }
+            if pending_item_id.is_some() {
+                return Err(WorkspaceManagedBlockError::MalformedItem {
+                    block_id: block_id.to_owned(),
+                    line: "dangling managed item marker".to_owned(),
+                });
+            }
+            Ok(ParsedManagedBlock { range: Some((begin_start, block_end)), entries })
+        }
+    }
+}
+
+fn render_managed_block(
+    heading: &str,
+    block_id: &str,
+    entries: &[WorkspaceManagedEntry],
+) -> String {
+    let mut lines = vec![
+        format!("## {heading}"),
+        format!("{PALYRA_MANAGED_BLOCK_PREFIX}{block_id}{PALYRA_MANAGED_BLOCK_SUFFIX}"),
+    ];
+    for entry in entries {
+        lines.push(format!(
+            "{PALYRA_MANAGED_ITEM_PREFIX}{}{PALYRA_MANAGED_BLOCK_SUFFIX}",
+            entry.entry_id
+        ));
+        lines.push(format!("- [{}] {}", entry.label, entry.content));
+    }
+    lines.push(format!(
+        "{PALYRA_MANAGED_BLOCK_END_PREFIX}{block_id}{PALYRA_MANAGED_BLOCK_SUFFIX}"
+    ));
+    lines.push(String::new());
+    lines.join("\n")
+}
+
+fn append_managed_block(current_content: &str, rendered_block: &str) -> String {
+    let normalized = normalize_workspace_document_content(current_content.to_owned());
+    let mut content = normalized.trim_end_matches('\n').to_owned();
+    if !content.is_empty() {
+        content.push_str("\n\n");
+    }
+    content.push_str(rendered_block.trim_matches('\n'));
+    content.push('\n');
+    normalize_workspace_document_content(content)
+}
+
+fn normalize_workspace_document_content(content: String) -> String {
+    let normalized = content.replace("\r\n", "\n");
+    if normalized.is_empty() || normalized.ends_with('\n') {
+        normalized
+    } else {
+        format!("{normalized}\n")
+    }
+}
+
+fn build_managed_block_diff(
+    before_content: &str,
+    after_content: &str,
+    before_hash: String,
+    after_hash: String,
+) -> WorkspaceManagedBlockDiff {
+    let before_lines = before_content.lines().map(str::trim).collect::<Vec<_>>();
+    let after_lines = after_content.lines().map(str::trim).collect::<Vec<_>>();
+    let added_lines = after_lines
+        .iter()
+        .filter(|line| !line.is_empty() && !before_lines.contains(line))
+        .count();
+    let removed_lines = before_lines
+        .iter()
+        .filter(|line| !line.is_empty() && !after_lines.contains(line))
+        .count();
+    WorkspaceManagedBlockDiff {
+        before_hash,
+        after_hash,
+        added_lines,
+        removed_lines,
+        before_preview: truncate_preview(before_content, 220),
+        after_preview: truncate_preview(after_content, 220),
+    }
+}
+
+fn truncate_preview(content: &str, max_chars: usize) -> String {
+    let normalized = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= max_chars {
+        return normalized;
+    }
+    let mut shortened = normalized.chars().take(max_chars).collect::<String>();
+    shortened.push_str("...");
+    shortened
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,5 +765,53 @@ mod tests {
         assert!(templates.iter().any(|entry| entry.path == "README.md"));
         assert!(templates.iter().any(|entry| entry.path == "MEMORY.md"));
         assert!(templates.iter().any(|entry| entry.path == "HEARTBEAT.md"));
+    }
+
+    #[test]
+    fn managed_block_merge_is_idempotent_and_preserves_manual_text() {
+        let existing = "# Memory\n\nManual note that stays outside the managed block.\n";
+        let update = WorkspaceManagedBlockUpdate {
+            block_id: "continuity-memory".to_owned(),
+            heading: "Compaction Continuity".to_owned(),
+            entries: vec![WorkspaceManagedEntry {
+                entry_id: "fact-1".to_owned(),
+                label: "fact".to_owned(),
+                content: "Use GH CLI for GitHub operations.".to_owned(),
+            }],
+        };
+        let first =
+            apply_workspace_managed_block(existing, &update).expect("first merge should succeed");
+        let second = apply_workspace_managed_block(first.content_text.as_str(), &update)
+            .expect("second merge should remain valid");
+        assert!(
+            first.content_text.contains("Manual note that stays outside the managed block."),
+            "manual text outside the system block must be preserved"
+        );
+        assert_eq!(second.action, "noop");
+        assert_eq!(
+            second.inserted_entry_ids.len(),
+            0,
+            "repeating the same candidate must not duplicate entries"
+        );
+    }
+
+    #[test]
+    fn managed_block_merge_rejects_manual_edits_inside_block() {
+        let malformed = "# Memory\n\n## Compaction Continuity\n<!-- PALYRA:BEGIN continuity-memory -->\nManual text\n<!-- PALYRA:END continuity-memory -->\n";
+        let update = WorkspaceManagedBlockUpdate {
+            block_id: "continuity-memory".to_owned(),
+            heading: "Compaction Continuity".to_owned(),
+            entries: vec![WorkspaceManagedEntry {
+                entry_id: "fact-1".to_owned(),
+                label: "fact".to_owned(),
+                content: "Keep automatic compaction deterministic.".to_owned(),
+            }],
+        };
+        let error =
+            apply_workspace_managed_block(malformed, &update).expect_err("manual edits must conflict");
+        assert!(
+            matches!(error, WorkspaceManagedBlockError::MalformedItem { .. }),
+            "manual edits inside the managed block must fail closed"
+        );
     }
 }

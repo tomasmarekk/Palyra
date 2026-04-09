@@ -6,12 +6,15 @@ use tokio::sync::mpsc;
 use tonic::Status;
 
 use crate::{
+    application::session_compaction::{
+        apply_session_compaction, preview_session_compaction, SessionCompactionApplyRequest,
+    },
     gateway::{
         approval_prompt_message, approval_scope_to_proto, status_kind_name, GatewayRuntimeState,
         MAX_MODEL_TOKEN_TAPE_EVENTS_PER_RUN,
     },
     journal::{ApprovalDecisionScope, ApprovalPromptRecord, OrchestratorTapeAppendRequest},
-    transport::grpc::proto::palyra::common::v1 as common_v1,
+    transport::grpc::{auth::RequestContext, proto::palyra::common::v1 as common_v1},
 };
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn append_tool_decision_tape_event(
@@ -248,6 +251,8 @@ pub(crate) async fn send_status_with_tape(
 pub(crate) async fn send_model_token_with_tape(
     sender: &mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
     runtime_state: &Arc<GatewayRuntimeState>,
+    request_context: &RequestContext,
+    session_id: &str,
     run_id: &str,
     tape_seq: &mut i64,
     token_tape_events: &mut usize,
@@ -262,7 +267,17 @@ pub(crate) async fn send_model_token_with_tape(
         .map_err(|_| Status::cancelled("run stream response channel closed"))?;
     if !is_final && *token_tape_events >= MAX_MODEL_TOKEN_TAPE_EVENTS_PER_RUN {
         if !*compaction_emitted {
-            compact_model_token_tape_stub(runtime_state, run_id, tape_seq).await?;
+            compact_model_token_tape(runtime_state, request_context, session_id, run_id, tape_seq)
+                .await?;
+            send_status_with_tape(
+                sender,
+                runtime_state,
+                run_id,
+                tape_seq,
+                common_v1::stream_status::StatusKind::InProgress,
+                "Automatic compaction lifecycle executed after the model token tape cap was reached.",
+            )
+            .await?;
             *compaction_emitted = true;
         }
         return Ok(());
@@ -281,17 +296,73 @@ pub(crate) async fn send_model_token_with_tape(
 }
 
 #[allow(clippy::result_large_err)]
-pub(crate) async fn compact_model_token_tape_stub(
+pub(crate) async fn compact_model_token_tape(
     runtime_state: &Arc<GatewayRuntimeState>,
+    request_context: &RequestContext,
+    session_id: &str,
     run_id: &str,
     tape_seq: &mut i64,
 ) -> Result<(), Status> {
+    let session = runtime_state
+        .resolve_orchestrator_session(crate::journal::OrchestratorSessionResolveRequest {
+            session_id: Some(session_id.to_owned()),
+            session_key: None,
+            session_label: None,
+            principal: request_context.principal.clone(),
+            device_id: request_context.device_id.clone(),
+            channel: request_context.channel.clone(),
+            require_existing: true,
+            reset_session: false,
+        })
+        .await?
+        .session;
+    let preview = preview_session_compaction(
+        runtime_state,
+        &session,
+        Some("token_tape_cap_reached"),
+        Some("token_tape_cap_v1"),
+    )
+    .await?;
+    let payload_json = if preview.eligible {
+        let execution = apply_session_compaction(SessionCompactionApplyRequest {
+            runtime_state,
+            session: &session,
+            actor_principal: session.principal.as_str(),
+            run_id: Some(run_id),
+            mode: "automatic",
+            trigger_reason: Some("token_tape_cap_reached"),
+            trigger_policy: Some("token_tape_cap_v1"),
+            accept_candidate_ids: &[],
+            reject_candidate_ids: &[],
+        })
+        .await?;
+        json!({
+            "event": "session.compaction.applied",
+            "artifact_id": execution.artifact.artifact_id,
+            "checkpoint_id": execution.checkpoint.checkpoint_id,
+            "policy": "token_tape_cap_v1",
+            "estimated_input_tokens": execution.plan.estimated_input_tokens,
+            "estimated_output_tokens": execution.plan.estimated_output_tokens,
+            "token_delta": execution.plan.estimated_input_tokens.saturating_sub(execution.plan.estimated_output_tokens),
+            "write_count": execution.writes.len(),
+        })
+        .to_string()
+    } else {
+        json!({
+            "event": "session.compaction.blocked",
+            "policy": "token_tape_cap_v1",
+            "blocked_reason": preview.blocked_reason,
+            "estimated_input_tokens": preview.estimated_input_tokens,
+            "estimated_output_tokens": preview.estimated_output_tokens,
+        })
+        .to_string()
+    };
     runtime_state
         .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
             run_id: run_id.to_owned(),
             seq: *tape_seq,
-            event_type: "model_token_compaction".to_owned(),
-            payload_json: model_token_compaction_tape_payload(MAX_MODEL_TOKEN_TAPE_EVENTS_PER_RUN),
+            event_type: "session.compaction".to_owned(),
+            payload_json,
         })
         .await?;
     *tape_seq += 1;
@@ -648,15 +719,6 @@ fn model_token_tape_payload(token: &str, is_final: bool) -> String {
     json!({
         "is_final": is_final,
         "token": token,
-    })
-    .to_string()
-}
-
-fn model_token_compaction_tape_payload(max_model_token_events: usize) -> String {
-    json!({
-        "kind": "token_cap_reached",
-        "max_model_token_tape_events": max_model_token_events,
-        "compaction_hook": "stub",
     })
     .to_string()
 }

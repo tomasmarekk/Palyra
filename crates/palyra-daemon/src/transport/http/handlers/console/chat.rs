@@ -1,6 +1,6 @@
 use crate::{
     application::session_compaction::{
-        build_session_compaction_plan, SESSION_COMPACTION_STRATEGY, SESSION_COMPACTION_VERSION,
+        apply_session_compaction, preview_session_compaction, SessionCompactionApplyRequest,
     },
     *,
 };
@@ -1176,23 +1176,14 @@ pub(crate) async fn console_chat_compaction_preview_handler(
     let session = authorize_console_session(&state, &headers, false)?;
     let session_record =
         load_console_chat_session(&state, &session.context, session_id.as_str(), true).await?;
-    let transcript = state
-        .runtime
-        .list_orchestrator_session_transcript(session_record.session_id.clone())
-        .await
-        .map_err(runtime_status_response)?;
-    let pins = state
-        .runtime
-        .list_orchestrator_session_pins(session_record.session_id.clone())
-        .await
-        .map_err(runtime_status_response)?;
-    let plan = build_session_compaction_plan(
+    let plan = preview_session_compaction(
+        &state.runtime,
         &session_record,
-        transcript.as_slice(),
-        pins.as_slice(),
         payload.trigger_reason.as_deref(),
         payload.trigger_policy.as_deref(),
-    );
+    )
+    .await
+    .map_err(runtime_status_response)?;
     Ok(Json(json!({
         "session": session_record,
         "preview": plan.to_response_json(),
@@ -1209,60 +1200,24 @@ pub(crate) async fn console_chat_compaction_apply_handler(
     let session = authorize_console_session(&state, &headers, true)?;
     let session_record =
         load_console_chat_session(&state, &session.context, session_id.as_str(), true).await?;
-    let transcript = state
-        .runtime
-        .list_orchestrator_session_transcript(session_record.session_id.clone())
-        .await
-        .map_err(runtime_status_response)?;
-    let pins = state
-        .runtime
-        .list_orchestrator_session_pins(session_record.session_id.clone())
-        .await
-        .map_err(runtime_status_response)?;
-    let plan = build_session_compaction_plan(
-        &session_record,
-        transcript.as_slice(),
-        pins.as_slice(),
-        payload.trigger_reason.as_deref(),
-        payload.trigger_policy.as_deref(),
-    );
-    if !plan.eligible {
-        return Err(runtime_status_response(tonic::Status::failed_precondition(
-            "session does not currently have enough older transcript material to compact",
-        )));
-    }
-    let artifact = state
-        .runtime
-        .create_orchestrator_compaction_artifact(
-            journal::OrchestratorCompactionArtifactCreateRequest {
-                artifact_id: Ulid::new().to_string(),
-                session_id: session_record.session_id.clone(),
-                run_id: session_record.last_run_id.clone(),
-                mode: "manual".to_owned(),
-                strategy: SESSION_COMPACTION_STRATEGY.to_owned(),
-                compressor_version: SESSION_COMPACTION_VERSION.to_owned(),
-                trigger_reason: plan.trigger_reason.clone(),
-                trigger_policy: plan.trigger_policy.clone(),
-                trigger_inputs_json: Some(plan.trigger_inputs_json.clone()),
-                summary_text: plan.summary_text.clone(),
-                summary_preview: plan.summary_preview.clone(),
-                source_event_count: plan.source_event_count,
-                protected_event_count: plan.protected_event_count,
-                condensed_event_count: plan.condensed_event_count,
-                omitted_event_count: plan.omitted_event_count,
-                estimated_input_tokens: plan.estimated_input_tokens,
-                estimated_output_tokens: plan.estimated_output_tokens,
-                source_records_json: plan.source_records_json.clone(),
-                summary_json: plan.summary_json.clone(),
-                created_by_principal: session.context.principal.clone(),
-            },
-        )
-        .await
-        .map_err(runtime_status_response)?;
+    let execution = apply_session_compaction(SessionCompactionApplyRequest {
+        runtime_state: &state.runtime,
+        session: &session_record,
+        actor_principal: session.context.principal.as_str(),
+        run_id: session_record.last_run_id.as_deref(),
+        mode: "manual",
+        trigger_reason: payload.trigger_reason.as_deref(),
+        trigger_policy: payload.trigger_policy.as_deref(),
+        accept_candidate_ids: payload.accept_candidate_ids.as_slice(),
+        reject_candidate_ids: payload.reject_candidate_ids.as_slice(),
+    })
+    .await
+    .map_err(runtime_status_response)?;
     Ok(Json(json!({
         "session": session_record,
-        "artifact": artifact,
-        "preview": plan.to_response_json(),
+        "artifact": execution.artifact,
+        "checkpoint": execution.checkpoint,
+        "preview": execution.plan.to_response_json(),
         "contract": contract_descriptor(),
     })))
 }
@@ -1286,9 +1241,22 @@ pub(crate) async fn console_chat_compaction_detail_handler(
     let session_record =
         load_console_chat_session(&state, &session.context, artifact.session_id.as_str(), false)
             .await?;
+    let related_checkpoints = state
+        .runtime
+        .list_orchestrator_checkpoints(artifact.session_id.clone())
+        .await
+        .map_err(runtime_status_response)?
+        .into_iter()
+        .filter(|checkpoint| {
+            serde_json::from_str::<Vec<String>>(checkpoint.referenced_compaction_ids_json.as_str())
+                .ok()
+                .is_some_and(|references| references.iter().any(|value| value == &artifact.artifact_id))
+        })
+        .collect::<Vec<_>>();
     Ok(Json(json!({
         "session": session_record,
         "artifact": artifact,
+        "related_checkpoints": related_checkpoints,
         "contract": contract_descriptor(),
     })))
 }

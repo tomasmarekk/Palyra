@@ -12,8 +12,8 @@ use crate::{
     },
     application::service_authorization::authorize_memory_action,
     application::session_compaction::{
-        build_session_compaction_plan, render_compaction_prompt_block, SESSION_COMPACTION_STRATEGY,
-        SESSION_COMPACTION_VERSION,
+        apply_session_compaction, preview_session_compaction, render_compaction_prompt_block,
+        SessionCompactionApplyRequest,
     },
     gateway::{
         ingest_memory_best_effort, non_empty, truncate_with_ellipsis, GatewayRuntimeState,
@@ -21,8 +21,7 @@ use crate::{
         MAX_PREVIOUS_RUN_CONTEXT_TURNS, MEMORY_AUTO_INJECT_MIN_SCORE,
     },
     journal::{
-        MemorySearchHit, MemorySearchRequest, MemorySource,
-        OrchestratorCompactionArtifactCreateRequest, OrchestratorCompactionArtifactRecord,
+        MemorySearchHit, MemorySearchRequest, MemorySource, OrchestratorCompactionArtifactRecord,
         OrchestratorSessionResolveRequest, OrchestratorTapeAppendRequest, OrchestratorTapeRecord,
         WorkspaceSearchHit, WorkspaceSearchRequest,
     },
@@ -557,16 +556,13 @@ async fn maybe_apply_automatic_session_compaction(
         })
         .await?
         .session;
-    let transcript =
-        runtime_state.list_orchestrator_session_transcript(session_id.to_owned()).await?;
-    let pins = runtime_state.list_orchestrator_session_pins(session_id.to_owned()).await?;
-    let plan = build_session_compaction_plan(
+    let plan = preview_session_compaction(
+        runtime_state,
         &session,
-        transcript.as_slice(),
-        pins.as_slice(),
         Some("automatic_compaction_policy"),
         Some("budget_guard_v1"),
-    );
+    )
+    .await?;
     let token_delta = plan.estimated_input_tokens.saturating_sub(plan.estimated_output_tokens);
     if !plan.eligible
         || plan.estimated_input_tokens < AUTO_SESSION_COMPACTION_MIN_INPUT_TOKENS
@@ -616,30 +612,19 @@ async fn maybe_apply_automatic_session_compaction(
         return Ok(existing.into_iter().next());
     }
 
-    let artifact = runtime_state
-        .create_orchestrator_compaction_artifact(OrchestratorCompactionArtifactCreateRequest {
-            artifact_id: ulid::Ulid::new().to_string(),
-            session_id: session_id.to_owned(),
-            run_id: Some(run_id.to_owned()),
-            mode: "automatic".to_owned(),
-            strategy: SESSION_COMPACTION_STRATEGY.to_owned(),
-            compressor_version: SESSION_COMPACTION_VERSION.to_owned(),
-            trigger_reason: plan.trigger_reason.clone(),
-            trigger_policy: plan.trigger_policy.clone(),
-            trigger_inputs_json: Some(plan.trigger_inputs_json.clone()),
-            summary_text: plan.summary_text.clone(),
-            summary_preview: plan.summary_preview.clone(),
-            source_event_count: plan.source_event_count,
-            protected_event_count: plan.protected_event_count,
-            condensed_event_count: plan.condensed_event_count,
-            omitted_event_count: plan.omitted_event_count,
-            estimated_input_tokens: plan.estimated_input_tokens,
-            estimated_output_tokens: plan.estimated_output_tokens,
-            source_records_json: plan.source_records_json.clone(),
-            summary_json: plan.summary_json.clone(),
-            created_by_principal: context.principal.clone(),
-        })
-        .await?;
+    let artifact = apply_session_compaction(SessionCompactionApplyRequest {
+        runtime_state,
+        session: &session,
+        actor_principal: context.principal.as_str(),
+        run_id: Some(run_id),
+        mode: "automatic",
+        trigger_reason: Some("automatic_compaction_policy"),
+        trigger_policy: Some("budget_guard_v1"),
+        accept_candidate_ids: &[],
+        reject_candidate_ids: &[],
+    })
+    .await?
+    .artifact;
     runtime_state
         .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
             run_id: run_id.to_owned(),

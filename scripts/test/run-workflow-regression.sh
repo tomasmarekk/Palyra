@@ -43,6 +43,8 @@ CARGO_BIN="$(resolve_cargo)"
 "$CARGO_BIN" build -p palyra-browserd --bin palyra-browserd --locked
 
 "$CARGO_BIN" test -p palyra-daemon --lib --locked compat::tests
+"$CARGO_BIN" test -p palyra-daemon --lib --locked session_compaction_apply_persists_durable_writes_and_quality_gates
+"$CARGO_BIN" test -p palyra-daemon --lib --locked session_compaction_apply_rolls_back_workspace_writes_on_partial_failure
 "$CARGO_BIN" test -p palyra-cli --test wizard_cli --locked -- --test-threads=1
 "$CARGO_BIN" test -p palyra-cli --test cli_v1_acp_shim --locked -- --test-threads=1
 "$CARGO_BIN" test -p palyra-cli --test workflow_regression_matrix --locked -- --test-threads=1
