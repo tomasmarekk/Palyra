@@ -401,6 +401,9 @@ pub(crate) fn map_provider_error(error: ProviderError) -> Status {
         ProviderError::MissingApiKey => {
             Status::failed_precondition("model provider API key is missing")
         }
+        ProviderError::MissingAnthropicApiKey => {
+            Status::failed_precondition("anthropic model provider API key is missing")
+        }
         ProviderError::MissingEmbeddingsModel => {
             Status::failed_precondition("model provider embeddings model is missing")
         }

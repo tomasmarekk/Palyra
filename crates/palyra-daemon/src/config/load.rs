@@ -22,7 +22,9 @@ use crate::cron::CronTimezoneMode;
 use crate::media::MediaRuntimeConfig;
 use crate::model_provider::{
     validate_openai_base_url_network_policy, ModelProviderAuthProviderKind, ModelProviderConfig,
-    ModelProviderKind,
+    ModelProviderCredentialSource, ModelProviderKind, ProviderCapabilitiesSnapshot,
+    ProviderCostTier, ProviderLatencyTier, ProviderMetadataSource, ProviderModelEntryConfig,
+    ProviderModelRole, ProviderRegistryEntryConfig,
 };
 use crate::sandbox_runner::{EgressEnforcementMode, SandboxProcessRunnerTier};
 
@@ -281,17 +283,25 @@ pub fn load_config() -> Result<LoadedConfig> {
         }
         if let Some(file_model_provider) = parsed.model_provider {
             if let Some(kind) = file_model_provider.kind {
-                model_provider.kind = ModelProviderKind::parse(kind.as_str())
-                    .context("model_provider.kind must be deterministic or openai_compatible")?;
+                model_provider.kind = ModelProviderKind::parse(kind.as_str()).context(
+                    "model_provider.kind must be deterministic, openai_compatible, or anthropic",
+                )?;
             }
             if let Some(openai_base_url) = file_model_provider.openai_base_url {
                 model_provider.openai_base_url = parse_openai_base_url(openai_base_url.as_str())?;
+            }
+            if let Some(anthropic_base_url) = file_model_provider.anthropic_base_url {
+                model_provider.anthropic_base_url =
+                    parse_openai_base_url(anthropic_base_url.as_str())?;
             }
             if let Some(allow_private_base_url) = file_model_provider.allow_private_base_url {
                 model_provider.allow_private_base_url = allow_private_base_url;
             }
             if let Some(openai_model) = file_model_provider.openai_model {
                 model_provider.openai_model = parse_openai_model(openai_model.as_str())?;
+            }
+            if let Some(anthropic_model) = file_model_provider.anthropic_model {
+                model_provider.anthropic_model = parse_openai_model(anthropic_model.as_str())?;
             }
             if let Some(openai_embeddings_model) = file_model_provider.openai_embeddings_model {
                 model_provider.openai_embeddings_model =
@@ -313,6 +323,23 @@ pub fn load_config() -> Result<LoadedConfig> {
                         None
                     } else {
                         Some(openai_api_key_vault_ref)
+                    };
+            }
+            if let Some(anthropic_api_key) = file_model_provider.anthropic_api_key {
+                model_provider.anthropic_api_key = if anthropic_api_key.trim().is_empty() {
+                    None
+                } else {
+                    Some(anthropic_api_key)
+                };
+            }
+            if let Some(anthropic_api_key_vault_ref) =
+                file_model_provider.anthropic_api_key_vault_ref
+            {
+                model_provider.anthropic_api_key_vault_ref =
+                    if anthropic_api_key_vault_ref.trim().is_empty() {
+                        None
+                    } else {
+                        Some(anthropic_api_key_vault_ref)
                     };
             }
             if let Some(auth_profile_ref) = file_model_provider.auth_profile_ref {
@@ -356,6 +383,63 @@ pub fn load_config() -> Result<LoadedConfig> {
                 model_provider.circuit_breaker_cooldown_ms =
                     parse_positive_u64(cooldown_ms, "model_provider.circuit_breaker_cooldown_ms")?;
             }
+            let mut registry = model_provider.registry.clone();
+            if let Some(entries) = file_model_provider.providers {
+                registry.providers = entries
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, entry)| {
+                        parse_model_provider_registry_entry(entry, index, &model_provider)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+            }
+            if let Some(entries) = file_model_provider.models {
+                registry.models = entries
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, entry)| {
+                        parse_model_provider_registry_model(entry, index, &registry.providers)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+            }
+            if let Some(model_id) = file_model_provider.default_chat_model_id {
+                registry.default_chat_model_id =
+                    parse_optional_text(model_id.as_str(), "model_provider.default_chat_model_id")?;
+            }
+            if let Some(model_id) = file_model_provider.default_embeddings_model_id {
+                registry.default_embeddings_model_id = parse_optional_text(
+                    model_id.as_str(),
+                    "model_provider.default_embeddings_model_id",
+                )?;
+            }
+            if let Some(model_id) = file_model_provider.default_audio_transcription_model_id {
+                registry.default_audio_transcription_model_id = parse_optional_text(
+                    model_id.as_str(),
+                    "model_provider.default_audio_transcription_model_id",
+                )?;
+            }
+            if let Some(value) = file_model_provider.failover_enabled {
+                registry.failover_enabled = value;
+            }
+            if let Some(value) = file_model_provider.response_cache_enabled {
+                registry.response_cache_enabled = value;
+            }
+            if let Some(value) = file_model_provider.response_cache_ttl_ms {
+                registry.response_cache_ttl_ms =
+                    parse_positive_u64(value, "model_provider.response_cache_ttl_ms")?;
+            }
+            if let Some(value) = file_model_provider.response_cache_max_entries {
+                registry.response_cache_max_entries =
+                    parse_positive_usize(value, "model_provider.response_cache_max_entries")?;
+            }
+            if let Some(value) = file_model_provider.discovery_ttl_ms {
+                registry.discovery_ttl_ms =
+                    parse_positive_u64(value, "model_provider.discovery_ttl_ms")?;
+            }
+            if let Some(value) = file_model_provider.health_ttl_ms {
+                registry.health_ttl_ms = parse_positive_u64(value, "model_provider.health_ttl_ms")?;
+            }
+            model_provider.registry = registry;
         }
         if let Some(file_tool_call) = parsed.tool_call {
             if let Some(allowed_tools) = file_tool_call.allowed_tools {
@@ -1604,12 +1688,486 @@ fn parse_optional_auth_profile_id(raw: &str, source_name: &str) -> Result<Option
     Ok(Some(normalized))
 }
 
+fn parse_optional_text(raw: &str, source_name: &str) -> Result<Option<String>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.contains('\0') {
+        anyhow::bail!("{source_name} cannot contain embedded NUL byte");
+    }
+    if trimmed.len() > 256 {
+        anyhow::bail!("{source_name} exceeds maximum bytes ({} > 256)", trimmed.len());
+    }
+    Ok(Some(trimmed.to_owned()))
+}
+
+fn parse_registry_identifier(raw: &str, source_name: &str) -> Result<String> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        anyhow::bail!("{source_name} cannot be empty");
+    }
+    if normalized.len() > 128 {
+        anyhow::bail!("{source_name} exceeds maximum bytes ({} > 128)", normalized.len());
+    }
+    if !normalized
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':'))
+    {
+        anyhow::bail!("{source_name} contains invalid identifier '{raw}'");
+    }
+    Ok(normalized)
+}
+
+fn parse_optional_display_name(raw: &str, source_name: &str) -> Result<Option<String>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.len() > 128 {
+        anyhow::bail!("{source_name} exceeds maximum bytes ({} > 128)", trimmed.len());
+    }
+    Ok(Some(trimmed.to_owned()))
+}
+
+fn parse_registry_string_list(raw: &[String], source_name: &str) -> Result<Vec<String>> {
+    if raw.len() > 32 {
+        anyhow::bail!("{source_name} exceeds maximum entries ({} > 32)", raw.len());
+    }
+    let mut values = Vec::new();
+    let mut seen = HashSet::new();
+    for candidate in raw.iter().map(String::as_str).map(str::trim).filter(|value| !value.is_empty())
+    {
+        if candidate.len() > 128 {
+            anyhow::bail!("{source_name} contains oversized entry ({} > 128)", candidate.len());
+        }
+        let normalized = candidate.to_owned();
+        if seen.insert(normalized.clone()) {
+            values.push(normalized);
+        }
+    }
+    Ok(values)
+}
+
+fn parse_provider_model_role(raw: &str, source_name: &str) -> Result<ProviderModelRole> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "chat" => Ok(ProviderModelRole::Chat),
+        "embeddings" => Ok(ProviderModelRole::Embeddings),
+        "audio_transcription" | "audio-transcription" | "audio" | "transcription" => {
+            Ok(ProviderModelRole::AudioTranscription)
+        }
+        _ => anyhow::bail!("{source_name} must be one of: chat, embeddings, audio_transcription"),
+    }
+}
+
+fn parse_provider_metadata_source(raw: &str, source_name: &str) -> Result<ProviderMetadataSource> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "legacy_migration" | "legacy-migration" => Ok(ProviderMetadataSource::LegacyMigration),
+        "static" => Ok(ProviderMetadataSource::Static),
+        "discovery" => Ok(ProviderMetadataSource::Discovery),
+        "operator_override" | "operator-override" => Ok(ProviderMetadataSource::OperatorOverride),
+        _ => anyhow::bail!(
+            "{source_name} must be one of: legacy_migration, static, discovery, operator_override"
+        ),
+    }
+}
+
+fn parse_provider_cost_tier(raw: &str, source_name: &str) -> Result<ProviderCostTier> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "low" => Ok(ProviderCostTier::Low),
+        "standard" => Ok(ProviderCostTier::Standard),
+        "premium" => Ok(ProviderCostTier::Premium),
+        _ => anyhow::bail!("{source_name} must be one of: low, standard, premium"),
+    }
+}
+
+fn parse_provider_latency_tier(raw: &str, source_name: &str) -> Result<ProviderLatencyTier> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "low" => Ok(ProviderLatencyTier::Low),
+        "standard" => Ok(ProviderLatencyTier::Standard),
+        "high" => Ok(ProviderLatencyTier::High),
+        _ => anyhow::bail!("{source_name} must be one of: low, standard, high"),
+    }
+}
+
+fn default_provider_auth_kind(kind: ModelProviderKind) -> Option<ModelProviderAuthProviderKind> {
+    match kind {
+        ModelProviderKind::Deterministic => None,
+        ModelProviderKind::OpenAiCompatible => Some(ModelProviderAuthProviderKind::Openai),
+        ModelProviderKind::Anthropic => Some(ModelProviderAuthProviderKind::Anthropic),
+    }
+}
+
+fn provider_capability_defaults(
+    kind: ModelProviderKind,
+    role: ProviderModelRole,
+) -> ProviderCapabilitiesSnapshot {
+    match (kind, role) {
+        (ModelProviderKind::Deterministic, ProviderModelRole::Chat) => {
+            ProviderCapabilitiesSnapshot {
+                streaming_tokens: true,
+                tool_calls: false,
+                json_mode: true,
+                vision: false,
+                audio_transcribe: false,
+                embeddings: false,
+                max_context_tokens: Some(8_192),
+                cost_tier: ProviderCostTier::Low.as_str().to_owned(),
+                latency_tier: ProviderLatencyTier::Low.as_str().to_owned(),
+                recommended_use_cases: vec![
+                    "offline testing".to_owned(),
+                    "deterministic smoke flows".to_owned(),
+                ],
+                known_limitations: vec!["no real provider auth".to_owned(), "no vision".to_owned()],
+                operator_override: false,
+                metadata_source: ProviderMetadataSource::Static.as_str().to_owned(),
+            }
+        }
+        (ModelProviderKind::Deterministic, ProviderModelRole::Embeddings)
+        | (ModelProviderKind::Deterministic, ProviderModelRole::AudioTranscription) => {
+            ProviderCapabilitiesSnapshot {
+                streaming_tokens: false,
+                tool_calls: false,
+                json_mode: false,
+                vision: false,
+                audio_transcribe: false,
+                embeddings: false,
+                max_context_tokens: None,
+                cost_tier: ProviderCostTier::Low.as_str().to_owned(),
+                latency_tier: ProviderLatencyTier::Low.as_str().to_owned(),
+                recommended_use_cases: vec!["offline testing".to_owned()],
+                known_limitations: vec!["role unsupported by deterministic provider".to_owned()],
+                operator_override: false,
+                metadata_source: ProviderMetadataSource::Static.as_str().to_owned(),
+            }
+        }
+        (ModelProviderKind::OpenAiCompatible, ProviderModelRole::Chat) => {
+            ProviderCapabilitiesSnapshot {
+                streaming_tokens: true,
+                tool_calls: true,
+                json_mode: true,
+                vision: true,
+                audio_transcribe: true,
+                embeddings: false,
+                max_context_tokens: Some(128_000),
+                cost_tier: ProviderCostTier::Standard.as_str().to_owned(),
+                latency_tier: ProviderLatencyTier::Standard.as_str().to_owned(),
+                recommended_use_cases: vec![
+                    "general chat".to_owned(),
+                    "JSON workflows".to_owned(),
+                    "tool-calling agents".to_owned(),
+                ],
+                known_limitations: vec!["provider-specific compatibility varies".to_owned()],
+                operator_override: false,
+                metadata_source: ProviderMetadataSource::Static.as_str().to_owned(),
+            }
+        }
+        (ModelProviderKind::OpenAiCompatible, ProviderModelRole::Embeddings) => {
+            ProviderCapabilitiesSnapshot {
+                streaming_tokens: false,
+                tool_calls: false,
+                json_mode: false,
+                vision: false,
+                audio_transcribe: false,
+                embeddings: true,
+                max_context_tokens: None,
+                cost_tier: ProviderCostTier::Low.as_str().to_owned(),
+                latency_tier: ProviderLatencyTier::Low.as_str().to_owned(),
+                recommended_use_cases: vec![
+                    "semantic search".to_owned(),
+                    "workspace recall".to_owned(),
+                ],
+                known_limitations: vec!["no chat completions".to_owned()],
+                operator_override: false,
+                metadata_source: ProviderMetadataSource::Static.as_str().to_owned(),
+            }
+        }
+        (ModelProviderKind::OpenAiCompatible, ProviderModelRole::AudioTranscription) => {
+            ProviderCapabilitiesSnapshot {
+                streaming_tokens: false,
+                tool_calls: false,
+                json_mode: false,
+                vision: false,
+                audio_transcribe: true,
+                embeddings: false,
+                max_context_tokens: None,
+                cost_tier: ProviderCostTier::Standard.as_str().to_owned(),
+                latency_tier: ProviderLatencyTier::Standard.as_str().to_owned(),
+                recommended_use_cases: vec!["meeting notes".to_owned(), "voice uploads".to_owned()],
+                known_limitations: vec!["no chat completions".to_owned()],
+                operator_override: false,
+                metadata_source: ProviderMetadataSource::Static.as_str().to_owned(),
+            }
+        }
+        (ModelProviderKind::Anthropic, ProviderModelRole::Chat) => ProviderCapabilitiesSnapshot {
+            streaming_tokens: true,
+            tool_calls: true,
+            json_mode: true,
+            vision: true,
+            audio_transcribe: false,
+            embeddings: false,
+            max_context_tokens: Some(200_000),
+            cost_tier: ProviderCostTier::Premium.as_str().to_owned(),
+            latency_tier: ProviderLatencyTier::Standard.as_str().to_owned(),
+            recommended_use_cases: vec![
+                "high-context reasoning".to_owned(),
+                "vision-assisted analysis".to_owned(),
+            ],
+            known_limitations: vec![
+                "no native embeddings".to_owned(),
+                "no audio transcription".to_owned(),
+            ],
+            operator_override: false,
+            metadata_source: ProviderMetadataSource::Static.as_str().to_owned(),
+        },
+        (ModelProviderKind::Anthropic, ProviderModelRole::Embeddings)
+        | (ModelProviderKind::Anthropic, ProviderModelRole::AudioTranscription) => {
+            ProviderCapabilitiesSnapshot {
+                streaming_tokens: false,
+                tool_calls: false,
+                json_mode: false,
+                vision: false,
+                audio_transcribe: false,
+                embeddings: false,
+                max_context_tokens: None,
+                cost_tier: ProviderCostTier::Premium.as_str().to_owned(),
+                latency_tier: ProviderLatencyTier::Standard.as_str().to_owned(),
+                recommended_use_cases: vec!["chat workloads".to_owned()],
+                known_limitations: vec!["role unsupported by anthropic provider".to_owned()],
+                operator_override: false,
+                metadata_source: ProviderMetadataSource::Static.as_str().to_owned(),
+            }
+        }
+    }
+}
+
+fn parse_model_provider_registry_entry(
+    raw: palyra_common::daemon_config_schema::FileModelProviderRegistryEntry,
+    index: usize,
+    defaults: &ModelProviderConfig,
+) -> Result<ProviderRegistryEntryConfig> {
+    let source_name = format!("model_provider.providers[{index}]");
+    let provider_id = parse_registry_identifier(
+        raw.provider_id.unwrap_or_default().as_str(),
+        format!("{source_name}.provider_id").as_str(),
+    )?;
+    let kind =
+        ModelProviderKind::parse(raw.kind.unwrap_or_default().as_str()).with_context(|| {
+            format!(
+                "{} must be one of: deterministic, openai_compatible, anthropic",
+                format!("{source_name}.kind")
+            )
+        })?;
+    let display_name = parse_optional_display_name(
+        raw.display_name.unwrap_or_default().as_str(),
+        format!("{source_name}.display_name").as_str(),
+    )?;
+    let base_url = match raw.base_url {
+        Some(value) => Some(parse_openai_base_url(value.as_str()).with_context(|| {
+            format!("{source_name}.base_url must be a valid provider base URL")
+        })?),
+        None => None,
+    };
+    let auth_profile_id = parse_optional_auth_profile_id(
+        raw.auth_profile_id.unwrap_or_default().as_str(),
+        format!("{source_name}.auth_profile_id").as_str(),
+    )?;
+    let auth_profile_provider_kind = if let Some(value) = raw.auth_provider_kind {
+        Some(parse_model_provider_auth_provider_kind(
+            value.as_str(),
+            format!("{source_name}.auth_provider_kind").as_str(),
+        )?)
+    } else {
+        default_provider_auth_kind(kind)
+    };
+    let api_key = parse_optional_text(
+        raw.api_key.unwrap_or_default().as_str(),
+        format!("{source_name}.api_key").as_str(),
+    )?;
+    let api_key_vault_ref = parse_optional_vault_ref_field(
+        raw.api_key_vault_ref.unwrap_or_default().as_str(),
+        format!("{source_name}.api_key_vault_ref").as_str(),
+    )?;
+    if api_key.is_some() && api_key_vault_ref.is_some() {
+        anyhow::bail!(
+            "{source_name} cannot set both api_key and api_key_vault_ref for the same provider entry"
+        );
+    }
+    let credential_source = if api_key.is_some() {
+        Some(ModelProviderCredentialSource::InlineConfig)
+    } else if api_key_vault_ref.is_some() {
+        Some(ModelProviderCredentialSource::VaultRef)
+    } else if auth_profile_id.is_some() {
+        auth_profile_provider_kind.map(|kind| match kind {
+            ModelProviderAuthProviderKind::Openai => {
+                ModelProviderCredentialSource::AuthProfileApiKey
+            }
+            ModelProviderAuthProviderKind::Anthropic => {
+                ModelProviderCredentialSource::AuthProfileApiKey
+            }
+        })
+    } else {
+        None
+    };
+
+    Ok(ProviderRegistryEntryConfig {
+        provider_id,
+        display_name,
+        kind,
+        base_url,
+        allow_private_base_url: raw
+            .allow_private_base_url
+            .unwrap_or(defaults.allow_private_base_url),
+        enabled: raw.enabled.unwrap_or(true),
+        auth_profile_id,
+        auth_profile_provider_kind,
+        api_key,
+        api_key_vault_ref,
+        credential_source,
+        request_timeout_ms: raw
+            .request_timeout_ms
+            .map(|value| {
+                parse_positive_u64(value, format!("{source_name}.request_timeout_ms").as_str())
+            })
+            .transpose()?
+            .unwrap_or(defaults.request_timeout_ms),
+        max_retries: raw
+            .max_retries
+            .map(|value| parse_retries(value, format!("{source_name}.max_retries").as_str()))
+            .transpose()?
+            .unwrap_or(defaults.max_retries),
+        retry_backoff_ms: raw
+            .retry_backoff_ms
+            .map(|value| {
+                parse_positive_u64(value, format!("{source_name}.retry_backoff_ms").as_str())
+            })
+            .transpose()?
+            .unwrap_or(defaults.retry_backoff_ms),
+        circuit_breaker_failure_threshold: raw
+            .circuit_breaker_failure_threshold
+            .map(|value| {
+                parse_positive_u32(
+                    value,
+                    format!("{source_name}.circuit_breaker_failure_threshold").as_str(),
+                )
+            })
+            .transpose()?
+            .unwrap_or(defaults.circuit_breaker_failure_threshold),
+        circuit_breaker_cooldown_ms: raw
+            .circuit_breaker_cooldown_ms
+            .map(|value| {
+                parse_positive_u64(
+                    value,
+                    format!("{source_name}.circuit_breaker_cooldown_ms").as_str(),
+                )
+            })
+            .transpose()?
+            .unwrap_or(defaults.circuit_breaker_cooldown_ms),
+    })
+}
+
+fn parse_model_provider_registry_model(
+    raw: palyra_common::daemon_config_schema::FileModelProviderRegistryModel,
+    index: usize,
+    providers: &[ProviderRegistryEntryConfig],
+) -> Result<ProviderModelEntryConfig> {
+    let source_name = format!("model_provider.models[{index}]");
+    let model_id = parse_optional_text(
+        raw.model_id.unwrap_or_default().as_str(),
+        format!("{source_name}.model_id").as_str(),
+    )?
+    .ok_or_else(|| anyhow::anyhow!("{source_name}.model_id cannot be empty"))?;
+    let provider_id = parse_registry_identifier(
+        raw.provider_id.unwrap_or_default().as_str(),
+        format!("{source_name}.provider_id").as_str(),
+    )?;
+    let role = parse_provider_model_role(
+        raw.role.unwrap_or_else(|| "chat".to_owned()).as_str(),
+        format!("{source_name}.role").as_str(),
+    )?;
+    let provider_kind = providers
+        .iter()
+        .find(|entry| entry.provider_id == provider_id)
+        .map(|entry| entry.kind)
+        .ok_or_else(|| {
+            anyhow::anyhow!("{source_name}.provider_id references unknown provider '{provider_id}'")
+        })?;
+    let metadata_source = if let Some(value) = raw.metadata_source {
+        parse_provider_metadata_source(
+            value.as_str(),
+            format!("{source_name}.metadata_source").as_str(),
+        )?
+    } else {
+        ProviderMetadataSource::Static
+    };
+    let operator_override = raw.operator_override.unwrap_or(false);
+    let defaults = provider_capability_defaults(provider_kind, role);
+    let cost_tier = if let Some(value) = raw.cost_tier {
+        parse_provider_cost_tier(value.as_str(), format!("{source_name}.cost_tier").as_str())?
+            .as_str()
+            .to_owned()
+    } else {
+        defaults.cost_tier.clone()
+    };
+    let latency_tier = if let Some(value) = raw.latency_tier {
+        parse_provider_latency_tier(value.as_str(), format!("{source_name}.latency_tier").as_str())?
+            .as_str()
+            .to_owned()
+    } else {
+        defaults.latency_tier.clone()
+    };
+    let recommended_use_cases = raw
+        .recommended_use_cases
+        .as_ref()
+        .map(|values| {
+            parse_registry_string_list(
+                values,
+                format!("{source_name}.recommended_use_cases").as_str(),
+            )
+        })
+        .transpose()?
+        .unwrap_or_else(|| defaults.recommended_use_cases.clone());
+    let known_limitations = raw
+        .known_limitations
+        .as_ref()
+        .map(|values| {
+            parse_registry_string_list(values, format!("{source_name}.known_limitations").as_str())
+        })
+        .transpose()?
+        .unwrap_or_else(|| defaults.known_limitations.clone());
+
+    Ok(ProviderModelEntryConfig {
+        model_id,
+        provider_id,
+        role,
+        enabled: raw.enabled.unwrap_or(true),
+        metadata_source,
+        operator_override,
+        capabilities: ProviderCapabilitiesSnapshot {
+            streaming_tokens: defaults.streaming_tokens,
+            tool_calls: raw.tool_calls.unwrap_or(defaults.tool_calls),
+            json_mode: raw.json_mode.unwrap_or(defaults.json_mode),
+            vision: raw.vision.unwrap_or(defaults.vision),
+            audio_transcribe: raw.audio_transcribe.unwrap_or(defaults.audio_transcribe),
+            embeddings: raw.embeddings.unwrap_or(defaults.embeddings),
+            max_context_tokens: raw.max_context_tokens.or(defaults.max_context_tokens),
+            cost_tier,
+            latency_tier,
+            recommended_use_cases,
+            known_limitations,
+            operator_override,
+            metadata_source: metadata_source.as_str().to_owned(),
+        },
+    })
+}
+
 fn parse_model_provider_auth_provider_kind(
     raw: &str,
     source_name: &str,
 ) -> Result<ModelProviderAuthProviderKind> {
-    ModelProviderAuthProviderKind::parse(raw)
-        .with_context(|| format!("{source_name} must be one of: openai, openai_compatible"))
+    ModelProviderAuthProviderKind::parse(raw).with_context(|| {
+        format!("{source_name} must be one of: openai, openai_compatible, anthropic")
+    })
 }
 
 fn parse_identity_store_dir(raw: &str) -> Result<PathBuf> {
@@ -2160,6 +2718,7 @@ mod tests {
         parse_default_memory_ttl_ms, parse_direct_message_policy, parse_dns_suffix_allowlist,
         parse_host_allowlist, parse_http_header_allowlist, parse_journal_db_path,
         parse_memory_retention_vacuum_schedule, parse_model_provider_auth_provider_kind,
+        parse_model_provider_registry_entry, parse_model_provider_registry_model,
         parse_openai_base_url, parse_openai_embeddings_dims, parse_optional_auth_profile_id,
         parse_optional_browser_state_dir, parse_optional_openai_embeddings_model,
         parse_optional_vault_ref_field, parse_positive_u32, parse_positive_usize,
@@ -2172,9 +2731,13 @@ mod tests {
         ToolCallConfig,
     };
     use crate::channel_router::{BroadcastStrategy, DirectMessagePolicy};
-    use crate::model_provider::{ModelProviderAuthProviderKind, ModelProviderKind};
+    use crate::model_provider::{
+        ModelProviderAuthProviderKind, ModelProviderKind, ProviderMetadataSource, ProviderModelRole,
+    };
     use crate::sandbox_runner::{EgressEnforcementMode, SandboxProcessRunnerTier};
-    use palyra_common::daemon_config_schema::RootFileConfig;
+    use palyra_common::daemon_config_schema::{
+        FileModelProviderRegistryEntry, FileModelProviderRegistryModel, RootFileConfig,
+    };
 
     #[test]
     fn identity_config_defaults_to_secure_mode() {
@@ -3087,15 +3650,127 @@ mod tests {
             .expect("openai_compatible kind should parse"),
             ModelProviderAuthProviderKind::Openai
         );
+        assert_eq!(
+            parse_model_provider_auth_provider_kind(
+                "anthropic",
+                "model_provider.auth_provider_kind",
+            )
+            .expect("anthropic kind should parse"),
+            ModelProviderAuthProviderKind::Anthropic
+        );
     }
 
     #[test]
     fn parse_model_provider_auth_provider_kind_rejects_unknown_values() {
         let result = parse_model_provider_auth_provider_kind(
-            "anthropic",
+            "unsupported_provider",
             "model_provider.auth_provider_kind",
         );
         assert!(result.is_err(), "unsupported auth provider kind should fail validation");
+    }
+
+    #[test]
+    fn parse_model_provider_registry_entry_inherits_model_provider_defaults() {
+        let defaults = ModelProviderConfig {
+            request_timeout_ms: 9_000,
+            max_retries: 4,
+            retry_backoff_ms: 275,
+            circuit_breaker_failure_threshold: 5,
+            circuit_breaker_cooldown_ms: 45_000,
+            ..ModelProviderConfig::default()
+        };
+        let entry = parse_model_provider_registry_entry(
+            FileModelProviderRegistryEntry {
+                provider_id: Some("OpenAI.Primary".to_owned()),
+                display_name: Some(" OpenAI Primary ".to_owned()),
+                kind: Some("openai_compatible".to_owned()),
+                base_url: Some("https://api.openai.com/v1".to_owned()),
+                allow_private_base_url: None,
+                enabled: Some(true),
+                auth_profile_id: Some("OpenAI.Default".to_owned()),
+                auth_provider_kind: None,
+                api_key: None,
+                api_key_vault_ref: Some("GLOBAL/openai_api_key".to_owned()),
+                request_timeout_ms: None,
+                max_retries: None,
+                retry_backoff_ms: None,
+                circuit_breaker_failure_threshold: None,
+                circuit_breaker_cooldown_ms: None,
+            },
+            0,
+            &defaults,
+        )
+        .expect("provider entry should parse");
+
+        assert_eq!(entry.provider_id, "openai.primary");
+        assert_eq!(entry.display_name.as_deref(), Some("OpenAI Primary"));
+        assert_eq!(entry.auth_profile_id.as_deref(), Some("openai.default"));
+        assert_eq!(entry.auth_profile_provider_kind, Some(ModelProviderAuthProviderKind::Openai));
+        assert_eq!(entry.api_key_vault_ref.as_deref(), Some("global/openai_api_key"));
+        assert_eq!(entry.request_timeout_ms, 9_000);
+        assert_eq!(entry.max_retries, 4);
+        assert_eq!(entry.retry_backoff_ms, 275);
+        assert_eq!(entry.circuit_breaker_failure_threshold, 5);
+        assert_eq!(entry.circuit_breaker_cooldown_ms, 45_000);
+    }
+
+    #[test]
+    fn parse_model_provider_registry_model_uses_provider_kind_defaults() {
+        let providers = vec![parse_model_provider_registry_entry(
+            FileModelProviderRegistryEntry {
+                provider_id: Some("anthropic-primary".to_owned()),
+                display_name: Some("Anthropic".to_owned()),
+                kind: Some("anthropic".to_owned()),
+                base_url: Some("https://api.anthropic.com".to_owned()),
+                allow_private_base_url: Some(false),
+                enabled: Some(true),
+                auth_profile_id: None,
+                auth_provider_kind: None,
+                api_key: None,
+                api_key_vault_ref: None,
+                request_timeout_ms: None,
+                max_retries: None,
+                retry_backoff_ms: None,
+                circuit_breaker_failure_threshold: None,
+                circuit_breaker_cooldown_ms: None,
+            },
+            0,
+            &ModelProviderConfig::default(),
+        )
+        .expect("provider entry should parse")];
+
+        let model = parse_model_provider_registry_model(
+            FileModelProviderRegistryModel {
+                model_id: Some("claude-3-5-sonnet".to_owned()),
+                provider_id: Some("anthropic-primary".to_owned()),
+                role: Some("chat".to_owned()),
+                enabled: Some(true),
+                metadata_source: None,
+                operator_override: None,
+                tool_calls: None,
+                json_mode: None,
+                vision: None,
+                audio_transcribe: None,
+                embeddings: None,
+                max_context_tokens: None,
+                cost_tier: None,
+                latency_tier: None,
+                recommended_use_cases: None,
+                known_limitations: None,
+            },
+            0,
+            &providers,
+        )
+        .expect("model entry should parse");
+
+        assert_eq!(model.role, ProviderModelRole::Chat);
+        assert_eq!(model.metadata_source, ProviderMetadataSource::Static);
+        assert!(model.capabilities.tool_calls);
+        assert!(model.capabilities.vision);
+        assert!(!model.capabilities.embeddings);
+        assert_eq!(model.capabilities.max_context_tokens, Some(200_000));
+        assert_eq!(model.capabilities.cost_tier, "premium");
+        assert_eq!(model.capabilities.metadata_source, "static");
     }
 
     #[test]

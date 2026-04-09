@@ -8,6 +8,8 @@ pub const SECRET_CONFIG_PATHS: &[&str] = &[
     "admin.connector_token",
     "model_provider.openai_api_key",
     "model_provider.openai_api_key_vault_ref",
+    "model_provider.anthropic_api_key",
+    "model_provider.anthropic_api_key_vault_ref",
     "gateway.admin_token",
     "tool_call.browser_service.auth_token",
     "tool_call.browser_service.state_key_vault_ref",
@@ -23,6 +25,7 @@ pub fn redact_secret_config_values(document: &mut Value) {
     for secret_path in SECRET_CONFIG_PATHS {
         redact_config_path(document, secret_path);
     }
+    redact_provider_registry_secrets(document);
 }
 
 fn redact_config_path(document: &mut Value, path: &str) {
@@ -57,6 +60,41 @@ fn normalize_config_path(path: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(".")
+}
+
+fn redact_provider_registry_secrets(document: &mut Value) {
+    let Some(model_provider) = document.get_mut("model_provider") else {
+        return;
+    };
+    let Some(model_provider_table) = model_provider.as_table_mut() else {
+        return;
+    };
+    let Some(providers) = model_provider_table.get_mut("providers") else {
+        return;
+    };
+    let Some(array) = providers.as_array_mut() else {
+        return;
+    };
+    for entry in array {
+        let Some(provider_table) = entry.as_table_mut() else {
+            continue;
+        };
+        for secret_field in [
+            "api_key",
+            "api_key_vault_ref",
+            "openai_api_key",
+            "openai_api_key_vault_ref",
+            "anthropic_api_key",
+            "anthropic_api_key_vault_ref",
+        ] {
+            if provider_table.contains_key(secret_field) {
+                provider_table.insert(
+                    secret_field.to_owned(),
+                    Value::String(REDACTED_CONFIG_VALUE.to_owned()),
+                );
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -195,12 +233,16 @@ pub struct FileMediaConfig {
 pub struct FileModelProviderConfig {
     pub kind: Option<String>,
     pub openai_base_url: Option<String>,
+    pub anthropic_base_url: Option<String>,
     pub allow_private_base_url: Option<bool>,
     pub openai_model: Option<String>,
+    pub anthropic_model: Option<String>,
     pub openai_embeddings_model: Option<String>,
     pub openai_embeddings_dims: Option<u32>,
     pub openai_api_key: Option<String>,
     pub openai_api_key_vault_ref: Option<String>,
+    pub anthropic_api_key: Option<String>,
+    pub anthropic_api_key_vault_ref: Option<String>,
     pub auth_profile_id: Option<String>,
     pub auth_profile_ref: Option<String>,
     pub auth_provider_kind: Option<String>,
@@ -209,6 +251,58 @@ pub struct FileModelProviderConfig {
     pub retry_backoff_ms: Option<u64>,
     pub circuit_breaker_failure_threshold: Option<u32>,
     pub circuit_breaker_cooldown_ms: Option<u64>,
+    pub providers: Option<Vec<FileModelProviderRegistryEntry>>,
+    pub models: Option<Vec<FileModelProviderRegistryModel>>,
+    pub default_chat_model_id: Option<String>,
+    pub default_embeddings_model_id: Option<String>,
+    pub default_audio_transcription_model_id: Option<String>,
+    pub failover_enabled: Option<bool>,
+    pub response_cache_enabled: Option<bool>,
+    pub response_cache_ttl_ms: Option<u64>,
+    pub response_cache_max_entries: Option<u64>,
+    pub discovery_ttl_ms: Option<u64>,
+    pub health_ttl_ms: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileModelProviderRegistryEntry {
+    pub provider_id: Option<String>,
+    pub display_name: Option<String>,
+    pub kind: Option<String>,
+    pub base_url: Option<String>,
+    pub allow_private_base_url: Option<bool>,
+    pub enabled: Option<bool>,
+    pub auth_profile_id: Option<String>,
+    pub auth_provider_kind: Option<String>,
+    pub api_key: Option<String>,
+    pub api_key_vault_ref: Option<String>,
+    pub request_timeout_ms: Option<u64>,
+    pub max_retries: Option<u32>,
+    pub retry_backoff_ms: Option<u64>,
+    pub circuit_breaker_failure_threshold: Option<u32>,
+    pub circuit_breaker_cooldown_ms: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileModelProviderRegistryModel {
+    pub model_id: Option<String>,
+    pub provider_id: Option<String>,
+    pub role: Option<String>,
+    pub enabled: Option<bool>,
+    pub metadata_source: Option<String>,
+    pub operator_override: Option<bool>,
+    pub tool_calls: Option<bool>,
+    pub json_mode: Option<bool>,
+    pub vision: Option<bool>,
+    pub audio_transcribe: Option<bool>,
+    pub embeddings: Option<bool>,
+    pub max_context_tokens: Option<u32>,
+    pub cost_tier: Option<String>,
+    pub latency_tier: Option<String>,
+    pub recommended_use_cases: Option<Vec<String>>,
+    pub known_limitations: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]

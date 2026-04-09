@@ -1,5 +1,5 @@
 use std::{
-    collections::hash_map::DefaultHasher,
+    collections::{hash_map::DefaultHasher, HashMap},
     future::Future,
     hash::{Hash, Hasher},
     net::{IpAddr, ToSocketAddrs},
@@ -19,6 +19,8 @@ use crate::orchestrator::{estimate_token_count, split_model_tokens, MAX_MODEL_TO
 const OPENAI_CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 const OPENAI_EMBEDDINGS_PATH: &str = "/embeddings";
 const OPENAI_AUDIO_TRANSCRIPTIONS_PATH: &str = "/audio/transcriptions";
+const ANTHROPIC_MESSAGES_PATH: &str = "/v1/messages";
+const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 const OPENAI_RETRYABLE_STATUS_CODES: &[u16] = &[429, 500, 502, 503, 504];
 // Keep provider envelope above default wasm module quota (256KiB) including base64 and JSON overhead.
 const MAX_TOOL_ARGUMENT_BYTES: usize = 512 * 1024;
@@ -27,11 +29,17 @@ const MAX_EMBEDDINGS_INPUT_BYTES: usize = 256 * 1024;
 const MAX_SINGLE_EMBEDDING_INPUT_BYTES: usize = 64 * 1024;
 const DEFAULT_DETERMINISTIC_EMBEDDINGS_DIMS: usize = 64;
 const DEFAULT_OPENAI_TRANSCRIPTION_MODEL: &str = "gpt-4o-mini-transcribe";
+const DEFAULT_PROVIDER_RESPONSE_CACHE_TTL_MS: u64 = 30_000;
+const DEFAULT_PROVIDER_RESPONSE_CACHE_MAX_ENTRIES: usize = 128;
+const DEFAULT_PROVIDER_DISCOVERY_TTL_MS: u64 = 5 * 60 * 1_000;
+const DEFAULT_PROVIDER_HEALTH_TTL_MS: u64 = 60_000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum ModelProviderKind {
     Deterministic,
     OpenAiCompatible,
+    Anthropic,
 }
 
 impl ModelProviderKind {
@@ -40,6 +48,7 @@ impl ModelProviderKind {
         match self {
             Self::Deterministic => "deterministic",
             Self::OpenAiCompatible => "openai_compatible",
+            Self::Anthropic => "anthropic",
         }
     }
 
@@ -47,7 +56,150 @@ impl ModelProviderKind {
         match value.trim().to_ascii_lowercase().as_str() {
             "deterministic" => Ok(Self::Deterministic),
             "openai_compatible" | "openai-compatible" | "openai" => Ok(Self::OpenAiCompatible),
+            "anthropic" => Ok(Self::Anthropic),
             _ => anyhow::bail!("unsupported model provider kind: {value}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderModelRole {
+    Chat,
+    Embeddings,
+    AudioTranscription,
+}
+
+impl ProviderModelRole {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::Embeddings => "embeddings",
+            Self::AudioTranscription => "audio_transcription",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderMetadataSource {
+    LegacyMigration,
+    Static,
+    Discovery,
+    OperatorOverride,
+}
+
+impl ProviderMetadataSource {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LegacyMigration => "legacy_migration",
+            Self::Static => "static",
+            Self::Discovery => "discovery",
+            Self::OperatorOverride => "operator_override",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderCostTier {
+    Low,
+    Standard,
+    Premium,
+}
+
+impl ProviderCostTier {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Standard => "standard",
+            Self::Premium => "premium",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderLatencyTier {
+    Low,
+    Standard,
+    High,
+}
+
+impl ProviderLatencyTier {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Standard => "standard",
+            Self::High => "high",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderRegistryEntryConfig {
+    pub provider_id: String,
+    pub display_name: Option<String>,
+    pub kind: ModelProviderKind,
+    pub base_url: Option<String>,
+    pub allow_private_base_url: bool,
+    pub enabled: bool,
+    pub auth_profile_id: Option<String>,
+    pub auth_profile_provider_kind: Option<ModelProviderAuthProviderKind>,
+    pub api_key: Option<String>,
+    pub api_key_vault_ref: Option<String>,
+    pub credential_source: Option<ModelProviderCredentialSource>,
+    pub request_timeout_ms: u64,
+    pub max_retries: u32,
+    pub retry_backoff_ms: u64,
+    pub circuit_breaker_failure_threshold: u32,
+    pub circuit_breaker_cooldown_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderModelEntryConfig {
+    pub model_id: String,
+    pub provider_id: String,
+    pub role: ProviderModelRole,
+    pub enabled: bool,
+    pub metadata_source: ProviderMetadataSource,
+    pub operator_override: bool,
+    pub capabilities: ProviderCapabilitiesSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelProviderRegistryConfig {
+    pub providers: Vec<ProviderRegistryEntryConfig>,
+    pub models: Vec<ProviderModelEntryConfig>,
+    pub default_chat_model_id: Option<String>,
+    pub default_embeddings_model_id: Option<String>,
+    pub default_audio_transcription_model_id: Option<String>,
+    pub failover_enabled: bool,
+    pub response_cache_enabled: bool,
+    pub response_cache_ttl_ms: u64,
+    pub response_cache_max_entries: usize,
+    pub discovery_ttl_ms: u64,
+    pub health_ttl_ms: u64,
+}
+
+impl Default for ModelProviderRegistryConfig {
+    fn default() -> Self {
+        Self {
+            providers: Vec::new(),
+            models: Vec::new(),
+            default_chat_model_id: None,
+            default_embeddings_model_id: None,
+            default_audio_transcription_model_id: None,
+            failover_enabled: true,
+            response_cache_enabled: true,
+            response_cache_ttl_ms: DEFAULT_PROVIDER_RESPONSE_CACHE_TTL_MS,
+            response_cache_max_entries: DEFAULT_PROVIDER_RESPONSE_CACHE_MAX_ENTRIES,
+            discovery_ttl_ms: DEFAULT_PROVIDER_DISCOVERY_TTL_MS,
+            health_ttl_ms: DEFAULT_PROVIDER_HEALTH_TTL_MS,
         }
     }
 }
@@ -78,9 +230,11 @@ fn build_openai_chat_content(request: &ProviderRequest) -> Value {
     Value::Array(parts)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum ModelProviderAuthProviderKind {
     Openai,
+    Anthropic,
 }
 
 impl ModelProviderAuthProviderKind {
@@ -88,18 +242,21 @@ impl ModelProviderAuthProviderKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Openai => "openai",
+            Self::Anthropic => "anthropic",
         }
     }
 
     pub fn parse(value: &str) -> Result<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "openai" | "openai_compatible" | "openai-compatible" => Ok(Self::Openai),
+            "anthropic" => Ok(Self::Anthropic),
             _ => anyhow::bail!("unsupported model provider auth provider kind: {value}"),
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum ModelProviderCredentialSource {
     InlineConfig,
     VaultRef,
@@ -123,12 +280,16 @@ impl ModelProviderCredentialSource {
 pub struct ModelProviderConfig {
     pub kind: ModelProviderKind,
     pub openai_base_url: String,
+    pub anthropic_base_url: String,
     pub allow_private_base_url: bool,
     pub openai_model: String,
+    pub anthropic_model: String,
     pub openai_embeddings_model: Option<String>,
     pub openai_embeddings_dims: Option<u32>,
     pub openai_api_key: Option<String>,
     pub openai_api_key_vault_ref: Option<String>,
+    pub anthropic_api_key: Option<String>,
+    pub anthropic_api_key_vault_ref: Option<String>,
     pub auth_profile_id: Option<String>,
     pub auth_profile_provider_kind: Option<ModelProviderAuthProviderKind>,
     pub credential_source: Option<ModelProviderCredentialSource>,
@@ -137,6 +298,7 @@ pub struct ModelProviderConfig {
     pub retry_backoff_ms: u64,
     pub circuit_breaker_failure_threshold: u32,
     pub circuit_breaker_cooldown_ms: u64,
+    pub registry: ModelProviderRegistryConfig,
 }
 
 impl Default for ModelProviderConfig {
@@ -144,12 +306,16 @@ impl Default for ModelProviderConfig {
         Self {
             kind: ModelProviderKind::Deterministic,
             openai_base_url: "https://api.openai.com/v1".to_owned(),
+            anthropic_base_url: "https://api.anthropic.com".to_owned(),
             allow_private_base_url: false,
             openai_model: "gpt-4o-mini".to_owned(),
+            anthropic_model: "claude-3-5-sonnet-latest".to_owned(),
             openai_embeddings_model: None,
             openai_embeddings_dims: None,
             openai_api_key: None,
             openai_api_key_vault_ref: None,
+            anthropic_api_key: None,
+            anthropic_api_key_vault_ref: None,
             auth_profile_id: None,
             auth_profile_provider_kind: None,
             credential_source: None,
@@ -158,7 +324,499 @@ impl Default for ModelProviderConfig {
             retry_backoff_ms: 150,
             circuit_breaker_failure_threshold: 3,
             circuit_breaker_cooldown_ms: 30_000,
+            registry: ModelProviderRegistryConfig::default(),
         }
+    }
+}
+
+impl ModelProviderConfig {
+    pub fn normalized_registry(&self) -> Result<ModelProviderRegistryConfig> {
+        let mut registry = self.registry.clone();
+        if registry.providers.is_empty() && registry.models.is_empty() {
+            registry = legacy_registry_from_config(self);
+        }
+        normalize_provider_registry(&mut registry)?;
+        Ok(registry)
+    }
+
+    #[must_use]
+    #[allow(dead_code)]
+    pub fn default_chat_model_id(&self) -> Option<String> {
+        self.normalized_registry().ok().and_then(|registry| registry.default_chat_model_id).or_else(
+            || match self.kind {
+                ModelProviderKind::Deterministic => Some("deterministic".to_owned()),
+                ModelProviderKind::OpenAiCompatible => Some(self.openai_model.clone()),
+                ModelProviderKind::Anthropic => Some(self.anthropic_model.clone()),
+            },
+        )
+    }
+
+    #[must_use]
+    #[allow(dead_code)]
+    pub fn default_embeddings_model_id(&self) -> Option<String> {
+        self.normalized_registry()
+            .ok()
+            .and_then(|registry| registry.default_embeddings_model_id)
+            .or_else(|| self.openai_embeddings_model.clone())
+    }
+}
+
+fn legacy_registry_from_config(config: &ModelProviderConfig) -> ModelProviderRegistryConfig {
+    let provider_id = match config.kind {
+        ModelProviderKind::Deterministic => "deterministic-primary".to_owned(),
+        ModelProviderKind::OpenAiCompatible => "openai-primary".to_owned(),
+        ModelProviderKind::Anthropic => "anthropic-primary".to_owned(),
+    };
+    let (display_name, base_url, api_key, api_key_vault_ref, model_id, auth_kind, capabilities) =
+        match config.kind {
+            ModelProviderKind::Deterministic => (
+                Some("Deterministic".to_owned()),
+                None,
+                None,
+                None,
+                "deterministic".to_owned(),
+                None,
+                capability_defaults_for_kind(config.kind, ProviderModelRole::Chat),
+            ),
+            ModelProviderKind::OpenAiCompatible => (
+                Some("OpenAI-compatible".to_owned()),
+                Some(config.openai_base_url.clone()),
+                config.openai_api_key.clone(),
+                config.openai_api_key_vault_ref.clone(),
+                config.openai_model.clone(),
+                Some(ModelProviderAuthProviderKind::Openai),
+                capability_defaults_for_kind(config.kind, ProviderModelRole::Chat),
+            ),
+            ModelProviderKind::Anthropic => (
+                Some("Anthropic".to_owned()),
+                Some(config.anthropic_base_url.clone()),
+                config.anthropic_api_key.clone(),
+                config.anthropic_api_key_vault_ref.clone(),
+                config.anthropic_model.clone(),
+                Some(ModelProviderAuthProviderKind::Anthropic),
+                capability_defaults_for_kind(config.kind, ProviderModelRole::Chat),
+            ),
+        };
+    let mut registry = ModelProviderRegistryConfig {
+        providers: vec![ProviderRegistryEntryConfig {
+            provider_id: provider_id.clone(),
+            display_name,
+            kind: config.kind,
+            base_url,
+            allow_private_base_url: config.allow_private_base_url,
+            enabled: true,
+            auth_profile_id: config.auth_profile_id.clone(),
+            auth_profile_provider_kind: config.auth_profile_provider_kind.or(auth_kind),
+            api_key,
+            api_key_vault_ref,
+            credential_source: config.credential_source,
+            request_timeout_ms: config.request_timeout_ms,
+            max_retries: config.max_retries,
+            retry_backoff_ms: config.retry_backoff_ms,
+            circuit_breaker_failure_threshold: config.circuit_breaker_failure_threshold,
+            circuit_breaker_cooldown_ms: config.circuit_breaker_cooldown_ms,
+        }],
+        models: vec![ProviderModelEntryConfig {
+            model_id: model_id.clone(),
+            provider_id: provider_id.clone(),
+            role: ProviderModelRole::Chat,
+            enabled: true,
+            metadata_source: ProviderMetadataSource::LegacyMigration,
+            operator_override: false,
+            capabilities,
+        }],
+        default_chat_model_id: Some(model_id),
+        default_embeddings_model_id: None,
+        default_audio_transcription_model_id: None,
+        failover_enabled: true,
+        response_cache_enabled: true,
+        response_cache_ttl_ms: DEFAULT_PROVIDER_RESPONSE_CACHE_TTL_MS,
+        response_cache_max_entries: DEFAULT_PROVIDER_RESPONSE_CACHE_MAX_ENTRIES,
+        discovery_ttl_ms: DEFAULT_PROVIDER_DISCOVERY_TTL_MS,
+        health_ttl_ms: DEFAULT_PROVIDER_HEALTH_TTL_MS,
+    };
+    if let Some(model_id) = config.openai_embeddings_model.clone() {
+        registry.default_embeddings_model_id = Some(model_id.clone());
+        registry.models.push(ProviderModelEntryConfig {
+            model_id,
+            provider_id,
+            role: ProviderModelRole::Embeddings,
+            enabled: true,
+            metadata_source: ProviderMetadataSource::LegacyMigration,
+            operator_override: false,
+            capabilities: capability_defaults_for_kind(
+                ModelProviderKind::OpenAiCompatible,
+                ProviderModelRole::Embeddings,
+            ),
+        });
+    }
+    registry
+}
+
+fn normalize_provider_registry(registry: &mut ModelProviderRegistryConfig) -> Result<()> {
+    if registry.response_cache_ttl_ms == 0 {
+        anyhow::bail!("model provider response cache TTL must be greater than 0ms");
+    }
+    if registry.response_cache_max_entries == 0 {
+        anyhow::bail!("model provider response cache max entries must be greater than 0");
+    }
+    if registry.discovery_ttl_ms == 0 {
+        anyhow::bail!("model provider discovery TTL must be greater than 0ms");
+    }
+    if registry.health_ttl_ms == 0 {
+        anyhow::bail!("model provider health TTL must be greater than 0ms");
+    }
+    if registry.providers.is_empty() {
+        anyhow::bail!("model provider registry must define at least one provider");
+    }
+    if registry.models.is_empty() {
+        anyhow::bail!("model provider registry must define at least one model");
+    }
+
+    let mut providers = HashMap::<String, ProviderRegistryEntryConfig>::new();
+    for provider in &mut registry.providers {
+        provider.provider_id = normalize_registry_identifier(
+            provider.provider_id.as_str(),
+            "model_provider.registry.providers[].provider_id",
+        )?;
+        if let Some(base_url) = provider.base_url.clone() {
+            validate_provider_base_url(
+                provider.kind,
+                base_url.as_str(),
+                provider.allow_private_base_url,
+            )?;
+        }
+        if providers.insert(provider.provider_id.clone(), provider.clone()).is_some() {
+            anyhow::bail!(
+                "duplicate provider id '{}' in model provider registry",
+                provider.provider_id
+            );
+        }
+    }
+
+    let mut model_ids = HashMap::<String, ProviderModelEntryConfig>::new();
+    for model in &mut registry.models {
+        model.model_id = model.model_id.trim().to_owned();
+        if model.model_id.is_empty() {
+            anyhow::bail!("model_provider.registry.models[].model_id cannot be empty");
+        }
+        model.provider_id = normalize_registry_identifier(
+            model.provider_id.as_str(),
+            "model_provider.registry.models[].provider_id",
+        )?;
+        if !providers.contains_key(model.provider_id.as_str()) {
+            anyhow::bail!(
+                "model '{}' references unknown provider '{}'",
+                model.model_id,
+                model.provider_id
+            );
+        }
+        if model_ids.insert(model.model_id.clone(), model.clone()).is_some() {
+            anyhow::bail!("duplicate model id '{}' in model provider registry", model.model_id);
+        }
+    }
+
+    if let Some(model_id) = registry.default_chat_model_id.as_ref() {
+        validate_default_model_role(model_id, ProviderModelRole::Chat, &model_ids)?;
+    } else {
+        registry.default_chat_model_id = registry
+            .models
+            .iter()
+            .find(|model| model.enabled && model.role == ProviderModelRole::Chat)
+            .map(|model| model.model_id.clone());
+    }
+    if let Some(model_id) = registry.default_embeddings_model_id.as_ref() {
+        validate_default_model_role(model_id, ProviderModelRole::Embeddings, &model_ids)?;
+    }
+    if let Some(model_id) = registry.default_audio_transcription_model_id.as_ref() {
+        validate_default_model_role(model_id, ProviderModelRole::AudioTranscription, &model_ids)?;
+    }
+    Ok(())
+}
+
+fn validate_default_model_role(
+    model_id: &str,
+    expected_role: ProviderModelRole,
+    models: &HashMap<String, ProviderModelEntryConfig>,
+) -> Result<()> {
+    let model = models.get(model_id).ok_or_else(|| {
+        anyhow::anyhow!("default model '{}' was not found in provider registry", model_id)
+    })?;
+    if model.role != expected_role {
+        anyhow::bail!("default model '{}' must have role '{}'", model_id, expected_role.as_str());
+    }
+    Ok(())
+}
+
+fn normalize_registry_identifier(raw: &str, field: &str) -> Result<String> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        anyhow::bail!("{field} cannot be empty");
+    }
+    if !normalized
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':'))
+    {
+        anyhow::bail!("{field} contains invalid identifier '{raw}'");
+    }
+    Ok(normalized)
+}
+
+fn validate_provider_base_url(
+    kind: ModelProviderKind,
+    base_url: &str,
+    allow_private_base_url: bool,
+) -> Result<()> {
+    match kind {
+        ModelProviderKind::Deterministic => Ok(()),
+        ModelProviderKind::OpenAiCompatible | ModelProviderKind::Anthropic => {
+            validate_openai_base_url_network_policy(base_url, allow_private_base_url)
+        }
+    }
+}
+
+fn capability_defaults_for_kind(
+    kind: ModelProviderKind,
+    role: ProviderModelRole,
+) -> ProviderCapabilitiesSnapshot {
+    match (kind, role) {
+        (ModelProviderKind::Deterministic, ProviderModelRole::Chat) => {
+            ProviderCapabilitiesSnapshot {
+                streaming_tokens: true,
+                tool_calls: false,
+                json_mode: true,
+                vision: false,
+                audio_transcribe: false,
+                embeddings: false,
+                max_context_tokens: Some(8_192),
+                cost_tier: ProviderCostTier::Low.as_str().to_owned(),
+                latency_tier: ProviderLatencyTier::Low.as_str().to_owned(),
+                recommended_use_cases: vec![
+                    "offline testing".to_owned(),
+                    "deterministic smoke flows".to_owned(),
+                ],
+                known_limitations: vec!["no real provider auth".to_owned(), "no vision".to_owned()],
+                operator_override: false,
+                metadata_source: ProviderMetadataSource::Static.as_str().to_owned(),
+            }
+        }
+        (ModelProviderKind::OpenAiCompatible, ProviderModelRole::Chat) => {
+            ProviderCapabilitiesSnapshot {
+                streaming_tokens: true,
+                tool_calls: true,
+                json_mode: true,
+                vision: true,
+                audio_transcribe: true,
+                embeddings: false,
+                max_context_tokens: Some(128_000),
+                cost_tier: ProviderCostTier::Standard.as_str().to_owned(),
+                latency_tier: ProviderLatencyTier::Standard.as_str().to_owned(),
+                recommended_use_cases: vec![
+                    "general chat".to_owned(),
+                    "JSON workflows".to_owned(),
+                    "vision requests".to_owned(),
+                ],
+                known_limitations: vec![],
+                operator_override: false,
+                metadata_source: ProviderMetadataSource::Static.as_str().to_owned(),
+            }
+        }
+        (ModelProviderKind::Anthropic, ProviderModelRole::Chat) => ProviderCapabilitiesSnapshot {
+            streaming_tokens: true,
+            tool_calls: true,
+            json_mode: true,
+            vision: true,
+            audio_transcribe: false,
+            embeddings: false,
+            max_context_tokens: Some(200_000),
+            cost_tier: ProviderCostTier::Premium.as_str().to_owned(),
+            latency_tier: ProviderLatencyTier::Standard.as_str().to_owned(),
+            recommended_use_cases: vec![
+                "long-context reasoning".to_owned(),
+                "tool-heavy chat".to_owned(),
+            ],
+            known_limitations: vec!["audio transcription not supported".to_owned()],
+            operator_override: false,
+            metadata_source: ProviderMetadataSource::Static.as_str().to_owned(),
+        },
+        (_, ProviderModelRole::Embeddings) => ProviderCapabilitiesSnapshot {
+            streaming_tokens: false,
+            tool_calls: false,
+            json_mode: false,
+            vision: false,
+            audio_transcribe: false,
+            embeddings: true,
+            max_context_tokens: Some(8_192),
+            cost_tier: ProviderCostTier::Standard.as_str().to_owned(),
+            latency_tier: ProviderLatencyTier::Low.as_str().to_owned(),
+            recommended_use_cases: vec!["memory indexing".to_owned()],
+            known_limitations: vec!["text embeddings only".to_owned()],
+            operator_override: false,
+            metadata_source: ProviderMetadataSource::Static.as_str().to_owned(),
+        },
+        (_, ProviderModelRole::AudioTranscription) => ProviderCapabilitiesSnapshot {
+            streaming_tokens: false,
+            tool_calls: false,
+            json_mode: false,
+            vision: false,
+            audio_transcribe: true,
+            embeddings: false,
+            max_context_tokens: None,
+            cost_tier: ProviderCostTier::Standard.as_str().to_owned(),
+            latency_tier: ProviderLatencyTier::Standard.as_str().to_owned(),
+            recommended_use_cases: vec!["audio ingestion".to_owned()],
+            known_limitations: vec![],
+            operator_override: false,
+            metadata_source: ProviderMetadataSource::Static.as_str().to_owned(),
+        },
+    }
+}
+
+fn empty_health_probe_snapshot(
+    state: &str,
+    message: &str,
+    source: &str,
+) -> ProviderHealthProbeSnapshot {
+    ProviderHealthProbeSnapshot {
+        state: state.to_owned(),
+        message: message.to_owned(),
+        checked_at_unix_ms: None,
+        latency_ms: None,
+        source: source.to_owned(),
+    }
+}
+
+fn empty_discovery_snapshot(source: &str) -> ProviderDiscoverySnapshot {
+    ProviderDiscoverySnapshot {
+        status: "unknown".to_owned(),
+        checked_at_unix_ms: None,
+        expires_at_unix_ms: None,
+        discovered_model_ids: Vec::new(),
+        source: source.to_owned(),
+        message: None,
+    }
+}
+
+fn empty_runtime_metrics_snapshot() -> ProviderRuntimeMetricsSnapshot {
+    ProviderRuntimeMetricsSnapshot {
+        request_count: 0,
+        error_count: 0,
+        error_rate_bps: 0,
+        total_retry_attempts: 0,
+        total_prompt_tokens: 0,
+        total_completion_tokens: 0,
+        avg_prompt_tokens_per_run: 0,
+        avg_completion_tokens_per_run: 0,
+        last_latency_ms: 0,
+        avg_latency_ms: 0,
+        max_latency_ms: 0,
+    }
+}
+
+fn registry_snapshot_from_config(
+    config: &ModelProviderConfig,
+    runtime_status: &ProviderStatusSnapshot,
+) -> ProviderRegistrySnapshot {
+    let Ok(registry) = config.normalized_registry() else {
+        return ProviderRegistrySnapshot {
+            default_chat_model_id: None,
+            default_embeddings_model_id: None,
+            default_audio_transcription_model_id: None,
+            failover_enabled: false,
+            response_cache_enabled: false,
+            providers: Vec::new(),
+            models: Vec::new(),
+        };
+    };
+
+    let providers = registry
+        .providers
+        .iter()
+        .map(|provider| ProviderRegistryProviderSnapshot {
+            provider_id: provider.provider_id.clone(),
+            display_name: provider
+                .display_name
+                .clone()
+                .unwrap_or_else(|| provider.kind.as_str().replace('_', " ")),
+            kind: provider.kind.as_str().to_owned(),
+            enabled: provider.enabled,
+            endpoint_base_url: provider.base_url.clone(),
+            auth_profile_id: provider.auth_profile_id.clone(),
+            auth_profile_provider_kind: provider
+                .auth_profile_provider_kind
+                .map(|kind| kind.as_str().to_owned()),
+            credential_source: provider.credential_source.map(|source| source.as_str().to_owned()),
+            api_key_configured: provider.api_key.is_some(),
+            retry_policy: ProviderRetryPolicySnapshot {
+                max_retries: provider.max_retries,
+                retry_backoff_ms: provider.retry_backoff_ms,
+            },
+            circuit_breaker: if provider.provider_id == runtime_status.provider_id {
+                runtime_status.circuit_breaker.clone()
+            } else {
+                ProviderCircuitBreakerSnapshot {
+                    failure_threshold: provider.circuit_breaker_failure_threshold,
+                    cooldown_ms: provider.circuit_breaker_cooldown_ms,
+                    consecutive_failures: 0,
+                    open: false,
+                }
+            },
+            runtime_metrics: if provider.provider_id == runtime_status.provider_id {
+                runtime_status.runtime_metrics.clone()
+            } else {
+                ProviderRuntimeMetricsSnapshot {
+                    request_count: 0,
+                    error_count: 0,
+                    error_rate_bps: 0,
+                    total_retry_attempts: 0,
+                    total_prompt_tokens: 0,
+                    total_completion_tokens: 0,
+                    avg_prompt_tokens_per_run: 0,
+                    avg_completion_tokens_per_run: 0,
+                    last_latency_ms: 0,
+                    avg_latency_ms: 0,
+                    max_latency_ms: 0,
+                }
+            },
+            health: if provider.provider_id == runtime_status.provider_id {
+                runtime_status.health.clone()
+            } else if provider.api_key.is_some() || provider.auth_profile_id.is_some() {
+                empty_health_probe_snapshot("ok", "provider configured", "registry")
+            } else {
+                empty_health_probe_snapshot(
+                    "missing_auth",
+                    "provider has no credential reference",
+                    "registry",
+                )
+            },
+            discovery: if provider.provider_id == runtime_status.provider_id {
+                runtime_status.discovery.clone()
+            } else {
+                empty_discovery_snapshot("registry")
+            },
+        })
+        .collect::<Vec<_>>();
+
+    let models = registry
+        .models
+        .iter()
+        .map(|model| ProviderRegistryModelSnapshot {
+            model_id: model.model_id.clone(),
+            provider_id: model.provider_id.clone(),
+            role: model.role.as_str().to_owned(),
+            enabled: model.enabled,
+            capabilities: model.capabilities.clone(),
+        })
+        .collect::<Vec<_>>();
+
+    ProviderRegistrySnapshot {
+        default_chat_model_id: registry.default_chat_model_id,
+        default_embeddings_model_id: registry.default_embeddings_model_id,
+        default_audio_transcription_model_id: registry.default_audio_transcription_model_id,
+        failover_enabled: registry.failover_enabled,
+        response_cache_enabled: registry.response_cache_enabled,
+        providers,
+        models,
     }
 }
 
@@ -192,6 +850,20 @@ pub struct ProviderResponse {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub retry_count: u32,
+    pub provider_id: String,
+    pub model_id: String,
+    pub served_from_cache: bool,
+    pub failover_count: u32,
+    pub attempts: Vec<ProviderAttemptSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderAttemptSummary {
+    pub provider_id: String,
+    pub model_id: String,
+    pub outcome: String,
+    pub retryable: bool,
+    pub served_from_cache: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -243,6 +915,10 @@ pub enum ProviderError {
     )]
     MissingApiKey,
     #[error(
+        "anthropic provider requires PALYRA_MODEL_PROVIDER_ANTHROPIC_API_KEY, PALYRA_MODEL_PROVIDER_AUTH_PROFILE_ID, or model_provider.anthropic_api_key_vault_ref"
+    )]
+    MissingAnthropicApiKey,
+    #[error(
         "openai-compatible embeddings provider requires model_provider.openai_embeddings_model or PALYRA_MODEL_PROVIDER_OPENAI_EMBEDDINGS_MODEL"
     )]
     MissingEmbeddingsModel,
@@ -276,12 +952,24 @@ impl ProviderError {
     }
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderCapabilitiesSnapshot {
     pub streaming_tokens: bool,
     pub tool_calls: bool,
     pub json_mode: bool,
     pub vision: bool,
+    pub audio_transcribe: bool,
+    pub embeddings: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_context_tokens: Option<u32>,
+    pub cost_tier: String,
+    pub latency_tier: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recommended_use_cases: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub known_limitations: Vec<String>,
+    pub operator_override: bool,
+    pub metadata_source: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -314,13 +1002,90 @@ pub struct ProviderRuntimeMetricsSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ProviderHealthProbeSnapshot {
+    pub state: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checked_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ProviderDiscoverySnapshot {
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checked_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at_unix_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discovered_model_ids: Vec<String>,
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ProviderRegistryProviderSnapshot {
+    pub provider_id: String,
+    pub display_name: String,
+    pub kind: String,
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint_base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_profile_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_profile_provider_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_source: Option<String>,
+    pub api_key_configured: bool,
+    pub retry_policy: ProviderRetryPolicySnapshot,
+    pub circuit_breaker: ProviderCircuitBreakerSnapshot,
+    pub runtime_metrics: ProviderRuntimeMetricsSnapshot,
+    pub health: ProviderHealthProbeSnapshot,
+    pub discovery: ProviderDiscoverySnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ProviderRegistryModelSnapshot {
+    pub model_id: String,
+    pub provider_id: String,
+    pub role: String,
+    pub enabled: bool,
+    pub capabilities: ProviderCapabilitiesSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ProviderRegistrySnapshot {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_chat_model_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_embeddings_model_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_audio_transcription_model_id: Option<String>,
+    pub failover_enabled: bool,
+    pub response_cache_enabled: bool,
+    pub providers: Vec<ProviderRegistryProviderSnapshot>,
+    pub models: Vec<ProviderRegistryModelSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ProviderStatusSnapshot {
     pub kind: String,
+    pub provider_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
     pub capabilities: ProviderCapabilitiesSnapshot,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub openai_base_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub anthropic_base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub openai_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anthropic_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub openai_embeddings_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -335,6 +1100,9 @@ pub struct ProviderStatusSnapshot {
     pub retry_policy: ProviderRetryPolicySnapshot,
     pub circuit_breaker: ProviderCircuitBreakerSnapshot,
     pub runtime_metrics: ProviderRuntimeMetricsSnapshot,
+    pub health: ProviderHealthProbeSnapshot,
+    pub discovery: ProviderDiscoverySnapshot,
+    pub registry: ProviderRegistrySnapshot,
 }
 
 pub trait ModelProvider: Send + Sync {
@@ -358,13 +1126,7 @@ pub trait EmbeddingsProvider: Send + Sync {
 
 pub fn build_model_provider(config: &ModelProviderConfig) -> Result<Arc<dyn ModelProvider>> {
     validate_model_provider_config(config)?;
-
-    match config.kind {
-        ModelProviderKind::Deterministic => {
-            Ok(Arc::new(DeterministicProvider::new(config.clone())))
-        }
-        ModelProviderKind::OpenAiCompatible => Ok(Arc::new(OpenAiCompatibleProvider::new(config)?)),
-    }
+    Ok(Arc::new(RegistryBackedModelProvider::new(config.clone())?))
 }
 
 pub fn build_embeddings_provider(
@@ -379,6 +1141,9 @@ pub fn build_embeddings_provider(
         ModelProviderKind::OpenAiCompatible => {
             Ok(Arc::new(OpenAiCompatibleEmbeddingsProvider::new(config)?))
         }
+        ModelProviderKind::Anthropic => Err(anyhow::anyhow!(
+            "anthropic provider does not expose embeddings through the built-in adapter"
+        )),
     }
 }
 
@@ -395,12 +1160,22 @@ fn validate_model_provider_config(config: &ModelProviderConfig) -> Result<()> {
     if config.circuit_breaker_cooldown_ms == 0 {
         anyhow::bail!("model provider circuit breaker cooldown must be greater than 0ms");
     }
-    if config.kind == ModelProviderKind::OpenAiCompatible {
-        validate_openai_base_url_network_policy(
-            config.openai_base_url.as_str(),
-            config.allow_private_base_url,
-        )?;
+    match config.kind {
+        ModelProviderKind::OpenAiCompatible => {
+            validate_openai_base_url_network_policy(
+                config.openai_base_url.as_str(),
+                config.allow_private_base_url,
+            )?;
+        }
+        ModelProviderKind::Anthropic => {
+            validate_openai_base_url_network_policy(
+                config.anthropic_base_url.as_str(),
+                config.allow_private_base_url,
+            )?;
+        }
+        ModelProviderKind::Deterministic => {}
     }
+    let _ = config.normalized_registry()?;
     Ok(())
 }
 
@@ -491,6 +1266,737 @@ fn is_localhost_hostname(host: &str) -> bool {
     normalized == "localhost" || normalized.ends_with(".localhost")
 }
 
+struct RegistryProviderRuntime {
+    entry: ProviderRegistryEntryConfig,
+    provider: Arc<dyn ModelProvider>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedProviderResponse {
+    inserted_seq: u64,
+    expires_at: Instant,
+    response: ProviderResponse,
+}
+
+#[derive(Debug, Default)]
+struct ProviderResponseCacheState {
+    entries: HashMap<String, CachedProviderResponse>,
+    next_seq: u64,
+    hit_count: u64,
+    miss_count: u64,
+}
+
+struct RegistryBackedModelProvider {
+    config: ModelProviderConfig,
+    registry: ModelProviderRegistryConfig,
+    providers: HashMap<String, RegistryProviderRuntime>,
+    models: HashMap<String, ProviderModelEntryConfig>,
+    response_cache: Mutex<ProviderResponseCacheState>,
+    runtime_metrics: Mutex<ProviderRuntimeMetrics>,
+}
+
+impl RegistryBackedModelProvider {
+    fn new(config: ModelProviderConfig) -> Result<Self> {
+        let registry = config.normalized_registry()?;
+        let mut providers = HashMap::new();
+        let mut default_models_by_provider = HashMap::<String, String>::new();
+        for model in &registry.models {
+            if model.role == ProviderModelRole::Chat && model.enabled {
+                default_models_by_provider
+                    .entry(model.provider_id.clone())
+                    .or_insert_with(|| model.model_id.clone());
+            }
+        }
+        for entry in &registry.providers {
+            let provider = build_registry_provider_runtime(
+                &config,
+                &registry,
+                entry,
+                default_models_by_provider.get(entry.provider_id.as_str()).cloned(),
+            )?;
+            providers.insert(
+                entry.provider_id.clone(),
+                RegistryProviderRuntime { entry: entry.clone(), provider },
+            );
+        }
+        let models = registry
+            .models
+            .iter()
+            .cloned()
+            .map(|model| (model.model_id.clone(), model))
+            .collect::<HashMap<_, _>>();
+        Ok(Self {
+            config,
+            registry,
+            providers,
+            models,
+            response_cache: Mutex::new(ProviderResponseCacheState::default()),
+            runtime_metrics: Mutex::new(ProviderRuntimeMetrics::default()),
+        })
+    }
+
+    fn record_runtime_metrics(
+        &self,
+        error: bool,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        retry_count: u32,
+        latency_ms: u64,
+    ) {
+        let mut metrics = lock_runtime_metrics(&self.runtime_metrics);
+        metrics.record(error, prompt_tokens, completion_tokens, retry_count, latency_ms);
+    }
+
+    fn runtime_metrics_snapshot(&self) -> ProviderRuntimeMetricsSnapshot {
+        lock_runtime_metrics(&self.runtime_metrics).snapshot()
+    }
+
+    fn compatible_chat_models(&self, request: &ProviderRequest) -> Vec<&ProviderModelEntryConfig> {
+        self.registry
+            .models
+            .iter()
+            .filter(|model| {
+                model.enabled
+                    && model.role == ProviderModelRole::Chat
+                    && self
+                        .providers
+                        .get(model.provider_id.as_str())
+                        .is_some_and(|provider| provider.entry.enabled)
+                    && (!request.json_mode || model.capabilities.json_mode)
+                    && (!provider_request_has_vision(request) || model.capabilities.vision)
+            })
+            .collect()
+    }
+
+    fn candidate_order<'a>(
+        &'a self,
+        request: &ProviderRequest,
+    ) -> Result<Vec<&'a ProviderModelEntryConfig>, ProviderError> {
+        let compatible = self.compatible_chat_models(request);
+        if compatible.is_empty() {
+            if provider_request_has_vision(request) {
+                return Err(ProviderError::VisionUnsupported {
+                    provider: self
+                        .registry
+                        .default_chat_model_id
+                        .clone()
+                        .unwrap_or_else(|| self.config.kind.as_str().to_owned()),
+                });
+            }
+            return Err(ProviderError::RequestFailed {
+                message: "no enabled chat model matches the requested capability envelope"
+                    .to_owned(),
+                retryable: false,
+                retry_count: 0,
+            });
+        }
+
+        let requested_model_id = request
+            .model_override
+            .as_deref()
+            .or(self.registry.default_chat_model_id.as_deref())
+            .ok_or_else(|| ProviderError::RequestFailed {
+                message: "provider registry does not define a default chat model".to_owned(),
+                retryable: false,
+                retry_count: 0,
+            })?;
+        let primary = compatible
+            .iter()
+            .find(|model| model.model_id == requested_model_id)
+            .copied()
+            .ok_or_else(|| ProviderError::RequestFailed {
+                message: format!("requested chat model '{requested_model_id}' is unavailable"),
+                retryable: false,
+                retry_count: 0,
+            })?;
+
+        let mut fallbacks = compatible
+            .into_iter()
+            .filter(|model| model.model_id != primary.model_id)
+            .collect::<Vec<_>>();
+        fallbacks.sort_by(|left, right| {
+            fallback_cost_rank(left.capabilities.cost_tier.as_str())
+                .cmp(&fallback_cost_rank(right.capabilities.cost_tier.as_str()))
+                .then(
+                    fallback_latency_rank(left.capabilities.latency_tier.as_str())
+                        .cmp(&fallback_latency_rank(right.capabilities.latency_tier.as_str())),
+                )
+                .then_with(|| left.model_id.cmp(&right.model_id))
+        });
+        let mut ordered = vec![primary];
+        if self.registry.failover_enabled && request.model_override.is_none() {
+            ordered.extend(
+                fallbacks.into_iter().filter(|model| model.provider_id != primary.provider_id),
+            );
+        }
+        Ok(ordered)
+    }
+
+    fn response_cache_key(
+        &self,
+        request: &ProviderRequest,
+        model: &ProviderModelEntryConfig,
+    ) -> String {
+        let mut hasher = DefaultHasher::new();
+        model.provider_id.hash(&mut hasher);
+        model.model_id.hash(&mut hasher);
+        request.input_text.hash(&mut hasher);
+        request.json_mode.hash(&mut hasher);
+        for image in &request.vision_inputs {
+            image.mime_type.hash(&mut hasher);
+            image.bytes_base64.hash(&mut hasher);
+            image.file_name.hash(&mut hasher);
+            image.width_px.hash(&mut hasher);
+            image.height_px.hash(&mut hasher);
+            image.artifact_id.hash(&mut hasher);
+        }
+        format!("{:016x}", hasher.finish())
+    }
+
+    fn lookup_cached_response(
+        &self,
+        cache_key: &str,
+        model: &ProviderModelEntryConfig,
+    ) -> Option<ProviderResponse> {
+        if !self.registry.response_cache_enabled {
+            return None;
+        }
+        let mut cache = match self.response_cache.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let Some(entry) = cache.entries.get(cache_key).cloned() else {
+            cache.miss_count = cache.miss_count.saturating_add(1);
+            return None;
+        };
+        if entry.expires_at <= Instant::now() {
+            cache.entries.remove(cache_key);
+            cache.miss_count = cache.miss_count.saturating_add(1);
+            return None;
+        }
+        cache.hit_count = cache.hit_count.saturating_add(1);
+        let mut response = entry.response;
+        response.provider_id = model.provider_id.clone();
+        response.model_id = model.model_id.clone();
+        response.retry_count = 0;
+        response.served_from_cache = true;
+        response.failover_count = 0;
+        response.attempts = vec![ProviderAttemptSummary {
+            provider_id: model.provider_id.clone(),
+            model_id: model.model_id.clone(),
+            outcome: "cache_hit".to_owned(),
+            retryable: false,
+            served_from_cache: true,
+        }];
+        Some(response)
+    }
+
+    fn insert_cached_response(&self, cache_key: String, response: &ProviderResponse) {
+        if !self.registry.response_cache_enabled
+            || response.served_from_cache
+            || response
+                .events
+                .iter()
+                .any(|event| matches!(event, ProviderEvent::ToolProposal { .. }))
+        {
+            return;
+        }
+        let mut cache = match self.response_cache.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        cache.next_seq = cache.next_seq.saturating_add(1);
+        let inserted_seq = cache.next_seq;
+        cache.entries.insert(
+            cache_key,
+            CachedProviderResponse {
+                inserted_seq,
+                expires_at: Instant::now()
+                    + Duration::from_millis(self.registry.response_cache_ttl_ms),
+                response: response.clone(),
+            },
+        );
+        while cache.entries.len() > self.registry.response_cache_max_entries {
+            let Some(oldest_key) = cache
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.inserted_seq)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            cache.entries.remove(oldest_key.as_str());
+        }
+    }
+
+    fn provider_statuses(&self) -> HashMap<String, ProviderStatusSnapshot> {
+        self.providers
+            .iter()
+            .map(|(provider_id, runtime)| {
+                let mut snapshot = runtime.provider.status_snapshot();
+                snapshot.provider_id = provider_id.clone();
+                if let Some(default_model_id) =
+                    default_model_for_provider(&self.registry, provider_id.as_str())
+                {
+                    snapshot.model_id = Some(default_model_id.clone());
+                    match runtime.entry.kind {
+                        ModelProviderKind::OpenAiCompatible => {
+                            snapshot.openai_model = Some(default_model_id);
+                        }
+                        ModelProviderKind::Anthropic => {
+                            snapshot.anthropic_model = Some(default_model_id);
+                        }
+                        ModelProviderKind::Deterministic => {}
+                    }
+                }
+                if snapshot.discovery.discovered_model_ids.is_empty() {
+                    snapshot.discovery.status = "ok".to_owned();
+                    snapshot.discovery.discovered_model_ids = self
+                        .registry
+                        .models
+                        .iter()
+                        .filter(|model| model.provider_id == *provider_id)
+                        .map(|model| model.model_id.clone())
+                        .collect();
+                    snapshot.discovery.source = "registry".to_owned();
+                    snapshot.discovery.message =
+                        Some("serving configured registry models".to_owned());
+                }
+                (provider_id.clone(), snapshot)
+            })
+            .collect()
+    }
+}
+
+impl ModelProvider for RegistryBackedModelProvider {
+    fn complete<'a>(
+        &'a self,
+        request: ProviderRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<ProviderResponse, ProviderError>> + Send + 'a>> {
+        Box::pin(async move {
+            let started_at = Instant::now();
+            let candidates = match self.candidate_order(&request) {
+                Ok(candidates) => candidates,
+                Err(error) => {
+                    self.record_runtime_metrics(
+                        true,
+                        0,
+                        0,
+                        error.retry_count(),
+                        elapsed_millis_since(started_at),
+                    );
+                    return Err(error);
+                }
+            };
+            let mut attempts = Vec::new();
+            let mut failover_count = 0_u32;
+            let mut last_error = None;
+
+            for (index, model) in candidates.iter().enumerate() {
+                let runtime = self
+                    .providers
+                    .get(model.provider_id.as_str())
+                    .ok_or(ProviderError::StatePoisoned)?;
+                let cache_key = self.response_cache_key(&request, model);
+                if let Some(mut cached) = self.lookup_cached_response(cache_key.as_str(), model) {
+                    cached.failover_count = failover_count;
+                    cached.attempts =
+                        attempts.into_iter().chain(cached.attempts.into_iter()).collect();
+                    self.record_runtime_metrics(
+                        false,
+                        cached.prompt_tokens,
+                        cached.completion_tokens,
+                        cached.retry_count,
+                        elapsed_millis_since(started_at),
+                    );
+                    return Ok(cached);
+                }
+
+                let mut provider_request = request.clone();
+                provider_request.model_override = Some(model.model_id.clone());
+                match runtime.provider.complete(provider_request).await {
+                    Ok(mut response) => {
+                        response.provider_id = model.provider_id.clone();
+                        response.model_id = model.model_id.clone();
+                        response.served_from_cache = false;
+                        response.failover_count = failover_count;
+                        attempts.push(ProviderAttemptSummary {
+                            provider_id: model.provider_id.clone(),
+                            model_id: model.model_id.clone(),
+                            outcome: if index == 0 {
+                                "success".to_owned()
+                            } else {
+                                "failover_success".to_owned()
+                            },
+                            retryable: false,
+                            served_from_cache: false,
+                        });
+                        response.attempts = attempts;
+                        self.insert_cached_response(cache_key, &response);
+                        self.record_runtime_metrics(
+                            false,
+                            response.prompt_tokens,
+                            response.completion_tokens,
+                            response.retry_count,
+                            elapsed_millis_since(started_at),
+                        );
+                        return Ok(response);
+                    }
+                    Err(error) => {
+                        let retryable = matches!(
+                            error,
+                            ProviderError::CircuitOpen { .. }
+                                | ProviderError::RequestFailed { retryable: true, .. }
+                                | ProviderError::MissingApiKey
+                                | ProviderError::MissingAnthropicApiKey
+                        );
+                        attempts.push(ProviderAttemptSummary {
+                            provider_id: model.provider_id.clone(),
+                            model_id: model.model_id.clone(),
+                            outcome: "error".to_owned(),
+                            retryable,
+                            served_from_cache: false,
+                        });
+                        last_error = Some(error);
+                        if index + 1 < candidates.len() {
+                            failover_count = failover_count.saturating_add(1);
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            let error = last_error.unwrap_or(ProviderError::StatePoisoned);
+            self.record_runtime_metrics(
+                true,
+                0,
+                0,
+                error.retry_count(),
+                elapsed_millis_since(started_at),
+            );
+            Err(error)
+        })
+    }
+
+    fn transcribe_audio<'a>(
+        &'a self,
+        request: AudioTranscriptionRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<AudioTranscriptionResponse, ProviderError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let model_id =
+                self.registry.default_audio_transcription_model_id.clone().ok_or_else(|| {
+                    ProviderError::RequestFailed {
+                        message: "provider registry does not define an audio transcription model"
+                            .to_owned(),
+                        retryable: false,
+                        retry_count: 0,
+                    }
+                })?;
+            let model = self.models.get(model_id.as_str()).ok_or(ProviderError::StatePoisoned)?;
+            let runtime = self
+                .providers
+                .get(model.provider_id.as_str())
+                .ok_or(ProviderError::StatePoisoned)?;
+            runtime.provider.transcribe_audio(request).await
+        })
+    }
+
+    fn status_snapshot(&self) -> ProviderStatusSnapshot {
+        let statuses = self.provider_statuses();
+        let default_model_id = self.registry.default_chat_model_id.clone().or_else(|| {
+            self.registry
+                .models
+                .iter()
+                .find(|model| model.role == ProviderModelRole::Chat)
+                .map(|model| model.model_id.clone())
+        });
+        let default_model =
+            default_model_id.as_ref().and_then(|model_id| self.models.get(model_id.as_str()));
+        let default_provider_id = default_model
+            .map(|model| model.provider_id.clone())
+            .or_else(|| {
+                self.registry.providers.first().map(|provider| provider.provider_id.clone())
+            })
+            .unwrap_or_else(|| "unknown".to_owned());
+        let default_provider_entry = self
+            .registry
+            .providers
+            .iter()
+            .find(|provider| provider.provider_id == default_provider_id);
+        let default_provider_status = statuses.get(default_provider_id.as_str());
+        let mut providers = Vec::new();
+        for provider in &self.registry.providers {
+            let runtime_status = statuses.get(provider.provider_id.as_str());
+            providers.push(ProviderRegistryProviderSnapshot {
+                provider_id: provider.provider_id.clone(),
+                display_name: provider
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| provider.kind.as_str().replace('_', " ")),
+                kind: provider.kind.as_str().to_owned(),
+                enabled: provider.enabled,
+                endpoint_base_url: provider.base_url.clone(),
+                auth_profile_id: provider.auth_profile_id.clone(),
+                auth_profile_provider_kind: provider
+                    .auth_profile_provider_kind
+                    .map(|kind| kind.as_str().to_owned()),
+                credential_source: provider
+                    .credential_source
+                    .map(|source| source.as_str().to_owned()),
+                api_key_configured: provider.api_key.is_some()
+                    || provider.api_key_vault_ref.is_some()
+                    || provider.auth_profile_id.is_some(),
+                retry_policy: ProviderRetryPolicySnapshot {
+                    max_retries: provider.max_retries,
+                    retry_backoff_ms: provider.retry_backoff_ms,
+                },
+                circuit_breaker: runtime_status
+                    .map(|snapshot| snapshot.circuit_breaker.clone())
+                    .unwrap_or(ProviderCircuitBreakerSnapshot {
+                        failure_threshold: provider.circuit_breaker_failure_threshold,
+                        cooldown_ms: provider.circuit_breaker_cooldown_ms,
+                        consecutive_failures: 0,
+                        open: false,
+                    }),
+                runtime_metrics: runtime_status
+                    .map(|snapshot| snapshot.runtime_metrics.clone())
+                    .unwrap_or_else(empty_runtime_metrics_snapshot),
+                health: runtime_status.map(|snapshot| snapshot.health.clone()).unwrap_or_else(
+                    || {
+                        empty_health_probe_snapshot(
+                            "unknown",
+                            "provider has not been probed yet",
+                            "registry",
+                        )
+                    },
+                ),
+                discovery: runtime_status
+                    .map(|snapshot| snapshot.discovery.clone())
+                    .unwrap_or_else(|| empty_discovery_snapshot("registry")),
+            });
+        }
+        let models = self
+            .registry
+            .models
+            .iter()
+            .map(|model| ProviderRegistryModelSnapshot {
+                model_id: model.model_id.clone(),
+                provider_id: model.provider_id.clone(),
+                role: model.role.as_str().to_owned(),
+                enabled: model.enabled,
+                capabilities: model.capabilities.clone(),
+            })
+            .collect::<Vec<_>>();
+
+        ProviderStatusSnapshot {
+            kind: default_provider_entry
+                .map(|provider| provider.kind.as_str().to_owned())
+                .unwrap_or_else(|| self.config.kind.as_str().to_owned()),
+            provider_id: default_provider_id.clone(),
+            model_id: default_model_id.clone(),
+            capabilities: default_model.map(|model| model.capabilities.clone()).unwrap_or_else(
+                || capability_defaults_for_kind(self.config.kind, ProviderModelRole::Chat),
+            ),
+            openai_base_url: default_provider_entry
+                .filter(|provider| provider.kind == ModelProviderKind::OpenAiCompatible)
+                .and_then(|provider| provider.base_url.clone()),
+            anthropic_base_url: default_provider_entry
+                .filter(|provider| provider.kind == ModelProviderKind::Anthropic)
+                .and_then(|provider| provider.base_url.clone()),
+            openai_model: default_provider_entry
+                .filter(|provider| provider.kind == ModelProviderKind::OpenAiCompatible)
+                .and_then(|_| default_model_id.clone()),
+            anthropic_model: default_provider_entry
+                .filter(|provider| provider.kind == ModelProviderKind::Anthropic)
+                .and_then(|_| default_model_id.clone()),
+            openai_embeddings_model: self.registry.default_embeddings_model_id.clone(),
+            openai_embeddings_dims: None,
+            auth_profile_id: default_provider_entry
+                .and_then(|provider| provider.auth_profile_id.clone()),
+            auth_profile_provider_kind: default_provider_entry.and_then(|provider| {
+                provider.auth_profile_provider_kind.map(|kind| kind.as_str().to_owned())
+            }),
+            credential_source: default_provider_entry.and_then(|provider| {
+                provider.credential_source.map(|source| source.as_str().to_owned())
+            }),
+            api_key_configured: default_provider_entry.is_some_and(|provider| {
+                provider.api_key.is_some()
+                    || provider.api_key_vault_ref.is_some()
+                    || provider.auth_profile_id.is_some()
+            }),
+            retry_policy: default_provider_entry
+                .map(|provider| ProviderRetryPolicySnapshot {
+                    max_retries: provider.max_retries,
+                    retry_backoff_ms: provider.retry_backoff_ms,
+                })
+                .unwrap_or(ProviderRetryPolicySnapshot {
+                    max_retries: self.config.max_retries,
+                    retry_backoff_ms: self.config.retry_backoff_ms,
+                }),
+            circuit_breaker: default_provider_status
+                .map(|snapshot| snapshot.circuit_breaker.clone())
+                .unwrap_or(ProviderCircuitBreakerSnapshot {
+                    failure_threshold: self.config.circuit_breaker_failure_threshold,
+                    cooldown_ms: self.config.circuit_breaker_cooldown_ms,
+                    consecutive_failures: 0,
+                    open: false,
+                }),
+            runtime_metrics: self.runtime_metrics_snapshot(),
+            health: default_provider_status.map(|snapshot| snapshot.health.clone()).unwrap_or_else(
+                || {
+                    empty_health_probe_snapshot(
+                        "unknown",
+                        "provider has not been probed yet",
+                        "registry",
+                    )
+                },
+            ),
+            discovery: default_provider_status
+                .map(|snapshot| snapshot.discovery.clone())
+                .unwrap_or_else(|| empty_discovery_snapshot("registry")),
+            registry: ProviderRegistrySnapshot {
+                default_chat_model_id: self.registry.default_chat_model_id.clone(),
+                default_embeddings_model_id: self.registry.default_embeddings_model_id.clone(),
+                default_audio_transcription_model_id: self
+                    .registry
+                    .default_audio_transcription_model_id
+                    .clone(),
+                failover_enabled: self.registry.failover_enabled,
+                response_cache_enabled: self.registry.response_cache_enabled,
+                providers,
+                models,
+            },
+        }
+    }
+}
+
+fn default_model_for_provider(
+    registry: &ModelProviderRegistryConfig,
+    provider_id: &str,
+) -> Option<String> {
+    registry
+        .models
+        .iter()
+        .find(|model| {
+            model.provider_id == provider_id
+                && model.role == ProviderModelRole::Chat
+                && model.enabled
+        })
+        .map(|model| model.model_id.clone())
+}
+
+fn fallback_cost_rank(value: &str) -> u8 {
+    match value {
+        "low" => 0,
+        "standard" => 1,
+        "premium" => 2,
+        _ => 3,
+    }
+}
+
+fn fallback_latency_rank(value: &str) -> u8 {
+    match value {
+        "low" => 0,
+        "standard" => 1,
+        "high" => 2,
+        _ => 3,
+    }
+}
+
+fn build_registry_provider_runtime(
+    base_config: &ModelProviderConfig,
+    registry: &ModelProviderRegistryConfig,
+    entry: &ProviderRegistryEntryConfig,
+    default_chat_model_id: Option<String>,
+) -> Result<Arc<dyn ModelProvider>> {
+    let mut config = ModelProviderConfig {
+        kind: entry.kind,
+        openai_base_url: entry
+            .base_url
+            .clone()
+            .unwrap_or_else(|| base_config.openai_base_url.clone()),
+        anthropic_base_url: entry
+            .base_url
+            .clone()
+            .unwrap_or_else(|| base_config.anthropic_base_url.clone()),
+        allow_private_base_url: entry.allow_private_base_url,
+        openai_model: default_chat_model_id
+            .clone()
+            .unwrap_or_else(|| base_config.openai_model.clone()),
+        anthropic_model: default_chat_model_id
+            .clone()
+            .unwrap_or_else(|| base_config.anthropic_model.clone()),
+        openai_embeddings_model: registry
+            .models
+            .iter()
+            .find(|model| {
+                model.provider_id == entry.provider_id
+                    && model.role == ProviderModelRole::Embeddings
+                    && model.enabled
+            })
+            .map(|model| model.model_id.clone()),
+        openai_embeddings_dims: None,
+        openai_api_key: None,
+        openai_api_key_vault_ref: None,
+        anthropic_api_key: None,
+        anthropic_api_key_vault_ref: None,
+        auth_profile_id: entry
+            .auth_profile_id
+            .clone()
+            .or_else(|| base_config.auth_profile_id.clone()),
+        auth_profile_provider_kind: entry
+            .auth_profile_provider_kind
+            .or(base_config.auth_profile_provider_kind),
+        credential_source: entry.credential_source.or(base_config.credential_source),
+        request_timeout_ms: entry.request_timeout_ms,
+        max_retries: entry.max_retries,
+        retry_backoff_ms: entry.retry_backoff_ms,
+        circuit_breaker_failure_threshold: entry.circuit_breaker_failure_threshold,
+        circuit_breaker_cooldown_ms: entry.circuit_breaker_cooldown_ms,
+        registry: ModelProviderRegistryConfig::default(),
+    };
+    match entry.kind {
+        ModelProviderKind::Deterministic => {
+            Ok(Arc::new(DeterministicProvider::new(config)) as Arc<dyn ModelProvider>)
+        }
+        ModelProviderKind::OpenAiCompatible => {
+            config.openai_api_key = entry.api_key.clone().or_else(|| {
+                if base_config.kind == ModelProviderKind::OpenAiCompatible {
+                    base_config.openai_api_key.clone()
+                } else {
+                    None
+                }
+            });
+            config.openai_api_key_vault_ref = entry.api_key_vault_ref.clone().or_else(|| {
+                if base_config.kind == ModelProviderKind::OpenAiCompatible {
+                    base_config.openai_api_key_vault_ref.clone()
+                } else {
+                    None
+                }
+            });
+            Ok(Arc::new(OpenAiCompatibleProvider::new(&config)?) as Arc<dyn ModelProvider>)
+        }
+        ModelProviderKind::Anthropic => {
+            config.anthropic_api_key = entry.api_key.clone().or_else(|| {
+                if base_config.kind == ModelProviderKind::Anthropic {
+                    base_config.anthropic_api_key.clone()
+                } else {
+                    None
+                }
+            });
+            config.anthropic_api_key_vault_ref = entry.api_key_vault_ref.clone().or_else(|| {
+                if base_config.kind == ModelProviderKind::Anthropic {
+                    base_config.anthropic_api_key_vault_ref.clone()
+                } else {
+                    None
+                }
+            });
+            Ok(Arc::new(AnthropicProvider::new(&config)?) as Arc<dyn ModelProvider>)
+        }
+    }
+}
+
 #[derive(Debug)]
 struct DeterministicProvider {
     config: ModelProviderConfig,
@@ -555,6 +2061,8 @@ impl ModelProvider for DeterministicProvider {
                 .collect::<Vec<_>>();
             let prompt_tokens = estimate_token_count(request.input_text.as_str());
             let completion_tokens = token_count as u64;
+            let actual_model_id =
+                request.model_override.clone().unwrap_or_else(|| "deterministic".to_owned());
             self.record_runtime_metrics(
                 false,
                 prompt_tokens,
@@ -562,7 +2070,23 @@ impl ModelProvider for DeterministicProvider {
                 0,
                 elapsed_millis_since(started_at),
             );
-            Ok(ProviderResponse { events, prompt_tokens, completion_tokens, retry_count: 0 })
+            Ok(ProviderResponse {
+                events,
+                prompt_tokens,
+                completion_tokens,
+                retry_count: 0,
+                provider_id: "deterministic-primary".to_owned(),
+                model_id: actual_model_id.clone(),
+                served_from_cache: false,
+                failover_count: 0,
+                attempts: vec![ProviderAttemptSummary {
+                    provider_id: "deterministic-primary".to_owned(),
+                    model_id: actual_model_id,
+                    outcome: "success".to_owned(),
+                    retryable: false,
+                    served_from_cache: false,
+                }],
+            })
         })
     }
 
@@ -582,16 +2106,32 @@ impl ModelProvider for DeterministicProvider {
     }
 
     fn status_snapshot(&self) -> ProviderStatusSnapshot {
-        ProviderStatusSnapshot {
+        let mut snapshot = ProviderStatusSnapshot {
             kind: self.config.kind.as_str().to_owned(),
+            provider_id: "deterministic-primary".to_owned(),
+            model_id: Some("deterministic".to_owned()),
             capabilities: ProviderCapabilitiesSnapshot {
                 streaming_tokens: true,
                 tool_calls: false,
                 json_mode: true,
                 vision: false,
+                audio_transcribe: false,
+                embeddings: false,
+                max_context_tokens: Some(8_192),
+                cost_tier: ProviderCostTier::Low.as_str().to_owned(),
+                latency_tier: ProviderLatencyTier::Low.as_str().to_owned(),
+                recommended_use_cases: vec![
+                    "offline testing".to_owned(),
+                    "deterministic smoke flows".to_owned(),
+                ],
+                known_limitations: vec!["vision unsupported".to_owned()],
+                operator_override: false,
+                metadata_source: ProviderMetadataSource::Static.as_str().to_owned(),
             },
             openai_base_url: None,
+            anthropic_base_url: None,
             openai_model: None,
+            anthropic_model: None,
             openai_embeddings_model: None,
             openai_embeddings_dims: None,
             auth_profile_id: self.config.auth_profile_id.clone(),
@@ -615,7 +2155,31 @@ impl ModelProvider for DeterministicProvider {
                 open: false,
             },
             runtime_metrics: self.runtime_metrics_snapshot(),
-        }
+            health: empty_health_probe_snapshot(
+                "ok",
+                "deterministic provider is always available",
+                "static",
+            ),
+            discovery: ProviderDiscoverySnapshot {
+                status: "static".to_owned(),
+                checked_at_unix_ms: None,
+                expires_at_unix_ms: None,
+                discovered_model_ids: vec!["deterministic".to_owned()],
+                source: "static".to_owned(),
+                message: None,
+            },
+            registry: ProviderRegistrySnapshot {
+                default_chat_model_id: Some("deterministic".to_owned()),
+                default_embeddings_model_id: None,
+                default_audio_transcription_model_id: None,
+                failover_enabled: false,
+                response_cache_enabled: true,
+                providers: Vec::new(),
+                models: Vec::new(),
+            },
+        };
+        snapshot.registry = registry_snapshot_from_config(&self.config, &snapshot);
+        snapshot
     }
 }
 
@@ -755,6 +2319,28 @@ struct OpenAiAudioTranscriptionSegment {
     text: String,
     #[serde(default)]
     avg_logprob: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicMessagesResponse {
+    #[serde(default)]
+    content: Vec<AnthropicContentBlock>,
+    #[serde(default)]
+    stop_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicContentBlock {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    input: Option<Value>,
 }
 
 #[derive(Debug)]
@@ -1147,12 +2733,25 @@ impl OpenAiCompatibleProvider {
         for (index, token) in tokens.into_iter().enumerate() {
             events.push(ProviderEvent::ModelToken { token, is_final: index + 1 == token_count });
         }
+        let actual_model_id =
+            request.model_override.clone().unwrap_or_else(|| self.config.openai_model.clone());
 
         Ok(ProviderResponse {
             events,
             prompt_tokens: estimate_token_count(request.input_text.as_str()),
             completion_tokens,
             retry_count: 0,
+            provider_id: "openai-primary".to_owned(),
+            model_id: actual_model_id.clone(),
+            served_from_cache: false,
+            failover_count: 0,
+            attempts: vec![ProviderAttemptSummary {
+                provider_id: "openai-primary".to_owned(),
+                model_id: actual_model_id,
+                outcome: "success".to_owned(),
+                retryable: false,
+                served_from_cache: false,
+            }],
         })
     }
 
@@ -1383,16 +2982,33 @@ impl ModelProvider for OpenAiCompatibleProvider {
                 (state.consecutive_failures, open)
             })
             .unwrap_or((0, false));
-        ProviderStatusSnapshot {
+        let mut snapshot = ProviderStatusSnapshot {
             kind: self.config.kind.as_str().to_owned(),
+            provider_id: "openai-primary".to_owned(),
+            model_id: Some(self.config.openai_model.clone()),
             capabilities: ProviderCapabilitiesSnapshot {
                 streaming_tokens: true,
                 tool_calls: true,
                 json_mode: true,
                 vision: true,
+                audio_transcribe: true,
+                embeddings: self.config.openai_embeddings_model.is_some(),
+                max_context_tokens: Some(128_000),
+                cost_tier: ProviderCostTier::Standard.as_str().to_owned(),
+                latency_tier: ProviderLatencyTier::Standard.as_str().to_owned(),
+                recommended_use_cases: vec![
+                    "general chat".to_owned(),
+                    "JSON workflows".to_owned(),
+                    "vision requests".to_owned(),
+                ],
+                known_limitations: vec![],
+                operator_override: false,
+                metadata_source: ProviderMetadataSource::Static.as_str().to_owned(),
             },
             openai_base_url: Some(self.config.openai_base_url.clone()),
+            anthropic_base_url: None,
             openai_model: Some(self.config.openai_model.clone()),
+            anthropic_model: None,
             openai_embeddings_model: self.config.openai_embeddings_model.clone(),
             openai_embeddings_dims: self.config.openai_embeddings_dims,
             auth_profile_id: self.config.auth_profile_id.clone(),
@@ -1416,7 +3032,418 @@ impl ModelProvider for OpenAiCompatibleProvider {
                 open,
             },
             runtime_metrics: self.runtime_metrics_snapshot(),
+            health: if self.config.openai_api_key.is_some() || self.config.auth_profile_id.is_some()
+            {
+                empty_health_probe_snapshot("ok", "provider configured", "runtime")
+            } else {
+                empty_health_probe_snapshot("missing_auth", "provider has no credential", "runtime")
+            },
+            discovery: ProviderDiscoverySnapshot {
+                status: "static".to_owned(),
+                checked_at_unix_ms: None,
+                expires_at_unix_ms: None,
+                discovered_model_ids: std::iter::once(self.config.openai_model.clone())
+                    .chain(self.config.openai_embeddings_model.clone())
+                    .collect(),
+                source: "static".to_owned(),
+                message: None,
+            },
+            registry: ProviderRegistrySnapshot {
+                default_chat_model_id: Some(self.config.openai_model.clone()),
+                default_embeddings_model_id: self.config.openai_embeddings_model.clone(),
+                default_audio_transcription_model_id: Some(
+                    self.transcription_model_name().to_owned(),
+                ),
+                failover_enabled: true,
+                response_cache_enabled: true,
+                providers: Vec::new(),
+                models: Vec::new(),
+            },
+        };
+        snapshot.registry = registry_snapshot_from_config(&self.config, &snapshot);
+        snapshot
+    }
+}
+
+#[derive(Debug)]
+struct AnthropicProvider {
+    config: ModelProviderConfig,
+    client: Client,
+    circuit_state: Mutex<CircuitBreakerState>,
+    runtime_metrics: Mutex<ProviderRuntimeMetrics>,
+}
+
+impl AnthropicProvider {
+    fn new(config: &ModelProviderConfig) -> Result<Self> {
+        let client = Client::builder()
+            .timeout(Duration::from_millis(config.request_timeout_ms))
+            .build()
+            .context("failed to build anthropic provider HTTP client")?;
+        Ok(Self {
+            config: config.clone(),
+            client,
+            circuit_state: Mutex::new(CircuitBreakerState {
+                consecutive_failures: 0,
+                open_until: None,
+            }),
+            runtime_metrics: Mutex::new(ProviderRuntimeMetrics::default()),
+        })
+    }
+
+    fn record_runtime_metrics(
+        &self,
+        error: bool,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        retry_count: u32,
+        latency_ms: u64,
+    ) {
+        let mut metrics = lock_runtime_metrics(&self.runtime_metrics);
+        metrics.record(error, prompt_tokens, completion_tokens, retry_count, latency_ms);
+    }
+
+    fn runtime_metrics_snapshot(&self) -> ProviderRuntimeMetricsSnapshot {
+        lock_runtime_metrics(&self.runtime_metrics).snapshot()
+    }
+
+    fn ensure_circuit_closed(&self) -> Result<(), ProviderError> {
+        let now = Instant::now();
+        let mut state = self.circuit_state.lock().map_err(|_| ProviderError::StatePoisoned)?;
+        if let Some(open_until) = state.open_until {
+            if now < open_until {
+                let retry_after_ms = open_until.saturating_duration_since(now).as_millis() as u64;
+                return Err(ProviderError::CircuitOpen { retry_after_ms });
+            }
+            state.open_until = None;
+            state.consecutive_failures = 0;
         }
+        Ok(())
+    }
+
+    fn record_success(&self) -> Result<(), ProviderError> {
+        let mut state = self.circuit_state.lock().map_err(|_| ProviderError::StatePoisoned)?;
+        state.consecutive_failures = 0;
+        state.open_until = None;
+        Ok(())
+    }
+
+    fn record_failure(&self) -> Result<(), ProviderError> {
+        let mut state = self.circuit_state.lock().map_err(|_| ProviderError::StatePoisoned)?;
+        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        if state.consecutive_failures >= self.config.circuit_breaker_failure_threshold {
+            state.open_until = Some(
+                Instant::now() + Duration::from_millis(self.config.circuit_breaker_cooldown_ms),
+            );
+        }
+        Ok(())
+    }
+
+    fn backoff_for_retry(&self, retry_index: u32) -> Duration {
+        let exponent = retry_index.min(8);
+        let multiplier = 1_u64 << exponent;
+        Duration::from_millis(self.config.retry_backoff_ms.saturating_mul(multiplier))
+    }
+
+    fn messages_endpoint(&self) -> String {
+        format!(
+            "{}{}",
+            self.config.anthropic_base_url.trim_end_matches('/'),
+            ANTHROPIC_MESSAGES_PATH
+        )
+    }
+
+    async fn request_once(
+        &self,
+        api_key: &str,
+        request: &ProviderRequest,
+    ) -> Result<ProviderResponse, AttemptError> {
+        let model_name =
+            request.model_override.clone().unwrap_or_else(|| self.config.anthropic_model.clone());
+        let mut content = vec![json!({
+            "type": "text",
+            "text": request.input_text,
+        })];
+        for image in &request.vision_inputs {
+            content.push(json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": image.mime_type,
+                    "data": image.bytes_base64,
+                }
+            }));
+        }
+        let mut body = json!({
+            "model": model_name,
+            "max_tokens": 2048,
+            "messages": [{
+                "role": "user",
+                "content": content,
+            }],
+        });
+        if request.json_mode {
+            body["system"] = json!("Return valid JSON only.");
+        }
+
+        let response = self
+            .client
+            .post(self.messages_endpoint())
+            .header("x-api-key", api_key)
+            .header("anthropic-version", ANTHROPIC_API_VERSION)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| {
+                AttemptError::request_failed(format!("anthropic request failed: {error}"), true)
+            })?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let retryable = OPENAI_RETRYABLE_STATUS_CODES.contains(&status);
+            let body_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<anthropic error body unavailable>".to_owned());
+            return Err(AttemptError::request_failed(
+                format!(
+                    "anthropic endpoint returned HTTP {status}: {}",
+                    sanitize_remote_error(&body_text)
+                ),
+                retryable,
+            ));
+        }
+
+        let parsed = response.json::<AnthropicMessagesResponse>().await.map_err(|error| {
+            AttemptError::invalid_response(format!(
+                "anthropic response JSON parsing failed: {error}"
+            ))
+        })?;
+        let mut events = Vec::new();
+        let mut completion_fragments = Vec::new();
+        for block in parsed.content {
+            match block.kind.as_str() {
+                "text" => {
+                    if let Some(text) = block.text.and_then(|value| trim_to_option(value)) {
+                        completion_fragments.push(text);
+                    }
+                }
+                "tool_use" => {
+                    let Some(tool_name) = block.name else {
+                        continue;
+                    };
+                    let input_json = serde_json::to_vec(
+                        &block.input.unwrap_or(Value::Object(serde_json::Map::new())),
+                    )
+                    .map_err(|error| {
+                        AttemptError::invalid_response(format!(
+                            "anthropic tool payload serialization failed: {error}"
+                        ))
+                    })?;
+                    events.push(ProviderEvent::ToolProposal {
+                        proposal_id: block.id.unwrap_or_else(|| Ulid::new().to_string()),
+                        tool_name,
+                        input_json,
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        let completion_text = completion_fragments.join("\n");
+        let mut completion_tokens = 0_u64;
+        let mut tokens = split_model_tokens(completion_text.as_str(), MAX_MODEL_TOKENS_PER_EVENT);
+        if tokens.is_empty() && events.is_empty() {
+            tokens.push(parsed.stop_reason.unwrap_or_else(|| "ack".to_owned()));
+        }
+        let token_count = tokens.len();
+        completion_tokens += token_count as u64;
+        for (index, token) in tokens.into_iter().enumerate() {
+            events.push(ProviderEvent::ModelToken { token, is_final: index + 1 == token_count });
+        }
+        let actual_model_id =
+            request.model_override.clone().unwrap_or_else(|| self.config.anthropic_model.clone());
+
+        Ok(ProviderResponse {
+            events,
+            prompt_tokens: estimate_token_count(request.input_text.as_str()),
+            completion_tokens,
+            retry_count: 0,
+            provider_id: "anthropic-primary".to_owned(),
+            model_id: actual_model_id.clone(),
+            served_from_cache: false,
+            failover_count: 0,
+            attempts: vec![ProviderAttemptSummary {
+                provider_id: "anthropic-primary".to_owned(),
+                model_id: actual_model_id,
+                outcome: "success".to_owned(),
+                retryable: false,
+                served_from_cache: false,
+            }],
+        })
+    }
+}
+
+impl ModelProvider for AnthropicProvider {
+    fn complete<'a>(
+        &'a self,
+        request: ProviderRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<ProviderResponse, ProviderError>> + Send + 'a>> {
+        Box::pin(async move {
+            let started_at = Instant::now();
+            let Some(api_key) = self.config.anthropic_api_key.as_ref() else {
+                self.record_runtime_metrics(true, 0, 0, 0, elapsed_millis_since(started_at));
+                return Err(ProviderError::MissingAnthropicApiKey);
+            };
+            if let Err(error) = self.ensure_circuit_closed() {
+                self.record_runtime_metrics(
+                    true,
+                    0,
+                    0,
+                    error.retry_count(),
+                    elapsed_millis_since(started_at),
+                );
+                return Err(error);
+            }
+
+            let mut retry_count = 0_u32;
+            for attempt in 0..=self.config.max_retries {
+                match self.request_once(api_key.as_str(), &request).await {
+                    Ok(mut response) => {
+                        self.record_success()?;
+                        response.retry_count = retry_count;
+                        self.record_runtime_metrics(
+                            false,
+                            response.prompt_tokens,
+                            response.completion_tokens,
+                            response.retry_count,
+                            elapsed_millis_since(started_at),
+                        );
+                        return Ok(response);
+                    }
+                    Err(error) => {
+                        let can_retry = error.retryable && attempt < self.config.max_retries;
+                        if can_retry {
+                            tokio::time::sleep(self.backoff_for_retry(retry_count)).await;
+                            retry_count = retry_count.saturating_add(1);
+                            continue;
+                        }
+
+                        self.record_failure()?;
+                        let provider_error = if error.invalid_response {
+                            ProviderError::InvalidResponse { message: error.message, retry_count }
+                        } else {
+                            ProviderError::RequestFailed {
+                                message: error.message,
+                                retryable: error.retryable,
+                                retry_count,
+                            }
+                        };
+                        self.record_runtime_metrics(
+                            true,
+                            0,
+                            0,
+                            provider_error.retry_count(),
+                            elapsed_millis_since(started_at),
+                        );
+                        return Err(provider_error);
+                    }
+                }
+            }
+
+            Err(ProviderError::RequestFailed {
+                message: "anthropic execution exhausted retries".to_owned(),
+                retryable: true,
+                retry_count,
+            })
+        })
+    }
+
+    fn transcribe_audio<'a>(
+        &'a self,
+        _request: AudioTranscriptionRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<AudioTranscriptionResponse, ProviderError>> + Send + 'a>>
+    {
+        Box::pin(async {
+            Err(ProviderError::RequestFailed {
+                message: "anthropic provider does not support audio transcription".to_owned(),
+                retryable: false,
+                retry_count: 0,
+            })
+        })
+    }
+
+    fn status_snapshot(&self) -> ProviderStatusSnapshot {
+        let (consecutive_failures, open) = self
+            .circuit_state
+            .lock()
+            .map(|state| {
+                let now = Instant::now();
+                let open = state.open_until.map(|until| now < until).unwrap_or(false);
+                (state.consecutive_failures, open)
+            })
+            .unwrap_or((0, false));
+        let mut snapshot = ProviderStatusSnapshot {
+            kind: self.config.kind.as_str().to_owned(),
+            provider_id: "anthropic-primary".to_owned(),
+            model_id: Some(self.config.anthropic_model.clone()),
+            capabilities: capability_defaults_for_kind(
+                ModelProviderKind::Anthropic,
+                ProviderModelRole::Chat,
+            ),
+            openai_base_url: None,
+            anthropic_base_url: Some(self.config.anthropic_base_url.clone()),
+            openai_model: None,
+            anthropic_model: Some(self.config.anthropic_model.clone()),
+            openai_embeddings_model: None,
+            openai_embeddings_dims: None,
+            auth_profile_id: self.config.auth_profile_id.clone(),
+            auth_profile_provider_kind: self
+                .config
+                .auth_profile_provider_kind
+                .map(|kind| kind.as_str().to_owned()),
+            credential_source: self
+                .config
+                .credential_source
+                .map(|source| source.as_str().to_owned()),
+            api_key_configured: self.config.anthropic_api_key.is_some(),
+            retry_policy: ProviderRetryPolicySnapshot {
+                max_retries: self.config.max_retries,
+                retry_backoff_ms: self.config.retry_backoff_ms,
+            },
+            circuit_breaker: ProviderCircuitBreakerSnapshot {
+                failure_threshold: self.config.circuit_breaker_failure_threshold,
+                cooldown_ms: self.config.circuit_breaker_cooldown_ms,
+                consecutive_failures,
+                open,
+            },
+            runtime_metrics: self.runtime_metrics_snapshot(),
+            health: if self.config.anthropic_api_key.is_some()
+                || self.config.auth_profile_id.is_some()
+            {
+                empty_health_probe_snapshot("ok", "provider configured", "runtime")
+            } else {
+                empty_health_probe_snapshot("missing_auth", "provider has no credential", "runtime")
+            },
+            discovery: ProviderDiscoverySnapshot {
+                status: "static".to_owned(),
+                checked_at_unix_ms: None,
+                expires_at_unix_ms: None,
+                discovered_model_ids: vec![self.config.anthropic_model.clone()],
+                source: "static".to_owned(),
+                message: None,
+            },
+            registry: ProviderRegistrySnapshot {
+                default_chat_model_id: Some(self.config.anthropic_model.clone()),
+                default_embeddings_model_id: None,
+                default_audio_transcription_model_id: None,
+                failover_enabled: true,
+                response_cache_enabled: true,
+                providers: Vec::new(),
+                models: Vec::new(),
+            },
+        };
+        snapshot.registry = registry_snapshot_from_config(&self.config, &snapshot);
+        snapshot
     }
 }
 
@@ -1595,6 +3622,15 @@ pub(crate) fn sanitize_remote_error(body: &str) -> String {
     }
 }
 
+fn trim_to_option(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    }
+}
+
 fn redact_remote_error_secrets(raw: &str) -> String {
     const REDACTED: &[u8] = b"<redacted>";
     const KV_PATTERNS: [&[u8]; 3] = [b"api_key=", b"token=", b"secret="];
@@ -1733,11 +3769,13 @@ mod tests {
     };
 
     use super::{
-        build_embeddings_provider, build_model_provider, extract_completion_text,
-        normalize_tool_arguments, sanitize_remote_error,
+        build_embeddings_provider, build_model_provider, capability_defaults_for_kind,
+        extract_completion_text, normalize_tool_arguments, sanitize_remote_error,
         validate_openai_base_url_network_policy_with_resolver, EmbeddingsRequest,
-        ModelProviderConfig, ModelProviderKind, ProviderError, ProviderEvent, ProviderImageInput,
-        ProviderRequest,
+        ModelProviderAuthProviderKind, ModelProviderConfig, ModelProviderKind,
+        ModelProviderRegistryConfig, ProviderError, ProviderEvent, ProviderImageInput,
+        ProviderMetadataSource, ProviderModelEntryConfig, ProviderModelRole,
+        ProviderRegistryEntryConfig, ProviderRequest,
     };
 
     fn openai_test_config(base_url: String) -> ModelProviderConfig {
@@ -1750,14 +3788,105 @@ mod tests {
             openai_embeddings_dims: None,
             openai_api_key: Some("sk-test-secret".to_owned()),
             openai_api_key_vault_ref: None,
-            auth_profile_id: None,
-            auth_profile_provider_kind: None,
-            credential_source: None,
             request_timeout_ms: 5_000,
             max_retries: 2,
             retry_backoff_ms: 1,
             circuit_breaker_failure_threshold: 2,
             circuit_breaker_cooldown_ms: 120_000,
+            ..ModelProviderConfig::default()
+        }
+    }
+
+    fn multi_provider_test_config(
+        openai_base_url: String,
+        anthropic_base_url: String,
+    ) -> ModelProviderConfig {
+        ModelProviderConfig {
+            kind: ModelProviderKind::OpenAiCompatible,
+            openai_base_url: openai_base_url.clone(),
+            anthropic_base_url: anthropic_base_url.clone(),
+            allow_private_base_url: true,
+            openai_model: "gpt-4o-mini".to_owned(),
+            anthropic_model: "claude-3-5-sonnet-latest".to_owned(),
+            openai_api_key: Some("sk-openai-test".to_owned()),
+            anthropic_api_key: Some("sk-anthropic-test".to_owned()),
+            registry: ModelProviderRegistryConfig {
+                providers: vec![
+                    ProviderRegistryEntryConfig {
+                        provider_id: "openai-primary".to_owned(),
+                        display_name: Some("OpenAI".to_owned()),
+                        kind: ModelProviderKind::OpenAiCompatible,
+                        base_url: Some(openai_base_url),
+                        allow_private_base_url: true,
+                        enabled: true,
+                        auth_profile_id: None,
+                        auth_profile_provider_kind: Some(ModelProviderAuthProviderKind::Openai),
+                        api_key: Some("sk-openai-test".to_owned()),
+                        api_key_vault_ref: None,
+                        credential_source: None,
+                        request_timeout_ms: 5_000,
+                        max_retries: 0,
+                        retry_backoff_ms: 1,
+                        circuit_breaker_failure_threshold: 1,
+                        circuit_breaker_cooldown_ms: 60_000,
+                    },
+                    ProviderRegistryEntryConfig {
+                        provider_id: "anthropic-primary".to_owned(),
+                        display_name: Some("Anthropic".to_owned()),
+                        kind: ModelProviderKind::Anthropic,
+                        base_url: Some(anthropic_base_url),
+                        allow_private_base_url: true,
+                        enabled: true,
+                        auth_profile_id: None,
+                        auth_profile_provider_kind: Some(ModelProviderAuthProviderKind::Anthropic),
+                        api_key: Some("sk-anthropic-test".to_owned()),
+                        api_key_vault_ref: None,
+                        credential_source: None,
+                        request_timeout_ms: 5_000,
+                        max_retries: 0,
+                        retry_backoff_ms: 1,
+                        circuit_breaker_failure_threshold: 1,
+                        circuit_breaker_cooldown_ms: 60_000,
+                    },
+                ],
+                models: vec![
+                    ProviderModelEntryConfig {
+                        model_id: "gpt-4o-mini".to_owned(),
+                        provider_id: "openai-primary".to_owned(),
+                        role: ProviderModelRole::Chat,
+                        enabled: true,
+                        metadata_source: ProviderMetadataSource::Static,
+                        operator_override: false,
+                        capabilities: capability_defaults_for_kind(
+                            ModelProviderKind::OpenAiCompatible,
+                            ProviderModelRole::Chat,
+                        ),
+                    },
+                    ProviderModelEntryConfig {
+                        model_id: "claude-3-5-sonnet-latest".to_owned(),
+                        provider_id: "anthropic-primary".to_owned(),
+                        role: ProviderModelRole::Chat,
+                        enabled: true,
+                        metadata_source: ProviderMetadataSource::Static,
+                        operator_override: false,
+                        capabilities: capability_defaults_for_kind(
+                            ModelProviderKind::Anthropic,
+                            ProviderModelRole::Chat,
+                        ),
+                    },
+                ],
+                default_chat_model_id: Some("gpt-4o-mini".to_owned()),
+                response_cache_enabled: true,
+                response_cache_ttl_ms: 60_000,
+                response_cache_max_entries: 32,
+                ..ModelProviderRegistryConfig::default()
+            },
+            request_timeout_ms: 5_000,
+            max_retries: 0,
+            retry_backoff_ms: 1,
+            circuit_breaker_failure_threshold: 1,
+            circuit_breaker_cooldown_ms: 60_000,
+            ..ModelProviderConfig::default()
         }
     }
 
@@ -1878,6 +4007,86 @@ mod tests {
             "status snapshot should accumulate completion token usage per provider request"
         );
         handle.join().expect("scripted server thread should exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn registry_provider_fails_over_to_anthropic_when_primary_openai_fails() {
+        let (openai_base_url, openai_request_count, openai_handle) = spawn_scripted_server(vec![(
+            503_u16,
+            r#"{"error":{"message":"temporary upstream error"}}"#.to_owned(),
+        )]);
+        let (anthropic_base_url, anthropic_request_count, anthropic_handle) =
+            spawn_scripted_server(vec![(
+                200_u16,
+                r#"{"content":[{"type":"text","text":"fallback from anthropic"}],"stop_reason":"end_turn"}"#
+                    .to_owned(),
+            )]);
+        let provider =
+            build_model_provider(&multi_provider_test_config(openai_base_url, anthropic_base_url))
+                .expect("registry-backed provider should build");
+
+        let response = provider
+            .complete(ProviderRequest {
+                input_text: "fallback please".to_owned(),
+                json_mode: false,
+                vision_inputs: Vec::new(),
+                model_override: None,
+            })
+            .await
+            .expect("fallback provider should succeed");
+
+        assert_eq!(response.provider_id, "anthropic-primary");
+        assert_eq!(response.model_id, "claude-3-5-sonnet-latest");
+        assert_eq!(response.failover_count, 1);
+        assert_eq!(response.attempts.len(), 2);
+        assert_eq!(openai_request_count.load(Ordering::Relaxed), 1);
+        assert_eq!(anthropic_request_count.load(Ordering::Relaxed), 1);
+
+        let snapshot = provider.status_snapshot();
+        assert_eq!(snapshot.registry.default_chat_model_id.as_deref(), Some("gpt-4o-mini"));
+        assert_eq!(snapshot.registry.providers.len(), 2);
+
+        openai_handle.join().expect("openai scripted server thread should exit");
+        anthropic_handle.join().expect("anthropic scripted server thread should exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn registry_provider_serves_safe_read_only_response_from_cache() {
+        let (openai_base_url, openai_request_count, openai_handle) = spawn_scripted_server(vec![(
+            200_u16,
+            r#"{"choices":[{"message":{"content":"cached alpha beta"}}]}"#.to_owned(),
+        )]);
+        let provider = build_model_provider(&multi_provider_test_config(
+            openai_base_url,
+            "http://127.0.0.1:9".to_owned(),
+        ))
+        .expect("registry-backed provider should build");
+
+        let first = provider
+            .complete(ProviderRequest {
+                input_text: "cache me".to_owned(),
+                json_mode: false,
+                vision_inputs: Vec::new(),
+                model_override: None,
+            })
+            .await
+            .expect("first upstream request should succeed");
+        let second = provider
+            .complete(ProviderRequest {
+                input_text: "cache me".to_owned(),
+                json_mode: false,
+                vision_inputs: Vec::new(),
+                model_override: None,
+            })
+            .await
+            .expect("second request should be served from cache");
+
+        assert!(!first.served_from_cache);
+        assert!(second.served_from_cache);
+        assert_eq!(second.attempts.len(), 1);
+        assert_eq!(openai_request_count.load(Ordering::Relaxed), 1);
+
+        openai_handle.join().expect("openai scripted server thread should exit");
     }
 
     #[tokio::test(flavor = "multi_thread")]
