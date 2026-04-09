@@ -29,75 +29,75 @@ exceptions = [
 [[licenses.clarify]]
 crate = "palyra-a2ui"
 expression = "LicenseRef-Palyra-Community-Source-1.1"
-license-files = [{ path = "../../LICENSE", hash = 0x3f578910 }]
+license-files = [{ path = "../../LICENSE", hash = 0xc6635295 }]
 [[licenses.clarify]]
 crate = "palyra-auth"
 expression = "LicenseRef-Palyra-Community-Source-1.1"
-license-files = [{ path = "../../LICENSE", hash = 0x3f578910 }]
+license-files = [{ path = "../../LICENSE", hash = 0xc6635295 }]
 [[licenses.clarify]]
 crate = "palyra-browserd"
 expression = "LicenseRef-Palyra-Community-Source-1.1"
-license-files = [{ path = "../../LICENSE", hash = 0x3f578910 }]
+license-files = [{ path = "../../LICENSE", hash = 0xc6635295 }]
 [[licenses.clarify]]
 crate = "palyra-cli"
 expression = "LicenseRef-Palyra-Community-Source-1.1"
-license-files = [{ path = "../../LICENSE", hash = 0x3f578910 }]
+license-files = [{ path = "../../LICENSE", hash = 0xc6635295 }]
 [[licenses.clarify]]
 crate = "palyra-common"
 expression = "LicenseRef-Palyra-Community-Source-1.1"
-license-files = [{ path = "../../LICENSE", hash = 0x3f578910 }]
+license-files = [{ path = "../../LICENSE", hash = 0xc6635295 }]
 [[licenses.clarify]]
 crate = "palyra-control-plane"
 expression = "LicenseRef-Palyra-Community-Source-1.1"
-license-files = [{ path = "../../LICENSE", hash = 0x3f578910 }]
+license-files = [{ path = "../../LICENSE", hash = 0xc6635295 }]
 [[licenses.clarify]]
 crate = "palyra-connector-core"
 expression = "LicenseRef-Palyra-Community-Source-1.1"
-license-files = [{ path = "../../LICENSE", hash = 0x3f578910 }]
+license-files = [{ path = "../../LICENSE", hash = 0xc6635295 }]
 [[licenses.clarify]]
 crate = "palyra-connector-discord"
 expression = "LicenseRef-Palyra-Community-Source-1.1"
-license-files = [{ path = "../../LICENSE", hash = 0x3f578910 }]
+license-files = [{ path = "../../LICENSE", hash = 0xc6635295 }]
 [[licenses.clarify]]
 crate = "palyra-connectors"
 expression = "LicenseRef-Palyra-Community-Source-1.1"
-license-files = [{ path = "../../LICENSE", hash = 0x3f578910 }]
+license-files = [{ path = "../../LICENSE", hash = 0xc6635295 }]
 [[licenses.clarify]]
 crate = "palyra-daemon"
 expression = "LicenseRef-Palyra-Community-Source-1.1"
-license-files = [{ path = "../../LICENSE", hash = 0x3f578910 }]
+license-files = [{ path = "../../LICENSE", hash = 0xc6635295 }]
 [[licenses.clarify]]
 crate = "palyra-identity"
 expression = "LicenseRef-Palyra-Community-Source-1.1"
-license-files = [{ path = "../../LICENSE", hash = 0x3f578910 }]
+license-files = [{ path = "../../LICENSE", hash = 0xc6635295 }]
 [[licenses.clarify]]
 crate = "palyra-plugins-runtime"
 expression = "LicenseRef-Palyra-Community-Source-1.1"
-license-files = [{ path = "../../../LICENSE", hash = 0x3f578910 }]
+license-files = [{ path = "../../../LICENSE", hash = 0xc6635295 }]
 [[licenses.clarify]]
 crate = "palyra-plugins-sdk"
 expression = "LicenseRef-Palyra-Community-Source-1.1"
-license-files = [{ path = "../../../LICENSE", hash = 0x3f578910 }]
+license-files = [{ path = "../../../LICENSE", hash = 0xc6635295 }]
 [[licenses.clarify]]
 crate = "palyra-policy"
 expression = "LicenseRef-Palyra-Community-Source-1.1"
-license-files = [{ path = "../../LICENSE", hash = 0x3f578910 }]
+license-files = [{ path = "../../LICENSE", hash = 0xc6635295 }]
 [[licenses.clarify]]
 crate = "palyra-sandbox"
 expression = "LicenseRef-Palyra-Community-Source-1.1"
-license-files = [{ path = "../../LICENSE", hash = 0x3f578910 }]
+license-files = [{ path = "../../LICENSE", hash = 0xc6635295 }]
 [[licenses.clarify]]
 crate = "palyra-skills"
 expression = "LicenseRef-Palyra-Community-Source-1.1"
-license-files = [{ path = "../../LICENSE", hash = 0x3f578910 }]
+license-files = [{ path = "../../LICENSE", hash = 0xc6635295 }]
 [[licenses.clarify]]
 crate = "palyra-transport-quic"
 expression = "LicenseRef-Palyra-Community-Source-1.1"
-license-files = [{ path = "../../LICENSE", hash = 0x3f578910 }]
+license-files = [{ path = "../../LICENSE", hash = 0xc6635295 }]
 [[licenses.clarify]]
 crate = "palyra-vault"
 expression = "LicenseRef-Palyra-Community-Source-1.1"
-license-files = [{ path = "../../LICENSE", hash = 0x3f578910 }]
+license-files = [{ path = "../../LICENSE", hash = 0xc6635295 }]
 
 [bans]
 multiple-versions = "warn"
