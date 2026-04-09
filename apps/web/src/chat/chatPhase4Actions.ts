@@ -59,8 +59,58 @@ export async function runCompactionFlowAction(args: {
     trigger_reason: "chat_slash_command",
     trigger_policy: "manual_preview",
   });
+  const reviewCandidateIds = collectReviewCandidateIds(response.preview);
   args.upsertSession(response.session);
-  args.setDetailPanel(buildCompactionPreviewDetail(response.preview, args.sessionId));
+  args.setDetailPanel(
+    buildCompactionPreviewDetail(response.preview, args.sessionId, {
+      acceptAllReviewCandidates:
+        reviewCandidateIds.length === 0
+          ? undefined
+          : async () => {
+              const applyResponse = await args.api.applySessionCompaction(args.sessionId, {
+                trigger_reason: "chat_review_accept",
+                trigger_policy: "manual_review_accept",
+                accept_candidate_ids: reviewCandidateIds,
+              });
+              args.upsertSession(applyResponse.session);
+              args.setDetailPanel(buildDetailFromCompactionArtifact(applyResponse.artifact));
+              args.appendLocalEntry(
+                buildCompactionStatusEntry(
+                  applyResponse.preview,
+                  args.sessionId,
+                  applyResponse.artifact,
+                ),
+              );
+              await args.refreshSessionTranscript();
+              args.setNotice(
+                `Compaction applied with ${reviewCandidateIds.length} accepted review candidate${reviewCandidateIds.length === 1 ? "" : "s"}.`,
+              );
+            },
+      rejectAllReviewCandidates:
+        reviewCandidateIds.length === 0
+          ? undefined
+          : async () => {
+              const applyResponse = await args.api.applySessionCompaction(args.sessionId, {
+                trigger_reason: "chat_review_reject",
+                trigger_policy: "manual_review_reject",
+                reject_candidate_ids: reviewCandidateIds,
+              });
+              args.upsertSession(applyResponse.session);
+              args.setDetailPanel(buildDetailFromCompactionArtifact(applyResponse.artifact));
+              args.appendLocalEntry(
+                buildCompactionStatusEntry(
+                  applyResponse.preview,
+                  args.sessionId,
+                  applyResponse.artifact,
+                ),
+              );
+              await args.refreshSessionTranscript();
+              args.setNotice(
+                `Compaction applied while leaving ${reviewCandidateIds.length} review candidate${reviewCandidateIds.length === 1 ? "" : "s"} out of the durable write set.`,
+              );
+            },
+    }),
+  );
   args.appendLocalEntry(buildCompactionStatusEntry(response.preview, args.sessionId));
   args.setNotice(
     response.preview.eligible
@@ -77,7 +127,9 @@ export async function inspectCompactionAction(args: {
 }): Promise<void> {
   const response = await args.api.getSessionCompactionArtifact(args.artifactId);
   args.upsertSession(response.session);
-  args.setDetailPanel(buildDetailFromCompactionArtifact(response.artifact));
+  args.setDetailPanel(
+    buildDetailFromCompactionArtifact(response.artifact, response.related_checkpoints),
+  );
 }
 
 export async function inspectCheckpointAction(args: {
@@ -147,13 +199,35 @@ export async function runBackgroundTaskActionRequest(args: {
 function buildCompactionPreviewDetail(
   preview: ChatCompactionPreview,
   sessionId: string,
+  actions: {
+    acceptAllReviewCandidates?: () => Promise<void>;
+    rejectAllReviewCandidates?: () => Promise<void>;
+  },
 ): DetailPanelState {
+  const detailActions = [];
+  if (actions.acceptAllReviewCandidates !== undefined) {
+    detailActions.push({
+      key: "accept-review-candidates",
+      label: "Accept review candidates",
+      variant: "primary" as const,
+      onPress: actions.acceptAllReviewCandidates,
+    });
+  }
+  if (actions.rejectAllReviewCandidates !== undefined) {
+    detailActions.push({
+      key: "reject-review-candidates",
+      label: "Reject review candidates",
+      variant: "secondary" as const,
+      onPress: actions.rejectAllReviewCandidates,
+    });
+  }
   return {
     id: `compaction-preview-${sessionId}`,
     title: preview.eligible ? "Compaction preview" : "Compaction preview blocked",
     subtitle: `${preview.strategy} · ${formatTokenDelta(preview.token_delta)} token delta`,
     body: preview.summary_text,
     payload: preview as unknown as JsonValue,
+    actions: detailActions,
   };
 }
 
@@ -183,6 +257,24 @@ function buildCompactionStatusEntry(
 
 function formatTokenDelta(value: number): string {
   return `${value.toLocaleString()} tokens`;
+}
+
+function collectReviewCandidateIds(preview: ChatCompactionPreview): string[] {
+  const summary = preview.summary as
+    | {
+        planner?: {
+          candidates?: Array<{ candidate_id?: string; disposition?: string }>;
+        };
+      }
+    | undefined;
+  const candidates = summary?.planner?.candidates ?? [];
+  return candidates
+    .filter((candidate) => candidate.disposition === "review_required")
+    .flatMap((candidate) =>
+      typeof candidate.candidate_id === "string" && candidate.candidate_id.length > 0
+        ? [candidate.candidate_id]
+        : [],
+    );
 }
 
 export function describeBackgroundTask(task: ChatBackgroundTaskRecord): string {

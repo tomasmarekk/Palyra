@@ -761,6 +761,8 @@ export function MemorySection({ app }: MemorySectionProps) {
                   {recallWorkspaceHits.map((hit, index) => {
                     const document = readObject(hit, "document") ?? EMPTY_OBJECT;
                     const path = readString(document, "path") ?? `recall-workspace-${index}`;
+                    const curated = isCuratedWorkspacePath(path, curatedPaths);
+                    const compactionManaged = isCompactionManagedWorkspacePath(path);
                     return (
                       <article key={`${path}-${index}`} className="chat-ops-card">
                         <div className="chat-ops-card__copy">
@@ -772,6 +774,16 @@ export function MemorySection({ app }: MemorySectionProps) {
                           <WorkspaceStatusChip tone="accent">
                             {formatScore(hit)}
                           </WorkspaceStatusChip>
+                          {curated ? (
+                            <WorkspaceStatusChip tone="success">
+                              Curated durable doc
+                            </WorkspaceStatusChip>
+                          ) : null}
+                          {compactionManaged ? (
+                            <WorkspaceStatusChip tone="warning">
+                              Compaction target
+                            </WorkspaceStatusChip>
+                          ) : null}
                           <ActionButton
                             size="sm"
                             type="button"
@@ -818,6 +830,12 @@ export function MemorySection({ app }: MemorySectionProps) {
                   <p className="workspace-kicker">Prompt preview</p>
                   <h3>Previewed prompt augmentation</h3>
                 </div>
+                <WorkspaceInlineNotice title="Durable continuity" tone="default">
+                  <p>
+                    Curated durable docs and compaction targets show which workspace references can
+                    be written by the continuity planner and resurfaced later through recall.
+                  </p>
+                </WorkspaceInlineNotice>
                 <pre className="chat-detail-panel__payload">
                   {readString(app.memoryRecallPreview ?? EMPTY_OBJECT, "prompt_preview") ??
                     "No prompt preview returned."}
@@ -1144,6 +1162,20 @@ function readStringArray(source: JsonObject | null | undefined, key: string): st
   }
   return value.flatMap((entry) =>
     typeof entry === "string" && entry.trim().length > 0 ? [entry] : [],
+  );
+}
+
+function isCuratedWorkspacePath(path: string, curatedPaths: readonly string[]): boolean {
+  return curatedPaths.includes(path);
+}
+
+function isCompactionManagedWorkspacePath(path: string): boolean {
+  return (
+    path === "MEMORY.md" ||
+    path === "HEARTBEAT.md" ||
+    path === "context/current-focus.md" ||
+    path === "projects/inbox.md" ||
+    path.startsWith("daily/")
   );
 }
 

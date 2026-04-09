@@ -13,7 +13,13 @@ import type {
   JsonValue,
   SessionCatalogRecord,
 } from "../consoleApi";
-import { ActionButton, EmptyState, KeyValueList, SectionCard } from "../console/components/ui";
+import {
+  ActionButton,
+  ActionCluster,
+  EmptyState,
+  KeyValueList,
+  SectionCard,
+} from "../console/components/ui";
 
 import { ChatRunDrawer } from "./ChatRunDrawer";
 import {
@@ -41,6 +47,12 @@ export type DetailPanelState = {
   subtitle: string;
   body?: string;
   payload?: JsonValue;
+  actions?: Array<{
+    key: string;
+    label: string;
+    variant?: "primary" | "secondary" | "ghost" | "danger";
+    onPress: () => void | Promise<void>;
+  }>;
 };
 
 type ChatInspectorColumnProps = {
@@ -412,6 +424,9 @@ export function ChatInspectorColumn({
                 artifact.estimated_input_tokens - artifact.estimated_output_tokens,
               );
               const artifactRunId = artifact.run_id;
+              const summary = safeParseCompactionSummary(artifact.summary_json);
+              const reviewCount = summary?.planner?.review_candidate_count ?? 0;
+              const writeCount = summary?.writes?.length ?? 0;
               return (
                 <article key={artifact.artifact_id} className="chat-ops-card">
                   <div className="chat-ops-card__copy">
@@ -419,6 +434,13 @@ export function ChatInspectorColumn({
                     <span>
                       {formatApproxTokens(tokenDelta)} saved · {artifact.condensed_event_count}{" "}
                       condensed
+                    </span>
+                    <span>
+                      {(summary?.lifecycle_state ?? "stored").replaceAll("_", " ")} · {writeCount}{" "}
+                      write{writeCount === 1 ? "" : "s"}
+                      {reviewCount > 0
+                        ? ` · ${reviewCount} review candidate${reviewCount === 1 ? "" : "s"}`
+                        : ""}
                     </span>
                     <p>{artifact.summary_preview}</p>
                   </div>
@@ -667,6 +689,21 @@ export function ChatInspectorColumn({
             {detailPanel.body !== undefined ? (
               <p className="chat-entry-text">{detailPanel.body}</p>
             ) : null}
+            {detailPanel.actions !== undefined && detailPanel.actions.length > 0 ? (
+              <ActionCluster>
+                {detailPanel.actions.map((action) => (
+                  <ActionButton
+                    key={action.key}
+                    size="sm"
+                    type="button"
+                    variant={action.variant ?? "secondary"}
+                    onPress={() => void action.onPress()}
+                  >
+                    {action.label}
+                  </ActionButton>
+                ))}
+              </ActionCluster>
+            ) : null}
             {detailPanel.payload !== undefined ? (
               <PrettyJsonBlock
                 className="chat-detail-panel__payload"
@@ -759,5 +796,27 @@ function collectSessionIds(value: JsonValue, sessionIds: Set<string>): void {
       sessionIds.add(nestedValue);
     }
     collectSessionIds(nestedValue, sessionIds);
+  }
+}
+
+function safeParseCompactionSummary(value: string | null | undefined):
+  | {
+      lifecycle_state?: string;
+      planner?: { review_candidate_count?: number };
+      writes?: Array<unknown>;
+    }
+  | undefined {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    return undefined;
+  }
+
+  try {
+    return JSON.parse(value) as {
+      lifecycle_state?: string;
+      planner?: { review_candidate_count?: number };
+      writes?: Array<unknown>;
+    };
+  } catch {
+    return undefined;
   }
 }

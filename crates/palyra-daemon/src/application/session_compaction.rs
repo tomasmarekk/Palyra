@@ -1,9 +1,9 @@
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Arc,
 };
-#[cfg(test)]
-use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -12,8 +12,8 @@ use ulid::Ulid;
 
 use crate::{
     domain::workspace::{
-        apply_workspace_managed_block, current_daily_workspace_path, curated_workspace_roots,
-        curated_workspace_templates, scan_workspace_content_for_prompt_injection,
+        apply_workspace_managed_block, curated_workspace_roots, curated_workspace_templates,
+        current_daily_workspace_path, scan_workspace_content_for_prompt_injection,
         WorkspaceManagedBlockDiff, WorkspaceManagedBlockOutcome, WorkspaceManagedBlockUpdate,
         WorkspaceManagedEntry,
     },
@@ -290,16 +290,10 @@ pub(crate) async fn apply_session_compaction(
         return Err(Status::failed_precondition(message));
     }
 
-    let accept = request
-        .accept_candidate_ids
-        .iter()
-        .map(|value| value.as_str())
-        .collect::<HashSet<_>>();
-    let reject = request
-        .reject_candidate_ids
-        .iter()
-        .map(|value| value.as_str())
-        .collect::<HashSet<_>>();
+    let accept =
+        request.accept_candidate_ids.iter().map(|value| value.as_str()).collect::<HashSet<_>>();
+    let reject =
+        request.reject_candidate_ids.iter().map(|value| value.as_str()).collect::<HashSet<_>>();
     let effective_candidates =
         collect_effective_write_candidates(plan.candidates.as_slice(), &accept, &reject);
     let write_inputs =
@@ -341,8 +335,14 @@ pub(crate) async fn apply_session_compaction(
                 path: input.path.clone(),
                 title: input.existing.as_ref().map(|document| document.title.clone()),
                 content_text: input.outcome.content_text.clone(),
-                template_id: input.existing.as_ref().and_then(|document| document.template_id.clone()),
-                template_version: input.existing.as_ref().and_then(|document| document.template_version),
+                template_id: input
+                    .existing
+                    .as_ref()
+                    .and_then(|document| document.template_id.clone()),
+                template_version: input
+                    .existing
+                    .as_ref()
+                    .and_then(|document| document.template_version),
                 template_content_hash: None,
                 source_memory_id: None,
                 manual_override: false,
@@ -435,12 +435,10 @@ pub(crate) async fn apply_session_compaction(
             branch_state: request.session.branch_state.clone(),
             parent_session_id: request.session.parent_session_id.clone(),
             referenced_compaction_ids_json: json!([artifact.artifact_id.clone()]).to_string(),
-            workspace_paths_json: json!(
-                applied_writes
-                    .iter()
-                    .map(|write| write.target_path.clone())
-                    .collect::<Vec<_>>()
-            )
+            workspace_paths_json: json!(applied_writes
+                .iter()
+                .map(|write| write.target_path.clone())
+                .collect::<Vec<_>>())
             .to_string(),
             created_by_principal: request.actor_principal.to_owned(),
         })
@@ -457,10 +455,8 @@ pub(crate) fn build_session_compaction_plan(
     trigger_reason: Option<&str>,
     trigger_policy: Option<&str>,
 ) -> SessionCompactionPlan {
-    let pin_keys = pins
-        .iter()
-        .map(|pin| (pin.run_id.clone(), pin.tape_seq))
-        .collect::<HashSet<_>>();
+    let pin_keys =
+        pins.iter().map(|pin| (pin.run_id.clone(), pin.tape_seq)).collect::<HashSet<_>>();
     let extracted = transcript
         .iter()
         .filter_map(|record| {
@@ -524,8 +520,8 @@ pub(crate) fn build_session_compaction_plan(
     let mut write_previews =
         build_initial_write_previews(candidates.as_mut_slice(), workspace_documents);
     write_previews.sort_by(|left, right| left.target_path.cmp(&right.target_path));
-    let eligible =
-        blocked_reason.is_none() && condensed_records.len() >= SESSION_COMPACTION_MIN_CONDENSED_EVENTS;
+    let eligible = blocked_reason.is_none()
+        && condensed_records.len() >= SESSION_COMPACTION_MIN_CONDENSED_EVENTS;
     let summary_lines = condensed_records
         .iter()
         .take(SESSION_COMPACTION_MAX_SUMMARY_LINES)
@@ -573,8 +569,9 @@ pub(crate) fn build_session_compaction_plan(
         .filter(|candidate| candidate.disposition == "auto_write")
         .map(|candidate| estimate_token_count(candidate.content.as_str()))
         .sum::<u64>();
-    let estimated_output_tokens =
-        estimate_token_count(summary_text.as_str()).saturating_add(protected_tokens).saturating_add(planner_tokens);
+    let estimated_output_tokens = estimate_token_count(summary_text.as_str())
+        .saturating_add(protected_tokens)
+        .saturating_add(planner_tokens);
     let checkpoint_preview = SessionCompactionCheckpointPreview {
         name: "Compaction checkpoint".to_owned(),
         note: format!(
@@ -711,7 +708,10 @@ fn build_summary_text(
             "Continuity planner preserved {candidate_count} candidate(s) and flagged {review_candidate_count} for review."
         ));
     } else {
-        sections.push("Continuity planner found nothing durable enough to flush before compaction.".to_owned());
+        sections.push(
+            "Continuity planner found nothing durable enough to flush before compaction."
+                .to_owned(),
+        );
     }
     sections.join("\n\n")
 }
@@ -769,15 +769,12 @@ fn build_initial_write_previews(
         if candidate.disposition != "auto_write" {
             continue;
         }
-        grouped
-            .entry(candidate.target_path.clone())
-            .or_default()
-            .push(EffectiveCandidateView {
-                candidate_id: candidate.candidate_id.clone(),
-                target_path: candidate.target_path.clone(),
-                label: candidate.category.clone(),
-                content: candidate.content.clone(),
-            });
+        grouped.entry(candidate.target_path.clone()).or_default().push(EffectiveCandidateView {
+            candidate_id: candidate.candidate_id.clone(),
+            target_path: candidate.target_path.clone(),
+            label: candidate.category.clone(),
+            content: candidate.content.clone(),
+        });
     }
     let existing_by_path = workspace_documents
         .iter()
@@ -807,7 +804,10 @@ fn build_initial_write_previews(
                 target_path: path,
                 status: "planned".to_owned(),
                 action: outcome.action,
-                candidate_ids: group.iter().map(|candidate| candidate.candidate_id.clone()).collect(),
+                candidate_ids: group
+                    .iter()
+                    .map(|candidate| candidate.candidate_id.clone())
+                    .collect(),
                 conflict_reason: None,
                 document_id: existing.map(|document| document.document_id.clone()),
                 version: existing.map(|document| document.latest_version),
@@ -824,7 +824,10 @@ fn build_initial_write_previews(
                     target_path: path,
                     status: "review_required".to_owned(),
                     action: "blocked_merge".to_owned(),
-                    candidate_ids: group.iter().map(|candidate| candidate.candidate_id.clone()).collect(),
+                    candidate_ids: group
+                        .iter()
+                        .map(|candidate| candidate.candidate_id.clone())
+                        .collect(),
                     conflict_reason: Some(error.to_string()),
                     document_id: existing.map(|document| document.document_id.clone()),
                     version: existing.map(|document| document.latest_version),
@@ -912,7 +915,9 @@ fn build_quality_gate_metrics(
             .count(),
         applied_write_count: writes
             .iter()
-            .filter(|write| write.status == "applied" || write.status == "planned" || write.status == "noop")
+            .filter(|write| {
+                write.status == "applied" || write.status == "planned" || write.status == "noop"
+            })
             .count(),
     }
 }
@@ -1002,9 +1007,10 @@ fn build_write_inputs(
             .as_ref()
             .map(|document| document.content_text.clone())
             .unwrap_or_else(|| default_workspace_document_content(path.as_str()));
-        let outcome = apply_workspace_managed_block(base_content.as_str(), &update).map_err(
-            |error| Status::failed_precondition(format!("compaction merge requires review: {error}")),
-        )?;
+        let outcome =
+            apply_workspace_managed_block(base_content.as_str(), &update).map_err(|error| {
+                Status::failed_precondition(format!("compaction merge requires review: {error}"))
+            })?;
         inputs.push(WriteInput {
             path,
             candidate_ids: group.iter().map(|candidate| candidate.candidate_id.clone()).collect(),
@@ -1039,7 +1045,7 @@ async fn rollback_applied_workspace_writes(
                         template_content_hash: None,
                         source_memory_id: previous.source_memory_id.clone(),
                         manual_override: previous.manual_override,
-                        })
+                    })
                     .await?;
             }
             None => {
@@ -1087,7 +1093,10 @@ fn finalize_candidate(
     } else if existing_lines.iter().any(|existing| {
         existing.path == seed.target_path
             && normalize_candidate_signature(existing.path.as_str(), existing.line.as_str())
-                == normalize_candidate_signature(seed.target_path.as_str(), normalized_content.as_str())
+                == normalize_candidate_signature(
+                    seed.target_path.as_str(),
+                    normalized_content.as_str(),
+                )
     }) {
         disposition = "skipped_duplicate".to_owned();
         rationale = "candidate already exists in the curated workspace".to_owned();
@@ -1097,7 +1106,8 @@ fn finalize_candidate(
         .then(|| existing.path.clone())
     }) {
         disposition = "review_required".to_owned();
-        rationale = format!("candidate conflicts with an existing durable entry in {conflict_path}");
+        rationale =
+            format!("candidate conflicts with an existing durable entry in {conflict_path}");
     } else if seed.confidence < AUTO_WRITE_CONFIDENCE_THRESHOLD {
         disposition = "review_required".to_owned();
         rationale = "candidate confidence is below the automatic write threshold".to_owned();
@@ -1185,14 +1195,17 @@ fn classify_candidate_seed(record: &SessionCompactionRecordSnapshot) -> Option<C
             target_path: "MEMORY.md".to_owned(),
             content: text,
             confidence: 0.86,
-            rationale: "mentions a durable contract, path, command, or environment surface".to_owned(),
+            rationale: "mentions a durable contract, path, command, or environment surface"
+                .to_owned(),
             provenance,
         });
     }
     None
 }
 
-fn derive_current_focus_candidate(candidates: &[SessionCompactionCandidate]) -> Option<CandidateSeed> {
+fn derive_current_focus_candidate(
+    candidates: &[SessionCompactionCandidate],
+) -> Option<CandidateSeed> {
     let source = candidates.iter().find(|candidate| {
         matches!(candidate.category.as_str(), "next_action" | "decision" | "open_loop")
             && matches!(candidate.disposition.as_str(), "auto_write" | "review_required")
@@ -1208,7 +1221,9 @@ fn derive_current_focus_candidate(candidates: &[SessionCompactionCandidate]) -> 
     })
 }
 
-fn derive_daily_compaction_candidate(candidates: &[SessionCompactionCandidate]) -> Option<CandidateSeed> {
+fn derive_daily_compaction_candidate(
+    candidates: &[SessionCompactionCandidate],
+) -> Option<CandidateSeed> {
     let mut counts = BTreeMap::<&str, usize>::new();
     for candidate in candidates {
         if matches!(
@@ -1318,11 +1333,7 @@ fn collect_existing_workspace_lines(
             }
             lines.push(ExistingWorkspaceLine {
                 path: document.path.clone(),
-                line: trimmed
-                    .trim_start_matches("- ")
-                    .trim_start_matches("* ")
-                    .trim()
-                    .to_owned(),
+                line: trimmed.trim_start_matches("- ").trim_start_matches("* ").trim().to_owned(),
             });
         }
     }
@@ -1377,9 +1388,7 @@ fn looks_like_noise(content: &str) -> bool {
 
 fn is_sensitive_candidate(content: &str) -> bool {
     let lower = content.to_ascii_lowercase();
-    SENSITIVE_CANDIDATE_PATTERNS
-        .iter()
-        .any(|pattern| lower.contains(pattern))
+    SENSITIVE_CANDIDATE_PATTERNS.iter().any(|pattern| lower.contains(pattern))
 }
 
 fn lines_look_contradictory(left: &str, right: &str) -> bool {
@@ -1427,9 +1436,11 @@ fn extract_transcript_search_text(record: &OrchestratorSessionTranscriptRecord) 
     match record.event_type.as_str() {
         "message.received" | "queued.input" => extract_transcript_text(record, "text"),
         "message.replied" => extract_transcript_text(record, "reply_text"),
-        "rollback.marker" => serde_json::from_str::<Value>(record.payload_json.as_str())
-            .ok()
-            .and_then(|payload| payload.get("event").and_then(Value::as_str).map(ToOwned::to_owned)),
+        "rollback.marker" => {
+            serde_json::from_str::<Value>(record.payload_json.as_str()).ok().and_then(|payload| {
+                payload.get("event").and_then(Value::as_str).map(ToOwned::to_owned)
+            })
+        }
         _ => None,
     }
 }
@@ -1626,11 +1637,11 @@ mod tests {
 
         assert!(plan.eligible);
         assert!(plan.protected_event_count >= 5);
-        assert!(
-            plan.candidates
-                .iter()
-                .any(|candidate| candidate.category == "decision" && candidate.target_path == "MEMORY.md")
-        );
+        assert!(plan
+            .candidates
+            .iter()
+            .any(|candidate| candidate.category == "decision"
+                && candidate.target_path == "MEMORY.md"));
         assert!(plan.candidates.iter().any(|candidate| candidate.category == "current_focus"));
     }
 
@@ -1652,26 +1663,14 @@ mod tests {
                 "message.replied",
                 r#"{"reply_text":"Next action: wait for approval."}"#,
             ),
-            transcript_record(
-                3,
-                "message.received",
-                r#"{"text":"Older continuity text one."}"#,
-            ),
+            transcript_record(3, "message.received", r#"{"text":"Older continuity text one."}"#),
             transcript_record(
                 4,
                 "message.replied",
                 r#"{"reply_text":"Older continuity text two."}"#,
             ),
-            transcript_record(
-                5,
-                "message.received",
-                r#"{"text":"Recent context one."}"#,
-            ),
-            transcript_record(
-                6,
-                "message.replied",
-                r#"{"reply_text":"Recent context two."}"#,
-            ),
+            transcript_record(5, "message.received", r#"{"text":"Recent context one."}"#),
+            transcript_record(6, "message.replied", r#"{"reply_text":"Recent context two."}"#),
         ];
         let plan = build_session_compaction_plan(
             &session_record(),
@@ -1682,10 +1681,7 @@ mod tests {
             Some("test_policy"),
         );
         assert!(!plan.eligible);
-        assert_eq!(
-            plan.blocked_reason.as_deref(),
-            Some("an approval interaction is still open")
-        );
+        assert_eq!(plan.blocked_reason.as_deref(), Some("an approval interaction is still open"));
     }
 
     #[test]
@@ -1716,31 +1712,11 @@ mod tests {
                 "message.replied",
                 r#"{"reply_text":"Next action: capture the contradiction review in the UI."}"#,
             ),
-            transcript_record(
-                5,
-                "message.received",
-                r#"{"text":"Recent context one."}"#,
-            ),
-            transcript_record(
-                6,
-                "message.replied",
-                r#"{"reply_text":"Recent context two."}"#,
-            ),
-            transcript_record(
-                7,
-                "message.received",
-                r#"{"text":"Recent context three."}"#,
-            ),
-            transcript_record(
-                8,
-                "message.replied",
-                r#"{"reply_text":"Recent context four."}"#,
-            ),
-            transcript_record(
-                9,
-                "message.received",
-                r#"{"text":"Recent context five."}"#,
-            ),
+            transcript_record(5, "message.received", r#"{"text":"Recent context one."}"#),
+            transcript_record(6, "message.replied", r#"{"reply_text":"Recent context two."}"#),
+            transcript_record(7, "message.received", r#"{"text":"Recent context three."}"#),
+            transcript_record(8, "message.replied", r#"{"reply_text":"Recent context four."}"#),
+            transcript_record(9, "message.received", r#"{"text":"Recent context five."}"#),
         ];
         let plan = build_session_compaction_plan(
             &session_record(),
@@ -1752,9 +1728,15 @@ mod tests {
             Some("test_compaction"),
             Some("test_policy"),
         );
-        assert!(plan.candidates.iter().any(|candidate| candidate.disposition == "skipped_duplicate"));
+        assert!(plan
+            .candidates
+            .iter()
+            .any(|candidate| candidate.disposition == "skipped_duplicate"));
         assert!(plan.candidates.iter().any(|candidate| candidate.disposition == "review_required"));
-        assert!(plan.candidates.iter().any(|candidate| candidate.disposition == "blocked_poisoned"));
+        assert!(plan
+            .candidates
+            .iter()
+            .any(|candidate| candidate.disposition == "blocked_poisoned"));
     }
 
     #[test]

@@ -1600,6 +1600,148 @@ describe("M35 web console app", () => {
     expect(requestBody(request?.body)).toContain('"name":"Phase 4 Session checkpoint"');
   });
 
+  it("shows recent compactions and checkpoints in the sessions detail continuity surface", async () => {
+    const session = {
+      session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+      session_key: "phase4-session",
+      session_label: "Phase 4 Session",
+      title: "Phase 4 Session",
+      title_source: "label",
+      preview: "continuity-ready session",
+      preview_state: "present",
+      last_intent: "compact this",
+      last_intent_state: "present",
+      last_summary: "Continuity detail ready",
+      last_summary_state: "present",
+      branch_state: "active_branch",
+      branch_origin_run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+      principal: "admin:web-console",
+      device_id: "device-1",
+      created_at_unix_ms: 100,
+      updated_at_unix_ms: 200,
+      last_run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+      last_run_state: "completed",
+      last_run_started_at_unix_ms: 190,
+      prompt_tokens: 120,
+      completion_tokens: 80,
+      total_tokens: 200,
+      pending_approvals: 0,
+      archived: false,
+    };
+    const fetchMock = withM56Baseline((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = requestUrl(input);
+      const method = (init?.method ?? "GET").toUpperCase();
+
+      if (path === "/console/v1/auth/session" && method === "GET") {
+        return Promise.resolve(
+          jsonResponse({
+            principal: "admin:web-console",
+            device_id: "device-1",
+            channel: "web",
+            csrf_token: "csrf-1",
+            issued_at_unix_ms: 100,
+            expires_at_unix_ms: 300,
+          }),
+        );
+      }
+
+      if (path === "/console/v1/sessions" && method === "GET") {
+        return Promise.resolve(
+          jsonResponse({
+            contract: { contract_version: "control-plane.v1" },
+            sessions: [session],
+            summary: {
+              active_sessions: 1,
+              archived_sessions: 0,
+              sessions_with_pending_approvals: 0,
+              sessions_with_active_runs: 0,
+            },
+            query: {
+              limit: 50,
+              cursor: 0,
+              include_archived: false,
+              sort: "updated_desc",
+            },
+            page: { limit: 50, returned: 1, has_more: false },
+          }),
+        );
+      }
+
+      if (
+        path === "/console/v1/chat/sessions/01ARZ3NDEKTSV4RRFFQ69G5FAV/transcript" &&
+        method === "GET"
+      ) {
+        return Promise.resolve(
+          jsonResponse({
+            session,
+            records: [],
+            attachments: [],
+            derived_artifacts: [],
+            pins: [],
+            compactions: [
+              {
+                artifact_id: "artifact-1",
+                session_id: session.session_id,
+                run_id: session.last_run_id,
+                mode: "manual",
+                strategy: "session_window_v1",
+                compressor_version: "v1",
+                trigger_reason: "manual_apply",
+                summary_text: "summary",
+                summary_preview: "Continuity planner preserved the release gate state.",
+                source_event_count: 20,
+                protected_event_count: 5,
+                condensed_event_count: 12,
+                omitted_event_count: 3,
+                estimated_input_tokens: 1000,
+                estimated_output_tokens: 700,
+                source_records_json: "[]",
+                summary_json:
+                  '{"lifecycle_state":"applied_with_pending_review","planner":{"review_candidate_count":1},"writes":[{"target_path":"MEMORY.md"}]}',
+                created_by_principal: "admin:web-console",
+                created_at_unix_ms: 300,
+              },
+            ],
+            checkpoints: [
+              {
+                checkpoint_id: "checkpoint-1",
+                session_id: session.session_id,
+                run_id: session.last_run_id,
+                name: "Phase 4 checkpoint",
+                tags_json: "[]",
+                note: "Created after compaction.",
+                branch_state: "active_branch",
+                parent_session_id: undefined,
+                referenced_compaction_ids_json: '["artifact-1"]',
+                workspace_paths_json: '["MEMORY.md"]',
+                created_by_principal: "admin:web-console",
+                created_at_unix_ms: 310,
+                restore_count: 0,
+              },
+            ],
+            queued_inputs: [],
+            runs: [],
+            background_tasks: [],
+            contract: { contract_version: "control-plane.v1" },
+          }),
+        );
+      }
+
+      throw new Error(`Unhandled mocked request: ${method} ${path}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Session Catalog" }));
+    expect(await screen.findByRole("heading", { name: "Sessions" })).toBeInTheDocument();
+
+    expect(await screen.findByRole("heading", { name: "Recent compactions" })).toBeInTheDocument();
+    expect(document.body).toHaveTextContent("applied with pending review · 1 write · 1 review");
+    expect(document.body).toHaveTextContent("Continuity planner preserved the release gate state.");
+    expect(document.body).toHaveTextContent("Phase 4 checkpoint");
+    expect(document.body).toHaveTextContent("Created after compaction.");
+  });
+
   it("keeps empty usage states stable and surfaces refresh errors", async () => {
     let usageSummaryCalls = 0;
     const fetchMock = withM56Baseline((input: RequestInfo | URL, init?: RequestInit) => {

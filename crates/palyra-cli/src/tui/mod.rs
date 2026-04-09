@@ -929,9 +929,95 @@ impl App {
 
     async fn handle_compaction_command(&mut self, arguments: Vec<String>) -> Result<()> {
         let session_id = self.active_session_id()?;
-        let apply = matches!(arguments.first().map(String::as_str), Some("apply"));
         let context = self.connect_admin_console().await?;
-        let path = if apply {
+        let spec = parse_tui_compaction_arguments(arguments.as_slice())?;
+        if spec.history {
+            let payload = context
+                .client
+                .get_json_value(format!(
+                    "console/v1/chat/sessions/{}/transcript",
+                    percent_encode_component(session_id.as_str())
+                ))
+                .await?;
+            let compactions = payload
+                .pointer("/compactions")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let checkpoints = payload
+                .pointer("/checkpoints")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let mut lines = Vec::new();
+            if compactions.is_empty() {
+                lines.push("Compactions: none".to_owned());
+            } else {
+                lines.push("Compactions:".to_owned());
+                for artifact in compactions.iter().rev().take(3) {
+                    let artifact_id = artifact
+                        .pointer("/artifact_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown");
+                    let summary = artifact
+                        .pointer("/summary_json")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(parse_tui_json_string);
+                    let lifecycle = summary
+                        .as_ref()
+                        .and_then(|value| value.pointer("/lifecycle_state"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("stored");
+                    let review_count = summary
+                        .as_ref()
+                        .and_then(|value| value.pointer("/planner/review_candidate_count"))
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or_default();
+                    lines.push(format!(
+                        "- {} {} review={} {}",
+                        shorten_id(artifact_id),
+                        lifecycle,
+                        review_count,
+                        artifact
+                            .pointer("/summary_preview")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("No compaction preview.")
+                    ));
+                }
+            }
+            if checkpoints.is_empty() {
+                lines.push("Checkpoints: none".to_owned());
+            } else {
+                lines.push("Checkpoints:".to_owned());
+                for checkpoint in checkpoints.iter().rev().take(3) {
+                    let checkpoint_id = checkpoint
+                        .pointer("/checkpoint_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown");
+                    lines.push(format!(
+                        "- {} {} restores={} {}",
+                        shorten_id(checkpoint_id),
+                        checkpoint
+                            .pointer("/name")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("Unnamed checkpoint"),
+                        checkpoint
+                            .pointer("/restore_count")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or_default(),
+                        checkpoint
+                            .pointer("/note")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("No note recorded.")
+                    ));
+                }
+            }
+            self.push_entry(EntryKind::System, "Compaction history", lines.join("\n"));
+            self.status_line = "Compaction history loaded".to_owned();
+            return Ok(());
+        }
+
+        let path = if spec.apply {
             format!(
                 "console/v1/chat/sessions/{}/compactions",
                 percent_encode_component(session_id.as_str())
@@ -942,7 +1028,16 @@ impl App {
                 percent_encode_component(session_id.as_str())
             )
         };
-        let payload = context.client.post_json_value(path, &serde_json::json!({})).await?;
+        let payload = context
+            .client
+            .post_json_value(
+                path,
+                &serde_json::json!({
+                    "accept_candidate_ids": spec.accept_candidate_ids,
+                    "reject_candidate_ids": spec.reject_candidate_ids,
+                }),
+            )
+            .await?;
         let preview = payload.pointer("/preview").cloned().unwrap_or_else(|| serde_json::json!({}));
         let summary_preview = preview
             .pointer("/summary_preview")
@@ -950,18 +1045,34 @@ impl App {
             .unwrap_or("No compaction preview available.");
         let token_delta =
             preview.pointer("/token_delta").and_then(serde_json::Value::as_u64).unwrap_or_default();
-        if apply {
+        let review_count = preview
+            .pointer("/summary/planner/review_candidate_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default();
+        let write_count = preview
+            .pointer("/summary/writes")
+            .and_then(serde_json::Value::as_array)
+            .map(|writes| writes.len())
+            .unwrap_or_default();
+        if spec.apply {
             let artifact_id = payload
                 .pointer("/artifact/artifact_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let checkpoint_id = payload
+                .pointer("/checkpoint/checkpoint_id")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("unknown");
             self.push_entry(
                 EntryKind::System,
                 "Compaction",
                 format!(
-                    "Created compaction artifact {} with estimated token delta {}.\n{}",
+                    "Created compaction artifact {} and checkpoint {} with estimated token delta {}.\nPlanned writes: {} · Review candidates: {}\n{}",
                     shorten_id(artifact_id),
+                    shorten_id(checkpoint_id),
                     token_delta,
+                    write_count,
+                    review_count,
                     summary_preview
                 ),
             );
@@ -970,7 +1081,10 @@ impl App {
             self.push_entry(
                 EntryKind::System,
                 "Compaction preview",
-                format!("Estimated token delta {}.\n{}", token_delta, summary_preview),
+                format!(
+                    "Estimated token delta {}.\nPlanned writes: {} · Review candidates: {}\n{}",
+                    token_delta, write_count, review_count, summary_preview
+                ),
             );
             self.status_line = "Compaction preview loaded".to_owned();
         }
@@ -1787,6 +1901,58 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(help), area);
 }
 
+#[derive(Debug, Default)]
+struct TuiCompactionCommand {
+    apply: bool,
+    history: bool,
+    accept_candidate_ids: Vec<String>,
+    reject_candidate_ids: Vec<String>,
+}
+
+fn parse_tui_compaction_arguments(arguments: &[String]) -> Result<TuiCompactionCommand> {
+    let mut command = TuiCompactionCommand::default();
+    let mut index = 0usize;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "preview" => {}
+            "apply" => command.apply = true,
+            "history" => command.history = true,
+            "--accept" => {
+                let candidate_id = arguments
+                    .get(index + 1)
+                    .cloned()
+                    .context("Usage: /compact [preview|apply|history] [--accept <candidate_id>] [--reject <candidate_id>]")?;
+                command.accept_candidate_ids.push(candidate_id);
+                index += 1;
+            }
+            "--reject" => {
+                let candidate_id = arguments
+                    .get(index + 1)
+                    .cloned()
+                    .context("Usage: /compact [preview|apply|history] [--accept <candidate_id>] [--reject <candidate_id>]")?;
+                command.reject_candidate_ids.push(candidate_id);
+                index += 1;
+            }
+            other => anyhow::bail!(
+                "unknown /compact argument `{other}`; use preview, apply, history, --accept, or --reject"
+            ),
+        }
+        index += 1;
+    }
+    if command.history
+        && (command.apply
+            || !command.accept_candidate_ids.is_empty()
+            || !command.reject_candidate_ids.is_empty())
+    {
+        anyhow::bail!("history cannot be combined with apply or candidate review flags");
+    }
+    Ok(command)
+}
+
+fn parse_tui_json_string(value: &str) -> Option<serde_json::Value> {
+    serde_json::from_str::<serde_json::Value>(value).ok()
+}
+
 fn render_help_popup(frame: &mut Frame<'_>, area: Rect) {
     let popup = centered_rect(72, 14, area);
     let text = Text::from(vec![
@@ -1801,7 +1967,7 @@ fn render_help_popup(frame: &mut Frame<'_>, area: Rect) {
             "  /delegate <profile-or-template> <text>  /checkpoint save|list|restore",
         ),
         Line::from(
-            "  /background list|add|show|pause|resume|retry|cancel  /abort [run_id] /usage /compact [apply] /attach /settings",
+            "  /background list|add|show|pause|resume|retry|cancel  /abort [run_id] /usage /compact [preview|apply|history] /attach /settings",
         ),
         Line::from("  /tools on|off /thinking on|off /shell on|off /exit"),
         Line::default(),

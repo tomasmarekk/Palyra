@@ -77,7 +77,11 @@ export function ChatConsolePanel({
   const [searchParams] = useSearchParams();
   const preferredSessionId = searchParams.get("sessionId");
   const preferredRunId = searchParams.get("runId");
+  const preferredCompactionId = searchParams.get("compactionId");
+  const preferredCheckpointId = searchParams.get("checkpointId");
   const deepLinkedRunRef = useRef<string | null>(null);
+  const deepLinkedCompactionRef = useRef<string | null>(null);
+  const deepLinkedCheckpointRef = useRef<string | null>(null);
   const sessionSwitchRef = useRef<string>("");
   const transcriptRequestSeqRef = useRef(0);
   const transcriptSearchSeqRef = useRef(0);
@@ -300,6 +304,50 @@ export function ChatConsolePanel({
     deepLinkedRunRef.current = preferredRunId;
     openRunDetails(preferredRunId);
   }, [openRunDetails, preferredRunId, preferredSessionId, sessions.activeSessionId]);
+
+  useEffect(() => {
+    if (preferredCompactionId === null || preferredCompactionId.trim().length === 0) {
+      deepLinkedCompactionRef.current = null;
+      return;
+    }
+    if (sessions.activeSessionId.trim().length === 0) {
+      return;
+    }
+    if (
+      preferredSessionId !== null &&
+      preferredSessionId.trim().length > 0 &&
+      sessions.activeSessionId !== preferredSessionId
+    ) {
+      return;
+    }
+    if (deepLinkedCompactionRef.current === preferredCompactionId) {
+      return;
+    }
+    deepLinkedCompactionRef.current = preferredCompactionId;
+    void inspectCompaction(preferredCompactionId);
+  }, [preferredCompactionId, preferredSessionId, sessions.activeSessionId]);
+
+  useEffect(() => {
+    if (preferredCheckpointId === null || preferredCheckpointId.trim().length === 0) {
+      deepLinkedCheckpointRef.current = null;
+      return;
+    }
+    if (sessions.activeSessionId.trim().length === 0) {
+      return;
+    }
+    if (
+      preferredSessionId !== null &&
+      preferredSessionId.trim().length > 0 &&
+      sessions.activeSessionId !== preferredSessionId
+    ) {
+      return;
+    }
+    if (deepLinkedCheckpointRef.current === preferredCheckpointId) {
+      return;
+    }
+    deepLinkedCheckpointRef.current = preferredCheckpointId;
+    void inspectCheckpoint(preferredCheckpointId);
+  }, [preferredCheckpointId, preferredSessionId, sessions.activeSessionId]);
 
   const refreshSessionTranscript = useCallback(async () => {
     const sessionId = sessions.activeSessionId.trim();

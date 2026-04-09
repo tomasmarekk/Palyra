@@ -1,8 +1,13 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Chip } from "@heroui/react";
 import { useNavigate } from "react-router-dom";
 
 import { buildSessionLineageHint, describeBranchState } from "../../chat/chatShared";
+import type {
+  ChatCheckpointRecord,
+  ChatCompactionArtifactRecord,
+  ChatCompactionPreview,
+} from "../../consoleApi";
 import { getSectionPath } from "../navigation";
 import { ActionButton, SelectField, SwitchField, TextInputField } from "../components/ui";
 import {
@@ -29,8 +34,49 @@ export function SessionsSection({ app }: SessionsSectionProps) {
   const navigate = useNavigate();
   const catalog = useSessionCatalogDomain(app);
   const selected = catalog.selectedSession;
-  const [phase4Busy, setPhase4Busy] = useState<"checkpoint" | null>(null);
+  const [phase4Busy, setPhase4Busy] = useState<"checkpoint" | "preview" | "apply" | null>(null);
+  const [continuityBusy, setContinuityBusy] = useState(false);
+  const [sessionCompactions, setSessionCompactions] = useState<ChatCompactionArtifactRecord[]>([]);
+  const [sessionCheckpoints, setSessionCheckpoints] = useState<ChatCheckpointRecord[]>([]);
+  const [compactionPreview, setCompactionPreview] = useState<ChatCompactionPreview | null>(null);
   const selectedLineage = buildSessionLineageHint(selected);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadContinuitySummary(): Promise<void> {
+      if (selected === null) {
+        setSessionCompactions([]);
+        setSessionCheckpoints([]);
+        setCompactionPreview(null);
+        return;
+      }
+
+      setContinuityBusy(true);
+      app.setError(null);
+      try {
+        const response = await app.api.getSessionTranscript(selected.session_id);
+        if (cancelled) {
+          return;
+        }
+        setSessionCompactions(response.compactions);
+        setSessionCheckpoints(response.checkpoints);
+      } catch (error) {
+        if (!cancelled) {
+          app.setError(error instanceof Error ? error.message : "Unexpected failure.");
+        }
+      } finally {
+        if (!cancelled) {
+          setContinuityBusy(false);
+        }
+      }
+    }
+
+    void loadContinuitySummary();
+    return () => {
+      cancelled = true;
+    };
+  }, [app, selected?.session_id]);
 
   async function createCheckpoint(): Promise<void> {
     if (selected === null) {
@@ -47,6 +93,7 @@ export function SessionsSection({ app }: SessionsSectionProps) {
         note: `Created from the Sessions console on ${new Date().toLocaleString()}.`,
         tags: ["web-console", "sessions-section"],
       });
+      setSessionCheckpoints((previous) => [...previous, response.checkpoint]);
       app.setNotice(`Checkpoint created: ${response.checkpoint.name}.`);
     } catch (error) {
       app.setError(error instanceof Error ? error.message : "Unexpected failure.");
@@ -54,6 +101,114 @@ export function SessionsSection({ app }: SessionsSectionProps) {
       setPhase4Busy(null);
     }
   }
+
+  async function previewCompaction(): Promise<void> {
+    if (selected === null) {
+      app.setError("Select a session first.");
+      return;
+    }
+    setPhase4Busy("preview");
+    app.setError(null);
+    app.setNotice(null);
+    try {
+      const response = await app.api.previewSessionCompaction(selected.session_id, {
+        trigger_reason: "sessions_section_preview",
+        trigger_policy: "operator_preview",
+      });
+      setCompactionPreview(response.preview);
+      const summary = readCompactionSummary(response.preview.summary);
+      const reviewCount = summary?.planner?.review_candidate_count ?? 0;
+      const writeCount = summary?.writes?.length ?? 0;
+      app.setNotice(
+        response.preview.eligible
+          ? `Compaction preview ready: ${writeCount} planned write${writeCount === 1 ? "" : "s"}${reviewCount > 0 ? ` and ${reviewCount} review candidate${reviewCount === 1 ? "" : "s"}` : ""}.`
+          : "Compaction preview is blocked for this session right now.",
+      );
+    } catch (error) {
+      app.setError(error instanceof Error ? error.message : "Unexpected failure.");
+    } finally {
+      setPhase4Busy(null);
+    }
+  }
+
+  async function applyCompaction(): Promise<void> {
+    if (selected === null) {
+      app.setError("Select a session first.");
+      return;
+    }
+
+    const preview =
+      compactionPreview?.trigger_reason === "sessions_section_preview"
+        ? compactionPreview
+        : await app.api
+            .previewSessionCompaction(selected.session_id, {
+              trigger_reason: "sessions_section_preview",
+              trigger_policy: "operator_preview",
+            })
+            .then((response) => {
+              setCompactionPreview(response.preview);
+              return response.preview;
+            });
+    const summary = readCompactionSummary(preview.summary);
+    const reviewCount = summary?.planner?.review_candidate_count ?? 0;
+    if (reviewCount > 0) {
+      app.setNotice(
+        `Compaction review is required for ${reviewCount} candidate${reviewCount === 1 ? "" : "s"}. Open the session in chat to accept or reject them explicitly.`,
+      );
+      return;
+    }
+
+    setPhase4Busy("apply");
+    app.setError(null);
+    app.setNotice(null);
+    try {
+      const response = await app.api.applySessionCompaction(selected.session_id, {
+        trigger_reason: "sessions_section_apply",
+        trigger_policy: "operator_apply",
+      });
+      setSessionCompactions((previous) => [...previous, response.artifact]);
+      setSessionCheckpoints((previous) => [...previous, response.checkpoint]);
+      setCompactionPreview(response.preview);
+      const appliedSummary = safeParseCompactionSummaryJson(response.artifact.summary_json);
+      const writeCount = appliedSummary?.writes?.length ?? 0;
+      app.setNotice(
+        `Compaction applied: ${writeCount} durable write${writeCount === 1 ? "" : "s"} and checkpoint ${response.checkpoint.name}.`,
+      );
+    } catch (error) {
+      app.setError(error instanceof Error ? error.message : "Unexpected failure.");
+    } finally {
+      setPhase4Busy(null);
+    }
+  }
+
+  function openChatWithArtifact(options: {
+    runId?: string;
+    compactionId?: string;
+    checkpointId?: string;
+  }): void {
+    if (selected === null) {
+      return;
+    }
+    const search = new URLSearchParams();
+    search.set("sessionId", selected.session_id);
+    if (options.runId !== undefined && options.runId.length > 0) {
+      search.set("runId", options.runId);
+    }
+    if (options.compactionId !== undefined && options.compactionId.length > 0) {
+      search.set("compactionId", options.compactionId);
+    }
+    if (options.checkpointId !== undefined && options.checkpointId.length > 0) {
+      search.set("checkpointId", options.checkpointId);
+    }
+    void navigate(`${getSectionPath("chat")}?${search.toString()}`);
+  }
+
+  const continuitySummary =
+    compactionPreview === null ? null : readCompactionSummary(compactionPreview.summary);
+  const continuityReviewCount = continuitySummary?.planner?.review_candidate_count ?? 0;
+  const continuityWriteCount = continuitySummary?.writes?.length ?? 0;
+  const recentCompactions = [...sessionCompactions].reverse().slice(0, 3);
+  const recentCheckpoints = [...sessionCheckpoints].reverse().slice(0, 3);
 
   return (
     <main className="workspace-page">
@@ -268,6 +423,22 @@ export function SessionsSection({ app }: SessionsSectionProps) {
                 >
                   {phase4Busy === "checkpoint" ? "Checkpointing..." : "Create checkpoint"}
                 </ActionButton>
+                <ActionButton
+                  isDisabled={catalog.busy || phase4Busy !== null}
+                  type="button"
+                  variant="secondary"
+                  onPress={() => void previewCompaction()}
+                >
+                  {phase4Busy === "preview" ? "Previewing..." : "Preview compaction"}
+                </ActionButton>
+                <ActionButton
+                  isDisabled={catalog.busy || phase4Busy !== null}
+                  type="button"
+                  variant="primary"
+                  onPress={() => void applyCompaction()}
+                >
+                  {phase4Busy === "apply" ? "Applying..." : "Apply compaction"}
+                </ActionButton>
               </div>
 
               <ActionButton
@@ -339,10 +510,186 @@ export function SessionsSection({ app }: SessionsSectionProps) {
                   </p>
                 </WorkspaceInlineNotice>
               ) : null}
+
+              {compactionPreview !== null ? (
+                <WorkspaceInlineNotice
+                  title={compactionPreview.eligible ? "Compaction preview" : "Compaction blocked"}
+                  tone={
+                    !compactionPreview.eligible
+                      ? "warning"
+                      : continuityReviewCount > 0
+                        ? "warning"
+                        : "success"
+                  }
+                >
+                  <p>
+                    <strong>Summary:</strong> {compactionPreview.summary_preview}
+                  </p>
+                  <p>
+                    <strong>Token delta:</strong> {compactionPreview.token_delta} ·{" "}
+                    <strong>Planned writes:</strong> {continuityWriteCount} ·{" "}
+                    <strong>Review candidates:</strong> {continuityReviewCount}
+                  </p>
+                  {continuityReviewCount > 0 ? (
+                    <p>
+                      Use the chat compaction flow to accept or reject the review-required
+                      candidates explicitly.
+                    </p>
+                  ) : null}
+                </WorkspaceInlineNotice>
+              ) : null}
+
+              <div className="workspace-inline-actions">
+                <WorkspaceStatusChip tone={continuityBusy ? "warning" : "default"}>
+                  {continuityBusy
+                    ? "Loading continuity"
+                    : `${sessionCompactions.length} compactions`}
+                </WorkspaceStatusChip>
+                <WorkspaceStatusChip tone={sessionCheckpoints.length > 0 ? "accent" : "default"}>
+                  {sessionCheckpoints.length} checkpoints
+                </WorkspaceStatusChip>
+                <WorkspaceStatusChip tone={continuityReviewCount > 0 ? "warning" : "default"}>
+                  {continuityReviewCount} pending review
+                </WorkspaceStatusChip>
+              </div>
+
+              <div className="workspace-stack">
+                <div className="workspace-panel__intro">
+                  <p className="workspace-kicker">Continuity artifacts</p>
+                  <h3>Recent compactions</h3>
+                  <p className="chat-muted">
+                    Inspect the last stored compactions and jump straight into the chat detail
+                    sidebar for raw diff and audit context.
+                  </p>
+                </div>
+                {recentCompactions.length === 0 ? (
+                  <WorkspaceEmptyState
+                    compact
+                    description="No compaction artifacts are stored for this session yet."
+                    title="No compactions yet"
+                  />
+                ) : (
+                  <div className="chat-ops-list">
+                    {recentCompactions.map((artifact) => {
+                      const summary = safeParseCompactionSummaryJson(artifact.summary_json);
+                      const lifecycleState = summary?.lifecycle_state ?? "stored";
+                      const reviewCount = summary?.planner?.review_candidate_count ?? 0;
+                      const writeCount = summary?.writes?.length ?? 0;
+                      return (
+                        <article key={artifact.artifact_id} className="chat-ops-card">
+                          <div className="chat-ops-card__copy">
+                            <strong>{artifact.mode}</strong>
+                            <span>
+                              {lifecycleState.replaceAll("_", " ")} · {writeCount} write
+                              {writeCount === 1 ? "" : "s"} · {reviewCount} review
+                            </span>
+                            <p>{artifact.summary_preview}</p>
+                          </div>
+                          <div className="chat-ops-card__actions">
+                            <WorkspaceStatusChip tone={reviewCount > 0 ? "warning" : "accent"}>
+                              {artifact.strategy}
+                            </WorkspaceStatusChip>
+                            <ActionButton
+                              size="sm"
+                              type="button"
+                              variant="ghost"
+                              onPress={() =>
+                                openChatWithArtifact({
+                                  runId: artifact.run_id,
+                                  compactionId: artifact.artifact_id,
+                                })
+                              }
+                            >
+                              Open in chat
+                            </ActionButton>
+                          </div>
+                        </article>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+
+              <div className="workspace-stack">
+                <div className="workspace-panel__intro">
+                  <p className="workspace-kicker">Recovery points</p>
+                  <h3>Recent checkpoints</h3>
+                  <p className="chat-muted">
+                    Checkpoints stay paired with compaction history so rollback is visible without
+                    opening the raw journal.
+                  </p>
+                </div>
+                {recentCheckpoints.length === 0 ? (
+                  <WorkspaceEmptyState
+                    compact
+                    description="Create a checkpoint or apply a compaction to start the rollback history."
+                    title="No checkpoints yet"
+                  />
+                ) : (
+                  <div className="chat-ops-list">
+                    {recentCheckpoints.map((checkpoint) => (
+                      <article key={checkpoint.checkpoint_id} className="chat-ops-card">
+                        <div className="chat-ops-card__copy">
+                          <strong>{checkpoint.name}</strong>
+                          <span>
+                            {describeBranchState(checkpoint.branch_state)} · restores{" "}
+                            {checkpoint.restore_count}
+                          </span>
+                          <p>{checkpoint.note ?? "No note recorded for this checkpoint."}</p>
+                        </div>
+                        <div className="chat-ops-card__actions">
+                          <WorkspaceStatusChip tone="accent">
+                            {formatUnixMs(checkpoint.created_at_unix_ms)}
+                          </WorkspaceStatusChip>
+                          <ActionButton
+                            size="sm"
+                            type="button"
+                            variant="ghost"
+                            onPress={() =>
+                              openChatWithArtifact({
+                                runId: checkpoint.run_id,
+                                checkpointId: checkpoint.checkpoint_id,
+                              })
+                            }
+                          >
+                            Open in chat
+                          </ActionButton>
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                )}
+              </div>
             </div>
           )}
         </WorkspaceSectionCard>
       </section>
     </main>
   );
+}
+
+type ContinuitySummary = {
+  lifecycle_state?: string;
+  planner?: { review_candidate_count?: number };
+  writes?: Array<unknown>;
+};
+
+function readCompactionSummary(value: unknown): ContinuitySummary | undefined {
+  if (value === null || value === undefined || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  return value as ContinuitySummary;
+}
+
+function safeParseCompactionSummaryJson(
+  value: string | null | undefined,
+): ContinuitySummary | undefined {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    return undefined;
+  }
+  try {
+    return JSON.parse(value) as ContinuitySummary;
+  } catch {
+    return undefined;
+  }
 }

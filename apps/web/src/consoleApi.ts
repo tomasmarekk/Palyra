@@ -2731,7 +2731,12 @@ export class ConsoleApiClient {
 
   async previewSessionCompaction(
     sessionId: string,
-    payload: { trigger_reason?: string; trigger_policy?: string } = {},
+    payload: {
+      trigger_reason?: string;
+      trigger_policy?: string;
+      accept_candidate_ids?: string[];
+      reject_candidate_ids?: string[];
+    } = {},
   ): Promise<{
     session: SessionCatalogRecord;
     preview: ChatCompactionPreview;
@@ -2749,10 +2754,16 @@ export class ConsoleApiClient {
 
   async applySessionCompaction(
     sessionId: string,
-    payload: { trigger_reason?: string; trigger_policy?: string } = {},
+    payload: {
+      trigger_reason?: string;
+      trigger_policy?: string;
+      accept_candidate_ids?: string[];
+      reject_candidate_ids?: string[];
+    } = {},
   ): Promise<{
     session: SessionCatalogRecord;
     artifact: ChatCompactionArtifactRecord;
+    checkpoint: ChatCheckpointRecord;
     preview: ChatCompactionPreview;
     contract: ContractDescriptor;
   }> {
@@ -2769,6 +2780,7 @@ export class ConsoleApiClient {
   async getSessionCompactionArtifact(artifactId: string): Promise<{
     session: SessionCatalogRecord;
     artifact: ChatCompactionArtifactRecord;
+    related_checkpoints: ChatCheckpointRecord[];
     contract: ContractDescriptor;
   }> {
     return this.request(`/console/v1/chat/compactions/${encodeURIComponent(artifactId)}`);

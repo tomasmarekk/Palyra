@@ -1250,7 +1250,9 @@ pub(crate) async fn console_chat_compaction_detail_handler(
         .filter(|checkpoint| {
             serde_json::from_str::<Vec<String>>(checkpoint.referenced_compaction_ids_json.as_str())
                 .ok()
-                .is_some_and(|references| references.iter().any(|value| value == &artifact.artifact_id))
+                .is_some_and(|references| {
+                    references.iter().any(|value| value == &artifact.artifact_id)
+                })
         })
         .collect::<Vec<_>>();
     Ok(Json(json!({

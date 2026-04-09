@@ -1426,6 +1426,18 @@ describe("ConsoleApiClient", () => {
           created_by_principal: "admin:web-console",
           created_at_unix_ms: 100,
         },
+        checkpoint: {
+          checkpoint_id: "checkpoint-1",
+          session_id: "session-1",
+          name: "Checkpoint 1",
+          tags_json: "[]",
+          branch_state: "active_branch",
+          referenced_compaction_ids_json: '["artifact-1"]',
+          workspace_paths_json: '["MEMORY.md"]',
+          created_by_principal: "admin:web-console",
+          created_at_unix_ms: 100,
+          restore_count: 0,
+        },
         preview: {
           eligible: true,
           strategy: "head_tail_v1",
@@ -1467,6 +1479,20 @@ describe("ConsoleApiClient", () => {
           created_by_principal: "admin:web-console",
           created_at_unix_ms: 100,
         },
+        related_checkpoints: [
+          {
+            checkpoint_id: "checkpoint-1",
+            session_id: "session-1",
+            name: "Checkpoint 1",
+            tags_json: "[]",
+            branch_state: "active_branch",
+            referenced_compaction_ids_json: '["artifact-1"]',
+            workspace_paths_json: '["MEMORY.md"]',
+            created_by_principal: "admin:web-console",
+            created_at_unix_ms: 100,
+            restore_count: 0,
+          },
+        ],
         contract: { contract_version: "control-plane.v1" },
       }),
       jsonResponse({
@@ -1536,7 +1562,11 @@ describe("ConsoleApiClient", () => {
       channel: "web",
     });
     await client.previewSessionCompaction("session-1", { trigger_reason: "manual_preview" });
-    await client.applySessionCompaction("session-1", { trigger_reason: "manual_apply" });
+    await client.applySessionCompaction("session-1", {
+      trigger_reason: "manual_apply",
+      accept_candidate_ids: ["candidate-1"],
+      reject_candidate_ids: ["candidate-2"],
+    });
     await client.getSessionCompactionArtifact("artifact-1");
     await client.createSessionCheckpoint("session-1", { name: "Checkpoint 1" });
     await client.getSessionCheckpoint("checkpoint-1");
@@ -1549,6 +1579,8 @@ describe("ConsoleApiClient", () => {
 
     expect(requestUrl(calls[2]?.input)).toBe("/console/v1/chat/sessions/session-1/compactions");
     expect(new Headers(calls[2]?.init?.headers).get("x-palyra-csrf-token")).toBe("csrf-1");
+    expect(requestBody(calls[2]?.init?.body)).toContain('"accept_candidate_ids":["candidate-1"]');
+    expect(requestBody(calls[2]?.init?.body)).toContain('"reject_candidate_ids":["candidate-2"]');
 
     expect(requestUrl(calls[3]?.input)).toBe("/console/v1/chat/compactions/artifact-1");
     expect(new Headers(calls[3]?.init?.headers).get("x-palyra-csrf-token")).toBeNull();
@@ -1919,6 +1951,10 @@ function requestUrl(input: RequestInfo | URL | undefined): string {
     return input.toString();
   }
   return input.url;
+}
+
+function requestBody(body: BodyInit | null | undefined): string {
+  return typeof body === "string" ? body : "";
 }
 
 function ndjsonResponse(lines: unknown[]): Response {

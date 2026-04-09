@@ -578,18 +578,44 @@ pub(crate) async fn run_sessions_async(
             } else {
                 let preview =
                     payload.pointer("/preview").context("compaction preview is missing")?;
+                let review_candidate_count = preview
+                    .pointer("/summary/planner/review_candidate_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                let write_count = preview
+                    .pointer("/summary/writes")
+                    .and_then(Value::as_array)
+                    .map(|writes| writes.len())
+                    .unwrap_or_default();
+                let blocked_reason = json_optional_string_in(preview, "/summary/blocked_reason")
+                    .or_else(|| json_optional_string_in(preview, "/blocked_reason"))
+                    .unwrap_or_else(|| "none".to_owned());
+                let checkpoint_name =
+                    json_optional_string_in(preview, "/summary/checkpoint_preview/name")
+                        .unwrap_or_else(|| "none".to_owned());
                 println!(
-                    "sessions.compact.preview eligible={} source_events={} protected={} condensed={} token_delta={} preview={}",
+                    "sessions.compact.preview eligible={} source_events={} protected={} condensed={} token_delta={} writes={} review_candidates={} blocked_reason={} checkpoint={} preview={}",
                     preview.pointer("/eligible").and_then(Value::as_bool).unwrap_or(false),
                     preview.pointer("/source_event_count").and_then(Value::as_u64).unwrap_or_default(),
                     preview.pointer("/protected_event_count").and_then(Value::as_u64).unwrap_or_default(),
                     preview.pointer("/condensed_event_count").and_then(Value::as_u64).unwrap_or_default(),
                     preview.pointer("/token_delta").and_then(Value::as_u64).unwrap_or_default(),
+                    write_count,
+                    review_candidate_count,
+                    blocked_reason,
+                    checkpoint_name,
                     json_optional_string_in(preview, "/summary_preview").unwrap_or_else(|| "none".to_owned())
                 );
             }
         }
-        SessionsCommand::CompactApply { session_id, trigger_reason, trigger_policy, json: _ } => {
+        SessionsCommand::CompactApply {
+            session_id,
+            trigger_reason,
+            trigger_policy,
+            accept_candidate_ids,
+            reject_candidate_ids,
+            json: _,
+        } => {
             let context = connect_sessions_admin_console(&connection).await?;
             let payload = context
                 .client
@@ -601,6 +627,8 @@ pub(crate) async fn run_sessions_async(
                     &json!({
                         "trigger_reason": trigger_reason,
                         "trigger_policy": trigger_policy,
+                        "accept_candidate_ids": accept_candidate_ids,
+                        "reject_candidate_ids": reject_candidate_ids,
                     }),
                 )
                 .await?;
@@ -609,11 +637,36 @@ pub(crate) async fn run_sessions_async(
             } else {
                 let artifact =
                     payload.pointer("/artifact").context("compaction artifact is missing")?;
+                let checkpoint =
+                    payload.pointer("/checkpoint").context("checkpoint payload is missing")?;
+                let summary =
+                    parse_json_string(artifact.pointer("/summary_json").and_then(Value::as_str));
+                let lifecycle_state = summary
+                    .as_ref()
+                    .and_then(|value| json_optional_string_in(value, "/lifecycle_state"))
+                    .unwrap_or_else(|| "stored".to_owned());
+                let write_count = summary
+                    .as_ref()
+                    .and_then(|value| value.pointer("/writes").and_then(Value::as_array))
+                    .map(|writes| writes.len())
+                    .unwrap_or_default();
+                let review_candidate_count = summary
+                    .as_ref()
+                    .and_then(|value| {
+                        value.pointer("/planner/review_candidate_count").and_then(Value::as_u64)
+                    })
+                    .unwrap_or_default();
                 println!(
-                    "sessions.compact.apply artifact_id={} mode={} strategy={} input_tokens={} output_tokens={}",
+                    "sessions.compact.apply artifact_id={} checkpoint_id={} mode={} strategy={} lifecycle={} writes={} review_candidates={} input_tokens={} output_tokens={}",
                     redacted_optional_identifier_for_output(artifact.pointer("/artifact_id").and_then(Value::as_str)),
+                    redacted_optional_identifier_for_output(
+                        checkpoint.pointer("/checkpoint_id").and_then(Value::as_str)
+                    ),
                     json_optional_string_in(artifact, "/mode").unwrap_or_else(|| "unknown".to_owned()),
                     json_optional_string_in(artifact, "/strategy").unwrap_or_else(|| "unknown".to_owned()),
+                    lifecycle_state,
+                    write_count,
+                    review_candidate_count,
                     artifact.pointer("/estimated_input_tokens").and_then(Value::as_u64).unwrap_or_default(),
                     artifact.pointer("/estimated_output_tokens").and_then(Value::as_u64).unwrap_or_default(),
                 );
@@ -633,8 +686,30 @@ pub(crate) async fn run_sessions_async(
             } else {
                 let artifact =
                     payload.pointer("/artifact").context("compaction artifact is missing")?;
+                let related_checkpoint_count = payload
+                    .pointer("/related_checkpoints")
+                    .and_then(Value::as_array)
+                    .map(|items| items.len())
+                    .unwrap_or_default();
+                let summary =
+                    parse_json_string(artifact.pointer("/summary_json").and_then(Value::as_str));
+                let lifecycle_state = summary
+                    .as_ref()
+                    .and_then(|value| json_optional_string_in(value, "/lifecycle_state"))
+                    .unwrap_or_else(|| "stored".to_owned());
+                let write_count = summary
+                    .as_ref()
+                    .and_then(|value| value.pointer("/writes").and_then(Value::as_array))
+                    .map(|writes| writes.len())
+                    .unwrap_or_default();
+                let review_candidate_count = summary
+                    .as_ref()
+                    .and_then(|value| {
+                        value.pointer("/planner/review_candidate_count").and_then(Value::as_u64)
+                    })
+                    .unwrap_or_default();
                 println!(
-                    "sessions.compaction.show artifact_id={} mode={} trigger_reason={} preview={}",
+                    "sessions.compaction.show artifact_id={} mode={} trigger_reason={} lifecycle={} writes={} review_candidates={} related_checkpoints={} preview={}",
                     redacted_optional_identifier_for_output(
                         artifact.pointer("/artifact_id").and_then(Value::as_str)
                     ),
@@ -642,6 +717,10 @@ pub(crate) async fn run_sessions_async(
                         .unwrap_or_else(|| "unknown".to_owned()),
                     json_optional_string_in(artifact, "/trigger_reason")
                         .unwrap_or_else(|| "unknown".to_owned()),
+                    lifecycle_state,
+                    write_count,
+                    review_candidate_count,
+                    related_checkpoint_count,
                     json_optional_string_in(artifact, "/summary_preview")
                         .unwrap_or_else(|| "none".to_owned())
                 );
@@ -1041,6 +1120,10 @@ fn json_optional_string(payload: &Value, pointer: &str) -> Option<String> {
 
 fn json_optional_string_in(payload: &Value, pointer: &str) -> Option<String> {
     json_optional_string(payload, pointer)
+}
+
+fn parse_json_string(value: Option<&str>) -> Option<Value> {
+    value.and_then(|raw| serde_json::from_str::<Value>(raw).ok())
 }
 
 fn percent_encode_component(value: &str) -> String {

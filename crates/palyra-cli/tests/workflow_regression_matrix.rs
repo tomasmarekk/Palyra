@@ -273,6 +273,68 @@ fn local_remote_and_lifecycle_workflows_are_regression_tested() -> Result<()> {
 }
 
 #[test]
+fn session_compaction_cli_preview_surfaces_the_phase4_contract() -> Result<()> {
+    let workdir = TempDir::new().context("failed to create temporary workdir")?;
+    let (daemon_child, admin_port, grpc_port) = spawn_palyrad_with_dynamic_ports(None, None)?;
+    let _daemon = ChildGuard::new(daemon_child);
+
+    let gateway_grpc_url = format!("http://127.0.0.1:{grpc_port}");
+    let config_path = workdir.path().join("continuity-workflow").join("palyra.toml");
+    write_browser_workflow_config(config_path.as_path(), admin_port, grpc_port)?;
+    let config_path_string = config_path.display().to_string();
+    let cli_env = admin_cli_envs(config_path_string.as_str(), gateway_grpc_url.as_str());
+
+    let resolve_output = run_cli_json(
+        &workdir,
+        &[
+            "sessions",
+            "resolve",
+            "--session-key",
+            "continuity:preview",
+            "--session-label",
+            "Continuity Preview",
+        ],
+        &cli_env,
+    )?;
+    assert_json_success(resolve_output, "sessions resolve")?;
+    let session_id = resolve_gateway_session_id(
+        gateway_grpc_url.as_str(),
+        ADMIN_TOKEN,
+        "admin:local",
+        DEVICE_ID,
+        "cli",
+        "continuity:preview",
+    )?;
+
+    let preview_output = run_cli_json(
+        &workdir,
+        &[
+            "sessions",
+            "compact-preview",
+            session_id.as_str(),
+            "--trigger-reason",
+            "workflow_regression",
+            "--trigger-policy",
+            "phase4_contract",
+        ],
+        &cli_env,
+    )?;
+    let preview_payload = assert_json_success(preview_output, "sessions compact-preview")?;
+    let preview = preview_payload
+        .get("preview")
+        .context("compact-preview should return a preview payload")?;
+    assert_eq!(preview.get("trigger_reason").and_then(Value::as_str), Some("workflow_regression"));
+    assert_eq!(preview.get("trigger_policy").and_then(Value::as_str), Some("phase4_contract"));
+    assert!(
+        preview.get("summary").is_some(),
+        "phase 4 preview output should include the structured summary contract"
+    );
+    assert_eq!(preview.get("eligible").and_then(Value::as_bool), Some(false));
+
+    Ok(())
+}
+
+#[test]
 fn browser_channels_and_session_workflows_are_regression_tested() -> Result<()> {
     let workdir = TempDir::new().context("failed to create temporary workdir")?;
     let browser_state_dir = workdir.path().join("browserd-state");
@@ -767,6 +829,15 @@ fn browser_workflow_envs<'a>(
         ("PALYRA_BROWSER_SERVICE_ENABLED", "true"),
         ("PALYRA_BROWSER_SERVICE_ENDPOINT", browser_grpc_url),
         ("PALYRA_BROWSER_SERVICE_AUTH_TOKEN", browser_auth_token),
+    ]
+}
+
+fn admin_cli_envs<'a>(config_path: &'a str, gateway_grpc_url: &'a str) -> [(&'a str, &'a str); 4] {
+    [
+        ("PALYRA_CONFIG", config_path),
+        ("PALYRA_ADMIN_TOKEN", ADMIN_TOKEN),
+        ("PALYRA_ADMIN_BOUND_PRINCIPAL", "admin:local"),
+        ("PALYRA_GATEWAY_GRPC_URL", gateway_grpc_url),
     ]
 }
 

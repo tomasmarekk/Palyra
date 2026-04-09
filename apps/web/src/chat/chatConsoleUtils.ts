@@ -49,6 +49,7 @@ export function buildDetailFromSearchMatch(match: TranscriptSearchMatch): Detail
 
 export function buildDetailFromCompactionArtifact(
   artifact: ChatCompactionArtifactRecord,
+  relatedCheckpoints: ChatCheckpointRecord[] = [],
 ): DetailPanelState {
   return {
     id: `compaction-${artifact.artifact_id}`,
@@ -65,6 +66,14 @@ export function buildDetailFromCompactionArtifact(
             ? undefined
             : safeParseJsonString(artifact.trigger_inputs_json),
       } as unknown as JsonValue,
+      related_checkpoints: relatedCheckpoints.map((checkpoint) => ({
+        ...checkpoint,
+        tags_json: safeParseJsonString(checkpoint.tags_json),
+        referenced_compaction_ids_json: safeParseJsonString(
+          checkpoint.referenced_compaction_ids_json,
+        ),
+        workspace_paths_json: safeParseJsonString(checkpoint.workspace_paths_json),
+      })) as unknown as JsonValue,
     },
   };
 }

@@ -401,7 +401,8 @@ pub fn apply_workspace_managed_block(
             .then_with(|| left.entry_id.cmp(&right.entry_id))
     });
     let preserved_entry_ids = existing.entries.iter().map(|entry| entry.entry_id.clone()).collect();
-    let rendered_block = render_managed_block(update.heading.as_str(), update.block_id.as_str(), &merged_entries);
+    let rendered_block =
+        render_managed_block(update.heading.as_str(), update.block_id.as_str(), &merged_entries);
     let next_content = match existing.range {
         Some((start, end)) => {
             let mut content = String::new();
@@ -413,7 +414,12 @@ pub fn apply_workspace_managed_block(
         None => append_managed_block(current_content, rendered_block.as_str()),
     };
     let after_hash = crate::sha256_hex(next_content.as_bytes());
-    let diff = build_managed_block_diff(before_content.as_str(), next_content.as_str(), before_hash, after_hash);
+    let diff = build_managed_block_diff(
+        before_content.as_str(),
+        next_content.as_str(),
+        before_hash,
+        after_hash,
+    );
     let action = match existing.range {
         Some(_) if inserted_entry_ids.is_empty() && before_content == next_content => "noop",
         Some(_) => "updated_block",
@@ -580,7 +586,8 @@ fn parse_existing_block(
     current_content: &str,
     block_id: &str,
 ) -> Result<ParsedManagedBlock, WorkspaceManagedBlockError> {
-    let begin_marker = format!("{PALYRA_MANAGED_BLOCK_PREFIX}{block_id}{PALYRA_MANAGED_BLOCK_SUFFIX}");
+    let begin_marker =
+        format!("{PALYRA_MANAGED_BLOCK_PREFIX}{block_id}{PALYRA_MANAGED_BLOCK_SUFFIX}");
     let end_marker =
         format!("{PALYRA_MANAGED_BLOCK_END_PREFIX}{block_id}{PALYRA_MANAGED_BLOCK_SUFFIX}");
     let begin = current_content.find(begin_marker.as_str());
@@ -664,9 +671,7 @@ fn render_managed_block(
         ));
         lines.push(format!("- [{}] {}", entry.label, entry.content));
     }
-    lines.push(format!(
-        "{PALYRA_MANAGED_BLOCK_END_PREFIX}{block_id}{PALYRA_MANAGED_BLOCK_SUFFIX}"
-    ));
+    lines.push(format!("{PALYRA_MANAGED_BLOCK_END_PREFIX}{block_id}{PALYRA_MANAGED_BLOCK_SUFFIX}"));
     lines.push(String::new());
     lines.join("\n")
 }
@@ -699,14 +704,10 @@ fn build_managed_block_diff(
 ) -> WorkspaceManagedBlockDiff {
     let before_lines = before_content.lines().map(str::trim).collect::<Vec<_>>();
     let after_lines = after_content.lines().map(str::trim).collect::<Vec<_>>();
-    let added_lines = after_lines
-        .iter()
-        .filter(|line| !line.is_empty() && !before_lines.contains(line))
-        .count();
-    let removed_lines = before_lines
-        .iter()
-        .filter(|line| !line.is_empty() && !after_lines.contains(line))
-        .count();
+    let added_lines =
+        after_lines.iter().filter(|line| !line.is_empty() && !before_lines.contains(line)).count();
+    let removed_lines =
+        before_lines.iter().filter(|line| !line.is_empty() && !after_lines.contains(line)).count();
     WorkspaceManagedBlockDiff {
         before_hash,
         after_hash,
@@ -807,8 +808,8 @@ mod tests {
                 content: "Keep automatic compaction deterministic.".to_owned(),
             }],
         };
-        let error =
-            apply_workspace_managed_block(malformed, &update).expect_err("manual edits must conflict");
+        let error = apply_workspace_managed_block(malformed, &update)
+            .expect_err("manual edits must conflict");
         assert!(
             matches!(error, WorkspaceManagedBlockError::MalformedItem { .. }),
             "manual edits inside the managed block must fail closed"

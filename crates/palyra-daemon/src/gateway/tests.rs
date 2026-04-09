@@ -22,8 +22,8 @@ use crate::journal::{
     ApprovalSubjectType, JournalAppendRequest, JournalConfig, JournalStore,
     MemoryItemCreateRequest, MemoryItemRecord, MemoryScoreBreakdown, MemorySearchHit,
     MemorySearchRequest, MemorySource, OrchestratorRunStartRequest,
-    OrchestratorSessionResolveRequest,
-    OrchestratorSessionUpsertRequest, OrchestratorTapeAppendRequest,
+    OrchestratorSessionResolveRequest, OrchestratorSessionUpsertRequest,
+    OrchestratorTapeAppendRequest,
 };
 use tonic::Code;
 use ulid::Ulid;
@@ -51,14 +51,14 @@ use crate::application::{
         prepare_model_provider_input, render_memory_augmented_prompt, MemoryPromptFailureMode,
         PrepareModelProviderInputRequest,
     },
-    session_compaction::{
-        apply_session_compaction, configure_test_write_failure_path, SessionCompactionApplyRequest,
-    },
     route_message::approval::resolve_route_tool_approval_outcome,
     route_message::response::parse_route_message_structured_output,
     service_authorization::{
         authorize_approvals_action, authorize_memory_action, principal_has_sensitive_service_role,
         SensitiveServiceRole,
+    },
+    session_compaction::{
+        apply_session_compaction, configure_test_write_failure_path, SessionCompactionApplyRequest,
     },
     tool_runtime::{
         http_fetch::{
@@ -2730,8 +2730,8 @@ async fn model_token_tape_compaction_emits_real_lifecycle_event() {
         "01ARZ3NDEKTSV4RRFFQ69G5FAX",
         &mut tape_seq,
     )
-        .await
-        .expect("compaction lifecycle should append tape event");
+    .await
+    .expect("compaction lifecycle should append tape event");
     assert_eq!(tape_seq, 9);
 
     let tape = state
@@ -2887,9 +2887,7 @@ async fn session_compaction_apply_rolls_back_workspace_writes_on_partial_failure
     .expect_err("compaction apply should fail on the injected second write");
 
     assert!(
-        error
-            .message()
-            .contains("injected test failure for context/current-focus.md"),
+        error.message().contains("injected test failure for context/current-focus.md"),
         "error should expose the injected failure path"
     );
 
@@ -2920,10 +2918,7 @@ async fn session_compaction_apply_rolls_back_workspace_writes_on_partial_failure
         .list_orchestrator_checkpoints(session_id.to_owned())
         .await
         .expect("checkpoint list should succeed");
-    assert!(
-        checkpoints.is_empty(),
-        "no checkpoint should persist after a failed write phase"
-    );
+    assert!(checkpoints.is_empty(), "no checkpoint should persist after a failed write phase");
 }
 
 #[tokio::test(flavor = "multi_thread")]
