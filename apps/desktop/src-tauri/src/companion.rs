@@ -11,7 +11,7 @@ use super::desktop_state::{
 use super::onboarding::{DesktopRefreshPayload, OnboardingStatusInputs};
 use super::snapshot::{
     build_control_plane_client, build_dashboard_open_url, ensure_console_session_with_csrf,
-    sanitize_log_line, DashboardOpenInputs,
+    request_console_session, sanitize_log_line, DashboardOpenInputs,
 };
 use super::{normalize_optional_text, unix_ms_now, ControlCenter, RuntimeConfig};
 

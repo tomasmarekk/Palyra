@@ -962,7 +962,7 @@ pub(crate) async fn build_dashboard_open_url(
     normalize_local_browser_handoff_url(dashboard_url, handoff.handoff_url.as_str())
 }
 
-async fn request_console_session(
+pub(crate) async fn request_console_session(
     control_plane: &mut ControlPlaneClient,
     admin_token: &str,
 ) -> Result<control_plane::ConsoleSession> {
