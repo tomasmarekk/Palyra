@@ -27,6 +27,8 @@ const CLI_PROFILES_RELATIVE_PATH: &str = "cli/profiles.toml";
 const CLI_PROFILE_SCHEMA_VERSION: u32 = 1;
 const PROFILE_STATE_ROOT_RELATIVE_PREFIX: &str = "profiles";
 const PROFILE_STATE_ROOT_RELATIVE_SUFFIX: &str = "state";
+const PROFILE_CONFIG_RELATIVE_DIR: &str = "config";
+const PROFILE_CONFIG_FILE_NAME: &str = "palyra.toml";
 
 #[derive(Debug, Clone)]
 pub(crate) struct RootCommandContext {
@@ -443,6 +445,15 @@ pub(crate) fn default_profile_state_root(profile_name: &str) -> Result<PathBuf> 
         .join(PROFILE_STATE_ROOT_RELATIVE_PREFIX)
         .join(profile_name)
         .join(PROFILE_STATE_ROOT_RELATIVE_SUFFIX))
+}
+
+pub(crate) fn default_profile_config_path(profile_name: &str) -> Result<PathBuf> {
+    let base_state_root = resolve_cli_state_root(None)?;
+    Ok(base_state_root
+        .join(PROFILE_STATE_ROOT_RELATIVE_PREFIX)
+        .join(profile_name)
+        .join(PROFILE_CONFIG_RELATIVE_DIR)
+        .join(PROFILE_CONFIG_FILE_NAME))
 }
 
 pub(crate) fn validate_profile_name(raw: &str) -> Result<String> {

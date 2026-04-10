@@ -96,7 +96,7 @@ pub use pairing::{PairingClientKindArg, PairingCommand, PairingMethodArg, Pairin
 pub use patch::PatchCommand;
 pub use plugins::PluginsCommand;
 pub use policy::PolicyCommand;
-pub use profile::{ProfileCommand, ProfileModeArg, ProfileRiskLevelArg};
+pub use profile::{ProfileCommand, ProfileExportModeArg, ProfileModeArg, ProfileRiskLevelArg};
 pub use protocol::ProtocolCommand;
 pub use reset::{ResetCommand, ResetScopeArg};
 pub use routines::{

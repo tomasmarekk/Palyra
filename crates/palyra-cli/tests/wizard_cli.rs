@@ -2,7 +2,7 @@ use std::{
     ffi::OsString,
     fs,
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
 };
 
 use anyhow::{Context, Result};
@@ -21,13 +21,38 @@ fn configure_cli_env(command: &mut Command, workdir: &TempDir) {
 }
 
 fn run_cli(workdir: &TempDir, args: &[&str], envs: &[(&str, &str)]) -> Result<Output> {
+    run_cli_with_stdin(workdir, args, envs, None)
+}
+
+fn run_cli_with_stdin(
+    workdir: &TempDir,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    stdin_bytes: Option<&[u8]>,
+) -> Result<Output> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_palyra"));
     command.current_dir(workdir.path()).args(args);
     configure_cli_env(&mut command, workdir);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
     for (key, value) in envs {
         command.env(key, value);
     }
-    command.output().with_context(|| format!("failed to execute palyra {}", args.join(" ")))
+    if stdin_bytes.is_some() {
+        command.stdin(Stdio::piped());
+    }
+    let mut child =
+        command.spawn().with_context(|| format!("failed to execute palyra {}", args.join(" ")))?;
+    if let Some(stdin_bytes) = stdin_bytes {
+        use std::io::Write;
+
+        let mut stdin = child.stdin.take().context("child stdin should be piped")?;
+        stdin
+            .write_all(stdin_bytes)
+            .with_context(|| format!("failed to write stdin for palyra {}", args.join(" ")))?;
+    }
+    child
+        .wait_with_output()
+        .with_context(|| format!("failed to collect output for palyra {}", args.join(" ")))
 }
 
 fn backup_path(path: &Path, index: usize) -> PathBuf {
@@ -456,5 +481,270 @@ fn profile_delete_requires_yes_for_active_profile() -> Result<()> {
     assert!(!delete.status.success(), "active profile delete should require --yes");
     let stderr = String::from_utf8_lossy(&delete.stderr);
     assert!(stderr.contains("without --yes"), "expected explicit safety message, got: {stderr}");
+    Ok(())
+}
+
+#[test]
+fn profile_clone_copies_config_into_isolated_namespace() -> Result<()> {
+    let workdir = TempDir::new().context("failed to create temporary workdir")?;
+    let source_config = workdir.path().join("profiles").join("prod.toml");
+    seed_quickstart_config(&workdir, &source_config)?;
+    let source_config_string = source_config.to_string_lossy().into_owned();
+    let create = run_cli(
+        &workdir,
+        &[
+            "profile",
+            "create",
+            "prod",
+            "--mode",
+            "remote",
+            "--config-path",
+            &source_config_string,
+            "--set-default",
+            "--json",
+        ],
+        &[],
+    )?;
+    assert!(
+        create.status.success(),
+        "profile create should succeed: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let cloned = run_cli(
+        &workdir,
+        &["profile", "clone", "prod", "staging", "--set-default", "--json"],
+        &[],
+    )?;
+    assert!(
+        cloned.status.success(),
+        "profile clone should succeed: {}",
+        String::from_utf8_lossy(&cloned.stderr)
+    );
+    let payload: Value =
+        serde_json::from_slice(&cloned.stdout).context("profile clone stdout should be JSON")?;
+    assert_eq!(payload.get("action").and_then(Value::as_str), Some("clone"));
+    assert_eq!(payload.get("source_profile").and_then(Value::as_str), Some("prod"));
+    assert_eq!(payload.pointer("/profile/name").and_then(Value::as_str), Some("staging"));
+    assert_eq!(
+        payload.pointer("/validation/config_snapshot_written").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        payload.pointer("/validation/isolated_state_root").and_then(Value::as_bool),
+        Some(true)
+    );
+    let cloned_config = workdir
+        .path()
+        .join("state-root")
+        .join("profiles")
+        .join("staging")
+        .join("config")
+        .join("palyra.toml");
+    assert!(cloned_config.exists(), "expected cloned config snapshot to exist");
+    let cloned_config_raw = fs::read_to_string(&cloned_config)
+        .with_context(|| format!("failed to read {}", cloned_config.display()))?;
+    assert!(
+        cloned_config_raw.contains("openai_api_key_vault_ref"),
+        "expected cloned config to preserve config snapshot"
+    );
+    let registry = fs::read_to_string(profiles_registry_path(&workdir))
+        .context("expected CLI profiles registry after clone")?;
+    assert!(registry.contains("default_profile = \"staging\""));
+    assert!(
+        registry.contains("state-root")
+            && registry.contains("profiles")
+            && registry.contains("staging")
+            && registry.contains("config")
+    );
+    Ok(())
+}
+
+#[test]
+fn profile_export_redacted_hides_inline_secrets() -> Result<()> {
+    let workdir = TempDir::new().context("failed to create temporary workdir")?;
+    let config_path = workdir.path().join("profiles").join("redacted.toml");
+    fs::create_dir_all(config_path.parent().context("missing config parent")?)?;
+    fs::write(
+        &config_path,
+        r#"
+[daemon]
+port = 7142
+
+[model_provider]
+kind = "openai_compatible"
+openai_base_url = "https://api.openai.com/v1"
+openai_api_key = "sk-inline-secret"
+openai_api_key_vault_ref = "global/openai_api_key"
+"#,
+    )?;
+    let config_path_string = config_path.to_string_lossy().into_owned();
+    let create = run_cli(
+        &workdir,
+        &["profile", "create", "redacted", "--config-path", &config_path_string, "--force"],
+        &[],
+    )?;
+    assert!(
+        create.status.success(),
+        "profile create should succeed: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let export_path = workdir.path().join("exports").join("redacted-profile.json");
+    let export_path_string = export_path.to_string_lossy().into_owned();
+    let exported = run_cli(
+        &workdir,
+        &["profile", "export", "redacted", "--output", &export_path_string, "--json"],
+        &[],
+    )?;
+    assert!(
+        exported.status.success(),
+        "profile export should succeed: {}",
+        String::from_utf8_lossy(&exported.stderr)
+    );
+    let exported_bundle: Value = serde_json::from_slice(
+        &fs::read(&export_path)
+            .with_context(|| format!("failed to read {}", export_path.display()))?,
+    )
+    .context("exported bundle should be JSON")?;
+    let config_content = exported_bundle
+        .pointer("/config/content")
+        .and_then(Value::as_str)
+        .context("expected config snapshot in exported bundle")?;
+    assert!(
+        config_content.contains("<redacted>"),
+        "expected redacted bundle to hide secret values"
+    );
+    assert!(
+        !config_content.contains("sk-inline-secret"),
+        "inline secret must not survive redacted export"
+    );
+    assert_eq!(
+        exported_bundle.pointer("/secret_references/0/reference").and_then(Value::as_str),
+        Some("global/openai_api_key")
+    );
+    Ok(())
+}
+
+#[test]
+fn profile_export_encrypted_and_import_reports_missing_secret_refs() -> Result<()> {
+    let workdir = TempDir::new().context("failed to create temporary workdir")?;
+    let config_path = workdir.path().join("profiles").join("prod.toml");
+    fs::create_dir_all(config_path.parent().context("missing config parent")?)?;
+    fs::write(
+        &config_path,
+        r#"
+[daemon]
+port = 7142
+
+[model_provider]
+kind = "openai_compatible"
+openai_base_url = "https://api.openai.com/v1"
+openai_api_key_vault_ref = "global/missing_openai_key"
+"#,
+    )?;
+    let config_path_string = config_path.to_string_lossy().into_owned();
+    let create = run_cli(
+        &workdir,
+        &[
+            "profile",
+            "create",
+            "prod",
+            "--mode",
+            "remote",
+            "--config-path",
+            &config_path_string,
+            "--admin-token-env",
+            "PALYRA_PROD_ADMIN_TOKEN",
+            "--force",
+        ],
+        &[],
+    )?;
+    assert!(
+        create.status.success(),
+        "profile create should succeed: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let export_path = workdir.path().join("exports").join("prod-profile.enc");
+    let export_path_string = export_path.to_string_lossy().into_owned();
+    let exported = run_cli_with_stdin(
+        &workdir,
+        &[
+            "profile",
+            "export",
+            "prod",
+            "--output",
+            &export_path_string,
+            "--mode",
+            "encrypted",
+            "--password-stdin",
+            "--json",
+        ],
+        &[],
+        Some(b"test-password\n"),
+    )?;
+    assert!(
+        exported.status.success(),
+        "encrypted profile export should succeed: {}",
+        String::from_utf8_lossy(&exported.stderr)
+    );
+    let encrypted_raw = fs::read_to_string(&export_path)
+        .with_context(|| format!("failed to read {}", export_path.display()))?;
+    assert!(encrypted_raw.contains("palyra_cli_profile_bundle_encrypted_v1"));
+    assert!(
+        !encrypted_raw.contains("missing_openai_key")
+            && !encrypted_raw.contains("PALYRA_PROD_ADMIN_TOKEN"),
+        "encrypted bundle should not expose exported profile details in plaintext"
+    );
+
+    let imported = run_cli_with_stdin(
+        &workdir,
+        &[
+            "profile",
+            "import",
+            "--input",
+            &export_path_string,
+            "--name",
+            "imported",
+            "--password-stdin",
+            "--json",
+        ],
+        &[],
+        Some(b"test-password\n"),
+    )?;
+    assert!(
+        imported.status.success(),
+        "profile import should succeed: {}",
+        String::from_utf8_lossy(&imported.stderr)
+    );
+    let payload: Value =
+        serde_json::from_slice(&imported.stdout).context("profile import stdout should be JSON")?;
+    assert_eq!(payload.get("action").and_then(Value::as_str), Some("import"));
+    assert_eq!(payload.pointer("/profile/name").and_then(Value::as_str), Some("imported"));
+    assert_eq!(
+        payload.pointer("/validation/summary/blocking_findings").and_then(Value::as_u64),
+        Some(1)
+    );
+    assert!(
+        payload.pointer("/validation/findings").and_then(Value::as_array).is_some_and(|findings| {
+            findings.iter().any(|finding| {
+                finding.get("code").and_then(Value::as_str) == Some("missing_secret_reference")
+            })
+        }),
+        "expected missing secret validation finding: {payload}"
+    );
+    assert_eq!(
+        payload.pointer("/validation/isolated_config_path").and_then(Value::as_bool),
+        Some(true)
+    );
+    let imported_config = workdir
+        .path()
+        .join("state-root")
+        .join("profiles")
+        .join("imported")
+        .join("config")
+        .join("palyra.toml");
+    assert!(imported_config.exists(), "expected imported config snapshot");
     Ok(())
 }

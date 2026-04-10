@@ -1,0 +1,20 @@
+Usage: palyra profile import [OPTIONS] --input <INPUT>
+
+Options:
+      --input <INPUT>
+      --name <NAME>
+      --password-stdin
+      --set-default
+      --force
+      --json
+  -h, --help            Print help
+
+Global Options:
+      --profile <PROFILE>
+      --config <CONFIG_PATH>
+      --state-root <STATE_ROOT>
+  -v, --verbose...                     Increase logging verbosity (-v => debug, -vv => trace)
+      --log-level <LOG_LEVEL>          [default: info] [possible values: error, warn, info, debug, trace]
+      --output-format <OUTPUT_FORMAT>  [default: text] [possible values: text, json, ndjson]
+      --plain
+      --no-color

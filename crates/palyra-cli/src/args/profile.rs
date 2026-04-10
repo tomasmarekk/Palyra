@@ -5,6 +5,10 @@ const PROFILE_AFTER_HELP: &str = "\
 Examples:
   palyra profile list
   palyra profile create staging --mode remote --set-default
+  palyra profile clone prod staging --json
+  palyra profile export prod --output ./artifacts/prod-profile.json
+  palyra profile export prod --mode encrypted --password-stdin --output ./artifacts/prod-profile.enc
+  palyra profile import --input ./artifacts/staging-profile.enc --password-stdin --json
   palyra profile show
   palyra profile use prod
   palyra profile rename stage staging
@@ -12,7 +16,8 @@ Examples:
 
 Discoverability:
   `profile show` without a name resolves the active profile.
-  `profile create` assigns an isolated per-profile state root by default.";
+  `profile create`, `profile clone`, and `profile import` assign isolated per-profile state roots.
+  `profile clone` and `profile import` also write copied config snapshots into isolated per-profile config paths when source config is available.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -29,6 +34,13 @@ pub enum ProfileRiskLevelArg {
     Elevated,
     High,
     Critical,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileExportModeArg {
+    Redacted,
+    Encrypted,
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
@@ -76,6 +88,51 @@ pub enum ProfileCommand {
         device_id: Option<String>,
         #[arg(long)]
         channel: Option<String>,
+        #[arg(long, default_value_t = false)]
+        set_default: bool,
+        #[arg(long, default_value_t = false)]
+        force: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Clone {
+        name: String,
+        new_name: String,
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long)]
+        environment: Option<String>,
+        #[arg(long)]
+        color: Option<String>,
+        #[arg(long, value_enum)]
+        risk_level: Option<ProfileRiskLevelArg>,
+        #[arg(long, default_value_t = false)]
+        strict_mode: bool,
+        #[arg(long, default_value_t = false)]
+        set_default: bool,
+        #[arg(long, default_value_t = false)]
+        force: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Export {
+        name: Option<String>,
+        #[arg(long)]
+        output: String,
+        #[arg(long, value_enum, default_value_t = ProfileExportModeArg::Redacted)]
+        mode: ProfileExportModeArg,
+        #[arg(long, default_value_t = false)]
+        password_stdin: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Import {
+        #[arg(long)]
+        input: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long, default_value_t = false)]
+        password_stdin: bool,
         #[arg(long, default_value_t = false)]
         set_default: bool,
         #[arg(long, default_value_t = false)]

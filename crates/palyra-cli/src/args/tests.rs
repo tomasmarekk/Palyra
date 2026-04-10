@@ -16,7 +16,7 @@ use super::{
     ObjectiveScheduleTypeArg, ObjectiveUpsertCommandArgs, ObjectivesCommand,
     OnboardingAuthMethodArg, OnboardingCommand, OnboardingFlowArg, PairingClientKindArg,
     PairingCommand, PairingMethodArg, PairingStateArg, PatchCommand, PluginsCommand, PolicyCommand,
-    ProfileCommand, ProfileModeArg, ProfileRiskLevelArg, ProtocolCommand,
+    ProfileCommand, ProfileExportModeArg, ProfileModeArg, ProfileRiskLevelArg, ProtocolCommand,
     RemoteVerificationModeArg, ResetCommand, ResetScopeArg, RoutineApprovalModeArg,
     RoutineDeliveryModeArg, RoutinePreviewTimezoneArg, RoutineTriggerKindArg, RoutinesCommand,
     SandboxCommand, SandboxRuntimeArg, SecretsCommand, SecretsConfigureCommand, SecurityCommand,
@@ -127,6 +127,96 @@ fn parse_profile_show_delete_and_rename() {
                 name: "old-sandbox".to_owned(),
                 yes: true,
                 delete_state_root: true,
+                json: true,
+            }
+        }
+    );
+}
+
+#[test]
+fn parse_profile_clone_export_and_import() {
+    let cloned = Cli::parse_from([
+        "palyra",
+        "profile",
+        "clone",
+        "prod",
+        "staging",
+        "--label",
+        "Staging",
+        "--environment",
+        "staging",
+        "--risk-level",
+        "elevated",
+        "--strict-mode",
+        "--set-default",
+        "--force",
+        "--json",
+    ]);
+    assert_eq!(
+        cloned.command,
+        Command::Profile {
+            command: ProfileCommand::Clone {
+                name: "prod".to_owned(),
+                new_name: "staging".to_owned(),
+                label: Some("Staging".to_owned()),
+                environment: Some("staging".to_owned()),
+                color: None,
+                risk_level: Some(ProfileRiskLevelArg::Elevated),
+                strict_mode: true,
+                set_default: true,
+                force: true,
+                json: true,
+            }
+        }
+    );
+
+    let export = Cli::parse_from([
+        "palyra",
+        "profile",
+        "export",
+        "prod",
+        "--output",
+        "artifacts/prod-profile.enc",
+        "--mode",
+        "encrypted",
+        "--password-stdin",
+        "--json",
+    ]);
+    assert_eq!(
+        export.command,
+        Command::Profile {
+            command: ProfileCommand::Export {
+                name: Some("prod".to_owned()),
+                output: "artifacts/prod-profile.enc".to_owned(),
+                mode: ProfileExportModeArg::Encrypted,
+                password_stdin: true,
+                json: true,
+            }
+        }
+    );
+
+    let import = Cli::parse_from([
+        "palyra",
+        "profile",
+        "import",
+        "--input",
+        "artifacts/staging-profile.enc",
+        "--name",
+        "staging",
+        "--password-stdin",
+        "--set-default",
+        "--force",
+        "--json",
+    ]);
+    assert_eq!(
+        import.command,
+        Command::Profile {
+            command: ProfileCommand::Import {
+                input: "artifacts/staging-profile.enc".to_owned(),
+                name: Some("staging".to_owned()),
+                password_stdin: true,
+                set_default: true,
+                force: true,
                 json: true,
             }
         }

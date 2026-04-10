@@ -820,6 +820,39 @@ path = "profile delete"
 file = "profile-delete-help.txt"
 
 [[entries]]
+path = "profile clone"
+category = "nested_surface"
+status = "done"
+summary = "Profile clone workflow with isolated config/state namespaces."
+required_flags = ["label", "environment", "color", "risk-level", "strict-mode", "set-default", "force"]
+
+[entries.snapshot]
+path = "profile clone"
+file = "profile-clone-help.txt"
+
+[[entries]]
+path = "profile export"
+category = "nested_surface"
+status = "done"
+summary = "Profile portability export workflow with redacted and encrypted bundle modes."
+required_flags = ["output", "mode", "password-stdin"]
+
+[entries.snapshot]
+path = "profile export"
+file = "profile-export-help.txt"
+
+[[entries]]
+path = "profile import"
+category = "nested_surface"
+status = "done"
+summary = "Profile portability import workflow with validation reporting."
+required_flags = ["input", "name", "password-stdin", "set-default", "force"]
+
+[entries.snapshot]
+path = "profile import"
+file = "profile-import-help.txt"
+
+[[entries]]
 path = "cron update"
 category = "nested_surface"
 status = "done"

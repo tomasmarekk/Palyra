@@ -6,6 +6,9 @@ Commands:
   list
   show
   create
+  clone
+  export
+  import
   use
   rename
   delete
@@ -39,6 +42,10 @@ Global Options:
 Examples:
   palyra profile list
   palyra profile create staging --mode remote --set-default
+  palyra profile clone prod staging --json
+  palyra profile export prod --output ./artifacts/prod-profile.json
+  palyra profile export prod --mode encrypted --password-stdin --output ./artifacts/prod-profile.enc
+  palyra profile import --input ./artifacts/staging-profile.enc --password-stdin --json
   palyra profile show
   palyra profile use prod
   palyra profile rename stage staging
@@ -46,4 +53,5 @@ Examples:
 
 Discoverability:
   `profile show` without a name resolves the active profile.
-  `profile create` assigns an isolated per-profile state root by default.
+  `profile create`, `profile clone`, and `profile import` assign isolated per-profile state roots.
+  `profile clone` and `profile import` also write copied config snapshots into isolated per-profile config paths when source config is available.
