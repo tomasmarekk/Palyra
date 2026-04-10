@@ -1,10 +1,5 @@
 import { getSectionPath } from "./navigation";
-import {
-  readObject,
-  readString,
-  readStringList,
-  type JsonObject,
-} from "./shared";
+import { readObject, readString, readStringList, type JsonObject } from "./shared";
 
 type SessionLike = {
   session_id?: string;

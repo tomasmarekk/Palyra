@@ -59,15 +59,8 @@ import { useRecallPreview } from "./useRecallPreview";
 import { useChatRunStream } from "./useChatRunStream";
 import { useChatSessions } from "./useChatSessions";
 import { usePhase4DeepLinks } from "./usePhase4DeepLinks";
-import {
-  buildObjectiveOverviewHref,
-  findObjectiveForSession,
-} from "../console/objectiveLinks";
-import {
-  isJsonObject,
-  readString,
-  type JsonObject,
-} from "../console/shared";
+import { buildObjectiveOverviewHref, findObjectiveForSession } from "../console/objectiveLinks";
+import { isJsonObject, readString, type JsonObject } from "../console/shared";
 
 interface ChatConsolePanelProps {
   readonly api: ConsoleApiClient;
@@ -327,10 +320,7 @@ export function ChatConsolePanel({
 
   useEffect(() => {
     void sessions.refreshSessions(true);
-    void Promise.all([
-      api.getDelegationCatalog(),
-      refreshObjectives(),
-    ])
+    void Promise.all([api.getDelegationCatalog(), refreshObjectives()])
       .then(([delegationResponse]) => {
         setDelegationCatalog(delegationResponse.catalog);
       })

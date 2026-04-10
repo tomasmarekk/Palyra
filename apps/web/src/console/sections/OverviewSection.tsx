@@ -299,7 +299,9 @@ export function OverviewSection({ app }: OverviewSectionProps) {
   function openSelectedObjectiveOperations(): void {
     const objectiveId = resolveObjectiveId(selectedObjective);
     if (objectiveId !== null) {
-      void navigate(`${getSectionPath("operations")}?objectiveId=${encodeURIComponent(objectiveId)}`);
+      void navigate(
+        `${getSectionPath("operations")}?objectiveId=${encodeURIComponent(objectiveId)}`,
+      );
       return;
     }
     app.setSection("operations");
