@@ -92,7 +92,8 @@ export function App() {
     null;
   const selectedApprovalIdResolved = readString(selectedApproval, "approval_id") ?? "";
   const unreadNotifications = snapshot.notifications.filter((entry) => !entry.read);
-  const activeProfile = snapshot.active_profile?.context ?? snapshot.console_session?.profile ?? null;
+  const activeProfile =
+    snapshot.active_profile?.context ?? snapshot.console_session?.profile ?? null;
   const offlineDraftsForSession = snapshot.offline_drafts.filter(
     (draft) => draft.session_id === undefined || draft.session_id === activeSessionId,
   );
