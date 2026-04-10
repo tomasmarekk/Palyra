@@ -1468,7 +1468,10 @@ fn handle_openai_mock_request(
     stream: &mut TcpStream,
     state: &Arc<Mutex<OpenAiMockState>>,
 ) -> Result<()> {
-    let request = read_http_request(stream)?;
+    let request = match read_http_request(stream)? {
+        Some(request) => request,
+        None => return Ok(()),
+    };
     if request.request_line.starts_with("GET /v1/models ") {
         let authorization =
             request.headers.get("authorization").map(String::as_str).unwrap_or_default();
@@ -1544,7 +1547,7 @@ fn handle_openai_mock_request(
     write_json_response(stream, "404 Not Found", r#"{"error":"not_found"}"#)
 }
 
-fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
+fn read_http_request(stream: &mut TcpStream) -> Result<Option<HttpRequest>> {
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .context("failed to set OpenAI mock stream read timeout")?;
@@ -1553,7 +1556,7 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
     let request_line_bytes =
         reader.read_line(&mut request_line).context("failed to read OpenAI mock request line")?;
     if request_line_bytes == 0 {
-        anyhow::bail!("OpenAI mock request is missing request-line");
+        return Ok(None);
     }
     let request_line = request_line.trim_end_matches(&['\r', '\n'][..]).to_owned();
     let path = request_line
@@ -1594,7 +1597,7 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
     let body =
         String::from_utf8(body_bytes).context("OpenAI mock request body was not valid UTF-8")?;
 
-    Ok(HttpRequest { request_line, path, headers, body })
+    Ok(Some(HttpRequest { request_line, path, headers, body }))
 }
 
 fn write_json_response(stream: &mut TcpStream, status_line: &str, body: &str) -> Result<()> {
