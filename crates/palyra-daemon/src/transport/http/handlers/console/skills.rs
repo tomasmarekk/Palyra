@@ -487,6 +487,7 @@ fn default_generated_skill_id(candidate_id: &str) -> String {
     format!("palyra.generated.procedure.{}", candidate_id.to_ascii_lowercase())
 }
 
+#[allow(clippy::result_large_err)]
 fn normalize_generated_skill_identifier(raw: &str, field: &str) -> Result<String, Response> {
     let normalized = raw.trim().to_ascii_lowercase();
     if normalized.is_empty()
@@ -502,6 +503,7 @@ fn normalize_generated_skill_identifier(raw: &str, field: &str) -> Result<String
     Ok(normalized)
 }
 
+#[allow(clippy::result_large_err)]
 fn write_procedure_skill_scaffold(
     candidate: &LearningCandidateRecord,
     skill_id: &str,
