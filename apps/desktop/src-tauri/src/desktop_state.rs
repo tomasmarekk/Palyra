@@ -533,10 +533,8 @@ pub(crate) fn validate_runtime_state_root_override(
 struct PersistedDesktopStateEnvelope {
     #[serde(default = "default_legacy_schema_version")]
     schema_version: u32,
-    #[serde(default)]
-    admin_token: String,
-    #[serde(default)]
-    browser_auth_token: String,
+    #[serde(flatten)]
+    legacy_secrets: LegacyDesktopSecrets,
     #[serde(default = "default_browser_service_enabled")]
     browser_service_enabled: bool,
     #[serde(default)]
@@ -557,8 +555,7 @@ impl Default for PersistedDesktopStateEnvelope {
     fn default() -> Self {
         Self {
             schema_version: default_legacy_schema_version(),
-            admin_token: String::new(),
-            browser_auth_token: String::new(),
+            legacy_secrets: LegacyDesktopSecrets::default(),
             browser_service_enabled: default_browser_service_enabled(),
             active_profile_name: Some(IMPLICIT_DESKTOP_PROFILE_NAME.to_owned()),
             recent_profile_names: vec![IMPLICIT_DESKTOP_PROFILE_NAME.to_owned()],
@@ -570,9 +567,27 @@ impl Default for PersistedDesktopStateEnvelope {
     }
 }
 
+#[derive(Clone, Default, Deserialize)]
+#[serde(default)]
+struct LegacyDesktopSecrets {
+    admin_token: String,
+    browser_auth_token: String,
+}
+
+impl std::fmt::Debug for LegacyDesktopSecrets {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LegacyDesktopSecrets")
+            .field("admin_token", &"<redacted>")
+            .field("browser_auth_token", &"<redacted>")
+            .finish()
+    }
+}
+
 impl PersistedDesktopStateEnvelope {
-    fn into_state(self) -> DesktopStateFile {
+    fn into_parts(self) -> (DesktopStateFile, LegacyDesktopSecrets) {
         let _ = self.schema_version;
+        let legacy_secrets = self.legacy_secrets;
         let mut profile_states = self.profile_states;
         if profile_states.is_empty() {
             profile_states.insert(
@@ -596,7 +611,7 @@ impl PersistedDesktopStateEnvelope {
             profile_states,
         };
         state.ensure_profile_integrity();
-        state
+        (state, legacy_secrets)
     }
 }
 
@@ -605,6 +620,11 @@ pub(crate) struct LoadedDesktopState {
     pub(crate) persisted: DesktopStateFile,
     pub(crate) admin_token: String,
     pub(crate) browser_auth_token: String,
+}
+
+struct DesktopRuntimeSecrets {
+    admin_token: String,
+    browser_auth_token: String,
 }
 
 pub(crate) struct DesktopSecretStore {
@@ -701,26 +721,25 @@ pub(crate) fn load_or_initialize_state_file(
             .with_context(|| format!("failed to read desktop state file {}", path.display()))?;
         let persisted_envelope: PersistedDesktopStateEnvelope = serde_json::from_str(raw.as_str())
             .with_context(|| format!("failed to parse desktop state file {}", path.display()))?;
-        let admin_token = secret_store.load_or_create_secret(
-            DESKTOP_SECRET_KEY_ADMIN_TOKEN,
-            Some(persisted_envelope.admin_token.as_str()),
-        )?;
-        let browser_auth_token = secret_store.load_or_create_secret(
-            DESKTOP_SECRET_KEY_BROWSER_AUTH_TOKEN,
-            Some(persisted_envelope.browser_auth_token.as_str()),
-        )?;
-        let mut persisted = persisted_envelope.into_state();
+        let (mut persisted, legacy_secrets) = persisted_envelope.into_parts();
+        let runtime_secrets = load_desktop_runtime_secrets(secret_store, legacy_secrets)?;
         persisted.ensure_profile_integrity();
         persist_desktop_state_file(path, &persisted, "normalized")?;
-        return Ok(LoadedDesktopState { persisted, admin_token, browser_auth_token });
+        return Ok(LoadedDesktopState {
+            persisted,
+            admin_token: runtime_secrets.admin_token,
+            browser_auth_token: runtime_secrets.browser_auth_token,
+        });
     }
 
     let persisted = DesktopStateFile::new_default();
-    let admin_token = secret_store.load_or_create_secret(DESKTOP_SECRET_KEY_ADMIN_TOKEN, None)?;
-    let browser_auth_token =
-        secret_store.load_or_create_secret(DESKTOP_SECRET_KEY_BROWSER_AUTH_TOKEN, None)?;
+    let runtime_secrets = load_desktop_runtime_secrets(secret_store, LegacyDesktopSecrets::default())?;
     persist_desktop_state_file(path, &persisted, "default")?;
-    Ok(LoadedDesktopState { persisted, admin_token, browser_auth_token })
+    Ok(LoadedDesktopState {
+        persisted,
+        admin_token: runtime_secrets.admin_token,
+        browser_auth_token: runtime_secrets.browser_auth_token,
+    })
 }
 
 fn persist_desktop_state_file(path: &Path, state: &DesktopStateFile, label: &str) -> Result<()> {
@@ -728,6 +747,21 @@ fn persist_desktop_state_file(path: &Path, state: &DesktopStateFile, label: &str
         .with_context(|| format!("failed to encode {label} desktop state file"))?;
     fs::write(path, encoded)
         .with_context(|| format!("failed to persist {label} desktop state file {}", path.display()))
+}
+
+fn load_desktop_runtime_secrets(
+    secret_store: &DesktopSecretStore,
+    legacy_secrets: LegacyDesktopSecrets,
+) -> Result<DesktopRuntimeSecrets> {
+    let admin_token = secret_store.load_or_create_secret(
+        DESKTOP_SECRET_KEY_ADMIN_TOKEN,
+        Some(legacy_secrets.admin_token.as_str()),
+    )?;
+    let browser_auth_token = secret_store.load_or_create_secret(
+        DESKTOP_SECRET_KEY_BROWSER_AUTH_TOKEN,
+        Some(legacy_secrets.browser_auth_token.as_str()),
+    )?;
+    Ok(DesktopRuntimeSecrets { admin_token, browser_auth_token })
 }
 
 fn generate_secret_token() -> String {
