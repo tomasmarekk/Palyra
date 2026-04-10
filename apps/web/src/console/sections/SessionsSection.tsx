@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Chip } from "@heroui/react";
 import { useNavigate } from "react-router-dom";
 
@@ -8,6 +8,11 @@ import type {
   ChatCompactionArtifactRecord,
   ChatCompactionPreview,
 } from "../../consoleApi";
+import {
+  buildObjectiveChatHref,
+  buildObjectiveOverviewHref,
+  findObjectiveForSession,
+} from "../objectiveLinks";
 import { getSectionPath } from "../navigation";
 import { ActionButton, SelectField, SwitchField, TextInputField } from "../components/ui";
 import {
@@ -23,7 +28,7 @@ import {
   workspaceToneForState,
 } from "../components/workspace/WorkspacePatterns";
 import { useSessionCatalogDomain } from "../hooks/useSessionCatalogDomain";
-import { formatUnixMs } from "../shared";
+import { formatUnixMs, isJsonObject, readString, type JsonObject } from "../shared";
 import type { ConsoleAppState } from "../useConsoleAppState";
 
 type SessionsSectionProps = {
@@ -39,7 +44,23 @@ export function SessionsSection({ app }: SessionsSectionProps) {
   const [sessionCompactions, setSessionCompactions] = useState<ChatCompactionArtifactRecord[]>([]);
   const [sessionCheckpoints, setSessionCheckpoints] = useState<ChatCheckpointRecord[]>([]);
   const [compactionPreview, setCompactionPreview] = useState<ChatCompactionPreview | null>(null);
+  const [objectivesBusy, setObjectivesBusy] = useState(false);
+  const [objectives, setObjectives] = useState<JsonObject[]>([]);
   const selectedLineage = buildSessionLineageHint(selected);
+  const selectedObjective = useMemo(
+    () =>
+      findObjectiveForSession(
+        objectives,
+        selected === null
+          ? null
+          : {
+              session_id: selected.session_id,
+              session_key: selected.session_key,
+              session_label: selected.session_label,
+            },
+      ),
+    [objectives, selected],
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -77,6 +98,36 @@ export function SessionsSection({ app }: SessionsSectionProps) {
       cancelled = true;
     };
   }, [app, selected?.session_id]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadObjectives(): Promise<void> {
+      setObjectivesBusy(true);
+      try {
+        const response = await app.api.listObjectives(new URLSearchParams({ limit: "64" }));
+        if (cancelled) {
+          return;
+        }
+        setObjectives(
+          Array.isArray(response.objectives) ? response.objectives.filter(isJsonObject) : [],
+        );
+      } catch (error) {
+        if (!cancelled) {
+          app.setError(error instanceof Error ? error.message : "Unexpected failure.");
+        }
+      } finally {
+        if (!cancelled) {
+          setObjectivesBusy(false);
+        }
+      }
+    }
+
+    void loadObjectives();
+    return () => {
+      cancelled = true;
+    };
+  }, [app]);
 
   async function createCheckpoint(): Promise<void> {
     if (selected === null) {
@@ -445,6 +496,16 @@ export function SessionsSection({ app }: SessionsSectionProps) {
                 type="button"
                 variant="secondary"
                 onPress={() => {
+                  if (selectedObjective !== null) {
+                    void navigate(
+                      buildObjectiveChatHref({
+                        objective: selectedObjective,
+                        fallbackSessionId: selected.session_id,
+                        runId: selected.last_run_id,
+                      }),
+                    );
+                    return;
+                  }
                   const search = new URLSearchParams();
                   search.set("sessionId", selected.session_id);
                   if (selected.last_run_id) {
@@ -454,6 +515,23 @@ export function SessionsSection({ app }: SessionsSectionProps) {
                 }}
               >
                 Open in chat
+              </ActionButton>
+              <ActionButton
+                type="button"
+                variant="secondary"
+                isDisabled={selectedObjective === null}
+                onPress={() => {
+                  if (selectedObjective === null) {
+                    return;
+                  }
+                  const objectiveId = readString(selectedObjective, "objective_id");
+                  if (objectiveId === null) {
+                    return;
+                  }
+                  void navigate(buildObjectiveOverviewHref(objectiveId));
+                }}
+              >
+                Open objective
               </ActionButton>
               <ActionButton
                 type="button"
@@ -510,6 +588,39 @@ export function SessionsSection({ app }: SessionsSectionProps) {
                   </p>
                 </WorkspaceInlineNotice>
               ) : null}
+
+              <WorkspaceInlineNotice
+                title={selectedObjective === null ? "Objective linkage" : "Linked objective"}
+                tone={selectedObjective === null ? "default" : "accent"}
+              >
+                {selectedObjective === null ? (
+                  objectivesBusy ? (
+                    <p>Loading objective linkage for the selected session.</p>
+                  ) : (
+                    <p>No objective currently points at this session.</p>
+                  )
+                ) : (
+                  <>
+                    <p>
+                      <strong>
+                        {readString(selectedObjective, "name") ?? "Unnamed objective"}
+                      </strong>{" "}
+                      · {readString(selectedObjective, "kind") ?? "objective"} ·{" "}
+                      {readString(selectedObjective, "state") ?? "unknown"}
+                    </p>
+                    <p>
+                      <strong>Current focus:</strong>{" "}
+                      {readString(selectedObjective, "current_focus") ??
+                        "No current focus recorded."}
+                    </p>
+                    <p>
+                      <strong>Next action:</strong>{" "}
+                      {readString(selectedObjective, "next_recommended_step") ??
+                        "No next action recorded."}
+                    </p>
+                  </>
+                )}
+              </WorkspaceInlineNotice>
 
               {compactionPreview !== null ? (
                 <WorkspaceInlineNotice

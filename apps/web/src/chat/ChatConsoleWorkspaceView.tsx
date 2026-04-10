@@ -28,11 +28,14 @@ interface ChatConsoleWorkspaceViewProps {
   readonly contextBudget: ChatContextBudgetSummary;
   readonly inspectorProps: ComponentProps<typeof ChatInspectorColumn>;
   readonly onAbortRun: () => void;
+  readonly onOpenObjective?: (() => void) | null;
   readonly onOpenRunDetails: () => void;
   readonly onRefresh: () => void;
   readonly onSetAllowSensitiveTools: (next: boolean) => void;
   readonly pendingApprovalCount: number;
   readonly runActionBusy: boolean;
+  readonly selectedObjectiveFocus?: string | null;
+  readonly selectedObjectiveLabel?: string | null;
   readonly selectedSessionBranchState: string;
   readonly selectedSessionLineage: string;
   readonly selectedSessionTitle: string;
@@ -52,11 +55,14 @@ export function ChatConsoleWorkspaceView({
   contextBudget,
   inspectorProps,
   onAbortRun,
+  onOpenObjective,
   onOpenRunDetails,
   onRefresh,
   onSetAllowSensitiveTools,
   pendingApprovalCount,
   runActionBusy,
+  selectedObjectiveFocus,
+  selectedObjectiveLabel,
   selectedSessionBranchState,
   selectedSessionLineage,
   selectedSessionTitle,
@@ -84,6 +90,9 @@ export function ChatConsoleWorkspaceView({
             <StatusChip tone={toolPayloadCount > 0 ? "accent" : "default"}>
               {toolPayloadCount} payload{toolPayloadCount === 1 ? "" : "s"} in sidebar
             </StatusChip>
+            {selectedObjectiveLabel ? (
+              <StatusChip tone="accent">{selectedObjectiveLabel}</StatusChip>
+            ) : null}
             <Chip size="sm" variant="secondary">
               {selectedSessionBranchState}
             </Chip>
@@ -108,6 +117,16 @@ export function ChatConsoleWorkspaceView({
             <ActionButton isDisabled={!canInspectRun} type="button" onPress={onOpenRunDetails}>
               Run details
             </ActionButton>
+            {selectedObjectiveLabel ? (
+              <ActionButton
+                isDisabled={onOpenObjective === null || onOpenObjective === undefined}
+                type="button"
+                variant="secondary"
+                onPress={() => onOpenObjective?.()}
+              >
+                Open objective
+              </ActionButton>
+            ) : null}
             <ActionButton
               isDisabled={runActionBusy || !canAbortRun}
               type="button"
@@ -154,6 +173,9 @@ export function ChatConsoleWorkspaceView({
               >
                 {contextBudget.label}
               </StatusChip>
+              {selectedObjectiveFocus ? (
+                <StatusChip tone="accent">{selectedObjectiveFocus}</StatusChip>
+              ) : null}
               <Chip variant="secondary">{selectedSessionLineage}</Chip>
             </div>
           }

@@ -170,8 +170,8 @@ describe("M56 runtime and operations surfaces", () => {
       expect(await screen.findByText(/message\.routed/)).toBeInTheDocument();
       expect(await screen.findByText("Diagnostics snapshot")).toBeInTheDocument();
 
-      fireEvent.click(screen.getByRole("button", { name: "Routines" }));
-      expect(await screen.findByRole("heading", { name: "Routines" })).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Automations" }));
+      expect(await screen.findByRole("heading", { name: "Automations" })).toBeInTheDocument();
       expect((await screen.findAllByText("nightly")).length).toBeGreaterThan(0);
       fireEvent.click(screen.getByRole("button", { name: /Run .* now/ }));
       await waitFor(() => {

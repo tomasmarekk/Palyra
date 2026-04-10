@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { useNavigate, useSearchParams } from "react-router-dom";
 
 import {
   ActionButton,
@@ -22,6 +23,12 @@ import {
   WorkspaceInlineNotice,
   workspaceToneForState,
 } from "../components/workspace/WorkspacePatterns";
+import {
+  buildObjectiveChatHref,
+  objectiveWorkspaceDocumentPath,
+  resolveObjectiveId,
+} from "../objectiveLinks";
+import { getSectionPath } from "../navigation";
 import {
   emptyToUndefined,
   formatUnixMs,
@@ -91,6 +98,9 @@ const DEFAULT_OBJECTIVE_FORM: ObjectiveEditorForm = {
 };
 
 export function OverviewSection({ app }: OverviewSectionProps) {
+  const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const preferredObjectiveId = searchParams.get("objectiveId");
   const [objectivesBusy, setObjectivesBusy] = useState(false);
   const [objectiveMutationBusy, setObjectiveMutationBusy] = useState(false);
   const [showObjectiveEditor, setShowObjectiveEditor] = useState(false);
@@ -171,6 +181,15 @@ export function OverviewSection({ app }: OverviewSectionProps) {
   }, [app.api]);
 
   useEffect(() => {
+    if (preferredObjectiveId !== null && preferredObjectiveId.trim().length > 0) {
+      const preferredExists = objectives.some(
+        (objective) => resolveObjectiveId(objective) === preferredObjectiveId.trim(),
+      );
+      if (preferredExists && selectedObjectiveId !== preferredObjectiveId.trim()) {
+        setSelectedObjectiveId(preferredObjectiveId.trim());
+        return;
+      }
+    }
     if (selectedObjectiveId.length === 0) {
       const firstObjectiveId = resolveObjectiveId(objectives[0] ?? null);
       if (firstObjectiveId !== null) {
@@ -184,7 +203,7 @@ export function OverviewSection({ app }: OverviewSectionProps) {
     if (!stillExists) {
       setSelectedObjectiveId(resolveObjectiveId(objectives[0] ?? null) ?? "");
     }
-  }, [objectives, selectedObjectiveId]);
+  }, [objectives, preferredObjectiveId, selectedObjectiveId]);
 
   async function loadObjectives(): Promise<void> {
     setObjectivesBusy(true);
@@ -244,6 +263,46 @@ export function OverviewSection({ app }: OverviewSectionProps) {
     } finally {
       setObjectiveMutationBusy(false);
     }
+  }
+
+  function openSelectedObjectiveChat(): void {
+    if (selectedObjective === null) {
+      app.setError("Select an objective first.");
+      return;
+    }
+    void navigate(
+      buildObjectiveChatHref({
+        objective: selectedObjective,
+        runId: readString(readObject(selectedObjective, "last_run") ?? {}, "run_id"),
+      }),
+    );
+  }
+
+  function openSelectedObjectiveMemory(): void {
+    const path = objectiveWorkspaceDocumentPath(selectedObjective);
+    app.setSection("memory");
+    if (path !== null) {
+      app.setNotice(`Open workspace document ${path} in Memory.`);
+    }
+  }
+
+  function openSelectedObjectiveRoutines(): void {
+    app.setSection("cron");
+    const routineId =
+      readString(readObject(selectedObjective ?? {}, "automation") ?? {}, "routine_id") ??
+      readString(readObject(selectedObjective ?? {}, "linked_routine") ?? {}, "job_id");
+    if (routineId !== null) {
+      app.setNotice(`Inspect linked automation ${routineId} in Automations.`);
+    }
+  }
+
+  function openSelectedObjectiveOperations(): void {
+    const objectiveId = resolveObjectiveId(selectedObjective);
+    if (objectiveId !== null) {
+      void navigate(`${getSectionPath("operations")}?objectiveId=${encodeURIComponent(objectiveId)}`);
+      return;
+    }
+    app.setSection("operations");
   }
 
   return (
@@ -508,16 +567,16 @@ export function OverviewSection({ app }: OverviewSectionProps) {
                 {objectiveActivitySummary(selectedObjective)}
               </WorkspaceInlineNotice>
               <ActionCluster>
-                <ActionButton variant="secondary" onPress={() => app.setSection("chat")}>
+                <ActionButton variant="secondary" onPress={openSelectedObjectiveChat}>
                   Open chat
                 </ActionButton>
-                <ActionButton variant="secondary" onPress={() => app.setSection("memory")}>
+                <ActionButton variant="secondary" onPress={openSelectedObjectiveMemory}>
                   Open memory
                 </ActionButton>
-                <ActionButton variant="secondary" onPress={() => app.setSection("cron")}>
-                  Open routines
+                <ActionButton variant="secondary" onPress={openSelectedObjectiveRoutines}>
+                  Open automations
                 </ActionButton>
-                <ActionButton variant="secondary" onPress={() => app.setSection("operations")}>
+                <ActionButton variant="secondary" onPress={openSelectedObjectiveOperations}>
                   Open operations
                 </ActionButton>
               </ActionCluster>
@@ -673,8 +732,8 @@ export function OverviewSection({ app }: OverviewSectionProps) {
               onClick={() => app.setSection("approvals")}
             />
             <QuickAction
-              detail="Inspect routines, heartbeats, and trigger wiring."
-              label="Open routines"
+              detail="Inspect heartbeats, standing orders, programs, and trigger wiring."
+              label="Open automations"
               onClick={() => app.setSection("cron")}
             />
             <QuickAction
@@ -809,13 +868,6 @@ function buildAttentionItems({
     items.push(`Provider auth state is ${providerState}.`);
   }
   return items;
-}
-
-function resolveObjectiveId(objective: JsonObject | null): string | null {
-  if (objective === null) {
-    return null;
-  }
-  return readString(objective, "objective_id");
 }
 
 function objectiveKindLabel(kind: string | null): string {

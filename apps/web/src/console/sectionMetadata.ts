@@ -16,8 +16,8 @@ export const CONSOLE_SECTIONS = [
   { id: "approvals", label: "Approvals", detail: "Sensitive action gate" },
   {
     id: "cron",
-    label: "Routines",
-    detail: "Scheduled and event-driven automations, runs, templates, and approvals",
+    label: "Automations",
+    detail: "Heartbeats, standing orders, programs, routines, runs, templates, and approvals",
   },
   { id: "channels", label: "Channels", detail: "Connectors, router, and Discord setup" },
   { id: "browser", label: "Browser", detail: "Profiles, relay, and downloads" },

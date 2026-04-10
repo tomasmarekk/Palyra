@@ -1,5 +1,5 @@
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
-import { useSearchParams } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import type {
   ChatAttachmentRecord,
   ChatBackgroundTaskRecord,
@@ -59,6 +59,15 @@ import { useRecallPreview } from "./useRecallPreview";
 import { useChatRunStream } from "./useChatRunStream";
 import { useChatSessions } from "./useChatSessions";
 import { usePhase4DeepLinks } from "./usePhase4DeepLinks";
+import {
+  buildObjectiveOverviewHref,
+  findObjectiveForSession,
+} from "../console/objectiveLinks";
+import {
+  isJsonObject,
+  readString,
+  type JsonObject,
+} from "../console/shared";
 
 interface ChatConsolePanelProps {
   readonly api: ConsoleApiClient;
@@ -75,11 +84,13 @@ export function ChatConsolePanel({
   setNotice,
   openBrowserSessionWorkbench,
 }: ChatConsolePanelProps) {
+  const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const preferredSessionId = searchParams.get("sessionId");
   const preferredRunId = searchParams.get("runId");
   const preferredCompactionId = searchParams.get("compactionId");
   const preferredCheckpointId = searchParams.get("checkpointId");
+  const preferredObjectiveId = searchParams.get("objectiveId");
   const sessionSwitchRef = useRef<string>("");
   const transcriptRequestSeqRef = useRef(0);
   const transcriptSearchSeqRef = useRef(0);
@@ -98,6 +109,7 @@ export function ChatConsolePanel({
   const [queuedInputs, setQueuedInputs] = useState<ChatQueuedInputRecord[]>([]);
   const [backgroundTasks, setBackgroundTasks] = useState<ChatBackgroundTaskRecord[]>([]);
   const [delegationCatalog, setDelegationCatalog] = useState<ChatDelegationCatalog | null>(null);
+  const [objectives, setObjectives] = useState<JsonObject[]>([]);
   const [transcriptSearchQuery, setTranscriptSearchQuery] = useState("");
   const [transcriptSearchBusy, setTranscriptSearchBusy] = useState(false);
   const [transcriptSearchResults, setTranscriptSearchResults] = useState<TranscriptSearchMatch[]>(
@@ -204,6 +216,35 @@ export function ChatConsolePanel({
     () => buildSessionLineageHint(sessions.selectedSession),
     [sessions.selectedSession],
   );
+  const selectedObjective = useMemo(
+    () =>
+      findObjectiveForSession(
+        objectives,
+        sessions.selectedSession === null
+          ? null
+          : {
+              session_id: sessions.selectedSession.session_id,
+              session_key: sessions.selectedSession.session_key,
+              session_label: sessions.selectedSession.session_label,
+            },
+        preferredObjectiveId,
+      ),
+    [objectives, preferredObjectiveId, sessions.selectedSession],
+  );
+  const selectedObjectiveLabel = useMemo(() => {
+    if (selectedObjective === null) {
+      return null;
+    }
+    const name = readString(selectedObjective, "name") ?? "Objective";
+    const kind = readString(selectedObjective, "kind") ?? "objective";
+    return `${kind.replaceAll("_", " ")} · ${name}`;
+  }, [selectedObjective]);
+  const selectedObjectiveFocus = useMemo(() => {
+    if (selectedObjective === null) {
+      return null;
+    }
+    return readString(selectedObjective, "current_focus");
+  }, [selectedObjective]);
   const attachSelectedFiles = useChatAttachmentUploadHandler({
     api,
     sessionId: sessions.activeSessionId.trim(),
@@ -213,6 +254,13 @@ export function ChatConsolePanel({
     setError,
     setNotice,
   });
+
+  const refreshObjectives = useCallback(async () => {
+    const response = await api.listObjectives(new URLSearchParams({ limit: "64" }));
+    setObjectives(
+      Array.isArray(response.objectives) ? response.objectives.filter(isJsonObject) : [],
+    );
+  }, [api]);
 
   usePhase4DeepLinks({
     activeSessionId: sessions.activeSessionId,
@@ -279,10 +327,12 @@ export function ChatConsolePanel({
 
   useEffect(() => {
     void sessions.refreshSessions(true);
-    void api
-      .getDelegationCatalog()
-      .then((response) => {
-        setDelegationCatalog(response.catalog);
+    void Promise.all([
+      api.getDelegationCatalog(),
+      refreshObjectives(),
+    ])
+      .then(([delegationResponse]) => {
+        setDelegationCatalog(delegationResponse.catalog);
       })
       .catch((error) => {
         setError(toErrorMessage(error));
@@ -290,7 +340,7 @@ export function ChatConsolePanel({
     return () => {
       dispose();
     };
-  }, [api, dispose, sessions.refreshSessions, setError]);
+  }, [api, dispose, refreshObjectives, sessions.refreshSessions, setError]);
 
   const refreshSessionTranscript = useCallback(async () => {
     const sessionId = sessions.activeSessionId.trim();
@@ -941,6 +991,17 @@ export function ChatConsolePanel({
         onAbortRun={() => {
           void abortCurrentRun();
         }}
+        onOpenObjective={
+          selectedObjective === null
+            ? null
+            : () => {
+                const objectiveId = readString(selectedObjective, "objective_id");
+                if (objectiveId === null) {
+                  return;
+                }
+                void navigate(buildObjectiveOverviewHref(objectiveId));
+              }
+        }
         onOpenRunDetails={() => {
           const targetRunId = activeRunId ?? knownRunIds[0] ?? null;
           if (targetRunId === null) {
@@ -950,11 +1011,17 @@ export function ChatConsolePanel({
           openRunDetails(targetRunId);
         }}
         onRefresh={() => {
-          void Promise.all([sessions.refreshSessions(false), refreshSessionTranscript()]);
+          void Promise.all([
+            sessions.refreshSessions(false),
+            refreshSessionTranscript(),
+            refreshObjectives(),
+          ]);
         }}
         onSetAllowSensitiveTools={setAllowSensitiveTools}
         pendingApprovalCount={pendingApprovalCount}
         runActionBusy={runActionBusy}
+        selectedObjectiveFocus={selectedObjectiveFocus}
+        selectedObjectiveLabel={selectedObjectiveLabel}
         selectedSessionBranchState={describeBranchState(
           sessions.selectedSession?.branch_state ?? "missing",
         )}

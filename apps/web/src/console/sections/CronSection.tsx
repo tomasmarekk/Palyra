@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { useNavigate } from "react-router-dom";
 
 import {
   ActionButton,
@@ -52,10 +53,17 @@ import {
   TRIGGER_OPTIONS,
   type RoutineEditorForm,
 } from "./routinesHelpers";
+import {
+  buildObjectiveChatHref,
+  buildObjectiveOverviewHref,
+  resolveObjectiveId,
+} from "../objectiveLinks";
+import { getSectionPath } from "../navigation";
 
 type CronSectionProps = { app: ConsoleAppState };
 
 export function CronSection({ app }: CronSectionProps) {
+  const navigate = useNavigate();
   const bootstrappedRef = useRef(false);
   const lastLoadedRunsRoutineIdRef = useRef("");
   const [showEditor, setShowEditor] = useState(false);
@@ -63,6 +71,7 @@ export function CronSection({ app }: CronSectionProps) {
   const [routineBusy, setRoutineBusy] = useState(false);
   const [previewBusy, setPreviewBusy] = useState(false);
   const [templates, setTemplates] = useState<JsonObject[]>([]);
+  const [objectives, setObjectives] = useState<JsonObject[]>([]);
   const [routineForm, setRoutineForm] = useState<RoutineEditorForm>(() =>
     defaultRoutineForm(app.session?.channel),
   );
@@ -82,7 +91,7 @@ export function CronSection({ app }: CronSectionProps) {
     if (app.cronJobs.length === 0) {
       void app.refreshCron();
     }
-    void loadTemplates();
+    void Promise.all([loadTemplates(), loadObjectives()]);
   }, [app]);
 
   useEffect(() => {
@@ -108,6 +117,13 @@ export function CronSection({ app }: CronSectionProps) {
   const selectedTriggerKind = readString(selectedRoutine ?? {}, "trigger_kind") ?? "manual";
   const selectedTriggerPayload = readObject(selectedRoutine ?? {}, "trigger_payload") ?? {};
   const selectedLastRun = readObject(selectedRoutine ?? {}, "last_run") ?? {};
+  const selectedObjective =
+    selectedRoutineId === null
+      ? null
+      : objectives.find(
+          (objective) =>
+            readString(readObject(objective, "automation") ?? {}, "routine_id") === selectedRoutineId,
+        ) ?? null;
   const busy = app.cronBusy || routineBusy || previewBusy;
 
   useEffect(() => {
@@ -120,21 +136,46 @@ export function CronSection({ app }: CronSectionProps) {
   const scheduleCount = app.cronJobs.filter(
     (routine) => readString(routine, "trigger_kind") === "schedule",
   ).length;
+  const heartbeatCount = objectives.filter((objective) => readString(objective, "kind") === "heartbeat").length;
+  const standingOrderCount = objectives.filter(
+    (objective) => readString(objective, "kind") === "standing_order",
+  ).length;
+  const programCount = objectives.filter((objective) => readString(objective, "kind") === "program").length;
+  const productBackedRoutineCount = objectives.filter((objective) => {
+    const routineId = readString(readObject(objective, "automation") ?? {}, "routine_id");
+    return routineId !== null;
+  }).length;
+  const genericRoutineCount = Math.max(app.cronJobs.length - productBackedRoutineCount, 0);
   const routineRows = useMemo(
     () =>
       app.cronJobs.map((routine) => {
         const lastRun = readObject(routine, "last_run") ?? {};
+        const linkedObjective =
+          objectives.find(
+            (objective) =>
+              readString(readObject(objective, "automation") ?? {}, "routine_id") ===
+              resolveRoutineId(routine),
+          ) ?? null;
         return {
           record: routine,
+          linkedObjective,
           routineId: resolveRoutineId(routine) ?? "unknown",
           name: readString(routine, "name") ?? "unknown",
+          product:
+            linkedObjective !== null
+              ? objectiveProductLabel(linkedObjective)
+              : templateProductLabel(readString(routine, "template_id")),
           triggerKind: readString(routine, "trigger_kind") ?? "unknown",
           enabled: readBool(routine, "enabled"),
           nextRun: formatUnixMs(readNumber(routine, "next_run_at_unix_ms")),
           lastOutcome: readString(lastRun, "outcome_kind") ?? "never_run",
+          productTone: productToneForObjective(linkedObjective),
+          focus:
+            readString(linkedObjective ?? {}, "current_focus") ??
+            routineSummary(routine),
         };
       }),
-    [app.cronJobs],
+    [app.cronJobs, objectives],
   );
 
   async function loadTemplates(): Promise<void> {
@@ -145,6 +186,24 @@ export function CronSection({ app }: CronSectionProps) {
       );
     } catch (failure) {
       app.setError(toErrorMessage(failure));
+    }
+  }
+
+  async function loadObjectives(): Promise<void> {
+    try {
+      const response = await app.api.listObjectives(new URLSearchParams({ limit: "64" }));
+      setObjectives(
+        Array.isArray(response.objectives) ? response.objectives.filter(isJsonObject) : [],
+      );
+    } catch (failure) {
+      app.setError(toErrorMessage(failure));
+    }
+  }
+
+  async function refreshAutomationSurface(options?: { refreshRuns?: boolean }): Promise<void> {
+    await Promise.all([app.refreshCron(), loadObjectives()]);
+    if (options?.refreshRuns && selectedRoutineId !== null) {
+      await app.refreshCronRuns();
     }
   }
 
@@ -174,7 +233,7 @@ export function CronSection({ app }: CronSectionProps) {
       if (savedRoutineId !== null) {
         app.setCronJobId(savedRoutineId);
       }
-      await app.refreshCron();
+      await refreshAutomationSurface();
       if (savedRoutineId !== null) {
         await app.refreshCronRuns();
       }
@@ -223,7 +282,7 @@ export function CronSection({ app }: CronSectionProps) {
     }
     await runBusyAction(async () => {
       const response = await app.api.setRoutineEnabled(routineId, enabled);
-      await app.refreshCron();
+      await refreshAutomationSurface();
       const approvalId =
         response.approval !== undefined && isJsonObject(response.approval)
           ? readString(response.approval, "approval_id")
@@ -245,8 +304,7 @@ export function CronSection({ app }: CronSectionProps) {
     await runBusyAction(async () => {
       const response = await app.api.runRoutineNow(routineId);
       app.setCronJobId(routineId);
-      await app.refreshCron();
-      await app.refreshCronRuns();
+      await refreshAutomationSurface({ refreshRuns: true });
       app.setNotice(
         response.run_id === undefined
           ? response.message
@@ -278,7 +336,7 @@ export function CronSection({ app }: CronSectionProps) {
       if (importedRoutineId !== null) {
         app.setCronJobId(importedRoutineId);
       }
-      await app.refreshCron();
+      await refreshAutomationSurface();
       app.setNotice(
         response.approval === undefined
           ? `Routine imported from ${response.imported_from}.`
@@ -305,8 +363,7 @@ export function CronSection({ app }: CronSectionProps) {
           payload,
           dedupe_key: dispatchDedupeKey.trim() || undefined,
         });
-        await app.refreshCron();
-        await app.refreshCronRuns();
+        await refreshAutomationSurface({ refreshRuns: true });
         app.setNotice(`Hook adapter evaluated ${response.dispatches.length} matching routines.`);
         return;
       }
@@ -323,8 +380,7 @@ export function CronSection({ app }: CronSectionProps) {
           source: readString(selectedTriggerPayload, "provider") ?? undefined,
           dedupe_key: dispatchDedupeKey.trim() || undefined,
         });
-        await app.refreshCron();
-        await app.refreshCronRuns();
+        await refreshAutomationSurface({ refreshRuns: true });
         app.setNotice(`Webhook adapter evaluated ${response.dispatches.length} matching routines.`);
         return;
       }
@@ -338,8 +394,7 @@ export function CronSection({ app }: CronSectionProps) {
           summary: dispatchReason.trim() || undefined,
           details: payload,
         });
-        await app.refreshCron();
-        await app.refreshCronRuns();
+        await refreshAutomationSurface({ refreshRuns: true });
         app.setNotice(
           `System event ${response.event} emitted; ${response.routine_dispatches.length} routines evaluated.`,
         );
@@ -354,8 +409,7 @@ export function CronSection({ app }: CronSectionProps) {
               trigger_payload: payload,
               trigger_dedupe_key: dispatchDedupeKey.trim() || undefined,
             });
-      await app.refreshCron();
-      await app.refreshCronRuns();
+      await refreshAutomationSurface({ refreshRuns: true });
       app.setNotice(
         response.run_id === undefined
           ? response.message
@@ -381,17 +435,19 @@ export function CronSection({ app }: CronSectionProps) {
     <main className="workspace-page">
       <WorkspacePageHeader
         eyebrow="Control"
-        title="Routines"
-        headingLabel="Routines"
-        description="Unify schedules, hooks, webhooks, system events, delivery semantics, and approvals under one automation model."
+        title="Automations"
+        headingLabel="Automations"
+        description="Productize heartbeats, standing orders, programs, and low-level routines on top of the same schedule, hook, webhook, and approval backend."
         status={
           <>
-            <WorkspaceStatusChip tone="default">{app.cronJobs.length} routines</WorkspaceStatusChip>
+            <WorkspaceStatusChip tone="default">
+              {app.cronJobs.length} automation{app.cronJobs.length === 1 ? "" : "s"}
+            </WorkspaceStatusChip>
+            <WorkspaceStatusChip tone={heartbeatCount > 0 ? "accent" : "default"}>
+              {heartbeatCount} heartbeat{heartbeatCount === 1 ? "" : "s"}
+            </WorkspaceStatusChip>
             <WorkspaceStatusChip tone={enabledCount > 0 ? "success" : "default"}>
               {enabledCount} enabled
-            </WorkspaceStatusChip>
-            <WorkspaceStatusChip tone="accent">
-              {app.cronJobs.length - scheduleCount} event-driven
             </WorkspaceStatusChip>
           </>
         }
@@ -402,10 +458,10 @@ export function CronSection({ app }: CronSectionProps) {
             </ActionButton>
             <ActionButton
               variant="secondary"
-              onPress={() => void app.refreshCron()}
+              onPress={() => void refreshAutomationSurface({ refreshRuns: true })}
               isDisabled={busy}
             >
-              {busy ? "Refreshing..." : "Refresh routines"}
+              {busy ? "Refreshing..." : "Refresh automations"}
             </ActionButton>
           </ActionCluster>
         }
@@ -413,18 +469,38 @@ export function CronSection({ app }: CronSectionProps) {
 
       <section className="workspace-metric-grid workspace-metric-grid--compact">
         <WorkspaceMetricCard
-          label="Scheduled"
-          value={scheduleCount}
-          detail="Cron-compatible paths now map onto routines."
-          tone={scheduleCount > 0 ? "success" : "default"}
+          label="Heartbeats"
+          value={heartbeatCount}
+          detail="Recurring status products with explicit cadence and output contracts."
+          tone={heartbeatCount > 0 ? "accent" : "default"}
+        />
+        <WorkspaceMetricCard
+          label="Standing orders"
+          value={standingOrderCount}
+          detail="Durable authority products that stay visible and approval-aware."
+          tone={standingOrderCount > 0 ? "accent" : "default"}
+        />
+        <WorkspaceMetricCard
+          label="Programs"
+          value={programCount}
+          detail="Multi-step initiatives anchored to objectives instead of a second orchestration engine."
+          tone={programCount > 0 ? "accent" : "default"}
+        />
+        <WorkspaceMetricCard
+          label="General routines"
+          value={genericRoutineCount}
+          detail={`${scheduleCount} scheduled, ${app.cronJobs.length - scheduleCount} event-driven.`}
+          tone={genericRoutineCount > 0 ? "default" : "success"}
         />
         <WorkspaceMetricCard
           label="Selected"
           value={selectedRoutineId ?? "None"}
           detail={
             selectedRoutine === null
-              ? "Pick a routine to inspect runtime state."
-              : routineSummary(selectedRoutine)
+              ? "Pick an automation to inspect runtime state."
+              : selectedObjective !== null
+                ? `${objectiveProductLabel(selectedObjective)} · ${readString(selectedObjective, "current_focus") ?? "No current focus recorded."}`
+                : routineSummary(selectedRoutine)
           }
           tone={selectedRoutine === null ? "default" : "accent"}
         />
@@ -433,7 +509,7 @@ export function CronSection({ app }: CronSectionProps) {
           value={readString(selectedLastRun, "outcome_kind") ?? "never_run"}
           detail={
             readString(selectedLastRun, "outcome_message") ??
-            "Skipped, throttled, and silent runs stay explicit."
+            "Skipped, throttled, silent, and denied automations stay explicit."
           }
           tone={workspaceToneForState(readString(selectedLastRun, "outcome_kind"))}
         />
@@ -441,8 +517,8 @@ export function CronSection({ app }: CronSectionProps) {
 
       <section className="workspace-two-column">
         <WorkspaceSectionCard
-          title="Routine catalog"
-          description="List-first surface for selection, enablement, and manual run-now execution."
+          title="Automation catalog"
+          description="One list for heartbeats, standing orders, programs, and lower-level routines without fragmenting the operator surface."
         >
           <EntityTable
             ariaLabel="Routine catalog"
@@ -455,7 +531,7 @@ export function CronSection({ app }: CronSectionProps) {
                   <div className="workspace-stack">
                     <strong>{row.name}</strong>
                     <span className="chat-muted">
-                      {row.triggerKind} · next {row.nextRun}
+                      {row.product} · {row.focus}
                     </span>
                   </div>
                 ),
@@ -467,6 +543,9 @@ export function CronSection({ app }: CronSectionProps) {
                   <div className="workspace-inline">
                     <WorkspaceStatusChip tone={row.enabled ? "success" : "default"}>
                       {row.enabled ? "enabled" : "paused"}
+                    </WorkspaceStatusChip>
+                    <WorkspaceStatusChip tone={row.productTone}>
+                      {row.product}
                     </WorkspaceStatusChip>
                     <WorkspaceStatusChip tone={workspaceToneForState(row.lastOutcome)}>
                       {row.lastOutcome}
@@ -515,23 +594,23 @@ export function CronSection({ app }: CronSectionProps) {
             ]}
             rows={routineRows}
             getRowId={(row) => row.routineId}
-            emptyTitle="No routines configured"
-            emptyDescription="Create the first routine to unify schedule and event automation."
+            emptyTitle="No automations configured"
+            emptyDescription="Create the first heartbeat, standing order, program, or routine."
           />
         </WorkspaceSectionCard>
 
         <WorkspaceSectionCard
-          title={editorMode === "create" ? "New routine" : "Edit routine"}
-          description="Single editor for trigger kind, scheduling, delivery, quiet hours, and approvals."
+          title={editorMode === "create" ? "New automation" : "Edit automation"}
+          description="Single editor for low-level routine wiring; productized automation modes stay visible through linked objectives."
         >
           {!showEditor ? (
             <EmptyState
               compact
-              title="Routine editor collapsed"
-              description="Open the editor when you are ready to create or update a routine."
+              title="Automation editor collapsed"
+              description="Open the editor when you need to create or update a low-level routine."
               action={
                 <ActionButton variant="secondary" onPress={openCreateEditor}>
-                  Open routine editor
+                  Open automation editor
                 </ActionButton>
               }
             />
@@ -818,19 +897,26 @@ export function CronSection({ app }: CronSectionProps) {
 
       <section className="workspace-two-column workspace-two-column--history">
         <WorkspaceSectionCard
-          title="Selected routine"
-          description="Inspect delivery, trigger payload, cooldown, and approval posture before changing anything."
+          title="Selected automation"
+          description="Inspect product posture, delivery contract, trigger wiring, cooldown, and approval guardrails before changing anything."
         >
           {selectedRoutine === null ? (
             <EmptyState
               compact
-              title="No routine selected"
-              description="Select a routine to inspect its configuration and run posture."
+              title="No automation selected"
+              description="Select an automation to inspect its configuration and run posture."
             />
           ) : (
             <>
               <KeyValueList
                 items={[
+                  {
+                    label: "Product",
+                    value:
+                      selectedObjective !== null
+                        ? objectiveProductLabel(selectedObjective)
+                        : templateProductLabel(readString(selectedRoutine, "template_id")),
+                  },
                   { label: "Routine id", value: selectedRoutineId ?? "n/a" },
                   { label: "Trigger", value: selectedTriggerKind },
                   { label: "Summary", value: routineSummary(selectedRoutine) },
@@ -852,6 +938,66 @@ export function CronSection({ app }: CronSectionProps) {
                   },
                 ]}
               />
+              {selectedObjective !== null ? (
+                <InlineNotice
+                  title="Linked objective"
+                  tone={workspaceToneForState(readString(selectedObjective, "state"))}
+                >
+                  <p>
+                    <strong>{readString(selectedObjective, "name") ?? "Unnamed objective"}</strong>{" "}
+                    · {readString(selectedObjective, "kind") ?? "objective"} ·{" "}
+                    {readString(selectedObjective, "state") ?? "unknown"}
+                  </p>
+                  <p>
+                    <strong>Current focus:</strong>{" "}
+                    {readString(selectedObjective, "current_focus") ??
+                      "No current focus recorded."}
+                  </p>
+                  <p>
+                    <strong>Next action:</strong>{" "}
+                    {readString(selectedObjective, "next_recommended_step") ??
+                      "No next action recorded."}
+                  </p>
+                  <ActionCluster>
+                    <ActionButton
+                      variant="secondary"
+                      size="sm"
+                      onPress={() => {
+                        const objectiveId = resolveObjectiveId(selectedObjective);
+                        if (objectiveId === null) {
+                          return;
+                        }
+                        void navigate(buildObjectiveOverviewHref(objectiveId));
+                      }}
+                    >
+                      Open objective
+                    </ActionButton>
+                    <ActionButton
+                      variant="secondary"
+                      size="sm"
+                      onPress={() =>
+                        void navigate(
+                          buildObjectiveChatHref({
+                            objective: selectedObjective,
+                            fallbackSessionId: readString(selectedRoutine, "session_id"),
+                            runId: readString(selectedLastRun, "run_id"),
+                          }),
+                        )
+                      }
+                    >
+                      Open chat
+                    </ActionButton>
+                  </ActionCluster>
+                </InlineNotice>
+              ) : null}
+              {selectedObjective !== null && readString(selectedObjective, "kind") === "heartbeat" ? (
+                <InlineNotice
+                  title="Heartbeat signal"
+                  tone={heartbeatSignalTone(selectedLastRun)}
+                >
+                  {heartbeatSignalSummary(selectedObjective, selectedLastRun)}
+                </InlineNotice>
+              ) : null}
               <TextAreaField
                 label="Trigger payload"
                 readOnly
@@ -864,7 +1010,7 @@ export function CronSection({ app }: CronSectionProps) {
         </WorkspaceSectionCard>
         <WorkspaceSectionCard
           title="Run history"
-          description="Recent routine runs keep skipped, throttled, and silent outcomes distinct."
+          description="Recent automation runs keep skipped, throttled, silent, and denied outcomes distinct."
         >
           <EntityTable
             ariaLabel="Routine run history"
@@ -918,7 +1064,7 @@ export function CronSection({ app }: CronSectionProps) {
       <section className="workspace-two-column">
         <WorkspaceSectionCard
           title="Template pack"
-          description="Bootstrap common routines from built-in heartbeat, report, follow-up, change-check, and ingest templates."
+          description="Bootstrap common automations from built-in heartbeat, report, follow-up, change-check, and ingest templates."
         >
           <EntityTable
             ariaLabel="Routine templates"
@@ -974,7 +1120,7 @@ export function CronSection({ app }: CronSectionProps) {
 
         <WorkspaceSectionCard
           title="Import, export, and trigger test"
-          description="Portable bundles and adapter test firing stay inside the same routine surface."
+          description="Portable bundles and adapter test firing stay inside the same automation surface."
         >
           <ActionCluster>
             <ActionButton
@@ -1013,7 +1159,7 @@ export function CronSection({ app }: CronSectionProps) {
             onChange={setImportEnabled}
           />
           <ActionButton onPress={() => void importRoutineBundle()} isDisabled={busy}>
-            Import routine
+            Import automation
           </ActionButton>
           <TextAreaField
             label="Trigger payload"
@@ -1035,12 +1181,75 @@ export function CronSection({ app }: CronSectionProps) {
           </div>
           {selectedTriggerKind === "schedule" ? (
             <InlineNotice title="Schedule routines" tone="default">
-              Schedule routines use run-now. Hook, webhook, and system-event routines can fire their
-              adapter path directly from this panel.
+              Scheduled automations use run-now. Hook, webhook, and system-event routines can fire
+              their adapter path directly from this panel.
             </InlineNotice>
           ) : null}
         </WorkspaceSectionCard>
       </section>
     </main>
   );
+}
+
+function objectiveProductLabel(objective: JsonObject): string {
+  const kind = readString(objective, "kind");
+  switch (kind) {
+    case "heartbeat":
+      return "Heartbeat";
+    case "standing_order":
+      return "Standing order";
+    case "program":
+      return "Program";
+    default:
+      return "Objective";
+  }
+}
+
+function templateProductLabel(templateId: string | null): string {
+  if (templateId === "heartbeat") {
+    return "Heartbeat template";
+  }
+  return "Routine";
+}
+
+function productToneForObjective(linkedObjective: JsonObject | null): "default" | "accent" {
+  if (linkedObjective === null) {
+    return "default";
+  }
+  const kind = readString(linkedObjective, "kind");
+  return kind === "heartbeat" || kind === "standing_order" || kind === "program"
+    ? "accent"
+    : "default";
+}
+
+function heartbeatSignalTone(selectedLastRun: JsonObject): "default" | "warning" | "success" {
+  const outcome = readString(selectedLastRun, "outcome_kind");
+  if (outcome === "failed" || outcome === "denied" || outcome === "skipped") {
+    return "warning";
+  }
+  if (outcome === "success_with_output") {
+    return "success";
+  }
+  return "default";
+}
+
+function heartbeatSignalSummary(objective: JsonObject, selectedLastRun: JsonObject): string {
+  const name = readString(objective, "name") ?? "Heartbeat";
+  const outcome = readString(selectedLastRun, "outcome_kind");
+  const nextRun = readString(readObject(objective, "linked_routine") ?? {}, "next_run_at_unix_ms");
+  const nextAction =
+    readString(objective, "next_recommended_step") ?? "Review the latest heartbeat output.";
+  if (outcome === "success_with_output") {
+    return `${name} produced output successfully. Next action: ${nextAction}`;
+  }
+  if (outcome === "failed" || outcome === "denied") {
+    return `${name} needs follow-up because the latest run ended as ${outcome}. Next action: ${nextAction}`;
+  }
+  if (outcome === "skipped" || outcome === "throttled") {
+    return `${name} did not emit a fresh update on the latest run (${outcome}). Confirm cadence, cooldown, and signal quality before the next heartbeat.`;
+  }
+  if (nextRun !== null) {
+    return `${name} is configured but has not produced a durable output yet. Watch the next scheduled run and confirm that HEARTBEAT.md stays current.`;
+  }
+  return `${name} is not currently scheduled. Add a cadence or fire it manually so the heartbeat produces visible output.`;
 }

@@ -1,9 +1,11 @@
 // @vitest-environment jsdom
 
+import type { ComponentProps } from "react";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
 import { ChatComposer } from "./ChatComposer";
+import { ChatConsoleWorkspaceView } from "./ChatConsoleWorkspaceView";
 import { ChatTranscript } from "./ChatTranscript";
 import {
   buildContextBudgetSummary,
@@ -298,6 +300,49 @@ describe("Chat web UX primitives", () => {
     fireEvent.click(screen.getByRole("button", { name: "Purge" }));
     expect(runDerivedArtifactAction).toHaveBeenCalledWith("01ARZ3NDEKTSV4RRFFQ69G5FZZ", "purge");
   });
+
+  it("surfaces linked objective navigation in the chat workspace header", () => {
+    const onOpenObjective = vi.fn();
+
+    render(
+      <ChatConsoleWorkspaceView
+        allowSensitiveTools={false}
+        canAbortRun={false}
+        canInspectRun={false}
+        composerProps={baseComposerProps()}
+        contextBudget={buildContextBudgetSummary({
+          baseline_tokens: 900,
+          draft_text: "Keep the deployment handoff current.",
+          attachments: [],
+        })}
+        inspectorProps={baseInspectorProps()}
+        onAbortRun={vi.fn()}
+        onOpenObjective={onOpenObjective}
+        onOpenRunDetails={vi.fn()}
+        onRefresh={vi.fn()}
+        onSetAllowSensitiveTools={vi.fn()}
+        pendingApprovalCount={0}
+        runActionBusy={false}
+        selectedObjectiveFocus="Keep the deployment handoff current."
+        selectedObjectiveLabel="heartbeat · Daily status"
+        selectedSessionBranchState="linear"
+        selectedSessionLineage="Root session"
+        selectedSessionTitle="Operator workspace"
+        sessionsBusy={false}
+        sessionsSidebarProps={baseSessionsSidebarProps()}
+        streaming={false}
+        toolPayloadCount={0}
+        transcriptBusy={false}
+        transcriptProps={baseTranscriptProps()}
+      />,
+    );
+
+    expect(screen.getByText("heartbeat · Daily status")).toBeInTheDocument();
+    expect(screen.getByText("Keep the deployment handoff current.")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open objective" }));
+    expect(onOpenObjective).toHaveBeenCalledTimes(1);
+  });
 });
 
 function sampleAttachment(): ComposerAttachment {
@@ -327,5 +372,137 @@ function sampleToolEntry(): TranscriptEntry {
       token: "secret",
       status: "ok",
     },
+  };
+}
+
+function baseComposerProps(): ComponentProps<typeof ChatComposer> {
+  return {
+    composerText: "",
+    setComposerText: vi.fn(),
+    streaming: false,
+    activeSessionId: "session-1",
+    attachments: [],
+    attachmentBusy: false,
+    canQueueFollowUp: false,
+    submitMessage: vi.fn(),
+    retryLast: vi.fn(),
+    branchSession: vi.fn(),
+    queueFollowUp: vi.fn(),
+    cancelStreaming: vi.fn(),
+    clearTranscript: vi.fn(),
+    openAttachmentPicker: vi.fn(),
+    removeAttachment: vi.fn(),
+    attachFiles: vi.fn(),
+    showSlashPalette: false,
+    parsedSlashCommand: null,
+    slashCommandMatches: [],
+    useSlashCommand: vi.fn(),
+    contextBudget: buildContextBudgetSummary({
+      baseline_tokens: 900,
+      draft_text: "",
+      attachments: [],
+    }),
+    contextReferencePreview: null,
+    contextReferencePreviewBusy: false,
+    contextReferencePreviewStale: false,
+    refreshContextReferencePreview: vi.fn(),
+    removeContextReference: vi.fn(),
+    recallPreview: null,
+    recallPreviewBusy: false,
+    recallPreviewStale: false,
+    refreshRecallPreview: vi.fn(),
+  };
+}
+
+function baseInspectorProps(): ComponentProps<
+  typeof import("./ChatInspectorColumn").ChatInspectorColumn
+> {
+  return {
+    pendingApprovalCount: 0,
+    a2uiSurfaces: [],
+    runIds: [],
+    selectedSession: null,
+    selectedSessionLineage: "Root session",
+    contextBudgetEstimatedTokens: 900,
+    transcriptBusy: false,
+    transcriptSearchQuery: "",
+    setTranscriptSearchQuery: vi.fn(),
+    transcriptSearchBusy: false,
+    canSearchTranscript: false,
+    pinnedRecordKeys: new Set<string>(),
+    searchResults: [],
+    searchTranscript: vi.fn(),
+    inspectSearchMatch: vi.fn(),
+    exportBusy: null,
+    exportTranscript: vi.fn(),
+    recentTranscriptRecords: [],
+    inspectTranscriptRecord: vi.fn(),
+    pinTranscriptRecord: vi.fn(),
+    sessionPins: [],
+    deletePin: vi.fn(),
+    compactions: [],
+    inspectCompaction: vi.fn(),
+    checkpoints: [],
+    inspectCheckpoint: vi.fn(),
+    restoreCheckpoint: vi.fn(),
+    queuedInputs: [],
+    backgroundTasks: [],
+    inspectBackgroundTask: vi.fn(),
+    runBackgroundTaskAction: vi.fn(),
+    detailPanel: null,
+    revealSensitiveValues: false,
+    inspectorVisible: false,
+    openRunDetails: vi.fn(),
+    phase4BusyKey: null,
+    runDrawerId: "",
+    setRunDrawerId: vi.fn(),
+    runDrawerBusy: false,
+    runStatus: null,
+    runTape: null,
+    runLineage: null,
+    refreshRunDetails: vi.fn(),
+    closeRunDrawer: vi.fn(),
+    openBrowserSessionWorkbench: vi.fn(),
+  };
+}
+
+function baseSessionsSidebarProps(): ComponentProps<
+  typeof import("./ChatSessionsSidebar").ChatSessionsSidebar
+> {
+  return {
+    sessionsBusy: false,
+    newSessionLabel: "",
+    setNewSessionLabel: vi.fn(),
+    searchQuery: "",
+    setSearchQuery: vi.fn(),
+    includeArchived: false,
+    setIncludeArchived: vi.fn(),
+    sessionLabelDraft: "",
+    setSessionLabelDraft: vi.fn(),
+    selectedSession: null,
+    sortedSessions: [],
+    activeSessionId: "",
+    setActiveSessionId: vi.fn(),
+    createSession: vi.fn(),
+    renameSession: vi.fn(),
+    resetSession: vi.fn(),
+    archiveSession: vi.fn(),
+  };
+}
+
+function baseTranscriptProps(): ComponentProps<typeof ChatTranscript> {
+  return {
+    visibleTranscript: [],
+    sessionAttachments: [],
+    sessionDerivedArtifacts: [],
+    hiddenTranscriptItems: 0,
+    transcriptBoxRef: { current: null },
+    approvalDrafts: {},
+    a2uiDocuments: {},
+    selectedDetailId: null,
+    updateApprovalDraft: vi.fn(),
+    decideInlineApproval: vi.fn(),
+    openRunDetails: vi.fn(),
+    inspectPayload: vi.fn(),
   };
 }

@@ -717,7 +717,7 @@ describe("M35 web console app", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "Routines" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Automations" }));
     expect((await screen.findAllByText("job-one")).length).toBeGreaterThan(0);
 
     fireEvent.click(screen.getByRole("button", { name: "New routine" }));
