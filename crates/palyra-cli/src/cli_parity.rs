@@ -5,6 +5,9 @@ use clap::{Command as ClapCommand, CommandFactory};
 use serde::{Deserialize, Serialize};
 
 use crate::cli::Cli;
+use crate::shared_chat_commands::{
+    shared_chat_commands, SharedChatCommandExecution, SharedChatCommandSurface,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -156,6 +159,34 @@ pub struct CliParityReport {
     pub version: u32,
     pub summary: CliParitySummary,
     pub entries: Vec<CliParityReportEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedChatCommandParityEntry {
+    pub name: String,
+    pub synopsis: String,
+    pub category: String,
+    pub execution: SharedChatCommandExecution,
+    pub surfaces: Vec<String>,
+    pub aliases: Vec<String>,
+    pub capability_tags: Vec<String>,
+    pub entity_targets: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedChatCommandParitySummary {
+    pub total_commands: usize,
+    pub shared_commands: usize,
+    pub web_commands: usize,
+    pub tui_commands: usize,
+    pub web_only_commands: usize,
+    pub tui_only_commands: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedChatCommandParityReport {
+    pub summary: SharedChatCommandParitySummary,
+    pub entries: Vec<SharedChatCommandParityEntry>,
 }
 
 pub fn build_cli_root_command() -> ClapCommand {
@@ -346,6 +377,127 @@ pub fn validate_cli_parity_report(report: &CliParityReport) -> Result<()> {
     }
 
     anyhow::bail!("CLI parity regressions detected:\n{}", regressions.join("\n"));
+}
+
+pub fn build_shared_chat_command_parity_report() -> SharedChatCommandParityReport {
+    let mut shared_commands = 0_usize;
+    let mut web_only_commands = 0_usize;
+    let mut tui_only_commands = 0_usize;
+    let mut web_commands = 0_usize;
+    let mut tui_commands = 0_usize;
+    let mut entries = Vec::new();
+
+    for command in shared_chat_commands() {
+        let surfaces = command
+            .surfaces
+            .iter()
+            .map(|surface| surface.as_label().to_owned())
+            .collect::<Vec<_>>();
+        let has_web = command.surfaces.contains(&SharedChatCommandSurface::Web);
+        let has_tui = command.surfaces.contains(&SharedChatCommandSurface::Tui);
+        if has_web {
+            web_commands = web_commands.saturating_add(1);
+        }
+        if has_tui {
+            tui_commands = tui_commands.saturating_add(1);
+        }
+        match (has_web, has_tui) {
+            (true, true) => shared_commands = shared_commands.saturating_add(1),
+            (true, false) => web_only_commands = web_only_commands.saturating_add(1),
+            (false, true) => tui_only_commands = tui_only_commands.saturating_add(1),
+            (false, false) => {}
+        }
+        entries.push(SharedChatCommandParityEntry {
+            name: command.name.clone(),
+            synopsis: command.synopsis.clone(),
+            category: command.category.clone(),
+            execution: command.execution,
+            surfaces,
+            aliases: command.aliases.clone(),
+            capability_tags: command.capability_tags.clone(),
+            entity_targets: command.entity_targets.clone(),
+        });
+    }
+
+    SharedChatCommandParityReport {
+        summary: SharedChatCommandParitySummary {
+            total_commands: entries.len(),
+            shared_commands,
+            web_commands,
+            tui_commands,
+            web_only_commands,
+            tui_only_commands,
+        },
+        entries,
+    }
+}
+
+pub fn render_shared_chat_command_parity_markdown(
+    report: &SharedChatCommandParityReport,
+) -> String {
+    let mut lines = Vec::new();
+    lines.push("# Shared Chat Command Registry".to_owned());
+    lines.push(String::new());
+    lines.push("This report is generated from the shared slash-command registry consumed by the web chat composer and the TUI.".to_owned());
+    lines.push(String::new());
+    lines.push("## Summary".to_owned());
+    lines.push(String::new());
+    lines.push(format!("- Total commands: `{}`", report.summary.total_commands));
+    lines.push(format!("- Shared across web and TUI: `{}`", report.summary.shared_commands));
+    lines.push(format!("- Web-visible commands: `{}`", report.summary.web_commands));
+    lines.push(format!("- TUI-visible commands: `{}`", report.summary.tui_commands));
+    lines.push(format!("- Web-only commands: `{}`", report.summary.web_only_commands));
+    lines.push(format!("- TUI-only commands: `{}`", report.summary.tui_only_commands));
+    lines.push(String::new());
+    lines.push("## Entries".to_owned());
+    lines.push(String::new());
+    lines.push("| Command | Synopsis | Category | Execution | Surfaces | Aliases | Capability tags | Entity targets |".to_owned());
+    lines.push("| --- | --- | --- | --- | --- | --- | --- | --- |".to_owned());
+    for entry in &report.entries {
+        let aliases = if entry.aliases.is_empty() {
+            "-".to_owned()
+        } else {
+            entry.aliases.iter().map(|value| format!("`/{value}`")).collect::<Vec<_>>().join(", ")
+        };
+        let capability_tags = if entry.capability_tags.is_empty() {
+            "-".to_owned()
+        } else {
+            entry
+                .capability_tags
+                .iter()
+                .map(|value| format!("`{value}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let entity_targets = if entry.entity_targets.is_empty() {
+            "-".to_owned()
+        } else {
+            entry
+                .entity_targets
+                .iter()
+                .map(|value| format!("`{value}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        lines.push(format!(
+            "| `/{}` | `{}` | `{}` | `{}` | {} | {} | {} | {} |",
+            entry.name,
+            entry.synopsis,
+            entry.category,
+            entry.execution.as_label(),
+            entry
+                .surfaces
+                .iter()
+                .map(|surface| format!("`{surface}`"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            aliases,
+            capability_tags,
+            entity_targets
+        ));
+    }
+    lines.push(String::new());
+    lines.join("\n")
 }
 
 fn find_command<'a>(root: &'a ClapCommand, path: &str) -> Option<&'a ClapCommand> {

@@ -2,12 +2,15 @@ use std::{collections::BTreeSet, fs, path::PathBuf};
 
 use anyhow::{Context, Result};
 use palyra_cli::cli_parity::{
-    build_cli_parity_report, build_cli_root_command, render_cli_parity_report_markdown,
+    build_cli_parity_report, build_cli_root_command, build_shared_chat_command_parity_report,
+    render_cli_parity_report_markdown, render_shared_chat_command_parity_markdown,
     validate_cli_parity_report, CliParityMatrix,
 };
 
 const MATRIX_PATH: &str = "tests/cli_parity_matrix.toml";
 const REPORT_SNAPSHOT_PATH: &str = "tests/cli_parity_report.md";
+const SHARED_CHAT_COMMAND_SNAPSHOT_PATH: &str = "tests/shared_chat_command_parity.md";
+
 fn crate_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -61,6 +64,11 @@ fn generate_report_markdown() -> Result<String> {
     Ok(render_cli_parity_report_markdown(&report))
 }
 
+fn generate_shared_chat_command_markdown() -> String {
+    let report = build_shared_chat_command_parity_report();
+    render_shared_chat_command_parity_markdown(&report)
+}
+
 #[test]
 fn cli_parity_matrix_has_no_regressions() -> Result<()> {
     let matrix = load_matrix()?;
@@ -75,5 +83,14 @@ fn cli_parity_report_matches_committed_snapshot() -> Result<()> {
     let expected = fs::read_to_string(&expected_path)
         .with_context(|| format!("failed to read {}", expected_path.display()))?;
     assert_eq!(generate_report_markdown()?, expected.replace("\r\n", "\n"));
+    Ok(())
+}
+
+#[test]
+fn shared_chat_command_registry_matches_committed_snapshot() -> Result<()> {
+    let expected_path = crate_root().join(SHARED_CHAT_COMMAND_SNAPSHOT_PATH);
+    let expected = fs::read_to_string(&expected_path)
+        .with_context(|| format!("failed to read {}", expected_path.display()))?;
+    assert_eq!(generate_shared_chat_command_markdown(), expected.replace("\r\n", "\n"));
     Ok(())
 }

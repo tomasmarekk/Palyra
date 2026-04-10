@@ -21,6 +21,10 @@ use ratatui::{
 use crate::{
     client::operator::{ManagedRunStream, OperatorRuntime},
     commands::models::ModelsListPayload,
+    shared_chat_commands::{
+        find_shared_chat_command, render_shared_chat_command_synopsis_lines,
+        SharedChatCommandSurface,
+    },
     *,
 };
 
@@ -519,6 +523,10 @@ impl App {
         let Some(name) = parts.next() else {
             return Ok(());
         };
+        if find_shared_chat_command(name, SharedChatCommandSurface::Tui).is_none() {
+            self.status_line = format!("Unknown slash command: /{name}");
+            return Ok(());
+        }
         match name {
             "help" => self.mode = Mode::Help,
             "status" => {
@@ -642,9 +650,9 @@ impl App {
                 }
             }
             "exit" | "quit" => self.status_line = "__exit__".to_owned(),
-            other => {
-                self.status_line = format!("Unknown slash command: /{other}");
-            }
+            other => anyhow::bail!(
+                "shared chat command registry contains an unmapped TUI command `{other}`"
+            ),
         }
         Ok(())
     }
@@ -2295,25 +2303,11 @@ fn parse_tui_objective_kind(value: &str) -> Result<&'static str> {
 }
 
 fn render_help_popup(frame: &mut Frame<'_>, area: Rect) {
-    let popup = centered_rect(72, 14, area);
-    let text = Text::from(vec![
-        Line::from("Slash commands"),
-        Line::from(
-            "  /help /status /new [label] /agent [/id] /session [/id-or-key] /history [query]",
-        ),
-        Line::from(
-            "  /resume [/id-or-key] /model [/id] /reset /retry /branch [label] /queue <text>",
-        ),
-        Line::from(
-            "  /objective list|show|select|fire|pause|resume|archive|create  /heartbeat ...  /standing-order ...  /program ...",
-        ),
-        Line::from(
-            "  /delegate <profile-or-template> <text>  /checkpoint save|list|restore",
-        ),
-        Line::from(
-            "  /background list|add|show|pause|resume|retry|cancel  /abort [run_id] /usage /compact [preview|apply|history] /attach /settings",
-        ),
-        Line::from("  /tools on|off /thinking on|off /shell on|off /exit"),
+    let mut lines = vec![Line::from("Slash commands")];
+    for line in render_shared_chat_command_synopsis_lines(SharedChatCommandSurface::Tui, 84) {
+        lines.push(Line::from(line));
+    }
+    lines.extend([
         Line::default(),
         Line::from("Context references"),
         Line::from(
@@ -2332,6 +2326,9 @@ fn render_help_popup(frame: &mut Frame<'_>, area: Rect) {
             "Retry, branch, delegation, compaction, checkpoints, and background tasks reuse the console HTTP contracts.",
         ),
     ]);
+    let popup_height = area.height.saturating_sub(2).min(lines.len() as u16 + 2).max(14);
+    let popup = centered_rect(88, popup_height, area);
+    let text = Text::from(lines);
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(text)

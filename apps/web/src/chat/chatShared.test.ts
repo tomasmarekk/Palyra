@@ -4,6 +4,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import type { JsonValue } from "../consoleApi";
 import {
+  CHAT_SLASH_COMMANDS,
   buildContextBudgetSummary,
   buildSessionLineageHint,
   collectCanvasFrameUrls,
@@ -30,6 +31,16 @@ describe("chatShared helpers", () => {
       name: "help",
       args: "",
     });
+    expect(parseSlashCommand("/status")).toBeNull();
+    expect(parseSlashCommand("/agent default")).toBeNull();
+  });
+
+  it("exposes only web-supported slash commands from the shared registry", () => {
+    const commandNames = CHAT_SLASH_COMMANDS.map((command) => command.name);
+    expect(commandNames).toContain("help");
+    expect(commandNames).toContain("compact");
+    expect(commandNames).not.toContain("status");
+    expect(commandNames).not.toContain("shell");
   });
 
   it("resolves compact slash subcommands with preview as the safe default", () => {

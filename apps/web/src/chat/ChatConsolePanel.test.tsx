@@ -53,6 +53,13 @@ describe("Chat web UX primitives", () => {
             synopsis: "/queue <text>",
             description: "Queue a follow-up message for the active run.",
             example: "/queue Inspect backlog after deploy",
+            category: "run",
+            execution: "server",
+            surfaces: ["web", "tui"],
+            aliases: [],
+            capability_tags: ["run", "queue"],
+            entity_targets: ["run"],
+            keywords: ["queue", "follow-up", "run"],
           },
         ]}
         useSlashCommand={vi.fn()}

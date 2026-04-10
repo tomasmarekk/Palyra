@@ -9,6 +9,15 @@ import {
   TextInputField,
 } from "../console/components/ui";
 import type { JsonValue, MediaDerivedArtifactRecord, SessionCatalogRecord } from "../consoleApi";
+import {
+  findChatSlashCommand,
+} from "./chatCommandRegistry";
+export {
+  CHAT_SLASH_COMMANDS,
+  type SlashCommandDefinition,
+  type SlashCommandExecution,
+  type SlashCommandSurface,
+} from "./chatCommandRegistry";
 
 const SENSITIVE_KEY_PATTERN =
   /(secret|token|password|cookie|authorization|credential|api[-_]?key|private[-_]?key|vault[-_]?ref)/i;
@@ -64,106 +73,10 @@ export interface ContextBudgetSummary {
   readonly warning?: string;
 }
 
-export interface SlashCommandDefinition {
-  readonly name: string;
-  readonly synopsis: string;
-  readonly description: string;
-  readonly example: string;
-}
-
 export type CompactCommandMode = "preview" | "apply";
 
-export const CHAT_SLASH_COMMANDS: readonly SlashCommandDefinition[] = [
-  {
-    name: "help",
-    synopsis: "/help",
-    description: "Show the slash command palette and quick usage hints.",
-    example: "/help",
-  },
-  {
-    name: "new",
-    synopsis: "/new [label]",
-    description: "Create a fresh session and optionally apply a label immediately.",
-    example: "/new Incident follow-up",
-  },
-  {
-    name: "reset",
-    synopsis: "/reset",
-    description: "Reset the active session without archiving it.",
-    example: "/reset",
-  },
-  {
-    name: "retry",
-    synopsis: "/retry",
-    description: "Retry the last user turn in the current session.",
-    example: "/retry",
-  },
-  {
-    name: "branch",
-    synopsis: "/branch [label]",
-    description: "Create a child session from the latest run. Optional text becomes the new label.",
-    example: "/branch Incident follow-up",
-  },
-  {
-    name: "queue",
-    synopsis: "/queue <text>",
-    description: "Queue a follow-up message for the active run without interrupting it.",
-    example: "/queue After the deploy check the error budget delta.",
-  },
-  {
-    name: "delegate",
-    synopsis: "/delegate <profile-or-template> <text>",
-    description:
-      "Spawn a delegated child run using a built-in profile or template and merge the result back with provenance.",
-    example: "/delegate research_then_synthesize Summarize the daemon migration impact.",
-  },
-  {
-    name: "history",
-    synopsis: "/history [query]",
-    description: "Filter the session rail to find older sessions quickly.",
-    example: "/history deploy rollback",
-  },
-  {
-    name: "resume",
-    synopsis: "/resume <session-id-or-key>",
-    description: "Switch the active workspace to a known session id or key.",
-    example: "/resume 01ARZ3NDEKTSV4RRFFQ69G5FAV",
-  },
-  {
-    name: "attach",
-    synopsis: "/attach",
-    description: "Open the attachment picker for the current session.",
-    example: "/attach",
-  },
-  {
-    name: "usage",
-    synopsis: "/usage",
-    description: "Summarize the current budget, branch state, and transcript load.",
-    example: "/usage",
-  },
-  {
-    name: "compact",
-    synopsis: "/compact [preview|apply]",
-    description:
-      "Preview or apply a transcript compaction so long-running sessions keep a smaller working set.",
-    example: "/compact apply",
-  },
-  {
-    name: "search",
-    synopsis: "/search <query>",
-    description: "Search the persisted transcript for the current session.",
-    example: "/search approval denied",
-  },
-  {
-    name: "export",
-    synopsis: "/export [json|markdown]",
-    description: "Export the current session transcript as JSON or Markdown.",
-    example: "/export markdown",
-  },
-] as const;
-
 export interface ParsedSlashCommand {
-  readonly name: (typeof CHAT_SLASH_COMMANDS)[number]["name"];
+  readonly name: string;
   readonly args: string;
 }
 
@@ -626,9 +539,9 @@ export function parseSlashCommand(raw: string): ParsedSlashCommand | null {
   ).toLowerCase();
   const args = firstSpace === -1 ? "" : withoutPrefix.slice(firstSpace + 1).trim();
 
-  if (CHAT_SLASH_COMMANDS.some((command) => command.name === name)) {
+  if (findChatSlashCommand(name, "web") !== null) {
     return {
-      name: name as ParsedSlashCommand["name"],
+      name,
       args,
     };
   }
