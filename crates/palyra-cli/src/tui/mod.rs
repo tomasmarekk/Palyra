@@ -124,6 +124,7 @@ struct App {
     allow_sensitive_tools: bool,
     include_archived_sessions: bool,
     last_run_id: Option<String>,
+    selected_objective_id: Option<String>,
     scroll_offset: u16,
     status_line: String,
     settings_selected: usize,
@@ -214,6 +215,7 @@ impl App {
             allow_sensitive_tools: options.allow_sensitive_tools,
             include_archived_sessions: options.include_archived_sessions,
             last_run_id: None,
+            selected_objective_id: None,
             scroll_offset: 0,
             status_line: "Connected".to_owned(),
             settings_selected: 0,
@@ -534,6 +536,22 @@ impl App {
                 } else {
                     self.open_picker(PickerKind::Session).await?;
                 }
+            }
+            "objective" => {
+                let arguments = parts.map(ToOwned::to_owned).collect::<Vec<_>>();
+                self.handle_objective_command(None, arguments).await?;
+            }
+            "heartbeat" => {
+                let arguments = parts.map(ToOwned::to_owned).collect::<Vec<_>>();
+                self.handle_objective_command(Some("heartbeat"), arguments).await?;
+            }
+            "standing-order" => {
+                let arguments = parts.map(ToOwned::to_owned).collect::<Vec<_>>();
+                self.handle_objective_command(Some("standing_order"), arguments).await?;
+            }
+            "program" => {
+                let arguments = parts.map(ToOwned::to_owned).collect::<Vec<_>>();
+                self.handle_objective_command(Some("program"), arguments).await?;
             }
             "history" => {
                 let query = normalize_optional_text(parts.collect::<Vec<_>>().join(" "));
@@ -925,6 +943,201 @@ impl App {
             .as_ref()
             .map(|value| value.ulid.clone())
             .context("active TUI session is missing a session_id")
+    }
+
+    async fn handle_objective_command(
+        &mut self,
+        fixed_kind: Option<&'static str>,
+        arguments: Vec<String>,
+    ) -> Result<()> {
+        let context = self.connect_admin_console().await?;
+        let Some(command) = arguments.first().map(String::as_str) else {
+            let label = fixed_kind.unwrap_or("objective");
+            self.status_line =
+                format!("Usage: /{label} list|show|select|fire|pause|resume|archive|create");
+            return Ok(());
+        };
+        match command {
+            "list" => {
+                let payload = crate::commands::objectives::list_objectives_value(
+                    &context.client,
+                    None,
+                    Some(10),
+                    fixed_kind,
+                    None,
+                )
+                .await?;
+                let objectives = payload
+                    .pointer("/objectives")
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let mut lines = Vec::new();
+                if objectives.is_empty() {
+                    lines.push("No objectives found.".to_owned());
+                } else {
+                    for objective in objectives.iter().take(10) {
+                        let objective_id = objective
+                            .pointer("/objective_id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown");
+                        let kind = objective
+                            .pointer("/kind")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("objective");
+                        let state = objective
+                            .pointer("/state")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown");
+                        let name = objective
+                            .pointer("/name")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("Untitled");
+                        let focus = objective
+                            .pointer("/current_focus")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("No focus recorded.");
+                        lines.push(format!("{objective_id} [{kind}/{state}] {name}"));
+                        lines.push(format!("  focus: {focus}"));
+                    }
+                }
+                self.push_entry(EntryKind::System, "Objectives", lines.join("\n"));
+                self.status_line = "Objective list refreshed".to_owned();
+            }
+            "select" => {
+                let objective_id =
+                    arguments.get(1).cloned().context("Usage: /objective select <objective_id>")?;
+                let payload = crate::commands::objectives::get_objective_value(
+                    &context.client,
+                    objective_id.as_str(),
+                )
+                .await?;
+                let resolved_id = payload
+                    .pointer("/objective/objective_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(objective_id.as_str())
+                    .to_owned();
+                self.selected_objective_id = Some(resolved_id.clone());
+                self.push_entry(
+                    EntryKind::System,
+                    "Objective selected",
+                    format!("Selected objective {resolved_id}."),
+                );
+                self.status_line = format!("Objective selected: {resolved_id}");
+            }
+            "show" => {
+                let objective_id = resolve_tui_objective_reference(
+                    arguments.get(1).cloned(),
+                    self.selected_objective_id.as_ref(),
+                )?;
+                let payload = crate::commands::objectives::get_objective_summary_value(
+                    &context.client,
+                    objective_id.as_str(),
+                )
+                .await?;
+                let markdown = payload
+                    .pointer("/summary_markdown")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("Objective summary is unavailable.");
+                self.selected_objective_id = Some(objective_id.clone());
+                self.push_entry(EntryKind::System, "Objective summary", markdown.to_owned());
+                self.status_line = format!("Objective summary loaded: {objective_id}");
+            }
+            "fire" | "pause" | "resume" | "archive" => {
+                let objective_id = resolve_tui_objective_reference(
+                    arguments.get(1).cloned(),
+                    self.selected_objective_id.as_ref(),
+                )?;
+                let payload = crate::commands::objectives::objective_lifecycle_value(
+                    &context.client,
+                    objective_id.as_str(),
+                    command,
+                    None,
+                )
+                .await?;
+                let objective = payload.pointer("/objective").cloned().unwrap_or(payload);
+                let state = objective
+                    .pointer("/state")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown");
+                let name = objective
+                    .pointer("/name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("Untitled objective");
+                self.selected_objective_id = Some(objective_id.clone());
+                self.push_entry(
+                    EntryKind::System,
+                    "Objective lifecycle",
+                    format!("{objective_id} [{state}] {name}"),
+                );
+                self.status_line = format!("Objective {command}: {objective_id}");
+            }
+            "create" => {
+                let spec = parse_tui_objective_create_spec(fixed_kind, arguments.as_slice())?;
+                let payload = crate::commands::objectives::upsert_objective_value(
+                    &context.client,
+                    &serde_json::Map::from_iter([
+                        ("kind".to_owned(), serde_json::Value::String(spec.kind.to_owned())),
+                        ("name".to_owned(), serde_json::Value::String(spec.name.clone())),
+                        ("prompt".to_owned(), serde_json::Value::String(spec.prompt.clone())),
+                        ("enabled".to_owned(), serde_json::Value::Bool(true)),
+                        (
+                            "delivery_mode".to_owned(),
+                            serde_json::Value::String("same_channel".to_owned()),
+                        ),
+                        (
+                            "approval_mode".to_owned(),
+                            serde_json::Value::String(
+                                if spec.kind == "standing_order" || spec.kind == "program" {
+                                    "before_first_run"
+                                } else {
+                                    "none"
+                                }
+                                .to_owned(),
+                            ),
+                        ),
+                        (
+                            "template_id".to_owned(),
+                            if spec.kind == "heartbeat" {
+                                serde_json::Value::String("heartbeat".to_owned())
+                            } else {
+                                serde_json::Value::Null
+                            },
+                        ),
+                        (
+                            "natural_language_schedule".to_owned(),
+                            if spec.kind == "heartbeat" {
+                                serde_json::Value::String("every weekday at 9".to_owned())
+                            } else {
+                                serde_json::Value::Null
+                            },
+                        ),
+                    ]),
+                )
+                .await?;
+                let objective = payload.pointer("/objective").cloned().unwrap_or(payload);
+                let objective_id = objective
+                    .pointer("/objective_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_owned();
+                let state = objective
+                    .pointer("/state")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown");
+                self.selected_objective_id = Some(objective_id.clone());
+                self.push_entry(
+                    EntryKind::System,
+                    "Objective created",
+                    format!("{objective_id} [{state}] {}", spec.name),
+                );
+                self.status_line = format!("Objective created: {objective_id}");
+            }
+            other => {
+                self.status_line = format!("Unknown objective subcommand: {other}");
+            }
+        }
+        Ok(())
     }
 
     async fn handle_compaction_command(&mut self, arguments: Vec<String>) -> Result<()> {
@@ -1953,6 +2166,60 @@ fn parse_tui_json_string(value: &str) -> Option<serde_json::Value> {
     serde_json::from_str::<serde_json::Value>(value).ok()
 }
 
+struct TuiObjectiveCreateSpec {
+    kind: &'static str,
+    name: String,
+    prompt: String,
+}
+
+fn resolve_tui_objective_reference(
+    explicit: Option<String>,
+    selected: Option<&String>,
+) -> Result<String> {
+    explicit
+        .or_else(|| selected.cloned())
+        .context("Select an objective first or pass an explicit objective_id")
+}
+
+fn parse_tui_objective_create_spec(
+    fixed_kind: Option<&'static str>,
+    arguments: &[String],
+) -> Result<TuiObjectiveCreateSpec> {
+    let create_arguments =
+        arguments.get(1..).context("Usage: /objective create <kind> <name> :: <prompt>")?;
+    let joined = create_arguments.join(" ");
+    let (head, prompt) =
+        joined.split_once("::").context("Usage: /objective create <kind> <name> :: <prompt>")?;
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        anyhow::bail!("objective prompt cannot be empty");
+    }
+    let mut head_parts = head.split_whitespace();
+    let kind = match fixed_kind {
+        Some(kind) => kind,
+        None => parse_tui_objective_kind(
+            head_parts.next().context("Usage: /objective create <kind> <name> :: <prompt>")?,
+        )?,
+    };
+    let name = head_parts.collect::<Vec<_>>().join(" ").trim().to_owned();
+    if name.is_empty() {
+        anyhow::bail!("objective name cannot be empty");
+    }
+    Ok(TuiObjectiveCreateSpec { kind, name, prompt: prompt.to_owned() })
+}
+
+fn parse_tui_objective_kind(value: &str) -> Result<&'static str> {
+    match value.to_ascii_lowercase().as_str() {
+        "objective" => Ok("objective"),
+        "heartbeat" => Ok("heartbeat"),
+        "standing-order" | "standing_order" => Ok("standing_order"),
+        "program" => Ok("program"),
+        other => anyhow::bail!(
+            "unknown objective kind `{other}`; use objective, heartbeat, standing-order, or program"
+        ),
+    }
+}
+
 fn render_help_popup(frame: &mut Frame<'_>, area: Rect) {
     let popup = centered_rect(72, 14, area);
     let text = Text::from(vec![
@@ -1962,6 +2229,9 @@ fn render_help_popup(frame: &mut Frame<'_>, area: Rect) {
         ),
         Line::from(
             "  /resume [/id-or-key] /model [/id] /reset /retry /branch [label] /queue <text>",
+        ),
+        Line::from(
+            "  /objective list|show|select|fire|pause|resume|archive|create  /heartbeat ...  /standing-order ...",
         ),
         Line::from(
             "  /delegate <profile-or-template> <text>  /checkpoint save|list|restore",
@@ -2298,7 +2568,10 @@ fn format_shell_result(result: &ShellResult) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{display_session_identity, parse_toggle, sanitize_terminal_text, App, Focus, Mode};
+    use super::{
+        display_session_identity, parse_toggle, parse_tui_objective_create_spec,
+        parse_tui_objective_kind, sanitize_terminal_text, App, Focus, Mode,
+    };
     use crate::proto::palyra::{common::v1 as common_v1, gateway::v1 as gateway_v1};
 
     fn test_app() -> App {
@@ -2329,6 +2602,7 @@ mod tests {
             allow_sensitive_tools: false,
             include_archived_sessions: false,
             last_run_id: None,
+            selected_objective_id: None,
             scroll_offset: 0,
             status_line: String::new(),
             settings_selected: 0,
@@ -2422,5 +2696,34 @@ mod tests {
         assert_eq!(app.transcript.len(), 1);
         assert_eq!(app.transcript[0].title, "Approval requested: shell<ESC>[31m");
         assert_eq!(app.transcript[0].body, "run<U+0007> dangerous\ncommand");
+    }
+
+    #[test]
+    fn parse_tui_objective_kind_accepts_product_aliases() {
+        assert_eq!(parse_tui_objective_kind("objective").unwrap(), "objective");
+        assert_eq!(parse_tui_objective_kind("heartbeat").unwrap(), "heartbeat");
+        assert_eq!(parse_tui_objective_kind("standing-order").unwrap(), "standing_order");
+        assert_eq!(parse_tui_objective_kind("program").unwrap(), "program");
+    }
+
+    #[test]
+    fn parse_tui_objective_create_spec_supports_inline_prompt_separator() {
+        let spec = parse_tui_objective_create_spec(
+            None,
+            &[
+                "create".to_owned(),
+                "heartbeat".to_owned(),
+                "Ops".to_owned(),
+                "status".to_owned(),
+                "::".to_owned(),
+                "Summarize".to_owned(),
+                "current".to_owned(),
+                "state".to_owned(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(spec.kind, "heartbeat");
+        assert_eq!(spec.name, "Ops status");
+        assert_eq!(spec.prompt, "Summarize current state");
     }
 }
