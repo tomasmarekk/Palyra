@@ -1,4 +1,4 @@
-use clap::{Subcommand, ValueEnum};
+use clap::{Args, Subcommand, ValueEnum};
 
 use super::routines::{RoutineApprovalModeArg, RoutineDeliveryModeArg, RoutinePreviewTimezoneArg};
 
@@ -41,66 +41,7 @@ pub enum ObjectivesCommand {
         json: bool,
     },
     #[command(visible_alias = "apply")]
-    Upsert {
-        #[arg(long)]
-        id: Option<String>,
-        #[arg(long, value_enum)]
-        kind: ObjectiveKindArg,
-        #[arg(long)]
-        name: String,
-        #[arg(long)]
-        prompt: String,
-        #[arg(long)]
-        owner: Option<String>,
-        #[arg(long)]
-        channel: Option<String>,
-        #[arg(long)]
-        session_key: Option<String>,
-        #[arg(long)]
-        session_label: Option<String>,
-        #[arg(long, value_enum, default_value_t = ObjectivePriorityArg::Normal)]
-        priority: ObjectivePriorityArg,
-        #[arg(long)]
-        max_runs: Option<u32>,
-        #[arg(long)]
-        max_tokens: Option<u64>,
-        #[arg(long)]
-        budget_notes: Option<String>,
-        #[arg(long)]
-        current_focus: Option<String>,
-        #[arg(long)]
-        success_criteria: Option<String>,
-        #[arg(long)]
-        exit_condition: Option<String>,
-        #[arg(long)]
-        next_recommended_step: Option<String>,
-        #[arg(long)]
-        standing_order: Option<String>,
-        #[arg(long)]
-        enabled: Option<bool>,
-        #[arg(long)]
-        natural_language_schedule: Option<String>,
-        #[arg(long, value_enum)]
-        schedule_type: Option<ObjectiveScheduleTypeArg>,
-        #[arg(long)]
-        schedule: Option<String>,
-        #[arg(long, value_enum, default_value_t = RoutineDeliveryModeArg::SameChannel)]
-        delivery_mode: RoutineDeliveryModeArg,
-        #[arg(long)]
-        delivery_channel: Option<String>,
-        #[arg(long)]
-        quiet_hours_start: Option<String>,
-        #[arg(long)]
-        quiet_hours_end: Option<String>,
-        #[arg(long, value_enum)]
-        quiet_hours_timezone: Option<RoutinePreviewTimezoneArg>,
-        #[arg(long, default_value_t = 0)]
-        cooldown_ms: u64,
-        #[arg(long, value_enum, default_value_t = RoutineApprovalModeArg::None)]
-        approval_mode: RoutineApprovalModeArg,
-        #[arg(long, default_value_t = false)]
-        json: bool,
-    },
+    Upsert(Box<ObjectiveUpsertCommandArgs>),
     Fire {
         #[arg(long)]
         id: String,
@@ -141,6 +82,68 @@ pub enum ObjectivesCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+}
+
+#[derive(Args, Debug, PartialEq, Eq)]
+pub struct ObjectiveUpsertCommandArgs {
+    #[arg(long)]
+    pub id: Option<String>,
+    #[arg(long, value_enum)]
+    pub kind: ObjectiveKindArg,
+    #[arg(long)]
+    pub name: String,
+    #[arg(long)]
+    pub prompt: String,
+    #[arg(long)]
+    pub owner: Option<String>,
+    #[arg(long)]
+    pub channel: Option<String>,
+    #[arg(long)]
+    pub session_key: Option<String>,
+    #[arg(long)]
+    pub session_label: Option<String>,
+    #[arg(long, value_enum, default_value_t = ObjectivePriorityArg::Normal)]
+    pub priority: ObjectivePriorityArg,
+    #[arg(long)]
+    pub max_runs: Option<u32>,
+    #[arg(long)]
+    pub max_tokens: Option<u64>,
+    #[arg(long)]
+    pub budget_notes: Option<String>,
+    #[arg(long)]
+    pub current_focus: Option<String>,
+    #[arg(long)]
+    pub success_criteria: Option<String>,
+    #[arg(long)]
+    pub exit_condition: Option<String>,
+    #[arg(long)]
+    pub next_recommended_step: Option<String>,
+    #[arg(long)]
+    pub standing_order: Option<String>,
+    #[arg(long)]
+    pub enabled: Option<bool>,
+    #[arg(long)]
+    pub natural_language_schedule: Option<String>,
+    #[arg(long, value_enum)]
+    pub schedule_type: Option<ObjectiveScheduleTypeArg>,
+    #[arg(long)]
+    pub schedule: Option<String>,
+    #[arg(long, value_enum, default_value_t = RoutineDeliveryModeArg::SameChannel)]
+    pub delivery_mode: RoutineDeliveryModeArg,
+    #[arg(long)]
+    pub delivery_channel: Option<String>,
+    #[arg(long)]
+    pub quiet_hours_start: Option<String>,
+    #[arg(long)]
+    pub quiet_hours_end: Option<String>,
+    #[arg(long, value_enum)]
+    pub quiet_hours_timezone: Option<RoutinePreviewTimezoneArg>,
+    #[arg(long, default_value_t = 0)]
+    pub cooldown_ms: u64,
+    #[arg(long, value_enum, default_value_t = RoutineApprovalModeArg::None)]
+    pub approval_mode: RoutineApprovalModeArg,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]

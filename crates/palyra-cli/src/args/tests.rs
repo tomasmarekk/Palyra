@@ -13,15 +13,16 @@ use super::{
     GatewayBindProfileArg, HooksCommand, InitModeArg, InitTlsScaffoldArg, JournalCheckpointModeArg,
     MemoryCommand, MemoryLearningCommand, MemoryScopeArg, MemorySourceArg, MessageCommand,
     ModelsCommand, NodeCommand, NodesCommand, ObjectiveKindArg, ObjectivePriorityArg,
-    ObjectiveScheduleTypeArg, ObjectivesCommand, OnboardingAuthMethodArg, OnboardingCommand,
-    OnboardingFlowArg, PairingClientKindArg, PairingCommand, PairingMethodArg, PairingStateArg,
-    PatchCommand, PluginsCommand, PolicyCommand, ProtocolCommand, RemoteVerificationModeArg,
-    ResetCommand, ResetScopeArg, RoutineApprovalModeArg, RoutineDeliveryModeArg,
-    RoutinePreviewTimezoneArg, RoutineTriggerKindArg, RoutinesCommand, SandboxCommand,
-    SandboxRuntimeArg, SecretsCommand, SecretsConfigureCommand, SecurityCommand, SessionsCommand,
-    SetupWizardOverridesArg, SkillsCommand, SkillsPackageCommand, SupportBundleCommand,
-    SystemCommand, SystemEventCommand, SystemEventSeverityArg, TuiCommand, UninstallCommand,
-    UpdateCommand, WebhooksCommand, WizardOverridesArg, WorkspaceRoleArg,
+    ObjectiveScheduleTypeArg, ObjectiveUpsertCommandArgs, ObjectivesCommand,
+    OnboardingAuthMethodArg, OnboardingCommand, OnboardingFlowArg, PairingClientKindArg,
+    PairingCommand, PairingMethodArg, PairingStateArg, PatchCommand, PluginsCommand, PolicyCommand,
+    ProtocolCommand, RemoteVerificationModeArg, ResetCommand, ResetScopeArg,
+    RoutineApprovalModeArg, RoutineDeliveryModeArg, RoutinePreviewTimezoneArg,
+    RoutineTriggerKindArg, RoutinesCommand, SandboxCommand, SandboxRuntimeArg, SecretsCommand,
+    SecretsConfigureCommand, SecurityCommand, SessionsCommand, SetupWizardOverridesArg,
+    SkillsCommand, SkillsPackageCommand, SupportBundleCommand, SystemCommand, SystemEventCommand,
+    SystemEventSeverityArg, TuiCommand, UninstallCommand, UpdateCommand, WebhooksCommand,
+    WizardOverridesArg, WorkspaceRoleArg,
 };
 
 #[test]
@@ -1547,7 +1548,7 @@ fn parse_objectives_upsert_with_schedule_and_budget() {
     assert_eq!(
         parsed.command,
         Command::Objectives {
-            command: ObjectivesCommand::Upsert {
+            command: ObjectivesCommand::Upsert(Box::new(ObjectiveUpsertCommandArgs {
                 id: Some("obj-01".to_owned()),
                 kind: ObjectiveKindArg::StandingOrder,
                 name: "Ops daily objective".to_owned(),
@@ -1577,7 +1578,7 @@ fn parse_objectives_upsert_with_schedule_and_budget() {
                 cooldown_ms: 300000,
                 approval_mode: RoutineApprovalModeArg::BeforeFirstRun,
                 json: true,
-            }
+            }))
         }
     );
 }

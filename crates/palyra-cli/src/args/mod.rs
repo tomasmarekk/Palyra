@@ -85,7 +85,7 @@ pub use node::NodeCommand;
 pub use nodes::NodesCommand;
 pub use objectives::{
     ObjectiveKindArg, ObjectivePriorityArg, ObjectiveScheduleTypeArg, ObjectiveStateArg,
-    ObjectivesCommand,
+    ObjectiveUpsertCommandArgs, ObjectivesCommand,
 };
 pub use onboarding::{
     GatewayBindProfileArg, OnboardingAuthMethodArg, OnboardingCommand, OnboardingFlowArg,

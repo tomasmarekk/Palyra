@@ -1040,7 +1040,7 @@ impl App {
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("Objective summary is unavailable.");
                 self.selected_objective_id = Some(objective_id.clone());
-                self.push_entry(EntryKind::System, "Objective summary", markdown.to_owned());
+                self.push_entry(EntryKind::System, "Objective summary", markdown);
                 self.status_line = format!("Objective summary loaded: {objective_id}");
             }
             "fire" | "pause" | "resume" | "archive" => {

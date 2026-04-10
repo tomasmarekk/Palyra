@@ -3,7 +3,8 @@ use serde_json::{json, Map, Value};
 
 use crate::cli::{
     ObjectiveKindArg, ObjectivePriorityArg, ObjectiveScheduleTypeArg, ObjectiveStateArg,
-    ObjectivesCommand, RoutineApprovalModeArg, RoutineDeliveryModeArg, RoutinePreviewTimezoneArg,
+    ObjectiveUpsertCommandArgs, ObjectivesCommand, RoutineApprovalModeArg, RoutineDeliveryModeArg,
+    RoutinePreviewTimezoneArg,
 };
 use crate::commands::routines::json_optional_string_at;
 use crate::*;
@@ -48,37 +49,38 @@ pub(crate) async fn run_objectives_async(command: ObjectivesCommand) -> Result<(
                 Ok(())
             }
         }
-        ObjectivesCommand::Upsert {
-            id,
-            kind,
-            name,
-            prompt,
-            owner,
-            channel,
-            session_key,
-            session_label,
-            priority,
-            max_runs,
-            max_tokens,
-            budget_notes,
-            current_focus,
-            success_criteria,
-            exit_condition,
-            next_recommended_step,
-            standing_order,
-            enabled,
-            natural_language_schedule,
-            schedule_type,
-            schedule,
-            delivery_mode,
-            delivery_channel,
-            quiet_hours_start,
-            quiet_hours_end,
-            quiet_hours_timezone,
-            cooldown_ms,
-            approval_mode,
-            json,
-        } => {
+        ObjectivesCommand::Upsert(args) => {
+            let ObjectiveUpsertCommandArgs {
+                id,
+                kind,
+                name,
+                prompt,
+                owner,
+                channel,
+                session_key,
+                session_label,
+                priority,
+                max_runs,
+                max_tokens,
+                budget_notes,
+                current_focus,
+                success_criteria,
+                exit_condition,
+                next_recommended_step,
+                standing_order,
+                enabled,
+                natural_language_schedule,
+                schedule_type,
+                schedule,
+                delivery_mode,
+                delivery_channel,
+                quiet_hours_start,
+                quiet_hours_end,
+                quiet_hours_timezone,
+                cooldown_ms,
+                approval_mode,
+                json,
+            } = *args;
             let payload = build_objective_upsert_payload(ObjectiveUpsertArgs {
                 id,
                 kind,
