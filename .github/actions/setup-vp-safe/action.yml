@@ -17,13 +17,25 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: Setup Vite+
-      uses: voidzero-dev/setup-vp@e34774bccb4e7d7f2e23514ca980177a71425e43
+    - name: Setup Node.js with npm cache
+      if: ${{ inputs.cache == 'true' }}
+      uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
       with:
         node-version-file: ${{ inputs.node-version-file }}
-        cache: ${{ inputs.cache }}
-        run-install: ${{ inputs.run-install }}
+        cache: npm
+        cache-dependency-path: package-lock.json
+
+    - name: Setup Node.js without cache
+      if: ${{ inputs.cache != 'true' }}
+      uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+      with:
+        node-version-file: ${{ inputs.node-version-file }}
 
     - name: Ensure Vite+ CLI
       shell: pwsh
       run: ./scripts/ci/ensure-vp.ps1
+
+    - name: Install workspace dependencies
+      if: ${{ inputs.run-install == 'true' }}
+      shell: pwsh
+      run: vp install
