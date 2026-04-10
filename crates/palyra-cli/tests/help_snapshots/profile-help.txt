@@ -1,0 +1,49 @@
+Manage CLI connection profiles and active environment selection
+
+Usage: palyra profile [OPTIONS] <COMMAND>
+
+Commands:
+  list
+  show
+  create
+  use
+  rename
+  delete
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global Options:
+      --profile <PROFILE>
+
+      --config <CONFIG_PATH>
+
+      --state-root <STATE_ROOT>
+
+  -v, --verbose...
+          Increase logging verbosity (-v => debug, -vv => trace)
+
+      --log-level <LOG_LEVEL>
+          [default: info]
+          [possible values: error, warn, info, debug, trace]
+
+      --output-format <OUTPUT_FORMAT>
+          [default: text]
+          [possible values: text, json, ndjson]
+
+      --plain
+
+      --no-color
+
+Examples:
+  palyra profile list
+  palyra profile create staging --mode remote --set-default
+  palyra profile show
+  palyra profile use prod
+  palyra profile rename stage staging
+  palyra profile delete old-sandbox --yes
+
+Discoverability:
+  `profile show` without a name resolves the active profile.
+  `profile create` assigns an isolated per-profile state root by default.

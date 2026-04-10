@@ -16,19 +16,121 @@ use super::{
     ObjectiveScheduleTypeArg, ObjectiveUpsertCommandArgs, ObjectivesCommand,
     OnboardingAuthMethodArg, OnboardingCommand, OnboardingFlowArg, PairingClientKindArg,
     PairingCommand, PairingMethodArg, PairingStateArg, PatchCommand, PluginsCommand, PolicyCommand,
-    ProtocolCommand, RemoteVerificationModeArg, ResetCommand, ResetScopeArg,
-    RoutineApprovalModeArg, RoutineDeliveryModeArg, RoutinePreviewTimezoneArg,
-    RoutineTriggerKindArg, RoutinesCommand, SandboxCommand, SandboxRuntimeArg, SecretsCommand,
-    SecretsConfigureCommand, SecurityCommand, SessionsCommand, SetupWizardOverridesArg,
-    SkillsCommand, SkillsPackageCommand, SupportBundleCommand, SystemCommand, SystemEventCommand,
-    SystemEventSeverityArg, TuiCommand, UninstallCommand, UpdateCommand, WebhooksCommand,
-    WizardOverridesArg, WorkspaceRoleArg,
+    ProfileCommand, ProfileModeArg, ProfileRiskLevelArg, ProtocolCommand,
+    RemoteVerificationModeArg, ResetCommand, ResetScopeArg, RoutineApprovalModeArg,
+    RoutineDeliveryModeArg, RoutinePreviewTimezoneArg, RoutineTriggerKindArg, RoutinesCommand,
+    SandboxCommand, SandboxRuntimeArg, SecretsCommand, SecretsConfigureCommand, SecurityCommand,
+    SessionsCommand, SetupWizardOverridesArg, SkillsCommand, SkillsPackageCommand,
+    SupportBundleCommand, SystemCommand, SystemEventCommand, SystemEventSeverityArg, TuiCommand,
+    UninstallCommand, UpdateCommand, WebhooksCommand, WizardOverridesArg, WorkspaceRoleArg,
 };
 
 #[test]
 fn parse_version_subcommand() {
     let parsed = Cli::parse_from(["palyra", "version"]);
     assert_eq!(parsed.command, Command::Version);
+}
+
+#[test]
+fn parse_profile_create_with_guided_defaults() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "profile",
+        "create",
+        "staging",
+        "--mode",
+        "remote",
+        "--label",
+        "Staging cluster",
+        "--environment",
+        "staging",
+        "--color",
+        "amber",
+        "--risk-level",
+        "high",
+        "--strict-mode",
+        "--daemon-url",
+        "https://gateway.example.com",
+        "--grpc-url",
+        "https://grpc.example.com",
+        "--admin-token-env",
+        "PALYRA_STAGING_ADMIN_TOKEN",
+        "--principal",
+        "admin:staging",
+        "--device-id",
+        "01ARZ3NDEKTSV4RRFFQ69G5FB0",
+        "--channel",
+        "ops",
+        "--set-default",
+        "--json",
+    ]);
+    assert_eq!(
+        parsed.command,
+        Command::Profile {
+            command: ProfileCommand::Create {
+                name: "staging".to_owned(),
+                mode: ProfileModeArg::Remote,
+                label: Some("Staging cluster".to_owned()),
+                environment: Some("staging".to_owned()),
+                color: Some("amber".to_owned()),
+                risk_level: Some(ProfileRiskLevelArg::High),
+                strict_mode: true,
+                config_path: None,
+                state_root: None,
+                daemon_url: Some("https://gateway.example.com".to_owned()),
+                grpc_url: Some("https://grpc.example.com".to_owned()),
+                admin_token_env: Some("PALYRA_STAGING_ADMIN_TOKEN".to_owned()),
+                principal: Some("admin:staging".to_owned()),
+                device_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FB0".to_owned()),
+                channel: Some("ops".to_owned()),
+                set_default: true,
+                force: false,
+                json: true,
+            }
+        }
+    );
+}
+
+#[test]
+fn parse_profile_show_delete_and_rename() {
+    let show = Cli::parse_from(["palyra", "profile", "show", "--json"]);
+    assert_eq!(
+        show.command,
+        Command::Profile { command: ProfileCommand::Show { name: None, json: true } }
+    );
+
+    let rename = Cli::parse_from(["palyra", "profile", "rename", "stage", "staging", "--json"]);
+    assert_eq!(
+        rename.command,
+        Command::Profile {
+            command: ProfileCommand::Rename {
+                name: "stage".to_owned(),
+                new_name: "staging".to_owned(),
+                json: true,
+            }
+        }
+    );
+
+    let delete = Cli::parse_from([
+        "palyra",
+        "profile",
+        "delete",
+        "old-sandbox",
+        "--yes",
+        "--delete-state-root",
+        "--json",
+    ]);
+    assert_eq!(
+        delete.command,
+        Command::Profile {
+            command: ProfileCommand::Delete {
+                name: "old-sandbox".to_owned(),
+                yes: true,
+                delete_state_root: true,
+                json: true,
+            }
+        }
+    );
 }
 
 #[test]

@@ -63,6 +63,7 @@ pub(crate) fn run_init(
         serialize_document_pretty(&document).context("failed to serialize init config document")?;
     fs::write(config_path.as_path(), rendered)
         .with_context(|| format!("failed to write init config {}", config_path.display()))?;
+    app::update_active_profile_paths(Some(config_path.as_path()), Some(state_root.as_path()))?;
 
     println!(
         "init.status=complete mode={} config_path={} force={}",

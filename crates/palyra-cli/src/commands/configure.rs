@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use crate::*;
 
 #[allow(clippy::too_many_arguments)]
@@ -31,6 +33,7 @@ pub(crate) fn run_configure(
     skip_channels: bool,
     skip_skills: bool,
 ) -> Result<()> {
+    let requested_path = path.clone();
     commands::operator_wizard::run_configure_wizard(
         commands::operator_wizard::ConfigureWizardRequest {
             path,
@@ -62,5 +65,14 @@ pub(crate) fn run_configure(
             skip_channels,
             skip_skills,
         },
-    )
+    )?;
+    let config_path = requested_path
+        .or_else(|| {
+            app::current_root_context()
+                .and_then(|context| context.config_path().map(|value| value.display().to_string()))
+        })
+        .map(PathBuf::from);
+    let state_root = app::current_root_context().map(|context| context.state_root().to_path_buf());
+    app::update_active_profile_paths(config_path.as_deref(), state_root.as_deref())?;
+    Ok(())
 }

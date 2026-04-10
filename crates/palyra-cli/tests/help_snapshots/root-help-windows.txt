@@ -26,6 +26,7 @@ Commands:
   docs            Discover bundled or committed operator docs and CLI help snapshots locally
   plugins
   hooks
+  profile         Manage CLI connection profiles and active environment selection
   devices
   node
   nodes
@@ -86,6 +87,7 @@ Examples:
   palyra gateway status
   palyra dashboard --open
   palyra backup create --output ./artifacts/palyra-backup.zip
+  palyra profile list --json
   palyra objectives list --kind heartbeat --json
   palyra system heartbeat
   palyra sandbox explain --runtime process-runner
@@ -111,4 +113,5 @@ Canonical command map:
   uninstall  Installer-aware package removal surface
   update     Package update/check orchestration surface
   onboarding Operator onboarding workflows (`onboard` stays as the shorthand alias)
+  profile    First-class CLI profile lifecycle and environment selection
   webhooks   Webhook-backed integration management surface

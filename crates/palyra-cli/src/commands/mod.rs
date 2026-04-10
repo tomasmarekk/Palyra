@@ -30,6 +30,7 @@ pub mod pairing;
 pub mod patch;
 pub mod plugins;
 pub mod policy;
+pub mod profile;
 pub mod protocol;
 pub mod reset;
 pub mod routines;

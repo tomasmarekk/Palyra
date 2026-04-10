@@ -289,6 +289,16 @@ path = "hooks"
 file = "hooks-help.txt"
 
 [[entries]]
+path = "profile"
+category = "canonical_family"
+status = "done"
+summary = "First-class CLI profile lifecycle and environment selection."
+
+[entries.snapshot]
+path = "profile"
+file = "profile-help.txt"
+
+[[entries]]
 path = "devices"
 category = "top_level"
 status = "done"
@@ -786,6 +796,28 @@ required_flags = ["path", "show-secrets"]
 [entries.snapshot]
 path = "config list"
 file = "config-list-help.txt"
+
+[[entries]]
+path = "profile create"
+category = "nested_surface"
+status = "done"
+summary = "Profile creation contract with isolated defaults."
+required_flags = ["mode", "environment", "color", "risk-level", "strict-mode", "set-default", "force"]
+
+[entries.snapshot]
+path = "profile create"
+file = "profile-create-help.txt"
+
+[[entries]]
+path = "profile delete"
+category = "nested_surface"
+status = "done"
+summary = "Profile deletion workflow with explicit state-root purge confirmation."
+required_flags = ["yes", "delete-state-root"]
+
+[entries.snapshot]
+path = "profile delete"
+file = "profile-delete-help.txt"
 
 [[entries]]
 path = "cron update"

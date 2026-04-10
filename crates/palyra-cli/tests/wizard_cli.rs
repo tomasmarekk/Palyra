@@ -36,6 +36,10 @@ fn backup_path(path: &Path, index: usize) -> PathBuf {
     PathBuf::from(raw)
 }
 
+fn profiles_registry_path(workdir: &TempDir) -> PathBuf {
+    workdir.path().join("state-root").join("cli").join("profiles.toml")
+}
+
 fn seed_quickstart_config(workdir: &TempDir, config_path: &Path) -> Result<()> {
     let config_path_string = config_path.to_string_lossy().into_owned();
     let output = run_cli(
@@ -375,5 +379,82 @@ fn configure_gateway_emits_section_diff_and_rotates_backup() -> Result<()> {
     assert!(written.contains("bind_profile = \"public_tls\""));
     assert!(written.contains("remote_base_url = \"https://dashboard.example.com/\""));
     assert!(written.contains("pinned_gateway_ca_fingerprint_sha256"));
+    Ok(())
+}
+
+#[test]
+fn profile_lifecycle_create_and_setup_attach_profile_paths() -> Result<()> {
+    let workdir = TempDir::new().context("failed to create temporary workdir")?;
+    let create = run_cli(
+        &workdir,
+        &["profile", "create", "staging", "--mode", "remote", "--set-default", "--json"],
+        &[],
+    )?;
+    assert!(
+        create.status.success(),
+        "profile create should succeed: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+    let create_payload: Value =
+        serde_json::from_slice(&create.stdout).context("profile create stdout should be JSON")?;
+    assert_eq!(create_payload.get("action").and_then(Value::as_str), Some("create"));
+    assert_eq!(create_payload.get("default_profile").and_then(Value::as_str), Some("staging"));
+    assert_eq!(create_payload.pointer("/profile/name").and_then(Value::as_str), Some("staging"));
+
+    let config_path = workdir.path().join("profiles").join("staging.toml");
+    let config_path_string = config_path.to_string_lossy().into_owned();
+    let setup = run_cli(
+        &workdir,
+        &[
+            "--profile",
+            "staging",
+            "setup",
+            "--mode",
+            "local",
+            "--path",
+            &config_path_string,
+            "--force",
+        ],
+        &[],
+    )?;
+    assert!(
+        setup.status.success(),
+        "profile-scoped setup should succeed: {}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+
+    let profiles = fs::read_to_string(profiles_registry_path(&workdir))
+        .context("expected CLI profiles registry to exist after profile setup")?;
+    assert!(profiles.contains("default_profile = \"staging\""));
+    assert!(
+        profiles.contains(config_path_string.as_str()),
+        "expected setup to persist profile config path"
+    );
+    assert!(
+        profiles.contains("state-root")
+            && profiles.contains("profiles")
+            && profiles.contains("staging"),
+        "expected setup to keep an isolated per-profile state root"
+    );
+    Ok(())
+}
+
+#[test]
+fn profile_delete_requires_yes_for_active_profile() -> Result<()> {
+    let workdir = TempDir::new().context("failed to create temporary workdir")?;
+    let create = run_cli(
+        &workdir,
+        &["profile", "create", "prod", "--mode", "remote", "--set-default"],
+        &[],
+    )?;
+    assert!(
+        create.status.success(),
+        "profile create should succeed: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+    let delete = run_cli(&workdir, &["--profile", "prod", "profile", "delete", "prod"], &[])?;
+    assert!(!delete.status.success(), "active profile delete should require --yes");
+    let stderr = String::from_utf8_lossy(&delete.stderr);
+    assert!(stderr.contains("without --yes"), "expected explicit safety message, got: {stderr}");
     Ok(())
 }

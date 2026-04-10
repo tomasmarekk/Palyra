@@ -29,6 +29,7 @@ mod pairing;
 mod patch;
 mod plugins;
 mod policy;
+mod profile;
 mod protocol;
 mod reset;
 mod routines;
@@ -95,6 +96,7 @@ pub use pairing::{PairingClientKindArg, PairingCommand, PairingMethodArg, Pairin
 pub use patch::PatchCommand;
 pub use plugins::PluginsCommand;
 pub use policy::PolicyCommand;
+pub use profile::{ProfileCommand, ProfileModeArg, ProfileRiskLevelArg};
 pub use protocol::ProtocolCommand;
 pub use reset::{ResetCommand, ResetScopeArg};
 pub use routines::{
@@ -121,6 +123,7 @@ Examples:
   palyra gateway status
   palyra dashboard --open
   palyra backup create --output ./artifacts/palyra-backup.zip
+  palyra profile list --json
   palyra objectives list --kind heartbeat --json
   palyra system heartbeat
   palyra sandbox explain --runtime process-runner
@@ -146,6 +149,7 @@ Canonical command map:
   uninstall  Installer-aware package removal surface
   update     Package update/check orchestration surface
   onboarding Operator onboarding workflows (`onboard` stays as the shorthand alias)
+  profile    First-class CLI profile lifecycle and environment selection
   webhooks   Webhook-backed integration management surface";
 
 const SETUP_AFTER_HELP: &str = "\
@@ -567,6 +571,11 @@ pub enum Command {
     Hooks {
         #[command(subcommand)]
         command: HooksCommand,
+    },
+    #[command(about = "Manage CLI connection profiles and active environment selection")]
+    Profile {
+        #[command(subcommand)]
+        command: ProfileCommand,
     },
     Devices {
         #[command(subcommand)]

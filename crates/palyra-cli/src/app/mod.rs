@@ -3,6 +3,7 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
@@ -10,7 +11,7 @@ use palyra_common::{
     config_system::get_value_at_path, default_config_search_paths, default_state_root,
     parse_config_path, parse_daemon_bind_socket, IdentityStorePathError,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::{
@@ -24,6 +25,8 @@ const CLI_PROFILE_ENV: &str = "PALYRA_CLI_PROFILE";
 const CLI_PROFILES_PATH_ENV: &str = "PALYRA_CLI_PROFILES_PATH";
 const CLI_PROFILES_RELATIVE_PATH: &str = "cli/profiles.toml";
 const CLI_PROFILE_SCHEMA_VERSION: u32 = 1;
+const PROFILE_STATE_ROOT_RELATIVE_PREFIX: &str = "profiles";
+const PROFILE_STATE_ROOT_RELATIVE_SUFFIX: &str = "state";
 
 #[derive(Debug, Clone)]
 pub(crate) struct RootCommandContext {
@@ -73,27 +76,37 @@ pub(crate) struct HttpConnection {
     pub trace_id: String,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CliProfilesDocument {
-    version: Option<u32>,
-    default_profile: Option<String>,
+pub(crate) struct CliProfilesDocument {
+    pub(crate) version: Option<u32>,
+    pub(crate) default_profile: Option<String>,
     #[serde(default)]
-    profiles: BTreeMap<String, CliConnectionProfile>,
+    pub(crate) profiles: BTreeMap<String, CliConnectionProfile>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CliConnectionProfile {
-    config_path: Option<String>,
-    state_root: Option<String>,
-    daemon_url: Option<String>,
-    grpc_url: Option<String>,
-    admin_token: Option<String>,
-    admin_token_env: Option<String>,
-    principal: Option<String>,
-    device_id: Option<String>,
-    channel: Option<String>,
+pub(crate) struct CliConnectionProfile {
+    pub(crate) config_path: Option<String>,
+    pub(crate) state_root: Option<String>,
+    pub(crate) daemon_url: Option<String>,
+    pub(crate) grpc_url: Option<String>,
+    pub(crate) admin_token: Option<String>,
+    pub(crate) admin_token_env: Option<String>,
+    pub(crate) principal: Option<String>,
+    pub(crate) device_id: Option<String>,
+    pub(crate) channel: Option<String>,
+    pub(crate) label: Option<String>,
+    pub(crate) environment: Option<String>,
+    pub(crate) color: Option<String>,
+    pub(crate) risk_level: Option<String>,
+    #[serde(default)]
+    pub(crate) strict_mode: bool,
+    pub(crate) mode: Option<String>,
+    pub(crate) created_at_unix_ms: Option<i64>,
+    pub(crate) updated_at_unix_ms: Option<i64>,
+    pub(crate) last_used_at_unix_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -353,10 +366,7 @@ fn resolve_profiles_path(base_state_root: &Path) -> Result<Option<PathBuf>> {
         };
         let parsed = parse_config_path(path)
             .with_context(|| format!("{CLI_PROFILES_PATH_ENV} contains an invalid path"))?;
-        if parsed.exists() {
-            return Ok(Some(parsed));
-        }
-        anyhow::bail!("CLI profiles file does not exist: {}", parsed.display());
+        return Ok(Some(parsed));
     }
 
     let default_path = base_state_root.join(CLI_PROFILES_RELATIVE_PATH);
@@ -371,6 +381,9 @@ fn load_profiles_document(path: Option<&Path>) -> Result<CliProfilesDocument> {
     let Some(path) = path else {
         return Ok(CliProfilesDocument::default());
     };
+    if !path.exists() {
+        return Ok(CliProfilesDocument::default());
+    }
     let content = fs::read_to_string(path)
         .with_context(|| format!("failed to read CLI profiles {}", path.display()))?;
     let document: CliProfilesDocument = toml::from_str(content.as_str())
@@ -383,6 +396,101 @@ fn load_profiles_document(path: Option<&Path>) -> Result<CliProfilesDocument> {
         }
     }
     Ok(document)
+}
+
+pub(crate) fn cli_profiles_registry_path() -> Result<PathBuf> {
+    let base_state_root = resolve_cli_state_root(None)?;
+    resolve_profiles_storage_path(base_state_root.as_path())
+}
+
+fn resolve_profiles_storage_path(base_state_root: &Path) -> Result<PathBuf> {
+    if let Ok(raw) = env::var(CLI_PROFILES_PATH_ENV) {
+        let Some(path) = normalize_optional_text(Some(raw.as_str())) else {
+            return Ok(base_state_root.join(CLI_PROFILES_RELATIVE_PATH));
+        };
+        return parse_config_path(path)
+            .with_context(|| format!("{CLI_PROFILES_PATH_ENV} contains an invalid path"));
+    }
+    Ok(base_state_root.join(CLI_PROFILES_RELATIVE_PATH))
+}
+
+pub(crate) fn load_cli_profiles_registry() -> Result<(PathBuf, CliProfilesDocument)> {
+    let path = cli_profiles_registry_path()?;
+    let document = load_profiles_document(Some(path.as_path()))?;
+    Ok((path, document))
+}
+
+pub(crate) fn persist_cli_profiles_registry(
+    path: &Path,
+    document: &CliProfilesDocument,
+) -> Result<()> {
+    let mut persisted = document.clone();
+    persisted.version = Some(CLI_PROFILE_SCHEMA_VERSION);
+    if let Some(parent) = path.parent().filter(|value| !value.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).with_context(|| {
+            format!("failed to create CLI profiles directory {}", parent.display())
+        })?;
+    }
+    let rendered =
+        toml::to_string_pretty(&persisted).context("failed to serialize CLI profiles registry")?;
+    fs::write(path, rendered.as_bytes())
+        .with_context(|| format!("failed to write CLI profiles {}", path.display()))
+}
+
+pub(crate) fn default_profile_state_root(profile_name: &str) -> Result<PathBuf> {
+    let base_state_root = resolve_cli_state_root(None)?;
+    Ok(base_state_root
+        .join(PROFILE_STATE_ROOT_RELATIVE_PREFIX)
+        .join(profile_name)
+        .join(PROFILE_STATE_ROOT_RELATIVE_SUFFIX))
+}
+
+pub(crate) fn validate_profile_name(raw: &str) -> Result<String> {
+    let normalized = raw.trim();
+    if normalized.is_empty() {
+        anyhow::bail!("profile name cannot be empty");
+    }
+    if normalized.len() > 64 {
+        anyhow::bail!("profile name must be 64 characters or fewer");
+    }
+    let is_valid = normalized
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '-' | '_' | '.'));
+    if !is_valid {
+        anyhow::bail!(
+            "profile name must use only lowercase ASCII letters, digits, '.', '-', or '_'"
+        );
+    }
+    Ok(normalized.to_owned())
+}
+
+pub(crate) fn normalized_profile_text(value: Option<&str>) -> Option<String> {
+    value.map(str::trim).filter(|candidate| !candidate.is_empty()).map(ToOwned::to_owned)
+}
+
+pub(crate) fn update_active_profile_paths(
+    config_path: Option<&Path>,
+    state_root: Option<&Path>,
+) -> Result<()> {
+    let Some(context) = current_root_context() else {
+        return Ok(());
+    };
+    let Some(profile_name) = context.profile_name().map(ToOwned::to_owned) else {
+        return Ok(());
+    };
+    let (path, mut document) = load_cli_profiles_registry()?;
+    let Some(profile) = document.profiles.get_mut(profile_name.as_str()) else {
+        return Ok(());
+    };
+    if let Some(config_path) = config_path {
+        profile.config_path = Some(config_path.display().to_string());
+    }
+    if let Some(state_root) = state_root {
+        profile.state_root = Some(state_root.display().to_string());
+    }
+    profile.updated_at_unix_ms = Some(current_unix_timestamp_ms()?);
+    profile.last_used_at_unix_ms = profile.updated_at_unix_ms;
+    persist_cli_profiles_registry(path.as_path(), &document)
 }
 
 fn resolve_active_profile_name(
@@ -560,6 +668,13 @@ fn normalize_optional_text(value: Option<&str>) -> Option<&str> {
 
 fn normalize_owned_text(value: Option<String>) -> Option<String> {
     value.map(|value| value.trim().to_owned()).filter(|value| !value.is_empty())
+}
+
+fn current_unix_timestamp_ms() -> Result<i64> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is set before UNIX_EPOCH")?;
+    i64::try_from(duration.as_millis()).context("system clock exceeds supported timestamp range")
 }
 
 impl ConnectionEnvironment {

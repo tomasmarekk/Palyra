@@ -273,6 +273,7 @@ fn run_cli() -> Result<()> {
         CliCommand::Docs { command } => commands::docs::run_docs(command),
         CliCommand::Plugins { command } => commands::plugins::run_plugins(command),
         CliCommand::Hooks { command } => commands::hooks::run_hooks(command),
+        CliCommand::Profile { command } => commands::profile::run_profile(command),
         CliCommand::Browser { command } => commands::browser::run_browser(command),
         CliCommand::System { command } => commands::system::run_system(command),
         CliCommand::Sandbox { command } => commands::sandbox::run_sandbox(command),
@@ -443,6 +444,9 @@ fn resolve_init_path(path: Option<String>) -> Result<PathBuf> {
 }
 
 fn resolve_init_state_root() -> Result<PathBuf> {
+    if let Some(context) = app::current_root_context() {
+        return Ok(context.state_root().to_path_buf());
+    }
     app::resolve_cli_state_root(None)
 }
 
