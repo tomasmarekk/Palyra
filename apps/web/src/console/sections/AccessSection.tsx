@@ -623,7 +623,10 @@ function RemoteVerifyCard({
           </code>
         </p>
         <p>
-          <code>cargo run -p palyra-cli -- support-bundle export --output ./artifacts/palyra-support-bundle.zip</code>
+          <code>
+            cargo run -p palyra-cli -- support-bundle export --output
+            ./artifacts/palyra-support-bundle.zip
+          </code>
         </p>
       </WorkspaceInlineNotice>
 

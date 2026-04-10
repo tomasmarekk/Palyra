@@ -346,12 +346,16 @@ export function OperationsSection({ app }: OperationsSectionProps) {
               <tr>
                 <td>ACP bridge</td>
                 <td>IDE-style session control</td>
-                <td>Stable session binding and reconnect behavior share the native approval model.</td>
+                <td>
+                  Stable session binding and reconnect behavior share the native approval model.
+                </td>
               </tr>
               <tr>
                 <td>MCP facade</td>
                 <td>Tool-oriented stdio integrations</td>
-                <td>Read-only by default, with explicit mutation tools gated by the same approvals.</td>
+                <td>
+                  Read-only by default, with explicit mutation tools gated by the same approvals.
+                </td>
               </tr>
               <tr>
                 <td>Compat API</td>
