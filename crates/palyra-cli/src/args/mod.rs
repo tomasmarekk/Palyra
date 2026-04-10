@@ -23,6 +23,7 @@ mod message;
 mod models;
 mod node;
 mod nodes;
+mod objectives;
 mod onboarding;
 mod pairing;
 mod patch;
@@ -82,6 +83,10 @@ pub use message::MessageCommand;
 pub use models::ModelsCommand;
 pub use node::NodeCommand;
 pub use nodes::NodesCommand;
+pub use objectives::{
+    ObjectiveKindArg, ObjectivePriorityArg, ObjectiveScheduleTypeArg, ObjectiveStateArg,
+    ObjectivesCommand,
+};
 pub use onboarding::{
     GatewayBindProfileArg, OnboardingAuthMethodArg, OnboardingCommand, OnboardingFlowArg,
     RemoteVerificationModeArg, SetupWizardOverridesArg, WizardOverridesArg,
@@ -494,6 +499,11 @@ pub enum Command {
     Routines {
         #[command(subcommand)]
         command: RoutinesCommand,
+    },
+    #[command(about = "Manage durable objectives, heartbeats, standing orders, and programs")]
+    Objectives {
+        #[command(subcommand)]
+        command: ObjectivesCommand,
     },
     #[command(
         about = "Manage schedule-only cron workflows through the routines compatibility layer",

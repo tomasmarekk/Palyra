@@ -257,6 +257,7 @@ fn run_cli() -> Result<()> {
         CliCommand::Agent { command } => commands::agent::run_agent(command),
         CliCommand::Agents { command } => commands::agents::run_agents(command),
         CliCommand::Routines { command } => commands::routines::run_routines(command),
+        CliCommand::Objectives { command } => commands::objectives::run_objectives(command),
         CliCommand::Cron { command } => commands::cron::run_cron(command),
         CliCommand::Memory { command } => commands::memory::run_memory(command),
         CliCommand::Message { command } => commands::message::run_message(command),

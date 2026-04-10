@@ -23,6 +23,7 @@ pub mod message;
 pub mod models;
 pub mod node;
 pub mod nodes;
+pub mod objectives;
 pub mod onboarding;
 pub(crate) mod operator_wizard;
 pub mod pairing;
