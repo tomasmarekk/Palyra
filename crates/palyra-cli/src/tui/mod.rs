@@ -18,11 +18,22 @@ use ratatui::{
     Frame, Terminal,
 };
 
+mod slash_palette;
+
+use slash_palette::{
+    build_tui_slash_palette, checkpoint_has_tag, preview_for_selection, read_json_bool,
+    read_json_i64, read_json_string, read_json_tags, select_undo_checkpoint,
+    BuildTuiSlashPaletteArgs, TuiSlashAuthProfileRecord, TuiSlashBrowserProfileRecord,
+    TuiSlashBrowserSessionRecord, TuiSlashCheckpointRecord, TuiSlashEntityCatalog,
+    TuiSlashObjectiveRecord, TuiSlashPaletteState, TuiSlashSessionRecord, TuiUxMetricKey,
+    TuiUxMetrics,
+};
+
 use crate::{
     client::operator::{ManagedRunStream, OperatorRuntime},
     commands::models::ModelsListPayload,
     shared_chat_commands::{
-        find_shared_chat_command, render_shared_chat_command_synopsis_lines,
+        render_shared_chat_command_synopsis_lines, resolve_shared_chat_command_name,
         SharedChatCommandSurface,
     },
     *,
@@ -120,6 +131,11 @@ struct App {
     pending_approval: Option<common_v1::ToolApprovalRequest>,
     pending_shell_command: Option<String>,
     pending_picker: Option<PickerState>,
+    pending_slash_palette: Option<TuiSlashPaletteState>,
+    slash_palette_selected: usize,
+    slash_palette_dismissed: bool,
+    slash_entity_catalog: TuiSlashEntityCatalog,
+    pending_redirect_prompt: Option<PendingRedirectPrompt>,
     focus: Focus,
     mode: Mode,
     show_tools: bool,
@@ -129,9 +145,17 @@ struct App {
     include_archived_sessions: bool,
     last_run_id: Option<String>,
     selected_objective_id: Option<String>,
+    ux_metrics: TuiUxMetrics,
     scroll_offset: u16,
     status_line: String,
     settings_selected: usize,
+}
+
+#[derive(Debug, Clone)]
+struct PendingRedirectPrompt {
+    prompt: String,
+    mode: String,
+    interrupted_run_id: String,
 }
 
 const BUILT_IN_DELEGATION_PROFILES: &[&str] =
@@ -211,6 +235,11 @@ impl App {
             pending_approval: None,
             pending_shell_command: None,
             pending_picker: None,
+            pending_slash_palette: None,
+            slash_palette_selected: 0,
+            slash_palette_dismissed: false,
+            slash_entity_catalog: TuiSlashEntityCatalog::default(),
+            pending_redirect_prompt: None,
             focus: Focus::Input,
             mode: Mode::Chat,
             show_tools: true,
@@ -220,6 +249,7 @@ impl App {
             include_archived_sessions: options.include_archived_sessions,
             last_run_id: None,
             selected_objective_id: None,
+            ux_metrics: TuiUxMetrics::default(),
             scroll_offset: 0,
             status_line: "Connected".to_owned(),
             settings_selected: 0,
@@ -233,6 +263,12 @@ impl App {
                 )
             }
         }
+        if let Err(error) = app.refresh_slash_entity_catalogs().await {
+            app.status_line = sanitize_terminal_text(
+                format!("Connected; slash catalogs unavailable: {error}").as_str(),
+            );
+        }
+        app.sync_slash_palette();
         app.push_entry(EntryKind::System, "Session", "Connected.");
         Ok(app)
     }
@@ -254,6 +290,25 @@ impl App {
                 Ok(Ok(None)) => {
                     self.active_stream = None;
                     self.status_line = "Run completed".to_owned();
+                    if let Some(redirect) = self.pending_redirect_prompt.take() {
+                        self.push_entry(
+                            EntryKind::System,
+                            "Redirect",
+                            format!(
+                                "{} interrupt completed for {}. Starting redirected prompt.\nAny external side effects already emitted remain in the world state.",
+                                redirect.mode,
+                                shorten_id(redirect.interrupted_run_id.as_str())
+                            ),
+                        );
+                        self.status_line = "Starting redirected prompt".to_owned();
+                        self.start_prompt_run(
+                            redirect.prompt,
+                            Some("interrupt_redirect".to_owned()),
+                            Some(redirect.interrupted_run_id),
+                            None,
+                        )
+                        .await?;
+                    }
                     break;
                 }
                 Ok(Err(error)) => {
@@ -261,6 +316,7 @@ impl App {
                     self.status_line =
                         sanitize_terminal_text(format!("Run failed: {error}").as_str());
                     self.push_entry(EntryKind::System, "Run error", error.to_string());
+                    self.pending_redirect_prompt = None;
                     break;
                 }
                 Err(_) => break,
@@ -470,8 +526,14 @@ impl App {
     async fn submit_input(&mut self) -> Result<()> {
         let value = self.input.trim().to_owned();
         self.input.clear();
+        self.slash_palette_dismissed = false;
+        self.pending_slash_palette = None;
+        self.slash_palette_selected = 0;
         if value.is_empty() {
             return Ok(());
+        }
+        if let Some(command) = value.strip_prefix('/') {
+            return self.handle_slash_command(command).await;
         }
         if self.active_stream.is_some() {
             self.status_line = "A run is already in progress".to_owned();
@@ -480,9 +542,7 @@ impl App {
         if let Some(shell_command) = value.strip_prefix('!') {
             return self.handle_shell_request(shell_command.trim().to_owned()).await;
         }
-        if let Some(command) = value.strip_prefix('/') {
-            return self.handle_slash_command(command).await;
-        }
+        self.create_undo_checkpoint("send").await?;
         self.push_entry(EntryKind::User, "You", value.clone());
         self.status_line = "Running prompt".to_owned();
         self.start_prompt_run(value, None, None, None).await
@@ -520,13 +580,22 @@ impl App {
 
     async fn handle_slash_command(&mut self, command: &str) -> Result<()> {
         let mut parts = command.split_whitespace();
-        let Some(name) = parts.next() else {
+        let Some(raw_name) = parts.next() else {
             return Ok(());
         };
-        if find_shared_chat_command(name, SharedChatCommandSurface::Tui).is_none() {
-            self.status_line = format!("Unknown slash command: /{name}");
+        let Some(name) = resolve_shared_chat_command_name(raw_name, SharedChatCommandSurface::Tui)
+        else {
+            self.status_line = format!("Unknown slash command: /{raw_name}");
+            return Ok(());
+        };
+        if self.active_stream.is_some()
+            && !matches!(name, "help" | "status" | "usage" | "queue" | "interrupt")
+        {
+            self.status_line =
+                format!("/{name} is unavailable while a run is active. Use /interrupt or /queue.");
             return Ok(());
         }
+        self.ux_metrics.record(TuiUxMetricKey::SlashCommands);
         match name {
             "help" => self.mode = Mode::Help,
             "status" => {
@@ -585,6 +654,14 @@ impl App {
                     self.open_picker(PickerKind::Model).await?;
                 }
             }
+            "undo" => {
+                let explicit_checkpoint_id = parts.next().map(ToOwned::to_owned);
+                self.undo_last_turn(explicit_checkpoint_id).await?;
+            }
+            "interrupt" => {
+                let arguments = parts.map(ToOwned::to_owned).collect::<Vec<_>>();
+                self.interrupt_run(arguments).await?;
+            }
             "reset" => self.reset_session().await?,
             "retry" => self.retry_last_turn().await?,
             "branch" => {
@@ -607,17 +684,21 @@ impl App {
                 let arguments = parts.map(ToOwned::to_owned).collect::<Vec<_>>();
                 self.handle_background_command(arguments).await?;
             }
-            "abort" => {
-                let explicit = parts.next().map(ToOwned::to_owned);
-                self.abort_run(explicit).await?;
-            }
             "usage" => {
                 self.push_entry(
                     EntryKind::System,
                     "Usage",
-                    "Detailed usage remains available in the web console and the `palyra usage` CLI surfaces.",
+                    format!(
+                        "Detailed usage remains available in the web console and the `palyra usage` CLI surfaces.\nSlash commands={} · palette accepts={} · keyboard accepts={} · undo={} · interrupts={} · errors={}",
+                        self.ux_metrics.slash_commands,
+                        self.ux_metrics.palette_accepts,
+                        self.ux_metrics.keyboard_accepts,
+                        self.ux_metrics.undo,
+                        self.ux_metrics.interrupt,
+                        self.ux_metrics.errors,
+                    ),
                 );
-                self.status_line = "Usage summary is not embedded in the TUI yet".to_owned();
+                self.status_line = "Usage summary refreshed".to_owned();
             }
             "compact" => {
                 let arguments = parts.map(ToOwned::to_owned).collect::<Vec<_>>();
@@ -630,6 +711,18 @@ impl App {
                     "Attachment upload is currently available in the web chat composer. The TUI keeps the same `/attach` terminology but does not upload files yet.",
                 );
                 self.status_line = "Attachment upload is currently web-only".to_owned();
+            }
+            "profile" => {
+                let arguments = parts.map(ToOwned::to_owned).collect::<Vec<_>>();
+                self.handle_profile_command(arguments).await?;
+            }
+            "browser" => {
+                let arguments = parts.map(ToOwned::to_owned).collect::<Vec<_>>();
+                self.handle_browser_command(arguments).await?;
+            }
+            "doctor" => {
+                let arguments = parts.map(ToOwned::to_owned).collect::<Vec<_>>();
+                self.handle_doctor_command(arguments).await?;
             }
             "settings" => self.mode = Mode::Settings,
             "tools" => self.show_tools = parse_toggle(parts.next(), self.show_tools)?,
@@ -714,6 +807,8 @@ impl App {
         self.transcript.clear();
         self.push_entry(EntryKind::System, "Session", "Session switched.");
         self.refresh_agent_identity(None, false).await?;
+        self.refresh_slash_entity_catalogs().await?;
+        self.sync_slash_palette();
         self.status_line = "Session switched".to_owned();
         self.mode = Mode::Chat;
         Ok(())
@@ -741,11 +836,17 @@ impl App {
         self.transcript.clear();
         self.push_entry(EntryKind::System, "Session", "Session history reset.");
         self.refresh_agent_identity(None, false).await?;
+        self.refresh_slash_entity_catalogs().await?;
+        self.sync_slash_palette();
         self.status_line = "Session reset".to_owned();
         Ok(())
     }
 
-    async fn abort_run(&mut self, explicit_run_id: Option<String>) -> Result<()> {
+    async fn abort_run(
+        &mut self,
+        explicit_run_id: Option<String>,
+        reason: Option<String>,
+    ) -> Result<()> {
         let run_id = if let Some(run_id) = explicit_run_id {
             resolve_or_generate_canonical_id(Some(run_id))?
         } else {
@@ -753,10 +854,13 @@ impl App {
                 .clone()
                 .context("/abort without explicit run_id requires a previous run")?
         };
-        let response = self.runtime.abort_run(run_id.clone(), Some("tui_abort".to_owned())).await?;
+        let response = self
+            .runtime
+            .abort_run(run_id.clone(), reason.or(Some("tui_interrupt".to_owned())))
+            .await?;
         self.push_entry(
             EntryKind::System,
-            "Abort",
+            "Interrupt",
             format!(
                 "cancel_requested={} run_id={}",
                 response.cancel_requested,
@@ -769,7 +873,123 @@ impl App {
                 )
             ),
         );
-        self.status_line = "Abort requested".to_owned();
+        self.status_line = "Interrupt requested".to_owned();
+        Ok(())
+    }
+
+    async fn create_undo_checkpoint(&mut self, source: &'static str) -> Result<()> {
+        let session_id = self.active_session_id()?;
+        if self.transcript.is_empty() && self.last_run_id.is_none() {
+            return Ok(());
+        }
+        let context = self.connect_admin_console().await?;
+        let note = match source {
+            "retry" => {
+                "Created automatically before retry so /undo can restore the prior conversational state."
+            }
+            "redirect" => {
+                "Created automatically before interrupt redirect so /undo can restore the prior conversational state."
+            }
+            _ => {
+                "Created automatically before a new chat run so /undo can restore the prior conversational state."
+            }
+        };
+        let result = context
+            .client
+            .post_json_value(
+                format!(
+                    "console/v1/chat/sessions/{}/checkpoints",
+                    percent_encode_component(session_id.as_str())
+                ),
+                &serde_json::json!({
+                    "name": format!("Undo checkpoint before {source}"),
+                    "note": note,
+                    "tags": ["undo_safe", source],
+                }),
+            )
+            .await;
+        match result {
+            Ok(_) => {
+                self.refresh_checkpoint_catalog().await?;
+                Ok(())
+            }
+            Err(error) => {
+                self.ux_metrics.record(TuiUxMetricKey::Errors);
+                self.status_line =
+                    sanitize_terminal_text(format!("Undo checkpoint skipped: {error}").as_str());
+                Ok(())
+            }
+        }
+    }
+
+    async fn undo_last_turn(&mut self, explicit_checkpoint_id: Option<String>) -> Result<()> {
+        let checkpoint = if let Some(explicit_checkpoint_id) = explicit_checkpoint_id {
+            self.slash_entity_catalog
+                .checkpoints
+                .iter()
+                .find(|checkpoint| checkpoint.checkpoint_id == explicit_checkpoint_id)
+        } else {
+            select_undo_checkpoint(self.slash_entity_catalog.checkpoints.as_slice())
+        };
+        let Some(checkpoint) = checkpoint else {
+            self.status_line = "No safe undo checkpoint is available yet. Send another turn first or restore a checkpoint explicitly.".to_owned();
+            self.ux_metrics.record(TuiUxMetricKey::Errors);
+            return Ok(());
+        };
+        self.ux_metrics.record(TuiUxMetricKey::Undo);
+        self.restore_checkpoint_with_notice(checkpoint.checkpoint_id.clone(), "undo").await
+    }
+
+    async fn interrupt_run(&mut self, arguments: Vec<String>) -> Result<()> {
+        let Some(active_run_id) =
+            self.active_stream.as_ref().map(|stream| stream.run_id().to_owned())
+        else {
+            self.status_line = "No run is available for interruption.".to_owned();
+            self.ux_metrics.record(TuiUxMetricKey::Errors);
+            return Ok(());
+        };
+        let trimmed = arguments.join(" ");
+        let mut parts = trimmed.split_whitespace();
+        let first = parts.next().unwrap_or_default();
+        let (mode, redirect_prompt) = if matches!(first, "soft" | "force") {
+            (first, parts.collect::<Vec<_>>().join(" ").trim().to_owned())
+        } else {
+            ("soft", trimmed.trim().to_owned())
+        };
+        if !redirect_prompt.is_empty() {
+            self.create_undo_checkpoint("redirect").await?;
+            self.pending_redirect_prompt = Some(PendingRedirectPrompt {
+                prompt: redirect_prompt,
+                mode: mode.to_owned(),
+                interrupted_run_id: active_run_id.clone(),
+            });
+        } else {
+            self.pending_redirect_prompt = None;
+        }
+        self.ux_metrics.record(TuiUxMetricKey::Interrupt);
+        self.abort_run(Some(active_run_id.clone()), Some(format!("tui_interrupt_{mode}"))).await?;
+        self.push_entry(
+            EntryKind::System,
+            "Interrupt",
+            if self.pending_redirect_prompt.is_some() {
+                format!(
+                    "{} interrupt requested for {}. The redirected prompt will start after the run closes cleanly.",
+                    mode,
+                    shorten_id(active_run_id.as_str())
+                )
+            } else {
+                format!(
+                    "{} interrupt requested for {}.\nAny external side effects already emitted remain in the world state.",
+                    mode,
+                    shorten_id(active_run_id.as_str())
+                )
+            },
+        );
+        self.status_line = if self.pending_redirect_prompt.is_some() {
+            "Interrupt requested; redirect queued".to_owned()
+        } else {
+            "Interrupt requested".to_owned()
+        };
         Ok(())
     }
 
@@ -795,6 +1015,8 @@ impl App {
         self.last_run_id = None;
         self.push_entry(EntryKind::System, "Session", "Created a new session.");
         self.refresh_agent_identity(None, false).await?;
+        self.refresh_slash_entity_catalogs().await?;
+        self.sync_slash_palette();
         self.status_line = "Session created".to_owned();
         Ok(())
     }
@@ -810,6 +1032,7 @@ impl App {
             .as_ref()
             .map(|value| value.ulid.clone())
             .context("active TUI session is missing a session_id")?;
+        self.create_undo_checkpoint("retry").await?;
         let context = client::control_plane::connect_admin_console(app::ConnectionOverrides {
             grpc_url: Some(self.runtime.connection().grpc_url.clone()),
             daemon_url: None,
@@ -893,6 +1116,8 @@ impl App {
             "Branch",
             "Created a new active branch from the latest terminal run.",
         );
+        self.refresh_slash_entity_catalogs().await?;
+        self.sync_slash_palette();
         self.status_line = "Branched into a new session".to_owned();
         Ok(())
     }
@@ -957,6 +1182,488 @@ impl App {
             .as_ref()
             .map(|value| value.ulid.clone())
             .context("active TUI session is missing a session_id")
+    }
+
+    fn sync_slash_palette(&mut self) {
+        if !self.input.trim_start().starts_with('/') {
+            self.pending_slash_palette = None;
+            self.slash_palette_dismissed = false;
+            self.slash_palette_selected = 0;
+            return;
+        }
+        if self.slash_palette_dismissed {
+            self.pending_slash_palette = None;
+            return;
+        }
+        self.pending_slash_palette = build_tui_slash_palette(BuildTuiSlashPaletteArgs {
+            input: self.input.as_str(),
+            catalog: &self.slash_entity_catalog,
+            streaming: self.active_stream.is_some(),
+            delegation_profiles: BUILT_IN_DELEGATION_PROFILES,
+            delegation_templates: BUILT_IN_DELEGATION_TEMPLATES,
+        });
+        let suggestion_count = self
+            .pending_slash_palette
+            .as_ref()
+            .map(|palette| palette.suggestions.len())
+            .unwrap_or(0);
+        self.slash_palette_selected =
+            self.slash_palette_selected.min(suggestion_count.saturating_sub(1));
+    }
+
+    fn apply_selected_slash_suggestion(&mut self, accepted_with_keyboard: bool) {
+        let Some(palette) = self.pending_slash_palette.as_ref() else {
+            return;
+        };
+        let Some(suggestion) = palette.suggestions.get(self.slash_palette_selected) else {
+            return;
+        };
+        self.input = suggestion.replacement.clone();
+        self.slash_palette_dismissed = false;
+        self.pending_slash_palette = None;
+        self.slash_palette_selected = 0;
+        self.ux_metrics.record(TuiUxMetricKey::PaletteAccepts);
+        if accepted_with_keyboard {
+            self.ux_metrics.record(TuiUxMetricKey::KeyboardAccepts);
+        }
+        self.sync_slash_palette();
+    }
+
+    async fn refresh_slash_entity_catalogs(&mut self) -> Result<()> {
+        self.refresh_session_catalog().await?;
+        self.refresh_objective_catalog().await?;
+        self.refresh_auth_profile_catalog().await?;
+        self.refresh_browser_catalog().await?;
+        self.refresh_checkpoint_catalog().await?;
+        Ok(())
+    }
+
+    async fn refresh_session_catalog(&mut self) -> Result<()> {
+        let response = self
+            .runtime
+            .list_session_catalog(vec![
+                ("limit", Some("32".to_owned())),
+                ("sort", Some("updated_desc".to_owned())),
+                ("include_archived", self.include_archived_sessions.then(|| "true".to_owned())),
+            ])
+            .await?;
+        self.slash_entity_catalog.sessions = response
+            .sessions
+            .into_iter()
+            .map(|session| TuiSlashSessionRecord {
+                session_id: session.session_id,
+                title: session.title,
+                session_key: session.session_key,
+                archived: session.archived,
+                preview: session.preview.unwrap_or_default(),
+            })
+            .collect();
+        Ok(())
+    }
+
+    async fn refresh_objective_catalog(&mut self) -> Result<()> {
+        let context = self.connect_admin_console().await?;
+        let payload = crate::commands::objectives::list_objectives_value(
+            &context.client,
+            None,
+            Some(32),
+            None,
+            None,
+        )
+        .await?;
+        self.slash_entity_catalog.objectives = payload
+            .pointer("/objectives")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|value| TuiSlashObjectiveRecord {
+                objective_id: read_json_string(&value, "/objective_id"),
+                name: read_json_string(&value, "/name"),
+                kind: read_json_string(&value, "/kind"),
+                focus: read_json_string(&value, "/current_focus"),
+            })
+            .filter(|record| !record.objective_id.is_empty())
+            .collect();
+        Ok(())
+    }
+
+    async fn refresh_auth_profile_catalog(&mut self) -> Result<()> {
+        let context = self.connect_admin_console().await?;
+        let payload =
+            context.client.get_json_value("console/v1/auth/profiles?limit=32".to_owned()).await?;
+        self.slash_entity_catalog.auth_profiles = payload
+            .pointer("/profiles")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|value| TuiSlashAuthProfileRecord {
+                profile_id: read_json_string(&value, "/profile_id"),
+                profile_name: read_json_string(&value, "/profile_name"),
+                provider_kind: read_json_string(&value, "/provider/kind"),
+                scope_kind: read_json_string(&value, "/scope/kind"),
+            })
+            .filter(|record| !record.profile_id.is_empty())
+            .collect();
+        Ok(())
+    }
+
+    async fn refresh_browser_catalog(&mut self) -> Result<()> {
+        let context = self.connect_admin_console().await?;
+        let profiles_payload = context
+            .client
+            .get_json_value("console/v1/browser/profiles?limit=16".to_owned())
+            .await?;
+        self.slash_entity_catalog.browser_profiles = profiles_payload
+            .pointer("/profiles")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|value| TuiSlashBrowserProfileRecord {
+                profile_id: read_json_string(&value, "/profile_id"),
+                name: read_json_string(&value, "/name"),
+                persistence_enabled: read_json_bool(&value, "/persistence_enabled")
+                    || read_json_bool(&value, "/persistence"),
+                private_profile: read_json_bool(&value, "/private_profile"),
+            })
+            .filter(|record| !record.profile_id.is_empty())
+            .collect();
+        let sessions_payload = context
+            .client
+            .get_json_value("console/v1/browser/sessions?limit=16".to_owned())
+            .await?;
+        self.slash_entity_catalog.browser_sessions = sessions_payload
+            .pointer("/sessions")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|value| {
+                let page_title = read_json_string(&value, "/page_title");
+                let target_url = read_json_string(&value, "/target_url");
+                let channel = read_json_string(&value, "/channel");
+                let title = if !page_title.is_empty() {
+                    page_title
+                } else if !target_url.is_empty() {
+                    target_url
+                } else if !channel.is_empty() {
+                    channel
+                } else {
+                    "Browser session".to_owned()
+                };
+                TuiSlashBrowserSessionRecord {
+                    session_id: read_json_string(&value, "/session_id"),
+                    title,
+                }
+            })
+            .filter(|record| !record.session_id.is_empty())
+            .collect();
+        Ok(())
+    }
+
+    async fn refresh_checkpoint_catalog(&mut self) -> Result<()> {
+        let session_id = self.active_session_id()?;
+        let context = self.connect_admin_console().await?;
+        let payload = context
+            .client
+            .get_json_value(format!(
+                "console/v1/chat/sessions/{}/transcript",
+                percent_encode_component(session_id.as_str())
+            ))
+            .await?;
+        self.slash_entity_catalog.checkpoints = payload
+            .pointer("/checkpoints")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|value| {
+                let tags_json = read_json_string(&value, "/tags_json");
+                let parsed_tags =
+                    serde_json::from_str::<serde_json::Value>(tags_json.as_str()).ok();
+                TuiSlashCheckpointRecord {
+                    checkpoint_id: read_json_string(&value, "/checkpoint_id"),
+                    name: read_json_string(&value, "/name"),
+                    note: read_json_string(&value, "/note"),
+                    created_at_unix_ms: read_json_i64(&value, "/created_at_unix_ms"),
+                    tags: parsed_tags
+                        .as_ref()
+                        .map(|parsed| read_json_tags(parsed, ""))
+                        .unwrap_or_default(),
+                }
+            })
+            .filter(|record| !record.checkpoint_id.is_empty())
+            .collect();
+        Ok(())
+    }
+
+    async fn restore_checkpoint_with_notice(
+        &mut self,
+        checkpoint_id: String,
+        source: &'static str,
+    ) -> Result<()> {
+        let context = self.connect_admin_console().await?;
+        let payload = context
+            .client
+            .post_json_value(
+                format!(
+                    "console/v1/chat/checkpoints/{}/restore",
+                    percent_encode_component(checkpoint_id.as_str())
+                ),
+                &serde_json::json!({}),
+            )
+            .await?;
+        let next_session_id = payload
+            .pointer("/session/session_id")
+            .and_then(serde_json::Value::as_str)
+            .context("checkpoint restore response is missing session_id")?
+            .to_owned();
+        self.switch_session(next_session_id).await?;
+        let warning = if source == "undo" {
+            "Conversation state was restored from a checkpoint. Any external side effects already emitted remain in the world state."
+        } else {
+            "Checkpoint restored into a new branch. Any external side effects already emitted remain in the world state."
+        };
+        self.push_entry(
+            EntryKind::System,
+            if source == "undo" { "Undo" } else { "Checkpoint restore" },
+            format!("{warning}\ncheckpoint={}", shorten_id(checkpoint_id.as_str())),
+        );
+        self.status_line = if source == "undo" {
+            "Undo restore completed".to_owned()
+        } else {
+            "Checkpoint restored as a new branch".to_owned()
+        };
+        Ok(())
+    }
+
+    async fn handle_profile_command(&mut self, arguments: Vec<String>) -> Result<()> {
+        if self.slash_entity_catalog.auth_profiles.is_empty() {
+            self.refresh_auth_profile_catalog().await?;
+        }
+        let target = normalize_optional_text(arguments.join(" "));
+        if let Some(target) = target {
+            let target = target.to_ascii_lowercase();
+            let matched = self
+                .slash_entity_catalog
+                .auth_profiles
+                .iter()
+                .find(|profile| {
+                    profile.profile_id.to_ascii_lowercase() == target
+                        || profile.profile_name.to_ascii_lowercase() == target
+                })
+                .cloned();
+            let Some(profile) = matched else {
+                self.status_line = "Auth profile not found in the loaded catalog.".to_owned();
+                self.ux_metrics.record(TuiUxMetricKey::Errors);
+                return Ok(());
+            };
+            self.push_entry(
+                EntryKind::System,
+                "Profile",
+                format!(
+                    "{}\nprofile_id={}\nprovider={} scope={}\nUse `palyra auth profiles show {}` or the web console Auth section for full posture detail.",
+                    profile.profile_name,
+                    profile.profile_id,
+                    profile.provider_kind,
+                    profile.scope_kind,
+                    profile.profile_id
+                ),
+            );
+            self.status_line = format!("Loaded profile {}", profile.profile_name);
+            return Ok(());
+        }
+        if self.slash_entity_catalog.auth_profiles.is_empty() {
+            self.push_entry(
+                EntryKind::System,
+                "Profile",
+                "No auth profiles are currently visible.",
+            );
+        } else {
+            let body = self
+                .slash_entity_catalog
+                .auth_profiles
+                .iter()
+                .take(8)
+                .map(|profile| {
+                    format!(
+                        "{} · {} · {} · {}",
+                        profile.profile_name,
+                        profile.profile_id,
+                        profile.provider_kind,
+                        profile.scope_kind
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.push_entry(EntryKind::System, "Profiles", body);
+        }
+        self.status_line = "Auth profile catalog refreshed".to_owned();
+        Ok(())
+    }
+
+    async fn handle_browser_command(&mut self, arguments: Vec<String>) -> Result<()> {
+        if self.slash_entity_catalog.browser_profiles.is_empty()
+            && self.slash_entity_catalog.browser_sessions.is_empty()
+        {
+            self.refresh_browser_catalog().await?;
+        }
+        let target = normalize_optional_text(arguments.join(" "));
+        if let Some(target) = target {
+            let target = target.to_ascii_lowercase();
+            if let Some(session) = self
+                .slash_entity_catalog
+                .browser_sessions
+                .iter()
+                .find(|session| session.session_id.to_ascii_lowercase() == target)
+                .cloned()
+            {
+                let context = self.connect_admin_console().await?;
+                let payload = context
+                    .client
+                    .get_json_value(format!(
+                        "console/v1/browser/sessions/{}",
+                        percent_encode_component(session.session_id.as_str())
+                    ))
+                    .await?;
+                self.push_entry(
+                    EntryKind::System,
+                    "Browser session",
+                    serde_json::to_string_pretty(&payload)?,
+                );
+                self.status_line = "Browser session detail loaded".to_owned();
+                return Ok(());
+            }
+            if let Some(profile) = self
+                .slash_entity_catalog
+                .browser_profiles
+                .iter()
+                .find(|profile| {
+                    profile.profile_id.to_ascii_lowercase() == target
+                        || profile.name.to_ascii_lowercase() == target
+                })
+                .cloned()
+            {
+                self.push_entry(
+                    EntryKind::System,
+                    "Browser profile",
+                    format!(
+                        "{}\nprofile_id={}\npersistence={} private={}\nUse `palyra browser profiles list` or the web browser workbench for richer actions.",
+                        profile.name,
+                        profile.profile_id,
+                        profile.persistence_enabled,
+                        profile.private_profile
+                    ),
+                );
+                self.status_line = format!("Loaded browser profile {}", profile.name);
+                return Ok(());
+            }
+            self.status_line =
+                "Browser profile or session not found in the loaded catalog.".to_owned();
+            self.ux_metrics.record(TuiUxMetricKey::Errors);
+            return Ok(());
+        }
+        let mut lines = Vec::new();
+        if self.slash_entity_catalog.browser_profiles.is_empty() {
+            lines.push("No browser profiles visible.".to_owned());
+        } else {
+            lines.push("Profiles:".to_owned());
+            lines.extend(self.slash_entity_catalog.browser_profiles.iter().take(6).map(
+                |profile| {
+                    format!(
+                        "  {} · {} · {}",
+                        profile.name,
+                        profile.profile_id,
+                        if profile.persistence_enabled { "persistent" } else { "ephemeral" }
+                    )
+                },
+            ));
+        }
+        if self.slash_entity_catalog.browser_sessions.is_empty() {
+            lines.push("No browser sessions visible.".to_owned());
+        } else {
+            lines.push("Sessions:".to_owned());
+            lines.extend(
+                self.slash_entity_catalog
+                    .browser_sessions
+                    .iter()
+                    .take(6)
+                    .map(|session| format!("  {} · {}", session.title, session.session_id)),
+            );
+        }
+        self.push_entry(EntryKind::System, "Browser", lines.join("\n"));
+        self.status_line = "Browser catalog refreshed".to_owned();
+        Ok(())
+    }
+
+    async fn handle_doctor_command(&mut self, arguments: Vec<String>) -> Result<()> {
+        let action = arguments.first().map(String::as_str).unwrap_or("jobs");
+        let context = self.connect_admin_console().await?;
+        match action {
+            "jobs" => {
+                let payload = context
+                    .client
+                    .get_json_value("console/v1/doctor/jobs?limit=8".to_owned())
+                    .await?;
+                let jobs = payload
+                    .pointer("/jobs")
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                if jobs.is_empty() {
+                    self.push_entry(
+                        EntryKind::System,
+                        "Doctor",
+                        "No doctor recovery jobs recorded.",
+                    );
+                } else {
+                    let body = jobs
+                        .iter()
+                        .map(|job| {
+                            format!(
+                                "{} · {} · {}",
+                                read_json_string(job, "/job_id"),
+                                read_json_string(job, "/state"),
+                                read_json_string(job, "/command_output")
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    self.push_entry(EntryKind::System, "Doctor jobs", body);
+                }
+                self.status_line = "Doctor jobs refreshed".to_owned();
+            }
+            "run" | "repair" => {
+                let payload = context
+                    .client
+                    .post_json_value(
+                        "console/v1/doctor/jobs".to_owned(),
+                        &serde_json::json!({
+                            "dry_run": action == "run",
+                            "repair": action == "repair",
+                        }),
+                    )
+                    .await?;
+                let job_id = read_json_string(&payload, "/job/job_id");
+                let state = read_json_string(&payload, "/job/state");
+                self.push_entry(
+                    EntryKind::System,
+                    "Doctor job",
+                    format!(
+                        "Queued doctor {action} job {} ({state}).",
+                        shorten_id(job_id.as_str())
+                    ),
+                );
+                self.status_line = format!("Doctor {action} job queued");
+            }
+            _ => {
+                self.status_line = "Usage: /doctor [jobs|run|repair]".to_owned();
+                self.ux_metrics.record(TuiUxMetricKey::Errors);
+            }
+        }
+        Ok(())
     }
 
     async fn handle_objective_command(
@@ -1282,6 +1989,7 @@ impl App {
             .map(|writes| writes.len())
             .unwrap_or_default();
         if spec.apply {
+            self.refresh_checkpoint_catalog().await?;
             let artifact_id = payload
                 .pointer("/artifact/artifact_id")
                 .and_then(serde_json::Value::as_str)
@@ -1324,7 +2032,6 @@ impl App {
                 "Usage: /checkpoint save <name> | list | restore <checkpoint_id>".to_owned();
             return Ok(());
         };
-        let context = self.connect_admin_console().await?;
         match action {
             "save" => {
                 let name = normalize_optional_text(
@@ -1335,6 +2042,7 @@ impl App {
                     return Ok(());
                 };
                 let session_id = self.active_session_id()?;
+                let context = self.connect_admin_console().await?;
                 let payload = context
                     .client
                     .post_json_value(
@@ -1348,6 +2056,7 @@ impl App {
                         }),
                     )
                     .await?;
+                self.refresh_checkpoint_catalog().await?;
                 let checkpoint_id = payload
                     .pointer("/checkpoint/checkpoint_id")
                     .and_then(serde_json::Value::as_str)
@@ -1360,40 +2069,32 @@ impl App {
                 self.status_line = "Checkpoint created".to_owned();
             }
             "list" => {
-                let session_id = self.active_session_id()?;
-                let payload = context
-                    .client
-                    .get_json_value(format!(
-                        "console/v1/chat/sessions/{}/transcript",
-                        percent_encode_component(session_id.as_str())
-                    ))
-                    .await?;
-                let checkpoints = payload
-                    .pointer("/checkpoints")
-                    .and_then(serde_json::Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
-                if checkpoints.is_empty() {
+                self.refresh_checkpoint_catalog().await?;
+                if self.slash_entity_catalog.checkpoints.is_empty() {
                     self.push_entry(
                         EntryKind::System,
                         "Checkpoint",
                         "No checkpoints stored for this session.",
                     );
                 } else {
-                    let body = checkpoints
+                    let body = self
+                        .slash_entity_catalog
+                        .checkpoints
                         .iter()
                         .map(|checkpoint| {
                             format!(
-                                "{} · {}",
-                                checkpoint
-                                    .pointer("/checkpoint_id")
-                                    .and_then(serde_json::Value::as_str)
-                                    .map(shorten_id)
-                                    .unwrap_or_else(|| "unknown".to_owned()),
-                                checkpoint
-                                    .pointer("/name")
-                                    .and_then(serde_json::Value::as_str)
-                                    .unwrap_or("unnamed")
+                                "{} · {}{}",
+                                shorten_id(checkpoint.checkpoint_id.as_str()),
+                                if checkpoint.name.is_empty() {
+                                    "unnamed".to_owned()
+                                } else {
+                                    checkpoint.name.clone()
+                                },
+                                if checkpoint_has_tag(checkpoint, "undo_safe") {
+                                    " · undo-safe".to_owned()
+                                } else {
+                                    String::new()
+                                }
                             )
                         })
                         .collect::<Vec<_>>()
@@ -1407,28 +2108,7 @@ impl App {
                     self.status_line = "Usage: /checkpoint restore <checkpoint_id>".to_owned();
                     return Ok(());
                 };
-                let payload = context
-                    .client
-                    .post_json_value(
-                        format!(
-                            "console/v1/chat/checkpoints/{}/restore",
-                            percent_encode_component(checkpoint_id.as_str())
-                        ),
-                        &serde_json::json!({}),
-                    )
-                    .await?;
-                let restored_session_id = payload
-                    .pointer("/session/session_id")
-                    .and_then(serde_json::Value::as_str)
-                    .context("checkpoint restore response is missing session_id")?
-                    .to_owned();
-                self.switch_session(restored_session_id).await?;
-                self.push_entry(
-                    EntryKind::System,
-                    "Checkpoint restore",
-                    format!("Restored checkpoint {} as a new branch.", shorten_id(checkpoint_id)),
-                );
-                self.status_line = "Checkpoint restored into a new session".to_owned();
+                self.restore_checkpoint_with_notice(checkpoint_id.clone(), "checkpoint").await?;
             }
             _ => {
                 self.status_line =
@@ -1801,6 +2481,8 @@ impl App {
     async fn reload_runtime_state(&mut self) -> Result<()> {
         self.refresh_agent_identity(None, false).await?;
         self.models = Some(self.runtime.list_models(None)?);
+        self.refresh_slash_entity_catalogs().await?;
+        self.sync_slash_palette();
         self.status_line = "Runtime state reloaded".to_owned();
         Ok(())
     }
@@ -1862,10 +2544,28 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
 async fn handle_chat_key(app: &mut App, key: KeyEvent) -> Result<()> {
     match key.code {
         KeyCode::Tab => {
-            app.focus = match app.focus {
-                Focus::Transcript => Focus::Input,
-                Focus::Input => Focus::Transcript,
-            };
+            if matches!(app.focus, Focus::Input)
+                && app
+                    .pending_slash_palette
+                    .as_ref()
+                    .map(|palette| !palette.suggestions.is_empty())
+                    .unwrap_or(false)
+            {
+                app.apply_selected_slash_suggestion(true);
+            } else {
+                app.focus = match app.focus {
+                    Focus::Transcript => Focus::Input,
+                    Focus::Input => Focus::Transcript,
+                };
+            }
+        }
+        KeyCode::Esc
+            if matches!(app.focus, Focus::Input) && app.pending_slash_palette.is_some() =>
+        {
+            app.slash_palette_dismissed = true;
+            app.pending_slash_palette = None;
+            app.slash_palette_selected = 0;
+            app.status_line = "Slash palette dismissed".to_owned();
         }
         KeyCode::Char('?') => app.mode = Mode::Help,
         KeyCode::F(2) => app.open_picker(PickerKind::Agent).await?,
@@ -1878,22 +2578,35 @@ async fn handle_chat_key(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Enter if matches!(app.focus, Focus::Input) => app.submit_input().await?,
         KeyCode::Backspace if matches!(app.focus, Focus::Input) => {
             app.input.pop();
+            app.slash_palette_dismissed = false;
+            app.sync_slash_palette();
         }
         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             if matches!(app.focus, Focus::Input) {
                 app.input.clear();
+                app.slash_palette_dismissed = false;
+                app.sync_slash_palette();
             }
         }
         KeyCode::Char(ch) if matches!(app.focus, Focus::Input) && key.modifiers.is_empty() => {
             app.input.push(ch);
+            app.slash_palette_dismissed = false;
+            app.sync_slash_palette();
         }
         KeyCode::Up => {
-            if matches!(app.focus, Focus::Transcript) {
+            if matches!(app.focus, Focus::Input) && app.pending_slash_palette.is_some() {
+                app.slash_palette_selected = app.slash_palette_selected.saturating_sub(1);
+            } else if matches!(app.focus, Focus::Transcript) {
                 app.scroll_offset = app.scroll_offset.saturating_add(1);
             }
         }
         KeyCode::Down => {
-            if matches!(app.focus, Focus::Transcript) {
+            if matches!(app.focus, Focus::Input) {
+                if let Some(palette) = app.pending_slash_palette.as_ref() {
+                    app.slash_palette_selected = (app.slash_palette_selected + 1)
+                        .min(palette.suggestions.len().saturating_sub(1));
+                }
+            } else if matches!(app.focus, Focus::Transcript) {
                 app.scroll_offset = app.scroll_offset.saturating_sub(1);
             }
         }
@@ -2055,7 +2768,11 @@ fn render(frame: &mut Frame<'_>, app: &App) {
         Mode::Picker(_) => render_picker_popup(frame, frame.area(), app),
         Mode::Settings => render_settings_popup(frame, frame.area(), app),
         Mode::ShellConfirm => render_shell_confirm_popup(frame, frame.area()),
-        Mode::Chat => {}
+        Mode::Chat => {
+            if app.pending_slash_palette.is_some() {
+                render_slash_palette_popup(frame, frame.area(), app);
+            }
+        }
     }
 }
 
@@ -2182,10 +2899,16 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     } else {
         ""
     };
+    let slash_hint = if app.pending_slash_palette.is_some() {
+        "  slash: Up/Down choose  Tab accept  Esc dismiss"
+    } else {
+        ""
+    };
     let help = format!(
-        "Enter send  Tab focus  F2/F3/F4 pickers  F5 settings  Ctrl+R reload  ? help  / commands  ! shell({}){}",
+        "Enter send  Tab focus  F2/F3/F4 pickers  F5 settings  Ctrl+R reload  ? help  / commands  ! shell({}){}{}",
         if app.local_shell_enabled { "on" } else { "off" },
-        strict_hint
+        strict_hint,
+        slash_hint,
     );
     frame.render_widget(Paragraph::new(help), area);
 }
@@ -2320,10 +3043,11 @@ fn render_help_popup(frame: &mut Frame<'_>, area: Rect) {
         Line::from("  F5 settings  Ctrl+R reload runtime state"),
         Line::default(),
         Line::from("Controls"),
-        Line::from("  Tab focus  Enter submit/select  Esc close overlay  q quit"),
+        Line::from("  Tab focus or accept slash suggestion  Enter submit/select"),
+        Line::from("  Up/Down navigate slash palette or transcript  Esc close overlay  q quit"),
         Line::default(),
         Line::from(
-            "Retry, branch, delegation, compaction, checkpoints, and background tasks reuse the console HTTP contracts.",
+            "Retry, undo, interrupt redirect, compaction, checkpoints, and background tasks reuse the console HTTP contracts.",
         ),
     ]);
     let popup_height = area.height.saturating_sub(2).min(lines.len() as u16 + 2).max(14);
@@ -2409,6 +3133,63 @@ fn render_picker_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
             popup,
         );
     }
+}
+
+fn render_slash_palette_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let Some(palette) = app.pending_slash_palette.as_ref() else {
+        return;
+    };
+    let preview = preview_for_selection(palette, app.slash_palette_selected);
+    let preview_lines = if let Some(preview) = preview {
+        vec![
+            Line::from(vec![
+                Span::styled(
+                    preview.badge,
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::raw(preview.title),
+            ]),
+            Line::from(preview.subtitle),
+            Line::from(preview.detail),
+            Line::from(format!("Example: {}", preview.example)),
+            Line::default(),
+        ]
+    } else {
+        vec![
+            Line::from("Slash command palette"),
+            Line::from("Type a slash command, then use Up/Down and Tab."),
+            Line::default(),
+        ]
+    };
+    let mut lines = preview_lines;
+    if palette.suggestions.is_empty() {
+        lines.push(Line::from("No suggestions for the current token."));
+    } else {
+        for (index, suggestion) in palette.suggestions.iter().enumerate() {
+            let selected = index == app.slash_palette_selected;
+            let prefix = if selected { ">" } else { " " };
+            lines.push(Line::from(Span::styled(
+                format!("{prefix} [{}] {}", suggestion.badge, suggestion.title),
+                if selected {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                },
+            )));
+            lines.push(Line::from(format!("  {}", suggestion.subtitle)));
+            lines.push(Line::from(format!("  {}", suggestion.detail)));
+            lines.push(Line::default());
+        }
+    }
+    let popup = centered_rect(92, 18, area);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(Block::default().borders(Borders::ALL).title("Slash palette"))
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
 }
 
 fn render_settings_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -2641,7 +3422,8 @@ fn format_shell_result(result: &ShellResult) -> String {
 mod tests {
     use super::{
         display_session_identity, parse_toggle, parse_tui_objective_create_spec,
-        parse_tui_objective_kind, sanitize_terminal_text, App, Focus, Mode,
+        parse_tui_objective_kind, sanitize_terminal_text, App, Focus, Mode, TuiSlashEntityCatalog,
+        TuiUxMetrics,
     };
     use crate::proto::palyra::{common::v1 as common_v1, gateway::v1 as gateway_v1};
 
@@ -2665,6 +3447,11 @@ mod tests {
             pending_approval: None,
             pending_shell_command: None,
             pending_picker: None,
+            pending_slash_palette: None,
+            slash_palette_selected: 0,
+            slash_palette_dismissed: false,
+            slash_entity_catalog: TuiSlashEntityCatalog::default(),
+            pending_redirect_prompt: None,
             focus: Focus::Input,
             mode: Mode::Chat,
             show_tools: true,
@@ -2674,6 +3461,7 @@ mod tests {
             include_archived_sessions: false,
             last_run_id: None,
             selected_objective_id: None,
+            ux_metrics: TuiUxMetrics::default(),
             scroll_offset: 0,
             status_line: String::new(),
             settings_selected: 0,

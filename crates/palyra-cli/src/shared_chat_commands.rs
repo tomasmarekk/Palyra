@@ -71,15 +71,35 @@ pub fn find_shared_chat_command(
     name: &str,
     surface: SharedChatCommandSurface,
 ) -> Option<&'static SharedChatCommandDefinition> {
+    let canonical = resolve_shared_chat_command_name(name, surface)?;
+    shared_chat_commands()
+        .iter()
+        .find(|command| command.name == canonical && command.surfaces.contains(&surface))
+}
+
+pub fn resolve_shared_chat_command_name(
+    name: &str,
+    surface: SharedChatCommandSurface,
+) -> Option<&'static str> {
     let normalized = name.trim().to_ascii_lowercase();
     if normalized.is_empty() {
         return None;
     }
 
-    shared_chat_commands().iter().find(|command| {
-        (command.name == normalized || command.aliases.iter().any(|alias| alias == &normalized))
-            && command.surfaces.contains(&surface)
-    })
+    if let Some(command) = shared_chat_commands()
+        .iter()
+        .find(|command| command.name == normalized && command.surfaces.contains(&surface))
+    {
+        return Some(command.name.as_str());
+    }
+
+    shared_chat_commands()
+        .iter()
+        .find(|command| {
+            command.surfaces.contains(&surface)
+                && command.aliases.iter().any(|alias| alias == &normalized)
+        })
+        .map(|command| command.name.as_str())
 }
 
 pub fn render_shared_chat_command_synopsis_lines(
@@ -177,8 +197,8 @@ fn validate_shared_chat_commands(
 #[cfg(test)]
 mod tests {
     use super::{
-        find_shared_chat_command, render_shared_chat_command_synopsis_lines, shared_chat_commands,
-        SharedChatCommandSurface,
+        find_shared_chat_command, render_shared_chat_command_synopsis_lines,
+        resolve_shared_chat_command_name, shared_chat_commands, SharedChatCommandSurface,
     };
 
     #[test]
@@ -196,6 +216,22 @@ mod tests {
         assert!(find_shared_chat_command("status", SharedChatCommandSurface::Web).is_none());
         assert!(find_shared_chat_command("status", SharedChatCommandSurface::Tui).is_some());
         assert!(find_shared_chat_command("quit", SharedChatCommandSurface::Tui).is_some());
+    }
+
+    #[test]
+    fn shared_chat_command_registry_resolves_aliases_to_canonical_names() {
+        assert_eq!(
+            resolve_shared_chat_command_name("interrupt", SharedChatCommandSurface::Tui),
+            Some("interrupt")
+        );
+        assert_eq!(
+            resolve_shared_chat_command_name("cancel", SharedChatCommandSurface::Tui),
+            Some("interrupt")
+        );
+        assert_eq!(
+            resolve_shared_chat_command_name("quit", SharedChatCommandSurface::Tui),
+            Some("exit")
+        );
     }
 
     #[test]

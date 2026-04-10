@@ -123,6 +123,76 @@ describe("Chat web UX primitives", () => {
     expect(removeAttachment).toHaveBeenCalledWith(attachment.local_id);
   });
 
+  it("supports keyboard-only slash palette navigation and dismissal", () => {
+    const setSelectedSlashSuggestionIndex = vi.fn();
+    const dismissSlashPalette = vi.fn();
+    const acceptSlashSuggestion = vi.fn();
+
+    render(
+      <ChatComposer
+        {...baseComposerProps()}
+        composerText="/br"
+        showSlashPalette
+        parsedSlashCommand={parseSlashCommand("/br")}
+        slashCommandMatches={[
+          {
+            name: "branch",
+            synopsis: "/branch [label]",
+            description: "Create a child session from the current conversation state.",
+            example: "/branch investigate-rollout",
+            category: "session",
+            execution: "server",
+            surfaces: ["web", "tui"],
+            aliases: [],
+            capability_tags: ["session", "branch", "lineage"],
+            entity_targets: ["session", "run"],
+            keywords: ["branch", "lineage"],
+          },
+        ]}
+        slashSuggestions={[
+          {
+            id: "branch:session-1",
+            kind: "entity",
+            commandName: "branch",
+            title: "/branch [label]",
+            subtitle: "Create a child session from the current conversation state.",
+            detail: "Fork from session session-1",
+            example: "/branch investigate-rollout",
+            replacement: "/branch investigate-rollout",
+            badge: "session",
+          },
+          {
+            id: "branch:session-2",
+            kind: "entity",
+            commandName: "branch",
+            title: "/branch [label]",
+            subtitle: "Create a child session from the current conversation state.",
+            detail: "Fork from session session-2",
+            example: "/branch document-follow-up",
+            replacement: "/branch document-follow-up",
+            badge: "session",
+          },
+        ]}
+        selectedSlashSuggestionIndex={0}
+        setSelectedSlashSuggestionIndex={setSelectedSlashSuggestionIndex}
+        dismissSlashPalette={dismissSlashPalette}
+        acceptSlashSuggestion={acceptSlashSuggestion}
+      />,
+    );
+
+    expect(screen.getByRole("listbox", { name: "Slash commands" })).toBeInTheDocument();
+    expect(screen.getAllByRole("option")).toHaveLength(2);
+
+    fireEvent.keyDown(screen.getByLabelText("Message"), { key: "ArrowDown" });
+    expect(setSelectedSlashSuggestionIndex).toHaveBeenCalledWith(1);
+
+    fireEvent.keyDown(screen.getByLabelText("Message"), { key: "Tab" });
+    expect(acceptSlashSuggestion).toHaveBeenCalledWith("/branch investigate-rollout", true);
+
+    fireEvent.keyDown(screen.getByLabelText("Message"), { key: "Escape" });
+    expect(dismissSlashPalette).toHaveBeenCalledTimes(1);
+  });
+
   it("moves payload details out of the main transcript and into the inspect callback", () => {
     const inspectPayload = vi.fn();
     const payloadEntry = sampleToolEntry();

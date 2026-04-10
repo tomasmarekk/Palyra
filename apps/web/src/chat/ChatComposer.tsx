@@ -102,6 +102,7 @@ export function ChatComposer({
 }: ChatComposerProps) {
   const [dragActive, setDragActive] = useState(false);
   const dragDepthRef = useRef(0);
+  const slashListboxId = "chat-composer-slash-listbox";
   const composerDisabled = activeSessionId.trim().length === 0;
   const activeSlashSuggestion =
     slashSuggestions[selectedSlashSuggestionIndex] ?? slashSuggestions[0] ?? null;
@@ -413,7 +414,12 @@ export function ChatComposer({
       ) : null}
 
       {showSlashPalette ? (
-        <div className="chat-composer__slash" role="listbox" aria-label="Slash commands">
+        <div
+          id={slashListboxId}
+          className="chat-composer__slash"
+          role="listbox"
+          aria-label="Slash commands"
+        >
           <div className="workspace-panel__intro">
             <p className="workspace-kicker">Slash commands</p>
             <h3>Operator shortcuts</h3>
@@ -454,9 +460,12 @@ export function ChatComposer({
             ).map((suggestion, index) => (
               <button
                 key={suggestion.id}
+                id={slashSuggestionDomId(suggestion.id)}
+                role="option"
                 aria-selected={index === selectedSlashSuggestionIndex}
                 className={`chat-command-card${index === selectedSlashSuggestionIndex ? " chat-command-card--selected" : ""}`}
                 type="button"
+                onMouseEnter={() => setSelectedSlashSuggestionIndex(index)}
                 onClick={() => acceptSlashSuggestion(suggestion.replacement, false)}
               >
                 <strong>{suggestion.title}</strong>
@@ -575,6 +584,10 @@ export function ChatComposer({
       </ActionCluster>
     </AppForm>
   );
+}
+
+function slashSuggestionDomId(suggestionId: string): string {
+  return `chat-composer-slash-${suggestionId.replace(/[^a-z0-9_-]/gi, "-")}`;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

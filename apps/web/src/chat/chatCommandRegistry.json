@@ -253,18 +253,6 @@
     "keywords": ["background", "task", "pause", "resume", "cancel"]
   },
   {
-    "name": "abort",
-    "synopsis": "/abort [run-id]",
-    "description": "Request cancellation for the active run or an explicit run id.",
-    "example": "/abort",
-    "category": "run",
-    "execution": "server",
-    "surfaces": ["tui"],
-    "capability_tags": ["run", "cancel"],
-    "entity_targets": ["run"],
-    "keywords": ["abort", "cancel", "interrupt"]
-  },
-  {
     "name": "usage",
     "synopsis": "/usage",
     "description": "Summarize context budget, branch state, and transcript load.",
