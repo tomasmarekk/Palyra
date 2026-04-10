@@ -32,9 +32,8 @@ const ALL_COMMANDS = Object.freeze(
 
 export const ALL_CHAT_SLASH_COMMANDS: readonly SlashCommandDefinition[] = ALL_COMMANDS;
 export const CHAT_SLASH_COMMANDS: readonly SlashCommandDefinition[] = getChatSlashCommands("web");
-export const TUI_CHAT_SLASH_COMMANDS: readonly SlashCommandDefinition[] = getChatSlashCommands(
-  "tui",
-);
+export const TUI_CHAT_SLASH_COMMANDS: readonly SlashCommandDefinition[] =
+  getChatSlashCommands("tui");
 
 export function getChatSlashCommands(
   surface: SlashCommandSurface,
