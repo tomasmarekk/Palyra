@@ -5,11 +5,9 @@ import { buildContextBudgetSummary, type ComposerAttachment } from "./chatShared
 type UseChatContextBudgetParams = {
   attachments: ComposerAttachment[];
   composerText: string;
-  contextReferencePreview:
-    | {
-        total_estimated_tokens: number;
-      }
-    | null;
+  contextReferencePreview: {
+    total_estimated_tokens: number;
+  } | null;
   contextReferencePreviewStale: boolean;
   runTotalTokens: number;
   sessionTotalTokens: number;

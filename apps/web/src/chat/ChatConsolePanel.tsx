@@ -64,7 +64,7 @@ import {
   describeSelectedSessionTitle,
 } from "./chatWorkspaceSessionBindings";
 import { buildObjectiveOverviewHref } from "../console/objectiveLinks";
-import { readString, type JsonObject } from "../console/shared";
+import { readString } from "../console/shared";
 
 interface ChatConsolePanelProps {
   readonly api: ConsoleApiClient;
@@ -96,8 +96,9 @@ export function ChatConsolePanel({
   const [transcriptBusy, setTranscriptBusy] = useState(false);
   const [transcriptRecords, setTranscriptRecords] = useState<ChatTranscriptRecord[]>([]);
   const [sessionAttachments, setSessionAttachments] = useState<ChatAttachmentRecord[]>([]);
-  const [sessionDerivedArtifacts, setSessionDerivedArtifacts] =
-    useState<MediaDerivedArtifactRecord[]>([]);
+  const [sessionDerivedArtifacts, setSessionDerivedArtifacts] = useState<
+    MediaDerivedArtifactRecord[]
+  >([]);
   const [sessionRuns, setSessionRuns] = useState<ChatRunStatusRecord[]>([]);
   const [sessionPins, setSessionPins] = useState<ChatPinRecord[]>([]);
   const [compactions, setCompactions] = useState<ChatCompactionArtifactRecord[]>([]);
@@ -206,9 +207,10 @@ export function ChatConsolePanel({
         : CHAT_SLASH_COMMANDS.filter((command) => command.name.includes(slashQuery)),
     [slashQuery],
   );
-  const selectedSessionLineage = useMemo(() => buildSessionLineageHint(sessions.selectedSession), [
-    sessions.selectedSession,
-  ]);
+  const selectedSessionLineage = useMemo(
+    () => buildSessionLineageHint(sessions.selectedSession),
+    [sessions.selectedSession],
+  );
   const attachSelectedFiles = useChatAttachmentUploadHandler({
     api,
     sessionId: sessions.activeSessionId.trim(),
@@ -218,23 +220,19 @@ export function ChatConsolePanel({
     setError,
     setNotice,
   });
-  const {
-    refreshObjectives,
-    selectedObjective,
-    selectedObjectiveFocus,
-    selectedObjectiveLabel,
-  } = useChatObjectives({
-    api,
-    preferredObjectiveId,
-    selectedSession:
-      sessions.selectedSession === null
-        ? null
-        : {
-            session_id: sessions.selectedSession.session_id,
-            session_key: sessions.selectedSession.session_key ?? undefined,
-            session_label: sessions.selectedSession.session_label ?? undefined,
-          },
-  });
+  const { refreshObjectives, selectedObjective, selectedObjectiveFocus, selectedObjectiveLabel } =
+    useChatObjectives({
+      api,
+      preferredObjectiveId,
+      selectedSession:
+        sessions.selectedSession === null
+          ? null
+          : {
+              session_id: sessions.selectedSession.session_id,
+              session_key: sessions.selectedSession.session_key ?? undefined,
+              session_label: sessions.selectedSession.session_label ?? undefined,
+            },
+    });
   const delegationCatalog = useChatPanelBootstrap({
     api,
     dispose,
