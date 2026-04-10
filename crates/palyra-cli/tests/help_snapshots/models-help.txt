@@ -3,6 +3,9 @@ Usage: palyra models [OPTIONS] <COMMAND>
 Commands:
   status
   list
+  test-connection
+  discover
+  explain
   set
   set-embeddings
 

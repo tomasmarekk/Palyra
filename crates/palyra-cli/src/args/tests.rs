@@ -3833,6 +3833,63 @@ fn parse_models_set_embeddings() {
 }
 
 #[test]
+fn parse_models_test_connection() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "models",
+        "test-connection",
+        "--provider",
+        "anthropic-primary",
+        "--timeout-ms",
+        "7000",
+        "--refresh",
+        "--path",
+        "custom.toml",
+        "--json",
+    ]);
+    assert_eq!(
+        parsed.command,
+        Command::Models {
+            command: ModelsCommand::TestConnection {
+                path: Some("custom.toml".to_owned()),
+                provider: Some("anthropic-primary".to_owned()),
+                timeout_ms: 7000,
+                refresh: true,
+                json: true,
+            }
+        }
+    );
+}
+
+#[test]
+fn parse_models_explain() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "models",
+        "explain",
+        "--model",
+        "claude-3-5-sonnet-latest",
+        "--json-mode",
+        "--vision",
+        "--path",
+        "custom.toml",
+        "--json",
+    ]);
+    assert_eq!(
+        parsed.command,
+        Command::Models {
+            command: ModelsCommand::Explain {
+                path: Some("custom.toml".to_owned()),
+                model: Some("claude-3-5-sonnet-latest".to_owned()),
+                json_mode: true,
+                vision: true,
+                json: true,
+            }
+        }
+    );
+}
+
+#[test]
 fn parse_skills_package_build() {
     let parsed = Cli::parse_from([
         "palyra",

@@ -14,6 +14,42 @@ pub enum ModelsCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    TestConnection {
+        #[arg(long)]
+        path: Option<String>,
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long, default_value_t = 5_000)]
+        timeout_ms: u64,
+        #[arg(long, default_value_t = false)]
+        refresh: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Discover {
+        #[arg(long)]
+        path: Option<String>,
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long, default_value_t = 5_000)]
+        timeout_ms: u64,
+        #[arg(long, default_value_t = false)]
+        refresh: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Explain {
+        #[arg(long)]
+        path: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json_mode: bool,
+        #[arg(long, default_value_t = false)]
+        vision: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     Set {
         model: String,
         #[arg(long)]
