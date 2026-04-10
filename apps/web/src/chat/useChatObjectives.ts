@@ -52,6 +52,7 @@ export function useChatObjectives({
   }, [selectedObjective]);
 
   return {
+    objectives,
     refreshObjectives,
     selectedObjective,
     selectedObjectiveFocus,

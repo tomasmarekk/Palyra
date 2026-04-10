@@ -34,6 +34,7 @@ export function ConsoleSectionContent({ app }: ConsoleSectionContentProps) {
           revealSensitiveValues={app.revealSensitiveValues}
           setError={app.setError}
           setNotice={app.setNotice}
+          setConsoleSection={app.setSection}
           openBrowserSessionWorkbench={app.openBrowserSessionWorkbench}
         />
       );

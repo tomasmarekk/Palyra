@@ -9,6 +9,7 @@ import {
   TextAreaField,
 } from "../console/components/ui";
 import type { ContextReferencePreviewEnvelope, RecallPreviewEnvelope } from "../consoleApi";
+import type { ChatSlashSuggestion } from "./chatCommandSuggestions";
 
 import type {
   ComposerAttachment,
@@ -37,7 +38,19 @@ type ChatComposerProps = {
   showSlashPalette: boolean;
   parsedSlashCommand: ParsedSlashCommand | null;
   slashCommandMatches: readonly SlashCommandDefinition[];
-  useSlashCommand: (command: SlashCommandDefinition) => void;
+  slashSuggestions: readonly ChatSlashSuggestion[];
+  selectedSlashSuggestionIndex: number;
+  setSelectedSlashSuggestionIndex: (value: number) => void;
+  dismissSlashPalette: () => void;
+  acceptSlashSuggestion: (replacement: string, acceptedWithKeyboard?: boolean) => void;
+  uxMetrics: {
+    readonly slashCommands: number;
+    readonly paletteAccepts: number;
+    readonly keyboardAccepts: number;
+    readonly undo: number;
+    readonly interrupt: number;
+    readonly errors: number;
+  };
   contextBudget: ContextBudgetSummary;
   contextReferencePreview: ContextReferencePreviewEnvelope | null;
   contextReferencePreviewBusy: boolean;
@@ -70,7 +83,12 @@ export function ChatComposer({
   showSlashPalette,
   parsedSlashCommand,
   slashCommandMatches,
-  useSlashCommand,
+  slashSuggestions,
+  selectedSlashSuggestionIndex,
+  setSelectedSlashSuggestionIndex,
+  dismissSlashPalette,
+  acceptSlashSuggestion,
+  uxMetrics,
   contextBudget,
   contextReferencePreview,
   contextReferencePreviewBusy,
@@ -85,6 +103,8 @@ export function ChatComposer({
   const [dragActive, setDragActive] = useState(false);
   const dragDepthRef = useRef(0);
   const composerDisabled = activeSessionId.trim().length === 0;
+  const activeSlashSuggestion =
+    slashSuggestions[selectedSlashSuggestionIndex] ?? slashSuggestions[0] ?? null;
   const sendLabel = streaming
     ? "Streaming..."
     : showSlashPalette && parsedSlashCommand !== null
@@ -324,6 +344,39 @@ export function ChatComposer({
         rows={5}
         value={composerText}
         onChange={setComposerText}
+        onKeyDown={(event) => {
+          if (!showSlashPalette || slashSuggestions.length === 0) {
+            if (event.key === "Escape" && showSlashPalette) {
+              event.preventDefault();
+              dismissSlashPalette();
+            }
+            return;
+          }
+          switch (event.key) {
+            case "ArrowDown":
+              event.preventDefault();
+              setSelectedSlashSuggestionIndex(
+                Math.min(selectedSlashSuggestionIndex + 1, slashSuggestions.length - 1),
+              );
+              break;
+            case "ArrowUp":
+              event.preventDefault();
+              setSelectedSlashSuggestionIndex(Math.max(selectedSlashSuggestionIndex - 1, 0));
+              break;
+            case "Tab":
+              event.preventDefault();
+              if (activeSlashSuggestion !== null) {
+                acceptSlashSuggestion(activeSlashSuggestion.replacement, true);
+              }
+              break;
+            case "Escape":
+              event.preventDefault();
+              dismissSlashPalette();
+              break;
+            default:
+              break;
+          }
+        }}
         onDragEnter={(event) => {
           event.preventDefault();
           dragDepthRef.current += 1;
@@ -365,21 +418,50 @@ export function ChatComposer({
             <p className="workspace-kicker">Slash commands</p>
             <h3>Operator shortcuts</h3>
             <p className="chat-muted">
-              Create sessions, switch history, retry, branch, queue, search, and export without
-              leaving the composer.
+              Autocomplete stays scoped to leading slash input, keeps entity suggestions contextual,
+              and remains fully keyboard-operable.
             </p>
           </div>
+          <div className="workspace-inline-actions">
+            <StatusChip tone="accent">{slashSuggestions.length} suggestions</StatusChip>
+            <StatusChip tone="default">{uxMetrics.slashCommands} slash commands</StatusChip>
+            <StatusChip tone="default">{uxMetrics.paletteAccepts} palette accepts</StatusChip>
+            <StatusChip tone="default">{uxMetrics.undo} undo restores</StatusChip>
+            <StatusChip tone="default">{uxMetrics.interrupt} interrupts</StatusChip>
+          </div>
+          {activeSlashSuggestion !== null ? (
+            <article className="chat-command-card chat-command-card--active" aria-live="polite">
+              <strong>{activeSlashSuggestion.title}</strong>
+              <span>{activeSlashSuggestion.subtitle}</span>
+              <p className="chat-muted">{activeSlashSuggestion.detail}</p>
+              <code>{activeSlashSuggestion.example}</code>
+            </article>
+          ) : null}
           <div className="chat-composer__slash-list">
-            {slashCommandMatches.map((command) => (
+            {(slashSuggestions.length > 0
+              ? slashSuggestions
+              : slashCommandMatches.map((command) => ({
+                  id: `fallback:${command.name}`,
+                  kind: "command" as const,
+                  commandName: command.name,
+                  title: command.synopsis,
+                  subtitle: command.description,
+                  detail: command.example,
+                  example: command.example,
+                  replacement: command.example,
+                  badge: command.category,
+                }))).map((suggestion, index) => (
               <button
-                key={command.name}
-                className="chat-command-card"
+                key={suggestion.id}
+                aria-selected={index === selectedSlashSuggestionIndex}
+                className={`chat-command-card${index === selectedSlashSuggestionIndex ? " chat-command-card--selected" : ""}`}
                 type="button"
-                onClick={() => useSlashCommand(command)}
+                onClick={() => acceptSlashSuggestion(suggestion.replacement, false)}
               >
-                <strong>{command.synopsis}</strong>
-                <span>{command.description}</span>
-                <code>{command.example}</code>
+                <strong>{suggestion.title}</strong>
+                <span>{suggestion.subtitle}</span>
+                <p className="chat-muted">{suggestion.badge}</p>
+                <code>{suggestion.example}</code>
               </button>
             ))}
           </div>

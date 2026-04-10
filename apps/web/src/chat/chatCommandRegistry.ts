@@ -57,3 +57,10 @@ export function findChatSlashCommand(
     ) ?? null
   );
 }
+
+export function resolveChatSlashCommandName(
+  name: string,
+  surface: SlashCommandSurface,
+): string | null {
+  return findChatSlashCommand(name, surface)?.name ?? null;
+}

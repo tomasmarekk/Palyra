@@ -61,13 +61,13 @@
   },
   {
     "name": "objective",
-    "synopsis": "/objective list|show|select|fire|pause|resume|archive|create",
-    "description": "Inspect or mutate objectives through the shared console objective workflows.",
-    "example": "/objective list",
+    "synopsis": "/objective [objective-id-or-name]",
+    "description": "Open the current or referenced objective, or inspect objective workflows on surfaces with richer controls.",
+    "example": "/objective Daily status",
     "category": "objective",
     "execution": "server",
-    "surfaces": ["tui"],
-    "capability_tags": ["objective", "mutating"],
+    "surfaces": ["web", "tui"],
+    "capability_tags": ["objective", "navigation"],
     "entity_targets": ["objective"],
     "keywords": ["objective", "heartbeat", "standing-order", "program"]
   },
@@ -144,6 +144,31 @@
     "keywords": ["model", "switch", "picker"]
   },
   {
+    "name": "undo",
+    "synopsis": "/undo [checkpoint-id]",
+    "description": "Restore the latest safe undo checkpoint or an explicit checkpoint and branch from that restored state.",
+    "example": "/undo",
+    "category": "session",
+    "execution": "server",
+    "surfaces": ["web", "tui"],
+    "capability_tags": ["undo", "checkpoint", "restore"],
+    "entity_targets": ["checkpoint", "session", "run"],
+    "keywords": ["undo", "restore", "checkpoint", "revert"]
+  },
+  {
+    "name": "interrupt",
+    "synopsis": "/interrupt [soft|force] [redirect-prompt]",
+    "description": "Request run interruption and optionally redirect into a fresh prompt once the current run has been stopped.",
+    "example": "/interrupt Summarize the failures instead.",
+    "category": "run",
+    "execution": "server",
+    "surfaces": ["web", "tui"],
+    "aliases": ["abort", "cancel"],
+    "capability_tags": ["run", "interrupt", "cancel", "redirect"],
+    "entity_targets": ["run"],
+    "keywords": ["interrupt", "abort", "cancel", "redirect"]
+  },
+  {
     "name": "reset",
     "synopsis": "/reset",
     "description": "Reset the active session without archiving it.",
@@ -205,12 +230,12 @@
   },
   {
     "name": "checkpoint",
-    "synopsis": "/checkpoint save|list|restore",
-    "description": "Save, inspect, or restore explicit checkpoints for the active session.",
-    "example": "/checkpoint list",
+    "synopsis": "/checkpoint list|restore <checkpoint-id>|save <name>",
+    "description": "List, save, or restore checkpoints for the active session with the same checkpoint lineage language across surfaces.",
+    "example": "/checkpoint restore 01ARZ3NDEKTSV4RRFFQ69G5FAW",
     "category": "session",
     "execution": "server",
-    "surfaces": ["tui"],
+    "surfaces": ["web", "tui"],
     "capability_tags": ["checkpoint", "restore"],
     "entity_targets": ["session", "checkpoint"],
     "keywords": ["checkpoint", "restore", "save"]
@@ -274,6 +299,42 @@
     "capability_tags": ["attachment", "local_capability"],
     "entity_targets": ["attachment"],
     "keywords": ["attach", "upload", "file"]
+  },
+  {
+    "name": "profile",
+    "synopsis": "/profile [profile-id-or-name]",
+    "description": "Open auth profile posture quickly and surface the referenced provider profile without leaving chat-driven flow.",
+    "example": "/profile openai-default",
+    "category": "profile",
+    "execution": "local",
+    "surfaces": ["web", "tui"],
+    "capability_tags": ["profile", "auth", "navigation"],
+    "entity_targets": ["profile"],
+    "keywords": ["profile", "auth", "provider", "oauth", "api-key"]
+  },
+  {
+    "name": "browser",
+    "synopsis": "/browser [profile-id-or-session-id]",
+    "description": "Jump into browser profiles or an active browser workbench from the chat surface.",
+    "example": "/browser default",
+    "category": "browser",
+    "execution": "local",
+    "surfaces": ["web", "tui"],
+    "capability_tags": ["browser", "navigation", "profile"],
+    "entity_targets": ["browser_profile", "browser_session"],
+    "keywords": ["browser", "profile", "session", "workbench"]
+  },
+  {
+    "name": "doctor",
+    "synopsis": "/doctor [jobs|run|repair]",
+    "description": "Inspect recent doctor recovery jobs or queue a new dry-run or repair pass from chat.",
+    "example": "/doctor jobs",
+    "category": "diagnostics",
+    "execution": "server",
+    "surfaces": ["web", "tui"],
+    "capability_tags": ["doctor", "diagnostics", "recovery"],
+    "entity_targets": ["doctor_job"],
+    "keywords": ["doctor", "diagnostics", "recovery", "repair"]
   },
   {
     "name": "search",

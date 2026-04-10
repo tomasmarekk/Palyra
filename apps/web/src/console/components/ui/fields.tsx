@@ -16,6 +16,7 @@ import type {
   DragEventHandler,
   FormEvent,
   HTMLAttributes,
+  KeyboardEventHandler,
   ReactNode,
   Ref,
 } from "react";
@@ -44,6 +45,7 @@ type TextAreaFieldProps = Omit<TextInputFieldProps, "type"> & {
   onDragOver?: DragEventHandler<HTMLTextAreaElement>;
   onDragEnter?: DragEventHandler<HTMLTextAreaElement>;
   onDragLeave?: DragEventHandler<HTMLTextAreaElement>;
+  onKeyDown?: KeyboardEventHandler<HTMLTextAreaElement>;
 };
 
 type SelectFieldOption = {
@@ -137,6 +139,7 @@ export function TextAreaField({
   onDragOver,
   onDragEnter,
   onDragLeave,
+  onKeyDown,
 }: TextAreaFieldProps) {
   return (
     <TextField className="workspace-field" isDisabled={disabled} isRequired={required} name={name}>
@@ -154,6 +157,7 @@ export function TextAreaField({
         onDragLeave={onDragLeave}
         onDragOver={onDragOver}
         onDrop={onDrop}
+        onKeyDown={onKeyDown}
         onPaste={onPaste}
       />
       {description !== undefined && <Description>{description}</Description>}

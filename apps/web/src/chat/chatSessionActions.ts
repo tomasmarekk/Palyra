@@ -427,6 +427,7 @@ export async function abortCurrentRunAction(args: {
   targetRunId: string | null;
   runDrawerOpen: boolean;
   runDrawerId: string;
+  reason?: string;
   refreshRunDetails: () => void;
   refreshSessions: (ensureSession: boolean) => Promise<void>;
   refreshSessionTranscript: () => Promise<void>;
@@ -443,7 +444,9 @@ export async function abortCurrentRunAction(args: {
   args.setError(null);
   args.setNotice(null);
   try {
-    const response = await args.api.abortSessionRun(args.targetRunId);
+    const response = await args.api.abortSessionRun(args.targetRunId, {
+      reason: args.reason,
+    });
     args.setNotice(
       response.cancel_requested ? "Run cancellation requested." : "Run was already idle.",
     );

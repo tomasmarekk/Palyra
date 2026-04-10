@@ -9,7 +9,7 @@ import {
   TextInputField,
 } from "../console/components/ui";
 import type { JsonValue, MediaDerivedArtifactRecord, SessionCatalogRecord } from "../consoleApi";
-import { findChatSlashCommand } from "./chatCommandRegistry";
+import { findChatSlashCommand, resolveChatSlashCommandName } from "./chatCommandRegistry";
 export {
   CHAT_SLASH_COMMANDS,
   type SlashCommandDefinition,
@@ -537,9 +537,10 @@ export function parseSlashCommand(raw: string): ParsedSlashCommand | null {
   ).toLowerCase();
   const args = firstSpace === -1 ? "" : withoutPrefix.slice(firstSpace + 1).trim();
 
-  if (findChatSlashCommand(name, "web") !== null) {
+  const resolvedName = resolveChatSlashCommandName(name, "web");
+  if (resolvedName !== null) {
     return {
-      name,
+      name: resolvedName,
       args,
     };
   }

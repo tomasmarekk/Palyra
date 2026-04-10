@@ -62,7 +62,31 @@ describe("Chat web UX primitives", () => {
             keywords: ["queue", "follow-up", "run"],
           },
         ]}
-        useSlashCommand={vi.fn()}
+        slashSuggestions={[
+          {
+            id: "queue:suggestion",
+            kind: "entity",
+            commandName: "queue",
+            title: "/queue <text>",
+            subtitle: "Queue a follow-up message for the active run.",
+            detail: "/queue Inspect backlog after deploy",
+            example: "/queue Inspect backlog after deploy",
+            replacement: "/queue Inspect backlog after deploy",
+            badge: "run",
+          },
+        ]}
+        selectedSlashSuggestionIndex={0}
+        setSelectedSlashSuggestionIndex={vi.fn()}
+        dismissSlashPalette={vi.fn()}
+        acceptSlashSuggestion={vi.fn()}
+        uxMetrics={{
+          slashCommands: 0,
+          paletteAccepts: 0,
+          keyboardAccepts: 0,
+          undo: 0,
+          interrupt: 0,
+          errors: 0,
+        }}
         contextBudget={buildContextBudgetSummary({
           baseline_tokens: 14_500,
           draft_text: "Inspect backlog after deploy and summarize the risky items.",
@@ -81,7 +105,7 @@ describe("Chat web UX primitives", () => {
     );
 
     expect(screen.getByText("Operator shortcuts")).toBeInTheDocument();
-    expect(screen.getByText("/queue <text>")).toBeInTheDocument();
+    expect(screen.getAllByText("/queue <text>").length).toBeGreaterThan(0);
     expect(screen.getByText("screen.png")).toBeInTheDocument();
     expect(screen.getByText(/approaching the budget/i)).toBeInTheDocument();
 
@@ -403,7 +427,19 @@ function baseComposerProps(): ComponentProps<typeof ChatComposer> {
     showSlashPalette: false,
     parsedSlashCommand: null,
     slashCommandMatches: [],
-    useSlashCommand: vi.fn(),
+    slashSuggestions: [],
+    selectedSlashSuggestionIndex: 0,
+    setSelectedSlashSuggestionIndex: vi.fn(),
+    dismissSlashPalette: vi.fn(),
+    acceptSlashSuggestion: vi.fn(),
+    uxMetrics: {
+      slashCommands: 0,
+      paletteAccepts: 0,
+      keyboardAccepts: 0,
+      undo: 0,
+      interrupt: 0,
+      errors: 0,
+    },
     contextBudget: buildContextBudgetSummary({
       baseline_tokens: 900,
       draft_text: "",

@@ -133,7 +133,7 @@ export function ChatConsoleWorkspaceView({
               variant="ghost"
               onPress={onAbortRun}
             >
-              {runActionBusy ? "Aborting..." : "Abort run"}
+              {runActionBusy ? "Interrupting..." : "Interrupt run"}
             </ActionButton>
           </div>
         }

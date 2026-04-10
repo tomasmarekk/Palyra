@@ -15,11 +15,15 @@ import type {
 import { type DetailPanelState, type TranscriptSearchMatch } from "./ChatInspectorColumn";
 import { ChatConsoleWorkspaceView } from "./ChatConsoleWorkspaceView";
 import {
-  inspectCheckpointAction,
-  inspectCompactionAction,
-  restoreCheckpointAction,
-  runCompactionFlowAction,
-} from "./chatPhase4Actions";
+  deleteChatPin,
+  exportChatTranscript,
+  inspectCheckpointDetails,
+  inspectCompactionDetails,
+  pinChatTranscriptRecord,
+  restoreChatCheckpoint,
+  runChatCompactionFlow,
+  searchChatTranscript,
+} from "./chatConsoleOperations";
 import {
   inspectBackgroundTaskDetail,
   inspectDerivedArtifactDetail,
@@ -31,22 +35,20 @@ import {
   useChatAttachmentUploadHandler,
 } from "./chatInspectorActions";
 import {
-  CHAT_SLASH_COMMANDS,
   buildSessionLineageHint,
   describeBranchState,
-  parseSlashCommand,
-  parseCompactCommandMode,
   toErrorMessage,
   type ComposerAttachment,
 } from "./chatShared";
 import {
-  abortCurrentRunAction,
+  createUndoCheckpoint,
+  executeChatSlashCommand,
+  interruptAndMaybeRedirect,
+} from "./chatSlashActions";
+import {
   branchCurrentSessionAction,
   createNewSessionAction,
   delegateWorkAction,
-  deletePinAction,
-  exportTranscriptAction,
-  pinTranscriptRecordAction,
   queueFollowUpTextAction,
   resumeSessionAction,
   retryLatestTurnAction,
@@ -56,6 +58,7 @@ import { useRecallPreview } from "./useRecallPreview";
 import { useChatContextBudget } from "./useChatContextBudget";
 import { useChatRunStream } from "./useChatRunStream";
 import { useChatSessions } from "./useChatSessions";
+import { useChatSlashPalette } from "./useChatSlashPalette";
 import { usePhase4DeepLinks } from "./usePhase4DeepLinks";
 import { useChatObjectives } from "./useChatObjectives";
 import { useChatPanelBootstrap } from "./useChatPanelBootstrap";
@@ -63,14 +66,15 @@ import {
   buildSessionsSidebarProps,
   describeSelectedSessionTitle,
 } from "./chatWorkspaceSessionBindings";
+import type { Section } from "../console/sectionMetadata";
 import { buildObjectiveOverviewHref } from "../console/objectiveLinks";
 import { readString } from "../console/shared";
-
 interface ChatConsolePanelProps {
   readonly api: ConsoleApiClient;
   readonly revealSensitiveValues: boolean;
   readonly setError: (next: string | null) => void;
   readonly setNotice: (next: string | null) => void;
+  readonly setConsoleSection: (section: Section) => void;
   readonly openBrowserSessionWorkbench: (sessionId: string) => void;
 }
 
@@ -79,6 +83,7 @@ export function ChatConsolePanel({
   revealSensitiveValues,
   setError,
   setNotice,
+  setConsoleSection,
   openBrowserSessionWorkbench,
 }: ChatConsolePanelProps) {
   const navigate = useNavigate();
@@ -190,23 +195,7 @@ export function ChatConsolePanel({
     return visibleTranscript.filter((entry) => entry.payload !== undefined).length;
   }, [visibleTranscript]);
   const recentTranscriptRecords = [...transcriptRecords].slice(-8).reverse();
-  const deferredComposerText = useDeferredValue(composerText);
   const deferredSearchQuery = useDeferredValue(transcriptSearchQuery);
-  const parsedSlashCommand = parseSlashCommand(deferredComposerText);
-  const showSlashPalette = deferredComposerText.trim().startsWith("/");
-  const slashQuery = useMemo(() => {
-    if (!showSlashPalette) {
-      return "";
-    }
-    return deferredComposerText.trim().slice(1).trim().split(/\s+/, 1)[0]?.toLowerCase() ?? "";
-  }, [deferredComposerText, showSlashPalette]);
-  const slashCommandMatches = useMemo(
-    () =>
-      slashQuery.length === 0 || slashQuery === "help"
-        ? CHAT_SLASH_COMMANDS
-        : CHAT_SLASH_COMMANDS.filter((command) => command.name.includes(slashQuery)),
-    [slashQuery],
-  );
   const selectedSessionLineage = useMemo(
     () => buildSessionLineageHint(sessions.selectedSession),
     [sessions.selectedSession],
@@ -220,19 +209,24 @@ export function ChatConsolePanel({
     setError,
     setNotice,
   });
-  const { refreshObjectives, selectedObjective, selectedObjectiveFocus, selectedObjectiveLabel } =
-    useChatObjectives({
-      api,
-      preferredObjectiveId,
-      selectedSession:
-        sessions.selectedSession === null
-          ? null
-          : {
-              session_id: sessions.selectedSession.session_id,
-              session_key: sessions.selectedSession.session_key ?? undefined,
-              session_label: sessions.selectedSession.session_label ?? undefined,
-            },
-    });
+  const {
+    objectives,
+    refreshObjectives,
+    selectedObjective,
+    selectedObjectiveFocus,
+    selectedObjectiveLabel,
+  } = useChatObjectives({
+    api,
+    preferredObjectiveId,
+    selectedSession:
+      sessions.selectedSession === null
+        ? null
+        : {
+            session_id: sessions.selectedSession.session_id,
+            session_key: sessions.selectedSession.session_key ?? undefined,
+            session_label: sessions.selectedSession.session_label ?? undefined,
+          },
+  });
   const delegationCatalog = useChatPanelBootstrap({
     api,
     dispose,
@@ -240,7 +234,33 @@ export function ChatConsolePanel({
     refreshSessions: sessions.refreshSessions,
     setError,
   });
-
+  const {
+    authProfiles,
+    browserProfiles,
+    browserSessions,
+    parsedSlashCommand,
+    showSlashPalette,
+    slashCommandMatches,
+    slashSuggestions,
+    selectedSlashSuggestionIndex,
+    setSelectedSlashSuggestionIndex,
+    dismissSlashPalette,
+    applySlashSuggestion,
+    updateComposerDraft,
+    refreshSlashEntityCatalogs,
+    uxMetrics,
+    recordUxMetric,
+  } = useChatSlashPalette({
+    api,
+    composerText,
+    setComposerText,
+    sessions: sessions.sortedSessions,
+    objectives,
+    checkpoints,
+    delegationCatalog,
+    streaming,
+    setError,
+  });
   usePhase4DeepLinks({
     activeSessionId: sessions.activeSessionId,
     preferredSessionId,
@@ -406,23 +426,8 @@ export function ChatConsolePanel({
     setNotice("Session archived. Local transcript cleared.");
   }
 
-  async function abortCurrentRun(): Promise<void> {
-    await abortCurrentRunAction({
-      api,
-      targetRunId: actionableRunId,
-      runDrawerOpen,
-      runDrawerId,
-      refreshRunDetails,
-      refreshSessions: sessions.refreshSessions,
-      refreshSessionTranscript,
-      setRunActionBusy,
-      setError,
-      setNotice,
-    });
-  }
-
   async function handleComposerSubmit(): Promise<void> {
-    const command = parseSlashCommand(composerText);
+    const command = parsedSlashCommand;
     if (command !== null) {
       await executeSlashCommand(command);
       return;
@@ -431,13 +436,27 @@ export function ChatConsolePanel({
     const effectiveContextReferencePreview = await ensureContextReferencePreviewForCurrentDraft();
     if (effectiveContextReferencePreview?.errors.length) {
       setError(effectiveContextReferencePreview.errors[0]?.message ?? "Invalid context reference.");
+      recordUxMetric("errors");
       return;
     }
     const effectiveRecallPreview = await ensureRecallPreviewForCurrentDraft();
+    await createUndoCheckpoint({
+      api,
+      activeSessionId: sessions.activeSessionId,
+      transcriptRecordCount: transcriptRecords.length,
+      sessionRunCount: sessionRuns.length,
+      source: "send",
+      setNotice,
+      recordUxMetric,
+    });
 
     const didSend = await sendMessage(
       async () => {
-        await Promise.all([sessions.refreshSessions(false), refreshSessionTranscript()]);
+        await Promise.all([
+          sessions.refreshSessions(false),
+          refreshSessionTranscript(),
+          refreshSlashEntityCatalogs(),
+        ]);
       },
       {
         attachments: attachments.map((attachment) => ({ artifact_id: attachment.artifact_id })),
@@ -458,126 +477,136 @@ export function ChatConsolePanel({
     }
   }
 
-  async function executeSlashCommand(command: NonNullable<ReturnType<typeof parseSlashCommand>>) {
-    if (commandBusy !== null) {
-      setError("Another chat command is already running.");
-      return;
-    }
-
-    switch (command.name) {
-      case "help":
-        setComposerText("/");
-        setNotice("Slash command help is open in the composer.");
-        return;
-      case "new":
-        await createNewSession(command.args);
-        return;
-      case "reset":
-        await resetSessionAndTranscript();
-        return;
-      case "retry":
-        await retryLatestTurn();
-        return;
-      case "branch":
-        await branchCurrentSession(command.args);
-        return;
-      case "queue":
-        if (command.args.length === 0) {
-          setError("Provide queued text after /queue.");
-          return;
+  async function interruptCurrentRun(raw: string): Promise<void> {
+    await interruptAndMaybeRedirect({
+      api,
+      actionableRunId,
+      raw,
+      activeSessionId: sessions.activeSessionId,
+      runDrawerOpen,
+      runDrawerId,
+      cancelStreaming,
+      refreshRunDetails: async () => {
+        await refreshRunDetails();
+      },
+      refreshSessions: async (preserveSelection = false) => {
+        await sessions.refreshSessions(preserveSelection);
+      },
+      refreshSessionTranscript,
+      refreshSlashEntityCatalogs,
+      setRunActionBusy,
+      setError,
+      setNotice,
+      recordUxMetric,
+      createUndoCheckpointBeforeRedirect: () =>
+        createUndoCheckpoint({
+          api,
+          activeSessionId: sessions.activeSessionId,
+          transcriptRecordCount: transcriptRecords.length,
+          sessionRunCount: sessionRuns.length,
+          source: "redirect",
+          setNotice,
+          recordUxMetric,
+        }),
+      clearComposerDraft: () => updateComposerDraft(""),
+      sendRedirectPrompt: async (redirectText, metadata) => {
+        const didSend = await sendMessage(
+          () =>
+            Promise.all([
+              sessions.refreshSessions(false),
+              refreshSessionTranscript(),
+              refreshSlashEntityCatalogs(),
+            ]).then(() => undefined),
+          { text: redirectText },
+        );
+        if (didSend) {
+          appendLocalEntry({
+            kind: "status",
+            session_id: sessions.activeSessionId,
+            run_id: metadata.runId,
+            title: "Interrupt redirect",
+            text: `Requested ${metadata.mode} interrupt and redirected the next prompt into a fresh run.`,
+          });
         }
-        await queueFollowUpText(command.args);
-        return;
-      case "delegate":
+      },
+    });
+  }
+
+  async function executeSlashCommand(command: NonNullable<typeof parsedSlashCommand>) {
+    await executeChatSlashCommand({
+      command,
+      commandBusy,
+      api,
+      activeSessionId: sessions.activeSessionId,
+      actionableRunId,
+      checkpoints,
+      objectives,
+      selectedObjective,
+      authProfiles,
+      browserProfiles,
+      browserSessions,
+      usageSummary: `Estimated context ${contextBudget.label}; branch ${describeBranchState(sessions.selectedSession?.branch_state ?? "missing")}; ${transcriptRecords.length} persisted transcript record${transcriptRecords.length === 1 ? "" : "s"}.`,
+      openAttachmentPicker: () => attachmentInputRef.current?.click(),
+      setSearchQuery: sessions.setSearchQuery,
+      setError,
+      setNotice,
+      setCommandBusy,
+      setConsoleSection,
+      recordUxMetric,
+      updateComposerDraft,
+      navigateToObjective: (objectiveId) => {
+        void navigate(buildObjectiveOverviewHref(objectiveId));
+      },
+      inspectCheckpoint,
+      restoreCheckpoint,
+      onInterrupt: interruptCurrentRun,
+      onCreateSession: createNewSession,
+      onResetSession: resetSessionAndTranscript,
+      onRetry: retryLatestTurn,
+      onBranchSession: branchCurrentSession,
+      onQueueFollowUp: queueFollowUpText,
+      onDelegate: async (raw) => {
         await delegateWorkAction({
           api,
           sessionId: sessions.activeSessionId.trim(),
-          raw: command.args,
+          raw,
           delegationCatalog,
           upsertSession: sessions.upsertSession,
           refreshSessionTranscript,
           appendLocalEntry,
-          setComposerText,
+          setComposerText: updateComposerDraft,
           setCommandBusy,
           setError,
           setNotice,
         });
-        return;
-      case "history":
-        sessions.setSearchQuery(command.args);
-        setNotice(
-          command.args.trim().length > 0
-            ? `Session history filtered by "${command.args.trim()}".`
-            : "Session history filter cleared.",
-        );
-        return;
-      case "resume":
-        await resumeSession(command.args);
-        return;
-      case "attach":
-        if (sessions.activeSessionId.trim().length === 0) {
-          setError("Select or create a session before attaching files.");
-          return;
-        }
-        attachmentInputRef.current?.click();
-        setNotice("Attachment picker opened for the active session.");
-        return;
-      case "usage":
-        setNotice(
-          `Estimated context ${contextBudget.label}; branch ${describeBranchState(sessions.selectedSession?.branch_state ?? "missing")}; ${transcriptRecords.length} persisted transcript record${transcriptRecords.length === 1 ? "" : "s"}.`,
-        );
-        return;
-      case "compact":
-        await runCompactionFlow(parseCompactCommandMode(command.args));
-        return;
-      case "search":
-        if (command.args.length === 0) {
-          setError("Provide a search term after /search.");
-          return;
-        }
-        setTranscriptSearchQuery(command.args);
-        await searchTranscript(command.args);
-        return;
-      case "export":
-        await exportTranscript(
-          command.args.trim().toLowerCase() === "markdown" ||
-            command.args.trim().toLowerCase() === "md"
-            ? "markdown"
-            : "json",
-        );
-        return;
-      default:
-        setError("Unsupported slash command.");
-    }
+      },
+      onResumeSession: resumeSession,
+      onRunCompactionFlow: runCompactionFlow,
+      onSearchTranscript: async (query) => {
+        setTranscriptSearchQuery(query);
+        await searchTranscript(query);
+      },
+      onExportTranscript: exportTranscript,
+      refreshSessionTranscript,
+      openBrowserSessionWorkbench,
+    });
   }
 
   async function runCompactionFlow(mode: "preview" | "apply"): Promise<void> {
-    const sessionId = sessions.activeSessionId.trim();
-    if (sessionId.length === 0) {
-      setError("Select a session before compacting.");
-      return;
-    }
-
-    setCommandBusy(mode === "apply" ? "compact-apply" : "compact-preview");
-    setError(null);
-    setNotice(null);
-    try {
-      await runCompactionFlowAction({
-        mode,
-        api,
-        sessionId,
-        upsertSession: sessions.upsertSession,
-        refreshSessionTranscript,
-        setDetailPanel,
-        appendLocalEntry,
-        setNotice,
-      });
-    } catch (error) {
-      setError(toErrorMessage(error));
-    } finally {
-      setCommandBusy(null);
-    }
+    await runChatCompactionFlow({
+      api,
+      activeSessionId: sessions.activeSessionId,
+      mode,
+      upsertSession: sessions.upsertSession,
+      refreshSessionTranscript,
+      setDetailPanel,
+      appendLocalEntry,
+      setCommandBusy,
+      setError,
+      setNotice,
+    });
   }
+
   async function createNewSession(requestedLabel?: string): Promise<void> {
     await createNewSessionAction({
       requestedLabel,
@@ -586,7 +615,7 @@ export function ChatConsolePanel({
       setDetailPanel,
       setTranscriptSearchResults,
       setAttachments,
-      setComposerText,
+      setComposerText: updateComposerDraft,
       setError,
       setNotice,
     });
@@ -597,13 +626,22 @@ export function ChatConsolePanel({
       rawTarget,
       sortedSessions: sessions.sortedSessions,
       setActiveSessionId: sessions.setActiveSessionId,
-      setComposerText,
+      setComposerText: updateComposerDraft,
       setError,
       setNotice,
     });
   }
 
   async function retryLatestTurn(): Promise<void> {
+    await createUndoCheckpoint({
+      api,
+      activeSessionId: sessions.activeSessionId,
+      transcriptRecordCount: transcriptRecords.length,
+      sessionRunCount: sessionRuns.length,
+      source: "retry",
+      setNotice,
+      recordUxMetric,
+    });
     await retryLatestTurnAction({
       api,
       sessionId: sessions.activeSessionId.trim(),
@@ -626,7 +664,7 @@ export function ChatConsolePanel({
       clearTranscriptState,
       setDetailPanel,
       setAttachments,
-      setComposerText,
+      setComposerText: updateComposerDraft,
       refreshSessions: sessions.refreshSessions,
       refreshSessionTranscript,
       setCommandBusy,
@@ -643,51 +681,31 @@ export function ChatConsolePanel({
       sessionId: sessions.activeSessionId,
       appendLocalEntry,
       refreshSessionTranscript,
-      setComposerText,
+      setComposerText: updateComposerDraft,
       setCommandBusy,
       setError,
       setNotice,
     });
   }
-
   async function searchTranscript(query = transcriptSearchQuery): Promise<void> {
-    const sessionId = sessions.activeSessionId.trim();
-    const trimmed = query.trim();
-    if (sessionId.length === 0) {
-      setError("Select a session before searching the transcript.");
-      return;
-    }
-    if (trimmed.length === 0) {
-      setTranscriptSearchResults([]);
-      return;
-    }
-
     transcriptSearchSeqRef.current += 1;
     const requestSeq = transcriptSearchSeqRef.current;
-    setTranscriptSearchBusy(true);
-    setError(null);
-    try {
-      const response = await api.searchSessionTranscript(sessionId, trimmed);
-      if (requestSeq !== transcriptSearchSeqRef.current) {
-        return;
-      }
-      sessions.upsertSession(response.session);
-      setTranscriptSearchResults(response.matches);
-    } catch (error) {
-      if (requestSeq === transcriptSearchSeqRef.current) {
-        setError(toErrorMessage(error));
-      }
-    } finally {
-      if (requestSeq === transcriptSearchSeqRef.current) {
-        setTranscriptSearchBusy(false);
-      }
-    }
-  }
-
-  async function exportTranscript(format: "json" | "markdown"): Promise<void> {
-    await exportTranscriptAction({
+    await searchChatTranscript({
       api,
-      sessionId: sessions.activeSessionId.trim(),
+      activeSessionId: sessions.activeSessionId,
+      query,
+      transcriptSearchRequestSeq: requestSeq,
+      getCurrentTranscriptSearchSeq: () => transcriptSearchSeqRef.current,
+      upsertSession: sessions.upsertSession,
+      setTranscriptSearchResults,
+      setTranscriptSearchBusy,
+      setError,
+    });
+  }
+  async function exportTranscript(format: "json" | "markdown"): Promise<void> {
+    await exportChatTranscript({
+      api,
+      activeSessionId: sessions.activeSessionId,
       sessionLabel: sessions.selectedSession?.session_label,
       format,
       setExportBusy,
@@ -695,11 +713,10 @@ export function ChatConsolePanel({
       setNotice,
     });
   }
-
   async function pinTranscriptRecord(record: ChatTranscriptRecord): Promise<void> {
-    await pinTranscriptRecordAction({
+    await pinChatTranscriptRecord({
       api,
-      sessionId: sessions.activeSessionId.trim(),
+      activeSessionId: sessions.activeSessionId,
       record,
       refreshSessionTranscript,
       setCommandBusy,
@@ -707,11 +724,10 @@ export function ChatConsolePanel({
       setNotice,
     });
   }
-
   async function deletePin(pinId: string): Promise<void> {
-    await deletePinAction({
+    await deleteChatPin({
       api,
-      sessionId: sessions.activeSessionId.trim(),
+      activeSessionId: sessions.activeSessionId,
       pinId,
       refreshSessionTranscript,
       setCommandBusy,
@@ -720,61 +736,49 @@ export function ChatConsolePanel({
     });
   }
   async function inspectCompaction(artifactId: string): Promise<void> {
-    setPhase4BusyKey(`inspect-compaction:${artifactId}`);
-    setError(null);
-    try {
-      await inspectCompactionAction({
-        api,
-        artifactId,
-        upsertSession: sessions.upsertSession,
-        setDetailPanel,
-      });
-    } catch (error) {
-      setError(toErrorMessage(error));
-    } finally {
-      setPhase4BusyKey(null);
-    }
+    await inspectCompactionDetails({
+      api,
+      artifactId,
+      upsertSession: sessions.upsertSession,
+      setDetailPanel,
+      setPhase4BusyKey,
+      setError,
+    });
   }
-
   async function inspectCheckpoint(checkpointId: string): Promise<void> {
-    setPhase4BusyKey(`inspect-checkpoint:${checkpointId}`);
-    setError(null);
-    try {
-      await inspectCheckpointAction({
-        api,
-        checkpointId,
-        upsertSession: sessions.upsertSession,
-        setDetailPanel,
-      });
-    } catch (error) {
-      setError(toErrorMessage(error));
-    } finally {
-      setPhase4BusyKey(null);
-    }
+    await inspectCheckpointDetails({
+      api,
+      checkpointId,
+      upsertSession: sessions.upsertSession,
+      setDetailPanel,
+      setPhase4BusyKey,
+      setError,
+    });
   }
-
-  async function restoreCheckpoint(checkpointId: string): Promise<void> {
-    setPhase4BusyKey(`restore-checkpoint:${checkpointId}`);
-    setError(null);
-    setNotice(null);
-    try {
-      await restoreCheckpointAction({
-        api,
-        checkpointId,
-        selectedSession: sessions.selectedSession,
-        upsertSession: sessions.upsertSession,
-        clearTranscriptState,
-        setAttachments,
-        refreshSessions: sessions.refreshSessions,
-        refreshSessionTranscript,
-        setDetailPanel,
-        setNotice,
-      });
-    } catch (error) {
-      setError(toErrorMessage(error));
-    } finally {
-      setPhase4BusyKey(null);
-    }
+  async function restoreCheckpoint(
+    checkpointId: string,
+    options?: { source?: "undo" | "checkpoint" | "inspector" },
+  ): Promise<void> {
+    await restoreChatCheckpoint({
+      api,
+      checkpointId,
+      checkpoints,
+      actionableRunId,
+      visibleTranscript,
+      selectedSession: sessions.selectedSession,
+      clearTranscriptState,
+      setAttachments,
+      refreshSessions: async (preserveSelection = false) => {
+        await sessions.refreshSessions(preserveSelection);
+      },
+      refreshSessionTranscript,
+      setDetailPanel,
+      setPhase4BusyKey,
+      setError,
+      setNotice,
+      upsertSession: sessions.upsertSession,
+      source: options?.source,
+    });
   }
 
   return (
@@ -794,7 +798,7 @@ export function ChatConsolePanel({
         canInspectRun={(activeRunId ?? runIds[0] ?? null) !== null}
         composerProps={{
           composerText,
-          setComposerText,
+          setComposerText: updateComposerDraft,
           streaming,
           activeSessionId: sessions.activeSessionId,
           attachments,
@@ -831,7 +835,14 @@ export function ChatConsolePanel({
           showSlashPalette,
           parsedSlashCommand,
           slashCommandMatches,
-          useSlashCommand: (command) => setComposerText(command.example),
+          slashSuggestions,
+          selectedSlashSuggestionIndex,
+          setSelectedSlashSuggestionIndex,
+          dismissSlashPalette,
+          acceptSlashSuggestion: (replacement, acceptedWithKeyboard) => {
+            applySlashSuggestion(replacement, acceptedWithKeyboard);
+          },
+          uxMetrics,
           contextBudget,
           contextReferencePreview,
           contextReferencePreviewBusy,
@@ -896,7 +907,7 @@ export function ChatConsolePanel({
             void inspectCheckpoint(checkpointId);
           },
           restoreCheckpoint: (checkpointId) => {
-            void restoreCheckpoint(checkpointId);
+            void restoreCheckpoint(checkpointId, { source: "inspector" });
           },
           queuedInputs,
           backgroundTasks,
@@ -936,7 +947,7 @@ export function ChatConsolePanel({
           openBrowserSessionWorkbench,
         }}
         onAbortRun={() => {
-          void abortCurrentRun();
+          void interruptCurrentRun("");
         }}
         onOpenObjective={
           selectedObjective === null
@@ -962,6 +973,7 @@ export function ChatConsolePanel({
             sessions.refreshSessions(false),
             refreshSessionTranscript(),
             refreshObjectives(),
+            refreshSlashEntityCatalogs(),
           ]);
         }}
         onSetAllowSensitiveTools={setAllowSensitiveTools}
