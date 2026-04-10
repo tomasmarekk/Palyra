@@ -74,7 +74,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use cron::{spawn_scheduler_loop, MEMORY_MAINTENANCE_INTERVAL};
 use gateway::{
     GatewayJournalConfigSnapshot, GatewayRuntimeConfigSnapshot, GatewayRuntimeState,
-    MemoryRuntimeConfig,
+    LearningRuntimeConfig, MemoryRuntimeConfig,
 };
 use journal::{
     ApprovalDecision, ApprovalDecisionScope, ApprovalSubjectType, CronJobUpdatePatch,
@@ -146,7 +146,9 @@ use palyra_policy::{
 };
 use palyra_skills::{
     audit_skill_artifact_security, inspect_skill_artifact, verify_skill_artifact,
-    SkillSecurityAuditPolicy, SkillTrustStore,
+    SkillCapabilities, SkillCompat, SkillFilesystemCapabilities, SkillIntegrity, SkillManifest,
+    SkillQuotaConfig, SkillSecurityAuditPolicy, SkillToolEntrypoint, SkillToolRisk,
+    SkillTrustStore, SkillEntrypoints, SKILL_MANIFEST_VERSION,
 };
 use palyra_vault::{Vault, VaultConfig as VaultConfigOptions, VaultRef, VaultScope};
 use reqwest::{Client as ReqwestClient, Url};
@@ -282,6 +284,20 @@ struct SkillStatusRequest {
     reason: Option<String>,
     #[serde(rename = "override")]
     override_enabled: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleProcedureSkillPromotionRequest {
+    #[serde(default)]
+    skill_id: Option<String>,
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    publisher: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    accept_candidate: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -452,6 +468,55 @@ struct ConsoleMemoryIndexRequest {
     until_complete: Option<bool>,
     #[serde(default)]
     run_maintenance: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleLearningCandidatesQuery {
+    #[serde(default)]
+    candidate_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    candidate_kind: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    scope_kind: Option<String>,
+    #[serde(default)]
+    scope_id: Option<String>,
+    #[serde(default)]
+    source_task_id: Option<String>,
+    #[serde(default)]
+    min_confidence: Option<f64>,
+    #[serde(default)]
+    max_confidence: Option<f64>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleLearningCandidateReviewRequest {
+    status: String,
+    #[serde(default)]
+    action_summary: Option<String>,
+    #[serde(default)]
+    action_payload_json: Option<String>,
+    #[serde(default)]
+    apply_preference: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleLearningPreferencesQuery {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    scope_kind: Option<String>,
+    #[serde(default)]
+    scope_id: Option<String>,
+    #[serde(default)]
+    key: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1660,6 +1725,79 @@ fn offline_mode_enabled() -> Result<bool> {
     }
 }
 
+fn build_learning_runtime_config() -> Result<LearningRuntimeConfig> {
+    let mut config = LearningRuntimeConfig::default();
+
+    fn parse_bps_env(name: &str, raw: &str) -> Result<u16> {
+        let value = raw
+            .trim()
+            .parse::<u16>()
+            .with_context(|| format!("{name} must be integer 0-10000, got '{raw}'"))?;
+        if value > 10_000 {
+            return Err(anyhow::anyhow!(
+                "{name} must be between 0 and 10000, got {}",
+                value
+            ));
+        }
+        Ok(value)
+    }
+
+    if let Ok(raw) = std::env::var("PALYRA_LEARNING_ENABLED") {
+        config.enabled = parse_offline_env_flag(raw.as_str())
+            .context("PALYRA_LEARNING_ENABLED must be boolean-like")?;
+    }
+    if let Ok(raw) = std::env::var("PALYRA_LEARNING_SAMPLING_PERCENT") {
+        let value = raw.trim().parse::<u16>().with_context(|| {
+            format!("PALYRA_LEARNING_SAMPLING_PERCENT must be integer 0-100, got '{raw}'")
+        })?;
+        if value > 100 {
+            return Err(anyhow::anyhow!(
+                "PALYRA_LEARNING_SAMPLING_PERCENT must be between 0 and 100, got {}",
+                value
+            ));
+        }
+        config.sampling_percent = value as u8;
+    }
+    if let Ok(raw) = std::env::var("PALYRA_LEARNING_COOLDOWN_MS") {
+        config.cooldown_ms = raw.trim().parse::<i64>().with_context(|| {
+            format!("PALYRA_LEARNING_COOLDOWN_MS must be integer milliseconds, got '{raw}'")
+        })?;
+    }
+    if let Ok(raw) = std::env::var("PALYRA_LEARNING_BUDGET_TOKENS") {
+        config.budget_tokens = raw.trim().parse::<u64>().with_context(|| {
+            format!("PALYRA_LEARNING_BUDGET_TOKENS must be integer, got '{raw}'")
+        })?;
+    }
+    if let Ok(raw) = std::env::var("PALYRA_LEARNING_MAX_CANDIDATES_PER_RUN") {
+        config.max_candidates_per_run = raw.trim().parse::<usize>().with_context(|| {
+            format!("PALYRA_LEARNING_MAX_CANDIDATES_PER_RUN must be integer, got '{raw}'")
+        })?;
+    }
+    if let Ok(raw) = std::env::var("PALYRA_LEARNING_DURABLE_FACT_REVIEW_MIN_CONFIDENCE_BPS") {
+        config.durable_fact_review_min_confidence_bps =
+            parse_bps_env("PALYRA_LEARNING_DURABLE_FACT_REVIEW_MIN_CONFIDENCE_BPS", raw.as_str())?;
+    }
+    if let Ok(raw) = std::env::var("PALYRA_LEARNING_DURABLE_FACT_AUTO_WRITE_THRESHOLD_BPS") {
+        config.durable_fact_auto_write_threshold_bps =
+            parse_bps_env("PALYRA_LEARNING_DURABLE_FACT_AUTO_WRITE_THRESHOLD_BPS", raw.as_str())?;
+    }
+    if let Ok(raw) = std::env::var("PALYRA_LEARNING_PREFERENCE_REVIEW_MIN_CONFIDENCE_BPS") {
+        config.preference_review_min_confidence_bps =
+            parse_bps_env("PALYRA_LEARNING_PREFERENCE_REVIEW_MIN_CONFIDENCE_BPS", raw.as_str())?;
+    }
+    if let Ok(raw) = std::env::var("PALYRA_LEARNING_PROCEDURE_MIN_OCCURRENCES") {
+        config.procedure_min_occurrences = raw.trim().parse::<usize>().with_context(|| {
+            format!("PALYRA_LEARNING_PROCEDURE_MIN_OCCURRENCES must be integer, got '{raw}'")
+        })?;
+    }
+    if let Ok(raw) = std::env::var("PALYRA_LEARNING_PROCEDURE_REVIEW_MIN_CONFIDENCE_BPS") {
+        config.procedure_review_min_confidence_bps =
+            parse_bps_env("PALYRA_LEARNING_PROCEDURE_REVIEW_MIN_CONFIDENCE_BPS", raw.as_str())?;
+    }
+
+    Ok(config)
+}
+
 fn build_memory_embedding_provider(
     config: &ModelProviderConfig,
     offline_mode: bool,
@@ -1915,6 +2053,7 @@ pub async fn run() -> Result<()> {
         retention_ttl_days: loaded.memory.retention.ttl_days,
         retention_vacuum_schedule: loaded.memory.retention.vacuum_schedule.clone(),
     });
+    runtime.configure_learning(build_learning_runtime_config()?);
 
     if journal_migrate_only {
         info!(

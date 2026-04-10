@@ -300,6 +300,37 @@ export function memoryStatusFixture() {
     maintenance: {
       last_vacuum_at_unix_ms: 1700000000000,
     },
+    learning: {
+      enabled: true,
+      sampling_percent: 100,
+      cooldown_ms: 300000,
+      budget_tokens: 1200,
+      max_candidates_per_run: 24,
+      durable_fact_review_min_confidence_bps: 7500,
+      durable_fact_auto_write_threshold_bps: 9000,
+      preference_review_min_confidence_bps: 8000,
+      procedure_min_occurrences: 2,
+      procedure_review_min_confidence_bps: 8500,
+      thresholds: {
+        durable_fact: {
+          review_min_confidence_bps: 7500,
+          auto_apply_confidence_bps: 9000,
+        },
+        preference: {
+          review_min_confidence_bps: 8000,
+        },
+        procedure: {
+          review_min_confidence_bps: 8500,
+          min_occurrences: 2,
+        },
+      },
+      counters: {
+        reflections_scheduled: 4,
+        reflections_completed: 3,
+        candidates_created: 5,
+        candidates_auto_applied: 1,
+      },
+    },
   };
 }
 
@@ -326,6 +357,92 @@ export function skillsFixture() {
         status: "active",
       },
     ],
+  };
+}
+
+export function learningCandidatesFixture() {
+  return {
+    candidates: [
+      {
+        candidate_id: "candidate-pref-1",
+        candidate_kind: "preference",
+        title: "Preference: interaction.style",
+        summary: "Please use concise status updates for release triage.",
+        status: "queued",
+        confidence: 0.83,
+        risk_level: "normal",
+        auto_applied: false,
+        content_json:
+          '{"key":"interaction.style","value":"Please use concise status updates for release triage.","source_kind":"explicit"}',
+        provenance_json:
+          '[{"run_id":"run-learning-1","seq":2,"event_type":"message.received","created_at_unix_ms":1700000001200,"excerpt":"Please use concise status updates for release triage."}]',
+      },
+      {
+        candidate_id: "candidate-proc-1",
+        candidate_kind: "procedure",
+        title: "Procedure candidate: palyra.fs.apply_patch -> palyra.http.fetch",
+        summary: "Observed 2 successful runs with the same tool sequence.",
+        status: "queued",
+        confidence: 0.88,
+        risk_level: "review",
+        auto_applied: false,
+        content_json:
+          '{"signature":"palyra.fs.apply_patch -> palyra.http.fetch","successful_runs":["run-1","run-2"]}',
+        provenance_json:
+          '[{"run_id":"run-1","excerpt":"proposed palyra.fs.apply_patch"},{"run_id":"run-2","excerpt":"proposed palyra.http.fetch"}]',
+      },
+    ],
+  };
+}
+
+export function learningCandidateHistoryFixture() {
+  return {
+    history: [
+      {
+        history_id: "hist-1",
+        candidate_id: "candidate-pref-1",
+        status: "accepted",
+        reviewed_by_principal: "admin:web-console",
+        action_summary: "confirmed preference",
+        created_at_unix_ms: 1700000002200,
+      },
+    ],
+  };
+}
+
+export function learningPreferencesFixture() {
+  return {
+    preferences: [
+      {
+        preference_id: "pref-1",
+        key: "interaction.style",
+        value: "direct",
+        scope_kind: "profile",
+        scope_id: "admin:web-console",
+        status: "active",
+        source_kind: "confirmed",
+        confidence: 0.95,
+      },
+    ],
+  };
+}
+
+export function procedurePromotionFixture() {
+  return {
+    candidate: {
+      candidate_id: "candidate-proc-1",
+      status: "accepted",
+      candidate_kind: "procedure",
+      title: "Procedure candidate: palyra.fs.apply_patch -> palyra.http.fetch",
+    },
+    skill: {
+      skill_id: "palyra.generated.ops.release",
+      version: "0.1.0",
+      status: "quarantined",
+      scaffold_path:
+        "state/skills/candidate-scaffolds/palyra.generated.ops.release/0.1.0/skill.toml",
+      source_candidate_id: "candidate-proc-1",
+    },
   };
 }
 

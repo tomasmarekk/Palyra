@@ -1498,6 +1498,157 @@ pub struct OrchestratorBackgroundTaskListFilter {
     pub limit: usize,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct LearningCandidateRecord {
+    pub candidate_id: String,
+    pub candidate_kind: String,
+    pub session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    pub owner_principal: String,
+    pub device_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    pub scope_kind: String,
+    pub scope_id: String,
+    pub status: String,
+    pub auto_applied: bool,
+    pub confidence: f64,
+    pub risk_level: String,
+    pub title: String,
+    pub summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_path: Option<String>,
+    pub dedupe_key: String,
+    pub content_json: String,
+    pub provenance_json: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_task_id: Option<String>,
+    pub created_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reviewed_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reviewed_by_principal: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_action_summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_action_payload_json: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LearningCandidateCreateRequest {
+    pub candidate_id: String,
+    pub candidate_kind: String,
+    pub session_id: String,
+    pub run_id: Option<String>,
+    pub owner_principal: String,
+    pub device_id: String,
+    pub channel: Option<String>,
+    pub scope_kind: String,
+    pub scope_id: String,
+    pub status: String,
+    pub auto_applied: bool,
+    pub confidence: f64,
+    pub risk_level: String,
+    pub title: String,
+    pub summary: String,
+    pub target_path: Option<String>,
+    pub dedupe_key: String,
+    pub content_json: String,
+    pub provenance_json: String,
+    pub source_task_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LearningCandidateListFilter {
+    pub candidate_id: Option<String>,
+    pub owner_principal: Option<String>,
+    pub device_id: Option<String>,
+    pub channel: Option<String>,
+    pub session_id: Option<String>,
+    pub scope_kind: Option<String>,
+    pub scope_id: Option<String>,
+    pub candidate_kind: Option<String>,
+    pub status: Option<String>,
+    pub source_task_id: Option<String>,
+    pub min_confidence: Option<f64>,
+    pub max_confidence: Option<f64>,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LearningCandidateReviewRequest {
+    pub candidate_id: String,
+    pub status: String,
+    pub reviewed_by_principal: String,
+    pub action_summary: Option<String>,
+    pub action_payload_json: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct LearningCandidateHistoryRecord {
+    pub history_id: String,
+    pub candidate_id: String,
+    pub status: String,
+    pub reviewed_by_principal: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_payload_json: Option<String>,
+    pub created_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct LearningPreferenceRecord {
+    pub preference_id: String,
+    pub owner_principal: String,
+    pub device_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    pub scope_kind: String,
+    pub scope_id: String,
+    pub key: String,
+    pub value: String,
+    pub source_kind: String,
+    pub status: String,
+    pub confidence: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_id: Option<String>,
+    pub provenance_json: String,
+    pub created_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LearningPreferenceUpsertRequest {
+    pub preference_id: Option<String>,
+    pub owner_principal: String,
+    pub device_id: String,
+    pub channel: Option<String>,
+    pub scope_kind: String,
+    pub scope_id: String,
+    pub key: String,
+    pub value: String,
+    pub source_kind: String,
+    pub status: String,
+    pub confidence: f64,
+    pub candidate_id: Option<String>,
+    pub provenance_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LearningPreferenceListFilter {
+    pub owner_principal: Option<String>,
+    pub device_id: Option<String>,
+    pub channel: Option<String>,
+    pub scope_kind: Option<String>,
+    pub scope_id: Option<String>,
+    pub status: Option<String>,
+    pub key: Option<String>,
+    pub limit: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrchestratorQueuedInputCreateRequest {
     pub queued_input_id: String,
@@ -1950,6 +2101,10 @@ pub enum JournalError {
     SessionNotFound { selector: String },
     #[error("invalid orchestrator session selector: {reason}")]
     InvalidSessionSelector { reason: String },
+    #[error("learning candidate not found: {candidate_id}")]
+    LearningCandidateNotFound { candidate_id: String },
+    #[error("learning preference not found: {preference_id}")]
+    LearningPreferenceNotFound { preference_id: String },
     #[error("invalid canvas replay state for {canvas_id}: {reason}")]
     InvalidCanvasReplay { canvas_id: String, reason: String },
     #[error("{payload_kind} payload exceeds max bytes ({actual_bytes} > {max_bytes})")]
@@ -2789,6 +2944,87 @@ const MIGRATIONS: &[Migration] = &[
 
             ALTER TABLE orchestrator_background_tasks
                 ADD COLUMN delegation_json TEXT;
+        "#,
+    },
+    Migration {
+        version: 20,
+        name: "learning_loop_phase6",
+        sql: r#"
+            CREATE TABLE IF NOT EXISTS learning_candidates (
+                candidate_ulid TEXT PRIMARY KEY,
+                candidate_kind TEXT NOT NULL,
+                session_ulid TEXT NOT NULL,
+                run_ulid TEXT,
+                owner_principal TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                channel TEXT,
+                scope_kind TEXT NOT NULL,
+                scope_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                auto_applied INTEGER NOT NULL DEFAULT 0,
+                confidence REAL NOT NULL,
+                risk_level TEXT NOT NULL,
+                title TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                target_path TEXT,
+                dedupe_key TEXT NOT NULL,
+                content_json TEXT NOT NULL,
+                provenance_json TEXT NOT NULL,
+                source_task_ulid TEXT,
+                created_at_unix_ms INTEGER NOT NULL,
+                updated_at_unix_ms INTEGER NOT NULL,
+                reviewed_at_unix_ms INTEGER,
+                reviewed_by_principal TEXT,
+                last_action_summary TEXT,
+                last_action_payload_json TEXT,
+                FOREIGN KEY(session_ulid) REFERENCES orchestrator_sessions(session_ulid),
+                FOREIGN KEY(run_ulid) REFERENCES orchestrator_runs(run_ulid),
+                FOREIGN KEY(source_task_ulid) REFERENCES orchestrator_background_tasks(task_ulid)
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_learning_candidates_dedupe
+                ON learning_candidates(owner_principal, scope_kind, scope_id, candidate_kind, dedupe_key);
+            CREATE INDEX IF NOT EXISTS idx_learning_candidates_queue
+                ON learning_candidates(status, candidate_kind, confidence DESC, created_at_unix_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_learning_candidates_session
+                ON learning_candidates(session_ulid, created_at_unix_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_learning_candidates_source_task
+                ON learning_candidates(source_task_ulid, created_at_unix_ms DESC);
+
+            CREATE TABLE IF NOT EXISTS learning_candidate_history (
+                history_ulid TEXT PRIMARY KEY,
+                candidate_ulid TEXT NOT NULL,
+                status TEXT NOT NULL,
+                reviewed_by_principal TEXT NOT NULL,
+                action_summary TEXT,
+                action_payload_json TEXT,
+                created_at_unix_ms INTEGER NOT NULL,
+                FOREIGN KEY(candidate_ulid) REFERENCES learning_candidates(candidate_ulid) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_learning_candidate_history_candidate
+                ON learning_candidate_history(candidate_ulid, created_at_unix_ms DESC);
+
+            CREATE TABLE IF NOT EXISTS learning_preferences (
+                preference_ulid TEXT PRIMARY KEY,
+                owner_principal TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                channel TEXT,
+                scope_kind TEXT NOT NULL,
+                scope_id TEXT NOT NULL,
+                preference_key TEXT NOT NULL,
+                value_text TEXT NOT NULL,
+                source_kind TEXT NOT NULL,
+                status TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                candidate_ulid TEXT,
+                provenance_json TEXT NOT NULL,
+                created_at_unix_ms INTEGER NOT NULL,
+                updated_at_unix_ms INTEGER NOT NULL,
+                FOREIGN KEY(candidate_ulid) REFERENCES learning_candidates(candidate_ulid)
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_learning_preferences_scope_key
+                ON learning_preferences(owner_principal, scope_kind, scope_id, preference_key);
+            CREATE INDEX IF NOT EXISTS idx_learning_preferences_status
+                ON learning_preferences(status, scope_kind, scope_id, updated_at_unix_ms DESC);
         "#,
     },
 ];
@@ -5221,6 +5457,388 @@ impl JournalStore {
             )
             .optional()
             .map_err(JournalError::from)
+    }
+
+    pub fn upsert_learning_candidate(
+        &self,
+        request: &LearningCandidateCreateRequest,
+    ) -> Result<LearningCandidateRecord, JournalError> {
+        let now = current_unix_ms()?;
+        let confidence = request.confidence.clamp(0.0, 1.0);
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        guard.execute(
+            r#"
+                INSERT INTO learning_candidates (
+                    candidate_ulid,
+                    candidate_kind,
+                    session_ulid,
+                    run_ulid,
+                    owner_principal,
+                    device_id,
+                    channel,
+                    scope_kind,
+                    scope_id,
+                    status,
+                    auto_applied,
+                    confidence,
+                    risk_level,
+                    title,
+                    summary,
+                    target_path,
+                    dedupe_key,
+                    content_json,
+                    provenance_json,
+                    source_task_ulid,
+                    created_at_unix_ms,
+                    updated_at_unix_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?21)
+                ON CONFLICT(owner_principal, scope_kind, scope_id, candidate_kind, dedupe_key) DO UPDATE SET
+                    session_ulid = excluded.session_ulid,
+                    run_ulid = excluded.run_ulid,
+                    device_id = excluded.device_id,
+                    channel = excluded.channel,
+                    confidence = MAX(learning_candidates.confidence, excluded.confidence),
+                    risk_level = excluded.risk_level,
+                    title = excluded.title,
+                    summary = excluded.summary,
+                    target_path = excluded.target_path,
+                    content_json = excluded.content_json,
+                    provenance_json = excluded.provenance_json,
+                    source_task_ulid = excluded.source_task_ulid,
+                    updated_at_unix_ms = excluded.updated_at_unix_ms
+            "#,
+            params![
+                request.candidate_id.as_str(),
+                request.candidate_kind.as_str(),
+                request.session_id.as_str(),
+                request.run_id.as_deref(),
+                request.owner_principal.as_str(),
+                request.device_id.as_str(),
+                request.channel.as_deref(),
+                request.scope_kind.as_str(),
+                request.scope_id.as_str(),
+                request.status.as_str(),
+                if request.auto_applied { 1_i64 } else { 0_i64 },
+                confidence,
+                request.risk_level.as_str(),
+                request.title.as_str(),
+                request.summary.as_str(),
+                request.target_path.as_deref(),
+                request.dedupe_key.as_str(),
+                request.content_json.as_str(),
+                request.provenance_json.as_str(),
+                request.source_task_id.as_deref(),
+                now,
+            ],
+        )?;
+        load_learning_candidate_by_dedupe_key(
+            &guard,
+            request.owner_principal.as_str(),
+            request.scope_kind.as_str(),
+            request.scope_id.as_str(),
+            request.candidate_kind.as_str(),
+            request.dedupe_key.as_str(),
+        )?
+        .ok_or(JournalError::LearningCandidateNotFound {
+            candidate_id: request.candidate_id.clone(),
+        })
+    }
+
+    pub fn review_learning_candidate(
+        &self,
+        request: &LearningCandidateReviewRequest,
+    ) -> Result<LearningCandidateRecord, JournalError> {
+        let now = current_unix_ms()?;
+        let summary = request
+            .action_summary
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let payload = request
+            .action_payload_json
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let updated = guard.execute(
+            r#"
+                UPDATE learning_candidates
+                SET
+                    status = ?2,
+                    auto_applied = CASE WHEN ?2 = 'auto_applied' THEN 1 ELSE auto_applied END,
+                    reviewed_at_unix_ms = ?3,
+                    reviewed_by_principal = ?4,
+                    last_action_summary = ?5,
+                    last_action_payload_json = ?6,
+                    updated_at_unix_ms = ?3
+                WHERE candidate_ulid = ?1
+            "#,
+            params![
+                request.candidate_id.as_str(),
+                request.status.as_str(),
+                now,
+                request.reviewed_by_principal.as_str(),
+                summary.as_deref(),
+                payload.as_deref(),
+            ],
+        )?;
+        if updated == 0 {
+            return Err(JournalError::LearningCandidateNotFound {
+                candidate_id: request.candidate_id.clone(),
+            });
+        }
+        guard.execute(
+            r#"
+                INSERT INTO learning_candidate_history (
+                    history_ulid,
+                    candidate_ulid,
+                    status,
+                    reviewed_by_principal,
+                    action_summary,
+                    action_payload_json,
+                    created_at_unix_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "#,
+            params![
+                Ulid::new().to_string(),
+                request.candidate_id.as_str(),
+                request.status.as_str(),
+                request.reviewed_by_principal.as_str(),
+                summary.as_deref(),
+                payload.as_deref(),
+                now,
+            ],
+        )?;
+        load_learning_candidate_by_id(&guard, request.candidate_id.as_str())?.ok_or(
+            JournalError::LearningCandidateNotFound {
+                candidate_id: request.candidate_id.clone(),
+            },
+        )
+    }
+
+    pub fn list_learning_candidates(
+        &self,
+        filter: &LearningCandidateListFilter,
+    ) -> Result<Vec<LearningCandidateRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let limit = filter.limit.clamp(1, 256) as i64;
+        let mut statement = guard.prepare(
+            r#"
+                SELECT
+                    candidate_ulid,
+                    candidate_kind,
+                    session_ulid,
+                    run_ulid,
+                    owner_principal,
+                    device_id,
+                    channel,
+                    scope_kind,
+                    scope_id,
+                    status,
+                    auto_applied,
+                    confidence,
+                    risk_level,
+                    title,
+                    summary,
+                    target_path,
+                    dedupe_key,
+                    content_json,
+                    provenance_json,
+                    source_task_ulid,
+                    created_at_unix_ms,
+                    updated_at_unix_ms,
+                    reviewed_at_unix_ms,
+                    reviewed_by_principal,
+                    last_action_summary,
+                    last_action_payload_json
+                FROM learning_candidates
+                WHERE (?1 IS NULL OR candidate_ulid = ?1)
+                  AND (?2 IS NULL OR owner_principal = ?2)
+                  AND (?3 IS NULL OR device_id = ?3)
+                  AND (?4 IS NULL OR COALESCE(channel, '') = COALESCE(?4, ''))
+                  AND (?5 IS NULL OR session_ulid = ?5)
+                  AND (?6 IS NULL OR scope_kind = ?6)
+                  AND (?7 IS NULL OR scope_id = ?7)
+                  AND (?8 IS NULL OR candidate_kind = ?8)
+                  AND (?9 IS NULL OR status = ?9)
+                  AND (?10 IS NULL OR source_task_ulid = ?10)
+                  AND (?11 IS NULL OR confidence >= ?11)
+                  AND (?12 IS NULL OR confidence <= ?12)
+                ORDER BY confidence DESC, created_at_unix_ms DESC
+                LIMIT ?13
+            "#,
+        )?;
+        let mut rows = statement.query(params![
+            filter.candidate_id.as_deref(),
+            filter.owner_principal.as_deref(),
+            filter.device_id.as_deref(),
+            filter.channel.as_deref(),
+            filter.session_id.as_deref(),
+            filter.scope_kind.as_deref(),
+            filter.scope_id.as_deref(),
+            filter.candidate_kind.as_deref(),
+            filter.status.as_deref(),
+            filter.source_task_id.as_deref(),
+            filter.min_confidence,
+            filter.max_confidence,
+            limit,
+        ])?;
+        let mut records = Vec::new();
+        while let Some(row) = rows.next()? {
+            records.push(map_learning_candidate_row(row)?);
+        }
+        Ok(records)
+    }
+
+    pub fn learning_candidate_history(
+        &self,
+        candidate_id: &str,
+    ) -> Result<Vec<LearningCandidateHistoryRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let mut statement = guard.prepare(
+            r#"
+                SELECT
+                    history_ulid,
+                    candidate_ulid,
+                    status,
+                    reviewed_by_principal,
+                    action_summary,
+                    action_payload_json,
+                    created_at_unix_ms
+                FROM learning_candidate_history
+                WHERE candidate_ulid = ?1
+                ORDER BY created_at_unix_ms DESC, history_ulid DESC
+            "#,
+        )?;
+        let mut rows = statement.query(params![candidate_id])?;
+        let mut records = Vec::new();
+        while let Some(row) = rows.next()? {
+            records.push(map_learning_candidate_history_row(row)?);
+        }
+        Ok(records)
+    }
+
+    pub fn upsert_learning_preference(
+        &self,
+        request: &LearningPreferenceUpsertRequest,
+    ) -> Result<LearningPreferenceRecord, JournalError> {
+        let now = current_unix_ms()?;
+        let confidence = request.confidence.clamp(0.0, 1.0);
+        let preference_id = request
+            .preference_id
+            .clone()
+            .unwrap_or_else(|| Ulid::new().to_string());
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        guard.execute(
+            r#"
+                INSERT INTO learning_preferences (
+                    preference_ulid,
+                    owner_principal,
+                    device_id,
+                    channel,
+                    scope_kind,
+                    scope_id,
+                    preference_key,
+                    value_text,
+                    source_kind,
+                    status,
+                    confidence,
+                    candidate_ulid,
+                    provenance_json,
+                    created_at_unix_ms,
+                    updated_at_unix_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)
+                ON CONFLICT(owner_principal, scope_kind, scope_id, preference_key) DO UPDATE SET
+                    device_id = excluded.device_id,
+                    channel = excluded.channel,
+                    value_text = excluded.value_text,
+                    source_kind = excluded.source_kind,
+                    status = excluded.status,
+                    confidence = excluded.confidence,
+                    candidate_ulid = excluded.candidate_ulid,
+                    provenance_json = excluded.provenance_json,
+                    updated_at_unix_ms = excluded.updated_at_unix_ms
+            "#,
+            params![
+                preference_id.as_str(),
+                request.owner_principal.as_str(),
+                request.device_id.as_str(),
+                request.channel.as_deref(),
+                request.scope_kind.as_str(),
+                request.scope_id.as_str(),
+                request.key.as_str(),
+                request.value.as_str(),
+                request.source_kind.as_str(),
+                request.status.as_str(),
+                confidence,
+                request.candidate_id.as_deref(),
+                request.provenance_json.as_str(),
+                now,
+            ],
+        )?;
+        load_learning_preference_by_scope_key(
+            &guard,
+            request.owner_principal.as_str(),
+            request.scope_kind.as_str(),
+            request.scope_id.as_str(),
+            request.key.as_str(),
+        )?
+        .ok_or(JournalError::LearningPreferenceNotFound { preference_id })
+    }
+
+    pub fn list_learning_preferences(
+        &self,
+        filter: &LearningPreferenceListFilter,
+    ) -> Result<Vec<LearningPreferenceRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let limit = filter.limit.clamp(1, 256) as i64;
+        let mut statement = guard.prepare(
+            r#"
+                SELECT
+                    preference_ulid,
+                    owner_principal,
+                    device_id,
+                    channel,
+                    scope_kind,
+                    scope_id,
+                    preference_key,
+                    value_text,
+                    source_kind,
+                    status,
+                    confidence,
+                    candidate_ulid,
+                    provenance_json,
+                    created_at_unix_ms,
+                    updated_at_unix_ms
+                FROM learning_preferences
+                WHERE (?1 IS NULL OR owner_principal = ?1)
+                  AND (?2 IS NULL OR device_id = ?2)
+                  AND (?3 IS NULL OR COALESCE(channel, '') = COALESCE(?3, ''))
+                  AND (?4 IS NULL OR scope_kind = ?4)
+                  AND (?5 IS NULL OR scope_id = ?5)
+                  AND (?6 IS NULL OR status = ?6)
+                  AND (?7 IS NULL OR preference_key = ?7)
+                ORDER BY updated_at_unix_ms DESC, preference_ulid DESC
+                LIMIT ?8
+            "#,
+        )?;
+        let mut rows = statement.query(params![
+            filter.owner_principal.as_deref(),
+            filter.device_id.as_deref(),
+            filter.channel.as_deref(),
+            filter.scope_kind.as_deref(),
+            filter.scope_id.as_deref(),
+            filter.status.as_deref(),
+            filter.key.as_deref(),
+            limit,
+        ])?;
+        let mut records = Vec::new();
+        while let Some(row) = rows.next()? {
+            records.push(map_learning_preference_row(row)?);
+        }
+        Ok(records)
     }
 
     pub fn create_cron_job(
@@ -10076,6 +10694,216 @@ fn map_skill_status_row(row: &rusqlite::Row<'_>) -> Result<SkillStatusRecord, ru
     })
 }
 
+fn map_learning_candidate_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<LearningCandidateRecord, rusqlite::Error> {
+    Ok(LearningCandidateRecord {
+        candidate_id: row.get(0)?,
+        candidate_kind: row.get(1)?,
+        session_id: row.get(2)?,
+        run_id: row.get(3)?,
+        owner_principal: row.get(4)?,
+        device_id: row.get(5)?,
+        channel: row.get(6)?,
+        scope_kind: row.get(7)?,
+        scope_id: row.get(8)?,
+        status: row.get(9)?,
+        auto_applied: row.get::<_, i64>(10)? != 0,
+        confidence: row.get(11)?,
+        risk_level: row.get(12)?,
+        title: row.get(13)?,
+        summary: row.get(14)?,
+        target_path: row.get(15)?,
+        dedupe_key: row.get(16)?,
+        content_json: row.get(17)?,
+        provenance_json: row.get(18)?,
+        source_task_id: row.get(19)?,
+        created_at_unix_ms: row.get(20)?,
+        updated_at_unix_ms: row.get(21)?,
+        reviewed_at_unix_ms: row.get(22)?,
+        reviewed_by_principal: row.get(23)?,
+        last_action_summary: row.get(24)?,
+        last_action_payload_json: row.get(25)?,
+    })
+}
+
+fn map_learning_candidate_history_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<LearningCandidateHistoryRecord, rusqlite::Error> {
+    Ok(LearningCandidateHistoryRecord {
+        history_id: row.get(0)?,
+        candidate_id: row.get(1)?,
+        status: row.get(2)?,
+        reviewed_by_principal: row.get(3)?,
+        action_summary: row.get(4)?,
+        action_payload_json: row.get(5)?,
+        created_at_unix_ms: row.get(6)?,
+    })
+}
+
+fn map_learning_preference_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<LearningPreferenceRecord, rusqlite::Error> {
+    Ok(LearningPreferenceRecord {
+        preference_id: row.get(0)?,
+        owner_principal: row.get(1)?,
+        device_id: row.get(2)?,
+        channel: row.get(3)?,
+        scope_kind: row.get(4)?,
+        scope_id: row.get(5)?,
+        key: row.get(6)?,
+        value: row.get(7)?,
+        source_kind: row.get(8)?,
+        status: row.get(9)?,
+        confidence: row.get(10)?,
+        candidate_id: row.get(11)?,
+        provenance_json: row.get(12)?,
+        created_at_unix_ms: row.get(13)?,
+        updated_at_unix_ms: row.get(14)?,
+    })
+}
+
+fn load_learning_candidate_by_id(
+    connection: &Connection,
+    candidate_id: &str,
+) -> Result<Option<LearningCandidateRecord>, JournalError> {
+    let mut statement = connection.prepare(
+        r#"
+            SELECT
+                candidate_ulid,
+                candidate_kind,
+                session_ulid,
+                run_ulid,
+                owner_principal,
+                device_id,
+                channel,
+                scope_kind,
+                scope_id,
+                status,
+                auto_applied,
+                confidence,
+                risk_level,
+                title,
+                summary,
+                target_path,
+                dedupe_key,
+                content_json,
+                provenance_json,
+                source_task_ulid,
+                created_at_unix_ms,
+                updated_at_unix_ms,
+                reviewed_at_unix_ms,
+                reviewed_by_principal,
+                last_action_summary,
+                last_action_payload_json
+            FROM learning_candidates
+            WHERE candidate_ulid = ?1
+            LIMIT 1
+        "#,
+    )?;
+    statement
+        .query_row(params![candidate_id], map_learning_candidate_row)
+        .optional()
+        .map_err(Into::into)
+}
+
+fn load_learning_candidate_by_dedupe_key(
+    connection: &Connection,
+    owner_principal: &str,
+    scope_kind: &str,
+    scope_id: &str,
+    candidate_kind: &str,
+    dedupe_key: &str,
+) -> Result<Option<LearningCandidateRecord>, JournalError> {
+    let mut statement = connection.prepare(
+        r#"
+            SELECT
+                candidate_ulid,
+                candidate_kind,
+                session_ulid,
+                run_ulid,
+                owner_principal,
+                device_id,
+                channel,
+                scope_kind,
+                scope_id,
+                status,
+                auto_applied,
+                confidence,
+                risk_level,
+                title,
+                summary,
+                target_path,
+                dedupe_key,
+                content_json,
+                provenance_json,
+                source_task_ulid,
+                created_at_unix_ms,
+                updated_at_unix_ms,
+                reviewed_at_unix_ms,
+                reviewed_by_principal,
+                last_action_summary,
+                last_action_payload_json
+            FROM learning_candidates
+            WHERE owner_principal = ?1
+              AND scope_kind = ?2
+              AND scope_id = ?3
+              AND candidate_kind = ?4
+              AND dedupe_key = ?5
+            LIMIT 1
+        "#,
+    )?;
+    statement
+        .query_row(
+            params![owner_principal, scope_kind, scope_id, candidate_kind, dedupe_key],
+            map_learning_candidate_row,
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn load_learning_preference_by_scope_key(
+    connection: &Connection,
+    owner_principal: &str,
+    scope_kind: &str,
+    scope_id: &str,
+    key: &str,
+) -> Result<Option<LearningPreferenceRecord>, JournalError> {
+    let mut statement = connection.prepare(
+        r#"
+            SELECT
+                preference_ulid,
+                owner_principal,
+                device_id,
+                channel,
+                scope_kind,
+                scope_id,
+                preference_key,
+                value_text,
+                source_kind,
+                status,
+                confidence,
+                candidate_ulid,
+                provenance_json,
+                created_at_unix_ms,
+                updated_at_unix_ms
+            FROM learning_preferences
+            WHERE owner_principal = ?1
+              AND scope_kind = ?2
+              AND scope_id = ?3
+              AND preference_key = ?4
+            LIMIT 1
+        "#,
+    )?;
+    statement
+        .query_row(
+            params![owner_principal, scope_kind, scope_id, key],
+            map_learning_preference_row,
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
 fn load_skill_status_by_key(
     connection: &Connection,
     skill_id: &str,
@@ -11094,6 +11922,19 @@ mod tests {
                 channel: Some("cli".to_owned()),
             })
             .expect("orchestrator session should be upserted");
+    }
+
+    fn start_orchestrator_run(store: &JournalStore, session_id: &str, run_id: &str) {
+        store
+            .start_orchestrator_run(&OrchestratorRunStartRequest {
+                run_id: run_id.to_owned(),
+                session_id: session_id.to_owned(),
+                origin_kind: String::new(),
+                origin_run_id: None,
+                triggered_by_principal: None,
+                parameter_delta_json: None,
+            })
+            .expect("orchestrator run should be created");
     }
 
     fn sample_cron_job_request(job_id: &str) -> CronJobCreateRequest {
@@ -14096,5 +14937,157 @@ mod tests {
             risky_hits.iter().any(|hit| hit.document.path == "projects/risky-note.md"),
             "quarantined search should surface risky workspace content when explicitly requested"
         );
+    }
+
+    #[test]
+    fn learning_candidate_review_round_trip_persists_history() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        upsert_orchestrator_session(&store, "01ARZ3NDEKTSV4RRFFQ69G5FC2");
+        start_orchestrator_run(
+            &store,
+            "01ARZ3NDEKTSV4RRFFQ69G5FC2",
+            "01ARZ3NDEKTSV4RRFFQ69G5FC3",
+        );
+
+        let created = store
+            .upsert_learning_candidate(&super::LearningCandidateCreateRequest {
+                candidate_id: "01ARZ3NDEKTSV4RRFFQ69G5FC1".to_owned(),
+                candidate_kind: "procedure".to_owned(),
+                session_id: "01ARZ3NDEKTSV4RRFFQ69G5FC2".to_owned(),
+                run_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FC3".to_owned()),
+                owner_principal: "user:ops".to_owned(),
+                device_id: "dev-01".to_owned(),
+                channel: Some("cli".to_owned()),
+                scope_kind: "workspace".to_owned(),
+                scope_id: "01ARZ3NDEKTSV4RRFFQ69G5FC2".to_owned(),
+                status: "queued".to_owned(),
+                auto_applied: false,
+                confidence: 0.91,
+                risk_level: "review".to_owned(),
+                title: "Release promotion procedure".to_owned(),
+                summary: "Repeated successful release promotion flow.".to_owned(),
+                target_path: None,
+                dedupe_key: "procedure:release".to_owned(),
+                content_json: "{\"signature\":\"deploy -> verify\"}".to_owned(),
+                provenance_json: "[{\"run_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FC3\"}]".to_owned(),
+                source_task_id: None,
+            })
+            .expect("learning candidate should be created");
+        assert_eq!(created.status, "queued");
+
+        let reviewed = store
+            .review_learning_candidate(&super::LearningCandidateReviewRequest {
+                candidate_id: created.candidate_id.clone(),
+                status: "accepted".to_owned(),
+                reviewed_by_principal: "user:ops".to_owned(),
+                action_summary: Some("promoted to scaffold".to_owned()),
+                action_payload_json: Some("{\"action\":\"promote\"}".to_owned()),
+            })
+            .expect("learning candidate review should succeed");
+        assert_eq!(reviewed.status, "accepted");
+
+        let history = store
+            .learning_candidate_history(created.candidate_id.as_str())
+            .expect("learning candidate history should load");
+        assert_eq!(history.len(), 1, "review should emit a history row");
+        assert_eq!(history[0].status, "accepted");
+        assert_eq!(history[0].reviewed_by_principal, "user:ops");
+    }
+
+    #[test]
+    fn learning_preferences_upsert_by_scope_key() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        upsert_orchestrator_session(&store, "01ARZ3NDEKTSV4RRFFQ69G5FC6");
+        start_orchestrator_run(
+            &store,
+            "01ARZ3NDEKTSV4RRFFQ69G5FC6",
+            "01ARZ3NDEKTSV4RRFFQ69G5FC7",
+        );
+        store
+            .upsert_learning_candidate(&super::LearningCandidateCreateRequest {
+                candidate_id: "01ARZ3NDEKTSV4RRFFQ69G5FC5".to_owned(),
+                candidate_kind: "preference".to_owned(),
+                session_id: "01ARZ3NDEKTSV4RRFFQ69G5FC6".to_owned(),
+                run_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FC7".to_owned()),
+                owner_principal: "user:ops".to_owned(),
+                device_id: "dev-01".to_owned(),
+                channel: Some("cli".to_owned()),
+                scope_kind: "profile".to_owned(),
+                scope_id: "user:ops".to_owned(),
+                status: "accepted".to_owned(),
+                auto_applied: true,
+                confidence: 0.88,
+                risk_level: "low".to_owned(),
+                title: "Interaction style preference".to_owned(),
+                summary: "Operator prefers concise answers.".to_owned(),
+                target_path: None,
+                dedupe_key: "preference:interaction.style".to_owned(),
+                content_json: "{\"key\":\"interaction.style\",\"value\":\"concise\"}".to_owned(),
+                provenance_json: "[{\"run_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FC7\"}]".to_owned(),
+                source_task_id: None,
+            })
+            .expect("learning candidate seed should be created");
+
+        let first = store
+            .upsert_learning_preference(&super::LearningPreferenceUpsertRequest {
+                preference_id: None,
+                owner_principal: "user:ops".to_owned(),
+                device_id: "dev-01".to_owned(),
+                channel: Some("cli".to_owned()),
+                scope_kind: "profile".to_owned(),
+                scope_id: "user:ops".to_owned(),
+                key: "interaction.style".to_owned(),
+                value: "concise".to_owned(),
+                source_kind: "inferred".to_owned(),
+                status: "active".to_owned(),
+                confidence: 0.88,
+                candidate_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FC5".to_owned()),
+                provenance_json: "[]".to_owned(),
+            })
+            .expect("learning preference should be created");
+
+        let second = store
+            .upsert_learning_preference(&super::LearningPreferenceUpsertRequest {
+                preference_id: None,
+                owner_principal: "user:ops".to_owned(),
+                device_id: "dev-01".to_owned(),
+                channel: Some("cli".to_owned()),
+                scope_kind: "profile".to_owned(),
+                scope_id: "user:ops".to_owned(),
+                key: "interaction.style".to_owned(),
+                value: "direct".to_owned(),
+                source_kind: "confirmed".to_owned(),
+                status: "active".to_owned(),
+                confidence: 0.95,
+                candidate_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FC5".to_owned()),
+                provenance_json: "[{\"source\":\"operator\"}]".to_owned(),
+            })
+            .expect("learning preference should be updated in place");
+
+        assert_eq!(
+            first.preference_id, second.preference_id,
+            "scope/key upsert should preserve the same preference row"
+        );
+        assert_eq!(second.value, "direct");
+        assert_eq!(second.source_kind, "confirmed");
+
+        let preferences = store
+            .list_learning_preferences(&super::LearningPreferenceListFilter {
+                owner_principal: Some("user:ops".to_owned()),
+                device_id: None,
+                channel: Some("cli".to_owned()),
+                scope_kind: Some("profile".to_owned()),
+                scope_id: Some("user:ops".to_owned()),
+                status: Some("active".to_owned()),
+                key: Some("interaction.style".to_owned()),
+                limit: 8,
+            })
+            .expect("learning preferences should load");
+        assert_eq!(preferences.len(), 1);
+        assert_eq!(preferences[0].value, "direct");
     }
 }

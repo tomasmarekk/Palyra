@@ -1,15 +1,11 @@
-Usage: palyra memory [OPTIONS] <COMMAND>
+Usage: palyra memory learning [OPTIONS] <COMMAND>
 
 Commands:
-  status
-  index       [aliases: reindex]
-  search
-  purge
-  ingest
-  workspace
-  recall
-  search-all
-  learning
+  list
+  history
+  review
+  preferences
+  promote-procedure
 
 Options:
   -h, --help  Print help

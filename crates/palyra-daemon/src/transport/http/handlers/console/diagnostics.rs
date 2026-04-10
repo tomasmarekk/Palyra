@@ -54,6 +54,7 @@ pub(crate) async fn console_diagnostics_handler(
     let memory_status =
         state.runtime.memory_maintenance_status().await.map_err(runtime_status_response)?;
     let memory_runtime_config = state.runtime.memory_config_snapshot();
+    let learning_runtime_config = state.runtime.learning_config_snapshot();
     let access_snapshot = {
         let registry = super::access::lock_access_registry(&state.access_registry);
         registry.snapshot(session.context.principal.as_str())
@@ -108,6 +109,32 @@ pub(crate) async fn console_diagnostics_handler(
                 "last_vacuum_at_unix_ms": memory_status.last_vacuum_at_unix_ms,
                 "next_vacuum_due_at_unix_ms": memory_status.next_vacuum_due_at_unix_ms,
                 "next_run_at_unix_ms": memory_status.next_maintenance_run_at_unix_ms,
+            }
+        },
+        "learning": {
+            "enabled": learning_runtime_config.enabled,
+            "sampling_percent": learning_runtime_config.sampling_percent,
+            "cooldown_ms": learning_runtime_config.cooldown_ms,
+            "budget_tokens": learning_runtime_config.budget_tokens,
+            "max_candidates_per_run": learning_runtime_config.max_candidates_per_run,
+            "thresholds": {
+                "durable_fact": {
+                    "review_min_confidence_bps": learning_runtime_config.durable_fact_review_min_confidence_bps,
+                    "auto_apply_confidence_bps": learning_runtime_config.durable_fact_auto_write_threshold_bps,
+                },
+                "preference": {
+                    "review_min_confidence_bps": learning_runtime_config.preference_review_min_confidence_bps,
+                },
+                "procedure": {
+                    "review_min_confidence_bps": learning_runtime_config.procedure_review_min_confidence_bps,
+                    "min_occurrences": learning_runtime_config.procedure_min_occurrences,
+                }
+            },
+            "counters": {
+                "reflections_scheduled": status_snapshot.counters.learning_reflections_scheduled,
+                "reflections_completed": status_snapshot.counters.learning_reflections_completed,
+                "candidates_created": status_snapshot.counters.learning_candidates_created,
+                "candidates_auto_applied": status_snapshot.counters.learning_candidates_auto_applied,
             }
         },
     })))

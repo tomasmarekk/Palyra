@@ -7,19 +7,19 @@ It distinguishes expected parity posture (`done` / `partial` / `intentional_devi
 
 ## Summary
 
-- Total entries: `96`
-- Verified entries: `96`
+- Total entries: `100`
+- Verified entries: `100`
 - Regression entries: `0`
-- Help snapshot coverage: `96` entries
+- Help snapshot coverage: `100` entries
 
 ### Expected parity status counts
 
-- `done`: `92`
+- `done`: `96`
 - `partial`: `4`
 
 ### Validation status counts
 
-- `verified`: `96`
+- `verified`: `100`
 
 ## Entries
 
@@ -38,6 +38,10 @@ It distinguishes expected parity posture (`done` / `partial` / `intentional_devi
 | `cron` | `top_level` | `done` | `verified` | `cron-help.txt` | - | - | - |
 | `routines` | `top_level` | `done` | `verified` | `routines-help.txt` | - | - | - |
 | `memory` | `top_level` | `done` | `verified` | `memory-help.txt` | - | - | - |
+| `memory learning` | `nested_surface` | `done` | `verified` | `memory-learning-help.txt` | - | - | - |
+| `memory learning list` | `nested_surface` | `done` | `verified` | `memory-learning-list-help.txt` | - | - | - |
+| `memory learning review` | `nested_surface` | `done` | `verified` | `memory-learning-review-help.txt` | - | - | - |
+| `memory learning promote-procedure` | `nested_surface` | `done` | `verified` | `memory-learning-promote-procedure-help.txt` | - | - | - |
 | `message` | `top_level` | `done` | `verified` | `message-help.txt` | - | - | - |
 | `approvals` | `top_level` | `done` | `verified` | `approvals-help.txt` | - | - | - |
 | `sessions` | `top_level` | `done` | `verified` | `sessions-help.txt` | - | - | - |

@@ -11,8 +11,9 @@ use super::{
     ConfigCommand, ConfigureSectionArg, CronCommand, CronConcurrencyPolicyArg,
     CronMisfirePolicyArg, CronScheduleTypeArg, DaemonCommand, DevicesCommand, DocsCommand,
     GatewayBindProfileArg, HooksCommand, InitModeArg, InitTlsScaffoldArg, JournalCheckpointModeArg,
-    MemoryCommand, MemoryScopeArg, MemorySourceArg, MessageCommand, ModelsCommand, NodeCommand,
-    NodesCommand, OnboardingAuthMethodArg, OnboardingCommand, OnboardingFlowArg,
+    MemoryCommand, MemoryLearningCommand, MemoryScopeArg, MemorySourceArg, MessageCommand,
+    ModelsCommand, NodeCommand, NodesCommand, OnboardingAuthMethodArg, OnboardingCommand,
+    OnboardingFlowArg,
     PairingClientKindArg, PairingCommand, PairingMethodArg, PairingStateArg, PatchCommand,
     PluginsCommand, PolicyCommand, ProtocolCommand, RemoteVerificationModeArg, ResetCommand,
     ResetScopeArg, RoutineApprovalModeArg, RoutineDeliveryModeArg, RoutinePreviewTimezoneArg,
@@ -1631,6 +1632,108 @@ fn parse_memory_ingest() {
                 confidence: Some("0.9".to_owned()),
                 ttl_unix_ms: Some(1_730_000_000_000),
                 json: false,
+            }
+        }
+    );
+}
+
+#[test]
+fn parse_memory_learning_commands() {
+    let list = Cli::parse_from([
+        "palyra",
+        "memory",
+        "learning",
+        "list",
+        "--candidate-kind",
+        "procedure",
+        "--status",
+        "queued",
+        "--risk-level",
+        "review",
+        "--min-confidence",
+        "0.85",
+        "--max-confidence",
+        "0.99",
+        "--limit",
+        "12",
+        "--json",
+    ]);
+    assert_eq!(
+        list.command,
+        Command::Memory {
+            command: MemoryCommand::Learning {
+                command: MemoryLearningCommand::List {
+                    candidate_kind: Some("procedure".to_owned()),
+                    status: Some("queued".to_owned()),
+                    risk_level: Some("review".to_owned()),
+                    scope_kind: None,
+                    scope_id: None,
+                    session: None,
+                    min_confidence: Some("0.85".to_owned()),
+                    max_confidence: Some("0.99".to_owned()),
+                    limit: Some(12),
+                    json: true,
+                },
+            }
+        }
+    );
+
+    let review = Cli::parse_from([
+        "palyra",
+        "memory",
+        "learning",
+        "review",
+        "01ARZ3NDEKTSV4RRFFQ69G5FB9",
+        "accepted",
+        "--summary",
+        "promoted",
+        "--apply-preference",
+    ]);
+    assert_eq!(
+        review.command,
+        Command::Memory {
+            command: MemoryCommand::Learning {
+                command: MemoryLearningCommand::Review {
+                    candidate_id: "01ARZ3NDEKTSV4RRFFQ69G5FB9".to_owned(),
+                    status: "accepted".to_owned(),
+                    summary: Some("promoted".to_owned()),
+                    payload: None,
+                    apply_preference: true,
+                    json: false,
+                },
+            }
+        }
+    );
+
+    let promote = Cli::parse_from([
+        "palyra",
+        "memory",
+        "learning",
+        "promote-procedure",
+        "01ARZ3NDEKTSV4RRFFQ69G5FBA",
+        "--skill-id",
+        "palyra.generated.ops.release",
+        "--publisher",
+        "palyra.generated",
+        "--version",
+        "0.2.0",
+        "--name",
+        "Release workflow",
+        "--json",
+    ]);
+    assert_eq!(
+        promote.command,
+        Command::Memory {
+            command: MemoryCommand::Learning {
+                command: MemoryLearningCommand::PromoteProcedure {
+                    candidate_id: "01ARZ3NDEKTSV4RRFFQ69G5FBA".to_owned(),
+                    skill_id: Some("palyra.generated.ops.release".to_owned()),
+                    version: Some("0.2.0".to_owned()),
+                    publisher: Some("palyra.generated".to_owned()),
+                    name: Some("Release workflow".to_owned()),
+                    accept_candidate: true,
+                    json: true,
+                },
             }
         }
     );

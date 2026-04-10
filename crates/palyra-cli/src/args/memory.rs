@@ -112,6 +112,82 @@ pub enum MemoryCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    Learning {
+        #[command(subcommand)]
+        command: MemoryLearningCommand,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum MemoryLearningCommand {
+    List {
+        #[arg(long)]
+        candidate_kind: Option<String>,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        risk_level: Option<String>,
+        #[arg(long)]
+        scope_kind: Option<String>,
+        #[arg(long)]
+        scope_id: Option<String>,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        min_confidence: Option<String>,
+        #[arg(long)]
+        max_confidence: Option<String>,
+        #[arg(long)]
+        limit: Option<u32>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    History {
+        candidate_id: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Review {
+        candidate_id: String,
+        status: String,
+        #[arg(long)]
+        summary: Option<String>,
+        #[arg(long)]
+        payload: Option<String>,
+        #[arg(long, default_value_t = false)]
+        apply_preference: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Preferences {
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        scope_kind: Option<String>,
+        #[arg(long)]
+        scope_id: Option<String>,
+        #[arg(long)]
+        key: Option<String>,
+        #[arg(long)]
+        limit: Option<u32>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    PromoteProcedure {
+        candidate_id: String,
+        #[arg(long)]
+        skill_id: Option<String>,
+        #[arg(long)]
+        version: Option<String>,
+        #[arg(long)]
+        publisher: Option<String>,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long, default_value_t = true)]
+        accept_candidate: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]

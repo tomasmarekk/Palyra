@@ -9,6 +9,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::{
+    application::learning::{process_post_run_reflection_task, REFLECTION_TASK_KIND},
     delegation::{
         DelegationExecutionMode, DelegationMergeProvenanceRecord, DelegationMergeResult,
         DelegationMergeStrategy, DelegationSnapshot,
@@ -183,6 +184,9 @@ async fn process_background_task(
         return Ok(());
     }
     if task.state == "running" {
+        if task.task_kind == REFLECTION_TASK_KIND && task.target_run_id.is_none() {
+            return Ok(());
+        }
         if let Some(target_run_id) = task.target_run_id.as_deref() {
             let snapshot =
                 runtime.orchestrator_run_status_snapshot(target_run_id.to_owned()).await?;
@@ -233,8 +237,79 @@ async fn dispatch_background_task(
     grpc_url: &str,
     task: &OrchestratorBackgroundTaskRecord,
 ) -> Result<(), Status> {
-    let run_id = Ulid::new().to_string();
     let started_at_unix_ms = crate::gateway::current_unix_ms();
+    if task.task_kind == REFLECTION_TASK_KIND {
+        runtime
+            .update_orchestrator_background_task(OrchestratorBackgroundTaskUpdateRequest {
+                task_id: task.task_id.clone(),
+                state: Some("running".to_owned()),
+                target_run_id: Some(None),
+                increment_attempt_count: true,
+                last_error: Some(None),
+                result_json: Some(None),
+                started_at_unix_ms: Some(Some(started_at_unix_ms)),
+                completed_at_unix_ms: Some(None),
+            })
+            .await?;
+        let runtime = Arc::clone(runtime);
+        let task = task.clone();
+        tokio::spawn(async move {
+            match process_post_run_reflection_task(&runtime, &task).await {
+                Ok(result) => {
+                    let _ = runtime
+                        .update_orchestrator_background_task(OrchestratorBackgroundTaskUpdateRequest {
+                            task_id: task.task_id.clone(),
+                            state: Some("succeeded".to_owned()),
+                            target_run_id: Some(None),
+                            increment_attempt_count: false,
+                            last_error: Some(None),
+                            result_json: Some(Some(result.to_string())),
+                            started_at_unix_ms: None,
+                            completed_at_unix_ms: Some(Some(crate::gateway::current_unix_ms())),
+                        })
+                        .await;
+                    runtime.clear_self_healing_heartbeat(
+                        WorkHeartbeatKind::BackgroundTask,
+                        task.task_id.as_str(),
+                    );
+                }
+                Err(error) => {
+                    warn!(
+                        task_id = %task.task_id,
+                        status_code = ?error.code(),
+                        status_message = %error.message(),
+                        "post-run reflection task failed"
+                    );
+                    let _ = runtime
+                        .update_orchestrator_background_task(OrchestratorBackgroundTaskUpdateRequest {
+                            task_id: task.task_id.clone(),
+                            state: Some("failed".to_owned()),
+                            target_run_id: Some(None),
+                            increment_attempt_count: false,
+                            last_error: Some(Some(error.message().to_owned())),
+                            result_json: Some(Some(
+                                json!({
+                                    "status": "failed",
+                                    "task_id": task.task_id,
+                                    "error": error.message(),
+                                })
+                                .to_string(),
+                            )),
+                            started_at_unix_ms: None,
+                            completed_at_unix_ms: Some(Some(crate::gateway::current_unix_ms())),
+                        })
+                        .await;
+                    runtime.clear_self_healing_heartbeat(
+                        WorkHeartbeatKind::BackgroundTask,
+                        task.task_id.as_str(),
+                    );
+                }
+            }
+        });
+        return Ok(());
+    }
+
+    let run_id = Ulid::new().to_string();
     runtime
         .update_orchestrator_background_task(OrchestratorBackgroundTaskUpdateRequest {
             task_id: task.task_id.clone(),

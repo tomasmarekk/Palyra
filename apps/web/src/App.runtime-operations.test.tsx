@@ -21,8 +21,12 @@ import {
   cronRunsFixture,
   discordApplyFixture,
   discordPreflightFixture,
+  learningCandidateHistoryFixture,
+  learningCandidatesFixture,
+  learningPreferencesFixture,
   memoryHitsFixture,
   memoryStatusFixture,
+  procedurePromotionFixture,
   routerMintFixture,
   routerPairingsFixture,
   routerPreviewFixture,
@@ -282,11 +286,42 @@ describe("M56 runtime and operations surfaces", () => {
         if (request.path === "/console/v1/memory/search" && request.method === "GET") {
           return jsonResponse(memoryHitsFixture());
         }
+        if (request.path === "/console/v1/memory/learning/candidates" && request.method === "GET") {
+          return jsonResponse(learningCandidatesFixture());
+        }
+        if (
+          request.path === "/console/v1/memory/learning/candidates/candidate-pref-1/history" &&
+          request.method === "GET"
+        ) {
+          return jsonResponse(learningCandidateHistoryFixture());
+        }
+        if (
+          request.path === "/console/v1/memory/learning/candidates/candidate-pref-1/review" &&
+          request.method === "POST"
+        ) {
+          return jsonResponse({
+            candidate: {
+              ...learningCandidatesFixture().candidates[0],
+              status: "accepted",
+            },
+            history: learningCandidateHistoryFixture().history,
+            applied_preference: learningPreferencesFixture().preferences[0],
+          });
+        }
+        if (request.path === "/console/v1/memory/preferences" && request.method === "GET") {
+          return jsonResponse(learningPreferencesFixture());
+        }
         if (request.path === "/console/v1/memory/purge" && request.method === "POST") {
           return jsonResponse({ deleted_count: 1 });
         }
         if (request.path === "/console/v1/skills" && request.method === "GET") {
           return jsonResponse(skillsFixture());
+        }
+        if (
+          request.path === "/console/v1/skills/candidates/candidate-proc-1/promote" &&
+          request.method === "POST"
+        ) {
+          return jsonResponse(procedurePromotionFixture());
         }
         if (
           request.path === "/console/v1/skills/acme.echo_http/verify" &&
@@ -370,6 +405,27 @@ describe("M56 runtime and operations surfaces", () => {
       expect(
         (await screen.findAllByText(/paired sender prefers concise replies/)).length,
       ).toBeGreaterThan(0);
+      expect(await screen.findByText("Learning review queue")).toBeInTheDocument();
+      fireEvent.change(screen.getByLabelText("Candidate kind"), {
+        target: { value: "preference" },
+      });
+      fireEvent.change(screen.getByLabelText("Status"), {
+        target: { value: "queued" },
+      });
+      fireEvent.change(screen.getByLabelText("Risk"), {
+        target: { value: "normal" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Refresh queue" }));
+      expect((await screen.findAllByText("Preference: interaction.style")).length).toBeGreaterThan(
+        0,
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Accept" }));
+      await waitFor(() => {
+        expect(
+          screen.getByText("Learning candidate Preference: interaction.style marked as accepted."),
+        ).toBeInTheDocument();
+      });
+      expect(await screen.findByText("interaction.style")).toBeInTheDocument();
       fireEvent.click(screen.getByRole("button", { name: "Purge memory" }));
       const purgeDialog = await screen.findByRole("alertdialog", { name: "Purge memory" });
       fireEvent.click(within(purgeDialog).getByRole("button", { name: "Purge memory" }));
@@ -408,6 +464,15 @@ describe("M56 runtime and operations surfaces", () => {
       await waitFor(() => {
         expect(screen.getByText("Skill action 'enable' completed.")).toBeInTheDocument();
       });
+      fireEvent.click(screen.getAllByRole("button", { name: "Promote scaffold" })[0]);
+      await waitFor(() => {
+        expect(
+          screen.getByText("Procedure candidate promoted into a quarantined skill scaffold."),
+        ).toBeInTheDocument();
+      });
+      expect(
+        await screen.findByText(/candidate-scaffolds\/palyra\.generated\.ops\.release/i),
+      ).toBeInTheDocument();
 
       fireEvent.click(screen.getByRole("button", { name: "Browser" }));
       expect(await screen.findByRole("heading", { name: "Browser" })).toBeInTheDocument();

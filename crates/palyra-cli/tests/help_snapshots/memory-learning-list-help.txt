@@ -1,18 +1,17 @@
-Usage: palyra memory [OPTIONS] <COMMAND>
-
-Commands:
-  status
-  index       [aliases: reindex]
-  search
-  purge
-  ingest
-  workspace
-  recall
-  search-all
-  learning
+Usage: palyra memory learning list [OPTIONS]
 
 Options:
-  -h, --help  Print help
+      --candidate-kind <CANDIDATE_KIND>
+      --status <STATUS>
+      --risk-level <RISK_LEVEL>
+      --scope-kind <SCOPE_KIND>
+      --scope-id <SCOPE_ID>
+      --session <SESSION>
+      --min-confidence <MIN_CONFIDENCE>
+      --max-confidence <MAX_CONFIDENCE>
+      --limit <LIMIT>
+      --json
+  -h, --help                             Print help
 
 Global Options:
       --profile <PROFILE>

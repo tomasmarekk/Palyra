@@ -1,6 +1,13 @@
+import { Button } from "@heroui/react";
 import { type ReactNode, useMemo, useState } from "react";
 
-import { ActionButton, CheckboxField, TextAreaField, TextInputField } from "../components/ui";
+import {
+  ActionButton,
+  CheckboxField,
+  SelectField,
+  TextAreaField,
+  TextInputField,
+} from "../components/ui";
 import {
   WorkspaceMetricCard,
   WorkspacePageHeader,
@@ -48,12 +55,30 @@ type MemorySectionProps = {
     | "setMemoryWorkspaceSearchQuery"
     | "memoryWorkspaceHits"
     | "memoryDerivedArtifacts"
+    | "memoryLearningBusy"
+    | "memoryLearningCandidates"
+    | "memoryLearningHistory"
+    | "memoryLearningPreferences"
+    | "memoryLearningCandidateId"
+    | "memoryLearningCandidateKindFilter"
+    | "setMemoryLearningCandidateKindFilter"
+    | "memoryLearningStatusFilter"
+    | "setMemoryLearningStatusFilter"
+    | "memoryLearningRiskFilter"
+    | "setMemoryLearningRiskFilter"
+    | "memoryLearningMinConfidenceFilter"
+    | "setMemoryLearningMinConfidenceFilter"
+    | "memoryLearningMaxConfidenceFilter"
+    | "setMemoryLearningMaxConfidenceFilter"
+    | "setMemoryLearningCandidateId"
     | "memorySearchAllQuery"
     | "setMemorySearchAllQuery"
     | "memorySearchAllResults"
     | "memoryRecallPreview"
     | "refreshMemoryStatus"
+    | "refreshLearningQueue"
     | "refreshWorkspaceDocuments"
+    | "selectLearningCandidate"
     | "selectWorkspaceDocument"
     | "saveWorkspaceDocument"
     | "bootstrapWorkspace"
@@ -65,6 +90,7 @@ type MemorySectionProps = {
     | "searchAllMemorySources"
     | "promoteMemoryHitToWorkspaceDraft"
     | "purgeMemory"
+    | "reviewLearningCandidate"
   >;
 };
 
@@ -126,6 +152,29 @@ export function MemorySection({ app }: MemorySectionProps) {
   );
   const selectedDerivedWarnings = readObjectArray(selectedDerivedArtifact, "warnings");
   const selectedDerivedAnchors = readObjectArray(selectedDerivedArtifact, "anchors");
+  const learningCandidates = app.memoryLearningCandidates;
+  const learningPreferences = app.memoryLearningPreferences;
+  const learningHistory = app.memoryLearningHistory;
+  const selectedLearningCandidate =
+    learningCandidates.find(
+      (candidate) => readString(candidate, "candidate_id") === app.memoryLearningCandidateId,
+    ) ?? learningCandidates[0] ?? null;
+  const selectedLearningCandidateId =
+    readString(selectedLearningCandidate ?? EMPTY_OBJECT, "candidate_id") ??
+    app.memoryLearningCandidateId;
+  const queuedLearningCount = learningCandidates.filter(
+    (candidate) => readString(candidate, "status") === "queued",
+  ).length;
+  const autoAppliedLearningCount = learningCandidates.filter(
+    (candidate) => readBoolean(candidate, "auto_applied"),
+  ).length;
+  const learningStatus = readObject(app.memoryStatus ?? {}, "learning");
+  const learningThresholds =
+    learningStatus === null ? null : readObject(learningStatus, "thresholds");
+  const durableFactThresholds =
+    learningThresholds === null ? null : readObject(learningThresholds, "durable_fact");
+  const procedureThresholds =
+    learningThresholds === null ? null : readObject(learningThresholds, "procedure");
 
   return (
     <main className="workspace-page">
@@ -207,10 +256,256 @@ export function MemorySection({ app }: MemorySectionProps) {
           value={readNumber(derivedRecord, "total") ?? 0}
         />
         <WorkspaceMetricCard
+          detail="Learning candidates currently waiting for review or auto-apply."
+          label="Learning queue"
+          tone={queuedLearningCount > 0 ? "warning" : "default"}
+          value={learningCandidates.length}
+        />
+        <WorkspaceMetricCard
+          detail="Active operator or workspace preferences currently injected into prompts."
+          label="Active preferences"
+          tone={learningPreferences.length > 0 ? "accent" : "default"}
+          value={learningPreferences.length}
+        />
+        <WorkspaceMetricCard
           detail="Retention policy remains visible so recall and purge stay deliberate."
           label="Retention TTL"
           value={`${readNumber(retention ?? {}, "ttl_days") ?? 0} days`}
         />
+      </section>
+
+      <section className="workspace-aside-grid">
+        <div className="workspace-stack">
+          <WorkspaceSectionCard
+            description="Review durable facts, preferences, and reusable procedures that reflection extracted from completed runs."
+            title="Learning review queue"
+          >
+            <div className="workspace-inline-actions">
+              <WorkspaceStatusChip tone={queuedLearningCount > 0 ? "warning" : "default"}>
+                {queuedLearningCount} queued
+              </WorkspaceStatusChip>
+              <WorkspaceStatusChip
+                tone={autoAppliedLearningCount > 0 ? "accent" : "default"}
+              >
+                {autoAppliedLearningCount} auto-applied
+              </WorkspaceStatusChip>
+              <ActionButton
+                isDisabled={app.memoryLearningBusy}
+                type="button"
+                variant="secondary"
+                onPress={() => void app.refreshLearningQueue()}
+              >
+                {app.memoryLearningBusy ? "Refreshing..." : "Refresh queue"}
+              </ActionButton>
+            </div>
+            <div className="workspace-stack">
+              <SelectField
+                label="Candidate kind"
+                name="memory-learning-kind-filter"
+                value={app.memoryLearningCandidateKindFilter}
+                onChange={app.setMemoryLearningCandidateKindFilter}
+                options={[
+                  { key: "", label: "All kinds" },
+                  { key: "durable_fact", label: "Durable facts" },
+                  { key: "preference", label: "Preferences" },
+                  { key: "procedure", label: "Procedures" },
+                ]}
+              />
+              <SelectField
+                label="Status"
+                name="memory-learning-status-filter"
+                value={app.memoryLearningStatusFilter}
+                onChange={app.setMemoryLearningStatusFilter}
+                options={[
+                  { key: "", label: "All statuses" },
+                  { key: "queued", label: "Queued" },
+                  { key: "accepted", label: "Accepted" },
+                  { key: "denied", label: "Denied" },
+                  { key: "suppressed", label: "Suppressed" },
+                ]}
+              />
+              <SelectField
+                label="Risk"
+                name="memory-learning-risk-filter"
+                value={app.memoryLearningRiskFilter}
+                onChange={app.setMemoryLearningRiskFilter}
+                options={[
+                  { key: "", label: "All risk levels" },
+                  { key: "normal", label: "Normal" },
+                  { key: "review", label: "Review" },
+                  { key: "low_confidence", label: "Low confidence" },
+                  { key: "sensitive", label: "Sensitive" },
+                  { key: "poisoned", label: "Poisoned" },
+                ]}
+              />
+            </div>
+            <div className="workspace-stack">
+              <TextInputField
+                label="Min confidence"
+                name="memory-learning-min-confidence-filter"
+                placeholder="0.80"
+                value={app.memoryLearningMinConfidenceFilter}
+                onChange={app.setMemoryLearningMinConfidenceFilter}
+              />
+              <TextInputField
+                label="Max confidence"
+                name="memory-learning-max-confidence-filter"
+                placeholder="1.00"
+                value={app.memoryLearningMaxConfidenceFilter}
+                onChange={app.setMemoryLearningMaxConfidenceFilter}
+              />
+              <WorkspaceInlineNotice tone="default" title="Threshold policy">
+                Facts review at{" "}
+                {formatLearningConfidence(
+                  (readNumber(durableFactThresholds ?? EMPTY_OBJECT, "review_min_confidence_bps") ??
+                    0) / 10_000,
+                )}
+                , auto-apply at{" "}
+                {formatLearningConfidence(
+                  (readNumber(durableFactThresholds ?? EMPTY_OBJECT, "auto_apply_confidence_bps") ??
+                    0) / 10_000,
+                )}
+                . Procedures require{" "}
+                {readNumber(procedureThresholds ?? EMPTY_OBJECT, "min_occurrences") ?? 0}{" "}
+                matching runs.
+              </WorkspaceInlineNotice>
+            </div>
+            {learningCandidates.length === 0 ? (
+              <WorkspaceEmptyState
+                title="No learning candidates"
+                description="Run reflection-enabled sessions to populate durable facts, preferences, and procedure suggestions, or relax the queue filters above."
+              />
+            ) : (
+              <div className="workspace-list workspace-list--queue">
+                {learningCandidates.map((candidate) => {
+                  const candidateId = readString(candidate, "candidate_id") ?? "";
+                  const isSelected = candidateId === selectedLearningCandidateId;
+                  const candidateKind = readString(candidate, "candidate_kind") ?? "unknown";
+                  const candidateStatus = readString(candidate, "status") ?? "queued";
+                  return (
+                    <Button
+                      key={candidateId}
+                      type="button"
+                      className={`workspace-list-button${isSelected ? " is-active" : ""}`}
+                      variant={isSelected ? "secondary" : "ghost"}
+                      onPress={() => {
+                        app.setMemoryLearningCandidateId(candidateId);
+                        void app.selectLearningCandidate(candidateId);
+                      }}
+                    >
+                      <div>
+                        <strong>{readString(candidate, "title") ?? candidateKind}</strong>
+                        <p className="chat-muted">
+                          {candidateKind} · confidence{" "}
+                          {formatLearningConfidence(readNumber(candidate, "confidence") ?? 0)} · risk{" "}
+                          {readString(candidate, "risk_level") ?? "normal"}
+                        </p>
+                      </div>
+                      <WorkspaceStatusChip
+                        tone={isSelected ? "accent" : workspaceToneForState(candidateStatus)}
+                      >
+                        {candidateStatus}
+                      </WorkspaceStatusChip>
+                    </Button>
+                  );
+                })}
+              </div>
+            )}
+          </WorkspaceSectionCard>
+        </div>
+
+        <div className="workspace-stack">
+          <WorkspaceSectionCard
+            description="Inspect candidate provenance and active prompt preferences before you accept or deny them."
+            title="Candidate detail"
+          >
+            {selectedLearningCandidate === null ? (
+              <WorkspaceEmptyState
+                title="No candidate selected"
+                description="Choose a learning candidate to inspect its audit history and decide whether it should survive."
+              />
+            ) : (
+              <div className="workspace-stack">
+                <WorkspaceInlineNotice
+                  tone="default"
+                  title={readString(selectedLearningCandidate, "title") ?? "Candidate"}
+                >
+                  {readString(selectedLearningCandidate, "summary") ?? "No summary provided."}
+                </WorkspaceInlineNotice>
+                <div className="workspace-inline-actions">
+                  <ActionButton
+                    isDisabled={app.memoryLearningBusy}
+                    type="button"
+                    variant="primary"
+                    onPress={() =>
+                      void app.reviewLearningCandidate(
+                        selectedLearningCandidateId,
+                        "accepted",
+                        readString(selectedLearningCandidate, "candidate_kind") === "preference",
+                      )
+                    }
+                  >
+                    Accept
+                  </ActionButton>
+                  <ActionButton
+                    isDisabled={app.memoryLearningBusy}
+                    type="button"
+                    variant="secondary"
+                    onPress={() =>
+                      void app.reviewLearningCandidate(selectedLearningCandidateId, "denied")
+                    }
+                  >
+                    Deny
+                  </ActionButton>
+                </div>
+                <TextAreaField
+                  label="Candidate payload"
+                  rows={8}
+                  name="learning-candidate-payload"
+                  value={readString(selectedLearningCandidate, "content_json") ?? "{}"}
+                  onChange={() => undefined}
+                />
+                <TextAreaField
+                  label="Provenance"
+                  rows={6}
+                  name="learning-candidate-provenance"
+                  value={readString(selectedLearningCandidate, "provenance_json") ?? "[]"}
+                  onChange={() => undefined}
+                />
+                <GroupedResultsSection
+                  title="Review history"
+                  items={learningHistory}
+                  emptyDescription="This candidate has not been reviewed yet."
+                  renderItem={(item, index) => (
+                    <div
+                      key={readString(item, "history_id") ?? `history-${index + 1}`}
+                      className="workspace-list-item"
+                    >
+                      <strong>{readString(item, "status") ?? "unknown"}</strong>
+                      <span>{readString(item, "reviewed_by_principal") ?? "system"}</span>
+                      <span>{formatUnixMs(readNumber(item, "created_at_unix_ms"))}</span>
+                    </div>
+                  )}
+                />
+                <GroupedResultsSection
+                  title="Active preferences"
+                  items={learningPreferences}
+                  emptyDescription="No active preferences are currently injected into prompts."
+                  renderItem={(item, index) => (
+                    <div
+                      key={readString(item, "preference_id") ?? `preference-${index + 1}`}
+                      className="workspace-list-item"
+                    >
+                      <strong>{readString(item, "key") ?? "preference"}</strong>
+                      <span>{readString(item, "value") ?? ""}</span>
+                      <span>{readString(item, "scope_kind") ?? "profile"}</span>
+                    </div>
+                  )}
+                />
+              </div>
+            )}
+          </WorkspaceSectionCard>
+        </div>
       </section>
 
       <section className="workspace-aside-grid">
@@ -1196,6 +1491,10 @@ function formatScore(hit: JsonObject): string {
     readNumber(hit, "score") ??
     readNumber(readObject(hit, "breakdown") ?? EMPTY_OBJECT, "final_score");
   return score === null ? "n/a" : score.toFixed(2);
+}
+
+function formatLearningConfidence(value: number): string {
+  return value.toFixed(2);
 }
 
 function shortHash(value: string | null): string {

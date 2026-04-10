@@ -40,6 +40,8 @@ type OperationsSectionProps = {
     | "refreshDiagnostics"
     | "overviewUsageInsights"
     | "overviewCatalog"
+    | "memoryStatus"
+    | "refreshMemoryStatus"
     | "revealSensitiveValues"
   >;
 };
@@ -49,6 +51,9 @@ export function OperationsSection({ app }: OperationsSectionProps) {
   const groupedCapabilities = capabilitiesByMode(capabilitiesForSection(catalog, "operations"));
   const diagnostics = app.diagnosticsSnapshot;
   const usageInsights = app.overviewUsageInsights;
+  const learning = readObject(app.memoryStatus ?? {}, "learning");
+  const learningCounters = readObject(learning ?? {}, "counters");
+  const learningEnabled = typeof learning?.enabled === "boolean" ? learning.enabled : false;
   const observability = readObject(diagnostics ?? {}, "observability");
   const modelProvider = readObject(diagnostics ?? {}, "model_provider");
   const authProfiles = readObject(diagnostics ?? {}, "auth_profiles");
@@ -104,6 +109,14 @@ export function OperationsSection({ app }: OperationsSectionProps) {
             >
               {app.auditBusy ? "Refreshing..." : "Refresh audit"}
             </ActionButton>
+            <ActionButton
+              type="button"
+              variant="ghost"
+              onPress={() => void app.refreshMemoryStatus()}
+              isDisabled={app.diagnosticsBusy}
+            >
+              Refresh learning
+            </ActionButton>
           </div>
         }
       />
@@ -154,6 +167,12 @@ export function OperationsSection({ app }: OperationsSectionProps) {
               : (readString(latestDoctorRecovery, "mode") ?? "Latest mode unavailable")
           }
           tone={workspaceToneForState(readString(latestDoctorRecovery ?? {}, "state") ?? "unknown")}
+        />
+        <WorkspaceMetricCard
+          label="Learning reflections"
+          value={readNumber(learningCounters ?? {}, "reflections_scheduled") ?? 0}
+          detail={`${readNumber(learningCounters ?? {}, "candidates_created") ?? 0} candidates · ${readNumber(learningCounters ?? {}, "candidates_auto_applied") ?? 0} auto-applied`}
+          tone={(readNumber(learningCounters ?? {}, "reflections_scheduled") ?? 0) > 0 ? "accent" : "default"}
         />
       </section>
 
@@ -239,6 +258,56 @@ export function OperationsSection({ app }: OperationsSectionProps) {
                   <td>Budget evaluations</td>
                   <td>{usageInsights.budgets.evaluations.length}</td>
                   <td>{usageInsights.alerts.length} active alerts</td>
+                </tr>
+              </WorkspaceTable>
+            )}
+          </WorkspaceSectionCard>
+
+          <WorkspaceSectionCard
+            title="Learning workload"
+            description="Reflection stays visible as a separate background workload so operators can distinguish Phase 6 learning activity from user-facing runs."
+          >
+            {learning === null ? (
+              <WorkspaceEmptyState
+                compact
+                title="No learning policy loaded"
+                description="Refresh learning to load reflection policy and candidate counters."
+              />
+            ) : (
+              <WorkspaceTable
+                ariaLabel="Learning workload"
+                columns={["Metric", "Value", "Detail"]}
+              >
+                <tr>
+                  <td>Enabled</td>
+                  <td>{learningEnabled ? "true" : "false"}</td>
+                  <td>{readNumber(learning, "sampling_percent") ?? 0}% sampled background reflections</td>
+                </tr>
+                <tr>
+                  <td>Cooldown</td>
+                  <td>{readNumber(learning, "cooldown_ms") ?? 0} ms</td>
+                  <td>{readNumber(learning, "budget_tokens") ?? 0} tokens per reflection task</td>
+                </tr>
+                <tr>
+                  <td>Thresholds</td>
+                  <td>{readNumber(learning, "durable_fact_review_min_confidence_bps") ?? 0} bps facts review</td>
+                  <td>
+                    {readNumber(learning, "durable_fact_auto_write_threshold_bps") ?? 0} bps auto-write ·{" "}
+                    {readNumber(learning, "preference_review_min_confidence_bps") ?? 0} bps preferences
+                  </td>
+                </tr>
+                <tr>
+                  <td>Throughput</td>
+                  <td>{readNumber(learningCounters ?? {}, "reflections_completed") ?? 0} completed</td>
+                  <td>{readNumber(learningCounters ?? {}, "candidates_created") ?? 0} candidates generated</td>
+                </tr>
+                <tr>
+                  <td>Procedure policy</td>
+                  <td>{readNumber(learning, "procedure_min_occurrences") ?? 0} matching runs</td>
+                  <td>
+                    {readNumber(learning, "procedure_review_min_confidence_bps") ?? 0} bps review ·{" "}
+                    {readNumber(learning, "max_candidates_per_run") ?? 0} max candidates/run
+                  </td>
                 </tr>
               </WorkspaceTable>
             )}

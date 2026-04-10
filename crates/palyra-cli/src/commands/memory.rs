@@ -10,7 +10,8 @@ pub(crate) fn run_memory(command: MemoryCommand) -> Result<()> {
         | MemoryCommand::Index { .. }
         | MemoryCommand::Workspace { .. }
         | MemoryCommand::Recall { .. }
-        | MemoryCommand::SearchAll { .. } => runtime.block_on(run_memory_admin_async(command)),
+        | MemoryCommand::SearchAll { .. }
+        | MemoryCommand::Learning { .. } => runtime.block_on(run_memory_admin_async(command)),
         other => {
             let connection = root_context.resolve_grpc_connection(
                 app::ConnectionOverrides::default(),
@@ -231,7 +232,8 @@ pub(crate) async fn run_memory_async(
         | MemoryCommand::Index { .. }
         | MemoryCommand::Workspace { .. }
         | MemoryCommand::Recall { .. }
-        | MemoryCommand::SearchAll { .. } => {
+        | MemoryCommand::SearchAll { .. }
+        | MemoryCommand::Learning { .. } => {
             unreachable!("memory admin commands are handled by run_memory_admin_async")
         }
     }
@@ -541,6 +543,152 @@ async fn run_memory_admin_async(command: MemoryCommand) -> Result<()> {
                 &["/groups"],
             )
         }
+        MemoryCommand::Learning { command } => match command {
+            MemoryLearningCommand::List {
+                candidate_kind,
+                status,
+                risk_level,
+                scope_kind,
+                scope_id,
+                session,
+                min_confidence,
+                max_confidence,
+                limit,
+                json,
+            } => {
+                let path = build_console_query_path(
+                    "console/v1/memory/learning/candidates",
+                    vec![
+                        ("candidate_kind", candidate_kind),
+                        ("status", status),
+                        ("risk_level", risk_level),
+                        ("scope_kind", scope_kind),
+                        ("scope_id", scope_id),
+                        ("session_id", session),
+                        ("min_confidence", min_confidence),
+                        ("max_confidence", max_confidence),
+                        ("limit", limit.map(|value| value.to_string())),
+                    ],
+                );
+                let payload = context.client.get_json_value(path.as_str()).await?;
+                emit_admin_payload(
+                    "memory.learning.list",
+                    &payload,
+                    output::preferred_json(json),
+                    &["/candidates"],
+                )
+            }
+            MemoryLearningCommand::History { candidate_id, json } => {
+                let payload = context
+                    .client
+                    .get_json_value(
+                        format!(
+                            "console/v1/memory/learning/candidates/{}/history",
+                            percent_encode_component(candidate_id.as_str())
+                        )
+                        .as_str(),
+                    )
+                    .await?;
+                emit_admin_payload(
+                    "memory.learning.history",
+                    &payload,
+                    output::preferred_json(json),
+                    &["/history"],
+                )
+            }
+            MemoryLearningCommand::Review {
+                candidate_id,
+                status,
+                summary,
+                payload,
+                apply_preference,
+                json,
+            } => {
+                let request = json!({
+                    "status": status,
+                    "action_summary": summary,
+                    "action_payload_json": payload,
+                    "apply_preference": apply_preference,
+                });
+                let payload = context
+                    .client
+                    .post_json_value(
+                        format!(
+                            "console/v1/memory/learning/candidates/{}/review",
+                            percent_encode_component(candidate_id.as_str())
+                        )
+                        .as_str(),
+                        &request,
+                    )
+                    .await?;
+                emit_admin_payload(
+                    "memory.learning.review",
+                    &payload,
+                    output::preferred_json(json),
+                    &["/candidate", "/preference"],
+                )
+            }
+            MemoryLearningCommand::Preferences {
+                status,
+                scope_kind,
+                scope_id,
+                key,
+                limit,
+                json,
+            } => {
+                let path = build_console_query_path(
+                    "console/v1/memory/preferences",
+                    vec![
+                        ("status", status),
+                        ("scope_kind", scope_kind),
+                        ("scope_id", scope_id),
+                        ("key", key),
+                        ("limit", limit.map(|value| value.to_string())),
+                    ],
+                );
+                let payload = context.client.get_json_value(path.as_str()).await?;
+                emit_admin_payload(
+                    "memory.learning.preferences",
+                    &payload,
+                    output::preferred_json(json),
+                    &["/preferences"],
+                )
+            }
+            MemoryLearningCommand::PromoteProcedure {
+                candidate_id,
+                skill_id,
+                version,
+                publisher,
+                name,
+                accept_candidate,
+                json,
+            } => {
+                let request = json!({
+                    "skill_id": skill_id,
+                    "version": version,
+                    "publisher": publisher,
+                    "name": name,
+                    "accept_candidate": accept_candidate,
+                });
+                let payload = context
+                    .client
+                    .post_json_value(
+                        format!(
+                            "console/v1/skills/candidates/{}/promote",
+                            percent_encode_component(candidate_id.as_str())
+                        )
+                        .as_str(),
+                        &request,
+                    )
+                    .await?;
+                emit_admin_payload(
+                    "memory.learning.promote_procedure",
+                    &payload,
+                    output::preferred_json(json),
+                    &["/skill"],
+                )
+            }
+        },
         _ => unreachable!("memory user-scoped commands are handled by run_memory_async"),
     }
 }

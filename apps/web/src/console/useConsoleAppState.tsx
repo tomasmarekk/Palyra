@@ -447,9 +447,21 @@ export function useConsoleAppState() {
   const [memorySearchAllResults, setMemorySearchAllResults] = useState<JsonObject | null>(null);
   const [memoryRecallPreview, setMemoryRecallPreview] = useState<JsonObject | null>(null);
   const [memoryDerivedArtifacts, setMemoryDerivedArtifacts] = useState<JsonObject[]>([]);
+  const [memoryLearningBusy, setMemoryLearningBusy] = useState(false);
+  const [memoryLearningCandidates, setMemoryLearningCandidates] = useState<JsonObject[]>([]);
+  const [memoryLearningHistory, setMemoryLearningHistory] = useState<JsonObject[]>([]);
+  const [memoryLearningPreferences, setMemoryLearningPreferences] = useState<JsonObject[]>([]);
+  const [memoryLearningCandidateId, setMemoryLearningCandidateId] = useState("");
+  const [memoryLearningCandidateKindFilter, setMemoryLearningCandidateKindFilter] = useState("");
+  const [memoryLearningStatusFilter, setMemoryLearningStatusFilter] = useState("");
+  const [memoryLearningRiskFilter, setMemoryLearningRiskFilter] = useState("");
+  const [memoryLearningMinConfidenceFilter, setMemoryLearningMinConfidenceFilter] = useState("");
+  const [memoryLearningMaxConfidenceFilter, setMemoryLearningMaxConfidenceFilter] = useState("");
 
   const [skillsBusy, setSkillsBusy] = useState(false);
   const [skillsEntries, setSkillsEntries] = useState<JsonObject[]>([]);
+  const [skillProcedureCandidates, setSkillProcedureCandidates] = useState<JsonObject[]>([]);
+  const [lastSkillPromotion, setLastSkillPromotion] = useState<JsonObject | null>(null);
   const [skillArtifactPath, setSkillArtifactPath] = useState("");
   const [skillAllowTofu, setSkillAllowTofu] = useState(true);
   const [skillAllowUntrusted, setSkillAllowUntrusted] = useState(false);
@@ -734,6 +746,7 @@ export function useConsoleAppState() {
     if (section === "memory") {
       void refreshMemoryStatus();
       void refreshWorkspaceDocuments();
+      void refreshLearningQueue();
     }
     if (section === "skills") {
       void refreshSkills();
@@ -755,6 +768,9 @@ export function useConsoleAppState() {
       section === "operations"
     ) {
       void refreshDiagnostics();
+    }
+    if (section === "usage" || section === "operations") {
+      void refreshMemoryStatus();
     }
     if (section === "secrets") {
       void refreshSecrets();
@@ -812,9 +828,22 @@ export function useConsoleAppState() {
     setMemorySearchAllQuery("");
     setMemorySearchAllResults(null);
     setMemoryRecallPreview(null);
+    setMemoryDerivedArtifacts([]);
+    setMemoryLearningBusy(false);
+    setMemoryLearningCandidates([]);
+    setMemoryLearningHistory([]);
+    setMemoryLearningPreferences([]);
+    setMemoryLearningCandidateId("");
+    setMemoryLearningCandidateKindFilter("");
+    setMemoryLearningStatusFilter("");
+    setMemoryLearningRiskFilter("");
+    setMemoryLearningMinConfidenceFilter("");
+    setMemoryLearningMaxConfidenceFilter("");
 
     setSkillsBusy(false);
     setSkillsEntries([]);
+    setSkillProcedureCandidates([]);
+    setLastSkillPromotion(null);
     setSkillArtifactPath("");
     setSkillAllowTofu(true);
     setSkillAllowUntrusted(false);
@@ -1056,6 +1085,101 @@ export function useConsoleAppState() {
       setError(toErrorMessage(failure));
     } finally {
       setMemoryStatusBusy(false);
+    }
+  }
+
+  async function refreshLearningQueue(): Promise<void> {
+    setMemoryLearningBusy(true);
+    setError(null);
+    try {
+      const candidateParams = new URLSearchParams({ limit: "64" });
+      if (memoryLearningCandidateKindFilter.trim().length > 0) {
+        candidateParams.set("candidate_kind", memoryLearningCandidateKindFilter.trim());
+      }
+      if (memoryLearningStatusFilter.trim().length > 0) {
+        candidateParams.set("status", memoryLearningStatusFilter.trim());
+      }
+      if (memoryLearningRiskFilter.trim().length > 0) {
+        candidateParams.set("risk_level", memoryLearningRiskFilter.trim());
+      }
+      if (memoryLearningMinConfidenceFilter.trim().length > 0) {
+        candidateParams.set("min_confidence", memoryLearningMinConfidenceFilter.trim());
+      }
+      if (memoryLearningMaxConfidenceFilter.trim().length > 0) {
+        candidateParams.set("max_confidence", memoryLearningMaxConfidenceFilter.trim());
+      }
+      const [candidatesResponse, preferencesResponse] = await Promise.all([
+        api.listLearningCandidates(candidateParams),
+        api.listLearningPreferences(new URLSearchParams({ limit: "64", status: "active" })),
+      ]);
+      const candidates = toJsonObjectArray(candidatesResponse.candidates as unknown as JsonValue[]);
+      setMemoryLearningCandidates(candidates);
+      setMemoryLearningPreferences(
+        toJsonObjectArray(preferencesResponse.preferences as unknown as JsonValue[]),
+      );
+      const nextCandidateId =
+        memoryLearningCandidateId.trim().length > 0
+          ? memoryLearningCandidateId.trim()
+          : readString(candidates[0], "candidate_id") ?? "";
+      setMemoryLearningCandidateId(nextCandidateId);
+      if (nextCandidateId.length > 0) {
+        const historyResponse = await api.getLearningCandidateHistory(nextCandidateId);
+        setMemoryLearningHistory(
+          toJsonObjectArray(historyResponse.history as unknown as JsonValue[]),
+        );
+      } else {
+        setMemoryLearningHistory([]);
+      }
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setMemoryLearningBusy(false);
+    }
+  }
+
+  async function selectLearningCandidate(candidateId: string): Promise<void> {
+    const trimmed = candidateId.trim();
+    setMemoryLearningCandidateId(trimmed);
+    if (trimmed.length === 0) {
+      setMemoryLearningHistory([]);
+      return;
+    }
+    setMemoryLearningBusy(true);
+    setError(null);
+    try {
+      const response = await api.getLearningCandidateHistory(trimmed);
+      setMemoryLearningHistory(toJsonObjectArray(response.history as unknown as JsonValue[]));
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setMemoryLearningBusy(false);
+    }
+  }
+
+  async function reviewLearningCandidate(
+    candidateId: string,
+    status: string,
+    applyPreference = false,
+  ): Promise<void> {
+    const trimmed = candidateId.trim();
+    if (trimmed.length === 0) {
+      setError("Learning candidate ID is missing.");
+      return;
+    }
+    setMemoryLearningBusy(true);
+    setError(null);
+    try {
+      const response = await api.reviewLearningCandidate(trimmed, {
+        status,
+        apply_preference: applyPreference,
+      });
+      setNotice(`Learning candidate ${response.candidate.title} marked as ${response.candidate.status}.`);
+      await refreshLearningQueue();
+      await selectLearningCandidate(trimmed);
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setMemoryLearningBusy(false);
     }
   }
 
@@ -1381,8 +1505,21 @@ export function useConsoleAppState() {
     setSkillsBusy(true);
     setError(null);
     try {
-      const response = await api.listSkills();
+      const [response, candidateResponse] = await Promise.all([
+        api.listSkills(),
+        api.listLearningCandidates(
+          new URLSearchParams([
+            ["candidate_kind", "procedure"],
+            ["limit", "24"],
+          ]),
+        ),
+      ]);
       setSkillsEntries(toJsonObjectArray(response.entries));
+      setSkillProcedureCandidates(
+        toJsonObjectArray(candidateResponse.candidates as unknown as JsonValue[]).filter(
+          (candidate) => readString(candidate, "candidate_kind") === "procedure",
+        ),
+      );
     } catch (failure) {
       setError(toErrorMessage(failure));
     } finally {
@@ -1453,6 +1590,22 @@ export function useConsoleAppState() {
       }
       setNotice(`Skill action '${action}' completed.`);
       await refreshSkills();
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setSkillsBusy(false);
+    }
+  }
+
+  async function promoteProcedureCandidate(candidateId: string): Promise<void> {
+    setSkillsBusy(true);
+    setError(null);
+    try {
+      const response = await api.promoteProcedureCandidate(candidateId);
+      setLastSkillPromotion(response.skill as unknown as JsonObject);
+      setNotice("Procedure candidate promoted into a quarantined skill scaffold.");
+      await refreshSkills();
+      await refreshLearningQueue();
     } catch (failure) {
       setError(toErrorMessage(failure));
     } finally {
@@ -1676,13 +1829,31 @@ export function useConsoleAppState() {
     setMemoryWorkspaceSearchQuery,
     memoryWorkspaceHits,
     memoryDerivedArtifacts,
+    memoryLearningBusy,
+    memoryLearningCandidates,
+    memoryLearningHistory,
+    memoryLearningPreferences,
+    memoryLearningCandidateId,
+    memoryLearningCandidateKindFilter,
+    setMemoryLearningCandidateKindFilter,
+    memoryLearningStatusFilter,
+    setMemoryLearningStatusFilter,
+    memoryLearningRiskFilter,
+    setMemoryLearningRiskFilter,
+    memoryLearningMinConfidenceFilter,
+    setMemoryLearningMinConfidenceFilter,
+    memoryLearningMaxConfidenceFilter,
+    setMemoryLearningMaxConfidenceFilter,
+    setMemoryLearningCandidateId,
     memorySearchAllQuery,
     setMemorySearchAllQuery,
     memorySearchAllResults,
     memoryRecallPreview,
     refreshMemoryStatus,
+    refreshLearningQueue,
     refreshWorkspaceDocuments,
     searchMemory,
+    selectLearningCandidate,
     selectWorkspaceDocument,
     saveWorkspaceDocument,
     bootstrapWorkspace,
@@ -1694,8 +1865,11 @@ export function useConsoleAppState() {
     searchAllMemorySources,
     promoteMemoryHitToWorkspaceDraft,
     purgeMemory,
+    reviewLearningCandidate,
     skillsBusy,
     skillsEntries,
+    skillProcedureCandidates,
+    lastSkillPromotion,
     skillArtifactPath,
     setSkillArtifactPath,
     skillAllowTofu,
@@ -1707,6 +1881,7 @@ export function useConsoleAppState() {
     refreshSkills,
     installSkill,
     executeSkillAction,
+    promoteProcedureCandidate,
     ...browserDomain,
     auditBusy,
     auditFilterContains,

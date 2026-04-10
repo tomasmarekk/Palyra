@@ -75,7 +75,10 @@ pub use devices::DevicesCommand;
 pub use docs::DocsCommand;
 pub use hooks::HooksCommand;
 pub use init::{InitModeArg, InitTlsScaffoldArg};
-pub use memory::{MemoryCommand, MemoryScopeArg, MemorySourceArg, MemoryWorkspaceCommand};
+pub use memory::{
+    MemoryCommand, MemoryLearningCommand, MemoryScopeArg, MemorySourceArg,
+    MemoryWorkspaceCommand,
+};
 pub use message::MessageCommand;
 pub use models::ModelsCommand;
 pub use node::NodeCommand;

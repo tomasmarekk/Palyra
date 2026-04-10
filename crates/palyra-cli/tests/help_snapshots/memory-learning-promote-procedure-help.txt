@@ -1,18 +1,16 @@
-Usage: palyra memory [OPTIONS] <COMMAND>
+Usage: palyra memory learning promote-procedure [OPTIONS] <CANDIDATE_ID>
 
-Commands:
-  status
-  index       [aliases: reindex]
-  search
-  purge
-  ingest
-  workspace
-  recall
-  search-all
-  learning
+Arguments:
+  <CANDIDATE_ID>
 
 Options:
-  -h, --help  Print help
+      --skill-id <SKILL_ID>
+      --version <VERSION>
+      --publisher <PUBLISHER>
+      --name <NAME>
+      --accept-candidate
+      --json
+  -h, --help                   Print help
 
 Global Options:
       --profile <PROFILE>

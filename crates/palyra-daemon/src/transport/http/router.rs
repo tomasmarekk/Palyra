@@ -653,6 +653,22 @@ pub(crate) fn build_router(state: AppState) -> Router {
         )
         .route("/console/v1/memory/index", post(console::memory::console_memory_index_handler))
         .route("/console/v1/memory/search", get(console::memory::console_memory_search_handler))
+        .route(
+            "/console/v1/memory/learning/candidates",
+            get(console::memory::console_learning_candidates_list_handler),
+        )
+        .route(
+            "/console/v1/memory/learning/candidates/{candidate_id}/history",
+            get(console::memory::console_learning_candidate_history_handler),
+        )
+        .route(
+            "/console/v1/memory/learning/candidates/{candidate_id}/review",
+            post(console::memory::console_learning_candidate_review_handler),
+        )
+        .route(
+            "/console/v1/memory/preferences",
+            get(console::memory::console_learning_preferences_list_handler),
+        )
         .route("/console/v1/memory/search-all", get(console::memory::console_search_all_handler))
         .route(
             "/console/v1/memory/recall/preview",
@@ -793,6 +809,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route(
             "/console/v1/skills/{skill_id}/enable",
             post(console::skills::console_skill_enable_handler),
+        )
+        .route(
+            "/console/v1/skills/candidates/{candidate_id}/promote",
+            post(console::skills::console_procedure_skill_promote_handler),
         )
         .route("/console/v1/plugins", get(console::plugins::console_plugins_list_handler))
         .route(

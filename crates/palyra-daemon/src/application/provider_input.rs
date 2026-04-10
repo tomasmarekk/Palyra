@@ -10,6 +10,7 @@ use crate::{
     application::context_references::{
         render_context_reference_prompt, ContextReferencePreviewEnvelope,
     },
+    application::learning::render_preference_prompt_context,
     application::service_authorization::authorize_memory_action,
     application::session_compaction::{
         apply_session_compaction, preview_session_compaction, render_compaction_prompt_block,
@@ -829,6 +830,24 @@ pub(crate) async fn prepare_model_provider_input(
                 provider_input_text_before_memory
             }
         },
+    };
+    let provider_input_text = match render_preference_prompt_context(runtime_state, context).await {
+        Ok(Some(preference_context)) => {
+            format!("{preference_context}\n\n{provider_input_text}")
+        }
+        Ok(None) => provider_input_text,
+        Err(error) => {
+            warn!(
+                run_id,
+                principal = %context.principal,
+                session_id,
+                channel = channel_for_log,
+                status_code = ?error.code(),
+                status_message = %error.message(),
+                "failed to enrich prompt with preference context; continuing without preferences"
+            );
+            provider_input_text
+        }
     };
     Ok(PreparedModelProviderInput {
         provider_input_text,

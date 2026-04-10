@@ -1,18 +1,15 @@
-Usage: palyra memory [OPTIONS] <COMMAND>
+Usage: palyra memory learning review [OPTIONS] <CANDIDATE_ID> <STATUS>
 
-Commands:
-  status
-  index       [aliases: reindex]
-  search
-  purge
-  ingest
-  workspace
-  recall
-  search-all
-  learning
+Arguments:
+  <CANDIDATE_ID>
+  <STATUS>
 
 Options:
-  -h, --help  Print help
+      --summary <SUMMARY>
+      --payload <PAYLOAD>
+      --apply-preference
+      --json
+  -h, --help               Print help
 
 Global Options:
       --profile <PROFILE>

@@ -6,6 +6,9 @@ use crate::agents::{
 };
 use crate::application::auth::map_auth_profile_error;
 use crate::journal::{
+    LearningCandidateCreateRequest, LearningCandidateHistoryRecord, LearningCandidateListFilter,
+    LearningCandidateRecord, LearningCandidateReviewRequest, LearningPreferenceListFilter,
+    LearningPreferenceRecord, LearningPreferenceUpsertRequest,
     MemoryEmbeddingsStatus, MemoryItemRecord, OrchestratorBackgroundTaskCreateRequest,
     OrchestratorBackgroundTaskListFilter, OrchestratorBackgroundTaskRecord,
     OrchestratorBackgroundTaskUpdateRequest, OrchestratorCheckpointCreateRequest,
@@ -79,6 +82,20 @@ pub struct MemoryRuntimeConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LearningRuntimeConfig {
+    pub enabled: bool,
+    pub sampling_percent: u8,
+    pub cooldown_ms: i64,
+    pub budget_tokens: u64,
+    pub max_candidates_per_run: usize,
+    pub durable_fact_review_min_confidence_bps: u16,
+    pub durable_fact_auto_write_threshold_bps: u16,
+    pub preference_review_min_confidence_bps: u16,
+    pub procedure_min_occurrences: usize,
+    pub procedure_review_min_confidence_bps: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HttpFetchRuntimeConfig {
     pub allow_private_targets: bool,
     pub connect_timeout_ms: u64,
@@ -127,6 +144,23 @@ impl Default for MemoryRuntimeConfig {
             retention_max_bytes: None,
             retention_ttl_days: None,
             retention_vacuum_schedule: "0 0 * * 0".to_owned(),
+        }
+    }
+}
+
+impl Default for LearningRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            sampling_percent: 100,
+            cooldown_ms: 5 * 60 * 1_000,
+            budget_tokens: 1_200,
+            max_candidates_per_run: 24,
+            durable_fact_review_min_confidence_bps: 7_500,
+            durable_fact_auto_write_threshold_bps: 9_000,
+            preference_review_min_confidence_bps: 8_000,
+            procedure_min_occurrences: 2,
+            procedure_review_min_confidence_bps: 8_500,
         }
     }
 }
@@ -291,6 +325,7 @@ pub struct GatewayRuntimeState {
     model_provider: Arc<dyn ModelProvider>,
     pub(crate) vault: Arc<Vault>,
     pub(crate) memory_config: RwLock<MemoryRuntimeConfig>,
+    pub(crate) learning_config: RwLock<LearningRuntimeConfig>,
     pub(crate) memory_search_cache: Mutex<HashMap<String, CachedMemorySearchEntry>>,
     pub(crate) http_fetch_cache: Mutex<HashMap<String, CachedHttpFetchEntry>>,
     tool_approval_cache: Mutex<HashMap<String, CachedToolApprovalDecision>>,
@@ -353,6 +388,10 @@ pub(crate) struct RuntimeCounters {
     memory_search_requests: AtomicU64,
     memory_search_cache_hits: AtomicU64,
     memory_auto_inject_events: AtomicU64,
+    learning_reflections_scheduled: AtomicU64,
+    learning_reflections_completed: AtomicU64,
+    learning_candidates_created: AtomicU64,
+    learning_candidates_auto_applied: AtomicU64,
     vault_put_requests: AtomicU64,
     vault_get_requests: AtomicU64,
     vault_delete_requests: AtomicU64,
@@ -489,6 +528,10 @@ pub struct CountersSnapshot {
     pub memory_search_requests: u64,
     pub memory_search_cache_hits: u64,
     pub memory_auto_inject_events: u64,
+    pub learning_reflections_scheduled: u64,
+    pub learning_reflections_completed: u64,
+    pub learning_candidates_created: u64,
+    pub learning_candidates_auto_applied: u64,
     pub vault_put_requests: u64,
     pub vault_get_requests: u64,
     pub vault_delete_requests: u64,
@@ -756,7 +799,7 @@ impl AuthRuntimeState {
 }
 
 impl RuntimeCounters {
-    fn snapshot(&self) -> CountersSnapshot {
+    pub(crate) fn snapshot(&self) -> CountersSnapshot {
         CountersSnapshot {
             run_stream_requests: self.run_stream_requests.load(Ordering::Relaxed),
             append_event_requests: self.append_event_requests.load(Ordering::Relaxed),
@@ -825,6 +868,18 @@ impl RuntimeCounters {
             memory_search_requests: self.memory_search_requests.load(Ordering::Relaxed),
             memory_search_cache_hits: self.memory_search_cache_hits.load(Ordering::Relaxed),
             memory_auto_inject_events: self.memory_auto_inject_events.load(Ordering::Relaxed),
+            learning_reflections_scheduled: self
+                .learning_reflections_scheduled
+                .load(Ordering::Relaxed),
+            learning_reflections_completed: self
+                .learning_reflections_completed
+                .load(Ordering::Relaxed),
+            learning_candidates_created: self
+                .learning_candidates_created
+                .load(Ordering::Relaxed),
+            learning_candidates_auto_applied: self
+                .learning_candidates_auto_applied
+                .load(Ordering::Relaxed),
             vault_put_requests: self.vault_put_requests.load(Ordering::Relaxed),
             vault_get_requests: self.vault_get_requests.load(Ordering::Relaxed),
             vault_delete_requests: self.vault_delete_requests.load(Ordering::Relaxed),
@@ -997,6 +1052,10 @@ impl GatewayRuntimeState {
                 memory_search_requests: AtomicU64::new(0),
                 memory_search_cache_hits: AtomicU64::new(0),
                 memory_auto_inject_events: AtomicU64::new(0),
+                learning_reflections_scheduled: AtomicU64::new(0),
+                learning_reflections_completed: AtomicU64::new(0),
+                learning_candidates_created: AtomicU64::new(0),
+                learning_candidates_auto_applied: AtomicU64::new(0),
                 vault_put_requests: AtomicU64::new(0),
                 vault_get_requests: AtomicU64::new(0),
                 vault_delete_requests: AtomicU64::new(0),
@@ -1032,6 +1091,7 @@ impl GatewayRuntimeState {
             model_provider,
             vault,
             memory_config: RwLock::new(MemoryRuntimeConfig::default()),
+            learning_config: RwLock::new(LearningRuntimeConfig::default()),
             memory_search_cache: Mutex::new(HashMap::new()),
             http_fetch_cache: Mutex::new(HashMap::new()),
             tool_approval_cache: Mutex::new(HashMap::new()),
@@ -1163,6 +1223,30 @@ impl GatewayRuntimeState {
 
     pub(crate) fn record_memory_auto_inject_event(&self) {
         self.counters.memory_auto_inject_events.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_learning_reflection_scheduled(&self) {
+        self.counters
+            .learning_reflections_scheduled
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_learning_reflection_completed(&self) {
+        self.counters
+            .learning_reflections_completed
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_learning_candidate_created(&self) {
+        self.counters
+            .learning_candidates_created
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_learning_candidate_auto_applied(&self) {
+        self.counters
+            .learning_candidates_auto_applied
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_tool_decision(&self, tool_name: &str, decision_allowed: bool) {
@@ -3708,6 +3792,134 @@ impl GatewayRuntimeState {
     }
 
     #[allow(clippy::result_large_err)]
+    fn upsert_learning_candidate_blocking(
+        &self,
+        request: &LearningCandidateCreateRequest,
+    ) -> Result<LearningCandidateRecord, Status> {
+        self.journal_store.upsert_learning_candidate(request).map_err(|error| {
+            map_orchestrator_store_error("upsert learning candidate", error)
+        })
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn upsert_learning_candidate(
+        self: &Arc<Self>,
+        request: LearningCandidateCreateRequest,
+    ) -> Result<LearningCandidateRecord, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.upsert_learning_candidate_blocking(&request))
+            .await
+            .map_err(|_| Status::internal("learning candidate upsert worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn review_learning_candidate_blocking(
+        &self,
+        request: &LearningCandidateReviewRequest,
+    ) -> Result<LearningCandidateRecord, Status> {
+        self.journal_store.review_learning_candidate(request).map_err(|error| {
+            map_orchestrator_store_error("review learning candidate", error)
+        })
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn review_learning_candidate(
+        self: &Arc<Self>,
+        request: LearningCandidateReviewRequest,
+    ) -> Result<LearningCandidateRecord, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.review_learning_candidate_blocking(&request))
+            .await
+            .map_err(|_| Status::internal("learning candidate review worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn list_learning_candidates_blocking(
+        &self,
+        filter: &LearningCandidateListFilter,
+    ) -> Result<Vec<LearningCandidateRecord>, Status> {
+        self.journal_store.list_learning_candidates(filter).map_err(|error| {
+            map_orchestrator_store_error("list learning candidates", error)
+        })
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn list_learning_candidates(
+        self: &Arc<Self>,
+        filter: LearningCandidateListFilter,
+    ) -> Result<Vec<LearningCandidateRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.list_learning_candidates_blocking(&filter))
+            .await
+            .map_err(|_| Status::internal("learning candidate list worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn learning_candidate_history_blocking(
+        &self,
+        candidate_id: &str,
+    ) -> Result<Vec<LearningCandidateHistoryRecord>, Status> {
+        self.journal_store.learning_candidate_history(candidate_id).map_err(|error| {
+            map_orchestrator_store_error("list learning candidate history", error)
+        })
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn learning_candidate_history(
+        self: &Arc<Self>,
+        candidate_id: String,
+    ) -> Result<Vec<LearningCandidateHistoryRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.learning_candidate_history_blocking(candidate_id.as_str())
+        })
+        .await
+        .map_err(|_| Status::internal("learning candidate history worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn upsert_learning_preference_blocking(
+        &self,
+        request: &LearningPreferenceUpsertRequest,
+    ) -> Result<LearningPreferenceRecord, Status> {
+        self.journal_store.upsert_learning_preference(request).map_err(|error| {
+            map_orchestrator_store_error("upsert learning preference", error)
+        })
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn upsert_learning_preference(
+        self: &Arc<Self>,
+        request: LearningPreferenceUpsertRequest,
+    ) -> Result<LearningPreferenceRecord, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.upsert_learning_preference_blocking(&request))
+            .await
+            .map_err(|_| Status::internal("learning preference upsert worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn list_learning_preferences_blocking(
+        &self,
+        filter: &LearningPreferenceListFilter,
+    ) -> Result<Vec<LearningPreferenceRecord>, Status> {
+        self.journal_store.list_learning_preferences(filter).map_err(|error| {
+            map_orchestrator_store_error("list learning preferences", error)
+        })
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn list_learning_preferences(
+        self: &Arc<Self>,
+        filter: LearningPreferenceListFilter,
+    ) -> Result<Vec<LearningPreferenceRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.list_learning_preferences_blocking(&filter))
+            .await
+            .map_err(|_| Status::internal("learning preference list worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
     pub(crate) fn orchestrator_tape_snapshot_blocking(
         &self,
         run_id: &str,
@@ -4357,6 +4569,30 @@ impl GatewayRuntimeState {
             Ok(config) => config.clone(),
             Err(poisoned) => {
                 warn!("memory config lock poisoned while reading runtime config");
+                poisoned.into_inner().clone()
+            }
+        }
+    }
+
+    pub fn configure_learning(&self, config: LearningRuntimeConfig) {
+        match self.learning_config.write() {
+            Ok(mut guard) => {
+                *guard = config;
+            }
+            Err(poisoned) => {
+                warn!("learning config lock poisoned while applying runtime config");
+                let mut guard = poisoned.into_inner();
+                *guard = config;
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn learning_config_snapshot(&self) -> LearningRuntimeConfig {
+        match self.learning_config.read() {
+            Ok(config) => config.clone(),
+            Err(poisoned) => {
+                warn!("learning config lock poisoned while reading runtime config");
                 poisoned.into_inner().clone()
             }
         }

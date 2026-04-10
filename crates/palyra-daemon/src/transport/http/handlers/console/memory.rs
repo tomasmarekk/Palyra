@@ -3,6 +3,7 @@ use crate::gateway::ListOrchestratorSessionsRequest;
 use crate::journal::MemoryRetentionPolicy;
 use crate::*;
 use crate::{
+    application::learning::apply_preference_candidate,
     application::provider_input::render_memory_augmented_prompt,
     domain::workspace::{curated_workspace_roots, curated_workspace_templates},
 };
@@ -17,6 +18,8 @@ pub(crate) async fn console_memory_status_handler(
     let embeddings_status =
         state.runtime.memory_embeddings_status().await.map_err(runtime_status_response)?;
     let memory_config = state.runtime.memory_config_snapshot();
+    let learning_config = state.runtime.learning_config_snapshot();
+    let counters = state.runtime.counters.snapshot();
     let workspace_preview = state
         .runtime
         .list_workspace_documents(journal::WorkspaceDocumentListFilter {
@@ -47,6 +50,37 @@ pub(crate) async fn console_memory_status_handler(
             "last_vacuum_at_unix_ms": maintenance_status.last_vacuum_at_unix_ms,
             "next_vacuum_due_at_unix_ms": maintenance_status.next_vacuum_due_at_unix_ms,
             "next_run_at_unix_ms": maintenance_status.next_maintenance_run_at_unix_ms,
+        },
+        "learning": {
+            "enabled": learning_config.enabled,
+            "sampling_percent": learning_config.sampling_percent,
+            "cooldown_ms": learning_config.cooldown_ms,
+            "budget_tokens": learning_config.budget_tokens,
+            "max_candidates_per_run": learning_config.max_candidates_per_run,
+            "durable_fact_review_min_confidence_bps": learning_config.durable_fact_review_min_confidence_bps,
+            "durable_fact_auto_write_threshold_bps": learning_config.durable_fact_auto_write_threshold_bps,
+            "preference_review_min_confidence_bps": learning_config.preference_review_min_confidence_bps,
+            "procedure_min_occurrences": learning_config.procedure_min_occurrences,
+            "procedure_review_min_confidence_bps": learning_config.procedure_review_min_confidence_bps,
+            "thresholds": {
+                "durable_fact": {
+                    "review_min_confidence_bps": learning_config.durable_fact_review_min_confidence_bps,
+                    "auto_apply_confidence_bps": learning_config.durable_fact_auto_write_threshold_bps,
+                },
+                "preference": {
+                    "review_min_confidence_bps": learning_config.preference_review_min_confidence_bps,
+                },
+                "procedure": {
+                    "review_min_confidence_bps": learning_config.procedure_review_min_confidence_bps,
+                    "min_occurrences": learning_config.procedure_min_occurrences,
+                }
+            },
+            "counters": {
+                "reflections_scheduled": counters.learning_reflections_scheduled,
+                "reflections_completed": counters.learning_reflections_completed,
+                "candidates_created": counters.learning_candidates_created,
+                "candidates_auto_applied": counters.learning_candidates_auto_applied,
+            },
         },
         "workspace": {
             "roots": curated_workspace_roots(),
@@ -257,6 +291,117 @@ pub(crate) async fn console_memory_purge_handler(
         .await
         .map_err(runtime_status_response)?;
     Ok(Json(json!({ "deleted_count": deleted_count })))
+}
+
+pub(crate) async fn console_learning_candidates_list_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ConsoleLearningCandidatesQuery>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, false)?;
+    let candidates = state
+        .runtime
+        .list_learning_candidates(journal::LearningCandidateListFilter {
+            candidate_id: query.candidate_id.and_then(trim_to_option),
+            owner_principal: Some(session.context.principal.clone()),
+            device_id: None,
+            channel: session.context.channel.clone(),
+            session_id: query.session_id.and_then(trim_to_option),
+            scope_kind: query.scope_kind.and_then(trim_to_option),
+            scope_id: query.scope_id.and_then(trim_to_option),
+            candidate_kind: query.candidate_kind.and_then(trim_to_option),
+            status: query.status.and_then(trim_to_option),
+            source_task_id: query.source_task_id.and_then(trim_to_option),
+            min_confidence: query.min_confidence,
+            max_confidence: query.max_confidence,
+            limit: query.limit.unwrap_or(64).clamp(1, 256),
+        })
+        .await
+        .map_err(runtime_status_response)?;
+    Ok(Json(json!({
+        "candidates": candidates,
+        "contract": contract_descriptor(),
+    })))
+}
+
+pub(crate) async fn console_learning_candidate_history_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(candidate_id): Path<String>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, false)?;
+    let candidate = load_console_learning_candidate(&state, &session.context, candidate_id.as_str()).await?;
+    let history = state
+        .runtime
+        .learning_candidate_history(candidate.candidate_id.clone())
+        .await
+        .map_err(runtime_status_response)?;
+    Ok(Json(json!({
+        "candidate": candidate,
+        "history": history,
+        "contract": contract_descriptor(),
+    })))
+}
+
+pub(crate) async fn console_learning_candidate_review_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(candidate_id): Path<String>,
+    Json(payload): Json<ConsoleLearningCandidateReviewRequest>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    let candidate = load_console_learning_candidate(&state, &session.context, candidate_id.as_str()).await?;
+    let reviewed = state
+        .runtime
+        .review_learning_candidate(journal::LearningCandidateReviewRequest {
+            candidate_id: candidate.candidate_id.clone(),
+            status: payload.status.trim().to_owned(),
+            reviewed_by_principal: session.context.principal.clone(),
+            action_summary: payload.action_summary.and_then(trim_to_option),
+            action_payload_json: payload.action_payload_json.and_then(trim_to_option),
+        })
+        .await
+        .map_err(runtime_status_response)?;
+    let applied_preference = if payload.apply_preference.unwrap_or(false)
+        || (reviewed.candidate_kind == "preference" && reviewed.status == "accepted")
+    {
+        apply_preference_candidate(&state.runtime, &reviewed, session.context.principal.as_str())
+            .await
+            .map_err(runtime_status_response)?
+    } else {
+        None
+    };
+    Ok(Json(json!({
+        "candidate": reviewed,
+        "applied_preference": applied_preference,
+        "contract": contract_descriptor(),
+    })))
+}
+
+pub(crate) async fn console_learning_preferences_list_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ConsoleLearningPreferencesQuery>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, false)?;
+    let preferences = state
+        .runtime
+        .list_learning_preferences(journal::LearningPreferenceListFilter {
+            owner_principal: Some(session.context.principal.clone()),
+            device_id: None,
+            channel: session.context.channel.clone(),
+            scope_kind: query.scope_kind.and_then(trim_to_option),
+            scope_id: query.scope_id.and_then(trim_to_option),
+            status: query.status.and_then(trim_to_option),
+            key: query.key.and_then(trim_to_option),
+            limit: query.limit.unwrap_or(64).clamp(1, 256),
+        })
+        .await
+        .map_err(runtime_status_response)?;
+    Ok(Json(json!({
+        "preferences": preferences,
+        "contract": contract_descriptor(),
+    })))
 }
 
 pub(crate) async fn console_workspace_documents_list_handler(
@@ -846,4 +991,36 @@ fn preview_text(raw: &str, max_chars: usize) -> String {
     let mut truncated = trimmed.chars().take(max_chars).collect::<String>();
     truncated.push_str("...");
     truncated
+}
+
+async fn load_console_learning_candidate(
+    state: &AppState,
+    context: &RequestContext,
+    candidate_id: &str,
+) -> Result<journal::LearningCandidateRecord, Response> {
+    let candidate = state
+        .runtime
+        .list_learning_candidates(journal::LearningCandidateListFilter {
+            candidate_id: Some(candidate_id.to_owned()),
+            owner_principal: Some(context.principal.clone()),
+            device_id: None,
+            channel: context.channel.clone(),
+            session_id: None,
+            scope_kind: None,
+            scope_id: None,
+            candidate_kind: None,
+            status: None,
+            source_task_id: None,
+            min_confidence: None,
+            max_confidence: None,
+            limit: 1,
+        })
+        .await
+        .map_err(runtime_status_response)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            runtime_status_response(tonic::Status::not_found("learning candidate not found"))
+        })?;
+    Ok(candidate)
 }

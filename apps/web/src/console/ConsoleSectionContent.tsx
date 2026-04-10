@@ -49,6 +49,7 @@ export function ConsoleSectionContent({ app }: ConsoleSectionContentProps) {
             setError: app.setError,
             setNotice: app.setNotice,
             diagnosticsSnapshot: app.diagnosticsSnapshot,
+            memoryStatus: app.memoryStatus,
           }}
         />
       );

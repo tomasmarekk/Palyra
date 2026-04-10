@@ -139,6 +139,46 @@ path = "memory"
 file = "memory-help.txt"
 
 [[entries]]
+path = "memory learning"
+category = "nested_surface"
+status = "done"
+summary = "Phase 6 learning candidate review and promotion workflows."
+
+[entries.snapshot]
+path = "memory learning"
+file = "memory-learning-help.txt"
+
+[[entries]]
+path = "memory learning list"
+category = "nested_surface"
+status = "done"
+summary = "List learning candidates with risk and confidence filters."
+
+[entries.snapshot]
+path = "memory learning list"
+file = "memory-learning-list-help.txt"
+
+[[entries]]
+path = "memory learning review"
+category = "nested_surface"
+status = "done"
+summary = "Review a learning candidate and optionally apply preferences."
+
+[entries.snapshot]
+path = "memory learning review"
+file = "memory-learning-review-help.txt"
+
+[[entries]]
+path = "memory learning promote-procedure"
+category = "nested_surface"
+status = "done"
+summary = "Promote a procedure candidate into a quarantined skill scaffold."
+
+[entries.snapshot]
+path = "memory learning promote-procedure"
+file = "memory-learning-promote-procedure-help.txt"
+
+[[entries]]
 path = "message"
 category = "top_level"
 status = "done"

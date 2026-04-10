@@ -638,6 +638,63 @@ export interface ChatBackgroundTaskRecord {
   completed_at_unix_ms?: number;
 }
 
+export interface LearningCandidateRecord {
+  candidate_id: string;
+  candidate_kind: string;
+  session_id: string;
+  run_id?: string;
+  owner_principal: string;
+  device_id: string;
+  channel?: string;
+  scope_kind: string;
+  scope_id: string;
+  status: string;
+  auto_applied: boolean;
+  confidence: number;
+  risk_level: string;
+  title: string;
+  summary: string;
+  target_path?: string;
+  dedupe_key: string;
+  content_json: string;
+  provenance_json: string;
+  source_task_id?: string;
+  created_at_unix_ms: number;
+  updated_at_unix_ms: number;
+  reviewed_at_unix_ms?: number;
+  reviewed_by_principal?: string;
+  last_action_summary?: string;
+  last_action_payload_json?: string;
+}
+
+export interface LearningCandidateHistoryRecord {
+  history_id: string;
+  candidate_id: string;
+  status: string;
+  reviewed_by_principal: string;
+  action_summary?: string;
+  action_payload_json?: string;
+  created_at_unix_ms: number;
+}
+
+export interface LearningPreferenceRecord {
+  preference_id: string;
+  owner_principal: string;
+  device_id: string;
+  channel?: string;
+  scope_kind: string;
+  scope_id: string;
+  key: string;
+  value: string;
+  source_kind: string;
+  status: string;
+  confidence: number;
+  candidate_id?: string;
+  provenance_json: string;
+  created_at_unix_ms: number;
+  updated_at_unix_ms: number;
+}
+
 export interface ChatAttachmentRecord {
   artifact_id: string;
   attachment_id: string;
@@ -3739,6 +3796,53 @@ export class ConsoleApiClient {
     return this.request("/console/v1/memory/status");
   }
 
+  async listLearningCandidates(params?: URLSearchParams): Promise<{
+    candidates: LearningCandidateRecord[];
+    contract: ContractDescriptor;
+  }> {
+    return this.request(buildPathWithQuery("/console/v1/memory/learning/candidates", params));
+  }
+
+  async getLearningCandidateHistory(candidateId: string): Promise<{
+    candidate: LearningCandidateRecord;
+    history: LearningCandidateHistoryRecord[];
+    contract: ContractDescriptor;
+  }> {
+    return this.request(
+      `/console/v1/memory/learning/candidates/${encodeURIComponent(candidateId)}/history`,
+    );
+  }
+
+  async reviewLearningCandidate(
+    candidateId: string,
+    payload: {
+      status: string;
+      action_summary?: string;
+      action_payload_json?: string;
+      apply_preference?: boolean;
+    },
+  ): Promise<{
+    candidate: LearningCandidateRecord;
+    applied_preference?: LearningPreferenceRecord;
+    contract: ContractDescriptor;
+  }> {
+    return this.request(
+      `/console/v1/memory/learning/candidates/${encodeURIComponent(candidateId)}/review`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      { csrf: true },
+    );
+  }
+
+  async listLearningPreferences(params?: URLSearchParams): Promise<{
+    preferences: LearningPreferenceRecord[];
+    contract: ContractDescriptor;
+  }> {
+    return this.request(buildPathWithQuery("/console/v1/memory/preferences", params));
+  }
+
   async listWorkspaceDocuments(params?: URLSearchParams): Promise<{
     documents: WorkspaceDocumentRecord[];
     roots: string[];
@@ -4005,6 +4109,26 @@ export class ConsoleApiClient {
           reason: payload.reason,
           override: true,
         }),
+      },
+      { csrf: true },
+    );
+  }
+
+  async promoteProcedureCandidate(
+    candidateId: string,
+    payload: {
+      skill_id?: string;
+      version?: string;
+      publisher?: string;
+      name?: string;
+      accept_candidate?: boolean;
+    } = {},
+  ): Promise<{ candidate: JsonValue; skill: JsonValue }> {
+    return this.request(
+      `/console/v1/skills/candidates/${encodeURIComponent(candidateId)}/promote`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
       },
       { csrf: true },
     );

@@ -21,11 +21,14 @@ import {
 } from "../components/workspace/WorkspacePatterns";
 import { useUsageDomain } from "../hooks/useUsageDomain";
 import { parseRoutingExplanation, readProviderRegistrySummary } from "../providerRegistry";
-import { formatUnixMs } from "../shared";
+import { formatUnixMs, readNumber, readObject } from "../shared";
 import type { ConsoleAppState } from "../useConsoleAppState";
 
 type UsageSectionProps = {
-  app: Pick<ConsoleAppState, "api" | "setError" | "setNotice" | "diagnosticsSnapshot">;
+  app: Pick<
+    ConsoleAppState,
+    "api" | "setError" | "setNotice" | "diagnosticsSnapshot" | "memoryStatus"
+  >;
 };
 
 export function UsageSection({ app }: UsageSectionProps) {
@@ -33,6 +36,8 @@ export function UsageSection({ app }: UsageSectionProps) {
   const usage = useUsageDomain(app);
   const detail = usage.selectedSessionDetail;
   const providerRegistry = readProviderRegistrySummary(app.diagnosticsSnapshot);
+  const learning = readObject(app.memoryStatus ?? {}, "learning");
+  const learningCounters = readObject(learning ?? {}, "counters");
   const timelinePreview = useMemo(
     () => (usage.summary?.timeline ?? []).slice(-8).reverse(),
     [usage.summary?.timeline],
@@ -124,6 +129,12 @@ export function UsageSection({ app }: UsageSectionProps) {
                 ? "enabled"
                 : "disabled"
           }
+        />
+        <WorkspaceMetricCard
+          detail="Reflection workload is tracked separately from foreground runs."
+          label="Learning reflections"
+          tone={(readNumber(learningCounters ?? {}, "reflections_scheduled") ?? 0) > 0 ? "accent" : "default"}
+          value={readNumber(learningCounters ?? {}, "reflections_scheduled") ?? 0}
         />
       </section>
 

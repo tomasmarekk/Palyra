@@ -1,6 +1,7 @@
 pub mod approvals;
 pub mod auth;
 pub mod context_references;
+pub mod learning;
 pub mod memory;
 pub mod provider_events;
 pub mod provider_input;

@@ -14,7 +14,7 @@ import {
   WorkspaceTable,
   workspaceToneForState,
 } from "../components/workspace/WorkspacePatterns";
-import { readString, skillMetadata, toPrettyJson, type JsonObject } from "../shared";
+import { readNumber, readString, skillMetadata, toPrettyJson, type JsonObject } from "../shared";
 import type { ConsoleAppState } from "../useConsoleAppState";
 
 type SkillAction = "verify" | "audit" | "quarantine" | "enable";
@@ -24,6 +24,8 @@ type SkillsSectionProps = {
     ConsoleAppState,
     | "skillsBusy"
     | "skillsEntries"
+    | "skillProcedureCandidates"
+    | "lastSkillPromotion"
     | "skillArtifactPath"
     | "setSkillArtifactPath"
     | "skillAllowTofu"
@@ -35,6 +37,7 @@ type SkillsSectionProps = {
     | "refreshSkills"
     | "installSkill"
     | "executeSkillAction"
+    | "promoteProcedureCandidate"
     | "revealSensitiveValues"
   >;
 };
@@ -47,6 +50,9 @@ export function SkillsSection({ app }: SkillsSectionProps) {
   } | null>(null);
   const quarantinedCount = app.skillsEntries.filter(
     (entry) => readString(entry, "status") === "quarantined",
+  ).length;
+  const promotableProcedureCount = app.skillProcedureCandidates.filter(
+    (candidate) => !["rejected", "suppressed"].includes(readString(candidate, "status") ?? ""),
   ).length;
 
   return (
@@ -62,6 +68,9 @@ export function SkillsSection({ app }: SkillsSectionProps) {
             </WorkspaceStatusChip>
             <WorkspaceStatusChip tone={quarantinedCount > 0 ? "danger" : "default"}>
               {quarantinedCount} quarantined
+            </WorkspaceStatusChip>
+            <WorkspaceStatusChip tone={promotableProcedureCount > 0 ? "accent" : "default"}>
+              {promotableProcedureCount} procedure candidates
             </WorkspaceStatusChip>
           </>
         }
@@ -101,6 +110,12 @@ export function SkillsSection({ app }: SkillsSectionProps) {
           }
           detail="Keep trust exceptions visible instead of burying them in the install form."
           tone={app.skillAllowUntrusted ? "danger" : app.skillAllowTofu ? "warning" : "success"}
+        />
+        <WorkspaceMetricCard
+          label="Procedure queue"
+          value={app.skillProcedureCandidates.length}
+          detail="Only reusable procedure candidates can be promoted into quarantined skill scaffolds."
+          tone={promotableProcedureCount > 0 ? "accent" : "default"}
         />
       </section>
 
@@ -246,6 +261,78 @@ export function SkillsSection({ app }: SkillsSectionProps) {
             ) : (
               <pre className="workspace-code-panel">
                 {toPrettyJson(app.skillsEntries[0], app.revealSensitiveValues)}
+              </pre>
+            )}
+          </WorkspaceSectionCard>
+
+          <WorkspaceSectionCard
+            title="Procedure promotion"
+            description="Phase 6 promotion stays conservative: convert only procedure candidates into quarantined scaffolds, then route them through the normal signing and trust flow."
+          >
+            {app.skillProcedureCandidates.length === 0 ? (
+              <WorkspaceEmptyState
+                compact
+                title="No procedure candidates"
+                description="Reflection has not proposed any reusable procedure candidates for skill promotion yet."
+              />
+            ) : (
+              <WorkspaceTable
+                ariaLabel="Procedure skill candidates"
+                columns={["Candidate", "Confidence", "Status", "Risk", "Actions"]}
+              >
+                {app.skillProcedureCandidates.map((candidate, index) => {
+                  const candidateId =
+                    readString(candidate, "candidate_id") ?? `procedure-${index + 1}`;
+                  const candidateStatus = readString(candidate, "status") ?? "unknown";
+                  return (
+                    <tr key={candidateId}>
+                      <td>
+                        <div className="workspace-table__meta">
+                          <strong>{readString(candidate, "title") ?? candidateId}</strong>
+                          <span className="chat-muted">
+                            {readString(candidate, "summary") ?? "No summary"}
+                          </span>
+                        </div>
+                      </td>
+                      <td>
+                        {typeof readNumber(candidate, "confidence") === "number"
+                          ? readNumber(candidate, "confidence")?.toFixed(2)
+                          : "n/a"}
+                      </td>
+                      <td>{candidateStatus}</td>
+                      <td>{readString(candidate, "risk_level") ?? "unknown"}</td>
+                      <td>
+                        <ActionButton
+                          type="button"
+                          variant="primary"
+                          onPress={() => void app.promoteProcedureCandidate(candidateId)}
+                          isDisabled={
+                            app.skillsBusy || ["rejected", "suppressed"].includes(candidateStatus)
+                          }
+                        >
+                          Promote scaffold
+                        </ActionButton>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </WorkspaceTable>
+            )}
+          </WorkspaceSectionCard>
+
+          <WorkspaceSectionCard
+            title="Last promotion"
+            description="Scaffold output stays explicit so operators can inspect the generated path and quarantine posture before packaging or signing anything."
+          >
+            {app.lastSkillPromotion === null ? (
+              <WorkspaceEmptyState
+                compact
+                title="No promotion result"
+                description="Promote a procedure candidate to inspect the generated scaffold metadata here."
+              />
+            ) : (
+              <pre className="workspace-code-panel">
+                {toPrettyJson(app.lastSkillPromotion, app.revealSensitiveValues)}
               </pre>
             )}
           </WorkspaceSectionCard>
