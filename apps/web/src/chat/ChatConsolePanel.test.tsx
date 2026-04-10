@@ -414,9 +414,7 @@ function baseComposerProps(): ComponentProps<typeof ChatComposer> {
   };
 }
 
-function baseInspectorProps(): ComponentProps<
-  typeof import("./ChatInspectorColumn").ChatInspectorColumn
-> {
+function baseInspectorProps() {
   return {
     pendingApprovalCount: 0,
     a2uiSurfaces: [],
@@ -466,9 +464,7 @@ function baseInspectorProps(): ComponentProps<
   };
 }
 
-function baseSessionsSidebarProps(): ComponentProps<
-  typeof import("./ChatSessionsSidebar").ChatSessionsSidebar
-> {
+function baseSessionsSidebarProps() {
   return {
     sessionsBusy: false,
     newSessionLabel: "",
