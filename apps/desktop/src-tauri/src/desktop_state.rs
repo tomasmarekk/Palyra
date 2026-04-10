@@ -555,7 +555,7 @@ impl std::fmt::Debug for PersistedDesktopStateEnvelope {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PersistedDesktopStateEnvelope")
             .field("schema_version", &self.schema_version)
-            .field("legacy_secrets", &self.legacy_secrets)
+            .field("legacy_secrets", &"<redacted>")
             .field("browser_service_enabled", &self.browser_service_enabled)
             .field("active_profile_name", &self.active_profile_name)
             .field("recent_profile_names", &self.recent_profile_names)
