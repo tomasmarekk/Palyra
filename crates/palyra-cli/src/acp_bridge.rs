@@ -45,10 +45,8 @@ struct BridgeState {
 
 impl BridgeState {
     fn remember_binding(&mut self, acp_session_id: &str, binding: SessionBinding) {
-        self.bindings_by_acp_session_id
-            .insert(acp_session_id.to_owned(), binding.clone());
-        self.bindings_by_session_key
-            .insert(binding.session_key.clone(), binding.clone());
+        self.bindings_by_acp_session_id.insert(acp_session_id.to_owned(), binding.clone());
+        self.bindings_by_session_key.insert(binding.session_key.clone(), binding.clone());
         self.bindings_by_gateway_session_id
             .insert(binding.gateway_session_id_ulid.clone(), binding);
     }
@@ -338,8 +336,7 @@ impl PalyraAcpAgent {
                 overrides.reset_session.unwrap_or(self.session_defaults.reset_session),
             )
             .await?;
-        self.lock_state()?
-            .remember_binding(session_id_value.as_str(), binding.clone());
+        self.lock_state()?.remember_binding(session_id_value.as_str(), binding.clone());
         Ok(binding)
     }
 
@@ -576,8 +573,7 @@ impl acp::Agent for PalyraAcpAgent {
             .await?;
         binding.cwd = arguments.cwd;
 
-        self.lock_state()?
-            .remember_binding(binding.session_key.as_str(), binding.clone());
+        self.lock_state()?.remember_binding(binding.session_key.as_str(), binding.clone());
 
         Ok(acp::NewSessionResponse::new(acp::SessionId::new(binding.session_key)))
     }
@@ -600,8 +596,7 @@ impl acp::Agent for PalyraAcpAgent {
             .await?;
         binding.cwd = arguments.cwd;
 
-        self.lock_state()?
-            .remember_binding(arguments.session_id.0.as_ref(), binding);
+        self.lock_state()?.remember_binding(arguments.session_id.0.as_ref(), binding);
         Ok(acp::LoadSessionResponse::new())
     }
 
@@ -836,13 +831,12 @@ fn map_list_sessions_response(
                 .as_ref()
                 .map(|binding| binding.cwd.clone())
                 .unwrap_or_else(|| default_cwd.to_path_buf());
-            acp::SessionInfo::new(acp::SessionId::new(session_key), cwd)
-                .title(
-                    binding
-                        .as_ref()
-                        .and_then(|binding| binding.session_label.clone())
-                        .or_else(|| non_empty(Some(session.session_label))),
-                )
+            acp::SessionInfo::new(acp::SessionId::new(session_key), cwd).title(
+                binding
+                    .as_ref()
+                    .and_then(|binding| binding.session_label.clone())
+                    .or_else(|| non_empty(Some(session.session_label))),
+            )
         })
         .collect::<Vec<_>>();
     acp::ListSessionsResponse::new(sessions)
@@ -1150,10 +1144,7 @@ mod tests {
         state.remember_binding("acp-session-1", binding.clone());
 
         assert_eq!(
-            state
-                .lookup_binding("acp-session-1")
-                .expect("binding by ACP session id")
-                .cwd,
+            state.lookup_binding("acp-session-1").expect("binding by ACP session id").cwd,
             binding.cwd
         );
         assert_eq!(

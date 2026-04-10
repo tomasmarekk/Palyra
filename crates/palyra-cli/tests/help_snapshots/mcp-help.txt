@@ -1,0 +1,46 @@
+Run the MCP stdio facade
+
+Usage: palyra mcp [OPTIONS] <COMMAND>
+
+Commands:
+  serve  Run the stdio MCP server
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global Options:
+      --profile <PROFILE>
+
+      --expect-profile <EXPECT_PROFILE>
+
+      --config <CONFIG_PATH>
+
+      --state-root <STATE_ROOT>
+
+  -v, --verbose...
+          Increase logging verbosity (-v => debug, -vv => trace)
+
+      --log-level <LOG_LEVEL>
+          [default: info]
+          [possible values: error, warn, info, debug, trace]
+
+      --output-format <OUTPUT_FORMAT>
+          [default: text]
+          [possible values: text, json, ndjson]
+
+      --plain
+
+      --no-color
+
+      --allow-profile-mismatch
+
+      --allow-strict-profile-actions
+
+Examples:
+  palyra mcp serve --read-only
+  palyra mcp serve --session-key ops:triage
+  palyra mcp serve --allow-sensitive-tools
+
+Discoverability:
+  `mcp serve` exposes a stdio MCP facade over the same connection, access control, and approval model used by the rest of the CLI.

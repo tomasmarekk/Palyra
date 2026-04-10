@@ -18,6 +18,7 @@ mod devices;
 mod docs;
 mod hooks;
 mod init;
+mod mcp;
 mod memory;
 mod message;
 mod models;
@@ -77,6 +78,7 @@ pub use devices::DevicesCommand;
 pub use docs::DocsCommand;
 pub use hooks::HooksCommand;
 pub use init::{InitModeArg, InitTlsScaffoldArg};
+pub use mcp::{McpCommand, McpSubcommand};
 pub use memory::{
     MemoryCommand, MemoryLearningCommand, MemoryScopeArg, MemorySourceArg, MemoryWorkspaceCommand,
 };
@@ -282,6 +284,15 @@ Examples:
 Discoverability:
   `acp` is the preferred ACP bridge entry point. `palyra agent acp` and `palyra agent acp-shim` remain compatible.
   CLI defaults for `session_key`, `session_label`, `require_existing`, and `reset_session` seed bridge behavior; `_meta` prompt overrides still win when present.";
+
+const MCP_AFTER_HELP: &str = "\
+Examples:
+  palyra mcp serve --read-only
+  palyra mcp serve --session-key ops:triage
+  palyra mcp serve --allow-sensitive-tools
+
+Discoverability:
+  `mcp serve` exposes a stdio MCP facade over the same connection, access control, and approval model used by the rest of the CLI.";
 
 const DOCS_AFTER_HELP: &str = "\
 Examples:
@@ -497,6 +508,11 @@ pub enum Command {
     Acp {
         #[command(flatten)]
         command: AcpCommand,
+    },
+    #[command(about = "Run the MCP stdio facade", after_long_help = MCP_AFTER_HELP)]
+    Mcp {
+        #[command(flatten)]
+        command: McpCommand,
     },
     Agent {
         #[command(subcommand)]

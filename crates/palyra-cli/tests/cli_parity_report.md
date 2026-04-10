@@ -7,19 +7,19 @@ It distinguishes expected parity posture (`done` / `partial` / `intentional_devi
 
 ## Summary
 
-- Total entries: `107`
-- Verified entries: `107`
+- Total entries: `109`
+- Verified entries: `109`
 - Regression entries: `0`
-- Help snapshot coverage: `107` entries
+- Help snapshot coverage: `109` entries
 
 ### Expected parity status counts
 
-- `done`: `103`
+- `done`: `105`
 - `partial`: `4`
 
 ### Validation status counts
 
-- `verified`: `107`
+- `verified`: `109`
 
 ## Entries
 
@@ -33,6 +33,8 @@ It distinguishes expected parity posture (`done` / `partial` / `intentional_devi
 | `logs` | `top_level` | `done` | `verified` | `logs-help.txt` | - | `--db-path`, `--lines`, `--follow` | - |
 | `status` | `top_level` | `done` | `verified` | `status-help.txt` | - | - | - |
 | `acp` | `canonical_family` | `done` | `verified` | `acp-help.txt` | - | `--session-key`, `--session-label`, `--require-existing`, `--reset-session` | - |
+| `mcp` | `top_level` | `done` | `verified` | `mcp-help.txt` | - | - | - |
+| `mcp serve` | `nested_surface` | `done` | `verified` | `mcp-serve-help.txt` | - | `--read-only`, `--allow-sensitive-tools`, `--session-key`, `--session-label` | - |
 | `agent` | `top_level` | `done` | `verified` | `agent-help.txt` | - | - | - |
 | `agents` | `top_level` | `done` | `verified` | `agents-help.txt` | - | - | - |
 | `cron` | `top_level` | `done` | `verified` | `cron-help.txt` | - | - | - |

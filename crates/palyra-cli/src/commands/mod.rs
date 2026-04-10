@@ -18,6 +18,7 @@ pub mod health;
 pub mod hooks;
 pub mod init;
 pub mod logs;
+pub mod mcp;
 pub mod memory;
 pub mod message;
 pub mod models;

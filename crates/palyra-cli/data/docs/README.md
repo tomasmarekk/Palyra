@@ -7,6 +7,8 @@ source checkout and bundled into portable installs for offline lookup.
 
 - `docs/cli-v1-acp-shim.md`: current CLI and ACP bridge surface, including the preferred command
   families used by release docs and package smoke.
+- `docs/cli-mcp-interop-playbook.md`: MCP facade scope, mutation posture, and safe stdio client
+  rollout guidance.
 - `docs/cli-parity-migration-v1.md`: canonical versus compatibility command names and the migration
   guidance for existing automation.
 - `docs/release-engineering-v1.md`: portable archive contract, provenance sidecars, and release

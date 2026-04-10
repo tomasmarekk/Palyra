@@ -255,6 +255,7 @@ fn run_cli() -> Result<()> {
             commands::status::run_status(url, grpc_url, admin, token, principal, device_id, channel)
         }
         CliCommand::Acp { command } => commands::acp::run_acp(command),
+        CliCommand::Mcp { command } => commands::mcp::run_mcp(command),
         CliCommand::Agent { command } => commands::agent::run_agent(command),
         CliCommand::Agents { command } => commands::agents::run_agents(command),
         CliCommand::Routines { command } => commands::routines::run_routines(command),

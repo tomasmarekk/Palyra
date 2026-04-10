@@ -124,7 +124,9 @@ pub(crate) fn run_daemon(command: DaemonCommand) -> Result<()> {
                         verification_report.gateway_ca_fingerprint_sha256.as_deref().unwrap_or("none")
                     );
                 }
-                if let Some(remote_assist) = build_remote_dashboard_assist_payload(&target, verify_remote) {
+                if let Some(remote_assist) =
+                    build_remote_dashboard_assist_payload(&target, verify_remote)
+                {
                     emit_remote_dashboard_assist_lines("daemon.dashboard_url", &remote_assist);
                 }
                 if open {
@@ -881,10 +883,8 @@ fn build_remote_dashboard_assist_payload(
         return None;
     }
 
-    let verification_mode = target
-        .verification
-        .as_ref()
-        .map(|verification| verification.method.as_str().to_owned());
+    let verification_mode =
+        target.verification.as_ref().map(|verification| verification.method.as_str().to_owned());
     let trust_state = match (target.verification.as_ref(), verify_remote) {
         (Some(_), true) => "verified",
         (Some(_), false) => "verification_configured",

@@ -89,6 +89,27 @@ path = "acp"
 file = "acp-help.txt"
 
 [[entries]]
+path = "mcp"
+category = "top_level"
+status = "done"
+summary = "MCP command family and stdio facade entrypoint."
+
+[entries.snapshot]
+path = "mcp"
+file = "mcp-help.txt"
+
+[[entries]]
+path = "mcp serve"
+category = "nested_surface"
+status = "done"
+summary = "Preferred MCP stdio facade."
+required_flags = ["read-only", "allow-sensitive-tools", "session-key", "session-label"]
+
+[entries.snapshot]
+path = "mcp serve"
+file = "mcp-serve-help.txt"
+
+[[entries]]
 path = "agent"
 category = "top_level"
 status = "done"
