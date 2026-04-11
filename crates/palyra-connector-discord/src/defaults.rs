@@ -36,3 +36,31 @@ pub fn discord_connector_spec(
         enabled,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use palyra_connector_core::ConnectorKind;
+
+    use super::{discord_connector_spec, discord_default_egress_allowlist};
+
+    #[test]
+    fn default_egress_allowlist_keeps_discord_domains_explicit() {
+        let allowlist = discord_default_egress_allowlist();
+        assert_eq!(allowlist.len(), 8, "baseline allowlist should remain stable");
+        assert!(allowlist.iter().any(|entry| entry == "discord.com"));
+        assert!(allowlist.iter().any(|entry| entry == "*.discord.com"));
+        assert!(allowlist.iter().any(|entry| entry == "discordapp.net"));
+    }
+
+    #[test]
+    fn connector_spec_normalizes_account_identity_and_wiring() {
+        let spec = discord_connector_spec(" Ops ", true).expect("spec should build");
+        assert_eq!(spec.connector_id, "discord:ops");
+        assert_eq!(spec.kind, ConnectorKind::Discord);
+        assert_eq!(spec.principal, "channel:discord:ops");
+        assert_eq!(spec.auth_profile_ref.as_deref(), Some("discord.ops"));
+        assert_eq!(spec.token_vault_ref.as_deref(), Some("global/discord_bot_token.ops"));
+        assert!(spec.enabled);
+        assert_eq!(spec.egress_allowlist, discord_default_egress_allowlist());
+    }
+}
