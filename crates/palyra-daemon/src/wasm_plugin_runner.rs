@@ -829,6 +829,7 @@ mod tests {
                     min_palyra_version: "0.1.0".to_owned(),
                 },
                 integrity: SkillIntegrity::default(),
+                builder: None,
             },
             selected_tool: None,
             capability_grants: SkillCapabilityGrantSnapshot {

@@ -87,7 +87,7 @@ pub(crate) async fn console_skill_builder_candidate_create_handler(
                 "dynamic builder only accepts procedure learning candidates or explicit prompts",
             )));
         }
-        BuilderSource::Procedure(candidate)
+        BuilderSource::Procedure(Box::new(candidate))
     } else {
         let prompt = payload.prompt.clone().and_then(trim_to_option).ok_or_else(|| {
             runtime_status_response(tonic::Status::invalid_argument(
@@ -564,7 +564,7 @@ pub(crate) async fn console_procedure_skill_promote_handler(
         .unwrap_or_else(|| candidate.title.clone());
 
     let scaffold = write_skill_builder_scaffold(
-        &BuilderSource::Procedure(candidate.clone()),
+        &BuilderSource::Procedure(Box::new(candidate.clone())),
         SkillBuilderScaffoldRequest {
             skill_id: skill_id.clone(),
             version: version.clone(),
@@ -665,7 +665,7 @@ pub(crate) async fn console_procedure_skill_promote_handler(
 
 #[derive(Debug, Clone)]
 enum BuilderSource {
-    Procedure(LearningCandidateRecord),
+    Procedure(Box<LearningCandidateRecord>),
     Prompt { prompt: String, source_ref: String },
 }
 

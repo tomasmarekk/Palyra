@@ -110,7 +110,6 @@ pub(crate) struct ExecutionBackendResolution {
     pub(crate) reason: String,
 }
 
-#[must_use]
 pub(crate) fn parse_execution_backend_preference(
     raw: &str,
     field_name: &str,

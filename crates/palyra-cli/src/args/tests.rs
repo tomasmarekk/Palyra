@@ -911,6 +911,7 @@ fn parse_agents_create_with_workspace_roots() {
                 agent_dir: None,
                 workspace_root: vec!["workspace".to_owned(), "scratch".to_owned()],
                 model_profile: Some("gpt-4o-mini".to_owned()),
+                execution_backend: None,
                 tool_allow: vec!["palyra.echo".to_owned()],
                 skill_allow: vec!["acme.review".to_owned()],
                 set_default: true,
