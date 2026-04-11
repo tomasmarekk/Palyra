@@ -11,6 +11,9 @@ use serde::Serialize;
 use super::desktop_state::{
     DesktopDiscordOnboardingState, DesktopOnboardingEvent, DesktopOnboardingFailureState,
 };
+use super::features::onboarding::connectors::discord::{
+    derive_discord_onboarding_summary, discord_connect_detail, DesktopDiscordOnboardingSummary,
+};
 use super::openai_auth::{
     load_openai_auth_status, OpenAiAuthStatusSnapshot, OpenAiControlPlaneInputs,
 };
@@ -212,15 +215,8 @@ pub(crate) async fn build_desktop_refresh_payload(
     let operator_auth =
         probe_operator_auth(&http_client, &runtime, admin_token.as_str(), &snapshot).await;
     let openai_ready = is_openai_ready(&openai_status);
-    let discord_ready = is_discord_ready(&snapshot);
     let onboarding = persisted.active_onboarding().clone();
-    let discord_verified = discord_ready
-        && onboarding.discord.last_verified_at_unix_ms.is_some()
-        && onboarding
-            .discord
-            .last_connector_id
-            .as_deref()
-            .is_some_and(|value| value == snapshot.quick_facts.discord.connector_id);
+    let discord_summary = derive_discord_onboarding_summary(&snapshot, &onboarding.discord);
 
     let current_step = derive_current_step(
         &persisted,
@@ -228,7 +224,7 @@ pub(crate) async fn build_desktop_refresh_payload(
         &preflight,
         &operator_auth,
         openai_ready,
-        discord_verified,
+        discord_summary.verified,
     );
     let recovery = derive_recovery(
         onboarding.last_failure.as_ref(),
@@ -243,8 +239,7 @@ pub(crate) async fn build_desktop_refresh_payload(
         &operator_auth,
         &openai_status,
         openai_ready,
-        discord_ready,
-        discord_verified,
+        &discord_summary,
         dashboard_reachable,
         runtime_root.to_string_lossy().as_ref(),
         current_step,
@@ -312,11 +307,11 @@ pub(crate) async fn build_desktop_refresh_payload(
         openai_ready,
         openai_default_profile_id: openai_status.default_profile_id.clone(),
         openai_note: openai_status.note.clone(),
-        discord_ready,
-        discord_verified,
-        discord_last_verified_target: onboarding.discord.last_verified_target.clone(),
-        discord_last_verified_at_unix_ms: onboarding.discord.last_verified_at_unix_ms,
-        discord_defaults: onboarding.discord.clone(),
+        discord_ready: discord_summary.ready,
+        discord_verified: discord_summary.verified,
+        discord_last_verified_target: discord_summary.last_verified_target.clone(),
+        discord_last_verified_at_unix_ms: discord_summary.last_verified_at_unix_ms,
+        discord_defaults: discord_summary.defaults.clone(),
         recovery,
         failure_step_counts,
         support_bundle_exports,
@@ -704,14 +699,6 @@ fn is_openai_ready(status: &OpenAiAuthStatusSnapshot) -> bool {
         && status.profiles.iter().any(|profile| profile.is_default)
 }
 
-fn is_discord_ready(snapshot: &ControlCenterSnapshot) -> bool {
-    let discord = &snapshot.quick_facts.discord;
-    discord.enabled
-        && discord.authenticated
-        && discord.readiness.eq_ignore_ascii_case("ready")
-        && discord.liveness.eq_ignore_ascii_case("running")
-}
-
 fn derive_current_step(
     persisted: &super::DesktopStateFile,
     snapshot: &ControlCenterSnapshot,
@@ -847,8 +834,7 @@ fn build_step_snapshots(
     operator_auth: &OnboardingOperatorAuthSnapshot,
     openai_status: &OpenAiAuthStatusSnapshot,
     openai_ready: bool,
-    discord_ready: bool,
-    discord_verified: bool,
+    discord_summary: &DesktopDiscordOnboardingSummary,
     dashboard_reachable: bool,
     runtime_root_path: &str,
     current_step: DesktopOnboardingStep,
@@ -937,22 +923,9 @@ fn build_step_snapshots(
                     },
                 ),
                 DesktopOnboardingStep::DiscordConnect => (
-                    discord_verified,
+                    discord_summary.verified,
                     false,
-                    if discord_verified {
-                        format!(
-                            "Discord verification last succeeded for {}.",
-                            onboarding
-                                .discord
-                                .last_verified_target
-                                .as_deref()
-                                .unwrap_or("the configured target")
-                        )
-                    } else if discord_ready {
-                        "Discord connector is ready. Send the verification test to finish onboarding.".to_owned()
-                    } else {
-                        "Run Discord preflight, apply the connector config, and verify a test send.".to_owned()
-                    },
+                    discord_connect_detail(discord_summary),
                 ),
                 DesktopOnboardingStep::DashboardHandoff => (
                     onboarding.dashboard_handoff_at_unix_ms.is_some(),

@@ -1,3 +1,33 @@
+import {
+  addChannelMessageReaction as addChannelMessageReactionRequest,
+  deleteChannelMessage as deleteChannelMessageRequest,
+  discardChannelDeadLetter as discardChannelDeadLetterRequest,
+  drainChannelQueue as drainChannelQueueRequest,
+  editChannelMessage as editChannelMessageRequest,
+  getChannelRouterRules as getChannelRouterRulesRequest,
+  getChannelRouterWarnings as getChannelRouterWarningsRequest,
+  getChannelStatus as getChannelStatusRequest,
+  listChannelLogs as listChannelLogsRequest,
+  listChannelRouterPairings as listChannelRouterPairingsRequest,
+  listChannels as listChannelsRequest,
+  mintChannelRouterPairingCode as mintChannelRouterPairingCodeRequest,
+  pauseChannelQueue as pauseChannelQueueRequest,
+  previewChannelRoute as previewChannelRouteRequest,
+  readChannelMessages as readChannelMessagesRequest,
+  removeChannelMessageReaction as removeChannelMessageReactionRequest,
+  replayChannelDeadLetter as replayChannelDeadLetterRequest,
+  resumeChannelQueue as resumeChannelQueueRequest,
+  searchChannelMessages as searchChannelMessagesRequest,
+  sendChannelTestMessage as sendChannelTestMessageRequest,
+  setChannelEnabled as setChannelEnabledRequest,
+} from "./consoleApi/channels/core";
+import {
+  applyDiscordOnboarding as applyDiscordOnboardingRequest,
+  probeDiscordOnboarding as probeDiscordOnboardingRequest,
+  refreshChannelHealth as refreshChannelHealthRequest,
+  sendChannelDiscordTestSend as sendChannelDiscordTestSendRequest,
+} from "./consoleApi/channels/discord";
+
 export type JsonValue =
   | string
   | number
@@ -6,7 +36,7 @@ export type JsonValue =
   | { [key: string]: JsonValue }
   | JsonValue[];
 
-type ChannelStatusEnvelope = {
+export type ChannelStatusEnvelope = {
   connector: JsonValue;
   runtime?: JsonValue;
   operations?: JsonValue;
@@ -3721,33 +3751,29 @@ export class ConsoleApiClient {
   }
 
   async listChannels(): Promise<{ connectors: JsonValue[] }> {
-    return this.request("/console/v1/channels");
+    return listChannelsRequest(this.request.bind(this));
   }
 
   async getChannelStatus(connectorId: string): Promise<ChannelStatusEnvelope> {
-    return this.request(`/console/v1/channels/${encodeURIComponent(connectorId)}`);
+    return getChannelStatusRequest(this.request.bind(this), connectorId);
   }
 
   async setChannelEnabled(
     connectorId: string,
     enabled: boolean,
   ): Promise<{ connector: JsonValue }> {
-    return this.request(
-      `/console/v1/channels/${encodeURIComponent(connectorId)}/enabled`,
-      {
-        method: "POST",
-        body: JSON.stringify({ enabled }),
-      },
-      { csrf: true },
-    );
+    return setChannelEnabledRequest(this.request.bind(this), connectorId, enabled);
   }
 
   async listChannelLogs(
     connectorId: string,
     params?: URLSearchParams,
   ): Promise<{ events: JsonValue[]; dead_letters: JsonValue[] }> {
-    return this.request(
-      buildPathWithQuery(`/console/v1/channels/${encodeURIComponent(connectorId)}/logs`, params),
+    return listChannelLogsRequest(
+      this.request.bind(this),
+      buildPathWithQuery,
+      connectorId,
+      params,
     );
   }
 
@@ -3763,14 +3789,7 @@ export class ConsoleApiClient {
       requested_broadcast?: boolean;
     },
   ): Promise<{ ingest: JsonValue; status: JsonValue }> {
-    return this.request(
-      `/console/v1/channels/${encodeURIComponent(connectorId)}/test`,
-      {
-        method: "POST",
-        body: JSON.stringify(payload),
-      },
-      { csrf: true },
-    );
+    return sendChannelTestMessageRequest(this.request.bind(this), connectorId, payload);
   }
 
   async readChannelMessages(
@@ -3787,14 +3806,7 @@ export class ConsoleApiClient {
       };
     },
   ): Promise<{ result: JsonValue }> {
-    return this.request(
-      `/console/v1/channels/${encodeURIComponent(connectorId)}/messages/read`,
-      {
-        method: "POST",
-        body: JSON.stringify(payload),
-      },
-      { csrf: true },
-    );
+    return readChannelMessagesRequest(this.request.bind(this), connectorId, payload);
   }
 
   async searchChannelMessages(
@@ -3811,14 +3823,7 @@ export class ConsoleApiClient {
       };
     },
   ): Promise<{ result: JsonValue }> {
-    return this.request(
-      `/console/v1/channels/${encodeURIComponent(connectorId)}/messages/search`,
-      {
-        method: "POST",
-        body: JSON.stringify(payload),
-      },
-      { csrf: true },
-    );
+    return searchChannelMessagesRequest(this.request.bind(this), connectorId, payload);
   }
 
   async editChannelMessage(
@@ -3835,14 +3840,7 @@ export class ConsoleApiClient {
       approval_id?: string;
     },
   ): Promise<{ result?: JsonValue; approval_required?: boolean; approval?: JsonValue }> {
-    return this.request(
-      `/console/v1/channels/${encodeURIComponent(connectorId)}/messages/edit`,
-      {
-        method: "POST",
-        body: JSON.stringify(payload),
-      },
-      { csrf: true },
-    );
+    return editChannelMessageRequest(this.request.bind(this), connectorId, payload);
   }
 
   async deleteChannelMessage(
@@ -3859,14 +3857,7 @@ export class ConsoleApiClient {
       approval_id?: string;
     },
   ): Promise<{ result?: JsonValue; approval_required?: boolean; approval?: JsonValue }> {
-    return this.request(
-      `/console/v1/channels/${encodeURIComponent(connectorId)}/messages/delete`,
-      {
-        method: "POST",
-        body: JSON.stringify(payload),
-      },
-      { csrf: true },
-    );
+    return deleteChannelMessageRequest(this.request.bind(this), connectorId, payload);
   }
 
   async addChannelMessageReaction(
@@ -3883,14 +3874,7 @@ export class ConsoleApiClient {
       approval_id?: string;
     },
   ): Promise<{ result?: JsonValue; approval_required?: boolean; approval?: JsonValue }> {
-    return this.request(
-      `/console/v1/channels/${encodeURIComponent(connectorId)}/messages/react-add`,
-      {
-        method: "POST",
-        body: JSON.stringify(payload),
-      },
-      { csrf: true },
-    );
+    return addChannelMessageReactionRequest(this.request.bind(this), connectorId, payload);
   }
 
   async removeChannelMessageReaction(
@@ -3907,14 +3891,7 @@ export class ConsoleApiClient {
       approval_id?: string;
     },
   ): Promise<{ result?: JsonValue; approval_required?: boolean; approval?: JsonValue }> {
-    return this.request(
-      `/console/v1/channels/${encodeURIComponent(connectorId)}/messages/react-remove`,
-      {
-        method: "POST",
-        body: JSON.stringify(payload),
-      },
-      { csrf: true },
-    );
+    return removeChannelMessageReactionRequest(this.request.bind(this), connectorId, payload);
   }
 
   async sendChannelDiscordTestSend(
@@ -3927,82 +3904,48 @@ export class ConsoleApiClient {
       thread_id?: string;
     },
   ): Promise<{ dispatch: JsonValue; status: JsonValue; runtime?: JsonValue }> {
-    return this.request(
-      `/console/v1/channels/${encodeURIComponent(connectorId)}/test-send`,
-      {
-        method: "POST",
-        body: JSON.stringify(payload),
-      },
-      { csrf: true },
-    );
+    return sendChannelDiscordTestSendRequest(this.request.bind(this), connectorId, payload);
   }
 
   async refreshChannelHealth(
     connectorId: string,
     payload: { verify_channel_id?: string },
   ): Promise<ChannelStatusEnvelope> {
-    return this.request(
-      `/console/v1/channels/${encodeURIComponent(connectorId)}/operations/health-refresh`,
-      {
-        method: "POST",
-        body: JSON.stringify(payload),
-      },
-      { csrf: true },
-    );
+    return refreshChannelHealthRequest(this.request.bind(this), connectorId, payload);
   }
 
   async pauseChannelQueue(connectorId: string): Promise<ChannelStatusEnvelope> {
-    return this.request(
-      `/console/v1/channels/${encodeURIComponent(connectorId)}/operations/queue/pause`,
-      { method: "POST" },
-      { csrf: true },
-    );
+    return pauseChannelQueueRequest(this.request.bind(this), connectorId);
   }
 
   async resumeChannelQueue(connectorId: string): Promise<ChannelStatusEnvelope> {
-    return this.request(
-      `/console/v1/channels/${encodeURIComponent(connectorId)}/operations/queue/resume`,
-      { method: "POST" },
-      { csrf: true },
-    );
+    return resumeChannelQueueRequest(this.request.bind(this), connectorId);
   }
 
   async drainChannelQueue(connectorId: string): Promise<ChannelStatusEnvelope> {
-    return this.request(
-      `/console/v1/channels/${encodeURIComponent(connectorId)}/operations/queue/drain`,
-      { method: "POST" },
-      { csrf: true },
-    );
+    return drainChannelQueueRequest(this.request.bind(this), connectorId);
   }
 
   async replayChannelDeadLetter(
     connectorId: string,
     deadLetterId: number,
   ): Promise<ChannelStatusEnvelope> {
-    return this.request(
-      `/console/v1/channels/${encodeURIComponent(connectorId)}/operations/dead-letters/${deadLetterId}/replay`,
-      { method: "POST" },
-      { csrf: true },
-    );
+    return replayChannelDeadLetterRequest(this.request.bind(this), connectorId, deadLetterId);
   }
 
   async discardChannelDeadLetter(
     connectorId: string,
     deadLetterId: number,
   ): Promise<ChannelStatusEnvelope> {
-    return this.request(
-      `/console/v1/channels/${encodeURIComponent(connectorId)}/operations/dead-letters/${deadLetterId}/discard`,
-      { method: "POST" },
-      { csrf: true },
-    );
+    return discardChannelDeadLetterRequest(this.request.bind(this), connectorId, deadLetterId);
   }
 
   async getChannelRouterRules(): Promise<{ config: JsonValue; config_hash: string }> {
-    return this.request("/console/v1/channels/router/rules");
+    return getChannelRouterRulesRequest(this.request.bind(this));
   }
 
   async getChannelRouterWarnings(): Promise<{ warnings: JsonValue[]; config_hash: string }> {
-    return this.request("/console/v1/channels/router/warnings");
+    return getChannelRouterWarningsRequest(this.request.bind(this));
   }
 
   async previewChannelRoute(payload: {
@@ -4018,20 +3961,13 @@ export class ConsoleApiClient {
     adapter_thread_id?: string;
     max_payload_bytes?: number;
   }): Promise<{ preview: JsonValue }> {
-    return this.request(
-      "/console/v1/channels/router/preview",
-      {
-        method: "POST",
-        body: JSON.stringify(payload),
-      },
-      { csrf: true },
-    );
+    return previewChannelRouteRequest(this.request.bind(this), payload);
   }
 
   async listChannelRouterPairings(
     params?: URLSearchParams,
   ): Promise<{ pairings: JsonValue[]; config_hash: string }> {
-    return this.request(buildPathWithQuery("/console/v1/channels/router/pairings", params));
+    return listChannelRouterPairingsRequest(this.request.bind(this), buildPathWithQuery, params);
   }
 
   async mintChannelRouterPairingCode(payload: {
@@ -4039,14 +3975,7 @@ export class ConsoleApiClient {
     issued_by?: string;
     ttl_ms?: number;
   }): Promise<{ code: JsonValue; config_hash: string }> {
-    return this.request(
-      "/console/v1/channels/router/pairing-codes",
-      {
-        method: "POST",
-        body: JSON.stringify(payload),
-      },
-      { csrf: true },
-    );
+    return mintChannelRouterPairingCodeRequest(this.request.bind(this), payload);
   }
 
   async probeDiscordOnboarding(payload: {
@@ -4063,14 +3992,7 @@ export class ConsoleApiClient {
     confirm_open_guild_channels?: boolean;
     verify_channel_id?: string;
   }): Promise<{ [key: string]: JsonValue }> {
-    return this.request(
-      "/console/v1/channels/discord/onboarding/probe",
-      {
-        method: "POST",
-        body: JSON.stringify(payload),
-      },
-      { csrf: true },
-    );
+    return probeDiscordOnboardingRequest(this.request.bind(this), payload);
   }
 
   async applyDiscordOnboarding(payload: {
@@ -4087,14 +4009,7 @@ export class ConsoleApiClient {
     confirm_open_guild_channels?: boolean;
     verify_channel_id?: string;
   }): Promise<{ [key: string]: JsonValue }> {
-    return this.request(
-      "/console/v1/channels/discord/onboarding/apply",
-      {
-        method: "POST",
-        body: JSON.stringify(payload),
-      },
-      { csrf: true },
-    );
+    return applyDiscordOnboardingRequest(this.request.bind(this), payload);
   }
 
   async searchMemory(params?: URLSearchParams): Promise<{ hits: JsonValue[] }> {

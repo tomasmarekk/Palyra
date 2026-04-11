@@ -1,6 +1,7 @@
 import type { Dispatch, FormEvent, SetStateAction } from "react";
 
 import { type ConsoleApiClient, type JsonValue } from "../../../../consoleApi";
+import type { DiscordChannelState } from "./controller";
 import {
   applyDiscordOnboarding as applyDiscordOnboardingRequest,
   probeDiscordOnboarding,
@@ -21,34 +22,10 @@ type Setter<T> = Dispatch<SetStateAction<T>>;
 export type DiscordChannelDomainDeps = {
   api: ConsoleApiClient;
   channelsSelectedConnectorId: string;
-  channelsDiscordTarget: string;
-  channelsDiscordText: string;
-  channelsDiscordAutoReaction: string;
-  channelsDiscordThreadId: string;
-  channelsDiscordConfirm: boolean;
-  discordWizardAccountId: string;
-  discordWizardMode: "local" | "remote_vps";
-  discordWizardToken: string;
-  discordWizardScope: "dm_only" | "allowlisted_guild_channels" | "open_guild_channels";
-  discordWizardAllowFrom: string;
-  discordWizardDenyFrom: string;
-  discordWizardRequireMention: boolean;
-  discordWizardBroadcast: "deny" | "mention_only" | "allow";
-  discordWizardConcurrency: string;
-  discordWizardConfirmOpen: boolean;
-  discordWizardVerifyChannelId: string;
-  discordWizardVerifyTarget: string;
-  discordWizardVerifyText: string;
-  discordWizardVerifyConfirm: boolean;
+  discordChannelState: DiscordChannelState;
   setChannelsBusy: Setter<boolean>;
   setError: Setter<string | null>;
   setNotice: Setter<string | null>;
-  setChannelsDiscordConfirm: Setter<boolean>;
-  setDiscordWizardBusy: Setter<boolean>;
-  setDiscordWizardToken: Setter<string>;
-  setDiscordWizardPreflight: Setter<JsonObject | null>;
-  setDiscordWizardApply: Setter<JsonObject | null>;
-  setDiscordWizardVerifyConfirm: Setter<boolean>;
   setSelectedChannelStatusPayload: (payload: JsonValue) => void;
   refreshChannels: (preferredConnectorId?: string) => Promise<void>;
   loadChannel: (connectorId: string) => Promise<void>;
@@ -84,14 +61,27 @@ export function createDiscordChannelDomain(deps: DiscordChannelDomainDeps) {
   const {
     api,
     channelsSelectedConnectorId,
+    discordChannelState,
+    setChannelsBusy,
+    setError,
+    setNotice,
+    setSelectedChannelStatusPayload,
+    refreshChannels,
+    loadChannel,
+    refreshChannelLogs,
+  } = deps;
+  const {
     channelsDiscordTarget,
     channelsDiscordText,
     channelsDiscordAutoReaction,
     channelsDiscordThreadId,
     channelsDiscordConfirm,
+    setChannelsDiscordConfirm,
+    setDiscordWizardBusy,
     discordWizardAccountId,
     discordWizardMode,
     discordWizardToken,
+    setDiscordWizardToken,
     discordWizardScope,
     discordWizardAllowFrom,
     discordWizardDenyFrom,
@@ -100,23 +90,13 @@ export function createDiscordChannelDomain(deps: DiscordChannelDomainDeps) {
     discordWizardConcurrency,
     discordWizardConfirmOpen,
     discordWizardVerifyChannelId,
+    setDiscordWizardPreflight,
+    setDiscordWizardApply,
     discordWizardVerifyTarget,
     discordWizardVerifyText,
     discordWizardVerifyConfirm,
-    setChannelsBusy,
-    setError,
-    setNotice,
-    setChannelsDiscordConfirm,
-    setDiscordWizardBusy,
-    setDiscordWizardToken,
-    setDiscordWizardPreflight,
-    setDiscordWizardApply,
     setDiscordWizardVerifyConfirm,
-    setSelectedChannelStatusPayload,
-    refreshChannels,
-    loadChannel,
-    refreshChannelLogs,
-  } = deps;
+  } = discordChannelState;
 
   function parsedDiscordWizardConcurrency(): number {
     const parsed = parseInteger(discordWizardConcurrency);

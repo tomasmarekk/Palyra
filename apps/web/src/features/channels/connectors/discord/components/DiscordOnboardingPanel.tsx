@@ -6,13 +6,17 @@ import {
   TextInputField,
 } from "../../../../../console/components/ui";
 import { DiscordOnboardingHighlights, toPrettyJson } from "../../../../../console/shared";
-import type { ConsoleAppState } from "../../../../../console/useConsoleAppState";
+import type { DiscordChannelController } from "../controller";
 
 type DiscordOnboardingPanelProps = {
-  app: ConsoleAppState;
+  discord: DiscordChannelController;
+  revealSensitiveValues: boolean;
 };
 
-export function DiscordOnboardingPanel({ app }: DiscordOnboardingPanelProps) {
+export function DiscordOnboardingPanel({
+  discord,
+  revealSensitiveValues,
+}: DiscordOnboardingPanelProps) {
   const modeOptions = [
     { key: "local", label: "local" },
     { key: "remote_vps", label: "remote_vps" },
@@ -44,35 +48,35 @@ export function DiscordOnboardingPanel({ app }: DiscordOnboardingPanelProps) {
       <div className="console-grid-4">
         <TextInputField
           label="Account ID"
-          value={app.discordWizardAccountId}
-          onChange={app.setDiscordWizardAccountId}
+          value={discord.discordWizardAccountId}
+          onChange={discord.setDiscordWizardAccountId}
         />
         <SelectField
           label="Mode"
-          value={app.discordWizardMode}
+          value={discord.discordWizardMode}
           onChange={(value) =>
-            app.setDiscordWizardMode(value === "remote_vps" ? "remote_vps" : "local")
+            discord.setDiscordWizardMode(value === "remote_vps" ? "remote_vps" : "local")
           }
           options={modeOptions}
         />
         <TextInputField
           label="Bot token"
-          value={app.discordWizardToken}
-          onChange={app.setDiscordWizardToken}
+          value={discord.discordWizardToken}
+          onChange={discord.setDiscordWizardToken}
           placeholder="Never persisted in config plaintext"
         />
         <TextInputField
           label="Verify channel ID"
-          value={app.discordWizardVerifyChannelId}
-          onChange={app.setDiscordWizardVerifyChannelId}
+          value={discord.discordWizardVerifyChannelId}
+          onChange={discord.setDiscordWizardVerifyChannelId}
         />
       </div>
       <div className="console-grid-4">
         <SelectField
           label="Inbound scope"
-          value={app.discordWizardScope}
+          value={discord.discordWizardScope}
           onChange={(value) =>
-            app.setDiscordWizardScope(
+            discord.setDiscordWizardScope(
               value as "dm_only" | "allowlisted_guild_channels" | "open_guild_channels",
             )
           }
@@ -80,67 +84,67 @@ export function DiscordOnboardingPanel({ app }: DiscordOnboardingPanelProps) {
         />
         <TextInputField
           label="Allow from"
-          value={app.discordWizardAllowFrom}
-          onChange={app.setDiscordWizardAllowFrom}
+          value={discord.discordWizardAllowFrom}
+          onChange={discord.setDiscordWizardAllowFrom}
         />
         <TextInputField
           label="Deny from"
-          value={app.discordWizardDenyFrom}
-          onChange={app.setDiscordWizardDenyFrom}
+          value={discord.discordWizardDenyFrom}
+          onChange={discord.setDiscordWizardDenyFrom}
         />
         <TextInputField
           label="Concurrency"
-          value={app.discordWizardConcurrency}
-          onChange={app.setDiscordWizardConcurrency}
+          value={discord.discordWizardConcurrency}
+          onChange={discord.setDiscordWizardConcurrency}
         />
       </div>
       <div className="workspace-stack">
         <div className="console-grid-4">
           <CheckboxField
             label="Require mention"
-            checked={app.discordWizardRequireMention}
-            onChange={app.setDiscordWizardRequireMention}
-            disabled={app.discordWizardBusy}
+            checked={discord.discordWizardRequireMention}
+            onChange={discord.setDiscordWizardRequireMention}
+            disabled={discord.discordWizardBusy}
           />
           <SelectField
             label="Broadcast strategy"
-            value={app.discordWizardBroadcast}
+            value={discord.discordWizardBroadcast}
             onChange={(value) =>
-              app.setDiscordWizardBroadcast(value as "deny" | "mention_only" | "allow")
+              discord.setDiscordWizardBroadcast(value as "deny" | "mention_only" | "allow")
             }
             options={broadcastOptions}
-            disabled={app.discordWizardBusy}
+            disabled={discord.discordWizardBusy}
           />
         </div>
         <ActionCluster>
           <ActionButton
             type="button"
             variant="secondary"
-            onPress={() => void app.runDiscordPreflight()}
-            isDisabled={app.discordWizardBusy}
+            onPress={() => void discord.runPreflight()}
+            isDisabled={discord.discordWizardBusy}
           >
-            {app.discordWizardBusy ? "Running..." : "Run preflight"}
+            {discord.discordWizardBusy ? "Running..." : "Run preflight"}
           </ActionButton>
           <ActionButton
             type="button"
-            onPress={() => void app.applyDiscordOnboarding()}
-            isDisabled={app.discordWizardBusy}
+            onPress={() => void discord.applyOnboarding()}
+            isDisabled={discord.discordWizardBusy}
           >
-            {app.discordWizardBusy ? "Applying..." : "Apply onboarding"}
+            {discord.discordWizardBusy ? "Applying..." : "Apply onboarding"}
           </ActionButton>
         </ActionCluster>
       </div>
-      {app.discordWizardPreflight !== null && (
+      {discord.discordWizardPreflight !== null && (
         <DiscordOnboardingHighlights
           title="Preflight highlights"
-          payload={app.discordWizardPreflight}
+          payload={discord.discordWizardPreflight}
         />
       )}
-      {app.discordWizardPreflight !== null && (
-        <pre>{toPrettyJson(app.discordWizardPreflight, app.revealSensitiveValues)}</pre>
+      {discord.discordWizardPreflight !== null && (
+        <pre>{toPrettyJson(discord.discordWizardPreflight, revealSensitiveValues)}</pre>
       )}
-      {app.discordWizardApply !== null && (
-        <pre>{toPrettyJson(app.discordWizardApply, app.revealSensitiveValues)}</pre>
+      {discord.discordWizardApply !== null && (
+        <pre>{toPrettyJson(discord.discordWizardApply, revealSensitiveValues)}</pre>
       )}
     </section>
   );

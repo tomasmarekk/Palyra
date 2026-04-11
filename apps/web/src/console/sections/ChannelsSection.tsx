@@ -71,6 +71,7 @@ type MessageRow = {
 
 export function ChannelsSection({ app }: { app: ConsoleAppState }) {
   const [activeTab, setActiveTab] = useState<ChannelsTab>("connectors");
+  const discord = app.discordChannel;
   const selectedStatusPayload: JsonObject = app.channelsSelectedStatus ?? {};
   const selectedConnector = readObject(selectedStatusPayload, "connector") ?? selectedStatusPayload;
   const selectedOperations = readObject(selectedStatusPayload, "operations");
@@ -184,8 +185,8 @@ export function ChannelsSection({ app }: { app: ConsoleAppState }) {
             >
               {app.channelRouterWarnings.length} router warnings
             </WorkspaceStatusChip>
-            <WorkspaceStatusChip tone={app.discordWizardBusy ? "warning" : "default"}>
-              {app.discordWizardBusy ? "Discord setup busy" : "Discord setup ready"}
+            <WorkspaceStatusChip tone={discord.discordWizardBusy ? "warning" : "default"}>
+              {discord.discordWizardBusy ? "Discord setup busy" : "Discord setup ready"}
             </WorkspaceStatusChip>
           </>
         }
@@ -229,16 +230,16 @@ export function ChannelsSection({ app }: { app: ConsoleAppState }) {
         <WorkspaceMetricCard
           label="Discord onboarding"
           value={
-            app.discordWizardApply === null
+            discord.discordWizardApply === null
               ? "Awaiting action"
-              : (readString(app.discordWizardApply, "result") ?? "Result ready")
+              : (readString(discord.discordWizardApply, "result") ?? "Result ready")
           }
           detail={
-            app.discordWizardPreflight === null
+            discord.discordWizardPreflight === null
               ? "Run preflight to inspect requirements."
               : "Preflight results are available."
           }
-          tone={app.discordWizardApply === null ? "default" : "success"}
+          tone={discord.discordWizardApply === null ? "default" : "success"}
         />
       </section>
 
@@ -395,7 +396,7 @@ export function ChannelsSection({ app }: { app: ConsoleAppState }) {
                   </ActionButton>
                   <ActionButton
                     variant="secondary"
-                    onPress={() => void app.refreshChannelHealth()}
+                    onPress={() => void discord.refreshHealth()}
                     isDisabled={app.channelsBusy}
                   >
                     Refresh health
@@ -1125,7 +1126,10 @@ export function ChannelsSection({ app }: { app: ConsoleAppState }) {
               title="Discord onboarding"
               description="Probe, apply, and verify onboarding from the dashboard instead of the old desktop flow."
             >
-              <DiscordOnboardingPanel app={app} />
+              <DiscordOnboardingPanel
+                discord={discord}
+                revealSensitiveValues={app.revealSensitiveValues}
+              />
             </WorkspaceSectionCard>
 
             <WorkspaceSectionCard
@@ -1135,13 +1139,13 @@ export function ChannelsSection({ app }: { app: ConsoleAppState }) {
               <div className="workspace-stack">
                 <TextInputField
                   label="Verify channel"
-                  value={app.discordWizardVerifyChannelId}
-                  onChange={app.setDiscordWizardVerifyChannelId}
+                  value={discord.discordWizardVerifyChannelId}
+                  onChange={discord.setDiscordWizardVerifyChannelId}
                 />
                 <ActionCluster>
                   <ActionButton
                     variant="secondary"
-                    onPress={() => void app.refreshChannelHealth()}
+                    onPress={() => void discord.refreshHealth()}
                     isDisabled={app.channelsBusy}
                   >
                     Refresh health
@@ -1155,7 +1159,7 @@ export function ChannelsSection({ app }: { app: ConsoleAppState }) {
                   </ActionButton>
                 </ActionCluster>
                 <DiscordConnectorActionsPanel
-                  app={app}
+                  discord={discord}
                   selectedConnectorKind={selectedConnectorKind}
                 />
               </div>
