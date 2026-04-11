@@ -4,6 +4,11 @@ set -euo pipefail
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 cd "${repo_root}"
 
+strict_mode=false
+if [[ "${1-}" == "--strict" ]]; then
+  strict_mode=true
+fi
+
 include_regex='\.(rs|toml|ts|tsx|js|mjs|sh|ps1|md|yml|yaml)$'
 exclude_regex='^(schemas/generated/|apps/desktop/src-tauri/third_party/|apps/web/dist/|apps/web/.vite/|apps/desktop/ui/dist/|apps/desktop/ui/.vite/|target/|fuzz/target/|node_modules/|security-artifacts/)'
 
@@ -20,8 +25,9 @@ tracked_source_files() {
 is_provider_allowlisted() {
   local path="$1"
   [[ "${path}" == crates/palyra-connector-discord/* ]] && return 0
-  [[ "${path}" == crates/palyra-connectors/src/connectors/* ]] && return 0
   [[ "${path}" == crates/palyra-connectors/src/lib.rs ]] && return 0
+  [[ "${path}" == crates/palyra-connectors/src/connectors/* ]] && return 0
+  [[ "${path}" == crates/palyra-connectors/src/providers/* ]] && return 0
   [[ "${path}" == crates/palyra-daemon/src/channels/discord.rs ]] && return 0
   [[ "${path}" == crates/palyra-daemon/src/transport/http/handlers/admin/channels/connectors/discord.rs ]] && return 0
   [[ "${path}" == crates/palyra-daemon/src/transport/http/handlers/console/channels/connectors/discord.rs ]] && return 0
@@ -74,6 +80,8 @@ done < <(tracked_source_files)
 core_import_violations="$(
   rg -n 'palyra_connector_core' crates apps fuzz \
     --glob '!crates/palyra-connectors/**' \
+    --glob '!crates/palyra-connector-core/**' \
+    --glob '!crates/palyra-connector-discord/**' \
     --glob '!schemas/generated/**' \
     --glob '!apps/desktop/src-tauri/third_party/**' || true
 )"
@@ -81,14 +89,22 @@ core_import_violations="$(
 discord_import_violations="$(
   rg -n 'palyra_connector_discord' crates apps fuzz \
     --glob '!crates/palyra-connectors/**' \
+    --glob '!crates/palyra-connector-core/**' \
+    --glob '!crates/palyra-connector-discord/**' \
     --glob '!schemas/generated/**' \
     --glob '!apps/desktop/src-tauri/third_party/**' || true
+)"
+
+cargo_manifest_violations="$(
+  rg -n 'palyra-connector-(core|discord)' crates/*/Cargo.toml apps/desktop/src-tauri/Cargo.toml |
+    rg -v '^(crates/palyra-connectors|crates/palyra-connector-core|crates/palyra-connector-discord)/Cargo.toml:' || true
 )"
 
 connector_kind_violations="$(
   rg -n 'ConnectorKind::Discord' crates apps fuzz \
     --glob '!crates/palyra-connector-discord/**' \
     --glob '!crates/palyra-connectors/src/connectors/**' \
+    --glob '!crates/palyra-connectors/src/providers/**' \
     --glob '!crates/palyra-daemon/src/channels/discord.rs' \
     --glob '!crates/palyra-daemon/src/transport/http/handlers/admin/channels/connectors/discord.rs' \
     --glob '!crates/palyra-daemon/src/transport/http/handlers/console/channels/connectors/discord.rs' \
@@ -133,12 +149,25 @@ print_matches_or_none \
   bash -lc "printf '%s' \"\$0\"" "${discord_import_violations}"
 
 print_matches_or_none \
+  "Direct Cargo manifest references to legacy connector crates (outside crates/palyra-connectors)" \
+  bash -lc "printf '%s' \"\$0\"" "${cargo_manifest_violations}"
+
+print_matches_or_none \
   "ConnectorKind::Discord scatter outside provider/dispatch allowlist" \
   bash -lc "printf '%s' \"\$0\"" "${connector_kind_violations}"
 
 cat <<'EOF'
 Milestone acceptance grep commands:
-  rg -n 'palyra_connector_core|palyra_connector_discord' crates apps fuzz docs docs-codebase AGENTS.md Cargo.toml
+  rg -n 'palyra_connector_core|palyra_connector_discord' crates apps fuzz
+  rg -n 'palyra-connector-core|palyra-connector-discord' crates/*/Cargo.toml apps/desktop/src-tauri/Cargo.toml
   rg -n 'ConnectorKind::Discord' crates/palyra-daemon crates/palyra-cli crates/palyra-connectors
-  rg -n -i 'discord' crates apps docs
+  bash scripts/dev/report-connector-leakage.sh --strict
 EOF
+
+if ${strict_mode}; then
+  if [[ -n "${core_import_violations}" || -n "${discord_import_violations}" || -n "${cargo_manifest_violations}" ]]; then
+    echo
+    echo "strict mode: legacy connector imports or manifest references are still present" >&2
+    exit 1
+  fi
+fi

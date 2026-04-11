@@ -1,18 +1,26 @@
 pub mod connectors;
-pub use palyra_connector_core::{
-    net, protocol, storage, supervisor, AttachmentKind, AttachmentRef, ConnectorAdapter,
-    ConnectorAdapterError, ConnectorApprovalMode, ConnectorAvailability,
-    ConnectorConversationTarget, ConnectorEventRecord, ConnectorInstanceRecord,
-    ConnectorInstanceSpec, ConnectorKind, ConnectorLiveness, ConnectorMessageDeleteRequest,
-    ConnectorMessageEditRequest, ConnectorMessageLocator, ConnectorMessageMutationDiff,
-    ConnectorMessageMutationResult, ConnectorMessageMutationStatus, ConnectorMessageReactionRecord,
-    ConnectorMessageReactionRequest, ConnectorMessageReadRequest, ConnectorMessageReadResult,
-    ConnectorMessageRecord, ConnectorMessageSearchRequest, ConnectorMessageSearchResult,
-    ConnectorOperationPreflight, ConnectorQueueDepth, ConnectorQueueSnapshot, ConnectorReadiness,
-    ConnectorRiskLevel, ConnectorRouter, ConnectorRouterError, ConnectorStatusSnapshot,
-    ConnectorStore, ConnectorStoreError, ConnectorSupervisor, ConnectorSupervisorConfig,
-    ConnectorSupervisorError, DeadLetterRecord, DeliveryOutcome, DrainOutcome,
-    InboundIngestOutcome, InboundMessageEvent, OutboundA2uiUpdate, OutboundAttachment,
-    OutboundMessageRequest, OutboxEnqueueOutcome, OutboxEntryRecord, RetryClass,
-    RouteInboundResult, RoutedOutboundMessage,
-};
+pub mod core;
+pub mod providers;
+
+pub use crate::core::*;
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        core::ConnectorKind,
+        providers::discord::{
+            discord_connector_spec, discord_policy_action_for_operation, DiscordMessageOperation,
+        },
+    };
+
+    #[test]
+    fn curated_surface_exposes_core_and_discord_provider_modules() {
+        let spec = discord_connector_spec("ops", true).expect("spec should build");
+
+        assert_eq!(spec.kind, ConnectorKind::Discord);
+        assert_eq!(
+            discord_policy_action_for_operation(DiscordMessageOperation::Delete),
+            "channel.message.delete"
+        );
+    }
+}

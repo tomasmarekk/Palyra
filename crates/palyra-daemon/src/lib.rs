@@ -127,7 +127,7 @@ use palyra_common::{
     validate_canonical_id,
 };
 use palyra_common::{default_identity_store_root, default_state_root};
-use palyra_connector_discord::{
+use palyra_connectors::providers::discord::{
     discord_min_invite_permissions, discord_required_permission_labels,
     resolve_discord_intents_from_flags, DiscordPrivilegedIntentStatus,
     DiscordPrivilegedIntentsSummary, DISCORD_PERMISSION_ATTACH_FILES,
@@ -136,7 +136,7 @@ use palyra_connector_discord::{
     DISCORD_PERMISSION_VIEW_CHANNEL,
 };
 #[cfg(test)]
-use palyra_connector_discord::{
+use palyra_connectors::providers::discord::{
     discord_required_permissions, DISCORD_APP_FLAG_GATEWAY_GUILD_MEMBERS,
     DISCORD_APP_FLAG_GATEWAY_MESSAGE_CONTENT, DISCORD_APP_FLAG_GATEWAY_PRESENCE,
 };

@@ -11,7 +11,7 @@ use crate::transport::http::handlers::console::channels::connectors::discord::{
     normalize_optional_discord_channel_id, probe_discord_bot_identity,
 };
 use crate::*;
-use palyra_connector_discord::{
+use palyra_connectors::providers::discord::{
     discord_permission_labels_for_operation, discord_policy_action_for_operation,
     DiscordMessageOperation,
 };

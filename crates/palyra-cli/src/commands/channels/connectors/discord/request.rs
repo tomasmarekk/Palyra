@@ -1,9 +1,10 @@
 use crate::*;
+use palyra_connectors::providers::discord::{discord_connector_id, normalize_discord_account_id};
 
 pub(crate) fn connector_id(account_id: &str) -> Result<String> {
-    let normalized = palyra_connector_discord::normalize_discord_account_id(account_id)
+    let normalized = normalize_discord_account_id(account_id)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    Ok(palyra_connector_discord::discord_connector_id(normalized.as_str()))
+    Ok(discord_connector_id(normalized.as_str()))
 }
 
 pub(crate) fn probe_payload(

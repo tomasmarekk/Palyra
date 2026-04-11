@@ -1,5 +1,7 @@
-use palyra_connector_discord as shared;
-use palyra_connectors::{ConnectorInstanceRecord, ConnectorInstanceSpec, ConnectorMessageRecord};
+use palyra_connectors::{
+    providers::discord as shared, ConnectorInstanceRecord, ConnectorInstanceSpec,
+    ConnectorMessageRecord,
+};
 
 use crate::journal::ApprovalRiskLevel;
 

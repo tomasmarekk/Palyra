@@ -22,7 +22,7 @@ futures.workspace = true
 palyra-auth = { version = "0.1.0", path = "../palyra-auth" }
 palyra-common = { version = "0.1.0", path = "../palyra-common" }
 palyra-control-plane = { version = "0.1.0", path = "../palyra-control-plane" }
-palyra-connector-discord = { version = "0.1.0", path = "../palyra-connector-discord" }
+palyra-connectors = { version = "0.1.0", path = "../palyra-connectors" }
 palyra-identity = { version = "0.1.0", path = "../palyra-identity" }
 palyra-policy = { version = "0.1.0", path = "../palyra-policy" }
 palyra-skills = { version = "0.1.0", path = "../palyra-skills" }

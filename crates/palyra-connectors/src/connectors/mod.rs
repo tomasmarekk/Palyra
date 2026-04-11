@@ -4,9 +4,7 @@ mod telegram;
 
 use std::sync::Arc;
 
-use palyra_connector_discord::DiscordConnectorAdapter;
-
-use crate::supervisor::ConnectorAdapter;
+use crate::{core::ConnectorAdapter, providers::discord::DiscordConnectorAdapter};
 
 pub use echo::EchoConnectorAdapter;
 pub use slack::SlackConnectorAdapter;

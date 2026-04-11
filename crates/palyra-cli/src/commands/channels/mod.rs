@@ -5,7 +5,7 @@ pub(crate) mod connectors {
 }
 
 use anyhow::{bail, Context, Result};
-use palyra_connector_discord::{
+use palyra_connectors::providers::discord::{
     canonical_discord_channel_identity, canonical_discord_sender_identity,
     normalize_discord_account_id, normalize_discord_target,
 };
