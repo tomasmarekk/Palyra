@@ -20,10 +20,7 @@ export function DiscordConnectorActionsPanel({
       {selectedConnectorKind === "discord" && (
         <>
           <h4>Discord direct verification</h4>
-          <AppForm
-            className="console-form"
-            onSubmit={(event) => void discord.sendTest(event)}
-          >
+          <AppForm className="console-form" onSubmit={(event) => void discord.sendTest(event)}>
             <div className="console-grid-4">
               <TextInputField
                 label="Target"

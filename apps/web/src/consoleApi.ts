@@ -3769,12 +3769,7 @@ export class ConsoleApiClient {
     connectorId: string,
     params?: URLSearchParams,
   ): Promise<{ events: JsonValue[]; dead_letters: JsonValue[] }> {
-    return listChannelLogsRequest(
-      this.request.bind(this),
-      buildPathWithQuery,
-      connectorId,
-      params,
-    );
+    return listChannelLogsRequest(this.request.bind(this), buildPathWithQuery, connectorId, params);
   }
 
   async sendChannelTestMessage(

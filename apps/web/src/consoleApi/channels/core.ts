@@ -5,11 +5,7 @@ type RequestOptions = {
   timeoutMs?: number;
 };
 
-type RequestFn = <T>(
-  path: string,
-  init?: RequestInit,
-  options?: RequestOptions,
-) => Promise<T>;
+type RequestFn = <T>(path: string, init?: RequestInit, options?: RequestOptions) => Promise<T>;
 
 type BuildPathWithQueryFn = (path: string, params?: URLSearchParams) => string;
 
