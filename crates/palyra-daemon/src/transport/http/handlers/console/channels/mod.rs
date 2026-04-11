@@ -1,7 +1,10 @@
 pub(crate) mod connectors;
 
+use crate::application::channels::{
+    build_channel_health_refresh_payload, build_channel_status_payload, build_channel_test_payload,
+    build_channel_test_send_payload,
+};
 use crate::transport::http::handlers::admin::channels::{
-    build_channel_health_refresh_payload, build_channel_status_payload,
     channel_message_delete_response, channel_message_edit_response,
     channel_message_reaction_response, channel_message_read_response,
     channel_message_search_response,
@@ -299,35 +302,8 @@ pub(crate) async fn console_channel_test_handler(
 ) -> Result<Json<Value>, Response> {
     let _session = authorize_console_session(&state, &headers, true)?;
     let connector_id = normalize_non_empty_field(connector_id, "connector_id")?;
-    let ingest = state
-        .channels
-        .submit_test_message(
-            connector_id.as_str(),
-            channels::ChannelTestMessageRequest {
-                text: payload.text,
-                conversation_id: payload
-                    .conversation_id
-                    .unwrap_or_else(|| "test:conversation".to_owned()),
-                sender_id: payload.sender_id.unwrap_or_else(|| "test-user".to_owned()),
-                sender_display: payload.sender_display,
-                simulate_crash_once: payload.simulate_crash_once.unwrap_or(false),
-                is_direct_message: payload.is_direct_message.unwrap_or(true),
-                requested_broadcast: payload.requested_broadcast.unwrap_or(false),
-            },
-        )
-        .await
-        .map_err(channel_platform_error_response)?;
-    let status =
-        state.channels.status(connector_id.as_str()).map_err(channel_platform_error_response)?;
-    let runtime = state
-        .channels
-        .runtime_snapshot(connector_id.as_str())
-        .map_err(channel_platform_error_response)?;
-    Ok(Json(json!({
-        "ingest": ingest,
-        "status": status,
-        "runtime": runtime,
-    })))
+    let response = build_channel_test_payload(&state, connector_id.as_str(), payload).await?;
+    Ok(Json(response))
 }
 
 pub(crate) async fn console_channel_test_send_handler(
@@ -338,32 +314,8 @@ pub(crate) async fn console_channel_test_send_handler(
 ) -> Result<Json<Value>, Response> {
     let _session = authorize_console_session(&state, &headers, true)?;
     let connector_id = normalize_non_empty_field(connector_id, "connector_id")?;
-    let dispatch = state
-        .channels
-        .submit_discord_test_send(
-            connector_id.as_str(),
-            channels::ChannelDiscordTestSendRequest {
-                target: payload.target,
-                text: payload.text.unwrap_or_else(|| "palyra discord test message".to_owned()),
-                confirm: payload.confirm.unwrap_or(false),
-                auto_reaction: payload.auto_reaction,
-                thread_id: payload.thread_id,
-                reply_to_message_id: payload.reply_to_message_id,
-            },
-        )
-        .await
-        .map_err(channel_platform_error_response)?;
-    let status =
-        state.channels.status(connector_id.as_str()).map_err(channel_platform_error_response)?;
-    let runtime = state
-        .channels
-        .runtime_snapshot(connector_id.as_str())
-        .map_err(channel_platform_error_response)?;
-    Ok(Json(json!({
-        "dispatch": dispatch,
-        "status": status,
-        "runtime": runtime,
-    })))
+    let response = build_channel_test_send_payload(&state, connector_id.as_str(), payload).await?;
+    Ok(Json(response))
 }
 
 pub(crate) async fn console_channel_router_rules_handler(

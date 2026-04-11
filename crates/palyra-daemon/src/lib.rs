@@ -130,10 +130,9 @@ use palyra_common::{default_identity_store_root, default_state_root};
 use palyra_connectors::providers::discord::{
     discord_min_invite_permissions, discord_required_permission_labels,
     resolve_discord_intents_from_flags, DiscordPrivilegedIntentStatus,
-    DiscordPrivilegedIntentsSummary, DISCORD_PERMISSION_ATTACH_FILES,
-    DISCORD_PERMISSION_EMBED_LINKS, DISCORD_PERMISSION_READ_MESSAGE_HISTORY,
-    DISCORD_PERMISSION_SEND_MESSAGES, DISCORD_PERMISSION_SEND_MESSAGES_IN_THREADS,
-    DISCORD_PERMISSION_VIEW_CHANNEL,
+    DISCORD_PERMISSION_ATTACH_FILES, DISCORD_PERMISSION_EMBED_LINKS,
+    DISCORD_PERMISSION_READ_MESSAGE_HISTORY, DISCORD_PERMISSION_SEND_MESSAGES,
+    DISCORD_PERMISSION_SEND_MESSAGES_IN_THREADS, DISCORD_PERMISSION_VIEW_CHANNEL,
 };
 #[cfg(test)]
 use palyra_connectors::providers::discord::{
@@ -175,9 +174,25 @@ use transport::grpc::auth::{
 };
 use ulid::Ulid;
 
+#[cfg(test)]
+pub(crate) use crate::application::channels::providers::discord::{
+    build_discord_channel_permission_warnings, build_discord_inbound_monitor_warnings,
+    build_discord_onboarding_plan, build_discord_onboarding_security_defaults,
+    discord_inbound_monitor_is_alive, finalize_discord_onboarding_plan, normalize_discord_token,
+    normalize_optional_discord_channel_id, summarize_discord_inbound_monitor,
+};
 use crate::gateway::proto::palyra::{
     browser::v1 as browser_v1, common::v1 as common_v1, cron::v1 as cron_v1,
     gateway::v1 as gateway_v1,
+};
+pub(crate) use crate::transport::http::contracts::channels::discord::{
+    DiscordAccountLifecycleActionRequest, DiscordAccountLifecycleRequest,
+    DiscordOnboardingPreflightResponse, DiscordOnboardingRequest,
+};
+#[cfg(test)]
+pub(crate) use crate::transport::http::contracts::channels::discord::{
+    DiscordBotIdentitySummary, DiscordChannelPermissionCheck, DiscordChannelPermissionCheckStatus,
+    DiscordOnboardingScope,
 };
 pub(crate) use crate::transport::http::handlers::admin::skills::skill_status_response;
 #[cfg(test)]
@@ -191,13 +206,6 @@ pub(crate) use crate::transport::http::handlers::console::browser::{
 #[cfg(test)]
 pub(crate) use crate::transport::http::handlers::console::browser::{
     clamp_console_relay_token_ttl_ms, mint_console_relay_token, prune_console_relay_tokens,
-};
-#[cfg(test)]
-pub(crate) use crate::transport::http::handlers::console::channels::connectors::discord::{
-    build_discord_channel_permission_warnings, build_discord_inbound_monitor_warnings,
-    build_discord_onboarding_plan, build_discord_onboarding_security_defaults,
-    discord_inbound_monitor_is_alive, finalize_discord_onboarding_plan, normalize_discord_token,
-    normalize_optional_discord_channel_id, summarize_discord_inbound_monitor,
 };
 pub(crate) use crate::transport::http::handlers::console::chat::{
     lock_console_chat_streams, sync_console_chat_approval_to_stream,
@@ -756,19 +764,6 @@ struct ChannelEnabledRequest {
     enabled: bool,
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct DiscordAccountLifecycleRequest {
-    #[serde(default)]
-    keep_credential: Option<bool>,
-}
-
-#[derive(Debug, Deserialize)]
-struct DiscordAccountLifecycleActionRequest {
-    account_id: String,
-    #[serde(default)]
-    keep_credential: Option<bool>,
-}
-
 #[derive(Debug, Deserialize)]
 struct ChannelTestRequest {
     text: String,
@@ -886,182 +881,6 @@ struct ChannelRouterPairingCodeMintRequest {
 struct ChannelRouterPairingsQuery {
     #[serde(default)]
     channel: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct DiscordOnboardingRequest {
-    #[serde(default)]
-    account_id: Option<String>,
-    token: String,
-    #[serde(default)]
-    mode: Option<String>,
-    #[serde(default)]
-    inbound_scope: Option<String>,
-    #[serde(default)]
-    allow_from: Option<Vec<String>>,
-    #[serde(default)]
-    deny_from: Option<Vec<String>>,
-    #[serde(default)]
-    require_mention: Option<bool>,
-    #[serde(default)]
-    mention_patterns: Option<Vec<String>>,
-    #[serde(default)]
-    concurrency_limit: Option<u64>,
-    #[serde(default)]
-    direct_message_policy: Option<String>,
-    #[serde(default)]
-    broadcast_strategy: Option<String>,
-    #[serde(default)]
-    confirm_open_guild_channels: Option<bool>,
-    #[serde(default)]
-    verify_channel_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum DiscordOnboardingMode {
-    Local,
-    RemoteVps,
-}
-
-impl DiscordOnboardingMode {
-    fn parse(raw: Option<&str>) -> Option<Self> {
-        let normalized = raw?.trim().to_ascii_lowercase();
-        match normalized.as_str() {
-            "local" => Some(Self::Local),
-            "remote_vps" | "remote-vps" | "remote" | "vps" => Some(Self::RemoteVps),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum DiscordOnboardingScope {
-    DmOnly,
-    AllowlistedGuildChannels,
-    OpenGuildChannels,
-}
-
-impl DiscordOnboardingScope {
-    fn parse(raw: Option<&str>) -> Option<Self> {
-        let normalized = raw?.trim().to_ascii_lowercase();
-        match normalized.as_str() {
-            "dm_only" | "dm-only" | "dm" => Some(Self::DmOnly),
-            "allowlisted_guild_channels" | "allowlisted-guild-channels" | "allowlisted" => {
-                Some(Self::AllowlistedGuildChannels)
-            }
-            "open_guild_channels" | "open-guild-channels" | "open" => Some(Self::OpenGuildChannels),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct DiscordApplicationSummary {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    flags: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    intents: Option<DiscordPrivilegedIntentsSummary>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct DiscordBotIdentitySummary {
-    id: String,
-    username: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct DiscordRoutingPreview {
-    connector_id: String,
-    mode: DiscordOnboardingMode,
-    inbound_scope: DiscordOnboardingScope,
-    require_mention: bool,
-    mention_patterns: Vec<String>,
-    allow_from: Vec<String>,
-    deny_from: Vec<String>,
-    allow_direct_messages: bool,
-    direct_message_policy: String,
-    broadcast_strategy: String,
-    concurrency_limit: u64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct DiscordInboundMonitorSummary {
-    connector_registered: bool,
-    gateway_connected: bool,
-    recent_inbound: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    last_inbound_unix_ms: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    last_connect_unix_ms: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    last_disconnect_unix_ms: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    last_event_type: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum DiscordChannelPermissionCheckStatus {
-    Ok,
-    Forbidden,
-    NotFound,
-    Unavailable,
-    ParseError,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct DiscordChannelPermissionCheck {
-    channel_id: String,
-    status: DiscordChannelPermissionCheckStatus,
-    can_view_channel: bool,
-    can_send_messages: bool,
-    can_read_message_history: bool,
-    can_embed_links: bool,
-    can_attach_files: bool,
-    can_send_messages_in_threads: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct DiscordOnboardingPreflightResponse {
-    connector_id: String,
-    account_id: String,
-    mode: DiscordOnboardingMode,
-    inbound_scope: DiscordOnboardingScope,
-    bot: DiscordBotIdentitySummary,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    application: Option<DiscordApplicationSummary>,
-    invite_url_template: String,
-    required_permissions: Vec<String>,
-    egress_allowlist: Vec<String>,
-    security_defaults: Vec<String>,
-    routing_preview: DiscordRoutingPreview,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    channel_permission_check: Option<DiscordChannelPermissionCheck>,
-    inbound_monitor: DiscordInboundMonitorSummary,
-    inbound_alive: bool,
-    warnings: Vec<String>,
-    policy_warnings: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
-struct DiscordOnboardingPlan {
-    connector_id: String,
-    account_id: String,
-    mode: DiscordOnboardingMode,
-    inbound_scope: DiscordOnboardingScope,
-    require_mention: bool,
-    mention_patterns: Vec<String>,
-    allow_from: Vec<String>,
-    deny_from: Vec<String>,
-    allow_direct_messages: bool,
-    direct_message_policy: channel_router::DirectMessagePolicy,
-    broadcast_strategy: channel_router::BroadcastStrategy,
-    concurrency_limit: u64,
-    confirm_open_guild_channels: bool,
 }
 
 #[derive(Debug, Deserialize)]

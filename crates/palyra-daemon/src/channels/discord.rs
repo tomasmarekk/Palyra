@@ -1,11 +1,12 @@
 use palyra_connectors::{
-    providers::discord as shared, ConnectorInstanceRecord, ConnectorInstanceSpec,
-    ConnectorMessageRecord,
+    providers::discord as shared, ConnectorInstanceRecord, ConnectorInstanceSpec, ConnectorKind,
+    ConnectorMessageRecord, OutboundMessageRequest,
 };
+use ulid::Ulid;
 
 use crate::journal::ApprovalRiskLevel;
 
-use super::ChannelPlatformError;
+use super::{ChannelPlatform, ChannelPlatformError};
 
 pub use shared::{
     canonical_discord_channel_identity, canonical_discord_sender_identity, discord_connector_id,
@@ -28,6 +29,127 @@ pub(super) fn discord_connector_spec(account_id: &str, enabled: bool) -> Connect
 pub(super) fn normalize_discord_target(raw: &str) -> Result<String, ChannelPlatformError> {
     shared::normalize_discord_target(raw)
         .map_err(|error| ChannelPlatformError::InvalidInput(error.to_string()))
+}
+
+#[derive(Debug, Clone)]
+pub struct ChannelDiscordTestSendRequest {
+    pub target: String,
+    pub text: String,
+    pub confirm: bool,
+    pub auto_reaction: Option<String>,
+    pub thread_id: Option<String>,
+    pub reply_to_message_id: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ChannelDiscordTestSendOutcome {
+    pub envelope_id: String,
+    pub connector_id: String,
+    pub target: String,
+    pub enqueued: bool,
+    pub delivered: usize,
+    pub retried: usize,
+    pub dead_lettered: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_message_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_reply_to_message_id: Option<String>,
+}
+
+impl ChannelPlatform {
+    pub async fn submit_discord_test_send(
+        &self,
+        connector_id: &str,
+        request: ChannelDiscordTestSendRequest,
+    ) -> Result<ChannelDiscordTestSendOutcome, ChannelPlatformError> {
+        let connector_id = connector_id.trim();
+        if connector_id.is_empty() {
+            return Err(ChannelPlatformError::InvalidInput(
+                "connector_id cannot be empty".to_owned(),
+            ));
+        }
+        if !request.confirm {
+            return Err(ChannelPlatformError::InvalidInput(
+                "discord test send requires explicit confirmation".to_owned(),
+            ));
+        }
+        let status = self.status(connector_id)?;
+        if status.kind != ConnectorKind::Discord {
+            return Err(ChannelPlatformError::InvalidInput(format!(
+                "discord test send is only supported for discord connectors (received kind={})",
+                status.kind.as_str()
+            )));
+        }
+
+        let text = request.text.trim();
+        if text.is_empty() {
+            return Err(ChannelPlatformError::InvalidInput(
+                "test-send text cannot be empty".to_owned(),
+            ));
+        }
+        let target = normalize_discord_target(request.target.as_str())?;
+        let thread_id = request
+            .thread_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let auto_reaction = request
+            .auto_reaction
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let reply_to_message_id = request
+            .reply_to_message_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+
+        let outbound = OutboundMessageRequest {
+            envelope_id: Ulid::new().to_string(),
+            connector_id: connector_id.to_owned(),
+            conversation_id: target.clone(),
+            reply_thread_id: thread_id,
+            in_reply_to_message_id: reply_to_message_id,
+            text: text.to_owned(),
+            broadcast: false,
+            auto_ack_text: None,
+            auto_reaction,
+            attachments: Vec::new(),
+            structured_json: None,
+            a2ui_update: None,
+            timeout_ms: 30_000,
+            max_payload_bytes: self.supervisor_config().max_outbound_body_bytes,
+        };
+        let enqueue = self.supervisor.enqueue_outbound(&outbound)?;
+        let drain = self
+            .supervisor
+            .drain_due_outbox_for_connector(
+                connector_id,
+                self.supervisor_config().immediate_drain_batch_size,
+            )
+            .await?;
+        let native_message_id = (drain.delivered > 0)
+            .then(|| self.find_native_message_id(connector_id, outbound.envelope_id.as_str()))
+            .transpose()?
+            .flatten();
+        Ok(ChannelDiscordTestSendOutcome {
+            envelope_id: outbound.envelope_id,
+            connector_id: connector_id.to_owned(),
+            target,
+            enqueued: enqueue.created,
+            delivered: drain.delivered,
+            retried: drain.retried,
+            dead_lettered: drain.dead_lettered,
+            native_message_id,
+            thread_id: outbound.reply_thread_id,
+            in_reply_to_message_id: outbound.in_reply_to_message_id,
+        })
+    }
 }
 
 const LOW_RISK_EDIT_WINDOW_MS: i64 = 15 * 60 * 1_000;

@@ -1,5 +1,6 @@
 pub mod approvals;
 pub mod auth;
+pub mod channels;
 pub mod context_references;
 pub mod learning;
 pub mod memory;
