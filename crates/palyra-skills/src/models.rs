@@ -24,6 +24,8 @@ pub struct SkillManifest {
     pub compat: SkillCompat,
     #[serde(default)]
     pub integrity: SkillIntegrity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builder: Option<SkillBuilderMetadata>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -146,6 +148,28 @@ pub struct SkillIntegrity {
 pub struct SkillIntegrityEntry {
     pub path: String,
     pub sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SkillBuilderMetadata {
+    pub experimental: bool,
+    pub source_kind: String,
+    pub source_ref: String,
+    pub rollout_flag: String,
+    #[serde(default)]
+    pub review_status: String,
+    pub checklist: SkillBuilderChecklist,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SkillBuilderChecklist {
+    pub capability_declaration_path: String,
+    pub provenance_path: String,
+    pub test_harness_path: String,
+    #[serde(default)]
+    pub review_notes: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -143,6 +143,9 @@ fn validate_manifest(manifest: &SkillManifest) -> Result<(), SkillPackagingError
             "capabilities.quotas values must be non-zero and memory >= 65536".to_owned(),
         ));
     }
+    if let Some(builder) = manifest.builder.as_ref() {
+        validate_builder_metadata(builder)?;
+    }
     Ok(())
 }
 
@@ -252,6 +255,54 @@ fn validate_secret_scope(scope: &str) -> Result<(), SkillPackagingError> {
         }
     }
     Err(SkillPackagingError::ManifestValidation(format!("invalid secret scope '{}'", scope)))
+}
+
+fn validate_builder_metadata(
+    builder: &crate::models::SkillBuilderMetadata,
+) -> Result<(), SkillPackagingError> {
+    if !builder.experimental {
+        return Err(SkillPackagingError::ManifestValidation(
+            "builder.experimental must stay true for generated builder outputs".to_owned(),
+        ));
+    }
+    if builder.source_kind.trim().is_empty() {
+        return Err(SkillPackagingError::ManifestValidation(
+            "builder.source_kind cannot be empty".to_owned(),
+        ));
+    }
+    if builder.source_ref.trim().is_empty() {
+        return Err(SkillPackagingError::ManifestValidation(
+            "builder.source_ref cannot be empty".to_owned(),
+        ));
+    }
+    if builder.rollout_flag.trim().is_empty() {
+        return Err(SkillPackagingError::ManifestValidation(
+            "builder.rollout_flag cannot be empty".to_owned(),
+        ));
+    }
+    validate_builder_artifact_path(
+        builder.checklist.capability_declaration_path.as_str(),
+        "builder.checklist.capability_declaration_path",
+    )?;
+    validate_builder_artifact_path(
+        builder.checklist.provenance_path.as_str(),
+        "builder.checklist.provenance_path",
+    )?;
+    validate_builder_artifact_path(
+        builder.checklist.test_harness_path.as_str(),
+        "builder.checklist.test_harness_path",
+    )?;
+    Ok(())
+}
+
+fn validate_builder_artifact_path(path: &str, field_name: &str) -> Result<(), SkillPackagingError> {
+    if path.trim().is_empty() {
+        return Err(SkillPackagingError::ManifestValidation(format!(
+            "{field_name} cannot be empty"
+        )));
+    }
+    normalize_artifact_path(path)?;
+    Ok(())
 }
 
 fn validate_identifier_or_wildcard(

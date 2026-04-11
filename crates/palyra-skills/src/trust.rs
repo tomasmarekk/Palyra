@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, fs, path::Path};
 
 use crate::error::SkillPackagingError;
 use crate::manifest::{normalize_identifier, normalize_public_key_hex};
-use crate::models::SkillTrustStore;
+use crate::models::{SkillManifest, SkillTrustStore};
 
 impl SkillTrustStore {
     pub fn load(path: &Path) -> Result<Self, SkillPackagingError> {
@@ -118,4 +118,15 @@ impl SkillTrustStore {
         self.tofu_publishers = tofu_publishers;
         Ok(())
     }
+}
+
+#[must_use]
+pub fn builder_manifest_requires_review(manifest: &SkillManifest) -> bool {
+    manifest.builder.as_ref().is_some_and(|builder| {
+        builder.experimental
+            && !matches!(
+                builder.review_status.trim().to_ascii_lowercase().as_str(),
+                "approved" | "signed"
+            )
+    })
 }

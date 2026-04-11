@@ -3,6 +3,8 @@ use std::{collections::BTreeSet, fs, path::PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use palyra_skills::SkillManifest;
+
 use crate::*;
 
 const PLUGIN_BINDINGS_LAYOUT_VERSION: u32 = 1;
@@ -382,5 +384,23 @@ impl PluginCapabilityProfile {
             storage_prefixes: self.storage_prefixes.clone(),
             channels: self.channels.clone(),
         }
+    }
+}
+
+pub(crate) fn plugin_capability_profile_from_manifest(
+    manifest: &SkillManifest,
+) -> PluginCapabilityProfile {
+    PluginCapabilityProfile {
+        http_hosts: manifest.capabilities.http_egress_allowlist.clone(),
+        secrets: manifest
+            .capabilities
+            .secrets
+            .iter()
+            .flat_map(|scope| scope.key_names.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect(),
+        storage_prefixes: manifest.capabilities.filesystem.write_roots.clone(),
+        channels: manifest.capabilities.node_capabilities.clone(),
     }
 }

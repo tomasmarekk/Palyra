@@ -10,6 +10,7 @@ import {
   supportBundleJobsFixture,
 } from "./console/__fixtures__/m56ControlPlane";
 import {
+  builderCandidateCreateFixture,
   browserDownloadsFixture,
   browserProfilesFixture,
   browserRelayActionFixture,
@@ -32,6 +33,7 @@ import {
   routerPreviewFixture,
   routerRulesFixture,
   routerWarningsFixture,
+  skillBuilderCandidatesFixture,
   skillsFixture,
 } from "./console/__fixtures__/m56Operations";
 import { createFetchRouter, jsonResponse, sessionResponse } from "./console/testUtils";
@@ -256,6 +258,7 @@ describe("M56 runtime and operations surfaces", () => {
     "covers memory, skills, and browser lifecycle workflows",
     async () => {
       const browserState = browserProfilesFixture();
+      const builderState = skillBuilderCandidatesFixture();
       const fetchMock = createFetchRouter(routeBaseRequests, (request) => {
         if (request.path === "/console/v1/memory/status" && request.method === "GET") {
           return jsonResponse(memoryStatusFixture());
@@ -317,11 +320,24 @@ describe("M56 runtime and operations surfaces", () => {
         if (request.path === "/console/v1/skills" && request.method === "GET") {
           return jsonResponse(skillsFixture());
         }
+        if (request.path === "/console/v1/skills/builder/candidates" && request.method === "GET") {
+          return jsonResponse({
+            ...builderState,
+            count: builderState.entries.length,
+          });
+        }
         if (
           request.path === "/console/v1/skills/candidates/candidate-proc-1/promote" &&
           request.method === "POST"
         ) {
-          return jsonResponse(procedurePromotionFixture());
+          const response = procedurePromotionFixture();
+          builderState.entries.push(response.builder_candidate);
+          return jsonResponse(response);
+        }
+        if (request.path === "/console/v1/skills/builder/candidates" && request.method === "POST") {
+          const response = builderCandidateCreateFixture();
+          builderState.entries.push(response.candidate);
+          return jsonResponse(response);
         }
         if (
           request.path === "/console/v1/skills/acme.echo_http/verify" &&
@@ -436,6 +452,7 @@ describe("M56 runtime and operations surfaces", () => {
       fireEvent.click(screen.getByRole("button", { name: "Skills" }));
       expect(await screen.findByRole("heading", { name: "Skills" })).toBeInTheDocument();
       expect(await screen.findByText("acme.echo_http")).toBeInTheDocument();
+      expect(await screen.findByText("palyra.generated.builder.release_check")).toBeInTheDocument();
       fireEvent.click(screen.getByRole("button", { name: "Verify" }));
       await waitFor(() => {
         expect(screen.getByText("Skill action 'verify' completed.")).toBeInTheDocument();
@@ -464,14 +481,27 @@ describe("M56 runtime and operations surfaces", () => {
       await waitFor(() => {
         expect(screen.getByText("Skill action 'enable' completed.")).toBeInTheDocument();
       });
-      fireEvent.click(screen.getAllByRole("button", { name: "Promote scaffold" })[0]);
+      fireEvent.click(screen.getAllByRole("button", { name: "Build candidate" })[0]);
       await waitFor(() => {
         expect(
           screen.getByText("Procedure candidate promoted into a quarantined skill scaffold."),
         ).toBeInTheDocument();
       });
+      expect(document.body.textContent ?? "").toContain(
+        "state/skills/builder-candidates/palyra.generated.ops.release/0.1.0",
+      );
+      fireEvent.change(screen.getByLabelText("Builder prompt"), {
+        target: { value: "Collect overnight incidents and summarize operator actions." },
+      });
+      fireEvent.change(screen.getByLabelText("Candidate name"), {
+        target: { value: "Daily triage briefing" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Create builder candidate" }));
+      await waitFor(() => {
+        expect(screen.getByText("Builder candidate created in quarantine.")).toBeInTheDocument();
+      });
       expect(
-        await screen.findByText(/candidate-scaffolds\/palyra\.generated\.ops\.release/i),
+        await screen.findByText("palyra.generated.builder.triage_briefing"),
       ).toBeInTheDocument();
 
       fireEvent.click(screen.getByRole("button", { name: "Browser" }));

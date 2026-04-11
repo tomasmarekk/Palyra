@@ -306,6 +306,50 @@ struct ConsoleProcedureSkillPromotionRequest {
     accept_candidate: Option<bool>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ConsoleSkillBuilderCandidatesQuery {
+    #[serde(default)]
+    source_kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ConsoleSkillBuilderCapabilityRequest {
+    #[serde(default)]
+    http_hosts: Vec<String>,
+    #[serde(default)]
+    secrets: Vec<String>,
+    #[serde(default)]
+    storage_prefixes: Vec<String>,
+    #[serde(default)]
+    channels: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleSkillBuilderCreateRequest {
+    #[serde(default)]
+    learning_candidate_id: Option<String>,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    skill_id: Option<String>,
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    publisher: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    tool_id: Option<String>,
+    #[serde(default)]
+    tool_name: Option<String>,
+    #[serde(default)]
+    tool_description: Option<String>,
+    #[serde(default)]
+    review_notes: Option<String>,
+    #[serde(default)]
+    capabilities: Option<ConsoleSkillBuilderCapabilityRequest>,
+}
+
 #[derive(Debug, Serialize)]
 struct SkillStatusResponse {
     skill_id: String,
@@ -1586,6 +1630,51 @@ struct InstalledSkillsIndex {
     updated_at_unix_ms: i64,
     #[serde(default)]
     entries: Vec<InstalledSkillRecord>,
+}
+
+const SKILL_BUILDER_CANDIDATE_LAYOUT_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SkillBuilderCandidateIndex {
+    schema_version: u32,
+    updated_at_unix_ms: i64,
+    #[serde(default)]
+    entries: Vec<SkillBuilderCandidateRecord>,
+}
+
+impl Default for SkillBuilderCandidateIndex {
+    fn default() -> Self {
+        Self {
+            schema_version: SKILL_BUILDER_CANDIDATE_LAYOUT_VERSION,
+            updated_at_unix_ms: 0,
+            entries: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SkillBuilderCandidateRecord {
+    candidate_id: String,
+    skill_id: String,
+    version: String,
+    publisher: String,
+    name: String,
+    source_kind: String,
+    source_ref: String,
+    summary: String,
+    status: String,
+    rollout_flag: String,
+    rollout_enabled: bool,
+    scaffold_root: String,
+    manifest_path: String,
+    capability_declaration_path: String,
+    provenance_path: String,
+    test_harness_path: String,
+    capability_profile: crate::plugins::PluginCapabilityProfile,
+    generated_at_unix_ms: i64,
+    updated_at_unix_ms: i64,
 }
 
 impl Default for InstalledSkillsIndex {

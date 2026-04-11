@@ -294,6 +294,11 @@ pub(crate) async fn collect_console_skills_diagnostics(state: &AppState) -> Valu
             });
         }
     };
+    let builder_index =
+        crate::transport::http::handlers::console::skills::load_skill_builder_candidate_index(
+            skills_root.as_path(),
+        )
+        .ok();
 
     let mut publishers =
         index.entries.iter().map(|entry| entry.publisher.clone()).collect::<Vec<_>>();
@@ -353,6 +358,22 @@ pub(crate) async fn collect_console_skills_diagnostics(state: &AppState) -> Valu
             "quarantined": runtime_quarantined,
             "disabled": runtime_disabled,
             "errors": runtime_errors,
+        },
+        "builder": {
+            "rollout_flag": "PALYRA_EXPERIMENTAL_DYNAMIC_TOOL_BUILDER",
+            "rollout_enabled": std::env::var("PALYRA_EXPERIMENTAL_DYNAMIC_TOOL_BUILDER")
+                .ok()
+                .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+                .unwrap_or(false),
+            "candidate_total": builder_index.as_ref().map(|index| index.entries.len()).unwrap_or(0),
+            "procedure_candidates": builder_index
+                .as_ref()
+                .map(|index| index.entries.iter().filter(|entry| entry.source_kind == "procedure").count())
+                .unwrap_or(0),
+            "prompt_candidates": builder_index
+                .as_ref()
+                .map(|index| index.entries.iter().filter(|entry| entry.source_kind == "prompt").count())
+                .unwrap_or(0),
         },
     })
 }

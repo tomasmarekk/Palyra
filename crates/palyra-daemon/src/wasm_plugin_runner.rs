@@ -81,6 +81,34 @@ pub(crate) struct WasmPluginRequestedCapabilities {
     pub(crate) channels: Vec<String>,
 }
 
+pub(crate) fn build_manifest_test_harness(
+    manifest: &SkillManifest,
+    tool: &SkillToolEntrypoint,
+) -> serde_json::Value {
+    json!({
+        "harness_version": 1,
+        "runner": "palyra.plugin.run",
+        "skill_id": manifest.skill_id,
+        "tool_id": tool.id,
+        "entrypoint": DEFAULT_RUNTIME_ENTRYPOINT,
+        "requested_capabilities": {
+            "http_hosts": manifest.capabilities.http_egress_allowlist,
+            "secrets": manifest
+                .capabilities
+                .secrets
+                .iter()
+                .flat_map(|scope| scope.key_names.iter().cloned())
+                .collect::<Vec<_>>(),
+            "storage_prefixes": manifest.capabilities.filesystem.write_roots,
+            "channels": manifest.capabilities.node_capabilities,
+        },
+        "assertions": {
+            "requires_approval": tool.risk.requires_approval,
+            "experimental_builder": manifest.builder.is_some(),
+        },
+    })
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedInstalledSkillModule {
     pub(crate) skill_id: String,

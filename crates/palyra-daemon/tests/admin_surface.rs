@@ -3331,6 +3331,212 @@ allowed_channels = []
 }
 
 #[test]
+fn console_skill_builder_prompt_requires_rollout_flag() -> Result<()> {
+    let (child, admin_port) = spawn_palyrad_with_bound_console_principal(CONSOLE_ADMIN_PRINCIPAL)?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .context("failed to build HTTP client")?;
+    let (cookie, csrf_token) = login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
+
+    let response = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/skills/builder/candidates"))
+        .header("Cookie", cookie)
+        .header("x-palyra-csrf-token", csrf_token)
+        .json(&json!({
+            "prompt": "Collect overnight incidents and summarize operator actions.",
+            "name": "Daily triage briefing",
+            "review_notes": "operator requested",
+        }))
+        .send()
+        .context("failed to call console skill builder create without rollout flag")?;
+    assert_eq!(
+        response.status().as_u16(),
+        412,
+        "builder prompt entrypoint must stay fail-closed until rollout is explicitly enabled"
+    );
+    let body = response.text().context("failed to read rollout rejection body")?;
+    assert!(
+        body.contains("PALYRA_EXPERIMENTAL_DYNAMIC_TOOL_BUILDER"),
+        "rollout rejection should explain the opt-in flag: {body}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn console_skill_builder_prompt_creates_quarantined_scaffold_with_review_files() -> Result<()> {
+    let (child, admin_port) = spawn_palyrad_with_dynamic_ports_with_env(&[
+        ("PALYRA_ADMIN_BOUND_PRINCIPAL", CONSOLE_ADMIN_PRINCIPAL),
+        ("PALYRA_EXPERIMENTAL_DYNAMIC_TOOL_BUILDER", "true"),
+    ])?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .context("failed to build HTTP client")?;
+    let (cookie, csrf_token) = login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
+
+    let created = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/skills/builder/candidates"))
+        .header("Cookie", cookie.clone())
+        .header("x-palyra-csrf-token", csrf_token.clone())
+        .json(&json!({
+            "prompt": "Collect overnight incidents and summarize operator actions.",
+            "name": "Daily triage briefing",
+            "review_notes": "operator requested",
+            "capabilities": {
+                "http_hosts": ["api.example.test"],
+                "secrets": ["release_api_key"],
+                "storage_prefixes": ["workspace/release"],
+                "channels": ["discord:default"],
+            },
+        }))
+        .send()
+        .context("failed to create prompt-based builder candidate")?
+        .error_for_status()
+        .context("builder candidate create returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse builder candidate create response json")?;
+
+    assert_eq!(
+        created.get("rollout_enabled").and_then(Value::as_bool),
+        Some(true),
+        "builder create response should confirm rollout is enabled"
+    );
+    assert_eq!(
+        created.pointer("/skill/quarantine_status/status").and_then(Value::as_str),
+        Some("quarantined"),
+        "builder create must leave the generated skill in quarantine"
+    );
+
+    let candidate = created
+        .get("candidate")
+        .ok_or_else(|| anyhow::anyhow!("builder create response missing candidate payload"))?;
+    assert_eq!(
+        candidate.get("source_kind").and_then(Value::as_str),
+        Some("prompt"),
+        "prompt entrypoint should label the source kind explicitly"
+    );
+    assert_eq!(
+        candidate.get("status").and_then(Value::as_str),
+        Some("quarantined"),
+        "builder candidate record must remain quarantined"
+    );
+
+    let scaffold_root = candidate
+        .get("scaffold_root")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("builder candidate missing scaffold_root"))?;
+    let manifest_path = candidate
+        .get("manifest_path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("builder candidate missing manifest_path"))?;
+    let capability_path = candidate
+        .get("capability_declaration_path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("builder candidate missing capability_declaration_path"))?;
+    let provenance_path = candidate
+        .get("provenance_path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("builder candidate missing provenance_path"))?;
+    let test_harness_path = candidate
+        .get("test_harness_path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("builder candidate missing test_harness_path"))?;
+
+    assert!(
+        PathBuf::from(scaffold_root).exists(),
+        "builder scaffold root should exist on disk: {scaffold_root}"
+    );
+    assert!(
+        PathBuf::from(manifest_path).exists(),
+        "builder manifest should exist on disk: {manifest_path}"
+    );
+    assert!(
+        PathBuf::from(capability_path).exists(),
+        "builder capability declaration should exist on disk: {capability_path}"
+    );
+    assert!(
+        PathBuf::from(provenance_path).exists(),
+        "builder provenance file should exist on disk: {provenance_path}"
+    );
+    assert!(
+        PathBuf::from(test_harness_path).exists(),
+        "builder test harness should exist on disk: {test_harness_path}"
+    );
+
+    let manifest = fs::read_to_string(manifest_path)
+        .with_context(|| format!("failed to read builder manifest {manifest_path}"))?;
+    assert!(
+        manifest.contains("experimental = true") && manifest.contains("rollout_flag"),
+        "builder manifest should embed experimental builder metadata: {manifest}"
+    );
+
+    let capability_declaration = fs::read_to_string(capability_path)
+        .with_context(|| format!("failed to read capability declaration {capability_path}"))?;
+    assert!(
+        capability_declaration.contains("\"requires_review\": true")
+            && capability_declaration.contains("\"api.example.test\"")
+            && capability_declaration.contains("\"release_api_key\""),
+        "capability declaration should capture review posture and requested permissions: {capability_declaration}"
+    );
+
+    let provenance = fs::read_to_string(provenance_path)
+        .with_context(|| format!("failed to read provenance file {provenance_path}"))?;
+    assert!(
+        provenance.contains("\"builder-request.json\"")
+            && provenance.contains("\"builder-capabilities.json\"")
+            && provenance.contains("\"tests/smoke.test.json\""),
+        "provenance should attest the scaffold review files: {provenance}"
+    );
+
+    let test_harness = fs::read_to_string(test_harness_path)
+        .with_context(|| format!("failed to read test harness {test_harness_path}"))?;
+    assert!(
+        test_harness.contains("\"experimental_builder\": true")
+            && test_harness.contains("\"requires_approval\": true"),
+        "builder test harness should declare the quarantine and approval posture: {test_harness}"
+    );
+
+    let listed = client
+        .get(format!("http://127.0.0.1:{admin_port}/console/v1/skills/builder/candidates"))
+        .header("Cookie", cookie)
+        .send()
+        .context("failed to list builder candidates")?
+        .error_for_status()
+        .context("builder candidates list returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse builder candidates list response json")?;
+    assert_eq!(
+        listed.get("count").and_then(Value::as_u64),
+        Some(1),
+        "builder candidate list should include the newly created scaffold"
+    );
+    assert_eq!(
+        listed.pointer("/entries/0/candidate_id").and_then(Value::as_str),
+        candidate.get("candidate_id").and_then(Value::as_str),
+        "builder candidate list should round-trip the created candidate"
+    );
+
+    let journal_event =
+        wait_for_admin_journal_event(&client, admin_port, "skill.builder_candidate_created")
+            .context("builder create should emit a journal event for operators")?;
+    assert_eq!(
+        journal_event.get("status").and_then(Value::as_str),
+        Some("quarantined"),
+        "builder create journal event should report the quarantined status"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn console_config_migrate_and_recover_require_session_csrf_and_keep_secrets_redacted() -> Result<()>
 {
     let config_path = unique_temp_config_path();

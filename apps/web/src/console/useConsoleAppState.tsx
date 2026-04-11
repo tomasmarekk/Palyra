@@ -531,11 +531,14 @@ export function useConsoleAppState() {
   const [skillsBusy, setSkillsBusy] = useState(false);
   const [skillsEntries, setSkillsEntries] = useState<JsonObject[]>([]);
   const [skillProcedureCandidates, setSkillProcedureCandidates] = useState<JsonObject[]>([]);
+  const [skillBuilderCandidates, setSkillBuilderCandidates] = useState<JsonObject[]>([]);
   const [lastSkillPromotion, setLastSkillPromotion] = useState<JsonObject | null>(null);
   const [skillArtifactPath, setSkillArtifactPath] = useState("");
   const [skillAllowTofu, setSkillAllowTofu] = useState(true);
   const [skillAllowUntrusted, setSkillAllowUntrusted] = useState(false);
   const [skillReason, setSkillReason] = useState("");
+  const [skillBuilderPrompt, setSkillBuilderPrompt] = useState("");
+  const [skillBuilderName, setSkillBuilderName] = useState("");
 
   const [auditBusy, setAuditBusy] = useState(false);
   const [auditFilterContains, setAuditFilterContains] = useState("");
@@ -913,11 +916,14 @@ export function useConsoleAppState() {
     setSkillsBusy(false);
     setSkillsEntries([]);
     setSkillProcedureCandidates([]);
+    setSkillBuilderCandidates([]);
     setLastSkillPromotion(null);
     setSkillArtifactPath("");
     setSkillAllowTofu(true);
     setSkillAllowUntrusted(false);
     setSkillReason("");
+    setSkillBuilderPrompt("");
+    setSkillBuilderName("");
 
     setAuditBusy(false);
     setAuditFilterContains("");
@@ -1577,7 +1583,7 @@ export function useConsoleAppState() {
     setSkillsBusy(true);
     setError(null);
     try {
-      const [response, candidateResponse] = await Promise.all([
+      const [response, candidateResponse, builderResponse] = await Promise.all([
         api.listSkills(),
         api.listLearningCandidates(
           new URLSearchParams([
@@ -1585,6 +1591,7 @@ export function useConsoleAppState() {
             ["limit", "24"],
           ]),
         ),
+        api.listSkillBuilderCandidates(),
       ]);
       setSkillsEntries(toJsonObjectArray(response.entries));
       setSkillProcedureCandidates(
@@ -1592,6 +1599,7 @@ export function useConsoleAppState() {
           (candidate) => readString(candidate, "candidate_kind") === "procedure",
         ),
       );
+      setSkillBuilderCandidates(toJsonObjectArray(builderResponse.entries as unknown as JsonValue[]));
     } catch (failure) {
       setError(toErrorMessage(failure));
     } finally {
@@ -1678,6 +1686,32 @@ export function useConsoleAppState() {
       setNotice("Procedure candidate promoted into a quarantined skill scaffold.");
       await refreshSkills();
       await refreshLearningQueue();
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setSkillsBusy(false);
+    }
+  }
+
+  async function createSkillBuilderCandidate(event?: React.FormEvent<HTMLFormElement>): Promise<void> {
+    event?.preventDefault();
+    if (skillBuilderPrompt.trim().length === 0) {
+      setError("Builder prompt cannot be empty.");
+      return;
+    }
+    setSkillsBusy(true);
+    setError(null);
+    try {
+      const response = await api.createSkillBuilderCandidate({
+        prompt: skillBuilderPrompt.trim(),
+        name: emptyToUndefined(skillBuilderName),
+        review_notes: emptyToUndefined(skillReason),
+      });
+      setSkillBuilderPrompt("");
+      setSkillBuilderName("");
+      setLastSkillPromotion(response.skill as unknown as JsonObject);
+      setNotice("Builder candidate created in quarantine.");
+      await refreshSkills();
     } catch (failure) {
       setError(toErrorMessage(failure));
     } finally {
@@ -1984,6 +2018,7 @@ export function useConsoleAppState() {
     skillsBusy,
     skillsEntries,
     skillProcedureCandidates,
+    skillBuilderCandidates,
     lastSkillPromotion,
     skillArtifactPath,
     setSkillArtifactPath,
@@ -1993,10 +2028,15 @@ export function useConsoleAppState() {
     setSkillAllowUntrusted,
     skillReason,
     setSkillReason,
+    skillBuilderPrompt,
+    setSkillBuilderPrompt,
+    skillBuilderName,
+    setSkillBuilderName,
     refreshSkills,
     installSkill,
     executeSkillAction,
     promoteProcedureCandidate,
+    createSkillBuilderCandidate,
     ...browserDomain,
     auditBusy,
     auditFilterContains,

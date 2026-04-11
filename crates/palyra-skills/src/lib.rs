@@ -21,6 +21,7 @@ pub use models::*;
 pub use runtime::{
     capability_grants_from_manifest, policy_bindings_from_manifest, policy_requests_from_manifest,
 };
+pub use trust::builder_manifest_requires_review;
 pub use verify::{inspect_skill_artifact, verify_skill_artifact};
 
 #[cfg(test)]

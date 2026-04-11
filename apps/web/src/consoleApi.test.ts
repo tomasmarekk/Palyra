@@ -1441,6 +1441,72 @@ describe("ConsoleApiClient", () => {
     expect(requestUrl(calls[22]?.input)).toBe("/console/v1/browser/downloads");
   });
 
+  it("uses separate builder candidate endpoints for list and create", async () => {
+    const calls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
+    const responses = [
+      jsonResponse({
+        principal: "admin:web-console",
+        device_id: "device-1",
+        csrf_token: "csrf-1",
+        issued_at_unix_ms: 100,
+        expires_at_unix_ms: 200,
+      }),
+      jsonResponse({
+        rollout_flag: "PALYRA_EXPERIMENTAL_DYNAMIC_TOOL_BUILDER",
+        rollout_enabled: true,
+        count: 1,
+        entries: [],
+      }),
+      jsonResponse({
+        rollout_flag: "PALYRA_EXPERIMENTAL_DYNAMIC_TOOL_BUILDER",
+        rollout_enabled: true,
+        candidate: {
+          candidate_id: "builder-candidate-1",
+          skill_id: "palyra.generated.builder.release_check",
+        },
+        skill: {
+          skill_id: "palyra.generated.builder.release_check",
+          version: "0.1.0",
+        },
+      }),
+    ];
+    const fetcher: typeof fetch = (input, init) => {
+      calls.push({ input, init });
+      const response = responses.shift();
+      if (response === undefined) {
+        throw new Error("No response queued for fetch mock.");
+      }
+      return Promise.resolve(response);
+    };
+
+    const client = new ConsoleApiClient("", fetcher);
+    await client.login({
+      admin_token: "token",
+      principal: "admin:web-console",
+      device_id: "device-1",
+      channel: "web",
+    });
+    await client.listSkillBuilderCandidates();
+    await client.createSkillBuilderCandidate({
+      prompt: "Collect overnight incidents and summarize operator actions.",
+      name: "Daily triage briefing",
+      review_notes: "operator requested",
+    });
+
+    expect(requestUrl(calls[1]?.input)).toBe("/console/v1/skills/builder/candidates");
+    expect(new Headers(calls[1]?.init?.headers).get("x-palyra-csrf-token")).toBeNull();
+
+    expect(requestUrl(calls[2]?.input)).toBe("/console/v1/skills/builder/candidates");
+    expect(new Headers(calls[2]?.init?.headers).get("x-palyra-csrf-token")).toBe("csrf-1");
+    expect(calls[2]?.init?.body).toBe(
+      JSON.stringify({
+        prompt: "Collect overnight incidents and summarize operator actions.",
+        name: "Daily triage briefing",
+        review_notes: "operator requested",
+      }),
+    );
+  });
+
   it("lists chat sessions and streams NDJSON responses with CSRF", async () => {
     const calls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
     const responses = [

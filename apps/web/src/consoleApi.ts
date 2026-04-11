@@ -1801,6 +1801,68 @@ export interface AgentSetDefaultEnvelope {
   previous_default_agent_id?: string;
 }
 
+export interface SkillBuilderCapabilityRequest {
+  http_hosts?: string[];
+  secrets?: string[];
+  storage_prefixes?: string[];
+  channels?: string[];
+}
+
+export interface SkillBuilderCandidateRecord {
+  candidate_id: string;
+  skill_id: string;
+  version: string;
+  publisher: string;
+  name: string;
+  source_kind: string;
+  source_ref: string;
+  summary: string;
+  status: string;
+  rollout_flag: string;
+  rollout_enabled: boolean;
+  scaffold_root: string;
+  manifest_path: string;
+  capability_declaration_path: string;
+  provenance_path: string;
+  test_harness_path: string;
+  capability_profile: {
+    http_hosts: string[];
+    secrets: string[];
+    storage_prefixes: string[];
+    channels: string[];
+  };
+  generated_at_unix_ms: number;
+  updated_at_unix_ms: number;
+}
+
+export interface SkillBuilderCandidatesEnvelope {
+  rollout_flag: string;
+  rollout_enabled: boolean;
+  count: number;
+  entries: SkillBuilderCandidateRecord[];
+}
+
+export interface SkillBuilderCreateRequest {
+  learning_candidate_id?: string;
+  prompt?: string;
+  skill_id?: string;
+  version?: string;
+  publisher?: string;
+  name?: string;
+  tool_id?: string;
+  tool_name?: string;
+  tool_description?: string;
+  review_notes?: string;
+  capabilities?: SkillBuilderCapabilityRequest;
+}
+
+export interface SkillBuilderCreateEnvelope {
+  rollout_flag: string;
+  rollout_enabled: boolean;
+  candidate?: SkillBuilderCandidateRecord;
+  skill: JsonValue;
+}
+
 export class ControlPlaneApiError extends Error {
   readonly status: number;
   readonly code?: string;
@@ -4288,6 +4350,25 @@ export class ConsoleApiClient {
 
   async listSkills(params?: URLSearchParams): Promise<{ entries: JsonValue[] }> {
     return this.request(buildPathWithQuery("/console/v1/skills", params));
+  }
+
+  async listSkillBuilderCandidates(
+    params?: URLSearchParams,
+  ): Promise<SkillBuilderCandidatesEnvelope> {
+    return this.request(buildPathWithQuery("/console/v1/skills/builder/candidates", params));
+  }
+
+  async createSkillBuilderCandidate(
+    payload: SkillBuilderCreateRequest,
+  ): Promise<SkillBuilderCreateEnvelope> {
+    return this.request(
+      "/console/v1/skills/builder/candidates",
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      { csrf: true },
+    );
   }
 
   async installSkill(payload: {

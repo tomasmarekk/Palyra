@@ -866,6 +866,11 @@ pub(crate) fn build_router(state: AppState) -> Router {
             post(console::channels::connectors::discord::console_discord_account_remove_handler),
         )
         .route("/console/v1/skills", get(console::skills::console_skills_list_handler))
+        .route(
+            "/console/v1/skills/builder/candidates",
+            get(console::skills::console_skill_builder_candidates_list_handler)
+                .post(console::skills::console_skill_builder_candidate_create_handler),
+        )
         .route("/console/v1/skills/install", post(console::skills::console_skills_install_handler))
         .route(
             "/console/v1/skills/{skill_id}/verify",

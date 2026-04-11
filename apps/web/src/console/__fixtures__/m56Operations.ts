@@ -360,6 +360,53 @@ export function skillsFixture() {
   };
 }
 
+export function builderCandidateRecordFixture(overrides: Partial<Record<string, unknown>> = {}) {
+  return {
+    candidate_id: "builder-candidate-1",
+    skill_id: "palyra.generated.builder.release_check",
+    version: "0.1.0",
+    publisher: "palyra.generated",
+    name: "Release check builder candidate",
+    source_kind: "prompt",
+    source_ref: "prompt:01buildercandidate",
+    summary: "Summarize deployment readiness and release blockers.",
+    status: "quarantined",
+    rollout_flag: "PALYRA_EXPERIMENTAL_DYNAMIC_TOOL_BUILDER",
+    rollout_enabled: true,
+    scaffold_root: "state/skills/builder-candidates/palyra.generated.builder.release_check/0.1.0",
+    manifest_path:
+      "state/skills/builder-candidates/palyra.generated.builder.release_check/0.1.0/skill.toml",
+    capability_declaration_path:
+      "state/skills/builder-candidates/palyra.generated.builder.release_check/0.1.0/builder-capabilities.json",
+    provenance_path:
+      "state/skills/builder-candidates/palyra.generated.builder.release_check/0.1.0/provenance.json",
+    test_harness_path:
+      "state/skills/builder-candidates/palyra.generated.builder.release_check/0.1.0/tests/smoke.test.json",
+    capability_profile: {
+      http_hosts: ["api.example.test"],
+      secrets: ["release_api_key"],
+      storage_prefixes: ["workspace/release"],
+      channels: ["discord:default"],
+    },
+    generated_at_unix_ms: 1700000005000,
+    updated_at_unix_ms: 1700000005000,
+    ...overrides,
+  };
+}
+
+export function skillBuilderCandidatesFixture(
+  entries = [builderCandidateRecordFixture()],
+  rolloutEnabled = true,
+) {
+  return {
+    rollout_flag: "PALYRA_EXPERIMENTAL_DYNAMIC_TOOL_BUILDER",
+    rollout_enabled: rolloutEnabled,
+    count: entries.length,
+    entries,
+    skills_root: "state/skills",
+  };
+}
+
 export function learningCandidatesFixture() {
   return {
     candidates: [
@@ -428,6 +475,22 @@ export function learningPreferencesFixture() {
 }
 
 export function procedurePromotionFixture() {
+  const builderCandidate = builderCandidateRecordFixture({
+    candidate_id: "builder-candidate-procedure-1",
+    skill_id: "palyra.generated.ops.release",
+    name: "Procedure candidate: palyra.fs.apply_patch -> palyra.http.fetch",
+    source_kind: "procedure",
+    source_ref: "candidate-proc-1",
+    summary: "Observed 2 successful runs with the same tool sequence.",
+    scaffold_root: "state/skills/builder-candidates/palyra.generated.ops.release/0.1.0",
+    manifest_path: "state/skills/builder-candidates/palyra.generated.ops.release/0.1.0/skill.toml",
+    capability_declaration_path:
+      "state/skills/builder-candidates/palyra.generated.ops.release/0.1.0/builder-capabilities.json",
+    provenance_path:
+      "state/skills/builder-candidates/palyra.generated.ops.release/0.1.0/provenance.json",
+    test_harness_path:
+      "state/skills/builder-candidates/palyra.generated.ops.release/0.1.0/tests/smoke.test.json",
+  });
   return {
     candidate: {
       candidate_id: "candidate-proc-1",
@@ -438,10 +501,75 @@ export function procedurePromotionFixture() {
     skill: {
       skill_id: "palyra.generated.ops.release",
       version: "0.1.0",
-      status: "quarantined",
-      scaffold_path:
-        "state/skills/candidate-scaffolds/palyra.generated.ops.release/0.1.0/skill.toml",
-      source_candidate_id: "candidate-proc-1",
+      publisher: "palyra.generated",
+      name: "Procedure candidate: palyra.fs.apply_patch -> palyra.http.fetch",
+      scaffold_root: builderCandidate.scaffold_root,
+      files: [
+        `${builderCandidate.scaffold_root}/skill.toml`,
+        `${builderCandidate.scaffold_root}/README.md`,
+        `${builderCandidate.scaffold_root}/builder-request.json`,
+        builderCandidate.capability_declaration_path,
+        builderCandidate.test_harness_path,
+        `${builderCandidate.scaffold_root}/sbom.cdx.json`,
+        builderCandidate.provenance_path,
+      ],
+      quarantine_status: {
+        skill_id: "palyra.generated.ops.release",
+        version: "0.1.0",
+        status: "quarantined",
+        reason: "generated_from_learning_candidate:candidate-proc-1",
+        detected_at_ms: 1700000005400,
+        operator_principal: "admin:web-console",
+      },
+    },
+    builder_candidate: builderCandidate,
+  };
+}
+
+export function builderCandidateCreateFixture() {
+  const candidate = builderCandidateRecordFixture({
+    candidate_id: "builder-candidate-prompt-2",
+    skill_id: "palyra.generated.builder.triage_briefing",
+    name: "Daily triage briefing",
+    source_ref: "prompt:01buildercandidateprompt",
+    summary: "Collect overnight incidents and summarize operator actions.",
+    scaffold_root: "state/skills/builder-candidates/palyra.generated.builder.triage_briefing/0.1.0",
+    manifest_path:
+      "state/skills/builder-candidates/palyra.generated.builder.triage_briefing/0.1.0/skill.toml",
+    capability_declaration_path:
+      "state/skills/builder-candidates/palyra.generated.builder.triage_briefing/0.1.0/builder-capabilities.json",
+    provenance_path:
+      "state/skills/builder-candidates/palyra.generated.builder.triage_briefing/0.1.0/provenance.json",
+    test_harness_path:
+      "state/skills/builder-candidates/palyra.generated.builder.triage_briefing/0.1.0/tests/smoke.test.json",
+  });
+  return {
+    rollout_flag: "PALYRA_EXPERIMENTAL_DYNAMIC_TOOL_BUILDER",
+    rollout_enabled: true,
+    candidate,
+    skill: {
+      skill_id: candidate.skill_id,
+      version: candidate.version,
+      publisher: candidate.publisher,
+      name: candidate.name,
+      scaffold_root: candidate.scaffold_root,
+      files: [
+        `${candidate.scaffold_root}/skill.toml`,
+        `${candidate.scaffold_root}/README.md`,
+        `${candidate.scaffold_root}/builder-request.json`,
+        candidate.capability_declaration_path,
+        candidate.test_harness_path,
+        `${candidate.scaffold_root}/sbom.cdx.json`,
+        candidate.provenance_path,
+      ],
+      quarantine_status: {
+        skill_id: candidate.skill_id,
+        version: candidate.version,
+        status: "quarantined",
+        reason: `dynamic_builder_candidate:${candidate.candidate_id}`,
+        detected_at_ms: 1700000005600,
+        operator_principal: "admin:web-console",
+      },
     },
   };
 }

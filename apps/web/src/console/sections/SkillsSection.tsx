@@ -1,6 +1,12 @@
 import { useState } from "react";
 
-import { ActionButton, AppForm, CheckboxField, TextInputField } from "../components/ui";
+import {
+  ActionButton,
+  AppForm,
+  CheckboxField,
+  TextAreaField,
+  TextInputField,
+} from "../components/ui";
 import {
   WorkspaceMetricCard,
   WorkspacePageHeader,
@@ -25,6 +31,7 @@ type SkillsSectionProps = {
     | "skillsBusy"
     | "skillsEntries"
     | "skillProcedureCandidates"
+    | "skillBuilderCandidates"
     | "lastSkillPromotion"
     | "skillArtifactPath"
     | "setSkillArtifactPath"
@@ -34,10 +41,15 @@ type SkillsSectionProps = {
     | "setSkillAllowUntrusted"
     | "skillReason"
     | "setSkillReason"
+    | "skillBuilderPrompt"
+    | "setSkillBuilderPrompt"
+    | "skillBuilderName"
+    | "setSkillBuilderName"
     | "refreshSkills"
     | "installSkill"
     | "executeSkillAction"
     | "promoteProcedureCandidate"
+    | "createSkillBuilderCandidate"
     | "revealSensitiveValues"
   >;
 };
@@ -54,6 +66,7 @@ export function SkillsSection({ app }: SkillsSectionProps) {
   const promotableProcedureCount = app.skillProcedureCandidates.filter(
     (candidate) => !["rejected", "suppressed"].includes(readString(candidate, "status") ?? ""),
   ).length;
+  const builderCandidateCount = app.skillBuilderCandidates.length;
 
   return (
     <main className="workspace-page">
@@ -71,6 +84,9 @@ export function SkillsSection({ app }: SkillsSectionProps) {
             </WorkspaceStatusChip>
             <WorkspaceStatusChip tone={promotableProcedureCount > 0 ? "accent" : "default"}>
               {promotableProcedureCount} procedure candidates
+            </WorkspaceStatusChip>
+            <WorkspaceStatusChip tone={builderCandidateCount > 0 ? "warning" : "default"}>
+              {builderCandidateCount} builder candidates
             </WorkspaceStatusChip>
           </>
         }
@@ -116,6 +132,12 @@ export function SkillsSection({ app }: SkillsSectionProps) {
           value={app.skillProcedureCandidates.length}
           detail="Only reusable procedure candidates can be promoted into quarantined skill scaffolds."
           tone={promotableProcedureCount > 0 ? "accent" : "default"}
+        />
+        <WorkspaceMetricCard
+          label="Builder queue"
+          value={builderCandidateCount}
+          detail="Experimental builder outputs stay separate from installed skills and remain quarantined by design."
+          tone={builderCandidateCount > 0 ? "warning" : "default"}
         />
       </section>
 
@@ -249,6 +271,36 @@ export function SkillsSection({ app }: SkillsSectionProps) {
           </WorkspaceSectionCard>
 
           <WorkspaceSectionCard
+            title="Create builder candidate"
+            description="Explicit prompt-based builder output stays experimental, opt-in, and quarantined until packaging, signing, and review are complete."
+          >
+            <AppForm
+              className="workspace-stack"
+              onSubmit={(event) => void app.createSkillBuilderCandidate(event)}
+            >
+              <TextAreaField
+                label="Builder prompt"
+                rows={4}
+                value={app.skillBuilderPrompt}
+                onChange={app.setSkillBuilderPrompt}
+              />
+              <TextInputField
+                label="Candidate name"
+                value={app.skillBuilderName}
+                onChange={app.setSkillBuilderName}
+              />
+              <TextInputField
+                label="Operator reason"
+                value={app.skillReason}
+                onChange={app.setSkillReason}
+              />
+              <ActionButton type="submit" variant="primary" isDisabled={app.skillsBusy}>
+                {app.skillsBusy ? "Creating..." : "Create builder candidate"}
+              </ActionButton>
+            </AppForm>
+          </WorkspaceSectionCard>
+
+          <WorkspaceSectionCard
             title="Selected raw detail"
             description="Raw entry data is still available for operator inspection, but it no longer dominates the page."
           >
@@ -267,7 +319,7 @@ export function SkillsSection({ app }: SkillsSectionProps) {
 
           <WorkspaceSectionCard
             title="Procedure promotion"
-            description="Phase 6 promotion stays conservative: convert only procedure candidates into quarantined scaffolds, then route them through the normal signing and trust flow."
+            description="Phase 6 promotion now feeds the same experimental builder loop so procedure-derived outputs and prompt-derived outputs share one quarantine and review model."
           >
             {app.skillProcedureCandidates.length === 0 ? (
               <WorkspaceEmptyState
@@ -310,9 +362,70 @@ export function SkillsSection({ app }: SkillsSectionProps) {
                             app.skillsBusy || ["rejected", "suppressed"].includes(candidateStatus)
                           }
                         >
-                          Promote scaffold
+                          Build candidate
                         </ActionButton>
                       </td>
+                    </tr>
+                  );
+                })}
+              </WorkspaceTable>
+            )}
+          </WorkspaceSectionCard>
+
+          <WorkspaceSectionCard
+            title="Builder candidates"
+            description="Builder outputs stay visibly separate from installed skills so provenance, capability declaration, and test harness files can be reviewed before any packaging or signing step."
+          >
+            {app.skillBuilderCandidates.length === 0 ? (
+              <WorkspaceEmptyState
+                compact
+                title="No builder candidates"
+                description="Use a reusable procedure candidate or an explicit builder prompt to create the first quarantined candidate."
+              />
+            ) : (
+              <WorkspaceTable
+                ariaLabel="Builder candidates"
+                columns={["Candidate", "Source", "Status", "Review files", "Scaffold root"]}
+              >
+                {app.skillBuilderCandidates.map((candidate, index) => {
+                  const candidateId =
+                    readString(candidate, "candidate_id") ?? `builder-${index + 1}`;
+                  return (
+                    <tr key={candidateId}>
+                      <td>
+                        <div className="workspace-table__meta">
+                          <strong>{readString(candidate, "skill_id") ?? candidateId}</strong>
+                          <span className="chat-muted">
+                            {readString(candidate, "summary") ?? "No summary"}
+                          </span>
+                        </div>
+                      </td>
+                      <td>
+                        {readString(candidate, "source_kind") ?? "unknown"} ·{" "}
+                        {readString(candidate, "source_ref") ?? "n/a"}
+                      </td>
+                      <td>
+                        <WorkspaceStatusChip
+                          tone={workspaceToneForState(readString(candidate, "status") ?? "unknown")}
+                        >
+                          {readString(candidate, "status") ?? "unknown"}
+                        </WorkspaceStatusChip>
+                      </td>
+                      <td>
+                        <div className="workspace-table__meta">
+                          <strong>Capability / provenance / test</strong>
+                          <span className="chat-muted">
+                            {[
+                              readString(candidate, "capability_declaration_path"),
+                              readString(candidate, "provenance_path"),
+                              readString(candidate, "test_harness_path"),
+                            ]
+                              .filter((value): value is string => value !== null)
+                              .join(" · ")}
+                          </span>
+                        </div>
+                      </td>
+                      <td>{readString(candidate, "scaffold_root") ?? "n/a"}</td>
                     </tr>
                   );
                 })}

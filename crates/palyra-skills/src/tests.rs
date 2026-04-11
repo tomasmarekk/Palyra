@@ -1,9 +1,10 @@
 use super::{
-    audit_skill_artifact_security, build_signed_skill_artifact, capability_grants_from_manifest,
-    inspect_skill_artifact, parse_ed25519_signing_key, parse_manifest_toml,
-    policy_requests_from_manifest, verify_skill_artifact, ArtifactFile, SkillArtifactBuildRequest,
-    SkillAuditCheckStatus, SkillPackagingError, SkillSecurityAuditPolicy, SkillTrustStore,
-    TrustDecision, MAX_ARTIFACT_BYTES, MAX_ENTRIES, SBOM_PATH, SIGNATURE_PATH, SKILL_MANIFEST_PATH,
+    audit_skill_artifact_security, build_signed_skill_artifact, builder_manifest_requires_review,
+    capability_grants_from_manifest, inspect_skill_artifact, parse_ed25519_signing_key,
+    parse_manifest_toml, policy_requests_from_manifest, verify_skill_artifact, ArtifactFile,
+    SkillArtifactBuildRequest, SkillAuditCheckStatus, SkillPackagingError,
+    SkillSecurityAuditPolicy, SkillTrustStore, TrustDecision, MAX_ARTIFACT_BYTES, MAX_ENTRIES,
+    SBOM_PATH, SIGNATURE_PATH, SKILL_MANIFEST_PATH,
 };
 use base64::Engine as _;
 
@@ -226,6 +227,33 @@ fn manifest_accepts_secret_scopes_with_valid_suffixes() {
         parse_manifest_toml(manifest.as_str())
             .unwrap_or_else(|error| panic!("scope '{valid_scope}' should be valid: {error:?}"));
     }
+}
+
+#[test]
+fn manifest_accepts_builder_metadata_with_required_checklist() {
+    let manifest = format!(
+        "{}\n\n[builder]\nexperimental = true\nsource_kind = \"procedure\"\nsource_ref = \"candidate-proc-1\"\nrollout_flag = \"PALYRA_EXPERIMENTAL_DYNAMIC_TOOL_BUILDER\"\nreview_status = \"quarantined\"\n\n[builder.checklist]\ncapability_declaration_path = \"builder-capabilities.json\"\nprovenance_path = \"provenance.json\"\ntest_harness_path = \"tests/smoke.test.json\"\nreview_notes = \"Needs signing review\"\n",
+        sample_manifest()
+    );
+    let parsed = parse_manifest_toml(manifest.as_str()).expect("builder metadata should validate");
+    assert!(parsed.builder.is_some(), "builder metadata should survive parsing");
+    assert!(
+        builder_manifest_requires_review(&parsed),
+        "experimental builder output should require explicit review"
+    );
+}
+
+#[test]
+fn manifest_rejects_builder_metadata_without_test_harness() {
+    let manifest = format!(
+        "{}\n\n[builder]\nexperimental = true\nsource_kind = \"prompt\"\nsource_ref = \"prompt:generate release helper\"\nrollout_flag = \"PALYRA_EXPERIMENTAL_DYNAMIC_TOOL_BUILDER\"\n\n[builder.checklist]\ncapability_declaration_path = \"builder-capabilities.json\"\nprovenance_path = \"provenance.json\"\ntest_harness_path = \"\"\n",
+        sample_manifest()
+    );
+    let error = parse_manifest_toml(manifest.as_str()).expect_err("missing harness must fail");
+    assert!(
+        matches!(error, SkillPackagingError::ManifestValidation(ref message) if message.contains("builder.checklist.test_harness_path")),
+        "expected builder checklist validation failure, got {error:?}"
+    );
 }
 
 #[test]
