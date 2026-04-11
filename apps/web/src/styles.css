@@ -1026,12 +1026,11 @@ pre {
   padding: 1rem;
   border: 1px solid color-mix(in oklab, var(--accent) 40%, transparent);
   border-radius: var(--field-radius);
-  background:
-    linear-gradient(
-      135deg,
-      color-mix(in oklab, var(--accent) 10%, var(--surface-secondary)),
-      color-mix(in oklab, var(--surface-secondary) 94%, transparent)
-    );
+  background: linear-gradient(
+    135deg,
+    color-mix(in oklab, var(--accent) 10%, var(--surface-secondary)),
+    color-mix(in oklab, var(--surface-secondary) 94%, transparent)
+  );
 }
 
 .a2ui-experiment-heading {

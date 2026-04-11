@@ -119,10 +119,7 @@ function normalizeExperimentalGovernance(
   const ambientMode = resolveExperimentAmbientMode(
     coerceString(value.ambient_mode ?? value.ambientMode, "disabled", 24).toLowerCase(),
   );
-  const consentRequired = coerceBoolean(
-    value.consent_required ?? value.consentRequired,
-    false,
-  );
+  const consentRequired = coerceBoolean(value.consent_required ?? value.consentRequired, false);
   if (ambientMode === "push_to_talk" && !consentRequired) {
     throw new A2uiError(
       "invalid_input",
@@ -140,10 +137,7 @@ function normalizeExperimentalGovernance(
       "A2UI experimental governance must include a security_review checklist.",
     );
   }
-  const exitCriteria = normalizeChecklistEntries(
-    value.exit_criteria ?? value.exitCriteria,
-    limits,
-  );
+  const exitCriteria = normalizeChecklistEntries(value.exit_criteria ?? value.exitCriteria, limits);
   if (exitCriteria.length === 0) {
     throw new A2uiError(
       "invalid_input",
@@ -457,10 +451,7 @@ function normalizeChartPoint(value: unknown, index: number): A2uiChartSeriesPoin
   };
 }
 
-function normalizeChecklistEntries(
-  value: unknown,
-  limits: RenderInputLimits,
-): readonly string[] {
+function normalizeChecklistEntries(value: unknown, limits: RenderInputLimits): readonly string[] {
   if (!Array.isArray(value)) {
     return [];
   }

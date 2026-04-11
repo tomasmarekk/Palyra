@@ -458,7 +458,9 @@ export function App() {
       return;
     }
     if (!voiceCaptureSupported) {
-      setNotice("This desktop host does not expose the browser microphone APIs required for voice capture.");
+      setNotice(
+        "This desktop host does not expose the browser microphone APIs required for voice capture.",
+      );
       return;
     }
     if (!(await ensureVoiceConsent())) {
@@ -1083,7 +1085,9 @@ export function App() {
               <InlineNotice
                 title="Fail-closed guardrails"
                 tone={
-                  snapshot.control_center.diagnostics.experiments.fail_closed ? "success" : "warning"
+                  snapshot.control_center.diagnostics.experiments.fail_closed
+                    ? "success"
+                    : "warning"
                 }
               >
                 Ambient listening remains disabled, native canvas can be turned off with{" "}
@@ -2128,10 +2132,7 @@ function stopRecordingStream(stream: MediaStream | null): void {
   stream?.getTracks().forEach((track) => track.stop());
 }
 
-async function stopRecorderAndCollectBlob(
-  recorder: MediaRecorder,
-  chunks: Blob[],
-): Promise<Blob> {
+async function stopRecorderAndCollectBlob(recorder: MediaRecorder, chunks: Blob[]): Promise<Blob> {
   if (recorder.state === "inactive") {
     return new Blob(chunks, { type: recorder.mimeType || "audio/webm" });
   }

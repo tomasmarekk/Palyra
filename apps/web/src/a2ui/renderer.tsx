@@ -95,13 +95,7 @@ function ExperimentBanner({ experiment }: { experiment: A2uiExperimentGovernance
   );
 }
 
-function ExperimentChecklist({
-  title,
-  items,
-}: {
-  title: string;
-  items: readonly string[];
-}) {
+function ExperimentChecklist({ title, items }: { title: string; items: readonly string[] }) {
   return (
     <section className="a2ui-experiment-checklist">
       <strong>{title}</strong>
