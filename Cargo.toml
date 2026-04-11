@@ -52,8 +52,8 @@ proptest = "1.11.0"
 libc = "0.2.184"
 protoc-bin-vendored = "3.0.0"
 prost = "0.14.3"
-rand = "0.10.0"
-ratatui = "0.30.0"
+rand = "0.10.1"
+ratatui = { version = "0.30.0", default-features = false, features = ["crossterm"] }
 reqwest = { version = "0.13.2", default-features = false, features = ["blocking", "form", "json", "native-tls", "query"] }
 rpassword = "7.3.1"
 rcgen = { version = "0.14.7", features = ["x509-parser"] }
