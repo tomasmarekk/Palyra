@@ -401,18 +401,20 @@ pub(crate) async fn channel_message_edit_response(
     let authorization = resolve_channel_message_mutation_authorization(
         state,
         context,
-        connector_id.as_str(),
-        channels::DiscordMessageMutationKind::Edit,
-        &request.locator,
-        preview.as_ref(),
-        approval_id.as_deref(),
-        json!({
-            "body": request.body,
-            "preview_diff": {
-                "before_body": preview.as_ref().map(|message| message.body.clone()),
-                "after_body": request.body,
-            },
-        }),
+        ChannelMessageMutationAuthorizationInput {
+            connector_id: connector_id.as_str(),
+            operation: channels::DiscordMessageMutationKind::Edit,
+            locator: &request.locator,
+            preview: preview.as_ref(),
+            approval_id: approval_id.as_deref(),
+            mutation_details: json!({
+                "body": request.body,
+                "preview_diff": {
+                    "before_body": preview.as_ref().map(|message| message.body.clone()),
+                    "after_body": request.body,
+                },
+            }),
+        },
     )
     .await?;
     if let Some(response) = authorization.pending_response {
@@ -458,18 +460,20 @@ pub(crate) async fn channel_message_delete_response(
     let authorization = resolve_channel_message_mutation_authorization(
         state,
         context,
-        connector_id.as_str(),
-        channels::DiscordMessageMutationKind::Delete,
-        &request.locator,
-        preview.as_ref(),
-        approval_id.as_deref(),
-        json!({
-            "reason": request.reason,
-            "preview_diff": {
-                "before_body": preview.as_ref().map(|message| message.body.clone()),
-                "after_body": Value::Null,
-            },
-        }),
+        ChannelMessageMutationAuthorizationInput {
+            connector_id: connector_id.as_str(),
+            operation: channels::DiscordMessageMutationKind::Delete,
+            locator: &request.locator,
+            preview: preview.as_ref(),
+            approval_id: approval_id.as_deref(),
+            mutation_details: json!({
+                "reason": request.reason,
+                "preview_diff": {
+                    "before_body": preview.as_ref().map(|message| message.body.clone()),
+                    "after_body": Value::Null,
+                },
+            }),
+        },
     )
     .await?;
     if let Some(response) = authorization.pending_response {
@@ -516,15 +520,17 @@ pub(crate) async fn channel_message_reaction_response(
     let authorization = resolve_channel_message_mutation_authorization(
         state,
         context,
-        connector_id.as_str(),
-        operation,
-        &request.locator,
-        preview.as_ref(),
-        approval_id.as_deref(),
-        json!({
-            "emoji": request.emoji,
-            "existing_reactions": preview.as_ref().map(|message| message.reactions.clone()),
-        }),
+        ChannelMessageMutationAuthorizationInput {
+            connector_id: connector_id.as_str(),
+            operation,
+            locator: &request.locator,
+            preview: preview.as_ref(),
+            approval_id: approval_id.as_deref(),
+            mutation_details: json!({
+                "emoji": request.emoji,
+                "existing_reactions": preview.as_ref().map(|message| message.reactions.clone()),
+            }),
+        },
     )
     .await?;
     if let Some(response) = authorization.pending_response {
@@ -588,31 +594,45 @@ struct ChannelMessageMutationAuthorization {
     pending_response: Option<Value>,
 }
 
+struct ChannelMessageMutationAuthorizationInput<'a> {
+    connector_id: &'a str,
+    operation: channels::DiscordMessageMutationKind,
+    locator: &'a ConnectorMessageLocator,
+    preview: Option<&'a ConnectorMessageRecord>,
+    approval_id: Option<&'a str>,
+    mutation_details: Value,
+}
+
+struct ChannelMessageApprovalInput<'a> {
+    connector_id: &'a str,
+    operation: channels::DiscordMessageMutationKind,
+    locator: &'a ConnectorMessageLocator,
+    preview: &'a ConnectorMessageRecord,
+    governance: &'a channels::DiscordMessageMutationGovernance,
+    mutation_details: Value,
+}
+
 async fn resolve_channel_message_mutation_authorization(
     state: &AppState,
     context: &RequestContext,
-    connector_id: &str,
-    operation: channels::DiscordMessageMutationKind,
-    locator: &ConnectorMessageLocator,
-    preview: Option<&ConnectorMessageRecord>,
-    approval_id: Option<&str>,
-    mutation_details: Value,
+    input: ChannelMessageMutationAuthorizationInput<'_>,
 ) -> Result<ChannelMessageMutationAuthorization, Response> {
-    let preview = preview.ok_or_else(|| {
+    let preview = input.preview.ok_or_else(|| {
         runtime_status_response(tonic::Status::not_found(
             "message preview is unavailable for the requested mutation",
         ))
     })?;
-    let connector = state.channels.status(connector_id).map_err(channel_platform_error_response)?;
+    let connector =
+        state.channels.status(input.connector_id).map_err(channel_platform_error_response)?;
     let governance = if connector.kind == palyra_connectors::ConnectorKind::Discord {
         let instance = state
             .channels
-            .connector_instance(connector_id)
+            .connector_instance(input.connector_id)
             .map_err(channel_platform_error_response)?;
         Some(channels::classify_discord_message_mutation_governance(
             &instance,
             preview,
-            operation,
+            input.operation,
             unix_ms_now().map_err(|error| {
                 runtime_status_response(tonic::Status::internal(sanitize_http_error_message(
                     error.to_string().as_str(),
@@ -626,9 +646,10 @@ async fn resolve_channel_message_mutation_authorization(
             reason: "non-Discord connector mutation defaults to explicit approval".to_owned(),
         })
     };
-    let policy_action = channel_message_policy_action(operation);
-    let subject_id = build_channel_message_subject_id(connector_id, operation, locator);
-    let resource = build_channel_message_resource(connector_id, locator);
+    let policy_action = channel_message_policy_action(input.operation);
+    let subject_id =
+        build_channel_message_subject_id(input.connector_id, input.operation, input.locator);
+    let resource = build_channel_message_resource(input.connector_id, input.locator);
     let mut policy_config = PolicyEvaluationConfig::default();
     if governance.as_ref().is_some_and(|value| value.approval_required) {
         policy_config.sensitive_actions.push(policy_action.to_owned());
@@ -636,7 +657,7 @@ async fn resolve_channel_message_mutation_authorization(
     let resolved_approval = if governance.as_ref().is_some_and(|value| value.approval_required) {
         load_channel_message_approval(
             state,
-            approval_id,
+            input.approval_id,
             subject_id.as_str(),
             context.principal.as_str(),
         )
@@ -655,7 +676,7 @@ async fn resolve_channel_message_mutation_authorization(
         },
         &PolicyRequestContext {
             device_id: Some(context.device_id.clone()),
-            channel: context.channel.clone().or_else(|| Some(connector_id.to_owned())),
+            channel: context.channel.clone().or_else(|| Some(input.connector_id.to_owned())),
             ..PolicyRequestContext::default()
         },
         &policy_config,
@@ -678,12 +699,16 @@ async fn resolve_channel_message_mutation_authorization(
                 let approval = ensure_channel_message_approval(
                     state,
                     context,
-                    connector_id,
-                    operation,
-                    locator,
-                    preview,
-                    governance.as_ref().expect("governance should exist for approval"),
-                    mutation_details,
+                    ChannelMessageApprovalInput {
+                        connector_id: input.connector_id,
+                        operation: input.operation,
+                        locator: input.locator,
+                        preview,
+                        governance: governance
+                            .as_ref()
+                            .expect("governance should exist for approval"),
+                        mutation_details: input.mutation_details,
+                    },
                 )
                 .await?;
                 record_channel_message_console_event(
@@ -691,7 +716,7 @@ async fn resolve_channel_message_mutation_authorization(
                     context,
                     "channel.message.approval_requested",
                     json!({
-                        "connector_id": connector_id,
+                        "connector_id": input.connector_id,
                         "subject_id": subject_id,
                         "policy_action": policy_action,
                         "policy_reason": reason,
@@ -712,7 +737,7 @@ async fn resolve_channel_message_mutation_authorization(
                             "explanation": evaluation.explanation.reason,
                         },
                         "preview": channels::ChannelMessageMutationPreview {
-                            locator: locator.clone(),
+                            locator: input.locator.clone(),
                             message: Some(preview.clone()),
                             approved: false,
                             approval_id: Some(approval.approval_id.clone()),
@@ -772,28 +797,24 @@ async fn load_channel_message_approval(
 async fn ensure_channel_message_approval(
     state: &AppState,
     context: &RequestContext,
-    connector_id: &str,
-    operation: channels::DiscordMessageMutationKind,
-    locator: &ConnectorMessageLocator,
-    preview: &ConnectorMessageRecord,
-    governance: &channels::DiscordMessageMutationGovernance,
-    mutation_details: Value,
+    input: ChannelMessageApprovalInput<'_>,
 ) -> Result<ApprovalRecord, Response> {
-    let subject_id = build_channel_message_subject_id(connector_id, operation, locator);
-    let policy_action = channel_message_policy_action(operation);
+    let subject_id =
+        build_channel_message_subject_id(input.connector_id, input.operation, input.locator);
+    let policy_action = channel_message_policy_action(input.operation);
     let details_json = json!({
-        "connector_id": connector_id,
-        "operation": operation.as_str(),
+        "connector_id": input.connector_id,
+        "operation": input.operation.as_str(),
         "policy_action": policy_action,
-        "locator": locator,
-        "preview_message": preview,
+        "locator": input.locator,
+        "preview_message": input.preview,
         "governance": {
-            "risk_level": governance.risk_level.as_str(),
-            "approval_required": governance.approval_required,
-            "reason": governance.reason,
+            "risk_level": input.governance.risk_level.as_str(),
+            "approval_required": input.governance.approval_required,
+            "reason": input.governance.reason,
         },
-        "mutation": mutation_details,
-        "required_permissions": channel_message_required_permissions(operation),
+        "mutation": input.mutation_details,
+        "required_permissions": channel_message_required_permissions(input.operation),
     })
     .to_string();
     let policy_hash = hex::encode(Sha256::digest(details_json.as_bytes()));
@@ -805,16 +826,19 @@ async fn ensure_channel_message_approval(
             run_id: Ulid::new().to_string(),
             principal: context.principal.clone(),
             device_id: context.device_id.clone(),
-            channel: context.channel.clone().or_else(|| Some(connector_id.to_owned())),
+            channel: context
+                .channel
+                .clone()
+                .or_else(|| Some(input.connector_id.to_owned())),
             subject_type: ApprovalSubjectType::Tool,
             subject_id: subject_id.clone(),
             request_summary: format!(
                 "connector={} operation={} conversation_id={} thread_id={} message_id={}",
-                connector_id,
-                operation.as_str(),
-                locator.target.conversation_id,
-                locator.target.thread_id.as_deref().unwrap_or("-"),
-                locator.message_id
+                input.connector_id,
+                input.operation.as_str(),
+                input.locator.target.conversation_id,
+                input.locator.target.thread_id.as_deref().unwrap_or("-"),
+                input.locator.message_id
             ),
             policy_snapshot: ApprovalPolicySnapshot {
                 policy_id: "discord.message.mutation.approval.v1".to_owned(),
@@ -822,27 +846,27 @@ async fn ensure_channel_message_approval(
                 evaluation_summary: format!(
                     "action={} approval_required={} risk_level={} {}",
                     policy_action,
-                    governance.approval_required,
-                    governance.risk_level.as_str(),
-                    governance.reason
+                    input.governance.approval_required,
+                    input.governance.risk_level.as_str(),
+                    input.governance.reason
                 ),
             },
             prompt: ApprovalPromptRecord {
-                title: format!("Approve Discord message {}", operation.as_str()),
-                risk_level: governance.risk_level,
+                title: format!("Approve Discord message {}", input.operation.as_str()),
+                risk_level: input.governance.risk_level,
                 subject_id,
                 summary: format!(
                     "Connector '{}' wants to {} Discord message '{}'",
-                    connector_id,
-                    operation.as_str(),
-                    locator.message_id
+                    input.connector_id,
+                    input.operation.as_str(),
+                    input.locator.message_id
                 ),
                 options: channel_message_approval_options(),
                 timeout_seconds: CHANNEL_MESSAGE_APPROVAL_TIMEOUT_SECONDS,
                 details_json,
                 policy_explanation: format!(
                     "Discord message mutations stay deny-by-default for higher-risk channel, age, and connector-profile combinations. {}",
-                    governance.reason
+                    input.governance.reason
                 ),
             },
         })

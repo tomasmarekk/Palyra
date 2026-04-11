@@ -277,10 +277,10 @@ impl ConnectorAdapter for MockConnectorServer {
                     && request
                         .author_id
                         .as_deref()
-                        .map_or(true, |author_id| message.sender_id == author_id)
+                        .is_none_or(|author_id| message.sender_id == author_id)
                     && request
                         .has_attachments
-                        .map_or(true, |expected| !message.attachments.is_empty() == expected)
+                        .is_none_or(|expected| message.attachments.is_empty() != expected)
             })
             .cloned()
             .collect::<Vec<_>>();

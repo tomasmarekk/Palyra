@@ -1198,6 +1198,8 @@ fn parse_message_read_with_connection_overrides() {
         "message",
         "read",
         "discord:default",
+        "--conversation-id",
+        "dm-ops",
         "--message-id",
         "msg-123",
         "--url",
@@ -1217,7 +1219,13 @@ fn parse_message_read_with_connection_overrides() {
         Command::Message {
             command: MessageCommand::Read {
                 connector_id: "discord:default".to_owned(),
-                message_id: "msg-123".to_owned(),
+                conversation_id: "dm-ops".to_owned(),
+                thread_id: None,
+                message_id: Some("msg-123".to_owned()),
+                before_message_id: None,
+                after_message_id: None,
+                around_message_id: None,
+                limit: 25,
                 url: Some("http://127.0.0.1:7142".to_owned()),
                 token: Some("secret-token".to_owned()),
                 principal: "user:test".to_owned(),

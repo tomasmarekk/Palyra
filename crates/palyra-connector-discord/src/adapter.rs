@@ -530,12 +530,14 @@ impl ConnectorAdapter for DiscordConnectorAdapter {
         let messages = self
             .fetch_message_page(
                 &context,
-                target_channel_id.as_str(),
-                request.before_message_id.as_deref(),
-                request.after_message_id.as_deref(),
-                request.around_message_id.as_deref(),
-                request.limit,
-                DiscordMessageOperation::Read,
+                DiscordMessagePageRequest {
+                    channel_id: target_channel_id.as_str(),
+                    before_message_id: request.before_message_id.as_deref(),
+                    after_message_id: request.after_message_id.as_deref(),
+                    around_message_id: request.around_message_id.as_deref(),
+                    limit: request.limit,
+                    operation: DiscordMessageOperation::Read,
+                },
             )
             .await?;
         let next_before_message_id =
@@ -595,12 +597,14 @@ impl ConnectorAdapter for DiscordConnectorAdapter {
         let scanned_messages = self
             .fetch_message_page(
                 &context,
-                target_channel_id.as_str(),
-                request.before_message_id.as_deref(),
-                None,
-                None,
-                request.limit,
-                DiscordMessageOperation::Search,
+                DiscordMessagePageRequest {
+                    channel_id: target_channel_id.as_str(),
+                    before_message_id: request.before_message_id.as_deref(),
+                    after_message_id: None,
+                    around_message_id: None,
+                    limit: request.limit,
+                    operation: DiscordMessageOperation::Search,
+                },
             )
             .await?;
         let matches = scanned_messages
@@ -939,7 +943,8 @@ fn missing_permission_labels(
 ) -> Vec<String> {
     crate::permissions::discord_permissions_for_operation(operation)
         .iter()
-        .filter_map(|(label, bit)| ((permission_mask & *bit) == 0).then(|| (*label).to_owned()))
+        .filter(|&(_, bit)| (permission_mask & *bit) == 0)
+        .map(|(label, _)| (*label).to_owned())
         .collect()
 }
 
@@ -983,24 +988,28 @@ fn search_message_matches(
     message: &ConnectorMessageRecord,
     request: &ConnectorMessageSearchRequest,
 ) -> bool {
-    let query_match = request
-        .query
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map_or(true, |query| {
-            message.body.to_ascii_lowercase().contains(query.to_ascii_lowercase().as_str())
-        });
+    let query_match =
+        request.query.as_deref().map(str::trim).filter(|value| !value.is_empty()).is_none_or(
+            |query| message.body.to_ascii_lowercase().contains(query.to_ascii_lowercase().as_str()),
+        );
     let author_match = request
         .author_id
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map_or(true, |author_id| message.sender_id.eq_ignore_ascii_case(author_id));
-    let attachment_match = request
-        .has_attachments
-        .map_or(true, |required| required == !message.attachments.is_empty());
+        .is_none_or(|author_id| message.sender_id.eq_ignore_ascii_case(author_id));
+    let attachment_match =
+        request.has_attachments.is_none_or(|required| required != message.attachments.is_empty());
     query_match && author_match && attachment_match
+}
+
+struct DiscordMessagePageRequest<'a> {
+    channel_id: &'a str,
+    before_message_id: Option<&'a str>,
+    after_message_id: Option<&'a str>,
+    around_message_id: Option<&'a str>,
+    limit: usize,
+    operation: DiscordMessageOperation,
 }
 
 fn handle_mutation_message_response(
@@ -4559,29 +4568,24 @@ impl DiscordConnectorAdapter {
     async fn fetch_message_page(
         &self,
         context: &DiscordAdminContext,
-        channel_id: &str,
-        before_message_id: Option<&str>,
-        after_message_id: Option<&str>,
-        around_message_id: Option<&str>,
-        limit: usize,
-        operation: DiscordMessageOperation,
+        request: DiscordMessagePageRequest<'_>,
     ) -> Result<Vec<ConnectorMessageRecord>, ConnectorAdapterError> {
-        let mut url = build_messages_url(&self.config.api_base_url, channel_id)?;
+        let mut url = build_messages_url(&self.config.api_base_url, request.channel_id)?;
         {
             let mut pairs = url.query_pairs_mut();
-            pairs.append_pair("limit", limit.max(1).min(100).to_string().as_str());
-            if let Some(before) = before_message_id {
+            pairs.append_pair("limit", request.limit.clamp(1, 100).to_string().as_str());
+            if let Some(before) = request.before_message_id {
                 pairs.append_pair("before", before);
             }
-            if let Some(after) = after_message_id {
+            if let Some(after) = request.after_message_id {
                 pairs.append_pair("after", after);
             }
-            if let Some(around) = around_message_id {
+            if let Some(around) = request.around_message_id {
                 pairs.append_pair("around", around);
             }
         }
         self.validate_url_target(&context.guard, &url)?;
-        let route_key = format!("discord:get:/channels/{channel_id}/messages");
+        let route_key = format!("discord:get:/channels/{}/messages", request.channel_id);
         let response = self
             .transport
             .get(&url, context.credential.token.as_str(), self.config.request_timeout_ms)
@@ -4594,7 +4598,7 @@ impl DiscordConnectorAdapter {
         if !(200..300).contains(&response.status) {
             return Err(ConnectorAdapterError::Backend(format!(
                 "discord {} history request failed (status={}): {}",
-                operation_name(operation),
+                operation_name(request.operation),
                 response.status,
                 parse_discord_error_summary(response.body.as_str())
                     .unwrap_or_else(|| "unexpected response".to_owned())
@@ -4617,7 +4621,7 @@ impl DiscordConnectorAdapter {
                     entry,
                     context.bot_identity.id.as_str(),
                     &ConnectorConversationTarget {
-                        conversation_id: channel_id.to_owned(),
+                        conversation_id: request.channel_id.to_owned(),
                         thread_id: None,
                     },
                 )
