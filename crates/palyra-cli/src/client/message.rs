@@ -315,10 +315,6 @@ pub(crate) fn remove_reaction(options: MessageReactionOptions) -> Result<Value> 
     mutate_reaction(options, "/messages/react-remove", MESSAGE_ACTION_REACT_REMOVE)
 }
 
-pub(crate) fn fallback_capabilities(provider_kind: &str) -> MessageCapabilities {
-    capabilities_from_status(&Value::Null, provider_kind)
-}
-
 pub(crate) fn encode_capabilities_json(
     connector_id: &str,
     capabilities: &MessageCapabilities,
@@ -404,7 +400,7 @@ fn ensure_message_actions_supported(
 
 fn capabilities_from_status(status: &Value, provider_kind: &str) -> MessageCapabilities {
     let action_details =
-        extract_action_details(status).unwrap_or_else(|| fallback_action_details(provider_kind));
+        extract_action_details(status).unwrap_or_else(|| missing_capability_details(provider_kind));
     let supported_actions = action_details
         .iter()
         .filter(|detail| detail.supported)
@@ -438,52 +434,25 @@ fn extract_action_details(status: &Value) -> Option<Vec<MessageCapabilityDetail>
     ])
 }
 
-fn fallback_action_details(provider_kind: &str) -> Vec<MessageCapabilityDetail> {
-    let discord = provider_kind.eq_ignore_ascii_case("discord");
+fn missing_capability_details(provider_kind: &str) -> Vec<MessageCapabilityDetail> {
+    let reason =
+        format!("message capability metadata is unavailable for provider '{}'", provider_kind);
     [
-        (MESSAGE_ACTION_SEND, discord, None),
-        (MESSAGE_ACTION_THREAD, discord, None),
-        (
-            MESSAGE_ACTION_REPLY,
-            discord,
-            (!discord).then_some("reply support is unavailable for this provider".to_owned()),
-        ),
-        (
-            MESSAGE_ACTION_READ,
-            discord,
-            (!discord).then_some("message read is unavailable for this provider".to_owned()),
-        ),
-        (
-            MESSAGE_ACTION_SEARCH,
-            discord,
-            (!discord).then_some("message search is unavailable for this provider".to_owned()),
-        ),
-        (
-            MESSAGE_ACTION_EDIT,
-            discord,
-            (!discord).then_some("message edit is unavailable for this provider".to_owned()),
-        ),
-        (
-            MESSAGE_ACTION_DELETE,
-            discord,
-            (!discord).then_some("message delete is unavailable for this provider".to_owned()),
-        ),
-        (
-            MESSAGE_ACTION_REACT_ADD,
-            discord,
-            (!discord).then_some("reaction add is unavailable for this provider".to_owned()),
-        ),
-        (
-            MESSAGE_ACTION_REACT_REMOVE,
-            discord,
-            (!discord).then_some("reaction remove is unavailable for this provider".to_owned()),
-        ),
+        MESSAGE_ACTION_SEND,
+        MESSAGE_ACTION_THREAD,
+        MESSAGE_ACTION_REPLY,
+        MESSAGE_ACTION_READ,
+        MESSAGE_ACTION_SEARCH,
+        MESSAGE_ACTION_EDIT,
+        MESSAGE_ACTION_DELETE,
+        MESSAGE_ACTION_REACT_ADD,
+        MESSAGE_ACTION_REACT_REMOVE,
     ]
     .into_iter()
-    .map(|(action, supported, reason)| MessageCapabilityDetail {
+    .map(|action| MessageCapabilityDetail {
         action: action.to_owned(),
-        supported,
-        reason,
+        supported: false,
+        reason: Some(reason.clone()),
         policy_action: None,
         approval_mode: None,
         risk_level: None,
@@ -565,12 +534,11 @@ fn mutate_reaction(
 #[cfg(test)]
 mod tests {
     use super::{
-        capabilities_from_status, fallback_capabilities, MESSAGE_ACTION_DELETE,
-        MESSAGE_ACTION_EDIT, MESSAGE_ACTION_REACT_ADD, MESSAGE_ACTION_REACT_REMOVE,
-        MESSAGE_ACTION_READ, MESSAGE_ACTION_REPLY, MESSAGE_ACTION_SEARCH, MESSAGE_ACTION_SEND,
-        MESSAGE_ACTION_THREAD,
+        capabilities_from_status, MESSAGE_ACTION_DELETE, MESSAGE_ACTION_EDIT,
+        MESSAGE_ACTION_REACT_ADD, MESSAGE_ACTION_REACT_REMOVE, MESSAGE_ACTION_READ,
+        MESSAGE_ACTION_REPLY, MESSAGE_ACTION_SEARCH, MESSAGE_ACTION_SEND, MESSAGE_ACTION_THREAD,
     };
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     #[test]
     fn capabilities_from_status_uses_connector_capability_payload() {
@@ -623,23 +591,21 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_from_status_falls_back_for_discord_when_capabilities_are_missing() {
-        let capabilities = fallback_capabilities("discord");
+    fn capabilities_from_status_marks_missing_metadata_as_unsupported() {
+        let capabilities = capabilities_from_status(&Value::Null, "discord");
 
-        assert!(capabilities.supported_actions.contains(&MESSAGE_ACTION_SEND.to_owned()));
-        assert!(capabilities.supported_actions.contains(&MESSAGE_ACTION_THREAD.to_owned()));
-        assert!(capabilities.supported_actions.contains(&MESSAGE_ACTION_REPLY.to_owned()));
-        assert!(capabilities.supported_actions.contains(&MESSAGE_ACTION_READ.to_owned()));
-        assert!(capabilities.supported_actions.contains(&MESSAGE_ACTION_SEARCH.to_owned()));
-        assert!(capabilities.supported_actions.contains(&MESSAGE_ACTION_EDIT.to_owned()));
-        assert!(capabilities.supported_actions.contains(&MESSAGE_ACTION_DELETE.to_owned()));
-        assert!(capabilities.supported_actions.contains(&MESSAGE_ACTION_REACT_ADD.to_owned()));
-        assert!(capabilities.supported_actions.contains(&MESSAGE_ACTION_REACT_REMOVE.to_owned()));
+        assert!(capabilities.supported_actions.is_empty());
+        assert_eq!(capabilities.unsupported_actions.len(), 9);
+        assert!(capabilities.action_details.iter().all(|detail| !detail.supported));
+        assert!(capabilities.action_details.iter().all(|detail| {
+            detail.reason.as_deref()
+                == Some("message capability metadata is unavailable for provider 'discord'")
+        }));
     }
 
     #[test]
-    fn capabilities_from_status_falls_back_to_all_unsupported_for_non_discord() {
-        let capabilities = fallback_capabilities("slack");
+    fn capabilities_from_status_marks_missing_metadata_as_unsupported_for_non_discord() {
+        let capabilities = capabilities_from_status(&Value::Null, "slack");
 
         assert!(capabilities.supported_actions.is_empty());
         assert_eq!(capabilities.unsupported_actions.len(), 9);
