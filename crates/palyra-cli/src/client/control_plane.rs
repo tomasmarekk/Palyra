@@ -20,7 +20,7 @@ pub(crate) async fn connect_admin_console(
             .context("failed to initialize control-plane HTTP client")?;
     client
         .login(&ConsoleLoginRequest {
-            admin_token: connection.token.clone().unwrap_or_default(),
+            admin_token: connection.token.clone(),
             principal: connection.principal.clone(),
             device_id: connection.device_id.clone(),
             channel: Some(connection.channel.clone()),

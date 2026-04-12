@@ -1068,7 +1068,8 @@ pub struct CapabilityMigrationNote {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsoleLoginRequest {
-    pub admin_token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admin_token: Option<String>,
     pub principal: String,
     pub device_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2450,4 +2451,24 @@ const fn default_support_bundle_backups() -> usize {
 
 const fn default_doctor_recovery_jobs() -> usize {
     16
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ConsoleLoginRequest;
+
+    #[test]
+    fn console_login_request_omits_admin_token_when_not_provided() {
+        let request = ConsoleLoginRequest {
+            admin_token: None,
+            principal: "admin:test".to_owned(),
+            device_id: "device-1".to_owned(),
+            channel: Some("cli".to_owned()),
+        };
+
+        let encoded = serde_json::to_value(&request).expect("console login request should encode");
+
+        assert!(encoded.get("admin_token").is_none());
+        assert_eq!(encoded.get("principal").and_then(serde_json::Value::as_str), Some("admin:test"));
+    }
 }
