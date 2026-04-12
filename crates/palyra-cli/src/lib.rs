@@ -6319,9 +6319,7 @@ fn repo_checkout_detected_from_binary_path(binary_path: &Path) -> bool {
 }
 
 fn looks_like_repo_root(path: &Path) -> bool {
-    ["Cargo.toml", "crates", "apps", "schemas"]
-        .iter()
-        .all(|entry| path.join(entry).exists())
+    ["Cargo.toml", "crates", "apps", "schemas"].iter().all(|entry| path.join(entry).exists())
 }
 
 fn memory_embeddings_model_config_ok() -> bool {

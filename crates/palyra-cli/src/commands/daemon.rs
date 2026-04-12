@@ -129,9 +129,7 @@ pub(crate) fn run_daemon(command: DaemonCommand) -> Result<()> {
                         verification_report.gateway_ca_fingerprint_sha256.as_deref().unwrap_or("none")
                     );
                 }
-                if let Some(remote_assist) =
-                    output.get("remote_assist")
-                {
+                if let Some(remote_assist) = output.get("remote_assist") {
                     emit_remote_dashboard_assist_lines("daemon.dashboard_url", remote_assist);
                 }
                 if open {

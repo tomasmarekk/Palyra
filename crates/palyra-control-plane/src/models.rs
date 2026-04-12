@@ -2469,6 +2469,9 @@ mod tests {
         let encoded = serde_json::to_value(&request).expect("console login request should encode");
 
         assert!(encoded.get("admin_token").is_none());
-        assert_eq!(encoded.get("principal").and_then(serde_json::Value::as_str), Some("admin:test"));
+        assert_eq!(
+            encoded.get("principal").and_then(serde_json::Value::as_str),
+            Some("admin:test")
+        );
     }
 }
