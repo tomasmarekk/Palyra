@@ -1262,9 +1262,8 @@ fn unix_ms_now() -> i64 {
 #[cfg(test)]
 mod tests {
     use palyra_connectors::{
-        providers::provider_availability,
-        AttachmentKind, AttachmentRef, ConnectorAvailability, ConnectorInstanceSpec, ConnectorKind,
-        ConnectorSupervisorConfig, ConnectorSupervisorError,
+        providers::provider_availability, AttachmentKind, AttachmentRef, ConnectorAvailability,
+        ConnectorInstanceSpec, ConnectorKind, ConnectorSupervisorConfig, ConnectorSupervisorError,
     };
     use tempfile::TempDir;
 
