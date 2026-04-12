@@ -60,18 +60,10 @@ describe("M35 web console app", () => {
     });
   });
 
-  it("retries bootstrap session before falling back to the auth screen", async () => {
+  it("does not retry bootstrap session before falling back to the auth screen", async () => {
     window.localStorage.removeItem("palyra.console.theme");
     const fetchMock = createQueuedFetch([
-      jsonResponse({ error: "admin API rate limit exceeded for 127.0.0.1" }, 429),
-      jsonResponse({ error: "admin API rate limit exceeded for 127.0.0.1" }, 429),
-      jsonResponse({
-        principal: "admin:desktop-control-center",
-        device_id: "device-1",
-        csrf_token: "csrf-1",
-        issued_at_unix_ms: 100,
-        expires_at_unix_ms: 300,
-      }),
+      jsonResponse({ error: "missing session" }, 403),
     ]);
     vi.stubGlobal("fetch", fetchMock);
 
@@ -79,16 +71,14 @@ describe("M35 web console app", () => {
 
     await waitFor(
       () => {
-        expect(
-          screen.getByRole("heading", { name: "Web Dashboard Operator Surface" }),
-        ).toBeInTheDocument();
+        expect(screen.getByRole("heading", { name: "Operator Dashboard" })).toBeInTheDocument();
       },
       { timeout: 4_000 },
     );
     const sessionCalls = fetchMock.mock.calls.filter(
       (call) => requestUrl(call[0]) === "/console/v1/auth/session",
     );
-    expect(sessionCalls).toHaveLength(3);
+    expect(sessionCalls).toHaveLength(1);
   });
 
   it("consumes the desktop handoff token before showing the auth screen", async () => {
@@ -171,21 +161,10 @@ describe("M35 web console app", () => {
     expect(window.location.search).toBe("");
   });
 
-  it("keeps the boot screen visible until a delayed desktop session arrives", async () => {
+  it("does not poll for speculative desktop session recovery on localhost", async () => {
     window.localStorage.removeItem("palyra.console.theme");
     const fetchMock = createQueuedFetch([
       jsonResponse({ error: "missing session" }, 403),
-      jsonResponse({ error: "missing session" }, 403),
-      jsonResponse({ error: "missing session" }, 403),
-      jsonResponse({ error: "missing session" }, 403),
-      jsonResponse({ error: "missing session" }, 403),
-      jsonResponse({
-        principal: "admin:desktop-control-center",
-        device_id: "device-1",
-        csrf_token: "csrf-1",
-        issued_at_unix_ms: 100,
-        expires_at_unix_ms: 300,
-      }),
     ]);
     vi.stubGlobal("fetch", fetchMock);
 
@@ -194,17 +173,14 @@ describe("M35 web console app", () => {
     expect(screen.getByRole("heading", { name: "Web Dashboard" })).toBeInTheDocument();
     await waitFor(
       () => {
-        expect(
-          screen.getByRole("heading", { name: "Web Dashboard Operator Surface" }),
-        ).toBeInTheDocument();
+        expect(screen.getByRole("heading", { name: "Operator Dashboard" })).toBeInTheDocument();
       },
       { timeout: 4_000 },
     );
-    expect(screen.queryByRole("heading", { name: "Operator Dashboard" })).not.toBeInTheDocument();
     const sessionCalls = fetchMock.mock.calls.filter(
       (call) => requestUrl(call[0]) === "/console/v1/auth/session",
     );
-    expect(sessionCalls).toHaveLength(6);
+    expect(sessionCalls).toHaveLength(1);
   });
 
   it("does not surface a false overview error after a successful baseline refresh", async () => {

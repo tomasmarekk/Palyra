@@ -54,10 +54,6 @@ export const AUTO_REFRESH_SECTION_TTL_MS: Partial<Record<Section, number>> = {
   support: 10_000,
 };
 
-const BOOTSTRAP_SESSION_RETRY_DELAY_MS = 150;
-const BOOTSTRAP_SESSION_RETRY_ATTEMPTS = 5;
-const DESKTOP_SESSION_RECOVERY_DELAY_MS = 750;
-const DESKTOP_SESSION_RECOVERY_ATTEMPTS = 8;
 const DESKTOP_HANDOFF_QUERY_PARAM = "desktop_handoff_token";
 
 export function shouldAutoRefreshSection(
@@ -72,39 +68,14 @@ export function shouldAutoRefreshSection(
   return now - lastRefreshedAt >= ttlMs;
 }
 
-function shouldRetryBootstrapSession(
-  error: unknown,
-  attempt: number,
-  maxAttempts: number,
-): boolean {
-  if (!(error instanceof ControlPlaneApiError)) {
-    return false;
-  }
-  if (attempt >= maxAttempts) {
-    return false;
-  }
-  return error.status === 401 || error.status === 403 || error.status === 429;
-}
-
 async function loadBootstrapSession(
   api: ConsoleApiClient,
   signal?: AbortSignal,
 ): Promise<ConsoleSession> {
-  for (let attempt = 1; attempt <= BOOTSTRAP_SESSION_RETRY_ATTEMPTS; attempt += 1) {
-    if (signal?.aborted) {
-      throw createAbortError();
-    }
-    try {
-      return await api.getSession();
-    } catch (error) {
-      if (!shouldRetryBootstrapSession(error, attempt, BOOTSTRAP_SESSION_RETRY_ATTEMPTS)) {
-        throw error;
-      }
-      await waitForDelay(BOOTSTRAP_SESSION_RETRY_DELAY_MS * attempt, signal);
-    }
+  if (signal?.aborted) {
+    throw createAbortError();
   }
-
-  throw new Error("Bootstrap session retry loop exhausted without returning a session.");
+  return api.getSession();
 }
 
 async function loadDesktopHandoffSession(
@@ -121,14 +92,6 @@ async function loadDesktopHandoffSession(
       throw handoffError;
     }
   }
-}
-
-function shouldAttemptDesktopSessionRecovery(): boolean {
-  if (typeof window === "undefined") {
-    return false;
-  }
-  const hostname = window.location.hostname.trim().toLowerCase();
-  return hostname === "127.0.0.1" || hostname === "localhost";
 }
 
 function readDesktopHandoffToken(): string | null {
@@ -168,7 +131,6 @@ function toWorkspaceSlug(value: string): string {
 
 export function useConsoleAppState() {
   const api = useMemo(() => new ConsoleApiClient(""), []);
-  const desktopSessionRecoveryAttemptedRef = useRef(false);
 
   const [booting, setBooting] = useState(true);
   const [session, setSession] = useState<ConsoleSession | null>(null);
@@ -637,7 +599,6 @@ export function useConsoleAppState() {
               return;
             }
             clearDesktopHandoffTokenFromAddressBar();
-            desktopSessionRecoveryAttemptedRef.current = true;
             applyConsoleSession(current);
             return;
           } catch {
@@ -648,7 +609,6 @@ export function useConsoleAppState() {
         if (cancelled) {
           return;
         }
-        desktopSessionRecoveryAttemptedRef.current = true;
         applyConsoleSession(current);
       } catch (failure) {
         if (!cancelled && !isAbortError(failure)) {
@@ -669,63 +629,6 @@ export function useConsoleAppState() {
       abortController.abort();
     };
   }, [api]);
-
-  useEffect(() => {
-    if (
-      booting ||
-      session !== null ||
-      loginBusy ||
-      logoutBusy ||
-      desktopSessionRecoveryAttemptedRef.current ||
-      !shouldAttemptDesktopSessionRecovery()
-    ) {
-      return;
-    }
-
-    desktopSessionRecoveryAttemptedRef.current = true;
-    let cancelled = false;
-    const abortController = new AbortController();
-    const recoverDesktopSession = async () => {
-      try {
-        for (let attempt = 1; attempt <= DESKTOP_SESSION_RECOVERY_ATTEMPTS; attempt += 1) {
-          if (abortController.signal.aborted) {
-            return;
-          }
-          try {
-            const current = await api.getSession();
-            if (cancelled) {
-              return;
-            }
-            setError(null);
-            applyConsoleSession(current);
-            return;
-          } catch (failure) {
-            if (!cancelled && !isExpectedUnauthenticatedSessionError(failure)) {
-              setError(toErrorMessage(failure));
-            }
-            if (attempt >= DESKTOP_SESSION_RECOVERY_ATTEMPTS) {
-              return;
-            }
-            await waitForDelay(DESKTOP_SESSION_RECOVERY_DELAY_MS * attempt, abortController.signal);
-          }
-        }
-      } catch (failure) {
-        if (
-          !cancelled &&
-          !isAbortError(failure) &&
-          !isExpectedUnauthenticatedSessionError(failure)
-        ) {
-          setError(toErrorMessage(failure));
-        }
-      }
-    };
-
-    void recoverDesktopSession();
-    return () => {
-      cancelled = true;
-      abortController.abort();
-    };
-  }, [api, booting, loginBusy, logoutBusy, session]);
 
   useEffect(() => {
     const root = document.documentElement;
@@ -2055,24 +1958,6 @@ export function useConsoleAppState() {
 }
 
 export type ConsoleAppState = ReturnType<typeof useConsoleAppState>;
-
-function waitForDelay(delayMs: number, signal?: AbortSignal): Promise<void> {
-  if (signal?.aborted) {
-    return Promise.reject(createAbortError());
-  }
-  return new Promise((resolve, reject) => {
-    const timer = window.setTimeout(() => {
-      signal?.removeEventListener("abort", onAbort);
-      resolve();
-    }, delayMs);
-    const onAbort = () => {
-      window.clearTimeout(timer);
-      signal?.removeEventListener("abort", onAbort);
-      reject(createAbortError());
-    };
-    signal?.addEventListener("abort", onAbort, { once: true });
-  });
-}
 
 function createAbortError(): Error {
   return new Error("console app effect aborted");
