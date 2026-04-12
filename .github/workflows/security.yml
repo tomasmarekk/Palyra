@@ -63,7 +63,7 @@ jobs:
             --threshold high
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7
+        uses: ./.github/actions/setup-rust-toolchain
         with:
           toolchain: 1.91.0
 

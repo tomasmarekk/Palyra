@@ -1,0 +1,87 @@
+name: Setup Rust Toolchain Safe
+description: Install a pinned Rust toolchain with bounded retries for transient rustup network failures.
+
+inputs:
+  toolchain:
+    description: Rust toolchain specifier to install and activate.
+    required: true
+  components:
+    description: Comma-separated Rust components to install with the toolchain.
+    required: false
+    default: ""
+  max-attempts:
+    description: Maximum rustup install attempts before failing the job.
+    required: false
+    default: "3"
+  download-timeout:
+    description: rustup component download timeout in seconds.
+    required: false
+    default: "300"
+
+runs:
+  using: composite
+  steps:
+    - name: Install Rust toolchain with retry
+      shell: pwsh
+      env:
+        RUSTUP_DOWNLOAD_TIMEOUT: ${{ inputs.download-timeout }}
+      run: |
+        $ErrorActionPreference = "Stop"
+
+        if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
+          throw "rustup is required on the runner PATH"
+        }
+
+        $toolchain = "${{ inputs.toolchain }}".Trim()
+        if ([string]::IsNullOrWhiteSpace($toolchain)) {
+          throw "toolchain input must not be empty"
+        }
+
+        $components = @()
+        foreach ($component in "${{ inputs.components }}".Split(",")) {
+          $trimmed = $component.Trim()
+          if (-not [string]::IsNullOrWhiteSpace($trimmed)) {
+            $components += $trimmed
+          }
+        }
+
+        $installArgs = @("toolchain", "install", $toolchain, "--profile", "minimal", "--no-self-update")
+        foreach ($component in $components) {
+          $installArgs += @("--component", $component)
+        }
+
+        $maxAttempts = [int]"${{ inputs.max-attempts }}"
+        if ($maxAttempts -lt 1) {
+          throw "max-attempts must be at least 1"
+        }
+
+        for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+          Write-Host "Installing Rust toolchain '$toolchain' (attempt $attempt/$maxAttempts)..."
+          & rustup @installArgs
+          if ($LASTEXITCODE -eq 0) {
+            break
+          }
+
+          if ($attempt -eq $maxAttempts) {
+            throw "rustup toolchain install failed after $maxAttempts attempts"
+          }
+
+          $backoffSeconds = 5 * $attempt
+          Write-Warning "rustup install attempt $attempt failed; retrying in $backoffSeconds seconds"
+          Start-Sleep -Seconds $backoffSeconds
+        }
+
+        & rustup default $toolchain
+        if ($LASTEXITCODE -ne 0) {
+          throw "failed to activate Rust toolchain '$toolchain'"
+        }
+
+        & rustc --version
+        if ($LASTEXITCODE -ne 0) {
+          throw "rustc was not available after activating '$toolchain'"
+        }
+
+        & cargo --version
+        if ($LASTEXITCODE -ne 0) {
+          throw "cargo was not available after activating '$toolchain'"
+        }
