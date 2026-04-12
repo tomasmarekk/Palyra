@@ -432,7 +432,9 @@ fn load_profiles_document(path: Option<&Path>) -> Result<CliProfilesDocument> {
 }
 
 pub(crate) fn cli_profiles_registry_path() -> Result<PathBuf> {
-    let base_state_root = resolve_cli_state_root(None)?;
+    let base_state_root = current_root_context()
+        .map(|context| context.state_root().to_path_buf())
+        .unwrap_or(resolve_cli_state_root(None)?);
     resolve_profiles_storage_path(base_state_root.as_path())
 }
 
@@ -818,8 +820,9 @@ fn read_normalized_env_var(name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_active_profile_context, build_root_context, CliConnectionProfile, ConnectionDefaults,
-        ConnectionOverrides, RootOptions, CLI_PROFILES_PATH_ENV, CLI_PROFILE_ENV,
+        build_active_profile_context, build_root_context, cli_profiles_registry_path,
+        context_cell, CliConnectionProfile, ConnectionDefaults, ConnectionOverrides, RootOptions,
+        CLI_PROFILES_PATH_ENV, CLI_PROFILES_RELATIVE_PATH, CLI_PROFILE_ENV,
     };
     use crate::args::{LogLevelArg, OutputFormatArg};
     use anyhow::Result;
@@ -846,6 +849,9 @@ mod tests {
             CLI_PROFILES_PATH_ENV,
         ] {
             env::remove_var(key);
+        }
+        if let Ok(mut guard) = context_cell().lock() {
+            *guard = None;
         }
     }
 
@@ -1003,6 +1009,25 @@ daemon_url = "http://127.0.0.1:8200"
             error.to_string().contains("active CLI profile mismatch"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn cli_profiles_registry_path_prefers_installed_root_context_state_root() -> Result<()> {
+        let _guard = env_lock().lock().expect("env lock");
+        clear_env();
+        let temp = tempdir()?;
+        let state_root = temp.path().join("portable-state");
+        let context = build_root_context(RootOptions {
+            state_root: Some(state_root.display().to_string()),
+            ..RootOptions::default()
+        })?;
+        let mut guard = context_cell().lock().expect("context lock");
+        *guard = Some(context);
+        drop(guard);
+
+        let registry_path = cli_profiles_registry_path()?;
+        assert_eq!(registry_path, state_root.join(CLI_PROFILES_RELATIVE_PATH));
+        Ok(())
     }
 
     #[test]
