@@ -2376,44 +2376,6 @@ fn env_u64(name: &str) -> Option<u64> {
     env::var(name).ok().and_then(|value| value.trim().parse::<u64>().ok())
 }
 
-#[cfg(test)]
-#[allow(clippy::items_after_test_module)]
-mod tests {
-    use super::{ensure_browser_service_enabled, BrowserPolicySnapshot};
-
-    fn disabled_policy() -> BrowserPolicySnapshot {
-        BrowserPolicySnapshot {
-            configured_enabled: false,
-            auth_token_configured: false,
-            endpoint: "http://127.0.0.1:7543".to_owned(),
-            connect_timeout_ms: None,
-            request_timeout_ms: None,
-            max_screenshot_bytes: None,
-            max_title_bytes: None,
-            state_dir: None,
-            state_key_vault_ref_configured: false,
-        }
-    }
-
-    #[test]
-    fn browser_start_fails_closed_when_service_is_disabled() {
-        let error = ensure_browser_service_enabled(&disabled_policy(), "start")
-            .expect_err("disabled browser service should block start");
-        assert!(
-            error.to_string().contains("tool_call.browser_service.enabled=false"),
-            "disabled-service error should explain the policy gate: {error}"
-        );
-    }
-
-    #[test]
-    fn browser_start_allows_enabled_policy() {
-        let mut policy = disabled_policy();
-        policy.configured_enabled = true;
-        ensure_browser_service_enabled(&policy, "start")
-            .expect("enabled browser service should allow start");
-    }
-}
-
 fn normalize_browser_base_url(raw: String, label: &str) -> Result<String> {
     let url = Url::parse(raw.trim()).with_context(|| format!("invalid {label}: {}", raw.trim()))?;
     if !matches!(url.scheme(), "http" | "https") {
@@ -3098,5 +3060,42 @@ fn proto_console_severity_text(value: i32) -> &'static str {
         browser_v1::BrowserDiagnosticSeverity::Warn => "warn",
         browser_v1::BrowserDiagnosticSeverity::Error => "error",
         _ => "info",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ensure_browser_service_enabled, BrowserPolicySnapshot};
+
+    fn disabled_policy() -> BrowserPolicySnapshot {
+        BrowserPolicySnapshot {
+            configured_enabled: false,
+            auth_token_configured: false,
+            endpoint: "http://127.0.0.1:7543".to_owned(),
+            connect_timeout_ms: None,
+            request_timeout_ms: None,
+            max_screenshot_bytes: None,
+            max_title_bytes: None,
+            state_dir: None,
+            state_key_vault_ref_configured: false,
+        }
+    }
+
+    #[test]
+    fn browser_start_fails_closed_when_service_is_disabled() {
+        let error = ensure_browser_service_enabled(&disabled_policy(), "start")
+            .expect_err("disabled browser service should block start");
+        assert!(
+            error.to_string().contains("tool_call.browser_service.enabled=false"),
+            "disabled-service error should explain the policy gate: {error}"
+        );
+    }
+
+    #[test]
+    fn browser_start_allows_enabled_policy() {
+        let mut policy = disabled_policy();
+        policy.configured_enabled = true;
+        ensure_browser_service_enabled(&policy, "start")
+            .expect("enabled browser service should allow start");
     }
 }

@@ -2204,62 +2204,6 @@ pub(crate) fn resolve_support_bundle_root() -> Result<PathBuf, String> {
     Ok(state_root.join("support-bundles"))
 }
 
-#[cfg(test)]
-#[allow(clippy::items_after_test_module)]
-mod support_bundle_root_tests {
-    use super::resolve_support_bundle_root;
-    use std::{
-        ffi::OsString,
-        sync::{Mutex, OnceLock},
-    };
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    struct ScopedEnvVar {
-        key: &'static str,
-        previous: Option<OsString>,
-    }
-
-    impl ScopedEnvVar {
-        fn set(key: &'static str, value: &str) -> Self {
-            let previous = std::env::var_os(key);
-            unsafe {
-                std::env::set_var(key, value);
-            }
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for ScopedEnvVar {
-        fn drop(&mut self) {
-            if let Some(previous) = self.previous.take() {
-                unsafe {
-                    std::env::set_var(self.key, previous);
-                }
-            } else {
-                unsafe {
-                    std::env::remove_var(self.key);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn resolve_support_bundle_root_prefers_explicit_state_root_env() {
-        let _lock = env_lock().lock().expect("env lock should be available");
-        let portable_state_root = std::env::temp_dir().join("palyra-portable-state");
-        let portable_state_root_string = portable_state_root.to_string_lossy().into_owned();
-        let _state_root =
-            ScopedEnvVar::set("PALYRA_STATE_ROOT", portable_state_root_string.as_str());
-        let support_root =
-            resolve_support_bundle_root().expect("support bundle root should resolve");
-        assert_eq!(support_root, portable_state_root.join("support-bundles"));
-    }
-}
-
 #[allow(clippy::result_large_err)]
 pub(crate) fn build_capability_catalog() -> Result<control_plane::CapabilityCatalog, Response> {
     let generated_at_unix_ms = unix_ms_now().map_err(|error| {
@@ -3130,4 +3074,59 @@ pub(crate) fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod support_bundle_root_tests {
+    use super::resolve_support_bundle_root;
+    use std::{
+        ffi::OsString,
+        sync::{Mutex, OnceLock},
+    };
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct ScopedEnvVar {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl ScopedEnvVar {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                unsafe {
+                    std::env::set_var(self.key, previous);
+                }
+            } else {
+                unsafe {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_support_bundle_root_prefers_explicit_state_root_env() {
+        let _lock = env_lock().lock().expect("env lock should be available");
+        let portable_state_root = std::env::temp_dir().join("palyra-portable-state");
+        let portable_state_root_string = portable_state_root.to_string_lossy().into_owned();
+        let _state_root =
+            ScopedEnvVar::set("PALYRA_STATE_ROOT", portable_state_root_string.as_str());
+        let support_root =
+            resolve_support_bundle_root().expect("support bundle root should resolve");
+        assert_eq!(support_root, portable_state_root.join("support-bundles"));
+    }
 }
