@@ -1,3 +1,8 @@
+//! Curated public surface for the connector subsystem.
+//!
+//! Generic runtime and storage primitives live under [`core`]. Provider-owned
+//! adapters and semantics stay under [`providers`].
+
 pub mod connectors;
 pub mod core;
 pub mod providers;

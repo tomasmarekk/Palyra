@@ -3,7 +3,7 @@ param()
 
 $ErrorActionPreference = "Stop"
 $rootDir = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
-$fixturePath = "crates/palyra-connector-core/tests/fixtures/channel_simulator_expected.json"
+$fixturePath = "crates/palyra-connectors/tests/fixtures/channel_simulator_expected.json"
 $absoluteFixturePath = Join-Path $rootDir $fixturePath
 
 $beforeHash = $null

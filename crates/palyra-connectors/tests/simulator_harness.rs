@@ -7,7 +7,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use palyra_connector_core::{
+use palyra_connectors::{
     AttachmentKind, AttachmentRef, ConnectorAdapter, ConnectorAdapterError, ConnectorApprovalMode,
     ConnectorAvailability, ConnectorConversationTarget, ConnectorInstanceSpec, ConnectorKind,
     ConnectorMessageDeleteRequest, ConnectorMessageEditRequest, ConnectorMessageLocator,
@@ -121,7 +121,7 @@ impl ConnectorAdapter for MockConnectorServer {
 
     async fn send_outbound(
         &self,
-        _instance: &palyra_connector_core::ConnectorInstanceRecord,
+        _instance: &palyra_connectors::ConnectorInstanceRecord,
         request: &OutboundMessageRequest,
     ) -> Result<DeliveryOutcome, ConnectorAdapterError> {
         let mut state = self.state.lock().map_err(|_| {
@@ -197,7 +197,7 @@ impl ConnectorAdapter for MockConnectorServer {
 
     async fn read_messages(
         &self,
-        _instance: &palyra_connector_core::ConnectorInstanceRecord,
+        _instance: &palyra_connectors::ConnectorInstanceRecord,
         request: &ConnectorMessageReadRequest,
     ) -> Result<ConnectorMessageReadResult, ConnectorAdapterError> {
         let state = self.state.lock().map_err(|_| {
@@ -259,7 +259,7 @@ impl ConnectorAdapter for MockConnectorServer {
 
     async fn search_messages(
         &self,
-        _instance: &palyra_connector_core::ConnectorInstanceRecord,
+        _instance: &palyra_connectors::ConnectorInstanceRecord,
         request: &ConnectorMessageSearchRequest,
     ) -> Result<ConnectorMessageSearchResult, ConnectorAdapterError> {
         let state = self.state.lock().map_err(|_| {
@@ -316,7 +316,7 @@ impl ConnectorAdapter for MockConnectorServer {
 
     async fn edit_message(
         &self,
-        _instance: &palyra_connector_core::ConnectorInstanceRecord,
+        _instance: &palyra_connectors::ConnectorInstanceRecord,
         request: &ConnectorMessageEditRequest,
     ) -> Result<ConnectorMessageMutationResult, ConnectorAdapterError> {
         let mut state = self.state.lock().map_err(|_| {
@@ -355,7 +355,7 @@ impl ConnectorAdapter for MockConnectorServer {
 
     async fn delete_message(
         &self,
-        _instance: &palyra_connector_core::ConnectorInstanceRecord,
+        _instance: &palyra_connectors::ConnectorInstanceRecord,
         request: &ConnectorMessageDeleteRequest,
     ) -> Result<ConnectorMessageMutationResult, ConnectorAdapterError> {
         let mut state = self.state.lock().map_err(|_| {
@@ -396,7 +396,7 @@ impl ConnectorAdapter for MockConnectorServer {
 
     async fn add_reaction(
         &self,
-        _instance: &palyra_connector_core::ConnectorInstanceRecord,
+        _instance: &palyra_connectors::ConnectorInstanceRecord,
         request: &ConnectorMessageReactionRequest,
     ) -> Result<ConnectorMessageMutationResult, ConnectorAdapterError> {
         mutate_reaction_state(&self.state, request, true)
@@ -404,7 +404,7 @@ impl ConnectorAdapter for MockConnectorServer {
 
     async fn remove_reaction(
         &self,
-        _instance: &palyra_connector_core::ConnectorInstanceRecord,
+        _instance: &palyra_connectors::ConnectorInstanceRecord,
         request: &ConnectorMessageReactionRequest,
     ) -> Result<ConnectorMessageMutationResult, ConnectorAdapterError> {
         mutate_reaction_state(&self.state, request, false)

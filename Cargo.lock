@@ -2986,7 +2986,6 @@ dependencies = [
  "flate2",
  "futures",
  "palyra-common",
- "palyra-connector-core",
  "palyra-connector-discord",
  "reqwest",
  "rusqlite",

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-FIXTURE_PATH="crates/palyra-connector-core/tests/fixtures/channel_simulator_expected.json"
+FIXTURE_PATH="crates/palyra-connectors/tests/fixtures/channel_simulator_expected.json"
 FIXTURE_ABS_PATH="$ROOT_DIR/$FIXTURE_PATH"
 
 before_hash=""

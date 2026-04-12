@@ -1,9 +1,13 @@
-//! Provider-neutral connector runtime and storage primitives owned by
-//! `palyra-connectors`.
+//! Temporary shim that forwards the legacy crate to the generic core sources
+//! owned by `palyra-connectors`.
 
+#[path = "../../../palyra-connectors/src/core/net.rs"]
 pub mod net;
+#[path = "../../../palyra-connectors/src/core/protocol.rs"]
 pub mod protocol;
+#[path = "../../../palyra-connectors/src/core/storage.rs"]
 pub mod storage;
+#[path = "../../../palyra-connectors/src/core/supervisor.rs"]
 pub mod supervisor;
 
 pub use protocol::{

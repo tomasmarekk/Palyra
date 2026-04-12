@@ -12,7 +12,6 @@ base64.workspace = true
 flate2.workspace = true
 futures.workspace = true
 palyra-common = { version = "0.1.0", path = "../palyra-common" }
-palyra-connector-core = { version = "0.1.0", path = "../palyra-connector-core" }
 palyra-connector-discord = { version = "0.1.0", path = "../palyra-connector-discord" }
 reqwest = { workspace = true, features = ["multipart"] }
 rusqlite.workspace = true

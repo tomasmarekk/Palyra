@@ -34,4 +34,4 @@ cd "$ROOT_DIR"
 
 CARGO_BIN="$(resolve_cargo)"
 
-PALYRA_REFRESH_DETERMINISTIC_FIXTURES=1 "$CARGO_BIN" test -p palyra-connector-core --test simulator_harness --locked
+PALYRA_REFRESH_DETERMINISTIC_FIXTURES=1 "$CARGO_BIN" test -p palyra-connectors --test simulator_harness --locked

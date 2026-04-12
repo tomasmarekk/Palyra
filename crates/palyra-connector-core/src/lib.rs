@@ -1,27 +1,10 @@
-pub mod net;
-pub mod protocol;
-pub mod storage;
-pub mod supervisor;
+//! Compatibility shim for the legacy `palyra-connector-core` crate.
+//!
+//! The generic connector core implementation now lives in
+//! `palyra-connectors/src/core`. This crate remains temporarily to keep
+//! downstream compatibility until provider code is absorbed in the next
+//! milestone.
 
-pub use protocol::{
-    AttachmentKind, AttachmentRef, ConnectorApprovalMode, ConnectorAvailability,
-    ConnectorCapabilitySet, ConnectorCapabilitySupport, ConnectorConversationTarget,
-    ConnectorInstanceSpec, ConnectorKind, ConnectorLiveness, ConnectorMessageCapabilitySet,
-    ConnectorMessageDeleteRequest, ConnectorMessageEditRequest, ConnectorMessageLocator,
-    ConnectorMessageMutationDiff, ConnectorMessageMutationResult, ConnectorMessageMutationStatus,
-    ConnectorMessageReactionRecord, ConnectorMessageReactionRequest, ConnectorMessageReadRequest,
-    ConnectorMessageReadResult, ConnectorMessageRecord, ConnectorMessageSearchRequest,
-    ConnectorMessageSearchResult, ConnectorOperationPreflight, ConnectorQueueDepth,
-    ConnectorReadiness, ConnectorRiskLevel, ConnectorStatusSnapshot, DeliveryOutcome,
-    InboundMessageEvent, OutboundA2uiUpdate, OutboundAttachment, OutboundMessageRequest,
-    RetryClass, RouteInboundResult, RoutedOutboundMessage,
-};
-pub use storage::{
-    ConnectorEventRecord, ConnectorInstanceRecord, ConnectorQueueSnapshot, ConnectorStore,
-    ConnectorStoreError, DeadLetterRecord, OutboxEnqueueOutcome, OutboxEntryRecord,
-};
-pub use supervisor::{
-    ConnectorAdapter, ConnectorAdapterError, ConnectorRouter, ConnectorRouterError,
-    ConnectorSupervisor, ConnectorSupervisorConfig, ConnectorSupervisorError, DrainOutcome,
-    InboundIngestOutcome,
-};
+pub mod core;
+
+pub use core::*;

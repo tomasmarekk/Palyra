@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::protocol::{
+use super::protocol::{
     ConnectorInstanceSpec, ConnectorKind, ConnectorLiveness, ConnectorQueueDepth,
     ConnectorReadiness, OutboundMessageRequest,
 };
@@ -1309,7 +1309,7 @@ fn outbox_column_exists(
 mod tests {
     use tempfile::TempDir;
 
-    use crate::protocol::{ConnectorInstanceSpec, ConnectorKind, OutboundMessageRequest};
+    use super::super::protocol::{ConnectorInstanceSpec, ConnectorKind, OutboundMessageRequest};
 
     use super::{ConnectorStore, ConnectorStoreError};
 

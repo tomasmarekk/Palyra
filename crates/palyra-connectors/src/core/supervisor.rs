@@ -9,7 +9,7 @@ use serde::Serialize;
 use serde_json::{json, Map, Value};
 use thiserror::Error;
 
-use crate::{
+use super::{
     protocol::{
         ConnectorAvailability, ConnectorCapabilitySet, ConnectorInstanceSpec, ConnectorKind,
         ConnectorLiveness, ConnectorMessageDeleteRequest, ConnectorMessageEditRequest,
@@ -148,7 +148,7 @@ pub trait ConnectorAdapter: Send + Sync {
 
     fn split_outbound(
         &self,
-        _instance: &crate::storage::ConnectorInstanceRecord,
+        _instance: &super::storage::ConnectorInstanceRecord,
         request: &OutboundMessageRequest,
     ) -> Result<Vec<OutboundMessageRequest>, ConnectorAdapterError> {
         Ok(vec![request.clone()])
@@ -156,14 +156,14 @@ pub trait ConnectorAdapter: Send + Sync {
 
     fn runtime_snapshot(
         &self,
-        _instance: &crate::storage::ConnectorInstanceRecord,
+        _instance: &super::storage::ConnectorInstanceRecord,
     ) -> Option<Value> {
         None
     }
 
     async fn poll_inbound(
         &self,
-        _instance: &crate::storage::ConnectorInstanceRecord,
+        _instance: &super::storage::ConnectorInstanceRecord,
         _limit: usize,
     ) -> Result<Vec<InboundMessageEvent>, ConnectorAdapterError> {
         Ok(Vec::new())
@@ -171,13 +171,13 @@ pub trait ConnectorAdapter: Send + Sync {
 
     async fn send_outbound(
         &self,
-        instance: &crate::storage::ConnectorInstanceRecord,
+        instance: &super::storage::ConnectorInstanceRecord,
         request: &OutboundMessageRequest,
     ) -> Result<DeliveryOutcome, ConnectorAdapterError>;
 
     async fn read_messages(
         &self,
-        _instance: &crate::storage::ConnectorInstanceRecord,
+        _instance: &super::storage::ConnectorInstanceRecord,
         _request: &ConnectorMessageReadRequest,
     ) -> Result<ConnectorMessageReadResult, ConnectorAdapterError> {
         Err(ConnectorAdapterError::Backend(format!(
@@ -188,7 +188,7 @@ pub trait ConnectorAdapter: Send + Sync {
 
     async fn search_messages(
         &self,
-        _instance: &crate::storage::ConnectorInstanceRecord,
+        _instance: &super::storage::ConnectorInstanceRecord,
         _request: &ConnectorMessageSearchRequest,
     ) -> Result<ConnectorMessageSearchResult, ConnectorAdapterError> {
         Err(ConnectorAdapterError::Backend(format!(
@@ -199,7 +199,7 @@ pub trait ConnectorAdapter: Send + Sync {
 
     async fn edit_message(
         &self,
-        _instance: &crate::storage::ConnectorInstanceRecord,
+        _instance: &super::storage::ConnectorInstanceRecord,
         _request: &ConnectorMessageEditRequest,
     ) -> Result<ConnectorMessageMutationResult, ConnectorAdapterError> {
         Err(ConnectorAdapterError::Backend(format!(
@@ -210,7 +210,7 @@ pub trait ConnectorAdapter: Send + Sync {
 
     async fn delete_message(
         &self,
-        _instance: &crate::storage::ConnectorInstanceRecord,
+        _instance: &super::storage::ConnectorInstanceRecord,
         _request: &ConnectorMessageDeleteRequest,
     ) -> Result<ConnectorMessageMutationResult, ConnectorAdapterError> {
         Err(ConnectorAdapterError::Backend(format!(
@@ -221,7 +221,7 @@ pub trait ConnectorAdapter: Send + Sync {
 
     async fn add_reaction(
         &self,
-        _instance: &crate::storage::ConnectorInstanceRecord,
+        _instance: &super::storage::ConnectorInstanceRecord,
         _request: &ConnectorMessageReactionRequest,
     ) -> Result<ConnectorMessageMutationResult, ConnectorAdapterError> {
         Err(ConnectorAdapterError::Backend(format!(
@@ -232,7 +232,7 @@ pub trait ConnectorAdapter: Send + Sync {
 
     async fn remove_reaction(
         &self,
-        _instance: &crate::storage::ConnectorInstanceRecord,
+        _instance: &super::storage::ConnectorInstanceRecord,
         _request: &ConnectorMessageReactionRequest,
     ) -> Result<ConnectorMessageMutationResult, ConnectorAdapterError> {
         Err(ConnectorAdapterError::Backend(format!(
@@ -592,7 +592,7 @@ impl ConnectorSupervisor {
         &self,
         connector_id: &str,
     ) -> Result<
-        (crate::storage::ConnectorInstanceRecord, Arc<dyn ConnectorAdapter>),
+        (super::storage::ConnectorInstanceRecord, Arc<dyn ConnectorAdapter>),
         ConnectorSupervisorError,
     > {
         let Some(instance) = self.store.get_instance(connector_id)? else {
@@ -734,7 +734,7 @@ impl ConnectorSupervisor {
         &self,
         connector_id: &str,
         limit: usize,
-    ) -> Result<Vec<crate::storage::ConnectorEventRecord>, ConnectorSupervisorError> {
+    ) -> Result<Vec<super::storage::ConnectorEventRecord>, ConnectorSupervisorError> {
         self.store.list_events(connector_id, limit).map_err(ConnectorSupervisorError::from)
     }
 
@@ -1214,7 +1214,7 @@ impl ConnectorSupervisor {
 
     async fn apply_delivery_outcome(
         &self,
-        instance: &crate::storage::ConnectorInstanceRecord,
+        instance: &super::storage::ConnectorInstanceRecord,
         entry: &OutboxEntryRecord,
         delivery: DeliveryOutcome,
         now_unix_ms: i64,
