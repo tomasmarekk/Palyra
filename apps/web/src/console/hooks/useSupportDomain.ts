@@ -77,8 +77,12 @@ export function useSupportDomain({ api, setError, setNotice }: UseSupportDomainA
           ? (pairingResponse as unknown as JsonObject)
           : null,
       );
-      setSupportNodePairingCodes(nodePairingResponse.codes);
-      setSupportNodePairingRequests(nodePairingResponse.requests);
+      setSupportNodePairingCodes(
+        Array.isArray(nodePairingResponse.codes) ? nodePairingResponse.codes : [],
+      );
+      setSupportNodePairingRequests(
+        Array.isArray(nodePairingResponse.requests) ? nodePairingResponse.requests : [],
+      );
       setSupportBundleJobs(toJsonObjectArray(jobsResponse.jobs as unknown as JsonValue[]));
       setSupportDoctorJobs(toJsonObjectArray(doctorJobsResponse.jobs as unknown as JsonValue[]));
       setSupportDeployment(

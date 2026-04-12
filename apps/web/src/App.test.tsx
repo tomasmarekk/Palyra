@@ -2179,6 +2179,62 @@ describe("M35 web console app", () => {
     expect(findRequestCall(fetchMock, "/console/v1/diagnostics", "GET")).toBeDefined();
   });
 
+  it("keeps the memory section stable when learning and workspace lists are empty", async () => {
+    const fetchMock = withM56Baseline((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = requestUrl(input);
+      const method = (init?.method ?? "GET").toUpperCase();
+
+      if (path === "/console/v1/auth/session" && method === "GET") {
+        return jsonResponse({
+          principal: "admin:web-console",
+          device_id: "device-1",
+          channel: "web",
+          csrf_token: "csrf-1",
+          issued_at_unix_ms: 100,
+          expires_at_unix_ms: 300,
+        });
+      }
+
+      if (path === "/console/v1/memory/status" && method === "GET") {
+        return jsonResponse({
+          roots: [],
+          curated_paths: [],
+          recent_documents: [],
+          learning: { enabled: true, counters: {} },
+        });
+      }
+
+      if (path === "/console/v1/memory/workspace/documents" && method === "GET") {
+        return jsonResponse({
+          contract: { contract_version: "control-plane.v1" },
+          documents: [],
+          roots: [],
+        });
+      }
+
+      if (path === "/console/v1/memory/learning/candidates" && method === "GET") {
+        return jsonResponse({
+          contract: { contract_version: "control-plane.v1" },
+        });
+      }
+
+      if (path === "/console/v1/memory/preferences" && method === "GET") {
+        return jsonResponse({
+          contract: { contract_version: "control-plane.v1" },
+          preferences: [],
+        });
+      }
+
+      throw new Error(`Unhandled mocked request: ${method} ${path}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Memory" }));
+
+    expect(await screen.findByRole("heading", { name: "Memory" })).toBeInTheDocument();
+  });
+
   it("redacts sensitive diagnostics values in the web console by default", async () => {
     const fetchMock = createQueuedFetch([
       jsonResponse({

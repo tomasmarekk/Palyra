@@ -41,28 +41,10 @@ export function useConfigDomain({ api, setError, setNotice }: UseConfigDomainArg
     setConfigBusy(true);
     setError(null);
     try {
-      const backups = normalizedBackupCount(configBackups);
-      const [inspectResponse, validationResponse, secretsResponse, deploymentResponse] =
-        await Promise.all([
-          api.inspectConfig({
-            path: emptyToUndefined(configInspectPath),
-            show_secrets: false,
-            backups,
-          }),
-          api.validateConfig({ path: emptyToUndefined(configInspectPath) }),
-          api.listSecrets(configSecretsScope),
-          api.getDeploymentPosture(),
-        ]);
-      setConfigInspectSnapshot(
-        isJsonObject(inspectResponse as unknown as JsonValue)
-          ? (inspectResponse as unknown as JsonObject)
-          : null,
-      );
-      setConfigValidation(
-        isJsonObject(validationResponse as unknown as JsonValue)
-          ? (validationResponse as unknown as JsonObject)
-          : null,
-      );
+      const [secretsResponse, deploymentResponse] = await Promise.all([
+        api.listSecrets(configSecretsScope),
+        api.getDeploymentPosture(),
+      ]);
       setConfigSecrets(toJsonObjectArray(secretsResponse.secrets as unknown as JsonValue[]));
       setConfigDeploymentPosture(
         isJsonObject(deploymentResponse as unknown as JsonValue)

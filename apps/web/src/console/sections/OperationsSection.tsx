@@ -72,6 +72,14 @@ export function OperationsSection({ app }: OperationsSectionProps) {
   const browserFailureSamples = toStringArray(
     Array.isArray(browser?.recent_failure_samples) ? browser.recent_failure_samples : [],
   );
+  const usageAlertCount = Array.isArray(usageInsights?.alerts) ? usageInsights.alerts.length : 0;
+  const usageBudgetEvaluations = Array.isArray(usageInsights?.budgets?.evaluations)
+    ? usageInsights.budgets.evaluations.length
+    : 0;
+  const usageDefaultMode = usageInsights?.routing?.default_mode ?? "No routing posture loaded.";
+  const usageRoutingOverrides = usageInsights?.routing?.overrides ?? 0;
+  const usageProviderHealth = usageInsights?.health?.provider_state ?? "unknown";
+  const usageProviderErrorRateBps = usageInsights?.health?.error_rate_bps ?? 0;
 
   return (
     <main className="workspace-page">
@@ -148,9 +156,9 @@ export function OperationsSection({ app }: OperationsSectionProps) {
         />
         <WorkspaceMetricCard
           label="Usage alerts"
-          value={usageInsights?.alerts.length ?? 0}
-          detail={usageInsights?.routing.default_mode ?? "No routing posture loaded."}
-          tone={(usageInsights?.alerts.length ?? 0) > 0 ? "warning" : "default"}
+          value={usageAlertCount}
+          detail={usageDefaultMode}
+          tone={usageAlertCount > 0 ? "warning" : "default"}
         />
         <WorkspaceMetricCard
           label="Self-healing incidents"
@@ -250,18 +258,18 @@ export function OperationsSection({ app }: OperationsSectionProps) {
               <WorkspaceTable ariaLabel="Routing telemetry" columns={["Metric", "Value", "Detail"]}>
                 <tr>
                   <td>Default routing mode</td>
-                  <td>{usageInsights.routing.default_mode}</td>
-                  <td>{usageInsights.routing.overrides} recent overrides</td>
+                  <td>{usageDefaultMode}</td>
+                  <td>{usageRoutingOverrides} recent overrides</td>
                 </tr>
                 <tr>
                   <td>Provider health</td>
-                  <td>{usageInsights.health.provider_state}</td>
-                  <td>{usageInsights.health.error_rate_bps} bps error rate</td>
+                  <td>{usageProviderHealth}</td>
+                  <td>{usageProviderErrorRateBps} bps error rate</td>
                 </tr>
                 <tr>
                   <td>Budget evaluations</td>
-                  <td>{usageInsights.budgets.evaluations.length}</td>
-                  <td>{usageInsights.alerts.length} active alerts</td>
+                  <td>{usageBudgetEvaluations}</td>
+                  <td>{usageAlertCount} active alerts</td>
                 </tr>
               </WorkspaceTable>
             )}

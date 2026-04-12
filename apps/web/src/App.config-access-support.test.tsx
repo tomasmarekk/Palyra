@@ -34,6 +34,43 @@ afterEach(() => {
 });
 
 describe("M56 config, access, and support surfaces", () => {
+  it("keeps config page read-only until the operator explicitly inspects or validates", async () => {
+    let inspectCalls = 0;
+    let validateCalls = 0;
+
+    const fetchMock = createFetchRouter(
+      (request) => routeOverviewRequests(request),
+      (request) => {
+        if (request.path === "/console/v1/config/inspect" && request.method === "POST") {
+          inspectCalls += 1;
+          return jsonResponse(configInspectFixture('version = 1\n[model_provider]\n'));
+        }
+        if (request.path === "/console/v1/config/validate" && request.method === "POST") {
+          validateCalls += 1;
+          return jsonResponse(configValidationFixture(true));
+        }
+        if (request.path === "/console/v1/secrets" && request.method === "GET") {
+          return jsonResponse(secretMetadataListFixture());
+        }
+        return undefined;
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Config" }));
+    expect(await screen.findByRole("heading", { name: "Config" })).toBeInTheDocument();
+    await waitFor(() => {
+      expect(document.body).toHaveTextContent(
+        "Remote gateway exposure requires explicit verification and operator acknowledgement.",
+      );
+    });
+
+    expect(inspectCalls).toBe(0);
+    expect(validateCalls).toBe(0);
+  });
+
   it(
     "operates config lifecycle and explicit secret reveal with default redaction",
     { timeout: 15_000 },

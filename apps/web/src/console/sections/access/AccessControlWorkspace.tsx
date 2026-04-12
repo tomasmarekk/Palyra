@@ -95,9 +95,10 @@ export function AccessControlWorkspace({ api, setError, setNotice }: AccessContr
     setError(null);
     try {
       const response = await api.getAccessSnapshot();
-      setSnapshot(response.snapshot);
-      if (response.snapshot.workspaces.length > 0) {
-        const defaultWorkspaceId = response.snapshot.workspaces[0]?.workspace_id ?? "";
+      const normalizedSnapshot = normalizeAccessSnapshot(response.snapshot);
+      setSnapshot(normalizedSnapshot);
+      if (normalizedSnapshot.workspaces.length > 0) {
+        const defaultWorkspaceId = normalizedSnapshot.workspaces[0]?.workspace_id ?? "";
         setTokenForm((current) =>
           current.workspaceId.length > 0
             ? current
@@ -792,4 +793,29 @@ function emptyToUndefined(raw: string): string | undefined {
 
 function describeFailure(failure: unknown): string {
   return failure instanceof Error ? failure.message : String(failure);
+}
+
+function normalizeAccessSnapshot(snapshot: AccessRegistrySnapshot): AccessRegistrySnapshot {
+  return {
+    ...snapshot,
+    feature_flags: Array.isArray(snapshot.feature_flags) ? snapshot.feature_flags : [],
+    api_tokens: Array.isArray(snapshot.api_tokens) ? snapshot.api_tokens : [],
+    teams: Array.isArray(snapshot.teams) ? snapshot.teams : [],
+    workspaces: Array.isArray(snapshot.workspaces) ? snapshot.workspaces : [],
+    memberships: Array.isArray(snapshot.memberships) ? snapshot.memberships : [],
+    invitations: Array.isArray(snapshot.invitations) ? snapshot.invitations : [],
+    shares: Array.isArray(snapshot.shares) ? snapshot.shares : [],
+    telemetry: Array.isArray(snapshot.telemetry) ? snapshot.telemetry : [],
+    migration: {
+      ...snapshot.migration,
+      checks: Array.isArray(snapshot.migration?.checks) ? snapshot.migration.checks : [],
+    },
+    rollout: {
+      ...snapshot.rollout,
+      packages: Array.isArray(snapshot.rollout?.packages) ? snapshot.rollout.packages : [],
+      operator_notes: Array.isArray(snapshot.rollout?.operator_notes)
+        ? snapshot.rollout.operator_notes
+        : [],
+    },
+  };
 }

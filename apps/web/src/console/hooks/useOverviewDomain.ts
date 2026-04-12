@@ -61,7 +61,7 @@ export function useOverviewDomain({ api, setError }: UseOverviewDomainArgs) {
       );
     }
     if (usageInsights.status === "fulfilled") {
-      setOverviewUsageInsights(usageInsights.value);
+      setOverviewUsageInsights(normalizeUsageInsightsEnvelope(usageInsights.value));
     }
     if (jobs.status === "fulfilled") {
       setOverviewSupportJobs(
@@ -98,6 +98,28 @@ export function useOverviewDomain({ api, setError }: UseOverviewDomainArgs) {
     overviewSupportJobs,
     refreshOverview,
     resetOverviewDomain,
+  };
+}
+
+function normalizeUsageInsightsEnvelope(value: UsageInsightsEnvelope): UsageInsightsEnvelope {
+  return {
+    ...value,
+    timeline: Array.isArray(value.timeline) ? value.timeline : [],
+    routing: {
+      ...value.routing,
+      recent_decisions: Array.isArray(value.routing?.recent_decisions)
+        ? value.routing.recent_decisions
+        : [],
+    },
+    budgets: {
+      ...value.budgets,
+      policies: Array.isArray(value.budgets?.policies) ? value.budgets.policies : [],
+      evaluations: Array.isArray(value.budgets?.evaluations) ? value.budgets.evaluations : [],
+    },
+    alerts: Array.isArray(value.alerts) ? value.alerts : [],
+    model_mix: Array.isArray(value.model_mix) ? value.model_mix : [],
+    scope_mix: Array.isArray(value.scope_mix) ? value.scope_mix : [],
+    tool_mix: Array.isArray(value.tool_mix) ? value.tool_mix : [],
   };
 }
 
