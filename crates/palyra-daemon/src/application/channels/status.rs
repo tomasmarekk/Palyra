@@ -221,11 +221,7 @@ fn apply_channel_auth_failure_surface(payload: &mut Value, message: &str) {
         .as_array_mut()
         .expect("channel saturation reasons should stay array-backed");
     let failure_reason = format!("last_auth_failure={message}");
-    if !reasons
-        .iter()
-        .filter_map(Value::as_str)
-        .any(|existing| existing == failure_reason)
-    {
+    if !reasons.iter().filter_map(Value::as_str).any(|existing| existing == failure_reason) {
         reasons.push(Value::String(failure_reason));
     }
 }
@@ -234,8 +230,8 @@ fn apply_channel_auth_failure_surface(payload: &mut Value, message: &str) {
 mod tests {
     use super::{apply_channel_auth_failure_surface, build_channel_operations_snapshot};
     use palyra_connectors::{
-        ConnectorAvailability, ConnectorKind, ConnectorLiveness,
-        ConnectorQueueDepth, ConnectorReadiness, ConnectorStatusSnapshot,
+        ConnectorAvailability, ConnectorKind, ConnectorLiveness, ConnectorQueueDepth,
+        ConnectorReadiness, ConnectorStatusSnapshot,
     };
     use serde_json::{json, Value};
 
@@ -244,7 +240,9 @@ mod tests {
             connector_id: "discord:default".to_owned(),
             kind: ConnectorKind::Discord,
             availability: ConnectorAvailability::Supported,
-            capabilities: palyra_connectors::providers::provider_capabilities(ConnectorKind::Discord),
+            capabilities: palyra_connectors::providers::provider_capabilities(
+                ConnectorKind::Discord,
+            ),
             principal: "channel:discord".to_owned(),
             enabled: true,
             readiness: ConnectorReadiness::Ready,
@@ -275,8 +273,13 @@ mod tests {
 
     #[test]
     fn channel_operations_snapshot_fails_closed_on_auth_failure() {
-        let payload =
-            build_channel_operations_snapshot("discord:default", &sample_connector(), None, &sample_queue(), &[]);
+        let payload = build_channel_operations_snapshot(
+            "discord:default",
+            &sample_connector(),
+            None,
+            &sample_queue(),
+            &[],
+        );
         assert_eq!(
             payload.pointer("/saturation/state").and_then(Value::as_str),
             Some("auth_failed")
@@ -314,10 +317,7 @@ mod tests {
             payload.pointer("/connector/readiness").and_then(Value::as_str),
             Some("missing_credential")
         );
-        assert_eq!(
-            payload.pointer("/connector/liveness").and_then(Value::as_str),
-            Some("stopped")
-        );
+        assert_eq!(payload.pointer("/connector/liveness").and_then(Value::as_str), Some("stopped"));
         assert_eq!(
             payload.pointer("/operations/saturation/state").and_then(Value::as_str),
             Some("auth_failed")

@@ -2949,10 +2949,7 @@ fn console_secret_inventory_lists_preexisting_shared_vault_metadata() -> Result<
     let vault_dir = state_root_dir.join("vault");
     let config_path = state_root_dir.join("config").join("palyra.toml");
     fs::create_dir_all(&identity_store_dir).with_context(|| {
-        format!(
-            "failed to create shared identity store dir {}",
-            identity_store_dir.display()
-        )
+        format!("failed to create shared identity store dir {}", identity_store_dir.display())
     })?;
     prepare_test_vault_dir(&vault_dir)?;
     write_test_config(&config_path, "version = 1\n")?;
@@ -2964,9 +2961,8 @@ fn console_secret_inventory_lists_preexisting_shared_vault_metadata() -> Result<
         ..VaultConfigOptions::default()
     })
     .context("failed to open shared test vault")?;
-    let global_scope = "global"
-        .parse::<VaultScope>()
-        .context("failed to parse global vault scope")?;
+    let global_scope =
+        "global".parse::<VaultScope>().context("failed to parse global vault scope")?;
     vault
         .put_secret(&global_scope, "codex-e2e-secret", b"test-secret-value")
         .context("failed to seed codex-e2e-secret into shared vault")?;

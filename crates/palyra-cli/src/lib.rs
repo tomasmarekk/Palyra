@@ -2558,16 +2558,16 @@ fn open_url_in_default_browser(url: &str) -> Result<()> {
             Ok(status) => failures.push(format!(
                 "{} exited with status {}",
                 command.display(),
-                status.code().map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_owned())
+                status
+                    .code()
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_owned())
             )),
             Err(error) => failures.push(format!("{} failed: {error}", command.display())),
         }
     }
 
-    anyhow::bail!(
-        "browser open command failed; tried {}",
-        failures.join("; ")
-    )
+    anyhow::bail!("browser open command failed; tried {}", failures.join("; "))
 }
 
 fn normalize_browser_open_url(raw: &str) -> Result<String> {
@@ -2603,35 +2603,21 @@ fn browser_open_commands(url: &str) -> Vec<BrowserOpenCommand> {
 
 #[cfg(target_os = "macos")]
 fn browser_open_commands(url: &str) -> Vec<BrowserOpenCommand> {
-    vec![BrowserOpenCommand {
-        program: "open",
-        args: vec![url.to_owned()],
-    }]
+    vec![BrowserOpenCommand { program: "open", args: vec![url.to_owned()] }]
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn browser_open_commands(url: &str) -> Vec<BrowserOpenCommand> {
-    vec![BrowserOpenCommand {
-        program: "xdg-open",
-        args: vec![url.to_owned()],
-    }]
+    vec![BrowserOpenCommand { program: "xdg-open", args: vec![url.to_owned()] }]
 }
 
 fn build_windows_browser_open_commands(url: &str) -> Vec<BrowserOpenCommand> {
     vec![
         BrowserOpenCommand {
             program: "cmd",
-            args: vec![
-                "/C".to_owned(),
-                "start".to_owned(),
-                "\"\"".to_owned(),
-                url.to_owned(),
-            ],
+            args: vec!["/C".to_owned(), "start".to_owned(), "\"\"".to_owned(), url.to_owned()],
         },
-        BrowserOpenCommand {
-            program: "explorer.exe",
-            args: vec![url.to_owned()],
-        },
+        BrowserOpenCommand { program: "explorer.exe", args: vec![url.to_owned()] },
     ]
 }
 
@@ -7302,10 +7288,7 @@ pinned_gateway_ca_fingerprint_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
                 "http://127.0.0.1:7142/".to_owned(),
             ],
         };
-        assert_eq!(
-            command.display(),
-            "`cmd /C start \"\" http://127.0.0.1:7142/`"
-        );
+        assert_eq!(command.display(), "`cmd /C start \"\" http://127.0.0.1:7142/`");
     }
 
     #[test]

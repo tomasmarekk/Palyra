@@ -659,9 +659,7 @@ mod tests {
         .expect_err("backup archives inside the live state root must be rejected");
 
         assert!(
-            error
-                .to_string()
-                .contains("must stay outside the live state root"),
+            error.to_string().contains("must stay outside the live state root"),
             "unexpected error: {error}"
         );
         Ok(())

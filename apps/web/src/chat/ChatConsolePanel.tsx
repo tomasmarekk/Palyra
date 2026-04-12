@@ -486,7 +486,7 @@ export function ChatConsolePanel({
       runDrawerId,
       cancelStreaming,
       refreshRunDetails: async () => {
-        await refreshRunDetails();
+        refreshRunDetails();
       },
       refreshSessions: async (preserveSelection = false) => {
         await sessions.refreshSessions(preserveSelection);

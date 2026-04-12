@@ -827,8 +827,8 @@ fn read_normalized_env_var(name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_active_profile_context, build_root_context, cli_profiles_registry_path,
-        context_cell, CliConnectionProfile, ConnectionDefaults, ConnectionOverrides, RootOptions,
+        build_active_profile_context, build_root_context, cli_profiles_registry_path, context_cell,
+        CliConnectionProfile, ConnectionDefaults, ConnectionOverrides, RootOptions,
         CLI_PROFILES_PATH_ENV, CLI_PROFILES_RELATIVE_PATH, CLI_PROFILE_ENV,
     };
     use crate::args::{LogLevelArg, OutputFormatArg};
@@ -1027,10 +1027,10 @@ bound_principal = "admin:local"
             allow_strict_profile_actions: false,
         })?;
 
-        let grpc =
-            context.resolve_grpc_connection(ConnectionOverrides::default(), ConnectionDefaults::USER)?;
-        let http =
-            context.resolve_http_connection(ConnectionOverrides::default(), ConnectionDefaults::USER)?;
+        let grpc = context
+            .resolve_grpc_connection(ConnectionOverrides::default(), ConnectionDefaults::USER)?;
+        let http = context
+            .resolve_http_connection(ConnectionOverrides::default(), ConnectionDefaults::USER)?;
 
         assert_eq!(grpc.token.as_deref(), Some("config-token"));
         assert_eq!(grpc.principal, "admin:local");

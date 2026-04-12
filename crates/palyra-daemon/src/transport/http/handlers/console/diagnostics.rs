@@ -2251,7 +2251,8 @@ mod support_bundle_root_tests {
         let _lock = env_lock().lock().expect("env lock should be available");
         let portable_state_root = std::env::temp_dir().join("palyra-portable-state");
         let portable_state_root_string = portable_state_root.to_string_lossy().into_owned();
-        let _state_root = ScopedEnvVar::set("PALYRA_STATE_ROOT", portable_state_root_string.as_str());
+        let _state_root =
+            ScopedEnvVar::set("PALYRA_STATE_ROOT", portable_state_root_string.as_str());
 
         let support_root =
             resolve_support_bundle_root().expect("support bundle root should resolve");

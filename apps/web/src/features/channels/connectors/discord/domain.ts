@@ -14,7 +14,6 @@ import {
   parseInteger,
   readString,
   toErrorMessage,
-  type JsonObject,
 } from "../../../../console/shared";
 
 type Setter<T> = Dispatch<SetStateAction<T>>;

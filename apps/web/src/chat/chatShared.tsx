@@ -9,7 +9,7 @@ import {
   TextInputField,
 } from "../console/components/ui";
 import type { JsonValue, MediaDerivedArtifactRecord, SessionCatalogRecord } from "../consoleApi";
-import { findChatSlashCommand, resolveChatSlashCommandName } from "./chatCommandRegistry";
+import { resolveChatSlashCommandName } from "./chatCommandRegistry";
 export {
   CHAT_SLASH_COMMANDS,
   type SlashCommandDefinition,

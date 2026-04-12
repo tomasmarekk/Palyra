@@ -43,7 +43,7 @@ describe("M56 config, access, and support surfaces", () => {
       (request) => {
         if (request.path === "/console/v1/config/inspect" && request.method === "POST") {
           inspectCalls += 1;
-          return jsonResponse(configInspectFixture('version = 1\n[model_provider]\n'));
+          return jsonResponse(configInspectFixture("version = 1\n[model_provider]\n"));
         }
         if (request.path === "/console/v1/config/validate" && request.method === "POST") {
           validateCalls += 1;
