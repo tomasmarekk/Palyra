@@ -2205,6 +2205,7 @@ pub(crate) fn resolve_support_bundle_root() -> Result<PathBuf, String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod support_bundle_root_tests {
     use super::resolve_support_bundle_root;
     use std::{

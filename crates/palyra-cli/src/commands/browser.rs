@@ -2377,6 +2377,7 @@ fn env_u64(name: &str) -> Option<u64> {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{ensure_browser_service_enabled, BrowserPolicySnapshot};
 
