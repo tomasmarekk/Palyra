@@ -653,7 +653,7 @@ fn build_doctor_checks() -> Vec<DoctorCheck> {
             is_workspace_writable().unwrap_or(false),
             &["palyra doctor", "palyra support-bundle export --output ./support-bundle.json"],
         ),
-        DoctorCheck::blocking("repo_scaffold_ok", required_directories_ok(), &[]),
+        build_doctor_repo_scaffold_check(),
         DoctorCheck::warning(
             "memory_embeddings_model_configured",
             memory_embeddings_model_config_ok(),
@@ -733,6 +733,18 @@ fn build_doctor_checks() -> Vec<DoctorCheck> {
         DoctorCheck::info("swiftlint_installed", command_available("swiftlint", &["version"]), &[]),
         DoctorCheck::info("detekt_installed", command_available("detekt", &["--version"]), &[]),
     ]
+}
+
+fn build_doctor_repo_scaffold_check() -> DoctorCheck {
+    doctor_repo_scaffold_check(required_directories_ok(), doctor_repo_scaffold_required())
+}
+
+fn doctor_repo_scaffold_check(repo_scaffold_ok: bool, repo_scaffold_required: bool) -> DoctorCheck {
+    if repo_scaffold_ok || repo_scaffold_required {
+        DoctorCheck::blocking("repo_scaffold_ok", repo_scaffold_ok, &[])
+    } else {
+        DoctorCheck::info("repo_scaffold_ok", repo_scaffold_ok, &[])
+    }
 }
 
 fn build_doctor_report(checks: &[DoctorCheck]) -> Result<DoctorReport> {
@@ -6296,6 +6308,22 @@ fn required_directories_ok() -> bool {
     .all(|path| Path::new(path).exists())
 }
 
+fn doctor_repo_scaffold_required() -> bool {
+    env::current_exe()
+        .ok()
+        .is_some_and(|path| repo_checkout_detected_from_binary_path(path.as_path()))
+}
+
+fn repo_checkout_detected_from_binary_path(binary_path: &Path) -> bool {
+    binary_path.ancestors().any(looks_like_repo_root)
+}
+
+fn looks_like_repo_root(path: &Path) -> bool {
+    ["Cargo.toml", "crates", "apps", "schemas"]
+        .iter()
+        .all(|entry| path.join(entry).exists())
+}
+
 fn memory_embeddings_model_config_ok() -> bool {
     memory_embeddings_model_config_ok_impl().unwrap_or(true)
 }
@@ -8520,6 +8548,45 @@ mod profile_guardrail_tests {
                 yes: false,
             },
         }));
+    }
+}
+
+#[cfg(test)]
+mod doctor_check_tests {
+    use super::{
+        doctor_repo_scaffold_check, looks_like_repo_root, repo_checkout_detected_from_binary_path,
+        DoctorSeverity,
+    };
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn repo_checkout_detection_finds_workspace_root_from_built_binary_path() {
+        let temp = tempdir().expect("temp dir");
+        for entry in ["crates", "apps", "schemas"] {
+            fs::create_dir_all(temp.path().join(entry)).expect("repo marker should be created");
+        }
+        fs::write(temp.path().join("Cargo.toml"), "[workspace]\nmembers = []\n")
+            .expect("cargo manifest should be created");
+        let binary_path = temp.path().join("target").join("release").join(if cfg!(windows) {
+            "palyra.exe"
+        } else {
+            "palyra"
+        });
+        fs::create_dir_all(binary_path.parent().expect("binary parent")).expect("binary dir");
+        fs::write(binary_path.as_path(), []).expect("binary placeholder should be created");
+
+        assert!(looks_like_repo_root(temp.path()));
+        assert!(repo_checkout_detected_from_binary_path(binary_path.as_path()));
+    }
+
+    #[test]
+    fn repo_scaffold_check_is_informational_for_installed_artifacts_outside_repo() {
+        let check = doctor_repo_scaffold_check(false, false);
+
+        assert!(!check.ok);
+        assert_eq!(check.severity, DoctorSeverity::Info);
+        assert!(!check.required);
     }
 }
 
