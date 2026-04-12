@@ -100,6 +100,16 @@ fn run_backup_create(
     let context = app::current_root_context()
         .ok_or_else(|| anyhow!("CLI root context is unavailable for backup command"))?;
     let output_path = resolve_backup_output_path(output)?;
+    let selected = BackupSelection::from_flags(include, include_workspace, include_support_bundle);
+    let config_path = resolve_optional_existing_file(
+        config_path.or_else(|| context.config_path().map(|value| value.display().to_string())),
+        "config_path",
+    )?;
+    let state_root = resolve_existing_directory(
+        state_root.unwrap_or_else(|| context.state_root().display().to_string()),
+        "state_root",
+    )?;
+    reject_live_state_root_backup_output(output_path.as_path(), state_root.as_path())?;
     if output_path.exists() && !force {
         anyhow::bail!(
             "backup archive already exists: {} (pass --force to replace it)",
@@ -110,17 +120,7 @@ fn run_backup_create(
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    let output_path =
-        support::lifecycle::canonicalize_lossy(output_path.as_path()).unwrap_or(output_path);
-    let selected = BackupSelection::from_flags(include, include_workspace, include_support_bundle);
-    let config_path = resolve_optional_existing_file(
-        config_path.or_else(|| context.config_path().map(|value| value.display().to_string())),
-        "config_path",
-    )?;
-    let state_root = resolve_existing_directory(
-        state_root.unwrap_or_else(|| context.state_root().display().to_string()),
-        "state_root",
-    )?;
+    let output_path = normalize_backup_comparison_path(output_path.as_path())?;
     let workspace_root =
         if selected.workspace { Some(resolve_workspace_root(workspace_root)?) } else { None };
 
@@ -529,6 +529,44 @@ fn emit_backup_verify_report(report: &BackupVerifyReport) -> Result<()> {
     std::io::stdout().flush().context("stdout flush failed")
 }
 
+fn reject_live_state_root_backup_output(output_path: &Path, state_root: &Path) -> Result<()> {
+    let normalized_output = normalize_backup_comparison_path(output_path)?;
+    let normalized_state_root = normalize_backup_comparison_path(state_root)?;
+    if normalized_output.starts_with(normalized_state_root.as_path()) {
+        anyhow::bail!(
+            "backup archive output {} must stay outside the live state root {}",
+            normalized_output.display(),
+            normalized_state_root.display()
+        );
+    }
+    Ok(())
+}
+
+fn normalize_backup_comparison_path(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()
+            .context("failed to resolve current directory for backup path normalization")?
+            .join(path)
+    };
+    Ok(normalize_backup_path_components(absolute.as_path()))
+}
+
+fn normalize_backup_path_components(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -605,6 +643,42 @@ mod tests {
             error.to_string().contains("escapes the allowed root"),
             "unexpected error: {error}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn reject_live_state_root_backup_output_blocks_archives_inside_state_root() -> Result<()> {
+        let temp = tempdir()?;
+        let state_root = temp.path().join("state");
+        fs::create_dir_all(state_root.as_path())?;
+
+        let error = reject_live_state_root_backup_output(
+            state_root.join("portable-backup.zip").as_path(),
+            state_root.as_path(),
+        )
+        .expect_err("backup archives inside the live state root must be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("must stay outside the live state root"),
+            "unexpected error: {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reject_live_state_root_backup_output_allows_archives_outside_state_root() -> Result<()> {
+        let temp = tempdir()?;
+        let state_root = temp.path().join("state");
+        let export_root = temp.path().join("exports");
+        fs::create_dir_all(state_root.as_path())?;
+        fs::create_dir_all(export_root.as_path())?;
+
+        reject_live_state_root_backup_output(
+            export_root.join("portable-backup.zip").as_path(),
+            state_root.as_path(),
+        )?;
         Ok(())
     }
 
