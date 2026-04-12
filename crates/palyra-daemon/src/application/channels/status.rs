@@ -46,6 +46,9 @@ pub(crate) async fn build_channel_health_refresh_payload(
     payload["health_refresh"] =
         build_channel_provider_health_refresh_payload(state, connector_id, verify_channel_id)
             .await?;
+    if let Some(message) = health_refresh_auth_failure_message(&payload["health_refresh"]) {
+        apply_channel_auth_failure_surface(&mut payload, message.as_str());
+    }
     Ok(payload)
 }
 
@@ -81,14 +84,7 @@ fn build_channel_operations_snapshot(
                 .count()
         })
         .unwrap_or(0);
-    let last_auth_failure = find_matching_message(
-        [
-            connector.last_error.as_deref(),
-            last_runtime_error.as_deref(),
-            recent_dead_letters.first().map(|entry| entry.reason.as_str()),
-        ],
-        &["auth", "token", "unauthorized", "credential missing", "missing credential"],
-    );
+    let last_auth_failure = find_channel_auth_failure(connector, runtime, recent_dead_letters);
     let mut saturation_reasons = Vec::new();
     let saturation_state = if !connector.enabled {
         saturation_reasons.push("connector_disabled".to_owned());
@@ -110,6 +106,9 @@ fn build_channel_operations_snapshot(
             saturation_reasons.push(format!("active_route_limits={active_route_limits}"));
         }
         "rate_limited"
+    } else if let Some(error) = last_auth_failure.as_deref() {
+        saturation_reasons.push(format!("last_auth_failure={error}"));
+        "auth_failed"
     } else if queue.claimed_outbox > 0 || queue.due_outbox > 0 {
         if queue.claimed_outbox > 0 {
             saturation_reasons.push(format!("claimed_outbox={}", queue.claimed_outbox));
@@ -160,4 +159,168 @@ fn build_channel_operations_snapshot(
         },
         "discord": provider,
     })
+}
+
+fn find_channel_auth_failure(
+    connector: &palyra_connectors::ConnectorStatusSnapshot,
+    runtime: Option<&Value>,
+    recent_dead_letters: &[palyra_connectors::DeadLetterRecord],
+) -> Option<String> {
+    find_matching_message(
+        [
+            connector.last_error.as_deref(),
+            runtime.and_then(|payload| payload.get("last_error")).and_then(Value::as_str),
+            recent_dead_letters.first().map(|entry| entry.reason.as_str()),
+        ],
+        &[
+            "auth",
+            "token",
+            "unauthorized",
+            "credential missing",
+            "missing credential",
+            "secret not found",
+        ],
+    )
+}
+
+fn health_refresh_auth_failure_message(health_refresh: &Value) -> Option<String> {
+    let message = health_refresh.get("message").and_then(Value::as_str)?;
+    find_matching_message(
+        [Some(message)],
+        &[
+            "auth",
+            "token",
+            "unauthorized",
+            "credential missing",
+            "missing credential",
+            "secret not found",
+        ],
+    )
+}
+
+fn apply_channel_auth_failure_surface(payload: &mut Value, message: &str) {
+    let readiness = if message.contains("credential missing")
+        || message.contains("missing credential")
+        || message.contains("secret not found")
+    {
+        "missing_credential"
+    } else {
+        "auth_failed"
+    };
+    payload["connector"]["readiness"] = Value::String(readiness.to_owned());
+    payload["connector"]["liveness"] = Value::String("stopped".to_owned());
+    if payload["connector"].get("last_error").is_none()
+        || payload["connector"]["last_error"].is_null()
+        || payload["connector"]["last_error"].as_str().is_some_and(|value| value.trim().is_empty())
+    {
+        payload["connector"]["last_error"] = Value::String(message.to_owned());
+    }
+    payload["operations"]["last_auth_failure"] = Value::String(message.to_owned());
+    payload["operations"]["saturation"]["state"] = Value::String("auth_failed".to_owned());
+    let reasons = payload["operations"]["saturation"]["reasons"]
+        .as_array_mut()
+        .expect("channel saturation reasons should stay array-backed");
+    let failure_reason = format!("last_auth_failure={message}");
+    if !reasons
+        .iter()
+        .filter_map(Value::as_str)
+        .any(|existing| existing == failure_reason)
+    {
+        reasons.push(Value::String(failure_reason));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_channel_auth_failure_surface, build_channel_operations_snapshot};
+    use palyra_connectors::{
+        ConnectorAvailability, ConnectorKind, ConnectorLiveness,
+        ConnectorQueueDepth, ConnectorReadiness, ConnectorStatusSnapshot,
+    };
+    use serde_json::{json, Value};
+
+    fn sample_connector() -> ConnectorStatusSnapshot {
+        ConnectorStatusSnapshot {
+            connector_id: "discord:default".to_owned(),
+            kind: ConnectorKind::Discord,
+            availability: ConnectorAvailability::Supported,
+            capabilities: palyra_connectors::providers::provider_capabilities(ConnectorKind::Discord),
+            principal: "channel:discord".to_owned(),
+            enabled: true,
+            readiness: ConnectorReadiness::Ready,
+            liveness: ConnectorLiveness::Running,
+            restart_count: 0,
+            queue_depth: ConnectorQueueDepth { pending_outbox: 0, dead_letters: 0 },
+            last_error: Some("discord credential missing for connector discord:default".to_owned()),
+            last_inbound_unix_ms: None,
+            last_outbound_unix_ms: None,
+            updated_at_unix_ms: 0,
+        }
+    }
+
+    fn sample_queue() -> palyra_connectors::ConnectorQueueSnapshot {
+        palyra_connectors::ConnectorQueueSnapshot {
+            pending_outbox: 0,
+            due_outbox: 0,
+            claimed_outbox: 0,
+            dead_letters: 0,
+            paused: false,
+            pause_reason: None,
+            pause_updated_at_unix_ms: None,
+            next_attempt_unix_ms: None,
+            oldest_pending_created_at_unix_ms: None,
+            latest_dead_letter_unix_ms: None,
+        }
+    }
+
+    #[test]
+    fn channel_operations_snapshot_fails_closed_on_auth_failure() {
+        let payload =
+            build_channel_operations_snapshot("discord:default", &sample_connector(), None, &sample_queue(), &[]);
+        assert_eq!(
+            payload.pointer("/saturation/state").and_then(Value::as_str),
+            Some("auth_failed")
+        );
+        assert_eq!(
+            payload.get("last_auth_failure").and_then(Value::as_str),
+            Some("discord credential missing for connector discord:default")
+        );
+    }
+
+    #[test]
+    fn health_refresh_auth_failure_overrides_ready_running_surface() {
+        let mut payload = json!({
+            "connector": {
+                "enabled": true,
+                "readiness": "ready",
+                "liveness": "running",
+                "last_error": null,
+            },
+            "operations": {
+                "last_auth_failure": null,
+                "saturation": {
+                    "state": "healthy",
+                    "reasons": [],
+                },
+            },
+        });
+
+        apply_channel_auth_failure_surface(
+            &mut payload,
+            "failed to load Discord token from vault ref 'global/discord_bot_token': secret not found",
+        );
+
+        assert_eq!(
+            payload.pointer("/connector/readiness").and_then(Value::as_str),
+            Some("missing_credential")
+        );
+        assert_eq!(
+            payload.pointer("/connector/liveness").and_then(Value::as_str),
+            Some("stopped")
+        );
+        assert_eq!(
+            payload.pointer("/operations/saturation/state").and_then(Value::as_str),
+            Some("auth_failed")
+        );
+    }
 }
