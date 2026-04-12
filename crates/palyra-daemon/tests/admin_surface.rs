@@ -3009,13 +3009,14 @@ fn console_secret_inventory_lists_preexisting_shared_vault_metadata() -> Result<
         .iter()
         .filter_map(|secret| secret.get("key").and_then(Value::as_str))
         .collect::<Vec<_>>();
+    let listed_secret_keys = secret_keys.join(", ");
     assert!(
         secret_keys.contains(&"codex-e2e-secret"),
-        "console secret list should include vault metadata seeded outside the console flow: {secrets}"
+        "console secret list should include vault metadata seeded outside the console flow; keys: {listed_secret_keys}"
     );
     assert!(
         secret_keys.contains(&"openai_api_key"),
-        "console secret list should include shared sensitive refs from the same vault root: {secrets}"
+        "console secret list should include shared sensitive refs from the same vault root; keys: {listed_secret_keys}"
     );
 
     Ok(())
