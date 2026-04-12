@@ -62,9 +62,7 @@ describe("M35 web console app", () => {
 
   it("does not retry bootstrap session before falling back to the auth screen", async () => {
     window.localStorage.removeItem("palyra.console.theme");
-    const fetchMock = createQueuedFetch([
-      jsonResponse({ error: "missing session" }, 403),
-    ]);
+    const fetchMock = createQueuedFetch([jsonResponse({ error: "missing session" }, 403)]);
     vi.stubGlobal("fetch", fetchMock);
 
     render(<App />);
@@ -163,9 +161,7 @@ describe("M35 web console app", () => {
 
   it("does not poll for speculative desktop session recovery on localhost", async () => {
     window.localStorage.removeItem("palyra.console.theme");
-    const fetchMock = createQueuedFetch([
-      jsonResponse({ error: "missing session" }, 403),
-    ]);
+    const fetchMock = createQueuedFetch([jsonResponse({ error: "missing session" }, 403)]);
     vi.stubGlobal("fetch", fetchMock);
 
     render(<App />);
