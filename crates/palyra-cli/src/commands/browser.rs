@@ -436,6 +436,7 @@ async fn run_browser_start(
     wait_ms: u64,
 ) -> Result<()> {
     let resolved = resolve_browser_config(endpoint, health_url, token)?;
+    ensure_browser_service_enabled(&resolved.policy, "start")?;
     if fetch_browser_health(resolved.connection.health_base_url.as_str()).await.is_ok() {
         let metadata = read_browser_service_metadata()?;
         let payload = BrowserLifecyclePayload {
@@ -2318,6 +2319,15 @@ fn resolve_browser_config(
     })
 }
 
+fn ensure_browser_service_enabled(policy: &BrowserPolicySnapshot, action: &str) -> Result<()> {
+    if policy.configured_enabled {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "browser service is disabled (tool_call.browser_service.enabled=false); enable it before running `palyra browser {action}`"
+    );
+}
+
 fn current_config_path() -> Option<PathBuf> {
     app::current_root_context().and_then(|context| context.config_path().map(Path::to_path_buf))
 }
@@ -2364,6 +2374,43 @@ fn env_bool(name: &str) -> Option<bool> {
 
 fn env_u64(name: &str) -> Option<u64> {
     env::var(name).ok().and_then(|value| value.trim().parse::<u64>().ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ensure_browser_service_enabled, BrowserPolicySnapshot};
+
+    fn disabled_policy() -> BrowserPolicySnapshot {
+        BrowserPolicySnapshot {
+            configured_enabled: false,
+            auth_token_configured: false,
+            endpoint: "http://127.0.0.1:7543".to_owned(),
+            connect_timeout_ms: None,
+            request_timeout_ms: None,
+            max_screenshot_bytes: None,
+            max_title_bytes: None,
+            state_dir: None,
+            state_key_vault_ref_configured: false,
+        }
+    }
+
+    #[test]
+    fn browser_start_fails_closed_when_service_is_disabled() {
+        let error = ensure_browser_service_enabled(&disabled_policy(), "start")
+            .expect_err("disabled browser service should block start");
+        assert!(
+            error.to_string().contains("tool_call.browser_service.enabled=false"),
+            "disabled-service error should explain the policy gate: {error}"
+        );
+    }
+
+    #[test]
+    fn browser_start_allows_enabled_policy() {
+        let mut policy = disabled_policy();
+        policy.configured_enabled = true;
+        ensure_browser_service_enabled(&policy, "start")
+            .expect("enabled browser service should allow start");
+    }
 }
 
 fn normalize_browser_base_url(raw: String, label: &str) -> Result<String> {
