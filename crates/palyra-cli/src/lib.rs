@@ -2598,7 +2598,13 @@ impl BrowserOpenCommand {
 
 #[cfg(target_os = "windows")]
 fn browser_open_commands(url: &str) -> Vec<BrowserOpenCommand> {
-    build_windows_browser_open_commands(url)
+    vec![
+        BrowserOpenCommand {
+            program: "cmd",
+            args: vec!["/C".to_owned(), "start".to_owned(), "\"\"".to_owned(), url.to_owned()],
+        },
+        BrowserOpenCommand { program: "explorer.exe", args: vec![url.to_owned()] },
+    ]
 }
 
 #[cfg(target_os = "macos")]
@@ -2609,17 +2615,6 @@ fn browser_open_commands(url: &str) -> Vec<BrowserOpenCommand> {
 #[cfg(all(unix, not(target_os = "macos")))]
 fn browser_open_commands(url: &str) -> Vec<BrowserOpenCommand> {
     vec![BrowserOpenCommand { program: "xdg-open", args: vec![url.to_owned()] }]
-}
-
-#[cfg(target_os = "windows")]
-fn build_windows_browser_open_commands(url: &str) -> Vec<BrowserOpenCommand> {
-    vec![
-        BrowserOpenCommand {
-            program: "cmd",
-            args: vec!["/C".to_owned(), "start".to_owned(), "\"\"".to_owned(), url.to_owned()],
-        },
-        BrowserOpenCommand { program: "explorer.exe", args: vec![url.to_owned()] },
-    ]
 }
 
 fn execute_agent_stream(
@@ -6885,9 +6880,9 @@ struct SkillStatusResponse {
 #[cfg(test)]
 mod cli_v1_tests {
     use super::{
-        build_journal_checkpoint_attestation, build_support_bundle_diagnostics_snapshot,
-        build_windows_browser_open_commands, compare_semver_versions,
-        ensure_remote_registry_same_origin, fetch_limited_bytes,
+        browser_open_commands, build_journal_checkpoint_attestation,
+        build_support_bundle_diagnostics_snapshot,
+        compare_semver_versions, ensure_remote_registry_same_origin, fetch_limited_bytes,
         fetch_remote_registry_entries_with_fetcher, is_retryable_grpc_error,
         memory_embeddings_model_configured, normalize_browser_open_url, normalize_client_socket,
         normalize_installed_skills_index, normalize_prompt_secret_value,
@@ -7268,9 +7263,10 @@ pinned_gateway_ca_fingerprint_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
         assert_eq!(normalized, "https://dashboard.example.com/palyra/");
     }
 
+    #[cfg(target_os = "windows")]
     #[test]
     fn windows_browser_open_commands_try_cmd_start_before_explorer() {
-        let commands = build_windows_browser_open_commands("http://127.0.0.1:7142/");
+        let commands = browser_open_commands("http://127.0.0.1:7142/");
         assert_eq!(commands.len(), 2);
         assert_eq!(commands[0].program, "cmd");
         assert_eq!(commands[0].args, vec!["/C", "start", "\"\"", "http://127.0.0.1:7142/"]);
