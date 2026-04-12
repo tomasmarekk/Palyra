@@ -90,22 +90,27 @@ pub(crate) fn run_daemon(command: DaemonCommand) -> Result<()> {
                     .with_context(|| format!("failed to open dashboard URL {}", target.url))?;
             }
 
-            if json {
-                let remote_assist = build_remote_dashboard_assist_payload(&target, verify_remote);
-                let output = serde_json::json!({
-                    "url": target.url,
-                    "mode": target.mode.as_str(),
-                    "source": target.source.as_str(),
-                    "config_path": target.config_path,
-                    "verification": verification_report,
-                    "remote_assist": remote_assist,
-                    "opened": open,
-                });
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&output)
-                        .context("failed to encode dashboard URL output as JSON")?
-                );
+            let remote_assist = build_remote_dashboard_assist_payload(&target, verify_remote);
+            let output = serde_json::json!({
+                "url": target.url,
+                "mode": target.mode.as_str(),
+                "source": target.source.as_str(),
+                "config_path": target.config_path,
+                "verification": verification_report,
+                "remote_assist": remote_assist,
+                "opened": open,
+            });
+
+            if output::preferred_json(json) {
+                output::print_json_pretty(
+                    &output,
+                    "failed to encode dashboard URL output as JSON",
+                )?;
+            } else if output::preferred_ndjson(json, false) {
+                output::print_json_line(
+                    &output,
+                    "failed to encode dashboard URL output as NDJSON",
+                )?;
             } else {
                 println!(
                     "daemon.dashboard_url mode={} source={} url={} config_path={}",
@@ -125,9 +130,9 @@ pub(crate) fn run_daemon(command: DaemonCommand) -> Result<()> {
                     );
                 }
                 if let Some(remote_assist) =
-                    build_remote_dashboard_assist_payload(&target, verify_remote)
+                    output.get("remote_assist")
                 {
-                    emit_remote_dashboard_assist_lines("daemon.dashboard_url", &remote_assist);
+                    emit_remote_dashboard_assist_lines("daemon.dashboard_url", remote_assist);
                 }
                 if open {
                     println!("daemon.dashboard_url.opened=true");
