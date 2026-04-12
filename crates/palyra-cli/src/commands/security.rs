@@ -1,7 +1,10 @@
 use crate::*;
 use palyra_control_plane as control_plane;
 
-use super::secrets::{build_secrets_audit_payload, SecretAuditFinding, SecretAuditPayload};
+use super::{
+    models::load_models_status,
+    secrets::{build_secrets_audit_payload, SecretAuditFinding, SecretAuditPayload},
+};
 
 #[derive(Debug, Serialize)]
 struct SecurityAuditPayload {
@@ -63,6 +66,7 @@ struct LocalSecurityConfigSnapshot {
     inline_api_key: bool,
     browser_service_enabled: bool,
     browser_service_auth_token_configured: bool,
+    effective_provider_kind: Option<String>,
 }
 
 pub(crate) fn run_security(command: SecurityCommand) -> Result<()> {
@@ -205,11 +209,7 @@ fn build_security_findings(
         });
     }
 
-    if local_config.provider_kind == "openai_compatible"
-        && local_config.auth_profile_id.is_none()
-        && local_config.api_key_vault_ref.is_none()
-        && !local_config.inline_api_key
-    {
+    if should_flag_missing_model_provider_auth(local_config) {
         findings.push(SecurityFinding {
             severity: "blocking".to_owned(),
             code: "model_provider_missing_auth".to_owned(),
@@ -383,6 +383,21 @@ fn build_security_findings(
     findings
 }
 
+fn should_flag_missing_model_provider_auth(local_config: &LocalSecurityConfigSnapshot) -> bool {
+    if local_config.provider_kind != "openai_compatible"
+        || local_config.auth_profile_id.is_some()
+        || local_config.api_key_vault_ref.is_some()
+        || local_config.inline_api_key
+    {
+        return false;
+    }
+
+    match local_config.effective_provider_kind.as_deref() {
+        Some("openai_compatible") | None => true,
+        Some(_) => false,
+    }
+}
+
 fn map_secret_finding_to_security_finding(finding: &SecretAuditFinding) -> SecurityFinding {
     SecurityFinding {
         severity: finding.severity.clone(),
@@ -498,6 +513,7 @@ fn load_local_security_config_snapshot(
                     inline_api_key: false,
                     browser_service_enabled: false,
                     browser_service_auth_token_configured: false,
+                    effective_provider_kind: None,
                 });
             }
         },
@@ -544,6 +560,8 @@ fn load_local_security_config_snapshot(
             .and_then(toml::Value::as_str)
             .map(str::trim)
             .is_some_and(|value| !value.is_empty());
+    let effective_provider_kind =
+        load_models_status(Some(resolved.clone())).ok().map(|status| status.provider_kind);
 
     Ok(LocalSecurityConfigSnapshot {
         path_exists: true,
@@ -553,6 +571,7 @@ fn load_local_security_config_snapshot(
         inline_api_key,
         browser_service_enabled,
         browser_service_auth_token_configured,
+        effective_provider_kind,
     })
 }
 
@@ -691,6 +710,7 @@ mod tests {
             inline_api_key: false,
             browser_service_enabled: false,
             browser_service_auth_token_configured: false,
+            effective_provider_kind: None,
         };
         let runtime = RuntimeSecuritySnapshot {
             used_runtime_posture: false,
@@ -707,6 +727,60 @@ mod tests {
     }
 
     #[test]
+    fn security_audit_ignores_missing_model_provider_auth_for_effective_deterministic_setup() {
+        let doctor = minimal_doctor();
+        let local = LocalSecurityConfigSnapshot {
+            path_exists: true,
+            provider_kind: "openai_compatible".to_owned(),
+            auth_profile_id: None,
+            api_key_vault_ref: None,
+            inline_api_key: false,
+            browser_service_enabled: false,
+            browser_service_auth_token_configured: false,
+            effective_provider_kind: Some("deterministic".to_owned()),
+        };
+        let runtime = RuntimeSecuritySnapshot {
+            used_runtime_posture: false,
+            deployment: None,
+            auth_summary: None,
+            browser: None,
+            error: None,
+        };
+        let findings = build_security_findings(&doctor, &local, &runtime, &minimal_secrets());
+        assert!(
+            !findings.iter().any(|finding| finding.code == "model_provider_missing_auth"),
+            "security audit should ignore missing OpenAI auth when the effective model status is deterministic"
+        );
+    }
+
+    #[test]
+    fn security_audit_flags_missing_model_provider_auth_when_effective_provider_is_openai() {
+        let doctor = minimal_doctor();
+        let local = LocalSecurityConfigSnapshot {
+            path_exists: true,
+            provider_kind: "openai_compatible".to_owned(),
+            auth_profile_id: None,
+            api_key_vault_ref: None,
+            inline_api_key: false,
+            browser_service_enabled: false,
+            browser_service_auth_token_configured: false,
+            effective_provider_kind: Some("openai_compatible".to_owned()),
+        };
+        let runtime = RuntimeSecuritySnapshot {
+            used_runtime_posture: false,
+            deployment: None,
+            auth_summary: None,
+            browser: None,
+            error: None,
+        };
+        let findings = build_security_findings(&doctor, &local, &runtime, &minimal_secrets());
+        assert!(
+            findings.iter().any(|finding| finding.code == "model_provider_missing_auth"),
+            "security audit should still flag missing OpenAI auth when the effective model status expects OpenAI"
+        );
+    }
+
+    #[test]
     fn security_audit_flags_remote_bind_without_tls() {
         let doctor = minimal_doctor();
         let local = LocalSecurityConfigSnapshot {
@@ -717,6 +791,7 @@ mod tests {
             inline_api_key: false,
             browser_service_enabled: false,
             browser_service_auth_token_configured: false,
+            effective_provider_kind: Some("deterministic".to_owned()),
         };
         let runtime = RuntimeSecuritySnapshot {
             used_runtime_posture: true,
@@ -764,6 +839,7 @@ mod tests {
             inline_api_key: false,
             browser_service_enabled: true,
             browser_service_auth_token_configured: true,
+            effective_provider_kind: Some("deterministic".to_owned()),
         };
         let runtime = RuntimeSecuritySnapshot {
             used_runtime_posture: true,
