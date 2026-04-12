@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from pathlib import Path
 from shutil import which
 
 CHECKS = [
@@ -73,10 +74,13 @@ CHECKS = [
 
 
 def run_rg(pattern: str, paths: list[str]) -> list[str]:
+    existing_paths = [path for path in paths if Path(path).exists()]
+    if not existing_paths:
+        return []
     if which("rg"):
-        command = ["rg", "-n", pattern, *paths]
+        command = ["rg", "-n", pattern, *existing_paths]
     else:
-        command = ["grep", "-R", "-n", "-E", "-I", pattern, *paths]
+        command = ["grep", "-R", "-n", "-E", "-I", pattern, *existing_paths]
     result = subprocess.run(command, capture_output=True, text=True)
     if result.returncode not in (0, 1):
         sys.stderr.write(result.stderr)
