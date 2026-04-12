@@ -6883,9 +6883,8 @@ mod cli_v1_tests {
     use super::browser_open_commands;
 
     use super::{
-        build_journal_checkpoint_attestation,
-        build_support_bundle_diagnostics_snapshot, compare_semver_versions,
-        ensure_remote_registry_same_origin, fetch_limited_bytes,
+        build_journal_checkpoint_attestation, build_support_bundle_diagnostics_snapshot,
+        compare_semver_versions, ensure_remote_registry_same_origin, fetch_limited_bytes,
         fetch_remote_registry_entries_with_fetcher, is_retryable_grpc_error,
         memory_embeddings_model_configured, normalize_browser_open_url, normalize_client_socket,
         normalize_installed_skills_index, normalize_prompt_secret_value,
