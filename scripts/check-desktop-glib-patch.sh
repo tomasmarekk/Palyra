@@ -114,6 +114,10 @@ sha256_file() {
 }
 
 select_python_interpreter() {
+  if [[ -x /mnt/c/Windows/py.exe ]] && /mnt/c/Windows/py.exe -3 -c "import sys" >/dev/null 2>&1; then
+    printf '%s\n' '/mnt/c/Windows/py.exe -3'
+    return 0
+  fi
   if command -v py >/dev/null 2>&1 && py -3 -c "import sys" >/dev/null 2>&1; then
     printf '%s\n' 'py -3'
     return 0

@@ -4,7 +4,31 @@ set -euo pipefail
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 cd "$ROOT"
 
-python3 - <<'PY'
+select_python_interpreter() {
+  if [[ -x /mnt/c/Windows/py.exe ]] && /mnt/c/Windows/py.exe -3 -c "import sys" >/dev/null 2>&1; then
+    printf '%s\n' '/mnt/c/Windows/py.exe -3'
+    return 0
+  fi
+  if command -v py >/dev/null 2>&1 && py -3 -c "import sys" >/dev/null 2>&1; then
+    printf '%s\n' 'py -3'
+    return 0
+  fi
+  if command -v python3 >/dev/null 2>&1 && python3 -c "import sys" >/dev/null 2>&1; then
+    printf '%s\n' python3
+    return 0
+  fi
+  if command -v python >/dev/null 2>&1 && python -c "import sys" >/dev/null 2>&1; then
+    printf '%s\n' python
+    return 0
+  fi
+  echo "A working Python 3 interpreter is required for channel/provider boundary checks." >&2
+  exit 1
+}
+
+python_selector="$(select_python_interpreter)"
+IFS=' ' read -r -a python_cmd <<< "$python_selector"
+
+"${python_cmd[@]}" - <<'PY'
 from __future__ import annotations
 
 import subprocess
@@ -96,7 +120,7 @@ violations: list[tuple[str, str]] = []
 for check in CHECKS:
     lines = run_rg(check["pattern"], check["paths"])
     for line in lines:
-        path = line.split(":", 1)[0]
+        path = line.split(":", 1)[0].replace("\\", "/")
         if not is_allowed(path, check["allow_prefixes"]):
             violations.append((check["name"], line))
 
