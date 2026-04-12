@@ -6879,8 +6879,11 @@ struct SkillStatusResponse {
 
 #[cfg(test)]
 mod cli_v1_tests {
+    #[cfg(target_os = "windows")]
+    use super::browser_open_commands;
+
     use super::{
-        browser_open_commands, build_journal_checkpoint_attestation,
+        build_journal_checkpoint_attestation,
         build_support_bundle_diagnostics_snapshot, compare_semver_versions,
         ensure_remote_registry_same_origin, fetch_limited_bytes,
         fetch_remote_registry_entries_with_fetcher, is_retryable_grpc_error,
