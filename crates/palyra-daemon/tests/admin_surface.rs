@@ -12,6 +12,7 @@ use std::{
 use anyhow::{Context, Result};
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use palyra_skills::{build_signed_skill_artifact, ArtifactFile, SkillArtifactBuildRequest};
+use palyra_vault::{BackendPreference, Vault, VaultConfig as VaultConfigOptions, VaultScope};
 use reqwest::blocking::Client;
 use reqwest::Url;
 use serde_json::{json, Value};
@@ -2936,6 +2937,89 @@ fn console_secret_reveal_allows_sensitive_ref_via_server_side_console_flow() -> 
         revealed.get("value_utf8").and_then(Value::as_str),
         Some("sk-sensitive-vault-value"),
         "console reveal should preserve UTF-8 content for operator display"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn console_secret_inventory_lists_preexisting_shared_vault_metadata() -> Result<()> {
+    let state_root_dir = unique_temp_state_root_dir();
+    let identity_store_dir = state_root_dir.join("identity");
+    let vault_dir = state_root_dir.join("vault");
+    let config_path = state_root_dir.join("config").join("palyra.toml");
+    fs::create_dir_all(&identity_store_dir).with_context(|| {
+        format!(
+            "failed to create shared identity store dir {}",
+            identity_store_dir.display()
+        )
+    })?;
+    prepare_test_vault_dir(&vault_dir)?;
+    write_test_config(&config_path, "version = 1\n")?;
+
+    let vault = Vault::open_with_config(VaultConfigOptions {
+        root: Some(vault_dir.clone()),
+        identity_store_root: Some(identity_store_dir.clone()),
+        backend_preference: BackendPreference::EncryptedFile,
+        ..VaultConfigOptions::default()
+    })
+    .context("failed to open shared test vault")?;
+    let global_scope = "global"
+        .parse::<VaultScope>()
+        .context("failed to parse global vault scope")?;
+    vault
+        .put_secret(&global_scope, "codex-e2e-secret", b"test-secret-value")
+        .context("failed to seed codex-e2e-secret into shared vault")?;
+    vault
+        .put_secret(&global_scope, "openai_api_key", b"sk-shared-secret")
+        .context("failed to seed openai_api_key into shared vault")?;
+
+    let state_root_env = state_root_dir.to_string_lossy().to_string();
+    let identity_store_env = identity_store_dir.to_string_lossy().to_string();
+    let vault_dir_env = vault_dir.to_string_lossy().to_string();
+    let config_path_env = config_path.to_string_lossy().to_string();
+    let (child, admin_port) = spawn_palyrad_with_config_and_env(
+        "version = 1\n",
+        &[
+            ("PALYRA_ADMIN_BOUND_PRINCIPAL", CONSOLE_ADMIN_PRINCIPAL),
+            ("PALYRA_STATE_ROOT", state_root_env.as_str()),
+            ("PALYRA_GATEWAY_IDENTITY_STORE_DIR", identity_store_env.as_str()),
+            ("PALYRA_VAULT_DIR", vault_dir_env.as_str()),
+            ("PALYRA_CONFIG", config_path_env.as_str()),
+        ],
+    )?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(4))
+        .build()
+        .context("failed to build HTTP client")?;
+    let (cookie, _) = login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
+
+    let secrets = client
+        .get(format!("http://127.0.0.1:{admin_port}/console/v1/secrets?scope=global"))
+        .header("Cookie", cookie)
+        .send()
+        .context("failed to fetch shared secret metadata through console")?
+        .error_for_status()
+        .context("console shared secret metadata returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse shared secret metadata response json")?;
+    let secret_keys = secrets
+        .get("secrets")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("console secret list response missing secrets array"))?
+        .iter()
+        .filter_map(|secret| secret.get("key").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    assert!(
+        secret_keys.iter().any(|key| *key == "codex-e2e-secret"),
+        "console secret list should include vault metadata seeded outside the console flow: {secrets}"
+    );
+    assert!(
+        secret_keys.iter().any(|key| *key == "openai_api_key"),
+        "console secret list should include shared sensitive refs from the same vault root: {secrets}"
     );
 
     Ok(())
