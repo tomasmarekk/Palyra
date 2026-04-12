@@ -1,4 +1,4 @@
-import { startTransition, useEffect, useMemo, useRef, useState } from "react";
+import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   applyPatchDocument,
@@ -146,35 +146,13 @@ export function useChatRunStream({
     return transcript.slice(-MAX_RENDERED_TRANSCRIPT);
   }, [transcript]);
 
-  useEffect(() => {
-    return () => {
-      streamAbortRef.current?.abort();
-      streamAbortRef.current = null;
-      cancelScheduledStreamFlush();
-    };
-  }, []);
-
-  useEffect(() => {
-    if (transcriptBoxRef.current === null) {
-      return;
-    }
-    transcriptBoxRef.current.scrollTop = transcriptBoxRef.current.scrollHeight;
-  }, [visibleTranscript.length]);
-
-  useEffect(() => {
-    if (!runDrawerOpen || runDrawerId.trim().length === 0) {
-      return;
-    }
-    void loadRunDetails(runDrawerId.trim());
-  }, [runDrawerOpen, runDrawerId]);
-
-  function dispose(): void {
+  const dispose = useCallback((): void => {
     streamAbortRef.current?.abort();
     streamAbortRef.current = null;
     cancelScheduledStreamFlush();
-  }
+  }, []);
 
-  function clearTranscriptState(): void {
+  const clearTranscriptState = useCallback((): void => {
     runDetailsRequestSeqRef.current += 1;
     cancelScheduledStreamFlush();
     assistantEntryByRunRef.current.clear();
@@ -192,7 +170,74 @@ export function useChatRunStream({
     a2uiDocumentsRef.current = {};
     setA2uiDocuments({});
     setApprovalDrafts({});
-  }
+  }, []);
+
+  const loadRunDetails = useCallback(
+    async (runId: string): Promise<void> => {
+      const requestSeq = runDetailsRequestSeqRef.current + 1;
+      runDetailsRequestSeqRef.current = requestSeq;
+      setRunDrawerBusy(true);
+      try {
+        const params = new URLSearchParams();
+        params.set("limit", "256");
+        const [statusResponse, eventsResponse] = await Promise.all([
+          api.chatRunStatus(runId),
+          api.chatRunEvents(runId, params),
+        ]);
+        if (requestSeq !== runDetailsRequestSeqRef.current) {
+          return;
+        }
+        setRunStatus(statusResponse.run);
+        setRunTape(eventsResponse.tape);
+        setRunLineage(eventsResponse.lineage ?? statusResponse.lineage);
+      } catch (error) {
+        if (requestSeq !== runDetailsRequestSeqRef.current) {
+          return;
+        }
+        setError(toErrorMessage(error));
+      } finally {
+        if (requestSeq === runDetailsRequestSeqRef.current) {
+          setRunDrawerBusy(false);
+        }
+      }
+    },
+    [api, setError],
+  );
+
+  const openRunDetails = useCallback((runId: string): void => {
+    setRunDrawerId(runId);
+    setRunDrawerOpen(true);
+  }, []);
+
+  const closeRunDrawer = useCallback((): void => {
+    setRunDrawerOpen(false);
+  }, []);
+
+  const refreshRunDetails = useCallback((): void => {
+    if (runDrawerId.trim().length > 0) {
+      void loadRunDetails(runDrawerId.trim());
+    }
+  }, [loadRunDetails, runDrawerId]);
+
+  useEffect(() => {
+    return () => {
+      dispose();
+    };
+  }, [dispose]);
+
+  useEffect(() => {
+    if (transcriptBoxRef.current === null) {
+      return;
+    }
+    transcriptBoxRef.current.scrollTop = transcriptBoxRef.current.scrollHeight;
+  }, [visibleTranscript.length]);
+
+  useEffect(() => {
+    if (!runDrawerOpen || runDrawerId.trim().length === 0) {
+      return;
+    }
+    void loadRunDetails(runDrawerId.trim());
+  }, [loadRunDetails, runDrawerOpen, runDrawerId]);
 
   async function sendMessage(
     onStreamComplete: () => Promise<void>,
@@ -659,50 +704,6 @@ export function useChatRunStream({
       setError(toErrorMessage(error));
     } finally {
       updateApprovalDraft(approvalId, (current) => ({ ...current, busy: false }));
-    }
-  }
-
-  async function loadRunDetails(runId: string): Promise<void> {
-    const requestSeq = runDetailsRequestSeqRef.current + 1;
-    runDetailsRequestSeqRef.current = requestSeq;
-    setRunDrawerBusy(true);
-    try {
-      const params = new URLSearchParams();
-      params.set("limit", "256");
-      const [statusResponse, eventsResponse] = await Promise.all([
-        api.chatRunStatus(runId),
-        api.chatRunEvents(runId, params),
-      ]);
-      if (requestSeq !== runDetailsRequestSeqRef.current) {
-        return;
-      }
-      setRunStatus(statusResponse.run);
-      setRunTape(eventsResponse.tape);
-      setRunLineage(eventsResponse.lineage ?? statusResponse.lineage);
-    } catch (error) {
-      if (requestSeq !== runDetailsRequestSeqRef.current) {
-        return;
-      }
-      setError(toErrorMessage(error));
-    } finally {
-      if (requestSeq === runDetailsRequestSeqRef.current) {
-        setRunDrawerBusy(false);
-      }
-    }
-  }
-
-  function openRunDetails(runId: string): void {
-    setRunDrawerId(runId);
-    setRunDrawerOpen(true);
-  }
-
-  function closeRunDrawer(): void {
-    setRunDrawerOpen(false);
-  }
-
-  function refreshRunDetails(): void {
-    if (runDrawerId.trim().length > 0) {
-      void loadRunDetails(runDrawerId.trim());
     }
   }
 
