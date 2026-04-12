@@ -7,7 +7,7 @@ use std::{
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use palyra_common::{validate_canonical_id, CANONICAL_PROTOCOL_MAJOR};
 use palyra_connectors::{
-    connectors::default_adapters, AttachmentKind, AttachmentRef, ConnectorAvailability,
+    providers::default_adapters, AttachmentKind, AttachmentRef, ConnectorAvailability,
     ConnectorConversationTarget, ConnectorInstanceSpec, ConnectorKind,
     ConnectorMessageDeleteRequest, ConnectorMessageEditRequest, ConnectorMessageLocator,
     ConnectorMessageMutationResult, ConnectorMessageReactionRequest, ConnectorMessageReadRequest,

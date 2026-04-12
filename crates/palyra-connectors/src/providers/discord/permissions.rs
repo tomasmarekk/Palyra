@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use palyra_connector_core::protocol::{
+use crate::core::{
     ConnectorApprovalMode, ConnectorCapabilitySupport, ConnectorOperationPreflight,
     ConnectorRiskLevel,
 };

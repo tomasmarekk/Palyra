@@ -3,24 +3,10 @@ mod defaults;
 mod error;
 mod ids;
 mod normalize;
-mod permissions;
+pub(crate) mod permissions;
 
-pub use adapter::{
-    DiscordAdapterConfig, DiscordConnectorAdapter, DiscordCredential, DiscordCredentialResolver,
-    EnvDiscordCredentialResolver,
-};
-pub use defaults::{discord_connector_spec, discord_default_egress_allowlist};
-pub use error::DiscordSemanticsError;
-pub use ids::{
-    discord_auth_profile_ref, discord_connector_id, discord_principal, discord_token_vault_ref,
-    normalize_discord_account_id,
-};
-pub use normalize::{
-    canonical_discord_channel_identity, canonical_discord_sender_identity, is_discord_connector,
-    normalize_discord_target,
-};
-pub use palyra_connector_core::net::{ConnectorNetGuard, ConnectorNetGuardError};
-pub use palyra_connector_core::{
+pub use crate::core::net::{ConnectorNetGuard, ConnectorNetGuardError};
+pub use crate::core::{
     net, protocol, storage, supervisor, AttachmentKind, AttachmentRef, ConnectorAdapter,
     ConnectorAdapterError, ConnectorApprovalMode, ConnectorAvailability,
     ConnectorConversationTarget, ConnectorEventRecord, ConnectorInstanceRecord,
@@ -36,6 +22,20 @@ pub use palyra_connector_core::{
     InboundIngestOutcome, InboundMessageEvent, OutboundA2uiUpdate, OutboundAttachment,
     OutboundMessageRequest, OutboxEnqueueOutcome, OutboxEntryRecord, RetryClass,
     RouteInboundResult, RoutedOutboundMessage,
+};
+pub use adapter::{
+    DiscordAdapterConfig, DiscordConnectorAdapter, DiscordCredential, DiscordCredentialResolver,
+    EnvDiscordCredentialResolver,
+};
+pub use defaults::{discord_connector_spec, discord_default_egress_allowlist};
+pub use error::DiscordSemanticsError;
+pub use ids::{
+    discord_auth_profile_ref, discord_connector_id, discord_principal, discord_token_vault_ref,
+    normalize_discord_account_id,
+};
+pub use normalize::{
+    canonical_discord_channel_identity, canonical_discord_sender_identity, is_discord_connector,
+    normalize_discord_target,
 };
 pub use permissions::{
     discord_approval_mode_for_operation, discord_audit_event_type_for_operation,

@@ -24,11 +24,10 @@ tracked_source_files() {
 
 is_provider_allowlisted() {
   local path="$1"
-  [[ "${path}" == crates/palyra-connector-discord/* ]] && return 0
   [[ "${path}" == crates/palyra-connectors/src/lib.rs ]] && return 0
-  [[ "${path}" == crates/palyra-connectors/src/connectors/* ]] && return 0
   [[ "${path}" == crates/palyra-connectors/src/providers/* ]] && return 0
   [[ "${path}" == crates/palyra-daemon/src/channels/discord.rs ]] && return 0
+  [[ "${path}" == crates/palyra-daemon/src/application/channels/providers/discord/* ]] && return 0
   [[ "${path}" == crates/palyra-daemon/src/transport/http/handlers/admin/channels/connectors/discord.rs ]] && return 0
   [[ "${path}" == crates/palyra-daemon/src/transport/http/handlers/console/channels/connectors/discord.rs ]] && return 0
   [[ "${path}" == crates/palyra-cli/src/commands/channels/connectors/* ]] && return 0
@@ -80,8 +79,6 @@ done < <(tracked_source_files)
 core_import_violations="$(
   rg -n 'palyra_connector_core' crates apps fuzz \
     --glob '!crates/palyra-connectors/**' \
-    --glob '!crates/palyra-connector-core/**' \
-    --glob '!crates/palyra-connector-discord/**' \
     --glob '!schemas/generated/**' \
     --glob '!apps/desktop/src-tauri/third_party/**' || true
 )"
@@ -89,23 +86,21 @@ core_import_violations="$(
 discord_import_violations="$(
   rg -n 'palyra_connector_discord' crates apps fuzz \
     --glob '!crates/palyra-connectors/**' \
-    --glob '!crates/palyra-connector-core/**' \
-    --glob '!crates/palyra-connector-discord/**' \
     --glob '!schemas/generated/**' \
     --glob '!apps/desktop/src-tauri/third_party/**' || true
 )"
 
 cargo_manifest_violations="$(
-  rg -n 'palyra-connector-(core|discord)' crates/*/Cargo.toml apps/desktop/src-tauri/Cargo.toml |
-    rg -v '^(crates/palyra-connectors|crates/palyra-connector-core|crates/palyra-connector-discord)/Cargo.toml:' || true
+  rg -n 'palyra-connector-(core|discord)' crates/*/Cargo.toml apps/desktop/src-tauri/Cargo.toml || true
 )"
 
 connector_kind_violations="$(
   rg -n 'ConnectorKind::Discord' crates apps fuzz \
-    --glob '!crates/palyra-connector-discord/**' \
-    --glob '!crates/palyra-connectors/src/connectors/**' \
+    --glob '!crates/palyra-connectors/src/lib.rs' \
+    --glob '!crates/palyra-connectors/src/core/**' \
     --glob '!crates/palyra-connectors/src/providers/**' \
     --glob '!crates/palyra-daemon/src/channels/discord.rs' \
+    --glob '!crates/palyra-daemon/src/application/channels/providers/**' \
     --glob '!crates/palyra-daemon/src/transport/http/handlers/admin/channels/connectors/discord.rs' \
     --glob '!crates/palyra-daemon/src/transport/http/handlers/console/channels/connectors/discord.rs' \
     --glob '!crates/palyra-cli/src/commands/channels/connectors/**' \
@@ -141,15 +136,15 @@ fi
 echo
 
 print_matches_or_none \
-  "Direct palyra_connector_core import violations (outside crates/palyra-connectors)" \
+  "Direct palyra_connector_core import violations" \
   bash -lc "printf '%s' \"\$0\"" "${core_import_violations}"
 
 print_matches_or_none \
-  "Direct palyra_connector_discord import violations (outside crates/palyra-connectors)" \
+  "Direct palyra_connector_discord import violations" \
   bash -lc "printf '%s' \"\$0\"" "${discord_import_violations}"
 
 print_matches_or_none \
-  "Direct Cargo manifest references to legacy connector crates (outside crates/palyra-connectors)" \
+  "Direct Cargo manifest references to legacy connector crates" \
   bash -lc "printf '%s' \"\$0\"" "${cargo_manifest_violations}"
 
 print_matches_or_none \
@@ -160,7 +155,7 @@ cat <<'EOF'
 Milestone acceptance grep commands:
   rg -n 'palyra_connector_core|palyra_connector_discord' crates apps fuzz
   rg -n 'palyra-connector-core|palyra-connector-discord' crates/*/Cargo.toml apps/desktop/src-tauri/Cargo.toml
-  rg -n 'ConnectorKind::Discord' crates/palyra-daemon crates/palyra-cli crates/palyra-connectors
+  rg -n 'ConnectorKind::Discord' crates/palyra-daemon crates/palyra-cli crates/palyra-connectors/src/providers
   bash scripts/dev/report-connector-leakage.sh --strict
 EOF
 

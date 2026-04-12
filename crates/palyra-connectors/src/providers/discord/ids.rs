@@ -1,4 +1,4 @@
-use crate::DiscordSemanticsError;
+use super::DiscordSemanticsError;
 
 #[must_use]
 pub fn discord_connector_id(account_id: &str) -> String {

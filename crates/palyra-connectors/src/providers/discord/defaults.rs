@@ -1,6 +1,6 @@
-use palyra_connector_core::{ConnectorInstanceSpec, ConnectorKind};
+use crate::core::{ConnectorInstanceSpec, ConnectorKind};
 
-use crate::{
+use super::{
     discord_auth_profile_ref, discord_connector_id, discord_principal, discord_token_vault_ref,
     normalize_discord_account_id, DiscordSemanticsError,
 };
@@ -39,7 +39,7 @@ pub fn discord_connector_spec(
 
 #[cfg(test)]
 mod tests {
-    use palyra_connector_core::ConnectorKind;
+    use crate::core::ConnectorKind;
 
     use super::{discord_connector_spec, discord_default_egress_allowlist};
 

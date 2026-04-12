@@ -1,4 +1,4 @@
-use crate::DiscordSemanticsError;
+use super::DiscordSemanticsError;
 
 #[must_use]
 pub fn is_discord_connector(connector_id: &str) -> bool {
@@ -68,11 +68,11 @@ fn parse_discord_channel_mention(raw: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::DiscordSemanticsError;
     use super::{
         canonical_discord_channel_identity, canonical_discord_sender_identity,
         is_discord_connector, normalize_discord_target,
     };
-    use crate::DiscordSemanticsError;
 
     #[test]
     fn canonical_sender_identity_normalizes_prefixes_and_mentions() {
