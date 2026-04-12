@@ -36,7 +36,7 @@ use super::{
     migrate_legacy_runtime_secrets_from_state_file, mpsc, parse_discord_status,
     parse_remote_dashboard_base_url, prepare_control_center_for_launch, resolve_binary_path,
     resolve_desktop_state_root, sanitize_log_line, try_enqueue_log_event,
-    validate_runtime_state_root_override,
+    validate_runtime_state_root_override, DesktopInstanceLock,
     BrowserStatusSnapshot, Client, ControlCenter, DashboardAccessMode, DesktopOnboardingStep,
     DesktopSecretStore, DesktopStateFile, LogEvent, LogStream, ManagedService, RuntimeConfig,
     ServiceKind, Ulid, LOG_EVENT_CHANNEL_CAPACITY,
@@ -171,6 +171,8 @@ fn build_test_control_center(root: &Path) -> ControlCenter {
     ControlCenter {
         desktop_state_root: root.to_path_buf(),
         state_dir: state_dir.clone(),
+        _instance_lock: DesktopInstanceLock::acquire(state_dir.as_path())
+            .expect("test control center instance lock should succeed"),
         default_runtime_root: runtime_root.clone(),
         runtime_root,
         support_bundle_dir,

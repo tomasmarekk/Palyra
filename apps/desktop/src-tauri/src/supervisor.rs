@@ -1,6 +1,7 @@
 use std::{
     collections::VecDeque,
     env, fs,
+    io::Write,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
@@ -212,6 +213,7 @@ pub(crate) struct HealthEndpointPayload {
 pub(crate) struct ControlCenter {
     pub(crate) desktop_state_root: PathBuf,
     pub(crate) state_dir: PathBuf,
+    pub(crate) _instance_lock: DesktopInstanceLock,
     pub(crate) default_runtime_root: PathBuf,
     pub(crate) runtime_root: PathBuf,
     pub(crate) support_bundle_dir: PathBuf,
@@ -241,6 +243,7 @@ impl ControlCenter {
         fs::create_dir_all(support_bundle_dir.as_path()).with_context(|| {
             format!("failed to create support bundle output dir {}", support_bundle_dir.display())
         })?;
+        let instance_lock = DesktopInstanceLock::acquire(state_dir.as_path())?;
 
         let state_file_path = state_dir.join("state.json");
         let secret_store = DesktopSecretStore::open(state_dir.as_path())?;
@@ -283,6 +286,7 @@ impl ControlCenter {
         Ok(Self {
             desktop_state_root: state_root,
             state_dir,
+            _instance_lock: instance_lock,
             default_runtime_root,
             runtime_root,
             support_bundle_dir,
@@ -1074,6 +1078,98 @@ impl ControlCenter {
     pub(crate) fn open_dashboard(&self, url: &str) -> Result<String> {
         open_url_in_default_browser(url)?;
         Ok(url.to_owned())
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct DesktopInstanceLock {
+    path: PathBuf,
+}
+
+impl DesktopInstanceLock {
+    pub(crate) fn acquire(state_dir: &Path) -> Result<Self> {
+        let path = state_dir.join("instance.lock");
+        let mut file = match fs::OpenOptions::new().write(true).create_new(true).open(path.as_path())
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                bail!(
+                    "desktop control center is already running for state root {}",
+                    state_dir.display()
+                );
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to create {}", path.display()));
+            }
+        };
+        writeln!(
+            file,
+            "pid={}\nstarted_at_unix_ms={}",
+            std::process::id(),
+            unix_ms_now()
+        )
+        .with_context(|| format!("failed to write desktop instance lock {}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to flush desktop instance lock {}", path.display()))?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for DesktopInstanceLock {
+    fn drop(&mut self) {
+        match fs::remove_file(self.path.as_path()) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod instance_lock_tests {
+    use super::DesktopInstanceLock;
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn temp_state_dir() -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("palyra-desktop-instance-lock-{unique}"));
+        fs::create_dir_all(dir.as_path()).expect("temp state dir should be created");
+        dir
+    }
+
+    #[test]
+    fn desktop_instance_lock_rejects_parallel_acquire_for_same_state_dir() {
+        let state_dir = temp_state_dir();
+        let _guard = DesktopInstanceLock::acquire(state_dir.as_path())
+            .expect("first desktop instance lock should succeed");
+
+        let error = DesktopInstanceLock::acquire(state_dir.as_path())
+            .expect_err("second desktop instance lock should fail");
+
+        assert!(
+            error.to_string().contains("already running"),
+            "parallel desktop instance error should explain the single-instance guard: {error}"
+        );
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn desktop_instance_lock_releases_on_drop() {
+        let state_dir = temp_state_dir();
+        {
+            let _guard = DesktopInstanceLock::acquire(state_dir.as_path())
+                .expect("desktop instance lock should succeed");
+        }
+
+        DesktopInstanceLock::acquire(state_dir.as_path())
+            .expect("lock should be reacquirable after prior guard drops");
+        let _ = fs::remove_dir_all(state_dir);
     }
 }
 

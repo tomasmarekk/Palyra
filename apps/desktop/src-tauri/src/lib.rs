@@ -57,8 +57,8 @@ pub(crate) use snapshot::{
 };
 #[cfg(test)]
 pub(crate) use supervisor::{
-    compute_backoff_ms, executable_file_name, try_enqueue_log_event, LogEvent, LogStream,
-    ManagedService,
+    compute_backoff_ms, executable_file_name, try_enqueue_log_event, DesktopInstanceLock,
+    LogEvent, LogStream, ManagedService,
 };
 
 pub(crate) fn configure_background_command(command: &mut Command) {
