@@ -645,6 +645,19 @@ fn emit_remote_init_guidance(
 }
 
 fn build_doctor_checks() -> Vec<DoctorCheck> {
+    build_doctor_checks_for_mode(doctor_running_from_installed_artifact())
+}
+
+fn build_doctor_checks_for_mode(installed_artifact: bool) -> Vec<DoctorCheck> {
+    let mut checks = Vec::new();
+    if !installed_artifact {
+        checks.extend(build_doctor_developer_environment_checks());
+    }
+    checks.extend(build_doctor_runtime_checks());
+    checks
+}
+
+fn build_doctor_developer_environment_checks() -> Vec<DoctorCheck> {
     vec![
         DoctorCheck::blocking("toolchain_ok", command_available("rustc", &["--version"]), &[]),
         DoctorCheck::blocking("cargo_ok", command_available("cargo", &["--version"]), &[]),
@@ -654,26 +667,6 @@ fn build_doctor_checks() -> Vec<DoctorCheck> {
             &["palyra doctor", "palyra support-bundle export --output ./support-bundle.json"],
         ),
         build_doctor_repo_scaffold_check(),
-        DoctorCheck::warning(
-            "memory_embeddings_model_configured",
-            memory_embeddings_model_config_ok(),
-            &["palyra config validate", "palyra doctor"],
-        ),
-        DoctorCheck::warning(
-            "process_runner_tier_b_egress_allowlists_preflight_only",
-            process_runner_tier_b_allowlist_config_ok(),
-            &["palyra security audit", "palyra doctor"],
-        ),
-        DoctorCheck::warning(
-            "process_runner_tier_c_strict_offline_only",
-            process_runner_tier_c_strict_offline_config_ok(),
-            &["palyra security audit", "palyra doctor"],
-        ),
-        DoctorCheck::warning(
-            "process_runner_tier_c_windows_backend_supported",
-            process_runner_tier_c_windows_backend_config_ok(),
-            &["palyra doctor", "palyra support-bundle export --output ./support-bundle.json"],
-        ),
         DoctorCheck::warning(
             "gitleaks_installed",
             command_available("gitleaks", &["--version"]),
@@ -732,6 +725,31 @@ fn build_doctor_checks() -> Vec<DoctorCheck> {
         ),
         DoctorCheck::info("swiftlint_installed", command_available("swiftlint", &["version"]), &[]),
         DoctorCheck::info("detekt_installed", command_available("detekt", &["--version"]), &[]),
+    ]
+}
+
+fn build_doctor_runtime_checks() -> Vec<DoctorCheck> {
+    vec![
+        DoctorCheck::warning(
+            "memory_embeddings_model_configured",
+            memory_embeddings_model_config_ok(),
+            &["palyra config validate", "palyra doctor"],
+        ),
+        DoctorCheck::warning(
+            "process_runner_tier_b_egress_allowlists_preflight_only",
+            process_runner_tier_b_allowlist_config_ok(),
+            &["palyra security audit", "palyra doctor"],
+        ),
+        DoctorCheck::warning(
+            "process_runner_tier_c_strict_offline_only",
+            process_runner_tier_c_strict_offline_config_ok(),
+            &["palyra security audit", "palyra doctor"],
+        ),
+        DoctorCheck::warning(
+            "process_runner_tier_c_windows_backend_supported",
+            process_runner_tier_c_windows_backend_config_ok(),
+            &["palyra doctor", "palyra support-bundle export --output ./support-bundle.json"],
+        ),
     ]
 }
 
@@ -4000,19 +4018,30 @@ fn resolve_config_relative_path(config_path: &Path, raw_path: &str) -> PathBuf {
 }
 
 fn discover_installed_journal_db_path() -> Result<Option<PathBuf>> {
+    Ok(discover_install_metadata_from_current_binary()?.map(|(metadata_root, metadata)| {
+        resolve_installed_journal_db_path_from_metadata(metadata_root.as_path(), &metadata)
+    }))
+}
+
+fn doctor_running_from_installed_artifact() -> bool {
+    discover_install_metadata_from_current_binary().ok().flatten().is_some()
+}
+
+fn discover_install_metadata_from_current_binary(
+) -> Result<Option<(PathBuf, support::lifecycle::InstallMetadata)>> {
     let current_binary = match support::lifecycle::current_cli_binary_path() {
         Ok(path) => path,
         Err(_) => return Ok(None),
     };
-    discover_installed_journal_db_path_from_binary(current_binary.as_path(), |install_root| {
+    discover_install_metadata_from_binary(current_binary.as_path(), |install_root| {
         support::lifecycle::load_install_metadata(install_root)
     })
 }
 
-fn discover_installed_journal_db_path_from_binary<F>(
+fn discover_install_metadata_from_binary<F>(
     current_binary: &Path,
     load_install_metadata: F,
-) -> Result<Option<PathBuf>>
+) -> Result<Option<(PathBuf, support::lifecycle::InstallMetadata)>>
 where
     F: Fn(&Path) -> Result<Option<support::lifecycle::InstallMetadata>>,
 {
@@ -4027,14 +4056,26 @@ where
 
     for candidate_root in candidate_roots {
         if let Some(metadata) = load_install_metadata(candidate_root.as_path())? {
-            return Ok(Some(resolve_installed_journal_db_path_from_metadata(
-                candidate_root.as_path(),
-                &metadata,
-            )));
+            return Ok(Some((candidate_root, metadata)));
         }
     }
 
     Ok(None)
+}
+
+#[cfg(test)]
+fn discover_installed_journal_db_path_from_binary<F>(
+    current_binary: &Path,
+    load_install_metadata: F,
+) -> Result<Option<PathBuf>>
+where
+    F: Fn(&Path) -> Result<Option<support::lifecycle::InstallMetadata>>,
+{
+    Ok(discover_install_metadata_from_binary(current_binary, load_install_metadata)?.map(
+        |(candidate_root, metadata)| {
+            resolve_installed_journal_db_path_from_metadata(candidate_root.as_path(), &metadata)
+        },
+    ))
 }
 
 fn resolve_installed_journal_db_path_from_metadata(
@@ -8632,8 +8673,8 @@ mod profile_guardrail_tests {
 #[cfg(test)]
 mod doctor_check_tests {
     use super::{
-        doctor_repo_scaffold_check, looks_like_repo_root, repo_checkout_detected_from_binary_path,
-        DoctorSeverity,
+        build_doctor_checks_for_mode, doctor_repo_scaffold_check, looks_like_repo_root,
+        repo_checkout_detected_from_binary_path, DoctorSeverity,
     };
     use std::fs;
     use tempfile::tempdir;
@@ -8665,6 +8706,38 @@ mod doctor_check_tests {
         assert!(!check.ok);
         assert_eq!(check.severity, DoctorSeverity::Info);
         assert!(!check.required);
+    }
+
+    #[test]
+    fn installed_artifact_doctor_checks_skip_developer_environment_checks() {
+        let keys = build_doctor_checks_for_mode(true)
+            .into_iter()
+            .map(|check| check.key)
+            .collect::<Vec<_>>();
+
+        assert!(
+            !keys.contains(&"cargo_ok"),
+            "installed artifact doctor should not lead with repo toolchain checks"
+        );
+        assert!(
+            !keys.contains(&"workspace_writable"),
+            "installed artifact doctor should not report repo workspace writability"
+        );
+        assert!(
+            keys.contains(&"memory_embeddings_model_configured"),
+            "installed artifact doctor must keep runtime diagnostics"
+        );
+    }
+
+    #[test]
+    fn repo_mode_doctor_checks_keep_developer_environment_checks() {
+        let keys = build_doctor_checks_for_mode(false)
+            .into_iter()
+            .map(|check| check.key)
+            .collect::<Vec<_>>();
+
+        assert!(keys.contains(&"cargo_ok"), "repo doctor should keep developer toolchain coverage");
+        assert!(keys.contains(&"repo_scaffold_ok"), "repo doctor should keep scaffold coverage");
     }
 }
 
