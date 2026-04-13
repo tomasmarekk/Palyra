@@ -2400,8 +2400,14 @@ async fn openai_oauth_bootstrap_and_callback_state_reuse_console_session() {
     let fixture = TempFixtureDir::new();
     let listener = TcpListener::bind("127.0.0.1:0").expect("test listener should bind");
     let port = listener.local_addr().expect("listener address should resolve").port();
+    let session_requests = Arc::new(AtomicU64::new(0));
+    let login_requests = Arc::new(AtomicU64::new(0));
+    let callback_state_requests = Arc::new(AtomicU64::new(0));
+    let session_requests_server = Arc::clone(&session_requests);
+    let login_requests_server = Arc::clone(&login_requests);
+    let callback_state_requests_server = Arc::clone(&callback_state_requests);
     let server = std::thread::spawn(move || {
-        for _ in 0..5 {
+        for _ in 0..4 {
             let (mut stream, _) = listener.accept().expect("listener should accept request");
             let mut buffer = [0_u8; 8192];
             let read = stream.read(&mut buffer).expect("request should be readable");
@@ -2409,6 +2415,7 @@ async fn openai_oauth_bootstrap_and_callback_state_reuse_console_session() {
             let request_line = request.lines().next().unwrap_or_default().to_owned();
             let has_cookie = request.contains("palyra_console_session=session-oauth");
             if request_line.starts_with("GET /console/v1/auth/session ") {
+                session_requests_server.fetch_add(1, Ordering::Relaxed);
                 if has_cookie {
                     write_json_response(
                         &mut stream,
@@ -2427,6 +2434,7 @@ async fn openai_oauth_bootstrap_and_callback_state_reuse_console_session() {
                 continue;
             }
             if request_line.starts_with("POST /console/v1/auth/login ") {
+                login_requests_server.fetch_add(1, Ordering::Relaxed);
                 write_json_response(
                     &mut stream,
                     "200 OK",
@@ -2453,6 +2461,7 @@ async fn openai_oauth_bootstrap_and_callback_state_reuse_console_session() {
             if request_line.starts_with(
                 "GET /console/v1/auth/providers/openai/callback-state?attempt_id=attempt-1 ",
             ) {
+                callback_state_requests_server.fetch_add(1, Ordering::Relaxed);
                 assert!(
                     has_cookie,
                     "callback-state polling should reuse the authenticated console session cookie"
@@ -2496,6 +2505,21 @@ async fn openai_oauth_bootstrap_and_callback_state_reuse_console_session() {
     assert!(callback_state.is_terminal);
     assert_eq!(callback_state.state, "failed");
     assert_eq!(callback_state.profile_id.as_deref(), Some("openai-oauth"));
+    assert_eq!(
+        session_requests.load(Ordering::Relaxed),
+        1,
+        "OAuth bootstrap should establish the console session once and reuse the cached session for callback polling",
+    );
+    assert_eq!(
+        login_requests.load(Ordering::Relaxed),
+        1,
+        "OAuth bootstrap should only login once per flow",
+    );
+    assert_eq!(
+        callback_state_requests.load(Ordering::Relaxed),
+        1,
+        "callback-state polling should hit the control plane exactly once",
+    );
 
     server.join().expect("test server thread should exit");
 }
@@ -2505,8 +2529,20 @@ async fn openai_profile_actions_hit_expected_routes_including_reconnect() {
     let fixture = TempFixtureDir::new();
     let listener = TcpListener::bind("127.0.0.1:0").expect("test listener should bind");
     let port = listener.local_addr().expect("listener address should resolve").port();
+    let session_requests = Arc::new(AtomicU64::new(0));
+    let login_requests = Arc::new(AtomicU64::new(0));
+    let refresh_requests = Arc::new(AtomicU64::new(0));
+    let default_profile_requests = Arc::new(AtomicU64::new(0));
+    let revoke_requests = Arc::new(AtomicU64::new(0));
+    let reconnect_requests = Arc::new(AtomicU64::new(0));
+    let session_requests_server = Arc::clone(&session_requests);
+    let login_requests_server = Arc::clone(&login_requests);
+    let refresh_requests_server = Arc::clone(&refresh_requests);
+    let default_profile_requests_server = Arc::clone(&default_profile_requests);
+    let revoke_requests_server = Arc::clone(&revoke_requests);
+    let reconnect_requests_server = Arc::clone(&reconnect_requests);
     let server = std::thread::spawn(move || {
-        for _ in 0..9 {
+        for _ in 0..6 {
             let (mut stream, _) = listener.accept().expect("listener should accept request");
             let mut buffer = [0_u8; 8192];
             let read = stream.read(&mut buffer).expect("request should be readable");
@@ -2514,6 +2550,7 @@ async fn openai_profile_actions_hit_expected_routes_including_reconnect() {
             let request_line = request.lines().next().unwrap_or_default().to_owned();
             let has_cookie = request.contains("palyra_console_session=session-actions");
             if request_line.starts_with("GET /console/v1/auth/session ") {
+                session_requests_server.fetch_add(1, Ordering::Relaxed);
                 if has_cookie {
                     write_json_response(
                         &mut stream,
@@ -2532,6 +2569,7 @@ async fn openai_profile_actions_hit_expected_routes_including_reconnect() {
                 continue;
             }
             if request_line.starts_with("POST /console/v1/auth/login ") {
+                login_requests_server.fetch_add(1, Ordering::Relaxed);
                 write_json_response(
                     &mut stream,
                     "200 OK",
@@ -2541,6 +2579,7 @@ async fn openai_profile_actions_hit_expected_routes_including_reconnect() {
                 continue;
             }
             if request_line.starts_with("POST /console/v1/auth/providers/openai/refresh ") {
+                refresh_requests_server.fetch_add(1, Ordering::Relaxed);
                 assert!(request.contains("x-palyra-csrf-token: csrf-actions"));
                 assert!(request.contains("\"profile_id\":\"openai-oauth\""));
                 write_json_response(
@@ -2552,6 +2591,7 @@ async fn openai_profile_actions_hit_expected_routes_including_reconnect() {
                 continue;
             }
             if request_line.starts_with("POST /console/v1/auth/providers/openai/default-profile ") {
+                default_profile_requests_server.fetch_add(1, Ordering::Relaxed);
                 assert!(request.contains("x-palyra-csrf-token: csrf-actions"));
                 assert!(request.contains("\"profile_id\":\"openai-oauth\""));
                 write_json_response(
@@ -2563,6 +2603,7 @@ async fn openai_profile_actions_hit_expected_routes_including_reconnect() {
                 continue;
             }
             if request_line.starts_with("POST /console/v1/auth/providers/openai/revoke ") {
+                revoke_requests_server.fetch_add(1, Ordering::Relaxed);
                 assert!(request.contains("x-palyra-csrf-token: csrf-actions"));
                 assert!(request.contains("\"profile_id\":\"openai-oauth\""));
                 write_json_response(
@@ -2574,6 +2615,7 @@ async fn openai_profile_actions_hit_expected_routes_including_reconnect() {
                 continue;
             }
             if request_line.starts_with("POST /console/v1/auth/providers/openai/reconnect ") {
+                reconnect_requests_server.fetch_add(1, Ordering::Relaxed);
                 assert!(request.contains("x-palyra-csrf-token: csrf-actions"));
                 assert!(request.contains("\"profile_id\":\"openai-oauth\""));
                 write_json_response(
@@ -2610,6 +2652,16 @@ async fn openai_profile_actions_hit_expected_routes_including_reconnect() {
         reconnect_openai_oauth(inputs, request).await.expect("reconnect action should succeed");
     assert_eq!(reconnect.attempt_id, "attempt-reconnect");
     assert_eq!(reconnect.profile_id.as_deref(), Some("openai-oauth"));
+    assert_eq!(
+        session_requests.load(Ordering::Relaxed),
+        1,
+        "profile actions should establish the console session once and reuse the cached session afterwards",
+    );
+    assert_eq!(login_requests.load(Ordering::Relaxed), 1);
+    assert_eq!(refresh_requests.load(Ordering::Relaxed), 1);
+    assert_eq!(default_profile_requests.load(Ordering::Relaxed), 1);
+    assert_eq!(revoke_requests.load(Ordering::Relaxed), 1);
+    assert_eq!(reconnect_requests.load(Ordering::Relaxed), 1);
 
     server.join().expect("test server thread should exit");
 }
