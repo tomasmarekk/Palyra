@@ -34,6 +34,7 @@ cd "$ROOT_DIR"
 
 CARGO_BIN="$(resolve_cargo)"
 
+mkdir -p "$ROOT_DIR/target"
 DESKTOP_TEST_TARGET_DIR="$(mktemp -d "$ROOT_DIR/target/prepush-desktop-tests.XXXXXX")"
 DESKTOP_TEST_TARGET_DIR_NATIVE="$DESKTOP_TEST_TARGET_DIR"
 
