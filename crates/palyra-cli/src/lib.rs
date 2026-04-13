@@ -3976,12 +3976,92 @@ fn resolve_daemon_journal_db_path(db_path_override: Option<String>) -> Result<Pa
             .map(|value| value.trim().to_owned())
         {
             if !journal_db_path.is_empty() {
-                return Ok(PathBuf::from(journal_db_path));
+                return Ok(resolve_config_relative_path(
+                    config_path.as_path(),
+                    journal_db_path.as_str(),
+                ));
             }
         }
     }
 
+    if let Some(installed_journal_path) = discover_installed_journal_db_path()? {
+        return Ok(installed_journal_path);
+    }
+
     Ok(PathBuf::from(DEFAULT_JOURNAL_DB_PATH))
+}
+
+fn resolve_config_relative_path(config_path: &Path, raw_path: &str) -> PathBuf {
+    let path = PathBuf::from(raw_path);
+    if path.is_absolute() {
+        return path;
+    }
+    config_path.parent().map(|parent| parent.join(path.clone())).unwrap_or(path)
+}
+
+fn discover_installed_journal_db_path() -> Result<Option<PathBuf>> {
+    let current_binary = match support::lifecycle::current_cli_binary_path() {
+        Ok(path) => path,
+        Err(_) => return Ok(None),
+    };
+    discover_installed_journal_db_path_from_binary(current_binary.as_path(), |install_root| {
+        support::lifecycle::load_install_metadata(install_root)
+    })
+}
+
+fn discover_installed_journal_db_path_from_binary<F>(
+    current_binary: &Path,
+    load_install_metadata: F,
+) -> Result<Option<PathBuf>>
+where
+    F: Fn(&Path) -> Result<Option<support::lifecycle::InstallMetadata>>,
+{
+    let mut candidate_roots = Vec::new();
+    if let Some(command_root) = current_binary.parent() {
+        candidate_roots.push(command_root.to_path_buf());
+        if let Some(install_root) = command_root.parent() {
+            candidate_roots.push(install_root.to_path_buf());
+        }
+    }
+    candidate_roots.dedup();
+
+    for candidate_root in candidate_roots {
+        if let Some(metadata) = load_install_metadata(candidate_root.as_path())? {
+            return Ok(Some(resolve_installed_journal_db_path_from_metadata(
+                candidate_root.as_path(),
+                &metadata,
+            )));
+        }
+    }
+
+    Ok(None)
+}
+
+fn resolve_installed_journal_db_path_from_metadata(
+    metadata_root: &Path,
+    metadata: &support::lifecycle::InstallMetadata,
+) -> PathBuf {
+    let install_root = metadata
+        .install_root
+        .as_deref()
+        .and_then(normalize_optional_text)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| metadata_root.to_path_buf());
+    let install_candidate = install_root.join(DEFAULT_JOURNAL_DB_PATH);
+    if install_candidate.is_file() {
+        return install_candidate;
+    }
+
+    if let Some(state_root) =
+        metadata.state_root.as_deref().and_then(normalize_optional_text).map(PathBuf::from)
+    {
+        let state_candidate = state_root.join(DEFAULT_JOURNAL_DB_PATH);
+        if state_candidate.is_file() {
+            return state_candidate;
+        }
+    }
+
+    install_candidate
 }
 
 fn ensure_journal_db_exists(db_path: &Path) -> Result<()> {
@@ -8585,6 +8665,70 @@ mod doctor_check_tests {
         assert!(!check.ok);
         assert_eq!(check.severity, DoctorSeverity::Info);
         assert!(!check.required);
+    }
+}
+
+#[cfg(test)]
+mod journal_path_tests {
+    use super::{
+        discover_installed_journal_db_path_from_binary, resolve_config_relative_path,
+        DEFAULT_JOURNAL_DB_PATH,
+    };
+    use crate::support::lifecycle::InstallMetadata;
+    use anyhow::Result;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn relative_configured_journal_path_resolves_against_config_directory() -> Result<()> {
+        let tempdir = tempdir()?;
+        let config_dir = tempdir.path().join("config");
+        let config_path = config_dir.join("palyra.toml");
+        fs::create_dir_all(config_dir.as_path())?;
+        let resolved = resolve_config_relative_path(config_path.as_path(), "data/journal.sqlite3");
+
+        assert_eq!(resolved, config_dir.join("data").join("journal.sqlite3"));
+        Ok(())
+    }
+
+    #[test]
+    fn installed_journal_path_uses_install_metadata_root_above_cli_command_root() -> Result<()> {
+        let tempdir = tempdir()?;
+        let install_root = tempdir.path().join("install");
+        let command_root = install_root.join("cli-bin");
+        let binary_path = command_root.join(if cfg!(windows) { "palyra.exe" } else { "palyra" });
+        let journal_path = install_root.join(DEFAULT_JOURNAL_DB_PATH);
+
+        fs::create_dir_all(command_root.as_path())?;
+        fs::create_dir_all(journal_path.parent().expect("journal parent should exist"))?;
+        fs::write(binary_path.as_path(), [])?;
+        fs::write(journal_path.as_path(), [])?;
+
+        let metadata = InstallMetadata {
+            schema_version: Some(2),
+            artifact_kind: Some("desktop".to_owned()),
+            installed_at_utc: None,
+            archive_path: None,
+            install_root: Some(install_root.display().to_string()),
+            config_path: None,
+            state_root: None,
+            cli_exposure: None,
+        };
+
+        let resolved = discover_installed_journal_db_path_from_binary(
+            binary_path.as_path(),
+            |candidate_root| {
+                if candidate_root == install_root.as_path() {
+                    Ok(Some(metadata.clone()))
+                } else {
+                    Ok(None)
+                }
+            },
+        )?
+        .expect("install metadata next to install root should resolve journal path");
+
+        assert_eq!(resolved, journal_path);
+        Ok(())
     }
 }
 
