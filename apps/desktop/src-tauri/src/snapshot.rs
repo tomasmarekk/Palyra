@@ -26,6 +26,7 @@ use super::{
     HealthEndpointPayload, LogLine, RuntimeConfig, ServiceKind, ServiceProcessSnapshot,
     CONSOLE_DEVICE_ID, CONSOLE_PRINCIPAL, DASHBOARD_SCHEME, LOOPBACK_HOST, MAX_DIAGNOSTIC_ERRORS,
 };
+pub(crate) use super::dashboard_open::{build_dashboard_open_url, DashboardOpenInputs};
 
 const DEFAULT_DASHBOARD_HASH_ROUTE: &str = "#/control/overview";
 const CONSOLE_SESSION_EXPIRY_SKEW_MS: i64 = 5_000;
@@ -240,14 +241,6 @@ pub(crate) struct SupportBundleExportResult {
     pub(crate) command_output: String,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct DashboardOpenInputs {
-    pub(crate) runtime: RuntimeConfig,
-    pub(crate) admin_token: String,
-    pub(crate) http_client: Client,
-    pub(crate) console_session_cache: Arc<Mutex<Option<ConsoleSessionCache>>>,
-}
-
 #[derive(Debug)]
 pub(crate) struct SnapshotBuildInputs {
     pub(crate) runtime: RuntimeConfig,
@@ -300,15 +293,6 @@ impl ControlCenter {
             http_client: self.http_client.clone(),
             console_session_cache: Arc::clone(&self.console_session_cache),
             console_payload_cache: Arc::clone(&self.console_payload_cache),
-        }
-    }
-
-    pub(crate) fn capture_dashboard_open_inputs(&self) -> DashboardOpenInputs {
-        DashboardOpenInputs {
-            runtime: self.runtime.clone(),
-            admin_token: self.admin_token.clone(),
-            http_client: self.http_client.clone(),
-            console_session_cache: Arc::clone(&self.console_session_cache),
         }
     }
 
@@ -1183,33 +1167,6 @@ pub(crate) async fn ensure_console_session_with_cached_csrf(
         .map(|session| session.csrf_token)
 }
 
-pub(crate) async fn build_dashboard_open_url(
-    inputs: DashboardOpenInputs,
-    dashboard_url: &str,
-    dashboard_access_mode: &str,
-) -> Result<String> {
-    if !dashboard_access_mode.eq_ignore_ascii_case("local") {
-        return Ok(dashboard_url.to_owned());
-    }
-
-    let redirect_path = dashboard_redirect_path_from_url(dashboard_url)?;
-    let mut control_plane =
-        build_control_plane_client(inputs.http_client.clone(), &inputs.runtime)?;
-    let _csrf_token = ensure_console_session_with_cached_csrf(
-        &mut control_plane,
-        inputs.admin_token.as_str(),
-        inputs.console_session_cache.as_ref(),
-    )
-    .await?;
-    let handoff = control_plane
-        .create_browser_handoff(&control_plane::ConsoleBrowserHandoffRequest {
-            redirect_path: Some(redirect_path),
-        })
-        .await
-        .map_err(|error| anyhow!("browser handoff bootstrap failed: {error}"))?;
-    normalize_local_browser_handoff_url(dashboard_url, handoff.handoff_url.as_str())
-}
-
 pub(crate) async fn request_console_session(
     control_plane: &mut ControlPlaneClient,
     admin_token: &str,
@@ -1231,7 +1188,7 @@ pub(crate) async fn request_console_session(
     }
 }
 
-fn dashboard_redirect_path_from_url(dashboard_url: &str) -> Result<String> {
+pub(crate) fn dashboard_redirect_path_from_url(dashboard_url: &str) -> Result<String> {
     let parsed = Url::parse(dashboard_url)
         .with_context(|| format!("failed to parse dashboard URL {dashboard_url}"))?;
     let host = parsed.host_str().ok_or_else(|| anyhow!("dashboard URL is missing a host"))?;
@@ -1256,7 +1213,10 @@ fn dashboard_redirect_path_from_url(dashboard_url: &str) -> Result<String> {
     Ok(redirect_path)
 }
 
-fn normalize_local_browser_handoff_url(dashboard_url: &str, handoff_url: &str) -> Result<String> {
+pub(crate) fn normalize_local_browser_handoff_url(
+    dashboard_url: &str,
+    handoff_url: &str,
+) -> Result<String> {
     let dashboard = Url::parse(dashboard_url)
         .with_context(|| format!("failed to parse dashboard URL {dashboard_url}"))?;
     let handoff = Url::parse(handoff_url)

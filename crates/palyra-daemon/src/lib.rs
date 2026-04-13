@@ -217,7 +217,6 @@ pub(crate) use crate::transport::http::handlers::console::diagnostics::*;
 #[cfg(test)]
 pub(crate) use crate::transport::http::middleware::{
     consume_admin_rate_limit_with_now, consume_canvas_rate_limit_with_now,
-    is_loopback_admin_rate_limit_exempt,
 };
 
 const DANGEROUS_REMOTE_BIND_ACK_ENV: &str = "PALYRA_GATEWAY_DANGEROUS_REMOTE_BIND_ACK";
@@ -3284,7 +3283,7 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use axum::http::{Method, StatusCode};
+    use axum::http::StatusCode;
     use palyra_auth::{
         AuthCredential, AuthProfileRegistry, AuthProfileScope, AuthProfileSetRequest, AuthProvider,
         AuthProviderKind,
@@ -3299,10 +3298,9 @@ mod tests {
         clamp_console_relay_token_ttl_ms, connector_db_path_from_journal_path,
         constant_time_eq_bytes, consume_admin_rate_limit_with_now,
         consume_canvas_rate_limit_with_now, enforce_remote_bind_guard,
-        finalize_discord_onboarding_plan, find_hashed_secret_map_key,
-        is_loopback_admin_rate_limit_exempt, loopback_grpc_url, mint_console_relay_token,
-        mint_console_secret_token, normalize_discord_token, parse_offline_env_flag,
-        prune_console_relay_tokens, redact_console_diagnostics_value,
+        finalize_discord_onboarding_plan, find_hashed_secret_map_key, loopback_grpc_url,
+        mint_console_relay_token, mint_console_secret_token, normalize_discord_token,
+        parse_offline_env_flag, prune_console_relay_tokens, redact_console_diagnostics_value,
         resolve_discord_intents_from_flags, resolve_model_provider_secret,
         resolve_runtime_state_root_with_override, runtime_status_response,
         sanitize_http_error_message, sha256_hex, summarize_discord_inbound_monitor,
@@ -4510,42 +4508,6 @@ mod tests {
         assert!(
             consume_admin_rate_limit_with_now(&buckets, ip, advanced),
             "request should be allowed after the fixed window expires"
-        );
-    }
-
-    #[test]
-    fn admin_rate_limit_exempts_loopback_console_auth_bootstrap_paths() {
-        let loopback_ip = IpAddr::from_str("127.0.0.1").expect("IP literal should parse");
-        for (method, path) in [
-            (Method::POST, "/console/v1/auth/login"),
-            (Method::GET, "/console/v1/auth/session"),
-            (Method::POST, "/console/v1/auth/browser-handoff"),
-            (Method::GET, "/console/v1/auth/browser-handoff/consume"),
-            (Method::POST, "/console/v1/auth/browser-handoff/session"),
-        ] {
-            assert!(
-                is_loopback_admin_rate_limit_exempt(loopback_ip, &method, path),
-                "loopback auth bootstrap path should bypass the generic admin rate limit: {} {}",
-                method,
-                path
-            );
-        }
-
-        assert!(
-            !is_loopback_admin_rate_limit_exempt(
-                loopback_ip,
-                &Method::GET,
-                "/console/v1/diagnostics"
-            ),
-            "non-auth console routes must remain rate limited on loopback"
-        );
-        assert!(
-            !is_loopback_admin_rate_limit_exempt(
-                IpAddr::from_str("203.0.113.10").expect("IP literal should parse"),
-                &Method::POST,
-                "/console/v1/auth/browser-handoff"
-            ),
-            "remote clients must not inherit the loopback auth bootstrap exemption"
         );
     }
 

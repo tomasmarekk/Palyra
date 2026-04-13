@@ -333,3 +333,48 @@ pub(crate) async fn canvas_rate_limit_middleware(
     }
     next.run(request).await
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{net::IpAddr, str::FromStr};
+
+    use axum::http::Method;
+
+    use super::is_loopback_admin_rate_limit_exempt;
+
+    #[test]
+    fn admin_rate_limit_exempts_loopback_console_auth_bootstrap_paths() {
+        let loopback_ip = IpAddr::from_str("127.0.0.1").expect("IP literal should parse");
+        for (method, path) in [
+            (Method::POST, "/console/v1/auth/login"),
+            (Method::GET, "/console/v1/auth/session"),
+            (Method::POST, "/console/v1/auth/browser-handoff"),
+            (Method::GET, "/console/v1/auth/browser-handoff/consume"),
+            (Method::POST, "/console/v1/auth/browser-handoff/session"),
+        ] {
+            assert!(
+                is_loopback_admin_rate_limit_exempt(loopback_ip, &method, path),
+                "loopback auth bootstrap path should bypass the generic admin rate limit: {} {}",
+                method,
+                path
+            );
+        }
+
+        assert!(
+            !is_loopback_admin_rate_limit_exempt(
+                loopback_ip,
+                &Method::GET,
+                "/console/v1/diagnostics"
+            ),
+            "non-auth console routes must remain rate limited on loopback"
+        );
+        assert!(
+            !is_loopback_admin_rate_limit_exempt(
+                IpAddr::from_str("203.0.113.10").expect("IP literal should parse"),
+                &Method::POST,
+                "/console/v1/auth/browser-handoff"
+            ),
+            "remote clients must not inherit the loopback auth bootstrap exemption"
+        );
+    }
+}

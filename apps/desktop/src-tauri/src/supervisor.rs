@@ -12,14 +12,15 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use palyra_control_plane as control_plane;
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
+pub(crate) use super::console_cache::{
+    CachedConsolePayload, ConsolePayloadCache, ConsoleSessionCache,
+};
 use super::companion::DesktopCompanionProfileRecord;
 use super::profile_registry::{DesktopProfileCatalog, DesktopResolvedProfile};
 use super::{
@@ -168,26 +169,6 @@ impl Default for RuntimeConfig {
             browser_grpc_port: BROWSER_GRPC_PORT,
         }
     }
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct ConsoleSessionCache {
-    pub(crate) session: control_plane::ConsoleSession,
-}
-
-#[derive(Debug, Clone, Default)]
-pub(crate) struct CachedConsolePayload {
-    pub(crate) payload: Option<Value>,
-    pub(crate) fetched_at_unix_ms: Option<i64>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub(crate) struct ConsolePayloadCache {
-    pub(crate) diagnostics: CachedConsolePayload,
-    pub(crate) discord: CachedConsolePayload,
-    pub(crate) companion_session_catalog: CachedConsolePayload,
-    pub(crate) companion_approvals: CachedConsolePayload,
-    pub(crate) companion_inventory: CachedConsolePayload,
 }
 
 #[derive(Debug, Serialize)]

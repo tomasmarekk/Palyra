@@ -23,7 +23,10 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 mod commands;
 mod companion;
+mod companion_console;
+mod console_cache;
 mod desktop_state;
+mod dashboard_open;
 mod features;
 mod onboarding;
 mod openai_auth;
