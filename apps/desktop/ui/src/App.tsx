@@ -20,6 +20,7 @@ import {
 import { useDesktopCompanion } from "./hooks/useDesktopCompanion";
 import {
   decideDesktopCompanionApproval,
+  emitDesktopCompanionUxEvent,
   enrollDesktopNode,
   getDesktopCompanionSessionTranscript,
   isDesktopHostAvailable,
@@ -46,6 +47,8 @@ import {
   type InventoryDeviceRecord,
   type JsonValue,
 } from "./lib/desktopApi";
+import { formatDesktopDateTime, translateDesktopMessage } from "./i18n";
+import { readStoredDesktopLocale, type DesktopLocale } from "./preferences";
 
 const SECTION_ORDER: DesktopCompanionSection[] = [
   "home",
@@ -59,6 +62,7 @@ const VOICE_TTS_CONSENT_KEY = "palyra.desktop.voice.tts-consent.v1";
 
 export function App() {
   const { snapshot, loading, error, previewMode, refresh } = useDesktopCompanion();
+  const [locale, setLocale] = useState<DesktopLocale>(() => readStoredDesktopLocale());
   const [actionState, setActionState] = useState<ActionName>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [activeSection, setActiveSection] = useState<DesktopCompanionSection>("home");
@@ -134,6 +138,37 @@ export function App() {
   const nativeCanvasExperiment = snapshot.control_center.diagnostics.experiments.native_canvas;
   const ambientCompanionEnabled =
     snapshot.rollout.voice_capture_enabled || snapshot.rollout.tts_playback_enabled;
+  const t = (
+    key: Parameters<typeof translateDesktopMessage>[1],
+    variables?: Record<string, string | number>,
+  ) => translateDesktopMessage(locale, key, variables);
+  const emitUxEvent = useEffectEvent(
+    async (payload: {
+      name: string;
+      summary?: string;
+      section?: string;
+      outcome?: string;
+      step?: string;
+      toolName?: string;
+      sessionId?: string;
+      runId?: string;
+      deviceId?: string;
+      objectiveId?: string;
+      canvasId?: string;
+      intent?: string;
+      source?: string;
+    }) => {
+      try {
+        await emitDesktopCompanionUxEvent({
+          ...payload,
+          locale,
+          source: payload.source ?? "desktop",
+        });
+      } catch (failure) {
+        console.warn("desktop companion UX telemetry failed", failure);
+      }
+    },
+  );
 
   useEffect(() => {
     const fallbackSessionId =
@@ -228,6 +263,19 @@ export function App() {
       new Notification(entry.title, { body: entry.detail });
     }
   }, [notificationPermission, snapshot.rollout.desktop_notifications_enabled, unreadNotifications]);
+
+  useEffect(() => {
+    window.localStorage.setItem("palyra.desktop.locale", locale);
+    document.documentElement.lang = locale === "qps-ploc" ? "en-XA" : "en";
+  }, [locale]);
+
+  useEffect(() => {
+    void emitUxEvent({
+      name: "ux.surface.opened",
+      section: activeSection,
+      summary: `Desktop companion opened ${activeSection}`,
+    });
+  }, [activeSection, emitUxEvent]);
 
   useEffect(() => {
     if (activeSessionId.trim().length === 0) {
@@ -365,6 +413,12 @@ export function App() {
       setActiveSessionId(session.session_id);
       setActiveSection("chat");
       setSessionLabelDraft(session.session_label ?? "");
+      await emitUxEvent({
+        name: "ux.session.resumed",
+        section: "chat",
+        sessionId: session.session_id,
+        summary: "Desktop companion created or resumed a chat session",
+      });
       await refresh();
     } catch (failure) {
       const message = failure instanceof Error ? failure.message : String(failure);
@@ -387,6 +441,12 @@ export function App() {
     }
     setSendBusy(true);
     try {
+      await emitUxEvent({
+        name: "ux.chat.prompt_submitted",
+        section: "chat",
+        sessionId: activeSessionId,
+        summary: "Desktop companion submitted a chat prompt",
+      });
       const result = await sendDesktopCompanionChatMessage({
         sessionId: activeSessionId,
         text,
@@ -592,6 +652,17 @@ export function App() {
         reason: approvalReason.trim() || undefined,
         scope: "once",
       });
+      await emitUxEvent({
+        name: "ux.approval.resolved",
+        section: "approvals",
+        outcome: approved ? "approved" : "denied",
+        toolName: readString(selectedApproval, "tool_name") ?? undefined,
+        sessionId: readString(selectedApproval, "session_id") ?? undefined,
+        runId: readString(selectedApproval, "run_id") ?? undefined,
+        summary: approved
+          ? "Desktop companion approved a pending action"
+          : "Desktop companion denied a pending action",
+      });
       setApprovalReason("");
       await refresh();
     } catch (failure) {
@@ -604,14 +675,37 @@ export function App() {
 
   async function openScopedHandoff(
     section: string,
-    options: { sessionId?: string; deviceId?: string; runId?: string } = {},
+    options: {
+      sessionId?: string;
+      runId?: string;
+      deviceId?: string;
+      objectiveId?: string;
+      canvasId?: string;
+      intent?: string;
+      source?: string;
+    } = {},
   ): Promise<void> {
     try {
       const result = await openDesktopCompanionHandoff({
         section,
         sessionId: options.sessionId,
-        deviceId: options.deviceId,
         runId: options.runId,
+        deviceId: options.deviceId,
+        objectiveId: options.objectiveId,
+        canvasId: options.canvasId,
+        intent: options.intent,
+        source: options.source ?? "desktop",
+      });
+      await emitUxEvent({
+        name: "ux.handoff.opened",
+        section,
+        sessionId: options.sessionId,
+        runId: options.runId,
+        deviceId: options.deviceId,
+        objectiveId: options.objectiveId,
+        canvasId: options.canvasId,
+        intent: options.intent,
+        summary: `Desktop companion opened a ${section} browser handoff`,
       });
       setNotice(result.message);
     } catch (failure) {
@@ -708,9 +802,9 @@ export function App() {
   return (
     <main className="desktop-root desktop-root--companion">
       <PageHeader
-        eyebrow="Desktop Companion"
-        title="Palyra companion shell"
-        description="One desktop surface for runtime control, active sessions, approvals, trust review, and reconnect-safe drafts."
+        eyebrow={t("desktop.header.eyebrow")}
+        title={t("desktop.header.title")}
+        description={t("desktop.header.description")}
         status={
           <>
             <StatusChip tone={toneForConnection(snapshot.connection_state)}>
@@ -739,10 +833,18 @@ export function App() {
           <>
             <ButtonGroup className="desktop-action-group">
               <Button variant="secondary" onPress={() => void refresh()} isDisabled={loading}>
-                {loading ? "Refreshing..." : "Refresh"}
+                {loading ? t("desktop.header.refreshing") : t("desktop.header.refresh")}
               </Button>
               <Button variant="secondary" onPress={() => void openDashboard()}>
-                Open dashboard
+                {t("desktop.header.openDashboard")}
+              </Button>
+              <Button
+                variant="ghost"
+                onPress={() => setLocale((current) => (current === "en" ? "qps-ploc" : "en"))}
+              >
+                {locale === "en"
+                  ? t("desktop.header.locale.switchToPseudo")
+                  : t("desktop.header.locale.switchToEnglish")}
               </Button>
             </ButtonGroup>
             <ButtonGroup className="desktop-action-group">
@@ -752,7 +854,7 @@ export function App() {
                   variant={section === activeSection ? "primary" : "ghost"}
                   onPress={() => setActiveSection(section)}
                 >
-                  {labelForSection(section)}
+                  {labelForSection(section, locale)}
                 </Button>
               ))}
             </ButtonGroup>
@@ -763,21 +865,20 @@ export function App() {
       {(previewMode || notice !== null || error !== null || snapshot.warnings.length > 0) && (
         <section className="desktop-notice-stack" aria-label="Desktop notices">
           {previewMode ? (
-            <InlineNotice title="Preview data active" tone="warning">
-              The Tauri bridge or local runtime data is unavailable, so the companion shell is
-              rendering preview data.
+            <InlineNotice title={t("desktop.notice.preview.title")} tone="warning">
+              {t("desktop.notice.preview.body")}
             </InlineNotice>
           ) : null}
           {notice !== null ? (
-            <InlineNotice title="Desktop action result">{notice}</InlineNotice>
+            <InlineNotice title={t("desktop.notice.result.title")}>{notice}</InlineNotice>
           ) : null}
           {error !== null ? (
-            <InlineNotice title="Companion refresh failed" tone="danger">
+            <InlineNotice title={t("desktop.notice.refreshFailed.title")} tone="danger">
               {error}
             </InlineNotice>
           ) : null}
           {snapshot.warnings.length > 0 ? (
-            <InlineNotice title="Companion warnings" tone="warning">
+            <InlineNotice title={t("desktop.notice.warnings.title")} tone="warning">
               <ul className="desktop-list">
                 {snapshot.warnings.map((warning) => (
                   <li key={warning}>{warning}</li>
@@ -787,10 +888,14 @@ export function App() {
           ) : null}
           {activeProfile !== null ? (
             <InlineNotice
-              title={`Active profile: ${activeProfile.label}`}
+              title={t("desktop.notice.profile.title", { label: activeProfile.label })}
               tone={activeProfile.strict_mode ? "warning" : "default"}
             >
-              {`Environment ${activeProfile.environment}, risk ${activeProfile.risk_level}, mode ${activeProfile.mode}.`}
+              {t("desktop.notice.profile.body", {
+                environment: activeProfile.environment,
+                riskLevel: activeProfile.risk_level,
+                mode: activeProfile.mode,
+              })}
             </InlineNotice>
           ) : null}
         </section>
@@ -852,7 +957,7 @@ export function App() {
             </SectionCard>
           </section>
 
-          <DesktopHeader loading={loading} snapshot={snapshot.control_center} />
+          <DesktopHeader loading={loading} locale={locale} snapshot={snapshot.control_center} />
 
           <LifecycleActionBar
             actionState={actionState}
@@ -1217,6 +1322,7 @@ export function App() {
                     void openScopedHandoff("chat", {
                       sessionId: selectedSession?.session_id,
                       runId: snapshot.preferences.last_run_id,
+                      intent: "resume_session",
                     })
                   }
                 >
@@ -1608,6 +1714,7 @@ export function App() {
                     void openScopedHandoff("approvals", {
                       sessionId: readString(selectedApproval, "session_id") ?? undefined,
                       runId: readString(selectedApproval, "run_id") ?? undefined,
+                      intent: "approve",
                     })
                   }
                 >
@@ -1736,6 +1843,7 @@ export function App() {
                   void openScopedHandoff("access", {
                     deviceId: selectedDevice?.device_id,
                     sessionId: selectedDevice?.latest_session_id,
+                    intent: "inspect_access",
                   })
                 }
               >
@@ -1801,6 +1909,7 @@ export function App() {
                       void openScopedHandoff("chat", {
                         sessionId: selectedDevice.latest_session_id,
                         deviceId: selectedDevice.device_id,
+                        intent: "resume_session",
                       })
                     }
                   >
@@ -1871,12 +1980,12 @@ export function App() {
       {activeSection === "onboarding" ? (
         <section className="desktop-grid desktop-grid--details">
           <SectionCard
-            title="Onboarding and rollout"
-            description="Desktop keeps current onboarding progress, authentication readiness, and release rollout state visible in one place."
+            title={t("desktop.onboarding.title")}
+            description={t("desktop.onboarding.description")}
             actions={
               <ButtonGroup className="desktop-action-group">
                 <Button variant="secondary" onPress={() => void openScopedHandoff("overview")}>
-                  Browser handoff
+                  {t("desktop.onboarding.browserHandoff")}
                 </Button>
                 <Button
                   variant="ghost"
@@ -1886,7 +1995,7 @@ export function App() {
                     })
                   }
                 >
-                  Toggle shell
+                  {t("desktop.onboarding.toggleShell")}
                 </Button>
               </ButtonGroup>
             }
@@ -1899,33 +2008,37 @@ export function App() {
               {snapshot.onboarding.current_step_detail}
             </InlineNotice>
             {snapshot.onboarding.recovery?.message ? (
-              <InlineNotice title="Recovery hint" tone="warning">
+              <InlineNotice title={t("desktop.onboarding.recoveryHint")} tone="warning">
                 {snapshot.onboarding.recovery.message}
               </InlineNotice>
             ) : null}
           </SectionCard>
 
           <SectionCard
-            title="Readiness"
-            description="Completion criteria for the desktop companion release path and operator onboarding handoff."
+            title={t("desktop.onboarding.readiness.title")}
+            description={t("desktop.onboarding.readiness.description")}
           >
             <div className="desktop-stack">
               <MetricCard
-                label="Onboarding progress"
+                label={t("desktop.onboarding.progress.label")}
                 value={onboardingProgressLabel}
                 detail={snapshot.onboarding.phase}
                 tone={snapshot.onboarding.dashboard_handoff_completed ? "success" : "warning"}
               />
               <MetricCard
-                label="OpenAI auth"
-                value={snapshot.openai_status.ready ? "Ready" : "Attention"}
-                detail={snapshot.openai_status.note ?? "No auth note published."}
+                label={t("desktop.onboarding.auth.label")}
+                value={
+                  snapshot.openai_status.ready
+                    ? t("desktop.onboarding.auth.ready")
+                    : t("desktop.onboarding.auth.attention")
+                }
+                detail={snapshot.openai_status.note ?? t("desktop.onboarding.auth.emptyNote")}
                 tone={snapshot.openai_status.ready ? "success" : "warning"}
               />
               <MetricCard
-                label="Last completion"
-                value={formatUnixMs(snapshot.onboarding.completion_unix_ms)}
-                detail="Persisted locally so desktop can resume after restart."
+                label={t("desktop.onboarding.completion.label")}
+                value={formatDesktopDateTime(locale, snapshot.onboarding.completion_unix_ms)}
+                detail={t("desktop.onboarding.completion.detail")}
               />
             </div>
           </SectionCard>
@@ -1935,18 +2048,18 @@ export function App() {
   );
 }
 
-function labelForSection(section: DesktopCompanionSection): string {
+function labelForSection(section: DesktopCompanionSection, locale: DesktopLocale): string {
   switch (section) {
     case "home":
-      return "Home";
+      return translateDesktopMessage(locale, "desktop.section.home");
     case "chat":
-      return "Chat";
+      return translateDesktopMessage(locale, "desktop.section.chat");
     case "approvals":
-      return "Approvals";
+      return translateDesktopMessage(locale, "desktop.section.approvals");
     case "access":
-      return "Access";
+      return translateDesktopMessage(locale, "desktop.section.access");
     case "onboarding":
-      return "Onboarding";
+      return translateDesktopMessage(locale, "desktop.section.onboarding");
   }
 }
 

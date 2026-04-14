@@ -1,20 +1,27 @@
 import { Skeleton } from "@heroui/react";
 
+import { formatDesktopDateTime, translateDesktopMessage } from "../i18n";
 import type { ControlCenterSnapshot } from "../lib/desktopApi";
-import { formatUnixMs, overallTone } from "./desktopPresentation";
+import type { DesktopLocale } from "../preferences";
+import { overallTone } from "./desktopPresentation";
 import { KeyValueList, PageHeader, StatusChip } from "./ui";
 
 type DesktopHeaderProps = {
+  locale: DesktopLocale;
   snapshot: ControlCenterSnapshot;
   loading: boolean;
 };
 
-export function DesktopHeader({ snapshot, loading }: DesktopHeaderProps) {
+export function DesktopHeader({ locale, snapshot, loading }: DesktopHeaderProps) {
+  const t = (
+    key: Parameters<typeof translateDesktopMessage>[1],
+    variables?: Record<string, string | number>,
+  ) => translateDesktopMessage(locale, key, variables);
   return (
     <PageHeader
-      eyebrow="Desktop Control Center"
-      title="Launch the runtime, verify posture, then open the dashboard."
-      description="Desktop stays intentionally short: lifecycle controls, runtime health, and the fastest handoff into the full operator console."
+      eyebrow={t("desktop.controlCenter.eyebrow")}
+      title={t("desktop.controlCenter.title")}
+      description={t("desktop.controlCenter.description")}
       status={
         <>
           <StatusChip tone={overallTone(snapshot.overall_status)}>
@@ -22,7 +29,9 @@ export function DesktopHeader({ snapshot, loading }: DesktopHeaderProps) {
           </StatusChip>
           <StatusChip tone="accent">{snapshot.quick_facts.dashboard_access_mode}</StatusChip>
           <StatusChip tone={loading ? "warning" : "success"}>
-            {loading ? "Refreshing snapshot" : "Snapshot ready"}
+            {loading
+              ? t("desktop.controlCenter.snapshotRefreshing")
+              : t("desktop.controlCenter.snapshotReady")}
           </StatusChip>
         </>
       }
@@ -31,7 +40,7 @@ export function DesktopHeader({ snapshot, loading }: DesktopHeaderProps) {
           <KeyValueList
             items={[
               {
-                label: "Overall state",
+                label: t("desktop.controlCenter.overallState"),
                 value: loading ? (
                   <Skeleton className="desktop-skeleton desktop-skeleton--chip" />
                 ) : (
@@ -41,7 +50,7 @@ export function DesktopHeader({ snapshot, loading }: DesktopHeaderProps) {
                 ),
               },
               {
-                label: "Dashboard mode",
+                label: t("desktop.controlCenter.dashboardMode"),
                 value: loading ? (
                   <Skeleton className="desktop-skeleton desktop-skeleton--text" />
                 ) : (
@@ -49,11 +58,11 @@ export function DesktopHeader({ snapshot, loading }: DesktopHeaderProps) {
                 ),
               },
               {
-                label: "Last snapshot",
+                label: t("desktop.controlCenter.lastSnapshot"),
                 value: loading ? (
                   <Skeleton className="desktop-skeleton desktop-skeleton--text" />
                 ) : (
-                  <strong>{formatUnixMs(snapshot.generated_at_unix_ms)}</strong>
+                  <strong>{formatDesktopDateTime(locale, snapshot.generated_at_unix_ms)}</strong>
                 ),
               },
             ]}

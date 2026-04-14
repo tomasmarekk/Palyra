@@ -9,14 +9,14 @@ use ulid::Ulid;
 
 use super::companion::{
     build_companion_handoff_url, build_companion_snapshot, decide_companion_approval,
-    fetch_companion_transcript, resolve_companion_chat_session, send_companion_chat_message,
-    transcribe_companion_audio, DesktopCompanionAudioTranscriptionRequest,
+    emit_companion_ux_event, fetch_companion_transcript, resolve_companion_chat_session,
+    send_companion_chat_message, transcribe_companion_audio, DesktopCompanionAudioTranscriptionRequest,
     DesktopCompanionAudioTranscriptionResult,
     DesktopCompanionApprovalDecisionRequest, DesktopCompanionNotificationsRequest,
     DesktopCompanionOpenDashboardRequest, DesktopCompanionPreferencesRequest,
     DesktopCompanionResolveSessionRequest, DesktopCompanionRolloutRequest,
     DesktopCompanionSendMessageRequest, DesktopCompanionSendMessageResult,
-    DesktopCompanionSnapshot, DesktopCompanionSwitchProfileRequest,
+    DesktopCompanionSnapshot, DesktopCompanionSwitchProfileRequest, DesktopCompanionUxEventRequest,
     DesktopSessionTranscriptEnvelope,
 };
 use super::features::onboarding::connectors::discord::{
@@ -359,6 +359,21 @@ pub(crate) async fn open_desktop_companion_handoff(
     let opened = supervisor.open_dashboard(handoff_url.as_str()).map_err(command_error)?;
     let _ = supervisor.mark_dashboard_handoff_complete();
     Ok(ActionResult { ok: true, message: format!("opened {opened}") })
+}
+
+#[tauri::command]
+pub(crate) async fn emit_desktop_companion_ux_event(
+    state: State<'_, DesktopAppState>,
+    payload: DesktopCompanionUxEventRequest,
+) -> Result<ActionResult, String> {
+    let companion_inputs = {
+        let mut supervisor = state.supervisor.lock().await;
+        supervisor.capture_companion_inputs()
+    };
+    emit_companion_ux_event(&companion_inputs, &payload)
+        .await
+        .map_err(command_error)?;
+    Ok(ActionResult { ok: true, message: format!("recorded {}", payload.name) })
 }
 
 #[tauri::command]
@@ -1038,6 +1053,7 @@ pub(crate) fn run() {
             reset_desktop_node,
             open_dashboard,
             open_desktop_companion_handoff,
+            emit_desktop_companion_ux_event,
             export_support_bundle,
             resolve_desktop_companion_chat_session,
             get_desktop_companion_session_transcript,

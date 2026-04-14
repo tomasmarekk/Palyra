@@ -845,10 +845,33 @@ export async function decideDesktopCompanionApproval(payload: {
 export async function openDesktopCompanionHandoff(payload: {
   section?: string;
   sessionId?: string;
-  deviceId?: string;
   runId?: string;
+  deviceId?: string;
+  objectiveId?: string;
+  canvasId?: string;
+  intent?: string;
+  source?: string;
 }): Promise<ActionResult> {
   return invoke<ActionResult>("open_desktop_companion_handoff", { payload });
+}
+
+export async function emitDesktopCompanionUxEvent(payload: {
+  name: string;
+  summary?: string;
+  section?: string;
+  outcome?: string;
+  step?: string;
+  toolName?: string;
+  sessionId?: string;
+  runId?: string;
+  deviceId?: string;
+  objectiveId?: string;
+  canvasId?: string;
+  intent?: string;
+  source?: string;
+  locale?: string;
+}): Promise<ActionResult> {
+  return invoke<ActionResult>("emit_desktop_companion_ux_event", { payload });
 }
 
 export async function startPalyra(): Promise<ActionResult> {

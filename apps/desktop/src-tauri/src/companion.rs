@@ -232,6 +232,46 @@ pub(crate) struct DesktopCompanionOpenDashboardRequest {
     pub(crate) device_id: Option<String>,
     #[serde(default)]
     pub(crate) run_id: Option<String>,
+    #[serde(default)]
+    pub(crate) objective_id: Option<String>,
+    #[serde(default)]
+    pub(crate) canvas_id: Option<String>,
+    #[serde(default)]
+    pub(crate) intent: Option<String>,
+    #[serde(default)]
+    pub(crate) source: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DesktopCompanionUxEventRequest {
+    pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) summary: Option<String>,
+    #[serde(default)]
+    pub(crate) section: Option<String>,
+    #[serde(default)]
+    pub(crate) outcome: Option<String>,
+    #[serde(default)]
+    pub(crate) step: Option<String>,
+    #[serde(default)]
+    pub(crate) tool_name: Option<String>,
+    #[serde(default)]
+    pub(crate) session_id: Option<String>,
+    #[serde(default)]
+    pub(crate) run_id: Option<String>,
+    #[serde(default)]
+    pub(crate) device_id: Option<String>,
+    #[serde(default)]
+    pub(crate) objective_id: Option<String>,
+    #[serde(default)]
+    pub(crate) canvas_id: Option<String>,
+    #[serde(default)]
+    pub(crate) intent: Option<String>,
+    #[serde(default)]
+    pub(crate) source: Option<String>,
+    #[serde(default)]
+    pub(crate) locale: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -873,6 +913,43 @@ pub(crate) async fn build_companion_handoff_url(
     .await
 }
 
+pub(crate) async fn emit_companion_ux_event(
+    inputs: &DesktopCompanionInputs,
+    payload: &DesktopCompanionUxEventRequest,
+) -> Result<()> {
+    let event_name =
+        normalize_optional_text(payload.name.as_str()).ok_or_else(|| anyhow!("desktop companion UX telemetry requires an event name"))?;
+    let mut control_plane = build_control_plane_client(inputs.http_client.clone(), &inputs.runtime)?;
+    let _csrf_token =
+        ensure_console_session_with_csrf(&mut control_plane, inputs.admin_token.as_str()).await?;
+    let details = json!({
+        "surface": "desktop",
+        "section": payload.section.as_deref().and_then(normalize_optional_text),
+        "outcome": payload.outcome.as_deref().and_then(normalize_optional_text),
+        "step": payload.step.as_deref().and_then(normalize_optional_text),
+        "toolName": payload.tool_name.as_deref().and_then(normalize_optional_text),
+        "sessionId": payload.session_id.as_deref().and_then(normalize_optional_text),
+        "runId": payload.run_id.as_deref().and_then(normalize_optional_text),
+        "deviceId": payload.device_id.as_deref().and_then(normalize_optional_text),
+        "objectiveId": payload.objective_id.as_deref().and_then(normalize_optional_text),
+        "canvasId": payload.canvas_id.as_deref().and_then(normalize_optional_text),
+        "intent": payload.intent.as_deref().and_then(normalize_optional_text),
+        "source": payload.source.as_deref().and_then(normalize_optional_text).or(Some("desktop")),
+        "locale": payload.locale.as_deref().and_then(normalize_optional_text),
+    });
+    control_plane
+        .post_json_value(
+            "console/v1/system/events/emit",
+            &json!({
+                "name": event_name,
+                "summary": payload.summary.as_deref().and_then(normalize_optional_text),
+                "details": details,
+            }),
+        )
+        .await?;
+    Ok(())
+}
+
 fn build_console_url(runtime: &RuntimeConfig, path: &str) -> Result<Url> {
     Url::parse(format!("http://127.0.0.1:{}/", runtime.gateway_admin_port).as_str())
         .map_err(|error| anyhow!("desktop companion console URL could not be created: {error}"))?
@@ -898,19 +975,18 @@ fn build_companion_redirect_path(payload: &DesktopCompanionOpenDashboardRequest)
     let section =
         payload.section.as_deref().and_then(normalize_optional_text).unwrap_or("overview");
     let mut query = Vec::new();
-    if let Some(session_id) = payload.session_id.as_deref().and_then(normalize_optional_text) {
-        query.push(format!("sessionId={}", urlencoding(session_id)));
-    }
-    if let Some(device_id) = payload.device_id.as_deref().and_then(normalize_optional_text) {
-        query.push(format!("deviceId={}", urlencoding(device_id)));
-    }
-    if let Some(run_id) = payload.run_id.as_deref().and_then(normalize_optional_text) {
-        query.push(format!("runId={}", urlencoding(run_id)));
-    }
+    push_redirect_query_param(&mut query, "sessionId", payload.session_id.as_deref());
+    push_redirect_query_param(&mut query, "runId", payload.run_id.as_deref());
+    push_redirect_query_param(&mut query, "deviceId", payload.device_id.as_deref());
+    push_redirect_query_param(&mut query, "objectiveId", payload.objective_id.as_deref());
+    push_redirect_query_param(&mut query, "canvasId", payload.canvas_id.as_deref());
+    push_redirect_query_param(&mut query, "intent", payload.intent.as_deref());
+    push_redirect_query_param(&mut query, "source", payload.source.as_deref());
     let base_path = match section {
         "chat" => "/#/chat",
         "approvals" => "/#/control/approvals",
         "access" => "/#/settings/access",
+        "browser" => "/#/browser",
         "onboarding" => "/#/settings/profiles",
         "overview" | "home" => "/#/control/overview",
         other if other.starts_with('/') => other,
@@ -921,6 +997,12 @@ fn build_companion_redirect_path(payload: &DesktopCompanionOpenDashboardRequest)
         base_path.to_owned()
     } else {
         format!("{base_path}?{}", query.join("&"))
+    }
+}
+
+fn push_redirect_query_param(query: &mut Vec<String>, key: &str, value: Option<&str>) {
+    if let Some(value) = value.and_then(normalize_optional_text) {
+        query.push(format!("{key}={}", urlencoding(value)));
     }
 }
 
@@ -968,11 +1050,34 @@ mod tests {
             session_id: Some("session-1".to_owned()),
             device_id: Some("device-1".to_owned()),
             run_id: Some("run-1".to_owned()),
+            objective_id: Some("objective-1".to_owned()),
+            canvas_id: Some("canvas-1".to_owned()),
+            intent: Some("approve".to_owned()),
+            source: Some("desktop".to_owned()),
         };
         let redirect = build_companion_redirect_path(&payload);
         assert_eq!(
             redirect,
-            "/#/settings/access?sessionId=session-1&deviceId=device-1&runId=run-1"
+            "/#/settings/access?sessionId=session-1&runId=run-1&deviceId=device-1&objectiveId=objective-1&canvasId=canvas-1&intent=approve&source=desktop"
+        );
+    }
+
+    #[test]
+    fn redirect_path_maps_browser_section_and_trims_empty_context() {
+        let payload = DesktopCompanionOpenDashboardRequest {
+            section: Some("browser".to_owned()),
+            session_id: Some(" session-1 ".to_owned()),
+            device_id: Some("   ".to_owned()),
+            run_id: Some("run-1".to_owned()),
+            objective_id: None,
+            canvas_id: Some("canvas-1".to_owned()),
+            intent: Some(" reopen_canvas ".to_owned()),
+            source: Some("desktop".to_owned()),
+        };
+        let redirect = build_companion_redirect_path(&payload);
+        assert_eq!(
+            redirect,
+            "/#/browser?sessionId=session-1&runId=run-1&canvasId=canvas-1&intent=reopen_canvas&source=desktop"
         );
     }
 
