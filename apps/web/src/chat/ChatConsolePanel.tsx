@@ -32,6 +32,7 @@ import {
   toErrorMessage,
   type ComposerAttachment,
 } from "./chatShared";
+import { emitPromptSubmitted, emitRunInspected, emitSessionResumed } from "./chatConsoleTelemetry";
 import {
   createUndoCheckpoint,
   executeChatSlashCommand,
@@ -120,14 +121,7 @@ export function ChatConsolePanel({
   const [phase4BusyKey, setPhase4BusyKey] = useState<string | null>(null);
   const attachmentInputRef = useRef<HTMLInputElement | null>(null);
   const handleSessionActivated = useCallback(
-    async (sessionId: string) => {
-      await emitUxEvent({
-        name: "ux.session.resumed",
-        section: "chat",
-        sessionId,
-        summary: "Resumed chat session.",
-      });
-    },
+    (sessionId: string) => emitSessionResumed(emitUxEvent, sessionId),
     [emitUxEvent],
   );
   const sessions = useChatSessions({
@@ -138,25 +132,11 @@ export function ChatConsolePanel({
     preferredSessionId,
   });
   const handlePromptSubmitted = useCallback(
-    async (sessionId: string) => {
-      await emitUxEvent({
-        name: "ux.chat.prompt_submitted",
-        section: "chat",
-        sessionId,
-        summary: "Submitted a chat prompt.",
-      });
-    },
+    (sessionId: string) => emitPromptSubmitted(emitUxEvent, sessionId),
     [emitUxEvent],
   );
   const handleRunInspected = useCallback(
-    async (runId: string) => {
-      await emitUxEvent({
-        name: "ux.run.inspected",
-        section: "chat",
-        runId,
-        summary: "Opened run inspector.",
-      });
-    },
+    (runId: string) => emitRunInspected(emitUxEvent, runId),
     [emitUxEvent],
   );
 
