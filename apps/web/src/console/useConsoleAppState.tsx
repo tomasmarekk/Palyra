@@ -614,19 +614,26 @@ export function useConsoleAppState() {
     [locale],
   );
 
-  const refreshUxTelemetry = useCallback(async (): Promise<void> => {
-    setUxTelemetryBusy(true);
-    setError(null);
-    try {
-      const response = await loadUxTelemetryAggregate(api);
-      setUxTelemetryAggregate(response.aggregate);
-      setUxTelemetryEvents(toJsonObjectArray(response.records as unknown as JsonValue[]));
-    } catch (failure) {
-      setError(toErrorMessage(failure));
-    } finally {
-      setUxTelemetryBusy(false);
-    }
-  }, [api]);
+  const refreshUxTelemetry = useCallback(
+    async (options?: { clearError?: boolean }): Promise<void> => {
+      setUxTelemetryBusy(true);
+      if (options?.clearError !== false) {
+        setError(null);
+      }
+      try {
+        const response = await loadUxTelemetryAggregate(api);
+        setUxTelemetryAggregate(response.aggregate);
+        setUxTelemetryEvents(toJsonObjectArray(response.records as unknown as JsonValue[]));
+      } catch (failure) {
+        if (options?.clearError !== false) {
+          setError(toErrorMessage(failure));
+        }
+      } finally {
+        setUxTelemetryBusy(false);
+      }
+    },
+    [api],
+  );
 
   const emitUxEvent = useCallback(
     async (event: Omit<UxTelemetryEvent, "surface" | "locale">): Promise<void> => {
@@ -719,7 +726,10 @@ export function useConsoleAppState() {
       return;
     }
     lastSectionAutoRefreshRef.current.overview = Date.now();
-    void Promise.all([refreshOverview(), refreshUxTelemetry()]);
+    void Promise.all([
+      refreshOverview({ clearError: false }),
+      refreshUxTelemetry({ clearError: false }),
+    ]);
     if (!initialSurfaceEventSentRef.current) {
       initialSurfaceEventSentRef.current = true;
       void emitUxEvent({
@@ -746,10 +756,13 @@ export function useConsoleAppState() {
     }
     lastSectionAutoRefreshRef.current[section] = Date.now();
     if (section === "overview") {
-      void Promise.all([refreshOverview(), refreshUxTelemetry()]);
+      void Promise.all([
+        refreshOverview({ clearError: false }),
+        refreshUxTelemetry({ clearError: false }),
+      ]);
     }
     if (section === "auth") {
-      void authDomain.refreshAuth();
+      void authDomain.refreshAuth({ clearError: false });
     }
     if (section === "approvals") {
       void refreshApprovals();
@@ -761,7 +774,7 @@ export function useConsoleAppState() {
       void refreshChannels();
     }
     if (section === "memory") {
-      void refreshMemoryStatus();
+      void refreshMemoryStatus({ clearError: false });
       void refreshWorkspaceDocuments();
       void refreshLearningQueue();
     }
@@ -784,10 +797,10 @@ export function useConsoleAppState() {
       section === "usage" ||
       section === "operations"
     ) {
-      void refreshDiagnostics();
+      void refreshDiagnostics({ clearError: false });
     }
     if (section === "usage" || section === "operations") {
-      void refreshMemoryStatus();
+      void refreshMemoryStatus({ clearError: false });
     }
     if (section === "secrets") {
       void refreshSecrets();
@@ -1131,9 +1144,11 @@ export function useConsoleAppState() {
     }
   }
 
-  async function refreshMemoryStatus(): Promise<void> {
+  async function refreshMemoryStatus(options?: { clearError?: boolean }): Promise<void> {
     setMemoryStatusBusy(true);
-    setError(null);
+    if (options?.clearError !== false) {
+      setError(null);
+    }
     try {
       const response = await api.getMemoryStatus();
       setMemoryStatus(response as unknown as JsonObject);
@@ -1727,9 +1742,11 @@ export function useConsoleAppState() {
     }
   }
 
-  async function refreshDiagnostics(): Promise<void> {
+  async function refreshDiagnostics(options?: { clearError?: boolean }): Promise<void> {
     setDiagnosticsBusy(true);
-    setError(null);
+    if (options?.clearError !== false) {
+      setError(null);
+    }
     try {
       const response = await api.getDiagnostics();
       setDiagnosticsSnapshot(response as unknown as JsonObject);

@@ -40,11 +40,11 @@ export function useUsageDomain({ api, setError, setNotice }: UseUsageDomainArgs)
   );
 
   useEffect(() => {
-    void refreshUsage();
+    void refreshUsage({ clearError: false });
   }, [windowKey, bucket, includeArchived]);
 
   useEffect(() => {
-    void refreshSelectedSessionDetail();
+    void refreshSelectedSessionDetail({ clearError: false });
   }, [selectedSessionId, windowKey, bucket, includeArchived]);
 
   function buildParams(now = Date.now()): URLSearchParams {
@@ -60,14 +60,16 @@ export function useUsageDomain({ api, setError, setNotice }: UseUsageDomainArgs)
     return params;
   }
 
-  async function refreshUsage(): Promise<void> {
+  async function refreshUsage(options?: { clearError?: boolean }): Promise<void> {
     const now = Date.now();
     const params = buildParams(now);
     const topParams = new URLSearchParams(params);
     topParams.set("limit", "8");
 
     setBusy(true);
-    setError(null);
+    if (options?.clearError !== false) {
+      setError(null);
+    }
     try {
       const [nextSummary, nextInsights, nextSessions, nextAgents, nextModels] = await Promise.all([
         api.getUsageSummary(params),
@@ -97,13 +99,15 @@ export function useUsageDomain({ api, setError, setNotice }: UseUsageDomainArgs)
     }
   }
 
-  async function refreshSelectedSessionDetail(): Promise<void> {
+  async function refreshSelectedSessionDetail(options?: { clearError?: boolean }): Promise<void> {
     if (selectedSessionId.trim().length === 0) {
       setSelectedSessionDetail(null);
       return;
     }
     try {
-      setError(null);
+      if (options?.clearError !== false) {
+        setError(null);
+      }
       const params = buildParams();
       params.set("run_limit", "12");
       const detail = await api.getUsageSessionDetail(selectedSessionId, params);

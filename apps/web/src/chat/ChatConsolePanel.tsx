@@ -26,14 +26,9 @@ import {
 } from "./chatConsoleOperations";
 import {
   inspectBackgroundTaskDetail,
-  inspectDerivedArtifactDetail,
-  inspectLiveEntryDetail,
-  inspectSearchMatchDetail,
-  inspectTranscriptRecordDetail,
-  runBackgroundTaskLifecycleAction,
-  runDerivedArtifactLifecycleAction,
   useChatAttachmentUploadHandler,
 } from "./chatInspectorActions";
+import { buildInspectorProps, buildTranscriptProps } from "./chatConsolePanelProps";
 import {
   buildSessionLineageHint,
   describeBranchState,
@@ -82,7 +77,6 @@ interface ChatConsolePanelProps {
   readonly setConsoleSection: (section: Section) => void;
   readonly openBrowserSessionWorkbench: (sessionId: string) => void;
 }
-
 export function ChatConsolePanel({
   api,
   emitUxEvent,
@@ -128,7 +122,6 @@ export function ChatConsolePanel({
   const [exportBusy, setExportBusy] = useState<"json" | "markdown" | null>(null);
   const [phase4BusyKey, setPhase4BusyKey] = useState<string | null>(null);
   const attachmentInputRef = useRef<HTMLInputElement | null>(null);
-
   const sessions = useChatSessions({
     api,
     onSessionActivated: async (sessionId) => {
@@ -197,7 +190,6 @@ export function ChatConsolePanel({
     setError,
     setNotice,
   });
-
   const pendingApprovalCount = useMemo(
     () =>
       visibleTranscript.filter(
@@ -368,7 +360,6 @@ export function ChatConsolePanel({
     runTotalTokens: runStatus?.total_tokens ?? 0,
     sessionTotalTokens: sessions.selectedSession?.total_tokens ?? 0,
   });
-
   const refreshSessionTranscript = useCallback(async () => {
     const sessionId = sessions.activeSessionId.trim();
     transcriptRequestSeqRef.current += 1;
@@ -386,7 +377,6 @@ export function ChatConsolePanel({
       setBackgroundTasks([]);
       return;
     }
-
     setTranscriptBusy(true);
     try {
       const response = await api.getSessionTranscript(sessionId);
@@ -413,7 +403,6 @@ export function ChatConsolePanel({
       }
     }
   }, [api, sessions.activeSessionId, sessions.upsertSession, setError]);
-
   useEffect(() => {
     const sessionId = sessions.activeSessionId.trim();
     if (sessionId.length === 0) {
@@ -435,7 +424,6 @@ export function ChatConsolePanel({
       resetContextReferencePreview();
       return;
     }
-
     if (sessionSwitchRef.current.length > 0 && sessionSwitchRef.current !== sessionId) {
       clearTranscriptState();
       setDetailPanel(null);
@@ -456,7 +444,6 @@ export function ChatConsolePanel({
     resetRecallPreview,
     sessions.activeSessionId,
   ]);
-
   async function resetSessionAndTranscript(): Promise<void> {
     const resetApplied = await sessions.resetSession();
     if (!resetApplied) {
@@ -471,7 +458,6 @@ export function ChatConsolePanel({
     void refreshSessionTranscript();
     setNotice("Session reset applied. Local transcript cleared.");
   }
-
   async function archiveSessionAndTranscript(): Promise<void> {
     const archived = await sessions.archiveSession();
     if (!archived) {
@@ -485,14 +471,12 @@ export function ChatConsolePanel({
     setSessionDerivedArtifacts([]);
     setNotice("Session archived. Local transcript cleared.");
   }
-
   async function handleComposerSubmit(): Promise<void> {
     const command = parsedSlashCommand;
     if (command !== null) {
       await executeSlashCommand(command);
       return;
     }
-
     const effectiveContextReferencePreview = await ensureContextReferencePreviewForCurrentDraft();
     if (effectiveContextReferencePreview?.errors.length) {
       setError(effectiveContextReferencePreview.errors[0]?.message ?? "Invalid context reference.");
@@ -509,7 +493,6 @@ export function ChatConsolePanel({
       setNotice,
       recordUxMetric,
     });
-
     const didSend = await sendMessage(
       async () => {
         await Promise.all([
@@ -536,7 +519,6 @@ export function ChatConsolePanel({
       setAttachments([]);
     }
   }
-
   async function interruptCurrentRun(raw: string): Promise<void> {
     await interruptAndMaybeRedirect({
       api,
@@ -590,7 +572,6 @@ export function ChatConsolePanel({
       },
     });
   }
-
   async function executeSlashCommand(command: NonNullable<typeof parsedSlashCommand>) {
     await executeChatSlashCommand({
       command,
@@ -649,7 +630,6 @@ export function ChatConsolePanel({
       openBrowserSessionWorkbench,
     });
   }
-
   async function runCompactionFlow(mode: "preview" | "apply"): Promise<void> {
     await runChatCompactionFlow({
       api,
@@ -664,7 +644,6 @@ export function ChatConsolePanel({
       setNotice,
     });
   }
-
   async function createNewSession(requestedLabel?: string): Promise<void> {
     await createNewSessionAction({
       requestedLabel,
@@ -678,7 +657,6 @@ export function ChatConsolePanel({
       setNotice,
     });
   }
-
   async function resumeSession(rawTarget: string): Promise<void> {
     resumeSessionAction({
       rawTarget,
@@ -689,7 +667,6 @@ export function ChatConsolePanel({
       setNotice,
     });
   }
-
   async function retryLatestTurn(): Promise<void> {
     await createUndoCheckpoint({
       api,
@@ -712,7 +689,6 @@ export function ChatConsolePanel({
       setNotice,
     });
   }
-
   async function branchCurrentSession(requestedLabel?: string): Promise<void> {
     await branchCurrentSessionAction({
       api,
@@ -730,7 +706,6 @@ export function ChatConsolePanel({
       setNotice,
     });
   }
-
   async function queueFollowUpText(text: string): Promise<void> {
     await queueFollowUpTextAction({
       api,
@@ -838,7 +813,6 @@ export function ChatConsolePanel({
       source: options?.source,
     });
   }
-
   return (
     <main className="workspace-page chat-workspace">
       <input
@@ -917,7 +891,8 @@ export function ChatConsolePanel({
           },
         }}
         contextBudget={contextBudget}
-        inspectorProps={{
+        inspectorProps={buildInspectorProps({
+          api,
           pendingApprovalCount,
           a2uiSurfaces,
           runIds: knownRunIds,
@@ -929,66 +904,26 @@ export function ChatConsolePanel({
           setTranscriptSearchQuery,
           transcriptSearchBusy,
           canSearchTranscript: deferredSearchQuery.trim().length > 0,
-          pinnedRecordKeys: new Set(sessionPins.map((pin) => `${pin.run_id}:${pin.tape_seq}`)),
+          sessionPins,
           searchResults: transcriptSearchResults,
-          searchTranscript: () => {
-            void searchTranscript();
-          },
-          inspectSearchMatch: (match) => {
-            inspectSearchMatchDetail({
-              match,
-              transcriptRecords,
-              setDetailPanel,
-            });
+          searchTranscript: async () => {
+            await searchTranscript();
           },
           exportBusy,
-          exportTranscript: (format) => {
-            void exportTranscript(format);
+          exportTranscript: async (format) => {
+            await exportTranscript(format);
           },
           recentTranscriptRecords,
-          inspectTranscriptRecord: (record) => {
-            inspectTranscriptRecordDetail(record, setDetailPanel);
+          pinTranscriptRecord: async (record) => {
+            await pinTranscriptRecord(record);
           },
-          pinTranscriptRecord: (record) => {
-            void pinTranscriptRecord(record);
-          },
-          sessionPins,
-          deletePin: (pinId) => {
-            void deletePin(pinId);
+          deletePin: async (pinId) => {
+            await deletePin(pinId);
           },
           compactions,
-          inspectCompaction: (artifactId) => {
-            void inspectCompaction(artifactId);
-          },
           checkpoints,
-          inspectCheckpoint: (checkpointId) => {
-            void inspectCheckpoint(checkpointId);
-          },
-          restoreCheckpoint: (checkpointId) => {
-            void restoreCheckpoint(checkpointId, { source: "inspector" });
-          },
           queuedInputs,
           backgroundTasks,
-          inspectBackgroundTask: (taskId) => {
-            void inspectBackgroundTaskDetail({
-              api,
-              taskId,
-              setDetailPanel,
-              setError,
-              setPhase4BusyKey,
-            });
-          },
-          runBackgroundTaskAction: (taskId, action) => {
-            void runBackgroundTaskLifecycleAction({
-              api,
-              taskId,
-              action,
-              refreshSessionTranscript,
-              setError,
-              setNotice,
-              setPhase4BusyKey,
-            });
-          },
           detailPanel,
           revealSensitiveValues,
           inspectorVisible,
@@ -1000,10 +935,27 @@ export function ChatConsolePanel({
           runStatus,
           runTape,
           runLineage,
-          refreshRunDetails,
+          refreshRunDetails: async () => {
+            refreshRunDetails();
+          },
           closeRunDrawer,
           openBrowserSessionWorkbench,
-        }}
+          transcriptRecords,
+          sessionAttachments,
+          sessionDerivedArtifacts,
+          inspectCompaction: async (artifactId) => {
+            await inspectCompaction(artifactId);
+          },
+          inspectCheckpoint: async (checkpointId) => {
+            await inspectCheckpoint(checkpointId);
+          },
+          restoreCheckpoint,
+          refreshSessionTranscript,
+          setDetailPanel,
+          setError,
+          setNotice,
+          setPhase4BusyKey,
+        })}
         onAbortRun={() => {
           void interruptCurrentRun("");
         }}
@@ -1063,7 +1015,8 @@ export function ChatConsolePanel({
         streaming={streaming}
         toolPayloadCount={toolPayloadCount}
         transcriptBusy={transcriptBusy}
-        transcriptProps={{
+        transcriptProps={buildTranscriptProps({
+          api,
           visibleTranscript,
           sessionAttachments,
           sessionDerivedArtifacts,
@@ -1073,34 +1026,16 @@ export function ChatConsolePanel({
           a2uiDocuments,
           selectedDetailId: detailPanel?.id ?? null,
           updateApprovalDraft: updateApprovalDraftValue,
-          decideInlineApproval: (approvalId, approved) => {
-            void decideInlineApproval(approvalId, approved);
+          decideInlineApproval: async (approvalId, approved) => {
+            await decideInlineApproval(approvalId, approved);
           },
           openRunDetails,
-          inspectPayload: (entry) => {
-            inspectLiveEntryDetail(entry, setDetailPanel);
-          },
-          inspectDerivedArtifact: (derivedArtifactId) => {
-            inspectDerivedArtifactDetail({
-              derivedArtifactId,
-              sessionDerivedArtifacts,
-              sessionAttachments,
-              setDetailPanel,
-              setError,
-            });
-          },
-          runDerivedArtifactAction: (derivedArtifactId, action) => {
-            void runDerivedArtifactLifecycleAction({
-              api,
-              derivedArtifactId,
-              action,
-              refreshSessionTranscript,
-              setError,
-              setNotice,
-              setPhase4BusyKey,
-            });
-          },
-        }}
+          refreshSessionTranscript,
+          setDetailPanel,
+          setError,
+          setNotice,
+          setPhase4BusyKey,
+        })}
       />
     </main>
   );

@@ -115,9 +115,11 @@ export function useAuthDomain({ api, setError, setNotice }: UseAuthDomainArgs) {
     setAuthProviderState(resolvePrimaryProviderState(providerStates, profilesResponse.profiles));
   }
 
-  async function refreshAuth(): Promise<void> {
+  async function refreshAuth(options?: { clearError?: boolean }): Promise<void> {
     setAuthBusy(true);
-    setError(null);
+    if (options?.clearError !== false) {
+      setError(null);
+    }
     try {
       await loadAuthState();
     } catch (failure) {

@@ -19,9 +19,11 @@ export function useOverviewDomain({ api, setError }: UseOverviewDomainArgs) {
   );
   const [overviewSupportJobs, setOverviewSupportJobs] = useState<JsonObject[]>([]);
 
-  async function refreshOverview(): Promise<void> {
+  async function refreshOverview(options?: { clearError?: boolean }): Promise<void> {
     setOverviewBusy(true);
-    setError(null);
+    if (options?.clearError !== false) {
+      setError(null);
+    }
     const [catalog, deployment, approvals, diagnostics, usageInsights, jobs] =
       await Promise.allSettled([
         api.getCapabilityCatalog(),
@@ -72,7 +74,7 @@ export function useOverviewDomain({ api, setError }: UseOverviewDomainArgs) {
     }
 
     const firstFailure = firstRejectedReason([catalog, deployment, jobs]);
-    if (firstFailure !== undefined) {
+    if (firstFailure !== undefined && options?.clearError !== false) {
       setError(toErrorMessage(firstFailure));
     }
     setOverviewBusy(false);
