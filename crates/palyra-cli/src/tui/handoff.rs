@@ -27,7 +27,10 @@ impl Default for TuiCrossSurfaceHandoff {
     }
 }
 
-const HANDOFF_PARAM_ORDER: &[(&str, fn(&TuiCrossSurfaceHandoff) -> Option<&str>)] = &[
+type HandoffParamResolver = fn(&TuiCrossSurfaceHandoff) -> Option<&str>;
+type HandoffParamOrderEntry = (&'static str, HandoffParamResolver);
+
+const HANDOFF_PARAM_ORDER: &[HandoffParamOrderEntry] = &[
     ("sessionId", |payload| payload.session_id.as_deref()),
     ("runId", |payload| payload.run_id.as_deref()),
     ("deviceId", |payload| payload.device_id.as_deref()),
