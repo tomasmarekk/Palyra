@@ -3758,7 +3758,9 @@ export class ConsoleApiClient {
     page: JsonValue;
   }> {
     const path =
-      params === undefined ? "/console/v1/system/events" : buildPathWithQuery("/console/v1/system/events", params);
+      params === undefined
+        ? "/console/v1/system/events"
+        : buildPathWithQuery("/console/v1/system/events", params);
     return this.request(path);
   }
 

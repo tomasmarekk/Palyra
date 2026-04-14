@@ -208,11 +208,14 @@ export function useChatRunStream({
     [api, setError],
   );
 
-  const openRunDetails = useCallback((runId: string): void => {
-    setRunDrawerId(runId);
-    setRunDrawerOpen(true);
-    void onRunInspected?.(runId);
-  }, [onRunInspected]);
+  const openRunDetails = useCallback(
+    (runId: string): void => {
+      setRunDrawerId(runId);
+      setRunDrawerOpen(true);
+      void onRunInspected?.(runId);
+    },
+    [onRunInspected],
+  );
 
   const closeRunDrawer = useCallback((): void => {
     setRunDrawerOpen(false);

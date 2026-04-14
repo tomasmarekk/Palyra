@@ -26,8 +26,7 @@ const DESKTOP_MESSAGES = {
   "desktop.notice.refreshFailed.title": "Companion refresh failed",
   "desktop.notice.warnings.title": "Companion warnings",
   "desktop.notice.profile.title": "Active profile: {label}",
-  "desktop.notice.profile.body":
-    "Environment {environment}, risk {riskLevel}, mode {mode}.",
+  "desktop.notice.profile.body": "Environment {environment}, risk {riskLevel}, mode {mode}.",
   "desktop.common.never": "Never",
   "desktop.section.home": "Home",
   "desktop.section.chat": "Chat",
@@ -49,8 +48,7 @@ const DESKTOP_MESSAGES = {
   "desktop.onboarding.auth.attention": "Attention",
   "desktop.onboarding.auth.emptyNote": "No auth note published.",
   "desktop.onboarding.completion.label": "Last completion",
-  "desktop.onboarding.completion.detail":
-    "Persisted locally so desktop can resume after restart.",
+  "desktop.onboarding.completion.detail": "Persisted locally so desktop can resume after restart.",
 } as const;
 
 export type DesktopMessageKey = keyof typeof DESKTOP_MESSAGES;

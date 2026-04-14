@@ -64,13 +64,7 @@ export function TroubleshootingCard({
   );
 }
 
-export function ScenarioCard({
-  title,
-  description,
-  children,
-  ctaLabel,
-  onCta,
-}: GuidanceCardProps) {
+export function ScenarioCard({ title, description, children, ctaLabel, onCta }: GuidanceCardProps) {
   return (
     <WorkspaceSectionCard title={title} description={description}>
       <div className="grid gap-4">

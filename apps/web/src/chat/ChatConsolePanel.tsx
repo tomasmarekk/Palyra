@@ -73,7 +73,9 @@ import { buildObjectiveOverviewHref } from "../console/objectiveLinks";
 import { readString } from "../console/shared";
 interface ChatConsolePanelProps {
   readonly api: ConsoleApiClient;
-  readonly emitUxEvent: (event: Omit<UxTelemetryEvent, "surface" | "locale" | "mode">) => Promise<void>;
+  readonly emitUxEvent: (
+    event: Omit<UxTelemetryEvent, "surface" | "locale" | "mode">,
+  ) => Promise<void>;
   readonly revealSensitiveValues: boolean;
   readonly setError: (next: string | null) => void;
   readonly setNotice: (next: string | null) => void;

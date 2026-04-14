@@ -976,7 +976,8 @@ export function useConsoleAppState() {
       return;
     }
     const selectedApproval =
-      approvals.find((approval) => readString(approval, "approval_id") === approvalId.trim()) ?? null;
+      approvals.find((approval) => readString(approval, "approval_id") === approvalId.trim()) ??
+      null;
     const toolName =
       readString(readObject(selectedApproval ?? {}, "prompt") ?? {}, "tool_name") ??
       readString(selectedApproval ?? {}, "subject_type") ??

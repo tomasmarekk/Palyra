@@ -1,8 +1,4 @@
-import {
-  CONSOLE_LOCALE_STORAGE_KEY,
-  type ConsoleLocale,
-  type ConsoleUiMode,
-} from "./preferences";
+import { CONSOLE_LOCALE_STORAGE_KEY, type ConsoleLocale, type ConsoleUiMode } from "./preferences";
 
 const EN_MESSAGES = {
   "boot.label": "Palyra console",
@@ -26,8 +22,7 @@ const EN_MESSAGES = {
   "auth.signingIn": "Signing in...",
   "auth.failed": "Sign-in failed",
   "shell.title": "Web Dashboard Operator Surface",
-  "shell.subtitle":
-    "{group} domain focused on {detail}.",
+  "shell.subtitle": "{group} domain focused on {detail}.",
   "shell.authenticated": "Authenticated",
   "shell.theme": "Theme: {theme}",
   "shell.locale": "Locale: {locale}",
@@ -128,8 +123,7 @@ const EN_MESSAGES = {
     "Basic mode narrows attention to first-success surfaces. Advanced mode restores the full operator rail instantly without changing backend capability.",
   "mode.basic.description":
     "Chat, overview, sessions, approvals, access, and support stay primary.",
-  "mode.advanced.description":
-    "Every operator section stays visible directly in the sidebar.",
+  "mode.advanced.description": "Every operator section stays visible directly in the sidebar.",
 } as const;
 
 export type ConsoleMessageKey = keyof typeof EN_MESSAGES;
@@ -168,10 +162,7 @@ export function formatConsoleNumber(locale: ConsoleLocale, value: number): strin
   return new Intl.NumberFormat(resolveIntlLocale(locale)).format(value);
 }
 
-function interpolate(
-  template: string,
-  variables: Record<string, string | number>,
-): string {
+function interpolate(template: string, variables: Record<string, string | number>): string {
   return template.replaceAll(/\{([a-zA-Z0-9_]+)\}/g, (_, key) => `${variables[key] ?? ""}`);
 }
 

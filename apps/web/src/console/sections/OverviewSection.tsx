@@ -359,9 +359,7 @@ export function OverviewSection({ app }: OverviewSectionProps) {
           onCta={() => app.setUiMode(app.uiMode === "basic" ? "advanced" : "basic")}
         >
           <p className="chat-muted">
-            {app.t(
-              app.uiMode === "basic" ? "mode.basic.description" : "mode.advanced.description",
-            )}
+            {app.t(app.uiMode === "basic" ? "mode.basic.description" : "mode.advanced.description")}
           </p>
         </NextActionCard>
         <OnboardingChecklistCard
@@ -1096,9 +1094,9 @@ function buildApprovalSummary(aggregate: ConsoleAppState["uxTelemetryAggregate"]
   if (aggregate === null || Object.keys(aggregate.approvalFatigueByTool).length === 0) {
     return "No approval fatigue signal yet.";
   }
-  const [toolName, count] =
-    Object.entries(aggregate.approvalFatigueByTool).sort((left, right) => right[1] - left[1])[0] ??
-    ["unknown", 0];
+  const [toolName, count] = Object.entries(aggregate.approvalFatigueByTool).sort(
+    (left, right) => right[1] - left[1],
+  )[0] ?? ["unknown", 0];
   return `${toolName} requested ${count} approval${count === 1 ? "" : "s"}.`;
 }
 
@@ -1106,9 +1104,9 @@ function buildTopFrictionSurface(aggregate: ConsoleAppState["uxTelemetryAggregat
   if (aggregate === null || aggregate.totalEvents === 0) {
     return "No friction signal yet.";
   }
-  const [surface, count] =
-    Object.entries(aggregate.frictionBySurface).sort((left, right) => right[1] - left[1])[0] ??
-    ["web", 0];
+  const [surface, count] = Object.entries(aggregate.frictionBySurface).sort(
+    (left, right) => right[1] - left[1],
+  )[0] ?? ["web", 0];
   return count === 0 ? "No blocked or error outcomes recorded." : `${surface} (${count})`;
 }
 

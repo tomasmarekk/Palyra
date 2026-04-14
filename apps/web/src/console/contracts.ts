@@ -175,7 +175,9 @@ export function nearestSupportedHandoffSection(payload: CrossSurfaceHandoff): Se
 }
 
 export function isUxSystemEvent(record: SystemEventRecord): boolean {
-  return typeof record.operator_event === "string" && record.operator_event.startsWith(UX_EVENT_PREFIX);
+  return (
+    typeof record.operator_event === "string" && record.operator_event.startsWith(UX_EVENT_PREFIX)
+  );
 }
 
 export function toSystemEventPayload(event: UxTelemetryEvent): {

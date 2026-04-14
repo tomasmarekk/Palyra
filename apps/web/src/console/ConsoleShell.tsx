@@ -17,8 +17,7 @@ function formatSessionExpiry(locale: ConsoleAppState["locale"], unixMs: number):
     dateStyle: "short",
     timeStyle: "medium",
     timeZone: "UTC",
-  })
-    .replace(",", "");
+  }).replace(",", "");
 }
 
 function toneForProfile(
@@ -57,9 +56,7 @@ export function ConsoleShell({ app, children }: ConsoleShellProps) {
             <div className="grid gap-2">
               <p className="console-label">{currentLabel}</p>
               <div className="grid gap-1">
-                <h1 className="text-2xl font-semibold tracking-tight">
-                  {app.t("shell.title")}
-                </h1>
+                <h1 className="text-2xl font-semibold tracking-tight">{app.t("shell.title")}</h1>
                 <p className="console-copy">
                   {app.t("shell.subtitle", { group: groupLabel, detail: currentDetail })}
                 </p>
@@ -137,9 +134,7 @@ export function ConsoleShell({ app, children }: ConsoleShellProps) {
             <CardHeader className="flex flex-col items-start gap-3 px-4 pb-0 pt-4 sm:flex-row sm:items-start sm:justify-between">
               <div>
                 <p className="text-sm font-semibold">{app.t("shell.sessionContext")}</p>
-                <p className="text-xs text-muted">
-                  {app.t("shell.sessionContextBody")}
-                </p>
+                <p className="text-xs text-muted">{app.t("shell.sessionContextBody")}</p>
               </div>
               <Button
                 aria-label="Reveal sensitive values"
@@ -160,7 +155,10 @@ export function ConsoleShell({ app, children }: ConsoleShellProps) {
                   { label: app.t("shell.device"), value: session.device_id },
                   { label: app.t("shell.channel"), value: session.channel ?? app.t("shell.none") },
                   { label: app.t("shell.transport"), value: app.t("shell.transportValue") },
-                  { label: app.t("shell.profile"), value: activeProfile?.label ?? app.t("shell.none") },
+                  {
+                    label: app.t("shell.profile"),
+                    value: activeProfile?.label ?? app.t("shell.none"),
+                  },
                   {
                     label: app.t("shell.environment"),
                     value: activeProfile?.environment ?? app.t("shell.notApplicable"),
