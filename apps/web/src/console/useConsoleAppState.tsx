@@ -2,6 +2,7 @@ import {
   type Dispatch,
   type FormEvent,
   type SetStateAction,
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -24,6 +25,16 @@ import { useBrowserDomain } from "./hooks/useBrowserDomain";
 import { useConfigDomain } from "./hooks/useConfigDomain";
 import { useOverviewDomain } from "./hooks/useOverviewDomain";
 import { useSupportDomain } from "./hooks/useSupportDomain";
+import { type ConsoleMessageKey, readStoredConsoleLocale, translateConsoleMessage } from "./i18n";
+import type { UxTelemetryAggregate, UxTelemetryEvent } from "./contracts";
+import {
+  CONSOLE_LOCALE_STORAGE_KEY,
+  CONSOLE_THEME_STORAGE_KEY,
+  CONSOLE_UI_MODE_STORAGE_KEY,
+  type ConsoleLocale,
+  type ConsoleUiMode,
+  type ThemeMode,
+} from "./preferences";
 import type { Section } from "./sectionMetadata";
 import { DEFAULT_CRON_FORM, DEFAULT_LOGIN_FORM, type CronForm, type LoginForm } from "./stateTypes";
 import {
@@ -36,9 +47,9 @@ import {
   toJsonObjectArray,
   type JsonObject,
 } from "./shared";
+import { emitUxSystemEvent, loadUxTelemetryAggregate } from "./uxTelemetry";
 
 export type { Section } from "./sectionMetadata";
-export type ThemeMode = "light" | "dark";
 
 export const AUTO_REFRESH_SECTION_TTL_MS: Partial<Record<Section, number>> = {
   overview: 10_000,
@@ -140,7 +151,7 @@ export function useConsoleAppState() {
     if (typeof window === "undefined") {
       return "dark";
     }
-    const stored = window.localStorage.getItem("palyra.console.theme");
+    const stored = window.localStorage.getItem(CONSOLE_THEME_STORAGE_KEY);
     if (stored === "light" || stored === "dark") {
       return stored;
     }
@@ -152,9 +163,26 @@ export function useConsoleAppState() {
     }
     return "dark";
   });
+  const [uiModeState, setUiModeState] = useState<ConsoleUiMode>(() => {
+    if (typeof window === "undefined") {
+      return "advanced";
+    }
+    return window.localStorage.getItem(CONSOLE_UI_MODE_STORAGE_KEY) === "basic"
+      ? "basic"
+      : "advanced";
+  });
+  const [localeState, setLocaleState] = useState<ConsoleLocale>(() => readStoredConsoleLocale());
   const [revealSensitiveValues, setRevealSensitiveValues] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [uxTelemetryBusy, setUxTelemetryBusy] = useState(false);
+  const [uxTelemetryAggregate, setUxTelemetryAggregate] = useState<UxTelemetryAggregate | null>(
+    null,
+  );
+  const [uxTelemetryEvents, setUxTelemetryEvents] = useState<JsonObject[]>([]);
+  const uiMode = uiModeState;
+  const locale = localeState;
+  const initialSurfaceEventSentRef = useRef(false);
 
   const [loginBusy, setLoginBusy] = useState(false);
   const [logoutBusy, setLogoutBusy] = useState(false);
@@ -580,6 +608,49 @@ export function useConsoleAppState() {
     );
   }
 
+  const t = useCallback(
+    (key: ConsoleMessageKey, variables?: Record<string, string | number>): string =>
+      translateConsoleMessage(locale, key, variables),
+    [locale],
+  );
+
+  const refreshUxTelemetry = useCallback(async (): Promise<void> => {
+    setUxTelemetryBusy(true);
+    setError(null);
+    try {
+      const response = await loadUxTelemetryAggregate(api);
+      setUxTelemetryAggregate(response.aggregate);
+      setUxTelemetryEvents(toJsonObjectArray(response.records as unknown as JsonValue[]));
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setUxTelemetryBusy(false);
+    }
+  }, [api]);
+
+  const emitUxEvent = useCallback(
+    async (event: Omit<UxTelemetryEvent, "surface" | "locale">): Promise<void> => {
+      if (session === null) {
+        return;
+      }
+      try {
+        await emitUxSystemEvent(api, {
+          surface: "web",
+          locale,
+          mode: uiMode,
+          deviceId: session.device_id,
+          ...event,
+        });
+      } catch {
+        return;
+      }
+      if (section === "overview") {
+        void refreshUxTelemetry();
+      }
+    },
+    [api, locale, refreshUxTelemetry, section, session, uiMode],
+  );
+
   useEffect(() => {
     let cancelled = false;
     const abortController = new AbortController();
@@ -633,18 +704,37 @@ export function useConsoleAppState() {
   useEffect(() => {
     const root = document.documentElement;
     root.setAttribute("data-theme", theme);
+    root.setAttribute("data-console-mode", uiMode);
+    root.lang = locale === "qps-ploc" ? "en-XA" : locale;
     root.classList.toggle("dark", theme === "dark");
     if (typeof window !== "undefined") {
-      window.localStorage.setItem("palyra.console.theme", theme);
+      window.localStorage.setItem(CONSOLE_THEME_STORAGE_KEY, theme);
+      window.localStorage.setItem(CONSOLE_UI_MODE_STORAGE_KEY, uiMode);
+      window.localStorage.setItem(CONSOLE_LOCALE_STORAGE_KEY, locale);
     }
-  }, [theme]);
+  }, [locale, theme, uiMode]);
   useEffect(() => {
     if (session === null) {
+      initialSurfaceEventSentRef.current = false;
       return;
     }
     lastSectionAutoRefreshRef.current.overview = Date.now();
-    void refreshOverview();
-  }, [session]);
+    void Promise.all([refreshOverview(), refreshUxTelemetry()]);
+    if (!initialSurfaceEventSentRef.current) {
+      initialSurfaceEventSentRef.current = true;
+      void emitUxEvent({
+        name: "ux.surface.opened",
+        section,
+        summary: `Opened ${section} surface.`,
+      });
+      void emitUxEvent({
+        name: "ux.onboarding.step",
+        step: "setup_started",
+        section,
+        summary: "Console session established.",
+      });
+    }
+  }, [emitUxEvent, refreshOverview, refreshUxTelemetry, section, session]);
 
   useEffect(() => {
     if (session === null) {
@@ -656,7 +746,7 @@ export function useConsoleAppState() {
     }
     lastSectionAutoRefreshRef.current[section] = Date.now();
     if (section === "overview") {
-      void refreshOverview();
+      void Promise.all([refreshOverview(), refreshUxTelemetry()]);
     }
     if (section === "auth") {
       void authDomain.refreshAuth();
@@ -708,16 +798,43 @@ export function useConsoleAppState() {
     if (section === "access" || section === "support") {
       void refreshSupport();
     }
-  }, [section, session]);
+  }, [refreshUxTelemetry, section, session]);
 
   function setSection(nextSection: Section): void {
+    if (nextSection !== section) {
+      void emitUxEvent({
+        name: "ux.surface.opened",
+        section: nextSection,
+        summary: `Opened ${nextSection} surface.`,
+      });
+    }
     setSectionState(nextSection);
+  }
+
+  function setUiMode(nextMode: ConsoleUiMode): void {
+    if (nextMode === uiMode) {
+      return;
+    }
+    setUiModeState(nextMode);
+    void emitUxEvent({
+      name: "ux.mode.changed",
+      mode: nextMode,
+      section,
+      summary: `Switched to ${nextMode} mode.`,
+    });
+  }
+
+  function setLocale(nextLocale: ConsoleLocale): void {
+    setLocaleState(nextLocale);
   }
 
   function resetOperatorScopedState(): void {
     setSectionState("overview");
     lastSectionAutoRefreshRef.current = {};
     setRevealSensitiveValues(false);
+    setUxTelemetryBusy(false);
+    setUxTelemetryAggregate(null);
+    setUxTelemetryEvents([]);
     resetOverviewDomain();
     authDomain.resetAuthDomain();
 
@@ -858,6 +975,12 @@ export function useConsoleAppState() {
       setError("Select an approval first.");
       return;
     }
+    const selectedApproval =
+      approvals.find((approval) => readString(approval, "approval_id") === approvalId.trim()) ?? null;
+    const toolName =
+      readString(readObject(selectedApproval ?? {}, "prompt") ?? {}, "tool_name") ??
+      readString(selectedApproval ?? {}, "subject_type") ??
+      approvalId.trim();
     setApprovalsBusy(true);
     setError(null);
     try {
@@ -869,6 +992,13 @@ export function useConsoleAppState() {
       });
       setNotice(approved ? "Approval allowed." : "Approval denied.");
       await refreshApprovals();
+      void emitUxEvent({
+        name: "ux.approval.resolved",
+        section: "approvals",
+        outcome: "ok",
+        toolName,
+        summary: approved ? "Approval allowed." : "Approval denied.",
+      });
     } catch (failure) {
       setError(toErrorMessage(failure));
     } finally {
@@ -1617,12 +1747,22 @@ export function useConsoleAppState() {
     setSection,
     theme,
     setTheme,
+    uiMode,
+    setUiMode,
+    locale,
+    setLocale,
+    t,
     revealSensitiveValues,
     setRevealSensitiveValues,
     error,
     setError,
     notice,
     setNotice,
+    uxTelemetryBusy,
+    uxTelemetryAggregate,
+    uxTelemetryEvents,
+    refreshUxTelemetry,
+    emitUxEvent,
     loginBusy,
     logoutBusy,
     loginForm,

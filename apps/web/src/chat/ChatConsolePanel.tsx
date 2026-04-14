@@ -66,11 +66,14 @@ import {
   buildSessionsSidebarProps,
   describeSelectedSessionTitle,
 } from "./chatWorkspaceSessionBindings";
+import type { UxTelemetryEvent } from "../console/contracts";
+import { parseConsoleHandoff } from "../console/contracts";
 import type { Section } from "../console/sectionMetadata";
 import { buildObjectiveOverviewHref } from "../console/objectiveLinks";
 import { readString } from "../console/shared";
 interface ChatConsolePanelProps {
   readonly api: ConsoleApiClient;
+  readonly emitUxEvent: (event: Omit<UxTelemetryEvent, "surface" | "locale" | "mode">) => Promise<void>;
   readonly revealSensitiveValues: boolean;
   readonly setError: (next: string | null) => void;
   readonly setNotice: (next: string | null) => void;
@@ -80,6 +83,7 @@ interface ChatConsolePanelProps {
 
 export function ChatConsolePanel({
   api,
+  emitUxEvent,
   revealSensitiveValues,
   setError,
   setNotice,
@@ -94,6 +98,7 @@ export function ChatConsolePanel({
   const preferredCheckpointId = searchParams.get("checkpointId");
   const preferredObjectiveId = searchParams.get("objectiveId");
   const sessionSwitchRef = useRef<string>("");
+  const handoffTelemetryRef = useRef<string>("");
   const transcriptRequestSeqRef = useRef(0);
   const transcriptSearchSeqRef = useRef(0);
   const [runActionBusy, setRunActionBusy] = useState(false);
@@ -124,6 +129,14 @@ export function ChatConsolePanel({
 
   const sessions = useChatSessions({
     api,
+    onSessionActivated: async (sessionId) => {
+      await emitUxEvent({
+        name: "ux.session.resumed",
+        section: "chat",
+        sessionId,
+        summary: "Resumed chat session.",
+      });
+    },
     setError,
     setNotice,
     preferredSessionId,
@@ -162,6 +175,22 @@ export function ChatConsolePanel({
   } = useChatRunStream({
     api,
     activeSessionId: sessions.activeSessionId,
+    onPromptSubmitted: async (sessionId) => {
+      await emitUxEvent({
+        name: "ux.chat.prompt_submitted",
+        section: "chat",
+        sessionId,
+        summary: "Submitted a chat prompt.",
+      });
+    },
+    onRunInspected: async (runId) => {
+      await emitUxEvent({
+        name: "ux.run.inspected",
+        section: "chat",
+        runId,
+        summary: "Opened run inspector.",
+      });
+    },
     sessionLabelDraft: sessions.sessionLabelDraft,
     setError,
     setNotice,
@@ -227,6 +256,35 @@ export function ChatConsolePanel({
             session_label: sessions.selectedSession.session_label ?? undefined,
           },
   });
+
+  useEffect(() => {
+    const signature = searchParams.toString();
+    if (signature.length === 0 || handoffTelemetryRef.current === signature) {
+      return;
+    }
+    const handoff = parseConsoleHandoff(searchParams);
+    if (
+      handoff.sessionId === undefined &&
+      handoff.runId === undefined &&
+      handoff.objectiveId === undefined &&
+      handoff.canvasId === undefined &&
+      handoff.intent === undefined &&
+      handoff.source === undefined
+    ) {
+      return;
+    }
+    handoffTelemetryRef.current = signature;
+    void emitUxEvent({
+      name: "ux.handoff.opened",
+      section: handoff.section === "home" ? "overview" : (handoff.section ?? "chat"),
+      sessionId: handoff.sessionId,
+      runId: handoff.runId,
+      objectiveId: handoff.objectiveId,
+      canvasId: handoff.canvasId,
+      intent: handoff.intent,
+      summary: "Opened a scoped handoff.",
+    });
+  }, [emitUxEvent, searchParams]);
   const delegationCatalog = useChatPanelBootstrap({
     api,
     dispose,

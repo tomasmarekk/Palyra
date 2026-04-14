@@ -6,6 +6,7 @@ import { emptyToUndefined, toErrorMessage } from "./chatShared";
 
 type UseChatSessionsArgs = {
   api: ConsoleApiClient;
+  onSessionActivated?: (sessionId: string) => void | Promise<void>;
   setError: (next: string | null) => void;
   setNotice: (next: string | null) => void;
   preferredSessionId?: string | null;
@@ -36,6 +37,7 @@ type UseChatSessionsResult = {
 
 export function useChatSessions({
   api,
+  onSessionActivated,
   setError,
   setNotice,
   preferredSessionId,
@@ -48,6 +50,7 @@ export function useChatSessions({
   const [searchQuery, setSearchQuery] = useState("");
   const [includeArchived, setIncludeArchived] = useState(false);
   const filtersHydratedRef = useRef(false);
+  const activeSessionIdRef = useRef("");
 
   const sortedSessions = useMemo(() => {
     return [...sessions].sort((left, right) => right.updated_at_unix_ms - left.updated_at_unix_ms);
@@ -56,6 +59,28 @@ export function useChatSessions({
   const selectedSession = useMemo(() => {
     return sortedSessions.find((session) => session.session_id === activeSessionId) ?? null;
   }, [activeSessionId, sortedSessions]);
+
+  useEffect(() => {
+    activeSessionIdRef.current = activeSessionId;
+  }, [activeSessionId]);
+
+  const activateSession = useCallback(
+    (sessionId: string): void => {
+      const trimmed = sessionId.trim();
+      if (trimmed.length === 0) {
+        activeSessionIdRef.current = "";
+        setActiveSessionId("");
+        return;
+      }
+      if (activeSessionIdRef.current === trimmed) {
+        return;
+      }
+      activeSessionIdRef.current = trimmed;
+      setActiveSessionId(trimmed);
+      void onSessionActivated?.(trimmed);
+    },
+    [onSessionActivated],
+  );
 
   useEffect(() => {
     if (selectedSession === null) {
@@ -71,9 +96,9 @@ export function useChatSessions({
       return;
     }
     if (sessions.some((session) => session.session_id === preferred)) {
-      setActiveSessionId(preferred);
+      activateSession(preferred);
     }
-  }, [preferredSessionId, sessions]);
+  }, [activateSession, preferredSessionId, sessions]);
 
   useEffect(() => {
     if (!filtersHydratedRef.current) {
@@ -106,41 +131,47 @@ export function useChatSessions({
           });
           const createdRecord = await api.getSessionCatalogEntry(created.session.session_id);
           setSessions([createdRecord.session]);
-          setActiveSessionId(created.session.session_id);
+          activateSession(created.session.session_id);
           setNewSessionLabel("");
           setNotice("New chat session created.");
           return;
         }
         setSessions(nextSessions);
         if (nextSessions.length === 0) {
-          setActiveSessionId("");
+          activateSession("");
           return;
         }
-        setActiveSessionId((previous) => {
-          if (
-            previous.length > 0 &&
-            nextSessions.some((session) => session.session_id === previous)
-          ) {
-            return previous;
+        if (
+          activeSessionIdRef.current.length > 0 &&
+          nextSessions.some((session) => session.session_id === activeSessionIdRef.current)
+        ) {
+          return;
+        }
+        const preferred = preferredSessionId?.trim() ?? "";
+        if (preferred.length > 0) {
+          const preferredSession = nextSessions.find((session) => session.session_id === preferred);
+          if (preferredSession !== undefined) {
+            activateSession(preferredSession.session_id);
+            return;
           }
-          const preferred = preferredSessionId?.trim() ?? "";
-          if (preferred.length > 0) {
-            const preferredSession = nextSessions.find(
-              (session) => session.session_id === preferred,
-            );
-            if (preferredSession !== undefined) {
-              return preferredSession.session_id;
-            }
-          }
-          return nextSessions[0].session_id;
-        });
+        }
+        activateSession(nextSessions[0].session_id);
       } catch (error) {
         setError(toErrorMessage(error));
       } finally {
         setSessionsBusy(false);
       }
     },
-    [api, includeArchived, newSessionLabel, preferredSessionId, searchQuery, setError, setNotice],
+    [
+      activateSession,
+      api,
+      includeArchived,
+      newSessionLabel,
+      preferredSessionId,
+      searchQuery,
+      setError,
+      setNotice,
+    ],
   );
 
   const createSessionWithLabel = useCallback(
@@ -159,7 +190,7 @@ export function useChatSessions({
           );
           return [createdRecord.session, ...without];
         });
-        setActiveSessionId(createdRecord.session.session_id);
+        activateSession(createdRecord.session.session_id);
         setNewSessionLabel("");
         setNotice("Chat session created.");
         return createdRecord.session.session_id;
@@ -184,10 +215,10 @@ export function useChatSessions({
         return [session, ...without];
       });
       if (options?.select) {
-        setActiveSessionId(session.session_id);
+        activateSession(session.session_id);
       }
     },
-    [],
+    [activateSession],
   );
 
   const renameSession = useCallback(async (): Promise<void> => {
@@ -263,7 +294,9 @@ export function useChatSessions({
     try {
       await api.archiveSession(activeSessionId);
       setSessions((previous) => previous.filter((entry) => entry.session_id !== activeSessionId));
-      setActiveSessionId((previous) => (previous === activeSessionId ? "" : previous));
+      if (activeSessionIdRef.current === activeSessionId) {
+        activateSession("");
+      }
       setNotice("Session archived.");
       return true;
     } catch (error) {
@@ -272,7 +305,7 @@ export function useChatSessions({
     } finally {
       setSessionsBusy(false);
     }
-  }, [activeSessionId, api, setError, setNotice]);
+  }, [activateSession, activeSessionId, api, setError, setNotice]);
 
   return {
     sessionsBusy,

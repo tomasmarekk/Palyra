@@ -19,6 +19,12 @@ import {
   WorkspaceStatusChip,
 } from "../components/workspace/WorkspaceChrome";
 import {
+  NextActionCard,
+  OnboardingChecklistCard,
+  ScenarioCard,
+  TroubleshootingCard,
+} from "../components/guidance/GuidanceCards";
+import {
   WorkspaceEmptyState,
   WorkspaceInlineNotice,
   workspaceToneForState,
@@ -58,6 +64,12 @@ type OverviewSectionProps = {
     | "setError"
     | "setNotice"
     | "setSection"
+    | "setUiMode"
+    | "t"
+    | "uiMode"
+    | "uxTelemetryAggregate"
+    | "uxTelemetryBusy"
+    | "refreshUxTelemetry"
   >;
 };
 
@@ -153,6 +165,7 @@ export function OverviewSection({ app }: OverviewSectionProps) {
     objectiveAttentionCount,
   });
   const busy = app.overviewBusy || objectivesBusy || objectiveMutationBusy;
+  const uxAggregate = app.uxTelemetryAggregate;
   const objectiveRows = useMemo(
     () =>
       objectives.map((objective) => ({
@@ -337,6 +350,62 @@ export function OverviewSection({ app }: OverviewSectionProps) {
           </ActionButton>
         }
       />
+
+      <section className="workspace-two-column">
+        <NextActionCard
+          ctaLabel={app.uiMode === "basic" ? app.t("nav.switchAdvanced") : app.t("nav.switchBasic")}
+          description={app.t("overview.modeGuidanceBody")}
+          title={app.t("overview.modeGuidanceTitle")}
+          onCta={() => app.setUiMode(app.uiMode === "basic" ? "advanced" : "basic")}
+        >
+          <p className="chat-muted">
+            {app.t(
+              app.uiMode === "basic" ? "mode.basic.description" : "mode.advanced.description",
+            )}
+          </p>
+        </NextActionCard>
+        <OnboardingChecklistCard
+          description={app.t("overview.telemetryBody")}
+          items={buildTelemetryChecklist(uxAggregate)}
+          title={app.t("overview.telemetryTitle")}
+        />
+      </section>
+
+      <section className="workspace-two-column">
+        <TroubleshootingCard
+          description={app.uxTelemetryBusy ? "Refreshing current journal-backed UX baseline." : ""}
+          items={buildTelemetryFrictionItems(uxAggregate)}
+          title={app.t("guidance.troubleshooting")}
+        />
+        <ScenarioCard
+          ctaLabel={app.t("guidance.cta")}
+          description={app.t("overview.telemetryBody")}
+          title={app.t("guidance.scenario")}
+          onCta={() =>
+            app.setSection(
+              (uxAggregate?.countsByName["ux.approval.resolved"] ?? 0) > 0 ? "approvals" : "chat",
+            )
+          }
+        >
+          <dl className="workspace-key-value-grid">
+            <div>
+              <dt>{app.t("overview.telemetryFunnel")}</dt>
+              <dd>{buildFunnelSummary(uxAggregate)}</dd>
+            </div>
+            <div>
+              <dt>{app.t("overview.telemetryApprovals")}</dt>
+              <dd>{buildApprovalSummary(uxAggregate)}</dd>
+            </div>
+            <div>
+              <dt>{app.t("overview.telemetryFriction")}</dt>
+              <dd>{buildTopFrictionSurface(uxAggregate)}</dd>
+            </div>
+          </dl>
+          <ActionButton type="button" variant="ghost" onPress={() => void app.refreshUxTelemetry()}>
+            {app.uxTelemetryBusy ? "Refreshing baseline..." : "Refresh baseline"}
+          </ActionButton>
+        </ScenarioCard>
+      </section>
 
       <section className="workspace-metric-grid">
         <WorkspaceMetricCard
@@ -990,6 +1059,57 @@ function objectiveModeDescription(kind: ObjectiveKindValue): string {
     default:
       return "Objective is the generic durable goal layer: define current focus, success criteria, and the next recommended step.";
   }
+}
+
+function buildTelemetryChecklist(aggregate: ConsoleAppState["uxTelemetryAggregate"]): string[] {
+  if (aggregate === null || aggregate.totalEvents === 0) {
+    return ["Console baseline is waiting for the first journal-backed UX events."];
+  }
+  return [
+    `Session starts recorded: ${aggregate.funnel.setup_started}`,
+    `First prompts recorded: ${aggregate.funnel.first_prompt_sent}`,
+    `Approvals resolved: ${aggregate.funnel.first_approval_resolved}`,
+    `Runs inspected: ${aggregate.funnel.first_run_inspected}`,
+  ];
+}
+
+function buildTelemetryFrictionItems(aggregate: ConsoleAppState["uxTelemetryAggregate"]): string[] {
+  if (aggregate === null || aggregate.totalEvents === 0) {
+    return ["No friction events recorded yet."];
+  }
+  return [
+    `Web friction events: ${aggregate.frictionBySurface.web}`,
+    `Desktop friction events: ${aggregate.frictionBySurface.desktop}`,
+    `TUI friction events: ${aggregate.frictionBySurface.tui}`,
+    `Mobile friction events: ${aggregate.frictionBySurface.mobile}`,
+  ];
+}
+
+function buildFunnelSummary(aggregate: ConsoleAppState["uxTelemetryAggregate"]): string {
+  if (aggregate === null || aggregate.totalEvents === 0) {
+    return "No UX baseline events recorded yet.";
+  }
+  return `${aggregate.funnel.setup_started} started · ${aggregate.funnel.first_prompt_sent} prompted · ${aggregate.funnel.first_run_inspected} inspected`;
+}
+
+function buildApprovalSummary(aggregate: ConsoleAppState["uxTelemetryAggregate"]): string {
+  if (aggregate === null || Object.keys(aggregate.approvalFatigueByTool).length === 0) {
+    return "No approval fatigue signal yet.";
+  }
+  const [toolName, count] =
+    Object.entries(aggregate.approvalFatigueByTool).sort((left, right) => right[1] - left[1])[0] ??
+    ["unknown", 0];
+  return `${toolName} requested ${count} approval${count === 1 ? "" : "s"}.`;
+}
+
+function buildTopFrictionSurface(aggregate: ConsoleAppState["uxTelemetryAggregate"]): string {
+  if (aggregate === null || aggregate.totalEvents === 0) {
+    return "No friction signal yet.";
+  }
+  const [surface, count] =
+    Object.entries(aggregate.frictionBySurface).sort((left, right) => right[1] - left[1])[0] ??
+    ["web", 0];
+  return count === 0 ? "No blocked or error outcomes recorded." : `${surface} (${count})`;
 }
 
 function buildObjectivePayload(

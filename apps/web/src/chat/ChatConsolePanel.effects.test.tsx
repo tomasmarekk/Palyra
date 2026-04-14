@@ -80,6 +80,7 @@ describe("ChatConsolePanel bootstrap effects", () => {
       <MemoryRouter initialEntries={["/#/chat"]}>
         <ChatConsolePanel
           api={api}
+          emitUxEvent={vi.fn(async () => undefined)}
           revealSensitiveValues={false}
           setError={vi.fn()}
           setNotice={vi.fn()}

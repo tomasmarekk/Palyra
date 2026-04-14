@@ -1,36 +1,61 @@
 import { Button, Card, CardContent } from "@heroui/react";
 import { useNavigate } from "react-router-dom";
 
-import { CONSOLE_NAV_GROUPS, getSectionPath } from "../../navigation";
+import type { ConsoleMessageKey } from "../../i18n";
+import { getNavigationGroups, getSectionPath } from "../../navigation";
+import type { ConsoleUiMode } from "../../preferences";
 import type { Section } from "../../useConsoleAppState";
 
 type ConsoleSidebarNavProps = {
   currentSection: Section;
   onSelect: (section: Section) => void;
+  onSwitchMode: () => void;
+  t: (key: ConsoleMessageKey, variables?: Record<string, string | number>) => string;
+  uiMode: ConsoleUiMode;
 };
 
-export function ConsoleSidebarNav({ currentSection, onSelect }: ConsoleSidebarNavProps) {
+export function ConsoleSidebarNav({
+  currentSection,
+  onSelect,
+  onSwitchMode,
+  t,
+  uiMode,
+}: ConsoleSidebarNavProps) {
   const navigate = useNavigate();
+  const navigationGroups = getNavigationGroups(uiMode, currentSection);
+  const currentModeLabel = uiMode === "basic" ? t("shell.basic") : t("shell.advanced");
+  const nextModeLabel = uiMode === "basic" ? t("nav.switchAdvanced") : t("nav.switchBasic");
 
   return (
     <Card className="workspace-card" variant="default">
       <CardContent className="grid gap-4 p-4">
         <div className="console-sidebar-header">
-          <p className="console-label">Navigation</p>
+          <p className="console-label">{t("nav.title")}</p>
           <div className="grid gap-1">
-            <h2 className="text-lg font-semibold tracking-tight">Operator domains</h2>
-            <p className="console-copy">
-              Chat, observability, control, agent, and settings stay grouped as one working rail.
-            </p>
+            <h2 className="text-lg font-semibold tracking-tight">{currentModeLabel}</h2>
+            <p className="console-copy">{t("nav.subtitle")}</p>
           </div>
         </div>
+        {uiMode === "basic" ? (
+          <div className="rounded-xl border border-border/80 bg-surface/60 p-3">
+            <p className="text-sm font-semibold">{t("nav.basicTitle")}</p>
+            <p className="mt-1 text-xs text-muted">{t("nav.basicBody")}</p>
+            <Button className="mt-3" size="sm" variant="secondary" onPress={onSwitchMode}>
+              {nextModeLabel}
+            </Button>
+          </div>
+        ) : (
+          <Button size="sm" variant="ghost" onPress={onSwitchMode}>
+            {nextModeLabel}
+          </Button>
+        )}
 
         <div className="console-sidebar-scroll">
           <nav aria-label="Dashboard domains" className="grid gap-4 pr-2">
-            {CONSOLE_NAV_GROUPS.map((group) => (
+            {navigationGroups.map((group) => (
               <div key={group.id} className="console-sidebar-group">
                 <p className="text-xs font-semibold uppercase tracking-[0.2em] text-muted">
-                  {group.label}
+                  {t(group.labelKey)}
                 </p>
                 <div className="console-nav-list">
                   {group.items.map((entry) => {
@@ -57,8 +82,8 @@ export function ConsoleSidebarNav({ currentSection, onSelect }: ConsoleSidebarNa
                           <NavigationGlyph section={entry.id} />
                         </span>
                         <span className="console-nav-item__content">
-                          <span className="text-sm font-semibold">{entry.label}</span>
-                          <span className="text-xs text-muted">{entry.detail}</span>
+                          <span className="text-sm font-semibold">{t(entry.labelKey)}</span>
+                          <span className="text-xs text-muted">{t(entry.detailKey)}</span>
                         </span>
                       </Button>
                     );

@@ -1,4 +1,6 @@
-import { CONSOLE_SECTIONS, type Section } from "./sectionMetadata";
+import type { ConsoleMessageKey } from "./i18n";
+import type { ConsoleUiMode } from "./preferences";
+import { CONSOLE_SECTIONS, isSectionVisibleInMode, type Section } from "./sectionMetadata";
 
 export type NavigationEntry = (typeof CONSOLE_SECTIONS)[number];
 
@@ -6,6 +8,7 @@ export type NavigationGroup = {
   id: "chat" | "control" | "operations" | "agent" | "settings";
   items: readonly NavigationEntry[];
   label: string;
+  labelKey: ConsoleMessageKey;
 };
 
 const SECTION_LOOKUP: Readonly<Record<Section, NavigationEntry>> = Object.fromEntries(
@@ -27,26 +30,31 @@ export const CONSOLE_NAV_GROUPS: readonly NavigationGroup[] = [
   {
     id: "chat",
     label: "Chat",
+    labelKey: "nav.group.chat",
     items: resolveEntries(["chat"]),
   },
   {
     id: "control",
     label: "Observability",
+    labelKey: "nav.group.control",
     items: resolveEntries(["overview", "sessions", "usage", "logs", "inventory", "support"]),
   },
   {
     id: "operations",
     label: "Control",
+    labelKey: "nav.group.operations",
     items: resolveEntries(["approvals", "cron", "channels", "browser"]),
   },
   {
     id: "agent",
     label: "Agent",
+    labelKey: "nav.group.agent",
     items: resolveEntries(["agents", "skills", "memory"]),
   },
   {
     id: "settings",
     label: "Settings",
+    labelKey: "nav.group.settings",
     items: resolveEntries(["auth", "access", "config", "secrets", "operations"]),
   },
 ] as const;
@@ -108,6 +116,22 @@ export function getNavigationEntry(section: Section): NavigationEntry {
 
 export function getNavigationGroupLabel(section: Section): string {
   return NAV_GROUP_LABELS[SECTION_GROUPS[section]];
+}
+
+export function getNavigationGroupId(section: Section): NavigationGroup["id"] {
+  return SECTION_GROUPS[section];
+}
+
+export function getNavigationGroups(
+  mode: ConsoleUiMode,
+  currentSection?: Section,
+): NavigationGroup[] {
+  return CONSOLE_NAV_GROUPS.map((group) => ({
+    ...group,
+    items: group.items.filter(
+      (entry) => isSectionVisibleInMode(entry.id, mode) || entry.id === currentSection,
+    ),
+  })).filter((group) => group.items.length > 0);
 }
 
 export function findSectionByPath(pathname: string): Section | null {

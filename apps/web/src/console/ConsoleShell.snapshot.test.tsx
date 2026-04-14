@@ -2,6 +2,7 @@ import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import { MemoryRouter } from "react-router-dom";
 
+import { translateConsoleMessage, type ConsoleMessageKey } from "./i18n";
 import { ConsoleShell } from "./ConsoleShell";
 import type { ConsoleAppState } from "./useConsoleAppState";
 
@@ -20,8 +21,14 @@ describe("ConsoleShell layout coverage", () => {
         issued_at_unix_ms: 100,
         expires_at_unix_ms: 200,
       },
+      locale: "en",
       theme: "dark",
       setTheme: vi.fn(),
+      uiMode: "advanced",
+      setUiMode: vi.fn(),
+      setLocale: vi.fn(),
+      t: (key: ConsoleMessageKey, variables?: Record<string, string | number>) =>
+        translateConsoleMessage("en", key, variables),
       revealSensitiveValues: false,
       setRevealSensitiveValues: vi.fn(),
       signOut: vi.fn(),
@@ -30,6 +37,11 @@ describe("ConsoleShell layout coverage", () => {
       setSection: vi.fn(),
       notice: "Overview refreshed.",
       error: null,
+      uxTelemetryBusy: false,
+      uxTelemetryAggregate: null,
+      uxTelemetryEvents: [],
+      refreshUxTelemetry: vi.fn(),
+      emitUxEvent: vi.fn(async () => undefined),
     } as unknown as ConsoleAppState;
 
     render(

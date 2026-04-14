@@ -14,17 +14,20 @@ function ConsoleApp() {
   const setLoginForm: Dispatch<SetStateAction<LoginForm>> = app.setLoginForm;
 
   if (app.booting) {
-    return <ConsoleBootScreen />;
+    return <ConsoleBootScreen locale={app.locale} t={app.t} />;
   }
 
   if (app.session === null) {
     return (
       <ConsoleAuthScreen
         error={app.error}
+        locale={app.locale}
         loginBusy={app.loginBusy}
         loginForm={loginForm}
         onSubmit={(event) => void app.signIn(event)}
+        setLocale={app.setLocale}
         setLoginForm={setLoginForm}
+        t={app.t}
       />
     );
   }

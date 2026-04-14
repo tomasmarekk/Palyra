@@ -31,6 +31,7 @@ export function ConsoleSectionContent({ app }: ConsoleSectionContentProps) {
       return (
         <ChatConsolePanel
           api={app.api}
+          emitUxEvent={app.emitUxEvent}
           revealSensitiveValues={app.revealSensitiveValues}
           setError={app.setError}
           setNotice={app.setNotice}

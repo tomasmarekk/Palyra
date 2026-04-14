@@ -41,6 +41,8 @@ import {
 type UseChatRunStreamArgs = {
   api: ConsoleApiClient;
   activeSessionId: string;
+  onPromptSubmitted?: (sessionId: string) => void | Promise<void>;
+  onRunInspected?: (runId: string) => void | Promise<void>;
   sessionLabelDraft: string;
   setError: (next: string | null) => void;
   setNotice: (next: string | null) => void;
@@ -95,6 +97,8 @@ type UseChatRunStreamResult = {
 export function useChatRunStream({
   api,
   activeSessionId,
+  onPromptSubmitted,
+  onRunInspected,
   sessionLabelDraft,
   setError,
   setNotice,
@@ -207,7 +211,8 @@ export function useChatRunStream({
   const openRunDetails = useCallback((runId: string): void => {
     setRunDrawerId(runId);
     setRunDrawerOpen(true);
-  }, []);
+    void onRunInspected?.(runId);
+  }, [onRunInspected]);
 
   const closeRunDrawer = useCallback((): void => {
     setRunDrawerOpen(false);
@@ -274,6 +279,7 @@ export function useChatRunStream({
       text: trimmed,
       attachments: request?.attachment_summaries,
     });
+    void onPromptSubmitted?.(activeSessionId);
 
     const controller = new AbortController();
     streamAbortRef.current = controller;

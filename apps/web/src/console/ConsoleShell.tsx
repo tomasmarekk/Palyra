@@ -3,7 +3,8 @@ import type { ReactNode } from "react";
 
 import { ConsoleSidebarNav } from "./components/layout/ConsoleSidebarNav";
 import { InlineNotice, KeyValueList, StatusChip } from "./components/ui";
-import { getNavigationEntry, getNavigationGroupLabel } from "./navigation";
+import { describeConsoleMode, formatConsoleDateTime } from "./i18n";
+import { getNavigationEntry, getNavigationGroupId } from "./navigation";
 import type { ConsoleAppState } from "./useConsoleAppState";
 
 type ConsoleShellProps = {
@@ -11,13 +12,12 @@ type ConsoleShellProps = {
   children: ReactNode;
 };
 
-function formatSessionExpiry(unixMs: number): string {
-  return new Intl.DateTimeFormat("sv-SE", {
+function formatSessionExpiry(locale: ConsoleAppState["locale"], unixMs: number): string {
+  return formatConsoleDateTime(locale, unixMs, {
     dateStyle: "short",
     timeStyle: "medium",
     timeZone: "UTC",
   })
-    .format(new Date(unixMs))
     .replace(",", "");
 }
 
@@ -42,8 +42,12 @@ export function ConsoleShell({ app, children }: ConsoleShellProps) {
     return null;
   }
   const currentEntry = getNavigationEntry(app.section);
-  const groupLabel = getNavigationGroupLabel(app.section);
+  const groupLabel = app.t(`nav.group.${getNavigationGroupId(app.section)}`);
+  const currentLabel = app.t(currentEntry.labelKey);
+  const currentDetail = app.t(currentEntry.detailKey).toLowerCase();
   const activeProfile = session.profile ?? null;
+  const localeLabel = app.locale === "qps-ploc" ? app.t("shell.pseudo") : app.t("shell.english");
+  const modeLabel = describeConsoleMode(app.locale, app.uiMode);
 
   return (
     <div className="console-root">
@@ -51,23 +55,24 @@ export function ConsoleShell({ app, children }: ConsoleShellProps) {
         <Card className="workspace-card flex-1" variant="secondary">
           <CardContent className="grid gap-4 p-4 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-start">
             <div className="grid gap-2">
-              <p className="console-label">{currentEntry.label}</p>
+              <p className="console-label">{currentLabel}</p>
               <div className="grid gap-1">
                 <h1 className="text-2xl font-semibold tracking-tight">
-                  Web Dashboard Operator Surface
+                  {app.t("shell.title")}
                 </h1>
                 <p className="console-copy">
-                  {groupLabel} domain focused on {currentEntry.detail.toLowerCase()}.
+                  {app.t("shell.subtitle", { group: groupLabel, detail: currentDetail })}
                 </p>
               </div>
             </div>
 
             <div className="grid gap-3">
               <div className="console-shell__meta">
-                <StatusChip tone="success">Authenticated</StatusChip>
+                <StatusChip tone="success">{app.t("shell.authenticated")}</StatusChip>
                 <Chip variant="secondary">{groupLabel}</Chip>
+                <Chip variant="secondary">{modeLabel}</Chip>
                 <Chip variant="secondary">
-                  Expires {formatSessionExpiry(session.expires_at_unix_ms)} UTC
+                  Expires {formatSessionExpiry(app.locale, session.expires_at_unix_ms)} UTC
                 </Chip>
                 {activeProfile !== null ? (
                   <StatusChip tone={toneForProfile(activeProfile.risk_level)}>
@@ -86,7 +91,21 @@ export function ConsoleShell({ app, children }: ConsoleShellProps) {
                     app.setTheme((current) => (current === "light" ? "dark" : "light"))
                   }
                 >
-                  Theme: {app.theme}
+                  {app.t("shell.theme", { theme: app.theme })}
+                </Button>
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onPress={() => app.setLocale(app.locale === "en" ? "qps-ploc" : "en")}
+                >
+                  {app.t("shell.locale", { locale: localeLabel })}
+                </Button>
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onPress={() => app.setUiMode(app.uiMode === "basic" ? "advanced" : "basic")}
+                >
+                  {app.t("shell.mode", { mode: modeLabel })}
                 </Button>
                 <Button
                   isDisabled={app.logoutBusy}
@@ -94,7 +113,7 @@ export function ConsoleShell({ app, children }: ConsoleShellProps) {
                   variant="ghost"
                   onPress={() => void app.signOut()}
                 >
-                  {app.logoutBusy ? "Signing out..." : "Sign out"}
+                  {app.logoutBusy ? app.t("shell.signingOut") : app.t("shell.signOut")}
                 </Button>
               </div>
             </div>
@@ -104,16 +123,22 @@ export function ConsoleShell({ app, children }: ConsoleShellProps) {
 
       <div className="console-shell-grid">
         <aside className="console-sidebar-card" aria-label="Dashboard domains">
-          <ConsoleSidebarNav currentSection={app.section} onSelect={app.setSection} />
+          <ConsoleSidebarNav
+            currentSection={app.section}
+            onSelect={app.setSection}
+            onSwitchMode={() => app.setUiMode(app.uiMode === "basic" ? "advanced" : "basic")}
+            t={app.t}
+            uiMode={app.uiMode}
+          />
         </aside>
 
         <section className="console-shell__content">
           <Card className="workspace-card" variant="default">
             <CardHeader className="flex flex-col items-start gap-3 px-4 pb-0 pt-4 sm:flex-row sm:items-start sm:justify-between">
               <div>
-                <p className="text-sm font-semibold">Session context</p>
+                <p className="text-sm font-semibold">{app.t("shell.sessionContext")}</p>
                 <p className="text-xs text-muted">
-                  Principal, device, and disclosure controls stay compact and secondary to the page.
+                  {app.t("shell.sessionContextBody")}
                 </p>
               </div>
               <Button
@@ -122,39 +147,51 @@ export function ConsoleShell({ app, children }: ConsoleShellProps) {
                 variant={app.revealSensitiveValues ? "secondary" : "ghost"}
                 onPress={() => app.setRevealSensitiveValues((current) => !current)}
               >
-                Reveal sensitive values: {app.revealSensitiveValues ? "On" : "Off"}
+                {app.t("shell.revealSensitive", {
+                  state: app.revealSensitiveValues ? app.t("shell.on") : app.t("shell.off"),
+                })}
               </Button>
             </CardHeader>
             <CardContent className="p-4 pt-4">
               <KeyValueList
                 className="console-session-grid"
                 items={[
-                  { label: "Principal", value: session.principal },
-                  { label: "Device", value: session.device_id },
-                  { label: "Channel", value: session.channel ?? "none" },
-                  { label: "Transport", value: "Cookie session + CSRF" },
-                  { label: "Profile", value: activeProfile?.label ?? "none" },
-                  { label: "Environment", value: activeProfile?.environment ?? "n/a" },
-                  { label: "Risk", value: activeProfile?.risk_level ?? "n/a" },
+                  { label: app.t("shell.principal"), value: session.principal },
+                  { label: app.t("shell.device"), value: session.device_id },
+                  { label: app.t("shell.channel"), value: session.channel ?? app.t("shell.none") },
+                  { label: app.t("shell.transport"), value: app.t("shell.transportValue") },
+                  { label: app.t("shell.profile"), value: activeProfile?.label ?? app.t("shell.none") },
+                  {
+                    label: app.t("shell.environment"),
+                    value: activeProfile?.environment ?? app.t("shell.notApplicable"),
+                  },
+                  {
+                    label: app.t("shell.risk"),
+                    value: activeProfile?.risk_level ?? app.t("shell.notApplicable"),
+                  },
                 ]}
               />
               {activeProfile !== null ? (
                 <InlineNotice
-                  title={`Active profile: ${activeProfile.label}`}
+                  title={app.t("shell.profileActive", { label: activeProfile.label })}
                   tone={activeProfile.strict_mode ? "warning" : "default"}
                 >
-                  {`Mode ${activeProfile.mode}, environment ${activeProfile.environment}, risk ${activeProfile.risk_level}.`}
+                  {app.t("shell.profileBody", {
+                    mode: activeProfile.mode,
+                    environment: activeProfile.environment,
+                    risk: activeProfile.risk_level,
+                  })}
                 </InlineNotice>
               ) : null}
             </CardContent>
           </Card>
           {app.notice !== null ? (
-            <InlineNotice title="Action result" tone="success">
+            <InlineNotice title={app.t("shell.actionResult")} tone="success">
               {app.notice}
             </InlineNotice>
           ) : null}
           {app.error !== null ? (
-            <InlineNotice title="Action blocked" tone="danger">
+            <InlineNotice title={app.t("shell.actionBlocked")} tone="danger">
               {app.error}
             </InlineNotice>
           ) : null}
