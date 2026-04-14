@@ -280,7 +280,9 @@ type ApprovalExplainability = {
   skillId: string | null;
 };
 
-function buildApprovalExplainability(entry: TranscriptEntry | undefined): ApprovalExplainability | null {
+function buildApprovalExplainability(
+  entry: TranscriptEntry | undefined,
+): ApprovalExplainability | null {
   if (entry?.kind !== "approval_request") {
     return null;
   }

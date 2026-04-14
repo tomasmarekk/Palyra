@@ -826,8 +826,10 @@ export function App() {
   const selectedApprovalPolicy = readObject(selectedApproval, "policy_snapshot");
   const selectedApprovalPromptDetails = readObject(selectedApprovalPrompt, "details_json");
   const selectedApprovalToolName =
-    readString(selectedApproval, "tool_name") ?? readString(selectedApprovalPromptDetails, "tool_name");
-  const selectedApprovalRiskLevel = readString(selectedApprovalPrompt, "risk_level") ?? "unspecified";
+    readString(selectedApproval, "tool_name") ??
+    readString(selectedApprovalPromptDetails, "tool_name");
+  const selectedApprovalRiskLevel =
+    readString(selectedApprovalPrompt, "risk_level") ?? "unspecified";
   const selectedApprovalPolicyExplanation =
     readString(selectedApprovalPrompt, "policy_explanation") ??
     "This action requires an explicit operator decision under the current tool posture.";
@@ -835,10 +837,6 @@ export function App() {
     toolName: selectedApprovalToolName,
     riskLevel: selectedApprovalRiskLevel,
   });
-  const selectedApprovalSubjectId =
-    readString(selectedApprovalPrompt, "subject_id") ??
-    readString(selectedApprovalPromptDetails, "subject_id");
-  const selectedApprovalSkillId = readString(selectedApprovalPromptDetails, "skill_id");
 
   const onboardingItems = useMemo(
     () => [
@@ -1903,14 +1901,6 @@ export function App() {
                       {
                         label: "Timeout",
                         value: `${readString(selectedApprovalPrompt, "timeout_seconds") ?? "n/a"}s`,
-                      },
-                      {
-                        label: "Subject",
-                        value: selectedApprovalSubjectId ?? "n/a",
-                      },
-                      {
-                        label: "Skill",
-                        value: selectedApprovalSkillId ?? "n/a",
                       },
                     ]}
                   />

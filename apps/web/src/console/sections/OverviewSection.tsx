@@ -1455,7 +1455,9 @@ function buildTopFrictionSurface(aggregate: ConsoleAppState["uxTelemetryAggregat
 
 function buildTopToolRecommendation(
   permissions: ToolPermissionsEnvelope | null,
-): (ToolPermissionRecord & { recommendation: NonNullable<ToolPermissionRecord["recommendation"]> }) | null {
+):
+  | (ToolPermissionRecord & { recommendation: NonNullable<ToolPermissionRecord["recommendation"]> })
+  | null {
   if (permissions === null) {
     return null;
   }
@@ -1467,8 +1469,7 @@ function buildTopToolRecommendation(
     } => tool.recommendation !== undefined && tool.recommendation.action === undefined,
   );
   candidates.sort((left, right) => {
-    const byApprovals =
-      right.recommendation.approvals_14d - left.recommendation.approvals_14d;
+    const byApprovals = right.recommendation.approvals_14d - left.recommendation.approvals_14d;
     if (byApprovals !== 0) {
       return byApprovals;
     }

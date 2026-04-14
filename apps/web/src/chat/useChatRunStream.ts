@@ -589,26 +589,26 @@ export function useChatRunStream({
     if (streamFlushHandleRef.current !== null) {
       globalThis.clearTimeout(streamFlushHandleRef.current);
       streamFlushHandleRef.current = null;
+    }
   }
-}
 
-function summarizeToolDecision(value: Record<string, JsonValue> | null): string | undefined {
-  if (value === null) {
-    return undefined;
+  function summarizeToolDecision(value: Record<string, JsonValue> | null): string | undefined {
+    if (value === null) {
+      return undefined;
+    }
+    const reason = asString(value.reason);
+    const kind = asString(value.kind);
+    if (reason === null && kind === null) {
+      return undefined;
+    }
+    if (reason === null) {
+      return `Decision: ${kind}`;
+    }
+    if (kind === null) {
+      return reason;
+    }
+    return `${kind}: ${reason}`;
   }
-  const reason = asString(value.reason);
-  const kind = asString(value.kind);
-  if (reason === null && kind === null) {
-    return undefined;
-  }
-  if (reason === null) {
-    return `Decision: ${kind}`;
-  }
-  if (kind === null) {
-    return reason;
-  }
-  return `${kind}: ${reason}`;
-}
 
   function flushPendingStreamUpdates(): void {
     cancelScheduledStreamFlush();
