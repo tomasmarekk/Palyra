@@ -119,9 +119,8 @@ export function ChatConsolePanel({
   const [exportBusy, setExportBusy] = useState<"json" | "markdown" | null>(null);
   const [phase4BusyKey, setPhase4BusyKey] = useState<string | null>(null);
   const attachmentInputRef = useRef<HTMLInputElement | null>(null);
-  const sessions = useChatSessions({
-    api,
-    onSessionActivated: async (sessionId) => {
+  const handleSessionActivated = useCallback(
+    async (sessionId: string) => {
       await emitUxEvent({
         name: "ux.session.resumed",
         section: "chat",
@@ -129,10 +128,37 @@ export function ChatConsolePanel({
         summary: "Resumed chat session.",
       });
     },
+    [emitUxEvent],
+  );
+  const sessions = useChatSessions({
+    api,
+    onSessionActivated: handleSessionActivated,
     setError,
     setNotice,
     preferredSessionId,
   });
+  const handlePromptSubmitted = useCallback(
+    async (sessionId: string) => {
+      await emitUxEvent({
+        name: "ux.chat.prompt_submitted",
+        section: "chat",
+        sessionId,
+        summary: "Submitted a chat prompt.",
+      });
+    },
+    [emitUxEvent],
+  );
+  const handleRunInspected = useCallback(
+    async (runId: string) => {
+      await emitUxEvent({
+        name: "ux.run.inspected",
+        section: "chat",
+        runId,
+        summary: "Opened run inspector.",
+      });
+    },
+    [emitUxEvent],
+  );
 
   const {
     composerText,
@@ -167,22 +193,8 @@ export function ChatConsolePanel({
   } = useChatRunStream({
     api,
     activeSessionId: sessions.activeSessionId,
-    onPromptSubmitted: async (sessionId) => {
-      await emitUxEvent({
-        name: "ux.chat.prompt_submitted",
-        section: "chat",
-        sessionId,
-        summary: "Submitted a chat prompt.",
-      });
-    },
-    onRunInspected: async (runId) => {
-      await emitUxEvent({
-        name: "ux.run.inspected",
-        section: "chat",
-        runId,
-        summary: "Opened run inspector.",
-      });
-    },
+    onPromptSubmitted: handlePromptSubmitted,
+    onRunInspected: handleRunInspected,
     sessionLabelDraft: sessions.sessionLabelDraft,
     setError,
     setNotice,
