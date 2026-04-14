@@ -152,7 +152,7 @@ pub enum OnboardingCommand {
         #[arg(long, default_value_t = false)]
         force: bool,
         #[command(flatten)]
-        options: WizardOverridesArg,
+        options: Box<WizardOverridesArg>,
     },
     Status {
         #[arg(long)]

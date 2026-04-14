@@ -2,6 +2,7 @@ Usage: palyra onboarding [OPTIONS] <COMMAND>
 
 Commands:
   wizard
+  status
 
 Options:
   -h, --help

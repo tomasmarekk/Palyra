@@ -54,6 +54,28 @@ struct OnboardingSignals {
     discord_enabled: bool,
 }
 
+#[derive(Debug)]
+struct StepPresentation {
+    blocked: Option<control_plane::OnboardingBlockedReason>,
+    optional: bool,
+    verification_state: Option<String>,
+}
+
+impl StepPresentation {
+    fn required(verification_state: Option<String>) -> Self {
+        Self { blocked: None, optional: false, verification_state }
+    }
+
+    fn optional(verification_state: Option<String>) -> Self {
+        Self { blocked: None, optional: true, verification_state }
+    }
+
+    fn with_blocked(mut self, blocked: Option<control_plane::OnboardingBlockedReason>) -> Self {
+        self.blocked = blocked;
+        self
+    }
+}
+
 pub(crate) async fn console_onboarding_posture_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -190,9 +212,7 @@ fn build_onboarding_steps(
             "No daemon config was found yet. Run the canonical setup wizard first.",
             control_plane::OnboardingStepStatus::Todo,
             Some(run_cli_action("Run setup wizard", "palyra onboarding wizard --flow quickstart")),
-            None,
-            false,
-            None,
+            StepPresentation::required(None),
         )
     };
 
@@ -213,9 +233,7 @@ fn build_onboarding_steps(
             "Pick the main workspace root before enabling local tool execution.",
             control_plane::OnboardingStepStatus::Todo,
             Some(run_cli_action("Configure workspace", "palyra configure --section workspace")),
-            None,
-            false,
-            None,
+            StepPresentation::required(None),
         )
     };
 
@@ -254,13 +272,15 @@ fn build_onboarding_steps(
                 "Configure gateway",
                 "palyra configure --section gateway",
             )),
-            signals.deployment_warning.as_deref().map(|detail| blocked_reason(
-                "deployment_posture",
-                detail,
-                "Resolve the bind/TLS/admin-auth warning before handing onboarding to another surface.",
-            )),
-            false,
-            None,
+            StepPresentation::required(None).with_blocked(
+                signals.deployment_warning.as_deref().map(|detail| {
+                    blocked_reason(
+                        "deployment_posture",
+                        detail,
+                        "Resolve the bind/TLS/admin-auth warning before handing onboarding to another surface.",
+                    )
+                }),
+            ),
         )
     };
 
@@ -276,15 +296,15 @@ fn build_onboarding_steps(
             "The primary model provider is configured and selected for onboarding.",
             status,
             Some(console_path_action("Open provider auth", "/#/control/auth")),
-            (status == control_plane::OnboardingStepStatus::Blocked).then(|| {
-                blocked_reason(
-                    "provider_auth_health",
-                    signals.provider_health_message.as_str(),
-                    "Repair or refresh the configured provider credential before continuing.",
-                )
-            }),
-            false,
-            Some(signals.provider_health_state.clone()),
+            StepPresentation::required(Some(signals.provider_health_state.clone())).with_blocked(
+                (status == control_plane::OnboardingStepStatus::Blocked).then(|| {
+                    blocked_reason(
+                        "provider_auth_health",
+                        signals.provider_health_message.as_str(),
+                        "Repair or refresh the configured provider credential before continuing.",
+                    )
+                }),
+            ),
         )
     } else {
         actionable_step(
@@ -293,9 +313,7 @@ fn build_onboarding_steps(
             "Connect the primary provider and select the model profile used for the first run.",
             control_plane::OnboardingStepStatus::Todo,
             Some(console_path_action("Connect provider", "/#/control/auth")),
-            None,
-            false,
-            Some("missing_auth".to_owned()),
+            StepPresentation::required(Some("missing_auth".to_owned())),
         )
     };
 
@@ -310,13 +328,13 @@ fn build_onboarding_steps(
                 "Open model diagnostics",
                 "/#/control/access?panel=models",
             )),
-            Some(blocked_reason(
-                "provider_not_ready",
-                "Provider auth or model selection is incomplete.",
-                "Connect the provider first, then rerun model verification.",
+            StepPresentation::required(Some("blocked".to_owned())).with_blocked(Some(
+                blocked_reason(
+                    "provider_not_ready",
+                    "Provider auth or model selection is incomplete.",
+                    "Connect the provider first, then rerun model verification.",
+                ),
             )),
-            false,
-            Some("blocked".to_owned()),
         )
     } else if signals.provider_health_state == "ok" && signals.model_discovery_ready {
         done_step(
@@ -338,13 +356,13 @@ fn build_onboarding_steps(
                 "Run model verification",
                 "/#/control/access?panel=models",
             )),
-            Some(blocked_reason(
-                "model_verification",
-                signals.model_discovery_message.as_str(),
-                "Use the model diagnostics action to test the provider and confirm discoverable models.",
-            )),
-            false,
-            Some(signals.provider_health_state.clone()),
+            StepPresentation::required(Some(signals.provider_health_state.clone())).with_blocked(
+                Some(blocked_reason(
+                    "model_verification",
+                    signals.model_discovery_message.as_str(),
+                    "Use the model diagnostics action to test the provider and confirm discoverable models.",
+                )),
+            ),
         )
     };
 
@@ -365,9 +383,7 @@ fn build_onboarding_steps(
                 "Configure Discord",
                 "/#/control/channels",
             )),
-            None,
-            true,
-            None,
+            StepPresentation::optional(None),
         )
     };
 
@@ -382,9 +398,7 @@ fn build_onboarding_steps(
             "Open the chat workspace and send a real request to finish the guided handoff.",
             control_plane::OnboardingStepStatus::InProgress,
             Some(console_path_action("Open chat workspace", "/#/chat")),
-            None,
-            false,
-            Some("ready".to_owned()),
+            StepPresentation::required(Some("ready".to_owned())),
         )
     } else {
         actionable_step(
@@ -396,13 +410,13 @@ fn build_onboarding_steps(
                 "Review blockers",
                 "/#/control/overview",
             )),
-            Some(blocked_reason(
-                "first_success_blocked",
-                "Prerequisite onboarding steps are still incomplete.",
-                "Clear the recommended blockers above, then open chat for the first guided success.",
+            StepPresentation::required(Some("blocked".to_owned())).with_blocked(Some(
+                blocked_reason(
+                    "first_success_blocked",
+                    "Prerequisite onboarding steps are still incomplete.",
+                    "Clear the recommended blockers above, then open chat for the first guided success.",
+                ),
             )),
-            false,
-            Some("blocked".to_owned()),
         )
     };
 
@@ -466,9 +480,7 @@ fn done_step(
         summary,
         control_plane::OnboardingStepStatus::Done,
         action,
-        None,
-        false,
-        Some("ok".to_owned()),
+        StepPresentation::required(Some("ok".to_owned())),
     )
 }
 
@@ -478,18 +490,16 @@ fn actionable_step(
     summary: impl Into<String>,
     status: control_plane::OnboardingStepStatus,
     action: Option<control_plane::OnboardingStepAction>,
-    blocked: Option<control_plane::OnboardingBlockedReason>,
-    optional: bool,
-    verification_state: Option<String>,
+    presentation: StepPresentation,
 ) -> control_plane::OnboardingStepView {
     control_plane::OnboardingStepView {
         step_id: step_id.to_owned(),
         title: title.to_owned(),
         summary: summary.into(),
         status,
-        optional,
-        verification_state,
-        blocked,
+        optional: presentation.optional,
+        verification_state: presentation.verification_state,
+        blocked: presentation.blocked,
         action,
     }
 }

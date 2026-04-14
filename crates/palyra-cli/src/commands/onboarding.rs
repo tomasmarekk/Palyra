@@ -53,6 +53,24 @@ struct OnboardingSignals {
     model_discovery_message: String,
 }
 
+#[derive(Debug)]
+struct StepPresentation {
+    blocked: Option<control_plane::OnboardingBlockedReason>,
+    optional: bool,
+    verification_state: Option<String>,
+}
+
+impl StepPresentation {
+    fn required(verification_state: Option<String>) -> Self {
+        Self { blocked: None, optional: false, verification_state }
+    }
+
+    fn with_blocked(mut self, blocked: Option<control_plane::OnboardingBlockedReason>) -> Self {
+        self.blocked = blocked;
+        self
+    }
+}
+
 pub(crate) fn run_onboarding(command: OnboardingCommand) -> Result<()> {
     match command {
         OnboardingCommand::Wizard { path, force, options } => {
@@ -62,7 +80,7 @@ pub(crate) fn run_onboarding(command: OnboardingCommand) -> Result<()> {
                     force,
                     setup_mode: None,
                     setup_tls_scaffold: None,
-                    options,
+                    options: *options,
                 },
             )
         }
@@ -235,9 +253,7 @@ fn build_onboarding_steps(
                 "Run setup wizard",
                 "palyra onboarding wizard --flow quickstart".to_owned(),
             )),
-            None,
-            false,
-            None,
+            StepPresentation::required(None),
         )
     };
 
@@ -261,9 +277,7 @@ fn build_onboarding_steps(
                 "Configure workspace",
                 "palyra configure --section workspace".to_owned(),
             )),
-            None,
-            false,
-            None,
+            StepPresentation::required(None),
         )
     };
 
@@ -304,13 +318,15 @@ fn build_onboarding_steps(
                 "Configure gateway",
                 "palyra configure --section gateway".to_owned(),
             )),
-            signals.deployment_warning.as_deref().map(|detail| blocked_reason(
-                "deployment_posture",
-                detail,
-                "Resolve the bind/TLS/admin-auth posture before handing onboarding to another surface.",
-            )),
-            false,
-            None,
+            StepPresentation::required(None).with_blocked(
+                signals.deployment_warning.as_deref().map(|detail| {
+                    blocked_reason(
+                        "deployment_posture",
+                        detail,
+                        "Resolve the bind/TLS/admin-auth posture before handing onboarding to another surface.",
+                    )
+                }),
+            ),
         )
     };
 
@@ -329,15 +345,15 @@ fn build_onboarding_steps(
                 "Inspect model setup",
                 format!("palyra models status --path {}", signals.config_path),
             )),
-            (status == control_plane::OnboardingStepStatus::Blocked).then(|| {
-                blocked_reason(
-                    "provider_auth_health",
-                    signals.provider_health_message.as_str(),
-                    "Repair the configured provider credential before continuing.",
-                )
-            }),
-            false,
-            Some(signals.provider_health_state.clone()),
+            StepPresentation::required(Some(signals.provider_health_state.clone())).with_blocked(
+                (status == control_plane::OnboardingStepStatus::Blocked).then(|| {
+                    blocked_reason(
+                        "provider_auth_health",
+                        signals.provider_health_message.as_str(),
+                        "Repair the configured provider credential before continuing.",
+                    )
+                }),
+            ),
         )
     } else {
         actionable_step(
@@ -349,9 +365,7 @@ fn build_onboarding_steps(
                 "Open configure wizard",
                 "palyra configure --section auth-model".to_owned(),
             )),
-            None,
-            false,
-            Some("missing_auth".to_owned()),
+            StepPresentation::required(Some("missing_auth".to_owned())),
         )
     };
 
@@ -366,13 +380,13 @@ fn build_onboarding_steps(
                 "Review model status",
                 format!("palyra models status --path {}", signals.config_path),
             )),
-            Some(blocked_reason(
-                "provider_not_ready",
-                "Provider auth or model selection is incomplete.",
-                "Connect the provider first, then run the model verification commands.",
+            StepPresentation::required(Some("blocked".to_owned())).with_blocked(Some(
+                blocked_reason(
+                    "provider_not_ready",
+                    "Provider auth or model selection is incomplete.",
+                    "Connect the provider first, then run the model verification commands.",
+                ),
             )),
-            false,
-            Some("blocked".to_owned()),
         )
     } else if signals.model_discovery_ready {
         done_step(
@@ -394,13 +408,13 @@ fn build_onboarding_steps(
                 "Run test connection",
                 format!("palyra models test-connection --path {} --json", signals.config_path),
             )),
-            Some(blocked_reason(
-                "model_verification",
-                signals.model_discovery_message.as_str(),
-                "Use the model commands to verify connectivity and confirm a selected chat model.",
-            )),
-            false,
-            Some(signals.provider_health_state.clone()),
+            StepPresentation::required(Some(signals.provider_health_state.clone())).with_blocked(
+                Some(blocked_reason(
+                    "model_verification",
+                    signals.model_discovery_message.as_str(),
+                    "Use the model commands to verify connectivity and confirm a selected chat model.",
+                )),
+            ),
         )
     };
 
@@ -418,9 +432,7 @@ fn build_onboarding_steps(
                 "Open dashboard",
                 "palyra dashboard".to_owned(),
             )),
-            None,
-            false,
-            Some("ready".to_owned()),
+            StepPresentation::required(Some("ready".to_owned())),
         )
     } else {
         actionable_step(
@@ -432,13 +444,13 @@ fn build_onboarding_steps(
                 "Review blockers",
                 format!("palyra onboarding status --path {} --json", signals.config_path),
             )),
-            Some(blocked_reason(
-                "first_success_blocked",
-                "Prerequisite onboarding steps are still incomplete.",
-                "Clear the recommended blockers above, then open the dashboard for the first guided success.",
+            StepPresentation::required(Some("blocked".to_owned())).with_blocked(Some(
+                blocked_reason(
+                    "first_success_blocked",
+                    "Prerequisite onboarding steps are still incomplete.",
+                    "Clear the recommended blockers above, then open the dashboard for the first guided success.",
+                ),
             )),
-            false,
-            Some("blocked".to_owned()),
         )
     };
 
@@ -559,9 +571,7 @@ fn done_step(
         summary,
         control_plane::OnboardingStepStatus::Done,
         action,
-        None,
-        false,
-        Some("ok".to_owned()),
+        StepPresentation::required(Some("ok".to_owned())),
     )
 }
 
@@ -571,18 +581,16 @@ fn actionable_step(
     summary: impl Into<String>,
     status: control_plane::OnboardingStepStatus,
     action: Option<control_plane::OnboardingStepAction>,
-    blocked: Option<control_plane::OnboardingBlockedReason>,
-    optional: bool,
-    verification_state: Option<String>,
+    presentation: StepPresentation,
 ) -> control_plane::OnboardingStepView {
     control_plane::OnboardingStepView {
         step_id: step_id.to_owned(),
         title: title.to_owned(),
         summary: summary.into(),
         status,
-        optional,
-        verification_state,
-        blocked,
+        optional: presentation.optional,
+        verification_state: presentation.verification_state,
+        blocked: presentation.blocked,
         action,
     }
 }

@@ -3404,7 +3404,7 @@ fn parse_onboarding_wizard_with_custom_path() {
             command: OnboardingCommand::Wizard {
                 path: Some("config/palyra.toml".to_owned()),
                 force: true,
-                options: WizardOverridesArg {
+                options: Box::new(WizardOverridesArg {
                     flow: Some(OnboardingFlowArg::Manual),
                     non_interactive: true,
                     accept_risk: true,
@@ -3435,7 +3435,7 @@ fn parse_onboarding_wizard_with_custom_path() {
                     skip_health: true,
                     skip_channels: true,
                     skip_skills: false,
-                },
+                }),
             }
         }
     );
