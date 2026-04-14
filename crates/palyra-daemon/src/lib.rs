@@ -1948,6 +1948,7 @@ pub async fn run() -> Result<()> {
         node_runtime::NodeRuntimeState::load(runtime_state_root.as_path())
             .context("failed to initialize node runtime state")?,
     );
+    #[rustfmt::skip]
     let runtime = GatewayRuntimeState::new_with_provider(
         GatewayRuntimeConfigSnapshot {
             grpc_bind_addr: loaded.gateway.grpc_bind_addr.clone(),
@@ -2070,12 +2071,7 @@ pub async fn run() -> Result<()> {
         },
         journal_store,
         identity_runtime.revoked_certificate_count,
-        gateway::GatewayRuntimeDependencies {
-            model_provider,
-            vault: Arc::clone(&vault),
-            agent_registry,
-            tool_posture_registry,
-        },
+        gateway::GatewayRuntimeDependencies { model_provider, vault: Arc::clone(&vault), agent_registry, tool_posture_registry },
     )
     .context("failed to initialize gateway runtime state")?;
     runtime.configure_memory(MemoryRuntimeConfig {

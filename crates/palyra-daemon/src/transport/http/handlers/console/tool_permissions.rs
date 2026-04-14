@@ -138,17 +138,11 @@ struct ToolPermissionsData {
     config: crate::gateway::GatewayRuntimeConfigSnapshot,
 }
 
+#[rustfmt::skip]
 struct ToolPermissionsJournalEvent<'a> {
-    event_name: &'a str,
-    scope_kind: ToolPostureScopeKind,
-    scope_id: &'a str,
-    tool_name: Option<&'a str>,
-    previous_state: Option<ToolPostureState>,
-    new_state: Option<ToolPostureState>,
-    source: &'a str,
-    reason: Option<&'a str>,
-    recommendation_id: Option<&'a str>,
-    preset_id: Option<&'a str>,
+    event_name: &'a str, scope_kind: ToolPostureScopeKind, scope_id: &'a str,
+    tool_name: Option<&'a str>, previous_state: Option<ToolPostureState>, new_state: Option<ToolPostureState>,
+    source: &'a str, reason: Option<&'a str>, recommendation_id: Option<&'a str>, preset_id: Option<&'a str>,
 }
 
 pub(crate) async fn console_tool_permissions_list_handler(
@@ -212,24 +206,11 @@ pub(crate) async fn console_tool_permission_override_handler(
             now_unix_ms: gateway::current_unix_ms(),
         })
         .map_err(runtime_status_response)?;
-    record_tool_permissions_journal_event(
-        &state.runtime,
-        &session.context,
-        ToolPermissionsJournalEvent {
-            event_name: "tool_posture.override_set",
-            scope_kind,
-            scope_id: scope_id.as_str(),
-            tool_name: Some(tool_name.as_str()),
-            previous_state: None,
-            new_state: Some(state_value),
-            source: "manual",
-            reason: payload.reason.as_deref(),
-            recommendation_id: None,
-            preset_id: None,
-        },
-    )
-    .await
-    .map_err(runtime_status_response)?;
+    #[rustfmt::skip]
+    let event = ToolPermissionsJournalEvent { event_name: "tool_posture.override_set", scope_kind, scope_id: scope_id.as_str(), tool_name: Some(tool_name.as_str()), previous_state: None, new_state: Some(state_value), source: "manual", reason: payload.reason.as_deref(), recommendation_id: None, preset_id: None };
+    record_tool_permissions_journal_event(&state.runtime, &session.context, event)
+        .await
+        .map_err(runtime_status_response)?;
     let detail =
         build_tool_permission_detail_for_scope(&state, tool_name.as_str(), scope_kind, &scope_id)
             .await?;
@@ -267,24 +248,11 @@ pub(crate) async fn console_tool_permission_reset_handler(
         })
         .map_err(runtime_status_response)?;
     if removed {
-        record_tool_permissions_journal_event(
-            &state.runtime,
-            &session.context,
-            ToolPermissionsJournalEvent {
-                event_name: "tool_posture.override_cleared",
-                scope_kind,
-                scope_id: scope_id.as_str(),
-                tool_name: Some(tool_name.as_str()),
-                previous_state: None,
-                new_state: None,
-                source: "manual_reset",
-                reason: payload.reason.as_deref(),
-                recommendation_id: None,
-                preset_id: None,
-            },
-        )
-        .await
-        .map_err(runtime_status_response)?;
+        #[rustfmt::skip]
+        let event = ToolPermissionsJournalEvent { event_name: "tool_posture.override_cleared", scope_kind, scope_id: scope_id.as_str(), tool_name: Some(tool_name.as_str()), previous_state: None, new_state: None, source: "manual_reset", reason: payload.reason.as_deref(), recommendation_id: None, preset_id: None };
+        record_tool_permissions_journal_event(&state.runtime, &session.context, event)
+            .await
+            .map_err(runtime_status_response)?;
     }
     let detail =
         build_tool_permission_detail_for_scope(&state, tool_name.as_str(), scope_kind, &scope_id)
@@ -320,24 +288,11 @@ pub(crate) async fn console_tool_permission_scope_reset_handler(
         })
         .map_err(runtime_status_response)?;
     for record in removed.as_slice() {
-        record_tool_permissions_journal_event(
-            &state.runtime,
-            &session.context,
-            ToolPermissionsJournalEvent {
-                event_name: "tool_posture.scope_reset",
-                scope_kind,
-                scope_id: scope_id.as_str(),
-                tool_name: Some(record.tool_name.as_str()),
-                previous_state: Some(record.state),
-                new_state: None,
-                source: "manual_scope_reset",
-                reason: payload.reason.as_deref(),
-                recommendation_id: None,
-                preset_id: None,
-            },
-        )
-        .await
-        .map_err(runtime_status_response)?;
+        #[rustfmt::skip]
+        let event = ToolPermissionsJournalEvent { event_name: "tool_posture.scope_reset", scope_kind, scope_id: scope_id.as_str(), tool_name: Some(record.tool_name.as_str()), previous_state: Some(record.state), new_state: None, source: "manual_scope_reset", reason: payload.reason.as_deref(), recommendation_id: None, preset_id: None };
+        record_tool_permissions_journal_event(&state.runtime, &session.context, event)
+            .await
+            .map_err(runtime_status_response)?;
     }
     let data = load_tool_permissions_data(
         &state,
@@ -456,24 +411,11 @@ pub(crate) async fn console_tool_permissions_preset_apply_handler(
             })
             .map_err(runtime_status_response)?;
         let source = format!("preset:{}", preset.preset_id);
-        record_tool_permissions_journal_event(
-            &state.runtime,
-            &session.context,
-            ToolPermissionsJournalEvent {
-                event_name: "tool_posture.preset_applied",
-                scope_kind,
-                scope_id: scope_id.as_str(),
-                tool_name: Some(entry.tool_name),
-                previous_state: Some(posture.effective_state),
-                new_state: Some(assignment.state),
-                source: source.as_str(),
-                reason: payload.reason.as_deref(),
-                recommendation_id: None,
-                preset_id: Some(preset.preset_id),
-            },
-        )
-        .await
-        .map_err(runtime_status_response)?;
+        #[rustfmt::skip]
+        let event = ToolPermissionsJournalEvent { event_name: "tool_posture.preset_applied", scope_kind, scope_id: scope_id.as_str(), tool_name: Some(entry.tool_name), previous_state: Some(posture.effective_state), new_state: Some(assignment.state), source: source.as_str(), reason: payload.reason.as_deref(), recommendation_id: None, preset_id: Some(preset.preset_id) };
+        record_tool_permissions_journal_event(&state.runtime, &session.context, event)
+            .await
+            .map_err(runtime_status_response)?;
     }
     let data_after = load_tool_permissions_data(
         &state,
@@ -563,24 +505,11 @@ pub(crate) async fn console_tool_permissions_recommendation_action_handler(
                 now_unix_ms: gateway::current_unix_ms(),
             })
             .map_err(runtime_status_response)?;
-        record_tool_permissions_journal_event(
-            &state.runtime,
-            &session.context,
-            ToolPermissionsJournalEvent {
-                event_name: "tool_posture.recommendation_accepted",
-                scope_kind,
-                scope_id: scope_id.as_str(),
-                tool_name: Some(payload.tool_name.as_str()),
-                previous_state: Some(record.effective_posture.effective_state),
-                new_state: Some(recommendation.recommended_state),
-                source: "recommendation",
-                reason: Some(recommendation.reason.as_str()),
-                recommendation_id: Some(payload.recommendation_id.as_str()),
-                preset_id: None,
-            },
-        )
-        .await
-        .map_err(runtime_status_response)?;
+        #[rustfmt::skip]
+        let event = ToolPermissionsJournalEvent { event_name: "tool_posture.recommendation_accepted", scope_kind, scope_id: scope_id.as_str(), tool_name: Some(payload.tool_name.as_str()), previous_state: Some(record.effective_posture.effective_state), new_state: Some(recommendation.recommended_state), source: "recommendation", reason: Some(recommendation.reason.as_str()), recommendation_id: Some(payload.recommendation_id.as_str()), preset_id: None };
+        record_tool_permissions_journal_event(&state.runtime, &session.context, event)
+            .await
+            .map_err(runtime_status_response)?;
     }
     let detail = build_tool_permission_detail_for_scope(
         &state,
@@ -980,18 +909,8 @@ async fn record_tool_permissions_journal_event(
     context: &crate::transport::grpc::auth::RequestContext,
     event: ToolPermissionsJournalEvent<'_>,
 ) -> Result<(), tonic::Status> {
-    let ToolPermissionsJournalEvent {
-        event_name,
-        scope_kind,
-        scope_id,
-        tool_name,
-        previous_state,
-        new_state,
-        source,
-        reason,
-        recommendation_id,
-        preset_id,
-    } = event;
+    #[rustfmt::skip]
+    let ToolPermissionsJournalEvent { event_name, scope_kind, scope_id, tool_name, previous_state, new_state, source, reason, recommendation_id, preset_id } = event;
     let synthetic_session_id = format!("tool-posture:{}:{scope_id}", scope_kind.as_str());
     runtime
         .record_journal_event(JournalAppendRequest {

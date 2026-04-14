@@ -320,12 +320,8 @@ pub struct GatewayJournalConfigSnapshot {
     pub hash_chain_enabled: bool,
 }
 
-pub struct GatewayRuntimeDependencies {
-    pub model_provider: Arc<dyn ModelProvider>,
-    pub vault: Arc<Vault>,
-    pub agent_registry: AgentRegistry,
-    pub tool_posture_registry: ToolPostureRegistry,
-}
+#[rustfmt::skip]
+pub struct GatewayRuntimeDependencies { pub model_provider: Arc<dyn ModelProvider>, pub vault: Arc<Vault>, pub agent_registry: AgentRegistry, pub tool_posture_registry: ToolPostureRegistry }
 
 pub struct GatewayRuntimeState {
     pub(crate) started_at: Instant,
@@ -953,17 +949,14 @@ impl GatewayRuntimeState {
             std::env::temp_dir().join(format!("palyra-tool-posture-{}", Ulid::new()));
         let tool_posture_registry = ToolPostureRegistry::open(tool_posture_root.as_path())
             .expect("test tool posture registry should initialize");
+        #[rustfmt::skip]
+        let dependencies = GatewayRuntimeDependencies { model_provider: default_provider, vault: default_vault, agent_registry, tool_posture_registry };
         Self::new_with_provider(
             config,
             journal_config,
             journal_store,
             revoked_certificate_count,
-            GatewayRuntimeDependencies {
-                model_provider: default_provider,
-                vault: default_vault,
-                agent_registry,
-                tool_posture_registry,
-            },
+            dependencies,
         )
     }
 
@@ -974,12 +967,8 @@ impl GatewayRuntimeState {
         revoked_certificate_count: usize,
         dependencies: GatewayRuntimeDependencies,
     ) -> Result<Arc<Self>, JournalError> {
-        let GatewayRuntimeDependencies {
-            model_provider,
-            vault,
-            agent_registry,
-            tool_posture_registry,
-        } = dependencies;
+        #[rustfmt::skip]
+        let GatewayRuntimeDependencies { model_provider, vault, agent_registry, tool_posture_registry } = dependencies;
         let build = build_metadata();
         let existing_events = journal_store.total_events()? as u64;
         let canvas_snapshots =
