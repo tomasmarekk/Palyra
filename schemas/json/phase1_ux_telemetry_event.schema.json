@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://palyra.local/schemas/phase1_ux_telemetry_event.schema.json",
+  "title": "Phase 1 UX Telemetry Event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "name",
+    "surface"
+  ],
+  "properties": {
+    "name": {
+      "type": "string",
+      "pattern": "^ux\\.[a-z0-9._:-]+$",
+      "maxLength": 64
+    },
+    "surface": {
+      "type": "string",
+      "enum": [
+        "web",
+        "desktop",
+        "tui",
+        "mobile"
+      ]
+    },
+    "section": {
+      "type": "string",
+      "maxLength": 64
+    },
+    "mode": {
+      "type": "string",
+      "enum": [
+        "basic",
+        "advanced"
+      ]
+    },
+    "locale": {
+      "type": "string",
+      "maxLength": 32
+    },
+    "outcome": {
+      "type": "string",
+      "enum": [
+        "ok",
+        "blocked",
+        "error",
+        "cancelled"
+      ]
+    },
+    "step": {
+      "type": "string",
+      "maxLength": 64
+    },
+    "toolName": {
+      "type": "string",
+      "maxLength": 128
+    },
+    "sessionId": {
+      "type": "string",
+      "maxLength": 128
+    },
+    "runId": {
+      "type": "string",
+      "maxLength": 128
+    },
+    "deviceId": {
+      "type": "string",
+      "maxLength": 128
+    },
+    "objectiveId": {
+      "type": "string",
+      "maxLength": 128
+    },
+    "canvasId": {
+      "type": "string",
+      "maxLength": 128
+    },
+    "intent": {
+      "type": "string",
+      "maxLength": 64
+    },
+    "latencyMs": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 3600000
+    },
+    "summary": {
+      "type": "string",
+      "maxLength": 240
+    }
+  }
+}

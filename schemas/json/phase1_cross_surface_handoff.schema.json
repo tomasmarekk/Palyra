@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://palyra.local/schemas/phase1_cross_surface_handoff.schema.json",
+  "title": "Phase 1 Cross-Surface Handoff",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "section": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "sessionId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "runId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "deviceId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "objectiveId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "canvasId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "intent": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "source": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 32
+    }
+  }
+}

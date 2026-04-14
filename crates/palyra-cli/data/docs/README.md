@@ -21,6 +21,8 @@ source checkout and bundled into portable installs for offline lookup.
 - `docs/architecture/README.md`: architecture subsection index for the packaged docs bundle.
 - `docs/architecture/browser-service-v1.md`: browser service runtime contract, security posture,
   and operator surfaces.
+- `product/phase1/*.md`: phase 1 product guardrails, handoff, telemetry, and i18n shell
+  contracts that future roadmap work should reference instead of re-stating.
 
 ## CLI help snapshots
 

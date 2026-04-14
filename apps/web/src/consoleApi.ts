@@ -3750,6 +3750,18 @@ export class ConsoleApiClient {
     );
   }
 
+  async listSystemEvents(params?: URLSearchParams): Promise<{
+    hash_chain_enabled: boolean;
+    total_events: number;
+    returned_events: number;
+    events: JsonValue[];
+    page: JsonValue;
+  }> {
+    const path =
+      params === undefined ? "/console/v1/system/events" : buildPathWithQuery("/console/v1/system/events", params);
+    return this.request(path);
+  }
+
   async listChannels(): Promise<{ connectors: JsonValue[] }> {
     return listChannelsRequest(this.request.bind(this));
   }

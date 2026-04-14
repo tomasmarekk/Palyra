@@ -18,6 +18,15 @@ surface.
 - Run `pwsh -NoLogo -File scripts/test/run-deterministic-core.ps1`.
 - Run `bash scripts/check-high-risk-patterns.sh`.
 
+## Product guardrail review
+
+- Confirm Basic mode still surfaces approvals, access posture, and an explicit path back to the full operator surface.
+- Confirm new onboarding or quick-start affordances do not bypass auth, pairing, approval, or trust verification flows.
+- Confirm browser handoff and relay defaults still require the existing local mediation and pairing posture.
+- Confirm deterministic project context and learned memory remain separate in both UX copy and implementation.
+- Confirm UX telemetry stays content-free and records only bounded metadata.
+- Confirm cross-surface handoffs carry identifiers and intent only, with no secrets or prompt content.
+
 ## Artifact review
 
 - Confirm desktop archives exist for Windows, macOS, and Linux.
