@@ -1,12 +1,15 @@
-import { readFileSync } from "node:fs";
-
 import { describe, expect, it } from "vite-plus/test";
 
+import authScreenSource from "./components/layout/ConsoleAuthScreen.tsx?raw";
+import bootScreenSource from "./components/layout/ConsoleBootScreen.tsx?raw";
+import sidebarNavSource from "./components/layout/ConsoleSidebarNav.tsx?raw";
+import consoleShellSource from "./ConsoleShell.tsx?raw";
+
 const SENSITIVE_FILES = [
-  "./ConsoleShell.tsx",
-  "./components/layout/ConsoleBootScreen.tsx",
-  "./components/layout/ConsoleAuthScreen.tsx",
-  "./components/layout/ConsoleSidebarNav.tsx",
+  ["./ConsoleShell.tsx", consoleShellSource],
+  ["./components/layout/ConsoleBootScreen.tsx", bootScreenSource],
+  ["./components/layout/ConsoleAuthScreen.tsx", authScreenSource],
+  ["./components/layout/ConsoleSidebarNav.tsx", sidebarNavSource],
 ] as const;
 
 const BANNED_COPY = [
@@ -21,8 +24,7 @@ const BANNED_COPY = [
 
 describe("console i18n guardrails", () => {
   it("keeps sensitive shell copy behind translation keys", () => {
-    for (const file of SENSITIVE_FILES) {
-      const source = readFileSync(new URL(file, import.meta.url), "utf8");
+    for (const [file, source] of SENSITIVE_FILES) {
       for (const banned of BANNED_COPY) {
         const quoted = [`"${banned}"`, `'${banned}'`, `\`${banned}\``];
         expect(
