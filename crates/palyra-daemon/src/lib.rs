@@ -32,6 +32,7 @@ mod routines;
 mod sandbox_runner;
 mod self_healing;
 pub mod support;
+mod tool_posture;
 mod tool_protocol;
 pub mod transport;
 mod usage_governance;
@@ -463,6 +464,82 @@ struct ConsoleApprovalDecisionRequest {
     reason: Option<String>,
     decision_scope: Option<String>,
     decision_scope_ttl_ms: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleToolPermissionsQuery {
+    #[serde(default)]
+    scope_kind: Option<String>,
+    #[serde(default)]
+    scope_id: Option<String>,
+    #[serde(default)]
+    q: Option<String>,
+    #[serde(default)]
+    category: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    locked_only: Option<bool>,
+    #[serde(default)]
+    high_friction_only: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleToolPostureOverrideRequest {
+    scope_kind: String,
+    #[serde(default)]
+    scope_id: Option<String>,
+    state: String,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    expires_at_unix_ms: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleToolPostureResetRequest {
+    scope_kind: String,
+    #[serde(default)]
+    scope_id: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleToolPostureScopeResetRequest {
+    scope_kind: String,
+    #[serde(default)]
+    scope_id: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleToolPosturePresetPreviewRequest {
+    preset_id: String,
+    scope_kind: String,
+    #[serde(default)]
+    scope_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleToolPosturePresetApplyRequest {
+    preset_id: String,
+    scope_kind: String,
+    #[serde(default)]
+    scope_id: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleToolPostureRecommendationActionRequest {
+    recommendation_id: String,
+    tool_name: String,
+    scope_kind: String,
+    #[serde(default)]
+    scope_id: Option<String>,
+    action: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1860,6 +1937,9 @@ pub async fn run() -> Result<()> {
         access_control::AccessRegistry::open(runtime_state_root.as_path())
             .context("failed to initialize access registry state")?,
     ));
+    let tool_posture_registry =
+        tool_posture::ToolPostureRegistry::open(runtime_state_root.as_path())
+            .context("failed to initialize tool posture state")?;
     let auth_runtime = Arc::new(gateway::AuthRuntimeState::new(
         Arc::clone(&auth_registry),
         Arc::new(HttpOAuthRefreshAdapter::default()) as Arc<dyn OAuthRefreshAdapter>,
@@ -1993,6 +2073,7 @@ pub async fn run() -> Result<()> {
         model_provider,
         Arc::clone(&vault),
         agent_registry,
+        tool_posture_registry,
     )
     .context("failed to initialize gateway runtime state")?;
     runtime.configure_memory(MemoryRuntimeConfig {

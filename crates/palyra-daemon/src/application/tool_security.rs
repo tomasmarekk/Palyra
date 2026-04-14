@@ -10,13 +10,18 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::{
+    agents::AgentBindingQuery,
     application::approvals::{apply_tool_approval_outcome, build_tool_approval_subject_id},
     gateway::{
         current_unix_ms, GatewayRuntimeState, ToolApprovalOutcome, ToolSkillContext,
         SKILL_EXECUTION_DENY_REASON_PREFIX,
     },
     journal::{JournalAppendRequest, SkillExecutionStatus},
-    tool_protocol::{decide_tool_call, tool_requires_approval, ToolDecision, ToolRequestContext},
+    tool_posture::{
+        derive_scope_chain, evaluate_effective_tool_posture, ToolPostureScopeKind,
+        ToolPostureScopeRef, ToolPostureState,
+    },
+    tool_protocol::{decide_tool_call, ToolDecision, ToolRequestContext},
     transport::grpc::{auth::RequestContext, proto::palyra::common::v1 as common_v1},
 };
 
@@ -26,6 +31,7 @@ pub(crate) struct ToolProposalSecurityEvaluation {
     pub(crate) skill_gate_decision: Option<ToolDecision>,
     pub(crate) approval_subject_id: String,
     pub(crate) proposal_approval_required: bool,
+    pub(crate) effective_posture: crate::tool_posture::EffectiveToolPosture,
 }
 
 #[allow(clippy::result_large_err)]
@@ -156,6 +162,7 @@ async fn evaluate_skill_execution_gate(
 pub(crate) async fn evaluate_tool_proposal_security(
     runtime_state: &Arc<GatewayRuntimeState>,
     request_context: &RequestContext,
+    session_id: &str,
     run_id: &str,
     proposal_id: &str,
     tool_name: &str,
@@ -204,16 +211,71 @@ pub(crate) async fn evaluate_tool_proposal_security(
                 };
         }
     }
+    let overrides = runtime_state.list_tool_posture_overrides().unwrap_or_default();
+    let agent_scope = runtime_state
+        .list_agent_bindings(AgentBindingQuery {
+            agent_id: None,
+            principal: Some(request_context.principal.clone()),
+            channel: request_context.channel.clone(),
+            session_id: Some(session_id.to_owned()),
+            limit: Some(1),
+        })
+        .await
+        .ok()
+        .and_then(|bindings| bindings.into_iter().next())
+        .map(|binding| ToolPostureScopeRef {
+            kind: ToolPostureScopeKind::Agent,
+            scope_id: binding.agent_id,
+            label: "Agent default".to_owned(),
+        });
+    let workspace_scope =
+        request_context.principal.strip_prefix("workspace:").map(|workspace_id| {
+            ToolPostureScopeRef {
+                kind: ToolPostureScopeKind::Workspace,
+                scope_id: workspace_id.to_owned(),
+                label: format!("Workspace {workspace_id}"),
+            }
+        });
+    let effective_posture = evaluate_effective_tool_posture(
+        &runtime_state.config,
+        overrides.as_slice(),
+        &derive_scope_chain(
+            ToolPostureScopeRef {
+                kind: ToolPostureScopeKind::Session,
+                scope_id: session_id.to_owned(),
+                label: "Current session".to_owned(),
+            },
+            workspace_scope,
+            agent_scope,
+        ),
+        tool_name,
+    );
+    if skill_gate_decision.is_none()
+        && effective_posture.effective_state == ToolPostureState::Disabled
+    {
+        let posture_reason = effective_posture.lock_reason.clone().unwrap_or_else(|| {
+            format!("tool posture disabled in {}", effective_posture.source_scope_label)
+        });
+        skill_gate_decision = Some(ToolDecision {
+            allowed: false,
+            reason: posture_reason,
+            approval_required: false,
+            policy_enforced: true,
+        });
+    }
     let proposal_approval_required = skill_gate_decision
         .as_ref()
-        .map(|decision| decision.allowed && tool_requires_approval(tool_name))
-        .unwrap_or_else(|| tool_requires_approval(tool_name));
+        .map(|decision| {
+            decision.allowed && effective_posture.effective_state == ToolPostureState::AskEachTime
+        })
+        .unwrap_or(effective_posture.effective_state == ToolPostureState::AskEachTime);
     let approval_subject_id = build_tool_approval_subject_id(tool_name, skill_context.as_ref());
     ToolProposalSecurityEvaluation {
         skill_context,
         skill_gate_decision,
         approval_subject_id,
         proposal_approval_required,
+        effective_posture,
     }
 }
 
@@ -222,19 +284,30 @@ fn resolve_tool_proposal_decision(
     policy_request_context: &ToolRequestContext,
     tool_name: &str,
     skill_gate_decision: Option<ToolDecision>,
+    effective_posture: &crate::tool_posture::EffectiveToolPosture,
     approval_outcome: Option<&ToolApprovalOutcome>,
     runtime_state: &Arc<GatewayRuntimeState>,
 ) -> ToolDecision {
     if let Some(skill_gate_decision) = skill_gate_decision {
         return skill_gate_decision;
     }
-    let decision = decide_tool_call(
+    let mut decision = decide_tool_call(
         &runtime_state.config.tool_call,
         remaining_tool_budget,
         policy_request_context,
         tool_name,
-        approval_outcome.map(|response| response.approved).unwrap_or(false),
+        approval_outcome.map(|response| response.approved).unwrap_or(false)
+            || effective_posture.effective_state == ToolPostureState::AlwaysAllow,
     );
+    if decision.allowed && effective_posture.effective_state == ToolPostureState::AlwaysAllow {
+        decision.approval_required = false;
+        decision.reason = format!(
+            "{}; posture={} ({})",
+            decision.reason,
+            effective_posture.effective_state.as_str(),
+            effective_posture.source_scope_label
+        );
+    }
     apply_tool_approval_outcome(decision, tool_name, approval_outcome)
 }
 
@@ -249,6 +322,7 @@ pub(crate) fn resolve_tool_proposal_decision_for_context(
     skill_context: Option<&ToolSkillContext>,
     remaining_tool_budget: &mut u32,
     skill_gate_decision: Option<ToolDecision>,
+    effective_posture: &crate::tool_posture::EffectiveToolPosture,
     approval_outcome: Option<&ToolApprovalOutcome>,
 ) -> ToolDecision {
     let policy_request_context = build_tool_policy_request_context(
@@ -263,6 +337,7 @@ pub(crate) fn resolve_tool_proposal_decision_for_context(
         &policy_request_context,
         tool_name,
         skill_gate_decision,
+        effective_posture,
         approval_outcome,
         runtime_state,
     );

@@ -31,6 +31,12 @@ use crate::self_healing::{
     RuntimeRemediationAttemptRecord, SelfHealingFeature, SelfHealingSettingsSnapshot,
     SelfHealingState, WorkHeartbeatKind, WorkHeartbeatRecord, WorkHeartbeatUpdate,
 };
+use crate::tool_posture::{
+    ToolPostureAuditEventRecord, ToolPostureOverrideClearRequest, ToolPostureOverrideRecord,
+    ToolPostureOverrideUpsertRequest, ToolPostureRecommendationActionRecord,
+    ToolPostureRecommendationActionRequest, ToolPostureRegistry, ToolPostureScopeKind,
+    ToolPostureScopeResetRequest, ToolPostureState,
+};
 use crate::usage_governance::SmartRoutingRuntimeConfig;
 use palyra_auth::AuthHealthReport;
 use std::path::PathBuf;
@@ -329,6 +335,7 @@ pub struct GatewayRuntimeState {
     pub(crate) memory_search_cache: Mutex<HashMap<String, CachedMemorySearchEntry>>,
     pub(crate) http_fetch_cache: Mutex<HashMap<String, CachedHttpFetchEntry>>,
     tool_approval_cache: Mutex<HashMap<String, CachedToolApprovalDecision>>,
+    pub(crate) tool_posture_registry: ToolPostureRegistry,
     pub(crate) vault_rate_limit: Mutex<HashMap<String, VaultRateLimitEntry>>,
     canvas_records: Mutex<HashMap<String, CanvasRecord>>,
     canvas_signing_secret: [u8; 32],
@@ -935,6 +942,10 @@ impl GatewayRuntimeState {
         )
         .expect("default deterministic model provider should initialize");
         let default_vault = build_test_vault();
+        let tool_posture_root =
+            std::env::temp_dir().join(format!("palyra-tool-posture-{}", Ulid::new()));
+        let tool_posture_registry = ToolPostureRegistry::open(tool_posture_root.as_path())
+            .expect("test tool posture registry should initialize");
         Self::new_with_provider(
             config,
             journal_config,
@@ -943,6 +954,7 @@ impl GatewayRuntimeState {
             default_provider,
             default_vault,
             agent_registry,
+            tool_posture_registry,
         )
     }
 
@@ -954,6 +966,7 @@ impl GatewayRuntimeState {
         model_provider: Arc<dyn ModelProvider>,
         vault: Arc<Vault>,
         agent_registry: AgentRegistry,
+        tool_posture_registry: ToolPostureRegistry,
     ) -> Result<Arc<Self>, JournalError> {
         let build = build_metadata();
         let existing_events = journal_store.total_events()? as u64;
@@ -1093,6 +1106,7 @@ impl GatewayRuntimeState {
             memory_search_cache: Mutex::new(HashMap::new()),
             http_fetch_cache: Mutex::new(HashMap::new()),
             tool_approval_cache: Mutex::new(HashMap::new()),
+            tool_posture_registry,
             vault_rate_limit: Mutex::new(HashMap::new()),
             canvas_records: Mutex::new(recovered_canvas_records),
             canvas_signing_secret: generate_canvas_signing_secret(),
@@ -4358,6 +4372,39 @@ impl GatewayRuntimeState {
                 result.subject_id.as_str(),
                 &cached_outcome,
             );
+            if matches!(
+                result.decision_scope,
+                Some(ApprovalDecisionScope::Session | ApprovalDecisionScope::Timeboxed)
+            ) {
+                let tool_name = result
+                    .subject_id
+                    .strip_prefix("tool:")
+                    .and_then(|value| value.split('|').next())
+                    .unwrap_or_default();
+                if !tool_name.is_empty() {
+                    let expires_at_unix_ms = result.decision_scope.and_then(|scope| match scope {
+                        ApprovalDecisionScope::Session | ApprovalDecisionScope::Timeboxed => result
+                            .decision_scope_ttl_ms
+                            .filter(|ttl_ms| *ttl_ms > 0)
+                            .map(|ttl_ms| current_unix_ms().saturating_add(ttl_ms)),
+                        ApprovalDecisionScope::Once => None,
+                    });
+                    let _ = self.upsert_tool_posture_override(ToolPostureOverrideUpsertRequest {
+                        tool_name: tool_name.to_owned(),
+                        scope_kind: ToolPostureScopeKind::Session,
+                        scope_id: result.session_id.clone(),
+                        state: ToolPostureState::from_approval_decision(matches!(
+                            decision,
+                            ApprovalDecision::Allow
+                        )),
+                        reason: result.decision_reason.clone(),
+                        actor_principal: result.principal.clone(),
+                        source: "approval_memory".to_owned(),
+                        expires_at_unix_ms,
+                        now_unix_ms: current_unix_ms(),
+                    });
+                }
+            }
         }
         Ok(result)
     }
@@ -4424,6 +4471,66 @@ impl GatewayRuntimeState {
                 None
             };
             (approvals, next_after)
+        })
+    }
+
+    pub fn list_tool_posture_overrides(&self) -> Result<Vec<ToolPostureOverrideRecord>, Status> {
+        self.tool_posture_registry.list_overrides().map_err(|error| {
+            Status::internal(format!("failed to list tool posture overrides: {error}"))
+        })
+    }
+
+    pub fn list_tool_posture_recommendation_actions(
+        &self,
+    ) -> Result<Vec<ToolPostureRecommendationActionRecord>, Status> {
+        self.tool_posture_registry.list_recommendation_actions().map_err(|error| {
+            Status::internal(format!("failed to list tool posture recommendation actions: {error}"))
+        })
+    }
+
+    pub fn list_tool_posture_audit_events(
+        &self,
+    ) -> Result<Vec<ToolPostureAuditEventRecord>, Status> {
+        self.tool_posture_registry.list_audit_events().map_err(|error| {
+            Status::internal(format!("failed to list tool posture audit events: {error}"))
+        })
+    }
+
+    pub fn upsert_tool_posture_override(
+        &self,
+        request: ToolPostureOverrideUpsertRequest,
+    ) -> Result<ToolPostureOverrideRecord, Status> {
+        self.tool_posture_registry.upsert_override(request).map_err(|error| {
+            Status::internal(format!("failed to persist tool posture override: {error}"))
+        })
+    }
+
+    pub fn clear_tool_posture_override(
+        &self,
+        request: ToolPostureOverrideClearRequest,
+    ) -> Result<bool, Status> {
+        self.tool_posture_registry.clear_override(request).map_err(|error| {
+            Status::internal(format!("failed to clear tool posture override: {error}"))
+        })
+    }
+
+    pub fn reset_tool_posture_scope(
+        &self,
+        request: ToolPostureScopeResetRequest,
+    ) -> Result<Vec<ToolPostureOverrideRecord>, Status> {
+        self.tool_posture_registry.reset_scope(request).map_err(|error| {
+            Status::internal(format!("failed to reset tool posture scope: {error}"))
+        })
+    }
+
+    pub fn record_tool_posture_recommendation_action(
+        &self,
+        request: ToolPostureRecommendationActionRequest,
+    ) -> Result<ToolPostureRecommendationActionRecord, Status> {
+        self.tool_posture_registry.record_recommendation_action(request).map_err(|error| {
+            Status::internal(format!(
+                "failed to persist tool posture recommendation action: {error}"
+            ))
         })
     }
 
@@ -4596,6 +4703,11 @@ impl GatewayRuntimeState {
     #[must_use]
     pub fn channel_router_config_hash(&self) -> String {
         self.channel_router.config_hash()
+    }
+
+    #[must_use]
+    pub fn runtime_config_snapshot(&self) -> GatewayRuntimeConfigSnapshot {
+        self.config.clone()
     }
 
     #[must_use]

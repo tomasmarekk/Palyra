@@ -985,6 +985,160 @@ export interface ContractDescriptor {
   contract_version: string;
 }
 
+export type ToolPostureScopeKind = "global" | "workspace" | "agent" | "session";
+export type ToolPostureState = "always_allow" | "ask_each_time" | "disabled";
+export type ToolPostureRecommendationAction = "accepted" | "dismissed" | "deferred";
+
+export interface ToolPostureScopeRef {
+  kind: ToolPostureScopeKind;
+  scope_id: string;
+  label: string;
+}
+
+export interface ToolPostureChainEntry extends ToolPostureScopeRef {
+  state?: ToolPostureState;
+  source?: string;
+}
+
+export interface EffectiveToolPosture {
+  effective_state: ToolPostureState;
+  default_state: ToolPostureState;
+  approval_mode: string;
+  source_scope_kind: ToolPostureScopeKind;
+  source_scope_id: string;
+  source_scope_label: string;
+  chain: ToolPostureChainEntry[];
+  lock_reason?: string;
+  editable: boolean;
+}
+
+export interface ToolFrictionMetrics {
+  requested_14d: number;
+  approved_14d: number;
+  denied_14d: number;
+  pending_14d: number;
+  unique_sessions_14d: number;
+}
+
+export interface ToolPosturePresetAssignment {
+  tool_name: string;
+  state: ToolPostureState;
+}
+
+export interface ToolPosturePresetDefinition {
+  preset_id: string;
+  label: string;
+  description: string;
+  assignments: ToolPosturePresetAssignment[];
+}
+
+export interface ToolPostureAuditEventRecord {
+  audit_id: string;
+  scope_kind: ToolPostureScopeKind;
+  scope_id: string;
+  tool_name?: string;
+  actor_principal: string;
+  action: string;
+  previous_state?: ToolPostureState;
+  new_state?: ToolPostureState;
+  source: string;
+  reason?: string;
+  recommendation_id?: string;
+  preset_id?: string;
+  created_at_unix_ms: number;
+}
+
+export interface ToolPostureRecommendation {
+  recommendation_id: string;
+  tool_name: string;
+  scope_kind: ToolPostureScopeKind;
+  scope_id: string;
+  current_state: ToolPostureState;
+  recommended_state: ToolPostureState;
+  reason: string;
+  approvals_14d: number;
+  action?: ToolPostureRecommendationAction;
+}
+
+export interface ToolPermissionRecord {
+  tool_name: string;
+  title: string;
+  description: string;
+  category: string;
+  risk_level: string;
+  effective_posture: EffectiveToolPosture;
+  friction: ToolFrictionMetrics;
+  recent_approvals: JsonValue[];
+  last_change?: ToolPostureAuditEventRecord;
+  recommendation?: ToolPostureRecommendation;
+}
+
+export interface ToolPermissionsScopeEnvelope {
+  active: ToolPostureScopeRef;
+  workspace?: ToolPostureScopeRef;
+  agent?: ToolPostureScopeRef;
+  chain: ToolPostureScopeRef[];
+}
+
+export interface ToolPermissionsSummary {
+  total_tools: number;
+  locked_tools: number;
+  high_friction_tools: number;
+  approval_requests_14d: number;
+  pending_approvals_14d: number;
+}
+
+export interface ToolPermissionsEnvelope {
+  contract: ContractDescriptor;
+  generated_at_unix_ms: number;
+  scope: ToolPermissionsScopeEnvelope;
+  summary: ToolPermissionsSummary;
+  categories: string[];
+  presets: ToolPosturePresetDefinition[];
+  tools: ToolPermissionRecord[];
+}
+
+export interface ToolPermissionDetailEnvelope {
+  contract: ContractDescriptor;
+  generated_at_unix_ms: number;
+  scope: ToolPermissionsScopeEnvelope;
+  tool: ToolPermissionRecord;
+  change_history: ToolPostureAuditEventRecord[];
+}
+
+export interface ToolPermissionPresetDiffEntry {
+  tool_name: string;
+  title: string;
+  current_state: ToolPostureState;
+  proposed_state: ToolPostureState;
+  changed: boolean;
+  locked: boolean;
+  lock_reason?: string;
+}
+
+export interface ToolPermissionPresetPreviewEnvelope {
+  contract: ContractDescriptor;
+  generated_at_unix_ms: number;
+  scope: ToolPermissionsScopeEnvelope;
+  preset: ToolPosturePresetDefinition;
+  preview: ToolPermissionPresetDiffEntry[];
+}
+
+export interface ToolPermissionMutationEnvelope {
+  contract: ContractDescriptor;
+  generated_at_unix_ms: number;
+  override_record?: JsonValue;
+  recommendation_action?: JsonValue;
+  detail: ToolPermissionDetailEnvelope;
+}
+
+export interface ToolPermissionScopeResetEnvelope {
+  contract: ContractDescriptor;
+  generated_at_unix_ms: number;
+  scope: ToolPermissionsScopeEnvelope;
+  removed: JsonValue[];
+}
+
 export interface AccessFeatureFlagRecord {
   key: string;
   label: string;
@@ -3520,6 +3674,120 @@ export class ConsoleApiClient {
 
   async getApproval(approvalId: string): Promise<{ approval: JsonValue }> {
     return this.request(`/console/v1/approvals/${encodeURIComponent(approvalId)}`);
+  }
+
+  async getToolPermissions(params?: URLSearchParams): Promise<ToolPermissionsEnvelope> {
+    return this.request(buildPathWithQuery("/console/v1/tool-permissions", params));
+  }
+
+  async getToolPermission(
+    toolName: string,
+    params?: URLSearchParams,
+  ): Promise<ToolPermissionDetailEnvelope> {
+    return this.request(
+      buildPathWithQuery(`/console/v1/tool-permissions/${encodeURIComponent(toolName)}`, params),
+    );
+  }
+
+  async setToolPermissionOverride(
+    toolName: string,
+    payload: {
+      scope_kind: ToolPostureScopeKind;
+      scope_id?: string;
+      state: ToolPostureState;
+      reason?: string;
+      expires_at_unix_ms?: number;
+    },
+  ): Promise<ToolPermissionMutationEnvelope> {
+    return this.request(
+      `/console/v1/tool-permissions/${encodeURIComponent(toolName)}/override`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      { csrf: true },
+    );
+  }
+
+  async resetToolPermission(
+    toolName: string,
+    payload: {
+      scope_kind: ToolPostureScopeKind;
+      scope_id?: string;
+      reason?: string;
+    },
+  ): Promise<ToolPermissionMutationEnvelope> {
+    return this.request(
+      `/console/v1/tool-permissions/${encodeURIComponent(toolName)}/reset`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      { csrf: true },
+    );
+  }
+
+  async resetToolPermissionScope(payload: {
+    scope_kind: ToolPostureScopeKind;
+    scope_id?: string;
+    reason?: string;
+  }): Promise<ToolPermissionScopeResetEnvelope> {
+    return this.request(
+      "/console/v1/tool-permissions/scopes/reset",
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      { csrf: true },
+    );
+  }
+
+  async previewToolPermissionPreset(payload: {
+    preset_id: string;
+    scope_kind: ToolPostureScopeKind;
+    scope_id?: string;
+  }): Promise<ToolPermissionPresetPreviewEnvelope> {
+    return this.request(
+      "/console/v1/tool-permissions/presets/preview",
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      { csrf: true },
+    );
+  }
+
+  async applyToolPermissionPreset(payload: {
+    preset_id: string;
+    scope_kind: ToolPostureScopeKind;
+    scope_id?: string;
+    reason?: string;
+  }): Promise<ToolPermissionPresetPreviewEnvelope> {
+    return this.request(
+      "/console/v1/tool-permissions/presets/apply",
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      { csrf: true },
+    );
+  }
+
+  async actOnToolPermissionRecommendation(payload: {
+    recommendation_id: string;
+    tool_name: string;
+    scope_kind: ToolPostureScopeKind;
+    scope_id?: string;
+    action: ToolPostureRecommendationAction;
+  }): Promise<ToolPermissionMutationEnvelope> {
+    return this.request(
+      "/console/v1/tool-permissions/recommendations/action",
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      { csrf: true },
+    );
   }
 
   async decideApproval(

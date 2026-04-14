@@ -39,9 +39,11 @@ pub(crate) async fn process_route_tool_proposal_event(
         skill_gate_decision,
         approval_subject_id: _,
         proposal_approval_required,
+        effective_posture,
     } = evaluate_tool_proposal_security(
         runtime_state,
         route_request_context,
+        session_id,
         run_id,
         proposal_id,
         tool_name,
@@ -83,6 +85,7 @@ pub(crate) async fn process_route_tool_proposal_event(
         skill_context.as_ref(),
         remaining_tool_budget,
         skill_gate_decision,
+        &effective_posture,
         None,
     );
     if let Some(approval_id) = pending_approval_id {

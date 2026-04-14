@@ -621,6 +621,38 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/console/v1/approvals/{approval_id}/decision",
             post(console::approvals::console_approval_decision_handler),
         )
+        .route(
+            "/console/v1/tool-permissions",
+            get(console::tool_permissions::console_tool_permissions_list_handler),
+        )
+        .route(
+            "/console/v1/tool-permissions/{tool_name}",
+            get(console::tool_permissions::console_tool_permission_get_handler),
+        )
+        .route(
+            "/console/v1/tool-permissions/{tool_name}/override",
+            post(console::tool_permissions::console_tool_permission_override_handler),
+        )
+        .route(
+            "/console/v1/tool-permissions/{tool_name}/reset",
+            post(console::tool_permissions::console_tool_permission_reset_handler),
+        )
+        .route(
+            "/console/v1/tool-permissions/scopes/reset",
+            post(console::tool_permissions::console_tool_permission_scope_reset_handler),
+        )
+        .route(
+            "/console/v1/tool-permissions/presets/preview",
+            post(console::tool_permissions::console_tool_permissions_preset_preview_handler),
+        )
+        .route(
+            "/console/v1/tool-permissions/presets/apply",
+            post(console::tool_permissions::console_tool_permissions_preset_apply_handler),
+        )
+        .route(
+            "/console/v1/tool-permissions/recommendations/action",
+            post(console::tool_permissions::console_tool_permissions_recommendation_action_handler),
+        )
         .route("/console/v1/cron/jobs", get(console::cron::console_cron_list_handler))
         .route("/console/v1/cron/jobs", post(console::cron::console_cron_create_handler))
         .route(

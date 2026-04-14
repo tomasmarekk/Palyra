@@ -118,14 +118,21 @@ async fn prepare_run_stream_tool_proposal_execution(
     remaining_tool_budget: &mut u32,
     tape_seq: &mut i64,
 ) -> Result<RunStreamToolProposalPreparation, Status> {
+    let resolved_session_id = active_session_id.ok_or_else(|| {
+        Status::internal(
+            "run stream internal invariant violated: missing session_id while preparing tool proposal",
+        )
+    })?;
     let ToolProposalSecurityEvaluation {
         skill_context,
         skill_gate_decision,
         approval_subject_id,
         proposal_approval_required,
+        effective_posture,
     } = evaluate_tool_proposal_security(
         runtime_state,
         request_context,
+        resolved_session_id,
         run_id,
         proposal_id,
         tool_name,
@@ -170,6 +177,7 @@ async fn prepare_run_stream_tool_proposal_execution(
         skill_context.as_ref(),
         remaining_tool_budget,
         skill_gate_decision,
+        &effective_posture,
         approval_outcome.as_ref(),
     );
     send_tool_decision_with_tape(
@@ -185,11 +193,6 @@ async fn prepare_run_stream_tool_proposal_execution(
         decision.policy_enforced,
     )
     .await?;
-    let resolved_session_id = active_session_id.ok_or_else(|| {
-        Status::internal(
-            "run stream internal invariant violated: missing session_id while recording policy decision",
-        )
-    })?;
     record_tool_proposal_decision_audit_trail(
         runtime_state,
         request_context,
