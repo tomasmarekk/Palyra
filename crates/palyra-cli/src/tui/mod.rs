@@ -18,8 +18,11 @@ use ratatui::{
     Frame, Terminal,
 };
 
+mod handoff;
 mod slash_palette;
+mod text;
 
+use handoff::{build_console_handoff_path, TuiCrossSurfaceHandoff};
 use slash_palette::{
     build_tui_slash_palette, checkpoint_has_tag, preview_for_selection, read_json_bool,
     read_json_i64, read_json_string, read_json_tags, select_undo_checkpoint,
@@ -28,6 +31,7 @@ use slash_palette::{
     TuiSlashObjectiveRecord, TuiSlashPaletteState, TuiSlashSessionRecord, TuiUxMetricKey,
     TuiUxMetrics,
 };
+use text::{resolve_tui_locale, TuiLocale};
 
 use crate::{
     client::operator::{ManagedRunStream, OperatorRuntime},
@@ -145,6 +149,7 @@ struct App {
     include_archived_sessions: bool,
     last_run_id: Option<String>,
     selected_objective_id: Option<String>,
+    locale: TuiLocale,
     ux_metrics: TuiUxMetrics,
     scroll_offset: u16,
     status_line: String,
@@ -223,6 +228,7 @@ impl App {
         let session = response
             .session
             .context("ResolveSession returned empty session payload for tui bootstrap")?;
+        let locale = resolve_tui_locale();
         let mut app = Self {
             runtime,
             session,
@@ -249,9 +255,10 @@ impl App {
             include_archived_sessions: options.include_archived_sessions,
             last_run_id: None,
             selected_objective_id: None,
+            locale,
             ux_metrics: TuiUxMetrics::default(),
             scroll_offset: 0,
-            status_line: "Connected".to_owned(),
+            status_line: text::connected(locale),
             settings_selected: 0,
         };
         app.refresh_agent_identity(None, false).await?;
@@ -259,17 +266,22 @@ impl App {
             Ok(models) => app.models = Some(models),
             Err(error) => {
                 app.status_line = sanitize_terminal_text(
-                    format!("Connected; model catalog unavailable: {error}").as_str(),
+                    text::connected_model_catalog_unavailable(
+                        app.locale,
+                        error.to_string().as_str(),
+                    )
+                    .as_str(),
                 )
             }
         }
         if let Err(error) = app.refresh_slash_entity_catalogs().await {
             app.status_line = sanitize_terminal_text(
-                format!("Connected; slash catalogs unavailable: {error}").as_str(),
+                text::connected_slash_catalog_unavailable(app.locale, error.to_string().as_str())
+                    .as_str(),
             );
         }
         app.sync_slash_palette();
-        app.push_entry(EntryKind::System, "Session", "Connected.");
+        app.push_entry(EntryKind::System, "Session", text::connected_entry(app.locale));
         Ok(app)
     }
 
@@ -289,7 +301,7 @@ impl App {
                 Ok(Ok(Some(event))) => self.handle_stream_event(event)?,
                 Ok(Ok(None)) => {
                     self.active_stream = None;
-                    self.status_line = "Run completed".to_owned();
+                    self.status_line = text::run_completed(self.locale);
                     if let Some(redirect) = self.pending_redirect_prompt.take() {
                         self.push_entry(
                             EntryKind::System,
@@ -300,7 +312,7 @@ impl App {
                                 shorten_id(redirect.interrupted_run_id.as_str())
                             ),
                         );
-                        self.status_line = "Starting redirected prompt".to_owned();
+                        self.status_line = text::starting_redirected_prompt(self.locale);
                         self.start_prompt_run(
                             redirect.prompt,
                             Some("interrupt_redirect".to_owned()),
@@ -332,7 +344,7 @@ impl App {
             Some(common_v1::run_stream_event::Body::ModelToken(token)) => {
                 self.append_assistant_token(run_id.as_str(), token.token.as_str());
                 if token.is_final {
-                    self.status_line = "Assistant response completed".to_owned();
+                    self.status_line = text::assistant_response_completed(self.locale);
                 }
             }
             Some(common_v1::run_stream_event::Body::Status(status)) => {
@@ -376,13 +388,13 @@ impl App {
                 approval.request_summary =
                     sanitize_terminal_text(approval.request_summary.as_str());
                 self.status_line = sanitize_terminal_text(
-                    format!(
-                        "Approval required for {}",
+                    text::approval_required(
+                        self.locale,
                         if approval.tool_name.trim().is_empty() {
                             "tool"
                         } else {
                             approval.tool_name.as_str()
-                        }
+                        },
                     )
                     .as_str(),
                 );
@@ -536,7 +548,7 @@ impl App {
             return self.handle_slash_command(command).await;
         }
         if self.active_stream.is_some() {
-            self.status_line = "A run is already in progress".to_owned();
+            self.status_line = text::run_already_in_progress(self.locale);
             return Ok(());
         }
         if let Some(shell_command) = value.strip_prefix('!') {
@@ -544,25 +556,35 @@ impl App {
         }
         self.create_undo_checkpoint("send").await?;
         self.push_entry(EntryKind::User, "You", value.clone());
-        self.status_line = "Running prompt".to_owned();
+        self.status_line = text::running_prompt(self.locale);
+        self.emit_ux_event(
+            "ux.chat.prompt_submitted",
+            Some("TUI submitted a chat prompt".to_owned()),
+            serde_json::json!({
+                "section": "chat",
+                "sessionId": self.active_session_id().ok(),
+                "objectiveId": self.selected_objective_id.clone(),
+            }),
+        )
+        .await;
         self.start_prompt_run(value, None, None, None).await
     }
 
     async fn handle_shell_request(&mut self, command: String) -> Result<()> {
         if command.is_empty() {
-            self.status_line = "Shell command is empty".to_owned();
+            self.status_line = text::shell_command_empty(self.locale);
             return Ok(());
         }
         if strict_profile_blocks_local_shell() {
             self.pending_shell_command = None;
             self.mode = Mode::Chat;
-            self.status_line = "Local shell is blocked by strict profile posture".to_owned();
+            self.status_line = text::local_shell_blocked(self.locale);
             return Ok(());
         }
         if !self.local_shell_enabled {
             self.pending_shell_command = Some(command);
             self.mode = Mode::ShellConfirm;
-            self.status_line = "Local shell requires explicit opt-in".to_owned();
+            self.status_line = text::local_shell_requires_opt_in(self.locale);
             return Ok(());
         }
         let result = run_local_shell(command.clone()).await?;
@@ -571,10 +593,7 @@ impl App {
             format!("Shell: {}", command),
             format_shell_result(&result),
         );
-        self.status_line = format!(
-            "Shell finished with {}",
-            result.exit_code.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_owned())
-        );
+        self.status_line = text::shell_finished(self.locale, result.exit_code);
         Ok(())
     }
 
@@ -600,7 +619,7 @@ impl App {
             "help" => self.mode = Mode::Help,
             "status" => {
                 self.push_entry(EntryKind::System, "Status", self.status_summary());
-                self.status_line = "Status refreshed".to_owned();
+                self.status_line = text::status_refreshed(self.locale);
             }
             "new" => {
                 let label = normalize_optional_text(parts.collect::<Vec<_>>().join(" "));
@@ -698,7 +717,7 @@ impl App {
                         self.ux_metrics.errors,
                     ),
                 );
-                self.status_line = "Usage summary refreshed".to_owned();
+                self.status_line = text::usage_summary_refreshed(self.locale);
             }
             "compact" => {
                 let arguments = parts.map(ToOwned::to_owned).collect::<Vec<_>>();
@@ -732,13 +751,13 @@ impl App {
                 if enabled && !self.local_shell_enabled {
                     self.mode = Mode::ShellConfirm;
                     self.pending_shell_command = None;
-                    self.status_line = "Confirm local shell opt-in".to_owned();
+                    self.status_line = text::confirm_local_shell_opt_in(self.locale);
                 } else {
                     self.local_shell_enabled = enabled;
                     self.status_line = if enabled {
-                        "Local shell enabled".to_owned()
+                        text::local_shell_enabled(self.locale)
                     } else {
-                        "Local shell disabled".to_owned()
+                        text::local_shell_disabled(self.locale)
                     };
                 }
             }
@@ -809,7 +828,16 @@ impl App {
         self.refresh_agent_identity(None, false).await?;
         self.refresh_slash_entity_catalogs().await?;
         self.sync_slash_palette();
-        self.status_line = "Session switched".to_owned();
+        self.status_line = text::session_switched(self.locale);
+        self.emit_ux_event(
+            "ux.session.resumed",
+            Some("TUI resumed an existing session".to_owned()),
+            serde_json::json!({
+                "section": "chat",
+                "sessionId": self.active_session_id().ok(),
+            }),
+        )
+        .await;
         self.mode = Mode::Chat;
         Ok(())
     }
@@ -838,7 +866,7 @@ impl App {
         self.refresh_agent_identity(None, false).await?;
         self.refresh_slash_entity_catalogs().await?;
         self.sync_slash_palette();
-        self.status_line = "Session reset".to_owned();
+        self.status_line = text::session_reset(self.locale);
         Ok(())
     }
 
@@ -1174,6 +1202,29 @@ impl App {
             channel: Some(self.runtime.connection().channel.clone()),
         })
         .await
+    }
+
+    async fn emit_ux_event(&self, name: &str, summary: Option<String>, details: Value) {
+        let Ok(context) = self.connect_admin_console().await else {
+            return;
+        };
+        let mut details = match details {
+            Value::Object(map) => map,
+            _ => serde_json::Map::new(),
+        };
+        details.insert("surface".to_owned(), Value::String("tui".to_owned()));
+        details.insert("locale".to_owned(), Value::String(self.locale.as_str().to_owned()));
+        let _ = context
+            .client
+            .post_json_value(
+                "console/v1/system/events/emit",
+                &serde_json::json!({
+                    "name": name,
+                    "summary": summary,
+                    "details": Value::Object(details),
+                }),
+            )
+            .await;
     }
 
     fn active_session_id(&self) -> Result<String> {
@@ -2488,10 +2539,18 @@ impl App {
     }
 
     fn status_summary(&self) -> String {
+        let handoff = build_console_handoff_path(&TuiCrossSurfaceHandoff {
+            section: "chat".to_owned(),
+            session_id: self.active_session_id().ok(),
+            run_id: self.last_run_id.clone(),
+            objective_id: self.selected_objective_id.clone(),
+            source: Some("tui".to_owned()),
+            ..TuiCrossSurfaceHandoff::default()
+        });
         let profile =
             app::current_root_context().and_then(|context| context.active_profile_context());
         format!(
-            "profile={} env={} risk={} strict={} session={} branch={} agent={} source={} model={} tools={} thinking={} shell={} active_run={}",
+            "profile={} env={} risk={} strict={} session={} branch={} agent={} source={} model={} tools={} thinking={} shell={} active_run={} handoff={}",
             profile.as_ref().map(|value| value.label.as_str()).unwrap_or("none"),
             profile.as_ref().map(|value| value.environment.as_str()).unwrap_or("none"),
             profile.as_ref().map(|value| value.risk_level.as_str()).unwrap_or("none"),
@@ -2518,7 +2577,8 @@ impl App {
                 .as_ref()
                 .map(|stream| stream.run_id())
                 .or(self.last_run_id.as_deref())
-                .unwrap_or("none")
+                .unwrap_or("none"),
+            handoff
         )
     }
 }
@@ -2532,7 +2592,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => app.mode = Mode::Chat,
             _ => {}
         },
-        Mode::Approval => handle_approval_key(app, key)?,
+        Mode::Approval => handle_approval_key(app, key).await?,
         Mode::ShellConfirm => handle_shell_confirm_key(app, key).await?,
         Mode::Settings => handle_settings_key(app, key),
         Mode::Picker(_) => handle_picker_key(app, key).await?,
@@ -2618,7 +2678,7 @@ async fn handle_chat_key(app: &mut App, key: KeyEvent) -> Result<()> {
     Ok(())
 }
 
-fn handle_approval_key(app: &mut App, key: KeyEvent) -> Result<()> {
+async fn handle_approval_key(app: &mut App, key: KeyEvent) -> Result<()> {
     let Some(approval) = app.pending_approval.clone() else {
         app.mode = Mode::Chat;
         return Ok(());
@@ -2641,7 +2701,18 @@ fn handle_approval_key(app: &mut App, key: KeyEvent) -> Result<()> {
             );
             app.pending_approval = None;
             app.mode = Mode::Chat;
-            app.status_line = "Approval granted once".to_owned();
+            app.status_line = text::approval_granted_once(app.locale);
+            app.emit_ux_event(
+                "ux.approval.resolved",
+                Some("TUI approved a pending action".to_owned()),
+                serde_json::json!({
+                    "section": "approvals",
+                    "outcome": "approved",
+                    "toolName": approval.tool_name.clone(),
+                    "runId": app.last_run_id.clone(),
+                }),
+            )
+            .await;
         }
         KeyCode::Char('n') | KeyCode::Esc => {
             if let Some(stream) = app.active_stream.as_ref() {
@@ -2660,7 +2731,18 @@ fn handle_approval_key(app: &mut App, key: KeyEvent) -> Result<()> {
             );
             app.pending_approval = None;
             app.mode = Mode::Chat;
-            app.status_line = "Approval denied".to_owned();
+            app.status_line = text::approval_denied(app.locale);
+            app.emit_ux_event(
+                "ux.approval.resolved",
+                Some("TUI denied a pending action".to_owned()),
+                serde_json::json!({
+                    "section": "approvals",
+                    "outcome": "denied",
+                    "toolName": approval.tool_name.clone(),
+                    "runId": app.last_run_id.clone(),
+                }),
+            )
+            .await;
         }
         _ => {}
     }
@@ -2673,13 +2755,12 @@ async fn handle_shell_confirm_key(app: &mut App, key: KeyEvent) -> Result<()> {
             if strict_profile_blocks_local_shell() {
                 app.pending_shell_command = None;
                 app.mode = Mode::Chat;
-                app.status_line =
-                    "Local shell remains disabled because the active profile is strict".to_owned();
+                app.status_line = text::local_shell_blocked(app.locale);
                 return Ok(());
             }
             app.local_shell_enabled = true;
             app.mode = Mode::Chat;
-            app.status_line = "Local shell enabled for this TUI session".to_owned();
+            app.status_line = text::local_shell_enabled_for_session(app.locale);
             if let Some(command) = app.pending_shell_command.take() {
                 app.handle_shell_request(command).await?;
             }
@@ -2687,7 +2768,7 @@ async fn handle_shell_confirm_key(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Char('n') | KeyCode::Esc => {
             app.pending_shell_command = None;
             app.mode = Mode::Chat;
-            app.status_line = "Local shell remains disabled".to_owned();
+            app.status_line = text::local_shell_remains_disabled(app.locale);
         }
         _ => {}
     }
@@ -2707,14 +2788,14 @@ fn handle_settings_key(app: &mut App, key: KeyEvent) {
             SettingsItem::ShowThinking => app.show_thinking = !app.show_thinking,
             SettingsItem::LocalShell => {
                 if strict_profile_blocks_local_shell() {
-                    app.status_line = "Local shell is blocked by strict profile posture".to_owned();
+                    app.status_line = text::local_shell_blocked(app.locale);
                 } else if app.local_shell_enabled {
                     app.local_shell_enabled = false;
-                    app.status_line = "Local shell disabled".to_owned();
+                    app.status_line = text::local_shell_disabled(app.locale);
                 } else {
                     app.mode = Mode::ShellConfirm;
                     app.pending_shell_command = None;
-                    app.status_line = "Confirm local shell opt-in".to_owned();
+                    app.status_line = text::confirm_local_shell_opt_in(app.locale);
                 }
             }
         },
@@ -3422,8 +3503,8 @@ fn format_shell_result(result: &ShellResult) -> String {
 mod tests {
     use super::{
         display_session_identity, parse_toggle, parse_tui_objective_create_spec,
-        parse_tui_objective_kind, sanitize_terminal_text, App, Focus, Mode, TuiSlashEntityCatalog,
-        TuiUxMetrics,
+        parse_tui_objective_kind, sanitize_terminal_text, App, Focus, Mode, TuiLocale,
+        TuiSlashEntityCatalog, TuiUxMetrics,
     };
     use crate::proto::palyra::{common::v1 as common_v1, gateway::v1 as gateway_v1};
 
@@ -3461,6 +3542,7 @@ mod tests {
             include_archived_sessions: false,
             last_run_id: None,
             selected_objective_id: None,
+            locale: TuiLocale::En,
             ux_metrics: TuiUxMetrics::default(),
             scroll_offset: 0,
             status_line: String::new(),
