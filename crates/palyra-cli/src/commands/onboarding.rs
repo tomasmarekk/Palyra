@@ -408,13 +408,12 @@ fn build_onboarding_steps(
                 "Run test connection",
                 format!("palyra models test-connection --path {} --json", signals.config_path),
             )),
-            StepPresentation::required(Some(signals.provider_health_state.clone())).with_blocked(
-                Some(blocked_reason(
-                    "model_verification",
-                    signals.model_discovery_message.as_str(),
-                    "Use the model commands to verify connectivity and confirm a selected chat model.",
-                )),
-            ),
+            StepPresentation::required(Some(signals.provider_health_state.clone()))
+                .with_blocked(Some(blocked_reason(
+                "model_verification",
+                signals.model_discovery_message.as_str(),
+                "Use the model commands to verify connectivity and confirm a selected chat model.",
+            ))),
         )
     };
 
