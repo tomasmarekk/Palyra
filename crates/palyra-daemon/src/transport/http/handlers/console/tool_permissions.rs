@@ -23,6 +23,8 @@ use crate::{
 const TOOL_PERMISSIONS_APPROVAL_PAGE_SIZE: usize = 500;
 const TOOL_PERMISSION_AUDIT_HISTORY_LIMIT: usize = 20;
 
+type ToolPermissionsStatusResult<T> = Result<T, tonic::Status>;
+
 #[derive(Debug, Serialize)]
 pub(crate) struct ToolPermissionsScopeEnvelope {
     active: ToolPostureScopeRef,
@@ -136,6 +138,19 @@ struct ToolPermissionsData {
     config: crate::gateway::GatewayRuntimeConfigSnapshot,
 }
 
+struct ToolPermissionsJournalEvent<'a> {
+    event_name: &'a str,
+    scope_kind: ToolPostureScopeKind,
+    scope_id: &'a str,
+    tool_name: Option<&'a str>,
+    previous_state: Option<ToolPostureState>,
+    new_state: Option<ToolPostureState>,
+    source: &'a str,
+    reason: Option<&'a str>,
+    recommendation_id: Option<&'a str>,
+    preset_id: Option<&'a str>,
+}
+
 pub(crate) async fn console_tool_permissions_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -164,7 +179,9 @@ pub(crate) async fn console_tool_permission_get_handler(
 ) -> Result<Json<ToolPermissionDetailEnvelope>, Response> {
     let _session = authorize_console_session(&state, &headers, false)?;
     let data = load_tool_permissions_data(&state, &query).await?;
-    Ok(Json(build_tool_permission_detail(&data, tool_name.as_str())?))
+    Ok(Json(
+        build_tool_permission_detail(&data, tool_name.as_str()).map_err(runtime_status_response)?,
+    ))
 }
 
 pub(crate) async fn console_tool_permission_override_handler(
@@ -174,11 +191,13 @@ pub(crate) async fn console_tool_permission_override_handler(
     Json(payload): Json<ConsoleToolPostureOverrideRequest>,
 ) -> Result<Json<ToolPermissionMutationEnvelope>, Response> {
     let session = authorize_console_session(&state, &headers, true)?;
-    ensure_known_tool(tool_name.as_str())?;
-    let scope_kind = parse_tool_posture_scope_kind(payload.scope_kind.as_str())?;
+    ensure_known_tool(tool_name.as_str()).map_err(runtime_status_response)?;
+    let scope_kind = parse_tool_posture_scope_kind(payload.scope_kind.as_str())
+        .map_err(runtime_status_response)?;
     let scope_id = normalize_scope_id(scope_kind, payload.scope_id.as_deref())
         .map_err(tool_posture_registry_error_response)?;
-    let state_value = parse_tool_posture_state(payload.state.as_str())?;
+    let state_value =
+        parse_tool_posture_state(payload.state.as_str()).map_err(runtime_status_response)?;
     let override_record = state
         .runtime
         .upsert_tool_posture_override(ToolPostureOverrideUpsertRequest {
@@ -196,16 +215,18 @@ pub(crate) async fn console_tool_permission_override_handler(
     record_tool_permissions_journal_event(
         &state.runtime,
         &session.context,
-        "tool_posture.override_set",
-        scope_kind,
-        scope_id.as_str(),
-        Some(tool_name.as_str()),
-        None,
-        Some(state_value),
-        "manual",
-        payload.reason.as_deref(),
-        None,
-        None,
+        ToolPermissionsJournalEvent {
+            event_name: "tool_posture.override_set",
+            scope_kind,
+            scope_id: scope_id.as_str(),
+            tool_name: Some(tool_name.as_str()),
+            previous_state: None,
+            new_state: Some(state_value),
+            source: "manual",
+            reason: payload.reason.as_deref(),
+            recommendation_id: None,
+            preset_id: None,
+        },
     )
     .await
     .map_err(runtime_status_response)?;
@@ -228,8 +249,9 @@ pub(crate) async fn console_tool_permission_reset_handler(
     Json(payload): Json<ConsoleToolPostureResetRequest>,
 ) -> Result<Json<ToolPermissionMutationEnvelope>, Response> {
     let session = authorize_console_session(&state, &headers, true)?;
-    ensure_known_tool(tool_name.as_str())?;
-    let scope_kind = parse_tool_posture_scope_kind(payload.scope_kind.as_str())?;
+    ensure_known_tool(tool_name.as_str()).map_err(runtime_status_response)?;
+    let scope_kind = parse_tool_posture_scope_kind(payload.scope_kind.as_str())
+        .map_err(runtime_status_response)?;
     let scope_id = normalize_scope_id(scope_kind, payload.scope_id.as_deref())
         .map_err(tool_posture_registry_error_response)?;
     let removed = state
@@ -248,16 +270,18 @@ pub(crate) async fn console_tool_permission_reset_handler(
         record_tool_permissions_journal_event(
             &state.runtime,
             &session.context,
-            "tool_posture.override_cleared",
-            scope_kind,
-            scope_id.as_str(),
-            Some(tool_name.as_str()),
-            None,
-            None,
-            "manual_reset",
-            payload.reason.as_deref(),
-            None,
-            None,
+            ToolPermissionsJournalEvent {
+                event_name: "tool_posture.override_cleared",
+                scope_kind,
+                scope_id: scope_id.as_str(),
+                tool_name: Some(tool_name.as_str()),
+                previous_state: None,
+                new_state: None,
+                source: "manual_reset",
+                reason: payload.reason.as_deref(),
+                recommendation_id: None,
+                preset_id: None,
+            },
         )
         .await
         .map_err(runtime_status_response)?;
@@ -280,7 +304,8 @@ pub(crate) async fn console_tool_permission_scope_reset_handler(
     Json(payload): Json<ConsoleToolPostureScopeResetRequest>,
 ) -> Result<Json<ToolPermissionScopeResetEnvelope>, Response> {
     let session = authorize_console_session(&state, &headers, true)?;
-    let scope_kind = parse_tool_posture_scope_kind(payload.scope_kind.as_str())?;
+    let scope_kind = parse_tool_posture_scope_kind(payload.scope_kind.as_str())
+        .map_err(runtime_status_response)?;
     let scope_id = normalize_scope_id(scope_kind, payload.scope_id.as_deref())
         .map_err(tool_posture_registry_error_response)?;
     let removed = state
@@ -298,16 +323,18 @@ pub(crate) async fn console_tool_permission_scope_reset_handler(
         record_tool_permissions_journal_event(
             &state.runtime,
             &session.context,
-            "tool_posture.scope_reset",
-            scope_kind,
-            scope_id.as_str(),
-            Some(record.tool_name.as_str()),
-            Some(record.state),
-            None,
-            "manual_scope_reset",
-            payload.reason.as_deref(),
-            None,
-            None,
+            ToolPermissionsJournalEvent {
+                event_name: "tool_posture.scope_reset",
+                scope_kind,
+                scope_id: scope_id.as_str(),
+                tool_name: Some(record.tool_name.as_str()),
+                previous_state: Some(record.state),
+                new_state: None,
+                source: "manual_scope_reset",
+                reason: payload.reason.as_deref(),
+                recommendation_id: None,
+                preset_id: None,
+            },
         )
         .await
         .map_err(runtime_status_response)?;
@@ -339,7 +366,8 @@ pub(crate) async fn console_tool_permissions_preset_preview_handler(
     Json(payload): Json<ConsoleToolPosturePresetPreviewRequest>,
 ) -> Result<Json<ToolPermissionPresetPreviewEnvelope>, Response> {
     let _session = authorize_console_session(&state, &headers, false)?;
-    let scope_kind = parse_tool_posture_scope_kind(payload.scope_kind.as_str())?;
+    let scope_kind = parse_tool_posture_scope_kind(payload.scope_kind.as_str())
+        .map_err(runtime_status_response)?;
     let scope_id = normalize_scope_id(scope_kind, payload.scope_id.as_deref())
         .map_err(tool_posture_registry_error_response)?;
     let data = load_tool_permissions_data(
@@ -376,7 +404,8 @@ pub(crate) async fn console_tool_permissions_preset_apply_handler(
     Json(payload): Json<ConsoleToolPosturePresetApplyRequest>,
 ) -> Result<Json<ToolPermissionPresetPreviewEnvelope>, Response> {
     let session = authorize_console_session(&state, &headers, true)?;
-    let scope_kind = parse_tool_posture_scope_kind(payload.scope_kind.as_str())?;
+    let scope_kind = parse_tool_posture_scope_kind(payload.scope_kind.as_str())
+        .map_err(runtime_status_response)?;
     let scope_id = normalize_scope_id(scope_kind, payload.scope_id.as_deref())
         .map_err(tool_posture_registry_error_response)?;
     let preset = tool_posture_preset(payload.preset_id.as_str()).ok_or_else(|| {
@@ -426,19 +455,22 @@ pub(crate) async fn console_tool_permissions_preset_apply_handler(
                 now_unix_ms: gateway::current_unix_ms(),
             })
             .map_err(runtime_status_response)?;
+        let source = format!("preset:{}", preset.preset_id);
         record_tool_permissions_journal_event(
             &state.runtime,
             &session.context,
-            "tool_posture.preset_applied",
-            scope_kind,
-            scope_id.as_str(),
-            Some(entry.tool_name),
-            Some(posture.effective_state),
-            Some(assignment.state),
-            &format!("preset:{}", preset.preset_id),
-            payload.reason.as_deref(),
-            None,
-            Some(preset.preset_id),
+            ToolPermissionsJournalEvent {
+                event_name: "tool_posture.preset_applied",
+                scope_kind,
+                scope_id: scope_id.as_str(),
+                tool_name: Some(entry.tool_name),
+                previous_state: Some(posture.effective_state),
+                new_state: Some(assignment.state),
+                source: source.as_str(),
+                reason: payload.reason.as_deref(),
+                recommendation_id: None,
+                preset_id: Some(preset.preset_id),
+            },
         )
         .await
         .map_err(runtime_status_response)?;
@@ -471,11 +503,13 @@ pub(crate) async fn console_tool_permissions_recommendation_action_handler(
     Json(payload): Json<ConsoleToolPostureRecommendationActionRequest>,
 ) -> Result<Json<ToolPermissionMutationEnvelope>, Response> {
     let session = authorize_console_session(&state, &headers, true)?;
-    ensure_known_tool(payload.tool_name.as_str())?;
-    let scope_kind = parse_tool_posture_scope_kind(payload.scope_kind.as_str())?;
+    ensure_known_tool(payload.tool_name.as_str()).map_err(runtime_status_response)?;
+    let scope_kind = parse_tool_posture_scope_kind(payload.scope_kind.as_str())
+        .map_err(runtime_status_response)?;
     let scope_id = normalize_scope_id(scope_kind, payload.scope_id.as_deref())
         .map_err(tool_posture_registry_error_response)?;
-    let action = parse_tool_posture_recommendation_action(payload.action.as_str())?;
+    let action = parse_tool_posture_recommendation_action(payload.action.as_str())
+        .map_err(runtime_status_response)?;
     let data = load_tool_permissions_data(
         &state,
         &ConsoleToolPermissionsQuery {
@@ -532,16 +566,18 @@ pub(crate) async fn console_tool_permissions_recommendation_action_handler(
         record_tool_permissions_journal_event(
             &state.runtime,
             &session.context,
-            "tool_posture.recommendation_accepted",
-            scope_kind,
-            scope_id.as_str(),
-            Some(payload.tool_name.as_str()),
-            Some(record.effective_posture.effective_state),
-            Some(recommendation.recommended_state),
-            "recommendation",
-            Some(recommendation.reason.as_str()),
-            Some(payload.recommendation_id.as_str()),
-            None,
+            ToolPermissionsJournalEvent {
+                event_name: "tool_posture.recommendation_accepted",
+                scope_kind,
+                scope_id: scope_id.as_str(),
+                tool_name: Some(payload.tool_name.as_str()),
+                previous_state: Some(record.effective_posture.effective_state),
+                new_state: Some(recommendation.recommended_state),
+                source: "recommendation",
+                reason: Some(recommendation.reason.as_str()),
+                recommendation_id: Some(payload.recommendation_id.as_str()),
+                preset_id: None,
+            },
         )
         .await
         .map_err(runtime_status_response)?;
@@ -588,8 +624,8 @@ async fn resolve_tool_permissions_scope(
     state: &AppState,
     query: &ConsoleToolPermissionsQuery,
 ) -> Result<ResolvedToolPermissionsScope, Response> {
-    let scope_kind =
-        parse_tool_posture_scope_kind(query.scope_kind.as_deref().unwrap_or("global"))?;
+    let scope_kind = parse_tool_posture_scope_kind(query.scope_kind.as_deref().unwrap_or("global"))
+        .map_err(runtime_status_response)?;
     let scope_id = normalize_scope_id(scope_kind, query.scope_id.as_deref())
         .map_err(tool_posture_registry_error_response)?;
     let active = ToolPostureScopeRef {
@@ -733,11 +769,9 @@ fn build_tool_permission_record(
 fn build_tool_permission_detail(
     data: &ToolPermissionsData,
     tool_name: &str,
-) -> Result<ToolPermissionDetailEnvelope, Response> {
+) -> ToolPermissionsStatusResult<ToolPermissionDetailEnvelope> {
     let catalog = tool_catalog_entry(tool_name).ok_or_else(|| {
-        runtime_status_response(tonic::Status::not_found(format!(
-            "tool posture record not found: {tool_name}"
-        )))
+        tonic::Status::not_found(format!("tool posture record not found: {tool_name}"))
     })?;
     let tool = build_tool_permission_record(data, catalog);
     let change_history = data
@@ -782,7 +816,7 @@ async fn build_tool_permission_detail_for_scope(
         },
     )
     .await?;
-    build_tool_permission_detail(&data, tool_name)
+    build_tool_permission_detail(&data, tool_name).map_err(runtime_status_response)
 }
 
 fn apply_tool_permissions_filters(
@@ -884,47 +918,45 @@ fn scope_in_chain(
     chain.iter().any(|scope| scope.kind == scope_kind && scope.scope_id == scope_id)
 }
 
-fn ensure_known_tool(tool_name: &str) -> Result<(), Response> {
+fn ensure_known_tool(tool_name: &str) -> ToolPermissionsStatusResult<()> {
     tool_catalog_entry(tool_name).map(|_| ()).ok_or_else(|| {
-        runtime_status_response(tonic::Status::not_found(format!(
-            "tool posture record not found: {tool_name}"
-        )))
+        tonic::Status::not_found(format!("tool posture record not found: {tool_name}"))
     })
 }
 
-fn parse_tool_posture_scope_kind(value: &str) -> Result<ToolPostureScopeKind, Response> {
+fn parse_tool_posture_scope_kind(value: &str) -> ToolPermissionsStatusResult<ToolPostureScopeKind> {
     match value.trim().to_ascii_lowercase().as_str() {
         "global" => Ok(ToolPostureScopeKind::Global),
         "workspace" => Ok(ToolPostureScopeKind::Workspace),
         "agent" => Ok(ToolPostureScopeKind::Agent),
         "session" => Ok(ToolPostureScopeKind::Session),
-        _ => Err(runtime_status_response(tonic::Status::invalid_argument(
+        _ => Err(tonic::Status::invalid_argument(
             "scope_kind must be one of global|workspace|agent|session",
-        ))),
+        )),
     }
 }
 
-fn parse_tool_posture_state(value: &str) -> Result<ToolPostureState, Response> {
+fn parse_tool_posture_state(value: &str) -> ToolPermissionsStatusResult<ToolPostureState> {
     match value.trim().to_ascii_lowercase().as_str() {
         "always_allow" => Ok(ToolPostureState::AlwaysAllow),
         "ask_each_time" => Ok(ToolPostureState::AskEachTime),
         "disabled" => Ok(ToolPostureState::Disabled),
-        _ => Err(runtime_status_response(tonic::Status::invalid_argument(
+        _ => Err(tonic::Status::invalid_argument(
             "state must be one of always_allow|ask_each_time|disabled",
-        ))),
+        )),
     }
 }
 
 fn parse_tool_posture_recommendation_action(
     value: &str,
-) -> Result<ToolPostureRecommendationAction, Response> {
+) -> ToolPermissionsStatusResult<ToolPostureRecommendationAction> {
     match value.trim().to_ascii_lowercase().as_str() {
         "accepted" => Ok(ToolPostureRecommendationAction::Accepted),
         "dismissed" => Ok(ToolPostureRecommendationAction::Dismissed),
         "deferred" => Ok(ToolPostureRecommendationAction::Deferred),
-        _ => Err(runtime_status_response(tonic::Status::invalid_argument(
+        _ => Err(tonic::Status::invalid_argument(
             "action must be one of accepted|dismissed|deferred",
-        ))),
+        )),
     }
 }
 
@@ -946,17 +978,20 @@ fn tool_posture_registry_error_response(
 async fn record_tool_permissions_journal_event(
     runtime: &std::sync::Arc<gateway::GatewayRuntimeState>,
     context: &crate::transport::grpc::auth::RequestContext,
-    event_name: &str,
-    scope_kind: ToolPostureScopeKind,
-    scope_id: &str,
-    tool_name: Option<&str>,
-    previous_state: Option<ToolPostureState>,
-    new_state: Option<ToolPostureState>,
-    source: &str,
-    reason: Option<&str>,
-    recommendation_id: Option<&str>,
-    preset_id: Option<&str>,
+    event: ToolPermissionsJournalEvent<'_>,
 ) -> Result<(), tonic::Status> {
+    let ToolPermissionsJournalEvent {
+        event_name,
+        scope_kind,
+        scope_id,
+        tool_name,
+        previous_state,
+        new_state,
+        source,
+        reason,
+        recommendation_id,
+        preset_id,
+    } = event;
     let synthetic_session_id = format!("tool-posture:{}:{scope_id}", scope_kind.as_str());
     runtime
         .record_journal_event(JournalAppendRequest {

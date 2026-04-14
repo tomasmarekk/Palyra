@@ -2070,10 +2070,12 @@ pub async fn run() -> Result<()> {
         },
         journal_store,
         identity_runtime.revoked_certificate_count,
-        model_provider,
-        Arc::clone(&vault),
-        agent_registry,
-        tool_posture_registry,
+        gateway::GatewayRuntimeDependencies {
+            model_provider,
+            vault: Arc::clone(&vault),
+            agent_registry,
+            tool_posture_registry,
+        },
     )
     .context("failed to initialize gateway runtime state")?;
     runtime.configure_memory(MemoryRuntimeConfig {

@@ -320,6 +320,13 @@ pub struct GatewayJournalConfigSnapshot {
     pub hash_chain_enabled: bool,
 }
 
+pub struct GatewayRuntimeDependencies {
+    pub model_provider: Arc<dyn ModelProvider>,
+    pub vault: Arc<Vault>,
+    pub agent_registry: AgentRegistry,
+    pub tool_posture_registry: ToolPostureRegistry,
+}
+
 pub struct GatewayRuntimeState {
     pub(crate) started_at: Instant,
     pub(crate) build: BuildSnapshot,
@@ -951,10 +958,12 @@ impl GatewayRuntimeState {
             journal_config,
             journal_store,
             revoked_certificate_count,
-            default_provider,
-            default_vault,
-            agent_registry,
-            tool_posture_registry,
+            GatewayRuntimeDependencies {
+                model_provider: default_provider,
+                vault: default_vault,
+                agent_registry,
+                tool_posture_registry,
+            },
         )
     }
 
@@ -963,11 +972,14 @@ impl GatewayRuntimeState {
         journal_config: GatewayJournalConfigSnapshot,
         journal_store: JournalStore,
         revoked_certificate_count: usize,
-        model_provider: Arc<dyn ModelProvider>,
-        vault: Arc<Vault>,
-        agent_registry: AgentRegistry,
-        tool_posture_registry: ToolPostureRegistry,
+        dependencies: GatewayRuntimeDependencies,
     ) -> Result<Arc<Self>, JournalError> {
+        let GatewayRuntimeDependencies {
+            model_provider,
+            vault,
+            agent_registry,
+            tool_posture_registry,
+        } = dependencies;
         let build = build_metadata();
         let existing_events = journal_store.total_events()? as u64;
         let canvas_snapshots =
