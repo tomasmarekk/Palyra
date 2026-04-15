@@ -80,27 +80,46 @@ pub(crate) async fn console_chat_session_rename_handler(
             "session_id must be a canonical ULID",
         ))
     })?;
-    let session_label = trim_to_option(payload.session_label).ok_or_else(|| {
-        runtime_status_response(tonic::Status::invalid_argument("session_label cannot be empty"))
-    })?;
-    let outcome = state
+    let existing_session =
+        load_console_chat_session(&state, &session.context, session_id.as_str(), true).await?;
+    let session_label = payload.session_label.and_then(trim_to_option);
+    let manual_title_locked = payload.manual_title_locked.unwrap_or(session_label.is_some());
+    if manual_title_locked && session_label.is_none() {
+        return Err(runtime_status_response(tonic::Status::invalid_argument(
+            "session_label cannot be empty when manual_title_locked is true",
+        )));
+    }
+    let updated_session = state
         .runtime
-        .resolve_orchestrator_session(journal::OrchestratorSessionResolveRequest {
-            session_id: Some(session_id),
-            session_key: None,
-            session_label: Some(session_label),
-            principal: session.context.principal,
-            device_id: session.context.device_id,
-            channel: session.context.channel,
-            require_existing: true,
-            reset_session: false,
+        .update_orchestrator_session_title(journal::OrchestratorSessionTitleUpdateRequest {
+            session_id: session_id.clone(),
+            session_label: session_label.clone(),
+            principal: session.context.principal.clone(),
+            device_id: session.context.device_id.clone(),
+            channel: session.context.channel.clone(),
+            manual_title_locked,
         })
         .await
         .map_err(runtime_status_response)?;
+    let _ = crate::gateway::record_agent_journal_event(
+        &state.runtime,
+        &session.context,
+        json!({
+            "event": "session.title.updated",
+            "session_id": session_id,
+            "previous_session_label": existing_session.session_label,
+            "session_label": session_label,
+            "previous_title": existing_session.title,
+            "title": updated_session.title,
+            "manual_title_locked": updated_session.manual_title_locked,
+            "title_generation_state": updated_session.title_generation_state,
+        }),
+    )
+    .await;
     Ok(Json(json!({
-        "session": outcome.session,
-        "created": outcome.created,
-        "reset_applied": outcome.reset_applied,
+        "session": updated_session,
+        "created": false,
+        "reset_applied": false,
     })))
 }
 
@@ -1080,6 +1099,9 @@ pub(crate) async fn console_chat_branch_handler(
     let session = authorize_console_session(&state, &headers, true)?;
     let source_session =
         load_console_chat_session(&state, &session.context, session_id.as_str(), true).await?;
+    let requested_session_label = payload.session_label.and_then(trim_to_option);
+    let family_title_seed =
+        load_lineage_title_seed(&state, &session.context, &source_session).await?;
     let source_run_id = source_session.last_run_id.clone().ok_or_else(|| {
         runtime_status_response(tonic::Status::failed_precondition(
             "branching requires a source run in the current session",
@@ -1106,7 +1128,7 @@ pub(crate) async fn console_chat_branch_handler(
         .resolve_orchestrator_session(journal::OrchestratorSessionResolveRequest {
             session_id: None,
             session_key: None,
-            session_label: payload.session_label.and_then(trim_to_option),
+            session_label: requested_session_label.clone(),
             principal: session.context.principal.clone(),
             device_id: session.context.device_id.clone(),
             channel: session.context.channel.clone(),
@@ -1122,6 +1144,9 @@ pub(crate) async fn console_chat_branch_handler(
             branch_state: "active_branch".to_owned(),
             parent_session_id: Some(source_session.session_id.clone()),
             branch_origin_run_id: Some(source_run_id.clone()),
+            suggested_auto_title: requested_session_label
+                .is_none()
+                .then(|| family_title_seed.suggested_title.clone()),
         })
         .await
         .map_err(runtime_status_response)?;
@@ -1132,6 +1157,7 @@ pub(crate) async fn console_chat_branch_handler(
             branch_state: "branch_source".to_owned(),
             parent_session_id: source_session.parent_session_id.clone(),
             branch_origin_run_id: source_session.branch_origin_run_id.clone(),
+            suggested_auto_title: None,
         })
         .await
         .map_err(runtime_status_response)?;
@@ -1162,6 +1188,7 @@ pub(crate) async fn console_chat_branch_handler(
     Ok(Json(json!({
         "session": branch_session,
         "source_run_id": source_run_id,
+        "suggested_session_label": family_title_seed.suggested_title,
         "action": "branch",
         "contract": contract_descriptor(),
     })))
@@ -1393,12 +1420,15 @@ pub(crate) async fn console_chat_checkpoint_restore_handler(
     let source_session =
         load_console_chat_session(&state, &session.context, checkpoint.session_id.as_str(), true)
             .await?;
+    let requested_session_label = payload.session_label.and_then(trim_to_option);
+    let family_title_seed =
+        load_lineage_title_seed(&state, &session.context, &source_session).await?;
     let restored = state
         .runtime
         .resolve_orchestrator_session(journal::OrchestratorSessionResolveRequest {
             session_id: None,
             session_key: None,
-            session_label: payload.session_label.and_then(trim_to_option),
+            session_label: requested_session_label.clone(),
             principal: session.context.principal.clone(),
             device_id: session.context.device_id.clone(),
             channel: session.context.channel.clone(),
@@ -1414,6 +1444,9 @@ pub(crate) async fn console_chat_checkpoint_restore_handler(
             branch_state: "active_branch".to_owned(),
             parent_session_id: Some(source_session.session_id.clone()),
             branch_origin_run_id: checkpoint.run_id.clone().or(source_session.last_run_id.clone()),
+            suggested_auto_title: requested_session_label
+                .is_none()
+                .then(|| family_title_seed.suggested_title.clone()),
         })
         .await
         .map_err(runtime_status_response)?;
@@ -1424,6 +1457,7 @@ pub(crate) async fn console_chat_checkpoint_restore_handler(
             branch_state: "branch_source".to_owned(),
             parent_session_id: source_session.parent_session_id.clone(),
             branch_origin_run_id: source_session.branch_origin_run_id.clone(),
+            suggested_auto_title: None,
         })
         .await
         .map_err(runtime_status_response)?;
@@ -1484,6 +1518,7 @@ pub(crate) async fn console_chat_checkpoint_restore_handler(
     Ok(Json(json!({
         "session": restored_session,
         "checkpoint": checkpoint,
+        "suggested_session_label": family_title_seed.suggested_title,
         "action": "checkpoint_restore",
         "contract": contract_descriptor(),
     })))
@@ -2378,6 +2413,95 @@ async fn load_console_chat_session(
         .await
         .map_err(runtime_status_response)?;
     Ok(response.session)
+}
+
+#[derive(Debug, Clone)]
+struct LineageTitleSeed {
+    suggested_title: String,
+}
+
+async fn load_lineage_title_seed(
+    state: &AppState,
+    context: &gateway::RequestContext,
+    session: &journal::OrchestratorSessionRecord,
+) -> Result<LineageTitleSeed, Response> {
+    let sessions = load_console_chat_scoped_sessions(state, context).await?;
+    let sessions_by_id = sessions
+        .iter()
+        .map(|entry| (entry.session_id.as_str(), entry))
+        .collect::<std::collections::HashMap<_, _>>();
+    let family_root = session_family_root(session.session_id.as_str(), &sessions_by_id)
+        .unwrap_or_else(|| session.title.clone());
+    let family_size = sessions
+        .iter()
+        .filter(|entry| {
+            session_family_root(entry.session_id.as_str(), &sessions_by_id)
+                .is_some_and(|root| root == family_root)
+        })
+        .count()
+        .max(1);
+    let suggested_title = format!("{} #{}", family_root, family_size + 1);
+    Ok(LineageTitleSeed { suggested_title })
+}
+
+async fn load_console_chat_scoped_sessions(
+    state: &AppState,
+    context: &gateway::RequestContext,
+) -> Result<Vec<journal::OrchestratorSessionRecord>, Response> {
+    let mut sessions = Vec::new();
+    let mut after_session_key = None::<String>;
+    loop {
+        let (mut page, next_after_session_key) = state
+            .runtime
+            .list_orchestrator_sessions(gateway::ListOrchestratorSessionsRequest {
+                after_session_key: after_session_key.clone(),
+                principal: context.principal.clone(),
+                device_id: context.device_id.clone(),
+                channel: context.channel.clone(),
+                include_archived: true,
+                requested_limit: Some(100),
+                search_query: None,
+            })
+            .await
+            .map_err(runtime_status_response)?;
+        sessions.append(&mut page);
+        let Some(next_after_session_key) = next_after_session_key else {
+            break;
+        };
+        after_session_key = Some(next_after_session_key);
+    }
+    Ok(sessions)
+}
+
+fn session_family_root<'a>(
+    session_id: &str,
+    sessions_by_id: &std::collections::HashMap<&'a str, &'a journal::OrchestratorSessionRecord>,
+) -> Option<String> {
+    let mut current = sessions_by_id.get(session_id).copied()?;
+    loop {
+        let title_root = normalize_title_family_root(current.title.as_str())
+            .or_else(|| current.session_label.as_deref().and_then(normalize_title_family_root))
+            .unwrap_or_else(|| current.session_key.clone());
+        let Some(parent_session_id) = current.parent_session_id.as_deref() else {
+            return Some(title_root);
+        };
+        let Some(parent) = sessions_by_id.get(parent_session_id).copied() else {
+            return Some(title_root);
+        };
+        current = parent;
+    }
+}
+
+fn normalize_title_family_root(raw: &str) -> Option<String> {
+    let normalized = trim_to_option(raw.to_owned())?;
+    let Some((prefix, suffix)) = normalized.rsplit_once('#') else {
+        return Some(normalized);
+    };
+    if suffix.trim().chars().all(|value| value.is_ascii_digit()) {
+        trim_to_option(prefix.trim().to_owned()).or(Some(normalized))
+    } else {
+        Some(normalized)
+    }
 }
 
 async fn load_console_background_task(

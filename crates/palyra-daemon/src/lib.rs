@@ -1354,9 +1354,12 @@ struct ConsoleChatSessionResolveRequest {
     reset_session: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 struct ConsoleChatRenameSessionRequest {
-    session_label: String,
+    #[serde(default)]
+    session_label: Option<String>,
+    #[serde(default)]
+    manual_title_locked: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]

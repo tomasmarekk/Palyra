@@ -211,7 +211,17 @@ function buildSessionSuggestions(
       return (
         session.session_id.toLowerCase().includes(query) ||
         session.title.toLowerCase().includes(query) ||
-        (session.session_key ?? "").toLowerCase().includes(query)
+        (session.session_key ?? "").toLowerCase().includes(query) ||
+        session.family.root_title.toLowerCase().includes(query) ||
+        (session.last_summary ?? "").toLowerCase().includes(query) ||
+        (session.agent_id ?? "").toLowerCase().includes(query) ||
+        (session.model_profile ?? "").toLowerCase().includes(query) ||
+        session.family.relatives.some((relative) => relative.title.toLowerCase().includes(query)) ||
+        session.recap.touched_files.some((file) => file.toLowerCase().includes(query)) ||
+        session.recap.active_context_files.some((file) => file.toLowerCase().includes(query)) ||
+        session.recap.recent_artifacts.some((artifact) =>
+          artifact.label.toLowerCase().includes(query),
+        )
       );
     })
     .slice(0, 6)
@@ -220,11 +230,21 @@ function buildSessionSuggestions(
       kind: "entity",
       commandName: command.name,
       title: session.title,
-      subtitle: session.session_key ?? session.session_id,
-      detail: session.preview ?? "Resume this session context.",
+      subtitle:
+        session.session_key && session.session_key.length > 0
+          ? session.family.family_size > 1
+            ? `${session.session_key} · family ${session.family.sequence}/${session.family.family_size}`
+            : session.session_key
+          : session.session_id,
+      detail:
+        session.preview ??
+        session.last_summary ??
+        (session.family.root_title !== session.title
+          ? `Family root: ${session.family.root_title}`
+          : "Resume this session context."),
       example: `/${command.name} ${session.session_id}`,
       replacement: `/${command.name} ${command.name === "history" ? session.title : session.session_id}`,
-      badge: session.archived ? "archived" : "session",
+      badge: session.archived ? "archived" : session.branch_state === "active_branch" ? "branch" : "session",
     }));
 }
 

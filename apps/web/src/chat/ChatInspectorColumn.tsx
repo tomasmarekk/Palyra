@@ -25,6 +25,7 @@ import { ChatRunDrawer } from "./ChatRunDrawer";
 import {
   PrettyJsonBlock,
   describeBranchState,
+  describeTitleGenerationState,
   formatApproxTokens,
   prettifyEventType,
   shortId,
@@ -193,8 +194,32 @@ export function ChatInspectorColumn({
               value: describeBranchState(selectedSession?.branch_state ?? "missing"),
             },
             {
+              label: "Title mode",
+              value:
+                selectedSession === null
+                  ? "none"
+                  : describeTitleGenerationState(
+                      selectedSession.title_generation_state,
+                      selectedSession.manual_title_locked,
+                    ),
+            },
+            {
               label: "Lineage",
               value: selectedSessionLineage,
+            },
+            {
+              label: "Agent",
+              value:
+                selectedSession?.quick_controls.agent.display_value ??
+                selectedSession?.agent_id ??
+                "default",
+            },
+            {
+              label: "Model",
+              value:
+                selectedSession?.quick_controls.model.display_value ??
+                selectedSession?.model_profile ??
+                "inherited",
             },
             {
               label: "Budget",
@@ -202,6 +227,55 @@ export function ChatInspectorColumn({
             },
           ]}
         />
+        {selectedSession !== null ? (
+          <div className="chat-ops-list">
+            <div className="workspace-panel__intro">
+              <p className="workspace-kicker">Resume recap</p>
+              <h3>
+                {selectedSession.family.family_size > 1
+                  ? `Family ${selectedSession.family.sequence}/${selectedSession.family.family_size}`
+                  : "Single-session thread"}
+              </h3>
+              <p className="chat-muted">
+                {selectedSession.preview ??
+                  selectedSession.last_summary ??
+                  "No summary has been published for this session yet."}
+              </p>
+            </div>
+            {selectedSession.recap.touched_files.length > 0 ? (
+              <div>
+                <p className="workspace-kicker">Touched files</p>
+                <ul className="workspace-bullet-list">
+                  {selectedSession.recap.touched_files.slice(0, 5).map((file) => (
+                    <li key={file}>{file}</li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+            {selectedSession.recap.active_context_files.length > 0 ? (
+              <div>
+                <p className="workspace-kicker">Active context</p>
+                <ul className="workspace-bullet-list">
+                  {selectedSession.recap.active_context_files.slice(0, 5).map((file) => (
+                    <li key={file}>{file}</li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+            {selectedSession.recap.recent_artifacts.length > 0 ? (
+              <div>
+                <p className="workspace-kicker">Recent artifacts</p>
+                <ul className="workspace-bullet-list">
+                  {selectedSession.recap.recent_artifacts.slice(0, 4).map((artifact) => (
+                    <li key={artifact.artifact_id}>
+                      {artifact.label} ({artifact.kind})
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+          </div>
+        ) : null}
         {a2uiSurfaces.length === 0 ? (
           <EmptyState
             compact

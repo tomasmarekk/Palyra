@@ -40,8 +40,11 @@ interface ChatConsoleWorkspaceViewProps {
   readonly selectedObjectiveFocus?: string | null;
   readonly selectedObjectiveLabel?: string | null;
   readonly selectedSessionBranchState: string;
+  readonly selectedSessionContextFileCount: number;
+  readonly selectedSessionFamilyLabel?: string | null;
   readonly selectedSessionLineage: string;
   readonly selectedSessionTitle: string;
+  readonly selectedSessionTitleState: string;
   readonly sessionsBusy: boolean;
   readonly sessionsSidebarProps: ComponentProps<typeof ChatSessionsSidebar>;
   readonly showStarterPrompts: boolean;
@@ -74,8 +77,11 @@ export function ChatConsoleWorkspaceView({
   selectedObjectiveFocus,
   selectedObjectiveLabel,
   selectedSessionBranchState,
+  selectedSessionContextFileCount,
+  selectedSessionFamilyLabel,
   selectedSessionLineage,
   selectedSessionTitle,
+  selectedSessionTitleState,
   sessionsBusy,
   sessionsSidebarProps,
   showStarterPrompts,
@@ -110,6 +116,20 @@ export function ChatConsoleWorkspaceView({
             <Chip size="sm" variant="secondary">
               {selectedSessionBranchState}
             </Chip>
+            <Chip size="sm" variant="secondary">
+              {selectedSessionTitleState}
+            </Chip>
+            {selectedSessionFamilyLabel ? (
+              <Chip size="sm" variant="secondary">
+                {selectedSessionFamilyLabel}
+              </Chip>
+            ) : null}
+            {selectedSessionContextFileCount > 0 ? (
+              <Chip size="sm" variant="secondary">
+                {selectedSessionContextFileCount} context file
+                {selectedSessionContextFileCount === 1 ? "" : "s"}
+              </Chip>
+            ) : null}
           </>
         }
         actions={

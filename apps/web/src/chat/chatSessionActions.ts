@@ -82,13 +82,37 @@ export function resumeSessionAction(args: {
 }): void {
   const target = args.rawTarget.trim();
   if (target.length === 0) {
-    args.setError("Usage: /resume <session-id-or-key>");
+    args.setError("Usage: /resume <session-id-or-key-or-title>");
     return;
   }
+  const normalizedTarget = target.toLowerCase();
   const matchedSession =
     args.sortedSessions.find((session) => session.session_id === target) ??
     args.sortedSessions.find((session) => session.session_key === target) ??
-    args.sortedSessions.find((session) => session.title.toLowerCase() === target.toLowerCase()) ??
+    args.sortedSessions.find((session) => session.title.toLowerCase() === normalizedTarget) ??
+    args.sortedSessions.find(
+      (session) => session.family.root_title.toLowerCase() === normalizedTarget,
+    ) ??
+    args.sortedSessions.find((session) =>
+      session.family.relatives.some((relative) => relative.title.toLowerCase() === normalizedTarget),
+    ) ??
+    args.sortedSessions.find((session) =>
+      [
+        session.session_key,
+        session.title,
+        session.family.root_title,
+        session.preview,
+        session.last_summary,
+        session.agent_id,
+        session.model_profile,
+        ...session.family.relatives.map((relative) => relative.title),
+        ...session.recap.touched_files,
+        ...session.recap.active_context_files,
+        ...session.recap.recent_artifacts.map((artifact) => artifact.label),
+      ]
+        .filter((value): value is string => typeof value === "string" && value.length > 0)
+        .some((value) => value.toLowerCase().includes(normalizedTarget)),
+    ) ??
     null;
   if (matchedSession === null) {
     args.setError(`No loaded session matches "${target}". Use /history first if needed.`);
@@ -184,7 +208,9 @@ export async function branchCurrentSessionAction(args: {
     args.setComposerText("");
     await Promise.all([args.refreshSessions(false), args.refreshSessionTranscript()]);
     args.setNotice(
-      `Branch ready: ${response.session.title} from run ${shortId(response.source_run_id)}.`,
+      response.suggested_session_label !== undefined
+        ? `Branch ready: ${response.session.title} from run ${shortId(response.source_run_id)}. Suggested title: ${response.suggested_session_label}.`
+        : `Branch ready: ${response.session.title} from run ${shortId(response.source_run_id)}.`,
     );
   } catch (error) {
     args.setError(toErrorMessage(error));

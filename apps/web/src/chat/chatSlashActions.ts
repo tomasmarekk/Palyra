@@ -172,6 +172,7 @@ export async function executeChatSlashCommand(args: {
   ) => Promise<void>;
   onInterrupt: (raw: string) => Promise<void>;
   onCreateSession: (requestedLabel?: string) => Promise<void>;
+  onRenameSession: (requestedLabel?: string) => Promise<void>;
   onResetSession: () => Promise<void>;
   onRetry: () => Promise<void>;
   onBranchSession: (requestedLabel?: string) => Promise<void>;
@@ -209,6 +210,7 @@ export async function executeChatSlashCommand(args: {
     restoreCheckpoint,
     onInterrupt,
     onCreateSession,
+    onRenameSession,
     onResetSession,
     onRetry,
     onBranchSession,
@@ -248,6 +250,9 @@ export async function executeChatSlashCommand(args: {
       return;
     case "new":
       await onCreateSession(command.args);
+      return;
+    case "title":
+      await onRenameSession(command.args.length > 0 ? command.args : undefined);
       return;
     case "reset":
       await onResetSession();

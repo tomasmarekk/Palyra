@@ -532,6 +532,29 @@ export function describeBranchState(branchState: string): string {
   return branchState;
 }
 
+export function describeTitleGenerationState(
+  titleGenerationState: string,
+  manualTitleLocked: boolean,
+): string {
+  if (manualTitleLocked) {
+    return "Manual title";
+  }
+  const normalized = titleGenerationState.trim().toLowerCase();
+  if (normalized === "ready") {
+    return "Auto title ready";
+  }
+  if (normalized === "pending") {
+    return "Auto title pending";
+  }
+  if (normalized === "failed") {
+    return "Auto title failed";
+  }
+  if (normalized === "idle") {
+    return "Auto title idle";
+  }
+  return titleGenerationState;
+}
+
 export function buildSessionLineageHint(session: SessionCatalogRecord | null): string {
   if (session === null) {
     return "Select a session to inspect lineage.";

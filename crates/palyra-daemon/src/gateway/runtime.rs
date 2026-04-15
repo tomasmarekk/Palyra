@@ -18,12 +18,12 @@ use crate::journal::{
     OrchestratorQueuedInputUpdateRequest, OrchestratorRunMetadataUpdateRequest,
     OrchestratorSessionCleanupOutcome, OrchestratorSessionCleanupRequest,
     OrchestratorSessionLineageUpdateRequest, OrchestratorSessionPinCreateRequest,
-    OrchestratorSessionPinRecord, OrchestratorSessionTranscriptRecord, OrchestratorUsageQuery,
-    OrchestratorUsageRunRecord, OrchestratorUsageSessionRecord, OrchestratorUsageSummary,
-    WorkspaceBootstrapOutcome, WorkspaceBootstrapRequest, WorkspaceDocumentDeleteRequest,
-    WorkspaceDocumentListFilter, WorkspaceDocumentMoveRequest, WorkspaceDocumentRecord,
-    WorkspaceDocumentVersionRecord, WorkspaceDocumentWriteRequest, WorkspaceSearchHit,
-    WorkspaceSearchRequest,
+    OrchestratorSessionPinRecord, OrchestratorSessionRecord, OrchestratorSessionTitleUpdateRequest,
+    OrchestratorSessionTranscriptRecord, OrchestratorUsageQuery, OrchestratorUsageRunRecord,
+    OrchestratorUsageSessionRecord, OrchestratorUsageSummary, WorkspaceBootstrapOutcome,
+    WorkspaceBootstrapRequest, WorkspaceDocumentDeleteRequest, WorkspaceDocumentListFilter,
+    WorkspaceDocumentMoveRequest, WorkspaceDocumentRecord, WorkspaceDocumentVersionRecord,
+    WorkspaceDocumentWriteRequest, WorkspaceSearchHit, WorkspaceSearchRequest,
 };
 use crate::self_healing::{
     IncidentDomain, RemediationAttemptStatus, RuntimeIncidentHistoryEntry,
@@ -2476,6 +2476,29 @@ impl GatewayRuntimeState {
         tokio::task::spawn_blocking(move || state.resolve_orchestrator_session_blocking(&request))
             .await
             .map_err(|_| Status::internal("orchestrator session resolve worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn update_orchestrator_session_title_blocking(
+        &self,
+        request: &OrchestratorSessionTitleUpdateRequest,
+    ) -> Result<OrchestratorSessionRecord, Status> {
+        self.journal_store.update_orchestrator_session_title(request).map_err(|error| {
+            map_orchestrator_store_error("update orchestrator session title", error)
+        })
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn update_orchestrator_session_title(
+        self: &Arc<Self>,
+        request: OrchestratorSessionTitleUpdateRequest,
+    ) -> Result<OrchestratorSessionRecord, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.update_orchestrator_session_title_blocking(&request)
+        })
+        .await
+        .map_err(|_| Status::internal("orchestrator session title worker panicked"))?
     }
 
     #[allow(clippy::result_large_err)]

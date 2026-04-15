@@ -9,7 +9,12 @@ import {
 } from "../console/components/ui";
 import type { SessionCatalogRecord } from "../consoleApi";
 
-import { buildSessionLineageHint, describeBranchState, shortId } from "./chatShared";
+import {
+  buildSessionLineageHint,
+  describeBranchState,
+  describeTitleGenerationState,
+  shortId,
+} from "./chatShared";
 
 type ChatSessionsSidebarProps = {
   sessionsBusy: boolean;
@@ -69,7 +74,7 @@ export function ChatSessionsSidebar({
         />
         <TextInputField
           label="History search"
-          placeholder="title, preview, or snippet"
+          placeholder="title, family, agent, model, file, or recap"
           value={searchQuery}
           onChange={setSearchQuery}
         />
@@ -97,7 +102,11 @@ export function ChatSessionsSidebar({
           <h3>{selectedSession?.title ?? "None"}</h3>
           {selectedSession !== null && (
             <p className="chat-muted">
-              {selectedSession.title_source} · {selectedSession.archived ? "archived" : "active"} ·{" "}
+              {describeTitleGenerationState(
+                selectedSession.title_generation_state,
+                selectedSession.manual_title_locked,
+              )}{" "}
+              · {selectedSession.archived ? "archived" : "active"} ·{" "}
               {shortId(selectedSession.session_id)}
             </p>
           )}
@@ -111,17 +120,37 @@ export function ChatSessionsSidebar({
                   Last run {selectedSession.last_run_state}
                 </Chip>
               ) : null}
+              {selectedSession.family.family_size > 1 ? (
+                <Chip size="sm" variant="secondary">
+                  Family {selectedSession.family.sequence}/{selectedSession.family.family_size}
+                </Chip>
+              ) : null}
+              {selectedSession.has_context_files ? (
+                <Chip size="sm" variant="secondary">
+                  {selectedSession.recap.active_context_files.length} context file
+                  {selectedSession.recap.active_context_files.length === 1 ? "" : "s"}
+                </Chip>
+              ) : null}
             </div>
+          ) : null}
+          {selectedSession !== null &&
+          selectedSession.family.root_title.length > 0 &&
+          selectedSession.family.root_title !== selectedSession.title ? (
+            <p className="chat-muted">Family root: {selectedSession.family.root_title}</p>
           ) : null}
           {selectedSession?.preview !== undefined && (
             <p className="chat-muted">{selectedSession.preview}</p>
           )}
+          {selectedSession?.preview === undefined && selectedSession?.last_summary !== undefined ? (
+            <p className="chat-muted">{selectedSession.last_summary}</p>
+          ) : null}
           {selectedSession !== null ? (
             <p className="chat-muted">{buildSessionLineageHint(selectedSession)}</p>
           ) : null}
         </div>
         <TextInputField
           disabled={selectedSession === null || sessionsBusy}
+          description="Leave empty to return to automatic titles."
           label="Active label"
           value={sessionLabelDraft}
           onChange={setSessionLabelDraft}
@@ -178,10 +207,24 @@ export function ChatSessionsSidebar({
                 <span className="flex w-full flex-col items-start gap-1 text-left">
                   <span className="chat-session-item__title">{session.title}</span>
                   {session.preview !== undefined && <small>{session.preview}</small>}
+                  {session.preview === undefined && session.last_summary !== undefined ? (
+                    <small>{session.last_summary}</small>
+                  ) : null}
                   <span className="chat-session-item__meta">
                     <Chip size="sm" variant="secondary">
                       {describeBranchState(session.branch_state)}
                     </Chip>
+                    <Chip size="sm" variant="secondary">
+                      {describeTitleGenerationState(
+                        session.title_generation_state,
+                        session.manual_title_locked,
+                      )}
+                    </Chip>
+                    {session.family.family_size > 1 ? (
+                      <Chip size="sm" variant="secondary">
+                        Family {session.family.sequence}/{session.family.family_size}
+                      </Chip>
+                    ) : null}
                     {session.pending_approvals > 0 ? (
                       <Chip color="warning" size="sm" variant="soft">
                         {session.pending_approvals} approval
@@ -189,6 +232,9 @@ export function ChatSessionsSidebar({
                       </Chip>
                     ) : null}
                   </span>
+                  {session.family.root_title !== session.title ? (
+                    <small>Root: {session.family.root_title}</small>
+                  ) : null}
                   <small>
                     Updated {new Date(session.updated_at_unix_ms).toLocaleTimeString()} ·{" "}
                     {session.archived ? "archived" : session.title_source} ·{" "}

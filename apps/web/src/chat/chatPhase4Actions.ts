@@ -165,7 +165,11 @@ export async function restoreCheckpointAction(args: {
   args.clearTranscriptState();
   args.setAttachments([]);
   await Promise.all([args.refreshSessions(false), args.refreshSessionTranscript()]);
-  args.setNotice(`Checkpoint restored into ${response.session.title}.`);
+  args.setNotice(
+    response.suggested_session_label !== undefined
+      ? `Checkpoint restored into ${response.session.title}. Suggested title: ${response.suggested_session_label}.`
+      : `Checkpoint restored into ${response.session.title}.`,
+  );
 }
 
 export async function inspectBackgroundTaskAction(args: {

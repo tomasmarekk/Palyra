@@ -56,9 +56,66 @@ export interface ChatSessionRecord {
   last_run_id?: string;
 }
 
+export interface SessionCatalogFamilyRelative {
+  session_id: string;
+  title: string;
+  branch_state: string;
+  relation: string;
+}
+
+export interface SessionCatalogFamilyRecord {
+  root_title: string;
+  sequence: number;
+  family_size: number;
+  parent_session_id?: string;
+  parent_title?: string;
+  relatives: SessionCatalogFamilyRelative[];
+}
+
+export interface SessionCatalogArtifactRecord {
+  artifact_id: string;
+  kind: string;
+  label: string;
+}
+
+export interface SessionCatalogRecapRecord {
+  touched_files: string[];
+  active_context_files: string[];
+  recent_artifacts: SessionCatalogArtifactRecord[];
+  ctas: string[];
+}
+
+export interface SessionCatalogQuickControlRecord {
+  value?: string;
+  display_value: string;
+  source: string;
+  inherited_value?: string;
+  override_active: boolean;
+}
+
+export interface SessionCatalogToggleControlRecord {
+  value: boolean;
+  source: string;
+  inherited_value: boolean;
+  override_active: boolean;
+}
+
+export interface SessionCatalogQuickControlsRecord {
+  agent: SessionCatalogQuickControlRecord;
+  model: SessionCatalogQuickControlRecord;
+  thinking: SessionCatalogToggleControlRecord;
+  trace: SessionCatalogToggleControlRecord;
+  verbose: SessionCatalogToggleControlRecord;
+  reset_to_default_available: boolean;
+}
+
 export interface SessionCatalogRecord extends ChatSessionRecord {
   title: string;
   title_source: string;
+  title_generation_state: string;
+  manual_title_locked: boolean;
+  auto_title_updated_at_unix_ms?: number;
+  manual_title_updated_at_unix_ms?: number;
   preview?: string;
   preview_state: string;
   last_intent?: string;
@@ -76,6 +133,14 @@ export interface SessionCatalogRecord extends ChatSessionRecord {
   archived: boolean;
   archived_at_unix_ms?: number;
   pending_approvals: number;
+  has_context_files: boolean;
+  last_context_file?: string;
+  agent_id?: string;
+  model_profile?: string;
+  artifact_count: number;
+  family: SessionCatalogFamilyRecord;
+  recap: SessionCatalogRecapRecord;
+  quick_controls: SessionCatalogQuickControlsRecord;
 }
 
 export interface SessionCatalogSummary {
@@ -83,6 +148,7 @@ export interface SessionCatalogSummary {
   archived_sessions: number;
   sessions_with_pending_approvals: number;
   sessions_with_active_runs: number;
+  sessions_with_context_files: number;
 }
 
 export interface SessionCatalogListEnvelope {
@@ -98,6 +164,11 @@ export interface SessionCatalogListEnvelope {
     sort: string;
     title_source?: string;
     has_pending_approvals?: boolean;
+    branch_state?: string;
+    has_context_files?: boolean;
+    agent_id?: string;
+    model_profile?: string;
+    title_state?: string;
   };
   page: PageInfo;
 }
@@ -3043,7 +3114,7 @@ export class ConsoleApiClient {
 
   async renameChatSession(
     sessionId: string,
-    payload: { session_label: string },
+    payload: { session_label?: string; manual_title_locked?: boolean },
   ): Promise<{ session: ChatSessionRecord; created: boolean; reset_applied: boolean }> {
     return this.request(
       `/console/v1/chat/sessions/${encodeURIComponent(sessionId)}/rename`,
@@ -3214,6 +3285,7 @@ export class ConsoleApiClient {
   ): Promise<{
     session: SessionCatalogRecord;
     source_run_id: string;
+    suggested_session_label?: string;
     action: string;
     contract: ContractDescriptor;
   }> {
@@ -3346,6 +3418,7 @@ export class ConsoleApiClient {
   ): Promise<{
     session: SessionCatalogRecord;
     checkpoint: ChatCheckpointRecord;
+    suggested_session_label?: string;
     action: string;
     contract: ContractDescriptor;
   }> {

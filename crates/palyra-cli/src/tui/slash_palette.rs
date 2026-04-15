@@ -22,6 +22,10 @@ pub(crate) struct TuiSlashSessionRecord {
     pub(crate) session_key: String,
     pub(crate) archived: bool,
     pub(crate) preview: String,
+    pub(crate) root_title: String,
+    pub(crate) last_summary: String,
+    pub(crate) branch_state: String,
+    pub(crate) family_size: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -334,6 +338,8 @@ fn build_session_suggestions(
                 || session.session_id.to_ascii_lowercase().contains(query.as_str())
                 || session.title.to_ascii_lowercase().contains(query.as_str())
                 || session.session_key.to_ascii_lowercase().contains(query.as_str())
+                || session.root_title.to_ascii_lowercase().contains(query.as_str())
+                || session.last_summary.to_ascii_lowercase().contains(query.as_str())
         })
         .take(6)
         .map(|session| TuiSlashSuggestion {
@@ -341,12 +347,19 @@ fn build_session_suggestions(
             subtitle: if session.session_key.is_empty() {
                 session.session_id.clone()
             } else {
-                session.session_key.clone()
+                let family_hint = (session.family_size > 1)
+                    .then(|| format!(" · family {}", session.family_size))
+                    .unwrap_or_default();
+                format!("{}{}", session.session_key, family_hint)
             },
-            detail: if session.preview.is_empty() {
-                "Resume this session context.".to_owned()
-            } else {
+            detail: if !session.preview.is_empty() {
                 session.preview.clone()
+            } else if !session.last_summary.is_empty() {
+                session.last_summary.clone()
+            } else if !session.root_title.is_empty() && session.root_title != session.title {
+                format!("Family root: {}", session.root_title)
+            } else {
+                "Resume this session context.".to_owned()
             },
             example: format!("/{} {}", command.name, session.session_id),
             replacement: if command.name == "history" {
@@ -354,7 +367,13 @@ fn build_session_suggestions(
             } else {
                 format!("/{} {}", command.name, session.session_id)
             },
-            badge: if session.archived { "archived".to_owned() } else { "session".to_owned() },
+            badge: if session.archived {
+                "archived".to_owned()
+            } else if session.branch_state.eq_ignore_ascii_case("active_branch") {
+                "branch".to_owned()
+            } else {
+                "session".to_owned()
+            },
         })
         .collect()
 }
@@ -706,6 +725,10 @@ mod tests {
                     session_key: "ops:triage".to_owned(),
                     archived: false,
                     preview: "Investigate deploy failures".to_owned(),
+                    root_title: "Ops Triage".to_owned(),
+                    last_summary: "Investigate deploy failures".to_owned(),
+                    branch_state: "root".to_owned(),
+                    family_size: 1,
                 }],
                 ..TuiSlashEntityCatalog::default()
             },

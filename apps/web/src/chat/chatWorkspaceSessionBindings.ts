@@ -1,5 +1,5 @@
 import type { SessionCatalogRecord } from "../consoleApi";
-import { shortId } from "./chatShared";
+import { describeBranchState, describeTitleGenerationState, shortId } from "./chatShared";
 
 type ChatSessionsSlice = {
   sessionsBusy: boolean;
@@ -27,6 +27,21 @@ type BuildSessionsSidebarPropsParams = {
 
 export function describeSelectedSessionTitle(session: SessionCatalogRecord | null): string {
   return session?.title ?? (session ? shortId(session.session_id) : "Operator workspace");
+}
+
+export function buildWorkspaceHeaderSessionState(session: SessionCatalogRecord | null) {
+  return {
+    selectedSessionBranchState: describeBranchState(session?.branch_state ?? "missing"),
+    selectedSessionContextFileCount: session?.recap.active_context_files.length ?? 0,
+    selectedSessionFamilyLabel:
+      session !== null && session.family.family_size > 1
+        ? `Family ${session.family.sequence}/${session.family.family_size}`
+        : null,
+    selectedSessionTitleState: describeTitleGenerationState(
+      session?.title_generation_state ?? "idle",
+      session?.manual_title_locked ?? false,
+    ),
+  };
 }
 
 export function buildSessionsSidebarProps({

@@ -673,6 +673,10 @@ impl App {
                     self.open_session_history_picker(None).await?;
                 }
             }
+            "title" => {
+                let label = normalize_optional_text(parts.collect::<Vec<_>>().join(" "));
+                self.rename_current_session(label).await?;
+            }
             "model" => {
                 if let Some(model_id) = parts.next() {
                     self.set_model(model_id.to_owned()).await?;
@@ -803,26 +807,84 @@ impl App {
         Ok(())
     }
 
+    fn resolve_loaded_session_reference(&self, reference: &str) -> Option<TuiSlashSessionRecord> {
+        let trimmed = reference.trim();
+        self.slash_entity_catalog
+            .sessions
+            .iter()
+            .find(|session| session_reference_matches(session, trimmed))
+            .cloned()
+    }
+
     async fn switch_session(&mut self, reference: String) -> Result<()> {
         if self.active_stream.is_some() {
             self.status_line = "Cannot switch sessions while a run is active".to_owned();
             return Ok(());
         }
-        let request = if looks_like_canonical_ulid(reference.as_str()) {
+        let trimmed = reference.trim();
+        let mut recap_session = self.resolve_loaded_session_reference(trimmed);
+        let request = if looks_like_canonical_ulid(trimmed) {
             SessionResolveInput {
-                session_id: Some(resolve_required_canonical_id(reference)?),
+                session_id: Some(resolve_required_canonical_id(trimmed.to_owned())?),
                 session_key: String::new(),
                 session_label: String::new(),
                 require_existing: true,
                 reset_session: false,
             }
         } else {
-            SessionResolveInput {
-                session_id: None,
-                session_key: reference,
-                session_label: String::new(),
-                require_existing: true,
-                reset_session: false,
+            if recap_session.is_none() {
+                let response = self
+                    .runtime
+                    .list_session_catalog(vec![
+                        ("limit", Some("12".to_owned())),
+                        ("q", Some(trimmed.to_owned())),
+                        (
+                            "include_archived",
+                            self.include_archived_sessions.then(|| "true".to_owned()),
+                        ),
+                    ])
+                    .await?;
+                recap_session = response
+                    .sessions
+                    .into_iter()
+                    .find(|session| {
+                        session_reference_equals(session.session_id.as_str(), trimmed)
+                            || session_reference_equals(session.session_key.as_str(), trimmed)
+                            || session_reference_equals(session.title.as_str(), trimmed)
+                            || session_reference_equals(session.family.root_title.as_str(), trimmed)
+                            || session.family.relatives.iter().any(|relative| {
+                                session_reference_equals(relative.title.as_str(), trimmed)
+                            })
+                    })
+                    .map(|session| TuiSlashSessionRecord {
+                        session_id: session.session_id,
+                        title: session.title,
+                        session_key: session.session_key,
+                        archived: session.archived,
+                        preview: session.preview.unwrap_or_default(),
+                        root_title: session.family.root_title,
+                        last_summary: session.last_summary.unwrap_or_default(),
+                        branch_state: session.branch_state,
+                        family_size: session.family.family_size,
+                    });
+            }
+
+            if let Some(session) = recap_session.as_ref() {
+                SessionResolveInput {
+                    session_id: Some(resolve_required_canonical_id(session.session_id.clone())?),
+                    session_key: String::new(),
+                    session_label: String::new(),
+                    require_existing: true,
+                    reset_session: false,
+                }
+            } else {
+                SessionResolveInput {
+                    session_id: None,
+                    session_key: trimmed.to_owned(),
+                    session_label: String::new(),
+                    require_existing: true,
+                    reset_session: false,
+                }
             }
         };
         let response = self.runtime.resolve_session(request).await?;
@@ -832,6 +894,18 @@ impl App {
         self.session = session;
         self.transcript.clear();
         self.push_entry(EntryKind::System, "Session", "Session switched.");
+        if let Some(recap_session) = recap_session.as_ref() {
+            let recap = if !recap_session.preview.is_empty() {
+                recap_session.preview.as_str()
+            } else if !recap_session.last_summary.is_empty() {
+                recap_session.last_summary.as_str()
+            } else if recap_session.root_title != recap_session.title {
+                recap_session.root_title.as_str()
+            } else {
+                "No stored recap is available for this session yet."
+            };
+            self.push_entry(EntryKind::System, "Recap", recap);
+        }
         self.refresh_agent_identity(None, false).await?;
         self.refresh_slash_entity_catalogs().await?;
         self.sync_slash_palette();
@@ -874,6 +948,34 @@ impl App {
         self.refresh_slash_entity_catalogs().await?;
         self.sync_slash_palette();
         self.status_line = text::session_reset(self.locale);
+        Ok(())
+    }
+
+    async fn rename_current_session(&mut self, requested_label: Option<String>) -> Result<()> {
+        let session_id = self.active_session_id()?;
+        let context = self.connect_admin_console().await?;
+        context
+            .client
+            .post_json_value(
+                format!(
+                    "console/v1/chat/sessions/{}/rename",
+                    percent_encode_component(session_id.as_str())
+                ),
+                &serde_json::json!({
+                    "session_label": requested_label,
+                    "manual_title_locked": requested_label.is_some(),
+                }),
+            )
+            .await?;
+        self.refresh_slash_entity_catalogs().await?;
+        self.sync_slash_palette();
+        let message = if requested_label.is_some() {
+            "Session title updated."
+        } else {
+            "Session title returned to automatic mode."
+        };
+        self.push_entry(EntryKind::System, "Title", message);
+        self.status_line = message.to_owned();
         Ok(())
     }
 
@@ -1145,11 +1247,20 @@ impl App {
             .and_then(serde_json::Value::as_str)
             .context("branch response is missing child session_id")?
             .to_owned();
+        let suggested_session_label = payload
+            .pointer("/suggested_session_label")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
         self.switch_session(next_session_id).await?;
         self.push_entry(
             EntryKind::System,
             "Branch",
-            "Created a new active branch from the latest terminal run.",
+            match suggested_session_label {
+                Some(label) => format!(
+                    "Created a new active branch from the latest terminal run.\nSuggested title: {label}"
+                ),
+                None => "Created a new active branch from the latest terminal run.".to_owned(),
+            },
         );
         self.refresh_slash_entity_catalogs().await?;
         self.sync_slash_palette();
@@ -1314,6 +1425,10 @@ impl App {
                 session_key: session.session_key,
                 archived: session.archived,
                 preview: session.preview.unwrap_or_default(),
+                root_title: session.family.root_title,
+                last_summary: session.last_summary.unwrap_or_default(),
+                branch_state: session.branch_state,
+                family_size: session.family.family_size,
             })
             .collect();
         Ok(())
@@ -1478,6 +1593,10 @@ impl App {
             .and_then(serde_json::Value::as_str)
             .context("checkpoint restore response is missing session_id")?
             .to_owned();
+        let suggested_session_label = payload
+            .pointer("/suggested_session_label")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
         self.switch_session(next_session_id).await?;
         let warning = if source == "undo" {
             "Conversation state was restored from a checkpoint. Any external side effects already emitted remain in the world state."
@@ -1487,7 +1606,13 @@ impl App {
         self.push_entry(
             EntryKind::System,
             if source == "undo" { "Undo" } else { "Checkpoint restore" },
-            format!("{warning}\ncheckpoint={}", shorten_id(checkpoint_id.as_str())),
+            match suggested_session_label {
+                Some(label) => format!(
+                    "{warning}\ncheckpoint={}\nsuggested title={label}",
+                    shorten_id(checkpoint_id.as_str())
+                ),
+                None => format!("{warning}\ncheckpoint={}", shorten_id(checkpoint_id.as_str())),
+            },
         );
         self.status_line = if source == "undo" {
             "Undo restore completed".to_owned()
@@ -2461,12 +2586,40 @@ impl App {
             .map(|session| PickerItem {
                 id: session.session_id.clone(),
                 title: session.title,
-                detail: format!(
-                    "{} | updated={} | {}",
-                    if session.archived { "archived" } else { session.title_source.as_str() },
-                    session.updated_at_unix_ms,
-                    session.preview.unwrap_or_else(|| "no preview".to_owned())
-                ),
+                detail: {
+                    let title_state = if session.manual_title_locked {
+                        "manual"
+                    } else {
+                        session.title_generation_state.as_str()
+                    };
+                    let family_hint = (session.family.family_size > 1)
+                        .then(|| {
+                            format!(
+                                "family {}/{}",
+                                session.family.sequence, session.family.family_size
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            describe_branch_state_label(session.branch_state.as_str())
+                        });
+                    let workspace_hint = if session.has_context_files {
+                        format!(
+                            "{} context file{}",
+                            session.recap.active_context_files.len(),
+                            if session.recap.active_context_files.len() == 1 { "" } else { "s" }
+                        )
+                    } else {
+                        "no context files".to_owned()
+                    };
+                    let summary = session
+                        .preview
+                        .or(session.last_summary)
+                        .unwrap_or_else(|| "no preview".to_owned());
+                    format!(
+                        "{title_state} | {family_hint} | {workspace_hint} | updated={} | {summary}",
+                        session.updated_at_unix_ms
+                    )
+                },
             })
             .collect::<Vec<_>>();
         let selected = items.iter().position(|item| item.id == current_session_id).unwrap_or(0);
@@ -3432,6 +3585,27 @@ fn parse_toggle(value: Option<&str>, current: bool) -> Result<bool> {
 
 fn looks_like_canonical_ulid(value: &str) -> bool {
     value.len() == 26 && value.chars().all(|ch| ch.is_ascii_alphanumeric())
+}
+
+fn session_reference_equals(candidate: &str, reference: &str) -> bool {
+    !candidate.trim().is_empty() && candidate.eq_ignore_ascii_case(reference)
+}
+
+fn session_reference_matches(session: &TuiSlashSessionRecord, reference: &str) -> bool {
+    session_reference_equals(session.session_id.as_str(), reference)
+        || session_reference_equals(session.session_key.as_str(), reference)
+        || session_reference_equals(session.title.as_str(), reference)
+        || session_reference_equals(session.root_title.as_str(), reference)
+}
+
+fn describe_branch_state_label(branch_state: &str) -> String {
+    match branch_state {
+        "root" => "root".to_owned(),
+        "active_branch" | "branched" => "branch".to_owned(),
+        "branch_source" => "branch source".to_owned(),
+        "missing" => "no lineage".to_owned(),
+        other => other.replace('_', " "),
+    }
 }
 
 fn agent_resolution_source_label(raw: i32) -> &'static str {

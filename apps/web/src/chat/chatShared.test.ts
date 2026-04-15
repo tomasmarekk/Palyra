@@ -9,6 +9,7 @@ import {
   buildSessionLineageHint,
   collectCanvasFrameUrls,
   describeBranchState,
+  describeTitleGenerationState,
   parseCompactCommandMode,
   parseSlashCommand,
 } from "./chatShared";
@@ -81,6 +82,10 @@ describe("chatShared helpers", () => {
         session_key: "web",
         title: "Incident follow-up",
         title_source: "manual",
+        title_generation_state: "ready",
+        manual_title_locked: true,
+        auto_title_updated_at_unix_ms: 100,
+        manual_title_updated_at_unix_ms: 100,
         preview_state: "computed",
         last_intent_state: "computed",
         last_summary_state: "computed",
@@ -96,8 +101,65 @@ describe("chatShared helpers", () => {
         total_tokens: 0,
         archived: false,
         pending_approvals: 0,
+        has_context_files: false,
+        artifact_count: 0,
+        family: {
+          root_title: "Incident follow-up",
+          sequence: 2,
+          family_size: 2,
+          parent_session_id: "01ARZ3NDEKTSV4RRFFQ69G5FA0",
+          parent_title: "Root incident",
+          relatives: [],
+        },
+        recap: {
+          touched_files: [],
+          active_context_files: [],
+          recent_artifacts: [],
+          ctas: [],
+        },
+        quick_controls: {
+          agent: {
+            value: "default",
+            display_value: "Default agent",
+            source: "default",
+            inherited_value: "default",
+            override_active: false,
+          },
+          model: {
+            value: "gpt-5.4",
+            display_value: "gpt-5.4",
+            source: "default",
+            inherited_value: "gpt-5.4",
+            override_active: false,
+          },
+          thinking: {
+            value: true,
+            source: "surface_default",
+            inherited_value: true,
+            override_active: false,
+          },
+          trace: {
+            value: false,
+            source: "surface_default",
+            inherited_value: false,
+            override_active: false,
+          },
+          verbose: {
+            value: false,
+            source: "surface_default",
+            inherited_value: false,
+            override_active: false,
+          },
+          reset_to_default_available: false,
+        },
       }),
     ).toMatch(/Active branch from .* at run/i);
+  });
+
+  it("maps title lifecycle states into operator-facing labels", () => {
+    expect(describeTitleGenerationState("ready", false)).toBe("Auto title ready");
+    expect(describeTitleGenerationState("pending", false)).toBe("Auto title pending");
+    expect(describeTitleGenerationState("idle", true)).toBe("Manual title");
   });
 });
 

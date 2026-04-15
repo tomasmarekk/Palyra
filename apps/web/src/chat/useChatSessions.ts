@@ -30,7 +30,7 @@ type UseChatSessionsResult = {
   upsertSession: (session: SessionCatalogRecord, options?: { select?: boolean }) => void;
   createSession: () => Promise<void>;
   createSessionWithLabel: (sessionLabel?: string) => Promise<string | null>;
-  renameSession: () => Promise<void>;
+  renameSession: (requestedLabel?: string) => Promise<void>;
   resetSession: () => Promise<boolean>;
   archiveSession: () => Promise<boolean>;
 };
@@ -221,38 +221,32 @@ export function useChatSessions({
     [activateSession],
   );
 
-  const renameSession = useCallback(async (): Promise<void> => {
+  const renameSession = useCallback(async (requestedLabel?: string): Promise<void> => {
     if (activeSessionId.trim().length === 0) {
       setError("Select a session first.");
-      return;
-    }
-    if (sessionLabelDraft.trim().length === 0) {
-      setError("Session label cannot be empty.");
       return;
     }
     setError(null);
     setNotice(null);
     setSessionsBusy(true);
     try {
+      const nextLabel = emptyToUndefined(requestedLabel ?? sessionLabelDraft);
       const response = await api.renameChatSession(activeSessionId, {
-        session_label: sessionLabelDraft.trim(),
+        session_label: nextLabel,
+        manual_title_locked: nextLabel !== undefined,
       });
       const updatedRecord = await api.getSessionCatalogEntry(response.session.session_id);
-      setSessions((previous) => {
-        return previous.map((entry) => {
-          if (entry.session_id !== updatedRecord.session.session_id) {
-            return entry;
-          }
-          return updatedRecord.session;
-        });
-      });
-      setNotice("Session label updated.");
+      upsertSession(updatedRecord.session);
+      setSessionLabelDraft(updatedRecord.session.session_label ?? "");
+      setNotice(
+        nextLabel === undefined ? "Session title returned to automatic mode." : "Session title updated.",
+      );
     } catch (error) {
       setError(toErrorMessage(error));
     } finally {
       setSessionsBusy(false);
     }
-  }, [activeSessionId, api, sessionLabelDraft, setError, setNotice]);
+  }, [activeSessionId, api, sessionLabelDraft, setError, setNotice, upsertSession]);
 
   const resetSession = useCallback(async (): Promise<boolean> => {
     if (activeSessionId.trim().length === 0) {
@@ -265,14 +259,7 @@ export function useChatSessions({
     try {
       const response = await api.resetChatSession(activeSessionId);
       const updatedRecord = await api.getSessionCatalogEntry(response.session.session_id);
-      setSessions((previous) => {
-        return previous.map((entry) => {
-          if (entry.session_id !== updatedRecord.session.session_id) {
-            return entry;
-          }
-          return updatedRecord.session;
-        });
-      });
+      upsertSession(updatedRecord.session);
       setNotice("Session reset applied.");
       return true;
     } catch (error) {
@@ -281,7 +268,7 @@ export function useChatSessions({
     } finally {
       setSessionsBusy(false);
     }
-  }, [activeSessionId, api, setError, setNotice]);
+  }, [activeSessionId, api, setError, setNotice, upsertSession]);
 
   const archiveSession = useCallback(async (): Promise<boolean> => {
     if (activeSessionId.trim().length === 0) {
@@ -292,9 +279,13 @@ export function useChatSessions({
     setNotice(null);
     setSessionsBusy(true);
     try {
-      await api.archiveSession(activeSessionId);
-      setSessions((previous) => previous.filter((entry) => entry.session_id !== activeSessionId));
-      if (activeSessionIdRef.current === activeSessionId) {
+      const response = await api.archiveSession(activeSessionId);
+      if (includeArchived) {
+        upsertSession(response.session, { select: activeSessionIdRef.current === activeSessionId });
+      } else {
+        setSessions((previous) => previous.filter((entry) => entry.session_id !== activeSessionId));
+      }
+      if (!includeArchived && activeSessionIdRef.current === activeSessionId) {
         activateSession("");
       }
       setNotice("Session archived.");
@@ -305,7 +296,7 @@ export function useChatSessions({
     } finally {
       setSessionsBusy(false);
     }
-  }, [activateSession, activeSessionId, api, setError, setNotice]);
+  }, [activateSession, activeSessionId, api, includeArchived, setError, setNotice, upsertSession]);
 
   return {
     sessionsBusy,

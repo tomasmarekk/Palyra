@@ -2,7 +2,11 @@ import { useEffect, useMemo, useState } from "react";
 import { Chip } from "@heroui/react";
 import { useNavigate } from "react-router-dom";
 
-import { buildSessionLineageHint, describeBranchState } from "../../chat/chatShared";
+import {
+  buildSessionLineageHint,
+  describeBranchState,
+  describeTitleGenerationState,
+} from "../../chat/chatShared";
 import type {
   ChatCheckpointRecord,
   ChatCompactionArtifactRecord,
@@ -317,6 +321,12 @@ export function SessionsSection({ app }: SessionsSectionProps) {
           tone={(catalog.summary?.sessions_with_active_runs ?? 0) > 0 ? "accent" : "default"}
           value={catalog.summary?.sessions_with_active_runs ?? 0}
         />
+        <WorkspaceMetricCard
+          detail="Sessions carrying active context files or workspace references."
+          label="Context files"
+          tone={(catalog.summary?.sessions_with_context_files ?? 0) > 0 ? "accent" : "default"}
+          value={catalog.summary?.sessions_with_context_files ?? 0}
+        />
       </section>
 
       <WorkspaceSectionCard
@@ -326,7 +336,7 @@ export function SessionsSection({ app }: SessionsSectionProps) {
         <div className="workspace-form-grid">
           <TextInputField
             label="Search"
-            placeholder="title, key, preview, or run state"
+            placeholder="title, family, agent, model, file, or recap"
             value={catalog.query}
             onChange={catalog.setQuery}
           />
@@ -351,6 +361,73 @@ export function SessionsSection({ app }: SessionsSectionProps) {
               )
             }
           />
+          <SelectField
+            label="Title mode"
+            options={[
+              { key: "all", label: "Any title mode" },
+              { key: "ready", label: "Auto title ready" },
+              { key: "pending", label: "Auto title pending" },
+              { key: "failed", label: "Auto title failed" },
+              { key: "idle", label: "Auto title idle" },
+            ]}
+            value={catalog.titleState}
+            onChange={catalog.setTitleState}
+          />
+          <SelectField
+            label="Title source"
+            options={[
+              { key: "all", label: "Any title source" },
+              { key: "label", label: "Manual label" },
+              { key: "semantic_title", label: "Semantic title" },
+              { key: "auto_title", label: "Automatic title" },
+              { key: "session_key", label: "Session key fallback" },
+            ]}
+            value={catalog.titleSource}
+            onChange={catalog.setTitleSource}
+          />
+          <SelectField
+            label="Branch state"
+            options={[
+              { key: "all", label: "Any lineage" },
+              { key: "root", label: "Root session" },
+              { key: "active_branch", label: "Active branch" },
+              { key: "branch_source", label: "Branch source" },
+            ]}
+            value={catalog.branchState}
+            onChange={catalog.setBranchState}
+          />
+          <SelectField
+            label="Pending approvals"
+            options={[
+              { key: "all", label: "Any approval state" },
+              { key: "yes", label: "With pending approvals" },
+              { key: "no", label: "Without pending approvals" },
+            ]}
+            value={catalog.hasPendingApprovals}
+            onChange={(value) => catalog.setHasPendingApprovals(value as "all" | "yes" | "no")}
+          />
+          <SelectField
+            label="Context files"
+            options={[
+              { key: "all", label: "Any context posture" },
+              { key: "yes", label: "With context files" },
+              { key: "no", label: "Without context files" },
+            ]}
+            value={catalog.hasContextFiles}
+            onChange={(value) => catalog.setHasContextFiles(value as "all" | "yes" | "no")}
+          />
+          <TextInputField
+            label="Agent"
+            placeholder="agent id"
+            value={catalog.agentId}
+            onChange={catalog.setAgentId}
+          />
+          <TextInputField
+            label="Model profile"
+            placeholder="model profile"
+            value={catalog.modelProfile}
+            onChange={catalog.setModelProfile}
+          />
           <SwitchField
             checked={catalog.includeArchived}
             description="Include archived records in the current list."
@@ -373,7 +450,7 @@ export function SessionsSection({ app }: SessionsSectionProps) {
           ) : (
             <WorkspaceTable
               ariaLabel="Session catalog"
-              columns={["Title", "Updated", "Run state", "Approvals", "Preview"]}
+              columns={["Title", "Family", "Updated", "Controls", "Recap"]}
             >
               {catalog.entries.map((entry) => {
                 const selectedRow = entry.session_id === catalog.selectedSessionId;
@@ -387,18 +464,41 @@ export function SessionsSection({ app }: SessionsSectionProps) {
                       <div className="workspace-stack">
                         <strong>{entry.title}</strong>
                         <small className="text-muted">
-                          {entry.title_source} · {entry.archived ? "archived" : "active"}
+                          {describeTitleGenerationState(
+                            entry.title_generation_state,
+                            entry.manual_title_locked,
+                          )}{" "}
+                          · {entry.archived ? "archived" : entry.title_source}
+                        </small>
+                      </div>
+                    </td>
+                    <td>
+                      <div className="workspace-stack">
+                        <strong>{entry.family.root_title}</strong>
+                        <small className="text-muted">
+                          {describeBranchState(entry.branch_state)}
+                          {entry.family.family_size > 1
+                            ? ` · ${entry.family.sequence}/${entry.family.family_size}`
+                            : ""}
                         </small>
                       </div>
                     </td>
                     <td>{formatUnixMs(entry.updated_at_unix_ms)}</td>
                     <td>
-                      <Chip size="sm" variant="secondary">
-                        {entry.last_run_state ?? "none"}
-                      </Chip>
+                      <div className="workspace-stack">
+                        <small>
+                          {entry.quick_controls.agent.display_value} ·{" "}
+                          {entry.quick_controls.model.display_value}
+                        </small>
+                        <small className="text-muted">
+                          {entry.pending_approvals} approval{entry.pending_approvals === 1 ? "" : "s"}
+                          {entry.has_context_files
+                            ? ` · ${entry.recap.active_context_files.length} context file${entry.recap.active_context_files.length === 1 ? "" : "s"}`
+                            : ""}
+                        </small>
+                      </div>
                     </td>
-                    <td>{entry.pending_approvals}</td>
-                    <td>{entry.preview ?? "No preview"}</td>
+                    <td>{entry.preview ?? entry.last_summary ?? "No recap"}</td>
                   </tr>
                 );
               })}
@@ -422,12 +522,34 @@ export function SessionsSection({ app }: SessionsSectionProps) {
                 <p className="workspace-kicker">Selected session</p>
                 <h3>{selected.title}</h3>
                 <p className="chat-muted">
-                  {selected.preview ?? "No preview was derivable from existing run history."}
+                  {selected.preview ??
+                    selected.last_summary ??
+                    "No preview was derivable from existing run history."}
                 </p>
+                <div className="workspace-chip-row">
+                  <WorkspaceStatusChip tone={selected.manual_title_locked ? "accent" : "default"}>
+                    {describeTitleGenerationState(
+                      selected.title_generation_state,
+                      selected.manual_title_locked,
+                    )}
+                  </WorkspaceStatusChip>
+                  <WorkspaceStatusChip tone="default">
+                    {selected.quick_controls.agent.display_value}
+                  </WorkspaceStatusChip>
+                  <WorkspaceStatusChip tone="default">
+                    {selected.quick_controls.model.display_value}
+                  </WorkspaceStatusChip>
+                  {selected.family.family_size > 1 ? (
+                    <WorkspaceStatusChip tone="accent">
+                      Family {selected.family.sequence}/{selected.family.family_size}
+                    </WorkspaceStatusChip>
+                  ) : null}
+                </div>
               </div>
 
               <TextInputField
                 disabled={catalog.busy}
+                description="Leave empty to return the session to automatic title mode."
                 label="Session label"
                 value={catalog.renameDraft}
                 onChange={catalog.setRenameDraft}
@@ -549,6 +671,14 @@ export function SessionsSection({ app }: SessionsSectionProps) {
                   <dd>{selected.session_key}</dd>
                 </div>
                 <div>
+                  <dt>Title source</dt>
+                  <dd>{selected.title_source}</dd>
+                </div>
+                <div>
+                  <dt>Family root</dt>
+                  <dd>{selected.family.root_title}</dd>
+                </div>
+                <div>
                   <dt>Created</dt>
                   <dd>{formatUnixMs(selected.created_at_unix_ms)}</dd>
                 </div>
@@ -576,6 +706,14 @@ export function SessionsSection({ app }: SessionsSectionProps) {
                   <dt>Pending approvals</dt>
                   <dd>{selected.pending_approvals}</dd>
                 </div>
+                <div>
+                  <dt>Context files</dt>
+                  <dd>
+                    {selected.has_context_files
+                      ? `${selected.recap.active_context_files.length} active`
+                      : "none"}
+                  </dd>
+                </div>
               </dl>
 
               {selected.last_intent || selected.last_summary ? (
@@ -586,6 +724,32 @@ export function SessionsSection({ app }: SessionsSectionProps) {
                   <p>
                     <strong>Last summary:</strong> {selected.last_summary ?? "Missing"}
                   </p>
+                </WorkspaceInlineNotice>
+              ) : null}
+
+              {selected.recap.touched_files.length > 0 ||
+              selected.recap.active_context_files.length > 0 ||
+              selected.recap.recent_artifacts.length > 0 ? (
+                <WorkspaceInlineNotice title="Resume recap" tone="accent">
+                  {selected.recap.touched_files.length > 0 ? (
+                    <p>
+                      <strong>Touched files:</strong> {selected.recap.touched_files.join(", ")}
+                    </p>
+                  ) : null}
+                  {selected.recap.active_context_files.length > 0 ? (
+                    <p>
+                      <strong>Active context:</strong>{" "}
+                      {selected.recap.active_context_files.join(", ")}
+                    </p>
+                  ) : null}
+                  {selected.recap.recent_artifacts.length > 0 ? (
+                    <p>
+                      <strong>Recent artifacts:</strong>{" "}
+                      {selected.recap.recent_artifacts
+                        .map((artifact) => `${artifact.label} (${artifact.kind})`)
+                        .join(", ")}
+                    </p>
+                  ) : null}
                 </WorkspaceInlineNotice>
               ) : null}
 

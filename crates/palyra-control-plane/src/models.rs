@@ -550,6 +550,75 @@ pub struct PairingSummaryEnvelope {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCatalogFamilyRelative {
+    pub session_id: String,
+    pub title: String,
+    pub branch_state: String,
+    pub relation: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCatalogFamilyRecord {
+    pub root_title: String,
+    pub sequence: u64,
+    pub family_size: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relatives: Vec<SessionCatalogFamilyRelative>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCatalogArtifactRecord {
+    pub artifact_id: String,
+    pub kind: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCatalogRecapRecord {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub touched_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_context_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_artifacts: Vec<SessionCatalogArtifactRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ctas: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCatalogQuickControlRecord {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    pub display_value: String,
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inherited_value: Option<String>,
+    pub override_active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCatalogToggleControlRecord {
+    pub value: bool,
+    pub source: String,
+    pub inherited_value: bool,
+    pub override_active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCatalogQuickControlsRecord {
+    pub agent: SessionCatalogQuickControlRecord,
+    pub model: SessionCatalogQuickControlRecord,
+    pub thinking: SessionCatalogToggleControlRecord,
+    pub trace: SessionCatalogToggleControlRecord,
+    pub verbose: SessionCatalogToggleControlRecord,
+    pub reset_to_default_available: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionCatalogRecord {
     pub session_id: String,
     pub session_key: String,
@@ -557,6 +626,12 @@ pub struct SessionCatalogRecord {
     pub session_label: Option<String>,
     pub title: String,
     pub title_source: String,
+    pub title_generation_state: String,
+    pub manual_title_locked: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_title_updated_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manual_title_updated_at_unix_ms: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preview: Option<String>,
     pub preview_state: String,
@@ -569,6 +644,8 @@ pub struct SessionCatalogRecord {
     pub branch_state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_origin_run_id: Option<String>,
     pub principal: String,
     pub device_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -588,6 +665,17 @@ pub struct SessionCatalogRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub archived_at_unix_ms: Option<i64>,
     pub pending_approvals: usize,
+    pub has_context_files: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_context_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_profile: Option<String>,
+    pub artifact_count: usize,
+    pub family: SessionCatalogFamilyRecord,
+    pub recap: SessionCatalogRecapRecord,
+    pub quick_controls: SessionCatalogQuickControlsRecord,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -596,6 +684,7 @@ pub struct SessionCatalogSummary {
     pub archived_sessions: usize,
     pub sessions_with_pending_approvals: usize,
     pub sessions_with_active_runs: usize,
+    pub sessions_with_context_files: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -612,6 +701,16 @@ pub struct SessionCatalogQueryEcho {
     pub title_source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub has_pending_approvals: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub has_context_files: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_profile: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title_state: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

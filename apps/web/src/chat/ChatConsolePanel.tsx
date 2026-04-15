@@ -55,10 +55,7 @@ import { useChatSlashPalette } from "./useChatSlashPalette";
 import { usePhase4DeepLinks } from "./usePhase4DeepLinks";
 import { useChatObjectives } from "./useChatObjectives";
 import { useChatPanelBootstrap } from "./useChatPanelBootstrap";
-import {
-  buildSessionsSidebarProps,
-  describeSelectedSessionTitle,
-} from "./chatWorkspaceSessionBindings";
+import { buildWorkspaceHeaderSessionState, buildSessionsSidebarProps, describeSelectedSessionTitle } from "./chatWorkspaceSessionBindings";
 import { FIRST_SUCCESS_PROMPTS } from "./starterPrompts";
 import { useStarterPromptGuidance } from "./useStarterPromptGuidance";
 import { useStarterPromptHandoff } from "./useStarterPromptHandoff";
@@ -601,6 +598,9 @@ export function ChatConsolePanel({
       restoreCheckpoint,
       onInterrupt: interruptCurrentRun,
       onCreateSession: createNewSession,
+      onRenameSession: async (requestedLabel) => {
+        await sessions.renameSession(requestedLabel);
+      },
       onResetSession: resetSessionAndTranscript,
       onRetry: retryLatestTurn,
       onBranchSession: branchCurrentSession,
@@ -991,9 +991,7 @@ export function ChatConsolePanel({
         runActionBusy={runActionBusy}
         selectedObjectiveFocus={selectedObjectiveFocus}
         selectedObjectiveLabel={selectedObjectiveLabel}
-        selectedSessionBranchState={describeBranchState(
-          sessions.selectedSession?.branch_state ?? "missing",
-        )}
+        {...buildWorkspaceHeaderSessionState(sessions.selectedSession)}
         selectedSessionLineage={selectedSessionLineage}
         selectedSessionTitle={describeSelectedSessionTitle(sessions.selectedSession)}
         sessionsBusy={sessions.sessionsBusy}

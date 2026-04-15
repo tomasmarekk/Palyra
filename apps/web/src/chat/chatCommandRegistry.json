@@ -132,6 +132,18 @@
     "keywords": ["resume", "session", "switch"]
   },
   {
+    "name": "title",
+    "synopsis": "/title [label]",
+    "description": "Set a manual session title, or clear it to return the active session to automatic title mode.",
+    "example": "/title Incident follow-up",
+    "category": "session",
+    "execution": "server",
+    "surfaces": ["web", "tui"],
+    "capability_tags": ["session", "title", "rename"],
+    "entity_targets": ["session"],
+    "keywords": ["title", "rename", "label", "session"]
+  },
+  {
     "name": "model",
     "synopsis": "/model [model-id]",
     "description": "Switch the preferred model or open the model picker when omitted.",

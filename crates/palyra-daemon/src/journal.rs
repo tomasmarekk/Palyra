@@ -1151,6 +1151,16 @@ pub struct OrchestratorSessionResolveRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrchestratorSessionTitleUpdateRequest {
+    pub session_id: String,
+    pub session_label: Option<String>,
+    pub principal: String,
+    pub device_id: String,
+    pub channel: Option<String>,
+    pub manual_title_locked: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrchestratorSessionCleanupRequest {
     pub session_id: Option<String>,
     pub session_key: Option<String>,
@@ -1181,6 +1191,12 @@ pub struct OrchestratorSessionRecord {
     pub auto_title_source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_title_generator_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_title_updated_at_unix_ms: Option<i64>,
+    pub title_generation_state: String,
+    pub manual_title_locked: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manual_title_updated_at_unix_ms: Option<i64>,
     pub title: String,
     pub title_source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1705,6 +1721,7 @@ pub struct OrchestratorSessionLineageUpdateRequest {
     pub branch_state: String,
     pub parent_session_id: Option<String>,
     pub branch_origin_run_id: Option<String>,
+    pub suggested_auto_title: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3027,6 +3044,22 @@ const MIGRATIONS: &[Migration] = &[
                 ON learning_preferences(status, scope_kind, scope_id, updated_at_unix_ms DESC);
         "#,
     },
+    Migration {
+        version: 21,
+        name: "orchestrator_session_title_lifecycle_phase4",
+        sql: r#"
+            ALTER TABLE orchestrator_sessions
+                ADD COLUMN auto_title_updated_at_unix_ms INTEGER;
+            ALTER TABLE orchestrator_sessions
+                ADD COLUMN title_generation_state TEXT NOT NULL DEFAULT 'idle';
+            ALTER TABLE orchestrator_sessions
+                ADD COLUMN manual_title_locked INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE orchestrator_sessions
+                ADD COLUMN manual_title_updated_at_unix_ms INTEGER;
+            CREATE INDEX IF NOT EXISTS idx_orchestrator_sessions_manual_title_locked
+                ON orchestrator_sessions(manual_title_locked, updated_at_unix_ms DESC);
+        "#,
+    },
 ];
 
 fn serialize_json_field<T: Serialize>(
@@ -3307,11 +3340,26 @@ impl JournalStore {
                     device_id,
                     channel,
                     created_at_unix_ms,
-                    updated_at_unix_ms
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+                    updated_at_unix_ms,
+                    title_generation_state,
+                    manual_title_locked,
+                    manual_title_updated_at_unix_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9, ?10)
                 ON CONFLICT(session_ulid) DO UPDATE SET
                     updated_at_unix_ms = excluded.updated_at_unix_ms,
-                    session_label = COALESCE(excluded.session_label, orchestrator_sessions.session_label)
+                    session_label = COALESCE(excluded.session_label, orchestrator_sessions.session_label),
+                    title_generation_state = CASE
+                        WHEN excluded.session_label IS NOT NULL THEN excluded.title_generation_state
+                        ELSE orchestrator_sessions.title_generation_state
+                    END,
+                    manual_title_locked = CASE
+                        WHEN excluded.session_label IS NOT NULL THEN excluded.manual_title_locked
+                        ELSE orchestrator_sessions.manual_title_locked
+                    END,
+                    manual_title_updated_at_unix_ms = CASE
+                        WHEN excluded.session_label IS NOT NULL THEN excluded.manual_title_updated_at_unix_ms
+                        ELSE orchestrator_sessions.manual_title_updated_at_unix_ms
+                    END
                 WHERE orchestrator_sessions.principal = excluded.principal
                   AND orchestrator_sessions.device_id = excluded.device_id
                   AND COALESCE(orchestrator_sessions.channel, '') = COALESCE(excluded.channel, '')
@@ -3325,6 +3373,13 @@ impl JournalStore {
                     request.device_id,
                     request.channel,
                     now,
+                    if request.session_label.is_some() {
+                        ORCHESTRATOR_TITLE_GENERATION_STATE_MANUAL_LOCKED
+                    } else {
+                        ORCHESTRATOR_TITLE_GENERATION_STATE_IDLE
+                    },
+                    request.session_label.is_some(),
+                    request.session_label.as_ref().map(|_| now),
                 ],
             )?;
         if updated == 0 {
@@ -3422,7 +3477,19 @@ impl JournalStore {
                     SET
                         updated_at_unix_ms = ?2,
                         session_label = COALESCE(?3, session_label),
-                        last_run_ulid = CASE WHEN ?4 = 1 THEN NULL ELSE last_run_ulid END
+                        last_run_ulid = CASE WHEN ?4 = 1 THEN NULL ELSE last_run_ulid END,
+                        title_generation_state = CASE
+                            WHEN ?3 IS NOT NULL THEN ?5
+                            ELSE title_generation_state
+                        END,
+                        manual_title_locked = CASE
+                            WHEN ?3 IS NOT NULL THEN 1
+                            ELSE manual_title_locked
+                        END,
+                        manual_title_updated_at_unix_ms = CASE
+                            WHEN ?3 IS NOT NULL THEN ?2
+                            ELSE manual_title_updated_at_unix_ms
+                        END
                     WHERE session_ulid = ?1
                 "#,
                 params![
@@ -3430,12 +3497,17 @@ impl JournalStore {
                     now,
                     requested_session_label,
                     if request.reset_session { 1_i64 } else { 0_i64 },
+                    ORCHESTRATOR_TITLE_GENERATION_STATE_MANUAL_LOCKED,
                 ],
             )?;
 
             session.updated_at_unix_ms = now;
             if requested_session_label.is_some() {
                 session.session_label = requested_session_label.clone();
+                session.title_generation_state =
+                    ORCHESTRATOR_TITLE_GENERATION_STATE_MANUAL_LOCKED.to_owned();
+                session.manual_title_locked = true;
+                session.manual_title_updated_at_unix_ms = Some(now);
             }
             if request.reset_session {
                 session.last_run_id = None;
@@ -3471,8 +3543,11 @@ impl JournalStore {
                     channel,
                     created_at_unix_ms,
                     updated_at_unix_ms,
-                    last_run_ulid
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, NULL)
+                    last_run_ulid,
+                    title_generation_state,
+                    manual_title_locked,
+                    manual_title_updated_at_unix_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, NULL, ?8, ?9, ?10)
             "#,
             params![
                 session_id,
@@ -3482,6 +3557,13 @@ impl JournalStore {
                 request.device_id,
                 request.channel,
                 now,
+                if request.session_label.is_some() {
+                    ORCHESTRATOR_TITLE_GENERATION_STATE_MANUAL_LOCKED
+                } else {
+                    ORCHESTRATOR_TITLE_GENERATION_STATE_IDLE
+                },
+                request.session_label.is_some(),
+                request.session_label.as_ref().map(|_| now),
             ],
         )?;
 
@@ -3499,6 +3581,14 @@ impl JournalStore {
             auto_title: None,
             auto_title_source: None,
             auto_title_generator_version: None,
+            auto_title_updated_at_unix_ms: None,
+            title_generation_state: if request.session_label.is_some() {
+                ORCHESTRATOR_TITLE_GENERATION_STATE_MANUAL_LOCKED.to_owned()
+            } else {
+                ORCHESTRATOR_TITLE_GENERATION_STATE_IDLE.to_owned()
+            },
+            manual_title_locked: request.session_label.is_some(),
+            manual_title_updated_at_unix_ms: request.session_label.as_ref().map(|_| now),
             title: String::new(),
             title_source: String::new(),
             title_generator_version: None,
@@ -3517,6 +3607,63 @@ impl JournalStore {
             created: true,
             reset_applied: false,
         })
+    }
+
+    pub fn update_orchestrator_session_title(
+        &self,
+        request: &OrchestratorSessionTitleUpdateRequest,
+    ) -> Result<OrchestratorSessionRecord, JournalError> {
+        let now = current_unix_ms()?;
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let mut session = load_orchestrator_session_by_id(&guard, request.session_id.as_str())?
+            .ok_or_else(|| JournalError::SessionNotFound {
+                selector: request.session_id.clone(),
+            })?;
+        if session.principal != request.principal
+            || session.device_id != request.device_id
+            || session.channel != request.channel
+        {
+            return Err(JournalError::SessionIdentityMismatch { session_id: session.session_id });
+        }
+
+        guard.execute(
+            r#"
+                UPDATE orchestrator_sessions
+                SET
+                    session_label = ?2,
+                    manual_title_locked = ?3,
+                    manual_title_updated_at_unix_ms = ?4,
+                    title_generation_state = CASE
+                        WHEN ?3 = 1 THEN ?5
+                        WHEN auto_title IS NOT NULL AND TRIM(auto_title) != '' THEN ?6
+                        ELSE ?7
+                    END,
+                    updated_at_unix_ms = ?4
+                WHERE session_ulid = ?1
+            "#,
+            params![
+                request.session_id,
+                request.session_label,
+                if request.manual_title_locked { 1_i64 } else { 0_i64 },
+                now,
+                ORCHESTRATOR_TITLE_GENERATION_STATE_MANUAL_LOCKED,
+                ORCHESTRATOR_TITLE_GENERATION_STATE_READY,
+                ORCHESTRATOR_TITLE_GENERATION_STATE_IDLE,
+            ],
+        )?;
+
+        session.session_label = request.session_label.clone();
+        session.manual_title_locked = request.manual_title_locked;
+        session.manual_title_updated_at_unix_ms = Some(now);
+        session.updated_at_unix_ms = now;
+        session.title_generation_state = if request.manual_title_locked {
+            ORCHESTRATOR_TITLE_GENERATION_STATE_MANUAL_LOCKED.to_owned()
+        } else if session.auto_title.as_deref().is_some_and(|value| !value.trim().is_empty()) {
+            ORCHESTRATOR_TITLE_GENERATION_STATE_READY.to_owned()
+        } else {
+            ORCHESTRATOR_TITLE_GENERATION_STATE_IDLE.to_owned()
+        };
+        hydrate_orchestrator_session(&guard, session, None)
     }
 
     pub fn list_orchestrator_sessions(
@@ -4460,7 +4607,27 @@ impl JournalStore {
                     branch_state = ?2,
                     parent_session_ulid = ?3,
                     branch_origin_run_ulid = ?4,
-                    updated_at_unix_ms = ?5
+                    auto_title = CASE
+                        WHEN ?5 IS NOT NULL AND manual_title_locked = 0 THEN ?5
+                        ELSE auto_title
+                    END,
+                    auto_title_source = CASE
+                        WHEN ?5 IS NOT NULL AND manual_title_locked = 0 THEN 'title_family'
+                        ELSE auto_title_source
+                    END,
+                    auto_title_generator_version = CASE
+                        WHEN ?5 IS NOT NULL AND manual_title_locked = 0 THEN ?6
+                        ELSE auto_title_generator_version
+                    END,
+                    auto_title_updated_at_unix_ms = CASE
+                        WHEN ?5 IS NOT NULL AND manual_title_locked = 0 THEN ?7
+                        ELSE auto_title_updated_at_unix_ms
+                    END,
+                    title_generation_state = CASE
+                        WHEN ?5 IS NOT NULL AND manual_title_locked = 0 THEN ?8
+                        ELSE title_generation_state
+                    END,
+                    updated_at_unix_ms = ?7
                 WHERE session_ulid = ?1
             "#,
             params![
@@ -4468,7 +4635,10 @@ impl JournalStore {
                 request.branch_state,
                 request.parent_session_id,
                 request.branch_origin_run_id,
+                request.suggested_auto_title,
+                ORCHESTRATOR_AUTO_TITLE_GENERATOR_VERSION,
                 now,
+                ORCHESTRATOR_TITLE_GENERATION_STATE_READY,
             ],
         )?;
         if updated == 0 {
@@ -8843,13 +9013,23 @@ fn load_orchestrator_tape_page(
 
 const ORCHESTRATOR_SESSION_TITLE_LEN: usize = 72;
 const ORCHESTRATOR_SESSION_PREVIEW_LEN: usize = 180;
-const ORCHESTRATOR_AUTO_TITLE_GENERATOR_VERSION: &str = "phase2.session_title.v1";
+const ORCHESTRATOR_AUTO_TITLE_GENERATOR_VERSION: &str = "phase4.session_title.v1";
+const ORCHESTRATOR_TITLE_GENERATION_STATE_IDLE: &str = "idle";
+const ORCHESTRATOR_TITLE_GENERATION_STATE_PENDING: &str = "pending";
+const ORCHESTRATOR_TITLE_GENERATION_STATE_READY: &str = "ready";
+const ORCHESTRATOR_TITLE_GENERATION_STATE_MANUAL_LOCKED: &str = "manual_locked";
 
 #[derive(Debug, Default)]
 struct OrchestratorSessionTranscriptSummary {
     first_user_message: Option<String>,
     latest_user_message: Option<String>,
     latest_assistant_message: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct OrchestratorAutoTitleCandidate {
+    title: String,
+    source: &'static str,
 }
 
 fn hydrate_orchestrator_session(
@@ -8868,29 +9048,61 @@ fn hydrate_orchestrator_session(
         .map(|run_id| load_orchestrator_run_state(connection, run_id))
         .transpose()?
         .flatten();
-    let auto_title_candidate = derive_orchestrator_auto_title(&transcript);
-    if session.auto_title.is_none() && auto_title_candidate.is_some() {
-        let auto_title = auto_title_candidate.clone().unwrap_or_default();
+    let now = current_unix_ms()?;
+    let auto_title_candidate = (!session.manual_title_locked)
+        .then(|| derive_orchestrator_auto_title(&transcript))
+        .flatten();
+    let can_refresh_auto_title = session.auto_title.is_none()
+        || session.title_generation_state == ORCHESTRATOR_TITLE_GENERATION_STATE_PENDING;
+    if let Some(candidate) = auto_title_candidate.as_ref().filter(|_| can_refresh_auto_title) {
         connection.execute(
             r#"
                 UPDATE orchestrator_sessions
                 SET
                     auto_title = ?2,
-                    auto_title_source = 'first_user_message',
-                    auto_title_generator_version = ?3
+                    auto_title_source = ?3,
+                    auto_title_generator_version = ?4,
+                    auto_title_updated_at_unix_ms = ?5,
+                    title_generation_state = ?6
                 WHERE session_ulid = ?1
-                  AND (auto_title IS NULL OR TRIM(auto_title) = '')
+                  AND manual_title_locked = 0
             "#,
             params![
                 session.session_id.as_str(),
-                auto_title.as_str(),
+                candidate.title.as_str(),
+                candidate.source,
                 ORCHESTRATOR_AUTO_TITLE_GENERATOR_VERSION,
+                now,
+                ORCHESTRATOR_TITLE_GENERATION_STATE_READY,
             ],
         )?;
-        session.auto_title = Some(auto_title);
-        session.auto_title_source = Some("first_user_message".to_owned());
+        session.auto_title = Some(candidate.title.clone());
+        session.auto_title_source = Some(candidate.source.to_owned());
         session.auto_title_generator_version =
             Some(ORCHESTRATOR_AUTO_TITLE_GENERATOR_VERSION.to_owned());
+        session.auto_title_updated_at_unix_ms = Some(now);
+        session.title_generation_state = ORCHESTRATOR_TITLE_GENERATION_STATE_READY.to_owned();
+    } else {
+        let next_generation_state = if session.manual_title_locked {
+            ORCHESTRATOR_TITLE_GENERATION_STATE_MANUAL_LOCKED
+        } else if session.auto_title.as_deref().is_some_and(|value| !value.trim().is_empty()) {
+            ORCHESTRATOR_TITLE_GENERATION_STATE_READY
+        } else if transcript.first_user_message.is_some() {
+            ORCHESTRATOR_TITLE_GENERATION_STATE_PENDING
+        } else {
+            ORCHESTRATOR_TITLE_GENERATION_STATE_IDLE
+        };
+        if session.title_generation_state != next_generation_state {
+            connection.execute(
+                r#"
+                    UPDATE orchestrator_sessions
+                    SET title_generation_state = ?2
+                    WHERE session_ulid = ?1
+                "#,
+                params![session.session_id.as_str(), next_generation_state],
+            )?;
+            session.title_generation_state = next_generation_state.to_owned();
+        }
     }
 
     let (title, title_source, title_generator_version) = if let Some(label) =
@@ -9039,15 +9251,60 @@ fn normalize_orchestrator_session_text(raw: &str, max_chars: usize) -> Option<St
 
 fn derive_orchestrator_auto_title(
     transcript: &OrchestratorSessionTranscriptSummary,
-) -> Option<String> {
-    let seed =
-        transcript.first_user_message.as_deref().or(transcript.latest_user_message.as_deref())?;
-    let meaningful =
-        transcript.latest_assistant_message.is_some() || seed.split_whitespace().count() >= 3;
-    if !meaningful {
+) -> Option<OrchestratorAutoTitleCandidate> {
+    let user_seed =
+        transcript.first_user_message.as_deref().or(transcript.latest_user_message.as_deref());
+    if let Some(assistant_seed) = transcript.latest_assistant_message.as_deref() {
+        if let Some(user_title) =
+            user_seed.filter(|value| !is_generic_orchestrator_title_seed(value)).and_then(|value| {
+                normalize_orchestrator_session_text(value, ORCHESTRATOR_SESSION_TITLE_LEN)
+            })
+        {
+            return Some(OrchestratorAutoTitleCandidate {
+                title: user_title,
+                source: "semantic_exchange",
+            });
+        }
+        if let Some(assistant_title) =
+            normalize_orchestrator_session_text(assistant_seed, ORCHESTRATOR_SESSION_TITLE_LEN)
+        {
+            return Some(OrchestratorAutoTitleCandidate {
+                title: assistant_title,
+                source: "semantic_exchange",
+            });
+        }
+    }
+
+    let fallback_seed = user_seed?;
+    if fallback_seed.split_whitespace().count() < 3 {
         return None;
     }
-    normalize_orchestrator_session_text(seed, ORCHESTRATOR_SESSION_TITLE_LEN)
+    normalize_orchestrator_session_text(fallback_seed, ORCHESTRATOR_SESSION_TITLE_LEN).map(
+        |title| OrchestratorAutoTitleCandidate { title, source: "first_user_message_fallback" },
+    )
+}
+
+fn is_generic_orchestrator_title_seed(raw: &str) -> bool {
+    let normalized_text = raw.to_ascii_lowercase().replace(['\r', '\n'], " ");
+    let normalized = normalized_text.split_whitespace().collect::<Vec<_>>();
+    if normalized.len() <= 2 {
+        return true;
+    }
+    matches!(
+        normalized.as_slice(),
+        ["continue"]
+            | ["resume"]
+            | ["help"]
+            | ["fix"]
+            | ["look", "into"]
+            | ["check", "this"]
+            | ["continue", "here"]
+            | ["resume", "here"]
+            | ["help", "me"]
+            | ["can", "you", ..]
+            | ["could", "you", ..]
+            | ["please", ..]
+    )
 }
 
 fn build_orchestrator_session_match_snippet(
@@ -9088,6 +9345,10 @@ fn map_orchestrator_session_row(
         auto_title: row.get(10)?,
         auto_title_source: row.get(11)?,
         auto_title_generator_version: row.get(12)?,
+        auto_title_updated_at_unix_ms: row.get(13)?,
+        title_generation_state: row.get(14)?,
+        manual_title_locked: row.get::<_, i64>(15)? != 0,
+        manual_title_updated_at_unix_ms: row.get(16)?,
         title: String::new(),
         title_source: String::new(),
         title_generator_version: None,
@@ -9095,9 +9356,9 @@ fn map_orchestrator_session_row(
         last_intent: None,
         last_summary: None,
         match_snippet: None,
-        branch_state: row.get(13)?,
-        parent_session_id: row.get(14)?,
-        branch_origin_run_id: row.get(15)?,
+        branch_state: row.get(17)?,
+        parent_session_id: row.get(18)?,
+        branch_origin_run_id: row.get(19)?,
         last_run_state: None,
     })
 }
@@ -9122,6 +9383,10 @@ fn load_orchestrator_session_by_id(
                 auto_title,
                 auto_title_source,
                 auto_title_generator_version,
+                auto_title_updated_at_unix_ms,
+                title_generation_state,
+                manual_title_locked,
+                manual_title_updated_at_unix_ms,
                 branch_state,
                 parent_session_ulid,
                 branch_origin_run_ulid
@@ -9156,6 +9421,10 @@ fn load_orchestrator_session_by_key(
                 auto_title,
                 auto_title_source,
                 auto_title_generator_version,
+                auto_title_updated_at_unix_ms,
+                title_generation_state,
+                manual_title_locked,
+                manual_title_updated_at_unix_ms,
                 branch_state,
                 parent_session_ulid,
                 branch_origin_run_ulid
@@ -9190,6 +9459,10 @@ fn load_orchestrator_session_by_label(
                 auto_title,
                 auto_title_source,
                 auto_title_generator_version,
+                auto_title_updated_at_unix_ms,
+                title_generation_state,
+                manual_title_locked,
+                manual_title_updated_at_unix_ms,
                 branch_state,
                 parent_session_ulid,
                 branch_origin_run_ulid
@@ -9231,6 +9504,10 @@ fn load_orchestrator_sessions_page(
                 auto_title,
                 auto_title_source,
                 auto_title_generator_version,
+                auto_title_updated_at_unix_ms,
+                title_generation_state,
+                manual_title_locked,
+                manual_title_updated_at_unix_ms,
                 branch_state,
                 parent_session_ulid,
                 branch_origin_run_ulid
