@@ -134,9 +134,7 @@ export function buildDesktopSessionRecap(session: SessionCatalogRecord): string 
     segments.push(`Touched files: ${session.recap.touched_files.slice(0, 3).join(", ")}`);
   }
   if (session.recap.active_context_files.length > 0) {
-    segments.push(
-      `Project rules: ${session.recap.active_context_files.slice(0, 2).join(", ")}`,
-    );
+    segments.push(`Project rules: ${session.recap.active_context_files.slice(0, 2).join(", ")}`);
   }
   if ((session.recap.project_context?.warnings.length ?? 0) > 0) {
     segments.push(

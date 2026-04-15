@@ -39,10 +39,11 @@ export function useProjectContextPreview({
 }: UseProjectContextPreviewArgs): UseProjectContextPreviewResult {
   const projectContextPreviewRequestSeqRef = useRef(0);
   const [projectContextPreviewBusy, setProjectContextPreviewBusy] = useState(false);
-  const [projectContextPreview, setProjectContextPreview] = useState<ProjectContextPreviewEnvelope | null>(
+  const [projectContextPreview, setProjectContextPreview] =
+    useState<ProjectContextPreviewEnvelope | null>(null);
+  const [projectContextPromptPreview, setProjectContextPromptPreview] = useState<string | null>(
     null,
   );
-  const [projectContextPromptPreview, setProjectContextPromptPreview] = useState<string | null>(null);
   const [projectContextPreviewQuery, setProjectContextPreviewQuery] = useState("");
   const deferredComposerText = useDeferredValue(composerText);
 
@@ -133,7 +134,12 @@ export function useProjectContextPreview({
     return () => {
       window.clearTimeout(timeoutHandle);
     };
-  }, [activeSessionId, deferredComposerText, loadProjectContextPreview, resetProjectContextPreview]);
+  }, [
+    activeSessionId,
+    deferredComposerText,
+    loadProjectContextPreview,
+    resetProjectContextPreview,
+  ]);
 
   return {
     projectContextPreview,

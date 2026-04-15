@@ -1,4 +1,8 @@
-import type { ConsoleApiClient, SessionCatalogRecord, SessionProjectContextEnvelope } from "../consoleApi";
+import type {
+  ConsoleApiClient,
+  SessionCatalogRecord,
+  SessionProjectContextEnvelope,
+} from "../consoleApi";
 
 import { toErrorMessage } from "./chatShared";
 
@@ -100,7 +104,8 @@ export async function scaffoldProjectContextAction(args: ProjectContextActionArg
     successMessage: "PALYRA.md was created in the workspace root.",
     operation: () =>
       args.api.scaffoldSessionProjectContext(args.sessionId, {
-        project_name: args.selectedSession?.session_label ?? args.selectedSession?.title ?? undefined,
+        project_name:
+          args.selectedSession?.session_label ?? args.selectedSession?.title ?? undefined,
       }),
   });
 }

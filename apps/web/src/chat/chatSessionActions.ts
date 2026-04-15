@@ -156,7 +156,8 @@ export async function submitComposerTurnAction(args: {
     return;
   }
   await args.ensureProjectContextPreviewForCurrentDraft();
-  const effectiveContextReferencePreview = await args.ensureContextReferencePreviewForCurrentDraft();
+  const effectiveContextReferencePreview =
+    await args.ensureContextReferencePreviewForCurrentDraft();
   if (effectiveContextReferencePreview?.errors.length) {
     args.setError(
       effectiveContextReferencePreview.errors[0]?.message ?? "Invalid context reference.",

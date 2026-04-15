@@ -1718,18 +1718,20 @@ export function App() {
                     {selectedSession.recap.project_context.focus_paths.length > 0 ? (
                       <div className="desktop-stack desktop-stack--compact">
                         <p className="desktop-label">Discovery</p>
-                        {selectedSession.recap.project_context.focus_paths.slice(0, 4).map((focus) => (
-                          <p
-                            key={`${focus.reason}:${focus.path}`}
-                            className="desktop-muted"
-                          >
-                            {focus.reason}: {focus.path}
-                          </p>
-                        ))}
+                        {selectedSession.recap.project_context.focus_paths
+                          .slice(0, 4)
+                          .map((focus) => (
+                            <p key={`${focus.reason}:${focus.path}`} className="desktop-muted">
+                              {focus.reason}: {focus.path}
+                            </p>
+                          ))}
                       </div>
                     ) : null}
                     {selectedSession.recap.project_context.entries.slice(0, 4).map((entry) => (
-                      <article key={entry.entry_id} className="desktop-transcript-entry desktop-transcript-entry--meta">
+                      <article
+                        key={entry.entry_id}
+                        className="desktop-transcript-entry desktop-transcript-entry--meta"
+                      >
                         <div className="desktop-inline-row">
                           <strong>
                             {entry.order}. {entry.path}
