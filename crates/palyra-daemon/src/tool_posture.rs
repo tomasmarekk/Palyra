@@ -95,15 +95,6 @@ impl ToolPostureState {
             Self::Disabled => "disabled",
         }
     }
-
-    #[must_use]
-    pub fn from_approval_decision(approved: bool) -> Self {
-        if approved {
-            Self::AlwaysAllow
-        } else {
-            Self::Disabled
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]

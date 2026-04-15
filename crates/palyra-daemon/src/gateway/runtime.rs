@@ -34,8 +34,7 @@ use crate::self_healing::{
 use crate::tool_posture::{
     ToolPostureAuditEventRecord, ToolPostureOverrideClearRequest, ToolPostureOverrideRecord,
     ToolPostureOverrideUpsertRequest, ToolPostureRecommendationActionRecord,
-    ToolPostureRecommendationActionRequest, ToolPostureRegistry, ToolPostureScopeKind,
-    ToolPostureScopeResetRequest, ToolPostureState,
+    ToolPostureRecommendationActionRequest, ToolPostureRegistry, ToolPostureScopeResetRequest,
 };
 use crate::usage_governance::SmartRoutingRuntimeConfig;
 use palyra_auth::AuthHealthReport;
@@ -4373,39 +4372,6 @@ impl GatewayRuntimeState {
                 result.subject_id.as_str(),
                 &cached_outcome,
             );
-            if matches!(
-                result.decision_scope,
-                Some(ApprovalDecisionScope::Session | ApprovalDecisionScope::Timeboxed)
-            ) {
-                let tool_name = result
-                    .subject_id
-                    .strip_prefix("tool:")
-                    .and_then(|value| value.split('|').next())
-                    .unwrap_or_default();
-                if !tool_name.is_empty() {
-                    let expires_at_unix_ms = result.decision_scope.and_then(|scope| match scope {
-                        ApprovalDecisionScope::Session | ApprovalDecisionScope::Timeboxed => result
-                            .decision_scope_ttl_ms
-                            .filter(|ttl_ms| *ttl_ms > 0)
-                            .map(|ttl_ms| current_unix_ms().saturating_add(ttl_ms)),
-                        ApprovalDecisionScope::Once => None,
-                    });
-                    let _ = self.upsert_tool_posture_override(ToolPostureOverrideUpsertRequest {
-                        tool_name: tool_name.to_owned(),
-                        scope_kind: ToolPostureScopeKind::Session,
-                        scope_id: result.session_id.clone(),
-                        state: ToolPostureState::from_approval_decision(matches!(
-                            decision,
-                            ApprovalDecision::Allow
-                        )),
-                        reason: result.decision_reason.clone(),
-                        actor_principal: result.principal.clone(),
-                        source: "approval_memory".to_owned(),
-                        expires_at_unix_ms,
-                        now_unix_ms: current_unix_ms(),
-                    });
-                }
-            }
         }
         Ok(result)
     }

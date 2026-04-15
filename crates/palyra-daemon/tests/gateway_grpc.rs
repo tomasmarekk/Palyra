@@ -8889,7 +8889,11 @@ allowed_channels = {allowed_channels}
 
 fn write_channel_router_config() -> Result<PathBuf> {
     let config_path = unique_temp_daemon_config_path();
-    let config_body = "\
+    let workspace_root = std::env::current_dir().context(
+        "failed to resolve workspace root for channel router process runner test config",
+    )?;
+    let config_body = format!(
+        "\
 [channel_router]
 enabled = true
 max_message_bytes = 8192
@@ -8905,9 +8909,22 @@ default_isolate_session_by_sender = false
 default_broadcast_strategy = \"deny\"
 default_concurrency_limit = 2
 channels = [
-  { channel = \"cli\", enabled = true, mention_patterns = [\"@palyra\"], allow_direct_messages = true, direct_message_policy = \"allow\", isolate_session_by_sender = false, response_prefix = \"[cli] \", auto_ack_text = \"processing\", auto_reaction = \"eyes\", broadcast_strategy = \"mention_only\", concurrency_limit = 1 }
+  {{ channel = \"cli\", enabled = true, mention_patterns = [\"@palyra\"], allow_direct_messages = true, direct_message_policy = \"allow\", isolate_session_by_sender = false, response_prefix = \"[cli] \", auto_ack_text = \"processing\", auto_reaction = \"eyes\", broadcast_strategy = \"mention_only\", concurrency_limit = 1 }}
 ]
-";
+ 
+[tool_call.process_runner]
+enabled = true
+egress_enforcement_mode = \"preflight\"
+workspace_root = {workspace_root}
+allowed_executables = []
+allowed_egress_hosts = []
+allowed_dns_suffixes = []
+cpu_time_limit_ms = 2000
+memory_limit_bytes = 134217728
+max_output_bytes = 65536
+",
+        workspace_root = toml_string(workspace_root.to_string_lossy().as_ref()),
+    );
     fs::write(&config_path, config_body).with_context(|| {
         format!("failed to write channel router test config at {}", config_path.display())
     })?;
