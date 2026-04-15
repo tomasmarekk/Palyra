@@ -50,6 +50,16 @@ export function SessionsSection({ app }: SessionsSectionProps) {
   const [objectivesBusy, setObjectivesBusy] = useState(false);
   const [objectives, setObjectives] = useState<JsonObject[]>([]);
   const selectedLineage = buildSessionLineageHint(selected);
+  const selectedFamilyRootTitle = selected?.family?.root_title ?? selected?.title ?? "Unknown";
+  const selectedFamilySize = selected?.family?.family_size ?? 1;
+  const selectedFamilySequence = selected?.family?.sequence ?? 1;
+  const selectedAgentDisplay =
+    selected?.quick_controls?.agent?.display_value ?? selected?.agent_id ?? "default agent";
+  const selectedModelDisplay =
+    selected?.quick_controls?.model?.display_value ?? selected?.model_profile ?? "default model";
+  const selectedTouchedFiles = selected?.recap?.touched_files ?? [];
+  const selectedActiveContextFiles = selected?.recap?.active_context_files ?? [];
+  const selectedRecentArtifacts = selected?.recap?.recent_artifacts ?? [];
   const selectedObjective = useMemo(
     () =>
       findObjectiveForSession(
@@ -453,6 +463,16 @@ export function SessionsSection({ app }: SessionsSectionProps) {
             >
               {catalog.entries.map((entry) => {
                 const selectedRow = entry.session_id === catalog.selectedSessionId;
+                const familyRootTitle = entry.family?.root_title ?? entry.title;
+                const familySize = entry.family?.family_size ?? 1;
+                const familySequence = entry.family?.sequence ?? 1;
+                const agentDisplay =
+                  entry.quick_controls?.agent?.display_value ?? entry.agent_id ?? "default agent";
+                const modelDisplay =
+                  entry.quick_controls?.model?.display_value ??
+                  entry.model_profile ??
+                  "default model";
+                const activeContextFiles = entry.recap?.active_context_files ?? [];
                 return (
                   <tr
                     key={entry.session_id}
@@ -473,12 +493,10 @@ export function SessionsSection({ app }: SessionsSectionProps) {
                     </td>
                     <td>
                       <div className="workspace-stack">
-                        <strong>{entry.family.root_title}</strong>
+                        <strong>{familyRootTitle}</strong>
                         <small className="text-muted">
                           {describeBranchState(entry.branch_state)}
-                          {entry.family.family_size > 1
-                            ? ` · ${entry.family.sequence}/${entry.family.family_size}`
-                            : ""}
+                          {familySize > 1 ? ` · ${familySequence}/${familySize}` : ""}
                         </small>
                       </div>
                     </td>
@@ -486,14 +504,13 @@ export function SessionsSection({ app }: SessionsSectionProps) {
                     <td>
                       <div className="workspace-stack">
                         <small>
-                          {entry.quick_controls.agent.display_value} ·{" "}
-                          {entry.quick_controls.model.display_value}
+                          {agentDisplay} · {modelDisplay}
                         </small>
                         <small className="text-muted">
                           {entry.pending_approvals} approval
                           {entry.pending_approvals === 1 ? "" : "s"}
-                          {entry.has_context_files
-                            ? ` · ${entry.recap.active_context_files.length} context file${entry.recap.active_context_files.length === 1 ? "" : "s"}`
+                          {activeContextFiles.length > 0
+                            ? ` · ${activeContextFiles.length} context file${activeContextFiles.length === 1 ? "" : "s"}`
                             : ""}
                         </small>
                       </div>
@@ -533,15 +550,11 @@ export function SessionsSection({ app }: SessionsSectionProps) {
                       selected.manual_title_locked,
                     )}
                   </WorkspaceStatusChip>
-                  <WorkspaceStatusChip tone="default">
-                    {selected.quick_controls.agent.display_value}
-                  </WorkspaceStatusChip>
-                  <WorkspaceStatusChip tone="default">
-                    {selected.quick_controls.model.display_value}
-                  </WorkspaceStatusChip>
-                  {selected.family.family_size > 1 ? (
+                  <WorkspaceStatusChip tone="default">{selectedAgentDisplay}</WorkspaceStatusChip>
+                  <WorkspaceStatusChip tone="default">{selectedModelDisplay}</WorkspaceStatusChip>
+                  {selectedFamilySize > 1 ? (
                     <WorkspaceStatusChip tone="accent">
-                      Family {selected.family.sequence}/{selected.family.family_size}
+                      Family {selectedFamilySequence}/{selectedFamilySize}
                     </WorkspaceStatusChip>
                   ) : null}
                 </div>
@@ -676,7 +689,7 @@ export function SessionsSection({ app }: SessionsSectionProps) {
                 </div>
                 <div>
                   <dt>Family root</dt>
-                  <dd>{selected.family.root_title}</dd>
+                  <dd>{selectedFamilyRootTitle}</dd>
                 </div>
                 <div>
                   <dt>Created</dt>
@@ -709,8 +722,8 @@ export function SessionsSection({ app }: SessionsSectionProps) {
                 <div>
                   <dt>Context files</dt>
                   <dd>
-                    {selected.has_context_files
-                      ? `${selected.recap.active_context_files.length} active`
+                    {selectedActiveContextFiles.length > 0
+                      ? `${selectedActiveContextFiles.length} active`
                       : "none"}
                   </dd>
                 </div>
@@ -727,25 +740,24 @@ export function SessionsSection({ app }: SessionsSectionProps) {
                 </WorkspaceInlineNotice>
               ) : null}
 
-              {selected.recap.touched_files.length > 0 ||
-              selected.recap.active_context_files.length > 0 ||
-              selected.recap.recent_artifacts.length > 0 ? (
+              {selectedTouchedFiles.length > 0 ||
+              selectedActiveContextFiles.length > 0 ||
+              selectedRecentArtifacts.length > 0 ? (
                 <WorkspaceInlineNotice title="Resume recap" tone="accent">
-                  {selected.recap.touched_files.length > 0 ? (
+                  {selectedTouchedFiles.length > 0 ? (
                     <p>
-                      <strong>Touched files:</strong> {selected.recap.touched_files.join(", ")}
+                      <strong>Touched files:</strong> {selectedTouchedFiles.join(", ")}
                     </p>
                   ) : null}
-                  {selected.recap.active_context_files.length > 0 ? (
+                  {selectedActiveContextFiles.length > 0 ? (
                     <p>
-                      <strong>Active context:</strong>{" "}
-                      {selected.recap.active_context_files.join(", ")}
+                      <strong>Active context:</strong> {selectedActiveContextFiles.join(", ")}
                     </p>
                   ) : null}
-                  {selected.recap.recent_artifacts.length > 0 ? (
+                  {selectedRecentArtifacts.length > 0 ? (
                     <p>
                       <strong>Recent artifacts:</strong>{" "}
-                      {selected.recap.recent_artifacts
+                      {selectedRecentArtifacts
                         .map((artifact) => `${artifact.label} (${artifact.kind})`)
                         .join(", ")}
                     </p>

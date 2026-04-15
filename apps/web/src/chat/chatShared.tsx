@@ -515,8 +515,11 @@ export function shortId(value: string): string {
   return `${value.slice(0, 6)}…${value.slice(-4)}`;
 }
 
-export function describeBranchState(branchState: string): string {
-  const normalized = branchState.trim().toLowerCase();
+export function describeBranchState(branchState: string | null | undefined): string {
+  const normalized = branchState?.trim().toLowerCase() ?? "";
+  if (normalized.length === 0) {
+    return "Unknown lineage";
+  }
   if (normalized === "root") {
     return "Root session";
   }
@@ -529,17 +532,20 @@ export function describeBranchState(branchState: string): string {
   if (normalized === "missing") {
     return "No lineage";
   }
-  return branchState;
+  return branchState ?? "Unknown lineage";
 }
 
 export function describeTitleGenerationState(
-  titleGenerationState: string,
+  titleGenerationState: string | null | undefined,
   manualTitleLocked: boolean,
 ): string {
   if (manualTitleLocked) {
     return "Manual title";
   }
-  const normalized = titleGenerationState.trim().toLowerCase();
+  const normalized = titleGenerationState?.trim().toLowerCase() ?? "";
+  if (normalized.length === 0) {
+    return "Auto title unavailable";
+  }
   if (normalized === "ready") {
     return "Auto title ready";
   }
@@ -552,14 +558,17 @@ export function describeTitleGenerationState(
   if (normalized === "idle") {
     return "Auto title idle";
   }
-  return titleGenerationState;
+  return titleGenerationState ?? "Auto title unavailable";
 }
 
 export function buildSessionLineageHint(session: SessionCatalogRecord | null): string {
   if (session === null) {
     return "Select a session to inspect lineage.";
   }
-  const normalized = session.branch_state.trim().toLowerCase();
+  const normalized = session.branch_state?.trim().toLowerCase() ?? "";
+  if (normalized.length === 0) {
+    return "Lineage metadata is unavailable for this session.";
+  }
   const parent = session.parent_session_id?.trim();
   const originRunId = session.branch_origin_run_id?.trim();
   if (normalized === "root") {
