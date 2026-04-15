@@ -2435,17 +2435,19 @@ impl App {
                 .await
             {
                 Ok(payload) => payload,
-                Err(_) => context
-                    .client
-                    .post_json_value(
-                        "console/v1/chat/workspace/compare".to_owned(),
-                        &serde_json::json!({
-                            "left_run_id": left_run_id,
-                            "right_checkpoint_id": target,
-                            "limit": 24,
-                        }),
-                    )
-                    .await?,
+                Err(_) => {
+                    context
+                        .client
+                        .post_json_value(
+                            "console/v1/chat/workspace/compare".to_owned(),
+                            &serde_json::json!({
+                                "left_run_id": left_run_id,
+                                "right_checkpoint_id": target,
+                                "limit": 24,
+                            }),
+                        )
+                        .await?
+                }
             };
             let diff = response
                 .pointer("/diff")
@@ -2462,7 +2464,10 @@ impl App {
                 read_json_string(&diff, "/right_anchor/label")
             )];
             if files.is_empty() {
-                lines.push("No changed workspace paths were found between the selected anchors.".to_owned());
+                lines.push(
+                    "No changed workspace paths were found between the selected anchors."
+                        .to_owned(),
+                );
             } else {
                 lines.push(format!("Changed files: {}", files.len()));
                 lines.extend(files.iter().take(12).map(|file| {
