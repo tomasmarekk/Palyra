@@ -1129,9 +1129,18 @@ async fn load_session_project_context_summaries(
             "",
             false,
         )
-        .await
-        .map_err(runtime_status_response)?;
-        previews.insert(session.session_id.clone(), preview);
+        .await;
+        match preview {
+            Ok(preview) => {
+                previews.insert(session.session_id.clone(), preview);
+            }
+            Err(status)
+                if matches!(
+                    status.code(),
+                    tonic::Code::FailedPrecondition | tonic::Code::NotFound
+                ) => {}
+            Err(status) => return Err(runtime_status_response(status)),
+        }
     }
     Ok(previews)
 }

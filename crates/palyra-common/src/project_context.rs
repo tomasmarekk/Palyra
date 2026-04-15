@@ -162,7 +162,6 @@ impl Default for ProjectContextRiskScan {
 }
 
 impl ProjectContextRiskScan {
-    #[must_use]
     pub fn push(
         &mut self,
         reaction: ProjectContextRiskAction,
@@ -233,7 +232,7 @@ pub fn scan_project_context_content(content: &str) -> ProjectContextRiskScan {
 
     for (pattern, detail) in BLOCK_PATTERNS {
         if lowered.contains(pattern) {
-            let _ = scan.push(
+            scan.push(
                 ProjectContextRiskAction::Blocked,
                 format!("blocked:{pattern}").as_str(),
                 "Blocked override or exfiltration pattern",
@@ -244,7 +243,7 @@ pub fn scan_project_context_content(content: &str) -> ProjectContextRiskScan {
     }
     for (pattern, detail) in APPROVAL_PATTERNS {
         if lowered.contains(pattern) {
-            let _ = scan.push(
+            scan.push(
                 ProjectContextRiskAction::ApprovalRequired,
                 format!("approval:{pattern}").as_str(),
                 "Sensitive instruction pattern",
@@ -255,7 +254,7 @@ pub fn scan_project_context_content(content: &str) -> ProjectContextRiskScan {
     }
     for (pattern, detail) in WARNING_PATTERNS {
         if lowered.contains(pattern) {
-            let _ = scan.push(
+            scan.push(
                 ProjectContextRiskAction::Warning,
                 format!("warning:{pattern}").as_str(),
                 "Project context wording worth reviewing",
@@ -266,7 +265,7 @@ pub fn scan_project_context_content(content: &str) -> ProjectContextRiskScan {
     }
 
     if let Some(comment) = first_hidden_html_comment(normalized.normalized_text.as_str()) {
-        let _ = scan.push(
+        scan.push(
             ProjectContextRiskAction::ApprovalRequired,
             "hidden_html_comment",
             "Hidden HTML comment content",
@@ -277,7 +276,7 @@ pub fn scan_project_context_content(content: &str) -> ProjectContextRiskScan {
     if let Some(description) =
         first_matching_control_char(normalized.normalized_text.as_str(), INVISIBLE_CHARS)
     {
-        let _ = scan.push(
+        scan.push(
             ProjectContextRiskAction::ApprovalRequired,
             "invisible_unicode",
             "Invisible Unicode content",
@@ -288,7 +287,7 @@ pub fn scan_project_context_content(content: &str) -> ProjectContextRiskScan {
     if let Some(description) =
         first_matching_control_char(normalized.normalized_text.as_str(), BLOCKED_BIDI_CHARS)
     {
-        let _ = scan.push(
+        scan.push(
             ProjectContextRiskAction::Blocked,
             "bidi_control",
             "Bidirectional control characters",
@@ -297,7 +296,7 @@ pub fn scan_project_context_content(content: &str) -> ProjectContextRiskScan {
         );
     }
     if lowered.contains("<script") {
-        let _ = scan.push(
+        scan.push(
             ProjectContextRiskAction::Blocked,
             "embedded_script_tag",
             "Embedded script tag",

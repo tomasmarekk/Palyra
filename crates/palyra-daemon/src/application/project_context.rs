@@ -44,8 +44,8 @@ pub(crate) enum ProjectContextEntryStatus {
 
 impl ProjectContextEntryStatus {
     #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
+    pub const fn as_str(&self) -> &'static str {
+        match *self {
             Self::Active => "active",
             Self::ActiveWithApproval => "active_with_approval",
             Self::Warning => "warning",
@@ -684,8 +684,6 @@ fn resolve_focus_directory(
 
     let chosen = if candidate.is_dir() {
         candidate
-    } else if candidate.is_file() {
-        candidate.parent().unwrap_or(root).to_path_buf()
     } else {
         candidate.parent().unwrap_or(root).to_path_buf()
     };
@@ -771,7 +769,7 @@ fn workspace_risk_as_project_context(content: &str) -> ProjectContextRiskScan {
         WorkspaceRiskState::Warning => {
             let mut scan = ProjectContextRiskScan::default();
             for reason in workspace_scan.reasons {
-                let _ = scan.push(
+                scan.push(
                     ProjectContextRiskAction::Warning,
                     format!("workspace:{reason}").as_str(),
                     "Workspace prompt-injection warning",
@@ -784,7 +782,7 @@ fn workspace_risk_as_project_context(content: &str) -> ProjectContextRiskScan {
         WorkspaceRiskState::Quarantined => {
             let mut scan = ProjectContextRiskScan::default();
             for reason in workspace_scan.reasons {
-                let _ = scan.push(
+                scan.push(
                     ProjectContextRiskAction::Blocked,
                     format!("workspace:{reason}").as_str(),
                     "Workspace prompt-injection block",
