@@ -1493,6 +1493,11 @@ struct ConsoleChatWorkspaceRestoreRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct ConsoleChatCanvasRestoreRequest {
+    state_version: u64,
+}
+
+#[derive(Debug, Deserialize)]
 struct ConsoleChatPinRequest {
     run_id: String,
     tape_seq: i64,

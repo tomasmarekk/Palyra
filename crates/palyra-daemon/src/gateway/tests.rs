@@ -3552,6 +3552,126 @@ fn canvas_patch_updates_are_replayable_and_deterministic() {
 }
 
 #[test]
+fn canvas_runtime_descriptor_can_be_reissued_for_scoped_session_canvases() {
+    let state = build_test_runtime_state(false);
+    let context = canvas_test_context();
+    let other_context = super::RequestContext {
+        principal: "user:someone-else".to_owned(),
+        device_id: "01ARZ3NDEKTSV4RRFFQ69G5FB0".to_owned(),
+        channel: Some("cli".to_owned()),
+    };
+    let session_id = "01ARZ3NDEKTSV4RRFFQ69G5FB1".to_owned();
+    let (created, descriptor) = state
+        .create_canvas(
+            &context,
+            None,
+            session_id.clone(),
+            br#"{"content":"ok"}"#,
+            1,
+            None,
+            canvas_test_bundle(br#"console.log("ok");"#),
+            vec!["https://console.example.com".to_owned()],
+            Some(600),
+        )
+        .expect("canvas create should succeed");
+    let _other = state
+        .create_canvas(
+            &other_context,
+            None,
+            "01ARZ3NDEKTSV4RRFFQ69G5FB2".to_owned(),
+            br#"{"content":"other"}"#,
+            1,
+            None,
+            canvas_test_bundle(br#"console.log("ok");"#),
+            vec!["https://console.example.com".to_owned()],
+            Some(600),
+        )
+        .expect("second scoped canvas should succeed");
+
+    let issued = state
+        .issue_canvas_runtime_descriptor(&context, created.canvas_id.as_str(), Some(30))
+        .expect("runtime descriptor should be reissued");
+    assert_eq!(issued.canvas_id, created.canvas_id);
+    assert_ne!(
+        issued.auth_token, descriptor.auth_token,
+        "descriptor reissue must mint a fresh token"
+    );
+    assert!(
+        issued.expires_at_unix_ms <= created.expires_at_unix_ms,
+        "descriptor token lifetime must stay bounded by canvas session expiry"
+    );
+
+    let scoped = state
+        .list_session_canvases(&context, session_id.as_str())
+        .expect("session canvas list should load");
+    assert_eq!(scoped.len(), 1, "session canvas listing must stay scoped to the requested session");
+    assert_eq!(scoped[0].canvas_id, created.canvas_id);
+}
+
+#[test]
+fn canvas_restore_replays_prior_revision_and_appends_new_state_version() {
+    let state = build_test_runtime_state(false);
+    let context = canvas_test_context();
+    let (created, _descriptor) = state
+        .create_canvas(
+            &context,
+            None,
+            "01ARZ3NDEKTSV4RRFFQ69G5FB3".to_owned(),
+            br#"{"content":"v1"}"#,
+            1,
+            None,
+            canvas_test_bundle(br#"console.log("ok");"#),
+            vec!["https://console.example.com".to_owned()],
+            Some(600),
+        )
+        .expect("canvas create should succeed");
+    let second = state
+        .update_canvas_state(
+            &context,
+            created.canvas_id.as_str(),
+            Some(br#"{"content":"v2"}"#.as_slice()),
+            None,
+            Some(created.state_version),
+            None,
+        )
+        .expect("second revision should succeed");
+    let third = state
+        .update_canvas_state(
+            &context,
+            created.canvas_id.as_str(),
+            Some(br#"{"content":"v3"}"#.as_slice()),
+            None,
+            Some(second.state_version),
+            None,
+        )
+        .expect("third revision should succeed");
+
+    let restored = state
+        .restore_canvas_state(&context, created.canvas_id.as_str(), second.state_version)
+        .expect("canvas restore should succeed");
+    assert_eq!(
+        restored.state_version,
+        third.state_version + 1,
+        "restoring a prior revision must append a new state transition"
+    );
+    let restored_state: Value = serde_json::from_slice(restored.state_json.as_slice())
+        .expect("restored state should decode");
+    assert_eq!(
+        restored_state.get("content").and_then(Value::as_str),
+        Some("v2"),
+        "restore must replay the requested prior revision payload"
+    );
+
+    let history = state
+        .load_canvas_patch_history(created.canvas_id.as_str())
+        .expect("patch history should load");
+    let latest = history.last().expect("restored revision should append history");
+    assert_eq!(latest.base_state_version, third.state_version);
+    assert_eq!(latest.state_version, restored.state_version);
+    assert_eq!(latest.resulting_state_json, r#"{"content":"v2"}"#);
+}
+
+#[test]
 fn canvas_update_rejects_version_conflict() {
     let state = build_test_runtime_state(false);
     let context = canvas_test_context();

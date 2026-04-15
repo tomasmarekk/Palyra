@@ -5,6 +5,39 @@ use crate::{
     *,
 };
 use base64::Engine as _;
+use serde::Serialize;
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
+struct ConsoleChatCanvasTranscriptReference {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_tape_seq: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_event_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    origin_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    origin_run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_referenced_at_unix_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct ConsoleChatCanvasSummary {
+    canvas_id: String,
+    session_id: String,
+    state_version: u64,
+    state_schema_version: u64,
+    created_at_unix_ms: i64,
+    updated_at_unix_ms: i64,
+    expires_at_unix_ms: i64,
+    closed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    close_reason: Option<String>,
+    runtime_status: String,
+    reference: ConsoleChatCanvasTranscriptReference,
+}
 
 pub(crate) async fn console_chat_sessions_list_handler(
     State(state): State<AppState>,
@@ -2445,6 +2478,152 @@ pub(crate) async fn console_chat_transcript_handler(
     })))
 }
 
+pub(crate) async fn console_chat_canvas_list_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, false)?;
+    let session_record =
+        load_console_chat_session(&state, &session.context, session_id.as_str(), false).await?;
+    let transcript = state
+        .runtime
+        .list_orchestrator_session_transcript(session_record.session_id.clone())
+        .await
+        .map_err(runtime_status_response)?;
+    let canvases = load_console_chat_canvas_summaries(
+        &state,
+        &session.context,
+        session_record.session_id.as_str(),
+        transcript.as_slice(),
+    )?;
+    Ok(Json(json!({
+        "session": session_record,
+        "canvases": canvases,
+        "contract": contract_descriptor(),
+    })))
+}
+
+pub(crate) async fn console_chat_canvas_detail_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((session_id, canvas_id)): Path<(String, String)>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, false)?;
+    let session_record =
+        load_console_chat_session(&state, &session.context, session_id.as_str(), false).await?;
+    let canvas = load_console_chat_canvas(
+        &state,
+        &session.context,
+        session_record.session_id.as_str(),
+        canvas_id.as_str(),
+    )
+    .await?;
+    let transcript = state
+        .runtime
+        .list_orchestrator_session_transcript(session_record.session_id.clone())
+        .await
+        .map_err(runtime_status_response)?;
+    let reference =
+        derive_canvas_transcript_reference(transcript.as_slice(), canvas.canvas_id.as_str());
+    let summary = build_console_chat_canvas_summary(&canvas, reference);
+    let state_payload =
+        serde_json::from_slice::<Value>(canvas.state_json.as_slice()).map_err(|error| {
+            runtime_status_response(tonic::Status::internal(format!(
+                "persisted canvas state JSON is invalid: {error}"
+            )))
+        })?;
+    let revisions = state
+        .runtime
+        .load_canvas_patch_history(canvas.canvas_id.as_str())
+        .map_err(runtime_status_response)?;
+    let (runtime_descriptor, runtime_error) = resolve_console_chat_canvas_runtime_descriptor(
+        &state,
+        &session.context,
+        canvas.canvas_id.as_str(),
+    )?;
+    Ok(Json(json!({
+        "session": session_record,
+        "canvas": summary,
+        "runtime": runtime_descriptor,
+        "runtime_error": runtime_error,
+        "state": state_payload,
+        "revisions": revisions,
+        "contract": contract_descriptor(),
+    })))
+}
+
+pub(crate) async fn console_chat_canvas_restore_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((session_id, canvas_id)): Path<(String, String)>,
+    Json(payload): Json<ConsoleChatCanvasRestoreRequest>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    let session_record =
+        load_console_chat_session(&state, &session.context, session_id.as_str(), true).await?;
+    let current = load_console_chat_canvas(
+        &state,
+        &session.context,
+        session_record.session_id.as_str(),
+        canvas_id.as_str(),
+    )
+    .await?;
+    let restored = state
+        .runtime
+        .restore_canvas_state(&session.context, current.canvas_id.as_str(), payload.state_version)
+        .map_err(runtime_status_response)?;
+    let transcript = state
+        .runtime
+        .list_orchestrator_session_transcript(session_record.session_id.clone())
+        .await
+        .map_err(runtime_status_response)?;
+    let reference =
+        derive_canvas_transcript_reference(transcript.as_slice(), restored.canvas_id.as_str());
+    let summary = build_console_chat_canvas_summary(&restored, reference.clone());
+    let state_payload =
+        serde_json::from_slice::<Value>(restored.state_json.as_slice()).map_err(|error| {
+            runtime_status_response(tonic::Status::internal(format!(
+                "persisted canvas state JSON is invalid: {error}"
+            )))
+        })?;
+    let revisions = state
+        .runtime
+        .load_canvas_patch_history(restored.canvas_id.as_str())
+        .map_err(runtime_status_response)?;
+    let (runtime_descriptor, runtime_error) = resolve_console_chat_canvas_runtime_descriptor(
+        &state,
+        &session.context,
+        restored.canvas_id.as_str(),
+    )?;
+    let _ = crate::gateway::record_agent_journal_event(
+        &state.runtime,
+        &session.context,
+        json!({
+            "event": "canvas.restore.completed",
+            "session_id": session_record.session_id,
+            "canvas_id": restored.canvas_id,
+            "previous_state_version": current.state_version,
+            "restored_from_state_version": payload.state_version,
+            "restored_to_state_version": restored.state_version,
+            "source_run_id": reference.source_run_id,
+            "runtime_available": runtime_descriptor.is_some(),
+        }),
+    )
+    .await;
+    Ok(Json(json!({
+        "session": session_record,
+        "canvas": summary,
+        "runtime": runtime_descriptor,
+        "runtime_error": runtime_error,
+        "state": state_payload,
+        "revisions": revisions,
+        "restored_from_state_version": payload.state_version,
+        "previous_state_version": current.state_version,
+        "contract": contract_descriptor(),
+    })))
+}
+
 pub(crate) async fn console_chat_transcript_search_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2975,6 +3154,135 @@ async fn load_console_chat_session(
         .await
         .map_err(runtime_status_response)?;
     Ok(response.session)
+}
+
+fn load_console_chat_canvas_summaries(
+    state: &AppState,
+    context: &gateway::RequestContext,
+    session_id: &str,
+    transcript: &[journal::OrchestratorSessionTranscriptRecord],
+) -> Result<Vec<ConsoleChatCanvasSummary>, Response> {
+    let canvases = state
+        .runtime
+        .list_session_canvases(context, session_id)
+        .map_err(runtime_status_response)?;
+    Ok(canvases
+        .iter()
+        .map(|canvas| {
+            build_console_chat_canvas_summary(
+                canvas,
+                derive_canvas_transcript_reference(transcript, canvas.canvas_id.as_str()),
+            )
+        })
+        .collect())
+}
+
+async fn load_console_chat_canvas(
+    state: &AppState,
+    context: &gateway::RequestContext,
+    session_id: &str,
+    canvas_id: &str,
+) -> Result<gateway::CanvasRecord, Response> {
+    let canvas = state.runtime.get_canvas(context, canvas_id).map_err(runtime_status_response)?;
+    if canvas.session_id != session_id {
+        return Err(runtime_status_response(tonic::Status::permission_denied(
+            "canvas does not belong to the requested session",
+        )));
+    }
+    Ok(canvas)
+}
+
+fn resolve_console_chat_canvas_runtime_descriptor(
+    state: &AppState,
+    context: &gateway::RequestContext,
+    canvas_id: &str,
+) -> Result<(Option<gateway::CanvasRuntimeDescriptor>, Option<String>), Response> {
+    match state.runtime.issue_canvas_runtime_descriptor(context, canvas_id, None) {
+        Ok(runtime) => Ok((Some(runtime), None)),
+        Err(error) if error.code() == tonic::Code::FailedPrecondition => {
+            Ok((None, Some(sanitize_http_error_message(error.message()))))
+        }
+        Err(error) => Err(runtime_status_response(error)),
+    }
+}
+
+fn build_console_chat_canvas_summary(
+    canvas: &gateway::CanvasRecord,
+    reference: ConsoleChatCanvasTranscriptReference,
+) -> ConsoleChatCanvasSummary {
+    let runtime_status = match unix_ms_now() {
+        Ok(_) if canvas.closed => "closed",
+        Ok(now_unix_ms) if canvas.expires_at_unix_ms <= now_unix_ms => "expired",
+        Ok(_) => "ready",
+        Err(_) => "unknown",
+    };
+    ConsoleChatCanvasSummary {
+        canvas_id: canvas.canvas_id.clone(),
+        session_id: canvas.session_id.clone(),
+        state_version: canvas.state_version,
+        state_schema_version: canvas.state_schema_version,
+        created_at_unix_ms: canvas.created_at_unix_ms,
+        updated_at_unix_ms: canvas.updated_at_unix_ms,
+        expires_at_unix_ms: canvas.expires_at_unix_ms,
+        closed: canvas.closed,
+        close_reason: canvas.close_reason.clone(),
+        runtime_status: runtime_status.to_owned(),
+        reference,
+    }
+}
+
+fn derive_canvas_transcript_reference(
+    transcript: &[journal::OrchestratorSessionTranscriptRecord],
+    canvas_id: &str,
+) -> ConsoleChatCanvasTranscriptReference {
+    transcript
+        .iter()
+        .rev()
+        .find(|record| payload_references_canvas(record.payload_json.as_str(), canvas_id))
+        .map(|record| ConsoleChatCanvasTranscriptReference {
+            source_run_id: Some(record.run_id.clone()),
+            source_tape_seq: Some(record.seq),
+            source_event_type: Some(record.event_type.clone()),
+            origin_kind: if record.origin_kind.trim().is_empty() {
+                None
+            } else {
+                Some(record.origin_kind.clone())
+            },
+            origin_run_id: record.origin_run_id.clone(),
+            last_referenced_at_unix_ms: Some(record.created_at_unix_ms),
+        })
+        .unwrap_or_default()
+}
+
+fn payload_references_canvas(payload_json: &str, canvas_id: &str) -> bool {
+    serde_json::from_str::<Value>(payload_json)
+        .ok()
+        .is_some_and(|payload| json_value_references_canvas(&payload, canvas_id))
+}
+
+fn json_value_references_canvas(value: &Value, canvas_id: &str) -> bool {
+    match value {
+        Value::String(raw) => extract_canvas_id_from_frame_reference(raw)
+            .is_some_and(|candidate| candidate == canvas_id),
+        Value::Array(entries) => {
+            entries.iter().any(|entry| json_value_references_canvas(entry, canvas_id))
+        }
+        Value::Object(entries) => {
+            entries.values().any(|entry| json_value_references_canvas(entry, canvas_id))
+        }
+        _ => false,
+    }
+}
+
+fn extract_canvas_id_from_frame_reference(raw: &str) -> Option<&str> {
+    const CANVAS_FRAME_MARKER: &str = "/canvas/v1/frame/";
+    let start = raw.find(CANVAS_FRAME_MARKER)?;
+    let remainder = &raw[start + CANVAS_FRAME_MARKER.len()..];
+    let end =
+        remainder.find(|ch: char| ch == '?' || ch == '#' || ch == '/').unwrap_or(remainder.len());
+    let candidate = &remainder[..end];
+    validate_canonical_id(candidate).ok()?;
+    Some(candidate)
 }
 
 #[derive(Debug, Clone)]
@@ -4045,7 +4353,10 @@ fn build_console_run_lineage_payload(
 
 #[cfg(test)]
 mod tests {
-    use super::run_matches_console_context;
+    use super::{
+        derive_canvas_transcript_reference, extract_canvas_id_from_frame_reference,
+        run_matches_console_context,
+    };
     use crate::{gateway, journal};
 
     #[test]
@@ -4076,6 +4387,66 @@ mod tests {
             run_matches_console_context(&run, &context),
             "run ownership check should allow the originating console context"
         );
+    }
+
+    #[test]
+    fn extract_canvas_id_from_frame_reference_accepts_absolute_and_relative_urls() {
+        assert_eq!(
+            extract_canvas_id_from_frame_reference(
+                "/canvas/v1/frame/01ARZ3NDEKTSV4RRFFQ69G5FB1?token=abc"
+            ),
+            Some("01ARZ3NDEKTSV4RRFFQ69G5FB1")
+        );
+        assert_eq!(
+            extract_canvas_id_from_frame_reference(
+                "https://console.example.com/canvas/v1/frame/01ARZ3NDEKTSV4RRFFQ69G5FB2?token=def"
+            ),
+            Some("01ARZ3NDEKTSV4RRFFQ69G5FB2")
+        );
+        assert_eq!(extract_canvas_id_from_frame_reference("not-a-canvas-url"), None);
+    }
+
+    #[test]
+    fn derive_canvas_transcript_reference_prefers_latest_matching_event() {
+        let transcript = vec![
+            journal::OrchestratorSessionTranscriptRecord {
+                session_id: "01ARZ3NDEKTSV4RRFFQ69G5FA1".to_owned(),
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FA2".to_owned(),
+                seq: 1,
+                event_type: "tool_result".to_owned(),
+                payload_json: serde_json::json!({
+                    "frame_url": "/canvas/v1/frame/01ARZ3NDEKTSV4RRFFQ69G5FB1?token=one"
+                })
+                .to_string(),
+                created_at_unix_ms: 10,
+                origin_kind: "console".to_owned(),
+                origin_run_id: None,
+            },
+            journal::OrchestratorSessionTranscriptRecord {
+                session_id: "01ARZ3NDEKTSV4RRFFQ69G5FA1".to_owned(),
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FA3".to_owned(),
+                seq: 7,
+                event_type: "tool_result".to_owned(),
+                payload_json: serde_json::json!({
+                    "nested": {
+                        "frame_url": "https://console.example.com/canvas/v1/frame/01ARZ3NDEKTSV4RRFFQ69G5FB1?token=two"
+                    }
+                })
+                .to_string(),
+                created_at_unix_ms: 20,
+                origin_kind: "retry".to_owned(),
+                origin_run_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FA2".to_owned()),
+            },
+        ];
+
+        let reference =
+            derive_canvas_transcript_reference(transcript.as_slice(), "01ARZ3NDEKTSV4RRFFQ69G5FB1");
+
+        assert_eq!(reference.source_run_id.as_deref(), Some("01ARZ3NDEKTSV4RRFFQ69G5FA3"));
+        assert_eq!(reference.source_tape_seq, Some(7));
+        assert_eq!(reference.origin_kind.as_deref(), Some("retry"));
+        assert_eq!(reference.origin_run_id.as_deref(), Some("01ARZ3NDEKTSV4RRFFQ69G5FA2"));
+        assert_eq!(reference.last_referenced_at_unix_ms, Some(20));
     }
 
     fn sample_run_status() -> journal::OrchestratorRunStatusSnapshot {

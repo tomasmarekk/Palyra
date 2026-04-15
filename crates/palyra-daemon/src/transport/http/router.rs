@@ -629,6 +629,18 @@ pub(crate) fn build_router(state: AppState) -> Router {
             get(console::chat::console_chat_transcript_handler),
         )
         .route(
+            "/console/v1/chat/sessions/{session_id}/canvases",
+            get(console::chat::console_chat_canvas_list_handler),
+        )
+        .route(
+            "/console/v1/chat/sessions/{session_id}/canvases/{canvas_id}",
+            get(console::chat::console_chat_canvas_detail_handler),
+        )
+        .route(
+            "/console/v1/chat/sessions/{session_id}/canvases/{canvas_id}/restore",
+            post(console::chat::console_chat_canvas_restore_handler),
+        )
+        .route(
             "/console/v1/chat/sessions/{session_id}/transcript/search",
             get(console::chat::console_chat_transcript_search_handler),
         )

@@ -304,6 +304,8 @@ pub struct CanvasRuntimeDescriptor {
     pub expires_at_unix_ms: i64,
 }
 
+const CANVAS_PATCH_HISTORY_BATCH_LIMIT: usize = 1_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CanvasTokenPayload {
     pub(crate) canvas_id: String,
@@ -1731,6 +1733,116 @@ impl GatewayRuntimeState {
     }
 
     #[allow(clippy::result_large_err)]
+    pub(crate) fn list_session_canvases(
+        &self,
+        context: &RequestContext,
+        session_id: &str,
+    ) -> Result<Vec<CanvasRecord>, Status> {
+        self.ensure_canvas_host_enabled()?;
+        validate_canonical_id(session_id).map_err(|_| {
+            Status::invalid_argument("session_id must be a canonical ULID identifier")
+        })?;
+        let records = self
+            .canvas_records
+            .lock()
+            .map_err(|_| Status::internal("canvas registry lock poisoned"))?;
+        let mut scoped = records
+            .values()
+            .filter(|record| {
+                record.principal == context.principal && record.session_id.as_str() == session_id
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        scoped.sort_by(|left, right| {
+            right
+                .updated_at_unix_ms
+                .cmp(&left.updated_at_unix_ms)
+                .then_with(|| left.canvas_id.cmp(&right.canvas_id))
+        });
+        Ok(scoped)
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn issue_canvas_runtime_descriptor(
+        &self,
+        context: &RequestContext,
+        canvas_id: &str,
+        requested_token_ttl_seconds: Option<u32>,
+    ) -> Result<CanvasRuntimeDescriptor, Status> {
+        self.ensure_canvas_host_enabled()?;
+        let record = self.get_canvas(context, canvas_id)?;
+        let now_unix_ms = unix_ms_now_for_status()?;
+        if record.expires_at_unix_ms <= now_unix_ms {
+            self.counters.canvas_denied.fetch_add(1, Ordering::Relaxed);
+            return Err(Status::failed_precondition("canvas session expired"));
+        }
+        let token_ttl_ms =
+            self.resolve_canvas_token_ttl_ms(requested_token_ttl_seconds.unwrap_or_default())?;
+        let expires_at_unix_ms =
+            now_unix_ms.saturating_add(token_ttl_ms as i64).min(record.expires_at_unix_ms);
+        let auth_token = self.issue_canvas_token(
+            record.canvas_id.as_str(),
+            context.principal.as_str(),
+            record.session_id.as_str(),
+            now_unix_ms,
+            expires_at_unix_ms,
+        )?;
+        Ok(CanvasRuntimeDescriptor {
+            canvas_id: record.canvas_id.clone(),
+            frame_url: format!(
+                "{}/canvas/v1/frame/{}",
+                self.config.canvas_host.public_base_url, record.canvas_id
+            ),
+            runtime_url: format!(
+                "{}/canvas/v1/runtime.js",
+                self.config.canvas_host.public_base_url
+            ),
+            auth_token,
+            expires_at_unix_ms,
+        })
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn restore_canvas_state(
+        &self,
+        context: &RequestContext,
+        canvas_id: &str,
+        target_state_version: u64,
+    ) -> Result<CanvasRecord, Status> {
+        if target_state_version == 0 {
+            return Err(Status::invalid_argument("target_state_version must be greater than 0"));
+        }
+        let record = self.get_canvas(context, canvas_id)?;
+        if record.closed {
+            return Err(Status::failed_precondition("canvas is closed and cannot be restored"));
+        }
+        if record.state_version == target_state_version {
+            return Ok(record);
+        }
+        let target_patch = self
+            .load_canvas_patch_history(record.canvas_id.as_str())?
+            .into_iter()
+            .find(|patch| patch.state_version == target_state_version)
+            .ok_or_else(|| {
+                Status::not_found(format!(
+                    "canvas state version not found: {}@{}",
+                    record.canvas_id, target_state_version
+                ))
+            })?;
+        if target_patch.closed {
+            return Err(Status::failed_precondition("closed canvas revisions cannot be restored"));
+        }
+        self.update_canvas_state(
+            context,
+            record.canvas_id.as_str(),
+            Some(target_patch.resulting_state_json.as_bytes()),
+            None,
+            Some(record.state_version),
+            Some(record.state_schema_version),
+        )
+    }
+
+    #[allow(clippy::result_large_err)]
     pub fn canvas_frame_document(
         &self,
         canvas_id: &str,
@@ -1916,6 +2028,31 @@ impl GatewayRuntimeState {
             close_reason: record.close_reason,
             expires_at_unix_ms: record.expires_at_unix_ms,
         }))
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn load_canvas_patch_history(
+        &self,
+        canvas_id: &str,
+    ) -> Result<Vec<CanvasStatePatchRecord>, Status> {
+        let mut history = Vec::new();
+        let mut next_after = 0_u64;
+        loop {
+            let batch = self
+                .journal_store
+                .list_canvas_state_patches(canvas_id, next_after, CANVAS_PATCH_HISTORY_BATCH_LIMIT)
+                .map_err(|error| map_canvas_store_error("list_canvas_state_patches", error))?;
+            if batch.is_empty() {
+                break;
+            }
+            next_after = batch.last().map(|record| record.state_version).unwrap_or(next_after);
+            let completed_batch = batch.len() < CANVAS_PATCH_HISTORY_BATCH_LIMIT;
+            history.extend(batch);
+            if completed_batch {
+                break;
+            }
+        }
+        Ok(history)
     }
 
     #[allow(clippy::result_large_err)]
