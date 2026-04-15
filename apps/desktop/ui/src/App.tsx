@@ -2301,7 +2301,10 @@ function toneForDevice(
 function buildDesktopSessionListBadges(
   session: SessionCatalogRecord,
 ): Array<{ label: string; tone: "default" | "success" | "warning" | "danger" | "accent" }> {
-  const badges: Array<{ label: string; tone: "default" | "success" | "warning" | "danger" | "accent" }> = [];
+  const badges: Array<{
+    label: string;
+    tone: "default" | "success" | "warning" | "danger" | "accent";
+  }> = [];
   if (session.manual_title_locked) {
     badges.push({ label: "manual title", tone: "accent" });
   }
@@ -2389,7 +2392,8 @@ function buildDesktopSessionDetailItems(
     },
     {
       label: "Context",
-      value: session.last_context_file ?? (session.has_context_files ? "active files attached" : "none"),
+      value:
+        session.last_context_file ?? (session.has_context_files ? "active files attached" : "none"),
     },
     {
       label: "Artifacts",
@@ -2411,9 +2415,7 @@ function buildDesktopSessionRecap(session: SessionCatalogRecord): string | null 
     segments.push(`Touched files: ${session.recap.touched_files.slice(0, 3).join(", ")}`);
   }
   if (session.recap.active_context_files.length > 0) {
-    segments.push(
-      `Active context: ${session.recap.active_context_files.slice(0, 2).join(", ")}`,
-    );
+    segments.push(`Active context: ${session.recap.active_context_files.slice(0, 2).join(", ")}`);
   }
   if (session.recap.ctas.length > 0) {
     segments.push(`Next steps: ${session.recap.ctas.slice(0, 2).join(", ")}`);

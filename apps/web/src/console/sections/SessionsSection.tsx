@@ -1,5 +1,4 @@
 import { useEffect, useMemo, useState } from "react";
-import { Chip } from "@heroui/react";
 import { useNavigate } from "react-router-dom";
 
 import {
@@ -491,7 +490,8 @@ export function SessionsSection({ app }: SessionsSectionProps) {
                           {entry.quick_controls.model.display_value}
                         </small>
                         <small className="text-muted">
-                          {entry.pending_approvals} approval{entry.pending_approvals === 1 ? "" : "s"}
+                          {entry.pending_approvals} approval
+                          {entry.pending_approvals === 1 ? "" : "s"}
                           {entry.has_context_files
                             ? ` · ${entry.recap.active_context_files.length} context file${entry.recap.active_context_files.length === 1 ? "" : "s"}`
                             : ""}

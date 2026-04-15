@@ -221,32 +221,37 @@ export function useChatSessions({
     [activateSession],
   );
 
-  const renameSession = useCallback(async (requestedLabel?: string): Promise<void> => {
-    if (activeSessionId.trim().length === 0) {
-      setError("Select a session first.");
-      return;
-    }
-    setError(null);
-    setNotice(null);
-    setSessionsBusy(true);
-    try {
-      const nextLabel = emptyToUndefined(requestedLabel ?? sessionLabelDraft);
-      const response = await api.renameChatSession(activeSessionId, {
-        session_label: nextLabel,
-        manual_title_locked: nextLabel !== undefined,
-      });
-      const updatedRecord = await api.getSessionCatalogEntry(response.session.session_id);
-      upsertSession(updatedRecord.session);
-      setSessionLabelDraft(updatedRecord.session.session_label ?? "");
-      setNotice(
-        nextLabel === undefined ? "Session title returned to automatic mode." : "Session title updated.",
-      );
-    } catch (error) {
-      setError(toErrorMessage(error));
-    } finally {
-      setSessionsBusy(false);
-    }
-  }, [activeSessionId, api, sessionLabelDraft, setError, setNotice, upsertSession]);
+  const renameSession = useCallback(
+    async (requestedLabel?: string): Promise<void> => {
+      if (activeSessionId.trim().length === 0) {
+        setError("Select a session first.");
+        return;
+      }
+      setError(null);
+      setNotice(null);
+      setSessionsBusy(true);
+      try {
+        const nextLabel = emptyToUndefined(requestedLabel ?? sessionLabelDraft);
+        const response = await api.renameChatSession(activeSessionId, {
+          session_label: nextLabel,
+          manual_title_locked: nextLabel !== undefined,
+        });
+        const updatedRecord = await api.getSessionCatalogEntry(response.session.session_id);
+        upsertSession(updatedRecord.session);
+        setSessionLabelDraft(updatedRecord.session.session_label ?? "");
+        setNotice(
+          nextLabel === undefined
+            ? "Session title returned to automatic mode."
+            : "Session title updated.",
+        );
+      } catch (error) {
+        setError(toErrorMessage(error));
+      } finally {
+        setSessionsBusy(false);
+      }
+    },
+    [activeSessionId, api, sessionLabelDraft, setError, setNotice, upsertSession],
+  );
 
   const resetSession = useCallback(async (): Promise<boolean> => {
     if (activeSessionId.trim().length === 0) {

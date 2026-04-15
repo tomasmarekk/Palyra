@@ -260,9 +260,7 @@ function describeToggleDescription(inheritedValue: boolean, source: string): str
   return `${describeControlSource(source)} · inherited ${inheritedValue ? "on" : "off"}`;
 }
 
-function toneForSource(
-  source: string,
-): "default" | "accent" | "success" | "warning" | "danger" {
+function toneForSource(source: string): "default" | "accent" | "success" | "warning" | "danger" {
   switch (source) {
     case "session_binding":
     case "session_override":

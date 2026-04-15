@@ -8,7 +8,10 @@ import type {
   SessionCatalogRecord,
 } from "../consoleApi";
 
-import { ChatSessionQuickControlHeader, ChatSessionQuickControlPanel } from "./ChatSessionQuickControls";
+import type {
+  ChatSessionQuickControlHeader,
+  ChatSessionQuickControlPanel,
+} from "./ChatSessionQuickControls";
 import { toErrorMessage, type TranscriptEntry } from "./chatShared";
 
 type UseChatSessionQuickControlsArgs = {
@@ -18,10 +21,7 @@ type UseChatSessionQuickControlsArgs = {
   readonly hiddenTranscriptItems: number;
   readonly setError: (next: string | null) => void;
   readonly setNotice: (next: string | null) => void;
-  readonly upsertSession: (
-    session: SessionCatalogRecord,
-    options?: { select?: boolean },
-  ) => void;
+  readonly upsertSession: (session: SessionCatalogRecord, options?: { select?: boolean }) => void;
 };
 
 type UseChatSessionQuickControlsResult = {
@@ -139,9 +139,7 @@ export function useChatSessionQuickControls({
     (agentId: string | null) => {
       void applySessionQuickControls(
         { agent_id: agentId },
-        agentId === null
-          ? "Session agent binding cleared."
-          : `Session agent bound to ${agentId}.`,
+        agentId === null ? "Session agent binding cleared." : `Session agent bound to ${agentId}.`,
       );
     },
     [applySessionQuickControls],
@@ -161,10 +159,7 @@ export function useChatSessionQuickControls({
 
   const clearSessionModel = useCallback(() => {
     setModelDraft("");
-    void applySessionQuickControls(
-      { model_profile: null },
-      "Session model override cleared.",
-    );
+    void applySessionQuickControls({ model_profile: null }, "Session model override cleared.");
   }, [applySessionQuickControls]);
 
   const setSessionThinking = useCallback(

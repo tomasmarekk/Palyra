@@ -94,7 +94,9 @@ export function resumeSessionAction(args: {
       (session) => session.family.root_title.toLowerCase() === normalizedTarget,
     ) ??
     args.sortedSessions.find((session) =>
-      session.family.relatives.some((relative) => relative.title.toLowerCase() === normalizedTarget),
+      session.family.relatives.some(
+        (relative) => relative.title.toLowerCase() === normalizedTarget,
+      ),
     ) ??
     args.sortedSessions.find((session) =>
       [

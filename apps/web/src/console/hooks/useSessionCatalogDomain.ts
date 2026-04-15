@@ -258,7 +258,9 @@ export function useSessionCatalogDomain({ api, setError, setNotice }: UseSession
       );
       setRenameDraft(updatedRecord.session.session_label ?? "");
       setNotice(
-        nextLabel.length > 0 ? "Session title updated." : "Session title returned to automatic mode.",
+        nextLabel.length > 0
+          ? "Session title updated."
+          : "Session title returned to automatic mode.",
       );
     } catch (error) {
       setError(toErrorMessage(error));

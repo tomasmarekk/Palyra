@@ -244,7 +244,11 @@ function buildSessionSuggestions(
           : "Resume this session context."),
       example: `/${command.name} ${session.session_id}`,
       replacement: `/${command.name} ${command.name === "history" ? session.title : session.session_id}`,
-      badge: session.archived ? "archived" : session.branch_state === "active_branch" ? "branch" : "session",
+      badge: session.archived
+        ? "archived"
+        : session.branch_state === "active_branch"
+          ? "branch"
+          : "session",
     }));
 }
 
