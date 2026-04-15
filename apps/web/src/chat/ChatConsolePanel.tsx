@@ -1,55 +1,31 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import type {
-  ChatAttachmentRecord,
-  ChatBackgroundTaskRecord,
-  ChatCheckpointRecord,
-  ChatCompactionArtifactRecord,
-  MediaDerivedArtifactRecord,
-  ChatPinRecord,
-  ChatQueuedInputRecord,
-  ChatRunStatusRecord,
-  ChatTranscriptRecord,
-  ConsoleApiClient,
+  ChatAttachmentRecord, ChatBackgroundTaskRecord, ChatCheckpointRecord,
+  ChatCompactionArtifactRecord, ChatPinRecord, ChatQueuedInputRecord, ChatRunStatusRecord,
+  ChatTranscriptRecord, ConsoleApiClient, MediaDerivedArtifactRecord,
+  WorkspaceRestoreResponseEnvelope,
 } from "../consoleApi";
 import { type DetailPanelState, type TranscriptSearchMatch } from "./ChatInspectorColumn";
+import type { RunDrawerTab } from "./ChatRunDrawer";
 import { ChatConsoleWorkspaceView } from "./ChatConsoleWorkspaceView";
 import {
-  deleteChatPin,
-  exportChatTranscript,
-  inspectCheckpointDetails,
-  inspectCompactionDetails,
-  pinChatTranscriptRecord,
-  restoreChatCheckpoint,
-  runChatCompactionFlow,
-  searchChatTranscript,
+  deleteChatPin, exportChatTranscript, inspectCheckpointDetails, inspectCompactionDetails,
+  pinChatTranscriptRecord, restoreChatCheckpoint, runChatCompactionFlow, searchChatTranscript,
 } from "./chatConsoleOperations";
 import { useChatAttachmentUploadHandler } from "./chatInspectorActions";
 import { buildInspectorProps, buildTranscriptProps } from "./chatConsolePanelProps";
 import { describeBranchState, toErrorMessage, type ComposerAttachment } from "./chatShared";
 import { emitPromptSubmitted, emitRunInspected, emitSessionResumed } from "./chatConsoleTelemetry";
+import { createUndoCheckpoint, executeChatSlashCommand, interruptAndMaybeRedirect } from "./chatSlashActions";
 import {
-  createUndoCheckpoint,
-  executeChatSlashCommand,
-  interruptAndMaybeRedirect,
-} from "./chatSlashActions";
-import {
-  branchCurrentSessionAction,
-  createNewSessionAction,
-  delegateWorkAction,
-  archiveSessionAndTranscriptAction,
-  queueFollowUpTextAction,
-  resetSessionAndTranscriptAction,
-  resumeSessionAction,
-  retryLatestTurnAction,
-  submitComposerTurnAction,
+  archiveSessionAndTranscriptAction, branchCurrentSessionAction, createNewSessionAction,
+  delegateWorkAction, queueFollowUpTextAction, resetSessionAndTranscriptAction,
+  resumeSessionAction, retryLatestTurnAction, submitComposerTurnAction,
 } from "./chatSessionActions";
 import {
-  approveProjectContextEntryAction,
-  disableProjectContextEntryAction,
-  enableProjectContextEntryAction,
-  refreshProjectContextAction,
-  scaffoldProjectContextAction,
+  approveProjectContextEntryAction, disableProjectContextEntryAction,
+  enableProjectContextEntryAction, refreshProjectContextAction, scaffoldProjectContextAction,
 } from "./chatProjectContextActions";
 import { useContextReferencePreview } from "./useContextReferencePreview";
 import { useProjectContextPreview } from "./useProjectContextPreview";
@@ -62,11 +38,8 @@ import { usePhase4DeepLinks } from "./usePhase4DeepLinks";
 import { useChatObjectives } from "./useChatObjectives";
 import { useChatPanelViewState } from "./useChatPanelViewState";
 import { useChatPanelBootstrap } from "./useChatPanelBootstrap";
-import {
-  buildWorkspaceHeaderSessionState,
-  buildSessionsSidebarProps,
-  describeSelectedSessionTitle,
-} from "./chatWorkspaceSessionBindings";
+import { openWorkspaceRollbackInspectorAction, previewWorkspaceRollbackDiffAction, reconcileWorkspaceRestoreAction } from "./chatWorkspaceRollbackActions";
+import { buildWorkspaceHeaderSessionState, buildSessionsSidebarProps, describeSelectedSessionTitle } from "./chatWorkspaceSessionBindings";
 import { FIRST_SUCCESS_PROMPTS } from "./starterPrompts";
 import { useStarterPromptGuidance } from "./useStarterPromptGuidance";
 import { useStarterPromptHandoff } from "./useStarterPromptHandoff";
@@ -131,6 +104,7 @@ export function ChatConsolePanel({
   const [attachmentBusy, setAttachmentBusy] = useState(false);
   const [exportBusy, setExportBusy] = useState<"json" | "markdown" | null>(null);
   const [phase4BusyKey, setPhase4BusyKey] = useState<string | null>(null);
+  const [runDrawerTab, setRunDrawerTab] = useState<RunDrawerTab>("status");
   const attachmentInputRef = useRef<HTMLInputElement | null>(null);
   const handleSessionActivated = useCallback(
     (sessionId: string) => emitSessionResumed(emitUxEvent, sessionId),
@@ -194,6 +168,13 @@ export function ChatConsolePanel({
     setError,
     setNotice,
   });
+  const openRunDetailsPanel = useCallback(
+    (runId: string, tab: RunDrawerTab = "status"): void => {
+      setRunDrawerTab(tab);
+      openRunDetails(runId);
+    },
+    [openRunDetails],
+  );
   const {
     filteredTranscript,
     filteredHiddenTranscriptItems,
@@ -343,7 +324,7 @@ export function ChatConsolePanel({
     preferredRunId,
     preferredCompactionId,
     preferredCheckpointId,
-    openRunDetails,
+    openRunDetails: openRunDetailsPanel,
     inspectCompaction,
     inspectCheckpoint,
   });
@@ -399,8 +380,8 @@ export function ChatConsolePanel({
     runTotalTokens: runStatus?.total_tokens ?? 0,
     sessionTotalTokens: sessions.selectedSession?.total_tokens ?? 0,
   });
-  const refreshSessionTranscript = useCallback(async () => {
-    const sessionId = sessions.activeSessionId.trim();
+  const refreshSessionTranscript = useCallback(async (sessionIdOverride?: string) => {
+    const sessionId = (sessionIdOverride ?? sessions.activeSessionId).trim();
     transcriptRequestSeqRef.current += 1;
     const requestSeq = transcriptRequestSeqRef.current;
 
@@ -442,6 +423,69 @@ export function ChatConsolePanel({
       }
     }
   }, [api, sessions.activeSessionId, sessions.upsertSession, setError]);
+  const openMemorySection = useCallback(() => setConsoleSection("memory"), [setConsoleSection]);
+  const openSupportSection = useCallback(() => setConsoleSection("support"), [setConsoleSection]);
+  const handleWorkspaceRestore = useCallback(async (response: WorkspaceRestoreResponseEnvelope): Promise<void> => {
+    await reconcileWorkspaceRestoreAction({
+      response,
+      upsertSession: sessions.upsertSession,
+      clearTranscriptState, setAttachments, setDetailPanel,
+      refreshSessions: () => sessions.refreshSessions(false),
+      refreshSessionTranscript,
+      appendLocalEntry, openRunDetails: openRunDetailsPanel, setNotice,
+    });
+  }, [
+    appendLocalEntry,
+    clearTranscriptState,
+    openRunDetailsPanel,
+    refreshSessionTranscript,
+    sessions,
+    setAttachments,
+    setDetailPanel,
+    setNotice,
+  ]);
+  const openRollbackInspector = useCallback(async (rawTarget = ""): Promise<void> => {
+    await openWorkspaceRollbackInspectorAction({
+      rawTarget,
+      actionableRunId,
+      sessionRuns,
+      selectedLastRunId: sessions.selectedSession?.last_run_id,
+      knownRunIds,
+      setDetailPanel, openRunDetails: openRunDetailsPanel, setError, setNotice,
+    });
+  }, [
+    actionableRunId,
+    knownRunIds,
+    openRunDetailsPanel,
+    sessionRuns,
+    sessions.selectedSession?.last_run_id,
+    setDetailPanel,
+    setError,
+    setNotice,
+  ]);
+  const previewRollbackDiff = useCallback(async (rawTarget: string): Promise<void> => {
+    await previewWorkspaceRollbackDiffAction({
+      api,
+      rawTarget,
+      actionableRunId,
+      runDrawerId,
+      sessionRuns,
+      selectedLastRunId: sessions.selectedSession?.last_run_id,
+      knownRunIds,
+      setDetailPanel, openRunDetails: openRunDetailsPanel, setError, setNotice,
+    });
+  }, [
+    actionableRunId,
+    api,
+    knownRunIds,
+    openRunDetailsPanel,
+    runDrawerId,
+    sessionRuns,
+    sessions.selectedSession?.last_run_id,
+    setDetailPanel,
+    setError,
+    setNotice,
+  ]);
   useEffect(() => {
     const sessionId = sessions.activeSessionId.trim();
     if (sessionId.length === 0) {
@@ -486,27 +530,22 @@ export function ChatConsolePanel({
   const resetSessionAndTranscript = async () => {
     await resetSessionAndTranscriptAction({
       resetSession: sessions.resetSession,
-      clearTranscriptState,
-      setDetailPanel,
-      setTranscriptSearchResults,
-      setAttachments,
+      clearTranscriptState, setDetailPanel, setTranscriptSearchResults, setAttachments,
       setSessionAttachments: () => setSessionAttachments([]),
       setSessionDerivedArtifacts: () => setSessionDerivedArtifacts([]),
       setNotice,
     });
     void refreshSessionTranscript();
   };
-  const archiveSessionAndTranscript = async () =>
-    archiveSessionAndTranscriptAction({
+  const archiveSessionAndTranscript = async () => {
+    await archiveSessionAndTranscriptAction({
       archiveSession: sessions.archiveSession,
-      clearTranscriptState,
-      setDetailPanel,
-      setTranscriptSearchResults,
-      setAttachments,
+      clearTranscriptState, setDetailPanel, setTranscriptSearchResults, setAttachments,
       setSessionAttachments: () => setSessionAttachments([]),
       setSessionDerivedArtifacts: () => setSessionDerivedArtifacts([]),
       setNotice,
     });
+  };
   async function handleComposerSubmit(): Promise<void> {
     await submitComposerTurnAction({
       parsedSlashCommand,
@@ -543,12 +582,8 @@ export function ChatConsolePanel({
       runDrawerOpen,
       runDrawerId,
       cancelStreaming,
-      refreshRunDetails: async () => {
-        refreshRunDetails();
-      },
-      refreshSessions: async (preserveSelection = false) => {
-        await sessions.refreshSessions(preserveSelection);
-      },
+      refreshRunDetails: async () => refreshRunDetails(),
+      refreshSessions: async (preserveSelection = false) => sessions.refreshSessions(preserveSelection),
       refreshSessionTranscript,
       refreshSlashEntityCatalogs,
       setRunActionBusy,
@@ -576,15 +611,16 @@ export function ChatConsolePanel({
             ]).then(() => undefined),
           { text: redirectText },
         );
-        if (didSend) {
-          appendLocalEntry({
-            kind: "status",
-            session_id: sessions.activeSessionId,
-            run_id: metadata.runId,
-            title: "Interrupt redirect",
-            text: `Requested ${metadata.mode} interrupt and redirected the next prompt into a fresh run.`,
-          });
+        if (!didSend) {
+          return;
         }
+        appendLocalEntry({
+          kind: "status",
+          session_id: sessions.activeSessionId,
+          run_id: metadata.runId,
+          title: "Interrupt redirect",
+          text: `Requested ${metadata.mode} interrupt and redirected the next prompt into a fresh run.`,
+        });
       },
     });
   }
@@ -609,16 +645,12 @@ export function ChatConsolePanel({
       setConsoleSection,
       recordUxMetric,
       updateComposerDraft,
-      navigateToObjective: (objectiveId) => {
-        void navigate(buildObjectiveOverviewHref(objectiveId));
-      },
+      navigateToObjective: (objectiveId) => void navigate(buildObjectiveOverviewHref(objectiveId)),
       inspectCheckpoint,
       restoreCheckpoint,
       onInterrupt: interruptCurrentRun,
       onCreateSession: createNewSession,
-      onRenameSession: async (requestedLabel) => {
-        await sessions.renameSession(requestedLabel);
-      },
+      onRenameSession: async (requestedLabel) => sessions.renameSession(requestedLabel),
       onResetSession: resetSessionAndTranscript,
       onRetry: retryLatestTurn,
       onBranchSession: branchCurrentSession,
@@ -640,6 +672,8 @@ export function ChatConsolePanel({
       },
       onResumeSession: resumeSession,
       onRunCompactionFlow: runCompactionFlow,
+      onOpenRollback: openRollbackInspector,
+      onPreviewRollbackDiff: previewRollbackDiff,
       onSearchTranscript: async (query) => {
         setTranscriptSearchQuery(query);
         await searchTranscript(query);
@@ -656,34 +690,24 @@ export function ChatConsolePanel({
       mode,
       upsertSession: sessions.upsertSession,
       refreshSessionTranscript,
-      setDetailPanel,
-      appendLocalEntry,
-      setCommandBusy,
-      setError,
-      setNotice,
+      setDetailPanel, appendLocalEntry, setCommandBusy, setError, setNotice,
     });
   }
   async function createNewSession(requestedLabel?: string): Promise<void> {
     await createNewSessionAction({
       requestedLabel,
       createSessionWithLabel: sessions.createSessionWithLabel,
-      clearTranscriptState,
-      setDetailPanel,
-      setTranscriptSearchResults,
-      setAttachments,
+      clearTranscriptState, setDetailPanel, setTranscriptSearchResults, setAttachments,
       setComposerText: updateComposerDraft,
-      setError,
-      setNotice,
+      setError, setNotice,
     });
   }
   async function resumeSession(rawTarget: string): Promise<void> {
     resumeSessionAction({
       rawTarget,
       sortedSessions: sessions.sortedSessions,
-      setActiveSessionId: sessions.setActiveSessionId,
-      setComposerText: updateComposerDraft,
-      setError,
-      setNotice,
+      setActiveSessionId: sessions.setActiveSessionId, setComposerText: updateComposerDraft,
+      setError, setNotice,
     });
   }
   async function retryLatestTurn(): Promise<void> {
@@ -693,19 +717,13 @@ export function ChatConsolePanel({
       transcriptRecordCount: transcriptRecords.length,
       sessionRunCount: sessionRuns.length,
       source: "retry",
-      setNotice,
-      recordUxMetric,
+      setNotice, recordUxMetric,
     });
     await retryLatestTurnAction({
       api,
       sessionId: sessions.activeSessionId.trim(),
       refreshSessions: sessions.refreshSessions,
-      refreshSessionTranscript,
-      sendMessage,
-      appendLocalEntry,
-      setCommandBusy,
-      setError,
-      setNotice,
+      refreshSessionTranscript, sendMessage, appendLocalEntry, setCommandBusy, setError, setNotice,
     });
   }
   async function branchCurrentSession(requestedLabel?: string): Promise<void> {
@@ -714,15 +732,11 @@ export function ChatConsolePanel({
       sessionId: sessions.activeSessionId.trim(),
       requestedLabel,
       upsertSession: sessions.upsertSession,
-      clearTranscriptState,
-      setDetailPanel,
-      setAttachments,
+      clearTranscriptState, setDetailPanel, setAttachments,
       setComposerText: updateComposerDraft,
       refreshSessions: sessions.refreshSessions,
       refreshSessionTranscript,
-      setCommandBusy,
-      setError,
-      setNotice,
+      setCommandBusy, setError, setNotice,
     });
   }
   async function queueFollowUpText(text: string): Promise<void> {
@@ -734,9 +748,7 @@ export function ChatConsolePanel({
       appendLocalEntry,
       refreshSessionTranscript,
       setComposerText: updateComposerDraft,
-      setCommandBusy,
-      setError,
-      setNotice,
+      setCommandBusy, setError, setNotice,
     });
   }
   async function searchTranscript(query = transcriptSearchQuery): Promise<void> {
@@ -749,9 +761,7 @@ export function ChatConsolePanel({
       transcriptSearchRequestSeq: requestSeq,
       getCurrentTranscriptSearchSeq: () => transcriptSearchSeqRef.current,
       upsertSession: sessions.upsertSession,
-      setTranscriptSearchResults,
-      setTranscriptSearchBusy,
-      setError,
+      setTranscriptSearchResults, setTranscriptSearchBusy, setError,
     });
   }
   async function exportTranscript(format: "json" | "markdown"): Promise<void> {
@@ -760,9 +770,7 @@ export function ChatConsolePanel({
       activeSessionId: sessions.activeSessionId,
       sessionLabel: sessions.selectedSession?.session_label,
       format,
-      setExportBusy,
-      setError,
-      setNotice,
+      setExportBusy, setError, setNotice,
     });
   }
   async function restoreCheckpoint(
@@ -776,16 +784,12 @@ export function ChatConsolePanel({
       actionableRunId,
       visibleTranscript,
       selectedSession: sessions.selectedSession,
-      clearTranscriptState,
-      setAttachments,
+      clearTranscriptState, setAttachments,
       refreshSessions: async (preserveSelection = false) => {
         await sessions.refreshSessions(preserveSelection);
       },
       refreshSessionTranscript,
-      setDetailPanel,
-      setPhase4BusyKey,
-      setError,
-      setNotice,
+      setDetailPanel, setPhase4BusyKey, setError, setNotice,
       upsertSession: sessions.upsertSession,
       source: options?.source,
     });
@@ -904,8 +908,8 @@ export function ChatConsolePanel({
           exportBusy,
           exportTranscript,
           recentTranscriptRecords,
-          pinTranscriptRecord: async (record) => {
-            await pinChatTranscriptRecord({
+          pinTranscriptRecord: async (record) =>
+            pinChatTranscriptRecord({
               api,
               activeSessionId: sessions.activeSessionId,
               record,
@@ -913,10 +917,9 @@ export function ChatConsolePanel({
               setCommandBusy,
               setError,
               setNotice,
-            });
-          },
-          deletePin: async (pinId) => {
-            await deleteChatPin({
+            }),
+          deletePin: async (pinId) =>
+            deleteChatPin({
               api,
               activeSessionId: sessions.activeSessionId,
               pinId,
@@ -924,8 +927,7 @@ export function ChatConsolePanel({
               setCommandBusy,
               setError,
               setNotice,
-            });
-          },
+            }),
           compactions,
           checkpoints,
           queuedInputs,
@@ -933,7 +935,7 @@ export function ChatConsolePanel({
           detailPanel,
           revealSensitiveValues,
           inspectorVisible,
-          openRunDetails,
+          openRunDetails: openRunDetailsPanel,
           phase4BusyKey,
           runDrawerId,
           setRunDrawerId,
@@ -941,6 +943,13 @@ export function ChatConsolePanel({
           runStatus,
           runTape,
           runLineage,
+          runDrawerTab,
+          setRunDrawerTab,
+          setError,
+          setNotice,
+          onWorkspaceRestore: handleWorkspaceRestore,
+          openMemorySection,
+          openSupportSection,
           refreshRunDetails,
           closeRunDrawer,
           openBrowserSessionWorkbench,
@@ -950,8 +959,6 @@ export function ChatConsolePanel({
           restoreCheckpoint,
           refreshSessionTranscript,
           setDetailPanel,
-          setError,
-          setNotice,
           setPhase4BusyKey,
         })}
         onAbortRun={() => void interruptCurrentRun("")}
@@ -960,10 +967,9 @@ export function ChatConsolePanel({
             ? null
             : () => {
                 const objectiveId = readString(selectedObjective, "objective_id");
-                if (objectiveId === null) {
-                  return;
+                if (objectiveId !== null) {
+                  void navigate(buildObjectiveOverviewHref(objectiveId));
                 }
-                void navigate(buildObjectiveOverviewHref(objectiveId));
               }
         }
         onOpenRunDetails={() => {
@@ -972,15 +978,10 @@ export function ChatConsolePanel({
             setError("No run is available for inspection.");
             return;
           }
-          openRunDetails(targetRunId);
+          openRunDetailsPanel(targetRunId);
         }}
         onRefresh={() =>
-          void Promise.all([
-            sessions.refreshSessions(false),
-            refreshSessionTranscript(),
-            refreshObjectives(),
-            refreshSlashEntityCatalogs(),
-          ])
+          void Promise.all([sessions.refreshSessions(false), refreshSessionTranscript(), refreshObjectives(), refreshSlashEntityCatalogs()])
         }
         onSetAllowSensitiveTools={setAllowSensitiveTools}
         onHideStarterPrompts={starterPromptGuidance.hideStarterPrompts}
@@ -1033,7 +1034,7 @@ export function ChatConsolePanel({
               `${getSectionPath("approvals")}?${new URLSearchParams([["tool", toolName]]).toString()}`,
             );
           },
-          openRunDetails,
+          openRunDetails: openRunDetailsPanel,
           refreshSessionTranscript,
           setDetailPanel,
           setError,

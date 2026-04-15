@@ -222,6 +222,113 @@ export function InventorySection({ app }: InventorySectionProps) {
                 </div>
               </dl>
 
+              {inventory.selectedDetail?.workspace_activity ? (
+                <WorkspaceSectionCard
+                  description="Checkpoint provenance and restore outcomes stay attached to the device detail so distributed rollback activity remains traceable."
+                  title="Workspace restore activity"
+                >
+                  <div className="workspace-stack">
+                    <dl className="workspace-key-value-grid">
+                      <div>
+                        <dt>Checkpoints</dt>
+                        <dd>{inventory.selectedDetail.workspace_activity.summary.checkpoint_count}</dd>
+                      </div>
+                      <div>
+                        <dt>Restore reports</dt>
+                        <dd>
+                          {inventory.selectedDetail.workspace_activity.summary.restore_report_count}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Successful restores</dt>
+                        <dd>
+                          {
+                            inventory.selectedDetail.workspace_activity.summary
+                              .succeeded_restore_count
+                          }
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Partial failures</dt>
+                        <dd>
+                          {
+                            inventory.selectedDetail.workspace_activity.summary
+                              .partial_failure_restore_count
+                          }
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Failed restores</dt>
+                        <dd>
+                          {inventory.selectedDetail.workspace_activity.summary.failed_restore_count}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Total restore attempts</dt>
+                        <dd>
+                          {
+                            inventory.selectedDetail.workspace_activity.summary
+                              .checkpoint_restore_total
+                          }
+                        </dd>
+                      </div>
+                    </dl>
+
+                    {inventory.selectedDetail.workspace_activity.recent_checkpoints.length > 0 ? (
+                      <WorkspaceTable
+                        ariaLabel="Recent workspace checkpoints"
+                        columns={["Checkpoint", "Created", "Source", "Restores"]}
+                      >
+                        {inventory.selectedDetail.workspace_activity.recent_checkpoints.map(
+                          (checkpoint) => (
+                            <tr key={checkpoint.checkpoint_id}>
+                              <td>
+                                <div className="workspace-stack">
+                                  <strong>{checkpoint.source_label}</strong>
+                                  <small className="text-muted">{checkpoint.checkpoint_id}</small>
+                                </div>
+                              </td>
+                              <td>{formatUnixMs(checkpoint.created_at_unix_ms)}</td>
+                              <td>{checkpoint.tool_name ?? checkpoint.source_kind}</td>
+                              <td>{checkpoint.restore_count}</td>
+                            </tr>
+                          ),
+                        )}
+                      </WorkspaceTable>
+                    ) : (
+                      <WorkspaceEmptyState
+                        compact
+                        description="Workspace checkpoints will appear here after mutating tool activity creates rollback points on this device."
+                        title="No workspace checkpoints"
+                      />
+                    )}
+
+                    {inventory.selectedDetail.workspace_activity.recent_restore_reports.length > 0 ? (
+                      <WorkspaceTable
+                        ariaLabel="Recent workspace restore reports"
+                        columns={["Report", "Created", "Result", "Scope"]}
+                      >
+                        {inventory.selectedDetail.workspace_activity.recent_restore_reports.map(
+                          (report) => (
+                            <tr key={report.report_id}>
+                              <td>
+                                <div className="workspace-stack">
+                                  <strong>{report.result_state}</strong>
+                                  <small className="text-muted">{report.report_id}</small>
+                                </div>
+                              </td>
+                              <td>{formatUnixMs(report.created_at_unix_ms)}</td>
+                              <td>{report.reconciliation_summary}</td>
+                              <td>{report.scope_kind}</td>
+                            </tr>
+                          ),
+                        )}
+                      </WorkspaceTable>
+                    ) : null}
+                  </div>
+                </WorkspaceSectionCard>
+              ) : null}
+
               {selected.capabilities.length > 0 ? (
                 <WorkspaceSectionCard
                   description="Capability inventory includes the execution posture published for this device so handoff semantics stay explicit."

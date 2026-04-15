@@ -11,11 +11,16 @@ import type {
   ChatRunLineage,
   ChatRunStatusRecord,
   ChatRunTapeSnapshot,
+  ConsoleApiClient,
   JsonValue,
+  WorkspaceRestoreResponseEnvelope,
 } from "../consoleApi";
 import { Tabs } from "@heroui/react";
 
 import { PrettyJsonBlock, parseTapePayload, shortId, toPrettyJson } from "./chatShared";
+import { ChatRunWorkspaceTab } from "./ChatRunWorkspaceTab";
+
+export type RunDrawerTab = "status" | "lineage" | "tape" | "workspace";
 
 type ChatRunDrawerProps = {
   open: boolean;
@@ -26,7 +31,17 @@ type ChatRunDrawerProps = {
   runStatus: ChatRunStatusRecord | null;
   runTape: ChatRunTapeSnapshot | null;
   runLineage: ChatRunLineage | null;
+  activeTab: RunDrawerTab;
+  setActiveTab: (tab: RunDrawerTab) => void;
+  api: ConsoleApiClient;
   revealSensitiveValues: boolean;
+  setError: (next: string | null) => void;
+  setNotice: (next: string | null) => void;
+  onInspectCompaction: (artifactId: string) => void;
+  onInspectSessionCheckpoint: (checkpointId: string) => void;
+  onWorkspaceRestore: (response: WorkspaceRestoreResponseEnvelope) => Promise<void>;
+  openMemorySection: () => void;
+  openSupportSection: () => void;
   refreshRun: () => void;
   close: () => void;
 };
@@ -40,7 +55,17 @@ export function ChatRunDrawer({
   runStatus,
   runTape,
   runLineage,
+  activeTab,
+  setActiveTab,
+  api,
   revealSensitiveValues,
+  setError,
+  setNotice,
+  onInspectCompaction,
+  onInspectSessionCheckpoint,
+  onWorkspaceRestore,
+  openMemorySection,
+  openSupportSection,
   refreshRun,
   close,
 }: ChatRunDrawerProps) {
@@ -81,7 +106,11 @@ export function ChatRunDrawer({
         />
       ) : (
         <>
-          <Tabs defaultSelectedKey="status" variant="secondary">
+          <Tabs
+            selectedKey={activeTab}
+            variant="secondary"
+            onSelectionChange={(key) => setActiveTab(String(key) as RunDrawerTab)}
+          >
             <Tabs.ListContainer>
               <Tabs.List aria-label="Run inspector sections" className="w-full">
                 <Tabs.Tab id="status">
@@ -94,6 +123,10 @@ export function ChatRunDrawer({
                 </Tabs.Tab>
                 <Tabs.Tab id="tape">
                   Tape
+                  <Tabs.Indicator />
+                </Tabs.Tab>
+                <Tabs.Tab id="workspace">
+                  Workspace
                   <Tabs.Indicator />
                 </Tabs.Tab>
               </Tabs.List>
@@ -264,6 +297,27 @@ export function ChatRunDrawer({
                   </div>
                 </SectionCard>
               )}
+            </Tabs.Panel>
+            <Tabs.Panel className="pt-4" id="workspace">
+              <ChatRunWorkspaceTab
+                active={activeTab === "workspace"}
+                api={api}
+                openMemorySection={openMemorySection}
+                openSupportSection={openSupportSection}
+                onInspectCompaction={onInspectCompaction}
+                onInspectSessionCheckpoint={onInspectSessionCheckpoint}
+                onOpenRun={(nextRunId, nextTab = "status") => {
+                  setActiveTab(nextTab);
+                  setRunDrawerId(nextRunId);
+                }}
+                onWorkspaceRestore={onWorkspaceRestore}
+                revealSensitiveValues={revealSensitiveValues}
+                runId={runDrawerId}
+                runIds={runIds}
+                runStatus={runStatus}
+                setError={setError}
+                setNotice={setNotice}
+              />
             </Tabs.Panel>
           </Tabs>
         </>

@@ -180,6 +180,8 @@ export async function executeChatSlashCommand(args: {
   onDelegate: (raw: string) => Promise<void>;
   onResumeSession: (rawTarget: string) => Promise<void>;
   onRunCompactionFlow: (mode: "preview" | "apply") => Promise<void>;
+  onOpenRollback: (rawTarget?: string) => Promise<void>;
+  onPreviewRollbackDiff: (rawTarget: string) => Promise<void>;
   onSearchTranscript: (query: string) => Promise<void>;
   onExportTranscript: (format: "json" | "markdown") => Promise<void>;
   refreshSessionTranscript: () => Promise<void>;
@@ -218,6 +220,8 @@ export async function executeChatSlashCommand(args: {
     onDelegate,
     onResumeSession,
     onRunCompactionFlow,
+    onOpenRollback,
+    onPreviewRollbackDiff,
     onSearchTranscript,
     onExportTranscript,
     refreshSessionTranscript,
@@ -359,6 +363,15 @@ export async function executeChatSlashCommand(args: {
     case "compact":
       await onRunCompactionFlow(parseCompactCommandMode(command.args));
       return;
+    case "rollback": {
+      const parsed = parseRollbackCommand(command.args);
+      if (parsed.mode === "diff") {
+        await onPreviewRollbackDiff(parsed.target);
+      } else {
+        await onOpenRollback(parsed.target);
+      }
+      return;
+    }
     case "search":
       if (command.args.length === 0) {
         setError("Provide a search term after /search.");
@@ -379,6 +392,18 @@ export async function executeChatSlashCommand(args: {
       setError("Unsupported slash command.");
       recordUxMetric("errors");
   }
+}
+
+function parseRollbackCommand(rawArgs: string): { mode: "inspect" | "diff"; target: string } {
+  const trimmed = rawArgs.trim();
+  if (trimmed.length === 0) {
+    return { mode: "inspect", target: "" };
+  }
+  const [firstToken = "", ...rest] = trimmed.split(/\s+/);
+  if (firstToken.toLowerCase() === "diff") {
+    return { mode: "diff", target: rest.join(" ").trim() };
+  }
+  return { mode: "inspect", target: trimmed };
 }
 
 async function undoLastTurn(args: {

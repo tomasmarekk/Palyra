@@ -168,6 +168,18 @@
     "keywords": ["undo", "restore", "checkpoint", "revert"]
   },
   {
+    "name": "rollback",
+    "synopsis": "/rollback [checkpoint-id-or-run-id] | /rollback diff <checkpoint-id-or-run-id>",
+    "description": "Open the workspace rollback inspector or preview a workspace diff before restoring files or the full workspace.",
+    "example": "/rollback diff 01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    "category": "workspace",
+    "execution": "server",
+    "surfaces": ["web", "tui"],
+    "capability_tags": ["workspace", "rollback", "diff", "restore"],
+    "entity_targets": ["checkpoint", "run", "session"],
+    "keywords": ["rollback", "workspace", "restore", "diff", "checkpoint"]
+  },
+  {
     "name": "interrupt",
     "synopsis": "/interrupt [soft|force] [redirect-prompt]",
     "description": "Request run interruption and optionally redirect into a fresh prompt once the current run has been stopped.",

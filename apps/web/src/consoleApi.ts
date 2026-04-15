@@ -825,6 +825,275 @@ export interface ChatCheckpointRecord {
   last_restored_at_unix_ms?: number;
 }
 
+export interface WorkspaceCheckpointSummary {
+  checkpoint_id: string;
+  session_id: string;
+  run_id: string;
+  source_kind: string;
+  source_label: string;
+  tool_name?: string;
+  proposal_id?: string;
+  actor_principal: string;
+  device_id: string;
+  channel?: string;
+  summary_text: string;
+  diff_summary: JsonValue;
+  created_at_unix_ms: number;
+  restore_count: number;
+  last_restored_at_unix_ms?: number;
+  latest_restore_report_id?: string;
+}
+
+export interface WorkspaceArtifactVersion {
+  artifact_id: string;
+  checkpoint_id: string;
+  checkpoint_created_at_unix_ms: number;
+  change_kind: string;
+  moved_from_path?: string;
+  content_type: string;
+  is_text: boolean;
+  size_bytes?: number;
+  content_sha256?: string;
+  deleted: boolean;
+}
+
+export interface WorkspaceArtifactRecord {
+  artifact_id: string;
+  path: string;
+  display_path: string;
+  workspace_root_index: number;
+  latest_checkpoint_id: string;
+  latest_checkpoint_created_at_unix_ms: number;
+  latest_checkpoint_label: string;
+  source_kind: string;
+  source_label: string;
+  tool_name?: string;
+  proposal_id?: string;
+  device_id: string;
+  channel?: string;
+  change_kind: string;
+  moved_from_path?: string;
+  content_type: string;
+  preview_kind: string;
+  is_text: boolean;
+  preview_text?: string;
+  size_bytes?: number;
+  content_sha256?: string;
+  deleted: boolean;
+  version_count: number;
+  versions: WorkspaceArtifactVersion[];
+}
+
+export interface WorkspaceArtifactDetail {
+  artifact: WorkspaceArtifactRecord;
+  checkpoint: WorkspaceCheckpointSummary;
+  content_available: boolean;
+  content_truncated: boolean;
+  text_content?: string;
+  content_base64?: string;
+}
+
+export interface WorkspaceDiffSide {
+  artifact_id: string;
+  checkpoint_id: string;
+  change_kind: string;
+  content_type: string;
+  size_bytes?: number;
+  content_sha256?: string;
+  deleted: boolean;
+}
+
+export interface WorkspaceDiffFileRecord {
+  path: string;
+  display_path: string;
+  workspace_root_index: number;
+  left?: WorkspaceDiffSide;
+  right?: WorkspaceDiffSide;
+  diff_kind: string;
+  diff_text?: string;
+}
+
+export interface WorkspaceAnchorSummary {
+  kind: string;
+  id: string;
+  label: string;
+  session_id: string;
+  run_id: string;
+  created_at_unix_ms: number;
+}
+
+export interface WorkspaceDiffResponse {
+  left_anchor: WorkspaceAnchorSummary;
+  right_anchor: WorkspaceAnchorSummary;
+  files_changed: number;
+  files: WorkspaceDiffFileRecord[];
+}
+
+export interface WorkspaceRestoreFailure {
+  path: string;
+  display_path: string;
+  workspace_root_index: number;
+  error: string;
+}
+
+export interface WorkspaceCheckpointFileRecord {
+  artifact_id: string;
+  checkpoint_id: string;
+  path: string;
+  workspace_root_index: number;
+  moved_from_path?: string;
+  change_kind: string;
+  before_content_sha256?: string;
+  before_size_bytes?: number;
+  after_content_sha256?: string;
+  after_size_bytes?: number;
+  blob_sha256?: string;
+  content_type: string;
+  is_text: boolean;
+  preview_text?: string;
+  search_text?: string;
+  created_at_unix_ms: number;
+}
+
+export interface WorkspaceCheckpointRecord {
+  checkpoint_id: string;
+  session_id: string;
+  run_id: string;
+  source_kind: string;
+  source_label: string;
+  tool_name?: string;
+  proposal_id?: string;
+  actor_principal: string;
+  device_id: string;
+  channel?: string;
+  summary_text: string;
+  diff_summary_json: string;
+  created_at_unix_ms: number;
+  restore_count: number;
+  last_restored_at_unix_ms?: number;
+  latest_restore_report_id?: string;
+}
+
+export interface WorkspaceRestoreReportRecord {
+  report_id: string;
+  checkpoint_id: string;
+  session_id: string;
+  run_id: string;
+  actor_principal: string;
+  device_id: string;
+  channel?: string;
+  scope_kind: string;
+  target_path?: string;
+  restored_paths_json: string;
+  failed_paths_json: string;
+  reconciliation_summary: string;
+  reconciliation_prompt: string;
+  branched_session_id?: string;
+  result_state: string;
+  created_at_unix_ms: number;
+}
+
+export interface WorkspaceRestoreReportSummary {
+  report_id: string;
+  checkpoint_id: string;
+  session_id: string;
+  run_id: string;
+  actor_principal: string;
+  device_id: string;
+  channel?: string;
+  scope_kind: string;
+  target_path?: string;
+  reconciliation_summary: string;
+  reconciliation_prompt: string;
+  branched_session_id?: string;
+  result_state: string;
+  created_at_unix_ms: number;
+}
+
+export interface WorkspaceRestoreReportDetail {
+  report: WorkspaceRestoreReportSummary;
+  checkpoint: WorkspaceCheckpointSummary;
+  restored_paths: string[];
+  failed_paths: WorkspaceRestoreFailure[];
+}
+
+export interface WorkspaceRestoreActivitySummary {
+  checkpoint_count: number;
+  checkpoint_restore_total: number;
+  restore_report_count: number;
+  succeeded_restore_count: number;
+  partial_failure_restore_count: number;
+  failed_restore_count: number;
+}
+
+export interface WorkspaceActivitySnapshot {
+  summary: WorkspaceRestoreActivitySummary;
+  recent_checkpoints: WorkspaceCheckpointSummary[];
+  recent_restore_reports: WorkspaceRestoreReportSummary[];
+}
+
+export interface RunWorkspaceArtifactsResponse {
+  artifacts: WorkspaceArtifactRecord[];
+  workspace_checkpoints: WorkspaceCheckpointSummary[];
+  background_tasks: ChatBackgroundTaskRecord[];
+  compactions: ChatCompactionArtifactRecord[];
+  session_checkpoints: ChatCheckpointRecord[];
+}
+
+export interface WorkspaceRestoreOutcome {
+  scope_kind: string;
+  target_path?: string;
+  target_workspace_root_index?: number;
+  restored_paths: string[];
+  failed_paths: WorkspaceRestoreFailure[];
+  affects_context_stack: boolean;
+  report: WorkspaceRestoreReportRecord;
+}
+
+export interface ChatRunWorkspaceEnvelope {
+  run: ChatRunStatusRecord;
+  workspace: RunWorkspaceArtifactsResponse;
+  contract: ContractDescriptor;
+}
+
+export interface WorkspaceArtifactDetailEnvelope {
+  run: ChatRunStatusRecord;
+  detail: WorkspaceArtifactDetail;
+  contract: ContractDescriptor;
+}
+
+export interface WorkspaceCompareEnvelope {
+  diff: WorkspaceDiffResponse;
+  contract: ContractDescriptor;
+}
+
+export interface WorkspaceCheckpointDetailEnvelope {
+  session: SessionCatalogRecord;
+  checkpoint: WorkspaceCheckpointRecord;
+  files: WorkspaceCheckpointFileRecord[];
+  restore_reports: WorkspaceRestoreReportRecord[];
+  contract: ContractDescriptor;
+}
+
+export interface WorkspaceRestoreReportEnvelope {
+  session: SessionCatalogRecord;
+  detail: WorkspaceRestoreReportDetail;
+  contract: ContractDescriptor;
+}
+
+export interface WorkspaceRestoreResponseEnvelope {
+  session: SessionCatalogRecord;
+  source_session: SessionCatalogRecord;
+  checkpoint: WorkspaceCheckpointRecord;
+  restore: WorkspaceRestoreOutcome;
+  project_context_refresh?: JsonValue | null;
+  project_context_refresh_error?: string | null;
+  project_context_copy_error?: string | null;
+  suggested_session_label?: string;
+  action: string;
+  contract: ContractDescriptor;
+}
+
 export interface ChatBackgroundTaskRecord {
   task_id: string;
   task_kind: string;
@@ -2078,6 +2347,56 @@ export interface InventoryDeviceDetailEnvelope {
   device: InventoryDeviceRecord;
   pairings: NodePairingRequestView[];
   capability_requests: NodeCapabilityRequestView[];
+  workspace_activity?: InventoryWorkspaceActivity;
+}
+
+export interface InventoryWorkspaceRestoreSummary {
+  checkpoint_count: number;
+  checkpoint_restore_total: number;
+  restore_report_count: number;
+  succeeded_restore_count: number;
+  partial_failure_restore_count: number;
+  failed_restore_count: number;
+}
+
+export interface InventoryWorkspaceCheckpointRecord {
+  checkpoint_id: string;
+  session_id: string;
+  run_id: string;
+  source_kind: string;
+  source_label: string;
+  tool_name?: string;
+  proposal_id?: string;
+  actor_principal: string;
+  device_id: string;
+  channel?: string;
+  summary_text: string;
+  created_at_unix_ms: number;
+  restore_count: number;
+  last_restored_at_unix_ms?: number;
+  latest_restore_report_id?: string;
+}
+
+export interface InventoryWorkspaceRestoreReportRecord {
+  report_id: string;
+  checkpoint_id: string;
+  session_id: string;
+  run_id: string;
+  actor_principal: string;
+  device_id: string;
+  channel?: string;
+  scope_kind: string;
+  target_path?: string;
+  reconciliation_summary: string;
+  branched_session_id?: string;
+  result_state: string;
+  created_at_unix_ms: number;
+}
+
+export interface InventoryWorkspaceActivity {
+  summary: InventoryWorkspaceRestoreSummary;
+  recent_checkpoints: InventoryWorkspaceCheckpointRecord[];
+  recent_restore_reports: InventoryWorkspaceRestoreReportRecord[];
 }
 
 export interface DeviceEnvelope {
@@ -3375,6 +3694,56 @@ export class ConsoleApiClient {
     );
   }
 
+  async chatRunWorkspace(
+    runId: string,
+    params?: { q?: string; limit?: number },
+  ): Promise<ChatRunWorkspaceEnvelope> {
+    const query = new URLSearchParams();
+    if (params?.q?.trim()) {
+      query.set("q", params.q.trim());
+    }
+    if (params?.limit !== undefined) {
+      query.set("limit", String(params.limit));
+    }
+    return this.request(
+      buildPathWithQuery(`/console/v1/chat/runs/${encodeURIComponent(runId)}/workspace`, query),
+    );
+  }
+
+  async chatRunWorkspaceArtifact(
+    runId: string,
+    artifactId: string,
+    params?: { include_content?: boolean },
+  ): Promise<WorkspaceArtifactDetailEnvelope> {
+    const query = new URLSearchParams();
+    if (params?.include_content === true) {
+      query.set("include_content", "true");
+    }
+    return this.request(
+      buildPathWithQuery(
+        `/console/v1/chat/runs/${encodeURIComponent(runId)}/workspace/artifacts/${encodeURIComponent(artifactId)}`,
+        query,
+      ),
+    );
+  }
+
+  async compareWorkspace(payload: {
+    left_run_id?: string;
+    right_run_id?: string;
+    left_checkpoint_id?: string;
+    right_checkpoint_id?: string;
+    limit?: number;
+  }): Promise<WorkspaceCompareEnvelope> {
+    return this.request(
+      "/console/v1/chat/workspace/compare",
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      { csrf: true },
+    );
+  }
+
   async streamChatMessage(
     sessionId: string,
     payload: {
@@ -3642,6 +4011,36 @@ export class ConsoleApiClient {
         body: JSON.stringify(payload),
       },
       { csrf: true },
+    );
+  }
+
+  async getWorkspaceCheckpoint(checkpointId: string): Promise<WorkspaceCheckpointDetailEnvelope> {
+    return this.request(`/console/v1/chat/workspace-checkpoints/${encodeURIComponent(checkpointId)}`);
+  }
+
+  async restoreWorkspaceCheckpoint(
+    checkpointId: string,
+    payload: {
+      session_label?: string;
+      scope_kind?: "workspace" | "file";
+      target_path?: string;
+      target_workspace_root_index?: number;
+      branch_session?: boolean;
+    } = {},
+  ): Promise<WorkspaceRestoreResponseEnvelope> {
+    return this.request(
+      `/console/v1/chat/workspace-checkpoints/${encodeURIComponent(checkpointId)}/restore`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      { csrf: true },
+    );
+  }
+
+  async getWorkspaceRestoreReport(reportId: string): Promise<WorkspaceRestoreReportEnvelope> {
+    return this.request(
+      `/console/v1/chat/workspace-restore-reports/${encodeURIComponent(reportId)}`,
     );
   }
 

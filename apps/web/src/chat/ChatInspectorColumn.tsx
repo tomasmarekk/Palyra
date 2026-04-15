@@ -10,8 +10,10 @@ import type {
   ChatRunStatusRecord,
   ChatRunTapeSnapshot,
   ChatTranscriptRecord,
+  ConsoleApiClient,
   JsonValue,
   SessionCatalogRecord,
+  WorkspaceRestoreResponseEnvelope,
 } from "../consoleApi";
 import {
   ActionButton,
@@ -21,7 +23,7 @@ import {
   SectionCard,
 } from "../console/components/ui";
 
-import { ChatRunDrawer } from "./ChatRunDrawer";
+import { ChatRunDrawer, type RunDrawerTab } from "./ChatRunDrawer";
 import { ChatSessionQuickControlPanel } from "./ChatSessionQuickControls";
 import {
   PrettyJsonBlock,
@@ -102,7 +104,7 @@ type ChatInspectorColumnProps = {
   detailPanel: DetailPanelState | null;
   revealSensitiveValues: boolean;
   inspectorVisible: boolean;
-  openRunDetails: (runId: string) => void;
+  openRunDetails: (runId: string, tab?: RunDrawerTab) => void;
   phase4BusyKey: string | null;
   runDrawerId: string;
   setRunDrawerId: (runId: string) => void;
@@ -110,6 +112,14 @@ type ChatInspectorColumnProps = {
   runStatus: ChatRunStatusRecord | null;
   runTape: ChatRunTapeSnapshot | null;
   runLineage: ChatRunLineage | null;
+  runDrawerTab: RunDrawerTab;
+  setRunDrawerTab: (tab: RunDrawerTab) => void;
+  api: ConsoleApiClient;
+  setError: (next: string | null) => void;
+  setNotice: (next: string | null) => void;
+  onWorkspaceRestore: (response: WorkspaceRestoreResponseEnvelope) => Promise<void>;
+  openMemorySection: () => void;
+  openSupportSection: () => void;
   refreshRunDetails: () => void;
   closeRunDrawer: () => void;
   openBrowserSessionWorkbench: (sessionId: string) => void;
@@ -165,6 +175,14 @@ export function ChatInspectorColumn({
   runStatus,
   runTape,
   runLineage,
+  runDrawerTab,
+  setRunDrawerTab,
+  api,
+  setError,
+  setNotice,
+  onWorkspaceRestore,
+  openMemorySection,
+  openSupportSection,
   refreshRunDetails,
   closeRunDrawer,
   openBrowserSessionWorkbench,
@@ -681,9 +699,9 @@ export function ChatInspectorColumn({
                         size="sm"
                         type="button"
                         variant="ghost"
-                        onPress={() => openRunDetails(artifactRunId)}
+                        onPress={() => openRunDetails(artifactRunId, "workspace")}
                       >
-                        Open run
+                        Workspace
                       </ActionButton>
                     ) : null}
                     <ActionButton
@@ -731,9 +749,9 @@ export function ChatInspectorColumn({
                         size="sm"
                         type="button"
                         variant="ghost"
-                        onPress={() => openRunDetails(checkpointRunId)}
+                        onPress={() => openRunDetails(checkpointRunId, "workspace")}
                       >
-                        Open run
+                        Workspace
                       </ActionButton>
                     ) : null}
                     <ActionButton
@@ -818,9 +836,9 @@ export function ChatInspectorColumn({
                         size="sm"
                         type="button"
                         variant="ghost"
-                        onPress={() => openRunDetails(targetRunId)}
+                        onPress={() => openRunDetails(targetRunId, "workspace")}
                       >
-                        Open run
+                        Workspace
                       </ActionButton>
                     ) : null}
                     <ActionButton
@@ -952,15 +970,25 @@ export function ChatInspectorColumn({
           title="Run inspector"
         >
           <ChatRunDrawer
+            activeTab={runDrawerTab}
+            api={api}
             open
+            openMemorySection={openMemorySection}
+            openSupportSection={openSupportSection}
+            onInspectCompaction={inspectCompaction}
+            onInspectSessionCheckpoint={inspectCheckpoint}
+            onWorkspaceRestore={onWorkspaceRestore}
             runIds={runIds}
             runDrawerId={runDrawerId}
             setRunDrawerId={setRunDrawerId}
+            setActiveTab={setRunDrawerTab}
             runDrawerBusy={runDrawerBusy}
             runStatus={runStatus}
             runTape={runTape}
             runLineage={runLineage}
             revealSensitiveValues={revealSensitiveValues}
+            setError={setError}
+            setNotice={setNotice}
             refreshRun={refreshRunDetails}
             close={closeRunDrawer}
           />

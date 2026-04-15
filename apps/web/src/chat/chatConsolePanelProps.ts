@@ -61,9 +61,14 @@ interface BuildInspectorPropsArgs {
   readonly runStatus: InspectorProps["runStatus"];
   readonly runTape: InspectorProps["runTape"];
   readonly runLineage: InspectorProps["runLineage"];
+  readonly runDrawerTab: InspectorProps["runDrawerTab"];
+  readonly setRunDrawerTab: InspectorProps["setRunDrawerTab"];
   readonly refreshRunDetails: InspectorProps["refreshRunDetails"];
   readonly closeRunDrawer: InspectorProps["closeRunDrawer"];
   readonly openBrowserSessionWorkbench: InspectorProps["openBrowserSessionWorkbench"];
+  readonly onWorkspaceRestore: InspectorProps["onWorkspaceRestore"];
+  readonly openMemorySection: InspectorProps["openMemorySection"];
+  readonly openSupportSection: InspectorProps["openSupportSection"];
   readonly transcriptRecords: ChatTranscriptRecord[];
   readonly inspectCompaction: (artifactId: string) => void;
   readonly inspectCheckpoint: (checkpointId: string) => void;
@@ -121,9 +126,14 @@ export function buildInspectorProps({
   runStatus,
   runTape,
   runLineage,
+  runDrawerTab,
+  setRunDrawerTab,
   refreshRunDetails,
   closeRunDrawer,
   openBrowserSessionWorkbench,
+  onWorkspaceRestore,
+  openMemorySection,
+  openSupportSection,
   transcriptRecords,
   inspectCompaction,
   inspectCheckpoint,
@@ -212,6 +222,14 @@ export function buildInspectorProps({
     runStatus,
     runTape,
     runLineage,
+    runDrawerTab,
+    setRunDrawerTab,
+    api,
+    setError,
+    setNotice,
+    onWorkspaceRestore,
+    openMemorySection,
+    openSupportSection,
     refreshRunDetails,
     closeRunDrawer,
     openBrowserSessionWorkbench,

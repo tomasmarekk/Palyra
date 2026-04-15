@@ -4,10 +4,10 @@ This report is generated from the shared slash-command registry consumed by the 
 
 ## Summary
 
-- Total commands: `36`
-- Shared across web and TUI: `20`
-- Web-visible commands: `22`
-- TUI-visible commands: `34`
+- Total commands: `37`
+- Shared across web and TUI: `21`
+- Web-visible commands: `23`
+- TUI-visible commands: `35`
 - Web-only commands: `2`
 - TUI-only commands: `14`
 
@@ -29,6 +29,7 @@ This report is generated from the shared slash-command registry consumed by the 
 | `/title` | `/title [label]` | `session` | `server` | `web`, `tui` | - | `session`, `title`, `rename` | `session` |
 | `/model` | `/model [model-id|default]` | `model` | `server` | `tui` | - | `model`, `picker`, `quick_controls` | `model` |
 | `/undo` | `/undo [checkpoint-id]` | `session` | `server` | `web`, `tui` | - | `undo`, `checkpoint`, `restore` | `checkpoint`, `session`, `run` |
+| `/rollback` | `/rollback [checkpoint-id-or-run-id] | /rollback diff <checkpoint-id-or-run-id>` | `workspace` | `server` | `web`, `tui` | - | `workspace`, `rollback`, `diff`, `restore` | `checkpoint`, `run`, `session` |
 | `/interrupt` | `/interrupt [soft|force] [redirect-prompt]` | `run` | `server` | `web`, `tui` | `/abort`, `/cancel` | `run`, `interrupt`, `cancel`, `redirect` | `run` |
 | `/reset` | `/reset` | `session` | `server` | `web`, `tui` | - | `session`, `reset` | `session` |
 | `/retry` | `/retry` | `run` | `server` | `web`, `tui` | - | `run`, `retry` | `run` |

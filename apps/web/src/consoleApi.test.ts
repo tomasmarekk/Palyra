@@ -1798,6 +1798,163 @@ describe("ConsoleApiClient", () => {
         action: "restored",
         contract: { contract_version: "control-plane.v1" },
       }),
+      jsonResponse({
+        run: {
+          run_id: "run-1",
+          session_id: "session-1",
+          state: "completed",
+        },
+        workspace: {
+          artifacts: [],
+          workspace_checkpoints: [],
+          background_tasks: [],
+          compactions: [],
+          session_checkpoints: [],
+        },
+        contract: { contract_version: "control-plane.v1" },
+      }),
+      jsonResponse({
+        run: {
+          run_id: "run-1",
+          session_id: "session-1",
+          state: "completed",
+        },
+        detail: {
+          artifact: {
+            artifact_id: "artifact-1",
+            path: "src/lib.rs",
+            display_path: "src/lib.rs",
+            workspace_root_index: 0,
+            latest_checkpoint_id: "workspace-checkpoint-1",
+            latest_checkpoint_created_at_unix_ms: 100,
+            latest_checkpoint_label: "Patch",
+            source_kind: "tool_call",
+            source_label: "Patch",
+            device_id: "device-1",
+            change_kind: "modified",
+            content_type: "text/plain",
+            preview_kind: "text",
+            is_text: true,
+            deleted: false,
+            version_count: 1,
+            versions: [],
+          },
+          checkpoint: {
+            checkpoint_id: "workspace-checkpoint-1",
+            session_id: "session-1",
+            run_id: "run-1",
+            source_kind: "tool_call",
+            source_label: "Patch",
+            actor_principal: "admin:web-console",
+            device_id: "device-1",
+            summary_text: "Patched src/lib.rs",
+            diff_summary: {},
+            created_at_unix_ms: 100,
+            restore_count: 0,
+          },
+          content_available: true,
+          content_truncated: false,
+          text_content: "patched content",
+        },
+        contract: { contract_version: "control-plane.v1" },
+      }),
+      jsonResponse({
+        diff: {
+          left_anchor: {
+            kind: "run",
+            id: "run-1",
+            label: "Run 1",
+            session_id: "session-1",
+            run_id: "run-1",
+            created_at_unix_ms: 100,
+          },
+          right_anchor: {
+            kind: "checkpoint",
+            id: "checkpoint-1",
+            label: "Checkpoint 1",
+            session_id: "session-1",
+            run_id: "run-1",
+            created_at_unix_ms: 90,
+          },
+          files_changed: 1,
+          files: [],
+        },
+        contract: { contract_version: "control-plane.v1" },
+      }),
+      jsonResponse({
+        session: { session_id: "session-1", title: "Phase 4 Session" },
+        checkpoint: {
+          checkpoint_id: "workspace-checkpoint-1",
+          session_id: "session-1",
+          run_id: "run-1",
+          source_kind: "tool_call",
+          source_label: "Patch",
+          actor_principal: "admin:web-console",
+          device_id: "device-1",
+          summary_text: "Patched src/lib.rs",
+          created_at_unix_ms: 100,
+          restore_count: 0,
+        },
+        files: [],
+        restore_reports: [],
+        contract: { contract_version: "control-plane.v1" },
+      }),
+      jsonResponse({
+        session: { session_id: "session-2", title: "Rollback session" },
+        source_session: { session_id: "session-1", title: "Phase 4 Session" },
+        checkpoint: {
+          checkpoint_id: "workspace-checkpoint-1",
+          session_id: "session-1",
+          run_id: "run-1",
+        },
+        restore: {
+          scope_kind: "file",
+          target_path: "src/lib.rs",
+          target_workspace_root_index: 0,
+          restored_paths: ["src/lib.rs"],
+          failed_paths: [],
+          affects_context_stack: false,
+          report: {
+            report_id: "workspace-report-1",
+          },
+        },
+        action: "restored",
+        contract: { contract_version: "control-plane.v1" },
+      }),
+      jsonResponse({
+        session: { session_id: "session-2", title: "Rollback session" },
+        detail: {
+          report: {
+            report_id: "workspace-report-1",
+            checkpoint_id: "workspace-checkpoint-1",
+            session_id: "session-1",
+            run_id: "run-1",
+            actor_principal: "admin:web-console",
+            device_id: "device-1",
+            scope_kind: "file",
+            reconciliation_summary: "Reconciled workspace state.",
+            reconciliation_prompt: "Continue from the restored file state.",
+            result_state: "succeeded",
+            created_at_unix_ms: 100,
+          },
+          checkpoint: {
+            checkpoint_id: "workspace-checkpoint-1",
+            session_id: "session-1",
+            run_id: "run-1",
+            source_kind: "tool_call",
+            source_label: "Patch",
+            actor_principal: "admin:web-console",
+            device_id: "device-1",
+            summary_text: "Patched src/lib.rs",
+            diff_summary: {},
+            created_at_unix_ms: 100,
+            restore_count: 1,
+          },
+          restored_paths: ["src/lib.rs"],
+          failed_paths: [],
+        },
+        contract: { contract_version: "control-plane.v1" },
+      }),
     ];
     const fetcher: typeof fetch = (input, init) => {
       calls.push({ input, init });
@@ -1825,6 +1982,21 @@ describe("ConsoleApiClient", () => {
     await client.createSessionCheckpoint("session-1", { name: "Checkpoint 1" });
     await client.getSessionCheckpoint("checkpoint-1");
     await client.restoreSessionCheckpoint("checkpoint-1", { session_label: "Checkpoint restore" });
+    await client.chatRunWorkspace("run-1", { q: "notes", limit: 5 });
+    await client.chatRunWorkspaceArtifact("run-1", "artifact-1", { include_content: true });
+    await client.compareWorkspace({
+      left_run_id: "run-1",
+      right_checkpoint_id: "checkpoint-1",
+      limit: 7,
+    });
+    await client.getWorkspaceCheckpoint("workspace-checkpoint-1");
+    await client.restoreWorkspaceCheckpoint("workspace-checkpoint-1", {
+      scope_kind: "file",
+      target_path: "src/lib.rs",
+      target_workspace_root_index: 0,
+      branch_session: false,
+    });
+    await client.getWorkspaceRestoreReport("workspace-report-1");
 
     expect(requestUrl(calls[1]?.input)).toBe(
       "/console/v1/chat/sessions/session-1/compactions/preview",
@@ -1847,6 +2019,40 @@ describe("ConsoleApiClient", () => {
 
     expect(requestUrl(calls[6]?.input)).toBe("/console/v1/chat/checkpoints/checkpoint-1/restore");
     expect(new Headers(calls[6]?.init?.headers).get("x-palyra-csrf-token")).toBe("csrf-1");
+    expect(requestBody(calls[6]?.init?.body)).toContain('"session_label":"Checkpoint restore"');
+
+    expect(requestUrl(calls[7]?.input)).toBe("/console/v1/chat/runs/run-1/workspace?q=notes&limit=5");
+    expect(new Headers(calls[7]?.init?.headers).get("x-palyra-csrf-token")).toBeNull();
+
+    expect(requestUrl(calls[8]?.input)).toBe(
+      "/console/v1/chat/runs/run-1/workspace/artifacts/artifact-1?include_content=true",
+    );
+    expect(new Headers(calls[8]?.init?.headers).get("x-palyra-csrf-token")).toBeNull();
+
+    expect(requestUrl(calls[9]?.input)).toBe("/console/v1/chat/workspace/compare");
+    expect(new Headers(calls[9]?.init?.headers).get("x-palyra-csrf-token")).toBe("csrf-1");
+    expect(requestBody(calls[9]?.init?.body)).toContain('"left_run_id":"run-1"');
+    expect(requestBody(calls[9]?.init?.body)).toContain('"right_checkpoint_id":"checkpoint-1"');
+    expect(requestBody(calls[9]?.init?.body)).toContain('"limit":7');
+
+    expect(requestUrl(calls[10]?.input)).toBe(
+      "/console/v1/chat/workspace-checkpoints/workspace-checkpoint-1",
+    );
+    expect(new Headers(calls[10]?.init?.headers).get("x-palyra-csrf-token")).toBeNull();
+
+    expect(requestUrl(calls[11]?.input)).toBe(
+      "/console/v1/chat/workspace-checkpoints/workspace-checkpoint-1/restore",
+    );
+    expect(new Headers(calls[11]?.init?.headers).get("x-palyra-csrf-token")).toBe("csrf-1");
+    expect(requestBody(calls[11]?.init?.body)).toContain('"scope_kind":"file"');
+    expect(requestBody(calls[11]?.init?.body)).toContain('"target_path":"src/lib.rs"');
+    expect(requestBody(calls[11]?.init?.body)).toContain('"target_workspace_root_index":0');
+    expect(requestBody(calls[11]?.init?.body)).toContain('"branch_session":false');
+
+    expect(requestUrl(calls[12]?.input)).toBe(
+      "/console/v1/chat/workspace-restore-reports/workspace-report-1",
+    );
+    expect(new Headers(calls[12]?.init?.headers).get("x-palyra-csrf-token")).toBeNull();
   });
 
   it("posts chat context reference preview requests with CSRF protection", async () => {

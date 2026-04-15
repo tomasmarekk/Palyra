@@ -3,6 +3,7 @@
 import type { ComponentProps } from "react";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
+import type { ConsoleApiClient } from "../consoleApi";
 
 import { ChatComposer } from "./ChatComposer";
 import { ChatConsoleWorkspaceView } from "./ChatConsoleWorkspaceView";
@@ -618,6 +619,14 @@ function baseInspectorProps() {
     runStatus: null,
     runTape: null,
     runLineage: null,
+    runDrawerTab: "status" as const,
+    setRunDrawerTab: vi.fn(),
+    api: {} as ConsoleApiClient,
+    setError: vi.fn(),
+    setNotice: vi.fn(),
+    onWorkspaceRestore: vi.fn(),
+    openMemorySection: vi.fn(),
+    openSupportSection: vi.fn(),
     refreshRunDetails: vi.fn(),
     closeRunDrawer: vi.fn(),
     openBrowserSessionWorkbench: vi.fn(),

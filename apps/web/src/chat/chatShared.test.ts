@@ -28,6 +28,10 @@ describe("chatShared helpers", () => {
       name: "delegate",
       args: "review_and_patch Inspect the failing lint job",
     });
+    expect(parseSlashCommand("/rollback diff checkpoint-1")).toEqual({
+      name: "rollback",
+      args: "diff checkpoint-1",
+    });
     expect(parseSlashCommand("/help")).toEqual({
       name: "help",
       args: "",
@@ -40,6 +44,7 @@ describe("chatShared helpers", () => {
     const commandNames = CHAT_SLASH_COMMANDS.map((command) => command.name);
     expect(commandNames).toContain("help");
     expect(commandNames).toContain("compact");
+    expect(commandNames).toContain("rollback");
     expect(commandNames).not.toContain("status");
     expect(commandNames).not.toContain("shell");
   });
