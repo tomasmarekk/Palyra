@@ -125,8 +125,10 @@ pub(crate) async fn process_route_tool_proposal_event(
             runtime_state,
             ToolRuntimeExecutionContext {
                 principal: route_request_context.principal.as_str(),
+                device_id: route_request_context.device_id.as_str(),
                 channel: route_request_context.channel.as_deref(),
                 session_id,
+                run_id,
             },
             proposal_id,
             tool_name,
@@ -178,8 +180,10 @@ pub(crate) async fn process_route_tool_proposal_event(
         runtime_state,
         ToolRuntimeExecutionContext {
             principal: route_request_context.principal.as_str(),
+            device_id: route_request_context.device_id.as_str(),
             channel: route_request_context.channel.as_deref(),
             session_id,
+            run_id,
         },
         tool_name,
         decision.allowed,

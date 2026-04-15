@@ -1398,6 +1398,20 @@ struct ConsoleChatRunEventsQuery {
     limit: Option<usize>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct ConsoleChatRunWorkspaceQuery {
+    #[serde(default)]
+    q: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ConsoleChatWorkspaceArtifactQuery {
+    #[serde(default)]
+    include_content: Option<bool>,
+}
+
 #[derive(Debug, Deserialize)]
 struct ConsoleChatQueueRequest {
     text: String,
@@ -1448,6 +1462,34 @@ struct ConsoleChatCheckpointRequest {
 struct ConsoleChatCheckpointRestoreRequest {
     #[serde(default)]
     session_label: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ConsoleChatWorkspaceCompareRequest {
+    #[serde(default)]
+    left_run_id: Option<String>,
+    #[serde(default)]
+    right_run_id: Option<String>,
+    #[serde(default)]
+    left_checkpoint_id: Option<String>,
+    #[serde(default)]
+    right_checkpoint_id: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ConsoleChatWorkspaceRestoreRequest {
+    #[serde(default)]
+    session_label: Option<String>,
+    #[serde(default)]
+    scope_kind: Option<String>,
+    #[serde(default)]
+    target_path: Option<String>,
+    #[serde(default)]
+    target_workspace_root_index: Option<u32>,
+    #[serde(default)]
+    branch_session: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]

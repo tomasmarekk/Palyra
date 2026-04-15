@@ -449,8 +449,10 @@ async fn execute_run_stream_tool_proposal(
             runtime_state,
             ToolRuntimeExecutionContext {
                 principal: request_context.principal.as_str(),
+                device_id: request_context.device_id.as_str(),
                 channel: request_context.channel.as_deref(),
                 session_id: resolved_session_id,
+                run_id,
             },
             proposal_id,
             tool_name,
@@ -539,8 +541,10 @@ async fn execute_run_stream_tool_proposal(
         runtime_state,
         ToolRuntimeExecutionContext {
             principal: request_context.principal.as_str(),
+            device_id: request_context.device_id.as_str(),
             channel: request_context.channel.as_deref(),
             session_id: resolved_session_id,
+            run_id,
         },
         tool_name,
         decision.allowed,

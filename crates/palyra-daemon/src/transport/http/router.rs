@@ -581,6 +581,22 @@ pub(crate) fn build_router(state: AppState) -> Router {
             post(console::chat::console_chat_checkpoint_restore_handler),
         )
         .route(
+            "/console/v1/chat/workspace-checkpoints/{checkpoint_id}",
+            get(console::chat::console_chat_workspace_checkpoint_detail_handler),
+        )
+        .route(
+            "/console/v1/chat/workspace-checkpoints/{checkpoint_id}/restore",
+            post(console::chat::console_chat_workspace_checkpoint_restore_handler),
+        )
+        .route(
+            "/console/v1/chat/workspace-restore-reports/{report_id}",
+            get(console::chat::console_chat_workspace_restore_report_handler),
+        )
+        .route(
+            "/console/v1/chat/workspace/compare",
+            post(console::chat::console_chat_workspace_compare_handler),
+        )
+        .route(
             "/console/v1/chat/background-tasks",
             get(console::chat::console_chat_background_tasks_list_handler),
         )
@@ -639,6 +655,14 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route(
             "/console/v1/chat/runs/{run_id}/status",
             get(console::chat::console_chat_run_status_handler),
+        )
+        .route(
+            "/console/v1/chat/runs/{run_id}/workspace",
+            get(console::chat::console_chat_run_workspace_handler),
+        )
+        .route(
+            "/console/v1/chat/runs/{run_id}/workspace/artifacts/{artifact_id}",
+            get(console::chat::console_chat_run_workspace_artifact_handler),
         )
         .route(
             "/console/v1/chat/runs/{run_id}/queue",

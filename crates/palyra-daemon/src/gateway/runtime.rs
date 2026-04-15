@@ -23,9 +23,14 @@ use crate::journal::{
     OrchestratorUsageSessionRecord, OrchestratorUsageSummary,
     SessionProjectContextStateCopyRequest, SessionProjectContextStateRecord,
     SessionProjectContextStateUpsertRequest, WorkspaceBootstrapOutcome, WorkspaceBootstrapRequest,
-    WorkspaceDocumentDeleteRequest, WorkspaceDocumentListFilter, WorkspaceDocumentMoveRequest,
-    WorkspaceDocumentRecord, WorkspaceDocumentVersionRecord, WorkspaceDocumentWriteRequest,
-    WorkspaceSearchHit, WorkspaceSearchRequest,
+    WorkspaceCheckpointCreateRequest, WorkspaceCheckpointFilePayload,
+    WorkspaceCheckpointFileRecord, WorkspaceCheckpointListFilter, WorkspaceCheckpointRecord,
+    WorkspaceCheckpointRestoreMarkRequest, WorkspaceDocumentDeleteRequest,
+    WorkspaceDocumentListFilter, WorkspaceDocumentMoveRequest, WorkspaceDocumentRecord,
+    WorkspaceDocumentVersionRecord, WorkspaceDocumentWriteRequest, WorkspaceRestoreActivityFilter,
+    WorkspaceRestoreActivitySummary, WorkspaceRestoreReportCreateRequest,
+    WorkspaceRestoreReportListFilter, WorkspaceRestoreReportRecord, WorkspaceSearchHit,
+    WorkspaceSearchRequest,
 };
 use crate::self_healing::{
     IncidentDomain, RemediationAttemptStatus, RuntimeIncidentHistoryEntry,
@@ -3839,6 +3844,230 @@ impl GatewayRuntimeState {
         })
         .await
         .map_err(|_| Status::internal("orchestrator checkpoint restore worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn create_workspace_checkpoint_blocking(
+        &self,
+        request: &WorkspaceCheckpointCreateRequest,
+    ) -> Result<WorkspaceCheckpointRecord, Status> {
+        self.journal_store
+            .create_workspace_checkpoint(request)
+            .map_err(|error| map_orchestrator_store_error("create workspace checkpoint", error))
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn create_workspace_checkpoint(
+        self: &Arc<Self>,
+        request: WorkspaceCheckpointCreateRequest,
+    ) -> Result<WorkspaceCheckpointRecord, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.create_workspace_checkpoint_blocking(&request))
+            .await
+            .map_err(|_| Status::internal("workspace checkpoint worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn list_workspace_checkpoints_blocking(
+        &self,
+        filter: &WorkspaceCheckpointListFilter,
+    ) -> Result<Vec<WorkspaceCheckpointRecord>, Status> {
+        self.journal_store
+            .list_workspace_checkpoints(filter)
+            .map_err(|error| map_orchestrator_store_error("list workspace checkpoints", error))
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn list_workspace_checkpoints(
+        self: &Arc<Self>,
+        filter: WorkspaceCheckpointListFilter,
+    ) -> Result<Vec<WorkspaceCheckpointRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.list_workspace_checkpoints_blocking(&filter))
+            .await
+            .map_err(|_| Status::internal("workspace checkpoint list worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn get_workspace_checkpoint_blocking(
+        &self,
+        checkpoint_id: &str,
+    ) -> Result<Option<WorkspaceCheckpointRecord>, Status> {
+        self.journal_store
+            .get_workspace_checkpoint(checkpoint_id)
+            .map_err(|error| map_orchestrator_store_error("load workspace checkpoint", error))
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn get_workspace_checkpoint(
+        self: &Arc<Self>,
+        checkpoint_id: String,
+    ) -> Result<Option<WorkspaceCheckpointRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.get_workspace_checkpoint_blocking(checkpoint_id.as_str())
+        })
+        .await
+        .map_err(|_| Status::internal("workspace checkpoint detail worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn list_workspace_checkpoint_files_blocking(
+        &self,
+        checkpoint_id: &str,
+    ) -> Result<Vec<WorkspaceCheckpointFileRecord>, Status> {
+        self.journal_store
+            .list_workspace_checkpoint_files(checkpoint_id)
+            .map_err(|error| map_orchestrator_store_error("list workspace checkpoint files", error))
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn list_workspace_checkpoint_files(
+        self: &Arc<Self>,
+        checkpoint_id: String,
+    ) -> Result<Vec<WorkspaceCheckpointFileRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.list_workspace_checkpoint_files_blocking(checkpoint_id.as_str())
+        })
+        .await
+        .map_err(|_| Status::internal("workspace checkpoint file list worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn get_workspace_checkpoint_file_payload_blocking(
+        &self,
+        artifact_id: &str,
+    ) -> Result<Option<WorkspaceCheckpointFilePayload>, Status> {
+        self.journal_store.get_workspace_checkpoint_file_payload(artifact_id).map_err(|error| {
+            map_orchestrator_store_error("get workspace checkpoint file payload", error)
+        })
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn get_workspace_checkpoint_file_payload(
+        self: &Arc<Self>,
+        artifact_id: String,
+    ) -> Result<Option<WorkspaceCheckpointFilePayload>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.get_workspace_checkpoint_file_payload_blocking(artifact_id.as_str())
+        })
+        .await
+        .map_err(|_| Status::internal("workspace checkpoint file payload worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn get_workspace_restore_report_blocking(
+        &self,
+        report_id: &str,
+    ) -> Result<Option<WorkspaceRestoreReportRecord>, Status> {
+        self.journal_store
+            .get_workspace_restore_report(report_id)
+            .map_err(|error| map_orchestrator_store_error("load workspace restore report", error))
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn get_workspace_restore_report(
+        self: &Arc<Self>,
+        report_id: String,
+    ) -> Result<Option<WorkspaceRestoreReportRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.get_workspace_restore_report_blocking(report_id.as_str())
+        })
+        .await
+        .map_err(|_| Status::internal("workspace restore report detail worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn list_workspace_restore_reports_blocking(
+        &self,
+        filter: &WorkspaceRestoreReportListFilter,
+    ) -> Result<Vec<WorkspaceRestoreReportRecord>, Status> {
+        self.journal_store
+            .list_workspace_restore_reports(filter)
+            .map_err(|error| map_orchestrator_store_error("list workspace restore reports", error))
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn list_workspace_restore_reports(
+        self: &Arc<Self>,
+        filter: WorkspaceRestoreReportListFilter,
+    ) -> Result<Vec<WorkspaceRestoreReportRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.list_workspace_restore_reports_blocking(&filter))
+            .await
+            .map_err(|_| Status::internal("workspace restore report list worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn summarize_workspace_restore_activity_blocking(
+        &self,
+        filter: &WorkspaceRestoreActivityFilter,
+    ) -> Result<WorkspaceRestoreActivitySummary, Status> {
+        self.journal_store.summarize_workspace_restore_activity(filter).map_err(|error| {
+            map_orchestrator_store_error("summarize workspace restore activity", error)
+        })
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn summarize_workspace_restore_activity(
+        self: &Arc<Self>,
+        filter: WorkspaceRestoreActivityFilter,
+    ) -> Result<WorkspaceRestoreActivitySummary, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.summarize_workspace_restore_activity_blocking(&filter)
+        })
+        .await
+        .map_err(|_| Status::internal("workspace restore activity worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn create_workspace_restore_report_blocking(
+        &self,
+        request: &WorkspaceRestoreReportCreateRequest,
+    ) -> Result<WorkspaceRestoreReportRecord, Status> {
+        self.journal_store
+            .create_workspace_restore_report(request)
+            .map_err(|error| map_orchestrator_store_error("create workspace restore report", error))
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn create_workspace_restore_report(
+        self: &Arc<Self>,
+        request: WorkspaceRestoreReportCreateRequest,
+    ) -> Result<WorkspaceRestoreReportRecord, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.create_workspace_restore_report_blocking(&request)
+        })
+        .await
+        .map_err(|_| Status::internal("workspace restore report worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn mark_workspace_checkpoint_restored_blocking(
+        &self,
+        request: &WorkspaceCheckpointRestoreMarkRequest,
+    ) -> Result<(), Status> {
+        self.journal_store.mark_workspace_checkpoint_restored(request).map_err(|error| {
+            map_orchestrator_store_error("mark workspace checkpoint restored", error)
+        })
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn mark_workspace_checkpoint_restored(
+        self: &Arc<Self>,
+        request: WorkspaceCheckpointRestoreMarkRequest,
+    ) -> Result<(), Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.mark_workspace_checkpoint_restored_blocking(&request)
+        })
+        .await
+        .map_err(|_| Status::internal("workspace checkpoint restore worker panicked"))?
     }
 
     #[allow(clippy::result_large_err)]

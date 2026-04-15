@@ -74,6 +74,7 @@ pub struct WorkspacePatchRequest {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct WorkspacePatchFileAttestation {
     pub path: String,
+    pub workspace_root_index: usize,
     pub operation: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub moved_from: Option<String>,
@@ -573,6 +574,7 @@ fn build_patch_plan(
                 });
                 file_attestations.push(WorkspacePatchFileAttestation {
                     path: normalize_relative_path_display(&relative),
+                    workspace_root_index: target_root_index,
                     operation: "create".to_owned(),
                     moved_from: None,
                     before_sha256: None,
@@ -593,6 +595,7 @@ fn build_patch_plan(
                 });
                 file_attestations.push(WorkspacePatchFileAttestation {
                     path: normalize_relative_path_display(&relative),
+                    workspace_root_index: target_root_index,
                     operation: "delete".to_owned(),
                     moved_from: None,
                     before_sha256: Some(sha256_hex(before_bytes.as_slice())),
@@ -616,6 +619,7 @@ fn build_patch_plan(
                 let mut destination = source.clone();
                 let source_root = canonical_roots[source_root_index].clone();
                 let mut destination_root = source_root.clone();
+                let mut output_root_index = source_root_index;
                 let mut moved_from = None;
                 let output_path = if let Some(move_target) = move_to {
                     let move_relative = parse_relative_patch_path(move_target)?;
@@ -632,6 +636,7 @@ fn build_patch_plan(
                     }
                     destination = resolved_destination;
                     destination_root = canonical_roots[destination_root_index].clone();
+                    output_root_index = destination_root_index;
                     moved_from = Some(normalize_relative_path_display(&relative));
                     normalize_relative_path_display(&move_relative)
                 } else {
@@ -652,6 +657,7 @@ fn build_patch_plan(
 
                 file_attestations.push(WorkspacePatchFileAttestation {
                     path: output_path,
+                    workspace_root_index: output_root_index,
                     operation: if moved_from.is_some() {
                         "move".to_owned()
                     } else {

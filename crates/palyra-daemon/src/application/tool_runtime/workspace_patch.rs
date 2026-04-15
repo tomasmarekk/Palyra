@@ -6,24 +6,31 @@ use palyra_common::workspace_patch::{
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tracing::warn;
+use tracing::{error, warn};
 use ulid::Ulid;
 
 use crate::{
     agents::AgentResolveRequest,
+    application::workspace_observability::{
+        capture_workspace_patch_checkpoint, WorkspacePatchCheckpointCapture,
+    },
     gateway::{
-        current_unix_ms, GatewayRuntimeState, MAX_PATCH_TOOL_MARKER_BYTES,
-        MAX_PATCH_TOOL_PATTERN_BYTES, MAX_PATCH_TOOL_REDACTION_PATTERNS,
-        MAX_PATCH_TOOL_SECRET_FILE_MARKERS, MAX_WORKSPACE_PATCH_TOOL_INPUT_BYTES,
+        current_unix_ms, record_agent_journal_event, GatewayRuntimeState,
+        MAX_PATCH_TOOL_MARKER_BYTES, MAX_PATCH_TOOL_PATTERN_BYTES,
+        MAX_PATCH_TOOL_REDACTION_PATTERNS, MAX_PATCH_TOOL_SECRET_FILE_MARKERS,
+        MAX_WORKSPACE_PATCH_TOOL_INPUT_BYTES,
     },
     tool_protocol::{ToolAttestation, ToolExecutionOutcome},
+    transport::grpc::auth::RequestContext,
 };
 
 pub(crate) async fn execute_workspace_patch_tool(
     runtime_state: &Arc<GatewayRuntimeState>,
     principal: &str,
+    device_id: &str,
     channel: Option<&str>,
     session_id: &str,
+    run_id: &str,
     proposal_id: &str,
     input_json: &[u8],
 ) -> ToolExecutionOutcome {
@@ -164,22 +171,127 @@ pub(crate) async fn execute_workspace_patch_tool(
     };
 
     match apply_workspace_patch(workspace_roots.as_slice(), &request, &limits) {
-        Ok(outcome) => match serde_json::to_vec(&outcome) {
-            Ok(output_json) => workspace_patch_tool_execution_outcome(
-                proposal_id,
-                input_json,
-                true,
-                output_json,
-                String::new(),
-            ),
-            Err(error) => workspace_patch_tool_execution_outcome(
-                proposal_id,
-                input_json,
-                false,
-                b"{}".to_vec(),
-                format!("palyra.fs.apply_patch failed to serialize output: {error}"),
-            ),
-        },
+        Ok(outcome) => {
+            let mut output_value = match serde_json::to_value(&outcome) {
+                Ok(value) => value,
+                Err(error) => {
+                    return workspace_patch_tool_execution_outcome(
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        format!("palyra.fs.apply_patch failed to serialize output: {error}"),
+                    );
+                }
+            };
+
+            if !dry_run {
+                match capture_workspace_patch_checkpoint(
+                    runtime_state,
+                    WorkspacePatchCheckpointCapture {
+                        principal,
+                        device_id,
+                        channel,
+                        session_id,
+                        run_id,
+                        tool_name: "palyra.fs.apply_patch",
+                        proposal_id,
+                        workspace_roots: workspace_roots.as_slice(),
+                        files_touched: outcome.files_touched.as_slice(),
+                    },
+                )
+                .await
+                {
+                    Ok(Some(checkpoint)) => {
+                        if let Value::Object(payload) = &mut output_value {
+                            payload.insert(
+                                "workspace_checkpoint".to_owned(),
+                                json!({
+                                    "checkpoint_id": checkpoint.checkpoint_id,
+                                    "session_id": checkpoint.session_id,
+                                    "run_id": checkpoint.run_id,
+                                    "summary_text": checkpoint.summary_text,
+                                    "source_kind": checkpoint.source_kind,
+                                    "source_label": checkpoint.source_label,
+                                    "tool_name": checkpoint.tool_name,
+                                    "device_id": checkpoint.device_id,
+                                    "channel": checkpoint.channel,
+                                    "created_at_unix_ms": checkpoint.created_at_unix_ms,
+                                    "diff_summary": serde_json::from_str::<Value>(
+                                        checkpoint.diff_summary_json.as_str()
+                                    )
+                                    .unwrap_or_else(|_| {
+                                        Value::String(checkpoint.diff_summary_json.clone())
+                                    }),
+                                }),
+                            );
+                        }
+                        let _ = record_agent_journal_event(
+                            runtime_state,
+                            &RequestContext {
+                                principal: principal.to_owned(),
+                                device_id: device_id.to_owned(),
+                                channel: channel.map(str::to_owned),
+                            },
+                            json!({
+                                "event": "workspace.checkpoint.created",
+                                "checkpoint_id": checkpoint.checkpoint_id,
+                                "session_id": checkpoint.session_id,
+                                "run_id": checkpoint.run_id,
+                                "source_kind": checkpoint.source_kind,
+                                "source_label": checkpoint.source_label,
+                                "tool_name": checkpoint.tool_name,
+                                "proposal_id": checkpoint.proposal_id,
+                                "actor_principal": checkpoint.actor_principal,
+                                "device_id": checkpoint.device_id,
+                                "channel": checkpoint.channel,
+                                "summary_text": checkpoint.summary_text,
+                                "diff_summary": serde_json::from_str::<Value>(
+                                    checkpoint.diff_summary_json.as_str(),
+                                )
+                                .unwrap_or_else(|_| {
+                                    Value::String(checkpoint.diff_summary_json.clone())
+                                }),
+                            }),
+                        )
+                        .await;
+                    }
+                    Ok(None) => {}
+                    Err(status) => {
+                        error!(
+                            proposal_id = %proposal_id,
+                            session_id = %session_id,
+                            run_id = %run_id,
+                            error = %status,
+                            "workspace checkpoint capture failed after patch apply"
+                        );
+                        if let Value::Object(payload) = &mut output_value {
+                            payload.insert(
+                                "workspace_checkpoint_error".to_owned(),
+                                Value::String(status.message().to_owned()),
+                            );
+                        }
+                    }
+                }
+            }
+
+            match serde_json::to_vec(&output_value) {
+                Ok(output_json) => workspace_patch_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    true,
+                    output_json,
+                    String::new(),
+                ),
+                Err(error) => workspace_patch_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    format!("palyra.fs.apply_patch failed to serialize output: {error}"),
+                ),
+            }
+        }
         Err(error) => {
             if let Some((line, column)) = error.parse_location() {
                 warn!(

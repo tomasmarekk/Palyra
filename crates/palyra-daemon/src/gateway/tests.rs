@@ -2946,8 +2946,10 @@ async fn workspace_patch_tool_applies_patch_and_emits_attested_hashes() {
     let outcome = execute_workspace_patch_tool(
         &state,
         "user:ops",
+        "01ARZ3NDEKTSV4RRFFQ69G5FAA",
         Some("cli"),
         "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "01ARZ3NDEKTSV4RRFFQ69G5FBA",
         "01ARZ3NDEKTSV4RRFFQ69G5FB1",
         input_json.as_slice(),
     )
@@ -3007,8 +3009,10 @@ async fn workspace_patch_tool_rejects_oversized_input_payload() {
     let outcome = execute_workspace_patch_tool(
         &state,
         "user:ops",
+        "01ARZ3NDEKTSV4RRFFQ69G5FAA",
         Some("cli"),
         "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "01ARZ3NDEKTSV4RRFFQ69G5FBA",
         "01ARZ3NDEKTSV4RRFFQ69G5FB2",
         oversized.as_slice(),
     )

@@ -457,8 +457,10 @@ pub(crate) fn build_tool_result_memory_text(
 #[derive(Clone, Copy)]
 pub(crate) struct ToolRuntimeExecutionContext<'a> {
     pub(crate) principal: &'a str,
+    pub(crate) device_id: &'a str,
     pub(crate) channel: Option<&'a str>,
     pub(crate) session_id: &'a str,
+    pub(crate) run_id: &'a str,
 }
 
 #[derive(Clone, Copy)]
@@ -507,8 +509,10 @@ pub(crate) async fn execute_tool_with_runtime_dispatch(
         crate::application::tool_runtime::workspace_patch::execute_workspace_patch_tool(
             runtime_state,
             context.principal,
+            context.device_id,
             context.channel,
             context.session_id,
+            context.run_id,
             proposal_id,
             input_json,
         )

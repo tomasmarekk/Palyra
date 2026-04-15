@@ -70,6 +70,18 @@ pub(crate) async fn console_inventory_device_detail_handler(
         .into_iter()
         .map(capability_request_view)
         .collect::<Vec<_>>();
+    let workspace_activity =
+        crate::application::workspace_observability::load_workspace_activity_snapshot(
+            &state.runtime,
+            crate::application::workspace_observability::WorkspaceActivityQuery {
+                session_id: None,
+                run_id: None,
+                device_id: Some(device.device_id.as_str()),
+                limit: 6,
+            },
+        )
+        .await
+        .map_err(runtime_status_response)?;
 
     Ok(Json(control_plane::InventoryDeviceDetailEnvelope {
         contract: contract_descriptor(),
@@ -77,6 +89,28 @@ pub(crate) async fn console_inventory_device_detail_handler(
         device,
         pairings,
         capability_requests,
+        workspace_activity: Some(control_plane::InventoryWorkspaceActivity {
+            summary: control_plane::InventoryWorkspaceRestoreSummary {
+                checkpoint_count: workspace_activity.summary.checkpoint_count,
+                checkpoint_restore_total: workspace_activity.summary.checkpoint_restore_total,
+                restore_report_count: workspace_activity.summary.restore_report_count,
+                succeeded_restore_count: workspace_activity.summary.succeeded_restore_count,
+                partial_failure_restore_count: workspace_activity
+                    .summary
+                    .partial_failure_restore_count,
+                failed_restore_count: workspace_activity.summary.failed_restore_count,
+            },
+            recent_checkpoints: workspace_activity
+                .recent_checkpoints
+                .into_iter()
+                .map(inventory_workspace_checkpoint_record)
+                .collect(),
+            recent_restore_reports: workspace_activity
+                .recent_restore_reports
+                .into_iter()
+                .map(inventory_workspace_restore_report_record)
+                .collect(),
+        }),
     }))
 }
 
@@ -118,6 +152,48 @@ fn capability_request_view(
         input_summary: record.input_summary,
         output_summary: record.output_summary,
         error: record.error,
+    }
+}
+
+fn inventory_workspace_checkpoint_record(
+    checkpoint: crate::application::workspace_observability::WorkspaceCheckpointSummary,
+) -> control_plane::InventoryWorkspaceCheckpointRecord {
+    control_plane::InventoryWorkspaceCheckpointRecord {
+        checkpoint_id: checkpoint.checkpoint_id,
+        session_id: checkpoint.session_id,
+        run_id: checkpoint.run_id,
+        source_kind: checkpoint.source_kind,
+        source_label: checkpoint.source_label,
+        tool_name: checkpoint.tool_name,
+        proposal_id: checkpoint.proposal_id,
+        actor_principal: checkpoint.actor_principal,
+        device_id: checkpoint.device_id,
+        channel: checkpoint.channel,
+        summary_text: checkpoint.summary_text,
+        created_at_unix_ms: checkpoint.created_at_unix_ms,
+        restore_count: checkpoint.restore_count,
+        last_restored_at_unix_ms: checkpoint.last_restored_at_unix_ms,
+        latest_restore_report_id: checkpoint.latest_restore_report_id,
+    }
+}
+
+fn inventory_workspace_restore_report_record(
+    report: crate::application::workspace_observability::WorkspaceRestoreReportSummary,
+) -> control_plane::InventoryWorkspaceRestoreReportRecord {
+    control_plane::InventoryWorkspaceRestoreReportRecord {
+        report_id: report.report_id,
+        checkpoint_id: report.checkpoint_id,
+        session_id: report.session_id,
+        run_id: report.run_id,
+        actor_principal: report.actor_principal,
+        device_id: report.device_id,
+        channel: report.channel,
+        scope_kind: report.scope_kind,
+        target_path: report.target_path,
+        reconciliation_summary: report.reconciliation_summary,
+        branched_session_id: report.branched_session_id,
+        result_state: report.result_state,
+        created_at_unix_ms: report.created_at_unix_ms,
     }
 }
 

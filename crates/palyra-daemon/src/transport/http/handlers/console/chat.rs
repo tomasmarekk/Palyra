@@ -1079,6 +1079,85 @@ pub(crate) async fn console_chat_run_events_handler(
     })))
 }
 
+pub(crate) async fn console_chat_run_workspace_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+    Query(query): Query<ConsoleChatRunWorkspaceQuery>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, false)?;
+    let run = load_console_chat_run(&state, &session.context, run_id.as_str()).await?;
+    let workspace = crate::application::workspace_observability::load_run_workspace_artifacts(
+        &state.runtime,
+        &run,
+        crate::application::workspace_observability::WorkspaceArtifactListQuery {
+            query: query.q.as_deref().map(str::trim).filter(|value| !value.is_empty()),
+            limit: query.limit.unwrap_or(128),
+        },
+    )
+    .await
+    .map_err(runtime_status_response)?;
+    Ok(Json(json!({
+        "run": run,
+        "workspace": workspace,
+        "contract": contract_descriptor(),
+    })))
+}
+
+pub(crate) async fn console_chat_run_workspace_artifact_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((run_id, artifact_id)): Path<(String, String)>,
+    Query(query): Query<ConsoleChatWorkspaceArtifactQuery>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, false)?;
+    validate_canonical_id(artifact_id.as_str()).map_err(|_| {
+        runtime_status_response(tonic::Status::invalid_argument(
+            "artifact_id must be a canonical ULID",
+        ))
+    })?;
+    let run = load_console_chat_run(&state, &session.context, run_id.as_str()).await?;
+    let detail = crate::application::workspace_observability::load_workspace_artifact_detail(
+        &state.runtime,
+        &run,
+        artifact_id.as_str(),
+        query.include_content.unwrap_or(false),
+    )
+    .await
+    .map_err(runtime_status_response)?;
+    Ok(Json(json!({
+        "run": run,
+        "detail": detail,
+        "contract": contract_descriptor(),
+    })))
+}
+
+pub(crate) async fn console_chat_workspace_compare_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<ConsoleChatWorkspaceCompareRequest>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, false)?;
+    let left =
+        parse_workspace_compare_anchor(payload.left_run_id, payload.left_checkpoint_id, "left")?;
+    let right =
+        parse_workspace_compare_anchor(payload.right_run_id, payload.right_checkpoint_id, "right")?;
+    authorize_workspace_compare_anchor(&state, &session.context, &left).await?;
+    authorize_workspace_compare_anchor(&state, &session.context, &right).await?;
+    let diff = crate::application::workspace_observability::compare_workspace_anchors(
+        &state.runtime,
+        left,
+        right,
+        payload.limit.unwrap_or(64),
+    )
+    .await
+    .map_err(runtime_status_response)?;
+    Ok(Json(json!({
+        "diff": diff,
+        "contract": contract_descriptor(),
+    })))
+}
+
 pub(crate) async fn console_chat_retry_prepare_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1447,6 +1526,81 @@ pub(crate) async fn console_chat_checkpoint_detail_handler(
     })))
 }
 
+pub(crate) async fn console_chat_workspace_checkpoint_detail_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(checkpoint_id): Path<String>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, false)?;
+    let checkpoint =
+        load_console_workspace_checkpoint(&state, &session.context, checkpoint_id.as_str(), false)
+            .await?;
+    let session_record =
+        load_console_chat_session(&state, &session.context, checkpoint.session_id.as_str(), false)
+            .await?;
+    let files = state
+        .runtime
+        .list_workspace_checkpoint_files(checkpoint.checkpoint_id.clone())
+        .await
+        .map_err(runtime_status_response)?;
+    let restore_reports = state
+        .runtime
+        .list_workspace_restore_reports(crate::journal::WorkspaceRestoreReportListFilter {
+            checkpoint_id: Some(checkpoint.checkpoint_id.clone()),
+            session_id: None,
+            run_id: None,
+            device_id: None,
+            limit: Some(32),
+        })
+        .await
+        .map_err(runtime_status_response)?;
+    Ok(Json(json!({
+        "session": session_record,
+        "checkpoint": checkpoint,
+        "files": files,
+        "restore_reports": restore_reports,
+        "contract": contract_descriptor(),
+    })))
+}
+
+pub(crate) async fn console_chat_workspace_restore_report_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(report_id): Path<String>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, false)?;
+    validate_canonical_id(report_id.as_str()).map_err(|_| {
+        runtime_status_response(tonic::Status::invalid_argument(
+            "report_id must be a canonical ULID",
+        ))
+    })?;
+    let detail = crate::application::workspace_observability::load_workspace_restore_report_detail(
+        &state.runtime,
+        report_id.as_str(),
+    )
+    .await
+    .map_err(runtime_status_response)?;
+    let session_record = load_console_chat_session(
+        &state,
+        &session.context,
+        detail.checkpoint.session_id.as_str(),
+        false,
+    )
+    .await?;
+    let _ = load_console_workspace_checkpoint(
+        &state,
+        &session.context,
+        detail.checkpoint.checkpoint_id.as_str(),
+        false,
+    )
+    .await?;
+    Ok(Json(json!({
+        "session": session_record,
+        "detail": detail,
+        "contract": contract_descriptor(),
+    })))
+}
+
 pub(crate) async fn console_chat_checkpoint_restore_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1574,6 +1728,221 @@ pub(crate) async fn console_chat_checkpoint_restore_handler(
         "checkpoint": checkpoint,
         "suggested_session_label": family_title_seed.suggested_title,
         "action": "checkpoint_restore",
+        "contract": contract_descriptor(),
+    })))
+}
+
+pub(crate) async fn console_chat_workspace_checkpoint_restore_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(checkpoint_id): Path<String>,
+    Json(payload): Json<ConsoleChatWorkspaceRestoreRequest>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    let checkpoint =
+        load_console_workspace_checkpoint(&state, &session.context, checkpoint_id.as_str(), true)
+            .await?;
+    let source_session =
+        load_console_chat_session(&state, &session.context, checkpoint.session_id.as_str(), true)
+            .await?;
+    let branch_session = payload.branch_session.unwrap_or(true);
+    let requested_session_label = payload.session_label.and_then(trim_to_option);
+    if !branch_session && requested_session_label.is_some() {
+        return Err(runtime_status_response(tonic::Status::invalid_argument(
+            "session_label is only supported when branch_session is true",
+        )));
+    }
+    let family_title_seed =
+        branch_session.then(|| load_lineage_title_seed(&state, &session.context, &source_session));
+    let mut project_context_copy_error = None::<String>;
+
+    let (target_session_id, suggested_session_label, branched_session_id) = if branch_session {
+        let family_title_seed = family_title_seed
+            .expect("family title seed future exists when branch_session is true")
+            .await?;
+        let branched = state
+            .runtime
+            .resolve_orchestrator_session(journal::OrchestratorSessionResolveRequest {
+                session_id: None,
+                session_key: None,
+                session_label: requested_session_label.clone(),
+                principal: session.context.principal.clone(),
+                device_id: session.context.device_id.clone(),
+                channel: session.context.channel.clone(),
+                require_existing: false,
+                reset_session: false,
+            })
+            .await
+            .map_err(runtime_status_response)?;
+        state
+            .runtime
+            .update_orchestrator_session_lineage(journal::OrchestratorSessionLineageUpdateRequest {
+                session_id: branched.session.session_id.clone(),
+                branch_state: "active_branch".to_owned(),
+                parent_session_id: Some(source_session.session_id.clone()),
+                branch_origin_run_id: Some(checkpoint.run_id.clone()),
+                suggested_auto_title: requested_session_label
+                    .is_none()
+                    .then(|| family_title_seed.suggested_title.clone()),
+            })
+            .await
+            .map_err(runtime_status_response)?;
+        state
+            .runtime
+            .update_orchestrator_session_lineage(journal::OrchestratorSessionLineageUpdateRequest {
+                session_id: source_session.session_id.clone(),
+                branch_state: "branch_source".to_owned(),
+                parent_session_id: source_session.parent_session_id.clone(),
+                branch_origin_run_id: source_session.branch_origin_run_id.clone(),
+                suggested_auto_title: None,
+            })
+            .await
+            .map_err(runtime_status_response)?;
+        if let Err(status) = crate::application::project_context::copy_project_context_state(
+            &state.runtime,
+            source_session.session_id.as_str(),
+            branched.session.session_id.as_str(),
+        )
+        .await
+        {
+            project_context_copy_error = Some(status.message().to_owned());
+        }
+        (
+            branched.session.session_id.clone(),
+            Some(family_title_seed.suggested_title),
+            Some(branched.session.session_id),
+        )
+    } else {
+        (source_session.session_id.clone(), None, None)
+    };
+
+    let scope_kind = payload
+        .scope_kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("workspace")
+        .to_owned();
+    let target_path = payload.target_path.and_then(trim_to_option);
+    let _ = crate::gateway::record_agent_journal_event(
+        &state.runtime,
+        &session.context,
+        json!({
+            "event": "workspace.restore.started",
+            "checkpoint_id": checkpoint.checkpoint_id,
+            "source_session_id": source_session.session_id,
+            "target_session_id": target_session_id,
+            "branched_session_id": branched_session_id,
+            "run_id": checkpoint.run_id,
+            "scope_kind": scope_kind,
+            "target_path": target_path,
+            "target_workspace_root_index": payload.target_workspace_root_index,
+        }),
+    )
+    .await;
+    let restore = match crate::application::workspace_observability::restore_workspace_checkpoint(
+        &state.runtime,
+        crate::application::workspace_observability::WorkspaceRestoreRequest {
+            principal: session.context.principal.as_str(),
+            device_id: session.context.device_id.as_str(),
+            channel: session.context.channel.as_deref(),
+            target_session_id: target_session_id.as_str(),
+            checkpoint: checkpoint.clone(),
+            scope_kind: scope_kind.as_str(),
+            target_path: target_path.as_deref(),
+            target_workspace_root_index: payload.target_workspace_root_index,
+            branched_session_id: branched_session_id.as_deref(),
+        },
+    )
+    .await
+    {
+        Ok(restore) => restore,
+        Err(status) => {
+            let _ = crate::gateway::record_agent_journal_event(
+                &state.runtime,
+                &session.context,
+                json!({
+                    "event": "workspace.restore.failed",
+                    "checkpoint_id": checkpoint.checkpoint_id,
+                    "source_session_id": source_session.session_id,
+                    "target_session_id": target_session_id,
+                    "branched_session_id": branched_session_id,
+                    "run_id": checkpoint.run_id,
+                    "scope_kind": scope_kind,
+                    "target_path": target_path,
+                    "target_workspace_root_index": payload.target_workspace_root_index,
+                    "error": status.message(),
+                }),
+            )
+            .await;
+            return Err(runtime_status_response(status));
+        }
+    };
+    let (project_context_refresh, project_context_refresh_error) =
+        match crate::application::project_context::refresh_project_context(
+            &state.runtime,
+            &session.context,
+            target_session_id.as_str(),
+        )
+        .await
+        {
+            Ok(preview) => (
+                Some(json!({
+                    "session_id": target_session_id,
+                    "preview": preview,
+                })),
+                None,
+            ),
+            Err(status) => (None, Some(status.message().to_owned())),
+        };
+    let _ = crate::gateway::record_agent_journal_event(
+        &state.runtime,
+        &session.context,
+        json!({
+            "event": "workspace.restore.completed",
+            "checkpoint_id": checkpoint.checkpoint_id,
+            "source_session_id": source_session.session_id,
+            "target_session_id": target_session_id,
+            "branched_session_id": branched_session_id,
+            "run_id": checkpoint.run_id,
+            "scope_kind": restore.scope_kind,
+            "target_path": restore.target_path,
+            "target_workspace_root_index": restore.target_workspace_root_index,
+            "restored_paths": restore.restored_paths,
+            "failed_paths": restore.failed_paths,
+            "affects_context_stack": restore.affects_context_stack,
+            "restore_report_id": restore.report.report_id,
+            "result_state": restore.report.result_state,
+            "reconciliation_summary": restore.report.reconciliation_summary,
+            "reconciliation_prompt": restore.report.reconciliation_prompt,
+            "project_context_refresh_error": project_context_refresh_error,
+            "project_context_copy_error": project_context_copy_error,
+        }),
+    )
+    .await;
+    let checkpoint = state
+        .runtime
+        .get_workspace_checkpoint(checkpoint.checkpoint_id.clone())
+        .await
+        .map_err(runtime_status_response)?
+        .ok_or_else(|| {
+            runtime_status_response(tonic::Status::not_found(
+                "workspace checkpoint disappeared after restore",
+            ))
+        })?;
+    let target_session =
+        load_console_chat_session(&state, &session.context, target_session_id.as_str(), true)
+            .await?;
+    Ok(Json(json!({
+        "session": target_session,
+        "source_session": source_session,
+        "checkpoint": checkpoint,
+        "restore": restore,
+        "project_context_refresh": project_context_refresh,
+        "project_context_refresh_error": project_context_refresh_error,
+        "project_context_copy_error": project_context_copy_error,
+        "suggested_session_label": suggested_session_label,
+        "action": "workspace_restore",
         "contract": contract_descriptor(),
     })))
 }
@@ -2469,6 +2838,116 @@ fn filter_console_derived_artifact_records(
             derived_artifact_matches_console_context(record, context, require_device_match)
         })
         .collect()
+}
+
+async fn load_console_chat_run(
+    state: &AppState,
+    context: &gateway::RequestContext,
+    run_id: &str,
+) -> Result<journal::OrchestratorRunStatusSnapshot, Response> {
+    validate_canonical_id(run_id).map_err(|_| {
+        runtime_status_response(tonic::Status::invalid_argument("run_id must be a canonical ULID"))
+    })?;
+    let run = state
+        .runtime
+        .orchestrator_run_status_snapshot(run_id.to_owned())
+        .await
+        .map_err(runtime_status_response)?
+        .ok_or_else(|| {
+            runtime_status_response(tonic::Status::not_found(format!(
+                "orchestrator run not found: {run_id}"
+            )))
+        })?;
+    if !run_matches_console_context(&run, context) {
+        return Err(runtime_status_response(tonic::Status::permission_denied(
+            "chat run does not belong to the authenticated console session context",
+        )));
+    }
+    Ok(run)
+}
+
+async fn load_console_workspace_checkpoint(
+    state: &AppState,
+    context: &gateway::RequestContext,
+    checkpoint_id: &str,
+    require_write: bool,
+) -> Result<journal::WorkspaceCheckpointRecord, Response> {
+    validate_canonical_id(checkpoint_id).map_err(|_| {
+        runtime_status_response(tonic::Status::invalid_argument(
+            "checkpoint_id must be a canonical ULID",
+        ))
+    })?;
+    let checkpoint = state
+        .runtime
+        .get_workspace_checkpoint(checkpoint_id.to_owned())
+        .await
+        .map_err(runtime_status_response)?
+        .ok_or_else(|| {
+            runtime_status_response(tonic::Status::not_found(format!(
+                "workspace checkpoint not found: {checkpoint_id}"
+            )))
+        })?;
+    let _session =
+        load_console_chat_session(state, context, checkpoint.session_id.as_str(), require_write)
+            .await?;
+    Ok(checkpoint)
+}
+
+fn parse_workspace_compare_anchor(
+    run_id: Option<String>,
+    checkpoint_id: Option<String>,
+    side: &str,
+) -> Result<crate::application::workspace_observability::WorkspaceCompareAnchor, Response> {
+    let run_id = run_id.and_then(trim_to_option);
+    let checkpoint_id = checkpoint_id.and_then(trim_to_option);
+    match (run_id, checkpoint_id) {
+        (Some(run_id), None) => {
+            validate_canonical_id(run_id.as_str()).map_err(|_| {
+                runtime_status_response(tonic::Status::invalid_argument(format!(
+                    "{side}_run_id must be a canonical ULID"
+                )))
+            })?;
+            Ok(crate::application::workspace_observability::WorkspaceCompareAnchor::Run(run_id))
+        }
+        (None, Some(checkpoint_id)) => {
+            validate_canonical_id(checkpoint_id.as_str()).map_err(|_| {
+                runtime_status_response(tonic::Status::invalid_argument(format!(
+                    "{side}_checkpoint_id must be a canonical ULID"
+                )))
+            })?;
+            Ok(crate::application::workspace_observability::WorkspaceCompareAnchor::Checkpoint(
+                checkpoint_id,
+            ))
+        }
+        (Some(_), Some(_)) => {
+            Err(runtime_status_response(tonic::Status::invalid_argument(format!(
+                "{side} compare anchor must set only one of {side}_run_id or {side}_checkpoint_id"
+            ))))
+        }
+        (None, None) => Err(runtime_status_response(tonic::Status::invalid_argument(format!(
+            "{side} compare anchor requires {side}_run_id or {side}_checkpoint_id"
+        )))),
+    }
+}
+
+async fn authorize_workspace_compare_anchor(
+    state: &AppState,
+    context: &gateway::RequestContext,
+    anchor: &crate::application::workspace_observability::WorkspaceCompareAnchor,
+) -> Result<(), Response> {
+    match anchor {
+        crate::application::workspace_observability::WorkspaceCompareAnchor::Run(run_id) => {
+            let _ = load_console_chat_run(state, context, run_id.as_str()).await?;
+        }
+        crate::application::workspace_observability::WorkspaceCompareAnchor::Checkpoint(
+            checkpoint_id,
+        ) => {
+            let _ =
+                load_console_workspace_checkpoint(state, context, checkpoint_id.as_str(), false)
+                    .await?;
+        }
+    }
+    Ok(())
 }
 
 async fn load_console_chat_session(

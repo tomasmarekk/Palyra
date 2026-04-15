@@ -1200,6 +1200,71 @@ pub struct InventoryDeviceDetailEnvelope {
     pub pairings: Vec<NodePairingRequestView>,
     #[serde(default)]
     pub capability_requests: Vec<NodeCapabilityRequestView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_activity: Option<InventoryWorkspaceActivity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct InventoryWorkspaceRestoreSummary {
+    pub checkpoint_count: u64,
+    pub checkpoint_restore_total: u64,
+    pub restore_report_count: u64,
+    pub succeeded_restore_count: u64,
+    pub partial_failure_restore_count: u64,
+    pub failed_restore_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InventoryWorkspaceCheckpointRecord {
+    pub checkpoint_id: String,
+    pub session_id: String,
+    pub run_id: String,
+    pub source_kind: String,
+    pub source_label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proposal_id: Option<String>,
+    pub actor_principal: String,
+    pub device_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    pub summary_text: String,
+    pub created_at_unix_ms: i64,
+    pub restore_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_restored_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_restore_report_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InventoryWorkspaceRestoreReportRecord {
+    pub report_id: String,
+    pub checkpoint_id: String,
+    pub session_id: String,
+    pub run_id: String,
+    pub actor_principal: String,
+    pub device_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    pub scope_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_path: Option<String>,
+    pub reconciliation_summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branched_session_id: Option<String>,
+    pub result_state: String,
+    pub created_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InventoryWorkspaceActivity {
+    pub summary: InventoryWorkspaceRestoreSummary,
+    #[serde(default)]
+    pub recent_checkpoints: Vec<InventoryWorkspaceCheckpointRecord>,
+    #[serde(default)]
+    pub recent_restore_reports: Vec<InventoryWorkspaceRestoreReportRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

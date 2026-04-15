@@ -12,6 +12,7 @@ pub mod service_authorization;
 pub mod session_compaction;
 pub mod tool_runtime;
 pub mod tool_security;
+pub mod workspace_observability;
 
 pub mod route_message;
 pub mod run_stream;

@@ -1486,6 +1486,182 @@ pub struct OrchestratorCheckpointRestoreMarkRequest {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WorkspaceCheckpointRecord {
+    pub checkpoint_id: String,
+    pub session_id: String,
+    pub run_id: String,
+    pub source_kind: String,
+    pub source_label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proposal_id: Option<String>,
+    pub actor_principal: String,
+    pub device_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    pub summary_text: String,
+    pub diff_summary_json: String,
+    pub created_at_unix_ms: i64,
+    pub restore_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_restored_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_restore_report_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WorkspaceCheckpointFileRecord {
+    pub artifact_id: String,
+    pub checkpoint_id: String,
+    pub path: String,
+    pub workspace_root_index: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moved_from_path: Option<String>,
+    pub change_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before_content_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before_size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after_content_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after_size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blob_sha256: Option<String>,
+    pub content_type: String,
+    pub is_text: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_text: Option<String>,
+    pub created_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceCheckpointFilePayload {
+    pub file: WorkspaceCheckpointFileRecord,
+    pub content_bytes: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceCheckpointFileCreateRequest {
+    pub artifact_id: String,
+    pub path: String,
+    pub workspace_root_index: u32,
+    pub moved_from_path: Option<String>,
+    pub change_kind: String,
+    pub before_content_sha256: Option<String>,
+    pub before_size_bytes: Option<u64>,
+    pub after_content_sha256: Option<String>,
+    pub after_size_bytes: Option<u64>,
+    pub content_type: String,
+    pub is_text: bool,
+    pub preview_text: Option<String>,
+    pub search_text: Option<String>,
+    pub content_bytes: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceCheckpointCreateRequest {
+    pub checkpoint_id: String,
+    pub session_id: String,
+    pub run_id: String,
+    pub source_kind: String,
+    pub source_label: String,
+    pub tool_name: Option<String>,
+    pub proposal_id: Option<String>,
+    pub actor_principal: String,
+    pub device_id: String,
+    pub channel: Option<String>,
+    pub summary_text: String,
+    pub diff_summary_json: String,
+    pub files: Vec<WorkspaceCheckpointFileCreateRequest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WorkspaceCheckpointListFilter {
+    pub session_id: Option<String>,
+    pub run_id: Option<String>,
+    pub device_id: Option<String>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WorkspaceRestoreReportListFilter {
+    pub checkpoint_id: Option<String>,
+    pub session_id: Option<String>,
+    pub run_id: Option<String>,
+    pub device_id: Option<String>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WorkspaceRestoreActivityFilter {
+    pub session_id: Option<String>,
+    pub run_id: Option<String>,
+    pub device_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
+pub struct WorkspaceRestoreActivitySummary {
+    pub checkpoint_count: u64,
+    pub checkpoint_restore_total: u64,
+    pub restore_report_count: u64,
+    pub succeeded_restore_count: u64,
+    pub partial_failure_restore_count: u64,
+    pub failed_restore_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceCheckpointRestoreMarkRequest {
+    pub checkpoint_id: String,
+    pub latest_restore_report_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WorkspaceRestoreReportRecord {
+    pub report_id: String,
+    pub checkpoint_id: String,
+    pub session_id: String,
+    pub run_id: String,
+    pub actor_principal: String,
+    pub device_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    pub scope_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_path: Option<String>,
+    pub restored_paths_json: String,
+    pub failed_paths_json: String,
+    pub reconciliation_summary: String,
+    pub reconciliation_prompt: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branched_session_id: Option<String>,
+    pub result_state: String,
+    pub created_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceRestoreReportCreateRequest {
+    pub report_id: String,
+    pub checkpoint_id: String,
+    pub session_id: String,
+    pub run_id: String,
+    pub actor_principal: String,
+    pub device_id: String,
+    pub channel: Option<String>,
+    pub scope_kind: String,
+    pub target_path: Option<String>,
+    pub restored_paths_json: String,
+    pub failed_paths_json: String,
+    pub reconciliation_summary: String,
+    pub reconciliation_prompt: String,
+    pub branched_session_id: Option<String>,
+    pub result_state: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct OrchestratorBackgroundTaskRecord {
     pub task_id: String,
     pub task_kind: String,
@@ -2184,6 +2360,8 @@ pub enum JournalError {
     LearningPreferenceNotFound { preference_id: String },
     #[error("invalid canvas replay state for {canvas_id}: {reason}")]
     InvalidCanvasReplay { canvas_id: String, reason: String },
+    #[error("invalid journal argument: {0}")]
+    InvalidArgument(String),
     #[error("{payload_kind} payload exceeds max bytes ({actual_bytes} > {max_bytes})")]
     PayloadTooLarge { payload_kind: &'static str, actual_bytes: usize, max_bytes: usize },
     #[error("journal max payload bytes must be greater than 0")]
@@ -3149,6 +3327,112 @@ const MIGRATIONS: &[Migration] = &[
                 updated_at_unix_ms INTEGER NOT NULL,
                 FOREIGN KEY(session_ulid) REFERENCES orchestrator_sessions(session_ulid) ON DELETE CASCADE
             );
+        "#,
+    },
+    Migration {
+        version: 24,
+        name: "workspace_checkpoints_phase6",
+        sql: r#"
+            CREATE TABLE IF NOT EXISTS workspace_checkpoints (
+                checkpoint_ulid TEXT PRIMARY KEY,
+                session_ulid TEXT NOT NULL,
+                run_ulid TEXT NOT NULL,
+                source_kind TEXT NOT NULL,
+                source_label TEXT NOT NULL,
+                tool_name TEXT,
+                proposal_id TEXT,
+                actor_principal TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                channel TEXT,
+                summary_text TEXT NOT NULL,
+                diff_summary_json TEXT NOT NULL,
+                created_at_unix_ms INTEGER NOT NULL,
+                restore_count INTEGER NOT NULL DEFAULT 0,
+                last_restored_at_unix_ms INTEGER,
+                latest_restore_report_ulid TEXT,
+                FOREIGN KEY(session_ulid) REFERENCES orchestrator_sessions(session_ulid) ON DELETE CASCADE,
+                FOREIGN KEY(run_ulid) REFERENCES orchestrator_runs(run_ulid) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_workspace_checkpoints_run
+                ON workspace_checkpoints(run_ulid, created_at_unix_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_workspace_checkpoints_session
+                ON workspace_checkpoints(session_ulid, created_at_unix_ms DESC);
+
+            CREATE TABLE IF NOT EXISTS workspace_checkpoint_blobs (
+                blob_sha256 TEXT PRIMARY KEY,
+                content_bytes BLOB NOT NULL,
+                content_size_bytes INTEGER NOT NULL,
+                content_type TEXT NOT NULL,
+                is_text INTEGER NOT NULL DEFAULT 0,
+                text_preview TEXT,
+                search_text TEXT,
+                created_at_unix_ms INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS workspace_checkpoint_files (
+                artifact_ulid TEXT PRIMARY KEY,
+                checkpoint_ulid TEXT NOT NULL,
+                path TEXT NOT NULL,
+                workspace_root_index INTEGER NOT NULL,
+                moved_from_path TEXT,
+                change_kind TEXT NOT NULL,
+                before_content_sha256 TEXT,
+                before_size_bytes INTEGER,
+                after_content_sha256 TEXT,
+                after_size_bytes INTEGER,
+                blob_sha256 TEXT,
+                content_type TEXT NOT NULL,
+                is_text INTEGER NOT NULL DEFAULT 0,
+                preview_text TEXT,
+                search_text TEXT,
+                created_at_unix_ms INTEGER NOT NULL,
+                FOREIGN KEY(checkpoint_ulid) REFERENCES workspace_checkpoints(checkpoint_ulid) ON DELETE CASCADE,
+                FOREIGN KEY(blob_sha256) REFERENCES workspace_checkpoint_blobs(blob_sha256)
+            );
+            CREATE INDEX IF NOT EXISTS idx_workspace_checkpoint_files_checkpoint
+                ON workspace_checkpoint_files(checkpoint_ulid, path ASC);
+            CREATE INDEX IF NOT EXISTS idx_workspace_checkpoint_files_path
+                ON workspace_checkpoint_files(path, created_at_unix_ms DESC);
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS workspace_checkpoint_files_fts
+                USING fts5(artifact_ulid UNINDEXED, path, search_text, tokenize='unicode61');
+            CREATE TRIGGER IF NOT EXISTS trg_workspace_checkpoint_files_ai
+            AFTER INSERT ON workspace_checkpoint_files
+            BEGIN
+                INSERT INTO workspace_checkpoint_files_fts(artifact_ulid, path, search_text)
+                VALUES (new.artifact_ulid, new.path, COALESCE(new.search_text, ''));
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_workspace_checkpoint_files_ad
+            AFTER DELETE ON workspace_checkpoint_files
+            BEGIN
+                DELETE FROM workspace_checkpoint_files_fts WHERE artifact_ulid = old.artifact_ulid;
+            END;
+
+            CREATE TABLE IF NOT EXISTS workspace_restore_reports (
+                report_ulid TEXT PRIMARY KEY,
+                checkpoint_ulid TEXT NOT NULL,
+                session_ulid TEXT NOT NULL,
+                run_ulid TEXT NOT NULL,
+                actor_principal TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                channel TEXT,
+                scope_kind TEXT NOT NULL,
+                target_path TEXT,
+                restored_paths_json TEXT NOT NULL,
+                failed_paths_json TEXT NOT NULL,
+                reconciliation_summary TEXT NOT NULL,
+                reconciliation_prompt TEXT NOT NULL,
+                branched_session_ulid TEXT,
+                result_state TEXT NOT NULL,
+                created_at_unix_ms INTEGER NOT NULL,
+                FOREIGN KEY(checkpoint_ulid) REFERENCES workspace_checkpoints(checkpoint_ulid) ON DELETE CASCADE,
+                FOREIGN KEY(session_ulid) REFERENCES orchestrator_sessions(session_ulid) ON DELETE CASCADE,
+                FOREIGN KEY(run_ulid) REFERENCES orchestrator_runs(run_ulid) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_workspace_restore_reports_checkpoint
+                ON workspace_restore_reports(checkpoint_ulid, created_at_unix_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_workspace_restore_reports_session
+                ON workspace_restore_reports(session_ulid, created_at_unix_ms DESC);
         "#,
     },
 ];
@@ -5531,6 +5815,781 @@ impl JournalStore {
                 WHERE checkpoint_ulid = ?1
             "#,
             params![request.checkpoint_id, now],
+        )?;
+        if updated == 0 {
+            return Err(JournalError::SessionNotFound { selector: request.checkpoint_id.clone() });
+        }
+        Ok(())
+    }
+
+    pub fn create_workspace_checkpoint(
+        &self,
+        request: &WorkspaceCheckpointCreateRequest,
+    ) -> Result<WorkspaceCheckpointRecord, JournalError> {
+        let now = current_unix_ms()?;
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction()?;
+        transaction.execute(
+            r#"
+                INSERT INTO workspace_checkpoints (
+                    checkpoint_ulid,
+                    session_ulid,
+                    run_ulid,
+                    source_kind,
+                    source_label,
+                    tool_name,
+                    proposal_id,
+                    actor_principal,
+                    device_id,
+                    channel,
+                    summary_text,
+                    diff_summary_json,
+                    created_at_unix_ms,
+                    restore_count,
+                    last_restored_at_unix_ms,
+                    latest_restore_report_ulid
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0, NULL, NULL)
+            "#,
+            params![
+                request.checkpoint_id,
+                request.session_id,
+                request.run_id,
+                request.source_kind,
+                request.source_label,
+                request.tool_name,
+                request.proposal_id,
+                request.actor_principal,
+                request.device_id,
+                request.channel,
+                request.summary_text,
+                request.diff_summary_json,
+                now,
+            ],
+        )?;
+
+        for file in &request.files {
+            let blob_sha256 = match file.content_bytes.as_ref() {
+                Some(content_bytes) => {
+                    let digest = file
+                        .after_content_sha256
+                        .clone()
+                        .unwrap_or_else(|| hex::encode(Sha256::digest(content_bytes.as_slice())));
+                    let preview_text = file.preview_text.clone();
+                    let search_text = file.search_text.clone();
+                    transaction.execute(
+                        r#"
+                            INSERT OR IGNORE INTO workspace_checkpoint_blobs (
+                                blob_sha256,
+                                content_bytes,
+                                content_size_bytes,
+                                content_type,
+                                is_text,
+                                text_preview,
+                                search_text,
+                                created_at_unix_ms
+                            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                        "#,
+                        params![
+                            digest,
+                            content_bytes,
+                            i64::try_from(content_bytes.len()).map_err(|_| {
+                                JournalError::InvalidArgument(
+                                    "workspace checkpoint blob exceeds sqlite integer range"
+                                        .to_owned(),
+                                )
+                            })?,
+                            file.content_type,
+                            i64::from(u8::from(file.is_text)),
+                            preview_text,
+                            search_text,
+                            now,
+                        ],
+                    )?;
+                    Some(digest)
+                }
+                None => None,
+            };
+            transaction.execute(
+                r#"
+                    INSERT INTO workspace_checkpoint_files (
+                        artifact_ulid,
+                        checkpoint_ulid,
+                        path,
+                        workspace_root_index,
+                        moved_from_path,
+                        change_kind,
+                        before_content_sha256,
+                        before_size_bytes,
+                        after_content_sha256,
+                        after_size_bytes,
+                        blob_sha256,
+                        content_type,
+                        is_text,
+                        preview_text,
+                        search_text,
+                        created_at_unix_ms
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                "#,
+                params![
+                    file.artifact_id,
+                    request.checkpoint_id,
+                    file.path,
+                    i64::from(file.workspace_root_index),
+                    file.moved_from_path,
+                    file.change_kind,
+                    file.before_content_sha256,
+                    file.before_size_bytes.map(|value| i64::try_from(value)).transpose().map_err(
+                        |_| {
+                            JournalError::InvalidArgument(
+                                "workspace checkpoint before size exceeds sqlite integer range"
+                                    .to_owned(),
+                            )
+                        }
+                    )?,
+                    file.after_content_sha256,
+                    file.after_size_bytes.map(|value| i64::try_from(value)).transpose().map_err(
+                        |_| {
+                            JournalError::InvalidArgument(
+                                "workspace checkpoint after size exceeds sqlite integer range"
+                                    .to_owned(),
+                            )
+                        }
+                    )?,
+                    blob_sha256,
+                    file.content_type,
+                    i64::from(u8::from(file.is_text)),
+                    file.preview_text,
+                    file.search_text,
+                    now,
+                ],
+            )?;
+        }
+
+        let mut stale_checkpoint_ids = Vec::new();
+        {
+            let mut statement = transaction.prepare(
+                r#"
+                    SELECT checkpoint_ulid
+                    FROM workspace_checkpoints
+                    WHERE session_ulid = ?1
+                    ORDER BY created_at_unix_ms DESC
+                    LIMIT -1 OFFSET 128
+                "#,
+            )?;
+            let mut rows = statement.query(params![request.session_id])?;
+            while let Some(row) = rows.next()? {
+                stale_checkpoint_ids.push(row.get::<_, String>(0)?);
+            }
+        }
+        for checkpoint_id in stale_checkpoint_ids {
+            transaction.execute(
+                "DELETE FROM workspace_checkpoints WHERE checkpoint_ulid = ?1",
+                params![checkpoint_id],
+            )?;
+        }
+        transaction.execute(
+            r#"
+                DELETE FROM workspace_checkpoint_blobs
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM workspace_checkpoint_files
+                    WHERE workspace_checkpoint_files.blob_sha256 = workspace_checkpoint_blobs.blob_sha256
+                )
+            "#,
+            [],
+        )?;
+        transaction.commit()?;
+
+        Ok(WorkspaceCheckpointRecord {
+            checkpoint_id: request.checkpoint_id.clone(),
+            session_id: request.session_id.clone(),
+            run_id: request.run_id.clone(),
+            source_kind: request.source_kind.clone(),
+            source_label: request.source_label.clone(),
+            tool_name: request.tool_name.clone(),
+            proposal_id: request.proposal_id.clone(),
+            actor_principal: request.actor_principal.clone(),
+            device_id: request.device_id.clone(),
+            channel: request.channel.clone(),
+            summary_text: request.summary_text.clone(),
+            diff_summary_json: request.diff_summary_json.clone(),
+            created_at_unix_ms: now,
+            restore_count: 0,
+            last_restored_at_unix_ms: None,
+            latest_restore_report_id: None,
+        })
+    }
+
+    pub fn list_workspace_checkpoints(
+        &self,
+        filter: &WorkspaceCheckpointListFilter,
+    ) -> Result<Vec<WorkspaceCheckpointRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let limit = i64::try_from(filter.limit.unwrap_or(64).clamp(1, 256)).map_err(|_| {
+            JournalError::InvalidArgument("workspace checkpoint limit is invalid".to_owned())
+        })?;
+        let mut sql = r#"
+                SELECT
+                    checkpoint_ulid,
+                    session_ulid,
+                    run_ulid,
+                    source_kind,
+                    source_label,
+                    tool_name,
+                    proposal_id,
+                    actor_principal,
+                    device_id,
+                    channel,
+                    summary_text,
+                    diff_summary_json,
+                    created_at_unix_ms,
+                    restore_count,
+                    last_restored_at_unix_ms,
+                    latest_restore_report_ulid
+                FROM workspace_checkpoints
+            "#
+        .to_owned();
+        let mut conditions = Vec::new();
+        let mut params = Vec::<Box<dyn rusqlite::ToSql>>::new();
+        let push_condition = |conditions: &mut Vec<String>,
+                              params: &mut Vec<Box<dyn rusqlite::ToSql>>,
+                              column: &str,
+                              value: &Option<String>| {
+            if let Some(value) = value.as_ref() {
+                let placeholder = params.len() + 1;
+                conditions.push(format!("{column} = ?{placeholder}"));
+                params.push(Box::new(value.clone()));
+            }
+        };
+        push_condition(&mut conditions, &mut params, "session_ulid", &filter.session_id);
+        push_condition(&mut conditions, &mut params, "run_ulid", &filter.run_id);
+        push_condition(&mut conditions, &mut params, "device_id", &filter.device_id);
+        if !conditions.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(conditions.join(" AND ").as_str());
+        }
+        let limit_placeholder = params.len() + 1;
+        sql.push_str(
+            format!(" ORDER BY created_at_unix_ms DESC LIMIT ?{limit_placeholder}").as_str(),
+        );
+        params.push(Box::new(limit));
+
+        let mut statement = guard.prepare(sql.as_str())?;
+        let mut rows = statement.query(params_from_iter(
+            params.iter().map(|value| value.as_ref() as &dyn rusqlite::ToSql),
+        ))?;
+        let mut records = Vec::new();
+        while let Some(row) = rows.next()? {
+            records.push(WorkspaceCheckpointRecord {
+                checkpoint_id: row.get(0)?,
+                session_id: row.get(1)?,
+                run_id: row.get(2)?,
+                source_kind: row.get(3)?,
+                source_label: row.get(4)?,
+                tool_name: row.get(5)?,
+                proposal_id: row.get(6)?,
+                actor_principal: row.get(7)?,
+                device_id: row.get(8)?,
+                channel: row.get(9)?,
+                summary_text: row.get(10)?,
+                diff_summary_json: row.get(11)?,
+                created_at_unix_ms: row.get(12)?,
+                restore_count: row.get::<_, i64>(13)?.max(0) as u64,
+                last_restored_at_unix_ms: row.get(14)?,
+                latest_restore_report_id: row.get(15)?,
+            });
+        }
+        Ok(records)
+    }
+
+    pub fn get_workspace_checkpoint(
+        &self,
+        checkpoint_id: &str,
+    ) -> Result<Option<WorkspaceCheckpointRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        guard
+            .query_row(
+                r#"
+                    SELECT
+                        checkpoint_ulid,
+                        session_ulid,
+                        run_ulid,
+                        source_kind,
+                        source_label,
+                        tool_name,
+                        proposal_id,
+                        actor_principal,
+                        device_id,
+                        channel,
+                        summary_text,
+                        diff_summary_json,
+                        created_at_unix_ms,
+                        restore_count,
+                        last_restored_at_unix_ms,
+                        latest_restore_report_ulid
+                    FROM workspace_checkpoints
+                    WHERE checkpoint_ulid = ?1
+                "#,
+                params![checkpoint_id],
+                |row| {
+                    Ok(WorkspaceCheckpointRecord {
+                        checkpoint_id: row.get(0)?,
+                        session_id: row.get(1)?,
+                        run_id: row.get(2)?,
+                        source_kind: row.get(3)?,
+                        source_label: row.get(4)?,
+                        tool_name: row.get(5)?,
+                        proposal_id: row.get(6)?,
+                        actor_principal: row.get(7)?,
+                        device_id: row.get(8)?,
+                        channel: row.get(9)?,
+                        summary_text: row.get(10)?,
+                        diff_summary_json: row.get(11)?,
+                        created_at_unix_ms: row.get(12)?,
+                        restore_count: row.get::<_, i64>(13)?.max(0) as u64,
+                        last_restored_at_unix_ms: row.get(14)?,
+                        latest_restore_report_id: row.get(15)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(JournalError::from)
+    }
+
+    pub fn get_workspace_restore_report(
+        &self,
+        report_id: &str,
+    ) -> Result<Option<WorkspaceRestoreReportRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let mut statement = guard.prepare(
+            r#"
+                SELECT
+                    report_ulid,
+                    checkpoint_ulid,
+                    session_ulid,
+                    run_ulid,
+                    actor_principal,
+                    device_id,
+                    channel,
+                    scope_kind,
+                    target_path,
+                    restored_paths_json,
+                    failed_paths_json,
+                    reconciliation_summary,
+                    reconciliation_prompt,
+                    branched_session_ulid,
+                    result_state,
+                    created_at_unix_ms
+                FROM workspace_restore_reports
+                WHERE report_ulid = ?1
+                LIMIT 1
+            "#,
+        )?;
+        statement
+            .query_row(params![report_id], |row| {
+                Ok(WorkspaceRestoreReportRecord {
+                    report_id: row.get(0)?,
+                    checkpoint_id: row.get(1)?,
+                    session_id: row.get(2)?,
+                    run_id: row.get(3)?,
+                    actor_principal: row.get(4)?,
+                    device_id: row.get(5)?,
+                    channel: row.get(6)?,
+                    scope_kind: row.get(7)?,
+                    target_path: row.get(8)?,
+                    restored_paths_json: row.get(9)?,
+                    failed_paths_json: row.get(10)?,
+                    reconciliation_summary: row.get(11)?,
+                    reconciliation_prompt: row.get(12)?,
+                    branched_session_id: row.get(13)?,
+                    result_state: row.get(14)?,
+                    created_at_unix_ms: row.get(15)?,
+                })
+            })
+            .optional()
+            .map_err(JournalError::from)
+    }
+
+    pub fn list_workspace_restore_reports(
+        &self,
+        filter: &WorkspaceRestoreReportListFilter,
+    ) -> Result<Vec<WorkspaceRestoreReportRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let limit = i64::try_from(filter.limit.unwrap_or(64).clamp(1, 256)).map_err(|_| {
+            JournalError::InvalidArgument("workspace restore report limit is invalid".to_owned())
+        })?;
+        let mut sql = r#"
+                SELECT
+                    report_ulid,
+                    checkpoint_ulid,
+                    session_ulid,
+                    run_ulid,
+                    actor_principal,
+                    device_id,
+                    channel,
+                    scope_kind,
+                    target_path,
+                    restored_paths_json,
+                    failed_paths_json,
+                    reconciliation_summary,
+                    reconciliation_prompt,
+                    branched_session_ulid,
+                    result_state,
+                    created_at_unix_ms
+                FROM workspace_restore_reports
+            "#
+        .to_owned();
+        let mut conditions = Vec::new();
+        let mut params = Vec::<Box<dyn rusqlite::ToSql>>::new();
+        let push_condition = |conditions: &mut Vec<String>,
+                              params: &mut Vec<Box<dyn rusqlite::ToSql>>,
+                              column: &str,
+                              value: &Option<String>| {
+            if let Some(value) = value.as_ref() {
+                let placeholder = params.len() + 1;
+                conditions.push(format!("{column} = ?{placeholder}"));
+                params.push(Box::new(value.clone()));
+            }
+        };
+        push_condition(&mut conditions, &mut params, "checkpoint_ulid", &filter.checkpoint_id);
+        push_condition(&mut conditions, &mut params, "session_ulid", &filter.session_id);
+        push_condition(&mut conditions, &mut params, "run_ulid", &filter.run_id);
+        push_condition(&mut conditions, &mut params, "device_id", &filter.device_id);
+        if !conditions.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(conditions.join(" AND ").as_str());
+        }
+        let limit_placeholder = params.len() + 1;
+        sql.push_str(
+            format!(" ORDER BY created_at_unix_ms DESC LIMIT ?{limit_placeholder}").as_str(),
+        );
+        params.push(Box::new(limit));
+
+        let mut statement = guard.prepare(sql.as_str())?;
+        let mut rows = statement.query(params_from_iter(
+            params.iter().map(|value| value.as_ref() as &dyn rusqlite::ToSql),
+        ))?;
+        let mut records = Vec::new();
+        while let Some(row) = rows.next()? {
+            records.push(WorkspaceRestoreReportRecord {
+                report_id: row.get(0)?,
+                checkpoint_id: row.get(1)?,
+                session_id: row.get(2)?,
+                run_id: row.get(3)?,
+                actor_principal: row.get(4)?,
+                device_id: row.get(5)?,
+                channel: row.get(6)?,
+                scope_kind: row.get(7)?,
+                target_path: row.get(8)?,
+                restored_paths_json: row.get(9)?,
+                failed_paths_json: row.get(10)?,
+                reconciliation_summary: row.get(11)?,
+                reconciliation_prompt: row.get(12)?,
+                branched_session_id: row.get(13)?,
+                result_state: row.get(14)?,
+                created_at_unix_ms: row.get(15)?,
+            });
+        }
+        Ok(records)
+    }
+
+    pub fn summarize_workspace_restore_activity(
+        &self,
+        filter: &WorkspaceRestoreActivityFilter,
+    ) -> Result<WorkspaceRestoreActivitySummary, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+
+        let mut checkpoint_sql =
+            "SELECT COUNT(*), COALESCE(SUM(restore_count), 0) FROM workspace_checkpoints"
+                .to_owned();
+        let mut checkpoint_conditions = Vec::new();
+        let mut checkpoint_params = Vec::<Box<dyn rusqlite::ToSql>>::new();
+        let push_condition = |conditions: &mut Vec<String>,
+                              params: &mut Vec<Box<dyn rusqlite::ToSql>>,
+                              column: &str,
+                              value: &Option<String>| {
+            if let Some(value) = value.as_ref() {
+                let placeholder = params.len() + 1;
+                conditions.push(format!("{column} = ?{placeholder}"));
+                params.push(Box::new(value.clone()));
+            }
+        };
+        push_condition(
+            &mut checkpoint_conditions,
+            &mut checkpoint_params,
+            "session_ulid",
+            &filter.session_id,
+        );
+        push_condition(
+            &mut checkpoint_conditions,
+            &mut checkpoint_params,
+            "run_ulid",
+            &filter.run_id,
+        );
+        push_condition(
+            &mut checkpoint_conditions,
+            &mut checkpoint_params,
+            "device_id",
+            &filter.device_id,
+        );
+        if !checkpoint_conditions.is_empty() {
+            checkpoint_sql.push_str(" WHERE ");
+            checkpoint_sql.push_str(checkpoint_conditions.join(" AND ").as_str());
+        }
+        let (checkpoint_count, checkpoint_restore_total): (i64, i64) = guard.query_row(
+            checkpoint_sql.as_str(),
+            params_from_iter(
+                checkpoint_params.iter().map(|value| value.as_ref() as &dyn rusqlite::ToSql),
+            ),
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+
+        let mut report_sql = r#"
+                SELECT
+                    COUNT(*),
+                    COALESCE(SUM(CASE WHEN result_state = 'succeeded' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN result_state = 'partial_failure' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN result_state = 'failed' THEN 1 ELSE 0 END), 0)
+                FROM workspace_restore_reports
+            "#
+        .to_owned();
+        let mut report_conditions = Vec::new();
+        let mut report_params = Vec::<Box<dyn rusqlite::ToSql>>::new();
+        push_condition(
+            &mut report_conditions,
+            &mut report_params,
+            "session_ulid",
+            &filter.session_id,
+        );
+        push_condition(&mut report_conditions, &mut report_params, "run_ulid", &filter.run_id);
+        push_condition(&mut report_conditions, &mut report_params, "device_id", &filter.device_id);
+        if !report_conditions.is_empty() {
+            report_sql.push_str(" WHERE ");
+            report_sql.push_str(report_conditions.join(" AND ").as_str());
+        }
+        let (
+            restore_report_count,
+            succeeded_restore_count,
+            partial_failure_restore_count,
+            failed_restore_count,
+        ): (i64, i64, i64, i64) = guard.query_row(
+            report_sql.as_str(),
+            params_from_iter(
+                report_params.iter().map(|value| value.as_ref() as &dyn rusqlite::ToSql),
+            ),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+
+        Ok(WorkspaceRestoreActivitySummary {
+            checkpoint_count: checkpoint_count.max(0) as u64,
+            checkpoint_restore_total: checkpoint_restore_total.max(0) as u64,
+            restore_report_count: restore_report_count.max(0) as u64,
+            succeeded_restore_count: succeeded_restore_count.max(0) as u64,
+            partial_failure_restore_count: partial_failure_restore_count.max(0) as u64,
+            failed_restore_count: failed_restore_count.max(0) as u64,
+        })
+    }
+
+    pub fn list_workspace_checkpoint_files(
+        &self,
+        checkpoint_id: &str,
+    ) -> Result<Vec<WorkspaceCheckpointFileRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let mut statement = guard.prepare(
+            r#"
+                SELECT
+                    artifact_ulid,
+                    checkpoint_ulid,
+                    path,
+                    workspace_root_index,
+                    moved_from_path,
+                    change_kind,
+                    before_content_sha256,
+                    before_size_bytes,
+                    after_content_sha256,
+                    after_size_bytes,
+                    blob_sha256,
+                    content_type,
+                    is_text,
+                    preview_text,
+                    search_text,
+                    created_at_unix_ms
+                FROM workspace_checkpoint_files
+                WHERE checkpoint_ulid = ?1
+                ORDER BY path ASC
+            "#,
+        )?;
+        let mut rows = statement.query(params![checkpoint_id])?;
+        let mut files = Vec::new();
+        while let Some(row) = rows.next()? {
+            files.push(WorkspaceCheckpointFileRecord {
+                artifact_id: row.get(0)?,
+                checkpoint_id: row.get(1)?,
+                path: row.get(2)?,
+                workspace_root_index: row.get::<_, i64>(3)?.max(0) as u32,
+                moved_from_path: row.get(4)?,
+                change_kind: row.get(5)?,
+                before_content_sha256: row.get(6)?,
+                before_size_bytes: row.get::<_, Option<i64>>(7)?.map(|value| value.max(0) as u64),
+                after_content_sha256: row.get(8)?,
+                after_size_bytes: row.get::<_, Option<i64>>(9)?.map(|value| value.max(0) as u64),
+                blob_sha256: row.get(10)?,
+                content_type: row.get(11)?,
+                is_text: row.get::<_, i64>(12)? != 0,
+                preview_text: row.get(13)?,
+                search_text: row.get(14)?,
+                created_at_unix_ms: row.get(15)?,
+            });
+        }
+        Ok(files)
+    }
+
+    pub fn get_workspace_checkpoint_file_payload(
+        &self,
+        artifact_id: &str,
+    ) -> Result<Option<WorkspaceCheckpointFilePayload>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        guard
+            .query_row(
+                r#"
+                    SELECT
+                        files.artifact_ulid,
+                        files.checkpoint_ulid,
+                        files.path,
+                        files.workspace_root_index,
+                        files.moved_from_path,
+                        files.change_kind,
+                        files.before_content_sha256,
+                        files.before_size_bytes,
+                        files.after_content_sha256,
+                        files.after_size_bytes,
+                        files.blob_sha256,
+                        files.content_type,
+                        files.is_text,
+                        files.preview_text,
+                        files.search_text,
+                        files.created_at_unix_ms,
+                        blobs.content_bytes
+                    FROM workspace_checkpoint_files AS files
+                    LEFT JOIN workspace_checkpoint_blobs AS blobs
+                        ON blobs.blob_sha256 = files.blob_sha256
+                    WHERE files.artifact_ulid = ?1
+                "#,
+                params![artifact_id],
+                |row| {
+                    Ok(WorkspaceCheckpointFilePayload {
+                        file: WorkspaceCheckpointFileRecord {
+                            artifact_id: row.get(0)?,
+                            checkpoint_id: row.get(1)?,
+                            path: row.get(2)?,
+                            workspace_root_index: row.get::<_, i64>(3)?.max(0) as u32,
+                            moved_from_path: row.get(4)?,
+                            change_kind: row.get(5)?,
+                            before_content_sha256: row.get(6)?,
+                            before_size_bytes: row
+                                .get::<_, Option<i64>>(7)?
+                                .map(|value| value.max(0) as u64),
+                            after_content_sha256: row.get(8)?,
+                            after_size_bytes: row
+                                .get::<_, Option<i64>>(9)?
+                                .map(|value| value.max(0) as u64),
+                            blob_sha256: row.get(10)?,
+                            content_type: row.get(11)?,
+                            is_text: row.get::<_, i64>(12)? != 0,
+                            preview_text: row.get(13)?,
+                            search_text: row.get(14)?,
+                            created_at_unix_ms: row.get(15)?,
+                        },
+                        content_bytes: row.get(16)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(JournalError::from)
+    }
+
+    pub fn create_workspace_restore_report(
+        &self,
+        request: &WorkspaceRestoreReportCreateRequest,
+    ) -> Result<WorkspaceRestoreReportRecord, JournalError> {
+        let now = current_unix_ms()?;
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        guard.execute(
+            r#"
+                INSERT INTO workspace_restore_reports (
+                    report_ulid,
+                    checkpoint_ulid,
+                    session_ulid,
+                    run_ulid,
+                    actor_principal,
+                    device_id,
+                    channel,
+                    scope_kind,
+                    target_path,
+                    restored_paths_json,
+                    failed_paths_json,
+                    reconciliation_summary,
+                    reconciliation_prompt,
+                    branched_session_ulid,
+                    result_state,
+                    created_at_unix_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+            "#,
+            params![
+                request.report_id,
+                request.checkpoint_id,
+                request.session_id,
+                request.run_id,
+                request.actor_principal,
+                request.device_id,
+                request.channel,
+                request.scope_kind,
+                request.target_path,
+                request.restored_paths_json,
+                request.failed_paths_json,
+                request.reconciliation_summary,
+                request.reconciliation_prompt,
+                request.branched_session_id,
+                request.result_state,
+                now,
+            ],
+        )?;
+        Ok(WorkspaceRestoreReportRecord {
+            report_id: request.report_id.clone(),
+            checkpoint_id: request.checkpoint_id.clone(),
+            session_id: request.session_id.clone(),
+            run_id: request.run_id.clone(),
+            actor_principal: request.actor_principal.clone(),
+            device_id: request.device_id.clone(),
+            channel: request.channel.clone(),
+            scope_kind: request.scope_kind.clone(),
+            target_path: request.target_path.clone(),
+            restored_paths_json: request.restored_paths_json.clone(),
+            failed_paths_json: request.failed_paths_json.clone(),
+            reconciliation_summary: request.reconciliation_summary.clone(),
+            reconciliation_prompt: request.reconciliation_prompt.clone(),
+            branched_session_id: request.branched_session_id.clone(),
+            result_state: request.result_state.clone(),
+            created_at_unix_ms: now,
+        })
+    }
+
+    pub fn mark_workspace_checkpoint_restored(
+        &self,
+        request: &WorkspaceCheckpointRestoreMarkRequest,
+    ) -> Result<(), JournalError> {
+        let now = current_unix_ms()?;
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let updated = guard.execute(
+            r#"
+                UPDATE workspace_checkpoints
+                SET
+                    restore_count = restore_count + 1,
+                    last_restored_at_unix_ms = ?2,
+                    latest_restore_report_ulid = COALESCE(?3, latest_restore_report_ulid)
+                WHERE checkpoint_ulid = ?1
+            "#,
+            params![request.checkpoint_id, now, request.latest_restore_report_id],
         )?;
         if updated == 0 {
             return Err(JournalError::SessionNotFound { selector: request.checkpoint_id.clone() });
@@ -15660,5 +16719,151 @@ mod tests {
             .expect("learning preferences should load");
         assert_eq!(preferences.len(), 1);
         assert_eq!(preferences[0].value, "direct");
+    }
+
+    #[test]
+    fn workspace_restore_activity_summary_filters_by_device() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        upsert_orchestrator_session(&store, "01ARZ3NDEKTSV4RRFFQ69G5WA1");
+        upsert_orchestrator_session(&store, "01ARZ3NDEKTSV4RRFFQ69G5WA2");
+        start_orchestrator_run(&store, "01ARZ3NDEKTSV4RRFFQ69G5WA1", "01ARZ3NDEKTSV4RRFFQ69G5WB1");
+        start_orchestrator_run(&store, "01ARZ3NDEKTSV4RRFFQ69G5WA2", "01ARZ3NDEKTSV4RRFFQ69G5WB2");
+
+        store
+            .create_workspace_checkpoint(&super::WorkspaceCheckpointCreateRequest {
+                checkpoint_id: "01ARZ3NDEKTSV4RRFFQ69G5WC1".to_owned(),
+                session_id: "01ARZ3NDEKTSV4RRFFQ69G5WA1".to_owned(),
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5WB1".to_owned(),
+                source_kind: "tool_result".to_owned(),
+                source_label: "Workspace patch".to_owned(),
+                tool_name: Some("palyra.fs.apply_patch".to_owned()),
+                proposal_id: Some("01ARZ3NDEKTSV4RRFFQ69G5WD1".to_owned()),
+                actor_principal: "user:ops".to_owned(),
+                device_id: "device-alpha".to_owned(),
+                channel: Some("cli".to_owned()),
+                summary_text: "checkpoint alpha".to_owned(),
+                diff_summary_json: "{\"files\":1}".to_owned(),
+                files: vec![super::WorkspaceCheckpointFileCreateRequest {
+                    artifact_id: "01ARZ3NDEKTSV4RRFFQ69G5WE1".to_owned(),
+                    path: "src/main.rs".to_owned(),
+                    workspace_root_index: 0,
+                    moved_from_path: None,
+                    change_kind: "update".to_owned(),
+                    before_content_sha256: Some("before".to_owned()),
+                    before_size_bytes: Some(3),
+                    after_content_sha256: Some("after".to_owned()),
+                    after_size_bytes: Some(5),
+                    content_type: "text/plain; charset=utf-8".to_owned(),
+                    is_text: true,
+                    preview_text: Some("hello".to_owned()),
+                    search_text: Some("hello".to_owned()),
+                    content_bytes: Some(b"hello".to_vec()),
+                }],
+            })
+            .expect("workspace checkpoint should be created");
+        store
+            .create_workspace_restore_report(&super::WorkspaceRestoreReportCreateRequest {
+                report_id: "01ARZ3NDEKTSV4RRFFQ69G5WF1".to_owned(),
+                checkpoint_id: "01ARZ3NDEKTSV4RRFFQ69G5WC1".to_owned(),
+                session_id: "01ARZ3NDEKTSV4RRFFQ69G5WA1".to_owned(),
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5WB1".to_owned(),
+                actor_principal: "user:ops".to_owned(),
+                device_id: "device-alpha".to_owned(),
+                channel: Some("cli".to_owned()),
+                scope_kind: "workspace".to_owned(),
+                target_path: None,
+                restored_paths_json: "[\"src/main.rs\"]".to_owned(),
+                failed_paths_json: "[]".to_owned(),
+                reconciliation_summary: "restore alpha".to_owned(),
+                reconciliation_prompt: "continue from alpha".to_owned(),
+                branched_session_id: Some("01ARZ3NDEKTSV4RRFFQ69G5WG1".to_owned()),
+                result_state: "succeeded".to_owned(),
+            })
+            .expect("workspace restore report should be created");
+        store
+            .mark_workspace_checkpoint_restored(&super::WorkspaceCheckpointRestoreMarkRequest {
+                checkpoint_id: "01ARZ3NDEKTSV4RRFFQ69G5WC1".to_owned(),
+                latest_restore_report_id: Some("01ARZ3NDEKTSV4RRFFQ69G5WF1".to_owned()),
+            })
+            .expect("workspace checkpoint should mark restored");
+
+        store
+            .create_workspace_checkpoint(&super::WorkspaceCheckpointCreateRequest {
+                checkpoint_id: "01ARZ3NDEKTSV4RRFFQ69G5WC2".to_owned(),
+                session_id: "01ARZ3NDEKTSV4RRFFQ69G5WA2".to_owned(),
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5WB2".to_owned(),
+                source_kind: "tool_result".to_owned(),
+                source_label: "Workspace patch".to_owned(),
+                tool_name: Some("palyra.fs.apply_patch".to_owned()),
+                proposal_id: Some("01ARZ3NDEKTSV4RRFFQ69G5WD2".to_owned()),
+                actor_principal: "user:ops".to_owned(),
+                device_id: "device-beta".to_owned(),
+                channel: Some("cli".to_owned()),
+                summary_text: "checkpoint beta".to_owned(),
+                diff_summary_json: "{\"files\":1}".to_owned(),
+                files: vec![super::WorkspaceCheckpointFileCreateRequest {
+                    artifact_id: "01ARZ3NDEKTSV4RRFFQ69G5WE2".to_owned(),
+                    path: "src/lib.rs".to_owned(),
+                    workspace_root_index: 0,
+                    moved_from_path: None,
+                    change_kind: "create".to_owned(),
+                    before_content_sha256: None,
+                    before_size_bytes: None,
+                    after_content_sha256: Some("after-beta".to_owned()),
+                    after_size_bytes: Some(4),
+                    content_type: "text/plain; charset=utf-8".to_owned(),
+                    is_text: true,
+                    preview_text: Some("beta".to_owned()),
+                    search_text: Some("beta".to_owned()),
+                    content_bytes: Some(b"beta".to_vec()),
+                }],
+            })
+            .expect("second workspace checkpoint should be created");
+
+        let filtered = store
+            .summarize_workspace_restore_activity(&super::WorkspaceRestoreActivityFilter {
+                session_id: None,
+                run_id: None,
+                device_id: Some("device-alpha".to_owned()),
+            })
+            .expect("workspace restore activity summary should load");
+        assert_eq!(filtered.checkpoint_count, 1);
+        assert_eq!(filtered.checkpoint_restore_total, 1);
+        assert_eq!(filtered.restore_report_count, 1);
+        assert_eq!(filtered.succeeded_restore_count, 1);
+        assert_eq!(filtered.partial_failure_restore_count, 0);
+        assert_eq!(filtered.failed_restore_count, 0);
+
+        let reports = store
+            .list_workspace_restore_reports(&super::WorkspaceRestoreReportListFilter {
+                checkpoint_id: None,
+                session_id: None,
+                run_id: None,
+                device_id: Some("device-alpha".to_owned()),
+                limit: Some(8),
+            })
+            .expect("workspace restore reports should load");
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].report_id, "01ARZ3NDEKTSV4RRFFQ69G5WF1");
+
+        let checkpoint_records = store
+            .list_workspace_checkpoints(&super::WorkspaceCheckpointListFilter {
+                session_id: None,
+                run_id: None,
+                device_id: Some("device-alpha".to_owned()),
+                limit: Some(8),
+            })
+            .expect("workspace checkpoints should load");
+        assert_eq!(checkpoint_records.len(), 1);
+        assert_eq!(checkpoint_records[0].checkpoint_id, "01ARZ3NDEKTSV4RRFFQ69G5WC1");
+
+        let report = store
+            .get_workspace_restore_report("01ARZ3NDEKTSV4RRFFQ69G5WF1")
+            .expect("workspace restore report should load")
+            .expect("workspace restore report should exist");
+        assert_eq!(report.device_id, "device-alpha");
+        assert_eq!(report.result_state, "succeeded");
     }
 }

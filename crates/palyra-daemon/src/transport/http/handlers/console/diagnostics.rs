@@ -683,6 +683,7 @@ pub(crate) fn build_support_bundle_observability(state: &AppState) -> Value {
         } else {
             10_000_u32.saturating_sub(summary.failure_rate_bps)
         },
+        "workspace_restore": build_workspace_restore_observability(state),
         "last_job": latest_job.map(|job| json!({
             "job_id": job.job_id,
             "state": match job.state {
@@ -696,6 +697,118 @@ pub(crate) fn build_support_bundle_observability(state: &AppState) -> Value {
             "output_path": job.output_path,
             "error": job.error,
         })),
+    })
+}
+
+fn build_workspace_restore_observability(state: &AppState) -> Value {
+    let summary = match state.runtime.journal_store.summarize_workspace_restore_activity(
+        &crate::journal::WorkspaceRestoreActivityFilter::default(),
+    ) {
+        Ok(summary) => summary,
+        Err(error) => {
+            return json!({
+                "error": sanitize_http_error_message(error.to_string().as_str()),
+            });
+        }
+    };
+    let recent_checkpoints = match state.runtime.journal_store.list_workspace_checkpoints(
+        &crate::journal::WorkspaceCheckpointListFilter {
+            session_id: None,
+            run_id: None,
+            device_id: None,
+            limit: Some(5),
+        },
+    ) {
+        Ok(records) => records,
+        Err(error) => {
+            return json!({
+                "summary": summary,
+                "error": sanitize_http_error_message(error.to_string().as_str()),
+            });
+        }
+    };
+    let recent_restore_reports = match state.runtime.journal_store.list_workspace_restore_reports(
+        &crate::journal::WorkspaceRestoreReportListFilter {
+            checkpoint_id: None,
+            session_id: None,
+            run_id: None,
+            device_id: None,
+            limit: Some(5),
+        },
+    ) {
+        Ok(records) => records,
+        Err(error) => {
+            return json!({
+                "summary": summary,
+                "error": sanitize_http_error_message(error.to_string().as_str()),
+            });
+        }
+    };
+
+    json!({
+        "summary": summary,
+        "recent_checkpoints": recent_checkpoints
+            .into_iter()
+            .map(workspace_checkpoint_support_summary)
+            .collect::<Vec<_>>(),
+        "recent_restore_reports": recent_restore_reports
+            .into_iter()
+            .map(workspace_restore_report_support_summary)
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn workspace_checkpoint_support_summary(
+    checkpoint: crate::journal::WorkspaceCheckpointRecord,
+) -> Value {
+    json!({
+        "checkpoint_id": checkpoint.checkpoint_id,
+        "session_id": checkpoint.session_id,
+        "run_id": checkpoint.run_id,
+        "source_kind": checkpoint.source_kind,
+        "source_label": checkpoint.source_label,
+        "tool_name": checkpoint.tool_name,
+        "proposal_id": checkpoint.proposal_id,
+        "actor_principal": checkpoint.actor_principal,
+        "device_id": checkpoint.device_id,
+        "channel": checkpoint.channel,
+        "summary_text": checkpoint.summary_text,
+        "diff_summary": serde_json::from_str::<Value>(checkpoint.diff_summary_json.as_str())
+            .unwrap_or_else(|_| Value::String(checkpoint.diff_summary_json)),
+        "created_at_unix_ms": checkpoint.created_at_unix_ms,
+        "restore_count": checkpoint.restore_count,
+        "last_restored_at_unix_ms": checkpoint.last_restored_at_unix_ms,
+        "latest_restore_report_id": checkpoint.latest_restore_report_id,
+    })
+}
+
+fn workspace_restore_report_support_summary(
+    report: crate::journal::WorkspaceRestoreReportRecord,
+) -> Value {
+    let restored_path_count =
+        serde_json::from_str::<Vec<String>>(report.restored_paths_json.as_str())
+            .map(|entries| entries.len())
+            .unwrap_or_default();
+    let failed_path_count = serde_json::from_str::<Vec<Value>>(report.failed_paths_json.as_str())
+        .map(|entries| entries.len())
+        .unwrap_or_default();
+    json!({
+        "report_id": report.report_id,
+        "checkpoint_id": report.checkpoint_id,
+        "session_id": report.session_id,
+        "run_id": report.run_id,
+        "actor_principal": report.actor_principal,
+        "device_id": report.device_id,
+        "channel": report.channel,
+        "scope_kind": report.scope_kind,
+        "target_path": report.target_path,
+        "restored_path_count": restored_path_count,
+        "failed_path_count": failed_path_count,
+        "reconciliation_summary": report.reconciliation_summary,
+        "reconciliation_prompt": report.reconciliation_prompt,
+        "branched_session_id": report.branched_session_id,
+        "result_state": report.result_state,
+        "created_at_unix_ms": report.created_at_unix_ms,
     })
 }
 
