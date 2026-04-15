@@ -78,9 +78,49 @@ export interface SessionCatalogArtifactRecord {
   label: string;
 }
 
+export interface SessionProjectContextFocusRecord {
+  path: string;
+  reason: string;
+}
+
+export interface SessionProjectContextEntryRecord {
+  entry_id: string;
+  order: number;
+  path: string;
+  source_kind: string;
+  source_label: string;
+  precedence_label: string;
+  depth: number;
+  root: boolean;
+  active: boolean;
+  disabled: boolean;
+  approved: boolean;
+  status: string;
+  content_hash: string;
+  loaded_at_unix_ms: number;
+  modified_at_unix_ms?: number;
+  estimated_tokens: number;
+  discovery_reasons: string[];
+  warnings: string[];
+  preview_text: string;
+}
+
+export interface SessionProjectContextRecord {
+  generated_at_unix_ms: number;
+  active_entries: number;
+  blocked_entries: number;
+  approval_required_entries: number;
+  disabled_entries: number;
+  active_estimated_tokens: number;
+  warnings: string[];
+  focus_paths: SessionProjectContextFocusRecord[];
+  entries: SessionProjectContextEntryRecord[];
+}
+
 export interface SessionCatalogRecapRecord {
   touched_files: string[];
   active_context_files: string[];
+  project_context?: SessionProjectContextRecord;
   recent_artifacts: SessionCatalogArtifactRecord[];
   ctas: string[];
 }
@@ -176,6 +216,81 @@ export interface SessionCatalogListEnvelope {
 export interface SessionCatalogDetailEnvelope {
   contract: ContractDescriptor;
   session: SessionCatalogRecord;
+}
+
+export interface ProjectContextRiskFinding {
+  finding_id: string;
+  action: "allow" | "warning" | "approval_required" | "blocked";
+  title: string;
+  detail: string;
+  rule_id?: string;
+  matched_text?: string;
+}
+
+export interface ProjectContextRiskScan {
+  recommended_action: "allow" | "warning" | "approval_required" | "blocked";
+  score: number;
+  findings: ProjectContextRiskFinding[];
+}
+
+export interface ProjectContextFocusPath {
+  path: string;
+  reason: string;
+}
+
+export interface ProjectContextStackEntry {
+  entry_id: string;
+  order: number;
+  path: string;
+  directory: string;
+  source_kind: string;
+  source_label: string;
+  precedence_label: string;
+  depth: number;
+  root: boolean;
+  active: boolean;
+  disabled: boolean;
+  approved: boolean;
+  status: string;
+  estimated_tokens: number;
+  content_hash: string;
+  loaded_at_unix_ms: number;
+  modified_at_unix_ms?: number;
+  byte_size: number;
+  line_count: number;
+  discovery_reasons: string[];
+  warnings: string[];
+  risk: ProjectContextRiskScan;
+  preview_text: string;
+  resolved_text: string;
+}
+
+export interface ProjectContextPreviewEnvelope {
+  generated_at_unix_ms: number;
+  active_estimated_tokens: number;
+  active_entries: number;
+  blocked_entries: number;
+  approval_required_entries: number;
+  disabled_entries: number;
+  warnings: string[];
+  focus_paths: ProjectContextFocusPath[];
+  entries: ProjectContextStackEntry[];
+}
+
+export interface ProjectContextScaffoldOutcome {
+  path: string;
+  content_hash: string;
+  preview_text: string;
+  created_at_unix_ms: number;
+  overwritten: boolean;
+}
+
+export interface SessionProjectContextEnvelope {
+  contract: ContractDescriptor;
+  session: SessionCatalogRecord;
+  preview: ProjectContextPreviewEnvelope;
+  action: string;
+  scaffold?: ProjectContextScaffoldOutcome;
 }
 
 export interface UsageQueryEcho {
@@ -3146,6 +3261,65 @@ export class ConsoleApiClient {
     );
   }
 
+  async getSessionProjectContext(sessionId: string): Promise<SessionProjectContextEnvelope> {
+    return this.request(`/console/v1/sessions/${encodeURIComponent(sessionId)}/project-context`);
+  }
+
+  async refreshSessionProjectContext(sessionId: string): Promise<SessionProjectContextEnvelope> {
+    return this.request(
+      `/console/v1/sessions/${encodeURIComponent(sessionId)}/project-context/refresh`,
+      { method: "POST" },
+      { csrf: true },
+    );
+  }
+
+  async disableSessionProjectContextEntry(
+    sessionId: string,
+    entryId: string,
+  ): Promise<SessionProjectContextEnvelope> {
+    return this.request(
+      `/console/v1/sessions/${encodeURIComponent(sessionId)}/project-context/entries/${encodeURIComponent(entryId)}/disable`,
+      { method: "POST" },
+      { csrf: true },
+    );
+  }
+
+  async enableSessionProjectContextEntry(
+    sessionId: string,
+    entryId: string,
+  ): Promise<SessionProjectContextEnvelope> {
+    return this.request(
+      `/console/v1/sessions/${encodeURIComponent(sessionId)}/project-context/entries/${encodeURIComponent(entryId)}/enable`,
+      { method: "POST" },
+      { csrf: true },
+    );
+  }
+
+  async approveSessionProjectContextEntry(
+    sessionId: string,
+    entryId: string,
+  ): Promise<SessionProjectContextEnvelope> {
+    return this.request(
+      `/console/v1/sessions/${encodeURIComponent(sessionId)}/project-context/entries/${encodeURIComponent(entryId)}/approve`,
+      { method: "POST" },
+      { csrf: true },
+    );
+  }
+
+  async scaffoldSessionProjectContext(
+    sessionId: string,
+    payload: { project_name?: string; force?: boolean } = {},
+  ): Promise<SessionProjectContextEnvelope> {
+    return this.request(
+      `/console/v1/sessions/${encodeURIComponent(sessionId)}/project-context/scaffold`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      { csrf: true },
+    );
+  }
+
   async updateSessionQuickControls(
     sessionId: string,
     payload: {
@@ -3264,6 +3438,24 @@ export class ConsoleApiClient {
   ): Promise<ContextReferencePreviewEnvelope> {
     return this.request(
       `/console/v1/chat/sessions/${encodeURIComponent(sessionId)}/references/preview`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      { csrf: true },
+    );
+  }
+
+  async previewChatProjectContext(
+    sessionId: string,
+    payload: { text?: string } = {},
+  ): Promise<{
+    preview: ProjectContextPreviewEnvelope;
+    prompt_preview?: string;
+    contract: ContractDescriptor;
+  }> {
+    return this.request(
+      `/console/v1/chat/sessions/${encodeURIComponent(sessionId)}/project-context/preview`,
       {
         method: "POST",
         body: JSON.stringify(payload),

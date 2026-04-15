@@ -276,6 +276,55 @@ export function MemorySection({ app }: MemorySectionProps) {
         />
       </section>
 
+      <WorkspaceSectionCard
+        description="Project rules stay deterministic and inspectable. They are not stored as learned memory items."
+        title="Deterministic project rules"
+      >
+        <div className="workspace-stack">
+          <WorkspaceInlineNotice
+            tone="accent"
+            title="Separate context layers"
+          >
+            Put durable repository rules in <code>PALYRA.md</code>. Keep learned preferences and
+            facts in Memory. Use one-off <code>@file</code> or <code>@folder</code> references only
+            for the current prompt.
+          </WorkspaceInlineNotice>
+          <div className="workspace-inline-actions">
+            <WorkspaceStatusChip tone="accent">PALYRA.md preferred</WorkspaceStatusChip>
+            <WorkspaceStatusChip tone="default">AGENTS.md compatible</WorkspaceStatusChip>
+            <WorkspaceStatusChip tone="default">CLAUDE.md compatible</WorkspaceStatusChip>
+            <WorkspaceStatusChip tone="default">.cursorrules compatible</WorkspaceStatusChip>
+          </div>
+          <div className="workspace-stack workspace-stack--compact">
+            <p className="workspace-kicker">Recommended structure</p>
+            <pre>{`# Project summary
+
+## Goals
+- What this repo is optimizing for
+
+## Guardrails
+- Security and correctness constraints
+
+## Workflow
+- Commands, test expectations, release notes
+
+## Style
+- Naming, architecture, review expectations
+`}</pre>
+          </div>
+          <ul className="workspace-bullet-list">
+            <li>Use project rules for stable repository guidance that should always be considered.</li>
+            <li>Use Memory for learned facts, preferences, and procedures gathered from work over time.</li>
+            <li>Use prompt-scoped references when only the current turn needs extra files or folders.</li>
+          </ul>
+          <p className="chat-muted">
+            The chat inspector can create a starter <code>PALYRA.md</code> in the active workspace
+            and will show warnings when deterministic context files contain suspicious hidden or
+            override-like instructions.
+          </p>
+        </div>
+      </WorkspaceSectionCard>
+
       <section className="workspace-aside-grid">
         <div className="workspace-stack">
           <WorkspaceSectionCard

@@ -68,6 +68,7 @@ export interface ComposerAttachment {
 export interface ContextBudgetSummary {
   readonly baseline_tokens: number;
   readonly draft_tokens: number;
+  readonly project_context_tokens: number;
   readonly reference_tokens: number;
   readonly attachment_tokens: number;
   readonly estimated_total_tokens: number;
@@ -538,16 +539,22 @@ export function buildContextBudgetSummary(args: {
   baseline_tokens: number;
   draft_text: string;
   attachments: readonly ComposerAttachment[];
+  project_context_tokens?: number;
   reference_tokens?: number;
 }): ContextBudgetSummary {
   const draft_tokens = estimateTextTokens(args.draft_text);
+  const project_context_tokens = Math.max(0, args.project_context_tokens ?? 0);
   const reference_tokens = Math.max(0, args.reference_tokens ?? 0);
   const attachment_tokens = args.attachments.reduce(
     (sum, attachment) => sum + attachment.budget_tokens,
     0,
   );
   const estimated_total_tokens =
-    args.baseline_tokens + draft_tokens + reference_tokens + attachment_tokens;
+    args.baseline_tokens +
+    draft_tokens +
+    project_context_tokens +
+    reference_tokens +
+    attachment_tokens;
   const ratio = estimated_total_tokens / CONTEXT_BUDGET_HARD_LIMIT;
   const tone =
     estimated_total_tokens >= CONTEXT_BUDGET_HARD_LIMIT
@@ -565,6 +572,7 @@ export function buildContextBudgetSummary(args: {
   return {
     baseline_tokens: args.baseline_tokens,
     draft_tokens,
+    project_context_tokens,
     reference_tokens,
     attachment_tokens,
     estimated_total_tokens,

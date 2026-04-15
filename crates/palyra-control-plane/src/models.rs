@@ -578,11 +578,61 @@ pub struct SessionCatalogArtifactRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionProjectContextFocusRecord {
+    pub path: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionProjectContextEntryRecord {
+    pub entry_id: String,
+    pub order: usize,
+    pub path: String,
+    pub source_kind: String,
+    pub source_label: String,
+    pub precedence_label: String,
+    pub depth: usize,
+    pub root: bool,
+    pub active: bool,
+    pub disabled: bool,
+    pub approved: bool,
+    pub status: String,
+    pub content_hash: String,
+    pub loaded_at_unix_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modified_at_unix_ms: Option<i64>,
+    pub estimated_tokens: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discovery_reasons: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+    pub preview_text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionProjectContextRecord {
+    pub generated_at_unix_ms: i64,
+    pub active_entries: usize,
+    pub blocked_entries: usize,
+    pub approval_required_entries: usize,
+    pub disabled_entries: usize,
+    pub active_estimated_tokens: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub focus_paths: Vec<SessionProjectContextFocusRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entries: Vec<SessionProjectContextEntryRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionCatalogRecapRecord {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub touched_files: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub active_context_files: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_context: Option<SessionProjectContextRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recent_artifacts: Vec<SessionCatalogArtifactRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

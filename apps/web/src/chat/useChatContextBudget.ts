@@ -5,6 +5,10 @@ import { buildContextBudgetSummary, type ComposerAttachment } from "./chatShared
 type UseChatContextBudgetParams = {
   attachments: ComposerAttachment[];
   composerText: string;
+  projectContextPreview: {
+    active_estimated_tokens: number;
+  } | null;
+  projectContextPreviewStale: boolean;
   contextReferencePreview: {
     total_estimated_tokens: number;
   } | null;
@@ -16,6 +20,8 @@ type UseChatContextBudgetParams = {
 export function useChatContextBudget({
   attachments,
   composerText,
+  projectContextPreview,
+  projectContextPreviewStale,
   contextReferencePreview,
   contextReferencePreviewStale,
   runTotalTokens,
@@ -27,6 +33,10 @@ export function useChatContextBudget({
         baseline_tokens: Math.max(sessionTotalTokens, runTotalTokens),
         draft_text: composerText,
         attachments,
+        project_context_tokens:
+          projectContextPreview !== null && !projectContextPreviewStale
+            ? projectContextPreview.active_estimated_tokens
+            : 0,
         reference_tokens:
           contextReferencePreview !== null && !contextReferencePreviewStale
             ? contextReferencePreview.total_estimated_tokens
@@ -35,6 +45,8 @@ export function useChatContextBudget({
     [
       attachments,
       composerText,
+      projectContextPreview,
+      projectContextPreviewStale,
       contextReferencePreview,
       contextReferencePreviewStale,
       runTotalTokens,

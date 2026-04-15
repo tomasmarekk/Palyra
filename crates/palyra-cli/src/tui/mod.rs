@@ -2645,14 +2645,32 @@ impl App {
                     } else {
                         describe_branch_state_label(session.branch_state.as_str())
                     };
-                    let workspace_hint = if session.has_context_files {
-                        format!(
+                    let workspace_hint = match session.recap.project_context.as_ref() {
+                        Some(project_context) if project_context.active_entries > 0 => format!(
+                            "{} project rule{}{}",
+                            project_context.active_entries,
+                            if project_context.active_entries == 1 { "" } else { "s" },
+                            if project_context.warnings.is_empty() {
+                                String::new()
+                            } else {
+                                format!(
+                                    " · {} warning{}",
+                                    project_context.warnings.len(),
+                                    if project_context.warnings.len() == 1 { "" } else { "s" }
+                                )
+                            }
+                        ),
+                        Some(project_context) if project_context.blocked_entries > 0 => format!(
+                            "{} blocked project rule{}",
+                            project_context.blocked_entries,
+                            if project_context.blocked_entries == 1 { "" } else { "s" }
+                        ),
+                        _ if session.has_context_files => format!(
                             "{} context file{}",
                             session.recap.active_context_files.len(),
                             if session.recap.active_context_files.len() == 1 { "" } else { "s" }
-                        )
-                    } else {
-                        "no context files".to_owned()
+                        ),
+                        _ => "no project rules".to_owned(),
                     };
                     let summary = session
                         .preview

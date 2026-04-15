@@ -8,7 +8,11 @@ import {
   StatusChip,
   TextAreaField,
 } from "../console/components/ui";
-import type { ContextReferencePreviewEnvelope, RecallPreviewEnvelope } from "../consoleApi";
+import type {
+  ContextReferencePreviewEnvelope,
+  ProjectContextPreviewEnvelope,
+  RecallPreviewEnvelope,
+} from "../consoleApi";
 import type { ChatSlashSuggestion } from "./chatCommandSuggestions";
 
 import type {
@@ -52,6 +56,11 @@ type ChatComposerProps = {
     readonly errors: number;
   };
   contextBudget: ContextBudgetSummary;
+  projectContextPreview: ProjectContextPreviewEnvelope | null;
+  projectContextPreviewBusy: boolean;
+  projectContextPreviewStale: boolean;
+  projectContextPromptPreview: string | null;
+  refreshProjectContextPreview: () => void;
   contextReferencePreview: ContextReferencePreviewEnvelope | null;
   contextReferencePreviewBusy: boolean;
   contextReferencePreviewStale: boolean;
@@ -90,6 +99,11 @@ export function ChatComposer({
   acceptSlashSuggestion,
   uxMetrics,
   contextBudget,
+  projectContextPreview,
+  projectContextPreviewBusy,
+  projectContextPreviewStale,
+  projectContextPromptPreview,
+  refreshProjectContextPreview,
   contextReferencePreview,
   contextReferencePreviewBusy,
   contextReferencePreviewStale,
@@ -119,6 +133,7 @@ export function ChatComposer({
     (contextReferencePreview.references.length > 0 ||
       contextReferencePreview.errors.length > 0 ||
       contextReferencePreview.warnings.length > 0);
+  const projectContextEntryPreview = projectContextPreview?.entries.slice(0, 4) ?? [];
   const previewWorkspaceHits = recallPreview?.workspace_hits.slice(0, 2) ?? [];
   const previewMemoryHits: Record<string, unknown>[] = [];
   for (const hit of recallPreview?.memory_hits ?? []) {
@@ -154,7 +169,8 @@ export function ChatComposer({
           <strong>Context budget</strong>
           <p className="chat-muted">
             Baseline {contextBudget.baseline_tokens.toLocaleString()} tokens, draft{" "}
-            {contextBudget.draft_tokens.toLocaleString()}, references{" "}
+            {contextBudget.draft_tokens.toLocaleString()}, project context{" "}
+            {contextBudget.project_context_tokens.toLocaleString()}, references{" "}
             {contextBudget.reference_tokens.toLocaleString()}, attachments{" "}
             {contextBudget.attachment_tokens.toLocaleString()}.
           </p>
@@ -166,6 +182,101 @@ export function ChatComposer({
         <InlineNotice tone={contextBudget.tone === "danger" ? "danger" : "warning"}>
           {contextBudget.warning}
         </InlineNotice>
+      ) : null}
+
+      {previewVisible ? (
+        <div className="chat-composer__recall">
+          <div className="workspace-panel__intro">
+            <p className="workspace-kicker">Project context</p>
+            <h3>Deterministic project rules for the next prompt</h3>
+            <p className="chat-muted">
+              Prompt layer order stays explicit: deterministic project rules first, prompt-scoped
+              references second, learned recall and workspace memory after that.
+            </p>
+          </div>
+          <div className="workspace-inline-actions">
+            <StatusChip tone="default">1. Project rules</StatusChip>
+            <StatusChip tone="accent">2. @references</StatusChip>
+            <StatusChip tone="success">3. Learned recall</StatusChip>
+          </div>
+          <div className="workspace-inline-actions">
+            <StatusChip tone={projectContextPreviewBusy ? "warning" : "default"}>
+              {projectContextPreviewBusy ? "Refreshing..." : "Preview ready"}
+            </StatusChip>
+            <StatusChip
+              tone={(projectContextPreview?.active_entries ?? 0) > 0 ? "accent" : "default"}
+            >
+              {projectContextPreview?.active_entries ?? 0} active files
+            </StatusChip>
+            <StatusChip
+              tone={(projectContextPreview?.warnings.length ?? 0) > 0 ? "warning" : "default"}
+            >
+              {projectContextPreview?.warnings.length ?? 0} warnings
+            </StatusChip>
+            <StatusChip tone={projectContextPreviewStale ? "warning" : "default"}>
+              {projectContextPreviewStale ? "Draft changed" : "In sync"}
+            </StatusChip>
+            <ActionButton
+              isDisabled={projectContextPreviewBusy}
+              type="button"
+              variant="secondary"
+              onPress={refreshProjectContextPreview}
+            >
+              {projectContextPreviewBusy ? "Refreshing..." : "Refresh project context"}
+            </ActionButton>
+          </div>
+          {projectContextPreview?.warnings.map((warning, index) => (
+            <InlineNotice key={`project-context-warning-${index}`} tone="warning">
+              {warning}
+            </InlineNotice>
+          ))}
+          {projectContextPreview === null ? (
+            <p className="chat-muted">
+              No deterministic project rules are active for this session yet.
+            </p>
+          ) : (
+            <>
+              {projectContextPreview.focus_paths.length > 0 ? (
+                <div className="workspace-inline-actions">
+                  {projectContextPreview.focus_paths.map((focus) => (
+                    <StatusChip key={`${focus.reason}-${focus.path}`} tone="default">
+                      {focus.reason}: {focus.path}
+                    </StatusChip>
+                  ))}
+                </div>
+              ) : null}
+              <div className="chat-ops-list">
+                {projectContextEntryPreview.map((entry) => (
+                  <article key={entry.entry_id} className="chat-ops-card">
+                    <div className="chat-ops-card__copy">
+                      <strong>
+                        {entry.order}. {entry.path}
+                      </strong>
+                      <span>
+                        {entry.source_label} · {entry.precedence_label} ·{" "}
+                        {entry.root ? "root scope" : `depth ${entry.depth}`}
+                      </span>
+                      <p>{entry.preview_text}</p>
+                      {entry.warnings.length > 0 ? <p>{entry.warnings.join(" ")}</p> : null}
+                    </div>
+                    <div className="chat-ops-card__actions">
+                      <StatusChip tone={entry.active ? "accent" : "warning"}>
+                        {entry.status.replaceAll("_", " ")}
+                      </StatusChip>
+                      <StatusChip tone="default">{entry.content_hash.slice(0, 10)}</StatusChip>
+                      <StatusChip tone="default">
+                        {entry.estimated_tokens.toLocaleString()} tok
+                      </StatusChip>
+                    </div>
+                  </article>
+                ))}
+              </div>
+              {projectContextPromptPreview !== null ? (
+                <pre className="chat-composer__recall-preview">{projectContextPromptPreview}</pre>
+              ) : null}
+            </>
+          )}
+        </div>
       ) : null}
 
       {referencePreviewVisible ? (

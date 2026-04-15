@@ -1683,6 +1683,69 @@ export function App() {
                     {buildDesktopSessionRecap(selectedSession)}
                   </InlineNotice>
                 ) : null}
+                {selectedSession.recap.project_context !== undefined ? (
+                  <div className="desktop-stack desktop-stack--compact">
+                    <div className="desktop-inline-row">
+                      <p className="desktop-label">Project context</p>
+                      <small className="desktop-muted">
+                        {selectedSession.recap.project_context.active_estimated_tokens.toLocaleString()}{" "}
+                        est. tokens
+                      </small>
+                    </div>
+                    <div className="desktop-inline-row">
+                      <StatusChip tone="accent">
+                        {selectedSession.recap.project_context.active_entries} active
+                      </StatusChip>
+                      <StatusChip
+                        tone={
+                          selectedSession.recap.project_context.blocked_entries > 0
+                            ? "danger"
+                            : "default"
+                        }
+                      >
+                        {selectedSession.recap.project_context.blocked_entries} blocked
+                      </StatusChip>
+                      <StatusChip
+                        tone={
+                          selectedSession.recap.project_context.warnings.length > 0
+                            ? "warning"
+                            : "default"
+                        }
+                      >
+                        {selectedSession.recap.project_context.warnings.length} warnings
+                      </StatusChip>
+                    </div>
+                    {selectedSession.recap.project_context.focus_paths.length > 0 ? (
+                      <div className="desktop-stack desktop-stack--compact">
+                        <p className="desktop-label">Discovery</p>
+                        {selectedSession.recap.project_context.focus_paths.slice(0, 4).map((focus) => (
+                          <p
+                            key={`${focus.reason}:${focus.path}`}
+                            className="desktop-muted"
+                          >
+                            {focus.reason}: {focus.path}
+                          </p>
+                        ))}
+                      </div>
+                    ) : null}
+                    {selectedSession.recap.project_context.entries.slice(0, 4).map((entry) => (
+                      <article key={entry.entry_id} className="desktop-transcript-entry desktop-transcript-entry--meta">
+                        <div className="desktop-inline-row">
+                          <strong>
+                            {entry.order}. {entry.path}
+                          </strong>
+                          <small className="desktop-muted">
+                            {entry.status.replaceAll("_", " ")} · {entry.content_hash.slice(0, 10)}
+                          </small>
+                        </div>
+                        <p>{entry.preview_text}</p>
+                        {entry.warnings.length > 0 ? (
+                          <p className="desktop-muted">{entry.warnings.join(" ")}</p>
+                        ) : null}
+                      </article>
+                    ))}
+                  </div>
+                ) : null}
                 <ScrollShadow
                   className="desktop-scroll-list desktop-transcript"
                   hideScrollBar

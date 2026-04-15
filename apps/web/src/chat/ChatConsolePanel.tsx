@@ -37,11 +37,22 @@ import {
   branchCurrentSessionAction,
   createNewSessionAction,
   delegateWorkAction,
+  archiveSessionAndTranscriptAction,
   queueFollowUpTextAction,
+  resetSessionAndTranscriptAction,
   resumeSessionAction,
   retryLatestTurnAction,
+  submitComposerTurnAction,
 } from "./chatSessionActions";
+import {
+  approveProjectContextEntryAction,
+  disableProjectContextEntryAction,
+  enableProjectContextEntryAction,
+  refreshProjectContextAction,
+  scaffoldProjectContextAction,
+} from "./chatProjectContextActions";
 import { useContextReferencePreview } from "./useContextReferencePreview";
+import { useProjectContextPreview } from "./useProjectContextPreview";
 import { useRecallPreview } from "./useRecallPreview";
 import { useChatContextBudget } from "./useChatContextBudget";
 import { useChatRunStream } from "./useChatRunStream";
@@ -308,6 +319,24 @@ export function ChatConsolePanel({
     setNotice,
     updateComposerDraft,
   });
+  const inspectCompaction = (artifactId: string) =>
+    inspectCompactionDetails({
+      api,
+      artifactId,
+      upsertSession: sessions.upsertSession,
+      setDetailPanel,
+      setPhase4BusyKey,
+      setError,
+    });
+  const inspectCheckpoint = (checkpointId: string) =>
+    inspectCheckpointDetails({
+      api,
+      checkpointId,
+      upsertSession: sessions.upsertSession,
+      setDetailPanel,
+      setPhase4BusyKey,
+      setError,
+    });
   usePhase4DeepLinks({
     activeSessionId: sessions.activeSessionId,
     preferredSessionId,
@@ -317,6 +346,19 @@ export function ChatConsolePanel({
     openRunDetails,
     inspectCompaction,
     inspectCheckpoint,
+  });
+  const {
+    projectContextPreview,
+    projectContextPreviewBusy,
+    projectContextPreviewStale,
+    projectContextPromptPreview,
+    ensureProjectContextPreviewForCurrentDraft,
+    loadProjectContextPreview,
+  } = useProjectContextPreview({
+    api,
+    activeSessionId: sessions.activeSessionId,
+    composerText,
+    setError,
   });
   const {
     recallPreview,
@@ -350,6 +392,8 @@ export function ChatConsolePanel({
   const contextBudget = useChatContextBudget({
     attachments,
     composerText,
+    projectContextPreview,
+    projectContextPreviewStale,
     contextReferencePreview,
     contextReferencePreviewStale,
     runTotalTokens: runStatus?.total_tokens ?? 0,
@@ -439,80 +483,57 @@ export function ChatConsolePanel({
     resetRecallPreview,
     sessions.activeSessionId,
   ]);
-  async function resetSessionAndTranscript(): Promise<void> {
-    const resetApplied = await sessions.resetSession();
-    if (!resetApplied) {
-      return;
-    }
-    clearTranscriptState();
-    setDetailPanel(null);
-    setTranscriptSearchResults([]);
-    setAttachments([]);
-    setSessionAttachments([]);
-    setSessionDerivedArtifacts([]);
-    void refreshSessionTranscript();
-    setNotice("Session reset applied. Local transcript cleared.");
-  }
-  async function archiveSessionAndTranscript(): Promise<void> {
-    const archived = await sessions.archiveSession();
-    if (!archived) {
-      return;
-    }
-    clearTranscriptState();
-    setDetailPanel(null);
-    setTranscriptSearchResults([]);
-    setAttachments([]);
-    setSessionAttachments([]);
-    setSessionDerivedArtifacts([]);
-    setNotice("Session archived. Local transcript cleared.");
-  }
-  async function handleComposerSubmit(): Promise<void> {
-    const command = parsedSlashCommand;
-    if (command !== null) {
-      await executeSlashCommand(command);
-      return;
-    }
-    const effectiveContextReferencePreview = await ensureContextReferencePreviewForCurrentDraft();
-    if (effectiveContextReferencePreview?.errors.length) {
-      setError(effectiveContextReferencePreview.errors[0]?.message ?? "Invalid context reference.");
-      recordUxMetric("errors");
-      return;
-    }
-    const effectiveRecallPreview = await ensureRecallPreviewForCurrentDraft();
-    await createUndoCheckpoint({
-      api,
-      activeSessionId: sessions.activeSessionId,
-      transcriptRecordCount: transcriptRecords.length,
-      sessionRunCount: sessionRuns.length,
-      source: "send",
+  const resetSessionAndTranscript = async () => {
+    await resetSessionAndTranscriptAction({
+      resetSession: sessions.resetSession,
+      clearTranscriptState,
+      setDetailPanel,
+      setTranscriptSearchResults,
+      setAttachments,
+      setSessionAttachments: () => setSessionAttachments([]),
+      setSessionDerivedArtifacts: () => setSessionDerivedArtifacts([]),
       setNotice,
+    });
+    void refreshSessionTranscript();
+  };
+  const archiveSessionAndTranscript = async () =>
+    archiveSessionAndTranscriptAction({
+      archiveSession: sessions.archiveSession,
+      clearTranscriptState,
+      setDetailPanel,
+      setTranscriptSearchResults,
+      setAttachments,
+      setSessionAttachments: () => setSessionAttachments([]),
+      setSessionDerivedArtifacts: () => setSessionDerivedArtifacts([]),
+      setNotice,
+    });
+  async function handleComposerSubmit(): Promise<void> {
+    await submitComposerTurnAction({
+      parsedSlashCommand,
+      executeSlashCommand,
+      ensureProjectContextPreviewForCurrentDraft,
+      ensureContextReferencePreviewForCurrentDraft,
+      ensureRecallPreviewForCurrentDraft,
+      createUndoCheckpoint: async () => {
+        await createUndoCheckpoint({
+          api,
+          activeSessionId: sessions.activeSessionId,
+          transcriptRecordCount: transcriptRecords.length,
+          sessionRunCount: sessionRuns.length,
+          source: "send",
+          setNotice,
+          recordUxMetric,
+        });
+      },
+      sendMessage,
+      refreshSessions: () => sessions.refreshSessions(false),
+      refreshSessionTranscript,
+      refreshSlashEntityCatalogs,
+      attachments,
+      setAttachments,
+      setError,
       recordUxMetric,
     });
-    const didSend = await sendMessage(
-      async () => {
-        await Promise.all([
-          sessions.refreshSessions(false),
-          refreshSessionTranscript(),
-          refreshSlashEntityCatalogs(),
-        ]);
-      },
-      {
-        attachments: attachments.map((attachment) => ({ artifact_id: attachment.artifact_id })),
-        attachment_summaries: attachments.map((attachment) => ({
-          id: attachment.artifact_id,
-          filename: attachment.filename,
-          kind: attachment.kind,
-          size_bytes: attachment.size_bytes,
-          budget_tokens: attachment.budget_tokens,
-          preview_url: attachment.preview_url,
-        })),
-        parameter_delta: effectiveRecallPreview?.parameter_delta,
-      },
-    );
-
-    if (didSend) {
-      setAttachments([]);
-    }
   }
   async function interruptCurrentRun(raw: string): Promise<void> {
     await interruptAndMaybeRedirect({
@@ -744,48 +765,6 @@ export function ChatConsolePanel({
       setNotice,
     });
   }
-  async function pinTranscriptRecord(record: ChatTranscriptRecord): Promise<void> {
-    await pinChatTranscriptRecord({
-      api,
-      activeSessionId: sessions.activeSessionId,
-      record,
-      refreshSessionTranscript,
-      setCommandBusy,
-      setError,
-      setNotice,
-    });
-  }
-  async function deletePin(pinId: string): Promise<void> {
-    await deleteChatPin({
-      api,
-      activeSessionId: sessions.activeSessionId,
-      pinId,
-      refreshSessionTranscript,
-      setCommandBusy,
-      setError,
-      setNotice,
-    });
-  }
-  async function inspectCompaction(artifactId: string): Promise<void> {
-    await inspectCompactionDetails({
-      api,
-      artifactId,
-      upsertSession: sessions.upsertSession,
-      setDetailPanel,
-      setPhase4BusyKey,
-      setError,
-    });
-  }
-  async function inspectCheckpoint(checkpointId: string): Promise<void> {
-    await inspectCheckpointDetails({
-      api,
-      checkpointId,
-      upsertSession: sessions.upsertSession,
-      setDetailPanel,
-      setPhase4BusyKey,
-      setError,
-    });
-  }
   async function restoreCheckpoint(
     checkpointId: string,
     options?: { source?: "undo" | "checkpoint" | "inspector" },
@@ -811,6 +790,17 @@ export function ChatConsolePanel({
       source: options?.source,
     });
   }
+  const projectContextActionArgs = {
+    api,
+    sessionId: sessions.activeSessionId,
+    selectedSession: sessions.selectedSession,
+    composerText,
+    loadProjectContextPreview,
+    upsertSession: sessions.upsertSession,
+    setError,
+    setNotice,
+    setPhase4BusyKey,
+  };
   return (
     <main className="workspace-page chat-workspace">
       <input
@@ -834,18 +824,10 @@ export function ChatConsolePanel({
           attachments,
           attachmentBusy,
           canQueueFollowUp: actionableRunId !== null,
-          submitMessage: () => {
-            void handleComposerSubmit();
-          },
-          retryLast: () => {
-            void retryLatestTurn();
-          },
-          branchSession: () => {
-            void branchCurrentSession();
-          },
-          queueFollowUp: () => {
-            void queueFollowUpText(composerText);
-          },
+          submitMessage: () => void handleComposerSubmit(),
+          retryLast: () => void retryLatestTurn(),
+          branchSession: () => void branchCurrentSession(),
+          queueFollowUp: () => void queueFollowUpText(composerText),
           cancelStreaming,
           clearTranscript: () => {
             clearTranscriptState();
@@ -859,9 +841,7 @@ export function ChatConsolePanel({
               previous.filter((attachment) => attachment.local_id !== localId),
             );
           },
-          attachFiles: (files) => {
-            attachSelectedFiles(files);
-          },
+          attachFiles: attachSelectedFiles,
           showSlashPalette,
           parsedSlashCommand,
           slashCommandMatches,
@@ -874,19 +854,22 @@ export function ChatConsolePanel({
           },
           uxMetrics,
           contextBudget,
+          projectContextPreview,
+          projectContextPreviewBusy,
+          projectContextPreviewStale,
+          projectContextPromptPreview,
+          refreshProjectContextPreview: () =>
+            void loadProjectContextPreview(composerText, { reportError: true }),
           contextReferencePreview,
           contextReferencePreviewBusy,
           contextReferencePreviewStale,
-          refreshContextReferencePreview: () => {
-            void loadContextReferencePreview(composerText, { reportError: true });
-          },
+          refreshContextReferencePreview: () =>
+            void loadContextReferencePreview(composerText, { reportError: true }),
           removeContextReference,
           recallPreview,
           recallPreviewBusy,
           recallPreviewStale,
-          refreshRecallPreview: () => {
-            void loadRecallPreview(composerText, { reportError: true });
-          },
+          refreshRecallPreview: () => void loadRecallPreview(composerText, { reportError: true }),
         }}
         contextBudget={contextBudget}
         inspectorProps={buildInspectorProps({
@@ -898,6 +881,18 @@ export function ChatConsolePanel({
           selectedSessionLineage,
           sessionQuickControlPanelProps,
           contextBudgetEstimatedTokens: contextBudget.estimated_total_tokens,
+          projectContextBusy: projectContextPreviewBusy,
+          refreshProjectContext: () => refreshProjectContextAction(projectContextActionArgs),
+          disableProjectContextEntry: (entryId) => {
+            void disableProjectContextEntryAction({ ...projectContextActionArgs, entryId });
+          },
+          enableProjectContextEntry: (entryId) => {
+            void enableProjectContextEntryAction({ ...projectContextActionArgs, entryId });
+          },
+          approveProjectContextEntry: (entryId) => {
+            void approveProjectContextEntryAction({ ...projectContextActionArgs, entryId });
+          },
+          scaffoldProjectContext: () => void scaffoldProjectContextAction(projectContextActionArgs),
           transcriptBusy,
           transcriptSearchQuery,
           setTranscriptSearchQuery,
@@ -905,19 +900,31 @@ export function ChatConsolePanel({
           canSearchTranscript: deferredSearchQuery.trim().length > 0,
           sessionPins,
           searchResults: transcriptSearchResults,
-          searchTranscript: async () => {
-            await searchTranscript();
-          },
+          searchTranscript,
           exportBusy,
-          exportTranscript: async (format) => {
-            await exportTranscript(format);
-          },
+          exportTranscript,
           recentTranscriptRecords,
           pinTranscriptRecord: async (record) => {
-            await pinTranscriptRecord(record);
+            await pinChatTranscriptRecord({
+              api,
+              activeSessionId: sessions.activeSessionId,
+              record,
+              refreshSessionTranscript,
+              setCommandBusy,
+              setError,
+              setNotice,
+            });
           },
           deletePin: async (pinId) => {
-            await deletePin(pinId);
+            await deleteChatPin({
+              api,
+              activeSessionId: sessions.activeSessionId,
+              pinId,
+              refreshSessionTranscript,
+              setCommandBusy,
+              setError,
+              setNotice,
+            });
           },
           compactions,
           checkpoints,
@@ -934,18 +941,12 @@ export function ChatConsolePanel({
           runStatus,
           runTape,
           runLineage,
-          refreshRunDetails: async () => {
-            refreshRunDetails();
-          },
+          refreshRunDetails,
           closeRunDrawer,
           openBrowserSessionWorkbench,
           transcriptRecords,
-          inspectCompaction: async (artifactId) => {
-            await inspectCompaction(artifactId);
-          },
-          inspectCheckpoint: async (checkpointId) => {
-            await inspectCheckpoint(checkpointId);
-          },
+          inspectCompaction,
+          inspectCheckpoint,
           restoreCheckpoint,
           refreshSessionTranscript,
           setDetailPanel,
@@ -973,14 +974,14 @@ export function ChatConsolePanel({
           }
           openRunDetails(targetRunId);
         }}
-        onRefresh={() => {
+        onRefresh={() =>
           void Promise.all([
             sessions.refreshSessions(false),
             refreshSessionTranscript(),
             refreshObjectives(),
             refreshSlashEntityCatalogs(),
-          ]);
-        }}
+          ])
+        }
         onSetAllowSensitiveTools={setAllowSensitiveTools}
         onHideStarterPrompts={starterPromptGuidance.hideStarterPrompts}
         onShowStarterPrompts={starterPromptGuidance.showStarterPrompts}

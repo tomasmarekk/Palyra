@@ -10,10 +10,12 @@ import type { DetailPanelState, TranscriptSearchMatch } from "./ChatInspectorCol
 import { downloadTextFile, uploadComposerAttachments } from "./chatConsoleUtils";
 import {
   emptyToUndefined,
+  type ParsedSlashCommand,
   prettifyEventType,
   shortId,
   toErrorMessage,
   type ComposerAttachment,
+  type TranscriptAttachmentSummary,
   type TranscriptEntry,
 } from "./chatShared";
 
@@ -43,6 +45,18 @@ type AppendLocalEntry = (entry: TranscriptEntry) => void;
 
 type UpsertSession = (session: SessionCatalogRecord, options?: { select?: boolean }) => void;
 
+type SendComposerMessage = (
+  onComplete: () => Promise<void>,
+  options?: {
+    text?: string;
+    origin_kind?: string;
+    origin_run_id?: string;
+    parameter_delta?: JsonValue;
+    attachments?: Array<{ artifact_id: string }>;
+    attachment_summaries?: TranscriptAttachmentSummary[];
+  },
+) => Promise<boolean>;
+
 export async function createNewSessionAction(args: {
   requestedLabel?: string;
   createSessionWithLabel: CreateSessionWithLabel;
@@ -70,6 +84,112 @@ export async function createNewSessionAction(args: {
       ? `Created a fresh session: ${args.requestedLabel.trim()}.`
       : "Created a fresh session.",
   );
+}
+
+export async function resetSessionAndTranscriptAction(args: {
+  resetSession: () => Promise<boolean>;
+  clearTranscriptState: () => void;
+  setDetailPanel: SetDetailPanel;
+  setTranscriptSearchResults: SetTranscriptSearchResults;
+  setAttachments: SetAttachments;
+  setSessionAttachments: () => void;
+  setSessionDerivedArtifacts: () => void;
+  setNotice: (value: string | null) => void;
+}): Promise<void> {
+  const resetApplied = await args.resetSession();
+  if (!resetApplied) {
+    return;
+  }
+  args.clearTranscriptState();
+  args.setDetailPanel(null);
+  args.setTranscriptSearchResults([]);
+  args.setAttachments([]);
+  args.setSessionAttachments();
+  args.setSessionDerivedArtifacts();
+  args.setNotice("Session reset applied. Local transcript cleared.");
+}
+
+export async function archiveSessionAndTranscriptAction(args: {
+  archiveSession: () => Promise<boolean>;
+  clearTranscriptState: () => void;
+  setDetailPanel: SetDetailPanel;
+  setTranscriptSearchResults: SetTranscriptSearchResults;
+  setAttachments: SetAttachments;
+  setSessionAttachments: () => void;
+  setSessionDerivedArtifacts: () => void;
+  setNotice: (value: string | null) => void;
+}): Promise<void> {
+  const archived = await args.archiveSession();
+  if (!archived) {
+    return;
+  }
+  args.clearTranscriptState();
+  args.setDetailPanel(null);
+  args.setTranscriptSearchResults([]);
+  args.setAttachments([]);
+  args.setSessionAttachments();
+  args.setSessionDerivedArtifacts();
+  args.setNotice("Session archived. Local transcript cleared.");
+}
+
+export async function submitComposerTurnAction(args: {
+  parsedSlashCommand: ParsedSlashCommand | null;
+  executeSlashCommand: (command: ParsedSlashCommand) => Promise<void>;
+  ensureProjectContextPreviewForCurrentDraft: () => Promise<unknown>;
+  ensureContextReferencePreviewForCurrentDraft: () => Promise<{
+    errors: Array<{ message?: string }>;
+  } | null>;
+  ensureRecallPreviewForCurrentDraft: () => Promise<{ parameter_delta?: JsonValue } | null>;
+  createUndoCheckpoint: () => Promise<void>;
+  sendMessage: SendComposerMessage;
+  refreshSessions: () => Promise<void>;
+  refreshSessionTranscript: () => Promise<void>;
+  refreshSlashEntityCatalogs: () => Promise<void>;
+  attachments: ComposerAttachment[];
+  setAttachments: SetAttachments;
+  setError: (value: string | null) => void;
+  recordUxMetric: (metric: "errors") => void;
+}): Promise<void> {
+  const command = args.parsedSlashCommand;
+  if (command !== null) {
+    await args.executeSlashCommand(command);
+    return;
+  }
+  await args.ensureProjectContextPreviewForCurrentDraft();
+  const effectiveContextReferencePreview = await args.ensureContextReferencePreviewForCurrentDraft();
+  if (effectiveContextReferencePreview?.errors.length) {
+    args.setError(
+      effectiveContextReferencePreview.errors[0]?.message ?? "Invalid context reference.",
+    );
+    args.recordUxMetric("errors");
+    return;
+  }
+  const effectiveRecallPreview = await args.ensureRecallPreviewForCurrentDraft();
+  await args.createUndoCheckpoint();
+  const didSend = await args.sendMessage(
+    async () => {
+      await Promise.all([
+        args.refreshSessions(),
+        args.refreshSessionTranscript(),
+        args.refreshSlashEntityCatalogs(),
+      ]);
+    },
+    {
+      attachments: args.attachments.map((attachment) => ({ artifact_id: attachment.artifact_id })),
+      attachment_summaries: args.attachments.map((attachment) => ({
+        id: attachment.artifact_id,
+        filename: attachment.filename,
+        kind: attachment.kind,
+        size_bytes: attachment.size_bytes,
+        budget_tokens: attachment.budget_tokens,
+        preview_url: attachment.preview_url,
+      })),
+      parameter_delta: effectiveRecallPreview?.parameter_delta,
+    },
+  );
+  if (didSend) {
+    args.setAttachments([]);
+  }
 }
 
 export function resumeSessionAction(args: {

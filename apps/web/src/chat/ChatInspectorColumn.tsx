@@ -65,6 +65,12 @@ type ChatInspectorColumnProps = {
   selectedSessionLineage: string;
   sessionQuickControlPanelProps: ComponentProps<typeof ChatSessionQuickControlPanel>;
   contextBudgetEstimatedTokens: number;
+  projectContextBusy: boolean;
+  refreshProjectContext: () => void;
+  disableProjectContextEntry: (entryId: string) => void;
+  enableProjectContextEntry: (entryId: string) => void;
+  approveProjectContextEntry: (entryId: string) => void;
+  scaffoldProjectContext: () => void;
   transcriptBusy: boolean;
   transcriptSearchQuery: string;
   setTranscriptSearchQuery: (value: string) => void;
@@ -117,6 +123,12 @@ export function ChatInspectorColumn({
   selectedSessionLineage,
   sessionQuickControlPanelProps,
   contextBudgetEstimatedTokens,
+  projectContextBusy,
+  refreshProjectContext,
+  disableProjectContextEntry,
+  enableProjectContextEntry,
+  approveProjectContextEntry,
+  scaffoldProjectContext,
   transcriptBusy,
   transcriptSearchQuery,
   setTranscriptSearchQuery,
@@ -159,6 +171,7 @@ export function ChatInspectorColumn({
 }: ChatInspectorColumnProps) {
   const phase4Busy = phase4BusyKey !== null;
   const browserSessionIds = extractBrowserSessionIds(runTape);
+  const sessionProjectContext = selectedSession?.recap.project_context ?? null;
 
   return (
     <div className="chat-inspector-column">
@@ -261,7 +274,141 @@ export function ChatInspectorColumn({
                 </ul>
               </div>
             ) : null}
-            {selectedSession.recap.active_context_files.length > 0 ? (
+            {sessionProjectContext !== null ? (
+              <div className="chat-ops-list">
+                <div className="workspace-panel__intro">
+                  <p className="workspace-kicker">Deterministic project context</p>
+                  <h3>{sessionProjectContext.active_entries} active project rules</h3>
+                  <p className="chat-muted">
+                    These files are deterministic project rules. They stay separate from learned
+                    memory and one-off `@file` references.
+                  </p>
+                </div>
+                <div className="workspace-inline-actions">
+                  <Chip
+                    color={sessionProjectContext.active_entries > 0 ? "accent" : "default"}
+                    variant="soft"
+                  >
+                    {sessionProjectContext.active_entries} active
+                  </Chip>
+                  <Chip
+                    color={
+                      sessionProjectContext.approval_required_entries > 0 ? "warning" : "default"
+                    }
+                    variant="soft"
+                  >
+                    {sessionProjectContext.approval_required_entries} approvals
+                  </Chip>
+                  <Chip
+                    color={sessionProjectContext.blocked_entries > 0 ? "danger" : "default"}
+                    variant="soft"
+                  >
+                    {sessionProjectContext.blocked_entries} blocked
+                  </Chip>
+                  <Chip
+                    color={sessionProjectContext.warnings.length > 0 ? "warning" : "default"}
+                    variant="soft"
+                  >
+                    {sessionProjectContext.warnings.length} warnings
+                  </Chip>
+                </div>
+                <ActionCluster>
+                  <ActionButton
+                    isDisabled={projectContextBusy || phase4Busy}
+                    size="sm"
+                    type="button"
+                    variant="secondary"
+                    onPress={refreshProjectContext}
+                  >
+                    {projectContextBusy ? "Refreshing..." : "Refresh project context"}
+                  </ActionButton>
+                  <ActionButton
+                    isDisabled={projectContextBusy || phase4Busy}
+                    size="sm"
+                    type="button"
+                    variant="secondary"
+                    onPress={scaffoldProjectContext}
+                  >
+                    Create PALYRA.md
+                  </ActionButton>
+                </ActionCluster>
+                {selectedSession.recap.active_context_files.length > 0 ? (
+                  <ul className="workspace-bullet-list">
+                    {selectedSession.recap.active_context_files.slice(0, 5).map((file) => (
+                      <li key={file}>{file}</li>
+                    ))}
+                  </ul>
+                ) : null}
+                {sessionProjectContext.focus_paths.length > 0 ? (
+                  <ul className="workspace-bullet-list">
+                    {sessionProjectContext.focus_paths.slice(0, 4).map((focus) => (
+                      <li key={`${focus.reason}-${focus.path}`}>
+                        {focus.reason}: {focus.path}
+                      </li>
+                    ))}
+                  </ul>
+                ) : null}
+                {sessionProjectContext.warnings.map((warning, index) => (
+                  <p key={`project-context-warning-${index}`} className="chat-muted">
+                    {warning}
+                  </p>
+                ))}
+                {sessionProjectContext.entries.slice(0, 4).map((entry) => (
+                  <article key={entry.entry_id} className="chat-ops-card">
+                    <div className="chat-ops-card__copy">
+                      <strong>
+                        {entry.order}. {entry.path}
+                      </strong>
+                      <span>
+                        {entry.source_label} · {entry.precedence_label} ·{" "}
+                        {entry.root ? "root scope" : `depth ${entry.depth}`}
+                      </span>
+                      <p>{entry.preview_text}</p>
+                      {entry.warnings.length > 0 ? <p>{entry.warnings.join(" ")}</p> : null}
+                    </div>
+                    <div className="chat-ops-card__actions">
+                      <Chip color={entry.active ? "accent" : "warning"} variant="soft">
+                        {entry.status.replaceAll("_", " ")}
+                      </Chip>
+                      <Chip variant="soft">{entry.content_hash.slice(0, 10)}</Chip>
+                      <Chip variant="soft">{entry.estimated_tokens.toLocaleString()} tok</Chip>
+                      {entry.disabled ? (
+                        <ActionButton
+                          isDisabled={projectContextBusy || phase4Busy}
+                          size="sm"
+                          type="button"
+                          variant="secondary"
+                          onPress={() => enableProjectContextEntry(entry.entry_id)}
+                        >
+                          Enable
+                        </ActionButton>
+                      ) : (
+                        <ActionButton
+                          isDisabled={projectContextBusy || phase4Busy}
+                          size="sm"
+                          type="button"
+                          variant="secondary"
+                          onPress={() => disableProjectContextEntry(entry.entry_id)}
+                        >
+                          Disable
+                        </ActionButton>
+                      )}
+                      {entry.status === "approval_required" ? (
+                        <ActionButton
+                          isDisabled={projectContextBusy || phase4Busy}
+                          size="sm"
+                          type="button"
+                          variant="primary"
+                          onPress={() => approveProjectContextEntry(entry.entry_id)}
+                        >
+                          Approve
+                        </ActionButton>
+                      ) : null}
+                    </div>
+                  </article>
+                ))}
+              </div>
+            ) : selectedSession.recap.active_context_files.length > 0 ? (
               <div>
                 <p className="workspace-kicker">Active context</p>
                 <ul className="workspace-bullet-list">

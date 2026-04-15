@@ -27,6 +27,12 @@ interface BuildInspectorPropsArgs {
   readonly selectedSessionLineage: InspectorProps["selectedSessionLineage"];
   readonly sessionQuickControlPanelProps: InspectorProps["sessionQuickControlPanelProps"];
   readonly contextBudgetEstimatedTokens: InspectorProps["contextBudgetEstimatedTokens"];
+  readonly projectContextBusy: InspectorProps["projectContextBusy"];
+  readonly refreshProjectContext: InspectorProps["refreshProjectContext"];
+  readonly disableProjectContextEntry: InspectorProps["disableProjectContextEntry"];
+  readonly enableProjectContextEntry: InspectorProps["enableProjectContextEntry"];
+  readonly approveProjectContextEntry: InspectorProps["approveProjectContextEntry"];
+  readonly scaffoldProjectContext: InspectorProps["scaffoldProjectContext"];
   readonly transcriptBusy: InspectorProps["transcriptBusy"];
   readonly transcriptSearchQuery: InspectorProps["transcriptSearchQuery"];
   readonly setTranscriptSearchQuery: InspectorProps["setTranscriptSearchQuery"];
@@ -81,6 +87,12 @@ export function buildInspectorProps({
   selectedSessionLineage,
   sessionQuickControlPanelProps,
   contextBudgetEstimatedTokens,
+  projectContextBusy,
+  refreshProjectContext,
+  disableProjectContextEntry,
+  enableProjectContextEntry,
+  approveProjectContextEntry,
+  scaffoldProjectContext,
   transcriptBusy,
   transcriptSearchQuery,
   setTranscriptSearchQuery,
@@ -130,6 +142,12 @@ export function buildInspectorProps({
     selectedSessionLineage,
     sessionQuickControlPanelProps,
     contextBudgetEstimatedTokens,
+    projectContextBusy,
+    refreshProjectContext,
+    disableProjectContextEntry,
+    enableProjectContextEntry,
+    approveProjectContextEntry,
+    scaffoldProjectContext,
     transcriptBusy,
     transcriptSearchQuery,
     setTranscriptSearchQuery,

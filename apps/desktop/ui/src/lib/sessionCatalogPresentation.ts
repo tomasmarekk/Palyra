@@ -26,7 +26,10 @@ export function buildDesktopSessionListBadges(
     });
   }
   if (session.has_context_files) {
-    badges.push({ label: "context", tone: "accent" });
+    badges.push({ label: "project rules", tone: "accent" });
+  }
+  if ((session.recap.project_context?.warnings.length ?? 0) > 0) {
+    badges.push({ label: "context warning", tone: "warning" });
   }
   if (session.quick_controls.model.override_active) {
     badges.push({
@@ -66,7 +69,7 @@ export function buildDesktopSessionDetailBadges(
     },
     {
       label: session.has_context_files
-        ? `${session.recap.active_context_files.length || 1} context`
+        ? `${session.recap.project_context?.active_entries ?? (session.recap.active_context_files.length || 1)} project rules`
         : "no context",
       tone: session.has_context_files ? "accent" : "default",
     },
@@ -104,7 +107,12 @@ export function buildDesktopSessionDetailItems(
     {
       label: "Context",
       value:
-        session.last_context_file ?? (session.has_context_files ? "active files attached" : "none"),
+        session.last_context_file ??
+        (session.recap.project_context !== undefined
+          ? `${session.recap.project_context.active_entries} active deterministic rules`
+          : session.has_context_files
+            ? "active files attached"
+            : "none"),
     },
     {
       label: "Artifacts",
@@ -126,7 +134,14 @@ export function buildDesktopSessionRecap(session: SessionCatalogRecord): string 
     segments.push(`Touched files: ${session.recap.touched_files.slice(0, 3).join(", ")}`);
   }
   if (session.recap.active_context_files.length > 0) {
-    segments.push(`Active context: ${session.recap.active_context_files.slice(0, 2).join(", ")}`);
+    segments.push(
+      `Project rules: ${session.recap.active_context_files.slice(0, 2).join(", ")}`,
+    );
+  }
+  if ((session.recap.project_context?.warnings.length ?? 0) > 0) {
+    segments.push(
+      `Context warnings: ${session.recap.project_context?.warnings.slice(0, 2).join(", ")}`,
+    );
   }
   if (session.recap.ctas.length > 0) {
     segments.push(`Next steps: ${session.recap.ctas.slice(0, 2).join(", ")}`);

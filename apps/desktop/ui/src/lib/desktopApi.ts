@@ -83,9 +83,49 @@ export type SessionCatalogArtifactRecord = {
   label: string;
 };
 
+export type SessionProjectContextFocusRecord = {
+  path: string;
+  reason: string;
+};
+
+export type SessionProjectContextEntryRecord = {
+  entry_id: string;
+  order: number;
+  path: string;
+  source_kind: string;
+  source_label: string;
+  precedence_label: string;
+  depth: number;
+  root: boolean;
+  active: boolean;
+  disabled: boolean;
+  approved: boolean;
+  status: string;
+  content_hash: string;
+  loaded_at_unix_ms: number;
+  modified_at_unix_ms?: number;
+  estimated_tokens: number;
+  discovery_reasons: string[];
+  warnings: string[];
+  preview_text: string;
+};
+
+export type SessionProjectContextRecord = {
+  generated_at_unix_ms: number;
+  active_entries: number;
+  blocked_entries: number;
+  approval_required_entries: number;
+  disabled_entries: number;
+  active_estimated_tokens: number;
+  warnings: string[];
+  focus_paths: SessionProjectContextFocusRecord[];
+  entries: SessionProjectContextEntryRecord[];
+};
+
 export type SessionCatalogRecapRecord = {
   touched_files: string[];
   active_context_files: string[];
+  project_context?: SessionProjectContextRecord;
   recent_artifacts: SessionCatalogArtifactRecord[];
   ctas: string[];
 };

@@ -92,6 +92,11 @@ describe("Chat web UX primitives", () => {
           draft_text: "Inspect backlog after deploy and summarize the risky items.",
           attachments: [attachment],
         })}
+        projectContextPreview={null}
+        projectContextPreviewBusy={false}
+        projectContextPreviewStale={false}
+        projectContextPromptPreview={null}
+        refreshProjectContextPreview={vi.fn()}
         contextReferencePreview={null}
         contextReferencePreviewBusy={false}
         contextReferencePreviewStale={false}
@@ -532,6 +537,11 @@ function baseComposerProps(): ComponentProps<typeof ChatComposer> {
       draft_text: "",
       attachments: [],
     }),
+    projectContextPreview: null,
+    projectContextPreviewBusy: false,
+    projectContextPreviewStale: false,
+    projectContextPromptPreview: null,
+    refreshProjectContextPreview: vi.fn(),
     contextReferencePreview: null,
     contextReferencePreviewBusy: false,
     contextReferencePreviewStale: false,
@@ -566,6 +576,12 @@ function baseInspectorProps() {
       onReset: vi.fn(),
     },
     contextBudgetEstimatedTokens: 900,
+    projectContextBusy: false,
+    refreshProjectContext: vi.fn(),
+    disableProjectContextEntry: vi.fn(),
+    enableProjectContextEntry: vi.fn(),
+    approveProjectContextEntry: vi.fn(),
+    scaffoldProjectContext: vi.fn(),
     transcriptBusy: false,
     transcriptSearchQuery: "",
     setTranscriptSearchQuery: vi.fn(),
