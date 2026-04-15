@@ -1057,7 +1057,13 @@ async fn load_session_catalog_context(
 
     let workspace_by_session = load_session_workspace_summaries(state, context).await?;
     let project_context_by_session =
-        load_session_project_context_summaries(state, context, base_sessions).await?;
+        crate::application::project_context_summary::load_project_context_summaries(
+            &state.runtime,
+            context,
+            base_sessions,
+        )
+        .await
+        .map_err(runtime_status_response)?;
     let (bindings_by_session, agents_by_id, default_agent_id) =
         load_session_agent_metadata(state, context).await?;
     let family_by_session = build_session_family_metadata(base_sessions);
@@ -1110,39 +1116,6 @@ async fn load_session_workspace_summaries(
             )
         })
         .collect())
-}
-
-async fn load_session_project_context_summaries(
-    state: &AppState,
-    context: &gateway::RequestContext,
-    sessions: &[journal::OrchestratorSessionRecord],
-) -> Result<
-    HashMap<String, crate::application::project_context::ProjectContextPreviewEnvelope>,
-    Response,
-> {
-    let mut previews = HashMap::new();
-    for session in sessions {
-        let preview = crate::application::project_context::preview_project_context(
-            &state.runtime,
-            context,
-            session.session_id.as_str(),
-            "",
-            false,
-        )
-        .await;
-        match preview {
-            Ok(preview) => {
-                previews.insert(session.session_id.clone(), preview);
-            }
-            Err(status)
-                if matches!(
-                    status.code(),
-                    tonic::Code::FailedPrecondition | tonic::Code::NotFound
-                ) => {}
-            Err(status) => return Err(runtime_status_response(status)),
-        }
-    }
-    Ok(previews)
 }
 
 async fn load_session_agent_metadata(
