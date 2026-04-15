@@ -15,8 +15,14 @@ pub(crate) async fn load_project_context_summaries(
 ) -> Result<HashMap<String, ProjectContextPreviewEnvelope>, Status> {
     let mut previews = HashMap::new();
     for session in sessions {
-        match preview_project_context(runtime_state, context, session.session_id.as_str(), "", false)
-            .await
+        match preview_project_context(
+            runtime_state,
+            context,
+            session.session_id.as_str(),
+            "",
+            false,
+        )
+        .await
         {
             Ok(preview) => {
                 previews.insert(session.session_id.clone(), preview);
