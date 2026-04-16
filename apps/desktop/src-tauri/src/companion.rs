@@ -7,8 +7,9 @@ use std::sync::{Arc, Mutex};
 
 use super::companion_console::fetch_companion_console_data;
 use super::desktop_state::{
-    DesktopCompanionNotificationKind, DesktopCompanionOfflineDraft, DesktopCompanionRolloutState,
-    DesktopCompanionSection,
+    DesktopCompanionAmbientState, DesktopCompanionNotificationKind, DesktopCompanionOfflineDraft,
+    DesktopCompanionRolloutState, DesktopCompanionSection, DesktopCompanionSurfaceMode,
+    DesktopCompanionVoiceAuditEntry, DesktopCompanionVoiceState, DesktopVoiceLifecycleState,
 };
 use super::onboarding::{DesktopRefreshPayload, OnboardingStatusInputs};
 use super::snapshot::{
@@ -41,10 +42,66 @@ pub(crate) struct DesktopCompanionPreferencesSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub(crate) struct DesktopCompanionAmbientSnapshot {
+    pub(crate) start_on_login_enabled: bool,
+    pub(crate) global_hotkey_enabled: bool,
+    pub(crate) global_hotkey: String,
+    pub(crate) hotkey_registration_error: Option<String>,
+    pub(crate) last_surface: DesktopCompanionSurfaceMode,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct DesktopCompanionVoiceAuditEntrySnapshot {
+    pub(crate) audit_id: String,
+    pub(crate) kind: String,
+    pub(crate) detail: String,
+    pub(crate) created_at_unix_ms: i64,
+    pub(crate) session_id: Option<String>,
+    pub(crate) remote_processing: bool,
+    pub(crate) tts_playback: bool,
+    pub(crate) input_device_label: Option<String>,
+    pub(crate) output_voice_label: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct DesktopCompanionVoiceSnapshot {
+    pub(crate) lifecycle_state: DesktopVoiceLifecycleState,
+    pub(crate) capture_consent_granted_at_unix_ms: Option<i64>,
+    pub(crate) tts_consent_granted_at_unix_ms: Option<i64>,
+    pub(crate) microphone_permission_state: String,
+    pub(crate) microphone_device_id: Option<String>,
+    pub(crate) microphone_device_label: Option<String>,
+    pub(crate) tts_voice_uri: Option<String>,
+    pub(crate) tts_voice_label: Option<String>,
+    pub(crate) tts_muted: bool,
+    pub(crate) silence_detection_enabled: bool,
+    pub(crate) silence_timeout_ms: u64,
+    pub(crate) draft_session_id: Option<String>,
+    pub(crate) draft_text: Option<String>,
+    pub(crate) draft_summary: Option<String>,
+    pub(crate) draft_language: Option<String>,
+    pub(crate) draft_duration_ms: Option<u64>,
+    pub(crate) last_error: Option<String>,
+    pub(crate) audit_log: Vec<DesktopCompanionVoiceAuditEntrySnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct DesktopCompanionActiveRunSnapshot {
+    pub(crate) session_id: String,
+    pub(crate) session_title: String,
+    pub(crate) run_id: String,
+    pub(crate) status: String,
+    pub(crate) started_at_unix_ms: Option<i64>,
+    pub(crate) pending_approvals: usize,
+    pub(crate) preview: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct DesktopCompanionMetrics {
     pub(crate) unread_notifications: usize,
     pub(crate) pending_approvals: usize,
     pub(crate) queued_offline_drafts: usize,
+    pub(crate) active_runs: usize,
     pub(crate) active_sessions: usize,
     pub(crate) sessions_with_active_runs: usize,
     pub(crate) trusted_devices: usize,
@@ -93,8 +150,11 @@ pub(crate) struct DesktopCompanionSnapshot {
     pub(crate) connection_state: String,
     pub(crate) rollout: DesktopCompanionRolloutState,
     pub(crate) preferences: DesktopCompanionPreferencesSnapshot,
+    pub(crate) ambient: DesktopCompanionAmbientSnapshot,
+    pub(crate) voice: DesktopCompanionVoiceSnapshot,
     pub(crate) notifications: Vec<super::desktop_state::DesktopCompanionNotification>,
     pub(crate) offline_drafts: Vec<DesktopCompanionOfflineDraft>,
+    pub(crate) active_runs: Vec<DesktopCompanionActiveRunSnapshot>,
     pub(crate) session_catalog: Vec<control_plane::SessionCatalogRecord>,
     pub(crate) session_summary: Option<control_plane::SessionCatalogSummary>,
     pub(crate) approvals: Vec<Value>,
@@ -118,9 +178,26 @@ pub(crate) struct DesktopCompanionPreferencesRequest {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct DesktopCompanionAmbientRequest {
+    #[serde(default)]
+    pub(crate) start_on_login_enabled: Option<bool>,
+    #[serde(default)]
+    pub(crate) global_hotkey_enabled: Option<bool>,
+    #[serde(default)]
+    pub(crate) global_hotkey: Option<String>,
+    #[serde(default)]
+    pub(crate) clear_hotkey_registration_error: bool,
+    #[serde(default)]
+    pub(crate) last_surface: Option<DesktopCompanionSurfaceMode>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct DesktopCompanionRolloutRequest {
     #[serde(default)]
     pub(crate) companion_shell_enabled: Option<bool>,
+    #[serde(default)]
+    pub(crate) ambient_companion_enabled: Option<bool>,
     #[serde(default)]
     pub(crate) desktop_notifications_enabled: Option<bool>,
     #[serde(default)]
@@ -128,9 +205,66 @@ pub(crate) struct DesktopCompanionRolloutRequest {
     #[serde(default)]
     pub(crate) voice_capture_enabled: Option<bool>,
     #[serde(default)]
+    pub(crate) voice_overlay_enabled: Option<bool>,
+    #[serde(default)]
+    pub(crate) voice_silence_detection_enabled: Option<bool>,
+    #[serde(default)]
     pub(crate) tts_playback_enabled: Option<bool>,
     #[serde(default)]
     pub(crate) release_channel: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DesktopCompanionVoiceStateRequest {
+    #[serde(default)]
+    pub(crate) capture_consent_granted: Option<bool>,
+    #[serde(default)]
+    pub(crate) tts_consent_granted: Option<bool>,
+    #[serde(default)]
+    pub(crate) microphone_permission_state: Option<String>,
+    #[serde(default)]
+    pub(crate) microphone_device_id: Option<String>,
+    #[serde(default)]
+    pub(crate) microphone_device_label: Option<String>,
+    #[serde(default)]
+    pub(crate) tts_voice_uri: Option<String>,
+    #[serde(default)]
+    pub(crate) tts_voice_label: Option<String>,
+    #[serde(default)]
+    pub(crate) tts_muted: Option<bool>,
+    #[serde(default)]
+    pub(crate) silence_detection_enabled: Option<bool>,
+    #[serde(default)]
+    pub(crate) silence_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub(crate) lifecycle_state: Option<DesktopVoiceLifecycleState>,
+    #[serde(default)]
+    pub(crate) draft_session_id: Option<String>,
+    #[serde(default)]
+    pub(crate) draft_text: Option<String>,
+    #[serde(default)]
+    pub(crate) draft_summary: Option<String>,
+    #[serde(default)]
+    pub(crate) draft_language: Option<String>,
+    #[serde(default)]
+    pub(crate) draft_duration_ms: Option<u64>,
+    #[serde(default)]
+    pub(crate) last_error: Option<String>,
+    #[serde(default)]
+    pub(crate) clear_draft: bool,
+    #[serde(default)]
+    pub(crate) clear_error: bool,
+    #[serde(default)]
+    pub(crate) audit_kind: Option<String>,
+    #[serde(default)]
+    pub(crate) audit_detail: Option<String>,
+    #[serde(default)]
+    pub(crate) audit_session_id: Option<String>,
+    #[serde(default)]
+    pub(crate) audit_remote_processing: Option<bool>,
+    #[serde(default)]
+    pub(crate) audit_tts_playback: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -421,6 +555,29 @@ impl ControlCenter {
         self.save_state_file()
     }
 
+    pub(crate) fn update_companion_ambient(
+        &mut self,
+        payload: &DesktopCompanionAmbientRequest,
+    ) -> Result<()> {
+        let companion = self.persisted.active_companion_mut();
+        if let Some(enabled) = payload.start_on_login_enabled {
+            companion.ambient.start_on_login_enabled = enabled;
+        }
+        if let Some(enabled) = payload.global_hotkey_enabled {
+            companion.ambient.global_hotkey_enabled = enabled;
+        }
+        if payload.global_hotkey.is_some() {
+            companion.set_global_hotkey(payload.global_hotkey.as_deref());
+        }
+        if payload.clear_hotkey_registration_error {
+            companion.set_hotkey_registration_error(None);
+        }
+        if let Some(surface) = payload.last_surface {
+            companion.set_last_surface(surface);
+        }
+        self.save_state_file()
+    }
+
     pub(crate) fn update_companion_rollout(
         &mut self,
         payload: &DesktopCompanionRolloutRequest,
@@ -428,6 +585,9 @@ impl ControlCenter {
         let rollout = &mut self.persisted.active_companion_mut().rollout;
         if let Some(enabled) = payload.companion_shell_enabled {
             rollout.companion_shell_enabled = enabled;
+        }
+        if let Some(enabled) = payload.ambient_companion_enabled {
+            rollout.ambient_companion_enabled = enabled;
         }
         if let Some(enabled) = payload.desktop_notifications_enabled {
             rollout.desktop_notifications_enabled = enabled;
@@ -438,6 +598,12 @@ impl ControlCenter {
         if let Some(enabled) = payload.voice_capture_enabled {
             rollout.voice_capture_enabled = enabled;
         }
+        if let Some(enabled) = payload.voice_overlay_enabled {
+            rollout.voice_overlay_enabled = enabled;
+        }
+        if let Some(enabled) = payload.voice_silence_detection_enabled {
+            rollout.voice_silence_detection_enabled = enabled;
+        }
         if let Some(enabled) = payload.tts_playback_enabled {
             rollout.tts_playback_enabled = enabled;
         }
@@ -445,6 +611,135 @@ impl ControlCenter {
             payload.release_channel.as_deref().and_then(normalize_optional_text)
         {
             rollout.release_channel = release_channel.to_owned();
+        }
+        self.save_state_file()
+    }
+
+    pub(crate) fn update_companion_voice_state(
+        &mut self,
+        payload: &DesktopCompanionVoiceStateRequest,
+    ) -> Result<()> {
+        let companion = self.persisted.active_companion_mut();
+        let now_unix_ms = unix_ms_now();
+        if payload.capture_consent_granted == Some(true) {
+            companion.grant_voice_capture_consent(now_unix_ms);
+        }
+        if payload.capture_consent_granted == Some(false) {
+            companion.voice.capture_consent_granted_at_unix_ms = None;
+        }
+        if payload.tts_consent_granted == Some(true) {
+            companion.grant_tts_consent(now_unix_ms);
+        }
+        if payload.tts_consent_granted == Some(false) {
+            companion.voice.tts_consent_granted_at_unix_ms = None;
+        }
+        if let Some(value) = payload
+            .microphone_permission_state
+            .as_deref()
+            .and_then(normalize_optional_text)
+        {
+            companion.voice.microphone_permission_state = value.to_owned();
+        }
+        if payload.microphone_device_id.is_some() {
+            companion.voice.microphone_device_id = payload
+                .microphone_device_id
+                .as_deref()
+                .and_then(normalize_optional_text)
+                .map(str::to_owned);
+        }
+        if payload.microphone_device_label.is_some() {
+            companion.voice.microphone_device_label = payload
+                .microphone_device_label
+                .as_deref()
+                .and_then(normalize_optional_text)
+                .map(str::to_owned);
+        }
+        if payload.tts_voice_uri.is_some() {
+            companion.voice.tts_voice_uri = payload
+                .tts_voice_uri
+                .as_deref()
+                .and_then(normalize_optional_text)
+                .map(str::to_owned);
+        }
+        if payload.tts_voice_label.is_some() {
+            companion.voice.tts_voice_label = payload
+                .tts_voice_label
+                .as_deref()
+                .and_then(normalize_optional_text)
+                .map(str::to_owned);
+        }
+        if let Some(value) = payload.tts_muted {
+            companion.voice.tts_muted = value;
+        }
+        if let Some(value) = payload.silence_detection_enabled {
+            companion.voice.silence_detection_enabled = value;
+        }
+        if let Some(value) = payload.silence_timeout_ms.filter(|value| *value > 0) {
+            companion.voice.silence_timeout_ms = value;
+        }
+        if let Some(value) = payload.lifecycle_state {
+            companion.voice.lifecycle_state = value;
+        }
+        if payload.draft_session_id.is_some() {
+            companion.voice.draft_session_id = payload
+                .draft_session_id
+                .as_deref()
+                .and_then(normalize_optional_text)
+                .map(str::to_owned);
+        }
+        if payload.draft_text.is_some() {
+            companion.voice.draft_text = payload
+                .draft_text
+                .as_deref()
+                .and_then(normalize_optional_text)
+                .map(str::to_owned);
+        }
+        if payload.draft_summary.is_some() {
+            companion.voice.draft_summary = payload
+                .draft_summary
+                .as_deref()
+                .and_then(normalize_optional_text)
+                .map(str::to_owned);
+        }
+        if payload.draft_language.is_some() {
+            companion.voice.draft_language = payload
+                .draft_language
+                .as_deref()
+                .and_then(normalize_optional_text)
+                .map(str::to_owned);
+        }
+        if payload.draft_duration_ms.is_some() {
+            companion.voice.draft_duration_ms = payload.draft_duration_ms;
+        }
+        if payload.last_error.is_some() {
+            companion.voice.last_error = payload
+                .last_error
+                .as_deref()
+                .and_then(normalize_optional_text)
+                .map(str::to_owned);
+        }
+        if payload.clear_error {
+            companion.voice.last_error = None;
+        }
+        if payload.clear_draft {
+            companion.clear_voice_draft();
+        }
+        if let (Some(kind), Some(detail)) = (
+            payload.audit_kind.as_deref().and_then(normalize_optional_text),
+            payload.audit_detail.as_deref().and_then(normalize_optional_text),
+        ) {
+            let input_device_label = companion.voice.microphone_device_label.clone();
+            let output_voice_label = companion.voice.tts_voice_label.clone();
+            companion.push_voice_audit(
+                kind,
+                detail,
+                now_unix_ms,
+                payload.audit_session_id.as_deref(),
+                payload.audit_remote_processing.unwrap_or(false),
+                payload.audit_tts_playback.unwrap_or(false),
+                input_device_label.as_deref(),
+                output_voice_label.as_deref(),
+            );
         }
         self.save_state_file()
     }
@@ -553,6 +848,8 @@ impl ControlCenter {
             active_device_id: companion.active_device_id.clone(),
             last_run_id: companion.last_run_id.clone(),
         };
+        snapshot.ambient = ambient_snapshot_from_state(&companion.ambient);
+        snapshot.voice = voice_snapshot_from_state(&companion.voice);
         snapshot.metrics.unread_notifications =
             companion.notifications.iter().filter(|entry| !entry.read).count();
         snapshot.metrics.queued_offline_drafts = companion.offline_drafts.len();
@@ -651,6 +948,10 @@ pub(crate) async fn build_companion_snapshot(
     let trusted_devices =
         inventory.as_ref().map(|value| value.summary.trusted_devices).unwrap_or(0);
     let stale_devices = inventory.as_ref().map(|value| value.summary.stale_devices).unwrap_or(0);
+    let active_runs = session_catalog
+        .iter()
+        .filter_map(active_run_snapshot_from_session)
+        .collect::<Vec<_>>();
 
     Ok(DesktopCompanionSnapshot {
         generated_at_unix_ms: unix_ms_now(),
@@ -670,8 +971,11 @@ pub(crate) async fn build_companion_snapshot(
             active_device_id: selected_device_id,
             last_run_id: companion_state.last_run_id.clone(),
         },
+        ambient: ambient_snapshot_from_state(&companion_state.ambient),
+        voice: voice_snapshot_from_state(&companion_state.voice),
         notifications: companion_state.notifications.clone(),
         offline_drafts: companion_state.offline_drafts.clone(),
+        active_runs: active_runs.clone(),
         session_catalog,
         session_summary,
         approvals,
@@ -685,12 +989,102 @@ pub(crate) async fn build_companion_snapshot(
                 .count(),
             pending_approvals: pending_approval_count,
             queued_offline_drafts: companion_state.offline_drafts.len(),
+            active_runs: active_runs.len(),
             active_sessions,
             sessions_with_active_runs,
             trusted_devices,
             stale_devices,
         },
     })
+}
+
+fn ambient_snapshot_from_state(
+    state: &DesktopCompanionAmbientState,
+) -> DesktopCompanionAmbientSnapshot {
+    DesktopCompanionAmbientSnapshot {
+        start_on_login_enabled: state.start_on_login_enabled,
+        global_hotkey_enabled: state.global_hotkey_enabled,
+        global_hotkey: state.global_hotkey.clone(),
+        hotkey_registration_error: state.hotkey_registration_error.clone(),
+        last_surface: state.last_surface,
+    }
+}
+
+fn voice_snapshot_from_state(state: &DesktopCompanionVoiceState) -> DesktopCompanionVoiceSnapshot {
+    DesktopCompanionVoiceSnapshot {
+        lifecycle_state: state.lifecycle_state,
+        capture_consent_granted_at_unix_ms: state.capture_consent_granted_at_unix_ms,
+        tts_consent_granted_at_unix_ms: state.tts_consent_granted_at_unix_ms,
+        microphone_permission_state: state.microphone_permission_state.clone(),
+        microphone_device_id: state.microphone_device_id.clone(),
+        microphone_device_label: state.microphone_device_label.clone(),
+        tts_voice_uri: state.tts_voice_uri.clone(),
+        tts_voice_label: state.tts_voice_label.clone(),
+        tts_muted: state.tts_muted,
+        silence_detection_enabled: state.silence_detection_enabled,
+        silence_timeout_ms: state.silence_timeout_ms,
+        draft_session_id: state.draft_session_id.clone(),
+        draft_text: state.draft_text.clone(),
+        draft_summary: state.draft_summary.clone(),
+        draft_language: state.draft_language.clone(),
+        draft_duration_ms: state.draft_duration_ms,
+        last_error: state.last_error.clone(),
+        audit_log: state
+            .audit_log
+            .iter()
+            .map(voice_audit_snapshot_from_state)
+            .collect(),
+    }
+}
+
+fn voice_audit_snapshot_from_state(
+    entry: &DesktopCompanionVoiceAuditEntry,
+) -> DesktopCompanionVoiceAuditEntrySnapshot {
+    DesktopCompanionVoiceAuditEntrySnapshot {
+        audit_id: entry.audit_id.clone(),
+        kind: entry.kind.clone(),
+        detail: entry.detail.clone(),
+        created_at_unix_ms: entry.created_at_unix_ms,
+        session_id: entry.session_id.clone(),
+        remote_processing: entry.remote_processing,
+        tts_playback: entry.tts_playback,
+        input_device_label: entry.input_device_label.clone(),
+        output_voice_label: entry.output_voice_label.clone(),
+    }
+}
+
+fn active_run_snapshot_from_session(
+    session: &control_plane::SessionCatalogRecord,
+) -> Option<DesktopCompanionActiveRunSnapshot> {
+    let run_id = session.last_run_id.as_deref().and_then(normalize_optional_text)?;
+    let status = session.last_run_state.as_deref().and_then(normalize_optional_text)?;
+    if !is_active_run_state(status) {
+        return None;
+    }
+
+    let preview = session
+        .preview
+        .as_deref()
+        .and_then(normalize_optional_text)
+        .or_else(|| session.last_summary.as_deref().and_then(normalize_optional_text))
+        .map(str::to_owned);
+
+    Some(DesktopCompanionActiveRunSnapshot {
+        session_id: session.session_id.clone(),
+        session_title: session.title.clone(),
+        run_id: run_id.to_owned(),
+        status: status.to_owned(),
+        started_at_unix_ms: session.last_run_started_at_unix_ms,
+        pending_approvals: session.pending_approvals,
+        preview,
+    })
+}
+
+fn is_active_run_state(state: &str) -> bool {
+    matches!(
+        state.trim().to_ascii_lowercase().as_str(),
+        "accepted" | "dispatching" | "in_progress" | "queued" | "running" | "streaming"
+    )
 }
 
 async fn fetch_shared_onboarding_posture(

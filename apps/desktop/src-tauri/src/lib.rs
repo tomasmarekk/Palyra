@@ -6,7 +6,7 @@ const DASHBOARD_SCHEME: &str = "http";
 const LOOPBACK_HOST: &str = "127.0.0.1";
 const CONSOLE_PRINCIPAL: &str = "admin:desktop-control-center";
 const CONSOLE_DEVICE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
-const DESKTOP_STATE_SCHEMA_VERSION: u32 = 6;
+const DESKTOP_STATE_SCHEMA_VERSION: u32 = 7;
 const DESKTOP_SECRET_MAX_BYTES: usize = 4_096;
 const DESKTOP_SECRET_KEY_ADMIN_TOKEN: &str = "desktop_admin_token";
 const DESKTOP_SECRET_KEY_BROWSER_AUTH_TOKEN: &str = "desktop_browser_auth_token";
@@ -21,6 +21,7 @@ const BROWSER_GRPC_PORT: u16 = 7543;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+mod ambient;
 mod commands;
 mod companion;
 mod companion_console;
@@ -39,8 +40,8 @@ use snapshot::sanitize_log_line;
 pub(crate) use desktop_state::{
     bootstrap_portable_install_environment, load_or_initialize_state_file, load_runtime_secrets,
     migrate_legacy_runtime_secrets_from_state_file, resolve_desktop_state_root,
-    validate_runtime_state_root_override, DesktopCompanionSection, DesktopOnboardingStep,
-    DesktopSecretStore, DesktopStateFile,
+    validate_runtime_state_root_override, DesktopCompanionSection, DesktopCompanionSurfaceMode,
+    DesktopOnboardingStep, DesktopSecretStore, DesktopStateFile,
 };
 #[cfg(test)]
 pub(crate) use desktop_state::bootstrap_portable_install_environment_for_executable;

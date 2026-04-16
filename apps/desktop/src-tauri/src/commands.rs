@@ -7,16 +7,23 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 use ulid::Ulid;
 
+use super::ambient::{
+    handle_window_event as handle_ambient_window_event, hide_surface, setup_ambient_runtime,
+    show_surface, sync_ambient_runtime_from_snapshot, sync_ambient_runtime_from_state,
+    AmbientSyncOutcome,
+};
 use super::companion::{
     build_companion_handoff_url, build_companion_snapshot, decide_companion_approval,
     emit_companion_ux_event, fetch_companion_transcript, resolve_companion_chat_session,
     send_companion_chat_message, transcribe_companion_audio, DesktopCompanionAudioTranscriptionRequest,
     DesktopCompanionAudioTranscriptionResult,
+    DesktopCompanionAmbientRequest,
     DesktopCompanionApprovalDecisionRequest, DesktopCompanionNotificationsRequest,
     DesktopCompanionOpenDashboardRequest, DesktopCompanionPreferencesRequest,
     DesktopCompanionResolveSessionRequest, DesktopCompanionRolloutRequest,
     DesktopCompanionSendMessageRequest, DesktopCompanionSendMessageResult,
     DesktopCompanionSnapshot, DesktopCompanionSwitchProfileRequest, DesktopCompanionUxEventRequest,
+    DesktopCompanionVoiceStateRequest,
     DesktopSessionTranscriptEnvelope,
 };
 use super::features::onboarding::connectors::discord::{
@@ -40,7 +47,7 @@ use super::snapshot::{
 };
 use super::{
     build_onboarding_status, ControlCenter, DesktopOnboardingStep, DiscordOnboardingRequest,
-    CONSOLE_PRINCIPAL, SUPERVISOR_TICK_MS,
+    DesktopCompanionSurfaceMode, CONSOLE_PRINCIPAL, SUPERVISOR_TICK_MS,
 };
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -61,7 +68,14 @@ struct DesktopNodeLifecyclePayload {
 }
 
 pub(crate) struct DesktopAppState {
-    supervisor: Arc<Mutex<ControlCenter>>,
+    pub(crate) supervisor: Arc<Mutex<ControlCenter>>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DesktopCompanionSurfaceRequest {
+    #[serde(default)]
+    surface: Option<DesktopCompanionSurfaceMode>,
 }
 
 #[tauri::command]
@@ -77,11 +91,7 @@ pub(crate) async fn get_snapshot(
 
 #[tauri::command]
 pub(crate) fn show_main_window(app: AppHandle) -> Result<(), String> {
-    let window = app
-        .get_webview_window("main")
-        .ok_or_else(|| "desktop main window is unavailable".to_owned())?;
-    window.show().map_err(command_error)?;
-    window.set_focus().map_err(command_error)?;
+    show_surface(&app, DesktopCompanionSurfaceMode::Main).map_err(command_error)?;
     Ok(())
 }
 
@@ -120,6 +130,7 @@ pub(crate) async fn get_desktop_refresh_payload(
 
 #[tauri::command]
 pub(crate) async fn get_desktop_companion_snapshot(
+    app: AppHandle,
     state: State<'_, DesktopAppState>,
 ) -> Result<DesktopCompanionSnapshot, String> {
     let inputs = {
@@ -131,6 +142,8 @@ pub(crate) async fn get_desktop_companion_snapshot(
         let mut supervisor = state.supervisor.lock().await;
         supervisor.reconcile_companion_snapshot(&mut snapshot).map_err(command_error)?;
     }
+    let outcome = sync_ambient_runtime_from_snapshot(&app, &snapshot).map_err(command_error)?;
+    apply_ambient_sync_outcome(&state, outcome).await.map_err(command_error)?;
     Ok(snapshot)
 }
 
@@ -185,12 +198,79 @@ pub(crate) async fn update_desktop_companion_preferences(
 
 #[tauri::command]
 pub(crate) async fn update_desktop_companion_rollout(
+    app: AppHandle,
     state: State<'_, DesktopAppState>,
     payload: DesktopCompanionRolloutRequest,
 ) -> Result<ActionResult, String> {
-    let mut supervisor = state.supervisor.lock().await;
-    supervisor.update_companion_rollout(&payload).map_err(command_error)?;
+    let companion = {
+        let mut supervisor = state.supervisor.lock().await;
+        supervisor.update_companion_rollout(&payload).map_err(command_error)?;
+        supervisor.persisted.active_companion().clone()
+    };
+    let outcome = sync_ambient_runtime_from_state(&app, &companion).map_err(command_error)?;
+    apply_ambient_sync_outcome(&state, outcome).await.map_err(command_error)?;
     Ok(ActionResult { ok: true, message: "desktop companion rollout updated".to_owned() })
+}
+
+#[tauri::command]
+pub(crate) async fn update_desktop_companion_ambient(
+    app: AppHandle,
+    state: State<'_, DesktopAppState>,
+    payload: DesktopCompanionAmbientRequest,
+) -> Result<ActionResult, String> {
+    let companion = {
+        let mut supervisor = state.supervisor.lock().await;
+        supervisor.update_companion_ambient(&payload).map_err(command_error)?;
+        supervisor.persisted.active_companion().clone()
+    };
+    let outcome = sync_ambient_runtime_from_state(&app, &companion).map_err(command_error)?;
+    apply_ambient_sync_outcome(&state, outcome).await.map_err(command_error)?;
+    Ok(ActionResult { ok: true, message: "desktop companion ambient settings updated".to_owned() })
+}
+
+#[tauri::command]
+pub(crate) async fn update_desktop_companion_voice_state(
+    app: AppHandle,
+    state: State<'_, DesktopAppState>,
+    payload: DesktopCompanionVoiceStateRequest,
+) -> Result<ActionResult, String> {
+    let companion = {
+        let mut supervisor = state.supervisor.lock().await;
+        supervisor.update_companion_voice_state(&payload).map_err(command_error)?;
+        supervisor.persisted.active_companion().clone()
+    };
+    let outcome = sync_ambient_runtime_from_state(&app, &companion).map_err(command_error)?;
+    apply_ambient_sync_outcome(&state, outcome).await.map_err(command_error)?;
+    Ok(ActionResult { ok: true, message: "desktop companion voice state updated".to_owned() })
+}
+
+#[tauri::command]
+pub(crate) async fn show_desktop_companion_window(
+    app: AppHandle,
+    state: State<'_, DesktopAppState>,
+    payload: DesktopCompanionSurfaceRequest,
+) -> Result<ActionResult, String> {
+    let requested_surface = payload.surface.unwrap_or(DesktopCompanionSurfaceMode::QuickPanel);
+    let surface = show_surface(&app, requested_surface).map_err(command_error)?;
+    let companion = {
+        let supervisor = state.supervisor.lock().await;
+        supervisor.persisted.active_companion().clone()
+    };
+    let outcome = sync_ambient_runtime_from_state(&app, &companion).map_err(command_error)?;
+    apply_ambient_sync_outcome(&state, outcome).await.map_err(command_error)?;
+    Ok(ActionResult {
+        ok: true,
+        message: format!("desktop companion {} window shown", format_surface(surface)),
+    })
+}
+
+#[tauri::command]
+pub(crate) async fn hide_desktop_companion_window(
+    app: AppHandle,
+    payload: DesktopCompanionSurfaceRequest,
+) -> Result<ActionResult, String> {
+    hide_surface(&app, payload.surface).map_err(command_error)?;
+    Ok(ActionResult { ok: true, message: "desktop companion window hidden".to_owned() })
 }
 
 #[tauri::command]
@@ -1024,14 +1104,48 @@ pub(crate) fn run() {
     prepare_control_center_for_launch(&mut control_center);
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(
+            tauri_plugin_autostart::Builder::new()
+                .arg("--from-autostart")
+                .app_name("Palyra Control Center")
+                .build(),
+        )
+        .on_window_event(|window, event| {
+            if let Err(error) = handle_ambient_window_event(window, event) {
+                eprintln!("ambient window event failed: {error}");
+            }
+        })
         .manage(DesktopAppState { supervisor: Arc::new(Mutex::new(control_center)) })
         .setup(|app| {
+            setup_ambient_runtime(app).map_err(|error| anyhow!(format_control_center_init_error(&error)))?;
+            let companion = {
+                let state = app.state::<DesktopAppState>();
+                let supervisor = state.supervisor.blocking_lock();
+                supervisor.persisted.active_companion().clone()
+            };
+            match sync_ambient_runtime_from_state(app.handle(), &companion) {
+                Ok(outcome) => {
+                    let state = app.state::<DesktopAppState>();
+                    let mut supervisor = state.supervisor.blocking_lock();
+                    supervisor
+                        .persisted
+                        .active_companion_mut()
+                        .set_hotkey_registration_error(outcome.hotkey_registration_error.as_deref());
+                    let _ = supervisor.save_state_file();
+                }
+                Err(error) => {
+                    eprintln!("ambient runtime sync failed during setup: {error}");
+                }
+            }
             let state = app.state::<DesktopAppState>().supervisor.clone();
             tauri::async_runtime::spawn(supervisor_loop(state));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             show_main_window,
+            show_desktop_companion_window,
+            hide_desktop_companion_window,
             get_snapshot,
             get_settings,
             get_onboarding_status,
@@ -1042,6 +1156,8 @@ pub(crate) fn run() {
             set_browser_service_enabled,
             update_desktop_companion_preferences,
             update_desktop_companion_rollout,
+            update_desktop_companion_ambient,
+            update_desktop_companion_voice_state,
             switch_desktop_companion_profile,
             mark_desktop_companion_notifications_read,
             remove_desktop_companion_offline_draft,
@@ -1075,4 +1191,24 @@ pub(crate) fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("tauri desktop runtime failed");
+}
+
+async fn apply_ambient_sync_outcome(
+    state: &State<'_, DesktopAppState>,
+    outcome: AmbientSyncOutcome,
+) -> Result<()> {
+    let mut supervisor = state.supervisor.lock().await;
+    supervisor
+        .persisted
+        .active_companion_mut()
+        .set_hotkey_registration_error(outcome.hotkey_registration_error.as_deref());
+    supervisor.save_state_file()
+}
+
+fn format_surface(surface: DesktopCompanionSurfaceMode) -> &'static str {
+    match surface {
+        DesktopCompanionSurfaceMode::Main => "main",
+        DesktopCompanionSurfaceMode::QuickPanel => "quick panel",
+        DesktopCompanionSurfaceMode::VoiceOverlay => "voice overlay",
+    }
 }

@@ -19,6 +19,7 @@ use super::{
 const DESKTOP_ONBOARDING_EVENT_LIMIT: usize = 40;
 const DESKTOP_COMPANION_NOTIFICATION_LIMIT: usize = 40;
 const DESKTOP_COMPANION_OFFLINE_DRAFT_LIMIT: usize = 20;
+const DESKTOP_COMPANION_VOICE_AUDIT_LIMIT: usize = 40;
 const DESKTOP_RECENT_PROFILE_LIMIT: usize = 6;
 const DESKTOP_INSTALL_METADATA_FILE_NAME: &str = "install-metadata.json";
 pub(crate) const IMPLICIT_DESKTOP_PROFILE_NAME: &str = "desktop-local";
@@ -36,6 +37,20 @@ pub(crate) enum DesktopCompanionSection {
 impl Default for DesktopCompanionSection {
     fn default() -> Self {
         Self::Home
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DesktopCompanionSurfaceMode {
+    Main,
+    QuickPanel,
+    VoiceOverlay,
+}
+
+impl Default for DesktopCompanionSurfaceMode {
+    fn default() -> Self {
+        Self::Main
     }
 }
 
@@ -68,13 +83,118 @@ pub(crate) struct DesktopCompanionOfflineDraft {
     pub(crate) created_at_unix_ms: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DesktopVoiceLifecycleState {
+    Idle,
+    Recording,
+    Transcribing,
+    Review,
+    Sending,
+    Speaking,
+    Error,
+    Cancelled,
+}
+
+impl Default for DesktopVoiceLifecycleState {
+    fn default() -> Self {
+        Self::Idle
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct DesktopCompanionVoiceAuditEntry {
+    pub(crate) audit_id: String,
+    pub(crate) kind: String,
+    pub(crate) detail: String,
+    pub(crate) created_at_unix_ms: i64,
+    pub(crate) session_id: Option<String>,
+    pub(crate) remote_processing: bool,
+    pub(crate) tts_playback: bool,
+    pub(crate) input_device_label: Option<String>,
+    pub(crate) output_voice_label: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct DesktopCompanionAmbientState {
+    pub(crate) start_on_login_enabled: bool,
+    pub(crate) global_hotkey_enabled: bool,
+    pub(crate) global_hotkey: String,
+    pub(crate) hotkey_registration_error: Option<String>,
+    pub(crate) last_surface: DesktopCompanionSurfaceMode,
+}
+
+impl Default for DesktopCompanionAmbientState {
+    fn default() -> Self {
+        Self {
+            start_on_login_enabled: false,
+            global_hotkey_enabled: true,
+            global_hotkey: "CommandOrControl+Shift+Space".to_owned(),
+            hotkey_registration_error: None,
+            last_surface: DesktopCompanionSurfaceMode::Main,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct DesktopCompanionVoiceState {
+    pub(crate) lifecycle_state: DesktopVoiceLifecycleState,
+    pub(crate) capture_consent_granted_at_unix_ms: Option<i64>,
+    pub(crate) tts_consent_granted_at_unix_ms: Option<i64>,
+    pub(crate) microphone_permission_state: String,
+    pub(crate) microphone_device_id: Option<String>,
+    pub(crate) microphone_device_label: Option<String>,
+    pub(crate) tts_voice_uri: Option<String>,
+    pub(crate) tts_voice_label: Option<String>,
+    pub(crate) tts_muted: bool,
+    pub(crate) silence_detection_enabled: bool,
+    pub(crate) silence_timeout_ms: u64,
+    pub(crate) draft_session_id: Option<String>,
+    pub(crate) draft_text: Option<String>,
+    pub(crate) draft_summary: Option<String>,
+    pub(crate) draft_language: Option<String>,
+    pub(crate) draft_duration_ms: Option<u64>,
+    pub(crate) last_error: Option<String>,
+    pub(crate) audit_log: Vec<DesktopCompanionVoiceAuditEntry>,
+}
+
+impl Default for DesktopCompanionVoiceState {
+    fn default() -> Self {
+        Self {
+            lifecycle_state: DesktopVoiceLifecycleState::Idle,
+            capture_consent_granted_at_unix_ms: None,
+            tts_consent_granted_at_unix_ms: None,
+            microphone_permission_state: "unknown".to_owned(),
+            microphone_device_id: None,
+            microphone_device_label: None,
+            tts_voice_uri: None,
+            tts_voice_label: None,
+            tts_muted: false,
+            silence_detection_enabled: false,
+            silence_timeout_ms: 1_800,
+            draft_session_id: None,
+            draft_text: None,
+            draft_summary: None,
+            draft_language: None,
+            draft_duration_ms: None,
+            last_error: None,
+            audit_log: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct DesktopCompanionRolloutState {
     pub(crate) companion_shell_enabled: bool,
+    pub(crate) ambient_companion_enabled: bool,
     pub(crate) desktop_notifications_enabled: bool,
     pub(crate) offline_drafts_enabled: bool,
     pub(crate) voice_capture_enabled: bool,
+    pub(crate) voice_overlay_enabled: bool,
+    pub(crate) voice_silence_detection_enabled: bool,
     pub(crate) tts_playback_enabled: bool,
     pub(crate) release_channel: String,
 }
@@ -83,9 +203,12 @@ impl Default for DesktopCompanionRolloutState {
     fn default() -> Self {
         Self {
             companion_shell_enabled: true,
+            ambient_companion_enabled: true,
             desktop_notifications_enabled: true,
             offline_drafts_enabled: true,
             voice_capture_enabled: false,
+            voice_overlay_enabled: true,
+            voice_silence_detection_enabled: false,
             tts_playback_enabled: false,
             release_channel: "preview".to_owned(),
         }
@@ -104,6 +227,8 @@ pub(crate) struct DesktopCompanionState {
     pub(crate) last_pending_approval_count: usize,
     pub(crate) notifications: Vec<DesktopCompanionNotification>,
     pub(crate) offline_drafts: Vec<DesktopCompanionOfflineDraft>,
+    pub(crate) ambient: DesktopCompanionAmbientState,
+    pub(crate) voice: DesktopCompanionVoiceState,
     pub(crate) rollout: DesktopCompanionRolloutState,
 }
 
@@ -119,6 +244,8 @@ impl Default for DesktopCompanionState {
             last_pending_approval_count: 0,
             notifications: Vec::new(),
             offline_drafts: Vec::new(),
+            ambient: DesktopCompanionAmbientState::default(),
+            voice: DesktopCompanionVoiceState::default(),
             rollout: DesktopCompanionRolloutState::default(),
         }
     }
@@ -139,6 +266,72 @@ impl DesktopCompanionState {
 
     pub(crate) fn set_last_run_id(&mut self, next: Option<&str>) {
         self.last_run_id = next.and_then(normalize_optional_text).map(str::to_owned);
+    }
+
+    pub(crate) fn set_last_surface(&mut self, next: DesktopCompanionSurfaceMode) {
+        self.ambient.last_surface = next;
+    }
+
+    pub(crate) fn set_global_hotkey(&mut self, next: Option<&str>) {
+        if let Some(value) = next.and_then(normalize_optional_text) {
+            self.ambient.global_hotkey = value.to_owned();
+        }
+    }
+
+    pub(crate) fn set_hotkey_registration_error(&mut self, next: Option<&str>) {
+        self.ambient.hotkey_registration_error =
+            next.and_then(normalize_optional_text).map(str::to_owned);
+    }
+
+    pub(crate) fn grant_voice_capture_consent(&mut self, granted_at_unix_ms: i64) {
+        self.voice.capture_consent_granted_at_unix_ms = Some(granted_at_unix_ms);
+    }
+
+    pub(crate) fn grant_tts_consent(&mut self, granted_at_unix_ms: i64) {
+        self.voice.tts_consent_granted_at_unix_ms = Some(granted_at_unix_ms);
+    }
+
+    pub(crate) fn clear_voice_draft(&mut self) {
+        self.voice.draft_session_id = None;
+        self.voice.draft_text = None;
+        self.voice.draft_summary = None;
+        self.voice.draft_language = None;
+        self.voice.draft_duration_ms = None;
+        self.voice.last_error = None;
+        self.voice.lifecycle_state = DesktopVoiceLifecycleState::Idle;
+    }
+
+    pub(crate) fn push_voice_audit(
+        &mut self,
+        kind: impl Into<String>,
+        detail: impl Into<String>,
+        created_at_unix_ms: i64,
+        session_id: Option<&str>,
+        remote_processing: bool,
+        tts_playback: bool,
+        input_device_label: Option<&str>,
+        output_voice_label: Option<&str>,
+    ) {
+        self.voice.audit_log.push(DesktopCompanionVoiceAuditEntry {
+            audit_id: Ulid::new().to_string(),
+            kind: kind.into(),
+            detail: detail.into(),
+            created_at_unix_ms,
+            session_id: session_id.and_then(normalize_optional_text).map(str::to_owned),
+            remote_processing,
+            tts_playback,
+            input_device_label: input_device_label
+                .and_then(normalize_optional_text)
+                .map(str::to_owned),
+            output_voice_label: output_voice_label
+                .and_then(normalize_optional_text)
+                .map(str::to_owned),
+        });
+        if self.voice.audit_log.len() > DESKTOP_COMPANION_VOICE_AUDIT_LIMIT {
+            let overflow =
+                self.voice.audit_log.len().saturating_sub(DESKTOP_COMPANION_VOICE_AUDIT_LIMIT);
+            self.voice.audit_log.drain(0..overflow);
+        }
     }
 
     pub(crate) fn push_notification(
@@ -475,6 +668,13 @@ impl DesktopStateFile {
 
         for state in self.profile_states.values_mut() {
             state.onboarding.ensure_flow_id();
+            if normalize_optional_text(state.companion.ambient.global_hotkey.as_str()).is_none() {
+                state.companion.ambient.global_hotkey = DesktopCompanionAmbientState::default().global_hotkey;
+            }
+            if state.companion.voice.silence_timeout_ms == 0 {
+                state.companion.voice.silence_timeout_ms =
+                    DesktopCompanionVoiceState::default().silence_timeout_ms;
+            }
         }
     }
 

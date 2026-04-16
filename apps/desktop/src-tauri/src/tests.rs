@@ -20,7 +20,10 @@ use support::{
     write_cli_profiles_file, write_config_file, write_file, write_json_response, TempFixtureDir,
 };
 
-use crate::companion::{build_companion_snapshot, DesktopCompanionRolloutRequest};
+use crate::companion::{
+    build_companion_snapshot, DesktopCompanionAmbientRequest, DesktopCompanionRolloutRequest,
+    DesktopCompanionVoiceStateRequest,
+};
 
 use super::commands::initialize_control_center;
 use super::features::onboarding::connectors::discord::{
@@ -172,9 +175,12 @@ fn companion_offline_draft_queueing_respects_rollout_toggle() {
     control_center
         .update_companion_rollout(&DesktopCompanionRolloutRequest {
             companion_shell_enabled: None,
+            ambient_companion_enabled: None,
             desktop_notifications_enabled: None,
             offline_drafts_enabled: Some(false),
             voice_capture_enabled: None,
+            voice_overlay_enabled: None,
+            voice_silence_detection_enabled: None,
             tts_playback_enabled: None,
             release_channel: None,
         })
@@ -193,9 +199,12 @@ fn companion_rollout_persists_voice_and_tts_flags() {
     control_center
         .update_companion_rollout(&DesktopCompanionRolloutRequest {
             companion_shell_enabled: None,
+            ambient_companion_enabled: None,
             desktop_notifications_enabled: None,
             offline_drafts_enabled: None,
             voice_capture_enabled: Some(true),
+            voice_overlay_enabled: None,
+            voice_silence_detection_enabled: None,
             tts_playback_enabled: Some(true),
             release_channel: Some("voice-preview".to_owned()),
         })
@@ -205,6 +214,95 @@ fn companion_rollout_persists_voice_and_tts_flags() {
     assert!(rollout.voice_capture_enabled, "voice capture flag should persist");
     assert!(rollout.tts_playback_enabled, "tts playback flag should persist");
     assert_eq!(rollout.release_channel, "voice-preview");
+}
+
+#[test]
+fn companion_ambient_preferences_persist_hotkey_and_surface() {
+    let fixture = TempFixtureDir::new();
+    let mut control_center = build_test_control_center(fixture.path());
+    control_center
+        .persisted
+        .active_companion_mut()
+        .set_hotkey_registration_error(Some("already registered elsewhere"));
+
+    control_center
+        .update_companion_ambient(&DesktopCompanionAmbientRequest {
+            start_on_login_enabled: Some(true),
+            global_hotkey_enabled: Some(true),
+            global_hotkey: Some("CommandOrControl+Alt+P".to_owned()),
+            clear_hotkey_registration_error: true,
+            last_surface: Some(super::DesktopCompanionSurfaceMode::QuickPanel),
+        })
+        .expect("ambient desktop preferences should persist");
+
+    let ambient = &control_center.persisted.active_companion().ambient;
+    assert!(ambient.start_on_login_enabled);
+    assert!(ambient.global_hotkey_enabled);
+    assert_eq!(ambient.global_hotkey, "CommandOrControl+Alt+P");
+    assert_eq!(ambient.last_surface, super::DesktopCompanionSurfaceMode::QuickPanel);
+    assert!(
+        ambient.hotkey_registration_error.is_none(),
+        "clearing the hotkey registration error should persist"
+    );
+}
+
+#[test]
+fn companion_voice_state_persists_audio_preferences_and_audit() {
+    let fixture = TempFixtureDir::new();
+    let mut control_center = build_test_control_center(fixture.path());
+
+    control_center
+        .update_companion_voice_state(&DesktopCompanionVoiceStateRequest {
+            capture_consent_granted: None,
+            tts_consent_granted: None,
+            microphone_permission_state: Some("granted".to_owned()),
+            microphone_device_id: Some("desk-mic".to_owned()),
+            microphone_device_label: Some("Desk microphone".to_owned()),
+            tts_voice_uri: Some("voice://desk".to_owned()),
+            tts_voice_label: Some("Desk voice".to_owned()),
+            tts_muted: Some(true),
+            silence_detection_enabled: Some(true),
+            silence_timeout_ms: Some(2_400),
+            lifecycle_state: Some(crate::desktop_state::DesktopVoiceLifecycleState::Review),
+            draft_session_id: Some("session-voice".to_owned()),
+            draft_text: Some("Edited transcript".to_owned()),
+            draft_summary: Some("Voice summary".to_owned()),
+            draft_language: Some("en".to_owned()),
+            draft_duration_ms: Some(1_234),
+            last_error: None,
+            clear_draft: false,
+            clear_error: false,
+            audit_kind: Some("transcript_ready".to_owned()),
+            audit_detail: Some("Voice transcript is ready for review.".to_owned()),
+            audit_session_id: Some("session-voice".to_owned()),
+            audit_remote_processing: Some(true),
+            audit_tts_playback: Some(false),
+        })
+        .expect("voice state should persist");
+
+    let voice = &control_center.persisted.active_companion().voice;
+    assert_eq!(voice.microphone_permission_state, "granted");
+    assert_eq!(voice.microphone_device_id.as_deref(), Some("desk-mic"));
+    assert_eq!(voice.microphone_device_label.as_deref(), Some("Desk microphone"));
+    assert_eq!(voice.tts_voice_uri.as_deref(), Some("voice://desk"));
+    assert_eq!(voice.tts_voice_label.as_deref(), Some("Desk voice"));
+    assert!(voice.tts_muted);
+    assert!(voice.silence_detection_enabled);
+    assert_eq!(voice.silence_timeout_ms, 2_400);
+    assert_eq!(
+        voice.lifecycle_state,
+        crate::desktop_state::DesktopVoiceLifecycleState::Review
+    );
+    assert_eq!(voice.draft_session_id.as_deref(), Some("session-voice"));
+    assert_eq!(voice.draft_text.as_deref(), Some("Edited transcript"));
+    assert_eq!(voice.audit_log.len(), 1);
+    assert_eq!(voice.audit_log[0].kind, "transcript_ready");
+    assert_eq!(voice.audit_log[0].session_id.as_deref(), Some("session-voice"));
+    assert_eq!(
+        voice.audit_log[0].input_device_label.as_deref(),
+        Some("Desk microphone")
+    );
+    assert!(!voice.audit_log[0].tts_playback);
 }
 
 #[test]
