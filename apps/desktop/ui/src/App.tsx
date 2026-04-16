@@ -575,8 +575,9 @@ export function App() {
       overrideText !== undefined
         ? overrideText.trim()
         : draftId === undefined
-        ? composerText.trim()
-        : (snapshot.offline_drafts.find((draft) => draft.draft_id === draftId)?.text.trim() ?? "");
+          ? composerText.trim()
+          : (snapshot.offline_drafts.find((draft) => draft.draft_id === draftId)?.text.trim() ??
+            "");
     if (text.length === 0) {
       setNotice("Message cannot be empty.");
       return;
@@ -754,8 +755,7 @@ export function App() {
   }
 
   async function selectVoiceInputDevice(deviceId: string): Promise<void> {
-    const selectedDevice =
-      voiceInputDevices.find((device) => device.deviceId === deviceId) ?? null;
+    const selectedDevice = voiceInputDevices.find((device) => device.deviceId === deviceId) ?? null;
     await updateVoiceAudioSettings(
       {
         microphoneDeviceId: deviceId,
@@ -999,7 +999,9 @@ export function App() {
     setVoiceBusy(true);
     try {
       const recordingDurationMs =
-        recordingStartedAtRef.current === null ? undefined : Date.now() - recordingStartedAtRef.current;
+        recordingStartedAtRef.current === null
+          ? undefined
+          : Date.now() - recordingStartedAtRef.current;
       await updateDesktopCompanionVoiceState({
         lifecycleState: "transcribing",
         draftSessionId: sessionId || undefined,
@@ -2811,32 +2813,36 @@ export function App() {
               />
             ) : (
               <div className="desktop-stack desktop-stack--compact">
-                {snapshot.voice.audit_log.slice().reverse().slice(0, 6).map((entry) => (
-                  <article key={entry.audit_id} className="desktop-timeline-item">
-                    <div className="desktop-inline-row">
-                      <strong>{entry.kind.replaceAll("_", " ")}</strong>
-                      <small className="desktop-muted">
-                        {formatUnixMs(entry.created_at_unix_ms)}
-                      </small>
-                    </div>
-                    <p>{entry.detail}</p>
-                    <div className="desktop-inline-row">
-                      <StatusChip tone={entry.remote_processing ? "warning" : "default"}>
-                        {entry.remote_processing ? "remote processing" : "local only"}
-                      </StatusChip>
-                      <StatusChip tone={entry.tts_playback ? "accent" : "default"}>
-                        {entry.tts_playback ? "tts" : "mic"}
-                      </StatusChip>
-                    </div>
-                    {entry.input_device_label || entry.output_voice_label ? (
-                      <p className="desktop-muted">
-                        {[entry.input_device_label, entry.output_voice_label]
-                          .filter((value): value is string => Boolean(value))
-                          .join(" · ")}
-                      </p>
-                    ) : null}
-                  </article>
-                ))}
+                {snapshot.voice.audit_log
+                  .slice()
+                  .reverse()
+                  .slice(0, 6)
+                  .map((entry) => (
+                    <article key={entry.audit_id} className="desktop-timeline-item">
+                      <div className="desktop-inline-row">
+                        <strong>{entry.kind.replaceAll("_", " ")}</strong>
+                        <small className="desktop-muted">
+                          {formatUnixMs(entry.created_at_unix_ms)}
+                        </small>
+                      </div>
+                      <p>{entry.detail}</p>
+                      <div className="desktop-inline-row">
+                        <StatusChip tone={entry.remote_processing ? "warning" : "default"}>
+                          {entry.remote_processing ? "remote processing" : "local only"}
+                        </StatusChip>
+                        <StatusChip tone={entry.tts_playback ? "accent" : "default"}>
+                          {entry.tts_playback ? "tts" : "mic"}
+                        </StatusChip>
+                      </div>
+                      {entry.input_device_label || entry.output_voice_label ? (
+                        <p className="desktop-muted">
+                          {[entry.input_device_label, entry.output_voice_label]
+                            .filter((value): value is string => Boolean(value))
+                            .join(" · ")}
+                        </p>
+                      ) : null}
+                    </article>
+                  ))}
               </div>
             )}
           </SectionCard>
@@ -3418,8 +3424,7 @@ function QuickPanelSurface(props: {
             <div className="desktop-stack desktop-stack--compact">
               <span className="desktop-label">Selected session</span>
               <div className="desktop-code-block">
-                {props.selectedSession?.title ??
-                  (props.activeSessionId || "No session selected")}
+                {props.selectedSession?.title ?? (props.activeSessionId || "No session selected")}
               </div>
             </div>
             <label className="desktop-stack desktop-stack--compact">
@@ -3475,7 +3480,10 @@ function QuickPanelSurface(props: {
                       {buildDesktopSessionListBadges(session)
                         .slice(0, 2)
                         .map((badge) => (
-                          <StatusChip key={`${session.session_id}:${badge.label}`} tone={badge.tone}>
+                          <StatusChip
+                            key={`${session.session_id}:${badge.label}`}
+                            tone={badge.tone}
+                          >
                             {badge.label}
                           </StatusChip>
                         ))}
@@ -3553,7 +3561,8 @@ function QuickPanelSurface(props: {
                   title={readString(approval, "request_summary") ?? "Approval waiting"}
                   tone="warning"
                 >
-                  {readString(approval, "subject_type") ?? "Tool approval requires explicit review."}
+                  {readString(approval, "subject_type") ??
+                    "Tool approval requires explicit review."}
                 </InlineNotice>
               ))}
             </div>
@@ -3578,7 +3587,9 @@ function QuickPanelSurface(props: {
                 <article key={draft.draft_id} className="desktop-timeline-item">
                   <div className="desktop-inline-row">
                     <strong>{draft.session_id ?? "Unbound draft"}</strong>
-                    <small className="desktop-muted">{formatUnixMs(draft.created_at_unix_ms)}</small>
+                    <small className="desktop-muted">
+                      {formatUnixMs(draft.created_at_unix_ms)}
+                    </small>
                   </div>
                   <p>{draft.text}</p>
                   <p className="desktop-muted">{draft.reason}</p>
@@ -3602,7 +3613,8 @@ function QuickPanelSurface(props: {
 
         {props.previewMode ? (
           <InlineNotice title="Preview data" tone="warning">
-            Desktop preview data is active, so quick panel actions are representative rather than live.
+            Desktop preview data is active, so quick panel actions are representative rather than
+            live.
           </InlineNotice>
         ) : null}
       </section>
@@ -3692,7 +3704,9 @@ function VoiceOverlaySurface(props: {
                   !props.voiceCaptureSupported ||
                   props.selectedSession === null
                 }
-                onPress={props.voiceRecording ? props.onStopVoiceCapture : props.onStartVoiceCapture}
+                onPress={
+                  props.voiceRecording ? props.onStopVoiceCapture : props.onStartVoiceCapture
+                }
               >
                 {props.voiceRecording ? "Stop recording" : "Start recording"}
               </Button>
@@ -3717,12 +3731,17 @@ function VoiceOverlaySurface(props: {
               { label: "Session", value: props.selectedSession?.title ?? "No session selected" },
               {
                 label: "Recording",
-                value: props.voiceRecording ? formatDurationMs(props.recordingElapsedMs) : "stopped",
+                value: props.voiceRecording
+                  ? formatDurationMs(props.recordingElapsedMs)
+                  : "stopped",
               },
               { label: "Lifecycle", value: props.lifecycleState },
               { label: "Mic permission", value: props.voicePermissionState },
               { label: "Input device", value: props.selectedVoiceInputLabel },
-              { label: "Speech playback", value: props.ttsPlaybackSupported ? "available" : "unavailable" },
+              {
+                label: "Speech playback",
+                value: props.ttsPlaybackSupported ? "available" : "unavailable",
+              },
               {
                 label: "Silence detection",
                 value: props.voiceSilenceDetectionRolloutEnabled
@@ -3804,7 +3823,9 @@ function VoiceOverlaySurface(props: {
                   {props.currentVoiceTranscript?.transcript_language ?? props.lifecycleState}
                 </StatusChip>
               </div>
-              {props.currentVoiceTranscript ? <p>{props.currentVoiceTranscript.transcript_text}</p> : null}
+              {props.currentVoiceTranscript ? (
+                <p>{props.currentVoiceTranscript.transcript_text}</p>
+              ) : null}
               {props.currentVoiceTranscript?.transcript_summary ? (
                 <p className="desktop-muted">{props.currentVoiceTranscript.transcript_summary}</p>
               ) : null}
@@ -3897,7 +3918,11 @@ function VoiceOverlaySurface(props: {
             <Button variant="secondary" onPress={props.onSpeakLatestAssistant}>
               Speak latest assistant
             </Button>
-            <Button variant="ghost" isDisabled={!props.speaking} onPress={props.onStopSpeechPlayback}>
+            <Button
+              variant="ghost"
+              isDisabled={!props.speaking}
+              onPress={props.onStopSpeechPlayback}
+            >
               Stop speaking
             </Button>
             <Button variant="ghost" onPress={props.onToggleTtsMute}>
@@ -3915,17 +3940,21 @@ function VoiceOverlaySurface(props: {
           </div>
           {props.voiceAuditLog.length > 0 ? (
             <div className="desktop-stack desktop-stack--compact">
-              {props.voiceAuditLog.slice().reverse().slice(0, 3).map((entry) => (
-                <article key={entry.audit_id} className="desktop-timeline-item">
-                  <div className="desktop-inline-row">
-                    <strong>{entry.kind.replaceAll("_", " ")}</strong>
-                    <small className="desktop-muted">
-                      {formatUnixMs(entry.created_at_unix_ms)}
-                    </small>
-                  </div>
-                  <p>{entry.detail}</p>
-                </article>
-              ))}
+              {props.voiceAuditLog
+                .slice()
+                .reverse()
+                .slice(0, 3)
+                .map((entry) => (
+                  <article key={entry.audit_id} className="desktop-timeline-item">
+                    <div className="desktop-inline-row">
+                      <strong>{entry.kind.replaceAll("_", " ")}</strong>
+                      <small className="desktop-muted">
+                        {formatUnixMs(entry.created_at_unix_ms)}
+                      </small>
+                    </div>
+                    <p>{entry.detail}</p>
+                  </article>
+                ))}
             </div>
           ) : null}
         </SectionCard>

@@ -951,7 +951,8 @@ export const DESKTOP_PREVIEW_COMPANION_SNAPSHOT: DesktopCompanionSnapshot = {
       status: "running",
       started_at_unix_ms: DESKTOP_PREVIEW_SNAPSHOT.generated_at_unix_ms - 15_000,
       pending_approvals: 1,
-      preview: "Gathering desktop companion rollout status before handing off to the full dashboard.",
+      preview:
+        "Gathering desktop companion rollout status before handing off to the full dashboard.",
     },
   ],
   session_catalog: [
@@ -1166,13 +1167,17 @@ export async function showMainWindow(): Promise<void> {
   return invoke<void>("show_main_window");
 }
 
-export async function showDesktopCompanionWindow(surface?: DesktopCompanionSurfaceMode): Promise<ActionResult> {
+export async function showDesktopCompanionWindow(
+  surface?: DesktopCompanionSurfaceMode,
+): Promise<ActionResult> {
   return invoke<ActionResult>("show_desktop_companion_window", {
     payload: { surface },
   });
 }
 
-export async function hideDesktopCompanionWindow(surface?: DesktopCompanionSurfaceMode): Promise<ActionResult> {
+export async function hideDesktopCompanionWindow(
+  surface?: DesktopCompanionSurfaceMode,
+): Promise<ActionResult> {
   return invoke<ActionResult>("hide_desktop_companion_window", {
     payload: { surface },
   });
