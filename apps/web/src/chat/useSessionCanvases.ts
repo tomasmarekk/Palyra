@@ -208,9 +208,10 @@ export function useSessionCanvases({
         setPinnedCanvasId(readSessionCanvasPreference(sessionId).pinnedCanvasId ?? null);
         setSelectedCanvas(response);
         setCanvases((previous) =>
-          [...previous.filter((canvas) => canvas.canvas_id !== response.canvas.canvas_id), response.canvas].sort(
-            compareSessionCanvases,
-          ),
+          [
+            ...previous.filter((canvas) => canvas.canvas_id !== response.canvas.canvas_id),
+            response.canvas,
+          ].sort(compareSessionCanvases),
         );
         await onCanvasRestored?.(response);
       } catch (error) {
@@ -244,10 +245,7 @@ export function useSessionCanvases({
   };
 }
 
-function compareSessionCanvases(
-  left: SessionCanvasSummary,
-  right: SessionCanvasSummary,
-): number {
+function compareSessionCanvases(left: SessionCanvasSummary, right: SessionCanvasSummary): number {
   if (left.updated_at_unix_ms !== right.updated_at_unix_ms) {
     return right.updated_at_unix_ms - left.updated_at_unix_ms;
   }

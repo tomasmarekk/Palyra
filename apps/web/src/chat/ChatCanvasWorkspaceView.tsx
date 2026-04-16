@@ -75,7 +75,11 @@ export function ChatCanvasWorkspaceView({
     <>
       <PageHeader
         eyebrow="Canvas"
-        title={selectedCanvasSummary ? `Canvas ${shortId(selectedCanvasSummary.canvas_id)}` : selectedSessionTitle}
+        title={
+          selectedCanvasSummary
+            ? `Canvas ${shortId(selectedCanvasSummary.canvas_id)}`
+            : selectedSessionTitle
+        }
         description="Session-linked rich surfaces stay reopenable, inspectable, and reversible without dropping back to raw transcript iframes. Shortcuts: Alt+S search, Alt+R run inspector, Alt+W workspace tab, Alt+C conversation, Alt+A approvals."
         status={
           <>
@@ -156,7 +160,11 @@ export function ChatCanvasWorkspaceView({
         <SectionCard
           className="chat-panel chat-panel--conversation"
           description="The active canvas keeps its runtime frame, persisted state, and provenance on one operator surface."
-          title={selectedCanvasSummary ? `Live canvas ${shortId(selectedCanvasSummary.canvas_id)}` : "Canvas surface"}
+          title={
+            selectedCanvasSummary
+              ? `Live canvas ${shortId(selectedCanvasSummary.canvas_id)}`
+              : "Canvas surface"
+          }
           actions={
             selectedCanvasSummary ? (
               <div className="workspace-inline-actions">
@@ -207,11 +215,19 @@ export function ChatCanvasWorkspaceView({
                   <KeyValueList
                     items={[
                       { label: "Canvas", value: shortId(selectedCanvasSummary.canvas_id) },
-                      { label: "Updated", value: formatCanvasTime(selectedCanvasSummary.updated_at_unix_ms) },
-                      { label: "Expires", value: formatCanvasTime(selectedCanvasSummary.expires_at_unix_ms) },
+                      {
+                        label: "Updated",
+                        value: formatCanvasTime(selectedCanvasSummary.updated_at_unix_ms),
+                      },
+                      {
+                        label: "Expires",
+                        value: formatCanvasTime(selectedCanvasSummary.expires_at_unix_ms),
+                      },
                       {
                         label: "Source run",
-                        value: selectedCanvasSourceRunId ? shortId(selectedCanvasSourceRunId) : "Not linked",
+                        value: selectedCanvasSourceRunId
+                          ? shortId(selectedCanvasSourceRunId)
+                          : "Not linked",
                       },
                       {
                         label: "Last referenced",
@@ -316,7 +332,8 @@ export function ChatCanvasWorkspaceView({
                           ) : null}
                         </span>
                         <small>
-                          Updated {formatCanvasTime(canvas.updated_at_unix_ms)}{" · "}
+                          Updated {formatCanvasTime(canvas.updated_at_unix_ms)}
+                          {" · "}
                           {canvas.reference.source_run_id
                             ? `run ${shortId(canvas.reference.source_run_id)}`
                             : "no source run"}
@@ -334,7 +351,9 @@ export function ChatCanvasWorkspaceView({
             title={`Revision history (${revisions.length})`}
             actions={
               selectedCanvasSummary ? (
-                <StatusChip tone="accent">Current v{selectedCanvasSummary.state_version}</StatusChip>
+                <StatusChip tone="accent">
+                  Current v{selectedCanvasSummary.state_version}
+                </StatusChip>
               ) : undefined
             }
           >
@@ -386,7 +405,11 @@ export function ChatCanvasWorkspaceView({
                         variant={isCurrent ? "secondary" : "primary"}
                         onPress={() => onRestoreCanvas(revision.state_version)}
                       >
-                        {restoreBusy ? "Restoring..." : isCurrent ? "Current state" : "Restore state"}
+                        {restoreBusy
+                          ? "Restoring..."
+                          : isCurrent
+                            ? "Current state"
+                            : "Restore state"}
                       </ActionButton>
                     </div>
                   );
@@ -400,10 +423,7 @@ export function ChatCanvasWorkspaceView({
   );
 }
 
-function formatCanvasTime(
-  unixMs: number | null | undefined,
-  fallback = "Unavailable",
-): string {
+function formatCanvasTime(unixMs: number | null | undefined, fallback = "Unavailable"): string {
   return typeof unixMs === "number" ? new Date(unixMs).toLocaleString() : fallback;
 }
 

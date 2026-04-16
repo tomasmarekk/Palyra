@@ -50,11 +50,7 @@ const OPEN_TARGET_TONES: Record<OpenTargetId, ComponentProps<typeof StatusChip>[
   external: "warning",
 };
 
-export function OpenTargetActions({
-  actions,
-  compact = false,
-  className,
-}: OpenTargetActionsProps) {
+export function OpenTargetActions({ actions, compact = false, className }: OpenTargetActionsProps) {
   if (actions.length === 0) {
     return null;
   }

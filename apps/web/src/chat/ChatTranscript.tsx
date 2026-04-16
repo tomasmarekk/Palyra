@@ -272,7 +272,8 @@ export function ChatTranscript({
                             target: "canvas",
                             label: "Open canvas",
                             variant: "secondary",
-                            onPress: () => openCanvasSurface(entry.canvas_url as string, entry.run_id),
+                            onPress: () =>
+                              openCanvasSurface(entry.canvas_url as string, entry.run_id),
                           },
                         ]}
                       />

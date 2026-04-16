@@ -1094,8 +1094,7 @@ export function ChatConsolePanel({
             recallPreview,
             recallPreviewBusy,
             recallPreviewStale,
-            refreshRecallPreview: () =>
-              void loadRecallPreview(composerText, { reportError: true }),
+            refreshRecallPreview: () => void loadRecallPreview(composerText, { reportError: true }),
           }}
           contextBudget={contextBudget}
           inspectorProps={buildInspectorProps({
@@ -1118,7 +1117,8 @@ export function ChatConsolePanel({
             approveProjectContextEntry: (entryId) => {
               void approveProjectContextEntryAction({ ...projectContextActionArgs, entryId });
             },
-            scaffoldProjectContext: () => void scaffoldProjectContextAction(projectContextActionArgs),
+            scaffoldProjectContext: () =>
+              void scaffoldProjectContextAction(projectContextActionArgs),
             transcriptBusy,
             transcriptSearchQuery,
             setTranscriptSearchQuery,

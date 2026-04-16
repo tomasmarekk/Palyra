@@ -23,13 +23,7 @@ import {
   WorkspaceTable,
   workspaceToneForState,
 } from "../components/workspace/WorkspacePatterns";
-import {
-  formatUnixMs,
-  readNumber,
-  readObject,
-  readString,
-  type JsonObject,
-} from "../shared";
+import { formatUnixMs, readNumber, readObject, readString, type JsonObject } from "../shared";
 import type { JsonValue } from "../../consoleApi";
 import type { ConsoleAppState } from "../useConsoleAppState";
 import { collectCanvasFrameUrls } from "../../chat/chatShared";
@@ -165,7 +159,9 @@ export function MemorySection({ app }: MemorySectionProps) {
   const selectedDerivedWarnings = readObjectArray(selectedDerivedArtifact, "warnings");
   const selectedDerivedAnchors = readObjectArray(selectedDerivedArtifact, "anchors");
   const selectedDerivedArtifactCanvasUrl =
-    selectedDerivedArtifact === null ? null : extractCanvasUrlFromMemoryArtifact(selectedDerivedArtifact);
+    selectedDerivedArtifact === null
+      ? null
+      : extractCanvasUrlFromMemoryArtifact(selectedDerivedArtifact);
   const learningCandidates = app.memoryLearningCandidates;
   const learningPreferences = app.memoryLearningPreferences;
   const learningHistory = app.memoryLearningHistory;
@@ -759,9 +755,11 @@ export function MemorySection({ app }: MemorySectionProps) {
                               onPress: () => {
                                 const canvasUrl = extractCanvasUrlFromMemoryArtifact(artifact);
                                 const canvasId =
-                                  canvasUrl === null ? null : extractCanvasIdFromFrameUrl(canvasUrl);
+                                  canvasUrl === null
+                                    ? null
+                                    : extractCanvasIdFromFrameUrl(canvasUrl);
                                 if (canvasId !== null) {
-                                  navigate(
+                                  void navigate(
                                     buildChatCanvasHref({
                                       sessionId: readString(artifact, "session_id") ?? undefined,
                                       canvasId,
@@ -830,9 +828,11 @@ export function MemorySection({ app }: MemorySectionProps) {
                         target: "canvas",
                         label: "Open canvas",
                         onPress: () => {
-                          const canvasId = extractCanvasIdFromFrameUrl(selectedDerivedArtifactCanvasUrl);
+                          const canvasId = extractCanvasIdFromFrameUrl(
+                            selectedDerivedArtifactCanvasUrl,
+                          );
                           if (canvasId !== null) {
-                            navigate(
+                            void navigate(
                               buildChatCanvasHref({
                                 sessionId:
                                   readString(selectedDerivedArtifact, "session_id") ?? undefined,

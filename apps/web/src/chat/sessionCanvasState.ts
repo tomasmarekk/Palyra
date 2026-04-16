@@ -137,7 +137,9 @@ export function buildCanvasRuntimeFrameUrl(
   try {
     const parsed = new URL(frameUrl, resolveUrlBase());
     parsed.searchParams.set("token", authToken);
-    return parsed.origin === resolveUrlBase() ? `${parsed.pathname}${parsed.search}` : parsed.toString();
+    return parsed.origin === resolveUrlBase()
+      ? `${parsed.pathname}${parsed.search}`
+      : parsed.toString();
   } catch {
     const separator = frameUrl.includes("?") ? "&" : "?";
     return `${frameUrl}${separator}token=${encodeURIComponent(authToken)}`;
@@ -148,7 +150,10 @@ function storageKey(sessionId: string): string {
   return `${SESSION_CANVAS_STORAGE_PREFIX}.${sessionId}`;
 }
 
-function writeSessionCanvasPreference(sessionId: string, preference: SessionCanvasPreference): void {
+function writeSessionCanvasPreference(
+  sessionId: string,
+  preference: SessionCanvasPreference,
+): void {
   if (typeof window === "undefined") {
     return;
   }
@@ -182,7 +187,10 @@ function normalizeStorageKeyPart(value: string): string | null {
   return normalized.length > 0 ? normalized : null;
 }
 
-function readPreferenceValue(source: object, key: "lastCanvasId" | "pinnedCanvasId"): string | null {
+function readPreferenceValue(
+  source: object,
+  key: "lastCanvasId" | "pinnedCanvasId",
+): string | null {
   const candidate = (source as Record<string, unknown>)[key];
   return typeof candidate === "string" ? candidate : null;
 }
