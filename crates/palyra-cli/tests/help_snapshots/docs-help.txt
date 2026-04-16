@@ -1,4 +1,4 @@
-Discover bundled or committed operator docs and CLI help snapshots locally
+Discover local CLI help snapshots from source checkouts or portable installs
 
 Usage: palyra docs [OPTIONS] <COMMAND>
 
@@ -41,9 +41,9 @@ Global Options:
 
 Examples:
   palyra docs list
-  palyra docs search acp
-  palyra docs show cli-v1-acp-shim
-  palyra docs show docs/architecture/browser-service-v1.md
+  palyra docs search gateway
+  palyra docs search browser
+  palyra docs show help/docs-help
 
 Discoverability:
-  `docs` indexes committed source docs in-repo and bundled docs/help snapshots from portable installs for local, offline lookup.
+  `docs` indexes committed CLI help snapshots in source checkouts and bundled help snapshots from portable installs for local, offline lookup.

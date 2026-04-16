@@ -1260,15 +1260,15 @@ mod tests {
     #[test]
     fn parse_compat_request_overrides_reads_palyra_metadata_keys() {
         let overrides = parse_compat_request_overrides(Some(&json!({
-            "palyra_session_key": "phase10",
-            "palyra_session_label": "Phase 10 rollout",
+            "palyra_session_key": "release-rollout",
+            "palyra_session_label": "Release rollout",
             "palyra_require_existing": true,
             "palyra_reset_session": false
         })))
         .expect("metadata should parse");
 
-        assert_eq!(overrides.session_key.as_deref(), Some("phase10"));
-        assert_eq!(overrides.session_label.as_deref(), Some("Phase 10 rollout"));
+        assert_eq!(overrides.session_key.as_deref(), Some("release-rollout"));
+        assert_eq!(overrides.session_label.as_deref(), Some("Release rollout"));
         assert!(overrides.require_existing);
         assert!(!overrides.reset_session);
     }

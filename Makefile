@@ -135,6 +135,12 @@ deterministic-soak:
 performance-smoke:
 	bash scripts/test/run-performance-smoke.sh
 
+surface-release-smoke:
+	pwsh -NoLogo -File scripts/test/run-surface-release-smoke.ps1
+
+surface-release-smoke-sh:
+	bash scripts/test/run-surface-release-smoke.sh
+
 module-budgets:
 	bash scripts/dev/report-module-budgets.sh
 

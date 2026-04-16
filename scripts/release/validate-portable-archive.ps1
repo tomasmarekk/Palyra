@@ -41,7 +41,6 @@ try {
         Assert-FileExists -Path (Join-Path $payloadRoot $requiredFile) -Label $requiredFile | Out-Null
     }
     Assert-FileExists -Path (Join-Path $payloadRoot "web/index.html") -Label "web/index.html" | Out-Null
-    Assert-CliDocsBundleExists -Path (Join-Path $payloadRoot "docs") -Label "docs" | Out-Null
     Assert-FileExists -Path (Join-Path $payloadRoot "docs/help_snapshots/docs-help.txt") -Label "docs/help_snapshots/docs-help.txt" | Out-Null
 
     $requiredBinaries =

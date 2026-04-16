@@ -121,7 +121,7 @@ const ROOT_AFTER_HELP: &str = "\
 Examples:
   palyra setup --mode local
   palyra acp --session-key ops:triage
-  palyra docs search acp
+  palyra docs search gateway
   palyra gateway status
   palyra dashboard --open
   palyra backup create --output ./artifacts/palyra-backup.zip
@@ -139,7 +139,7 @@ Canonical command map:
   setup      Preferred bootstrap/init workflow (`init` remains as a compatibility alias)
   configure  Guided reconfiguration workflow for an existing installation
   acp        Preferred ACP stdio bridge entry point (`agent acp` remains compatible)
-  docs       Local committed docs/help discovery surface
+  docs       Local CLI help snapshot discovery surface
   gateway    Preferred runtime/admin family (`daemon` remains as a compatibility alias)
   dashboard  Thin operator shortcut for dashboard URL discovery/open workflows
   objectives Durable objective, heartbeat, standing-order, and program surface
@@ -297,12 +297,12 @@ Discoverability:
 const DOCS_AFTER_HELP: &str = "\
 Examples:
   palyra docs list
-  palyra docs search acp
-  palyra docs show cli-v1-acp-shim
-  palyra docs show docs/architecture/browser-service-v1.md
+  palyra docs search gateway
+  palyra docs search browser
+  palyra docs show help/docs-help
 
 Discoverability:
-  `docs` indexes committed source docs in-repo and bundled docs/help snapshots from portable installs for local, offline lookup.";
+  `docs` indexes committed CLI help snapshots in source checkouts and bundled help snapshots from portable installs for local, offline lookup.";
 
 const BROWSER_AFTER_HELP: &str = "\
 Examples:
@@ -581,7 +581,7 @@ pub enum Command {
         command: WebhooksCommand,
     },
     #[command(
-        about = "Discover bundled or committed operator docs and CLI help snapshots locally",
+        about = "Discover local CLI help snapshots from source checkouts or portable installs",
         after_long_help = DOCS_AFTER_HELP
     )]
     Docs {

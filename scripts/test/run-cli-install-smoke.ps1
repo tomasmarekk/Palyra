@@ -375,8 +375,8 @@ try {
         @{ Label = "functional :: doctor-json"; Context = $baselineContext; Args = @("doctor", "--json"); Environment = $baseInstallEnvironment }
         @{ Label = "functional :: protocol-version"; Context = $baselineContext; Args = @("protocol", "version") }
         @{ Label = "functional :: protocol-validate-id"; Context = $baselineContext; Args = @("protocol", "validate-id", "--id", "01ARZ3NDEKTSV4RRFFQ69G5FAV") }
-        @{ Label = "functional :: docs-search-migration"; Context = $baselineContext; Args = @("docs", "search", "migration") }
-        @{ Label = "functional :: docs-search-acp"; Context = $baselineContext; Args = @("docs", "search", "acp") }
+        @{ Label = "functional :: docs-search-gateway"; Context = $baselineContext; Args = @("docs", "search", "gateway") }
+        @{ Label = "functional :: docs-show-help"; Context = $baselineContext; Args = @("docs", "show", "help/docs-help") }
         @{ Label = "functional :: setup-local"; Context = $bootstrapContext; Args = @("setup", "--mode", "local", "--path", $bootstrapContext.ConfigPath, "--force") }
         @{ Label = "functional :: setup-wizard-quickstart"; Context = $bootstrapContext; Args = @("setup", "--wizard", "--mode", "local", "--path", $bootstrapContext.ConfigPath, "--force", "--flow", "quickstart", "--non-interactive", "--accept-risk", "--auth-method", "api-key", "--api-key-env", "OPENAI_API_KEY", "--skip-health", "--skip-channels", "--skip-skills", "--json"); Environment = @{ OPENAI_API_KEY = "sk-installed-smoke" } }
         @{ Label = "functional :: config-validate"; Context = $bootstrapContext; Args = @("config", "validate", "--path", $bootstrapContext.ConfigPath) }

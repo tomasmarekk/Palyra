@@ -67,7 +67,7 @@ try {
     Invoke-CommandQuiet -Command "palyra" -Arguments @("--help")
     Invoke-CommandQuiet -Command "palyra" -Arguments @("gateway", "--help")
     Invoke-CommandQuiet -Command "palyra" -Arguments @("browser", "--help")
-    Invoke-CommandQuiet -Command "palyra" -Arguments @("docs", "search", "migration")
+    Invoke-CommandQuiet -Command "palyra" -Arguments @("docs", "search", "gateway")
     if ($null -ne $resolvedStateRoot) {
         Invoke-CommandQuiet -Command "palyra" -Arguments @("doctor", "--json")
     }

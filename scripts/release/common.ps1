@@ -13,10 +13,6 @@ function Get-ReleaseOutputRoot {
     return Join-Path (Get-RepoRoot) "target/release-artifacts"
 }
 
-function Get-CliDocsSourceRoot {
-    return Join-Path (Get-RepoRoot) "crates/palyra-cli/data/docs"
-}
-
 function Resolve-ExecutableName {
     param(
         [Parameter(Mandatory = $true)]
@@ -72,60 +68,6 @@ function Assert-FileExists {
     }
 
     return (Resolve-Path -LiteralPath $Path).Path
-}
-
-function Assert-DocsBundleExists {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Path,
-        [Parameter(Mandatory = $true)]
-        [string]$Label
-    )
-
-    if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
-        throw "$Label does not exist: $Path"
-    }
-
-    $docsFile =
-        Get-ChildItem -LiteralPath $Path -Recurse -File |
-        Where-Object {
-            $_.Extension -in @(".md", ".txt") -and
-            $_.FullName -notmatch '(^|[\\/])help_snapshots([\\/]|$)'
-        } |
-        Select-Object -First 1
-
-    if ($null -eq $docsFile) {
-        throw "$Label does not contain any committed docs files: $Path"
-    }
-
-    return (Resolve-Path -LiteralPath $Path).Path
-}
-
-function Assert-CliDocsBundleExists {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Path,
-        [Parameter(Mandatory = $true)]
-        [string]$Label
-    )
-
-    $resolvedPath = Assert-DocsBundleExists -Path $Path -Label $Label
-    $requiredRelativePaths = @(
-        "README.md",
-        "cli-v1-acp-shim.md",
-        "cli-parity-migration-v1.md",
-        "release-engineering-v1.md",
-        "release-validation-checklist.md",
-        "architecture/browser-service-v1.md"
-    )
-
-    foreach ($relativePath in $requiredRelativePaths) {
-        Assert-FileExists `
-            -Path (Join-Path $resolvedPath $relativePath) `
-            -Label "$Label required doc $relativePath" | Out-Null
-    }
-
-    return $resolvedPath
 }
 
 function New-CleanDirectory {

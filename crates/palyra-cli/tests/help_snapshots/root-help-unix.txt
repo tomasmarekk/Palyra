@@ -24,7 +24,7 @@ Commands:
   auth
   channels
   webhooks        Manage webhook-backed integrations
-  docs            Discover bundled or committed operator docs and CLI help snapshots locally
+  docs            Discover local CLI help snapshots from source checkouts or portable installs
   plugins
   hooks
   profile         Manage CLI connection profiles and active environment selection
@@ -90,7 +90,7 @@ Global Options:
 Examples:
   palyra setup --mode local
   palyra acp --session-key ops:triage
-  palyra docs search acp
+  palyra docs search gateway
   palyra gateway status
   palyra dashboard --open
   palyra backup create --output ./artifacts/palyra-backup.zip
@@ -108,7 +108,7 @@ Canonical command map:
   setup      Preferred bootstrap/init workflow (`init` remains as a compatibility alias)
   configure  Guided reconfiguration workflow for an existing installation
   acp        Preferred ACP stdio bridge entry point (`agent acp` remains compatible)
-  docs       Local committed docs/help discovery surface
+  docs       Local CLI help snapshot discovery surface
   gateway    Preferred runtime/admin family (`daemon` remains as a compatibility alias)
   dashboard  Thin operator shortcut for dashboard URL discovery/open workflows
   objectives Durable objective, heartbeat, standing-order, and program surface

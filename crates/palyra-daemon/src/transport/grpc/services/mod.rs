@@ -1,4 +1,4 @@
-//! Service-level gRPC split point for milestone 06.
+//! Service-level gRPC split point for the transport service modules.
 
 pub(crate) mod approvals;
 pub(crate) mod auth;

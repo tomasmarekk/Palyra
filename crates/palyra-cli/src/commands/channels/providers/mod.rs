@@ -69,7 +69,7 @@ pub(super) fn run_channel_lifecycle_upsert(
             other,
             None,
             json_output,
-            "provider lifecycle is implemented for Discord only in this milestone batch",
+            "provider lifecycle is implemented for Discord only in the current provider set",
         ),
     }
 }
@@ -105,7 +105,7 @@ pub(super) fn run_channel_lifecycle_disable(
             other,
             None,
             json_output,
-            "provider logout/remove is implemented for Discord only in this milestone batch",
+            "provider logout/remove is implemented for Discord only in the current provider set",
         ),
     }
 }

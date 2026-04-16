@@ -660,7 +660,7 @@ mod tests {
             kind: ObjectiveKind::Objective,
             state: ObjectiveState::Draft,
             name: "Ship objective board".to_owned(),
-            prompt: "Track and complete the objective board milestone.".to_owned(),
+            prompt: "Track and complete the objective board target.".to_owned(),
             owner_principal: "user:ops".to_owned(),
             channel: Some("cli".to_owned()),
             priority: ObjectivePriority::High,

@@ -817,19 +817,19 @@ fn parse_top_level_acp_shim_from_ndjson_stdin() {
 
 #[test]
 fn parse_docs_search_and_show() {
-    let parsed_search = Cli::parse_from(["palyra", "docs", "search", "acp", "--limit", "5"]);
+    let parsed_search = Cli::parse_from(["palyra", "docs", "search", "gateway", "--limit", "5"]);
     assert_eq!(
         parsed_search.command,
         Command::Docs {
-            command: DocsCommand::Search { query: "acp".to_owned(), limit: 5, json: false }
+            command: DocsCommand::Search { query: "gateway".to_owned(), limit: 5, json: false }
         }
     );
 
-    let parsed_show = Cli::parse_from(["palyra", "docs", "show", "cli-v1-acp-shim", "--json"]);
+    let parsed_show = Cli::parse_from(["palyra", "docs", "show", "help/docs-help", "--json"]);
     assert_eq!(
         parsed_show.command,
         Command::Docs {
-            command: DocsCommand::Show { slug_or_path: "cli-v1-acp-shim".to_owned(), json: true }
+            command: DocsCommand::Show { slug_or_path: "help/docs-help".to_owned(), json: true }
         }
     );
 }

@@ -47,9 +47,7 @@ if ($ArtifactKind -eq "desktop") {
 $resolvedDaemonBinary = Assert-FileExists -Path $DaemonBinaryPath -Label "Daemon binary"
 $resolvedBrowserBinary = Assert-FileExists -Path $BrowserBinaryPath -Label "Browser service binary"
 $resolvedCliBinary = Assert-FileExists -Path $CliBinaryPath -Label "CLI binary"
-$resolvedDocsRoot = Get-CliDocsSourceRoot
 $resolvedHelpSnapshotsRoot = Join-Path $repoRoot "crates/palyra-cli/tests/help_snapshots"
-$resolvedDocsRoot = Assert-CliDocsBundleExists -Path $resolvedDocsRoot -Label "Bundled operator docs source"
 $null = Assert-FileExists -Path (Join-Path $resolvedHelpSnapshotsRoot "docs-help.txt") -Label "CLI help snapshot bundle"
 $resolvedWebDistPath =
     if ([string]::IsNullOrWhiteSpace($WebDistPath)) {
@@ -90,7 +88,7 @@ Copy-BinaryIntoPayload -SourcePath $resolvedCliBinary -LogicalName "palyra"
 
 Copy-Item -LiteralPath (Join-Path $repoRoot "LICENSE") -Destination (Join-Path $payloadRoot "LICENSE.txt") -Force
 Copy-Item -LiteralPath $resolvedWebDistPath -Destination (Join-Path $payloadRoot "web") -Recurse -Force
-Copy-Item -LiteralPath $resolvedDocsRoot -Destination (Join-Path $payloadRoot "docs") -Recurse -Force
+New-Item -ItemType Directory -Path (Join-Path $payloadRoot "docs") -Force | Out-Null
 Copy-Item -LiteralPath $resolvedHelpSnapshotsRoot -Destination (Join-Path $payloadRoot "docs/help_snapshots") -Recurse -Force
 
 $installBody =
@@ -105,7 +103,7 @@ Install
 2. Keep `palyra-desktop-control-center`, `palyrad`, `palyra-browserd`, `palyra`, and the `web/` directory in the same directory.
 3. Treat `palyra` as a first-class entry point: either run it directly from this directory or expose it on your shell `PATH` with a shim or symlink.
 4. Review the installed operator surfaces with `palyra gateway --help`, `palyra browser --help`, `palyra docs --help`, `palyra update --help`, and `palyra uninstall --help`.
-5. Use `palyra docs search migration` for bundled offline operator and migration guidance.
+5. Use `palyra docs search gateway` for bundled offline CLI help guidance.
 6. Launch the desktop control center binary from that directory.
 
 Update
@@ -130,7 +128,7 @@ Install
 3. Run `palyra setup --mode remote --path <install-root>/config/palyra.toml --force`.
 4. Validate the generated config with `palyra config validate --path <install-root>/config/palyra.toml`.
 5. Review the installed operator surfaces with `palyra gateway --help`, `palyra browser --help`, `palyra node --help`, `palyra nodes --help`, `palyra docs --help`, `palyra update --help`, and `palyra uninstall --help`.
-6. Use `palyra docs search migration` for bundled offline operator and migration guidance.
+6. Use `palyra docs search gateway` for bundled offline CLI help guidance.
 7. Start `palyrad` with `PALYRA_CONFIG=<install-root>/config/palyra.toml`.
 8. Start `palyra-browserd` only when browser automation is intentionally enabled by config.
 
@@ -163,7 +161,7 @@ Release notes for Palyra $Version
 
 - Portable desktop bundles now ship the desktop control center, `palyrad`, `palyra-browserd`, `palyra`, and the colocated `web/` dashboard bundle, with installer support for exposing `palyra` as a user-scoped command.
 - Portable headless packages now ship repeatable archive-based install/update flow with `palyra setup`, config initialization/migration validation, and installer support for exposing `palyra` as a user-scoped command.
-- Portable packages now bundle offline operator docs plus CLI help snapshots so `palyra docs` remains usable outside a source checkout.
+- Portable packages now bundle offline CLI help snapshots so `palyra docs` remains usable outside a source checkout.
 - Windows and macOS remain the supported v1 desktop runtime targets; the Linux desktop bundle continues as a release-regression/package artifact until the Tauri Linux dependency chain is unblocked.
 - Release artifacts now include SHA256 manifests, release manifests, provenance sidecars, and package-boundary validation.
 - Release packaging smoke validates canonical lifecycle surfaces (`setup`, `gateway`, `onboarding wizard`) plus compatibility aliases (`init`, `daemon`, `onboard`) on installed packages before publication.

@@ -8,28 +8,23 @@ use serde::Serialize;
 
 use crate::DocsCommand;
 
-const SOURCE_DOCS_DIR: &str = "crates/palyra-cli/data/docs";
-const BUNDLED_DOCS_DIR: &str = "docs";
 const HELP_SOURCE_DIR: &str = "crates/palyra-cli/tests/help_snapshots";
 const HELP_BUNDLED_DIR: &str = "docs/help_snapshots";
 
 #[derive(Debug, Clone)]
 struct DocsLayout {
-    docs_root: PathBuf,
     help_root: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum IndexedDocKind {
-    Docs,
     Help,
 }
 
 impl IndexedDocKind {
     const fn as_str(self) -> &'static str {
         match self {
-            Self::Docs => "docs",
             Self::Help => "help",
         }
     }
@@ -193,13 +188,6 @@ fn build_docs_index() -> Result<Vec<IndexedDoc>> {
 
     let mut entries = Vec::new();
     index_tree(
-        layout.docs_root.as_path(),
-        layout.docs_root.as_path(),
-        IndexedDocKind::Docs,
-        "docs",
-        &mut entries,
-    )?;
-    index_tree(
         layout.help_root.as_path(),
         layout.help_root.as_path(),
         IndexedDocKind::Help,
@@ -282,27 +270,23 @@ fn source_repo_root() -> Result<PathBuf> {
 
 fn resolve_docs_layout() -> Result<DocsLayout> {
     let source_root = source_repo_root()?;
-    let source_docs = source_root.join(SOURCE_DOCS_DIR);
     let source_help = source_root.join(HELP_SOURCE_DIR);
-    if source_docs.is_dir() && source_help.is_dir() {
-        return Ok(DocsLayout { docs_root: source_docs, help_root: source_help });
+    if source_help.is_dir() {
+        return Ok(DocsLayout { help_root: source_help });
     }
 
     let current_exe = env::current_exe().context("failed to resolve current CLI executable")?;
     let install_root = current_exe.parent().map(Path::to_path_buf).ok_or_else(|| {
         anyhow!("failed to resolve install root from current CLI path {}", current_exe.display())
     })?;
-    let bundled_docs = install_root.join(BUNDLED_DOCS_DIR);
     let bundled_help = install_root.join(HELP_BUNDLED_DIR);
-    if bundled_docs.is_dir() && bundled_help.is_dir() {
-        return Ok(DocsLayout { docs_root: bundled_docs, help_root: bundled_help });
+    if bundled_help.is_dir() {
+        return Ok(DocsLayout { help_root: bundled_help });
     }
 
     bail!(
-        "docs index roots are unavailable; expected either source docs at {} and {} or bundled docs at {} and {}",
-        source_docs.display(),
+        "docs index roots are unavailable; expected either source help snapshots at {} or bundled help snapshots at {}",
         source_help.display(),
-        bundled_docs.display(),
         bundled_help.display()
     )
 }
@@ -321,10 +305,9 @@ fn doc_slug(logical_relative: &str, kind: IndexedDocKind) -> String {
     if normalized.ends_with("/README") {
         return normalized[..normalized.len() - "/README".len()].to_ascii_lowercase();
     }
-    if kind == IndexedDocKind::Help {
-        return normalized.to_ascii_lowercase();
+    match kind {
+        IndexedDocKind::Help => normalized.to_ascii_lowercase(),
     }
-    normalized.trim_start_matches("docs/").to_ascii_lowercase()
 }
 
 fn doc_title(relative: &Path, content: &str) -> String {
@@ -410,14 +393,10 @@ fn resolve_requested_doc_by_path<'a>(
     let canonical = candidate
         .canonicalize()
         .with_context(|| format!("failed to canonicalize docs path {}", candidate.display()))?;
-    let docs_root = layout.docs_root.canonicalize().with_context(|| {
-        format!("failed to canonicalize docs directory {}", layout.docs_root.display())
-    })?;
     let help_root = layout.help_root.canonicalize().with_context(|| {
         format!("failed to canonicalize help snapshots directory {}", layout.help_root.display())
     })?;
-    let allowed = canonical.starts_with(&docs_root) || canonical.starts_with(&help_root);
-    if !allowed {
+    if !canonical.starts_with(&help_root) {
         return Ok(None);
     }
     Ok(index.iter().find(|entry| entry.absolute_path == canonical))
@@ -481,32 +460,27 @@ mod tests {
     }
 
     #[test]
-    fn build_docs_index_includes_release_bundle_entries() {
-        let index = build_docs_index().expect("tracked docs bundle should index");
+    fn build_docs_index_includes_help_snapshot_entries() {
+        let index = build_docs_index().expect("help snapshots should index");
         assert!(index.iter().any(|entry| {
-            entry.slug == "release-validation-checklist"
-                && entry.relative_path == "docs/release-validation-checklist.md"
+            entry.slug == "help/docs-help" && entry.relative_path == "help/docs-help.txt"
         }));
         assert!(index.iter().any(|entry| {
-            entry.slug == "cli-v1-acp-shim" && entry.relative_path == "docs/cli-v1-acp-shim.md"
-        }));
-        assert!(index.iter().any(|entry| {
-            entry.slug == "architecture/browser-service-v1"
-                && entry.relative_path == "docs/architecture/browser-service-v1.md"
+            entry.slug == "help/root-help-unix" && entry.relative_path == "help/root-help-unix.txt"
         }));
     }
 
     #[test]
-    fn resolve_requested_doc_matches_release_validation_basename() {
-        let index = build_docs_index().expect("tracked docs bundle should index");
-        let entry = resolve_requested_doc(index.as_slice(), "release-validation-checklist")
-            .expect("release validation checklist should resolve");
-        assert_eq!(entry.relative_path, "docs/release-validation-checklist.md");
+    fn resolve_requested_doc_matches_help_snapshot_basename() {
+        let index = build_docs_index().expect("help snapshots should index");
+        let entry =
+            resolve_requested_doc(index.as_slice(), "docs-help").expect("docs help should resolve");
+        assert_eq!(entry.relative_path, "help/docs-help.txt");
     }
 
     #[test]
     fn resolve_requested_doc_ignores_existing_paths_outside_allowed_roots() {
-        let index = build_docs_index().expect("tracked docs bundle should index");
+        let index = build_docs_index().expect("help snapshots should index");
         let temp_path =
             std::env::temp_dir().join(format!("palyra-docs-test-{}.md", std::process::id()));
         fs::write(&temp_path, "# Temporary\n").expect("temp file should be writable");
@@ -531,7 +505,7 @@ mod tests {
             .expect("symlinked doc fixture should be created");
 
         let mut entries = Vec::new();
-        index_tree(&docs_root, &docs_root, IndexedDocKind::Docs, "docs", &mut entries)
+        index_tree(&docs_root, &docs_root, IndexedDocKind::Help, "docs", &mut entries)
             .expect("index should succeed");
 
         assert_eq!(entries.len(), 1, "symlinked docs entry should be ignored");

@@ -750,7 +750,7 @@ impl AccessRegistry {
             Some(actor_principal),
             None,
             None,
-            Some("phase10_access_registry"),
+            Some("access_registry_backfill"),
             now,
         );
         self.persist()?;
@@ -2079,7 +2079,7 @@ mod tests {
     }
 
     #[test]
-    fn backfill_repairs_phase10_access_records_idempotently() {
+    fn backfill_repairs_access_registry_records_idempotently() {
         let temp = tempdir().expect("tempdir should exist");
         let registry_path = temp.path().join(ACCESS_REGISTRY_FILE_NAME);
         let raw = serde_json::json!({

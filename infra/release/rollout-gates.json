@@ -1,0 +1,145 @@
+{
+  "updated_at": "2026-04-16",
+  "release_scope": "mobile_companion_localization_hardening",
+  "success_metrics": [
+    {
+      "metric_id": "time_to_first_value_minutes",
+      "source": "activation telemetry",
+      "target": "<= 10 minutes median for quickstart",
+      "operator_action_on_breach": "keep onboarding and mobile follow-up surfaces in preview"
+    },
+    {
+      "metric_id": "quickstart_completion_rate",
+      "source": "onboarding funnel telemetry",
+      "target": ">= 70% completion after rollout stabilization",
+      "operator_action_on_breach": "hold advanced-only defaults and refresh onboarding guidance"
+    },
+    {
+      "metric_id": "approval_fatigue_14d",
+      "source": "approval telemetry",
+      "target": "down or flat versus the pre-release baseline",
+      "operator_action_on_breach": "review tool posture recommendations before widening preview"
+    },
+    {
+      "metric_id": "resume_usage_rate",
+      "source": "session continuity telemetry",
+      "target": "upward trend after recent-sessions rollout",
+      "operator_action_on_breach": "keep mobile recent sessions and recap surfaces in limited preview"
+    },
+    {
+      "metric_id": "rollback_success_rate",
+      "source": "workspace rollback telemetry",
+      "target": ">= 95% successful restore flow completion",
+      "operator_action_on_breach": "keep rollback on explicit operator review only"
+    },
+    {
+      "metric_id": "desktop_quick_panel_adoption_rate",
+      "source": "desktop ambient telemetry",
+      "target": "steady usage without increased support failures",
+      "operator_action_on_breach": "keep ambient companion default-off"
+    },
+    {
+      "metric_id": "mobile_approval_resolution_rate",
+      "source": "mobile approval inbox telemetry",
+      "target": ">= 80% approval backlog handled without desktop fallback",
+      "operator_action_on_breach": "keep mobile approvals operator-preview only"
+    },
+    {
+      "metric_id": "voice_note_completion_rate",
+      "source": "mobile and desktop voice telemetry",
+      "target": ">= 90% transcript-review completion after recording stop",
+      "operator_action_on_breach": "keep voice note and voice overlay behind explicit opt-in"
+    }
+  ],
+  "gates": [
+    {
+      "feature_id": "mobile_companion",
+      "release_stage": "operator_preview",
+      "runtime_controls": [
+        "mobile.bootstrap.rollout.mobile_companion_enabled",
+        "mobile.bootstrap.rollout.approvals_enabled",
+        "mobile.bootstrap.rollout.notifications_enabled",
+        "mobile.bootstrap.rollout.recent_sessions_enabled",
+        "mobile.bootstrap.rollout.safe_url_open_enabled",
+        "mobile.bootstrap.rollout.voice_notes_enabled"
+      ],
+      "entry_criteria": [
+        "surface_release_smoke=passed",
+        "mobile approval and voice-note daemon tests pass",
+        "localized web/mobile strings reviewed against docs/localization-glossary.md"
+      ],
+      "exit_criteria": [
+        "mobile_approval_resolution_rate meets target for two release cuts",
+        "no unresolved CSRF or handoff audit regressions",
+        "safe URL mediation remains HTTPS-only and brokered"
+      ]
+    },
+    {
+      "feature_id": "desktop_ambient_companion",
+      "release_stage": "limited_preview",
+      "runtime_controls": [
+        "desktop.rollout.ambient_companion_enabled",
+        "desktop.rollout.desktop_notifications_enabled",
+        "desktop.rollout.quick_panel_enabled"
+      ],
+      "entry_criteria": [
+        "surface_release_smoke=passed",
+        "desktop UI typecheck passes",
+        "desktop quick-panel and notification flows stay reconnect-safe"
+      ],
+      "exit_criteria": [
+        "desktop_quick_panel_adoption_rate trends upward without extra support failures",
+        "no unresolved tray or quick-panel lifecycle regressions"
+      ]
+    },
+    {
+      "feature_id": "desktop_voice_overlay",
+      "release_stage": "operator_preview",
+      "runtime_controls": [
+        "desktop.rollout.voice_overlay_enabled"
+      ],
+      "entry_criteria": [
+        "voice consent prompts remain explicit",
+        "voice_note_completion_rate meets target in preview",
+        "no ambient-listening regression is introduced"
+      ],
+      "exit_criteria": [
+        "voice_note_completion_rate meets target for two release cuts",
+        "support bundle and audit evidence confirm explicit consent posture"
+      ]
+    },
+    {
+      "feature_id": "native_canvas",
+      "release_stage": "operator_preview",
+      "runtime_controls": [
+        "desktop.diagnostics.experiments.native_canvas.rollout_stage"
+      ],
+      "entry_criteria": [
+        "existing canvas history and rollback flows stay green",
+        "fallback browser path remains available"
+      ],
+      "exit_criteria": [
+        "no material support regression tied to canvas history or rendering failures",
+        "operator preview diagnostics remain clean for two release cuts"
+      ]
+    },
+    {
+      "feature_id": "workspace_rollback",
+      "release_stage": "operator_review_required",
+      "runtime_controls": [
+        "chat session compaction review requirement",
+        "support doctor rollback preview/apply flow",
+        "approval and audit trail linkage"
+      ],
+      "entry_criteria": [
+        "surface_release_smoke=passed",
+        "rollback_success_rate meets target in staging or operator preview",
+        "restore flow remains explicitly reviewable"
+      ],
+      "exit_criteria": [
+        "rollback_success_rate meets target for two release cuts",
+        "no missing audit links for restore and support flows"
+      ]
+    }
+  ]
+}

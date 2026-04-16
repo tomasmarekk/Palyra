@@ -91,12 +91,12 @@ fn installed_binary_runs_baseline_smoke_commands() -> Result<()> {
         "palyra config validate",
     )?;
     assert_success(
-        &run_cli(workdir_path, &["docs", "search", "migration"], &envs)?,
-        "palyra docs search migration",
+        &run_cli(workdir_path, &["docs", "search", "gateway"], &envs)?,
+        "palyra docs search gateway",
     )?;
     assert_success(
-        &run_cli(workdir_path, &["docs", "search", "acp"], &envs)?,
-        "palyra docs search acp",
+        &run_cli(workdir_path, &["docs", "show", "help/docs-help"], &envs)?,
+        "palyra docs show help/docs-help",
     )?;
 
     let update_payload = assert_json_success(

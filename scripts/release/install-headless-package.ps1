@@ -70,7 +70,7 @@ try {
     Invoke-CommandQuiet -Command "palyra" -Arguments @("browser", "--help")
     Invoke-CommandQuiet -Command "palyra" -Arguments @("node", "--help")
     Invoke-CommandQuiet -Command "palyra" -Arguments @("nodes", "--help")
-    Invoke-CommandQuiet -Command "palyra" -Arguments @("docs", "search", "migration")
+    Invoke-CommandQuiet -Command "palyra" -Arguments @("docs", "search", "gateway")
     Invoke-CommandQuiet -Command "palyra" -Arguments @("doctor", "--json")
 }
 finally {
