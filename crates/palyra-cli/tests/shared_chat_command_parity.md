@@ -4,19 +4,19 @@ This report is generated from the shared slash-command registry consumed by the 
 
 ## Summary
 
-- Total commands: `37`
+- Total commands: `38`
 - Shared across web and TUI: `21`
 - Web-visible commands: `23`
-- TUI-visible commands: `35`
+- TUI-visible commands: `36`
 - Web-only commands: `2`
-- TUI-only commands: `14`
+- TUI-only commands: `15`
 
 ## Entries
 
 | Command | Synopsis | Category | Execution | Surfaces | Aliases | Capability tags | Entity targets |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `/help` | `/help` | `navigation` | `local` | `web`, `tui` | - | `help`, `palette` | - |
-| `/status` | `/status` | `diagnostics` | `local` | `tui` | - | `status`, `diagnostics` | - |
+| `/status` | `/status [detail]` | `diagnostics` | `local` | `tui` | - | `status`, `diagnostics` | - |
 | `/new` | `/new [label]` | `session` | `server` | `web`, `tui` | - | `session`, `create` | `session` |
 | `/agent` | `/agent [agent-id]` | `agent` | `server` | `tui` | - | `agent`, `picker` | `agent` |
 | `/session` | `/session [session-id-or-key]` | `session` | `server` | `tui` | - | `session`, `picker` | `session` |
@@ -29,7 +29,8 @@ This report is generated from the shared slash-command registry consumed by the 
 | `/title` | `/title [label]` | `session` | `server` | `web`, `tui` | - | `session`, `title`, `rename` | `session` |
 | `/model` | `/model [model-id|default]` | `model` | `server` | `tui` | - | `model`, `picker`, `quick_controls` | `model` |
 | `/undo` | `/undo [checkpoint-id]` | `session` | `server` | `web`, `tui` | - | `undo`, `checkpoint`, `restore` | `checkpoint`, `session`, `run` |
-| `/rollback` | `/rollback [checkpoint-id-or-run-id] | /rollback diff <checkpoint-id-or-run-id>` | `workspace` | `server` | `web`, `tui` | - | `workspace`, `rollback`, `diff`, `restore` | `checkpoint`, `run`, `session` |
+| `/rollback` | `/rollback [checkpoint-id-or-run-id] | /rollback diff <checkpoint-id-or-run-id> | /rollback restore <checkpoint-id> --confirm` | `workspace` | `server` | `web`, `tui` | - | `workspace`, `rollback`, `diff`, `restore` | `checkpoint`, `run`, `session` |
+| `/workspace` | `/workspace [run-id] | /workspace show|open <index-or-artifact-id> | /workspace handoff [open]` | `workspace` | `local` | `tui` | - | `workspace`, `artifact`, `handoff`, `local_capability` | `artifact`, `run`, `checkpoint` |
 | `/interrupt` | `/interrupt [soft|force] [redirect-prompt]` | `run` | `server` | `web`, `tui` | `/abort`, `/cancel` | `run`, `interrupt`, `cancel`, `redirect` | `run` |
 | `/reset` | `/reset` | `session` | `server` | `web`, `tui` | - | `session`, `reset` | `session` |
 | `/retry` | `/retry` | `run` | `server` | `web`, `tui` | - | `run`, `retry` | `run` |
@@ -40,7 +41,7 @@ This report is generated from the shared slash-command registry consumed by the 
 | `/background` | `/background list|add|show|pause|resume|retry|cancel` | `background` | `server` | `tui` | - | `background`, `task`, `mutating` | `background_task` |
 | `/usage` | `/usage` | `diagnostics` | `local` | `web`, `tui` | - | `usage`, `diagnostics` | - |
 | `/compact` | `/compact [preview|apply|history]` | `session` | `server` | `web`, `tui` | - | `compact`, `session`, `history` | `session`, `compaction` |
-| `/attach` | `/attach` | `attachment` | `local_capability` | `web`, `tui` | - | `attachment`, `local_capability` | `attachment` |
+| `/attach` | `/attach [path|list|remove <index>|clear]` | `attachment` | `local_capability` | `web`, `tui` | - | `attachment`, `local_capability` | `attachment` |
 | `/profile` | `/profile [profile-id-or-name]` | `profile` | `local` | `web`, `tui` | - | `profile`, `auth`, `navigation` | `profile` |
 | `/browser` | `/browser [profile-id-or-session-id]` | `browser` | `local` | `web`, `tui` | - | `browser`, `navigation`, `profile` | `browser_profile`, `browser_session` |
 | `/doctor` | `/doctor [jobs|run|repair]` | `diagnostics` | `server` | `web`, `tui` | - | `doctor`, `diagnostics`, `recovery` | `doctor_job` |

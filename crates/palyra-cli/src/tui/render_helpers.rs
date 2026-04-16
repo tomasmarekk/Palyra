@@ -57,7 +57,7 @@ pub(super) fn estimate_text_tokens(text: &str) -> u64 {
     if trimmed.is_empty() {
         return 0;
     }
-    ((trimmed.len() as u64) + 3) / 4
+    (trimmed.len() as u64).div_ceil(4)
 }
 
 pub(super) fn format_approx_tokens(value: u64) -> String {

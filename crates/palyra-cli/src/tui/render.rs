@@ -248,7 +248,7 @@ pub(super) fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints(
-            std::iter::repeat(Constraint::Length(1)).take(area.height as usize).collect::<Vec<_>>(),
+            std::iter::repeat_n(Constraint::Length(1), area.height as usize).collect::<Vec<_>>(),
         )
         .split(area);
     let width = area.width as usize;
