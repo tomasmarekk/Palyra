@@ -1029,7 +1029,7 @@ fn console_mobile_endpoints_require_session_and_surface_cross_device_sessions() 
         .context("desktop-origin session create returned non-success status")?
         .json::<Value>()
         .context("failed to parse desktop-origin session json")?;
-    let desktop_session_id = created_session
+    let desktop_session_ref = created_session
         .get("session")
         .and_then(|value| value.get("session_id"))
         .and_then(Value::as_str)
@@ -1084,7 +1084,7 @@ fn console_mobile_endpoints_require_session_and_surface_cross_device_sessions() 
                     .get("session")
                     .and_then(|value| value.get("session_id"))
                     .and_then(Value::as_str)
-                    == Some(desktop_session_id)
+                    == Some(desktop_session_ref)
             })
         }),
         "mobile sessions should include sessions created on another device for the same principal"
@@ -1092,7 +1092,7 @@ fn console_mobile_endpoints_require_session_and_surface_cross_device_sessions() 
 
     let detail = client
         .get(format!(
-            "http://127.0.0.1:{admin_port}/console/v1/mobile/sessions/{desktop_session_id}"
+            "http://127.0.0.1:{admin_port}/console/v1/mobile/sessions/{desktop_session_ref}"
         ))
         .header("Cookie", mobile_cookie.clone())
         .send()
@@ -1103,7 +1103,7 @@ fn console_mobile_endpoints_require_session_and_surface_cross_device_sessions() 
         .context("failed to parse mobile session detail response")?;
     assert_eq!(
         detail.get("session").and_then(|value| value.get("session_id")).and_then(Value::as_str),
-        Some(desktop_session_id),
+        Some(desktop_session_ref),
         "mobile session detail should resolve cross-device session context"
     );
 
@@ -1123,7 +1123,7 @@ fn console_mobile_endpoints_require_session_and_surface_cross_device_sessions() 
         .post(format!("http://127.0.0.1:{admin_port}/console/v1/mobile/safe-url-open"))
         .header("Cookie", mobile_cookie.clone())
         .header("x-palyra-csrf-token", mobile_csrf)
-        .json(&serde_json::json!({ "target": format!("/chat?sessionId={desktop_session_id}") }))
+        .json(&serde_json::json!({ "target": format!("/chat?sessionId={desktop_session_ref}") }))
         .send()
         .context("failed to call mobile safe-url-open")?
         .error_for_status()
