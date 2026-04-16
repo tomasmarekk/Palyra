@@ -35,18 +35,84 @@ export type DesktopCompanionOfflineDraft = {
 
 export type DesktopCompanionRollout = {
   companion_shell_enabled: boolean;
+  ambient_companion_enabled: boolean;
   desktop_notifications_enabled: boolean;
   offline_drafts_enabled: boolean;
   voice_capture_enabled: boolean;
+  voice_overlay_enabled: boolean;
+  voice_silence_detection_enabled: boolean;
   tts_playback_enabled: boolean;
   release_channel: string;
 };
+
+export type DesktopCompanionSurfaceMode = "main" | "quick_panel" | "voice_overlay";
+
+export type DesktopVoiceLifecycleState =
+  | "idle"
+  | "recording"
+  | "transcribing"
+  | "review"
+  | "sending"
+  | "speaking"
+  | "error"
+  | "cancelled";
 
 export type DesktopCompanionPreferences = {
   active_section: DesktopCompanionSection;
   active_session_id?: string;
   active_device_id?: string;
   last_run_id?: string;
+};
+
+export type DesktopCompanionAmbient = {
+  start_on_login_enabled: boolean;
+  global_hotkey_enabled: boolean;
+  global_hotkey: string;
+  hotkey_registration_error?: string;
+  last_surface: DesktopCompanionSurfaceMode;
+};
+
+export type DesktopCompanionVoiceAuditEntry = {
+  audit_id: string;
+  kind: string;
+  detail: string;
+  created_at_unix_ms: number;
+  session_id?: string;
+  remote_processing: boolean;
+  tts_playback: boolean;
+  input_device_label?: string;
+  output_voice_label?: string;
+};
+
+export type DesktopCompanionVoice = {
+  lifecycle_state: DesktopVoiceLifecycleState;
+  capture_consent_granted_at_unix_ms?: number;
+  tts_consent_granted_at_unix_ms?: number;
+  microphone_permission_state: string;
+  microphone_device_id?: string;
+  microphone_device_label?: string;
+  tts_voice_uri?: string;
+  tts_voice_label?: string;
+  tts_muted: boolean;
+  silence_detection_enabled: boolean;
+  silence_timeout_ms: number;
+  draft_session_id?: string;
+  draft_text?: string;
+  draft_summary?: string;
+  draft_language?: string;
+  draft_duration_ms?: number;
+  last_error?: string;
+  audit_log: DesktopCompanionVoiceAuditEntry[];
+};
+
+export type DesktopCompanionActiveRun = {
+  session_id: string;
+  session_title: string;
+  run_id: string;
+  status: string;
+  started_at_unix_ms?: number;
+  pending_approvals: number;
+  preview?: string;
 };
 
 export type ChatSessionRecord = {
@@ -422,6 +488,7 @@ export type DesktopCompanionMetrics = {
   unread_notifications: number;
   pending_approvals: number;
   queued_offline_drafts: number;
+  active_runs: number;
   active_sessions: number;
   sessions_with_active_runs: number;
   trusted_devices: number;
@@ -449,8 +516,11 @@ export type DesktopCompanionSnapshot = {
   connection_state: "connected" | "reconnecting" | "offline";
   rollout: DesktopCompanionRollout;
   preferences: DesktopCompanionPreferences;
+  ambient: DesktopCompanionAmbient;
+  voice: DesktopCompanionVoice;
   notifications: DesktopCompanionNotification[];
   offline_drafts: DesktopCompanionOfflineDraft[];
+  active_runs: DesktopCompanionActiveRun[];
   session_catalog: SessionCatalogRecord[];
   session_summary?: SessionCatalogSummary;
   approvals: JsonValue[];
@@ -799,10 +869,13 @@ export const DESKTOP_PREVIEW_COMPANION_SNAPSHOT: DesktopCompanionSnapshot = {
   connection_state: "connected",
   rollout: {
     companion_shell_enabled: true,
+    ambient_companion_enabled: true,
     desktop_notifications_enabled: true,
     offline_drafts_enabled: true,
-    voice_capture_enabled: false,
-    tts_playback_enabled: false,
+    voice_capture_enabled: true,
+    voice_overlay_enabled: true,
+    voice_silence_detection_enabled: true,
+    tts_playback_enabled: true,
     release_channel: "preview",
   },
   preferences: {
@@ -810,6 +883,54 @@ export const DESKTOP_PREVIEW_COMPANION_SNAPSHOT: DesktopCompanionSnapshot = {
     active_session_id: "preview-session",
     active_device_id: "preview-device",
     last_run_id: "preview-run",
+  },
+  ambient: {
+    start_on_login_enabled: false,
+    global_hotkey_enabled: true,
+    global_hotkey: "CommandOrControl+Shift+Space",
+    last_surface: "quick_panel",
+  },
+  voice: {
+    lifecycle_state: "review",
+    capture_consent_granted_at_unix_ms: DESKTOP_PREVIEW_SNAPSHOT.generated_at_unix_ms - 600_000,
+    tts_consent_granted_at_unix_ms: DESKTOP_PREVIEW_SNAPSHOT.generated_at_unix_ms - 420_000,
+    microphone_permission_state: "granted",
+    microphone_device_id: "default-mic",
+    microphone_device_label: "Built-in microphone",
+    tts_voice_uri: "preview-voice",
+    tts_voice_label: "Preview voice",
+    tts_muted: false,
+    silence_detection_enabled: true,
+    silence_timeout_ms: 1800,
+    draft_session_id: "preview-session",
+    draft_text: "Summarize the active run and tell me whether any approval is blocking it.",
+    draft_summary: "Preview transcript queued for review",
+    draft_language: "en",
+    draft_duration_ms: 5200,
+    last_error: undefined,
+    audit_log: [
+      {
+        audit_id: "voice-audit-1",
+        kind: "capture_started",
+        detail: "Push-to-talk recording started from the quick panel.",
+        created_at_unix_ms: DESKTOP_PREVIEW_SNAPSHOT.generated_at_unix_ms - 24_000,
+        session_id: "preview-session",
+        remote_processing: false,
+        tts_playback: false,
+        input_device_label: "Built-in microphone",
+      },
+      {
+        audit_id: "voice-audit-2",
+        kind: "transcript_ready",
+        detail: "Transcript is ready for explicit review before sending.",
+        created_at_unix_ms: DESKTOP_PREVIEW_SNAPSHOT.generated_at_unix_ms - 8_000,
+        session_id: "preview-session",
+        remote_processing: true,
+        tts_playback: false,
+        input_device_label: "Built-in microphone",
+        output_voice_label: "Preview voice",
+      },
+    ],
   },
   notifications: [
     {
@@ -822,6 +943,17 @@ export const DESKTOP_PREVIEW_COMPANION_SNAPSHOT: DesktopCompanionSnapshot = {
     },
   ],
   offline_drafts: [],
+  active_runs: [
+    {
+      session_id: "preview-session",
+      session_title: "Preview conversation",
+      run_id: "preview-run",
+      status: "running",
+      started_at_unix_ms: DESKTOP_PREVIEW_SNAPSHOT.generated_at_unix_ms - 15_000,
+      pending_approvals: 1,
+      preview: "Gathering desktop companion rollout status before handing off to the full dashboard.",
+    },
+  ],
   session_catalog: [
     {
       session_id: "preview-session",
@@ -847,7 +979,7 @@ export const DESKTOP_PREVIEW_COMPANION_SNAPSHOT: DesktopCompanionSnapshot = {
       last_summary_state: "ready",
       branch_state: "root",
       branch_origin_run_id: "preview-run",
-      last_run_state: "completed",
+      last_run_state: "running",
       last_run_started_at_unix_ms: DESKTOP_PREVIEW_SNAPSHOT.generated_at_unix_ms - 10_000,
       prompt_tokens: 120,
       completion_tokens: 340,
@@ -923,7 +1055,7 @@ export const DESKTOP_PREVIEW_COMPANION_SNAPSHOT: DesktopCompanionSnapshot = {
     active_sessions: 1,
     archived_sessions: 0,
     sessions_with_pending_approvals: 1,
-    sessions_with_active_runs: 0,
+    sessions_with_active_runs: 1,
     sessions_with_context_files: 1,
   },
   approvals: [
@@ -1013,8 +1145,9 @@ export const DESKTOP_PREVIEW_COMPANION_SNAPSHOT: DesktopCompanionSnapshot = {
     unread_notifications: 1,
     pending_approvals: 1,
     queued_offline_drafts: 0,
+    active_runs: 1,
     active_sessions: 1,
-    sessions_with_active_runs: 0,
+    sessions_with_active_runs: 1,
     trusted_devices: 1,
     stale_devices: 0,
   },
@@ -1031,6 +1164,18 @@ export function isDesktopHostAvailable(): boolean {
 
 export async function showMainWindow(): Promise<void> {
   return invoke<void>("show_main_window");
+}
+
+export async function showDesktopCompanionWindow(surface?: DesktopCompanionSurfaceMode): Promise<ActionResult> {
+  return invoke<ActionResult>("show_desktop_companion_window", {
+    payload: { surface },
+  });
+}
+
+export async function hideDesktopCompanionWindow(surface?: DesktopCompanionSurfaceMode): Promise<ActionResult> {
+  return invoke<ActionResult>("hide_desktop_companion_window", {
+    payload: { surface },
+  });
 }
 
 export async function getSnapshot(): Promise<ControlCenterSnapshot> {
@@ -1054,13 +1199,59 @@ export async function updateDesktopCompanionPreferences(payload: {
 
 export async function updateDesktopCompanionRollout(payload: {
   companionShellEnabled?: boolean;
+  ambientCompanionEnabled?: boolean;
   desktopNotificationsEnabled?: boolean;
   offlineDraftsEnabled?: boolean;
   voiceCaptureEnabled?: boolean;
+  voiceOverlayEnabled?: boolean;
+  voiceSilenceDetectionEnabled?: boolean;
   ttsPlaybackEnabled?: boolean;
   releaseChannel?: string;
 }): Promise<ActionResult> {
   return invoke<ActionResult>("update_desktop_companion_rollout", {
+    payload,
+  });
+}
+
+export async function updateDesktopCompanionAmbient(payload: {
+  startOnLoginEnabled?: boolean;
+  globalHotkeyEnabled?: boolean;
+  globalHotkey?: string;
+  clearHotkeyRegistrationError?: boolean;
+  lastSurface?: DesktopCompanionSurfaceMode;
+}): Promise<ActionResult> {
+  return invoke<ActionResult>("update_desktop_companion_ambient", {
+    payload,
+  });
+}
+
+export async function updateDesktopCompanionVoiceState(payload: {
+  captureConsentGranted?: boolean;
+  ttsConsentGranted?: boolean;
+  microphonePermissionState?: string;
+  microphoneDeviceId?: string;
+  microphoneDeviceLabel?: string;
+  ttsVoiceUri?: string;
+  ttsVoiceLabel?: string;
+  ttsMuted?: boolean;
+  silenceDetectionEnabled?: boolean;
+  silenceTimeoutMs?: number;
+  lifecycleState?: DesktopVoiceLifecycleState;
+  draftSessionId?: string;
+  draftText?: string;
+  draftSummary?: string;
+  draftLanguage?: string;
+  draftDurationMs?: number;
+  lastError?: string;
+  clearDraft?: boolean;
+  clearError?: boolean;
+  auditKind?: string;
+  auditDetail?: string;
+  auditSessionId?: string;
+  auditRemoteProcessing?: boolean;
+  auditTtsPlayback?: boolean;
+}): Promise<ActionResult> {
+  return invoke<ActionResult>("update_desktop_companion_voice_state", {
     payload,
   });
 }

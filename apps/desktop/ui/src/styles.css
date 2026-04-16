@@ -271,6 +271,16 @@ samp {
   padding-bottom: 3rem;
 }
 
+.desktop-root--quick-panel,
+.desktop-root--voice-overlay {
+  width: min(100%, 36rem);
+}
+
+.desktop-root--quick-panel .desktop-grid--details,
+.desktop-root--voice-overlay .desktop-grid--details {
+  grid-template-columns: minmax(0, 1fr);
+}
+
 .desktop-stack {
   display: grid;
   gap: 1rem;
@@ -322,6 +332,22 @@ samp {
 .desktop-list-button.is-active {
   border-color: color-mix(in oklab, var(--accent) 56%, transparent);
   background: color-mix(in oklab, var(--accent) 14%, var(--surface-secondary));
+}
+
+.desktop-textarea,
+.desktop-select {
+  width: 100%;
+  border: 1px solid color-mix(in oklab, var(--border) 72%, transparent);
+  border-radius: var(--field-radius);
+  background: color-mix(in oklab, var(--surface-secondary) 92%, transparent);
+  color: inherit;
+  padding: 0.85rem 0.9rem;
+}
+
+.desktop-textarea {
+  min-height: 7rem;
+  resize: vertical;
+  line-height: 1.6;
 }
 
 .desktop-profile-grid {

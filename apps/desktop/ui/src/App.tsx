@@ -23,6 +23,7 @@ import {
   emitDesktopCompanionUxEvent,
   enrollDesktopNode,
   getDesktopCompanionSessionTranscript,
+  hideDesktopCompanionWindow,
   isDesktopHostAvailable,
   markDesktopCompanionNotificationsRead,
   openDashboard,
@@ -34,16 +35,20 @@ import {
   resolveDesktopCompanionChatSession,
   restartPalyra,
   sendDesktopCompanionChatMessage,
-  showMainWindow,
+  showDesktopCompanionWindow,
   startPalyra,
   stopPalyra,
   switchDesktopCompanionProfile,
   transcribeDesktopCompanionAudio,
+  updateDesktopCompanionAmbient,
   updateDesktopCompanionPreferences,
   updateDesktopCompanionRollout,
+  updateDesktopCompanionVoiceState,
   type ActionResult,
   type DesktopCompanionAudioTranscriptionResult,
   type DesktopCompanionSection,
+  type DesktopCompanionSnapshot,
+  type DesktopCompanionSurfaceMode,
   type DesktopSessionTranscriptEnvelope,
   type InventoryDeviceRecord,
   type JsonValue,
@@ -71,16 +76,40 @@ const SECTION_ORDER: DesktopCompanionSection[] = [
   "access",
   "onboarding",
 ];
-const VOICE_CAPTURE_CONSENT_KEY = "palyra.desktop.voice.capture-consent.v1";
-const VOICE_TTS_CONSENT_KEY = "palyra.desktop.voice.tts-consent.v1";
 const DESKTOP_FIRST_SUCCESS_PROMPTS = [
   "Summarize the current runtime posture and tell me what needs attention first.",
   "Verify my provider and model setup, then list anything still blocking a real run.",
   "Give me a safe first operator workflow I can run end-to-end from this environment.",
 ] as const;
+const DEFAULT_DESKTOP_SESSION_LABEL = "Desktop companion";
+const SILENCE_MONITOR_INTERVAL_MS = 200;
+const SILENCE_MONITOR_THRESHOLD_RMS = 0.015;
+
+type DesktopVoiceInputOption = {
+  deviceId: string;
+  label: string;
+};
+
+type DesktopVoiceOutputOption = {
+  voiceURI: string;
+  label: string;
+  lang: string;
+  default: boolean;
+};
+
+type VoiceCaptureStopReason = "manual" | "silence";
+
+type VoiceSilenceMonitor = {
+  audioContext: AudioContext;
+  analyser: AnalyserNode;
+  source: MediaStreamAudioSourceNode;
+  intervalId: number;
+  silenceStartedAt: number | null;
+};
 
 export function App() {
   const { snapshot, loading, error, previewMode, refresh } = useDesktopCompanion();
+  const surfaceMode = useMemo(resolveDesktopSurfaceMode, []);
   const [locale, setLocale] = useState<DesktopLocale>(() => readStoredDesktopLocale());
   const [actionState, setActionState] = useState<ActionName>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -90,6 +119,7 @@ export function App() {
   const [selectedApprovalId, setSelectedApprovalId] = useState("");
   const [approvalReason, setApprovalReason] = useState("");
   const [sessionLabelDraft, setSessionLabelDraft] = useState("");
+  const [ambientHotkeyDraft, setAmbientHotkeyDraft] = useState("");
   const [composerText, setComposerText] = useState("");
   const [transcriptBusy, setTranscriptBusy] = useState(false);
   const [sendBusy, setSendBusy] = useState(false);
@@ -100,8 +130,9 @@ export function App() {
   const [voiceRecording, setVoiceRecording] = useState(false);
   const [voiceTranscript, setVoiceTranscript] =
     useState<DesktopCompanionAudioTranscriptionResult | null>(null);
-  const [voiceConsentGranted, setVoiceConsentGranted] = useState(false);
-  const [ttsConsentGranted, setTtsConsentGranted] = useState(false);
+  const [voiceDraftText, setVoiceDraftText] = useState("");
+  const [voiceInputDevices, setVoiceInputDevices] = useState<DesktopVoiceInputOption[]>([]);
+  const [voiceOutputVoices, setVoiceOutputVoices] = useState<DesktopVoiceOutputOption[]>([]);
   const [speaking, setSpeaking] = useState(false);
   const [recordingElapsedMs, setRecordingElapsedMs] = useState(0);
   const [approvalBusy, setApprovalBusy] = useState(false);
@@ -112,12 +143,13 @@ export function App() {
     typeof window !== "undefined" && "Notification" in window ? Notification.permission : "denied",
   );
   const announcedNotificationIdsRef = useRef<Set<string>>(new Set());
-  const mainWindowShownRef = useRef(false);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordingStreamRef = useRef<MediaStream | null>(null);
   const recordingChunksRef = useRef<Blob[]>([]);
   const recordingStartedAtRef = useRef<number | null>(null);
+  const recordingSessionIdRef = useRef<string | null>(null);
   const speechUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
+  const silenceMonitorRef = useRef<VoiceSilenceMonitor | null>(null);
 
   const attentionItems = useMemo(
     () => collectAttentionItems(snapshot.control_center),
@@ -158,9 +190,30 @@ export function App() {
     () => findLatestAssistantNarration(transcript),
     [transcript],
   );
+  const activeRun = snapshot.active_runs[0] ?? null;
+  const currentVoiceTranscript = useMemo(
+    () => deriveCurrentVoiceTranscript(snapshot, voiceTranscript),
+    [snapshot, voiceTranscript],
+  );
+  const voiceConsentGranted = snapshot.voice.capture_consent_granted_at_unix_ms !== undefined;
+  const ttsConsentGranted = snapshot.voice.tts_consent_granted_at_unix_ms !== undefined;
+  const selectedVoiceInputLabel =
+    snapshot.voice.microphone_device_label ??
+    voiceInputDevices.find((device) => device.deviceId === snapshot.voice.microphone_device_id)
+      ?.label ??
+    "System default microphone";
+  const selectedVoiceOutput =
+    voiceOutputVoices.find((voice) => voice.voiceURI === snapshot.voice.tts_voice_uri) ??
+    voiceOutputVoices.find((voice) => voice.default) ??
+    voiceOutputVoices[0] ??
+    null;
+  const selectedVoiceOutputLabel =
+    snapshot.voice.tts_voice_label ??
+    (selectedVoiceOutput === null
+      ? "System speech voice"
+      : `${selectedVoiceOutput.label} (${selectedVoiceOutput.lang})`);
   const nativeCanvasExperiment = snapshot.control_center.diagnostics.experiments.native_canvas;
-  const ambientCompanionEnabled =
-    snapshot.rollout.voice_capture_enabled || snapshot.rollout.tts_playback_enabled;
+  const ambientCompanionEnabled = snapshot.rollout.ambient_companion_enabled;
   const t = (
     key: Parameters<typeof translateDesktopMessage>[1],
     variables?: Record<string, string | number>,
@@ -192,6 +245,40 @@ export function App() {
       }
     },
   );
+  const refreshVoiceInputDevices = useEffectEvent(async () => {
+    if (!voiceCaptureSupported || typeof navigator === "undefined") {
+      setVoiceInputDevices([]);
+      return;
+    }
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      setVoiceInputDevices(
+        devices
+          .filter((device) => device.kind === "audioinput")
+          .map((device, index) => ({
+            deviceId: device.deviceId,
+            label: device.label.trim().length > 0 ? device.label : `Microphone ${index + 1}`,
+          })),
+      );
+    } catch (failure) {
+      console.warn("desktop companion could not enumerate microphone devices", failure);
+      setVoiceInputDevices([]);
+    }
+  });
+  const refreshVoiceOutputVoices = useEffectEvent(() => {
+    if (!ttsPlaybackSupported || typeof window === "undefined") {
+      setVoiceOutputVoices([]);
+      return;
+    }
+    setVoiceOutputVoices(
+      window.speechSynthesis.getVoices().map((voice) => ({
+        voiceURI: voice.voiceURI,
+        label: voice.name,
+        lang: voice.lang,
+        default: voice.default,
+      })),
+    );
+  });
 
   useEffect(() => {
     const fallbackSessionId =
@@ -237,9 +324,8 @@ export function App() {
   }, [selectedSession?.session_id]);
 
   useEffect(() => {
-    setVoiceConsentGranted(readStoredConsent(VOICE_CAPTURE_CONSENT_KEY));
-    setTtsConsentGranted(readStoredConsent(VOICE_TTS_CONSENT_KEY));
-  }, []);
+    setAmbientHotkeyDraft(snapshot.ambient.global_hotkey);
+  }, [snapshot.ambient.global_hotkey]);
 
   useEffect(() => {
     if (!isDesktopHostAvailable()) {
@@ -253,22 +339,50 @@ export function App() {
     }).catch(() => {});
   }, [activeSection, activeDeviceId, activeSessionId, snapshot.preferences.last_run_id]);
 
-  const revealMainWindow = useEffectEvent(async () => {
-    if (mainWindowShownRef.current || !isDesktopHostAvailable()) {
+  useEffect(() => {
+    if (!isDesktopHostAvailable() || surfaceMode === "main") {
       return;
     }
-    try {
-      await showMainWindow();
-      mainWindowShownRef.current = true;
-    } catch (failure) {
-      const message = failure instanceof Error ? failure.message : String(failure);
-      setNotice(`Desktop window handoff failed: ${message}`);
-    }
-  });
+    void updateDesktopCompanionAmbient({
+      lastSurface: surfaceMode,
+      clearHotkeyRegistrationError: false,
+    }).catch(() => {});
+  }, [surfaceMode]);
 
   useEffect(() => {
-    void revealMainWindow();
-  }, [revealMainWindow]);
+    setVoiceDraftText(currentVoiceTranscript?.transcript_text ?? "");
+  }, [currentVoiceTranscript?.transcript_text]);
+
+  useEffect(() => {
+    void refreshVoiceInputDevices();
+  }, [refreshVoiceInputDevices, voiceCaptureSupported, voiceConsentGranted]);
+
+  useEffect(() => {
+    if (!voiceCaptureSupported || typeof navigator === "undefined") {
+      return;
+    }
+    const handleDeviceChange = () => {
+      void refreshVoiceInputDevices();
+    };
+    navigator.mediaDevices.addEventListener("devicechange", handleDeviceChange);
+    return () => {
+      navigator.mediaDevices.removeEventListener("devicechange", handleDeviceChange);
+    };
+  }, [refreshVoiceInputDevices, voiceCaptureSupported]);
+
+  useEffect(() => {
+    refreshVoiceOutputVoices();
+    if (!ttsPlaybackSupported || typeof window === "undefined") {
+      return;
+    }
+    const handleVoicesChanged = () => {
+      refreshVoiceOutputVoices();
+    };
+    window.speechSynthesis.addEventListener("voiceschanged", handleVoicesChanged);
+    return () => {
+      window.speechSynthesis.removeEventListener("voiceschanged", handleVoicesChanged);
+    };
+  }, [refreshVoiceOutputVoices, ttsConsentGranted, ttsPlaybackSupported]);
 
   useEffect(() => {
     if (
@@ -367,6 +481,7 @@ export function App() {
       if (recorder !== null && recorder.state !== "inactive") {
         recorder.stop();
       }
+      stopSilenceMonitor();
       stopRecordingStream(recordingStreamRef.current);
       if (typeof window !== "undefined" && typeof window.speechSynthesis !== "undefined") {
         window.speechSynthesis.cancel();
@@ -431,7 +546,9 @@ export function App() {
     try {
       const session = await resolveDesktopCompanionChatSession({
         sessionLabel:
-          sessionLabelDraft.trim().length > 0 ? sessionLabelDraft.trim() : "Desktop companion",
+          sessionLabelDraft.trim().length > 0
+            ? sessionLabelDraft.trim()
+            : DEFAULT_DESKTOP_SESSION_LABEL,
       });
       setActiveSessionId(session.session_id);
       setActiveSection("chat");
@@ -449,13 +566,15 @@ export function App() {
     }
   }
 
-  async function sendMessage(draftId?: string): Promise<void> {
+  async function sendMessage(draftId?: string, overrideText?: string): Promise<void> {
     if (activeSessionId.trim().length === 0) {
       setNotice("Create or select a session before sending a message.");
       return;
     }
     const text =
-      draftId === undefined
+      overrideText !== undefined
+        ? overrideText.trim()
+        : draftId === undefined
         ? composerText.trim()
         : (snapshot.offline_drafts.find((draft) => draft.draft_id === draftId)?.text.trim() ?? "");
     if (text.length === 0) {
@@ -464,6 +583,18 @@ export function App() {
     }
     setSendBusy(true);
     try {
+      if (overrideText !== undefined) {
+        await updateDesktopCompanionVoiceState({
+          lifecycleState: "sending",
+          draftText: text,
+          draftSessionId: activeSessionId,
+          auditKind: "send_requested",
+          auditDetail: "Operator confirmed the reviewed voice draft for delivery.",
+          auditSessionId: activeSessionId,
+          auditRemoteProcessing: true,
+          auditTtsPlayback: false,
+        }).catch(() => {});
+      }
       await emitUxEvent({
         name: "ux.chat.prompt_submitted",
         section: "chat",
@@ -483,11 +614,42 @@ export function App() {
         markDesktopFirstSuccessCompleted();
         setFirstSuccessCompleted(true);
       }
+      if (overrideText !== undefined) {
+        if (result.queued_offline) {
+          await updateDesktopCompanionVoiceState({
+            lifecycleState: "review",
+            draftText: text,
+            draftSessionId: activeSessionId,
+            clearError: true,
+            auditKind: "send_queued_offline",
+            auditDetail:
+              "Reviewed voice draft was queued as an offline draft and still requires reconnect before delivery.",
+            auditSessionId: activeSessionId,
+            auditRemoteProcessing: false,
+            auditTtsPlayback: false,
+          }).catch(() => {});
+        } else {
+          await finalizeVoiceDraftSend();
+        }
+      }
       await refresh();
       const nextTranscript = await getDesktopCompanionSessionTranscript(activeSessionId);
       setTranscript(nextTranscript);
     } catch (failure) {
       const message = failure instanceof Error ? failure.message : String(failure);
+      if (overrideText !== undefined) {
+        await updateDesktopCompanionVoiceState({
+          lifecycleState: "error",
+          lastError: message,
+          draftText: text,
+          draftSessionId: activeSessionId,
+          auditKind: "send_failed",
+          auditDetail: message,
+          auditSessionId: activeSessionId,
+          auditRemoteProcessing: true,
+          auditTtsPlayback: false,
+        }).catch(() => {});
+      }
       setNotice(message);
     } finally {
       setSendBusy(false);
@@ -498,9 +660,183 @@ export function App() {
     if (!ttsPlaybackSupported) {
       return;
     }
+    const wasSpeaking = speaking || speechUtteranceRef.current !== null;
     window.speechSynthesis.cancel();
     speechUtteranceRef.current = null;
     setSpeaking(false);
+    if (!wasSpeaking) {
+      return;
+    }
+    void updateDesktopCompanionVoiceState({
+      lifecycleState: "idle",
+      auditKind: "tts_stopped",
+      auditDetail: "Desktop speech playback was stopped by the operator.",
+      auditSessionId: activeSessionId || undefined,
+      auditRemoteProcessing: false,
+      auditTtsPlayback: true,
+    }).catch(() => {});
+  }
+
+  function stopSilenceMonitor(): void {
+    const monitor = silenceMonitorRef.current;
+    if (monitor === null) {
+      return;
+    }
+    window.clearInterval(monitor.intervalId);
+    monitor.source.disconnect();
+    monitor.analyser.disconnect();
+    void monitor.audioContext.close().catch(() => {});
+    silenceMonitorRef.current = null;
+  }
+
+  function startSilenceMonitor(stream: MediaStream): void {
+    stopSilenceMonitor();
+    if (
+      typeof AudioContext === "undefined" ||
+      !snapshot.rollout.voice_silence_detection_enabled ||
+      !snapshot.voice.silence_detection_enabled
+    ) {
+      return;
+    }
+    try {
+      const audioContext = new AudioContext();
+      const source = audioContext.createMediaStreamSource(stream);
+      const analyser = audioContext.createAnalyser();
+      analyser.fftSize = 2048;
+      analyser.smoothingTimeConstant = 0.12;
+      source.connect(analyser);
+      const samples = new Uint8Array(analyser.fftSize);
+      const monitor: VoiceSilenceMonitor = {
+        audioContext,
+        analyser,
+        source,
+        intervalId: 0,
+        silenceStartedAt: null,
+      };
+      monitor.intervalId = window.setInterval(() => {
+        const recorder = mediaRecorderRef.current;
+        if (recorder === null || recorder.state === "inactive") {
+          stopSilenceMonitor();
+          return;
+        }
+        analyser.getByteTimeDomainData(samples);
+        if (calculateVoiceSilenceRms(samples) < SILENCE_MONITOR_THRESHOLD_RMS) {
+          if (monitor.silenceStartedAt === null) {
+            monitor.silenceStartedAt = Date.now();
+            return;
+          }
+          if (Date.now() - monitor.silenceStartedAt >= snapshot.voice.silence_timeout_ms) {
+            stopSilenceMonitor();
+            void stopVoiceCapture("silence");
+          }
+          return;
+        }
+        monitor.silenceStartedAt = null;
+      }, SILENCE_MONITOR_INTERVAL_MS);
+      silenceMonitorRef.current = monitor;
+    } catch (failure) {
+      console.warn("desktop companion silence detection is unavailable", failure);
+    }
+  }
+
+  async function updateVoiceAudioSettings(
+    payload: Parameters<typeof updateDesktopCompanionVoiceState>[0],
+    successNotice?: string,
+  ): Promise<void> {
+    try {
+      const result = await updateDesktopCompanionVoiceState(payload);
+      setNotice(successNotice ?? result.message);
+      await refresh();
+    } catch (failure) {
+      const message = failure instanceof Error ? failure.message : String(failure);
+      setNotice(message);
+    }
+  }
+
+  async function selectVoiceInputDevice(deviceId: string): Promise<void> {
+    const selectedDevice =
+      voiceInputDevices.find((device) => device.deviceId === deviceId) ?? null;
+    await updateVoiceAudioSettings(
+      {
+        microphoneDeviceId: deviceId,
+        microphoneDeviceLabel: selectedDevice?.label ?? "",
+        auditKind: "input_device_selected",
+        auditDetail:
+          selectedDevice === null
+            ? "Desktop microphone selection was reset to the system default device."
+            : `Desktop microphone was set to ${selectedDevice.label}.`,
+        auditSessionId: activeSessionId || undefined,
+        auditRemoteProcessing: false,
+        auditTtsPlayback: false,
+      },
+      selectedDevice === null
+        ? "Desktop microphone reset to the system default input."
+        : `Desktop microphone set to ${selectedDevice.label}.`,
+    );
+  }
+
+  async function selectVoiceOutputVoice(voiceURI: string): Promise<void> {
+    const selectedVoice = voiceOutputVoices.find((voice) => voice.voiceURI === voiceURI) ?? null;
+    await updateVoiceAudioSettings(
+      {
+        ttsVoiceUri: voiceURI,
+        ttsVoiceLabel: selectedVoice?.label ?? "",
+        auditKind: "tts_voice_selected",
+        auditDetail:
+          selectedVoice === null
+            ? "Desktop speech playback reverted to the system default voice."
+            : `Desktop speech playback voice was set to ${selectedVoice.label}.`,
+        auditSessionId: activeSessionId || undefined,
+        auditRemoteProcessing: false,
+        auditTtsPlayback: true,
+      },
+      selectedVoice === null
+        ? "Desktop speech playback reverted to the system default voice."
+        : `Desktop speech playback voice set to ${selectedVoice.label}.`,
+    );
+  }
+
+  async function toggleTtsMute(): Promise<void> {
+    const nextMuted = !snapshot.voice.tts_muted;
+    if (nextMuted) {
+      stopSpeechPlayback();
+    }
+    await updateVoiceAudioSettings(
+      {
+        ttsMuted: nextMuted,
+        auditKind: nextMuted ? "tts_muted" : "tts_unmuted",
+        auditDetail: nextMuted
+          ? "Desktop speech playback was muted."
+          : "Desktop speech playback was unmuted.",
+        auditSessionId: activeSessionId || undefined,
+        auditRemoteProcessing: false,
+        auditTtsPlayback: true,
+      },
+      nextMuted ? "Desktop speech playback muted." : "Desktop speech playback unmuted.",
+    );
+  }
+
+  async function toggleSilenceDetection(): Promise<void> {
+    if (!snapshot.rollout.voice_silence_detection_enabled) {
+      setNotice("Silence detection is disabled by rollout configuration.");
+      return;
+    }
+    const nextEnabled = !snapshot.voice.silence_detection_enabled;
+    await updateVoiceAudioSettings(
+      {
+        silenceDetectionEnabled: nextEnabled,
+        auditKind: nextEnabled ? "silence_detection_enabled" : "silence_detection_disabled",
+        auditDetail: nextEnabled
+          ? "Optional silence detection was enabled for the desktop voice workflow."
+          : "Optional silence detection was disabled for the desktop voice workflow.",
+        auditSessionId: activeSessionId || undefined,
+        auditRemoteProcessing: false,
+        auditTtsPlayback: false,
+      },
+      nextEnabled
+        ? "Silence detection will stop long pauses automatically."
+        : "Silence detection disabled; push-to-talk stops only when you release it.",
+    );
   }
 
   async function ensureVoiceConsent(): Promise<boolean> {
@@ -513,8 +849,16 @@ export function App() {
     if (!accepted) {
       return false;
     }
-    storeConsent(VOICE_CAPTURE_CONSENT_KEY);
-    setVoiceConsentGranted(true);
+    await updateDesktopCompanionVoiceState({
+      captureConsentGranted: true,
+      lifecycleState: "idle",
+      auditKind: "consent_granted",
+      auditDetail: "Operator granted explicit push-to-talk consent from the desktop companion.",
+      auditSessionId: activeSessionId || undefined,
+      auditRemoteProcessing: false,
+      auditTtsPlayback: false,
+    });
+    await refresh();
     return true;
   }
 
@@ -528,16 +872,21 @@ export function App() {
     if (!accepted) {
       return false;
     }
-    storeConsent(VOICE_TTS_CONSENT_KEY);
-    setTtsConsentGranted(true);
+    await updateDesktopCompanionVoiceState({
+      ttsConsentGranted: true,
+      lifecycleState: "idle",
+      auditKind: "tts_consent_granted",
+      auditDetail:
+        "Operator granted explicit desktop speech playback consent from the companion shell.",
+      auditSessionId: activeSessionId || undefined,
+      auditRemoteProcessing: false,
+      auditTtsPlayback: true,
+    });
+    await refresh();
     return true;
   }
 
   async function startVoiceCapture(): Promise<void> {
-    if (selectedSession === null) {
-      setNotice("Create or select a session before recording voice input.");
-      return;
-    }
     if (!snapshot.rollout.voice_capture_enabled) {
       setNotice("Voice capture is disabled by rollout configuration.");
       return;
@@ -552,10 +901,36 @@ export function App() {
       setNotice("Voice capture remains disabled until you explicitly grant consent.");
       return;
     }
+    const sessionId = await ensureVoiceSession("voice capture");
+    if (sessionId === null) {
+      return;
+    }
     setVoiceBusy(true);
     setVoiceTranscript(null);
+    setVoiceDraftText("");
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const { stream, usedFallbackInput } = await requestVoiceCaptureStream(
+        snapshot.voice.microphone_device_id,
+      );
+      const activeTrack = stream.getAudioTracks()[0] ?? null;
+      const activeInputDeviceId = readVoiceTrackDeviceId(activeTrack);
+      const activeInputDeviceLabel =
+        activeTrack?.label.trim() ||
+        voiceInputDevices.find((device) => device.deviceId === activeInputDeviceId)?.label;
+      await updateDesktopCompanionVoiceState({
+        lifecycleState: "recording",
+        microphonePermissionState: "granted",
+        microphoneDeviceId: activeInputDeviceId,
+        microphoneDeviceLabel: activeInputDeviceLabel,
+        clearError: true,
+        auditKind: "capture_started",
+        auditDetail: usedFallbackInput
+          ? "Push-to-talk recording started on the default microphone because the preferred input was unavailable."
+          : "Push-to-talk recording started from the desktop companion.",
+        auditSessionId: sessionId,
+        auditRemoteProcessing: false,
+        auditTtsPlayback: false,
+      });
       const preferredMimeType = resolvePreferredVoiceMimeType();
       const recorder =
         preferredMimeType === null
@@ -564,6 +939,7 @@ export function App() {
       recordingStreamRef.current = stream;
       mediaRecorderRef.current = recorder;
       recordingChunksRef.current = [];
+      recordingSessionIdRef.current = sessionId;
       recorder.ondataavailable = (event) => {
         if (event.data.size > 0) {
           recordingChunksRef.current.push(event.data);
@@ -571,47 +947,125 @@ export function App() {
       };
       recorder.start();
       recordingStartedAtRef.current = Date.now();
+      void refreshVoiceInputDevices();
+      startSilenceMonitor(stream);
       setVoiceRecording(true);
-      setNotice("Voice capture started. Recording will upload only after you stop it.");
+      setNotice(
+        usedFallbackInput
+          ? "Preferred microphone was unavailable, so recording started on the default input."
+          : "Voice capture started. Recording will upload only after you stop it.",
+      );
     } catch (failure) {
       const message = failure instanceof Error ? failure.message : String(failure);
       stopRecordingStream(recordingStreamRef.current);
       mediaRecorderRef.current = null;
       recordingStreamRef.current = null;
+      recordingSessionIdRef.current = null;
+      await updateDesktopCompanionVoiceState({
+        lifecycleState: "error",
+        microphonePermissionState: deriveVoicePermissionState(failure),
+        lastError: message,
+        auditKind: "capture_failed",
+        auditDetail: message,
+        auditSessionId: sessionId,
+        auditRemoteProcessing: false,
+        auditTtsPlayback: false,
+      }).catch(() => {});
       setNotice(`Voice capture could not start: ${message}`);
     } finally {
       setVoiceBusy(false);
     }
   }
 
-  async function stopVoiceCapture(): Promise<void> {
+  async function stopVoiceCapture(reason: VoiceCaptureStopReason = "manual"): Promise<void> {
     const recorder = mediaRecorderRef.current;
+    const sessionId = recordingSessionIdRef.current ?? activeSessionId;
+    stopSilenceMonitor();
     if (recorder === null) {
+      setVoiceRecording(false);
+      return;
+    }
+    if (sessionId.trim().length === 0) {
+      setNotice("Voice recording does not have a valid session context to transcribe into.");
+      mediaRecorderRef.current = null;
+      recordingChunksRef.current = [];
+      recordingStartedAtRef.current = null;
+      recordingSessionIdRef.current = null;
+      stopRecordingStream(recordingStreamRef.current);
+      recordingStreamRef.current = null;
       setVoiceRecording(false);
       return;
     }
     setVoiceBusy(true);
     try {
+      const recordingDurationMs =
+        recordingStartedAtRef.current === null ? undefined : Date.now() - recordingStartedAtRef.current;
+      await updateDesktopCompanionVoiceState({
+        lifecycleState: "transcribing",
+        draftSessionId: sessionId || undefined,
+        draftDurationMs: recordingDurationMs,
+        clearError: true,
+        auditKind: reason === "silence" ? "capture_stopped_silence" : "capture_stopped",
+        auditDetail:
+          reason === "silence"
+            ? "Silence detection stopped the current voice capture and moved it into transcription review."
+            : "Operator stopped push-to-talk recording and queued transcription.",
+        auditSessionId: sessionId || undefined,
+        auditRemoteProcessing: false,
+        auditTtsPlayback: false,
+      }).catch(() => {});
       const audioBlob = await stopRecorderAndCollectBlob(recorder, recordingChunksRef.current);
       const contentType = audioBlob.type || recorder.mimeType || "audio/webm";
       const extension = extensionForAudioMimeType(contentType);
       const result = await transcribeDesktopCompanionAudio({
-        sessionId: activeSessionId,
+        sessionId,
         filename: `desktop-voice-${Date.now()}.${extension}`,
         contentType,
         bytesBase64: await blobToBase64(audioBlob),
         consentAcknowledged: true,
       });
       setVoiceTranscript(result);
-      setNotice("Voice capture uploaded and transcribed. Review the transcript before sending it.");
+      setVoiceDraftText(result.transcript_text);
+      await updateDesktopCompanionVoiceState({
+        lifecycleState: "review",
+        draftSessionId: sessionId,
+        draftText: result.transcript_text,
+        draftSummary: result.transcript_summary,
+        draftLanguage: result.transcript_language,
+        draftDurationMs: result.transcript_duration_ms,
+        clearError: true,
+        auditKind: "transcript_ready",
+        auditDetail:
+          reason === "silence"
+            ? "Voice transcript is ready after silence detection stopped the recording."
+            : "Voice transcript is ready for explicit operator review.",
+        auditSessionId: sessionId,
+        auditRemoteProcessing: true,
+        auditTtsPlayback: false,
+      });
+      setNotice(
+        reason === "silence"
+          ? "Silence detected. The transcript is ready for review before sending."
+          : "Voice capture uploaded and transcribed. Review the transcript before sending it.",
+      );
       await refresh();
     } catch (failure) {
       const message = failure instanceof Error ? failure.message : String(failure);
+      await updateDesktopCompanionVoiceState({
+        lifecycleState: "error",
+        lastError: message,
+        auditKind: "transcription_failed",
+        auditDetail: message,
+        auditSessionId: sessionId || undefined,
+        auditRemoteProcessing: true,
+        auditTtsPlayback: false,
+      }).catch(() => {});
       setNotice(`Voice transcription failed: ${message}`);
     } finally {
       mediaRecorderRef.current = null;
       recordingChunksRef.current = [];
       recordingStartedAtRef.current = null;
+      recordingSessionIdRef.current = null;
       stopRecordingStream(recordingStreamRef.current);
       recordingStreamRef.current = null;
       setVoiceRecording(false);
@@ -632,6 +1086,10 @@ export function App() {
       setNotice("No recent assistant output is available for speech playback.");
       return;
     }
+    if (snapshot.voice.tts_muted) {
+      setNotice("Desktop speech playback is muted. Unmute it before starting TTS.");
+      return;
+    }
     if (!(await ensureTtsConsent())) {
       setNotice("Speech playback remains disabled until you explicitly grant consent.");
       return;
@@ -639,15 +1097,51 @@ export function App() {
 
     stopSpeechPlayback();
     const utterance = new SpeechSynthesisUtterance(latestAssistantNarration);
+    if (selectedVoiceOutput !== null) {
+      const selectedVoice = window.speechSynthesis
+        .getVoices()
+        .find((voice) => voice.voiceURI === selectedVoiceOutput.voiceURI);
+      if (selectedVoice !== undefined) {
+        utterance.voice = selectedVoice;
+      }
+    }
     utterance.onend = () => {
       speechUtteranceRef.current = null;
       setSpeaking(false);
+      void updateDesktopCompanionVoiceState({
+        lifecycleState: "idle",
+        auditKind: "tts_finished",
+        auditDetail: "Desktop speech playback completed.",
+        auditSessionId: activeSessionId || undefined,
+        auditRemoteProcessing: false,
+        auditTtsPlayback: true,
+      }).catch(() => {});
     };
     utterance.onerror = () => {
       speechUtteranceRef.current = null;
       setSpeaking(false);
+      void updateDesktopCompanionVoiceState({
+        lifecycleState: "error",
+        lastError: "Desktop speech playback failed before completion.",
+        auditKind: "tts_failed",
+        auditDetail: "Desktop speech playback failed before completion.",
+        auditSessionId: activeSessionId || undefined,
+        auditRemoteProcessing: false,
+        auditTtsPlayback: true,
+      }).catch(() => {});
       setNotice("Desktop speech playback failed before completion.");
     };
+    void updateDesktopCompanionVoiceState({
+      lifecycleState: "speaking",
+      ttsVoiceUri: selectedVoiceOutput?.voiceURI,
+      ttsVoiceLabel: selectedVoiceOutput?.label,
+      clearError: true,
+      auditKind: "tts_started",
+      auditDetail: "Desktop speech playback started from explicit operator intent.",
+      auditSessionId: activeSessionId || undefined,
+      auditRemoteProcessing: false,
+      auditTtsPlayback: true,
+    }).catch(() => {});
     speechUtteranceRef.current = utterance;
     setSpeaking(true);
     window.speechSynthesis.speak(utterance);
@@ -773,18 +1267,24 @@ export function App() {
 
   async function toggleRollout(next: {
     companion_shell_enabled?: boolean;
+    ambient_companion_enabled?: boolean;
     desktop_notifications_enabled?: boolean;
     offline_drafts_enabled?: boolean;
     voice_capture_enabled?: boolean;
+    voice_overlay_enabled?: boolean;
+    voice_silence_detection_enabled?: boolean;
     tts_playback_enabled?: boolean;
     release_channel?: string;
   }): Promise<void> {
     try {
       const result = await updateDesktopCompanionRollout({
         companionShellEnabled: next.companion_shell_enabled,
+        ambientCompanionEnabled: next.ambient_companion_enabled,
         desktopNotificationsEnabled: next.desktop_notifications_enabled,
         offlineDraftsEnabled: next.offline_drafts_enabled,
         voiceCaptureEnabled: next.voice_capture_enabled,
+        voiceOverlayEnabled: next.voice_overlay_enabled,
+        voiceSilenceDetectionEnabled: next.voice_silence_detection_enabled,
         ttsPlaybackEnabled: next.tts_playback_enabled,
         releaseChannel: next.release_channel,
       });
@@ -828,6 +1328,170 @@ export function App() {
     } finally {
       setProfileSwitchBusy(false);
     }
+  }
+
+  async function openMainCompanion(): Promise<void> {
+    try {
+      const result = await showDesktopCompanionWindow("main");
+      setNotice(result.message);
+    } catch (failure) {
+      const message = failure instanceof Error ? failure.message : String(failure);
+      setNotice(message);
+    }
+  }
+
+  async function openQuickPanelSurface(): Promise<void> {
+    try {
+      const result = await showDesktopCompanionWindow("quick_panel");
+      setNotice(result.message);
+    } catch (failure) {
+      const message = failure instanceof Error ? failure.message : String(failure);
+      setNotice(message);
+    }
+  }
+
+  async function openVoiceOverlaySurface(): Promise<void> {
+    try {
+      const result = await showDesktopCompanionWindow("voice_overlay");
+      setNotice(result.message);
+      if (activeSessionId.trim().length === 0) {
+        void ensureVoiceSession("voice overlay");
+      }
+    } catch (failure) {
+      const message = failure instanceof Error ? failure.message : String(failure);
+      setNotice(message);
+    }
+  }
+
+  async function closeAmbientSurface(): Promise<void> {
+    if (surfaceMode === "main") {
+      return;
+    }
+    try {
+      const result = await hideDesktopCompanionWindow(surfaceMode);
+      setNotice(result.message);
+    } catch (failure) {
+      const message = failure instanceof Error ? failure.message : String(failure);
+      setNotice(message);
+    }
+  }
+
+  async function updateAmbientSettings(payload: {
+    startOnLoginEnabled?: boolean;
+    globalHotkeyEnabled?: boolean;
+    globalHotkey?: string;
+    clearHotkeyRegistrationError?: boolean;
+    lastSurface?: DesktopCompanionSurfaceMode;
+  }): Promise<void> {
+    try {
+      const result = await updateDesktopCompanionAmbient(payload);
+      setNotice(result.message);
+      await refresh();
+    } catch (failure) {
+      const message = failure instanceof Error ? failure.message : String(failure);
+      setNotice(message);
+    }
+  }
+
+  async function saveAmbientHotkey(): Promise<void> {
+    const nextHotkey = ambientHotkeyDraft.trim();
+    if (nextHotkey.length === 0) {
+      setNotice("Global hotkey cannot be empty.");
+      return;
+    }
+    await updateAmbientSettings({
+      globalHotkey: nextHotkey,
+      clearHotkeyRegistrationError: true,
+    });
+  }
+
+  async function ensureVoiceSession(source: string): Promise<string | null> {
+    if (activeSessionId.trim().length > 0) {
+      return activeSessionId;
+    }
+    if (previewMode) {
+      setNotice("Voice session bootstrap is unavailable while preview data is active.");
+      return null;
+    }
+    try {
+      const session = await resolveDesktopCompanionChatSession({
+        sessionLabel:
+          sessionLabelDraft.trim().length > 0
+            ? sessionLabelDraft.trim()
+            : DEFAULT_DESKTOP_SESSION_LABEL,
+      });
+      setActiveSessionId(session.session_id);
+      setActiveSection("chat");
+      setSessionLabelDraft(session.session_label ?? "");
+      setNotice(`Created a quick session for ${source}.`);
+      await emitUxEvent({
+        name: "ux.session.resumed",
+        section: "chat",
+        sessionId: session.session_id,
+        source: "desktop",
+        summary: `Desktop companion created a quick session for ${source}`,
+      });
+      void refresh();
+      return session.session_id;
+    } catch (failure) {
+      const message = failure instanceof Error ? failure.message : String(failure);
+      setNotice(message);
+      return null;
+    }
+  }
+
+  async function finalizeVoiceDraftSend(): Promise<void> {
+    setVoiceTranscript(null);
+    setVoiceDraftText("");
+    try {
+      await updateDesktopCompanionVoiceState({
+        clearDraft: true,
+        clearError: true,
+        lifecycleState: "idle",
+        auditKind: "send_completed",
+        auditDetail: "Reviewed voice draft was delivered to the active session.",
+        auditSessionId: activeSessionId || undefined,
+        auditRemoteProcessing: true,
+        auditTtsPlayback: false,
+      });
+      await refresh();
+    } catch (failure) {
+      console.warn("desktop companion could not finalize the voice draft state", failure);
+    }
+  }
+
+  async function clearVoiceDraft(): Promise<void> {
+    setVoiceTranscript(null);
+    setVoiceDraftText("");
+    try {
+      const result = await updateDesktopCompanionVoiceState({
+        clearDraft: true,
+        clearError: true,
+        lifecycleState: "cancelled",
+        auditKind: "review_discarded",
+        auditDetail: "Operator discarded the pending voice transcript review.",
+        auditSessionId: activeSessionId || undefined,
+        auditRemoteProcessing: true,
+        auditTtsPlayback: false,
+      });
+      setNotice(result.message);
+      await refresh();
+    } catch (failure) {
+      const message = failure instanceof Error ? failure.message : String(failure);
+      setNotice(message);
+    }
+  }
+
+  function updateReviewedVoiceDraft(nextValue: string): void {
+    setVoiceDraftText(nextValue);
+    void updateDesktopCompanionVoiceState({
+      lifecycleState: "review",
+      draftText: nextValue,
+      draftSessionId: activeSessionId || undefined,
+      draftSummary: currentVoiceTranscript?.transcript_summary,
+      draftLanguage: currentVoiceTranscript?.transcript_language,
+      draftDurationMs: currentVoiceTranscript?.transcript_duration_ms,
+    }).catch(() => {});
   }
 
   const selectedApprovalPrompt = readObject(selectedApproval, "prompt");
@@ -878,6 +1542,112 @@ export function App() {
     () => buildSharedOnboardingItems(sharedOnboarding),
     [sharedOnboarding],
   );
+
+  if (surfaceMode === "quick_panel") {
+    return (
+      <QuickPanelSurface
+        activeRun={activeRun}
+        activeSessionId={activeSessionId}
+        composerText={composerText}
+        connectionState={snapshot.connection_state}
+        loading={loading}
+        notice={notice}
+        offlineDrafts={offlineDraftsForSession}
+        pendingApprovals={snapshot.approvals}
+        previewMode={previewMode}
+        quickFacts={snapshot.control_center.quick_facts}
+        sendBusy={sendBusy}
+        sessionCatalog={snapshot.session_catalog}
+        selectedSession={selectedSession}
+        setActiveSessionId={setActiveSessionId}
+        setComposerText={setComposerText}
+        unreadNotifications={unreadNotifications}
+        voiceBusy={voiceBusy}
+        voiceOverlayEnabled={snapshot.rollout.voice_overlay_enabled}
+        voiceRecording={voiceRecording}
+        onClose={closeAmbientSurface}
+        onCreateSession={createSession}
+        onOpenActiveRun={() =>
+          void openScopedHandoff("chat", {
+            sessionId: activeRun?.session_id,
+            runId: activeRun?.run_id,
+            intent: "inspect-run",
+            source: "desktop",
+          })
+        }
+        onOpenApprovals={() =>
+          void openScopedHandoff("approvals", {
+            sessionId: selectedSession?.session_id,
+            runId: activeRun?.run_id,
+            intent: "review-approvals",
+            source: "desktop",
+          })
+        }
+        onOpenDashboard={() => void openScopedHandoff("overview", { source: "desktop" })}
+        onOpenFullCompanion={openMainCompanion}
+        onOpenSelectedSession={() =>
+          void openScopedHandoff("chat", {
+            sessionId: selectedSession?.session_id,
+            runId: selectedSession?.last_run_id,
+            intent: "resume-session",
+            source: "desktop",
+          })
+        }
+        onOpenVoiceOverlay={openVoiceOverlaySurface}
+        onRemoveDraft={(draftId) => void removeOfflineDraft(draftId)}
+        onSendMessage={() => void sendMessage()}
+        onSendOfflineDraft={(draftId) => void sendMessage(draftId)}
+      />
+    );
+  }
+
+  if (surfaceMode === "voice_overlay") {
+    return (
+      <VoiceOverlaySurface
+        currentVoiceTranscript={currentVoiceTranscript}
+        draftText={voiceDraftText}
+        lifecycleState={snapshot.voice.lifecycle_state}
+        loading={loading}
+        notice={notice}
+        recordingElapsedMs={recordingElapsedMs}
+        selectedSession={selectedSession}
+        sendBusy={sendBusy}
+        selectedVoiceInputId={snapshot.voice.microphone_device_id ?? ""}
+        selectedVoiceInputLabel={selectedVoiceInputLabel}
+        selectedVoiceOutputLabel={selectedVoiceOutputLabel}
+        selectedVoiceOutputUri={snapshot.voice.tts_voice_uri ?? ""}
+        speaking={speaking}
+        ttsMuted={snapshot.voice.tts_muted}
+        ttsPlaybackSupported={ttsPlaybackSupported}
+        voiceAuditLog={snapshot.voice.audit_log}
+        voiceBusy={voiceBusy}
+        voiceCaptureEnabled={snapshot.rollout.voice_capture_enabled}
+        voiceCaptureSupported={voiceCaptureSupported}
+        voiceInputDevices={voiceInputDevices}
+        voiceRecording={voiceRecording}
+        voiceOutputVoices={voiceOutputVoices}
+        voicePermissionState={snapshot.voice.microphone_permission_state}
+        voiceSilenceDetectionEnabled={snapshot.voice.silence_detection_enabled}
+        voiceSilenceDetectionRolloutEnabled={snapshot.rollout.voice_silence_detection_enabled}
+        voiceSilenceTimeoutMs={snapshot.voice.silence_timeout_ms}
+        onClearVoiceDraft={clearVoiceDraft}
+        onClose={closeAmbientSurface}
+        onCreateSession={() => void ensureVoiceSession("voice overlay")}
+        onOpenFullCompanion={openMainCompanion}
+        onSendMessage={() => void sendMessage(undefined, voiceDraftText)}
+        onSelectVoiceInputDevice={(deviceId) => void selectVoiceInputDevice(deviceId)}
+        onSelectVoiceOutputVoice={(voiceURI) => void selectVoiceOutputVoice(voiceURI)}
+        onSpeakLatestAssistant={() => void speakLatestAssistant()}
+        onStartVoiceCapture={() => void startVoiceCapture()}
+        onStopSpeechPlayback={stopSpeechPlayback}
+        onStopVoiceCapture={() => void stopVoiceCapture()}
+        onToggleTtsMute={() => void toggleTtsMute()}
+        onToggleSilenceDetection={() => void toggleSilenceDetection()}
+        onUpdateDraftText={updateReviewedVoiceDraft}
+        onUseTranscript={(text) => updateReviewedVoiceDraft(text)}
+      />
+    );
+  }
 
   return (
     <main className="desktop-root desktop-root--companion">
@@ -1158,14 +1928,47 @@ export function App() {
             </SectionCard>
 
             <SectionCard
-              title="Companion rollout"
-              description="Desktop rollout flags keep the richer companion surface staged without removing the underlying control-center safety rails."
+              title="Ambient runtime"
+              description="Rollout flags and ambient settings keep tray, quick panel, voice overlay, and global hotkey governed without weakening the existing control-plane guardrails."
+              footer={
+                <div className="desktop-stack">
+                  <div className="desktop-stack desktop-stack--compact">
+                    <p className="desktop-label">Global hotkey</p>
+                    <Input
+                      placeholder="CommandOrControl+Shift+Space"
+                      value={ambientHotkeyDraft}
+                      variant="secondary"
+                      onChange={(event) => setAmbientHotkeyDraft(event.currentTarget.value)}
+                    />
+                    {snapshot.ambient.hotkey_registration_error ? (
+                      <InlineNotice title="Hotkey registration" tone="warning">
+                        {snapshot.ambient.hotkey_registration_error}
+                      </InlineNotice>
+                    ) : null}
+                  </div>
+                  <div className="desktop-inline-row">
+                    <Button variant="secondary" onPress={() => void saveAmbientHotkey()}>
+                      Save hotkey
+                    </Button>
+                    <Button variant="ghost" onPress={() => void openQuickPanelSurface()}>
+                      Open quick panel
+                    </Button>
+                    <Button variant="ghost" onPress={() => void openVoiceOverlaySurface()}>
+                      Open voice overlay
+                    </Button>
+                  </div>
+                </div>
+              }
             >
               <KeyValueList
                 items={[
                   {
                     label: "Companion shell",
                     value: snapshot.rollout.companion_shell_enabled ? "enabled" : "disabled",
+                  },
+                  {
+                    label: "Ambient companion",
+                    value: snapshot.rollout.ambient_companion_enabled ? "enabled" : "disabled",
                   },
                   {
                     label: "Desktop notifications",
@@ -1176,13 +1979,33 @@ export function App() {
                     value: snapshot.rollout.offline_drafts_enabled ? "enabled" : "disabled",
                   },
                   {
+                    label: "Start on login",
+                    value: snapshot.ambient.start_on_login_enabled ? "enabled" : "disabled",
+                  },
+                  {
+                    label: "Global hotkey",
+                    value: snapshot.ambient.global_hotkey_enabled ? "enabled" : "disabled",
+                  },
+                  { label: "Preferred invoke surface", value: snapshot.ambient.last_surface },
+                  {
                     label: "Voice capture",
                     value: snapshot.rollout.voice_capture_enabled ? "enabled" : "disabled",
+                  },
+                  {
+                    label: "Voice overlay",
+                    value: snapshot.rollout.voice_overlay_enabled ? "enabled" : "disabled",
+                  },
+                  {
+                    label: "Silence detection rollout",
+                    value: snapshot.rollout.voice_silence_detection_enabled
+                      ? "enabled"
+                      : "disabled",
                   },
                   {
                     label: "TTS playback",
                     value: snapshot.rollout.tts_playback_enabled ? "enabled" : "disabled",
                   },
+                  { label: "Saved hotkey", value: snapshot.ambient.global_hotkey },
                   { label: "Release channel", value: snapshot.rollout.release_channel },
                   {
                     label: "Current onboarding step",
@@ -1191,6 +2014,16 @@ export function App() {
                 ]}
               />
               <div className="desktop-inline-row">
+                <Button
+                  variant="secondary"
+                  onPress={() =>
+                    void toggleRollout({
+                      ambient_companion_enabled: !snapshot.rollout.ambient_companion_enabled,
+                    })
+                  }
+                >
+                  Toggle ambient mode
+                </Button>
                 <Button
                   variant="secondary"
                   onPress={() =>
@@ -1226,11 +2059,53 @@ export function App() {
                   variant="secondary"
                   onPress={() =>
                     void toggleRollout({
+                      voice_overlay_enabled: !snapshot.rollout.voice_overlay_enabled,
+                    })
+                  }
+                >
+                  Toggle voice overlay
+                </Button>
+                <Button
+                  variant="secondary"
+                  onPress={() =>
+                    void toggleRollout({
+                      voice_silence_detection_enabled:
+                        !snapshot.rollout.voice_silence_detection_enabled,
+                    })
+                  }
+                >
+                  Toggle silence detection rollout
+                </Button>
+                <Button
+                  variant="secondary"
+                  onPress={() =>
+                    void toggleRollout({
                       tts_playback_enabled: !snapshot.rollout.tts_playback_enabled,
                     })
                   }
                 >
                   Toggle TTS playback
+                </Button>
+                <Button
+                  variant="ghost"
+                  onPress={() =>
+                    void updateAmbientSettings({
+                      startOnLoginEnabled: !snapshot.ambient.start_on_login_enabled,
+                    })
+                  }
+                >
+                  Toggle start on login
+                </Button>
+                <Button
+                  variant="ghost"
+                  onPress={() =>
+                    void updateAmbientSettings({
+                      globalHotkeyEnabled: !snapshot.ambient.global_hotkey_enabled,
+                      clearHotkeyRegistrationError: true,
+                    })
+                  }
+                >
+                  Toggle global hotkey
                 </Button>
               </div>
             </SectionCard>
@@ -1606,22 +2481,22 @@ export function App() {
                       This desktop host does not expose speech synthesis APIs.
                     </p>
                   ) : null}
-                  {voiceTranscript !== null ? (
+                  {currentVoiceTranscript !== null ? (
                     <article className="desktop-timeline-item">
                       <div className="desktop-inline-row">
                         <strong>Latest voice transcript</strong>
                         <StatusChip tone="success">
-                          {voiceTranscript.transcript_language ?? "unknown language"}
+                          {currentVoiceTranscript.transcript_language ?? "unknown language"}
                         </StatusChip>
                       </div>
-                      <p>{voiceTranscript.transcript_text}</p>
-                      {voiceTranscript.transcript_summary ? (
-                        <p className="desktop-muted">{voiceTranscript.transcript_summary}</p>
+                      <p>{currentVoiceTranscript.transcript_text}</p>
+                      {currentVoiceTranscript.transcript_summary ? (
+                        <p className="desktop-muted">{currentVoiceTranscript.transcript_summary}</p>
                       ) : null}
-                      <p className="desktop-muted">{voiceTranscript.privacy_note}</p>
-                      {voiceTranscript.warnings.length > 0 ? (
+                      <p className="desktop-muted">{currentVoiceTranscript.privacy_note}</p>
+                      {currentVoiceTranscript.warnings.length > 0 ? (
                         <ul className="desktop-list">
-                          {voiceTranscript.warnings.map((warning) => (
+                          {currentVoiceTranscript.warnings.map((warning) => (
                             <li key={warning}>{warning}</li>
                           ))}
                         </ul>
@@ -1630,11 +2505,11 @@ export function App() {
                         <Button
                           variant="secondary"
                           isDisabled={sendBusy}
-                          onPress={() => setComposerText(voiceTranscript.transcript_text)}
+                          onPress={() => setComposerText(currentVoiceTranscript.transcript_text)}
                         >
                           Use transcript
                         </Button>
-                        <Button variant="ghost" onPress={() => setVoiceTranscript(null)}>
+                        <Button variant="ghost" onPress={() => void clearVoiceDraft()}>
                           Discard transcript
                         </Button>
                       </div>
@@ -1814,6 +2689,154 @@ export function App() {
                     ))}
                   </div>
                 ) : null}
+              </div>
+            )}
+          </SectionCard>
+
+          <SectionCard
+            title="Voice privacy and audio"
+            description="Push-to-talk stays explicit, auditable, and tied to the same session model as the text composer."
+            actions={
+              <ButtonGroup className="desktop-action-group">
+                <Button variant="secondary" onPress={() => void openVoiceOverlaySurface()}>
+                  Open voice overlay
+                </Button>
+                <Button variant="ghost" onPress={() => void refreshVoiceInputDevices()}>
+                  Refresh devices
+                </Button>
+              </ButtonGroup>
+            }
+            footer={
+              <div className="desktop-stack">
+                <div className="desktop-grid desktop-grid--details">
+                  <label className="desktop-stack desktop-stack--compact">
+                    <span className="desktop-label">Microphone device</span>
+                    <select
+                      aria-label="Desktop microphone device"
+                      className="desktop-select"
+                      value={snapshot.voice.microphone_device_id ?? ""}
+                      onChange={(event) => void selectVoiceInputDevice(event.currentTarget.value)}
+                    >
+                      <option value="">System default microphone</option>
+                      {voiceInputDevices.map((device) => (
+                        <option key={device.deviceId} value={device.deviceId}>
+                          {device.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="desktop-stack desktop-stack--compact">
+                    <span className="desktop-label">Speech voice</span>
+                    <select
+                      aria-label="Desktop speech voice"
+                      className="desktop-select"
+                      value={snapshot.voice.tts_voice_uri ?? ""}
+                      onChange={(event) => void selectVoiceOutputVoice(event.currentTarget.value)}
+                    >
+                      <option value="">System default voice</option>
+                      {voiceOutputVoices.map((voice) => (
+                        <option key={voice.voiceURI} value={voice.voiceURI}>
+                          {voice.label} ({voice.lang})
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                </div>
+                <div className="desktop-inline-row">
+                  <Button variant="secondary" onPress={() => void toggleTtsMute()}>
+                    {snapshot.voice.tts_muted ? "Unmute TTS" : "Mute TTS"}
+                  </Button>
+                  <Button
+                    variant="secondary"
+                    onPress={() => void toggleSilenceDetection()}
+                    isDisabled={!snapshot.rollout.voice_silence_detection_enabled}
+                  >
+                    {snapshot.voice.silence_detection_enabled
+                      ? "Disable silence detection"
+                      : "Enable silence detection"}
+                  </Button>
+                </div>
+              </div>
+            }
+          >
+            <KeyValueList
+              items={[
+                {
+                  label: "Capture consent",
+                  value: voiceConsentGranted
+                    ? formatUnixMs(snapshot.voice.capture_consent_granted_at_unix_ms)
+                    : "required before first use",
+                },
+                {
+                  label: "TTS consent",
+                  value: ttsConsentGranted
+                    ? formatUnixMs(snapshot.voice.tts_consent_granted_at_unix_ms)
+                    : "required before first playback",
+                },
+                {
+                  label: "Mic permission",
+                  value: snapshot.voice.microphone_permission_state,
+                },
+                { label: "Input device", value: selectedVoiceInputLabel },
+                { label: "Speech voice", value: selectedVoiceOutputLabel },
+                { label: "TTS mute", value: snapshot.voice.tts_muted ? "muted" : "live" },
+                {
+                  label: "Silence detection",
+                  value:
+                    snapshot.rollout.voice_silence_detection_enabled &&
+                    snapshot.voice.silence_detection_enabled
+                      ? `${formatDurationMs(snapshot.voice.silence_timeout_ms)} timeout`
+                      : snapshot.rollout.voice_silence_detection_enabled
+                        ? "disabled"
+                        : "rollout disabled",
+                },
+                { label: "Lifecycle", value: snapshot.voice.lifecycle_state },
+              ]}
+            />
+            <InlineNotice title="Privacy posture" tone="default">
+              Audio is captured only during explicit push-to-talk, uploaded only after you stop
+              recording, and follows the existing media retention/redaction pipeline. Ambient
+              listening stays disabled.
+            </InlineNotice>
+            {snapshot.voice.last_error ? (
+              <InlineNotice title="Last voice error" tone="warning">
+                {snapshot.voice.last_error}
+              </InlineNotice>
+            ) : null}
+            {snapshot.voice.audit_log.length === 0 ? (
+              <EmptyState
+                compact
+                title="No voice audit trail yet"
+                description="Voice capture, review, send, and playback events will appear here."
+              />
+            ) : (
+              <div className="desktop-stack desktop-stack--compact">
+                {snapshot.voice.audit_log.slice().reverse().slice(0, 6).map((entry) => (
+                  <article key={entry.audit_id} className="desktop-timeline-item">
+                    <div className="desktop-inline-row">
+                      <strong>{entry.kind.replaceAll("_", " ")}</strong>
+                      <small className="desktop-muted">
+                        {formatUnixMs(entry.created_at_unix_ms)}
+                      </small>
+                    </div>
+                    <p>{entry.detail}</p>
+                    <div className="desktop-inline-row">
+                      <StatusChip tone={entry.remote_processing ? "warning" : "default"}>
+                        {entry.remote_processing ? "remote processing" : "local only"}
+                      </StatusChip>
+                      <StatusChip tone={entry.tts_playback ? "accent" : "default"}>
+                        {entry.tts_playback ? "tts" : "mic"}
+                      </StatusChip>
+                    </div>
+                    {entry.input_device_label || entry.output_voice_label ? (
+                      <p className="desktop-muted">
+                        {[entry.input_device_label, entry.output_voice_label]
+                          .filter((value): value is string => Boolean(value))
+                          .join(" · ")}
+                      </p>
+                    ) : null}
+                  </article>
+                ))}
               </div>
             )}
           </SectionCard>
@@ -2297,6 +3320,620 @@ export function App() {
   );
 }
 
+function QuickPanelSurface(props: {
+  activeRun: DesktopCompanionSnapshot["active_runs"][number] | null;
+  activeSessionId: string;
+  composerText: string;
+  connectionState: DesktopCompanionSnapshot["connection_state"];
+  loading: boolean;
+  notice: string | null;
+  offlineDrafts: DesktopCompanionSnapshot["offline_drafts"];
+  pendingApprovals: JsonValue[];
+  previewMode: boolean;
+  quickFacts: DesktopCompanionSnapshot["control_center"]["quick_facts"];
+  sendBusy: boolean;
+  sessionCatalog: DesktopCompanionSnapshot["session_catalog"];
+  selectedSession: DesktopCompanionSnapshot["session_catalog"][number] | null;
+  setActiveSessionId: (value: string) => void;
+  setComposerText: (value: string) => void;
+  unreadNotifications: DesktopCompanionSnapshot["notifications"];
+  voiceBusy: boolean;
+  voiceOverlayEnabled: boolean;
+  voiceRecording: boolean;
+  onClose: () => void;
+  onCreateSession: () => void;
+  onOpenActiveRun: () => void;
+  onOpenApprovals: () => void;
+  onOpenDashboard: () => void;
+  onOpenFullCompanion: () => void;
+  onOpenSelectedSession: () => void;
+  onOpenVoiceOverlay: () => void;
+  onRemoveDraft: (draftId: string) => void;
+  onSendMessage: () => void;
+  onSendOfflineDraft: (draftId: string) => void;
+}) {
+  return (
+    <main className="desktop-root desktop-root--companion desktop-root--quick-panel">
+      <section className="desktop-stack">
+        <PageHeader
+          eyebrow="Ambient companion"
+          title="Quick panel"
+          description="Recent sessions, pending approvals, active runs and the mini composer stay available without opening the full companion."
+          status={
+            <>
+              <StatusChip tone={toneForConnection(props.connectionState)}>
+                {props.connectionState}
+              </StatusChip>
+              <StatusChip tone={props.activeRun ? "warning" : "default"}>
+                {props.activeRun ? "active run" : "idle"}
+              </StatusChip>
+            </>
+          }
+        />
+        {props.notice ? (
+          <InlineNotice title="Desktop status" tone="default">
+            {props.notice}
+          </InlineNotice>
+        ) : null}
+        <div className="desktop-inline-row">
+          <Button variant="primary" onPress={props.onOpenFullCompanion}>
+            Open full companion
+          </Button>
+          <Button variant="secondary" onPress={props.onOpenDashboard}>
+            Browser handoff
+          </Button>
+          <Button variant="ghost" onPress={props.onClose}>
+            Hide panel
+          </Button>
+        </div>
+      </section>
+
+      <section className="desktop-grid desktop-grid--details">
+        <SectionCard
+          title="Mini composer"
+          description="Stay in the current session or start a new one without leaving the ambient surface."
+          actions={
+            <ButtonGroup className="desktop-action-group">
+              <Button variant="secondary" onPress={props.onCreateSession}>
+                New session
+              </Button>
+              <Button
+                variant="ghost"
+                isDisabled={props.selectedSession === null}
+                onPress={props.onOpenSelectedSession}
+              >
+                Open selected session
+              </Button>
+              <Button
+                variant="ghost"
+                isDisabled={!props.voiceOverlayEnabled || props.voiceBusy || props.voiceRecording}
+                onPress={props.onOpenVoiceOverlay}
+              >
+                Voice overlay
+              </Button>
+            </ButtonGroup>
+          }
+        >
+          <div className="desktop-stack desktop-stack--compact">
+            <div className="desktop-stack desktop-stack--compact">
+              <span className="desktop-label">Selected session</span>
+              <div className="desktop-code-block">
+                {props.selectedSession?.title ??
+                  (props.activeSessionId || "No session selected")}
+              </div>
+            </div>
+            <label className="desktop-stack desktop-stack--compact">
+              <span className="desktop-label">Quick panel composer</span>
+              <textarea
+                aria-label="Quick panel composer"
+                className="desktop-textarea"
+                placeholder="Send a fast operator prompt…"
+                rows={5}
+                value={props.composerText}
+                onChange={(event) => props.setComposerText(event.currentTarget.value)}
+              />
+            </label>
+            <Button
+              variant="primary"
+              isDisabled={props.sendBusy || props.composerText.trim().length === 0}
+              onPress={props.onSendMessage}
+            >
+              Send prompt
+            </Button>
+          </div>
+        </SectionCard>
+
+        <SectionCard
+          title="Recent sessions"
+          description="Jump straight into the most recent working context."
+        >
+          {props.loading && props.sessionCatalog.length === 0 ? (
+            <div className="desktop-loading-stack">
+              <Spinner size="sm" />
+              <p className="desktop-muted">Loading sessions…</p>
+            </div>
+          ) : props.sessionCatalog.length === 0 ? (
+            <EmptyState
+              compact
+              title="No recent sessions"
+              description="Create a new desktop session to start the quick panel workflow."
+            />
+          ) : (
+            <div className="desktop-list">
+              {props.sessionCatalog.slice(0, 4).map((session) => (
+                <button
+                  key={session.session_id}
+                  className={`desktop-list-button${
+                    session.session_id === props.activeSessionId ? " is-active" : ""
+                  }`}
+                  type="button"
+                  onClick={() => props.setActiveSessionId(session.session_id)}
+                >
+                  <div className="desktop-stack desktop-stack--compact">
+                    <div className="desktop-inline-row">
+                      <strong>{session.title}</strong>
+                      {buildDesktopSessionListBadges(session)
+                        .slice(0, 2)
+                        .map((badge) => (
+                          <StatusChip key={`${session.session_id}:${badge.label}`} tone={badge.tone}>
+                            {badge.label}
+                          </StatusChip>
+                        ))}
+                    </div>
+                    <small className="desktop-muted">{buildDesktopSessionMeta(session)}</small>
+                    {session.preview ? <p className="desktop-muted">{session.preview}</p> : null}
+                  </div>
+                </button>
+              ))}
+            </div>
+          )}
+        </SectionCard>
+      </section>
+
+      <section className="desktop-grid desktop-grid--details">
+        <SectionCard
+          title="Ambient status"
+          description="The quick panel keeps reconnect, approvals and background work visible."
+        >
+          <KeyValueList
+            items={[
+              { label: "Dashboard", value: props.quickFacts.dashboard_access_mode },
+              { label: "Runtime", value: props.quickFacts.gateway_version ?? "starting" },
+              {
+                label: "Unread notifications",
+                value: String(props.unreadNotifications.filter((entry) => !entry.read).length),
+              },
+              { label: "Offline drafts", value: String(props.offlineDrafts.length) },
+            ]}
+          />
+          {props.activeRun ? (
+            <InlineNotice title={`Active run · ${props.activeRun.session_title}`} tone="warning">
+              {props.activeRun.preview ??
+                `Run ${props.activeRun.run_id} is ${props.activeRun.status} and has ${props.activeRun.pending_approvals} pending approvals.`}
+              <div className="desktop-inline-row">
+                <Button variant="secondary" onPress={props.onOpenActiveRun}>
+                  Open run
+                </Button>
+                <Button variant="ghost" onPress={props.onOpenApprovals}>
+                  Open approvals
+                </Button>
+              </div>
+            </InlineNotice>
+          ) : (
+            <InlineNotice title="Active run" tone="default">
+              No active run is currently published into the ambient surface.
+            </InlineNotice>
+          )}
+        </SectionCard>
+
+        <SectionCard
+          title="Pending approvals"
+          description="Approval context stays visible, but detailed resolution still hands off safely."
+          actions={
+            <Button
+              variant="ghost"
+              isDisabled={props.pendingApprovals.length === 0}
+              onPress={props.onOpenApprovals}
+            >
+              Open approvals
+            </Button>
+          }
+        >
+          {props.pendingApprovals.length === 0 ? (
+            <EmptyState
+              compact
+              title="No approvals waiting"
+              description="New approval requests will surface here with a handoff into the full workflow."
+            />
+          ) : (
+            <div className="desktop-stack desktop-stack--compact">
+              {props.pendingApprovals.slice(0, 3).map((approval, index) => (
+                <InlineNotice
+                  key={readString(approval, "approval_id") ?? `approval-${index}`}
+                  title={readString(approval, "request_summary") ?? "Approval waiting"}
+                  tone="warning"
+                >
+                  {readString(approval, "subject_type") ?? "Tool approval requires explicit review."}
+                </InlineNotice>
+              ))}
+            </div>
+          )}
+        </SectionCard>
+      </section>
+
+      <section className="desktop-grid desktop-grid--details">
+        <SectionCard
+          title="Offline drafts"
+          description="Queued prompts stay visible and actionable across reconnect and restart."
+        >
+          {props.offlineDrafts.length === 0 ? (
+            <EmptyState
+              compact
+              title="No offline drafts"
+              description="Failed sends that were queued for retry will appear here."
+            />
+          ) : (
+            <div className="desktop-stack desktop-stack--compact">
+              {props.offlineDrafts.map((draft) => (
+                <article key={draft.draft_id} className="desktop-timeline-item">
+                  <div className="desktop-inline-row">
+                    <strong>{draft.session_id ?? "Unbound draft"}</strong>
+                    <small className="desktop-muted">{formatUnixMs(draft.created_at_unix_ms)}</small>
+                  </div>
+                  <p>{draft.text}</p>
+                  <p className="desktop-muted">{draft.reason}</p>
+                  <div className="desktop-inline-row">
+                    <Button
+                      variant="secondary"
+                      isDisabled={props.sendBusy}
+                      onPress={() => props.onSendOfflineDraft(draft.draft_id)}
+                    >
+                      Retry send
+                    </Button>
+                    <Button variant="ghost" onPress={() => props.onRemoveDraft(draft.draft_id)}>
+                      Discard
+                    </Button>
+                  </div>
+                </article>
+              ))}
+            </div>
+          )}
+        </SectionCard>
+
+        {props.previewMode ? (
+          <InlineNotice title="Preview data" tone="warning">
+            Desktop preview data is active, so quick panel actions are representative rather than live.
+          </InlineNotice>
+        ) : null}
+      </section>
+    </main>
+  );
+}
+
+function VoiceOverlaySurface(props: {
+  currentVoiceTranscript: DesktopCompanionAudioTranscriptionResult | null;
+  draftText: string;
+  lifecycleState: string;
+  loading: boolean;
+  notice: string | null;
+  recordingElapsedMs: number;
+  selectedSession: DesktopCompanionSnapshot["session_catalog"][number] | null;
+  sendBusy: boolean;
+  selectedVoiceInputId: string;
+  selectedVoiceInputLabel: string;
+  selectedVoiceOutputLabel: string;
+  selectedVoiceOutputUri: string;
+  speaking: boolean;
+  ttsMuted: boolean;
+  ttsPlaybackSupported: boolean;
+  voiceAuditLog: DesktopCompanionSnapshot["voice"]["audit_log"];
+  voiceBusy: boolean;
+  voiceCaptureEnabled: boolean;
+  voiceCaptureSupported: boolean;
+  voiceInputDevices: DesktopVoiceInputOption[];
+  voiceRecording: boolean;
+  voiceOutputVoices: DesktopVoiceOutputOption[];
+  voicePermissionState: string;
+  voiceSilenceDetectionEnabled: boolean;
+  voiceSilenceDetectionRolloutEnabled: boolean;
+  voiceSilenceTimeoutMs: number;
+  onClearVoiceDraft: () => void;
+  onClose: () => void;
+  onCreateSession: () => void;
+  onOpenFullCompanion: () => void;
+  onSendMessage: () => void;
+  onSelectVoiceInputDevice: (deviceId: string) => void;
+  onSelectVoiceOutputVoice: (voiceURI: string) => void;
+  onSpeakLatestAssistant: () => void;
+  onStartVoiceCapture: () => void;
+  onStopSpeechPlayback: () => void;
+  onStopVoiceCapture: () => void;
+  onToggleTtsMute: () => void;
+  onToggleSilenceDetection: () => void;
+  onUpdateDraftText: (value: string) => void;
+  onUseTranscript: (text: string) => void;
+}) {
+  return (
+    <main className="desktop-root desktop-root--companion desktop-root--voice-overlay">
+      <section className="desktop-stack">
+        <PageHeader
+          eyebrow="Ambient voice"
+          title="Voice overlay"
+          description="Push-to-talk stays explicit: record, review, then decide whether to send."
+          status={
+            <>
+              <StatusChip tone={props.voiceRecording ? "warning" : "default"}>
+                {props.lifecycleState}
+              </StatusChip>
+              <StatusChip tone={props.speaking ? "success" : "default"}>
+                {props.speaking ? "speaking" : "silent"}
+              </StatusChip>
+            </>
+          }
+        />
+        {props.notice ? (
+          <InlineNotice title="Voice status" tone="default">
+            {props.notice}
+          </InlineNotice>
+        ) : null}
+      </section>
+
+      <section className="desktop-grid desktop-grid--details">
+        <SectionCard
+          title="Push-to-talk"
+          description="Ambient listening stays disabled. Recording begins only from explicit operator action."
+          actions={
+            <ButtonGroup className="desktop-action-group">
+              <Button
+                variant="primary"
+                isDisabled={
+                  props.voiceBusy ||
+                  !props.voiceCaptureEnabled ||
+                  !props.voiceCaptureSupported ||
+                  props.selectedSession === null
+                }
+                onPress={props.voiceRecording ? props.onStopVoiceCapture : props.onStartVoiceCapture}
+              >
+                {props.voiceRecording ? "Stop recording" : "Start recording"}
+              </Button>
+              <Button
+                variant="secondary"
+                isDisabled={props.selectedSession !== null}
+                onPress={props.onCreateSession}
+              >
+                Create quick session
+              </Button>
+              <Button variant="ghost" onPress={props.onClose}>
+                Hide overlay
+              </Button>
+              <Button variant="ghost" onPress={props.onOpenFullCompanion}>
+                Full companion
+              </Button>
+            </ButtonGroup>
+          }
+        >
+          <KeyValueList
+            items={[
+              { label: "Session", value: props.selectedSession?.title ?? "No session selected" },
+              {
+                label: "Recording",
+                value: props.voiceRecording ? formatDurationMs(props.recordingElapsedMs) : "stopped",
+              },
+              { label: "Lifecycle", value: props.lifecycleState },
+              { label: "Mic permission", value: props.voicePermissionState },
+              { label: "Input device", value: props.selectedVoiceInputLabel },
+              { label: "Speech playback", value: props.ttsPlaybackSupported ? "available" : "unavailable" },
+              {
+                label: "Silence detection",
+                value: props.voiceSilenceDetectionRolloutEnabled
+                  ? props.voiceSilenceDetectionEnabled
+                    ? `${formatDurationMs(props.voiceSilenceTimeoutMs)} timeout`
+                    : "disabled"
+                  : "rollout disabled",
+              },
+            ]}
+          />
+          {props.selectedSession === null ? (
+            <InlineNotice title="Session required" tone="warning">
+              Voice overlay can safely create a quick chat session for you before recording starts.
+            </InlineNotice>
+          ) : null}
+          <button
+            className="desktop-list-button"
+            type="button"
+            disabled={
+              props.voiceBusy ||
+              !props.voiceCaptureEnabled ||
+              !props.voiceCaptureSupported ||
+              props.selectedSession === null
+            }
+            onMouseDown={() => {
+              if (!props.voiceRecording) {
+                props.onStartVoiceCapture();
+              }
+            }}
+            onMouseUp={() => {
+              if (props.voiceRecording) {
+                props.onStopVoiceCapture();
+              }
+            }}
+            onMouseLeave={() => {
+              if (props.voiceRecording) {
+                props.onStopVoiceCapture();
+              }
+            }}
+            onKeyDown={(event) => {
+              if (!props.voiceRecording && (event.key === " " || event.key === "Enter")) {
+                event.preventDefault();
+                props.onStartVoiceCapture();
+              }
+            }}
+            onKeyUp={(event) => {
+              if (props.voiceRecording && (event.key === " " || event.key === "Enter")) {
+                event.preventDefault();
+                props.onStopVoiceCapture();
+              }
+            }}
+          >
+            <strong>{props.voiceRecording ? "Release to stop recording" : "Hold to talk"}</strong>
+            <small className="desktop-muted">
+              Push-to-talk starts only from explicit press-and-hold or the start button above.
+            </small>
+          </button>
+        </SectionCard>
+
+        <SectionCard
+          title="Transcript review"
+          description="Nothing is sent automatically. The transcript must be explicitly reviewed first."
+        >
+          {props.currentVoiceTranscript === null &&
+          props.draftText.trim().length === 0 &&
+          props.lifecycleState !== "error" ? (
+            <EmptyState
+              compact
+              title="No transcript yet"
+              description="Record a short prompt to populate the review pane."
+            />
+          ) : (
+            <article className="desktop-timeline-item">
+              <div className="desktop-inline-row">
+                <strong>
+                  {props.currentVoiceTranscript === null ? "Manual fallback" : "Ready for review"}
+                </strong>
+                <StatusChip tone={props.currentVoiceTranscript === null ? "warning" : "success"}>
+                  {props.currentVoiceTranscript?.transcript_language ?? props.lifecycleState}
+                </StatusChip>
+              </div>
+              {props.currentVoiceTranscript ? <p>{props.currentVoiceTranscript.transcript_text}</p> : null}
+              {props.currentVoiceTranscript?.transcript_summary ? (
+                <p className="desktop-muted">{props.currentVoiceTranscript.transcript_summary}</p>
+              ) : null}
+              <p className="desktop-muted">
+                {props.currentVoiceTranscript?.privacy_note ??
+                  "Transcription failed or was cancelled. You can still type a manual fallback draft before sending."}
+              </p>
+              <label className="desktop-stack desktop-stack--compact">
+                <span className="desktop-label">Editable draft</span>
+                <textarea
+                  aria-label="Editable voice draft"
+                  className="desktop-textarea"
+                  rows={6}
+                  value={props.draftText}
+                  onChange={(event) => props.onUpdateDraftText(event.currentTarget.value)}
+                />
+              </label>
+              <div className="desktop-inline-row">
+                {props.currentVoiceTranscript ? (
+                  <Button
+                    variant="secondary"
+                    isDisabled={props.sendBusy}
+                    onPress={() =>
+                      props.onUseTranscript(props.currentVoiceTranscript!.transcript_text)
+                    }
+                  >
+                    Use transcript
+                  </Button>
+                ) : null}
+                <Button
+                  variant="primary"
+                  isDisabled={props.sendBusy || props.draftText.trim().length === 0}
+                  onPress={props.onSendMessage}
+                >
+                  Send reviewed draft
+                </Button>
+                <Button variant="ghost" onPress={props.onClearVoiceDraft}>
+                  Discard
+                </Button>
+              </div>
+            </article>
+          )}
+        </SectionCard>
+
+        <SectionCard
+          title="Speech playback"
+          description="TTS stays opt-in and reads only explicit assistant output selections. Output routing follows the OS default audio device."
+        >
+          <div className="desktop-grid desktop-grid--details">
+            <label className="desktop-stack desktop-stack--compact">
+              <span className="desktop-label">Microphone device</span>
+              <select
+                aria-label="Desktop microphone device"
+                className="desktop-select"
+                value={props.selectedVoiceInputId}
+                onChange={(event) => props.onSelectVoiceInputDevice(event.currentTarget.value)}
+              >
+                <option value="">System default microphone</option>
+                {props.voiceInputDevices.map((device) => (
+                  <option key={device.deviceId} value={device.deviceId}>
+                    {device.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="desktop-stack desktop-stack--compact">
+              <span className="desktop-label">Speech voice</span>
+              <select
+                aria-label="Desktop speech voice"
+                className="desktop-select"
+                value={props.selectedVoiceOutputUri}
+                onChange={(event) => props.onSelectVoiceOutputVoice(event.currentTarget.value)}
+              >
+                <option value="">System default voice</option>
+                {props.voiceOutputVoices.map((voice) => (
+                  <option key={voice.voiceURI} value={voice.voiceURI}>
+                    {voice.label} ({voice.lang})
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+          <KeyValueList
+            items={[
+              { label: "Selected voice", value: props.selectedVoiceOutputLabel },
+              { label: "Mute", value: props.ttsMuted ? "muted" : "live" },
+            ]}
+          />
+          <div className="desktop-inline-row">
+            <Button variant="secondary" onPress={props.onSpeakLatestAssistant}>
+              Speak latest assistant
+            </Button>
+            <Button variant="ghost" isDisabled={!props.speaking} onPress={props.onStopSpeechPlayback}>
+              Stop speaking
+            </Button>
+            <Button variant="ghost" onPress={props.onToggleTtsMute}>
+              {props.ttsMuted ? "Unmute TTS" : "Mute TTS"}
+            </Button>
+            <Button
+              variant="ghost"
+              isDisabled={!props.voiceSilenceDetectionRolloutEnabled}
+              onPress={props.onToggleSilenceDetection}
+            >
+              {props.voiceSilenceDetectionEnabled
+                ? "Disable silence detection"
+                : "Enable silence detection"}
+            </Button>
+          </div>
+          {props.voiceAuditLog.length > 0 ? (
+            <div className="desktop-stack desktop-stack--compact">
+              {props.voiceAuditLog.slice().reverse().slice(0, 3).map((entry) => (
+                <article key={entry.audit_id} className="desktop-timeline-item">
+                  <div className="desktop-inline-row">
+                    <strong>{entry.kind.replaceAll("_", " ")}</strong>
+                    <small className="desktop-muted">
+                      {formatUnixMs(entry.created_at_unix_ms)}
+                    </small>
+                  </div>
+                  <p>{entry.detail}</p>
+                </article>
+              ))}
+            </div>
+          ) : null}
+        </SectionCard>
+      </section>
+    </main>
+  );
+}
+
 function labelForSection(section: DesktopCompanionSection, locale: DesktopLocale): string {
   switch (section) {
     case "home":
@@ -2479,26 +4116,119 @@ function parsePayload(payloadJson: string): JsonValue | null {
   }
 }
 
-function readStoredConsent(storageKey: string): boolean {
+function resolveDesktopSurfaceMode(): DesktopCompanionSurfaceMode {
   if (typeof window === "undefined") {
-    return false;
+    return "main";
   }
-  try {
-    return window.localStorage.getItem(storageKey) === "granted";
-  } catch {
-    return false;
+  const surface = new URLSearchParams(window.location.search).get("surface");
+  if (surface === "quick-panel") {
+    return "quick_panel";
   }
+  if (surface === "voice-overlay") {
+    return "voice_overlay";
+  }
+  return "main";
 }
 
-function storeConsent(storageKey: string): void {
-  if (typeof window === "undefined") {
-    return;
+function deriveCurrentVoiceTranscript(
+  snapshot: DesktopCompanionSnapshot,
+  fallback: DesktopCompanionAudioTranscriptionResult | null,
+): DesktopCompanionAudioTranscriptionResult | null {
+  if (snapshot.voice.draft_text) {
+    return {
+      attachment_id: "desktop-voice-draft",
+      artifact_id: "desktop-voice-draft",
+      transcript_text: snapshot.voice.draft_text,
+      transcript_summary: snapshot.voice.draft_summary,
+      transcript_language: snapshot.voice.draft_language,
+      transcript_duration_ms: snapshot.voice.draft_duration_ms,
+      transcript_processing_ms: undefined,
+      derived_artifact_id: undefined,
+      privacy_note:
+        "Push-to-talk audio is uploaded only after you stop recording, follows the existing media retention/redaction pipeline, and ambient listening remains disabled.",
+      warnings: [],
+    };
   }
-  try {
-    window.localStorage.setItem(storageKey, "granted");
-  } catch {
-    // Ignore preference persistence failures; explicit consent is still required in-session.
+  return fallback;
+}
+
+async function requestVoiceCaptureStream(
+  preferredDeviceId?: string,
+): Promise<{ stream: MediaStream; usedFallbackInput: boolean }> {
+  if (preferredDeviceId && preferredDeviceId.trim().length > 0) {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: buildVoiceCaptureConstraints(preferredDeviceId),
+      });
+      return { stream, usedFallbackInput: false };
+    } catch (failure) {
+      if (!shouldRetryVoiceCaptureWithDefault(failure)) {
+        throw failure;
+      }
+    }
   }
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  return {
+    stream,
+    usedFallbackInput: Boolean(preferredDeviceId && preferredDeviceId.trim().length > 0),
+  };
+}
+
+function buildVoiceCaptureConstraints(deviceId?: string): MediaTrackConstraints | boolean {
+  if (!deviceId || deviceId.trim().length === 0) {
+    return true;
+  }
+  return {
+    deviceId: {
+      exact: deviceId,
+    },
+    noiseSuppression: true,
+    echoCancellation: true,
+  };
+}
+
+function shouldRetryVoiceCaptureWithDefault(failure: unknown): boolean {
+  return (
+    failure instanceof DOMException &&
+    (failure.name === "NotFoundError" || failure.name === "OverconstrainedError")
+  );
+}
+
+function readVoiceTrackDeviceId(track: MediaStreamTrack | null): string | undefined {
+  const deviceId = track?.getSettings().deviceId;
+  return typeof deviceId === "string" && deviceId.trim().length > 0 ? deviceId : undefined;
+}
+
+function deriveVoicePermissionState(value: unknown): string {
+  if (value instanceof DOMException) {
+    if (value.name === "NotAllowedError" || value.name === "SecurityError") {
+      return "denied";
+    }
+    if (value.name === "NotFoundError" || value.name === "OverconstrainedError") {
+      return "unavailable";
+    }
+  }
+  const text = value instanceof Error ? value.message : String(value);
+  const normalized = text.toLowerCase();
+  if (normalized.includes("denied") || normalized.includes("notallowed")) {
+    return "denied";
+  }
+  if (normalized.includes("notfound") || normalized.includes("overconstrained")) {
+    return "unavailable";
+  }
+  return "unknown";
+}
+
+function calculateVoiceSilenceRms(samples: Uint8Array): number {
+  if (samples.length === 0) {
+    return 0;
+  }
+  let total = 0;
+  for (const sample of samples) {
+    const centered = sample / 128 - 1;
+    total += centered * centered;
+  }
+  return Math.sqrt(total / samples.length);
 }
 
 function stopRecordingStream(stream: MediaStream | null): void {
