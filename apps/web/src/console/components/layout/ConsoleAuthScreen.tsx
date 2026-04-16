@@ -2,11 +2,7 @@ import type { Dispatch, FormEvent, SetStateAction } from "react";
 
 import { Alert, Button, Card, CardContent, Disclosure } from "@heroui/react";
 
-import {
-  describeConsoleLocale,
-  nextConsoleLocale,
-  type ConsoleMessageKey,
-} from "../../i18n";
+import { describeConsoleLocale, nextConsoleLocale, type ConsoleMessageKey } from "../../i18n";
 import type { ConsoleLocale } from "../../preferences";
 import { AppForm, TextInputField } from "../ui";
 import { DEFAULT_LOGIN_FORM, type LoginForm } from "../../stateTypes";

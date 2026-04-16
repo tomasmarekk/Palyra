@@ -184,8 +184,7 @@ const OVERVIEW_MESSAGES_CS: Readonly<Record<OverviewMessageKey, string>> = {
     "Kdykoli chceš doporučený další krok, opravu blockerů nebo prompty pro první úspěch, znovu otevři guidance surface.",
   "guidance.currentTrack": "Aktuální track",
   "onboarding.nextStep": "Další onboarding krok",
-  "onboarding.noRecommendation":
-    "Control plane zatím nepublikovala doporučený onboarding krok.",
+  "onboarding.noRecommendation": "Control plane zatím nepublikovala doporučený onboarding krok.",
   "onboarding.flow": "Flow: {flow}. Stav: {status}.",
   "onboarding.trackSummary": "{track} Povinné: {required}. Volitelné: {optional}.",
   "onboarding.quickStart": "Quick Start",
@@ -197,8 +196,7 @@ const OVERVIEW_MESSAGES_CS: Readonly<Record<OverviewMessageKey, string>> = {
   "scenario.openChat": "Otevřít chat",
   "scenario.reviewNextStep": "Zkontrolovat další krok",
   "scenario.readyDescription": "Otevři chat a ověř první end-to-end operátorský úkol.",
-  "scenario.finishSteps":
-    "Dokonči zbývající guided kroky a potom starter promptem ověř workspace.",
+  "scenario.finishSteps": "Dokonči zbývající guided kroky a potom starter promptem ověř workspace.",
   "scenario.reviewApprovals": "Zkontrolovat schválení",
   "scenario.inspectDiagnostics": "Zkontrolovat diagnostiku",
   "scenario.openSessions": "Otevřít relace",
@@ -219,7 +217,8 @@ const OVERVIEW_MESSAGES_CS: Readonly<Record<OverviewMessageKey, string>> = {
   "metric.objectiveLayer": "Vrstva objectives",
   "metric.noObjectives": "Zatím nejsou načtené žádné aktivní objective produkty.",
   "metric.objectiveHealth": "Zdraví objectives",
-  "metric.objectiveHealthNeedsFollowUp": "Zdraví heartbeat nebo objective vyžaduje navazující kontrolu.",
+  "metric.objectiveHealthNeedsFollowUp":
+    "Zdraví heartbeat nebo objective vyžaduje navazující kontrolu.",
   "metric.objectiveHealthClear": "Nejsou načtené žádné odchylky ve zdraví objectives.",
   "metric.attention": "Pozornost",
   "metric.healthy": "Zdravé",
@@ -573,8 +572,7 @@ export function OverviewSection({ app }: OverviewSectionProps) {
             >
               <div className="grid gap-2">
                 <p className="chat-muted">
-                  {recommendedOnboardingStep?.summary ??
-                    tOverview("onboarding.noRecommendation")}
+                  {recommendedOnboardingStep?.summary ?? tOverview("onboarding.noRecommendation")}
                 </p>
                 {recommendedOnboardingStep?.blocked !== undefined ? (
                   <p className="chat-muted">
@@ -651,8 +649,7 @@ export function OverviewSection({ app }: OverviewSectionProps) {
               }
               description={
                 onboarding?.ready_for_first_success
-                  ? (onboarding.first_success_hint ??
-                    tOverview("scenario.readyDescription"))
+                  ? (onboarding.first_success_hint ?? tOverview("scenario.readyDescription"))
                   : tOverview("scenario.finishSteps")
               }
               title={tOverview("scenario.firstSuccess")}
@@ -823,7 +820,9 @@ export function OverviewSection({ app }: OverviewSectionProps) {
           label={tOverview("metric.runtimePosture")}
           tone={attentionItems.length > 0 ? "warning" : "success"}
           value={
-            attentionItems.length > 0 ? tOverview("metric.attentionRequired") : tOverview("status.ready")
+            attentionItems.length > 0
+              ? tOverview("metric.attentionRequired")
+              : tOverview("status.ready")
           }
         />
         <WorkspaceMetricCard
@@ -850,7 +849,11 @@ export function OverviewSection({ app }: OverviewSectionProps) {
           }
           label={tOverview("metric.objectiveHealth")}
           tone={objectiveAttentionCount > 0 ? "warning" : "success"}
-          value={objectiveAttentionCount > 0 ? tOverview("metric.attention") : tOverview("metric.healthy")}
+          value={
+            objectiveAttentionCount > 0
+              ? tOverview("metric.attention")
+              : tOverview("metric.healthy")
+          }
         />
         <WorkspaceMetricCard
           detail={

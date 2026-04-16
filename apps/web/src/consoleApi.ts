@@ -4672,9 +4672,7 @@ export class ConsoleApiClient {
     return this.request(`/console/v1/mobile/sessions/${encodeURIComponent(sessionId)}`);
   }
 
-  async prepareMobileSafeUrlOpen(payload: {
-    target: string;
-  }): Promise<MobileSafeUrlOpenEnvelope> {
+  async prepareMobileSafeUrlOpen(payload: { target: string }): Promise<MobileSafeUrlOpenEnvelope> {
     return this.request(
       "/console/v1/mobile/safe-url-open",
       {

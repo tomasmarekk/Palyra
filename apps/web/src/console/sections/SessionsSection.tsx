@@ -139,8 +139,7 @@ const SESSION_MESSAGES = {
   "detail.noPreview": "No preview was derivable from existing run history.",
   "detail.family": "Family {index}/{count}",
   "detail.sessionLabel": "Session label",
-  "detail.sessionLabelDescription":
-    "Leave empty to return the session to automatic title mode.",
+  "detail.sessionLabelDescription": "Leave empty to return the session to automatic title mode.",
   "detail.sessionKey": "Session key",
   "detail.titleSource": "Title source",
   "detail.familyRoot": "Family root",
@@ -235,7 +234,8 @@ const SESSION_MESSAGES_CS: Readonly<Record<SessionMessageKey, string>> = {
   "metric.activeRuns": "Aktivní běhy",
   "metric.activeRunsDetail": "Poslední známý běh je stále přijatý nebo probíhá.",
   "metric.contextFiles": "Kontextové soubory",
-  "metric.contextFilesDetail": "Relace nesoucí aktivní kontextové soubory nebo odkazy na workspace.",
+  "metric.contextFilesDetail":
+    "Relace nesoucí aktivní kontextové soubory nebo odkazy na workspace.",
   "filters.title": "Filtry",
   "filters.description":
     "Filtry katalogu zůstávají server-backed, takže chat, web a budoucí operátorské surface nevymýšlejí oddělenou logiku relací.",
@@ -279,9 +279,11 @@ const SESSION_MESSAGES_CS: Readonly<Record<SessionMessageKey, string>> = {
   "filters.showArchived": "Zobrazit archivované",
   "filters.showArchivedDescription": "Zahrnout archivované záznamy do aktuálního seznamu.",
   "catalog.title": "Katalog",
-  "catalog.description": "Vyber relaci a zkontroluj její poslední aktivitu, preview a lifecycle stav.",
+  "catalog.description":
+    "Vyber relaci a zkontroluj její poslední aktivitu, preview a lifecycle stav.",
   "catalog.emptyTitle": "Aktuálnímu dotazu neodpovídají žádné relace",
-  "catalog.emptyDescription": "Uprav filtry nebo vytvoř aktivitu v chatu, aby se katalog relací naplnil.",
+  "catalog.emptyDescription":
+    "Uprav filtry nebo vytvoř aktivitu v chatu, aby se katalog relací naplnil.",
   "catalog.columns.title": "Název",
   "catalog.columns.family": "Rodina",
   "catalog.columns.updated": "Aktualizováno",
@@ -345,7 +347,8 @@ const SESSION_MESSAGES_CS: Readonly<Record<SessionMessageKey, string>> = {
   "continuity.recentCompactionsDescription":
     "Zkontroluj poslední uložené kompakce a skoč rovnou do chat detail sidebaru pro raw diff a auditní kontext.",
   "continuity.emptyCompactionsTitle": "Zatím žádné kompakce",
-  "continuity.emptyCompactionsDescription": "Pro tuto relaci zatím nejsou uložené žádné artefakty kompakce.",
+  "continuity.emptyCompactionsDescription":
+    "Pro tuto relaci zatím nejsou uložené žádné artefakty kompakce.",
   "continuity.review": "review",
   "continuity.recoveryPoints": "Body obnovy",
   "continuity.recentCheckpoints": "Nedávné checkpointy",
@@ -551,9 +554,7 @@ export function SessionsSection({ app }: SessionsSectionProps) {
     const summary = readCompactionSummary(preview.summary);
     const reviewCount = summary?.planner?.review_candidate_count ?? 0;
     if (reviewCount > 0) {
-      app.setNotice(
-        `${reviewCount} ${t("continuity.review")} · ${t("continuity.reviewHelp")}`,
-      );
+      app.setNotice(`${reviewCount} ${t("continuity.review")} · ${t("continuity.reviewHelp")}`);
       return;
     }
 
@@ -673,10 +674,7 @@ export function SessionsSection({ app }: SessionsSectionProps) {
         />
       </section>
 
-      <WorkspaceSectionCard
-        description={t("filters.description")}
-        title={t("filters.title")}
-      >
+      <WorkspaceSectionCard description={t("filters.description")} title={t("filters.title")}>
         <div className="workspace-form-grid">
           <TextInputField
             label={t("filters.search")}
@@ -782,10 +780,7 @@ export function SessionsSection({ app }: SessionsSectionProps) {
       </WorkspaceSectionCard>
 
       <section className="workspace-two-column">
-        <WorkspaceSectionCard
-          description={t("catalog.description")}
-          title={t("catalog.title")}
-        >
+        <WorkspaceSectionCard description={t("catalog.description")} title={t("catalog.title")}>
           {catalog.entries.length === 0 ? (
             <WorkspaceEmptyState
               description={t("catalog.emptyDescription")}
@@ -856,10 +851,7 @@ export function SessionsSection({ app }: SessionsSectionProps) {
           )}
         </WorkspaceSectionCard>
 
-        <WorkspaceSectionCard
-          description={t("detail.description")}
-          title={t("detail.title")}
-        >
+        <WorkspaceSectionCard description={t("detail.description")} title={t("detail.title")}>
           {selected === null ? (
             <WorkspaceEmptyState
               compact
@@ -872,9 +864,7 @@ export function SessionsSection({ app }: SessionsSectionProps) {
                 <p className="workspace-kicker">{t("detail.selectedSession")}</p>
                 <h3>{selected.title}</h3>
                 <p className="chat-muted">
-                  {selected.preview ??
-                    selected.last_summary ??
-                    t("detail.noPreview")}
+                  {selected.preview ?? selected.last_summary ?? t("detail.noPreview")}
                 </p>
                 <div className="workspace-chip-row">
                   <WorkspaceStatusChip tone={selected.manual_title_locked ? "accent" : "default"}>
@@ -1078,10 +1068,12 @@ export function SessionsSection({ app }: SessionsSectionProps) {
               {selected.last_intent || selected.last_summary ? (
                 <WorkspaceInlineNotice title={t("detail.latestActivity")} tone="default">
                   <p>
-                    <strong>{t("detail.lastIntent")}</strong> {selected.last_intent ?? t("detail.missing")}
+                    <strong>{t("detail.lastIntent")}</strong>{" "}
+                    {selected.last_intent ?? t("detail.missing")}
                   </p>
                   <p>
-                    <strong>{t("detail.lastSummary")}</strong> {selected.last_summary ?? t("detail.missing")}
+                    <strong>{t("detail.lastSummary")}</strong>{" "}
+                    {selected.last_summary ?? t("detail.missing")}
                   </p>
                 </WorkspaceInlineNotice>
               ) : null}
@@ -1092,7 +1084,8 @@ export function SessionsSection({ app }: SessionsSectionProps) {
                 <WorkspaceInlineNotice title={t("detail.resumeRecap")} tone="accent">
                   {selectedPresentation.touchedFiles.length > 0 ? (
                     <p>
-                      <strong>{t("detail.touchedFiles")}</strong> {selectedPresentation.touchedFiles.join(", ")}
+                      <strong>{t("detail.touchedFiles")}</strong>{" "}
+                      {selectedPresentation.touchedFiles.join(", ")}
                     </p>
                   ) : null}
                   {selectedPresentation.activeContextFiles.length > 0 ? (
@@ -1113,7 +1106,11 @@ export function SessionsSection({ app }: SessionsSectionProps) {
               ) : null}
 
               <WorkspaceInlineNotice
-                title={selectedObjective === null ? t("detail.objectiveLinkage") : t("detail.linkedObjective")}
+                title={
+                  selectedObjective === null
+                    ? t("detail.objectiveLinkage")
+                    : t("detail.linkedObjective")
+                }
                 tone={selectedObjective === null ? "default" : "accent"}
               >
                 {selectedObjective === null ? (
@@ -1133,8 +1130,7 @@ export function SessionsSection({ app }: SessionsSectionProps) {
                     </p>
                     <p>
                       <strong>{t("detail.currentFocus")}</strong>{" "}
-                      {readString(selectedObjective, "current_focus") ??
-                        t("detail.noCurrentFocus")}
+                      {readString(selectedObjective, "current_focus") ?? t("detail.noCurrentFocus")}
                     </p>
                     <p>
                       <strong>{t("detail.nextAction")}</strong>{" "}
@@ -1147,7 +1143,9 @@ export function SessionsSection({ app }: SessionsSectionProps) {
 
               {compactionPreview !== null ? (
                 <WorkspaceInlineNotice
-                  title={compactionPreview.eligible ? t("continuity.preview") : t("continuity.blocked")}
+                  title={
+                    compactionPreview.eligible ? t("continuity.preview") : t("continuity.blocked")
+                  }
                   tone={
                     !compactionPreview.eligible
                       ? "warning"
@@ -1164,9 +1162,7 @@ export function SessionsSection({ app }: SessionsSectionProps) {
                     <strong>{t("continuity.plannedWrites")}</strong> {continuityWriteCount} ·{" "}
                     <strong>{t("continuity.reviewCandidates")}</strong> {continuityReviewCount}
                   </p>
-                  {continuityReviewCount > 0 ? (
-                    <p>{t("continuity.reviewHelp")}</p>
-                  ) : null}
+                  {continuityReviewCount > 0 ? <p>{t("continuity.reviewHelp")}</p> : null}
                 </WorkspaceInlineNotice>
               ) : null}
 
@@ -1208,7 +1204,9 @@ export function SessionsSection({ app }: SessionsSectionProps) {
                           <div className="chat-ops-card__copy">
                             <strong>{artifact.mode}</strong>
                             <span>
-                              {lifecycleState.replaceAll("_", " ")} · {continuityCountLabel("write", writeCount)} · {reviewCount} {t("continuity.review")}
+                              {lifecycleState.replaceAll("_", " ")} ·{" "}
+                              {continuityCountLabel("write", writeCount)} · {reviewCount}{" "}
+                              {t("continuity.review")}
                             </span>
                             <p>{artifact.summary_preview}</p>
                           </div>
@@ -1256,8 +1254,8 @@ export function SessionsSection({ app }: SessionsSectionProps) {
                         <div className="chat-ops-card__copy">
                           <strong>{checkpoint.name}</strong>
                           <span>
-                            {describeBranchState(checkpoint.branch_state)} · {t("continuity.restores")}{" "}
-                            {checkpoint.restore_count}
+                            {describeBranchState(checkpoint.branch_state)} ·{" "}
+                            {t("continuity.restores")} {checkpoint.restore_count}
                           </span>
                           <p>{checkpoint.note ?? t("continuity.noCheckpointNote")}</p>
                         </div>

@@ -105,8 +105,7 @@ const DESKTOP_MESSAGES_CS: Readonly<Record<DesktopMessageKey, string>> = {
   "desktop.onboarding.auth.attention": "Pozornost",
   "desktop.onboarding.auth.emptyNote": "Není publikovaná žádná auth poznámka.",
   "desktop.onboarding.completion.label": "Poslední dokončení",
-  "desktop.onboarding.completion.detail":
-    "Uloženo lokálně, aby desktop mohl po restartu navázat.",
+  "desktop.onboarding.completion.detail": "Uloženo lokálně, aby desktop mohl po restartu navázat.",
 };
 
 export const DESKTOP_LOCALES: readonly DesktopLocale[] = ["en", "cs", "qps-ploc"] as const;

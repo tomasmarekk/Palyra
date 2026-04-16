@@ -879,10 +879,7 @@ export function ApprovalsSection({ app }: ApprovalsSectionProps) {
       </section>
 
       <section className="workspace-two-column workspace-two-column--queue">
-        <WorkspaceSectionCard
-          title={t("queue.title")}
-          description={t("queue.description")}
-        >
+        <WorkspaceSectionCard title={t("queue.title")} description={t("queue.description")}>
           <div className="workspace-list workspace-list--queue">
             {app.approvals.length === 0 ? (
               <p className="chat-muted">{t("queue.empty")}</p>
@@ -916,10 +913,7 @@ export function ApprovalsSection({ app }: ApprovalsSectionProps) {
           </div>
         </WorkspaceSectionCard>
 
-        <WorkspaceSectionCard
-          title={t("detail.title")}
-          description={t("detail.description")}
-        >
+        <WorkspaceSectionCard title={t("detail.title")} description={t("detail.description")}>
           {selectedApproval === null ? (
             <p className="chat-muted">{t("detail.empty")}</p>
           ) : (
@@ -944,7 +938,9 @@ export function ApprovalsSection({ app }: ApprovalsSectionProps) {
               <dl className="workspace-key-value-grid">
                 <div>
                   <dt>{t("detail.subjectType")}</dt>
-                  <dd>{readString(selectedApproval, "subject_type") ?? t("detail.notAvailable")}</dd>
+                  <dd>
+                    {readString(selectedApproval, "subject_type") ?? t("detail.notAvailable")}
+                  </dd>
                 </div>
                 <div>
                   <dt>{t("detail.subjectId")}</dt>

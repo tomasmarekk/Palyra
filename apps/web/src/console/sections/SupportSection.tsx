@@ -154,7 +154,8 @@ const SUPPORT_MESSAGES = {
   "table.requested": "requested {value}",
   "table.select": "Select",
   "bundleJobs.emptyTitle": "No support bundle jobs queued",
-  "bundleJobs.emptyDescription": "Queue a support bundle to inspect command output and artifact paths.",
+  "bundleJobs.emptyDescription":
+    "Queue a support bundle to inspect command output and artifact paths.",
   "selectedBundle.title": "Selected bundle job",
   "selectedBundle.description":
     "Load command output, output path, and failure detail for the chosen support bundle job.",
@@ -415,10 +416,7 @@ export function SupportSection({ app }: SupportSectionProps) {
       </section>
 
       <section className="workspace-two-column">
-        <WorkspaceSectionCard
-          title={t("bundle.title")}
-          description={t("bundle.description")}
-        >
+        <WorkspaceSectionCard title={t("bundle.title")} description={t("bundle.description")}>
           <div className="workspace-stack">
             <TextInputField
               label={t("bundle.retainJobs")}
@@ -529,10 +527,7 @@ export function SupportSection({ app }: SupportSectionProps) {
       </section>
 
       <section className="workspace-two-column">
-        <WorkspaceSectionCard
-          title={t("signals.title")}
-          description={t("signals.description")}
-        >
+        <WorkspaceSectionCard title={t("signals.title")} description={t("signals.description")}>
           {latestFailure === null ? (
             <EmptyState
               compact
@@ -558,10 +553,7 @@ export function SupportSection({ app }: SupportSectionProps) {
           )}
         </WorkspaceSectionCard>
 
-        <WorkspaceSectionCard
-          title={t("provider.title")}
-          description={t("provider.description")}
-        >
+        <WorkspaceSectionCard title={t("provider.title")} description={t("provider.description")}>
           <div className="workspace-stack">
             <div className="workspace-inline">
               <WorkspaceStatusChip
@@ -579,9 +571,7 @@ export function SupportSection({ app }: SupportSectionProps) {
                 {recoveryBacklog} {t("provider.degradedProfiles")}
               </WorkspaceStatusChip>
             </div>
-            <p className="chat-muted">
-              {t("provider.body")}
-            </p>
+            <p className="chat-muted">{t("provider.body")}</p>
             <ActionCluster>
               <ActionButton variant="secondary" onPress={() => app.setSection("operations")}>
                 {t("provider.openDiagnostics")}
@@ -595,10 +585,7 @@ export function SupportSection({ app }: SupportSectionProps) {
       </section>
 
       <section className="workspace-two-column">
-        <WorkspaceSectionCard
-          title={t("playbook.title")}
-          description={t("playbook.description")}
-        >
+        <WorkspaceSectionCard title={t("playbook.title")} description={t("playbook.description")}>
           <div className="workspace-stack">
             <ol className="workspace-bullet-list">
               <li>{t("playbook.step1")}</li>
@@ -612,10 +599,7 @@ export function SupportSection({ app }: SupportSectionProps) {
           </div>
         </WorkspaceSectionCard>
 
-        <WorkspaceSectionCard
-          title={t("summary.title")}
-          description={t("summary.description")}
-        >
+        <WorkspaceSectionCard title={t("summary.title")} description={t("summary.description")}>
           {latestDoctorRecovery === null ? (
             <EmptyState
               compact
@@ -804,7 +788,10 @@ export function SupportSection({ app }: SupportSectionProps) {
                 {selectedDoctorRecovery === null ? null : (
                   <div className="workspace-stack">
                     <InlineNotice
-                      title={readString(selectedDoctorReport ?? {}, "mode") ?? t("selectedRecovery.summary")}
+                      title={
+                        readString(selectedDoctorReport ?? {}, "mode") ??
+                        t("selectedRecovery.summary")
+                      }
                       tone={
                         readString(app.supportSelectedDoctorJob, "state") === "failed"
                           ? "danger"

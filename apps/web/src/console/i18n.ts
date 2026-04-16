@@ -222,8 +222,7 @@ const CS_MESSAGES: Readonly<Record<ConsoleMessageKey, string>> = {
   "section.approvals.label": "Schválení",
   "section.approvals.detail": "Brána pro citlivé akce",
   "section.cron.label": "Automatizace",
-  "section.cron.detail":
-    "Heartbeaty, standing orders, programy, rutiny, běhy, šablony a schválení",
+  "section.cron.detail": "Heartbeaty, standing orders, programy, rutiny, běhy, šablony a schválení",
   "section.channels.label": "Kanály",
   "section.channels.detail": "Konektory, router a nastavení Discordu",
   "section.browser.label": "Prohlížeč",
@@ -261,8 +260,7 @@ const CS_MESSAGES: Readonly<Record<ConsoleMessageKey, string>> = {
   "overview.modeGuidanceTitle": "Doporučení k režimu",
   "overview.modeGuidanceBody":
     "Základní režim zužuje pozornost na plochy pro první úspěch. Pokročilý režim okamžitě obnoví plnou operátorskou lištu bez změny backendových schopností.",
-  "mode.basic.description":
-    "Chat, přehled, relace, schválení, přístup a podpora zůstávají hlavní.",
+  "mode.basic.description": "Chat, přehled, relace, schválení, přístup a podpora zůstávají hlavní.",
   "mode.advanced.description":
     "Všechny operátorské sekce zůstávají viditelné přímo v postranním panelu.",
 };
