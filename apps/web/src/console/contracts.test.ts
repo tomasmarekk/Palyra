@@ -11,27 +11,27 @@ import {
 describe("phase 1 contracts", () => {
   it("builds and parses handoff URLs with the canonical identifier set", () => {
     const href = buildConsoleHandoffHref({
-      section: "chat",
+      section: "canvas",
       sessionId: "session-1",
       runId: "run-2",
       deviceId: "device-3",
       objectiveId: "objective-4",
       canvasId: "canvas-5",
-      intent: "approve",
+      intent: "reopen-canvas",
       source: "desktop",
     });
 
     expect(href).toBe(
-      "/chat?sessionId=session-1&runId=run-2&deviceId=device-3&objectiveId=objective-4&canvasId=canvas-5&intent=approve&source=desktop",
+      "/chat/canvas?sessionId=session-1&runId=run-2&deviceId=device-3&objectiveId=objective-4&canvasId=canvas-5&source=desktop&intent=reopen-canvas",
     );
     expect(parseConsoleHandoff(href)).toEqual({
-      section: "chat",
+      section: "canvas",
       sessionId: "session-1",
       runId: "run-2",
       deviceId: "device-3",
       objectiveId: "objective-4",
       canvasId: "canvas-5",
-      intent: "approve",
+      intent: "reopen-canvas",
       source: "desktop",
     });
   });
@@ -41,6 +41,26 @@ describe("phase 1 contracts", () => {
     expect(nearestSupportedHandoffSection({ section: "overview", canvasId: "canvas-1" })).toBe(
       "overview",
     );
+    expect(
+      nearestSupportedHandoffSection({
+        section: "canvas",
+        canvasId: "canvas-1",
+        intent: "reopen-canvas",
+      }),
+    ).toBe("canvas");
+  });
+
+  it("normalizes legacy desktop handoff intents into the canonical vocabulary", () => {
+    expect(parseConsoleHandoff("/chat/canvas?intent=reopen_canvas&canvasId=canvas-1")).toEqual({
+      section: "canvas",
+      canvasId: "canvas-1",
+      intent: "reopen-canvas",
+    });
+    expect(parseConsoleHandoff("/chat?intent=resume_session&sessionId=session-1")).toEqual({
+      section: "chat",
+      sessionId: "session-1",
+      intent: "resume-session",
+    });
   });
 
   it("serializes UX telemetry using the bounded system-event payload shape", () => {

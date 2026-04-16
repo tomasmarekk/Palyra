@@ -15,6 +15,7 @@ import type {
 } from "../consoleApi";
 import { type DetailPanelState, type TranscriptSearchMatch } from "./ChatInspectorColumn";
 import type { RunDrawerTab } from "./ChatRunDrawer";
+import { ChatCanvasWorkspaceView } from "./ChatCanvasWorkspaceView";
 import { ChatConsoleWorkspaceView } from "./ChatConsoleWorkspaceView";
 import {
   deleteChatPin,
@@ -62,10 +63,12 @@ import {
   describeSelectedSessionTitle,
 } from "./chatWorkspaceSessionBindings";
 import { FIRST_SUCCESS_PROMPTS } from "./starterPrompts";
+import { buildChatCanvasHref } from "./sessionCanvasState";
+import { useSessionCanvases } from "./useSessionCanvases";
 import { useStarterPromptGuidance } from "./useStarterPromptGuidance";
 import { useStarterPromptHandoff } from "./useStarterPromptHandoff";
 import type { UxTelemetryEvent } from "../console/contracts";
-import { parseConsoleHandoff } from "../console/contracts";
+import { buildConsoleHandoffHref, parseConsoleHandoff } from "../console/contracts";
 import { getSectionPath } from "../console/navigation";
 import type { Section } from "../console/sectionMetadata";
 import { buildObjectiveOverviewHref } from "../console/objectiveLinks";
@@ -75,6 +78,7 @@ interface ChatConsolePanelProps {
   readonly emitUxEvent: (
     event: Omit<UxTelemetryEvent, "surface" | "locale" | "mode">,
   ) => Promise<void>;
+  readonly surface?: "chat" | "canvas";
   readonly revealSensitiveValues: boolean;
   readonly setError: (next: string | null) => void;
   readonly setNotice: (next: string | null) => void;
@@ -84,6 +88,7 @@ interface ChatConsolePanelProps {
 export function ChatConsolePanel({
   api,
   emitUxEvent,
+  surface = "chat",
   revealSensitiveValues,
   setError,
   setNotice,
@@ -97,6 +102,7 @@ export function ChatConsolePanel({
   const preferredCompactionId = searchParams.get("compactionId");
   const preferredCheckpointId = searchParams.get("checkpointId");
   const preferredObjectiveId = searchParams.get("objectiveId");
+  const preferredCanvasId = searchParams.get("canvasId");
   const sessionSwitchRef = useRef<string>("");
   const handoffTelemetryRef = useRef<string>("");
   const transcriptRequestSeqRef = useRef(0);
@@ -447,6 +453,69 @@ export function ChatConsolePanel({
     },
     [api, sessions.activeSessionId, sessions.upsertSession, setError],
   );
+  const sessionCanvases = useSessionCanvases({
+    api,
+    activeSessionId: sessions.activeSessionId,
+    preferredCanvasId,
+    setError,
+    onCanvasRestored: async (response) => {
+      sessions.upsertSession(response.session);
+      await Promise.all([sessions.refreshSessions(false), refreshSessionTranscript()]);
+      setNotice(
+        `Restored canvas state v${response.restored_from_state_version} into v${response.canvas.state_version}.`,
+      );
+    },
+  });
+  const openSelectedCanvasSurface = useCallback(
+    (canvasId?: string | null, sessionIdOverride?: string) => {
+      const sessionId = (sessionIdOverride ?? sessions.activeSessionId).trim();
+      const normalizedCanvasId = canvasId?.trim() ?? "";
+      void navigate(
+        buildChatCanvasHref({
+          sessionId: sessionId.length > 0 ? sessionId : undefined,
+          canvasId: normalizedCanvasId.length > 0 ? normalizedCanvasId : undefined,
+        }),
+      );
+    },
+    [navigate, sessions.activeSessionId],
+  );
+  const openConversationSurface = useCallback(
+    (runId?: string | null) => {
+      const sessionId = sessions.activeSessionId.trim();
+      const normalizedRunId = runId?.trim() ?? "";
+      void navigate(
+        buildConsoleHandoffHref({
+          section: "chat",
+          sessionId: sessionId.length > 0 ? sessionId : undefined,
+          runId: normalizedRunId.length > 0 ? normalizedRunId : undefined,
+          intent: normalizedRunId.length > 0 ? "inspect-run" : "resume-session",
+        }),
+      );
+    },
+    [navigate, sessions.activeSessionId],
+  );
+  const openCanvasSourceRun = useCallback(() => {
+    const sourceRunId = sessionCanvases.selectedCanvas?.canvas.reference.source_run_id?.trim();
+    if (!sourceRunId) {
+      setError("Selected canvas is not linked to a source run.");
+      return;
+    }
+    openConversationSurface(sourceRunId);
+  }, [openConversationSurface, sessionCanvases.selectedCanvas, setError]);
+  const setCanvasSurfaceSessionId = useCallback(
+    (sessionId: string) => {
+      sessions.setActiveSessionId(sessionId);
+      openSelectedCanvasSurface(undefined, sessionId);
+    },
+    [openSelectedCanvasSurface, sessions.setActiveSessionId],
+  );
+  const selectCanvasSurfaceCanvas = useCallback(
+    (canvasId: string) => {
+      sessionCanvases.selectCanvas(canvasId);
+      openSelectedCanvasSurface(canvasId);
+    },
+    [openSelectedCanvasSurface, sessionCanvases.selectCanvas],
+  );
   const openMemorySection = useCallback(() => setConsoleSection("memory"), [setConsoleSection]);
   const openSupportSection = useCallback(() => setConsoleSection("support"), [setConsoleSection]);
   const handleWorkspaceRestore = useCallback(
@@ -771,6 +840,16 @@ export function ChatConsolePanel({
     setNotice,
     setPhase4BusyKey,
   };
+  const sessionsSidebarProps = buildSessionsSidebarProps({
+    sessions:
+      surface === "canvas"
+        ? { ...sessions, setActiveSessionId: setCanvasSurfaceSessionId }
+        : sessions,
+    createSession: () => void sessions.createSession(),
+    renameSession: () => void sessions.renameSession(),
+    resetSession: () => void resetSessionAndTranscript(),
+    archiveSession: () => void archiveSessionAndTranscript(),
+  });
   return (
     <main className="workspace-page chat-workspace">
       <input
@@ -782,237 +861,264 @@ export function ChatConsolePanel({
           attachSelectedFiles(Array.from(event.currentTarget.files ?? []));
         }}
       />
-      <ChatConsoleWorkspaceView
-        allowSensitiveTools={allowSensitiveTools}
-        canAbortRun={actionableRunId !== null}
-        canInspectRun={(activeRunId ?? runIds[0] ?? null) !== null}
-        composerProps={{
-          composerText,
-          setComposerText: updateComposerDraft,
-          streaming,
-          activeSessionId: sessions.activeSessionId,
-          attachments,
-          attachmentBusy,
-          canQueueFollowUp: actionableRunId !== null,
-          submitMessage: () => void handleComposerSubmit(),
-          retryLast: () => void retryLatestTurn(),
-          branchSession: () => void branchCurrentSession(),
-          queueFollowUp: () => void queueFollowUpText(composerText),
-          cancelStreaming,
-          clearTranscript: () => {
-            clearTranscriptState();
-            setDetailPanel(null);
-            setAttachments([]);
-            setNotice("Local transcript cleared.");
-          },
-          openAttachmentPicker: () => attachmentInputRef.current?.click(),
-          removeAttachment: (localId) => {
-            setAttachments((previous) =>
-              previous.filter((attachment) => attachment.local_id !== localId),
-            );
-          },
-          attachFiles: attachSelectedFiles,
-          showSlashPalette,
-          parsedSlashCommand,
-          slashCommandMatches,
-          slashSuggestions,
-          selectedSlashSuggestionIndex,
-          setSelectedSlashSuggestionIndex,
-          dismissSlashPalette,
-          acceptSlashSuggestion: (replacement, acceptedWithKeyboard) => {
-            applySlashSuggestion(replacement, acceptedWithKeyboard);
-          },
-          uxMetrics,
-          contextBudget,
-          projectContextPreview,
-          projectContextPreviewBusy,
-          projectContextPreviewStale,
-          projectContextPromptPreview,
-          refreshProjectContextPreview: () =>
-            void loadProjectContextPreview(composerText, { reportError: true }),
-          contextReferencePreview,
-          contextReferencePreviewBusy,
-          contextReferencePreviewStale,
-          refreshContextReferencePreview: () =>
-            void loadContextReferencePreview(composerText, { reportError: true }),
-          removeContextReference,
-          recallPreview,
-          recallPreviewBusy,
-          recallPreviewStale,
-          refreshRecallPreview: () => void loadRecallPreview(composerText, { reportError: true }),
-        }}
-        contextBudget={contextBudget}
-        inspectorProps={buildInspectorProps({
-          api,
-          pendingApprovalCount,
-          a2uiSurfaces,
-          runIds: knownRunIds,
-          selectedSession: sessions.selectedSession,
-          selectedSessionLineage,
-          sessionQuickControlPanelProps,
-          contextBudgetEstimatedTokens: contextBudget.estimated_total_tokens,
-          projectContextBusy: projectContextPreviewBusy,
-          refreshProjectContext: () => refreshProjectContextAction(projectContextActionArgs),
-          disableProjectContextEntry: (entryId) => {
-            void disableProjectContextEntryAction({ ...projectContextActionArgs, entryId });
-          },
-          enableProjectContextEntry: (entryId) => {
-            void enableProjectContextEntryAction({ ...projectContextActionArgs, entryId });
-          },
-          approveProjectContextEntry: (entryId) => {
-            void approveProjectContextEntryAction({ ...projectContextActionArgs, entryId });
-          },
-          scaffoldProjectContext: () => void scaffoldProjectContextAction(projectContextActionArgs),
-          transcriptBusy,
-          transcriptSearchQuery,
-          setTranscriptSearchQuery,
-          transcriptSearchBusy,
-          canSearchTranscript: deferredSearchQuery.trim().length > 0,
-          sessionPins,
-          searchResults: transcriptSearchResults,
-          searchTranscript,
-          exportBusy,
-          exportTranscript,
-          recentTranscriptRecords,
-          pinTranscriptRecord: async (record) =>
-            pinChatTranscriptRecord({
-              api,
-              activeSessionId: sessions.activeSessionId,
-              record,
-              refreshSessionTranscript,
-              setCommandBusy,
-              setError,
-              setNotice,
-            }),
-          deletePin: async (pinId) =>
-            deleteChatPin({
-              api,
-              activeSessionId: sessions.activeSessionId,
-              pinId,
-              refreshSessionTranscript,
-              setCommandBusy,
-              setError,
-              setNotice,
-            }),
-          compactions,
-          checkpoints,
-          queuedInputs,
-          backgroundTasks,
-          detailPanel,
-          revealSensitiveValues,
-          inspectorVisible,
-          openRunDetails: openRunDetailsPanel,
-          phase4BusyKey,
-          runDrawerId,
-          setRunDrawerId,
-          runDrawerBusy,
-          runStatus,
-          runTape,
-          runLineage,
-          runDrawerTab,
-          setRunDrawerTab,
-          setError,
-          setNotice,
-          onWorkspaceRestore: handleWorkspaceRestore,
-          openMemorySection,
-          openSupportSection,
-          refreshRunDetails,
-          closeRunDrawer,
-          openBrowserSessionWorkbench,
-          transcriptRecords,
-          inspectCompaction,
-          inspectCheckpoint,
-          restoreCheckpoint,
-          refreshSessionTranscript,
-          setDetailPanel,
-          setPhase4BusyKey,
-        })}
-        onAbortRun={() => void interruptCurrentRun("")}
-        onOpenObjective={
-          selectedObjective === null
-            ? null
-            : () => {
-                const objectiveId = readString(selectedObjective, "objective_id");
-                if (objectiveId !== null) {
-                  void navigate(buildObjectiveOverviewHref(objectiveId));
-                }
-              }
-        }
-        onOpenRunDetails={() => {
-          const targetRunId = activeRunId ?? knownRunIds[0] ?? null;
-          if (targetRunId === null) {
-            setError("No run is available for inspection.");
-            return;
+      {surface === "canvas" ? (
+        <ChatCanvasWorkspaceView
+          canvases={sessionCanvases.canvases}
+          canvasesBusy={sessionCanvases.canvasesBusy}
+          canvasDetailBusy={sessionCanvases.canvasDetailBusy}
+          pinnedCanvasId={sessionCanvases.pinnedCanvasId}
+          restoringStateVersion={sessionCanvases.restoringStateVersion}
+          runtimeFrameUrl={sessionCanvases.runtimeFrameUrl}
+          selectedCanvas={sessionCanvases.selectedCanvas}
+          selectedCanvasId={sessionCanvases.selectedCanvasId}
+          {...buildWorkspaceHeaderSessionState(sessions.selectedSession)}
+          selectedSessionLineage={selectedSessionLineage}
+          selectedSessionTitle={describeSelectedSessionTitle(sessions.selectedSession)}
+          sessionsBusy={sessions.sessionsBusy}
+          sessionsSidebarProps={sessionsSidebarProps}
+          onOpenConversation={() => openConversationSurface()}
+          onOpenSourceRun={openCanvasSourceRun}
+          onRefresh={() =>
+            void Promise.all([
+              sessions.refreshSessions(false),
+              refreshSessionTranscript(),
+              refreshObjectives(),
+              refreshSlashEntityCatalogs(),
+              sessionCanvases.refreshSessionCanvases(),
+            ])
           }
-          openRunDetailsPanel(targetRunId);
-        }}
-        onRefresh={() =>
-          void Promise.all([
-            sessions.refreshSessions(false),
-            refreshSessionTranscript(),
-            refreshObjectives(),
-            refreshSlashEntityCatalogs(),
-          ])
-        }
-        onSetAllowSensitiveTools={setAllowSensitiveTools}
-        onHideStarterPrompts={starterPromptGuidance.hideStarterPrompts}
-        onShowStarterPrompts={starterPromptGuidance.showStarterPrompts}
-        onUseStarterPrompt={updateComposerDraft}
-        pendingApprovalCount={pendingApprovalCount}
-        runActionBusy={runActionBusy}
-        selectedObjectiveFocus={selectedObjectiveFocus}
-        selectedObjectiveLabel={selectedObjectiveLabel}
-        sessionQuickControlHeaderProps={sessionQuickControlHeaderProps}
-        {...buildWorkspaceHeaderSessionState(sessions.selectedSession)}
-        selectedSessionLineage={selectedSessionLineage}
-        selectedSessionTitle={describeSelectedSessionTitle(sessions.selectedSession)}
-        sessionsBusy={sessions.sessionsBusy}
-        sessionsSidebarProps={buildSessionsSidebarProps({
-          sessions,
-          createSession: () => void sessions.createSession(),
-          renameSession: () => void sessions.renameSession(),
-          resetSession: () => void resetSessionAndTranscript(),
-          archiveSession: () => void archiveSessionAndTranscript(),
-        })}
-        showStarterPrompts={
-          !starterPromptGuidance.firstSuccessCompleted &&
-          !starterPromptGuidance.starterPromptsHidden &&
-          transcriptRecords.length === 0 &&
-          composerText.trim().length === 0
-        }
-        starterPromptsHidden={starterPromptGuidance.starterPromptsHidden}
-        starterPromptHint="Use a starter prompt to confirm the control plane is responsive before branching into a real task."
-        starterPrompts={FIRST_SUCCESS_PROMPTS}
-        streaming={streaming}
-        toolPayloadCount={toolPayloadCount}
-        transcriptBusy={transcriptBusy}
-        transcriptProps={buildTranscriptProps({
-          api,
-          visibleTranscript: filteredTranscript,
-          sessionAttachments,
-          sessionDerivedArtifacts,
-          hiddenTranscriptItems: filteredHiddenTranscriptItems,
-          transcriptBoxRef,
-          approvalDrafts,
-          a2uiDocuments,
-          selectedDetailId: detailPanel?.id ?? null,
-          updateApprovalDraft: updateApprovalDraftValue,
-          decideInlineApproval: async (approvalId, approved) =>
-            await decideInlineApproval(approvalId, approved),
-          openToolPermissions: (toolName) => {
-            setConsoleSection("approvals");
-            void navigate(
-              `${getSectionPath("approvals")}?${new URLSearchParams([["tool", toolName]]).toString()}`,
-            );
-          },
-          openRunDetails: openRunDetailsPanel,
-          refreshSessionTranscript,
-          setDetailPanel,
-          setError,
-          setNotice,
-          setPhase4BusyKey,
-        })}
-      />
+          onRestoreCanvas={(stateVersion) => void sessionCanvases.restoreCanvasState(stateVersion)}
+          onSelectCanvas={selectCanvasSurfaceCanvas}
+          onTogglePinnedCanvas={sessionCanvases.togglePinnedCanvas}
+        />
+      ) : (
+        <ChatConsoleWorkspaceView
+          allowSensitiveTools={allowSensitiveTools}
+          canAbortRun={actionableRunId !== null}
+          canInspectRun={(activeRunId ?? runIds[0] ?? null) !== null}
+          composerProps={{
+            composerText,
+            setComposerText: updateComposerDraft,
+            streaming,
+            activeSessionId: sessions.activeSessionId,
+            attachments,
+            attachmentBusy,
+            canQueueFollowUp: actionableRunId !== null,
+            submitMessage: () => void handleComposerSubmit(),
+            retryLast: () => void retryLatestTurn(),
+            branchSession: () => void branchCurrentSession(),
+            queueFollowUp: () => void queueFollowUpText(composerText),
+            cancelStreaming,
+            clearTranscript: () => {
+              clearTranscriptState();
+              setDetailPanel(null);
+              setAttachments([]);
+              setNotice("Local transcript cleared.");
+            },
+            openAttachmentPicker: () => attachmentInputRef.current?.click(),
+            removeAttachment: (localId) => {
+              setAttachments((previous) =>
+                previous.filter((attachment) => attachment.local_id !== localId),
+              );
+            },
+            attachFiles: attachSelectedFiles,
+            showSlashPalette,
+            parsedSlashCommand,
+            slashCommandMatches,
+            slashSuggestions,
+            selectedSlashSuggestionIndex,
+            setSelectedSlashSuggestionIndex,
+            dismissSlashPalette,
+            acceptSlashSuggestion: (replacement, acceptedWithKeyboard) => {
+              applySlashSuggestion(replacement, acceptedWithKeyboard);
+            },
+            uxMetrics,
+            contextBudget,
+            projectContextPreview,
+            projectContextPreviewBusy,
+            projectContextPreviewStale,
+            projectContextPromptPreview,
+            refreshProjectContextPreview: () =>
+              void loadProjectContextPreview(composerText, { reportError: true }),
+            contextReferencePreview,
+            contextReferencePreviewBusy,
+            contextReferencePreviewStale,
+            refreshContextReferencePreview: () =>
+              void loadContextReferencePreview(composerText, { reportError: true }),
+            removeContextReference,
+            recallPreview,
+            recallPreviewBusy,
+            recallPreviewStale,
+            refreshRecallPreview: () =>
+              void loadRecallPreview(composerText, { reportError: true }),
+          }}
+          contextBudget={contextBudget}
+          inspectorProps={buildInspectorProps({
+            api,
+            pendingApprovalCount,
+            a2uiSurfaces,
+            runIds: knownRunIds,
+            selectedSession: sessions.selectedSession,
+            selectedSessionLineage,
+            sessionQuickControlPanelProps,
+            contextBudgetEstimatedTokens: contextBudget.estimated_total_tokens,
+            projectContextBusy: projectContextPreviewBusy,
+            refreshProjectContext: () => refreshProjectContextAction(projectContextActionArgs),
+            disableProjectContextEntry: (entryId) => {
+              void disableProjectContextEntryAction({ ...projectContextActionArgs, entryId });
+            },
+            enableProjectContextEntry: (entryId) => {
+              void enableProjectContextEntryAction({ ...projectContextActionArgs, entryId });
+            },
+            approveProjectContextEntry: (entryId) => {
+              void approveProjectContextEntryAction({ ...projectContextActionArgs, entryId });
+            },
+            scaffoldProjectContext: () => void scaffoldProjectContextAction(projectContextActionArgs),
+            transcriptBusy,
+            transcriptSearchQuery,
+            setTranscriptSearchQuery,
+            transcriptSearchBusy,
+            canSearchTranscript: deferredSearchQuery.trim().length > 0,
+            sessionPins,
+            searchResults: transcriptSearchResults,
+            searchTranscript,
+            exportBusy,
+            exportTranscript,
+            recentTranscriptRecords,
+            pinTranscriptRecord: async (record) =>
+              pinChatTranscriptRecord({
+                api,
+                activeSessionId: sessions.activeSessionId,
+                record,
+                refreshSessionTranscript,
+                setCommandBusy,
+                setError,
+                setNotice,
+              }),
+            deletePin: async (pinId) =>
+              deleteChatPin({
+                api,
+                activeSessionId: sessions.activeSessionId,
+                pinId,
+                refreshSessionTranscript,
+                setCommandBusy,
+                setError,
+                setNotice,
+              }),
+            compactions,
+            checkpoints,
+            queuedInputs,
+            backgroundTasks,
+            detailPanel,
+            revealSensitiveValues,
+            inspectorVisible,
+            openRunDetails: openRunDetailsPanel,
+            phase4BusyKey,
+            runDrawerId,
+            setRunDrawerId,
+            runDrawerBusy,
+            runStatus,
+            runTape,
+            runLineage,
+            runDrawerTab,
+            setRunDrawerTab,
+            setError,
+            setNotice,
+            onWorkspaceRestore: handleWorkspaceRestore,
+            openMemorySection,
+            openSupportSection,
+            refreshRunDetails,
+            closeRunDrawer,
+            openBrowserSessionWorkbench,
+            transcriptRecords,
+            inspectCompaction,
+            inspectCheckpoint,
+            restoreCheckpoint,
+            refreshSessionTranscript,
+            setDetailPanel,
+            setPhase4BusyKey,
+          })}
+          onAbortRun={() => void interruptCurrentRun("")}
+          onOpenObjective={
+            selectedObjective === null
+              ? null
+              : () => {
+                  const objectiveId = readString(selectedObjective, "objective_id");
+                  if (objectiveId !== null) {
+                    void navigate(buildObjectiveOverviewHref(objectiveId));
+                  }
+                }
+          }
+          onOpenRunDetails={() => {
+            const targetRunId = activeRunId ?? knownRunIds[0] ?? null;
+            if (targetRunId === null) {
+              setError("No run is available for inspection.");
+              return;
+            }
+            openRunDetailsPanel(targetRunId);
+          }}
+          onRefresh={() =>
+            void Promise.all([
+              sessions.refreshSessions(false),
+              refreshSessionTranscript(),
+              refreshObjectives(),
+              refreshSlashEntityCatalogs(),
+            ])
+          }
+          onSetAllowSensitiveTools={setAllowSensitiveTools}
+          onHideStarterPrompts={starterPromptGuidance.hideStarterPrompts}
+          onShowStarterPrompts={starterPromptGuidance.showStarterPrompts}
+          onUseStarterPrompt={updateComposerDraft}
+          pendingApprovalCount={pendingApprovalCount}
+          runActionBusy={runActionBusy}
+          selectedObjectiveFocus={selectedObjectiveFocus}
+          selectedObjectiveLabel={selectedObjectiveLabel}
+          sessionQuickControlHeaderProps={sessionQuickControlHeaderProps}
+          {...buildWorkspaceHeaderSessionState(sessions.selectedSession)}
+          selectedSessionLineage={selectedSessionLineage}
+          selectedSessionTitle={describeSelectedSessionTitle(sessions.selectedSession)}
+          sessionsBusy={sessions.sessionsBusy}
+          sessionsSidebarProps={sessionsSidebarProps}
+          showStarterPrompts={
+            !starterPromptGuidance.firstSuccessCompleted &&
+            !starterPromptGuidance.starterPromptsHidden &&
+            transcriptRecords.length === 0 &&
+            composerText.trim().length === 0
+          }
+          starterPromptsHidden={starterPromptGuidance.starterPromptsHidden}
+          starterPromptHint="Use a starter prompt to confirm the control plane is responsive before branching into a real task."
+          starterPrompts={FIRST_SUCCESS_PROMPTS}
+          streaming={streaming}
+          toolPayloadCount={toolPayloadCount}
+          transcriptBusy={transcriptBusy}
+          transcriptProps={buildTranscriptProps({
+            api,
+            visibleTranscript: filteredTranscript,
+            sessionAttachments,
+            sessionDerivedArtifacts,
+            hiddenTranscriptItems: filteredHiddenTranscriptItems,
+            transcriptBoxRef,
+            approvalDrafts,
+            a2uiDocuments,
+            selectedDetailId: detailPanel?.id ?? null,
+            updateApprovalDraft: updateApprovalDraftValue,
+            decideInlineApproval: async (approvalId, approved) =>
+              await decideInlineApproval(approvalId, approved),
+            openToolPermissions: (toolName) => {
+              setConsoleSection("approvals");
+              void navigate(
+                `${getSectionPath("approvals")}?${new URLSearchParams([["tool", toolName]]).toString()}`,
+              );
+            },
+            openRunDetails: openRunDetailsPanel,
+            refreshSessionTranscript,
+            setDetailPanel,
+            setError,
+            setNotice,
+            setPhase4BusyKey,
+          })}
+        />
+      )}
     </main>
   );
 }

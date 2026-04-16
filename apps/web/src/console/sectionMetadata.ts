@@ -28,6 +28,14 @@ export const CONSOLE_SECTIONS = [
     modes: ["basic", "advanced"],
   },
   {
+    id: "canvas",
+    label: "Canvas",
+    detail: "Session-linked rich surface and history",
+    labelKey: "section.canvas.label",
+    detailKey: "section.canvas.detail",
+    modes: ["basic", "advanced"],
+  },
+  {
     id: "sessions",
     label: "Sessions",
     detail: "Catalog, lifecycle, and run posture",

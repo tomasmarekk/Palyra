@@ -8,7 +8,15 @@ describe("console navigation modes", () => {
       group.items.map((item) => item.id),
     );
 
-    expect(ids).toEqual(["chat", "overview", "sessions", "support", "approvals", "access"]);
+    expect(ids).toEqual([
+      "chat",
+      "canvas",
+      "overview",
+      "sessions",
+      "support",
+      "approvals",
+      "access",
+    ]);
   });
 
   it("keeps the active section reachable even when it is normally advanced-only", () => {

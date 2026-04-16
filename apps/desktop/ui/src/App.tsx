@@ -1402,7 +1402,7 @@ export function App() {
                     void openScopedHandoff("chat", {
                       sessionId: selectedSession?.session_id,
                       runId: snapshot.preferences.last_run_id,
-                      intent: "resume_session",
+                      intent: "resume-session",
                     })
                   }
                 >
@@ -2023,7 +2023,7 @@ export function App() {
                   void openScopedHandoff("access", {
                     deviceId: selectedDevice?.device_id,
                     sessionId: selectedDevice?.latest_session_id,
-                    intent: "inspect_access",
+                    intent: "inspect-access",
                   })
                 }
               >
@@ -2089,7 +2089,7 @@ export function App() {
                       void openScopedHandoff("chat", {
                         sessionId: selectedDevice.latest_session_id,
                         deviceId: selectedDevice.device_id,
-                        intent: "resume_session",
+                        intent: "resume-session",
                       })
                     }
                   >
@@ -2182,7 +2182,7 @@ export function App() {
                   variant="secondary"
                   onPress={() =>
                     void openScopedHandoff("operations", {
-                      intent: "inspect_diagnostics",
+                      intent: "inspect-diagnostics",
                       source: "desktop",
                     })
                   }
@@ -2656,6 +2656,9 @@ function toneForDesktopOnboardingStepStatus(
 
 function mapConsolePathToDesktopHandoffSection(target: string): string {
   const normalized = target.trim();
+  if (normalized.includes("/#/chat/canvas")) {
+    return "canvas";
+  }
   if (normalized.includes("/#/chat")) {
     return "chat";
   }

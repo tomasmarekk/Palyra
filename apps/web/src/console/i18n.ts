@@ -71,6 +71,8 @@ const EN_MESSAGES = {
   "section.overview.detail": "Operational posture, risks, and next actions",
   "section.chat.label": "Chat",
   "section.chat.detail": "Primary operator workspace",
+  "section.canvas.label": "Canvas",
+  "section.canvas.detail": "Session-linked rich surface and history",
   "section.sessions.label": "Sessions",
   "section.sessions.detail": "Catalog, lifecycle, and run posture",
   "section.usage.label": "Usage",

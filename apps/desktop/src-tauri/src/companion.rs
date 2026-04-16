@@ -1011,9 +1011,14 @@ fn build_companion_redirect_path(payload: &DesktopCompanionOpenDashboardRequest)
     push_redirect_query_param(&mut query, "deviceId", payload.device_id.as_deref());
     push_redirect_query_param(&mut query, "objectiveId", payload.objective_id.as_deref());
     push_redirect_query_param(&mut query, "canvasId", payload.canvas_id.as_deref());
-    push_redirect_query_param(&mut query, "intent", payload.intent.as_deref());
+    push_redirect_query_param(
+        &mut query,
+        "intent",
+        normalize_handoff_intent(payload.intent.as_deref()),
+    );
     push_redirect_query_param(&mut query, "source", payload.source.as_deref());
     let base_path = match section {
+        "canvas" => "/#/chat/canvas",
         "chat" => "/#/chat",
         "approvals" => "/#/control/approvals",
         "browser" => "/#/control/browser",
@@ -1032,6 +1037,20 @@ fn build_companion_redirect_path(payload: &DesktopCompanionOpenDashboardRequest)
         base_path.to_owned()
     } else {
         format!("{base_path}?{}", query.join("&"))
+    }
+}
+
+fn normalize_handoff_intent(raw: Option<&str>) -> Option<&'static str> {
+    let normalized = raw.and_then(normalize_optional_text)?;
+    match normalized.replace('_', "-").to_ascii_lowercase().as_str() {
+        "approve" => Some("approve"),
+        "inspect-access" => Some("inspect-access"),
+        "inspect-diagnostics" => Some("inspect-diagnostics"),
+        "inspect-run" => Some("inspect-run"),
+        "open-workspace" => Some("open-workspace"),
+        "reopen-canvas" => Some("reopen-canvas"),
+        "resume-session" => Some("resume-session"),
+        _ => None,
     }
 }
 
@@ -1112,7 +1131,26 @@ mod tests {
         let redirect = build_companion_redirect_path(&payload);
         assert_eq!(
             redirect,
-            "/#/control/browser?sessionId=session-1&runId=run-1&canvasId=canvas-1&intent=reopen_canvas&source=desktop"
+            "/#/control/browser?sessionId=session-1&runId=run-1&canvasId=canvas-1&intent=reopen-canvas&source=desktop"
+        );
+    }
+
+    #[test]
+    fn redirect_path_maps_canvas_section_with_canonical_intent_vocabulary() {
+        let payload = DesktopCompanionOpenDashboardRequest {
+            section: Some("canvas".to_owned()),
+            session_id: Some("session-1".to_owned()),
+            device_id: None,
+            run_id: Some("run-1".to_owned()),
+            objective_id: None,
+            canvas_id: Some("canvas-1".to_owned()),
+            intent: Some(" resume_session ".to_owned()),
+            source: Some("desktop".to_owned()),
+        };
+        let redirect = build_companion_redirect_path(&payload);
+        assert_eq!(
+            redirect,
+            "/#/chat/canvas?sessionId=session-1&runId=run-1&canvasId=canvas-1&intent=resume-session&source=desktop"
         );
     }
 

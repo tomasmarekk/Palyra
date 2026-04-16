@@ -102,6 +102,8 @@ function legacyNavigationLabel(section: Section): string | null {
   switch (section) {
     case "chat":
       return "Chat and Sessions";
+    case "canvas":
+      return "Canvas workspace";
     case "sessions":
       return "Session Catalog";
     case "usage":
@@ -137,6 +139,15 @@ function NavigationGlyph({ section }: { section: Section }) {
       return (
         <svg {...commonProps}>
           <path d="M5 7.5A2.5 2.5 0 0 1 7.5 5h9A2.5 2.5 0 0 1 19 7.5v5A2.5 2.5 0 0 1 16.5 15H11l-4 4V15.5A2.5 2.5 0 0 1 5 13.1z" />
+        </svg>
+      );
+    case "canvas":
+      return (
+        <svg {...commonProps}>
+          <rect x="5" y="5" width="14" height="14" rx="2.5" />
+          <path d="M9 9h6" />
+          <path d="M9 12h6" />
+          <path d="M9 15h3" />
         </svg>
       );
     case "overview":

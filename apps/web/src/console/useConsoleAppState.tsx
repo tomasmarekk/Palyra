@@ -53,6 +53,7 @@ export type { Section } from "./sectionMetadata";
 
 export const AUTO_REFRESH_SECTION_TTL_MS: Partial<Record<Section, number>> = {
   overview: 10_000,
+  canvas: 10_000,
   auth: 10_000,
   channels: 8_000,
   browser: 10_000,

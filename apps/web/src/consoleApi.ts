@@ -218,6 +218,27 @@ export interface SessionCatalogDetailEnvelope {
   session: SessionCatalogRecord;
 }
 
+export interface SessionCanvasListEnvelope {
+  contract: ContractDescriptor;
+  session: SessionCatalogRecord;
+  canvases: SessionCanvasSummary[];
+}
+
+export interface SessionCanvasDetailEnvelope {
+  contract: ContractDescriptor;
+  session: SessionCatalogRecord;
+  canvas: SessionCanvasSummary;
+  runtime?: SessionCanvasRuntimeDescriptor | null;
+  runtime_error?: string | null;
+  state: JsonValue;
+  revisions: SessionCanvasRevisionRecord[];
+}
+
+export interface SessionCanvasRestoreEnvelope extends SessionCanvasDetailEnvelope {
+  restored_from_state_version: number;
+  previous_state_version: number;
+}
+
 export interface ProjectContextRiskFinding {
   finding_id: string;
   action: "allow" | "warning" | "approval_required" | "blocked";
@@ -742,6 +763,52 @@ export interface ChatTranscriptRecord {
   created_at_unix_ms: number;
   origin_kind: string;
   origin_run_id?: string;
+}
+
+export interface CanvasTranscriptReference {
+  source_run_id?: string;
+  source_tape_seq?: number;
+  source_event_type?: string;
+  origin_kind?: string;
+  origin_run_id?: string;
+  last_referenced_at_unix_ms?: number;
+}
+
+export interface SessionCanvasSummary {
+  canvas_id: string;
+  session_id: string;
+  state_version: number;
+  state_schema_version: number;
+  created_at_unix_ms: number;
+  updated_at_unix_ms: number;
+  expires_at_unix_ms: number;
+  closed: boolean;
+  close_reason?: string;
+  runtime_status: string;
+  reference: CanvasTranscriptReference;
+}
+
+export interface SessionCanvasRuntimeDescriptor {
+  canvas_id: string;
+  frame_url: string;
+  runtime_url: string;
+  auth_token: string;
+  expires_at_unix_ms: number;
+}
+
+export interface SessionCanvasRevisionRecord {
+  seq: number;
+  canvas_id: string;
+  state_version: number;
+  base_state_version: number;
+  state_schema_version: number;
+  patch_json: string;
+  resulting_state_json: string;
+  closed: boolean;
+  close_reason?: string;
+  actor_principal: string;
+  actor_device_id: string;
+  applied_at_unix_ms: number;
 }
 
 export interface ChatQueuedInputRecord {
@@ -3909,6 +3976,34 @@ export class ConsoleApiClient {
     contract: ContractDescriptor;
   }> {
     return this.request(`/console/v1/chat/sessions/${encodeURIComponent(sessionId)}/transcript`);
+  }
+
+  async listSessionCanvases(sessionId: string): Promise<SessionCanvasListEnvelope> {
+    return this.request(`/console/v1/chat/sessions/${encodeURIComponent(sessionId)}/canvases`);
+  }
+
+  async getSessionCanvas(
+    sessionId: string,
+    canvasId: string,
+  ): Promise<SessionCanvasDetailEnvelope> {
+    return this.request(
+      `/console/v1/chat/sessions/${encodeURIComponent(sessionId)}/canvases/${encodeURIComponent(canvasId)}`,
+    );
+  }
+
+  async restoreSessionCanvas(
+    sessionId: string,
+    canvasId: string,
+    payload: { state_version: number },
+  ): Promise<SessionCanvasRestoreEnvelope> {
+    return this.request(
+      `/console/v1/chat/sessions/${encodeURIComponent(sessionId)}/canvases/${encodeURIComponent(canvasId)}/restore`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      { csrf: true },
+    );
   }
 
   async previewSessionCompaction(

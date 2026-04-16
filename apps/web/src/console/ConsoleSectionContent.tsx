@@ -39,6 +39,19 @@ export function ConsoleSectionContent({ app }: ConsoleSectionContentProps) {
           openBrowserSessionWorkbench={app.openBrowserSessionWorkbench}
         />
       );
+    case "canvas":
+      return (
+        <ChatConsolePanel
+          api={app.api}
+          emitUxEvent={app.emitUxEvent}
+          revealSensitiveValues={app.revealSensitiveValues}
+          setError={app.setError}
+          setNotice={app.setNotice}
+          setConsoleSection={app.setSection}
+          openBrowserSessionWorkbench={app.openBrowserSessionWorkbench}
+          surface="canvas"
+        />
+      );
     case "sessions":
       return (
         <SessionsSection app={{ api: app.api, setError: app.setError, setNotice: app.setNotice }} />

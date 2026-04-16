@@ -8,10 +8,12 @@ export type TelemetrySurface = "web" | "desktop" | "tui" | "mobile";
 
 export type HandoffIntent =
   | "approve"
+  | "inspect-access"
+  | "inspect-diagnostics"
+  | "inspect-run"
   | "open-workspace"
   | "reopen-canvas"
-  | "resume-session"
-  | "inspect-run";
+  | "resume-session";
 
 export type HandoffSection = Section | "home";
 
@@ -93,7 +95,6 @@ const HANDOFF_PARAM_ORDER: readonly (keyof CrossSurfaceHandoff)[] = [
   "deviceId",
   "objectiveId",
   "canvasId",
-  "intent",
   "source",
 ] as const;
 
@@ -103,6 +104,7 @@ export function normalizeHandoffSection(section?: string | null): HandoffSection
   const normalized = section?.trim();
   switch (normalized) {
     case "chat":
+    case "canvas":
     case "overview":
     case "sessions":
     case "usage":
@@ -137,6 +139,10 @@ export function buildConsoleHandoffHref(payload: CrossSurfaceHandoff): string {
       params.set(key, value.trim());
     }
   }
+  const intent = normalizeHandoffIntent(payload.intent);
+  if (intent !== undefined) {
+    params.set("intent", intent);
+  }
   const basePath =
     section === "home" ? getSectionPath("overview") : getSectionPath(section as Section);
   const query = params.toString();
@@ -156,12 +162,22 @@ export function parseConsoleHandoff(raw: URLSearchParams | string): CrossSurface
       handoff[key] = value.trim() as never;
     }
   }
+  const intent = normalizeHandoffIntent(params.get("intent"));
+  if (intent !== undefined) {
+    handoff.intent = intent;
+  }
   return handoff;
 }
 
 export function nearestSupportedHandoffSection(payload: CrossSurfaceHandoff): Section {
   if (payload.section === "home") {
     return "overview";
+  }
+  if (
+    payload.section === "canvas" ||
+    (payload.canvasId !== undefined && payload.intent === "reopen-canvas")
+  ) {
+    return "canvas";
   }
   if (payload.section === "chat") {
     return "chat";
@@ -176,6 +192,22 @@ export function nearestSupportedHandoffSection(payload: CrossSurfaceHandoff): Se
     return "browser";
   }
   return (payload.section as Section | undefined) ?? "overview";
+}
+
+function normalizeHandoffIntent(intent?: string | null): HandoffIntent | undefined {
+  const normalized = intent?.trim().toLowerCase().replaceAll("_", "-");
+  switch (normalized) {
+    case "approve":
+    case "inspect-access":
+    case "inspect-diagnostics":
+    case "inspect-run":
+    case "open-workspace":
+    case "reopen-canvas":
+    case "resume-session":
+      return normalized;
+    default:
+      return undefined;
+  }
 }
 
 export function isUxSystemEvent(record: SystemEventRecord): boolean {

@@ -31,7 +31,7 @@ export const CONSOLE_NAV_GROUPS: readonly NavigationGroup[] = [
     id: "chat",
     label: "Chat",
     labelKey: "nav.group.chat",
-    items: resolveEntries(["chat"]),
+    items: resolveEntries(["chat", "canvas"]),
   },
   {
     id: "control",
@@ -62,6 +62,7 @@ export const CONSOLE_NAV_GROUPS: readonly NavigationGroup[] = [
 const SECTION_PATHS: Readonly<Record<Section, string>> = {
   overview: "/control/overview",
   chat: "/chat",
+  canvas: "/chat/canvas",
   sessions: "/control/sessions",
   usage: "/control/usage",
   logs: "/control/logs",
@@ -87,6 +88,7 @@ const SECTION_PATH_ALIASES: Readonly<Record<string, Section>> = {
 const SECTION_GROUPS: Readonly<Record<Section, NavigationGroup["id"]>> = {
   overview: "control",
   chat: "chat",
+  canvas: "chat",
   sessions: "control",
   usage: "control",
   logs: "control",

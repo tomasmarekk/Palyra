@@ -737,6 +737,24 @@ pre {
   padding: 0.875rem 1rem;
 }
 
+.chat-canvas-list,
+.chat-canvas-history {
+  display: grid;
+  gap: 0.85rem;
+}
+
+.chat-canvas-list {
+  max-height: min(34rem, 52vh);
+  padding-right: 0.25rem;
+  overflow-y: auto;
+}
+
+.chat-canvas-item {
+  justify-content: flex-start;
+  border-radius: var(--field-radius);
+  padding: 0.875rem 1rem;
+}
+
 .chat-session-item__title {
   font-weight: 600;
 }
