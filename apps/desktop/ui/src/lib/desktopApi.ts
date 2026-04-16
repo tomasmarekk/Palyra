@@ -1163,10 +1163,6 @@ export function isDesktopHostAvailable(): boolean {
   return typeof host.__TAURI_INTERNALS__ !== "undefined" || typeof host.__TAURI__ !== "undefined";
 }
 
-export async function showMainWindow(): Promise<void> {
-  return invoke<void>("show_main_window");
-}
-
 export async function showDesktopCompanionWindow(
   surface?: DesktopCompanionSurfaceMode,
 ): Promise<ActionResult> {
