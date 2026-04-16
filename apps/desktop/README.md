@@ -29,10 +29,13 @@ top of the same local supervisor and `/console/v1` control-plane APIs.
   - session-aware chat,
   - approval inbox actions,
   - desktop/system notifications,
+  - tray/menu-bar ambient runtime with quick panel and voice overlay surfaces,
   - inventory and capability detail,
   - desktop node enrollment, repair, and local reset controls,
   - reconnect-safe offline drafts,
-  - onboarding and rollout state summary.
+  - onboarding and rollout state summary,
+  - voice audit trail, consent posture, selected microphone/voice preferences, and optional
+    silence detection.
 - Shows the current warning/diagnostics queue sourced from `/console/v1/diagnostics`.
 - Opens the discovered web dashboard target in the default browser with scoped handoff to chat,
   approvals, inventory/access, or overview routes.
@@ -44,7 +47,8 @@ top of the same local supervisor and `/console/v1` control-plane APIs.
 - Native Tauri surface:
   - sidecar supervision,
   - local persisted state,
-  - native window reveal and notification permission handling,
+  - native window reveal, tray/menu-bar runtime, start-on-login sync, global hotkey registration,
+    and notification permission handling,
   - secure browser handoff built on the existing admin-token + CSRF console session flow.
 - Shared control-plane contracts:
   - desktop reads the same chat session catalog, transcript, approvals, and inventory APIs as the
@@ -60,10 +64,13 @@ top of the same local supervisor and `/console/v1` control-plane APIs.
     repair state remain visible even before the browser console is opened.
 - Persisted local state:
   - rollout flags: `companion_shell_enabled`, `desktop_notifications_enabled`,
-    `offline_drafts_enabled`, `voice_capture_enabled`, `tts_playback_enabled`,
+    `ambient_companion_enabled`, `offline_drafts_enabled`, `voice_capture_enabled`,
+    `voice_overlay_enabled`, `voice_silence_detection_enabled`, `tts_playback_enabled`,
     `release_channel`,
   - companion preferences: active section, session, device, and latest run,
-  - bounded notifications and bounded offline draft queue.
+  - ambient preferences: start-on-login, global hotkey, last preferred surface, and hotkey
+    conflict state,
+  - bounded notifications, bounded offline draft queue, and bounded voice audit trail.
 - Trust model:
   - desktop companion never bypasses existing approval or browser handoff trust boundaries,
   - desktop node enrollment still uses the same pairing + mTLS trust chain as any other node
@@ -104,6 +111,15 @@ top of the same local supervisor and `/console/v1` control-plane APIs.
 - Connection state is surfaced as `connected`, `reconnecting`, or `offline` from companion refresh
   results plus local runtime expectations.
 - Desktop notifications are informative only; they do not auto-approve or auto-send anything.
+- Tray/menu-bar tooltip keeps the current connection state, unread notifications, pending
+  approvals, active-run count, and queued draft count visible even when the full window is hidden.
+- The quick panel is the default ambient invoke surface; it keeps recent sessions, mini composer,
+  pending approvals, active-run handoff, and offline draft retry/discard controls available.
+- The voice overlay is a separate ambient surface for the structured lifecycle
+  `idle -> recording -> transcribing -> review -> sending -> speaking/error/cancelled`.
+- Voice overlay focus rules differ from the quick panel: the quick panel auto-hides on focus loss,
+  while the voice overlay stays visible until the operator hides it so transcript review and TTS
+  controls are not lost during app switching.
 - Offline drafts are bounded, local-only, and removed only after successful resend or explicit
   operator discard.
 - Browser handoff preserves the current `sessionId`, `deviceId`, and optional `runId` whenever a
@@ -145,6 +161,13 @@ top of the same local supervisor and `/console/v1` control-plane APIs.
   confirmed or overridden during onboarding.
 - Desktop node-host trust material is stored under the runtime root and continues to rely on the
   existing mTLS certificate issuance and approval model; there is no desktop-only bypass path.
+- Voice capture remains explicit push-to-talk only:
+  - the operator must grant microphone consent before first use,
+  - audio is uploaded only after recording stops,
+  - the selected microphone, TTS voice, mute state, consent timestamps, and last voice audit
+    entries are persisted locally for restart-safe review,
+  - optional silence detection is guarded behind rollout and local preference toggles,
+  - TTS playback uses the OS default output device and reads only explicit assistant selections.
 - Linux `glib` advisory mitigation is documented in:
   - `src-tauri/docs/security/advisories/GHSA-wrw7-89jp-8q8g.md`
   - `src-tauri/docs/security/dependency-graph/glib.md`
@@ -216,7 +239,27 @@ cargo test --manifest-path src-tauri/Cargo.toml --locked
   - chat transcript refresh works,
   - sending while online creates a run and refreshes transcript,
   - sending while control plane is unavailable queues an offline draft instead of silently losing
-    input.
+    input,
+  - ambient quick panel can create a session, send a prompt, inspect recent sessions, and hand off
+    to approvals/run/browser detail,
+  - tray/menu-bar tooltip reflects connection state, approvals, active runs, and queued drafts.
+- Ambient runtime:
+  - closing the main window leaves the tray runtime alive,
+  - `Start on Login` and `Global Hotkey` can be toggled from desktop settings and tray menu,
+  - hotkey conflicts surface a readable error instead of failing silently,
+  - quick panel auto-hides on focus loss, while voice overlay remains available for review until
+    explicitly hidden.
+- Voice workflow:
+  - voice overlay can safely create a quick session when no active session is selected,
+  - lifecycle is visible as `idle`, `recording`, `transcribing`, `review`, `sending`,
+    `speaking`, `error`, or `cancelled`,
+  - hold-to-talk starts and stops deterministically, transcript review stays editable before send,
+  - microphone/TTS consent, mute posture, selected microphone/voice, and voice audit trail render
+    in the full companion,
+  - denied microphone permission, missing device, transcription failures, queued-offline send, TTS
+    failure, and mute/stop controls all leave the voice draft or state understandable,
+  - optional silence detection can be enabled only when rollout allows it and should stop a silent
+    recording into review without breaking normal push-to-talk flow.
 - Desktop node:
   - `Enroll node` pairs a desktop-first node client and the process monitor shows `node_host`,
   - `Repair node` recovers from missing local trust material without bypassing pairing approvals,
