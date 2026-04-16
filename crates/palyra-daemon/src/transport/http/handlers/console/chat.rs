@@ -2496,7 +2496,8 @@ pub(crate) async fn console_chat_canvas_list_handler(
         &session.context,
         session_record.session_id.as_str(),
         transcript.as_slice(),
-    )?;
+    )
+    .map_err(|response| *response)?;
     Ok(Json(json!({
         "session": session_record,
         "canvases": canvases,
@@ -2541,7 +2542,8 @@ pub(crate) async fn console_chat_canvas_detail_handler(
         &state,
         &session.context,
         canvas.canvas_id.as_str(),
-    )?;
+    )
+    .map_err(|response| *response)?;
     Ok(Json(json!({
         "session": session_record,
         "canvas": summary,
@@ -2595,7 +2597,8 @@ pub(crate) async fn console_chat_canvas_restore_handler(
         &state,
         &session.context,
         restored.canvas_id.as_str(),
-    )?;
+    )
+    .map_err(|response| *response)?;
     let _ = crate::gateway::record_agent_journal_event(
         &state.runtime,
         &session.context,
@@ -3161,11 +3164,11 @@ fn load_console_chat_canvas_summaries(
     context: &gateway::RequestContext,
     session_id: &str,
     transcript: &[journal::OrchestratorSessionTranscriptRecord],
-) -> Result<Vec<ConsoleChatCanvasSummary>, Response> {
+) -> Result<Vec<ConsoleChatCanvasSummary>, Box<Response>> {
     let canvases = state
         .runtime
         .list_session_canvases(context, session_id)
-        .map_err(runtime_status_response)?;
+        .map_err(|error| Box::new(runtime_status_response(error)))?;
     Ok(canvases
         .iter()
         .map(|canvas| {
@@ -3196,13 +3199,13 @@ fn resolve_console_chat_canvas_runtime_descriptor(
     state: &AppState,
     context: &gateway::RequestContext,
     canvas_id: &str,
-) -> Result<(Option<gateway::CanvasRuntimeDescriptor>, Option<String>), Response> {
+) -> Result<(Option<gateway::CanvasRuntimeDescriptor>, Option<String>), Box<Response>> {
     match state.runtime.issue_canvas_runtime_descriptor(context, canvas_id, None) {
         Ok(runtime) => Ok((Some(runtime), None)),
         Err(error) if error.code() == tonic::Code::FailedPrecondition => {
             Ok((None, Some(sanitize_http_error_message(error.message()))))
         }
-        Err(error) => Err(runtime_status_response(error)),
+        Err(error) => Err(Box::new(runtime_status_response(error))),
     }
 }
 
@@ -3278,8 +3281,7 @@ fn extract_canvas_id_from_frame_reference(raw: &str) -> Option<&str> {
     const CANVAS_FRAME_MARKER: &str = "/canvas/v1/frame/";
     let start = raw.find(CANVAS_FRAME_MARKER)?;
     let remainder = &raw[start + CANVAS_FRAME_MARKER.len()..];
-    let end =
-        remainder.find(|ch: char| ch == '?' || ch == '#' || ch == '/').unwrap_or(remainder.len());
+    let end = remainder.find(['?', '#', '/']).unwrap_or(remainder.len());
     let candidate = &remainder[..end];
     validate_canonical_id(candidate).ok()?;
     Some(candidate)

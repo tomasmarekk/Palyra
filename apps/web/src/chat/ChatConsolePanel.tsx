@@ -11,7 +11,6 @@ import type {
   ChatTranscriptRecord,
   ConsoleApiClient,
   MediaDerivedArtifactRecord,
-  WorkspaceRestoreResponseEnvelope,
 } from "../consoleApi";
 import { type DetailPanelState, type TranscriptSearchMatch } from "./ChatInspectorColumn";
 import type { RunDrawerTab } from "./ChatRunDrawer";
@@ -52,18 +51,14 @@ import { usePhase4DeepLinks } from "./usePhase4DeepLinks";
 import { useChatObjectives } from "./useChatObjectives";
 import { useChatPanelViewState } from "./useChatPanelViewState";
 import { useChatPanelBootstrap } from "./useChatPanelBootstrap";
-import {
-  openWorkspaceRollbackInspectorAction,
-  previewWorkspaceRollbackDiffAction,
-  reconcileWorkspaceRestoreAction,
-} from "./chatWorkspaceRollbackActions";
+import { useChatWorkspaceRollbackHandlers } from "./useChatWorkspaceRollbackHandlers";
 import {
   buildWorkspaceHeaderSessionState,
   buildSessionsSidebarProps,
   describeSelectedSessionTitle,
 } from "./chatWorkspaceSessionBindings";
 import { FIRST_SUCCESS_PROMPTS } from "./starterPrompts";
-import { buildChatCanvasHref, extractCanvasIdFromFrameUrl } from "./sessionCanvasState";
+import { useChatCanvasSurfaceActions } from "./useChatCanvasSurfaceActions";
 import { useSessionCanvases } from "./useSessionCanvases";
 import { useStarterPromptGuidance } from "./useStarterPromptGuidance";
 import { useStarterPromptHandoff } from "./useStarterPromptHandoff";
@@ -467,282 +462,57 @@ export function ChatConsolePanel({
       );
     },
   });
-  const openSelectedCanvasSurface = useCallback(
-    (canvasId?: string | null, sessionIdOverride?: string) => {
-      const sessionId = (sessionIdOverride ?? sessions.activeSessionId).trim();
-      const normalizedCanvasId = canvasId?.trim() ?? "";
-      void navigate(
-        buildChatCanvasHref({
-          sessionId: sessionId.length > 0 ? sessionId : undefined,
-          canvasId: normalizedCanvasId.length > 0 ? normalizedCanvasId : undefined,
-        }),
-      );
-    },
-    [navigate, sessions.activeSessionId],
-  );
-  const openConversationSurface = useCallback(
-    (runId?: string | null) => {
-      const sessionId = sessions.activeSessionId.trim();
-      const normalizedRunId = runId?.trim() ?? "";
-      void navigate(
-        buildConsoleHandoffHref({
-          section: "chat",
-          sessionId: sessionId.length > 0 ? sessionId : undefined,
-          runId: normalizedRunId.length > 0 ? normalizedRunId : undefined,
-          intent: normalizedRunId.length > 0 ? "inspect-run" : "resume-session",
-        }),
-      );
-    },
-    [navigate, sessions.activeSessionId],
-  );
-  const openCanvasSourceRun = useCallback(() => {
-    const sourceRunId = sessionCanvases.selectedCanvas?.canvas.reference.source_run_id?.trim();
-    if (!sourceRunId) {
-      setError("Selected canvas is not linked to a source run.");
-      return;
-    }
-    openConversationSurface(sourceRunId);
-  }, [openConversationSurface, sessionCanvases.selectedCanvas, setError]);
-  const setCanvasSurfaceSessionId = useCallback(
-    (sessionId: string) => {
-      sessions.setActiveSessionId(sessionId);
-      openSelectedCanvasSurface(undefined, sessionId);
-    },
-    [openSelectedCanvasSurface, sessions.setActiveSessionId],
-  );
-  const selectCanvasSurfaceCanvas = useCallback(
-    (canvasId: string) => {
-      sessionCanvases.selectCanvas(canvasId);
-      openSelectedCanvasSurface(canvasId);
-    },
-    [openSelectedCanvasSurface, sessionCanvases.selectCanvas],
-  );
-  const focusSessionSearch = useCallback(() => {
-    sessionSearchInputRef.current?.focus();
-    sessionSearchInputRef.current?.select();
-  }, []);
-  const openCurrentRunInspector = useCallback(
-    (tab: RunDrawerTab = "status") => {
-      const targetRunId = activeRunId ?? knownRunIds[0] ?? null;
-      if (targetRunId === null) {
-        setError("No run is available for inspection.");
-        return;
-      }
-      openRunDetailsPanel(targetRunId, tab);
-    },
-    [activeRunId, knownRunIds, openRunDetailsPanel, setError],
-  );
-  const openCanvasSurfaceFromUrl = useCallback(
-    (canvasUrl: string, runId?: string) => {
-      const canvasId = extractCanvasIdFromFrameUrl(canvasUrl);
-      if (canvasId === null) {
-        setError("This output does not expose a reusable canvas target.");
-        return;
-      }
-      sessionCanvases.selectCanvas(canvasId);
-      const sessionId = sessions.activeSessionId.trim();
-      const normalizedRunId = runId?.trim() ?? "";
-      void navigate(
-        buildChatCanvasHref({
-          sessionId: sessionId.length > 0 ? sessionId : undefined,
-          canvasId,
-          runId: normalizedRunId.length > 0 ? normalizedRunId : undefined,
-        }),
-      );
-    },
-    [navigate, sessionCanvases.selectCanvas, sessions.activeSessionId, setError],
-  );
-  const toggleCanvasPinFromUrl = useCallback(
-    (canvasUrl: string) => {
-      const canvasId = extractCanvasIdFromFrameUrl(canvasUrl);
-      if (canvasId === null) {
-        setError("This output does not expose a reusable canvas target.");
-        return;
-      }
-      sessionCanvases.togglePinnedCanvasById(canvasId);
-      setNotice(
-        sessionCanvases.pinnedCanvasId === canvasId
-          ? "Canvas unpinned."
-          : "Canvas pinned for consistent reopen across session resumes.",
-      );
-    },
-    [sessionCanvases.pinnedCanvasId, sessionCanvases.togglePinnedCanvasById, setError, setNotice],
-  );
-  const reopenLastCanvas = useCallback(() => {
-    const targetCanvasId =
-      sessionCanvases.pinnedCanvasId ??
-      sessionCanvases.selectedCanvasId ??
-      sessionCanvases.canvases[0]?.canvas_id ??
-      null;
-    if (targetCanvasId === null) {
-      setError("No canvas is available to reopen for this session.");
-      return;
-    }
-    openSelectedCanvasSurface(targetCanvasId);
-  }, [
-    openSelectedCanvasSurface,
-    sessionCanvases.canvases,
-    sessionCanvases.pinnedCanvasId,
-    sessionCanvases.selectedCanvasId,
-    setError,
-  ]);
-  useEffect(() => {
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (
-        event.defaultPrevented ||
-        !event.altKey ||
-        event.ctrlKey ||
-        event.metaKey ||
-        event.shiftKey ||
-        isEditableShortcutTarget(event.target)
-      ) {
-        return;
-      }
-
-      switch (event.key.toLowerCase()) {
-        case "s":
-          event.preventDefault();
-          focusSessionSearch();
-          return;
-        case "r":
-          event.preventDefault();
-          openCurrentRunInspector();
-          return;
-        case "w":
-          event.preventDefault();
-          openCurrentRunInspector("workspace");
-          return;
-        case "a":
-          event.preventDefault();
-          setConsoleSection("approvals");
-          void navigate(getSectionPath("approvals"));
-          return;
-        case "c":
-          event.preventDefault();
-          if (surface === "canvas") {
-            openConversationSurface();
-            return;
-          }
-          if (sessionCanvases.pinnedCanvasId === null && sessionCanvases.canvases.length === 0) {
-            setNotice("No canvas is available for the current session yet.");
-            return;
-          }
-          reopenLastCanvas();
-          return;
-        default:
-          return;
-      }
-    };
-
-    window.addEventListener("keydown", handleKeyDown);
-    return () => {
-      window.removeEventListener("keydown", handleKeyDown);
-    };
-  }, [
-    focusSessionSearch,
-    navigate,
+  const {
     openConversationSurface,
-    openCurrentRunInspector,
+    openCanvasSourceRun,
+    setCanvasSurfaceSessionId,
+    selectCanvasSurfaceCanvas,
+    openCanvasSurfaceFromUrl,
+    toggleCanvasPinFromUrl,
     reopenLastCanvas,
-    sessionCanvases.canvases,
-    sessionCanvases.pinnedCanvasId,
-    setConsoleSection,
-    setNotice,
+  } = useChatCanvasSurfaceActions({
+    navigate,
     surface,
-  ]);
+    activeSessionId: sessions.activeSessionId,
+    activeRunId,
+    knownRunIds,
+    sessionSearchInputRef,
+    selectedCanvas: sessionCanvases.selectedCanvas,
+    canvases: sessionCanvases.canvases,
+    pinnedCanvasId: sessionCanvases.pinnedCanvasId,
+    selectedCanvasId: sessionCanvases.selectedCanvasId,
+    setActiveSessionId: sessions.setActiveSessionId,
+    selectCanvas: sessionCanvases.selectCanvas,
+    togglePinnedCanvasById: sessionCanvases.togglePinnedCanvasById,
+    setConsoleSection,
+    openRunDetails: openRunDetailsPanel,
+    setError,
+    setNotice,
+  });
   const openMemorySection = useCallback(() => setConsoleSection("memory"), [setConsoleSection]);
   const openSupportSection = useCallback(() => setConsoleSection("support"), [setConsoleSection]);
-  const handleWorkspaceRestore = useCallback(
-    async (response: WorkspaceRestoreResponseEnvelope): Promise<void> => {
-      await reconcileWorkspaceRestoreAction({
-        response,
-        upsertSession: sessions.upsertSession,
-        clearTranscriptState,
-        setAttachments,
-        setDetailPanel,
-        refreshSessions: () => sessions.refreshSessions(false),
-        refreshSessionTranscript,
-        appendLocalEntry,
-        openRunDetails: openRunDetailsPanel,
-        setNotice: (next) => {
-          if (
-            next === null ||
-            (sessionCanvases.pinnedCanvasId === null && sessionCanvases.canvases.length === 0)
-          ) {
-            setNotice(next);
-            return;
-          }
-          setNotice(`${next} Reopen the canvas surface if you need to reconcile visual state.`);
-        },
-      });
-      await sessionCanvases.refreshSessionCanvases(response.session.session_id);
-    },
-    [
-      appendLocalEntry,
-      clearTranscriptState,
-      openRunDetailsPanel,
-      refreshSessionTranscript,
-      sessionCanvases,
-      sessions,
-      setAttachments,
-      setDetailPanel,
-      setNotice,
-    ],
-  );
-  const openRollbackInspector = useCallback(
-    async (rawTarget = ""): Promise<void> => {
-      await openWorkspaceRollbackInspectorAction({
-        rawTarget,
-        actionableRunId,
-        sessionRuns,
-        selectedLastRunId: sessions.selectedSession?.last_run_id,
-        knownRunIds,
-        setDetailPanel,
-        openRunDetails: openRunDetailsPanel,
-        setError,
-        setNotice,
-      });
-    },
-    [
-      actionableRunId,
-      knownRunIds,
-      openRunDetailsPanel,
-      sessionRuns,
-      sessions.selectedSession?.last_run_id,
-      setDetailPanel,
-      setError,
-      setNotice,
-    ],
-  );
-  const previewRollbackDiff = useCallback(
-    async (rawTarget: string): Promise<void> => {
-      await previewWorkspaceRollbackDiffAction({
-        api,
-        rawTarget,
-        actionableRunId,
-        runDrawerId,
-        sessionRuns,
-        selectedLastRunId: sessions.selectedSession?.last_run_id,
-        knownRunIds,
-        setDetailPanel,
-        openRunDetails: openRunDetailsPanel,
-        setError,
-        setNotice,
-      });
-    },
-    [
-      actionableRunId,
+  const { handleWorkspaceRestore, openRollbackInspector, previewRollbackDiff } =
+    useChatWorkspaceRollbackHandlers({
       api,
-      knownRunIds,
-      openRunDetailsPanel,
+      actionableRunId,
       runDrawerId,
       sessionRuns,
-      sessions.selectedSession?.last_run_id,
+      knownRunIds,
+      selectedLastRunId: sessions.selectedSession?.last_run_id,
+      pinnedCanvasId: sessionCanvases.pinnedCanvasId,
+      canvases: sessionCanvases.canvases,
+      upsertSession: sessions.upsertSession,
+      clearTranscriptState,
+      setAttachments,
       setDetailPanel,
+      refreshSessions: () => sessions.refreshSessions(false),
+      refreshSessionTranscript,
+      refreshSessionCanvases: sessionCanvases.refreshSessionCanvases,
+      appendLocalEntry,
+      openRunDetails: openRunDetailsPanel,
       setError,
       setNotice,
-    ],
-  );
+    });
   useEffect(() => {
     const sessionId = sessions.activeSessionId.trim();
     if (sessionId.length === 0) {
@@ -1272,17 +1042,5 @@ export function ChatConsolePanel({
         />
       )}
     </main>
-  );
-}
-
-function isEditableShortcutTarget(target: EventTarget | null): boolean {
-  if (!(target instanceof HTMLElement)) {
-    return false;
-  }
-  return (
-    target.isContentEditable ||
-    target instanceof HTMLInputElement ||
-    target instanceof HTMLTextAreaElement ||
-    target instanceof HTMLSelectElement
   );
 }
