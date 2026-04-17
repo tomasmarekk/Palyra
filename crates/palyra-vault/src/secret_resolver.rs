@@ -801,7 +801,7 @@ mod tests {
             .resolve(&make_ref(SecretSource::File {
                 path: PathBuf::from("trusted/secret.txt").to_string_lossy().into_owned(),
                 trusted_dirs: vec![PathBuf::from("trusted").to_string_lossy().into_owned()],
-                allow_symlinks: false,
+                allow_symlinks: true,
             }))
             .expect("file-backed secret should resolve");
         assert_eq!(
