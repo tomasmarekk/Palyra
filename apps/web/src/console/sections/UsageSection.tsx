@@ -254,14 +254,26 @@ export function UsageSection({ app }: UsageSectionProps) {
               <EntityTable
                 ariaLabel="Budget evaluations"
                 columns={[
-                  { key: "policy", label: "Policy", render: (row) => row.policy_id },
+                  {
+                    key: "policy",
+                    label: "Policy",
+                    render: (row) => row.policy_id,
+                  },
                   {
                     key: "scope",
                     label: "Scope",
                     render: (row) => `${row.scope_kind}:${row.scope_id}`,
                   },
-                  { key: "status", label: "Status", render: (row) => row.status },
-                  { key: "message", label: "Message", render: (row) => row.message },
+                  {
+                    key: "status",
+                    label: "Status",
+                    render: (row) => row.status,
+                  },
+                  {
+                    key: "message",
+                    label: "Message",
+                    render: (row) => row.message,
+                  },
                   {
                     key: "action",
                     label: "Action",
@@ -302,14 +314,26 @@ export function UsageSection({ app }: UsageSectionProps) {
               <EntityTable
                 ariaLabel="Usage alerts"
                 columns={[
-                  { key: "kind", label: "Kind", render: (row) => row.alert_kind },
-                  { key: "severity", label: "Severity", render: (row) => row.severity },
+                  {
+                    key: "kind",
+                    label: "Kind",
+                    render: (row) => row.alert_kind,
+                  },
+                  {
+                    key: "severity",
+                    label: "Severity",
+                    render: (row) => row.severity,
+                  },
                   {
                     key: "scope",
                     label: "Scope",
                     render: (row) => `${row.scope_kind}:${row.scope_id}`,
                   },
-                  { key: "summary", label: "Summary", render: (row) => row.summary },
+                  {
+                    key: "summary",
+                    label: "Summary",
+                    render: (row) => row.summary,
+                  },
                 ]}
                 getRowId={(row) => row.alert_id}
                 rows={usage.insights.alerts}
@@ -345,7 +369,11 @@ export function UsageSection({ app }: UsageSectionProps) {
                   ),
                 },
                 { key: "runs", label: "Runs", render: (row) => row.runs },
-                { key: "tokens", label: "Tokens", render: (row) => row.total_tokens },
+                {
+                  key: "tokens",
+                  label: "Tokens",
+                  render: (row) => row.total_tokens,
+                },
                 {
                   key: "latency",
                   label: "Avg latency",
@@ -432,8 +460,8 @@ export function UsageSection({ app }: UsageSectionProps) {
               {usage.insights?.pricing.estimate_only ? (
                 <WorkspaceInlineNotice title="Estimate only" tone="default">
                   <p>
-                    Pricing uses the shared catalog and is intentionally marked as an
-                    estimate-only surface.
+                    Pricing uses the shared catalog and is intentionally marked as an estimate-only
+                    surface.
                   </p>
                 </WorkspaceInlineNotice>
               ) : null}
@@ -443,7 +471,11 @@ export function UsageSection({ app }: UsageSectionProps) {
                 columns={[
                   { key: "run", label: "Run", render: (row) => row.run_id },
                   { key: "state", label: "State", render: (row) => row.state },
-                  { key: "tokens", label: "Tokens", render: (row) => row.total_tokens },
+                  {
+                    key: "tokens",
+                    label: "Tokens",
+                    render: (row) => row.total_tokens,
+                  },
                   {
                     key: "latency",
                     label: "Latency",
@@ -486,7 +518,11 @@ export function UsageSection({ app }: UsageSectionProps) {
                 </button>
               ),
             },
-            { key: "tokens", label: "Tokens", render: (row) => row.total_tokens },
+            {
+              key: "tokens",
+              label: "Tokens",
+              render: (row) => row.total_tokens,
+            },
             { key: "runs", label: "Runs", render: (row) => row.runs },
             {
               key: "latency",
@@ -514,8 +550,16 @@ export function UsageSection({ app }: UsageSectionProps) {
                 </div>
               ),
             },
-            { key: "tokens", label: "Tokens", render: (row) => row.total_tokens },
-            { key: "sessions", label: "Sessions", render: (row) => row.session_count },
+            {
+              key: "tokens",
+              label: "Tokens",
+              render: (row) => row.total_tokens,
+            },
+            {
+              key: "sessions",
+              label: "Sessions",
+              render: (row) => row.session_count,
+            },
             {
               key: "latency",
               label: "Avg latency",
@@ -542,8 +586,16 @@ export function UsageSection({ app }: UsageSectionProps) {
                 </div>
               ),
             },
-            { key: "tokens", label: "Tokens", render: (row) => row.total_tokens },
-            { key: "agents", label: "Agents", render: (row) => row.agent_count },
+            {
+              key: "tokens",
+              label: "Tokens",
+              render: (row) => row.total_tokens,
+            },
+            {
+              key: "agents",
+              label: "Agents",
+              render: (row) => row.agent_count,
+            },
             {
               key: "latency",
               label: "Avg latency",
@@ -584,7 +636,11 @@ export function UsageSection({ app }: UsageSectionProps) {
             columns={[
               { key: "scope", label: "Scope", render: (row) => row.scope },
               { key: "runs", label: "Runs", render: (row) => row.runs },
-              { key: "tokens", label: "Tokens", render: (row) => row.total_tokens },
+              {
+                key: "tokens",
+                label: "Tokens",
+                render: (row) => row.total_tokens,
+              },
               {
                 key: "cost",
                 label: "Est. cost",
@@ -606,7 +662,11 @@ export function UsageSection({ app }: UsageSectionProps) {
             onExportJson={() => usage.exportDataset("timeline", "json")}
             columns={[
               { key: "tool", label: "Tool", render: (row) => row.tool_name },
-              { key: "proposals", label: "Proposals", render: (row) => row.proposals },
+              {
+                key: "proposals",
+                label: "Proposals",
+                render: (row) => row.proposals,
+              },
             ]}
             getRowId={(row) => row.tool_name}
           />

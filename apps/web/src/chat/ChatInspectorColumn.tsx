@@ -208,10 +208,12 @@ export function ChatInspectorColumn({
         </div>
         <div className="workspace-tag-row">
           <Chip color={pendingApprovalCount > 0 ? "warning" : "success"} variant="soft">
-            {pendingApprovalCount} approval{pendingApprovalCount === 1 ? "" : "s"}
+            {pendingApprovalCount} approval
+            {pendingApprovalCount === 1 ? "" : "s"}
           </Chip>
           <Chip variant="secondary">
-            {a2uiSurfaces.length} A2UI surface{a2uiSurfaces.length === 1 ? "" : "s"}
+            {a2uiSurfaces.length} A2UI surface
+            {a2uiSurfaces.length === 1 ? "" : "s"}
           </Chip>
           <Chip variant="secondary">
             {runIds.length} known run{runIds.length === 1 ? "" : "s"}
@@ -220,7 +222,8 @@ export function ChatInspectorColumn({
             {compactions.length} compaction{compactions.length === 1 ? "" : "s"}
           </Chip>
           <Chip variant="secondary">
-            {backgroundTasks.length} background task{backgroundTasks.length === 1 ? "" : "s"}
+            {backgroundTasks.length} background task
+            {backgroundTasks.length === 1 ? "" : "s"}
           </Chip>
         </div>
         <KeyValueList
@@ -763,7 +766,8 @@ export function ChatInspectorColumn({
                       variant="secondary"
                       onPress={() => inspectCheckpoint(checkpoint.checkpoint_id)}
                     >
-                      {sessionMaintenanceBusyKey === `inspect-checkpoint:${checkpoint.checkpoint_id}`
+                      {sessionMaintenanceBusyKey ===
+                      `inspect-checkpoint:${checkpoint.checkpoint_id}`
                         ? "Loading..."
                         : "Inspect"}
                     </ActionButton>
@@ -774,7 +778,8 @@ export function ChatInspectorColumn({
                       variant="primary"
                       onPress={() => restoreCheckpoint(checkpoint.checkpoint_id)}
                     >
-                      {sessionMaintenanceBusyKey === `restore-checkpoint:${checkpoint.checkpoint_id}`
+                      {sessionMaintenanceBusyKey ===
+                      `restore-checkpoint:${checkpoint.checkpoint_id}`
                         ? "Restoring..."
                         : "Restore"}
                     </ActionButton>
