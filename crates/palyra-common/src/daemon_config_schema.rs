@@ -529,10 +529,10 @@ mod tests {
             trusted_dirs = ["secrets"]
             [tool_call.browser_service]
             auth_token = "browserd-token"
+            state_key_vault_ref = "global/browserd_state_key"
             [tool_call.browser_service.auth_token_secret_ref]
             kind = "exec"
             command = ["git", "--version"]
-            state_key_vault_ref = "global/browserd_state_key"
             [tool_call.browser_service.state_key_secret_ref]
             kind = "file"
             path = "secrets/browserd.key"
